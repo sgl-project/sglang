@@ -1013,7 +1013,7 @@ class FlashAttentionBackend(AttentionBackend):
         }
 
         # This is used by draft decode's first half of metadata when topk > 1
-        self.draft_decode_cuda_graph_metadata_topk_normal = {
+        self.draft_decode_metadata_topk_normal = {
             "cache_seqlens": torch.zeros(max_bs, dtype=torch.int32, device=self.device),
             "cu_seqlens_q": torch.arange(
                 0,
@@ -1034,7 +1034,7 @@ class FlashAttentionBackend(AttentionBackend):
         }
 
         # This is used by draft decode's second half of metadata when topk > 1
-        self.draft_decode_cuda_graph_metadata_topk_expand = {
+        self.draft_decode_metadata_topk_expand = {
             "cache_seqlens": torch.zeros(
                 max_bs * self.topk, dtype=torch.int32, device=self.device
             ),
@@ -1056,6 +1056,8 @@ class FlashAttentionBackend(AttentionBackend):
             ),
         }
 
+        # Biao's Note: Consolidate the three decode metadata
+
         self.target_verify_metadata = {
             "cache_seqlens": torch.zeros(max_bs, dtype=torch.int32, device=self.device),
             "cu_seqlens_q": torch.zeros(
@@ -1074,6 +1076,57 @@ class FlashAttentionBackend(AttentionBackend):
                 0, self.max_context_len, self.page_size, device=self.device
             ),
         }
+
+        self.target_verify_metadata_topk_normal = {
+            "cache_seqlens": torch.zeros(max_bs, dtype=torch.int32, device=self.device),
+            "cu_seqlens_q": torch.arange(
+                0,
+                max_bs * self.speculative_num_draft_tokens + 1,
+                step=self.speculative_num_draft_tokens,
+                dtype=torch.int32,
+                device=self.device,
+            ),
+            "cu_seqlens_k": torch.zeros(
+                max_bs + 1, dtype=torch.int32, device=self.device
+            ),
+            "page_table": torch.zeros(
+                max_bs,
+                self.max_context_len,
+                dtype=torch.int32,
+                device=self.device,
+            ),
+        }
+
+        self.target_verify_metadata_topk_expand = {
+            "cache_seqlens": torch.full(
+                (max_bs * self.speculative_num_draft_tokens,),
+                self.speculative_num_draft_tokens,
+                dtype=torch.int32,
+                device=self.device,
+            ),
+            "cu_seqlens_q": torch.arange(
+                0,
+                max_bs * self.speculative_num_draft_tokens + 1,
+                dtype=torch.int32,
+                device=self.device,
+            ),
+            "cu_seqlens_k": torch.arange(
+                0,
+                max_bs * self.speculative_num_draft_tokens * self.speculative_num_steps
+                + 1,
+                step=self.speculative_num_draft_tokens,
+                dtype=torch.int32,
+                device=self.device,
+            ),
+            "page_table": torch.zeros(
+                max_bs * self.speculative_num_draft_tokens,
+                self.speculative_num_draft_tokens,
+                dtype=torch.int32,
+                device=self.device,
+            ),
+        }
+
+        # Biao's Note: Consolidate the encoder metadata
 
         self.encoder_metadata = {
             "encoder_page_table": torch.zeros(
@@ -1135,41 +1188,35 @@ class FlashAttentionBackend(AttentionBackend):
                     # When top k > 1, we need two specific draft decode metadata, and then merge states
                     # 1. The first half of metadata for prefix tokens
                     metadata.cache_seqlens_int32 = (
-                        self.draft_decode_cuda_graph_metadata_topk_normal[
-                            "cache_seqlens"
-                        ][:bs]
+                        self.draft_decode_metadata_topk_normal["cache_seqlens"][:bs]
                     )
                     metadata.max_seq_len_q = self.topk
                     metadata.max_seq_len_k = seq_lens.max().item()
-                    metadata.cu_seqlens_q = (
-                        self.draft_decode_cuda_graph_metadata_topk_normal[
-                            "cu_seqlens_q"
-                        ][: bs + 1]
-                    )
+                    metadata.cu_seqlens_q = self.draft_decode_metadata_topk_normal[
+                        "cu_seqlens_q"
+                    ][: bs + 1]
                     metadata.cu_seqlens_k = torch.nn.functional.pad(
                         torch.cumsum(
                             metadata.cache_seqlens_int32, dim=0, dtype=torch.int32
                         ),
                         (1, 0),
                     )
-                    metadata.page_table = (
-                        self.draft_decode_cuda_graph_metadata_topk_normal["page_table"][
-                            req_pool_indices, :
-                        ]
-                    )
+                    metadata.page_table = self.draft_decode_metadata_topk_normal[
+                        "page_table"
+                    ][req_pool_indices, :]
 
                     # 2. The second half of metadata for draft tokens (per_batch_num_tokens = topk)
                     metadata_expand.cache_seqlens_int32 = (
-                        self.draft_decode_cuda_graph_metadata_topk_expand[
-                            "cache_seqlens"
-                        ][: bs * self.topk]
+                        self.draft_decode_metadata_topk_expand["cache_seqlens"][
+                            : bs * self.topk
+                        ]
                     )
                     metadata_expand.max_seq_len_q = 1
                     # metadata_expand.max_seq_len_k = self.speculative_step_id + 1, do this in replay
                     metadata_expand.cu_seqlens_q = (
-                        self.draft_decode_cuda_graph_metadata_topk_expand[
-                            "cu_seqlens_q"
-                        ][: bs * self.topk + 1]
+                        self.draft_decode_metadata_topk_expand["cu_seqlens_q"][
+                            : bs * self.topk + 1
+                        ]
                     )
                     metadata_expand.cu_seqlens_k = torch.nn.functional.pad(
                         torch.cumsum(
@@ -1179,11 +1226,9 @@ class FlashAttentionBackend(AttentionBackend):
                         ),
                         (1, 0),
                     )
-                    metadata_expand.page_table = (
-                        self.draft_decode_cuda_graph_metadata_topk_expand["page_table"][
-                            req_pool_indices, :
-                        ]
-                    )
+                    metadata_expand.page_table = self.draft_decode_metadata_topk_expand[
+                        "page_table"
+                    ][req_pool_indices, :]
             else:
                 # Normal Decode
                 # Get sequence information
@@ -1205,35 +1250,74 @@ class FlashAttentionBackend(AttentionBackend):
                 )
             self.decode_cuda_graph_metadata[bs] = metadata
         elif forward_mode.is_target_verify():
-            metadata.cache_seqlens_int32 = self.target_verify_metadata["cache_seqlens"][
-                :bs
-            ]
-            metadata.cache_seqlens_int32.copy_(
-                (seq_lens + self.speculative_num_draft_tokens).to(torch.int32)
-            )
+            if self.topk <= 1:
+                metadata.cache_seqlens_int32 = self.target_verify_metadata[
+                    "cache_seqlens"
+                ][:bs]
+                metadata.cache_seqlens_int32.copy_(
+                    (seq_lens + self.speculative_num_draft_tokens).to(torch.int32)
+                )
 
-            metadata.max_seq_len_q = self.speculative_num_draft_tokens
-            metadata.max_seq_len_k = (
-                seq_lens.max().item() + self.speculative_num_draft_tokens
-            )
+                metadata.max_seq_len_q = self.speculative_num_draft_tokens
+                metadata.max_seq_len_k = (
+                    seq_lens.max().item() + self.speculative_num_draft_tokens
+                )
 
-            metadata.cu_seqlens_q = torch.arange(
-                0,
-                bs * self.speculative_num_draft_tokens + 1,
-                self.speculative_num_draft_tokens,
-                dtype=torch.int32,
-                device=device,
-            )
+                metadata.cu_seqlens_q = torch.arange(
+                    0,
+                    bs * self.speculative_num_draft_tokens + 1,
+                    self.speculative_num_draft_tokens,
+                    dtype=torch.int32,
+                    device=device,
+                )
 
-            metadata.cu_seqlens_k = self.target_verify_metadata["cu_seqlens_k"][
-                : (bs + 1)
-            ]
+                metadata.cu_seqlens_k = self.target_verify_metadata["cu_seqlens_k"][
+                    : (bs + 1)
+                ]
 
-            metadata.page_table = self.target_verify_metadata["page_table"][
-                req_pool_indices, :
-            ]
+                metadata.page_table = self.target_verify_metadata["page_table"][
+                    req_pool_indices, :
+                ]
 
-            self.target_verify_metadata[bs] = metadata
+                self.target_verify_metadata[bs] = metadata
+            else:
+                # When topk > 1, we need two specific target verify metadata, and then merge states
+                # 1. The first half of metadata for prefix tokens
+                metadata.cache_seqlens_int32 = self.target_verify_metadata_topk_normal[
+                    "cache_seqlens"
+                ][:bs]
+                metadata.max_seq_len_q = self.speculative_num_draft_tokens
+                # metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item(), do this in replay
+                metadata.cu_seqlens_q = self.target_verify_metadata_topk_normal[
+                    "cu_seqlens_q"
+                ][: bs + 1]
+                metadata.cu_seqlens_k = self.target_verify_metadata_topk_normal[
+                    "cu_seqlens_k"
+                ][: bs + 1]
+                metadata.page_table = self.target_verify_metadata_topk_normal[
+                    "page_table"
+                ][req_pool_indices, :]
+
+                # 2. The second half of metadata for draft tokens (per_batch_num_tokens = topk)
+                metadata_expand.cache_seqlens_int32 = (
+                    self.target_verify_metadata_topk_expand["cache_seqlens"][
+                        : bs * self.speculative_num_draft_tokens
+                    ]
+                )
+                metadata_expand.max_seq_len_q = 1
+                metadata_expand.max_seq_len_k = self.speculative_num_steps
+                metadata_expand.cu_seqlens_q = self.target_verify_metadata_topk_expand[
+                    "cu_seqlens_q"
+                ][: bs * self.speculative_num_draft_tokens + 1]
+                metadata_expand.cu_seqlens_k = self.target_verify_metadata_topk_expand[
+                    "cu_seqlens_k"
+                ][: bs * self.speculative_num_draft_tokens + 1]
+                metadata_expand.page_table = self.target_verify_metadata_topk_expand[
+                    "page_table"
+                ]
+
+                self.target_verify_metadata_topk_normal[bs] = metadata
+                self.target_verify_metadata_topk_expand[bs] = metadata_expand
 
         if encoder_lens is not None:
             encoder_bs = encoder_lens.numel()
@@ -1298,7 +1382,7 @@ class FlashAttentionBackend(AttentionBackend):
                 else:
                     # When top k > 1, we need two specific draft decode metadata, and then merge states
                     # 1. The first half of metadata for prefix tokens
-                    metadata = self.draft_decode_cuda_graph_metadata_topk_normal[bs]
+                    metadata = self.draft_decode_metadata_topk_normal[bs]
                     metadata.cache_seqlens_int32.copy_(seq_lens.to(torch.int32))
                     # metadata.max_seq_len_q = self.topk, already set in capture
                     metadata.max_seq_len_k = seq_lens_cpu.max().item()
@@ -1319,9 +1403,7 @@ class FlashAttentionBackend(AttentionBackend):
                     metadata.page_table[:, : metadata.max_seq_len_k].copy_(page_table)
 
                     # 2. The second half of metadata for draft tokens (per_batch_num_tokens = topk)
-                    metadata_expand = self.draft_decode_cuda_graph_metadata_topk_expand[
-                        bs
-                    ]
+                    metadata_expand = self.draft_decode_metadata_topk_expand[bs]
                     decode_length = self.speculative_step_id + 1
                     cache_seqlens_int32 = torch.full(
                         (seq_lens.numel() * self.topk,),
@@ -1374,25 +1456,92 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.page_table[:, max_seq_pages:].fill_(0)
 
         elif forward_mode.is_target_verify():
-            metadata = self.target_verify_metadata[bs]
-            metadata.cache_seqlens_int32.copy_(
-                (seq_lens + self.speculative_num_draft_tokens).to(torch.int32)
-            )
+            if self.topk <= 1:
+                metadata = self.target_verify_metadata[bs]
+                metadata.cache_seqlens_int32.copy_(
+                    (seq_lens + self.speculative_num_draft_tokens).to(torch.int32)
+                )
 
-            metadata.max_seq_len_k = (
-                seq_lens_cpu.max().item() + self.speculative_num_draft_tokens
-            )
-            metadata.cu_seqlens_k.copy_(
-                torch.nn.functional.pad(
+                metadata.max_seq_len_k = (
+                    seq_lens_cpu.max().item() + self.speculative_num_draft_tokens
+                )
+                metadata.cu_seqlens_k.copy_(
+                    torch.nn.functional.pad(
+                        torch.cumsum(
+                            metadata.cache_seqlens_int32, dim=0, dtype=torch.int32
+                        ),
+                        (1, 0),
+                    )
+                )
+                page_table = self.req_to_token[
+                    req_pool_indices, : metadata.max_seq_len_k
+                ]
+                metadata.page_table[:, : metadata.max_seq_len_k].copy_(page_table)
+            else:
+                # When topk > 1, we need two specific target verify metadata, and then merge states
+                # 1. The first half of metadata for prefix tokens
+                metadata = self.target_verify_metadata_topk_normal[bs]
+                metadata.cache_seqlens_int32.copy_(seq_lens.to(torch.int32))
+                # metadata.max_seq_len_q = self.speculative_num_draft_tokens, already set in capture
+                metadata.max_seq_len_k = seq_lens_cpu.max().item()
+                # metadata.cu_seqlens_q already set in capture
+                metadata.cu_seqlens_k.copy_(
+                    torch.nn.functional.pad(
+                        torch.cumsum(
+                            metadata.cache_seqlens_int32, dim=0, dtype=torch.int32
+                        ),
+                        (1, 0),
+                    )
+                )
+                page_table = self.req_to_token[
+                    req_pool_indices, : metadata.max_seq_len_k
+                ]
+                metadata.page_table[:, : metadata.max_seq_len_k].copy_(page_table)
+
+                # 2. The second half of metadata for draft tokens (per_batch_num_tokens = topk)
+                metadata_expand = self.target_verify_metadata_topk_expand[bs]
+                # metadata_expand.cache_seqlens_int32 already set in capture
+                # metadata_expand.max_seq_len_q = 1, already set in capture
+                # metadata_expand.max_seq_len_k = self.speculative_num_draft_tokens, already set in capture
+                # metadata_expand.cu_seqlens_q already set in capture
+                # metadata_expand.cu_seqlens_k already set in capture
+                offsets = torch.arange(
+                    self.speculative_num_draft_tokens, device=device
+                ).unsqueeze(
+                    0
+                )  # shape: (1, self.speculative_num_draft_tokens)
+                cols = offsets.expand(
+                    forward_batch.seq_lens.numel(), -1
+                ) + forward_batch.seq_lens.unsqueeze(1)
+                non_masked_page_table = (
+                    forward_batch.req_to_token_pool.req_to_token[
+                        forward_batch.req_pool_indices, :
+                    ]
+                    .gather(1, cols)
+                    .repeat_interleave(self.speculative_num_draft_tokens, dim=0)
+                )  # (bsz, draft_num)
+
+                cum_len = torch.nn.functional.pad(
                     torch.cumsum(
-                        metadata.cache_seqlens_int32, dim=0, dtype=torch.int32
+                        (
+                            forward_batch.seq_lens + self.speculative_num_draft_tokens
+                        ).repeat_interleave(self.speculative_num_draft_tokens),
+                        dim=0,
                     ),
                     (1, 0),
+                )[:-1]
+                mask_extraction_indices = (
+                    cols.repeat_interleave(self.speculative_num_draft_tokens, dim=0)
+                    + cum_len[:, None]
+                ).view(1, -1)
+                mask = forward_batch.spec_info.custom_mask[
+                    mask_extraction_indices
+                ].view(
+                    -1, self.speculative_num_draft_tokens
+                )  # (bsz * draft_num, draft_num)
+                metadata_expand.page_table.copy_(
+                    (non_masked_page_table * mask).to(torch.int32)
                 )
-            )
-            page_table = self.req_to_token[req_pool_indices, : metadata.max_seq_len_k]
-            metadata.page_table[:, : metadata.max_seq_len_k].copy_(page_table)
-
         if encoder_lens is not None:
             # Only support encoder size 1 for now
             metadata.encoder_max_seq_len_k = encoder_lens[0]
