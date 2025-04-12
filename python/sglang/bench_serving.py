@@ -975,6 +975,7 @@ async def benchmark(
     lora_names: List[str],
     extra_request_body: Dict[str, Any],
     profile: bool,
+    enable_expert_distribution_recording: bool = False,
     pd_seperated: bool = False,
     flush_cache: bool = False,
 ):
@@ -1392,6 +1393,7 @@ def run_benchmark(args_: argparse.Namespace):
             lora_names=args.lora_name,
             extra_request_body=extra_request_body,
             profile=args.profile,
+            enable_expert_distribution_recording=args.enable_expert_distribution_recording,
             pd_seperated=args.pd_seperated,
             flush_cache=args.flush_cache,
         )
@@ -1563,7 +1565,7 @@ if __name__ == "__main__":
              "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
     )
     parser.add_argument(
-        "--enable-expert-distribution-record",
+        "--enable-expert-distribution-recording",
         action="store_true",
         help="Enable expert distribution recording",
     )
