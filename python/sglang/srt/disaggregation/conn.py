@@ -259,7 +259,8 @@ class KVManager:
                         dst_aux_ptrs,
                         dst_aux_index,
                     ) = self.waiting_pool.pop(room)
-                    self.sync_status_to_decode_endpoint(endpoint, room)
+                    # TODO(lsyin): I do not thinks this sync is necessary in current implementation
+                    # self.sync_status_to_decode_endpoint(endpoint, room)
                     (
                         prefill_kv_indices,
                         prefill_aux_index,
