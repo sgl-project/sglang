@@ -1886,3 +1886,14 @@ class DisposibleTensor:
         if isinstance(value, DisposibleTensor):
             return value.value
         return value
+
+
+class TensorCreator:
+    def __init__(self, creator: Callable[[], torch.Tensor]):
+        self._creator = creator
+
+    def create(self):
+        assert self._creator is not None
+        value = self._creator()
+        self._creator = None
+        return value
