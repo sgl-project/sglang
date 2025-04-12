@@ -1480,14 +1480,43 @@ def permute_weight(x: torch.Tensor) -> torch.Tensor:
 
 class MultiprocessingSerializer:
     @staticmethod
-    def serialize(obj):
+    def serialize(obj, output_str: bool = False):
+        """
+        Serialize a Python object using ForkingPickler.
+
+        Args:
+            obj: The object to serialize.
+            output_str (bool): If True, return a base64-encoded string instead of raw bytes.
+
+        Returns:
+            bytes or str: The serialized object.
+        """
         buf = io.BytesIO()
         ForkingPickler(buf).dump(obj)
         buf.seek(0)
-        return buf.read()
+        output = buf.read()
+
+        if output_str:
+            # Convert bytes to base64-encoded string
+            output = base64.b64encode(output).decode("utf-8")
+
+        return output
 
     @staticmethod
     def deserialize(data):
+        """
+        Deserialize a previously serialized object.
+
+        Args:
+            data (bytes or str): The serialized data, optionally base64-encoded.
+
+        Returns:
+            The deserialized Python object.
+        """
+        if isinstance(data, str):
+            # Decode base64 string to bytes
+            data = base64.b64decode(data)
+
         return ForkingPickler.loads(data)
 
 
@@ -1819,3 +1848,21 @@ class DeepEPMode(Enum):
             return DeepEPMode.low_latency
         else:
             return DeepEPMode.normal
+
+
+def fast_topk(values, topk, dim):
+    if topk == 1:
+        # Use max along the specified dimension to get both value and index
+        return torch.max(values, dim=dim, keepdim=True)
+    else:
+        # Use topk for efficiency with larger k values
+        return torch.topk(values, topk, dim=dim)
+
+
+def is_hopper_with_cuda_12_3():
+    if not is_cuda():
+        return False
+    is_hopper = torch.cuda.get_device_capability()[0] == 9
+    cuda_version = torch.version.cuda.split(".")
+    is_cuda_compatible = int(cuda_version[0]) == 12 and int(cuda_version[1]) >= 3
+    return is_hopper and is_cuda_compatible
