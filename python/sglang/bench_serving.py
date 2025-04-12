@@ -1563,6 +1563,11 @@ if __name__ == "__main__":
              "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
     )
     parser.add_argument(
+        "--enable-expert-distribution-record",
+        action="store_true",
+        help="Enable expert distribution recorder",
+    )
+    parser.add_argument(
         "--lora-name",
         type=str,
         nargs="*",
