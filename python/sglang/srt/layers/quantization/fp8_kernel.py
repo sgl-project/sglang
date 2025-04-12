@@ -45,7 +45,7 @@ if _is_cuda:
     from sgl_kernel import sgl_per_token_group_quant_fp8, sgl_per_token_quant_fp8
 
     sm_version = get_device_sm()
-    if sm_version >= 90 and get_bool_env_var("SGL_ENABLE_JIT_DEEPGEMM", default="true"):
+    if sm_version == 90 and get_bool_env_var("SGL_ENABLE_JIT_DEEPGEMM", default="true"):
         _enable_jit_deepgemm = True
 
 

@@ -87,7 +87,14 @@ void lightning_attention_decode(
     const torch::Tensor& slope,
     torch::Tensor output,
     torch::Tensor new_kv);
-
+void cutlass_mla_decode(
+    torch::Tensor const& out,
+    torch::Tensor const& q_nope_and_q_pe,
+    torch::Tensor const& kv_c_and_k_pe_cache,
+    torch::Tensor const& seq_lens,
+    torch::Tensor const& page_table,
+    torch::Tensor const& workspace);
+int64_t cutlass_mla_get_workspace_size(int64_t max_seq_len, int64_t num_batches, int64_t sm_count = 0);
 /*
  * From csrc/elementwise
  */
@@ -160,13 +167,6 @@ void sgl_per_token_group_quant_int8(
     double int8_max);
 void sgl_per_tensor_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s, bool is_static);
 void sgl_per_token_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s);
-void cublas_grouped_gemm(
-    const std::vector<torch::Tensor>& inputs,
-    const std::vector<torch::Tensor>& weights,
-    const std::vector<torch::Tensor>& outputs,
-    const torch::Dtype& out_dtype,
-    int64_t cublas_handle,
-    int64_t cuda_stream);
 void bmm_fp8(
     at::Tensor A,
     at::Tensor B,

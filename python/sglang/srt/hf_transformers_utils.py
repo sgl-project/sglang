@@ -215,6 +215,7 @@ def get_processor(
     tokenizer_mode: str = "auto",
     trust_remote_code: bool = False,
     tokenizer_revision: Optional[str] = None,
+    use_fast: Optional[bool] = True,
     **kwargs,
 ):
     # pop 'revision' from kwargs if present.
@@ -231,6 +232,9 @@ def get_processor(
     if config.model_type in {"qwen2_vl"}:
         if "size" not in kwargs:
             kwargs["size"] = {"shortest_edge": 3136, "longest_edge": 1003520}
+
+    if config.model_type not in {"llava", "clip"}:
+        kwargs["use_fast"] = use_fast
 
     processor = AutoProcessor.from_pretrained(
         tokenizer_name,
