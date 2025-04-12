@@ -19,9 +19,9 @@ from typing import Optional, Tuple, Union
 import torch
 import torch.nn as nn
 
-from sglang.srt.utils import is_cuda_available
+from sglang.srt.utils import is_cuda
 
-_is_cuda = is_cuda_available()
+_is_cuda = is_cuda()
 
 if _is_cuda:
     from sgl_kernel import (

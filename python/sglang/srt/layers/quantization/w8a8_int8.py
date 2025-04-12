@@ -2,9 +2,9 @@ from typing import Any, Callable, Dict, List, Optional
 
 import torch
 
-from sglang.srt.utils import is_cuda_available, set_weight_attrs
+from sglang.srt.utils import is_cuda, set_weight_attrs
 
-is_cuda = is_cuda_available()
+is_cuda = is_cuda()
 if is_cuda:
     from sgl_kernel import int8_scaled_mm
 

@@ -34,14 +34,9 @@ from sglang.srt.speculative.eagle_utils import (
     select_top_k_tokens,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.utils import (
-    empty_context,
-    fast_topk,
-    get_available_gpu_memory,
-    is_cuda_available,
-)
+from sglang.srt.utils import empty_context, fast_topk, get_available_gpu_memory, is_cuda
 
-if is_cuda_available():
+if is_cuda():
     from sgl_kernel import segment_packbits
 
 logger = logging.getLogger(__name__)
