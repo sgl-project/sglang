@@ -213,7 +213,7 @@ def compute_gpu_physical_count(
     """output: gpu_physical_count_of_batch (whatever, num_layer, num_gpu)"""
     return einops.reduce(
         physical_count_of_whatever,
-        "whatever num_layer (num_gpu num_expert_per_gpu) -> num_batch num_layer num_gpu",
+        "whatever num_layer (num_gpu num_expert_per_gpu) -> whatever num_layer num_gpu",
         "sum",
         num_gpu=num_gpu,
     )
