@@ -100,8 +100,8 @@ class ForwardMode(IntEnum):
     def is_draft_extend(self):
         return self == ForwardMode.DRAFT_EXTEND
 
-    def is_cuda_graph(self, device: str = "cuda"):
-        if device == "hpu":
+    def is_cuda_graph(self):
+        if _is_hpu:
             # hpu will always use graph runner
             return True
         return (
