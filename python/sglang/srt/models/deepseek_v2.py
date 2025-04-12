@@ -1480,14 +1480,24 @@ class DeepseekV2ForCausalLM(nn.Module):
         if self.n_share_experts_fusion is not None and self.n_share_experts_fusion > 0:
             weights_list = list(weights)
             weights_dict = dict(weights_list)
-            suffix_list = [
-                "down_proj.weight",
-                "down_proj.weight_scale_inv",
-                "gate_proj.weight",
-                "gate_proj.weight_scale_inv",
-                "up_proj.weight",
-                "up_proj.weight_scale_inv",
-            ]
+            if self.quant_config.get_name() == "w8a8_int8":
+                suffix_list = [
+                    "down_proj.weight",
+                    "down_proj.weight_scale",
+                    "gate_proj.weight",
+                    "gate_proj.weight_scale",
+                    "up_proj.weight",
+                    "up_proj.weight_scale",
+                ]
+            else:
+                suffix_list = [
+                    "down_proj.weight",
+                    "down_proj.weight_scale_inv",
+                    "gate_proj.weight",
+                    "gate_proj.weight_scale_inv",
+                    "up_proj.weight",
+                    "up_proj.weight_scale_inv",
+                ]
             names_to_remove = []
             for moe_layer in tqdm(
                 range(
