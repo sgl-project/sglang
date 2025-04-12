@@ -2011,7 +2011,7 @@ class ServerArgs:
         args.dp_size = args.data_parallel_size
         args.ep_size = args.expert_parallel_size
 
-        if args.enable_hip_attention:
+        if args.enable_hip_attention or (args.hip_attention_config is not None):
             from hip_attn.v1_2 import HiPAttentionConfig
 
             args.hip_attention_config = HiPAttentionConfig(
