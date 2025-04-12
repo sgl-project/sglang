@@ -162,10 +162,10 @@ See [Separate Reasoning](https://docs.sglang.ai/backend/separate_reasoning.html)
 
 ### Function calling for DeepSeek Models
 
-Add arguments `--tool-call-parser deepseekv3`, `--chat-template deepseek.jinja` to enable this feature. For example (running on 1 * H20 node):
+Add arguments `--tool-call-parser deepseekv3` to enable this feature. For example (running on 1 * H20 node):
 
 ```
-python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3-0324 --tp 8 --port 30000 --host 0.0.0.0 --mem-fraction-static 0.9 --tool-call-parser deepseekv3 --chat-template deepseek.jinja --grammar-backend outlines
+python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3-0324 --tp 8 --port 30000 --host 0.0.0.0 --mem-fraction-static 0.9 --disable-cuda-graph --tool-call-parser deepseekv3
 ```
 
 Sample Request:
@@ -173,58 +173,19 @@ Sample Request:
 ```
 curl "http://127.0.0.1:30000/v1/chat/completions" \
 -H "Content-Type: application/json" \
--d '{
-    "messages": [
-        {
-            "role": "assistant",
-            "content": "Act like you are a helpful assistant."
-        },
-        {
-            "role": "user",
-            "content": "Hows the weather like in Hangzhou and Shanghai today"
-        }
-    ],
-    "temperature": 0,
-    "max_tokens": 100,
-    "model": "deepseek-ai/DeepSeek-V3-0324",
-    "stream": true,
-    "tools": [
-        {
-            "type": "function",
-            "function": {
-                "name": "query_weather",
-                "description": "Get weather of an location, the user shoud supply a location first",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "city": {
-                            "type": "string",
-                            "description": "The city and state, e.g. Beijing"
-                        }
-                    },
-                    "required": [
-                        "city"
-                    ]
-                }
-            }
-        }
-    ]
-}'
+-d '{"temperature": 0, "max_tokens": 100, "model": "deepseek-ai/DeepSeek-V3-0324", "tools": [{"type": "function", "function": {"name": "query_weather", "description": "Get weather of an city, the user should supply a city first", "parameters": {"type": "object", "properties": {"city": {"type": "string", "description": "The city, e.g. Beijing"}}, "required": ["city"]}}}], "messages": [{"role": "user", "content": "Hows the weather like in Qingdao today"}]}'
 ```
 
 Expected Response
 
 ```
-{"id":"6fb35459ae4f4cb7b42e574f5fd618f2","object":"chat.completion","created":1744355658,"model":"deepseek-ai/DeepSeek-V3-0324","choices":[{"index":0,"message":{"role":"assistant","content":null,"reasoning_content":null,"tool_calls":[{"id":"0","type":"function","function":{"name":"query_weather","arguments":"{\"city\": \"Hangzhou\"}"}},{"id":"0","type":"function","function":{"name":"query_weather","arguments":"{\"city\": \"Shanghai\"}"}}]},"logprobs":null,"finish_reason":"tool_calls","matched_stop":null}],"usage":{"prompt_tokens":126,"total_tokens":169,"completion_tokens":43,"prompt_tokens_details":null}}
+{"id": "62af80528930423a82c806651ec66e7c", "object": "chat.completion", "created": 1744431333, "model": "deepseek-ai/DeepSeek-V3-0324", "choices": [{"index": 0, "message": {"role": "assistant", "content": null, "reasoning_content": null, "tool_calls": [{"id": "0", "type": "function", "function": {"name": "query_weather", "arguments": "{\\"city\\": \\"Guangzhou\\"}"}}]}, "logprobs": null, "finish_reason": "tool_calls", "matched_stop": null}], "usage": {"prompt_tokens": 118, "total_tokens": 140, "completion_tokens": 22, "prompt_tokens_details": null}}
 
 ```
 
 Important Notes:
-1. The `"messages"` field must include the `{"role": "assistant", "content": ...}` portion to match the format specified in the chat template (deepseek.jinja).
-3. Use a lower `"temperature"` value for better results..
-4. Currently, the function calling implementation for deepseek is incompatible with xgrammar and streaming requests.
-
-The chat template file is [here](https://github.com/sgl-project/sglang/tree/main/docs/references/deepseek.jinja)
+1. Use a lower `"temperature"` value for better results.
+2. Currently, the function calling implementation for deepseek is incompatible with streaming requests.
 
 
 ## FAQ
