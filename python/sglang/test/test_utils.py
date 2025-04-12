@@ -3,12 +3,12 @@
 import argparse
 import copy
 import logging
+import multiprocessing
 import os
 import random
 import subprocess
 import threading
 import time
-import traceback
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -20,11 +20,12 @@ import numpy as np
 import requests
 import torch
 import torch.nn.functional as F
-
 from sglang.bench_serving import run_benchmark
 from sglang.global_config import global_config
 from sglang.lang.backend.openai import OpenAI
 from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
+from sglang.srt.entrypoints.http_server import launch_server
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_bool_env_var, kill_process_tree, retry
 from sglang.test.run_eval import run_eval
 from sglang.utils import get_exception_traceback
@@ -111,9 +112,9 @@ def call_generate_vllm(prompt, temperature, max_tokens, stop=None, n=1, url=None
     res = requests.post(url, json=data)
     assert res.status_code == 200
     if n == 1:
-        pred = res.json()["text"][0][len(prompt) :]
+        pred = res.json()["text"][0][len(prompt):]
     else:
-        pred = [x[len(prompt) :] for x in res.json()["text"]]
+        pred = [x[len(prompt):] for x in res.json()["text"]]
     return pred
 
 
@@ -133,9 +134,9 @@ def call_generate_outlines(
     res = requests.post(url, json=data)
     assert res.status_code == 200
     if n == 1:
-        pred = res.json()["text"][0][len(prompt) :]
+        pred = res.json()["text"][0][len(prompt):]
     else:
-        pred = [x[len(prompt) :] for x in res.json()["text"]]
+        pred = [x[len(prompt):] for x in res.json()["text"]]
     return pred
 
 
@@ -169,12 +170,12 @@ def call_generate_guidance(
             model
             + prompt
             + gen(
-                name="answer",
-                max_tokens=max_tokens,
-                temperature=temperature,
-                stop=stop,
-                regex=regex,
-            )
+            name="answer",
+            max_tokens=max_tokens,
+            temperature=temperature,
+            stop=stop,
+            regex=regex,
+        )
         )
         rets.append(out["answer"])
     return rets if n > 1 else rets[0]
@@ -537,18 +538,23 @@ def get_benchmark_args(
     sharegpt_output_len=None,
     random_input_len=4096,
     random_output_len=2048,
+    random_range_ratio=0.0,
     sharegpt_context_len=None,
     request_rate=float("inf"),
     disable_stream=False,
     disable_ignore_eos=False,
     seed: int = 0,
     pd_seperated: bool = False,
+    flush_cache: bool = False,
+    max_concurrency=None,
+    host=None,
+    port=None,
 ):
     return SimpleNamespace(
         backend="sglang",
         base_url=base_url,
-        host=None,
-        port=None,
+        host=host,
+        port=port,
         dataset_name=dataset_name,
         dataset_path=dataset_path,
         model=None,
@@ -558,7 +564,7 @@ def get_benchmark_args(
         sharegpt_context_len=sharegpt_context_len,
         random_input_len=random_input_len,
         random_output_len=random_output_len,
-        random_range_ratio=0.0,
+        random_range_ratio=random_range_ratio,
         request_rate=request_rate,
         multi=None,
         output_file=None,
@@ -573,6 +579,8 @@ def get_benchmark_args(
         lora_name=None,
         prompt_suffix="",
         pd_seperated=pd_seperated,
+        flush_cache=flush_cache,
+        max_concurrency=max_concurrency,
     )
 
 
@@ -998,8 +1006,8 @@ def run_logprob_check(self: unittest.TestCase, arg: Tuple):
                             if (
                                 res["meta_info"]["output_top_logprobs"][i][rank][0]
                                 == res["meta_info"]["output_top_logprobs"][i][rank + 1][
-                                    0
-                                ]
+                                0
+                            ]
                             ):
                                 rank += 1
                             else:
@@ -1015,3 +1023,40 @@ class CustomTestCase(unittest.TestCase):
             lambda: super(CustomTestCase, self)._callTestMethod(method),
             max_retry=max_retry,
         )
+
+
+def launch_server_process(server_args: ServerArgs, await_startup: bool = True):
+    """launch_server, but in a subprocess"""
+
+    proc = multiprocessing.Process(
+        target=_launch_server_process_internal, args=(server_args,)
+    )
+    proc.start()
+    base_url = f"http://{server_args.host}:{server_args.port}"
+    timeout = 600
+
+    if not await_startup:
+        return proc, base_url
+
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        try:
+            headers = {
+                "Content-Type": "application/json; charset=utf-8",
+            }
+            response = requests.get(f"{base_url}/v1/models", headers=headers)
+            if response.status_code == 200:
+                return proc, base_url
+        except requests.RequestException:
+            pass
+        time.sleep(10)
+    raise TimeoutError("Server failed to start within the timeout period.")
+
+
+def _launch_server_process_internal(server_args):
+    try:
+        launch_server(server_args)
+    except Exception as e:
+        raise e
+    finally:
+        kill_process_tree(os.getpid(), include_parent=False)
