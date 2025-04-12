@@ -88,12 +88,13 @@ def scan_combinations(
                 tp_size=32,
                 enable_expert_location_by_eplb=enable_expert_location_by_eplb,
             )
-            for chunked_prefill_size_per_gpu in [8192, 4096, 2048, 1024]
+            for chunked_prefill_size_per_gpu in [1024, 2048, 4096, 8192, 16384]
             for enable_expert_location_by_eplb in [False, True]
         ]
     ]
 
     for server_args in server_args_list:
+        print()
         mean_utilization_rate = simulate_execution(logical_count_of_seq=logical_count_of_seq, server_args=server_args)
         print(f"{server_args=} {mean_utilization_rate=:.2f}")
 
@@ -108,7 +109,7 @@ def simulate_execution(
         logical_count_of_seq=logical_count_of_seq,
         chunked_prefill_size=server_args.chunked_prefill_size,
     )
-    # print(f"hi {logical_count_of_batch=}")
+    print(f"{logical_count_of_batch.shape=}")
 
     if server_args.enable_expert_location_by_eplb:
         num_physical_expert = model_config_for_expert_location.num_logical_experts + server_args.ep_num_redundant_experts
