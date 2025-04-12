@@ -1897,3 +1897,9 @@ class TensorCreator:
         value = self._creator()
         self._creator = None
         return value
+
+    @staticmethod
+    def maybe_create(value: Union[torch.Tensor, "TensorCreator"]) -> torch.Tensor:
+        if isinstance(value, TensorCreator):
+            return value.create()
+        return value
