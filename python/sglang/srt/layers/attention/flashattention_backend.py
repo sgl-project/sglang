@@ -838,7 +838,7 @@ class FlashAttentionBackend(AttentionBackend):
         """Initialize forward metadata for capturing CUDA graph."""
         metadata = FlashAttentionMetadata()
         device = seq_lens.device
-        if forward_mode.is_decode():
+        if forward_mode.is_decode_or_idle():
             if spec_info is not None:
                 # Draft Decode
                 metadata.cache_seqlens_int32 = self.decode_cuda_graph_metadata[
@@ -941,7 +941,7 @@ class FlashAttentionBackend(AttentionBackend):
         seq_lens = seq_lens[:bs]
         seq_lens_cpu = seq_lens_cpu[:bs]
         req_pool_indices = req_pool_indices[:bs]
-        if forward_mode.is_decode():
+        if forward_mode.is_decode_or_idle():
             metadata = self.decode_cuda_graph_metadata[bs]
 
             if spec_info is not None:
