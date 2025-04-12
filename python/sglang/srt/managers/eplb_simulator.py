@@ -71,7 +71,7 @@ def read_logical_count_of_seq(dir_data: Path):
         items.append(physical_count_of_rank_tensor)
 
     logical_count_of_seq = torch.stack(items)
-    # print(f"{logical_count_of_seq.shape=}")
+    print(f"{logical_count_of_seq.shape=}")
 
     return logical_count_of_seq
 
@@ -94,7 +94,7 @@ def scan_combinations(
 
     for server_args in server_args_list:
         mean_utilization_rate = simulate_execution(logical_count_of_seq=logical_count_of_seq, server_args=server_args)
-        # print(f"{server_args=} {mean_utilization_rate=:.2f}")
+        print(f"{server_args=} {mean_utilization_rate=:.2f}")
 
 
 def simulate_execution(
