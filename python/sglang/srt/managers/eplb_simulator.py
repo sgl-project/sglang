@@ -161,7 +161,7 @@ def simulate_logical_to_physical(
 
     physical_count_of_whatever = torch.zeros(
         (num_whatever, num_layer, num_physical_expert),
-        dtype=logical_to_all_physical_map.dtype,
+        dtype=torch.float32,
     )
 
     for layer_id in range(num_layer):
