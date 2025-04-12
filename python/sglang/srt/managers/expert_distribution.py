@@ -282,8 +282,11 @@ class _DetailAccumulator(_Accumulator):
 
     def __init__(self, expert_location_metadata: "ExpertLocationMetadata", rank: int):
         super().__init__(expert_location_metadata, rank)
-        self._save_dir = os.environ.get("SGLANG_EXPERT_DISTRIBUTION_RECORDER_SAVE_DIR")
         self._records = []
+
+        self._save_dir = os.environ.get("SGLANG_EXPERT_DISTRIBUTION_RECORDER_SAVE_DIR")
+        if self._save_dir is not None and not Path(self._save_dir).exists():
+            Path(self._save_dir).mkdir(parents=True, exist_ok=True)
 
     def get_single_pass_gatherer_keys(self):
         if False:  # TODO `server_args.enable_two_batch_overlap`
