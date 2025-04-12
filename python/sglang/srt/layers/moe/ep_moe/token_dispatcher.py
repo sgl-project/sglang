@@ -1,5 +1,6 @@
 from sglang.srt.managers.expert_distribution import expert_distribution_recorder
 from sglang.srt.utils import DeepEPMode
+from sglang.srt.utils import DeepEPMode, DisposibleTensor
 
 try:
     from deep_ep import Buffer
@@ -28,7 +29,6 @@ class DeepEPDispatchMode(IntEnum):
 
 
 class DeepEPBuffer:
-
     _buffer = None
     _dispatch_mode: Optional[DeepEPDispatchMode] = None
     _hidden_size: Optional[int] = None
@@ -206,6 +206,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             seg_indptr = torch.zeros(
                 (self.num_experts + 1,), device=hidden_states.device, dtype=torch.int64
             )
+            hidden_states = DisposibleTensor(hidden_states)
 
         masked_m = expected_m = None
 
@@ -313,7 +314,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             hidden_states.shape[1],
             BLOCK_SIZE=512,
         )
-        return reorder_topk_ids, seg_indptr, gateup_input
+        return reorder_topk_ids, seg_indptr, DisposibleTensor(gateup_input)
 
     def combine_a(
         self,

@@ -40,7 +40,15 @@ from sglang.srt.layers.quantization.base_config import (
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.utils import DeepEPMode, is_cuda, is_hip, set_weight_attrs
+from sglang.srt.utils import (
+    DeepEPMode,
+    DisposibleTensor,
+    MaybeDisposibleTensor,
+    TensorCreator,
+    is_cuda,
+    is_hip,
+    set_weight_attrs,
+)
 
 _is_cuda = is_cuda()
 
@@ -206,7 +214,9 @@ class EPMoE(torch.nn.Module):
 
         self.grouped_gemm_runner = None
 
-    def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
+    def forward(
+        self, hidden_states: MaybeDisposibleTensor, router_logits: torch.Tensor
+    ):
         assert self.quant_method is not None
 
         if self.grouped_gemm_runner is None:
@@ -245,7 +255,7 @@ class EPMoE(torch.nn.Module):
         )
         if self.activation_scheme == "dynamic" and not self.use_block_quant:
             max_value = (
-                torch.max(hidden_states)
+                torch.max(DisposibleTensor.maybe_unwrap(hidden_states))
                 .repeat(self.num_experts_per_partition)
                 .to(torch.float32)
             )
@@ -273,16 +283,18 @@ class EPMoE(torch.nn.Module):
             dtype=torch.int64,
         )
         # GroupGemm-0
-        gateup_output = torch.empty(
-            gateup_input.shape[0],
-            self.w13_weight.shape[1],
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
+        gateup_output_creator = TensorCreator(
+            lambda: torch.empty(
+                gateup_input.shape[0],
+                self.w13_weight.shape[1],
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
         )
         gateup_output = self.grouped_gemm_runner(
             a=gateup_input,
             b=self.w13_weight,
-            c=gateup_output,
+            c=gateup_output_creator,
             batch_size=self.num_experts_per_partition,
             weight_column_major=True,
             seg_indptr=seg_indptr_cur_rank,
@@ -339,6 +351,8 @@ class EPMoE(torch.nn.Module):
             )
         else:
             raise ValueError(f"Unsupported activation: {self.activation=}")
+
+        del gateup_output
 
         # GroupGemm-1
         down_output = torch.empty(
@@ -898,7 +912,7 @@ class DeepEPMoE(EPMoE):
 
     def forward_normal(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states: MaybeDisposibleTensor,
         reorder_topk_ids: torch.Tensor,
         seg_indptr: torch.Tensor,
     ):
@@ -911,7 +925,7 @@ class DeepEPMoE(EPMoE):
 
         if self.activation_scheme == "dynamic" and not self.use_block_quant:
             max_value = (
-                torch.max(hidden_states)
+                torch.max(DisposibleTensor.maybe_unwrap(hidden_states))
                 .repeat(self.num_experts_per_partition)
                 .to(torch.float32)
             )
@@ -924,18 +938,20 @@ class DeepEPMoE(EPMoE):
         )
 
         # GroupGemm-0
-        gateup_output = torch.empty(
-            hidden_states.shape[0],
-            self.w13_weight.shape[1],
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
+        gateup_output_creator = TensorCreator(
+            lambda: torch.empty(
+                hidden_states.shape[0],
+                self.w13_weight.shape[1],
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
         )
 
         if hidden_states.shape[0] > 0:
             gateup_output = self.grouped_gemm_runner(
                 a=hidden_states,
                 b=self.w13_weight,
-                c=gateup_output,
+                c=gateup_output_creator,
                 batch_size=self.num_experts_per_partition,
                 weight_column_major=True,
                 seg_indptr=seg_indptr,
@@ -949,6 +965,8 @@ class DeepEPMoE(EPMoE):
                 ),
                 block_shape=self.block_shape,
             )
+        else:
+            gateup_output = gateup_output_creator.create()
 
         # Act
         down_input = torch.empty(
@@ -981,6 +999,8 @@ class DeepEPMoE(EPMoE):
             )
         else:
             raise ValueError(f"Unsupported activation: {self.activation=}")
+
+        del gateup_output
 
         # GroupGemm-1
         down_output = torch.empty(

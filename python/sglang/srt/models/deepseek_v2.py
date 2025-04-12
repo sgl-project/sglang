@@ -298,10 +298,10 @@ class DeepseekV2MoE(nn.Module):
         shared_output = self._forward_shared_experts(hidden_states)
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
-        final_hidden_states = (
-            self.experts(hidden_states=hidden_states, router_logits=router_logits)
-            * self.routed_scaling_factor
+        final_hidden_states = self.experts(
+            hidden_states=hidden_states, router_logits=router_logits
         )
+        final_hidden_states *= self.routed_scaling_factor
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
         if self.tp_size > 1:
@@ -355,19 +355,15 @@ class DeepseekV2MoE(nn.Module):
                 topk_weights,
                 forward_mode=forward_mode,
             )
-            # print(f"hi [{get_tensor_model_parallel_rank()}, {self.__class__.__name__}] forward_deepep after dispatch "
-            #       f"{self.layer_id=} {topk_weights=} {topk_idx=} {hidden_states[:, :5]=} ")
-        final_hidden_states = (
-            self.experts(
-                hidden_states=hidden_states,
-                reorder_topk_ids=reorder_topk_ids,
-                seg_indptr=seg_indptr,
-                masked_m=masked_m,
-                expected_m=expected_m,
-                forward_mode=forward_mode,
-            )
-            * self.routed_scaling_factor
+        final_hidden_states = self.experts(
+            hidden_states=hidden_states,
+            reorder_topk_ids=reorder_topk_ids,
+            seg_indptr=seg_indptr,
+            masked_m=masked_m,
+            expected_m=expected_m,
+            forward_mode=forward_mode,
         )
+        final_hidden_states *= self.routed_scaling_factor
         if self.ep_size > 1:
             # print(f"hi [{get_tensor_model_parallel_rank()}, {self.__class__.__name__}] forward_deepep before combine "
             #       f"{self.layer_id=} {final_hidden_states[:, :5]=} ")

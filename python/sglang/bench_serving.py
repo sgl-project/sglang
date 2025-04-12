@@ -427,11 +427,11 @@ async def async_request_gserver(
     raise NotImplementedError()
 
 
-async def async_request_profile(api_url: str) -> RequestFuncOutput:
+async def async_request_profile(api_url: str, json_data=None) -> RequestFuncOutput:
     async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
         output = RequestFuncOutput()
         try:
-            async with session.post(url=api_url) as response:
+            async with session.post(url=api_url, json=json_data) as response:
                 if response.status == 200:
                     output.success = True
                 else:
@@ -688,7 +688,6 @@ def sample_random_requests(
     tokenizer: PreTrainedTokenizerBase,
     dataset_path: str,
 ) -> List[Tuple[str, int, int]]:
-
     input_lens = np.random.randint(
         max(int(input_len * range_ratio), 1),
         input_len + 1,
@@ -1043,7 +1042,7 @@ async def benchmark(
     if profile:
         print("Starting profiler...")
         profile_output = await async_request_profile(
-            api_url=base_url + "/start_profile"
+            api_url=base_url + "/start_profile", json_data={"activities": ["MEM"]}
         )
         if profile_output.success:
             print("Profiler started")
