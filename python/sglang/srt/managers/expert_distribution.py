@@ -326,6 +326,7 @@ class _DetailAccumulator(_Accumulator):
             return deepcopy(self._records)
         else:
             path_output = Path(self._save_dir) / f"{time.time()}-{self._rank}.pt"
+            logger.info(f"Write expert distribution to {path_output}")
             torch.save(self._records, str(path_output))
             return [dict(path_output=str(path_output))]
 
