@@ -1821,40 +1821,6 @@ class DeepEPMode(Enum):
             return DeepEPMode.normal
 
 
-T = TypeVar("T")
-
-
-class Withable(Generic[T]):
-    def __init__(self):
-        self._value: Optional[T] = None
-
-    @property
-    def value(self) -> T:
-        return self._value
-
-    @contextmanager
-    def with_value(self, new_value: T):
-        assert self._value is None
-        self._value = new_value
-        try:
-            yield
-        finally:
-            assert self._value is new_value
-            self._value = None
-
-
-@contextmanager
-def configure_deep_gemm_num_sms(num_sms):
-    import deep_gemm
-
-    original_num_sms = deep_gemm.get_num_sms()
-    deep_gemm.set_num_sms(num_sms)
-    try:
-        yield
-    finally:
-        deep_gemm.set_num_sms(original_num_sms)
-
-
 def fast_topk(values, topk, dim):
     if topk == 1:
         # Use max along the specified dimension to get both value and index
