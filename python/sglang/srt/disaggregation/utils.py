@@ -7,7 +7,6 @@ from typing import List
 import torch
 import torch.distributed as dist
 
-
 class DisaggregationMode(Enum):
     NULL = "null"
     PREFILL = "prefill"
@@ -42,3 +41,28 @@ class ReqToMetadataIdxAllocator:
 
     def free(self, free_index: int):
         self.free_slots.append(free_index)
+
+
+class TransferBackend(Enum):
+    MOONCAKE = "mooncake"
+    FAKE = "fake"
+    
+class KVClassType(Enum):
+    MANAGER = "manager"
+    SENDER = "sender"
+    RECEIVER = "receiver"
+    BOOTSTRAP_SERVER = "bootstrap_server"
+
+def get_kv_class(transfer_backend: TransferBackend, class_type: KVClassType):
+    if transfer_backend == TransferBackend.MOONCAKE:
+        from sglang.srt.disaggregation.mooncake.conn import (
+            MooncakeKVManager, MooncakeKVSender, MooncakeKVReceiver, MooncakeKVBootstrapServer
+        )
+        class_mapping = {
+            "manager": MooncakeKVManager,
+            "sender": MooncakeKVSender,
+            "receiver": MooncakeKVReceiver,
+            "bootstrap_server": MooncakeKVBootstrapServer
+        }
+        return class_mapping.get(class_type)
+    raise ValueError(f"Unsupported transfer backend: {transfer_backend}")
