@@ -1,11 +1,11 @@
 # TODO where to put this file?
-import polars as pl
 import dataclasses
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
 import einops
+import polars as pl
 import torch
 from sglang.srt.managers import deepseek_eplb
 from sglang.srt.managers.expert_location import ExpertLocationMetadata, ModelConfigForExpertLocation
@@ -103,7 +103,6 @@ def scan_combinations(
         mean_utilization_rate = simulate_execution(logical_count_of_seq=logical_count_of_seq, server_args=server_args)
         print(f"{server_args=} {mean_utilization_rate=:.2f}")
         rows.append(dict(**dataclasses.asdict(server_args), mean_utilization_rate=mean_utilization_rate))
-        break
 
     df = pl.DataFrame(rows)
     return df
