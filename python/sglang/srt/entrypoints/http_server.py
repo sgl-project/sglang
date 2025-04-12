@@ -825,7 +825,7 @@ def _wait_and_warmup(
 
     try:
         if server_args.disaggregation_mode == "null":
-            res = requests.post(
+            res = session.post(
                 url + request_name,
                 json=json_data,
                 headers=headers,

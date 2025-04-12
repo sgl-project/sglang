@@ -58,6 +58,7 @@ suites = {
         TestFile("test_skip_tokenizer_init.py", 72),
         TestFile("test_srt_engine.py", 237),
         TestFile("test_srt_endpoint.py", 94),
+        TestFile("test_srt_launch_server_ssl.py", 100),
         TestFile("test_torch_compile.py", 76),
         TestFile("test_torch_compile_moe.py", 85),
         TestFile("test_torch_native_attention_backend.py", 123),
