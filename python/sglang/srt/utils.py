@@ -1864,16 +1864,24 @@ def fast_topk(values, topk, dim):
         return torch.topk(values, topk, dim=dim)
 
 
+@dataclasses.dataclass
+class _TensorMetadata:
+    shape: Any
+    device: Any
+    dtype: Any
+
+
 class DisposibleTensor:
     def __init__(self, value: torch.Tensor):
         self._value = value
+        self._backuped_metadata: Optional[_TensorMetadata] = None
 
     @property
     def value(self):
         assert not self.is_disposed
         return self._value
 
-    def dispose(self):
+    def dispose(self, backup_metadata: bool):
         assert not self.is_disposed
         self._value = None
 
@@ -1886,6 +1894,18 @@ class DisposibleTensor:
         if isinstance(value, DisposibleTensor):
             return value.value
         return value
+
+    @property
+    def shape(self):
+        return TODO
+
+    @property
+    def device(self):
+        return TODO
+
+    @property
+    def dtype(self):
+        return TODO
 
 
 MaybeDisposibleTensor = Union[torch.Tensor, DisposibleTensor]
