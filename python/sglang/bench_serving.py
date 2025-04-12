@@ -480,10 +480,11 @@ def get_tokenizer(
 
 
 def get_dataset(args, tokenizer):
+    num_prompts = args.num_prompts
     if args.dataset_name == "sharegpt":
         input_requests = sample_sharegpt_requests(
             dataset_path=args.dataset_path,
-            num_requests=args.num_prompts,
+            num_requests=num_prompts,
             tokenizer=tokenizer,
             fixed_output_len=args.sharegpt_output_len,
             context_len=args.sharegpt_context_len,
@@ -494,7 +495,7 @@ def get_dataset(args, tokenizer):
         input_requests = sample_random_requests(
             input_len=args.random_input_len,
             output_len=args.random_output_len,
-            num_prompts=args.num_prompts,
+            num_prompts=num_prompts,
             range_ratio=args.random_range_ratio,
             tokenizer=tokenizer,
             dataset_path=args.dataset_path,
