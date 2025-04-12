@@ -975,7 +975,7 @@ async def benchmark(
     lora_names: List[str],
     extra_request_body: Dict[str, Any],
     profile: bool,
-    enable_expert_distribution_recording: bool = False,
+    enable_expert_distribution_record: bool = False,
     pd_seperated: bool = False,
     flush_cache: bool = False,
 ):
@@ -1041,6 +1041,12 @@ async def benchmark(
 
     time.sleep(1.0)
 
+    if enable_expert_distribution_record:
+        print("Starting expert distribution record...")
+        output = await async_request_profile(
+            api_url=base_url + "/start_expert_distribution_record"
+        )
+        assert output.success
     # Start profiler
     if profile:
         print("Starting profiler...")
@@ -1085,6 +1091,16 @@ async def benchmark(
         profile_output = await async_request_profile(api_url=base_url + "/stop_profile")
         if profile_output.success:
             print("Profiler stopped")
+    if enable_expert_distribution_record:
+        print("Stopping expert distribution record...")
+        output = await async_request_profile(
+            api_url=base_url + "/dump_expert_distribution_record"
+        )
+        assert output.success
+        output = await async_request_profile(
+            api_url=base_url + "/stop_expert_distribution_record"
+        )
+        assert output.success
 
     if pbar is not None:
         pbar.close()
@@ -1393,7 +1409,7 @@ def run_benchmark(args_: argparse.Namespace):
             lora_names=args.lora_name,
             extra_request_body=extra_request_body,
             profile=args.profile,
-            enable_expert_distribution_recording=args.enable_expert_distribution_recording,
+            enable_expert_distribution_record=args.enable_expert_distribution_record,
             pd_seperated=args.pd_seperated,
             flush_cache=args.flush_cache,
         )
@@ -1565,9 +1581,9 @@ if __name__ == "__main__":
              "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
     )
     parser.add_argument(
-        "--enable-expert-distribution-recording",
+        "--enable-expert-distribution-record",
         action="store_true",
-        help="Enable expert distribution recording",
+        help="Enable expert distribution record",
     )
     parser.add_argument(
         "--lora-name",
