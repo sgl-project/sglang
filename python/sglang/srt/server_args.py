@@ -388,6 +388,8 @@ class ServerArgs:
 
             # self.disagg_decode_addr_list = self.disagg_decode_peers.split(",")
             # for peer in self.disagg_decode_addr_list:
+            #     if peer == '':
+            #         continue
             #     # make sure host:port
             #     assert ":" in peer, f"Invalid peer {peer} in disagg_decode_peers"
             #     assert is_valid_ipv6_address(peer.split(":")[0]), f"Invalid peer {peer} in disagg_decode_peers"
@@ -406,6 +408,8 @@ class ServerArgs:
             self.disaggregation_prefill_host_list:list [str] = []
             self.disaggregation_prefill_tpworker0_bootstrap_port_list: list[str] = []
             for peer in self.disaggregation_prefill_bootstrap_addr.split(","):
+                if peer == '':
+                    continue
                 # make sure host:port
                 assert ":" in peer, f"Invalid peer {peer} in disagg_prefill_peers"
                 self.disaggregation_prefill_host_list.append(peer.split(":")[0])

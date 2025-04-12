@@ -8,6 +8,8 @@ import random
 import numpy as np
 import tqdm
 
+from typing import Optional
+
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 console_handler = logging.StreamHandler()
@@ -17,31 +19,30 @@ console_handler.setFormatter(formatter)
 logger.addHandler(console_handler)
 
 
-PREFILL_HOST = "127.0.0.1"
-# PREFILL_INIT_PORT = "20000"
-PREFILL_SSH_PORT = "2222"
-PREFILL_SERVE_PORT = "8080"
-PREFILL_BOOTSTRAP_PORT = "9500"
+# (HOST, SSH_PORT, SERVE_PORT, BOOTSTRAP_PORT, extra_env)
+PREFILLS = (
+  ("127.0.0.1", "2222", "8080", "9500", ["CUDA_VISIBLE_DEVICES=0,1"]),
+  ("127.0.0.1", "2222", "8081", "9520", ["CUDA_VISIBLE_DEVICES=2,3"]),
+)
 
-DECODE_HOST = "127.0.0.1"
-# DECODE_INIT_PORT = "20000"
-DECODE_SSH_PORT = "2222"
-DECODE_SERVE_PORT = "8090"
+DECODES = (
+  ("127.0.0.1", "2222", "8090", "10000", ["CUDA_VISIBLE_DEVICES=4,5"]),
+  ("127.0.0.1", "2222", "8091", "10010", ["CUDA_VISIBLE_DEVICES=6,7"]),
+)
 
 LB_HOST = "127.0.0.1"
-LB_SERVE_PORT = "8100"
+LB_SERVE_PORT = "15000"
 
 EXTRA_SSH_ARGS = "" # "-i ~/ytwu/.ssh/id_ed25519"
 
 # NETDEVICE = "eth0"
 NETDEVICE = "lo"
 
+TP=2
+
 MODEL="deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
 # MODEL="/home/qspace/upload/luban_cache/model/luban-llm_deepseek_v3-model_path/DeepSeek-V3/"
 # MODEL="deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
-
-# SGLANG_PATH = "/root/ytwu/save/sglang"
-# SGLANG_PATH = ""
 
 SGLANG_COMMON_ARGS = [
   f"--model-path", MODEL,
@@ -58,45 +59,21 @@ SGLANG_COMMON_ARGS = [
 ]
 
 # in future we will have multiple nodes in P or D instances.
-# "--tp", "1",
 # "--dist-init-addr", f"{MASTER_ADDR}:{MASTER_PORT}",
 # "--nnodes", "2",
 
-PREFILL_ARGS = [
-  "--tp 2",
-  "--nnodes 1",
-  "--disaggregation-mode prefill",
-  f"--disaggregation-bootstrap-port {PREFILL_BOOTSTRAP_PORT}",
-  "--disaggregation-decode-instance-num 1",
-  "--port", f"{PREFILL_SERVE_PORT}",
-]
-
-DECODE_ARGS = [
-  "--tp 2",
-  "--nnodes 1",
-  "--disaggregation-mode decode",
-  f"--disaggregation-prefill-bootstrap-addr {PREFILL_HOST}:{PREFILL_BOOTSTRAP_PORT}",
-  "--port", f"{DECODE_SERVE_PORT}",
-]
-
-PREFILL_OUTPUT_LOG='/tmp/sgl-prefill.log'
-DECODE_OUTPUT_LOG='/tmp/sgl-decode.log'
 BENCH_OUTPUT_LOG='/tmp/sgl-bench.log'
 LB_OUTPUT_LOG='/tmp/sgl-lb.log'
-os.system("rm -rf " + PREFILL_OUTPUT_LOG + " " + DECODE_OUTPUT_LOG + " " + BENCH_OUTPUT_LOG + " " + LB_OUTPUT_LOG)
+os.system("rm -rf " + BENCH_OUTPUT_LOG + " " + LB_OUTPUT_LOG)
 
-prefill_output_log = open(PREFILL_OUTPUT_LOG, 'w')
-decode_output_log = open(DECODE_OUTPUT_LOG, 'w')
 bench_output_log = open(BENCH_OUTPUT_LOG, 'w')
 lb_output_log = open(LB_OUTPUT_LOG, 'w')
 
-remotes = [
-  (PREFILL_HOST, PREFILL_SSH_PORT, prefill_output_log),
-  (DECODE_HOST, DECODE_SSH_PORT, decode_output_log),
+all_machines = [
+  ("127.0.0.1", "2222")
 ]
 
-
-def runCommand(cmd: list[str], remoteAddr: tuple[str, str] = None, outputStream = subprocess.DEVNULL) -> subprocess.Popen:
+def runCommand(cmd: list[str], remoteAddr: Optional[tuple[str, str]] = None, outputStream = subprocess.DEVNULL) -> subprocess.Popen:
     if remoteAddr is not None:
       # source ~/.bashrc fails to alias proxy_on. Dirty hack to fix.
       # PROXY_ON = "&& export HTTP_PROXY=http://hk-mmhttpproxy.woa.com:11113 && \
@@ -132,7 +109,7 @@ def wait_server(addr, port):
         http_request = b"GET / HTTP/1.1\r\nHost: %s:%d\r\n\r\n" % (addr.encode(), port)
         s.sendall(http_request)
         response = s.recv(4096)
-        print(f"Received response: {response.decode('utf-8', errors='ignore')}")
+        # print(f"Received response: {response.decode('utf-8', errors='ignore')}")
         return
     except socket.error as e:
       time.sleep(1)
@@ -143,57 +120,119 @@ def do_exp():
 
   def clean_up():
     logger.info("clean up...")
-    cleanup_cmd = "ps -ef | grep 'sglang' | grep -v grep | grep -v defunct | awk '{print \$2}' | xargs -r kill -SIGKILL; ps aux | grep 'sglang' | grep -v defunct; pkill -f sglang"
-    for addr, ssh_port, output_log in remotes:
-      b = runCommand([cleanup_cmd], (addr, ssh_port), output_log)
+    cleanup_cmd = "ps -ef | grep 'sglang' | grep -v grep | grep -v defunct | awk '{print \$2}' | xargs -r kill -SIGKILL; ps aux | grep 'sglang' | grep -v defunct; pkill -f sglang" # type: ignore
+    for addr, ssh_port in all_machines:
+      b = runCommand([cleanup_cmd], (addr, ssh_port))
       b.wait()
-    time.sleep(10)
+    time.sleep(5)
 
   clean_up()
 
+  prefill_logs = [] 
+  decode_logs = []
+  for i in range(len(PREFILLS)):
+    path=f"/tmp/sgl-prefill-{i}.log"
+    os.system("rm -rf " + path)
+    prefill_logs.append(open(path, 'w'))
+  for i in range(len(DECODES)):
+    path=f"/tmp/sgl-decode-{i}.log"
+    os.system("rm -rf " + path)
+    decode_logs.append(open(path, 'w'))
+
+  prefill_list_boostrap_port = ""
+  for i in range(len(PREFILLS)):
+    # host:bootstrap_port
+    prefill_list_boostrap_port += f"{PREFILLS[i][0]}:{PREFILLS[i][3]},"
+
   for bsz in tqdm.tqdm([32]):
-    filename = f"0408-pd-{bsz}.txt"
+    filename = f"0411-{len(PREFILLS)}P{len(DECODES)}D-TP{TP}-bsz-{bsz}.txt"
 
-    # setup sglang servers.
-    sglang_prefill_args = SGLANG_COMMON_ARGS.copy() + PREFILL_ARGS.copy() + [
-      "--max-running-requests", f"{bsz}",
-    ]
-    sglang_decode_args = SGLANG_COMMON_ARGS.copy() + DECODE_ARGS.copy() + [
-      "--max-running-requests", f"{bsz}",
-    ]
+    prefill_servers = []
+    decode_servers = []
 
-    prefill_env = [
-      "CUDA_VISIBLE_DEVICES=0,1",
-      "UCX_TLS=tcp,cuda",
-      f"UCX_NET_DEVICES={NETDEVICE}",
-      "UCX_LOG_LEVEL=info",
-      # "NCCL_DEBUG=INFO",
-    ]
+    for i, (HOST, SSH_PORT, SERVE_PORT, BOOTSTRAP_PORT, extra_env) in enumerate(PREFILLS):
+      # setup sglang servers.
+      sglang_prefill_args = SGLANG_COMMON_ARGS.copy() + [
+        "--disaggregation-mode prefill",
+        f"--tp {TP}",
+        "--nnodes 1",
+        "--max-running-requests", f"{bsz}",
+        "--disaggregation-mode prefill",
+        f"--disaggregation-bootstrap-port {BOOTSTRAP_PORT}",
+        f"--disaggregation-decode-instance-num {len(DECODES)}",
+        "--port", f"{SERVE_PORT}",
+      ]
+      prefill_env = [
+        "UCX_TLS=tcp,cuda",
+        f"UCX_NET_DEVICES={NETDEVICE}",
+        "UCX_LOG_LEVEL=info",
+        # "NCCL_DEBUG=INFO",
+      ] + extra_env
 
-    decode_env = [
-      "CUDA_VISIBLE_DEVICES=4,5",
-      "UCX_TLS=tcp,cuda",
-      f"UCX_NET_DEVICES={NETDEVICE}",
-      "UCX_LOG_LEVEL=info",
-      # "NCCL_DEBUG=INFO",
-    ]
+      server = runCommand([f"{' '.join(prefill_env)} python3 -m sglang.launch_server"] + sglang_prefill_args, (HOST, SSH_PORT), prefill_logs[i])
+      prefill_servers.append(server)
+    
 
-    prefillServer = runCommand([f"{' '.join(prefill_env)} python3 -m sglang.launch_server"] + sglang_prefill_args, (PREFILL_HOST, PREFILL_SSH_PORT), prefill_output_log)
-    decodeServer = runCommand([f"{' '.join(decode_env)} python3 -m sglang.launch_server"] + sglang_decode_args, (DECODE_HOST, DECODE_SSH_PORT), decode_output_log)
 
-    wait_server(PREFILL_HOST, PREFILL_SERVE_PORT)
-    wait_server(DECODE_HOST, DECODE_SERVE_PORT)
+    for i, (HOST, SSH_PORT, SERVE_PORT, BOOTSTRAP_PORT, extra_env) in enumerate(DECODES):
+      sglang_decode_args = SGLANG_COMMON_ARGS.copy() + [
+        f"--tp {TP}",
+        "--nnodes 1",
+        "--disaggregation-mode decode",
+        "--max-running-requests", f"{bsz}",
+        f"--disaggregation-prefill-bootstrap-addr {prefill_list_boostrap_port}",
+        "--port", f"{SERVE_PORT}",
+      ]
+
+      decode_env = [
+        "UCX_TLS=tcp,cuda",
+        f"UCX_NET_DEVICES={NETDEVICE}",
+        "UCX_LOG_LEVEL=info",
+        # "NCCL_DEBUG=INFO",
+      ] + extra_env
+
+      server = runCommand([f"{' '.join(decode_env)} python3 -m sglang.launch_server"] + sglang_decode_args, (HOST, SSH_PORT), decode_logs[i])
+      decode_servers.append(server)
+
+
+
+    # wait_server(PREFILL_HOST, PREFILL_SERVE_PORT)
+    # wait_server(DECODE_HOST, DECODE_SERVE_PORT)
+
+    for i, (HOST, SSH_PORT, SERVE_PORT, BOOTSTRAP_PORT, _) in enumerate(PREFILLS):
+      wait_server(HOST, SERVE_PORT)
+      logger.info(f"Prefill server {HOST}:{SERVE_PORT} is ready!")
+
+    for i, (HOST, SSH_PORT, SERVE_PORT, BOOTSTRAP_PORT, _) in enumerate(DECODES):
+      wait_server(HOST, SERVE_PORT)
+      logger.info(f"Decode server {HOST}:{SERVE_PORT} is ready!")
 
     logger.info("All PD servers are ready! Wait some seconds to let the server warm up.")
     time.sleep(10)
 
+
+    prefill_list_sport_bport = ""
+    for i in range(len(PREFILLS)):
+      # host:port:bootstrap_port
+      prefill_list_sport_bport += f"http://{PREFILLS[i][0]}:{PREFILLS[i][2]}:{PREFILLS[i][3]},"
+      
+    decode_list_sport = ""
+    for i in range(len(DECODES)):
+      # host:port
+      decode_list_sport += f"http://{DECODES[i][0]}:{DECODES[i][2]},"
+
+
+    # remove lasting ,
+    prefill_list_sport_bport = prefill_list_sport_bport[:-1]
+    decode_list_sport = decode_list_sport[:-1]
+
     lb = runCommand([
       "python3 -m sglang.srt.disaggregation.mini_lb",
-      "--prefill", f"http://{PREFILL_HOST}:{PREFILL_SERVE_PORT}:{PREFILL_BOOTSTRAP_PORT}",
-      "--decode", f"http://{DECODE_HOST}:{DECODE_SERVE_PORT}",
+      "--prefill", prefill_list_sport_bport,
+      "--decode", decode_list_sport,
       "--host 0.0.0.0", 
       "--port", f"{LB_SERVE_PORT}", 
-    ], outputStream=lb_output_log)
+    ], outputStream=lb_output_log) # type: ignore
 
     time.sleep(1)
     logger.info("Start benchmarking...")
@@ -206,8 +245,8 @@ def do_exp():
       "--dataset-name", "jsonl",
       "--num-prompts", f"{ bsz * 2 }", 
       # "--dataset-path", "/sgl-workspace/upload/dataset/qa_out_0216_r1_300_max_25k_formatted.jsonl",
-      "--dataset-path", "/sgl-workspace/upload/dataset/easy.jsonl",
-      # "--dataset-path", "/sgl-workspace/upload/dataset/long-easy.jsonl",
+      # "--dataset-path", "/sgl-workspace/upload/dataset/easy.jsonl",
+      "--dataset-path", "/sgl-workspace/upload/dataset/long-easy.jsonl",
       "--max-concurrency", f"{ bsz }",
       "--backend", f"openai-chat",
       "--tokenizer", f"{MODEL}",
@@ -215,7 +254,7 @@ def do_exp():
       "--save-result",
       "--result-filename", filename
     ]
-    benchmarkClient = runCommand(["python3 -m openai_benchmark.benchmark_serving"] + BENCHMARK_ARGS, outputStream=bench_output_log)
+    benchmarkClient = runCommand(["python3 -m openai_benchmark.benchmark_serving"] + BENCHMARK_ARGS, outputStream=bench_output_log) # type: ignore
     benchmarkClient.wait()
 
     # shutdown sglang servers.
