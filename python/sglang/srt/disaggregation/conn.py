@@ -347,7 +347,7 @@ class KVSender:
         self.kv_mgr.set_status(bootstrap_room, KVPoll.Bootstrapping)
         self.aux_index = None
 
-    def init(self, num_kv_indices: int, aux_index: Optional[int] = None):
+    def recv_pre_alloc(self, num_kv_indices: int, aux_index: Optional[int] = None):
         self.aux_index = aux_index
         self.num_kv_indices = num_kv_indices
 

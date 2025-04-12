@@ -141,7 +141,9 @@ class PrefillBootstrapQueue:
                 self.req_to_metadata_buffer_idx_allocator.alloc()
             )
             assert req.metadata_buffer_index is not None
-            req.disagg_kv_sender.init(num_kv_indices, req.metadata_buffer_index)
+            req.disagg_kv_sender.recv_pre_alloc(
+                num_kv_indices, req.metadata_buffer_index
+            )
 
             bootstrapped_reqs.append(req)
             indices_to_remove.add(i)
