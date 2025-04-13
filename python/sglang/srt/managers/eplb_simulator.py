@@ -60,6 +60,7 @@ _MY_MODEL_CONFIG_FOR_EXPERT_LOCATION = ModelConfigForExpertLocation(
     num_logical_experts=256,
     num_groups=8,
 )
+_MY_MODEL_CONFIG_NUM_EXPERTS_PER_TOK = 8
 
 
 def read_physical_count_of_forward_pass(dir_data: Path):
@@ -283,7 +284,8 @@ def compute_utilization_rate(
 
 
 def compute_num_token(whatever_with_num_layer_and_num_expert: torch.Tensor):
-    return whatever_with_num_layer_and_num_expert[..., -1, :].sum(dim=-1)
+    num_token_mul_num_experts = whatever_with_num_layer_and_num_expert[..., -1, :].sum(dim=-1)
+    return num_token_mul_num_experts / _MY_MODEL_CONFIG_NUM_EXPERTS_PER_TOK
 
 
 def chunker(objects, state_reducer, should_chunk):
