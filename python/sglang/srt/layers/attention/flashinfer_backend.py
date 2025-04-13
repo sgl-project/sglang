@@ -99,6 +99,9 @@ class FlashInferAttnBackend(AttentionBackend):
         self.kv_cache_dtype_str = model_runner.server_args.kv_cache_dtype
 
         self.enable_pd_colocation = enable_pd_colocation
+        # track this for 2D mask fill kernel to avoid recompilation
+        # TODO(Wenxuan) shrink down to avoid outliers?
+        self.max_req_input_len = 0
         if enable_pd_colocation:
             assert (
                 not self.is_multimodal
@@ -493,15 +496,33 @@ class FlashInferAttnBackend(AttentionBackend):
                 #     self.forward_metadata.prefill_kv_indptr,
                 #     self.forward_metadata.prefill_qo_indptr)
                 # TODO(Wenxuan) debug this
-                max_kv_len = next_power_of_2(forward_batch.seq_lens.max().item())
-                create_causal_mask_from_page_triton[(qo_indptr_p[-1],)](
+                max_kv_len = forward_batch.seq_lens.max()
+                if self.max_req_input_len < max_kv_len * 2:
+                    max_kv_len = next_power_of_2(max_kv_len.item())
+                    if max_kv_len > self.max_req_input_len:
+                        self.max_req_input_len = max_kv_len
+                # launch bs times more blocks, because we can't pass in bs
+                # as constexpr, or any change in bs triggers recompilation
+                # import socket
+                # from remote_pdb import RemotePdb
+
+                # def find_unused_port():
+                #     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                #         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                #         s.bind(("localhost", 0))  # Let the OS pick an ephemeral port.
+                #         return s.getsockname()[1]
+
+                # port = find_unused_port()
+                # print(f"Using port: {port}")
+                # RemotePdb(host='localhost', port=port).set_trace()
+                create_causal_mask_from_page_triton[(qo_indptr_p[-1], bs)](
                     mask_p,
                     qo_indptr_p,
                     kv_indptr_p,
                     forward_batch.extend_prefix_lens,
                     stride_mask_qo=mask_p.stride(0),
-                    bs=num_prefill_reqs,
-                    max_kv_len_per_req=max_kv_len,
+                    # max_kv_len_per_req=next_power_of_2(forward_batch.max_req_input_len),
+                    max_kv_len_per_req=self.max_req_input_len,
                 )
 
                 # for i in range(num_prefill_reqs):
@@ -517,20 +538,6 @@ class FlashInferAttnBackend(AttentionBackend):
                 #             j + forward_batch.extend_prefix_lens[i]
                 #         )
                 # if not (mask_for_loop == mask_p).all():
-                # import socket
-                # from remote_pdb import RemotePdb
-
-                # def find_unused_port():
-                #     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                #         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                #         s.bind(
-                #             ("localhost", 0)
-                #         )  # Let the OS pick an ephemeral port.
-                #         return s.getsockname()[1]
-
-                # port = find_unused_port()
-                # print(f"Using port: {port}")
-                # RemotePdb(host="localhost", port=port).set_trace()
                 o_p, o_d = pod_wrapper.run(
                     q_p,
                     k_cache_p,

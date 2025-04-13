@@ -316,7 +316,9 @@ class Scheduler(
         # Init running status
         self.waiting_queue: List[Req] = []
         # The running decoding batch for continuous batching
-        self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
+        self.running_batch: ScheduleBatch = ScheduleBatch(
+            reqs=[], batch_is_full=False, max_req_input_len=self.max_req_input_len
+        )
         # The current forward batch
         self.cur_batch: Optional[ScheduleBatch] = None
         # The last forward batch
@@ -648,6 +650,7 @@ class Scheduler(
                         reqs=None,
                         forward_mode=ForwardMode.DUMMY_FIRST,
                         next_batch_sampling_info=self.tp_worker.cur_sampling_info,
+                        max_req_input_len=self.max_req_input_len,
                     )
                     self.process_batch_result(tmp_batch, None)
 
@@ -1277,6 +1280,7 @@ class Scheduler(
             self.enable_overlap,
             self.spec_algorithm,
             self.server_args.enable_custom_logit_processor,
+            max_req_input_len=self.max_req_input_len,
         )
         new_batch.prepare_for_extend()
 
@@ -1294,7 +1298,9 @@ class Scheduler(
                 new_batch.mix_with_running(self.running_batch)
                 new_batch.decoding_reqs = self.running_batch.reqs
             self.running_batch = ScheduleBatch(
-                reqs=[], batch_is_full=self.running_batch.batch_is_full
+                reqs=[],
+                batch_is_full=self.running_batch.batch_is_full,
+                max_req_input_len=self.max_req_input_len,
             )
         else:
             new_batch.decoding_reqs = None

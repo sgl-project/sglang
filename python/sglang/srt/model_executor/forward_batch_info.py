@@ -184,6 +184,7 @@ class ForwardBatch:
     extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
     # For POD Attn
     num_decode_reqs: Optional[int] = 0
+    max_req_input_len: Optional[int] = 0
 
 
     # For MLA chunked prefix cache used in chunked prefill
@@ -296,6 +297,7 @@ class ForwardBatch:
             input_embeds=batch.input_embeds,
             extend_input_logprob_token_ids_gpu=extend_input_logprob_token_ids_gpu,
             num_decode_reqs=batch.num_decode_reqs,
+            max_req_input_len=batch.max_req_input_len,
         )
 
         # For DP attention

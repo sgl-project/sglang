@@ -103,34 +103,28 @@ def create_causal_mask_from_page_triton(
     cu_qo_indptr,  # [bs + 1], cumulative ranges for each req
     cu_kv_lens_ptr,  # [bs + 1]
     prefix_lens_ptr,  # [bs + 1]
-    stride_mask_qo: tl.constexpr,
-    bs: tl.constexpr,
+    stride_mask_qo,
     max_kv_len_per_req: tl.constexpr,
 ):
     """Each program handles a row of qo"""
     pid_qo = tl.program_id(axis=0)
+    req_id = tl.program_id(axis=1)
 
     # Find which req this row belongs to
-    req_id = 0
-    qo_start = 0
-    for i in range(bs + 1):
-        qo_start_ = tl.load(cu_qo_indptr + i).to(tl.int32)
-        qo_end_ = tl.load(cu_qo_indptr + i + 1).to(tl.int32)
-        if qo_start_ <= pid_qo and pid_qo < qo_end_:
-            req_id = i
-            qo_start = qo_start_
+    qo_start = tl.load(cu_qo_indptr + req_id).to(tl.int32)
+    qo_end = tl.load(cu_qo_indptr + req_id + 1).to(tl.int32)
+    if qo_start <= pid_qo and pid_qo < qo_end:
+        kv_start = tl.load(cu_kv_lens_ptr + req_id).to(tl.int32)
+        kv_end = tl.load(cu_kv_lens_ptr + req_id + 1).to(tl.int32)
+        kv_len = kv_end - kv_start
+        # mask_offset = pid_qo * stride_mask_qo + kv_start + tl.arange(0, max_kv_len)
 
-    kv_start = tl.load(cu_kv_lens_ptr + req_id).to(tl.int32)
-    kv_end = tl.load(cu_kv_lens_ptr + req_id + 1).to(tl.int32)
-    kv_len = kv_end - kv_start
-    # mask_offset = pid_qo * stride_mask_qo + kv_start + tl.arange(0, max_kv_len)
-
-    kv_indices = tl.arange(0, max_kv_len_per_req)
-    is_valid_kv = kv_indices < kv_len
-    kv_pos = kv_indices
-    qo_index_local = (pid_qo - qo_start) + tl.load(prefix_lens_ptr + req_id).to(
-        tl.int32
-    )
-    mask = (kv_pos <= qo_index_local) & is_valid_kv
-    mask_offsets = pid_qo * stride_mask_qo + kv_pos + kv_start
-    tl.store(mask_ptr + mask_offsets, mask, mask=is_valid_kv)
+        kv_indices = tl.arange(0, max_kv_len_per_req)
+        is_valid_kv = kv_indices < kv_len
+        kv_pos = kv_indices
+        qo_index_local = (pid_qo - qo_start) + tl.load(prefix_lens_ptr + req_id).to(
+            tl.int32
+        )
+        mask = (kv_pos <= qo_index_local) & is_valid_kv
+        mask_offsets = pid_qo * stride_mask_qo + kv_pos + kv_start
+        tl.store(mask_ptr + mask_offsets, mask, mask=is_valid_kv)
