@@ -113,7 +113,7 @@ class KVManager:
         self,
         mooncake_session_id: str,
         prefill_kv_indices: npt.NDArray[np.int64],
-        dst_ptrs: list[int],
+        dst_kv_ptrs: list[int],
         dst_kv_indices: npt.NDArray[np.int64],
     ):
         layer_num = int(len(self.kv_args.kv_data_ptrs) / 2)
@@ -126,8 +126,8 @@ class KVManager:
             prefill_value_layer_ptr = self.kv_args.kv_data_ptrs[layer_num + layer_id]
             value_item_len = self.kv_args.kv_item_lens[layer_num + layer_id]
 
-            decode_key_layer_ptr = dst_ptrs[layer_id]
-            decode_value_layer_ptr = dst_ptrs[layer_num + layer_id]
+            decode_key_layer_ptr = dst_kv_ptrs[layer_id]
+            decode_value_layer_ptr = dst_kv_ptrs[layer_num + layer_id]
 
             for prefill_index, decode_index in zip(prefill_kv_blocks, dst_kv_blocks):
                 prefill_key_addr = (
@@ -212,7 +212,7 @@ class KVManager:
                     endpoint,
                     mooncake_session_id,
                     bootstrap_room,
-                    dst_ptrs,
+                    dst_kv_ptrs,
                     dst_kv_indices,
                     dst_aux_ptrs,
                     dst_aux_index,
@@ -222,7 +222,9 @@ class KVManager:
                 endpoint = endpoint.decode("ascii")
                 mooncake_session_id = mooncake_session_id.decode("ascii")
                 bootstrap_room = int(bootstrap_room.decode("ascii"))
-                dst_ptrs = list(struct.unpack(f"{len(dst_ptrs)//8}Q", dst_ptrs))
+                dst_kv_ptrs = list(
+                    struct.unpack(f"{len(dst_kv_ptrs)//8}Q", dst_kv_ptrs)
+                )
                 dst_kv_indices = np.frombuffer(dst_kv_indices, dtype=np.int64)
                 dst_aux_ptrs = list(
                     struct.unpack(f"{len(dst_aux_ptrs)//8}Q", dst_aux_ptrs)
@@ -231,7 +233,7 @@ class KVManager:
                 self.waiting_pool[bootstrap_room] = (
                     endpoint,
                     mooncake_session_id,
-                    dst_ptrs,
+                    dst_kv_ptrs,
                     dst_kv_indices,
                     dst_aux_ptrs,
                     dst_aux_index,
@@ -254,7 +256,7 @@ class KVManager:
                     (
                         endpoint,
                         mooncake_session_id,
-                        dst_ptrs,
+                        dst_kv_ptrs,
                         dst_kv_indices,
                         dst_aux_ptrs,
                         dst_aux_index,
@@ -268,7 +270,7 @@ class KVManager:
                     ret = self.send_kvcache(
                         mooncake_session_id,
                         prefill_kv_indices,
-                        dst_ptrs,
+                        dst_kv_ptrs,
                         dst_kv_indices,
                     )
                     if ret != 0:
