@@ -188,15 +188,15 @@ def simulate_execution(
                 + server_args.ep_num_redundant_experts
         )
         if (x := server_args.init_expert_location) is not None:
-            print(f"Compute logical_count from {x}")
-            logical_count = torch.tensor(json.loads(Path(x).read_text())["logical_count"])
+            print(f"Compute eplb_input_logical_count from {x}")
+            eplb_input_logical_count = torch.tensor(json.loads(Path(x).read_text())["logical_count"])
         else:
-            print(f"Compute logical_count from logical_count_of_seq")
-            logical_count = einops.einsum(logical_count_of_seq,
-                                          "num_seq num_layer num_expert -> num_layer num_expert", )
+            print(f"Compute eplb_input_logical_count from logical_count_of_seq")
+            eplb_input_logical_count = einops.einsum(logical_count_of_seq,
+                                                     "num_seq num_layer num_expert -> num_layer num_expert", )
         expert_location_metadata = MyExpertLocationMetadata.init_by_eplb(
             server_args,
-            logical_count=logical_count,
+            logical_count=eplb_input_logical_count,
             num_physical_experts=num_physical_expert,
         )
         # print(f"hi {expert_location_metadata=}")
