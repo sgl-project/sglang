@@ -115,7 +115,7 @@ def scan_combinations(
                 init_expert_location=init_expert_location,
             )
 
-            for init_expert_location in [None, "/host_home/temp_sglang_server2local/1744461420780309768.json"]
+            for init_expert_location in ["/host_home/temp_sglang_server2local/1744461420780309768.json", None]
 
             # decode
             # for ep_num_redundant_experts in [0, 32]
@@ -189,7 +189,7 @@ def simulate_execution(
         )
         if (x := server_args.init_expert_location) is not None:
             print(f"Compute logical_count from {x}")
-            logical_count = json.loads(Path(x).read_text())["logical_count"]
+            logical_count = torch.tensor(json.loads(Path(x).read_text())["logical_count"])
         else:
             print(f"Compute logical_count from logical_count_of_seq")
             logical_count = einops.einsum(logical_count_of_seq,
