@@ -474,41 +474,57 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
                 kv_indices_p = self.forward_metadata.prefill_kv_indices
                 kv_indptr_p = self.forward_metadata.prefill_kv_indptr
-                # del self.forward_metadata.prefill_kv_indices, self.forward_metadata.prefill_kv_indptr
+                qo_indptr_p = self.forward_metadata.prefill_qo_indptr
                 kv_pool_indices_p = kv_indices_p[: kv_indptr_p[-1]]
 
                 # TODO(Wenxuan) Handle last_page_len for page size > 1 here
                 num_prefill_reqs = bs - self.forward_metadata.num_decode_reqs
-                k_cache_p = k_cache[kv_pool_indices_p]
+                k_cache_p = k_cache[
+                    kv_pool_indices_p
+                ]  # TODO(Wenxuan) de-duplicate the kv cache when reqs share prefix?
                 v_cache_p = v_cache[kv_pool_indices_p]
                 q_p = q[:num_prefill_reqs]
                 q_d = q[num_prefill_reqs:]
-                qo_indptr_p = self.forward_metadata.prefill_qo_indptr
                 mask_p = torch.zeros(
                     qo_indptr_p[-1], kv_indptr_p[-1], device=q.device, dtype=torch.bool
                 )
-
+                del self.forward_metadata
                 # TODO(Wenxuan) debug this
-                # create_casual_mask_from_page_triton[(qo_indptr_p[-1])](
-                #     mask_p,
-                #     qo_indptr_p,
-                #     kv_indptr_p,
-                #     forward_batch.extend_prefix_lens,
-                #     stride_mask_qo=mask_p.stride(0),
-                #     bs=num_prefill_reqs,
-                # )
-                for i in range(num_prefill_reqs):
-                    q_start = qo_indptr_p[i]
-                    q_end = qo_indptr_p[i + 1]
-                    kv_start = kv_indptr_p[i]
-                    kv_end = kv_indptr_p[i + 1]
-                    for j in range(q_start, q_end):
-                        submask = torch.arange(
-                            kv_start, kv_end, device=q.device, dtype=torch.int32
-                        )
-                        mask_p[j][kv_start:kv_end] = submask < (
-                            j + forward_batch.extend_prefix_lens[i]
-                        )
+                #
+                max_kv_len = forward_batch.seq_lens.max()
+                create_casual_mask_from_page_triton[(qo_indptr_p[-1])](
+                    mask_p,
+                    qo_indptr_p,
+                    kv_indptr_p,
+                    forward_batch.extend_prefix_lens,
+                    stride_mask_qo=mask_p.stride(0),
+                    bs=num_prefill_reqs,
+                    max_kv_len_per_req=max_kv_len,
+                )
+                # import socket
+                # from remote_pdb import RemotePdb
+
+                # def find_unused_port():
+                #     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                #         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                #         s.bind(("localhost", 0))  # Let the OS pick an ephemeral port.
+                #         return s.getsockname()[1]
+
+                # port = find_unused_port()
+                # print(f"Using port: {port}")
+                # RemotePdb(host='localhost', port=port).set_trace()
+                # for i in range(num_prefill_reqs):
+                #     q_start = qo_indptr_p[i]
+                #     q_end = qo_indptr_p[i + 1]
+                #     kv_start = kv_indptr_p[i]
+                #     kv_end = kv_indptr_p[i + 1]
+                #     for j in range(q_start, q_end):
+                #         submask = torch.arange(
+                #             kv_start, kv_end, device=q.device, dtype=torch.int32
+                #         )
+                #         mask_p[j][kv_start:kv_end] = submask < (
+                #             j + forward_batch.extend_prefix_lens[i]
+                #         )
 
                 o_p, o_d = pod_wrapper.run(
                     q_p,
@@ -525,7 +541,6 @@ class FlashInferAttnBackend(AttentionBackend):
                     # sm_scale_d=layer.scaling,
                 )
                 o = torch.cat([o_p, o_d], dim=0)
-                # print("pod forward")
             else:
                 o = prefill_wrapper_paged.forward(
                     q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),

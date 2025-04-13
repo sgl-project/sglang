@@ -100,30 +100,37 @@ def create_flashmla_kv_indices_triton(
 @triton.jit
 def create_casual_mask_from_page_triton(
     mask_ptr,  # [qo_len, kv_len]
-    qo_indptr,  # [bs + 1], cumulative ranges for each req
-    kv_indptr,  # [bs + 1]
+    cu_qo_indptr,  # [bs + 1], cumulative ranges for each req
+    cu_kv_lens_ptr,  # [bs + 1]
     prefix_lens_ptr,  # [bs + 1]
-    stride_mask_qo: tl.constexpr,
+    stride_qo: tl.constexpr,
     bs: tl.constexpr,
+    max_kv_len_per_req: tl.constexpr,
 ):
     """Each program handles a row of qo"""
     pid_qo = tl.program_id(axis=0)
-    # qo_indices = tl.load(qo_indptr + tl.arange(0, bs + 1)).to(tl.int32)
 
     # Find which req this row belongs to
     req_id = 0
+    qo_start = 0
     for i in range(bs + 1):
-        # qo_start = qo_indices[req_id]
-        # qo_end = qo_indices[req_id + 1]
-        qo_start = tl.load(qo_indptr + i).to(tl.int32)
-        qo_end = tl.load(qo_indptr + i + 1).to(tl.int32)
-        if qo_start <= pid_qo and pid_qo < qo_end:
+        qo_start_ = tl.load(cu_qo_indptr + i).to(tl.int32)
+        qo_end_ = tl.load(cu_qo_indptr + i + 1).to(tl.int32)
+        if qo_start_ <= pid_qo and pid_qo < qo_end_:
             req_id = i
+            qo_start = qo_start_
 
-    kv_start = tl.load(kv_indptr + req_id).to(tl.int32)
-    kv_end = tl.load(kv_indptr + req_id + 1).to(tl.int32)
+    kv_start = tl.load(cu_kv_lens_ptr + req_id).to(tl.int32)
+    kv_end = tl.load(cu_kv_lens_ptr + req_id + 1).to(tl.int32)
     kv_len = kv_end - kv_start
-    mask_offset = pid_qo * stride_mask_qo + kv_start + tl.arange(0, kv_len)
-    qo_index = pid_qo + tl.load(prefix_lens_ptr + pid_qo)
-    mask = tl.arange(kv_start, kv_end) < qo_index
-    tl.store(mask_ptr + mask_offset, mask)
+    # mask_offset = pid_qo * stride_mask_qo + kv_start + tl.arange(0, max_kv_len)
+
+    kv_indices = tl.arange(0, max_kv_len_per_req)
+    is_valid_kv = kv_indices < kv_len
+    kv_pos = kv_indices
+    qo_index_local = (pid_qo - qo_start) + tl.load(prefix_lens_ptr + req_id).to(
+        tl.int32
+    )
+    mask = (kv_pos <= qo_index_local) & is_valid_kv
+    mask_offsets = pid_qo * stride_qo + kv_pos + kv_start
+    tl.store(mask_ptr + mask_offsets, mask, mask=is_valid_kv)
