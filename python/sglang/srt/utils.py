@@ -16,6 +16,7 @@ import base64
 import builtins
 import ctypes
 import dataclasses
+import importlib
 import io
 import ipaddress
 import itertools
@@ -127,7 +128,7 @@ def is_flashinfer_available():
     """
     if not get_bool_env_var("SGLANG_IS_FLASHINFER_AVAILABLE", default="true"):
         return False
-    return is_cuda()
+    return importlib.util.find_spec("flashinfer") is not None and is_cuda()
 
 
 def is_cuda_available():
