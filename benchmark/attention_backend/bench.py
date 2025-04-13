@@ -1,6 +1,6 @@
 import argparse
+import itertools
 import logging
-import os
 import queue
 import re
 import subprocess
@@ -8,9 +8,7 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-import itertools
+from typing import List, Optional, Tuple
 
 import psutil
 import requests
@@ -267,17 +265,30 @@ def load_config(config_path: str) -> List[TaskConfig]:
 
     configs = []
     if "speculative_draft" in _server_cmd:
-        for in_out_len_pair, cudagraph, model_speculative_draft_pair, attn_backend in itertools.product(
+        for (
+            in_out_len_pair,
+            cudagraph,
+            model_speculative_draft_pair,
+            attn_backend,
+        ) in itertools.product(
             config_data.get("in_out_len_pairs", []),
             config_data.get("cudagraphs", []),
             config_data.get("models_speculative_draft_pairs", []),
-            config_data.get("attn_backends", [])
+            config_data.get("attn_backends", []),
         ):
             cuda_graph_arg = "--disable-cuda-graph" if not cudagraph else ""
             model, speculative_draft = model_speculative_draft_pair
             config = TaskConfig(
-                client_cmd=_client_cmd.format(random_input_len=in_out_len_pair[0], random_output_len=in_out_len_pair[1]),
-                server_cmd=_server_cmd.format(model_path=model, speculative_draft=speculative_draft, attn_backend=attn_backend, cudagraph=cuda_graph_arg),
+                client_cmd=_client_cmd.format(
+                    random_input_len=in_out_len_pair[0],
+                    random_output_len=in_out_len_pair[1],
+                ),
+                server_cmd=_server_cmd.format(
+                    model_path=model,
+                    speculative_draft=speculative_draft,
+                    attn_backend=attn_backend,
+                    cudagraph=cuda_graph_arg,
+                ),
                 name=f"SpecDecode-{attn_backend}-{model}-{speculative_draft}-cudagraph={cudagraph}-{in_out_len_pair[0]}-{in_out_len_pair[1]}",
             )
             configs.append(config)
@@ -286,12 +297,17 @@ def load_config(config_path: str) -> List[TaskConfig]:
             config_data.get("in_out_len_pairs", []),
             config_data.get("cudagraphs", []),
             config_data.get("models", []),
-            config_data.get("attn_backends", [])
+            config_data.get("attn_backends", []),
         ):
             cudagraph_arg = "--disable-cuda-graph" if not cudagraph else ""
             config = TaskConfig(
-                client_cmd=_client_cmd.format(random_input_len=in_out_len_pair[0], random_output_len=in_out_len_pair[1]),
-                server_cmd=_server_cmd.format(model_path=model, attn_backend=attn_backend, cudagraph=cudagraph_arg),
+                client_cmd=_client_cmd.format(
+                    random_input_len=in_out_len_pair[0],
+                    random_output_len=in_out_len_pair[1],
+                ),
+                server_cmd=_server_cmd.format(
+                    model_path=model, attn_backend=attn_backend, cudagraph=cudagraph_arg
+                ),
                 name=f"{attn_backend}-{model}-cudagraph={cudagraph}-{in_out_len_pair[0]}-{in_out_len_pair[1]}",
             )
             configs.append(config)
