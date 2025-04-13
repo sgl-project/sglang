@@ -145,9 +145,12 @@ class ExpertLocationMetadata:
             setattr(self, field, getattr(other, field))
 
     def to(self, device):
-        self.logical_to_rank_dispatch_physical_map = (
-            self.logical_to_rank_dispatch_physical_map.to(device)
-        )
+        for field in [
+            "logical_to_all_physical_map",
+            "logical_to_all_physical_map_num_valid",
+            "logical_to_rank_dispatch_physical_map",
+        ]:
+            setattr(self, field, getattr(self, field).to(device))
 
     # -------------------------------- usage ------------------------------------
 
