@@ -17,7 +17,8 @@ from tqdm.auto import tqdm
 
 @dataclass
 class MyServerArgs:
-    chunked_prefill_size: int
+    # When prefill, this is equivalent to `chunked_prefill_size`
+    process_num_tokens_overall: int
     ep_num_redundant_experts: int
     nnodes: int
     tp_size: int
@@ -101,7 +102,7 @@ def scan_combinations(
     server_args_list = [
         *[
             MyServerArgs(
-                chunked_prefill_size=chunked_prefill_size_per_gpu * 32,
+                process_num_tokens_overall=chunked_prefill_size_per_gpu * 32,
                 ep_num_redundant_experts=ep_num_redundant_experts,
                 nnodes=nnodes,
                 tp_size=8 * nnodes,
@@ -113,7 +114,6 @@ def scan_combinations(
                 4, 8,
                 *([9] if ep_num_redundant_experts == 32 else []),
             ]
-            # TODO rename this for decode
             for chunked_prefill_size_per_gpu in [64, 128]
 
             # for nnodes in [4]
@@ -163,7 +163,7 @@ def simulate_execution(
 
     logical_count_of_batch = simulate_batching(
         logical_count_of_seq=logical_count_of_seq,
-        chunked_prefill_size=server_args.chunked_prefill_size,
+        process_num_tokens_overall=server_args.process_num_tokens_overall,
     )
     print(f"{logical_count_of_batch.shape=}")
 
@@ -209,13 +209,13 @@ def simulate_execution(
 
 def simulate_batching(
         logical_count_of_seq: torch.Tensor,  # (num_seq, num_layer, num_logical_expert)
-        chunked_prefill_size: int,
+        process_num_tokens_overall: int,
 ) -> torch.Tensor:
     """output: (num_batch, num_layer, num_logical_expert)"""
     tensor_chunks = chunker(
         logical_count_of_seq,
         state_reducer=lambda count, tensor: count + compute_num_token(tensor).item(),
-        should_chunk=lambda count: count > chunked_prefill_size,
+        should_chunk=lambda count: count > process_num_tokens_overall,
     )
     return torch.stack(
         [torch.stack(tensor_chunk).sum(dim=0) for tensor_chunk in tensor_chunks]
