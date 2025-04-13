@@ -130,16 +130,11 @@ def scan_combinations(
     rows = []
     for server_args in server_args_list:
         print()
-        mean_utilization_rate = simulate_execution(
+        info = simulate_execution(
             logical_count_of_seq=logical_count_of_seq, server_args=server_args
         )
-        print(f"{server_args=} {mean_utilization_rate=:.2f}")
-        rows.append(
-            dict(
-                **dataclasses.asdict(server_args),
-                mean_utilization_rate=mean_utilization_rate,
-            )
-        )
+        print(f"{server_args=} {info=}")
+        rows.append(dict(**dataclasses.asdict(server_args), **info))
 
     df = pl.DataFrame(rows)
     return df
@@ -205,7 +200,10 @@ def simulate_execution(
     # NOTE: first 3 layers are MLP, thus those parts are not meaningful
     mean_utilization_rate = torch.mean(utilization_rate).item()
 
-    return mean_utilization_rate
+    return dict(
+        mean_utilization_rate=mean_utilization_rate,
+        num_simulated_batches=logical_count_of_batch.shape[0],
+    )
 
 
 def simulate_batching(
