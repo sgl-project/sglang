@@ -301,6 +301,7 @@ def select_experts(
         )
 
     if expert_logical_to_rank_dispatch_physical_map is not None:
+        # TODO optimize these things later
         if forward_mode.is_extend():
             topk_ids = _hack_expert_location_dispatch_random(
                 topk_ids=topk_ids,
