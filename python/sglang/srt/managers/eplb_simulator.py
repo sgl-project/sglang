@@ -7,13 +7,12 @@ from pathlib import Path
 import einops
 import polars as pl
 import torch
-from tqdm.auto import tqdm
-
 from sglang.srt.managers import deepseek_eplb
 from sglang.srt.managers.expert_location import (
     ExpertLocationMetadata,
     ModelConfigForExpertLocation,
 )
+from tqdm.auto import tqdm
 
 
 @dataclass
@@ -109,8 +108,14 @@ def scan_combinations(
                 enable_expert_location_by_eplb=enable_expert_location_by_eplb,
             )
             for ep_num_redundant_experts in [0, 32, 64]
-            for nnodes in [4]
-            for chunked_prefill_size_per_gpu in [1024, 4096, 8192, 16384]
+
+            for nnodes in [4, 8, 9]
+            # TODO rename this for decode
+            for chunked_prefill_size_per_gpu in [64, 128]
+
+            # for nnodes in [4]
+            # for chunked_prefill_size_per_gpu in [1024, 4096, 8192, 16384]
+
             for enable_expert_location_by_eplb in [
                 *([False] if ep_num_redundant_experts == 0 else []),
                 True,
@@ -236,7 +241,7 @@ def simulate_logical_to_physical(
             )
             for physical_expert_id in all_physical_expert_ids:
                 physical_count_of_whatever[
-                    :, layer_id, physical_expert_id
+                :, layer_id, physical_expert_id
                 ] += logical_count_of_whatever[:, layer_id, logical_expert_id] / len(
                     all_physical_expert_ids
                 )
