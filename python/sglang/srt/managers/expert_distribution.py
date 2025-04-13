@@ -142,8 +142,13 @@ class _SinglePassGatherer(ABC):
         server_args: ServerArgs, expert_location_metadata: "ExpertLocationMetadata"
     ) -> "_SinglePassGatherer":
         if server_args.enable_deepep_moe:
-            # TODO DeepEP low latency
-            return _DeepepNormalSinglePassGatherer(expert_location_metadata)
+            # `auto` has many restrictions now, so we lower the priority to implement low-latency capturing for auto
+            if server_args.deepep_mode in ["normal", "auto"]:
+                return _DeepepNormalSinglePassGatherer(expert_location_metadata)
+            elif server_args.deepep_mode == "low_latency":
+                return _DeepepLowLatencySinglePassGatherer(expert_location_metadata)
+            else:
+                raise NotImplementedError
         return _SelectExpertsSinglePassGatherer(expert_location_metadata)
 
     def __init__(self, expert_location_metadata: "ExpertLocationMetadata"):
