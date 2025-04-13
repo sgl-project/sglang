@@ -14,7 +14,7 @@ on:
 jobs:
   build-wheels:
     if: github.repository == 'sgl-project/sglang'
-    runs-on: ubuntu-latest
+    runs-on: sgl-kernel-release-node
     strategy:
       matrix:
         python-version: ['3.9']

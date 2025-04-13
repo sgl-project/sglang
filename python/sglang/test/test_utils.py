@@ -25,7 +25,12 @@ from sglang.bench_serving import run_benchmark
 from sglang.global_config import global_config
 from sglang.lang.backend.openai import OpenAI
 from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
-from sglang.srt.utils import get_bool_env_var, kill_process_tree, retry
+from sglang.srt.utils import (
+    get_bool_env_var,
+    is_port_available,
+    kill_process_tree,
+    retry,
+)
 from sglang.test.run_eval import run_eval
 from sglang.utils import get_exception_traceback
 
@@ -36,11 +41,6 @@ DEFAULT_FP8_MODEL_NAME_FOR_DYNAMIC_QUANT_ACCURACY_TEST = (
 )
 DEFAULT_FP8_MODEL_NAME_FOR_MODELOPT_QUANT_ACCURACY_TEST = (
     "nvidia/Llama-3.1-8B-Instruct-FP8"
-)
-# TODO(yundai424): right now specifying to an older revision since the latest one
-#  carries kv cache quantization which doesn't work yet
-DEFAULT_FP8_MODEL_NAME_FOR_MODELOPT_QUANT_ACCURACY_TEST_REVISION = (
-    "13858565416dbdc0b4e7a4a677fadfbd5b9e5bb9"
 )
 
 DEFAULT_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.1-8B-Instruct"
@@ -101,6 +101,17 @@ def call_generate_lightllm(prompt, temperature, max_tokens, stop=None, url=None)
     assert res.status_code == 200
     pred = res.json()["generated_text"][0]
     return pred
+
+
+def find_available_port(base_port: int):
+    port = base_port + random.randint(100, 1000)
+    while True:
+        if is_port_available(port):
+            return port
+        if port < 60000:
+            port += 42
+        else:
+            port -= 43
 
 
 def call_generate_vllm(prompt, temperature, max_tokens, stop=None, n=1, url=None):
@@ -674,8 +685,6 @@ def run_bench_one_batch(model, other_args):
         "python3",
         "-m",
         "sglang.bench_one_batch",
-        "--model-path",
-        model,
         "--batch-size",
         "1",
         "--input",
@@ -684,6 +693,8 @@ def run_bench_one_batch(model, other_args):
         "8",
         *[str(x) for x in other_args],
     ]
+    if model is not None:
+        command += ["--model-path", model]
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
     try:

@@ -70,8 +70,6 @@ def test_lightning_attention_decode(dtype, batch_size, num_heads, dim, embed_dim
         ref_output,
         rtol=rtol,
         atol=atol,
-        msg=f"Output mismatch for batch_size={batch_size}, num_heads={num_heads}, "
-        f"dim={dim}, embed_dim={embed_dim}, dtype={dtype}",
     )
 
     torch.testing.assert_close(
@@ -79,8 +77,6 @@ def test_lightning_attention_decode(dtype, batch_size, num_heads, dim, embed_dim
         ref_new_kv,
         rtol=rtol,
         atol=atol,
-        msg=f"New KV mismatch for batch_size={batch_size}, num_heads={num_heads}, "
-        f"dim={dim}, embed_dim={embed_dim}, dtype={dtype}",
     )
 
 

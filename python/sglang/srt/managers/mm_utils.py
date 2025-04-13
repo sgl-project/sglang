@@ -148,7 +148,8 @@ def get_embedding_and_mask(
         placeholder_tensor,
     ).unsqueeze(-1)
 
-    num_mm_tokens_in_input_ids = special_multimodal_mask.sum()
+    num_mm_tokens_in_input_ids = special_multimodal_mask.sum().item()
+
     if num_mm_tokens_in_input_ids != num_mm_tokens_in_embedding:
         logger.warning(
             f"Number of tokens in multimodal embedding does not match those in the input text."
@@ -172,7 +173,7 @@ def get_embedding_and_mask(
                 embedding = embedding[-num_multimodal:, :]
         else:
             raise RuntimeError(
-                "Insufficient multimodal embedding length. This is an internal error"
+                f"Insufficient multimodal embedding length: {num_mm_tokens_in_input_ids=} vs {num_mm_tokens_in_embedding=}. This is an internal error"
             )
 
     return embedding, special_multimodal_mask

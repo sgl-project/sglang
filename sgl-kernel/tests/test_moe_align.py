@@ -151,7 +151,6 @@ def moe_align_block_size_triton(
 def test_moe_align_block_size_compare_implementations(
     block_size, num_tokens, topk, num_experts
 ):
-    # For DeepSeek V3, we have 256 experts
 
     topk_ids = torch.stack(
         [

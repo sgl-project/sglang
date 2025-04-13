@@ -236,7 +236,11 @@ def make_local_attention_virtual_batches(
         np.arange(pages_per_local_batch, dtype=np.int32),
         (virtual_batches, pages_per_local_batch),
     ) + np.expand_dims(block_starts, axis=1)
-    block_indices = block_indices.flatten()
+    # Ensure block_indices doesn't exceed block_table dimensions
+    # This is a critical safety check that prevents index out of bounds errors
+    # when dealing with large sequences (>8192 tokens) or when the block_table
+    # dimensions are smaller than what would be needed for the full attention chunk size.
+    block_indices = block_indices.flatten().clip(max=block_table.shape[1] - 1)
     batch_indices = np.repeat(
         np.arange(actual_batch_size, dtype=np.int32),
         local_blocks * pages_per_local_batch,
@@ -292,6 +296,8 @@ class FlashAttentionBackend(AttentionBackend):
         self.decode_cuda_graph_metadata = {}
         self.target_verify_metadata = {}
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self.kv_cache_dtype = model_runner.kv_cache_dtype
+        self.kv_cache_dtype_str = model_runner.server_args.kv_cache_dtype
         self.page_size = model_runner.page_size
         self.use_mla = (
             model_runner.model_config.attention_arch == AttentionArch.MLA
@@ -319,7 +325,7 @@ class FlashAttentionBackend(AttentionBackend):
         batch_size = len(seqlens_in_batch)
         device = seqlens_in_batch.device
 
-        if forward_batch.forward_mode.is_decode():
+        if forward_batch.forward_mode.is_decode_or_idle():
             # Draft Decode
             if forward_batch.spec_info is not None:
                 metadata.cache_seqlens_int32 = (
@@ -517,9 +523,17 @@ class FlashAttentionBackend(AttentionBackend):
         # here is two side inclusive
         window_size = (
             (layer.sliding_window_size, 0)
-            if layer.sliding_window_size is not None
+            if layer.sliding_window_size is not None and layer.sliding_window_size > -1
             else (-1, -1)
         )
+        k_descale, v_descale = None, None
+        # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
+        # has corresponding quantization method so that layer.k_scale is not None
+        if self.kv_cache_dtype_str != "auto" and layer.k_scale is not None:
+            descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
+            k_descale = layer.k_scale.expand(descale_shape)
+            v_descale = layer.v_scale.expand(descale_shape)
+            q = q.to(self.kv_cache_dtype)
         causal = not layer.is_cross_attention
 
         # Check if we should use local attention
@@ -576,8 +590,8 @@ class FlashAttentionBackend(AttentionBackend):
                 causal=causal,
                 window_size=window_size,
                 softcap=layer.logit_cap,
-                k_descale=layer.k_scale,
-                v_descale=layer.v_scale,
+                k_descale=k_descale,
+                v_descale=v_descale,
             )
         else:
             # Do absorbed multi-latent attention
@@ -609,8 +623,8 @@ class FlashAttentionBackend(AttentionBackend):
                 softmax_scale=layer.scaling,
                 causal=True,
                 softcap=layer.logit_cap,
-                k_descale=layer.k_scale,
-                v_descale=layer.v_scale,
+                k_descale=k_descale,
+                v_descale=v_descale,
             )
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
@@ -652,10 +666,20 @@ class FlashAttentionBackend(AttentionBackend):
         # here is two side inclusive
         window_size = (
             (layer.sliding_window_size, 0)
-            if layer.sliding_window_size is not None
+            if layer.sliding_window_size is not None and layer.sliding_window_size > -1
             else (-1, -1)
         )
         causal = not layer.is_cross_attention
+
+        k_descale, v_descale = None, None
+        # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
+        # has corresponding quantization method so that layer.k_scale is not None
+        if self.kv_cache_dtype_str != "auto":
+            if layer.k_scale is not None:
+                descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
+                k_descale = layer.k_scale.expand(descale_shape)
+                v_descale = layer.v_scale.expand(descale_shape)
+            q = q.to(self.kv_cache_dtype)
 
         if not self.use_mla:
             # Do multi-head attention
@@ -694,8 +718,8 @@ class FlashAttentionBackend(AttentionBackend):
                 causal=causal,
                 window_size=window_size,
                 softcap=layer.logit_cap,
-                k_descale=layer.k_scale,
-                v_descale=layer.v_scale,
+                k_descale=k_descale,
+                v_descale=v_descale,
             )
         else:
             # Do absorbed multi-latent attention
@@ -729,8 +753,8 @@ class FlashAttentionBackend(AttentionBackend):
                 softmax_scale=layer.scaling,
                 causal=True,
                 softcap=layer.logit_cap,
-                k_descale=layer.k_scale,
-                v_descale=layer.v_scale,
+                k_descale=k_descale,
+                v_descale=v_descale,
             )
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
@@ -815,7 +839,7 @@ class FlashAttentionBackend(AttentionBackend):
         """Initialize forward metadata for capturing CUDA graph."""
         metadata = FlashAttentionMetadata()
         device = seq_lens.device
-        if forward_mode.is_decode():
+        if forward_mode.is_decode_or_idle():
             if spec_info is not None:
                 # Draft Decode
                 metadata.cache_seqlens_int32 = self.decode_cuda_graph_metadata[
@@ -918,7 +942,7 @@ class FlashAttentionBackend(AttentionBackend):
         seq_lens = seq_lens[:bs]
         seq_lens_cpu = seq_lens_cpu[:bs]
         req_pool_indices = req_pool_indices[:bs]
-        if forward_mode.is_decode():
+        if forward_mode.is_decode_or_idle():
             metadata = self.decode_cuda_graph_metadata[bs]
 
             if spec_info is not None:
@@ -958,10 +982,12 @@ class FlashAttentionBackend(AttentionBackend):
                     metadata.max_seq_len_k + self.page_size - 1
                 ) // self.page_size
                 page_indices = self.req_to_token[
-                    :,
-                    self.decode_cuda_graph_metadata["strided_indices"][:max_seq_pages],
+                    req_pool_indices[:, None],
+                    self.decode_cuda_graph_metadata["strided_indices"][:max_seq_pages][
+                        None, :
+                    ],
                 ]
-                page_indices = page_indices[req_pool_indices] // self.page_size
+                page_indices //= self.page_size
                 metadata.page_table[:, :max_seq_pages].copy_(page_indices)
                 metadata.page_table[:, max_seq_pages:].fill_(0)
 

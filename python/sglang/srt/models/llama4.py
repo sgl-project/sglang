@@ -27,6 +27,13 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.layers.dp_attention import (
+    dp_gather_partial,
+    dp_scatter,
+    get_attention_dp_size,
+    get_attention_tp_rank,
+    get_attention_tp_size,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
@@ -38,9 +45,10 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.llama import LlamaForCausalLM, LlamaMLP
-from sglang.srt.utils import add_prefix, get_compiler_backend, make_layers
+from sglang.srt.utils import add_prefix, fast_topk, get_compiler_backend, make_layers
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +63,7 @@ class Llama4MoE(nn.Module):
         topk: int,
         renormalize: bool,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        router_scores_aK, router_indices_aK = torch.topk(gating_output, topk, dim=-1)
+        router_scores_aK, router_indices_aK = fast_topk(gating_output, topk, dim=-1)
         router_scores_aK = torch.sigmoid(router_scores_aK.float()).to(
             hidden_states.dtype
         )
@@ -143,20 +151,24 @@ class Llama4Attention(nn.Module):
         self.hidden_size = hidden_size
         self.use_rope = int((layer_id + 1) % 4 != 0)
         self.use_qk_norm = config.use_qk_norm and self.use_rope
-        tp_size = get_tensor_model_parallel_world_size()
+
+        self.dp_size = get_attention_dp_size()
+        attn_tp_rank = get_attention_tp_rank()
+        attn_tp_size = get_attention_tp_size()
+
         self.total_num_heads = num_heads
-        assert self.total_num_heads % tp_size == 0
-        self.num_heads = self.total_num_heads // tp_size
+        assert self.total_num_heads % attn_tp_size == 0
+        self.num_heads = self.total_num_heads // attn_tp_size
         self.total_num_kv_heads = num_kv_heads
-        if self.total_num_kv_heads >= tp_size:
+        if self.total_num_kv_heads >= attn_tp_size:
             # Number of KV heads is greater than TP size, so we partition
             # the KV heads across multiple tensor parallel GPUs.
-            assert self.total_num_kv_heads % tp_size == 0
+            assert self.total_num_kv_heads % attn_tp_size == 0
         else:
             # Number of KV heads is less than TP size, so we replicate
             # the KV heads across multiple tensor parallel GPUs.
-            assert tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+            assert attn_tp_size % self.total_num_kv_heads == 0
+        self.num_kv_heads = max(1, self.total_num_kv_heads // attn_tp_size)
         self.head_dim = config.head_dim
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
@@ -183,6 +195,8 @@ class Llama4Attention(nn.Module):
             bias=bias,
             quant_config=quant_config,
             prefix=add_prefix("qkv_proj", prefix),
+            tp_rank=attn_tp_rank,
+            tp_size=attn_tp_size,
         )
 
         self.o_proj = RowParallelLinear(
@@ -191,6 +205,9 @@ class Llama4Attention(nn.Module):
             bias=bias_o_proj,
             quant_config=quant_config,
             prefix=add_prefix("o_proj", prefix),
+            tp_rank=attn_tp_rank,
+            tp_size=attn_tp_size,
+            reduce_results=False,
         )
         is_neox_style = True
         is_gguf = quant_config and quant_config.get_name() == "gguf"
@@ -223,8 +240,12 @@ class Llama4Attention(nn.Module):
     def _get_attn_scale(self, positions: torch.Tensor) -> torch.Tensor:
         floor = torch.floor((positions + 1.0) / self.floor_scale)
         attn_scale = torch.log(floor + 1.0) * self.attn_scale + 1.0
-
         return attn_scale.unsqueeze(-1)
+
+    @torch.compile(dynamic=True, backend=get_compiler_backend())
+    def _mul_attn_scale(self, positions, q):
+        attn_scale = self._get_attn_scale(positions)
+        return (q * attn_scale).to(q.dtype)
 
     def forward(
         self,
@@ -233,27 +254,29 @@ class Llama4Attention(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+
+        qk, v = qkv.split([self.q_size + self.kv_size, self.kv_size], dim=-1)
 
         if self.rotary_emb is not None:
-            q, k = self.rotary_emb(positions, q, k)
+            q_view, k_view = qk.split([self.q_size, self.kv_size], dim=-1)
+            q_out_unused, k_out_unused = self.rotary_emb(positions, q_view, k_view)
+            assert (q_out_unused is q_view) and (k_out_unused is k_view)
+            del q_view, k_view, q_out_unused, k_out_unused
 
         if self.qk_norm is not None:
-            # TODO: support float
-            q = q.reshape(-1, self.head_dim).contiguous().bfloat16()
-            k = k.reshape(-1, self.head_dim).contiguous().bfloat16()
-            q = self.qk_norm(q).to(q.dtype)
-            k = self.qk_norm(k).to(k.dtype)
-            q = q.reshape(-1, self.q_size)
-            k = k.reshape(-1, self.kv_size)
+            # TODO there are still 2 redundant direct_copy_kernel_cuda for this `reshape` and (in attn backend) q.contiguous(), maybe we can fuse them later
+            qk = qk.reshape(-1, self.head_dim).contiguous().bfloat16()
+            qk = self.qk_norm(qk).to(torch.bfloat16)
+            qk = qk.reshape(-1, self.q_size + self.kv_size)
+
+        q, k = qk.split([self.q_size, self.kv_size], dim=-1)
 
         # We are applying temperature tuning (https://arxiv.org/abs/2501.19399) to NoPE layers, where
         # the inference-time temperature tuning function is customized to not affect short context
         # while working at very long context
         # https://arxiv.org/abs/2501.19399
         if self.attn_temperature_tuning and not self.use_rope:
-            attn_scale = self._get_attn_scale(positions)
-            q = (q * attn_scale).to(q.dtype)
+            q = self._mul_attn_scale(positions=positions, q=q)
 
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
@@ -274,6 +297,9 @@ class Llama4DecoderLayer(nn.Module):
         rope_theta = config.rope_theta
         rope_scaling = config.rope_scaling
         max_position_embeddings = config.max_position_embeddings
+        self.dp_size = get_attention_dp_size()
+        self.attn_tp_size = get_attention_tp_size()
+        self.attn_tp_rank = get_attention_tp_rank()
 
         self.self_attn = Llama4Attention(
             config=config,
@@ -316,21 +342,58 @@ class Llama4DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Self Attention
-        if residual is None:
+        if hidden_states.shape[0] == 0:
             residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
         else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        hidden_states = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-            forward_batch=forward_batch,
-        )
+            # Self Attention
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.input_layernorm(hidden_states)
+            else:
+                hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+
+        # Gather
+        if get_tensor_model_parallel_world_size() > 1:
+            # all gather and all reduce
+            if self.dp_size != 1:
+                if self.attn_tp_rank == 0:
+                    hidden_states += residual
+                hidden_states, local_hidden_states = (
+                    forward_batch.gathered_buffer,
+                    hidden_states,
+                )
+                dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
+                dp_scatter(residual, hidden_states, forward_batch)
+                hidden_states = self.post_attention_layernorm(hidden_states)
+            else:
+                hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                hidden_states, residual = self.post_attention_layernorm(
+                    hidden_states, residual
+                )
+        else:
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual
+            )
 
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.feed_forward(hidden_states)
+
+        # TODO(ch-wan): ues reduce-scatter in MLP to avoid this scatter
+        # Scatter
+        if self.dp_size != 1:
+            # important: forward batch.gathered_buffer is used both after scatter and after gather.
+            # be careful about this!
+            hidden_states, global_hidden_states = (
+                forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
+                hidden_states,
+            )
+            dp_scatter(hidden_states, global_hidden_states, forward_batch)
+
         return hidden_states, residual
 
 
@@ -350,13 +413,14 @@ class Llama4Model(nn.Module):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("embed_tokens", prefix),
+            enable_tp=not global_server_args_dict["enable_dp_attention"],
         )
         self.layers = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: Llama4DecoderLayer(
                 config=config, layer_id=idx, quant_config=quant_config, prefix=prefix
             ),
-            prefix="model.layers",
+            prefix=add_prefix("layers", prefix),
         )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -385,7 +449,8 @@ class Llama4Model(nn.Module):
                 forward_batch,
                 residual,
             )
-        hidden_states, _ = self.norm(hidden_states, residual)
+        if not forward_batch.forward_mode.is_idle():
+            hidden_states, _ = self.norm(hidden_states, residual)
 
         if len(aux_hidden_states) == 0:
             return hidden_states
@@ -394,7 +459,6 @@ class Llama4Model(nn.Module):
 
 
 class Llama4ForCausalLM(LlamaForCausalLM):
-
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
@@ -407,6 +471,9 @@ class Llama4ForCausalLM(LlamaForCausalLM):
         prefix: str = "",
     ):
         super().__init__(config, quant_config, prefix)
+
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
 
     def _init_model(
         self,

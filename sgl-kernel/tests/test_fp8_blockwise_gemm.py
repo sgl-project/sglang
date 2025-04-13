@@ -79,12 +79,11 @@ def _test_accuracy_once(M, N, K, out_dtype, device):
     rtol = 0.02
     atol = 1
     torch.testing.assert_close(o, o1, rtol=rtol, atol=atol)
-    print(f"M={M}, N={N}, K={K}, out_dtype={out_dtype}: OK")
 
 
-@pytest.mark.parametrize("M", [1, 128, 512, 1024, 4096])
-@pytest.mark.parametrize("N", [128, 512, 1024, 4096])
-@pytest.mark.parametrize("K", [512, 1024, 4096, 8192, 16384])
+@pytest.mark.parametrize("M", [1, 3, 5, 127, 128, 512, 1024, 4096])
+@pytest.mark.parametrize("N", [128, 512, 1024, 4096, 8192, 14080])
+@pytest.mark.parametrize("K", [512, 1024, 4096, 8192, 14080, 16384])
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
 def test_accuracy(M, N, K, out_dtype):
     _test_accuracy_once(M, N, K, out_dtype, "cuda")
