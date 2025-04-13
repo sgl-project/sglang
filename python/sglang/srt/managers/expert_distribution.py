@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import Any, List, Optional, Type
 
 import torch
-
 from sglang.srt.managers.expert_location import ExpertLocationMetadata
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import Withable, get_bool_env_var
@@ -72,6 +71,9 @@ class _ExpertDistributionRecorder:
             "on_deepep_dispatch_normal",
             num_recv_tokens_per_expert_list=num_recv_tokens_per_expert_list,
         )
+
+    def on_deepep_dispatch_low_latency(self, recv_count: torch.Tensor):
+        self._on_hook("on_deepep_dispatch_low_latency", recv_count=recv_count)
 
     def _on_hook(self, hook_name: str, **kwargs):
         if not self._recording:
@@ -196,8 +198,8 @@ class _SelectExpertsSinglePassGatherer(_LayerBasedSinglePassGatherer):
         torch.cuda.synchronize()
 
         num_recv_tokens_per_expert_list = [
-            0
-        ] * self._expert_location_metadata.num_local_physical_experts
+                                              0
+                                          ] * self._expert_location_metadata.num_local_physical_experts
         for token_record in topk_ids_list:
             for global_physical_expert_idx in token_record:
                 local_physical_expert_idx = (
