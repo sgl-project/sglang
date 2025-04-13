@@ -433,17 +433,21 @@ class ForwardBatch:
                         batch.extend_prefix_lens[i],
                     )
                     # text only
-                    mrope_positions = [
+                    mrope_positions = torch.tensor(
                         [
-                            pos
-                            for pos in range(
-                                extend_prefix_len, extend_prefix_len + extend_seq_len
-                            )
+                            [
+                                pos
+                                for pos in range(
+                                    extend_prefix_len,
+                                    extend_prefix_len + extend_seq_len,
+                                )
+                            ]
                         ]
-                    ] * 3
+                        * 3
+                    )
                 else:
                     mrope_positions = mm_input.mrope_positions
-                mrope_positions_list[i] = torch.tensor(mrope_positions)
+                mrope_positions_list[i] = mrope_positions
 
         self.mrope_positions = torch.cat(
             [pos.to(device=device) for pos in mrope_positions_list],
