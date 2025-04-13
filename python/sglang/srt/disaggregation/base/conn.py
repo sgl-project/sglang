@@ -9,6 +9,7 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 
 class KVArgs:
     engine_rank: int
+    tp_size: int
     kv_data_ptrs: list[int]
     kv_data_lens: list[int]
     kv_item_lens: list[int]
