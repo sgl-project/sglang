@@ -44,6 +44,12 @@ jobs:
             cuda-version: '12.8'
     name: Build Wheel (CUDA ${{ matrix.cuda-version }})
     steps:
+      - name: Skip unnecessary builds on push to main
+        if: github.event_name == 'push' && (matrix.cuda-version == '11.8' || matrix.cuda-version == '12.8')
+        run: |
+          echo "Skipping CUDA ${{ matrix.cuda-version }} build on push to main"
+          exit 0
+
       - name: Cleanup
         run: |
           sudo rm -rf $GITHUB_WORKSPACE/* || true
