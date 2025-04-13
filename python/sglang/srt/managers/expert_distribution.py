@@ -228,9 +228,6 @@ class _DeepepNormalSinglePassGatherer(_LayerBasedSinglePassGatherer):
         self._on_layer_data(layer_idx, num_recv_tokens_per_expert_list)
 
 
-# TODO Wait for LowLatency DeepEP merging
-# e.g. use naive tensor copying
-# need to consider CUDA graph, e.g. add initialization and after-end
 class _DeepepLowLatencySinglePassGatherer(_SinglePassGatherer):
     def __init__(self, expert_location_metadata: "ExpertLocationMetadata"):
         super().__init__(expert_location_metadata)
@@ -245,9 +242,11 @@ class _DeepepLowLatencySinglePassGatherer(_SinglePassGatherer):
         self._data[layer_idx, :] = recv_count
 
     def reset(self):
+        print(f"hi _DeepepLowLatencySinglePassGatherer.reset")
         self._data[...] = 0
 
     def collect(self) -> torch.Tensor:
+        print(f"hi _DeepepLowLatencySinglePassGatherer.collect {self._data.sum()=}")
         return self._data.clone()
 
 
