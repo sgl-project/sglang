@@ -342,6 +342,7 @@ def fused_moe_kernel(
     use_fp8_w8a8: tl.constexpr,
     use_int8_w8a8: tl.constexpr,
     use_int8_w8a16: tl.constexpr,
+    per_channel_quant: tl.constexpr,
     even_Ks: tl.constexpr,
 ):
     """
@@ -416,20 +417,7 @@ def fused_moe_kernel(
         )
         b_scale = tl.load(b_scale_ptrs)
 
-    if use_fp8_w8a8:
-        # block-wise
-        if group_k > 0 and group_n > 0:
-            a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
-            offs_bsn = offs_bn // group_n
-            b_scale_ptrs = (
-                b_scale_ptr + off_experts * stride_bse + offs_bsn * stride_bsn
-            )
-        # tensor-wise
-        else:
-            a_scale = tl.load(a_scale_ptr)
-            b_scale = tl.load(b_scale_ptr + off_experts)
-
-    if use_int8_w8a8:
+    if use_fp8_w8a8 or use_int8_w8a8:
         # block-wise
         if group_k > 0 and group_n > 0:
             a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
@@ -438,8 +426,7 @@ def fused_moe_kernel(
                 b_scale_ptr + off_experts * stride_bse + offs_bsn * stride_bsn
             )
         # channel-wise
-        else:
-            # Load per-column scale for weights
+        elif per_channel_quant:
             b_scale_ptrs = (
                 b_scale_ptr + off_experts * stride_bse + offs_bn[None, :] * stride_bsn
             )
@@ -447,6 +434,10 @@ def fused_moe_kernel(
             # Load per-token scale for activations
             a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
             a_scale = tl.load(a_scale_ptrs, mask=token_mask, other=0.0)[:, None]
+        # tensor-wise
+        else:
+            a_scale = tl.load(a_scale_ptr)
+            b_scale = tl.load(b_scale_ptr + off_experts)
 
     # -----------------------------------------------------------
     # Iterate to compute a block of the C matrix.
@@ -711,12 +702,12 @@ def moe_align_block_size(
             num_tokens_post_pad,
         )
     else:
-        token_cnts_buffer = torch.zeros(
+        token_cnts_buffer = torch.empty(
             (num_experts + 1) * num_experts,
             dtype=torch.int32,
             device=topk_ids.device,
         )
-        cumsum_buffer = torch.zeros(
+        cumsum_buffer = torch.empty(
             num_experts + 1, dtype=torch.int32, device=topk_ids.device
         )
 
@@ -753,6 +744,7 @@ def invoke_fused_moe_kernel(
     use_int8_w8a8: bool,
     use_int8_w8a16: bool,
     use_int4_w4a16: bool,
+    per_channel_quant: bool,
     block_shape: Optional[List[int]] = None,
     no_combine: bool = False,
 ) -> None:
@@ -765,6 +757,8 @@ def invoke_fused_moe_kernel(
         from sglang.srt.layers.quantization.fp8_kernel import (
             sglang_per_token_group_quant_fp8,
         )
+    else:
+        from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
 
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
@@ -775,10 +769,15 @@ def invoke_fused_moe_kernel(
         if block_shape is None:
             # activation tensor-wise fp8 quantization, dynamic or static
             padded_size = padding_size
+            # activations apply per-token quantization when weights apply per-channel quantization by default
             if _is_cuda:
-                A, A_scale = sgl_scaled_fp8_quant(A, A_scale)
+                A, A_scale = sgl_scaled_fp8_quant(
+                    A, A_scale, use_per_token_if_dynamic=per_channel_quant
+                )
             else:
-                A, A_scale = vllm_ops.scaled_fp8_quant(A, A_scale)
+                A, A_scale = vllm_ops.scaled_fp8_quant(
+                    A, A_scale, use_per_token_if_dynamic=per_channel_quant
+                )
         else:
             # activation block-wise fp8 quantization
             assert len(block_shape) == 2
@@ -794,6 +793,9 @@ def invoke_fused_moe_kernel(
         assert B_scale is not None
         if block_shape is None:
             # activation channel-wise int8 quantization
+            assert (
+                per_channel_quant
+            ), "int8 quantization only supports channel-wise quantization except for block-wise quantization"
             A, A_scale = per_token_quant_int8(A)
         else:
             # activation block-wise int8 quantization
@@ -902,6 +904,7 @@ def invoke_fused_moe_kernel(
             use_fp8_w8a8=use_fp8_w8a8,
             use_int8_w8a8=use_int8_w8a8,
             use_int8_w8a16=use_int8_w8a16,
+            per_channel_quant=per_channel_quant,
             even_Ks=even_Ks,
             **config,
         )
@@ -953,7 +956,7 @@ def get_moe_configs(
     logger.warning(
         (
             "Using default MoE config. Performance might be sub-optimal! "
-            "Config file not found at %s"
+            "Config file not found at %s, you can tune the config with https://github.com/sgl-project/sglang/blob/main/benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton.py."
         ),
         config_file_path,
     )
@@ -1084,6 +1087,7 @@ def inplace_fused_experts(
     use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
+    per_channel_quant: bool = False,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
     w1_zp: Optional[torch.Tensor] = None,
@@ -1105,6 +1109,7 @@ def inplace_fused_experts(
         use_int8_w8a8,
         use_int8_w8a16,
         use_int4_w4a16,
+        per_channel_quant,
         w1_scale,
         w2_scale,
         w1_zp,
@@ -1127,6 +1132,7 @@ def inplace_fused_experts_fake(
     use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
+    per_channel_quant: bool = False,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
     w1_zp: Optional[torch.Tensor] = None,
@@ -1158,6 +1164,7 @@ def outplace_fused_experts(
     use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
+    per_channel_quant: bool = False,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
     w1_zp: Optional[torch.Tensor] = None,
@@ -1180,6 +1187,7 @@ def outplace_fused_experts(
         use_int8_w8a8,
         use_int8_w8a16,
         use_int4_w4a16,
+        per_channel_quant,
         w1_scale,
         w2_scale,
         w1_zp,
@@ -1203,6 +1211,7 @@ def outplace_fused_experts_fake(
     use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
+    per_channel_quant: bool = False,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
     w1_zp: Optional[torch.Tensor] = None,
@@ -1236,6 +1245,7 @@ def fused_experts(
     use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
+    per_channel_quant: bool = False,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
     w1_zp: Optional[torch.Tensor] = None,
@@ -1259,6 +1269,7 @@ def fused_experts(
             use_int8_w8a8,
             use_int8_w8a16,
             use_int4_w4a16,
+            per_channel_quant,
             w1_scale,
             w2_scale,
             w1_zp,
@@ -1281,6 +1292,7 @@ def fused_experts(
             use_int8_w8a8,
             use_int8_w8a16,
             use_int4_w4a16,
+            per_channel_quant,
             w1_scale,
             w2_scale,
             w1_zp,
@@ -1305,6 +1317,7 @@ def fused_experts_impl(
     use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
+    per_channel_quant: bool = False,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
     w1_zp: Optional[torch.Tensor] = None,
@@ -1441,6 +1454,7 @@ def fused_experts_impl(
             use_int8_w8a8=use_int8_w8a8,
             use_int8_w8a16=use_int8_w8a16,
             use_int4_w4a16=use_int4_w4a16,
+            per_channel_quant=per_channel_quant,
             block_shape=block_shape,
         )
         if activation == "silu":
@@ -1484,6 +1498,7 @@ def fused_experts_impl(
             use_int8_w8a8=use_int8_w8a8,
             use_int8_w8a16=use_int8_w8a16,
             use_int4_w4a16=use_int4_w4a16,
+            per_channel_quant=per_channel_quant,
             block_shape=block_shape,
         )
 
@@ -1530,6 +1545,7 @@ def fused_moe(
     use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
+    per_channel_quant: bool = False,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
     w1_zp: Optional[torch.Tensor] = None,
@@ -1606,6 +1622,7 @@ def fused_moe(
         use_int8_w8a8=use_int8_w8a8,
         use_int8_w8a16=use_int8_w8a16,
         use_int4_w4a16=use_int4_w4a16,
+        per_channel_quant=per_channel_quant,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
         w1_zp=w1_zp,

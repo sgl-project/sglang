@@ -535,6 +535,7 @@ class MllamaTextCrossAttention(nn.Module):
             self.num_local_key_value_heads,
             layer_id=layer_id,
             is_cross_attention=True,
+            quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
         )
 
