@@ -300,7 +300,9 @@ def select_experts(
     if expert_logical_to_rank_dispatch_physical_map is not None:
         # TODO this is inefficient, and I will fuse into existing kernels
         if get_bool_env_var("SGLANG_HACK_EXPERT_LOCATION_DISPATCH_RANDOM"):
-            topk_ids = expert_logical_to_all_physical_map[topk_ids, TODO]
+            chosen_dispatch_index = torch.randint(0, 65536, topk_ids.shape,
+                                                  dtype=torch.int32) % expert_logical_to_all_physical_map_num_valid
+            topk_ids = expert_logical_to_all_physical_map[topk_ids, chosen_dispatch_index]
         else:
             topk_ids = expert_logical_to_rank_dispatch_physical_map[topk_ids]
 
