@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
+import queue
 import struct
 import threading
 from functools import cache
@@ -63,10 +65,25 @@ class KVPoll:
     Success = 4
 
 
-RequestPoolType = Dict[int, Tuple[npt.NDArray[np.int64], Optional[int]]]
-WaitingPoolType = Dict[
-    int, Tuple[str, list[int], npt.NDArray[np.int64], list[int], int]
-]
+@dataclasses.dataclass
+class TransferKVChunk:
+    room: int
+    slice: Tuple[int, int]
+    prefill_kv_indices: npt.NDArray[np.int64]
+    prefill_aux_index: Optional[int]
+
+
+@dataclasses.dataclass
+class WaitingReq:
+    room: int
+    endpoint: str
+    mooncake_session_id: str
+    dst_kv_ptrs: list[int]
+    dst_kv_indices: npt.NDArray[np.int64]
+    dst_aux_ptrs: list[int]
+    dst_aux_index: int
+
+
 KVSENDER_POLLING_PORT = 17788
 KVRECEIVER_POLLING_PORT = 27788
 
@@ -81,9 +98,8 @@ class KVManager:
         self.server_socket = zmq.Context().socket(zmq.PULL)
         self.register_buffer_to_engine()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self.to_transfer_pool: RequestPoolType = {}
-            self.waiting_pool: WaitingPoolType = {}
-            self.transfer_event = threading.Event()
+            self.transfer_queue = queue.Queue()
+            self.waiting_pool: Dict[int, WaitingReq] = {}
             self.start_prefill_thread()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.start_decode_thread()
@@ -230,7 +246,8 @@ class KVManager:
                     struct.unpack(f"{len(dst_aux_ptrs)//8}Q", dst_aux_ptrs)
                 )
                 dst_aux_index = int(dst_aux_index.decode("ascii"))
-                self.waiting_pool[bootstrap_room] = (
+                self.waiting_pool[bootstrap_room] = WaitingReq(
+                    bootstrap_room,
                     endpoint,
                     mooncake_session_id,
                     dst_kv_ptrs,
@@ -238,57 +255,42 @@ class KVManager:
                     dst_aux_ptrs,
                     dst_aux_index,
                 )
-                self.transfer_event.set()
 
         threading.Thread(target=bootstrap_thread).start()
 
         def transfer_thread():
+            # TODO: Shall we use KVPoll.Transferring state?
             while True:
-                self.transfer_event.wait()
-                self.transfer_event.clear()
-                bootstrap_room_ready = self.to_transfer_pool.keys()
-                bootstrap_room_request = self.waiting_pool.keys()
-                for room in list(bootstrap_room_request):
-                    if room not in list(bootstrap_room_ready):
-                        continue
-                    status = KVPoll.Transferring
-                    self.request_status[room] = status
-                    (
-                        endpoint,
-                        mooncake_session_id,
-                        dst_kv_ptrs,
-                        dst_kv_indices,
-                        dst_aux_ptrs,
-                        dst_aux_index,
-                    ) = self.waiting_pool.pop(room)
-                    # TODO(lsyin): I do not thinks this sync is necessary in current implementation
-                    # self.sync_status_to_decode_endpoint(endpoint, room)
-                    (
-                        prefill_kv_indices,
-                        prefill_aux_index,
-                    ) = self.to_transfer_pool.pop(room)
+                try:
+                    kv_chunk: TransferKVChunk = self.transfer_queue.get(timeout=0.01)
+                    req = self.waiting_pool[kv_chunk.room]
                     ret = self.send_kvcache(
-                        mooncake_session_id,
-                        prefill_kv_indices,
-                        dst_kv_ptrs,
-                        dst_kv_indices,
+                        req.mooncake_session_id,
+                        kv_chunk.prefill_kv_indices,
+                        req.dst_kv_ptrs,
+                        req.dst_kv_indices,
                     )
                     if ret != 0:
-                        status = KVPoll.Failed
-                        self.sync_status_to_decode_endpoint(endpoint, room)
+                        self.request_status[kv_chunk.room] = KVPoll.Failed
+                        self.sync_status_to_decode_endpoint(req.endpoint, req.room)
                         continue
                     ret = self.send_aux(
-                        mooncake_session_id,
-                        prefill_aux_index,
-                        dst_aux_ptrs,
-                        dst_aux_index,
+                        req.mooncake_session_id,
+                        kv_chunk.prefill_aux_index,
+                        req.dst_aux_ptrs,
+                        req.dst_aux_index,
                     )
+
+                    # Check the chunked status to mark the KVPoll.Success
+                    # FIXME: until all chunks are sent
                     if ret != 0:
                         status = KVPoll.Failed
                     else:
                         status = KVPoll.Success
-                    self.request_status[room] = status
-                    self.sync_status_to_decode_endpoint(endpoint, room)
+                    self.request_status[req.room] = status
+                    self.sync_status_to_decode_endpoint(req.endpoint, req.room)
+                except queue.Empty:
+                    continue
 
         threading.Thread(target=transfer_thread).start()
 
@@ -312,9 +314,15 @@ class KVManager:
         aux_index: Optional[int],
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
-        self.to_transfer_pool[bootstrap_room] = (kv_indices, aux_index)
+        self.transfer_queue.put(
+            TransferKVChunk(
+                room=bootstrap_room,
+                slice=(0, len(kv_indices)),
+                prefill_kv_indices=kv_indices,
+                prefill_aux_index=aux_index,
+            )
+        )
         self.request_status[bootstrap_room] = KVPoll.WaitingForInput
-        self.transfer_event.set()
 
     def check_status(self, bootstrap_room: int):
         # TOOD: do we really need the poll()?
