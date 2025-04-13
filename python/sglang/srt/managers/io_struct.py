@@ -98,6 +98,7 @@ class GenerateReqInput:
     # For disaggregated inference
     bootstrap_host: Optional[str] = None
     bootstrap_room: Optional[int] = None
+    prefill_addr: Optional[str] = None
 
     def normalize_batch_and_arguments(self):
         """
@@ -442,6 +443,7 @@ class TokenizedGenerateReqInput:
     # For disaggregated inference
     bootstrap_host: Optional[str] = None
     bootstrap_room: Optional[int] = None
+    prefill_addr: Optional[str] = None
 
 
 @dataclass

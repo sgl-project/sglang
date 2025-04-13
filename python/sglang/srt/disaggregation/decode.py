@@ -118,7 +118,7 @@ class DecodePreallocQueue:
             metadata_buffer[0].nbytes for metadata_buffer in self.metadata_buffers
         ]
         kv_args.ib_device = "mock-ib-device"
-        kv_manager = KVManager(kv_args, DisaggregationMode("decode"))
+        kv_manager = KVManager(kv_args, DisaggregationMode("decode"), self.scheduler.server_args)
         return kv_manager
 
     def add(self, req: Req) -> None:
@@ -126,6 +126,7 @@ class DecodePreallocQueue:
 
         kv_receiver = KVReceiver(
             mgr=self.kv_manager,
+            prefill_addr=req.prefill_addr,
             bootstrap_addr=f"{req.bootstrap_host}:{self.bootstrap_port}",
             bootstrap_room=req.bootstrap_room,
         )

@@ -56,6 +56,7 @@ class PrefillBootstrapQueue:
         tp_size: int,
         bootstrap_port: int,
         gloo_group: ProcessGroup,
+        scheduler: Scheduler,
     ):
         self.token_to_kv_pool = token_to_kv_pool
         self.aux_dtype = aux_dtype
@@ -64,6 +65,7 @@ class PrefillBootstrapQueue:
         self.req_to_metadata_buffer_idx_allocator = req_to_metadata_buffer_idx_allocator
         self.tp_rank = tp_rank
         self.tp_size = tp_size
+        self.scheduler = scheduler
         self.kv_manager = self._init_kv_manager()
         self.queue: List[Req] = []
         self.gloo_group = gloo_group
@@ -97,7 +99,7 @@ class PrefillBootstrapQueue:
             metadata_buffer[0].nbytes for metadata_buffer in self.metadata_buffers
         ]
         kv_args.ib_device = "mock-ib-device"
-        kv_manager = KVManager(kv_args, DisaggregationMode("prefill"))
+        kv_manager = KVManager(kv_args, DisaggregationMode("prefill"), self.scheduler.server_args)
         return kv_manager
 
     def add(self, req: Req) -> None:

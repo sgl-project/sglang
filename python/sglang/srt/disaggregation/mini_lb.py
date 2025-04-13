@@ -155,12 +155,15 @@ async def handle_generate_request(request_data: dict):
 
     # Parse and transform prefill_server for bootstrap data
     parsed_url = urllib.parse.urlparse(prefill_server)
+
+    prefill_addr = parsed_url.netloc
     hostname = parsed_url.hostname
     modified_request = request_data.copy()
     modified_request.update(
         {
             "bootstrap_host": hostname,
             "bootstrap_room": random.randint(0, 2**63 - 1),
+            "prefill_addr": f"{prefill_addr}",
         }
     )
 

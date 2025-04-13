@@ -456,6 +456,7 @@ class TokenizerManager:
                 obj.stream,
                 bootstrap_host=obj.bootstrap_host,
                 bootstrap_room=obj.bootstrap_room,
+                prefill_addr=obj.prefill_addr,
                 lora_path=obj.lora_path,
                 input_embeds=input_embeds,
                 session_params=session_params,

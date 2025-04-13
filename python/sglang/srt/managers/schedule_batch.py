@@ -390,6 +390,7 @@ class Req:
         eos_token_ids: Optional[Set[int]] = None,
         bootstrap_host: Optional[str] = None,
         bootstrap_room: Optional[int] = None,
+        prefill_addr: Optional[str] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -525,6 +526,7 @@ class Req:
         # For disaggregation
         self.bootstrap_host: str = bootstrap_host
         self.bootstrap_room: Optional[int] = bootstrap_room
+        self.prefill_addr: str = prefill_addr
         self.disagg_kv_sender: Optional[KVSender] = None
 
         # used for warmup because we don't have a pair yet when init
