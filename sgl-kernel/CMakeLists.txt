@@ -25,6 +25,8 @@ find_package(Torch REQUIRED)
 # clean Torch Flag
 clear_cuda_arches(CMAKE_FLAG)
 
+set_property(GLOBAL PROPERTY CUDA_SEPARABLE_COMPILATION ON)
+
 include(FetchContent)
 
 # cutlass
@@ -104,6 +106,7 @@ set(SGL_KERNEL_CUDA_FLAGS
     "--expt-relaxed-constexpr"
     "-Xcompiler=-Wconversion"
     "-Xcompiler=-fno-strict-aliasing"
+    "--threads=16"
 )
 
 option(SGL_KERNEL_ENABLE_SM100A "Enable SM100A" OFF)
@@ -160,6 +163,7 @@ string(REPLACE "-D__CUDA_NO_HALF2_OPERATORS__"      "" CMAKE_CUDA_FLAGS "${CMAKE
 
 set(SOURCES
     "csrc/allreduce/custom_all_reduce.cu"
+    "csrc/attention/cascade.cu"
     "csrc/attention/cutlass_mla_kernel.cu"
     "csrc/attention/lightning_attention_decode_kernel.cu"
     "csrc/elementwise/activation.cu"
