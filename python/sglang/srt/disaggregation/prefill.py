@@ -69,7 +69,7 @@ class PrefillBootstrapQueue:
         self.gloo_group = gloo_group
         self.bootstrap_port = bootstrap_port
 
-    def allocate_token_id(self, idx: int, token_id: int):
+    def store_prefill_output(self, idx: int, token_id: int):
         assert token_id >= 0, f"token_id: {token_id} is negative"
         output_id_buffer = self.metadata_buffers[0]
         output_id_buffer[idx] = token_id
@@ -140,6 +140,7 @@ class PrefillBootstrapQueue:
             req.metadata_buffer_index = (
                 self.req_to_metadata_buffer_idx_allocator.alloc()
             )
+            # FIXME: where is the free() of metadata_buffer_index...
             assert req.metadata_buffer_index is not None
             req.disagg_kv_sender.recv_pre_alloc(
                 num_kv_indices, req.metadata_buffer_index
@@ -239,14 +240,18 @@ class SchedulerDisaggregationPrefillMixin:
         """
         start_idx = req.start_send_idx
         end_idx = min(len(req.fill_ids), len(req.origin_input_ids))
+
+        # Update next start_send_idx
+        req.start_send_idx = end_idx
+
         kv_indices = (
             self.req_to_token_pool.req_to_token[req.req_pool_idx][start_idx:end_idx]
             .cpu()
             .numpy()
         )
-        req.start_send_idx = end_idx
         if token_id is not None:
-            self.disagg_prefill_pending_queue.allocate_token_id(
+            self.disagg_prefill_pending_queue.store_prefill_output(
                 req.metadata_buffer_index, token_id
             )
-        req.disagg_kv_sender.send(kv_indices)
+        is_last = token_id is not None
+        req.disagg_kv_sender.send(kv_indices, slice(start_idx, end_idx), is_last)

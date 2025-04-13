@@ -68,8 +68,9 @@ class KVPoll:
 @dataclasses.dataclass
 class TransferKVChunk:
     room: int
-    slice: Tuple[int, int]
     prefill_kv_indices: npt.NDArray[np.int64]
+    index_slice: slice
+    is_last: bool
     prefill_aux_index: Optional[int]
 
 
@@ -240,8 +241,8 @@ class KVManager:
                 bootstrap_room = waiting_req_bytes[2].decode("ascii")
                 if bootstrap_room == "None":
                     continue
-                self.waiting_pool.update(
-                    int(bootstrap_room), WaitingReq.from_zmq(waiting_req_bytes)
+                self.waiting_pool[int(bootstrap_room)] = WaitingReq.from_zmq(
+                    waiting_req_bytes
                 )
 
         def transfer_thread():
@@ -250,31 +251,36 @@ class KVManager:
                 try:
                     kv_chunk: TransferKVChunk = self.transfer_queue.get(timeout=0.01)
                     req = self.waiting_pool[kv_chunk.room]
+                    chunked_dst_kv_indice = req.dst_kv_indices[kv_chunk.index_slice]
+                    assert len(chunked_dst_kv_indice) == len(
+                        kv_chunk.prefill_kv_indices
+                    )
+
                     ret = self.send_kvcache(
                         req.mooncake_session_id,
                         kv_chunk.prefill_kv_indices,
                         req.dst_kv_ptrs,
-                        req.dst_kv_indices,
+                        chunked_dst_kv_indice,
                     )
                     if ret != 0:
                         self.request_status[kv_chunk.room] = KVPoll.Failed
                         self.sync_status_to_decode_endpoint(req.endpoint, req.room)
                         continue
-                    ret = self.send_aux(
-                        req.mooncake_session_id,
-                        kv_chunk.prefill_aux_index,
-                        req.dst_aux_ptrs,
-                        req.dst_aux_index,
-                    )
 
-                    # Check the chunked status to mark the KVPoll.Success
-                    # FIXME: until all chunks are sent
-                    if ret != 0:
-                        status = KVPoll.Failed
-                    else:
-                        status = KVPoll.Success
-                    self.request_status[req.room] = status
-                    self.sync_status_to_decode_endpoint(req.endpoint, req.room)
+                    if kv_chunk.is_last:
+                        # Only the last chunk we need to send the aux data
+                        ret = self.send_aux(
+                            req.mooncake_session_id,
+                            kv_chunk.prefill_aux_index,
+                            req.dst_aux_ptrs,
+                            req.dst_aux_index,
+                        )
+                        self.request_status[req.room] = (
+                            KVPoll.Success if ret == 0 else KVPoll.Failed
+                        )
+                        self.sync_status_to_decode_endpoint(req.endpoint, req.room)
+                        self.waiting_pool.pop(req.room)
+
                 except queue.Empty:
                     continue
 
@@ -298,14 +304,19 @@ class KVManager:
         self,
         bootstrap_room: int,
         kv_indices: npt.NDArray[np.int64],
-        aux_index: Optional[int],
+        index_slice: slice,
+        is_last: bool,
+        aux_index: Optional[int] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
+        assert not is_last or (is_last and aux_index is not None)
+
         self.transfer_queue.put(
             TransferKVChunk(
                 room=bootstrap_room,
-                slice=(0, len(kv_indices)),
                 prefill_kv_indices=kv_indices,
+                index_slice=index_slice,
+                is_last=is_last,
                 prefill_aux_index=aux_index,
             )
         )
@@ -342,13 +353,27 @@ class KVSender:
         self.aux_index = None
 
     def recv_pre_alloc(self, num_kv_indices: int, aux_index: Optional[int] = None):
-        self.aux_index = aux_index
         self.num_kv_indices = num_kv_indices
+        self.aux_index = aux_index
 
-    def send(self, kv_indices: npt.NDArray[np.int64]):
-        self.kv_mgr.add_transfer_request(
-            self.bootstrap_room, kv_indices, self.aux_index
-        )
+    def send(
+        self,
+        kv_indices: npt.NDArray[np.int64],
+        index_slice: slice,
+        is_last: bool,
+    ):
+        if not is_last:
+            self.kv_mgr.add_transfer_request(
+                self.bootstrap_room, kv_indices, index_slice, False
+            )
+        else:
+            self.kv_mgr.add_transfer_request(
+                self.bootstrap_room,
+                kv_indices,
+                index_slice,
+                True,
+                aux_index=self.aux_index,
+            )
 
     def poll(self) -> KVPoll:
         return self.kv_mgr.check_status(self.bootstrap_room)
