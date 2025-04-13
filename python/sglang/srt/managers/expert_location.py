@@ -140,6 +140,7 @@ class ExpertLocationMetadata:
             getattr(self, field)[...] = getattr(other, field)
 
         for field in [
+            # TODO maybe make last dim size const to simplify the logic
             "logical_to_all_physical_map",
         ]:
             setattr(self, field, getattr(other, field).to(getattr(self, field).device))
