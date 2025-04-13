@@ -22,10 +22,12 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, is_hip
 
 _is_cuda = is_cuda()
-if _is_cuda:
+_is_hip = is_hip()
+
+if _is_cuda or _is_hip:
     CUDA_CAPABILITY = torch.cuda.get_device_capability()
 
 
@@ -174,7 +176,7 @@ def context_attention_fwd(
     b_seq_len: [b]
     out: [b * s, head, head_dim]
     """
-    if _is_cuda and CUDA_CAPABILITY[0] > 8:
+    if (_is_cuda or _is_hip) and CUDA_CAPABILITY[0] > 8:
         BLOCK = 128
     else:
         BLOCK = 64
