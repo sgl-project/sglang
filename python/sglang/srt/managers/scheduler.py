@@ -437,6 +437,7 @@ class Scheduler(
             context_length=server_args.context_length,
             model_override_args=server_args.json_model_override_args,
             is_embedding=server_args.is_embedding,
+            enable_multimodal=server_args.enable_multimodal,
             dtype=server_args.dtype,
             quantization=server_args.quantization,
         )
@@ -451,6 +452,7 @@ class Scheduler(
                     tokenizer_mode=server_args.tokenizer_mode,
                     trust_remote_code=server_args.trust_remote_code,
                     revision=server_args.revision,
+                    use_fast=not server_args.disable_fast_image_processor,
                 )
                 self.tokenizer = self.processor.tokenizer
             else:
