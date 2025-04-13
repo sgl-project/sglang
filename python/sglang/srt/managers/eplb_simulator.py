@@ -1,8 +1,10 @@
 # TODO where to put this file?
 import dataclasses
+import json
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 import einops
 import polars as pl
@@ -23,6 +25,7 @@ class MyServerArgs:
     nnodes: int
     tp_size: int
     enable_expert_location_by_eplb: bool
+    init_expert_location: Optional[str]
 
 
 @dataclass
@@ -109,7 +112,10 @@ def scan_combinations(
                 nnodes=nnodes,
                 tp_size=num_gpu_per_node * nnodes,
                 enable_expert_location_by_eplb=enable_expert_location_by_eplb,
+                init_expert_location=init_expert_location,
             )
+
+            for init_expert_location in [None, "/host_home/temp_sglang_server2local/1744461420780309768.json"]
 
             # decode
             # for ep_num_redundant_experts in [0, 32]
@@ -123,9 +129,12 @@ def scan_combinations(
             # for num_tokens_in_batch_per_gpu in [64, 128]
 
             # prefill
-            for ep_num_redundant_experts in [0, 32, 64]
-            for nnodes in [1, 2, 4]
-            for num_tokens_in_batch_per_gpu in [1024, 4096, 8192, 16384]
+            for ep_num_redundant_experts in [0, 32]
+            for nnodes in [4]
+            for num_tokens_in_batch_per_gpu in [8192]
+            # for ep_num_redundant_experts in [0, 32, 64]
+            # for nnodes in [1, 2, 4]
+            # for num_tokens_in_batch_per_gpu in [1024, 4096, 8192, 16384]
 
             for enable_expert_location_by_eplb in [
                 *([False] if ep_num_redundant_experts == 0 else []),
@@ -153,8 +162,11 @@ def analyze_actual_utilization_rate(dir_data: Path, num_gpu: int):
         physical_count_of_whatever=physical_count_of_forward_pass,
         num_gpu=num_gpu,
     )
+    print(f"{gpu_physical_count_of_forward_pass.shape=}")
     utilization_rate = compute_utilization_rate(gpu_physical_count_of_forward_pass)
     print(f"{utilization_rate.shape=}")
+    print(f"{torch.mean(utilization_rate, dim=0)=}")
+    print(f"{torch.mean(utilization_rate[:, 3:]).item()=}")
     print(dir_data, torch.mean(utilization_rate).item())
 
 
@@ -175,12 +187,16 @@ def simulate_execution(
                 model_config_for_expert_location.num_logical_experts
                 + server_args.ep_num_redundant_experts
         )
+        if (x := server_args.init_expert_location) is not None:
+            print(f"Compute logical_count from {x}")
+            logical_count = json.loads(Path(x).read_text())["logical_count"]
+        else:
+            print(f"Compute logical_count from logical_count_of_seq")
+            logical_count = einops.einsum(logical_count_of_seq,
+                                          "num_seq num_layer num_expert -> num_layer num_expert", )
         expert_location_metadata = MyExpertLocationMetadata.init_by_eplb(
             server_args,
-            logical_count=einops.einsum(
-                logical_count_of_seq,
-                "num_seq num_layer num_expert -> num_layer num_expert",
-            ),
+            logical_count=logical_count,
             num_physical_experts=num_physical_expert,
         )
         # print(f"hi {expert_location_metadata=}")
