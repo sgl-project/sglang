@@ -18,6 +18,7 @@ class ExpertLocationMetadata:
     num_logical_experts: int
     physical_to_logical_map: torch.Tensor  # (layers, num_physical_experts)
     logical_to_all_physical_map: torch.Tensor  # (layers, num_logical_experts, X)
+    logical_to_all_physical_map_num_valid: torch.Tensor  # (layers, num_logical_experts)
     # (num_gpus, layers, num_logical_experts)
     logical_to_rank_dispatch_physical_map: torch.Tensor
 
