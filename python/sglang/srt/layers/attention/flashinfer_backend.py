@@ -18,7 +18,7 @@ import torch
 from sglang.global_config import global_config
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import (
-    create_casual_mask_from_page_triton,
+    create_causal_mask_from_page_triton,
     create_flashinfer_kv_indices_triton,
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
@@ -494,7 +494,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 #     self.forward_metadata.prefill_qo_indptr)
                 # TODO(Wenxuan) debug this
                 max_kv_len = next_power_of_2(forward_batch.seq_lens.max().item())
-                create_casual_mask_from_page_triton[(qo_indptr_p[-1],)](
+                create_causal_mask_from_page_triton[(qo_indptr_p[-1],)](
                     mask_p,
                     qo_indptr_p,
                     kv_indptr_p,
@@ -539,6 +539,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     paged_kv_cache_d=(k_cache, v_cache),
                     custom_mask_p=mask_p,
                     causal_d=True,
+                    causal_p=True,
                     # logits_soft_cap_p=layer.logit_cap,
                     # logits_soft_cap_d=layer.logit_cap,
                     # TODO

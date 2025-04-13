@@ -98,7 +98,7 @@ def create_flashmla_kv_indices_triton(
 
 
 @triton.jit
-def create_casual_mask_from_page_triton(
+def create_causal_mask_from_page_triton(
     mask_ptr,  # [qo_len, kv_len]
     cu_qo_indptr,  # [bs + 1], cumulative ranges for each req
     cu_kv_lens_ptr,  # [bs + 1]
