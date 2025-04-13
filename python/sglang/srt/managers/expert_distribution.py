@@ -237,7 +237,7 @@ class _DeepepLowLatencySinglePassGatherer(_SinglePassGatherer):
         self._data = torch.zeros(
             (expert_location_metadata.num_layers, expert_location_metadata.num_local_physical_experts),
             dtype=torch.int,
-            device=TODO,
+            device="cuda",
         )
 
     def on_deepep_dispatch_low_latency(self, layer_idx: int, recv_count: torch.Tensor):
