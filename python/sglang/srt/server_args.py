@@ -287,6 +287,16 @@ class ServerArgs:
             )
             self.disable_cuda_graph = True
 
+        if self.attention_backend == "dual_chunk_flash_attn":
+            logger.warning(
+                "Cuda graph is disabled because of using dual chunk flash attention backend"
+            )
+            self.disable_cuda_graph = True
+            logger.warning(
+                "Mixed chunk is disabled because of using dual chunk flash attention backend"
+            )
+            self.enable_mixed_chunk = False
+
         # Choose grammar backend
         if self.grammar_backend is None:
             self.grammar_backend = "xgrammar"
@@ -824,7 +834,7 @@ class ServerArgs:
         parser.add_argument(
             "--attention-backend",
             type=str,
-            choices=["flashinfer", "triton", "torch_native", "fa3"],
+            choices=["flashinfer", "triton", "torch_native", "fa3", "dual_chunk_flash_attn"],
             default=ServerArgs.attention_backend,
             help="Choose the kernels for attention layers.",
         )

@@ -22,7 +22,9 @@ from typing import List, Optional, Set, Union
 import torch
 from transformers import PretrainedConfig
 
-from sglang.srt.hf_transformers_utils import get_config, get_context_length
+from sglang.srt.hf_transformers_utils import (get_config,
+                                              get_context_length,
+                                              get_sparse_attention_config)
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
 from sglang.srt.utils import get_bool_env_var, is_hip
 
@@ -183,9 +185,19 @@ class ModelConfig:
         # Verify quantization
         self._verify_quantization()
 
+        # Verify dual-chunk attention config
+        self._verify_dual_chunk_attention_config()
+
         # Cache attributes
         self.hf_eos_token_id = self.get_hf_eos_token_id()
         self.image_token_id = getattr(self.hf_config, "image_token_id", None)
+
+    def get_total_num_attention_heads(self) -> int:
+        return self.num_attention_heads
+
+    def get_num_attention_heads(self, tensor_parallel_size) -> int:
+        total_num_attention_heads = self.num_attention_heads
+        return total_num_attention_heads // tensor_parallel_size
 
     # adapted from https://github.com/vllm-project/vllm/blob/main/vllm/config.py#L289
     def get_total_num_kv_heads(self) -> int:
@@ -352,6 +364,19 @@ class ModelConfig:
                     "non-quantized models.",
                     self.quantization,
                 )
+
+    def _verify_dual_chunk_attention_config(self) -> None:
+        if hasattr(self.hf_config, "dual_chunk_attention_config"):
+            # Try loading the sparse attention config
+            sparse_attn_config = get_sparse_attention_config(self.model_path)
+            if not sparse_attn_config:
+                return
+            self.hf_config.dual_chunk_attention_config[
+                "sparse_attention_config"] = sparse_attn_config
+            if "sparse_attention_enabled" not in \
+                    self.hf_config.dual_chunk_attention_config:
+                self.hf_config.dual_chunk_attention_config[
+                    "sparse_attention_enabled"] = True
 
     def get_hf_eos_token_id(self) -> Optional[Set[int]]:
         eos_ids = getattr(self.hf_config, "eos_token_id", None)

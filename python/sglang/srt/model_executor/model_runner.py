@@ -914,6 +914,12 @@ class ModelRunner:
             )
 
             self.attn_backend = FlashAttentionBackend(self)
+        elif self.server_args.attention_backend == "dual_chunk_flash_attn":
+            from sglang.srt.layers.attention.dual_chunk_flashattention_backend import (
+                DualChunkFlashAttentionBackend,
+            )
+
+            self.attn_backend = DualChunkFlashAttentionBackend(self)
         else:
             raise ValueError(
                 f"Invalid attention backend: {self.server_args.attention_backend}"
