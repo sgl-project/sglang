@@ -311,10 +311,10 @@ class KVManager:
         kv_indices: npt.NDArray[np.int64],
         aux_index: Optional[int],
     ):
+        assert self.disaggregation_mode == DisaggregationMode.PREFILL
         self.to_transfer_pool[bootstrap_room] = (kv_indices, aux_index)
         self.request_status[bootstrap_room] = KVPoll.WaitingForInput
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self.transfer_event.set()
+        self.transfer_event.set()
 
     def check_status(self, bootstrap_room: int):
         # TOOD: do we really need the poll()?
