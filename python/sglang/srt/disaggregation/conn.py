@@ -240,9 +240,8 @@ class KVManager:
                 bootstrap_room = waiting_req_bytes[2].decode("ascii")
                 if bootstrap_room == "None":
                     continue
-                bootstrap_room = int(bootstrap_room)
-                self.waiting_pool[bootstrap_room] = WaitingReq.from_zmq(
-                    waiting_req_bytes
+                self.waiting_pool.update(
+                    int(bootstrap_room), WaitingReq.from_zmq(waiting_req_bytes)
                 )
 
         def transfer_thread():
