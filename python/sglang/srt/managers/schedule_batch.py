@@ -285,6 +285,7 @@ class MultimodalInputs:
     num_image_tokens: Optional[int] = None
 
     # QWen2-VL related
+    mrope_positions: Optional[List[torch.Tensor]] = None
     mrope_position_delta: Optional[torch.Tensor] = None
 
     # image
@@ -310,16 +311,14 @@ class MultimodalInputs:
         assert isinstance(ret.mm_items, list)
         ret.mm_items = [item for item in ret.mm_items if item.is_valid()]
 
-        assert len(ret.mm_items) != 0
+        # assert len(ret.mm_items) != 0
 
-        # Use image hash as fake token_ids. We use this as the key for prefix matching in the radix cache.
-        # Please note that if the `input_ids` is later used in the model forward,
-        # you also need to clamp the values within the range of [0, vocab_size) to avoid out-of-bound
-        # errors in cuda kernels. See also llava.py for example.
         for item in ret.mm_items:
             item.set_pad_value()
 
         optional_args = [
+            "mrope_positions",
+            "mrope_position_delta",
             "im_token_id",
             "im_start_id",
             "im_end_id",

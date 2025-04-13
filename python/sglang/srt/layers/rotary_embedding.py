@@ -906,6 +906,16 @@ class MRotaryEmbedding(RotaryEmbedding):
         if isinstance(video_grid_thw, torch.Tensor):
             video_grid_thw = video_grid_thw.tolist()
 
+        print(f"{input_tokens=}")
+        print(f"{image_grid_thw=}")
+        print(f"{image_token_id=}")
+        print(f"{vision_start_token_id=}")
+        print(f"{vision_end_token_id=}")
+        print(f"{spatial_merge_size=}")
+        print(f"{context_len=}")
+        print(f"{seq_len=}")
+        print(f"{second_per_grid_ts=}")
+        print(f"{tokens_per_second=}")
         input_tokens_tensor = torch.tensor(input_tokens)
         vision_start_indices = torch.argwhere(
             input_tokens_tensor == vision_start_token_id

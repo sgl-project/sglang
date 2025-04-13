@@ -224,7 +224,7 @@ class Qwen2VisionPatchMerger(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.hidden_size = context_dim * (spatial_merge_size**2)
+        self.hidden_size = context_dim * (spatial_merge_size ** 2)
         if norm_layer is None:
             norm_layer = partial(nn.LayerNorm, eps=1e-6)
         self.ln_q = norm_layer(context_dim)
@@ -542,7 +542,9 @@ class Qwen2VLForConditionalGeneration(nn.Module):
                 (Use input_metadata.mrope_positions to replace it)
         """
         if self.is_mrope_enabled:
-            positions = forward_batch.mrope_positions
+            S = input_ids.shape[0]
+            # deal with prefixed prefill
+            positions = forward_batch.mrope_positions[:, -S:]
 
         if not (
             forward_batch.forward_mode.is_decode()

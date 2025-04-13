@@ -49,7 +49,7 @@ from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternTokenPairs,
+    MultiModalityDataPaddingPatternImageTokens,
     general_mm_embed_routine,
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
@@ -488,12 +488,11 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         # Get all special token IDs
-        im_start_id: int = mm_inputs.im_start_id
-        im_end_id: int = mm_inputs.im_end_id
+        im_token_id: int = mm_inputs.im_token_id
 
-        media_token_pairs = [(im_start_id, im_end_id)]
-        pattern = MultiModalityDataPaddingPatternTokenPairs(media_token_pairs)
+        pattern = MultiModalityDataPaddingPatternImageTokens(torch.tensor(im_token_id))
         return pattern.pad_input_tokens(input_ids, mm_inputs)
+        # return input_ids
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         # in qwen-vl, last dim is the same
@@ -536,8 +535,9 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
                 (Use input_metadata.mrope_positions to replace it)
         """
         if self.is_mrope_enabled:
-            positions = forward_batch.mrope_positions
-
+            S = input_ids.shape[0]
+            # deal with prefixed prefill
+            positions = forward_batch.mrope_positions[:, -S:]
         if not (
             forward_batch.forward_mode.is_decode()
             or not forward_batch.contains_image_inputs()

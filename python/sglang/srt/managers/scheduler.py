@@ -1204,6 +1204,7 @@ class Scheduler(
 
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
+            print(f"waiting {req=}")
             if (
                 self.lora_paths
                 and len(
@@ -1228,6 +1229,7 @@ class Scheduler(
             res = adder.add_one_req(
                 req, self.chunked_req, self.enable_hierarchical_cache
             )
+            print(f"{adder.can_run_list=}")
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
                     if self.enable_hierarchical_cache:
@@ -1282,6 +1284,8 @@ class Scheduler(
             self.server_args.enable_custom_logit_processor,
         )
         new_batch.prepare_for_extend()
+
+        print(f"{new_batch=}")
 
         # Mixed-style chunked prefill
         if (
@@ -1357,6 +1361,8 @@ class Scheduler(
         if self.is_generation:
             if self.spec_algorithm.is_none():
                 model_worker_batch = batch.get_model_worker_batch()
+                print(f"{model_worker_batch.input_ids=}")
+                print(f"{len(model_worker_batch.input_ids)=}")
                 logits_output, next_token_ids = self.tp_worker.forward_batch_generation(
                     model_worker_batch
                 )
