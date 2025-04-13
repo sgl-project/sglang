@@ -519,9 +519,11 @@ class DeepSeekDetector(BaseFormatDetector):
 
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(
-            begin='<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>' + name + '\n```json\n',
-            end='\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>',
-            trigger='<｜tool▁calls▁begin｜>',
+            begin="<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>"
+            + name
+            + "\n```json\n",
+            end="\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
+            trigger="<｜tool▁calls▁begin｜>",
         )
 
     def _parse_function_call(self, input_str):
@@ -539,6 +541,7 @@ class DeepSeekDetector(BaseFormatDetector):
         except json.JSONDecodeError as e:
             raise ValueError(f"Invalid JSON format: {e}")
         return func_name.strip(), params
+
 
 class MultiFormatParser:
     def __init__(self, detectors: List[BaseFormatDetector]):
