@@ -15,6 +15,7 @@ from sgl_kernel.attention import (
     cutlass_mla_decode,
     cutlass_mla_get_workspace_size,
     lightning_attention_decode,
+    merge_state,
 )
 from sgl_kernel.elementwise import (
     apply_rope_with_cos_sin_cache_inplace,

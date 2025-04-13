@@ -44,6 +44,12 @@ jobs:
             cuda-version: '12.8'
     name: Build Wheel (CUDA ${{ matrix.cuda-version }})
     steps:
+      - name: Skip unnecessary builds on push to main
+        if: github.event_name == 'push' && (matrix.cuda-version == '11.8' || matrix.cuda-version == '12.8')
+        run: |
+          echo "Skipping CUDA ${{ matrix.cuda-version }} build on push to main"
+          exit 0
+
       - name: Cleanup
         run: |
           sudo rm -rf $GITHUB_WORKSPACE/* || true
@@ -87,7 +93,7 @@ jobs:
       - name: Install
         run: |
           bash scripts/ci_install_dependency.sh
-          pip3 install torch==2.5.1 && pip3 install pytest && pip3 install vllm==0.7.2
+          pip3 install torch==2.5.1 && pip3 install pytest
           pip3 uninstall sgl-kernel -y || true
           pip3 install sgl-kernel/dist/*whl --force-reinstall --no-deps
           pip3 list | grep sgl-kernel
