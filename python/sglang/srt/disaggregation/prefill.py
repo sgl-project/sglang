@@ -75,11 +75,11 @@ class PrefillBootstrapQueue:
         self.req_to_metadata_buffer_idx_allocator = req_to_metadata_buffer_idx_allocator
         self.tp_rank = tp_rank
         self.tp_size = tp_size
+        self.transfer_backend = transfer_backend
         self.kv_manager = self._init_kv_manager()
         self.queue: List[Req] = []
         self.gloo_group = gloo_group
         self.bootstrap_port = bootstrap_port
-        self.transfer_backend = transfer_backend
 
     def allocate_token_id(self, idx: int, token_id: int):
         assert token_id >= 0, f"token_id: {token_id} is negative"
@@ -109,7 +109,7 @@ class PrefillBootstrapQueue:
         ]
         kv_args.ib_device = "mock-ib-device"
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
-        kv_manager = kv_manager_class(kv_args, DisaggregationMode("prefill"))
+        kv_manager = kv_manager_class(kv_args, DisaggregationMode.PREFILL)
         return kv_manager
 
     def add(self, req: Req) -> None:

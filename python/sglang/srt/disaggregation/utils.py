@@ -58,7 +58,7 @@ class KVClassType(Enum):
 
 def get_kv_class(transfer_backend: TransferBackend, class_type: KVClassType):
     if transfer_backend == TransferBackend.MOONCAKE:
-        from sglang.srt.disaggregation.mooncake.conn import (
+        from sglang.srt.disaggregation.mooncake import (
             MooncakeKVBootstrapServer,
             MooncakeKVManager,
             MooncakeKVReceiver,
@@ -66,10 +66,10 @@ def get_kv_class(transfer_backend: TransferBackend, class_type: KVClassType):
         )
 
         class_mapping = {
-            "manager": MooncakeKVManager,
-            "sender": MooncakeKVSender,
-            "receiver": MooncakeKVReceiver,
-            "bootstrap_server": MooncakeKVBootstrapServer,
+            KVClassType.MANAGER: MooncakeKVManager,
+            KVClassType.SENDER: MooncakeKVSender,
+            KVClassType.RECEIVER: MooncakeKVReceiver,
+            KVClassType.BOOTSTRAP_SERVER: MooncakeKVBootstrapServer,
         }
         return class_mapping.get(class_type)
     raise ValueError(f"Unsupported transfer backend: {transfer_backend}")

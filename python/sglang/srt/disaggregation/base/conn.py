@@ -4,7 +4,7 @@ from typing import Optional
 import numpy as np
 import numpy.typing as npt
 
-from sglang.python.sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.utils import DisaggregationMode
 
 
 class KVArgs:
