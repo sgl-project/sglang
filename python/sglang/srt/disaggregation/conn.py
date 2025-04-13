@@ -83,6 +83,18 @@ class WaitingReq:
     dst_aux_ptrs: list[int]
     dst_aux_index: int
 
+    @classmethod
+    def from_zmq(cls, msg: List[bytes]):
+        return cls(
+            endpoint=msg[0].decode("ascii"),
+            mooncake_session_id=msg[1].decode("ascii"),
+            room=int(msg[2].decode("ascii")),
+            dst_kv_ptrs=list(struct.unpack(f"{len(msg[3])//8}Q", msg[3])),
+            dst_kv_indices=np.frombuffer(msg[4], dtype=np.int64),
+            dst_aux_ptrs=list(struct.unpack(f"{len(msg[5])//8}Q", msg[5])),
+            dst_aux_index=int(msg[6].decode("ascii")),
+        )
+
 
 KVSENDER_POLLING_PORT = 17788
 KVRECEIVER_POLLING_PORT = 27788
@@ -221,42 +233,17 @@ class KVManager:
         self.server_socket.bind("tcp://*:" + str(sender_rank_port))
 
         def bootstrap_thread():
-            # This thread recvs pre-alloc notification from the decode engine
+            """This thread recvs pre-alloc notification from the decode engine"""
             # KVPoll.Bootstrapping -> KVPoll.WaitingForInput
             while True:
-                (
-                    endpoint,
-                    mooncake_session_id,
-                    bootstrap_room,
-                    dst_kv_ptrs,
-                    dst_kv_indices,
-                    dst_aux_ptrs,
-                    dst_aux_index,
-                ) = self.server_socket.recv_multipart()
-                if bootstrap_room.decode("ascii") == "None":
+                waiting_req_bytes = self.server_socket.recv_multipart()
+                bootstrap_room = waiting_req_bytes[2].decode("ascii")
+                if bootstrap_room == "None":
                     continue
-                endpoint = endpoint.decode("ascii")
-                mooncake_session_id = mooncake_session_id.decode("ascii")
-                bootstrap_room = int(bootstrap_room.decode("ascii"))
-                dst_kv_ptrs = list(
-                    struct.unpack(f"{len(dst_kv_ptrs)//8}Q", dst_kv_ptrs)
+                bootstrap_room = int(bootstrap_room)
+                self.waiting_pool[bootstrap_room] = WaitingReq.from_zmq(
+                    waiting_req_bytes
                 )
-                dst_kv_indices = np.frombuffer(dst_kv_indices, dtype=np.int64)
-                dst_aux_ptrs = list(
-                    struct.unpack(f"{len(dst_aux_ptrs)//8}Q", dst_aux_ptrs)
-                )
-                dst_aux_index = int(dst_aux_index.decode("ascii"))
-                self.waiting_pool[bootstrap_room] = WaitingReq(
-                    bootstrap_room,
-                    endpoint,
-                    mooncake_session_id,
-                    dst_kv_ptrs,
-                    dst_kv_indices,
-                    dst_aux_ptrs,
-                    dst_aux_index,
-                )
-
-        threading.Thread(target=bootstrap_thread).start()
 
         def transfer_thread():
             # TODO: Shall we use KVPoll.Transferring state?
@@ -292,6 +279,7 @@ class KVManager:
                 except queue.Empty:
                     continue
 
+        threading.Thread(target=bootstrap_thread).start()
         threading.Thread(target=transfer_thread).start()
 
     def start_decode_thread(self):
