@@ -23,6 +23,8 @@ class _ExpertDistributionRecorder:
 
     def __init__(self):
         self._recording = False
+        # TODO improve API
+        self._enable_in_cuda_graph = get_bool_env_var("SGLANG_EXPERT_DISTRIBUTION_RECORDER_ENABLE_IN_CUDA_GRAPH")
         self._current_layer_idx = Withable()
         self._current_debug_name = Withable()
 
