@@ -99,13 +99,14 @@ def read_physical_count_of_forward_pass(dir_data: Path):
 def scan_combinations(
         logical_count_of_seq: torch.Tensor,
 ):
+    num_gpu_per_node = 8
     server_args_list = [
         *[
             MyServerArgs(
-                num_tokens_in_batch_overall=num_tokens_in_batch_per_gpu * 32,
+                num_tokens_in_batch_overall=num_tokens_in_batch_per_gpu * num_gpu_per_node * nnodes,
                 ep_num_redundant_experts=ep_num_redundant_experts,
                 nnodes=nnodes,
-                tp_size=8 * nnodes,
+                tp_size=num_gpu_per_node * nnodes,
                 enable_expert_location_by_eplb=enable_expert_location_by_eplb,
             )
             for ep_num_redundant_experts in [0, 32, 64]
