@@ -54,7 +54,7 @@ def cutlass_mla_decode(
         (B_q, H, D_latent), device=q_nope_and_q_pe.device, dtype=q_nope_and_q_pe.dtype
     )
 
-    torch.ops.sgl_kernel.cutlass_mla_decode(
+    torch.ops.sgl_kernel.cutlass_mla_decode.default(
         out, q_nope_and_q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace
     )
     return out
@@ -63,6 +63,6 @@ def cutlass_mla_decode(
 def cutlass_mla_get_workspace_size(
     max_seq_len: int, num_batches: int, sm_count: int = 0
 ) -> int:
-    return torch.ops.sgl_kernel.cutlass_mla_get_workspace_size(
+    return torch.ops.sgl_kernel.cutlass_mla_get_workspace_size.default(
         max_seq_len, num_batches, sm_count
     )
