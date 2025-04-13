@@ -41,7 +41,7 @@ fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
 
 _is_cuda = is_cuda()
 if _is_cuda:
-    import deep_gemm  # `pip install "sgl-kernel>=0.0.4.post3"`
+    import deep_gemm
     from sgl_kernel import sgl_per_token_group_quant_fp8, sgl_per_token_quant_fp8
 
     sm_version = get_device_sm()
