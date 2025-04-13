@@ -103,7 +103,7 @@ def create_casual_mask_from_page_triton(
     cu_qo_indptr,  # [bs + 1], cumulative ranges for each req
     cu_kv_lens_ptr,  # [bs + 1]
     prefix_lens_ptr,  # [bs + 1]
-    stride_qo: tl.constexpr,
+    stride_mask_qo: tl.constexpr,
     bs: tl.constexpr,
     max_kv_len_per_req: tl.constexpr,
 ):
@@ -132,5 +132,5 @@ def create_casual_mask_from_page_triton(
         tl.int32
     )
     mask = (kv_pos <= qo_index_local) & is_valid_kv
-    mask_offsets = pid_qo * stride_qo + kv_pos + kv_start
+    mask_offsets = pid_qo * stride_mask_qo + kv_pos + kv_start
     tl.store(mask_ptr + mask_offsets, mask, mask=is_valid_kv)

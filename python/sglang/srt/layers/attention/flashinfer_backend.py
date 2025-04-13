@@ -488,31 +488,38 @@ class FlashInferAttnBackend(AttentionBackend):
                 mask_p = torch.zeros(
                     qo_indptr_p[-1], kv_indptr_p[-1], device=q.device, dtype=torch.bool
                 )
-                del self.forward_metadata
+                # del (self.forward_metadata.prefill_kv_indices,
+                #     self.forward_metadata.prefill_kv_indptr,
+                #     self.forward_metadata.prefill_qo_indptr)
                 # TODO(Wenxuan) debug this
                 #
-                max_kv_len = forward_batch.seq_lens.max()
-                create_casual_mask_from_page_triton[(qo_indptr_p[-1])](
-                    mask_p,
-                    qo_indptr_p,
-                    kv_indptr_p,
-                    forward_batch.extend_prefix_lens,
-                    stride_mask_qo=mask_p.stride(0),
-                    bs=num_prefill_reqs,
-                    max_kv_len_per_req=max_kv_len,
-                )
-                # import socket
-                # from remote_pdb import RemotePdb
+                try:
+                    max_kv_len = next_power_of_2(forward_batch.seq_lens.max().item())
+                    create_casual_mask_from_page_triton[(qo_indptr_p[-1],)](
+                        mask_p,
+                        qo_indptr_p,
+                        kv_indptr_p,
+                        forward_batch.extend_prefix_lens,
+                        stride_mask_qo=mask_p.stride(0),
+                        bs=num_prefill_reqs,
+                        max_kv_len_per_req=max_kv_len,
+                    )
+                except Exception as e:
+                    import socket
 
-                # def find_unused_port():
-                #     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                #         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                #         s.bind(("localhost", 0))  # Let the OS pick an ephemeral port.
-                #         return s.getsockname()[1]
+                    from remote_pdb import RemotePdb
 
-                # port = find_unused_port()
-                # print(f"Using port: {port}")
-                # RemotePdb(host='localhost', port=port).set_trace()
+                    def find_unused_port():
+                        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                            s.bind(
+                                ("localhost", 0)
+                            )  # Let the OS pick an ephemeral port.
+                            return s.getsockname()[1]
+
+                    port = find_unused_port()
+                    print(f"Using port: {port}")
+                    RemotePdb(host="localhost", port=port).set_trace()
                 # for i in range(num_prefill_reqs):
                 #     q_start = qo_indptr_p[i]
                 #     q_end = qo_indptr_p[i + 1]
