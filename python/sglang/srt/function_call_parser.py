@@ -25,6 +25,7 @@ TOOLS_TAG_LIST = [
     "<tool_call>",
     "<|python_tag|>",
     "[TOOL_CALLS]",
+    "<｜tool▁calls▁begin｜>",
 ]
 
 
@@ -484,22 +485,6 @@ class DeepSeekDetector(BaseFormatDetector):
         https://huggingface.co/deepseek-ai/DeepSeek-V2.5#function-calling
     """
 
-    def _parse_function_call(input_str):
-        try:
-            func_name, json_part = input_str.split("\n", 1)
-        except ValueError:
-            raise ValueError("Invalid input format")
-
-        json_str = json_part.strip()
-        json_str = json_str.lstrip("```json").strip()
-        json_str = json_str.rstrip("```").strip()
-
-        try:
-            params = json.loads(json_str)
-        except json.JSONDecodeError as e:
-            raise ValueError(f"Invalid JSON format: {e}")
-        return func_name.strip(), params
-
     def __init__(self):
         super().__init__()
         self.bot_token = "<｜tool▁calls▁begin｜>"
@@ -519,7 +504,7 @@ class DeepSeekDetector(BaseFormatDetector):
         :param tools: List of available tools.
         :return: ParseResult indicating success or failure, consumed text, leftover text, and parsed calls.
         """
-        idx = text.find(self.funcbot_token)
+        idx = text.find(self.bot_token)
         normal_text = text[:idx].strip() if idx != -1 else text
         if self.eot_token not in text:
             return StreamingParseResult(normal_text=normal_text, calls=[])
@@ -528,10 +513,32 @@ class DeepSeekDetector(BaseFormatDetector):
         calls = []
         for match_result in match_result_list:
             func_name, func_args = self._parse_function_call(match_result)
-            func_call_struct = {"name": func_name, "arg": func_args}
+            func_call_struct = {"name": func_name, "arguments": func_args}
             calls.extend(self.parse_base_json(func_call_struct, tools))
         return StreamingParseResult(normal_text=normal_text, calls=calls)
 
+    def structure_info(self) -> _GetInfoFunc:
+        return lambda name: StructureInfo(
+            begin='<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>' + name + '\n```json\n',
+            end='\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>',
+            trigger='<｜tool▁calls▁begin｜>',
+        )
+
+    def _parse_function_call(self, input_str):
+        try:
+            func_name, json_part = input_str.split("\n", 1)
+        except ValueError:
+            raise ValueError("Invalid input format")
+
+        json_str = json_part.strip()
+        json_str = json_str.lstrip("```json").strip()
+        json_str = json_str.rstrip("```").strip()
+
+        try:
+            params = json.loads(json_str)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid JSON format: {e}")
+        return func_name.strip(), params
 
 class MultiFormatParser:
     def __init__(self, detectors: List[BaseFormatDetector]):
@@ -599,6 +606,7 @@ class FunctionCallParser:
         "llama3": Llama32Detector,
         "qwen25": Qwen25Detector,
         "mistral": MistralDetector,
+        "deepseek": DeepSeekDetector,
     }
 
     def __init__(self, tools: List[Tool], tool_call_parser: str):

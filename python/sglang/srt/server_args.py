@@ -1075,9 +1075,9 @@ class ServerArgs:
         parser.add_argument(
             "--tool-call-parser",
             type=str,
-            choices=["qwen25", "mistral", "llama3"],
+            choices=["qwen25", "mistral", "llama3", "deepseek"],
             default=ServerArgs.tool_call_parser,
-            help="Specify the parser for handling tool-call interactions. Options include: 'qwen25', 'mistral', and 'llama3'.",
+            help="Specify the parser for handling tool-call interactions. Options include: 'qwen25', 'mistral', 'llama3', and 'deepseek'.",
         )
         parser.add_argument(
             "--enable-hierarchical-cache",
