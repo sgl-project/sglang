@@ -112,20 +112,20 @@ def scan_combinations(
             )
 
             # decode
-            for ep_num_redundant_experts in [0, 32]
-            for nnodes in [
-                1,
-                2,
-                4,
-                *([8] if ep_num_redundant_experts == 0 else []),
-                *([9] if ep_num_redundant_experts == 32 else []),
-            ]
-            for num_tokens_in_batch_per_gpu in [64, 128]
+            # for ep_num_redundant_experts in [0, 32]
+            # for nnodes in [
+            #     1,
+            #     2,
+            #     4,
+            #     *([8] if ep_num_redundant_experts == 0 else []),
+            #     *([9] if ep_num_redundant_experts == 32 else []),
+            # ]
+            # for num_tokens_in_batch_per_gpu in [64, 128]
 
             # prefill
-            # for ep_num_redundant_experts in [0, 32, 64]
-            # for nnodes in [4]
-            # for num_tokens_in_batch_per_gpu in [1024, 4096, 8192, 16384]
+            for ep_num_redundant_experts in [0, 32, 64]
+            for nnodes in [1, 2, 4]
+            for num_tokens_in_batch_per_gpu in [1024, 4096, 8192, 16384]
 
             for enable_expert_location_by_eplb in [
                 *([False] if ep_num_redundant_experts == 0 else []),
