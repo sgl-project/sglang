@@ -123,6 +123,10 @@ class _ExpertDistributionRecorder:
         self._reset()
         return output
 
+    @property
+    def _enable(self):
+        return self._recording or (TODO and self._enable_in_cuda_graph)
+
 
 expert_distribution_recorder = _ExpertDistributionRecorder()
 
