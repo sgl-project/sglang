@@ -1,4 +1,5 @@
 import logging
+from contextlib import contextmanager
 from typing import Callable, List, Optional, Tuple
 
 import torch
@@ -986,9 +987,6 @@ class DeepEPMoE(EPMoE):
     ):
         assert self.quant_method is not None
         assert self.activation == "silu"
-        assert (
-            hidden_states_fp8[0].size(0) % 4 == 0
-        ), f"TMA alignment error: {hidden_states_fp8[0].size(0)}"
 
         # GroupGemm-0
         num_groups, m, k = hidden_states_fp8[0].size()
@@ -997,9 +995,14 @@ class DeepEPMoE(EPMoE):
         gateup_output = torch.empty(
             (num_groups, m, n), device=hidden_states_fp8[0].device, dtype=torch.bfloat16
         )
-        m_grouped_gemm_fp8_fp8_bf16_nt_masked(
-            hidden_states_fp8, self.w13_weight_fp8, gateup_output, masked_m, expected_m
-        )
+        with _ensure_get_col_major_tma_aligned_tensor_noop():
+            m_grouped_gemm_fp8_fp8_bf16_nt_masked(
+                hidden_states_fp8,
+                self.w13_weight_fp8,
+                gateup_output,
+                masked_m,
+                expected_m,
+            )
 
         # Act
         down_input = torch.empty(
@@ -1038,8 +1041,29 @@ class DeepEPMoE(EPMoE):
         down_output = torch.empty(
             (num_groups, m, n), device=down_input.device, dtype=torch.bfloat16
         )
-        m_grouped_gemm_fp8_fp8_bf16_nt_masked(
-            down_input_fp8, self.w2_weight_fp8, down_output, masked_m, expected_m
-        )
+        with _ensure_get_col_major_tma_aligned_tensor_noop():
+            m_grouped_gemm_fp8_fp8_bf16_nt_masked(
+                down_input_fp8, self.w2_weight_fp8, down_output, masked_m, expected_m
+            )
 
         return down_output
+
+
+@contextmanager
+def _ensure_get_col_major_tma_aligned_tensor_noop():
+    from deep_gemm.jit_kernels import utils
+
+    original_func = utils.get_col_major_tma_aligned_tensor
+
+    def patched_get_col_major_tma_aligned_tensor(x: torch.Tensor) -> torch.Tensor:
+        out = original_func(x)
+        assert (
+            x.data_ptr() == out.data_ptr()
+        ), f"get_col_major_tma_aligned_tensor is not noop ({x.data_ptr()=}, {out.data_ptr()=})"
+        return out
+
+    utils.get_col_major_tma_aligned_tensor = patched_get_col_major_tma_aligned_tensor
+    try:
+        yield
+    finally:
+        utils.get_col_major_tma_aligned_tensor = original_func
