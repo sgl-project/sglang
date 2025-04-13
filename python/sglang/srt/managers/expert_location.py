@@ -5,7 +5,6 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 import torch
-
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.managers import deepseek_eplb
 from sglang.srt.model_loader import get_model_architecture
@@ -61,6 +60,7 @@ class ExpertLocationMetadata:
             num_local_physical_experts=common["num_local_physical_experts"],
             physical_to_logical_map=physical_to_logical_map,
             logical_to_all_physical_map=logical_to_all_physical_map,
+            logical_to_all_physical_map_num_valid=torch.count_nonzero(logical_to_all_physical_map != -1, dim=-1),
             logical_to_rank_dispatch_physical_map=_compute_logical_to_rank_dispatch_physical_map(
                 logical_to_all_physical_map,
                 num_gpus=common["world_size"],
