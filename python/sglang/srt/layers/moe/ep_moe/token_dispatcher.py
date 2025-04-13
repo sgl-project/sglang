@@ -426,6 +426,8 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
     ):
         hook() if self.return_recv_hook else event.current_stream_wait()
 
+        expert_distribution_recorder.on_deepep_dispatch_low_latency(masked_m)
+
         reorder_topk_ids = seg_indptr = None
 
         return (
