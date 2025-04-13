@@ -50,10 +50,17 @@ class _ExpertDistributionRecorder:
 
     @contextmanager
     def with_forward_pass(self, forward_pass_id: int):
+        self._on_forward_pass_start()
         try:
             yield
         finally:
             self._on_forward_pass_end(forward_pass_id)
+
+    def _on_forward_pass_start(self):
+        if not self._recording:
+            return
+        for gatherer_key, gatherer in self._single_pass_gatherers.items():
+            gatherer.reset()
 
     def _on_forward_pass_end(self, forward_pass_id: int):
         if not self._recording:
@@ -63,7 +70,6 @@ class _ExpertDistributionRecorder:
             self._accumulator.append(
                 forward_pass_id, gatherer_key, single_pass_physical_count
             )
-            gatherer.reset()
 
     def on_select_experts(self, topk_ids: torch.Tensor):
         self._on_hook("on_select_experts", topk_ids=topk_ids)
@@ -244,11 +250,9 @@ class _DeepepLowLatencySinglePassGatherer(_SinglePassGatherer):
         self._data[layer_idx, :] = recv_count
 
     def reset(self):
-        print(f"hi _DeepepLowLatencySinglePassGatherer.reset")
         self._data[...] = 0
 
     def collect(self) -> torch.Tensor:
-        print(f"hi _DeepepLowLatencySinglePassGatherer.collect {self._data.sum()=}")
         return self._data.clone()
 
 
