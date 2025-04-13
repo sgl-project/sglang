@@ -12,7 +12,15 @@ import numpy.typing as npt
 import zmq
 from aiohttp import web
 
-from sglang.srt.disaggregation.transfer_engine.mooncake import MooncakeTransferEngine
+from sglang.srt.disaggregation.base.conn import (
+    BaseKVBootstrapServer,
+    BaseKVManager,
+    BaseKVReceiver,
+    BaseKVSender,
+    KVArgs,
+    KVPoll,
+)
+from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferEngine
 from sglang.srt.disaggregation.utils import DisaggregationMode
 
 logger = logging.getLogger(__name__)
@@ -44,25 +52,6 @@ def group_concurrent_contiguous(
     return src_groups, dst_groups
 
 
-class KVArgs:
-    engine_rank: int
-    kv_data_ptrs: list[int]
-    kv_data_lens: list[int]
-    kv_item_lens: list[int]
-    aux_data_ptrs: list[int]
-    aux_data_lens: list[int]
-    aux_item_lens: list[int]
-    ib_device: str
-
-
-class KVPoll:
-    Failed = 0
-    Bootstrapping = 1
-    WaitingForInput = 2
-    Transferring = 3
-    Success = 4
-
-
 RequestPoolType = Dict[int, Tuple[npt.NDArray[np.int64], Optional[int]]]
 WaitingPoolType = Dict[
     int, Tuple[str, list[int], npt.NDArray[np.int64], list[int], int]
@@ -71,8 +60,7 @@ KVSENDER_POLLING_PORT = 17788
 KVRECEIVER_POLLING_PORT = 27788
 
 
-class KVManager:
-    # TODO: make it general and support multiple transfer backend before merging
+class MooncakeKVManager(BaseKVManager):
     def __init__(self, args: KVArgs, disaggregation_mode: DisaggregationMode):
         self.engine = MooncakeTransferEngine()
         self.kv_args = args
@@ -331,9 +319,11 @@ class KVManager:
         return self.engine.get_session_id()
 
 
-class KVSender:
+class MooncakeKVSender(BaseKVSender):
 
-    def __init__(self, mgr: KVManager, bootstrap_addr: str, bootstrap_room: int):
+    def __init__(
+        self, mgr: MooncakeKVManager, bootstrap_addr: str, bootstrap_room: int
+    ):
         self.kv_mgr = mgr
         self.bootstrap_room = bootstrap_room
         self.kv_mgr.set_status(bootstrap_room, KVPoll.WaitingForInput)
@@ -353,10 +343,13 @@ class KVSender:
         raise Exception("Fake KVSender Exception")
 
 
-class KVReceiver:
+class MooncakeKVReceiver(BaseKVReceiver):
 
     def __init__(
-        self, mgr: KVManager, bootstrap_addr: str, bootstrap_room: Optional[int] = None
+        self,
+        mgr: MooncakeKVManager,
+        bootstrap_addr: str,
+        bootstrap_room: Optional[int] = None,
     ):
         self.bootstrap_room = bootstrap_room
         self.bootstrap_addr = bootstrap_addr
@@ -403,7 +396,7 @@ class KVReceiver:
         raise Exception("Fake KVReceiver Exception")
 
 
-class KVBootstrapServer:
+class MooncakeKVBootstrapServer(BaseKVBootstrapServer):
     def __init__(self, port: int):
         self.port = port
         self.app = web.Application()
