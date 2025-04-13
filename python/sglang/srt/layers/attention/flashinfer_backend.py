@@ -483,8 +483,8 @@ class FlashInferAttnBackend(AttentionBackend):
                     kv_pool_indices_p
                 ]  # TODO(Wenxuan) de-duplicate the kv cache when reqs share prefix?
                 v_cache_p = v_cache[kv_pool_indices_p]
-                q_p = q[:num_prefill_reqs]
-                q_d = q[num_prefill_reqs:]
+                q_p = q[: qo_indptr_p[-1]]
+                q_d = q[qo_indptr_p[-1] :]
                 mask_p = torch.zeros(
                     qo_indptr_p[-1], kv_indptr_p[-1], device=q.device, dtype=torch.bool
                 )
@@ -517,20 +517,20 @@ class FlashInferAttnBackend(AttentionBackend):
                 #             j + forward_batch.extend_prefix_lens[i]
                 #         )
                 # if not (mask_for_loop == mask_p).all():
-                #     import socket
-                #     from remote_pdb import RemotePdb
+                # import socket
+                # from remote_pdb import RemotePdb
 
-                #     def find_unused_port():
-                #         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                #             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                #             s.bind(
-                #                 ("localhost", 0)
-                #             )  # Let the OS pick an ephemeral port.
-                #             return s.getsockname()[1]
+                # def find_unused_port():
+                #     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                #         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                #         s.bind(
+                #             ("localhost", 0)
+                #         )  # Let the OS pick an ephemeral port.
+                #         return s.getsockname()[1]
 
-                #     port = find_unused_port()
-                #     print(f"Using port: {port}")
-                #     RemotePdb(host="localhost", port=port).set_trace()
+                # port = find_unused_port()
+                # print(f"Using port: {port}")
+                # RemotePdb(host="localhost", port=port).set_trace()
                 o_p, o_d = pod_wrapper.run(
                     q_p,
                     k_cache_p,
@@ -538,6 +538,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     q_d,
                     paged_kv_cache_d=(k_cache, v_cache),
                     custom_mask_p=mask_p,
+                    causal_d=True,
                     # logits_soft_cap_p=layer.logit_cap,
                     # logits_soft_cap_d=layer.logit_cap,
                     # TODO
