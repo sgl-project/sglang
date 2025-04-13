@@ -1,3 +1,5 @@
+from typing import Tuple
+
 import torch
 
 
@@ -5,6 +7,17 @@ def lightning_attention_decode(q, k, v, past_kv, slope, output, new_kv):
     torch.ops.sgl_kernel.lightning_attention_decode.default(
         q, k, v, past_kv, slope, output, new_kv
     )
+
+
+def merge_state(
+    v_a: torch.Tensor, s_a: torch.Tensor, v_b: torch.Tensor, s_b: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    s_a = s_a.to(torch.float32)
+    s_b = s_b.to(torch.float32)
+    v_merged = torch.empty_like(v_a)
+    s_merged = torch.empty_like(s_a)
+    torch.ops.sgl_kernel.merge_state.default(v_a, s_a, v_b, s_b, v_merged, s_merged)
+    return v_merged, s_merged
 
 
 def cutlass_mla_decode(
