@@ -49,7 +49,6 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe.ep_moe.kernels import masked_scale
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, EPMoE
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import select_experts
@@ -338,24 +337,17 @@ class DeepseekV2MoE(nn.Module):
                 topk_weights,
                 forward_mode=forward_mode,
             )
-        final_hidden_states = self.experts(
-            hidden_states=hidden_states,
-            reorder_topk_ids=reorder_topk_ids,
-            seg_indptr=seg_indptr,
-            masked_m=masked_m,
-            expected_m=expected_m,
-            forward_mode=forward_mode,
-        )
-        if self.ep_size > 1 and masked_m is not None:
-            final_hidden_states = masked_scale(
-                final_hidden_states,
-                masked_m,
-                self.routed_scaling_factor,
-                final_hidden_states,
+        final_hidden_states = (
+            self.experts(
+                hidden_states=hidden_states,
+                reorder_topk_ids=reorder_topk_ids,
+                seg_indptr=seg_indptr,
+                masked_m=masked_m,
+                expected_m=expected_m,
+                forward_mode=forward_mode,
             )
-        else:
-            final_hidden_states *= self.routed_scaling_factor
-
+            * self.routed_scaling_factor
+        )
         if self.ep_size > 1:
             final_hidden_states = self.deepep_dispatcher.combine(
                 final_hidden_states,
