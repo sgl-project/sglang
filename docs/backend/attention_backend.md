@@ -17,7 +17,7 @@
 - FlashInfer (Default)
 ```bash
 python3 -m sglang.launch_server --model meta-llama/Meta-Llama-3.1-8B-Instruct
-python3 -m sglang.launch_server --tp 8 --model deepseek-ai/DeepSeek-V3 
+python3 -m sglang.launch_server --tp 8 --model deepseek-ai/DeepSeek-V3
 ```
 
 - FlashAttention 3
