@@ -78,7 +78,7 @@ class _ExpertDistributionRecorder:
         self._on_hook("on_deepep_dispatch_low_latency", recv_count=recv_count)
 
     def _on_hook(self, hook_name: str, **kwargs):
-        if not self._recording:
+        if not self._enable:
             return
         gatherer = self._single_pass_gatherers[
             self._accumulator.get_single_pass_gatherer_key(
