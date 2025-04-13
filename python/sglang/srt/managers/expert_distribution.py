@@ -78,7 +78,7 @@ class _ExpertDistributionRecorder:
         self._on_hook("on_deepep_dispatch_low_latency", recv_count=recv_count)
 
     def _on_hook(self, hook_name: str, **kwargs):
-        if not self._enable:
+        if not (self._recording or (self._enable_in_cuda_graph and torch.cuda.is_current_stream_capturing())):
             return
         gatherer = self._single_pass_gatherers[
             self._accumulator.get_single_pass_gatherer_key(
@@ -122,10 +122,6 @@ class _ExpertDistributionRecorder:
         output = self._accumulator.dump()
         self._reset()
         return output
-
-    @property
-    def _enable(self):
-        return self._recording or (self._enable_in_cuda_graph and torch.cuda.is_current_stream_capturing())
 
 
 expert_distribution_recorder = _ExpertDistributionRecorder()
