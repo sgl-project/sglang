@@ -238,12 +238,16 @@ class KVManager:
             # KVPoll.Bootstrapping -> KVPoll.WaitingForInput
             while True:
                 waiting_req_bytes = self.server_socket.recv_multipart()
-                bootstrap_room = waiting_req_bytes[2].decode("ascii")
-                if bootstrap_room == "None":
+                room = waiting_req_bytes[2].decode("ascii")
+                if room == "None":
                     continue
-                self.transfer_infos[int(bootstrap_room)] = TransferInfo.from_zmq(
+                self.transfer_infos[int(room)] = TransferInfo.from_zmq(
                     waiting_req_bytes
                 )
+
+                # NOTE: after bootstrapping we can mark the req as waiting for input
+                assert self.request_status[room] == KVPoll.Bootstrapping
+                self.request_status[room] = KVPoll.WaitingForInput
 
         def transfer_thread():
             # TODO: Shall we use KVPoll.Transferring state?
@@ -324,13 +328,6 @@ class KVManager:
 
     def check_status(self, bootstrap_room: int):
         # TOOD: do we really need the poll()?
-        # NOTE: after bootstrapping we can mark the req as waiting for input
-        if (
-            self.disaggregation_mode == DisaggregationMode.PREFILL
-            and self.request_status[bootstrap_room] == KVPoll.Bootstrapping
-        ):
-            if bootstrap_room in self.transfer_infos:
-                self.request_status[bootstrap_room] = KVPoll.WaitingForInput
 
         return self.request_status[bootstrap_room]
 
