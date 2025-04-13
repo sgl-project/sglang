@@ -102,6 +102,7 @@ def read_physical_count_of_forward_pass(dir_data: Path):
 
 def scan_combinations(
         logical_count_of_seq: torch.Tensor,
+        override_eplb_input_logical_count: Optional[torch.Tensor] = None,
 ):
     num_gpu_per_node = 8
     server_args_list = [
@@ -147,7 +148,8 @@ def scan_combinations(
     for server_args in server_args_list:
         print()
         info = simulate_execution(
-            logical_count_of_seq=logical_count_of_seq, server_args=server_args
+            logical_count_of_seq=logical_count_of_seq, server_args=server_args,
+            override_eplb_input_logical_count=override_eplb_input_logical_count,
         )
         print(f"{server_args=} {info=}")
         rows.append(dict(**dataclasses.asdict(server_args), **info))
