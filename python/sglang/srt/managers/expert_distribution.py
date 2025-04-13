@@ -125,7 +125,7 @@ class _ExpertDistributionRecorder:
 
     @property
     def _enable(self):
-        return self._recording or (TODO and self._enable_in_cuda_graph)
+        return self._recording or (self._enable_in_cuda_graph and torch.cuda.is_current_stream_capturing())
 
 
 expert_distribution_recorder = _ExpertDistributionRecorder()
