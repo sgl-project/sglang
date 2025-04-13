@@ -236,7 +236,14 @@ class _DeepepLowLatencySinglePassGatherer(_SinglePassGatherer):
         )
 
     def on_deepep_dispatch_low_latency(self, layer_idx: int, recv_count: torch.Tensor):
-        self._data[layer_idx, :] = packed_recv_count
+        # Most naive implementation, can optimize later
+        self._data[layer_idx, :] = recv_count
+
+    def reset(self):
+        self._data[...] = 0
+
+    def collect(self) -> torch.Tensor:
+        return self._data.clone()
 
 
 # --------------------------------------- Accumulator -----------------------------------------
