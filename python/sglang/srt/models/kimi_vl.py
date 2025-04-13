@@ -42,7 +42,6 @@
 # SOFTWARE.
 
 import copy
-import logging
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -54,37 +53,39 @@ from torch import nn
 from transformers import BatchFeature
 from transformers.activations import GELUActivation
 
-from sglang.srt.config import VllmConfig
-from sglang.srt.distributed import (get_tensor_model_parallel_rank,
+from vllm.config import VllmConfig
+from vllm.distributed import (get_tensor_model_parallel_rank,
                               get_tensor_model_parallel_world_size)
-# from sglang.srt.logger import init_logger
-from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-from sglang.srt.layers.logits_processor import LogitsProcessor,LogitsProcessorOutput
-from sglang.srt.layers.vocab_parallel_embedding import (
+from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe import FusedMoE
+from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.sampler import SamplerOutput, get_sampler
+from vllm.model_executor.layers.vocab_parallel_embedding import (
     DEFAULT_VOCAB_PADDING_SIZE, ParallelLMHead)
-from sglang.srt.model_loader.weight_utils import (
+from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader, maybe_remap_kv_scale_name)
-from sglang.srt.models.deepseek_v2 import DeepseekV2Model
-from sglang.srt.models.interfaces import SupportsMultiModal
-from sglang.srt.models.kimi_vl_moonvit import MoonVitPretrainedModel
-from sglang.srt.utils import merge_multimodal_embeddings
-from sglang.srt.model_executor.sampling_metadata import SamplingMetadata
-from sglang.srt.multimodal import MULTIMODAL_REGISTRY
-from sglang.srt.multimodal.inputs import (MultiModalFieldConfig, MultiModalKwargs,
+from vllm.model_executor.models.deepseek_v2 import DeepseekV2Model
+from vllm.model_executor.models.interfaces import SupportsMultiModal
+from vllm.model_executor.models.moonvit import MoonVitPretrainedModel
+from vllm.model_executor.models.utils import merge_multimodal_embeddings
+from vllm.model_executor.sampling_metadata import SamplingMetadata
+from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.multimodal.inputs import (MultiModalFieldConfig, MultiModalKwargs,
                                     NestedTensors)
-from sglang.srt.multimodal.parse import (ImageEmbeddingItems, ImageProcessorItems,
+from vllm.multimodal.parse import (ImageEmbeddingItems, ImageProcessorItems,
                                    MultiModalDataItems)
-from sglang.srt.multimodal.processing import (BaseMultiModalProcessor,
+from vllm.multimodal.processing import (BaseMultiModalProcessor,
                                         BaseProcessingInfo, PromptReplacement,
                                         PromptUpdate)
-from sglang.srt.multimodal.profiling import BaseDummyInputsBuilder, ProcessorInputs
-from sglang.srt.sequence import IntermediateTensors
-from sglang.srt.configs import KimiVLConfig, MoonViTConfig
-from sglang.srt.configs.kimi_vl_deepseek_vl2 import DeepseekV2Config
+from vllm.multimodal.profiling import BaseDummyInputsBuilder, ProcessorInputs
+from vllm.sequence import IntermediateTensors
+from vllm.transformers_utils.configs import KimiVLConfig, MoonViTConfig
+from vllm.transformers_utils.configs.deepseek_vl2 import DeepseekV2Config
 
-from sglang.srt.utils import is_pp_missing_parameter, maybe_prefix
+from .utils import is_pp_missing_parameter, maybe_prefix
 
-logger = logging.getLogger(__name__)
+logger = init_logger(__name__)
+
 
 # For dummy input only
 @dataclass

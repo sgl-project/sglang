@@ -4,8 +4,8 @@ from typing import Optional, Union
 
 from transformers.configuration_utils import PretrainedConfig
 
-from sglang.srt.configs.kimi_vl_deepseek_vl2 import DeepseekV2Config
-from python.sglang.srt.configs.kimi_vl_moonvit import MoonViTConfig
+from sglang.srt.configs.deepseekvl2 import DeepseekV2Config
+from sglang.srt.configs.kimi_vl_moonvit import MoonViTConfig
 
 
 class KimiVLConfig(PretrainedConfig):
