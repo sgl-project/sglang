@@ -1,11 +1,13 @@
 # Adapted from https://github.com/flashinfer-ai/flashinfer/blob/55576c626421b5ee7e7ebe74afd26465c8ae863f/flashinfer/triton/kernels/cascade.py
 
 from typing import List
+
 import pytest
 import torch
-from sgl_kernel import merge_state
 import triton
 import triton.language as tl
+from sgl_kernel import merge_state
+
 
 def check_input(x: torch.Tensor):
     assert x.is_cuda, f"{str(x)} must be a CUDA Tensor"
@@ -23,12 +25,14 @@ def check_shape(a: torch.Tensor, b: torch.Tensor):
             i
         ), f"tensors shape mismatch, {a.size()} and {b.size()}"
 
+
 def check_device(tensors: List[torch.Tensor]):
     device = tensors[0].device
     for t in tensors:
         assert (
             t.device == device
         ), f"All tensors should be on the same device, but got {device} and {t.device}"
+
 
 @triton.jit
 def state_merge(o, m, d, other_o, other_m, other_d):
@@ -84,7 +88,8 @@ def merge_state_kernel(
                     s_merged_ptr + pos * num_heads + head_idx,
                     tl.log2(d) + s_max,
                 )
-        
+
+
 def merge_state_triton(
     v_a: torch.Tensor, s_a: torch.Tensor, v_b: torch.Tensor, s_b: torch.Tensor
 ):
@@ -116,6 +121,7 @@ def merge_state_triton(
     )
 
     return v_merged, s_merged
+
 
 @pytest.mark.parametrize("seq_len", [2048])
 @pytest.mark.parametrize("num_heads", [32])
