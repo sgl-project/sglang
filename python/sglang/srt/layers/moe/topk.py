@@ -246,6 +246,8 @@ def select_experts(
     correction_bias: Optional[torch.Tensor] = None,
     torch_native: bool = False,
     expert_logical_to_rank_dispatch_physical_map: Optional[torch.Tensor] = None,
+    expert_logical_to_all_physical_map=None,
+    expert_logical_to_all_physical_map_num_valid=None,
 ):
     n_share_experts_fusion = 0
     if global_server_args_dict["n_share_experts_fusion"] is not None:
