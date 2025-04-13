@@ -75,7 +75,7 @@ class TransferKVChunk:
 
 
 @dataclasses.dataclass
-class WaitingReq:
+class TransferInfo:
     room: int
     endpoint: str
     mooncake_session_id: str
@@ -112,7 +112,7 @@ class KVManager:
         self.register_buffer_to_engine()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.transfer_queue = queue.Queue()
-            self.waiting_pool: Dict[int, WaitingReq] = {}
+            self.transfer_infos: Dict[int, TransferInfo] = {}
             self.start_prefill_thread()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.start_decode_thread()
@@ -241,7 +241,7 @@ class KVManager:
                 bootstrap_room = waiting_req_bytes[2].decode("ascii")
                 if bootstrap_room == "None":
                     continue
-                self.waiting_pool[int(bootstrap_room)] = WaitingReq.from_zmq(
+                self.transfer_infos[int(bootstrap_room)] = TransferInfo.from_zmq(
                     waiting_req_bytes
                 )
 
@@ -250,7 +250,7 @@ class KVManager:
             while True:
                 try:
                     kv_chunk: TransferKVChunk = self.transfer_queue.get(timeout=0.01)
-                    req = self.waiting_pool[kv_chunk.room]
+                    req = self.transfer_infos[kv_chunk.room]
                     chunked_dst_kv_indice = req.dst_kv_indices[kv_chunk.index_slice]
                     assert len(chunked_dst_kv_indice) == len(
                         kv_chunk.prefill_kv_indices
@@ -279,7 +279,7 @@ class KVManager:
                             KVPoll.Success if ret == 0 else KVPoll.Failed
                         )
                         self.sync_status_to_decode_endpoint(req.endpoint, req.room)
-                        self.waiting_pool.pop(req.room)
+                        self.transfer_infos.pop(req.room)
 
                 except queue.Empty:
                     continue
@@ -329,7 +329,7 @@ class KVManager:
             self.disaggregation_mode == DisaggregationMode.PREFILL
             and self.request_status[bootstrap_room] == KVPoll.Bootstrapping
         ):
-            if bootstrap_room in self.waiting_pool:
+            if bootstrap_room in self.transfer_infos:
                 self.request_status[bootstrap_room] = KVPoll.WaitingForInput
 
         return self.request_status[bootstrap_room]
