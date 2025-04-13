@@ -114,6 +114,8 @@ def scan_combinations(
             # decode
             for ep_num_redundant_experts in [0, 32]
             for nnodes in [
+                1,
+                2,
                 4,
                 *([8] if ep_num_redundant_experts == 0 else []),
                 *([9] if ep_num_redundant_experts == 32 else []),
