@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, List, Optional, Type
 
 import torch
+
 from sglang.srt.managers.expert_location import ExpertLocationMetadata
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import Withable, get_bool_env_var
@@ -85,7 +86,9 @@ class _ExpertDistributionRecorder:
     def _reset(self):
         """Reset the expert distribution recorder."""
         logger.info("Resetting ExpertDistributionRecorder...")
-        assert self._current_layer_idx.value is None, f"{self._current_layer_idx.value=}"
+        assert (
+            self._current_layer_idx.value is None
+        ), f"{self._current_layer_idx.value=}"
         for gatherer in self._single_pass_gatherers.values():
             gatherer.reset()
         self._accumulator.reset()
@@ -96,7 +99,9 @@ class _ExpertDistributionRecorder:
             logger.warning(
                 "SGLang server is already recording expert ids. Did you forget to dump the expert ids recorded so far by sending requests to the `/stop_expert_distribution_record` and `/dump_expert_distribution_record` endpoints?"
             )
-        assert self._server_args.disable_overlap_schedule, "ExpertDistributionRecorder needs disable_overlap_schedule currently (will implement this later)"
+        assert (
+            self._server_args.disable_overlap_schedule
+        ), "ExpertDistributionRecorder needs disable_overlap_schedule currently (will implement this later)"
         self._reset()
         self._recording = True
 
@@ -191,8 +196,8 @@ class _SelectExpertsSinglePassGatherer(_LayerBasedSinglePassGatherer):
         torch.cuda.synchronize()
 
         num_recv_tokens_per_expert_list = [
-                                              0
-                                          ] * self._expert_location_metadata.num_local_physical_experts
+            0
+        ] * self._expert_location_metadata.num_local_physical_experts
         for token_record in topk_ids_list:
             for global_physical_expert_idx in token_record:
                 local_physical_expert_idx = (

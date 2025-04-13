@@ -7,9 +7,13 @@ from pathlib import Path
 import einops
 import polars as pl
 import torch
-from sglang.srt.managers import deepseek_eplb
-from sglang.srt.managers.expert_location import ExpertLocationMetadata, ModelConfigForExpertLocation
 from tqdm.auto import tqdm
+
+from sglang.srt.managers import deepseek_eplb
+from sglang.srt.managers.expert_location import (
+    ExpertLocationMetadata,
+    ModelConfigForExpertLocation,
+)
 
 
 @dataclass
@@ -27,7 +31,11 @@ class MyExpertLocationMetadata:
     logical_to_all_physical_map: torch.Tensor  # (layers, num_logical_experts, X)
 
     @staticmethod
-    def init_by_eplb(server_args: MyServerArgs, logical_count: torch.Tensor, num_physical_experts: int):
+    def init_by_eplb(
+        server_args: MyServerArgs,
+        logical_count: torch.Tensor,
+        num_physical_experts: int,
+    ):
         model_config_for_expert_location = _MY_MODEL_CONFIG_FOR_EXPERT_LOCATION
 
         physical_to_logical_map, logical_to_all_physical_map, _ = (
@@ -58,18 +66,28 @@ def read_physical_count_of_forward_pass(dir_data: Path):
     physical_count_of_forward_pass_id_and_rank = defaultdict(lambda: defaultdict())
     for path in tqdm(list(dir_data.glob("*.pt"))):
         for record in torch.load(path, weights_only=True):
-            assert physical_count_of_forward_pass_id_and_rank[record["forward_pass_id"]].get(record["rank"]) is None
-            physical_count_of_forward_pass_id_and_rank[record["forward_pass_id"]][record["rank"]] = record[
-                "physical_count"]
+            assert (
+                physical_count_of_forward_pass_id_and_rank[
+                    record["forward_pass_id"]
+                ].get(record["rank"])
+                is None
+            )
+            physical_count_of_forward_pass_id_and_rank[record["forward_pass_id"]][
+                record["rank"]
+            ] = record["physical_count"]
     # print(len(physical_count_of_forward_pass_id_and_rank))
 
     items = []
-    for forward_pass_id, physical_count_of_rank in sorted(physical_count_of_forward_pass_id_and_rank.items()):
-        physical_count_of_rank_tensor = torch.cat([
-            physical_count
-            for rank, physical_count
-            in sorted(physical_count_of_rank.items())
-        ], dim=-1)
+    for forward_pass_id, physical_count_of_rank in sorted(
+        physical_count_of_forward_pass_id_and_rank.items()
+    ):
+        physical_count_of_rank_tensor = torch.cat(
+            [
+                physical_count
+                for rank, physical_count in sorted(physical_count_of_rank.items())
+            ],
+            dim=-1,
+        )
         items.append(physical_count_of_rank_tensor)
 
     physical_count_of_forward_pass = torch.stack(items)
@@ -103,9 +121,16 @@ def scan_combinations(
     rows = []
     for server_args in server_args_list:
         print()
-        mean_utilization_rate = simulate_execution(logical_count_of_seq=logical_count_of_seq, server_args=server_args)
+        mean_utilization_rate = simulate_execution(
+            logical_count_of_seq=logical_count_of_seq, server_args=server_args
+        )
         print(f"{server_args=} {mean_utilization_rate=:.2f}")
-        rows.append(dict(**dataclasses.asdict(server_args), mean_utilization_rate=mean_utilization_rate))
+        rows.append(
+            dict(
+                **dataclasses.asdict(server_args),
+                mean_utilization_rate=mean_utilization_rate,
+            )
+        )
 
     df = pl.DataFrame(rows)
     return df
@@ -135,10 +160,16 @@ def simulate_execution(
     print(f"{logical_count_of_batch.shape=}")
 
     if server_args.enable_expert_location_by_eplb:
-        num_physical_expert = model_config_for_expert_location.num_logical_experts + server_args.ep_num_redundant_experts
+        num_physical_expert = (
+            model_config_for_expert_location.num_logical_experts
+            + server_args.ep_num_redundant_experts
+        )
         expert_location_metadata = MyExpertLocationMetadata.init_by_eplb(
             server_args,
-            logical_count=einops.einsum(logical_count_of_seq, "num_seq num_layer num_expert -> num_layer num_expert"),
+            logical_count=einops.einsum(
+                logical_count_of_seq,
+                "num_seq num_layer num_expert -> num_layer num_expert",
+            ),
             num_physical_experts=num_physical_expert,
         )
         # print(f"hi {expert_location_metadata=}")
@@ -178,7 +209,9 @@ def simulate_batching(
         state_reducer=lambda count, tensor: count + compute_num_token(tensor).item(),
         should_chunk=lambda count: count > chunked_prefill_size,
     )
-    return torch.stack([torch.stack(tensor_chunk).sum(dim=0) for tensor_chunk in tensor_chunks])
+    return torch.stack(
+        [torch.stack(tensor_chunk).sum(dim=0) for tensor_chunk in tensor_chunks]
+    )
 
 
 def simulate_logical_to_physical(
@@ -196,12 +229,17 @@ def simulate_logical_to_physical(
 
     for layer_id in range(num_layer):
         for logical_expert_id in range(num_logical_expert):
-            all_physical_expert_ids = ExpertLocationMetadata.logical_to_all_physical_raw(
-                logical_to_all_physical_map, layer_id, logical_expert_id
+            all_physical_expert_ids = (
+                ExpertLocationMetadata.logical_to_all_physical_raw(
+                    logical_to_all_physical_map, layer_id, logical_expert_id
+                )
             )
             for physical_expert_id in all_physical_expert_ids:
-                physical_count_of_whatever[:, layer_id, physical_expert_id] += \
-                    logical_count_of_whatever[:, layer_id, logical_expert_id] / len(all_physical_expert_ids)
+                physical_count_of_whatever[
+                    :, layer_id, physical_expert_id
+                ] += logical_count_of_whatever[:, layer_id, logical_expert_id] / len(
+                    all_physical_expert_ids
+                )
 
     return physical_count_of_whatever
 
@@ -224,10 +262,16 @@ def compute_utilization_rate(
 ):
     """output: utilization_rate (num_batch, num_layer)"""
     gpu_physical_count_of_batch = gpu_physical_count_of_batch.float()
-    max_gpu_physical_count = einops.reduce(gpu_physical_count_of_batch,
-                                           "num_batch num_layer num_gpu -> num_batch num_layer", 'max')
-    avg_gpu_physical_count = einops.reduce(gpu_physical_count_of_batch,
-                                           "num_batch num_layer num_gpu -> num_batch num_layer", 'mean')
+    max_gpu_physical_count = einops.reduce(
+        gpu_physical_count_of_batch,
+        "num_batch num_layer num_gpu -> num_batch num_layer",
+        "max",
+    )
+    avg_gpu_physical_count = einops.reduce(
+        gpu_physical_count_of_batch,
+        "num_batch num_layer num_gpu -> num_batch num_layer",
+        "mean",
+    )
     return (avg_gpu_physical_count + 1e-5) / (max_gpu_physical_count + 1e-5)
 
 

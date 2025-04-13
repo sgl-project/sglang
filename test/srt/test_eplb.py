@@ -3,8 +3,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import sglang as sgl
 import torch
+
+import sglang as sgl
 from sglang.srt.managers.expert_distribution_storage import ExpertDistributionStorage
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
@@ -18,7 +19,7 @@ from sglang.test.test_utils import (
 # DeepSeek-Coder-V2-Lite-Instruct
 _NUM_ROUTED_EXPERTS = 64
 _NUM_HIDDEN_LAYERS = 27
-_REF_OUTPUT = [', 4+4=8,', ', four plus four is eight, eight']
+_REF_OUTPUT = [", 4+4=8,", ", four plus four is eight, eight"]
 
 
 class TestEPLB(CustomTestCase):
@@ -117,7 +118,9 @@ class TestEPLB(CustomTestCase):
             print(
                 f"Action: start engine to check automatically loading from storage dir"
             )
-            engine = sgl.Engine(**engine_kwargs, eplb_storage_dir=eplb_storage_dir_a, port=22000)
+            engine = sgl.Engine(
+                **engine_kwargs, eplb_storage_dir=eplb_storage_dir_a, port=22000
+            )
             self._assert_behavior(engine, "not_equal_trivial")
             print(f"Action: shutdown engine")
             engine.shutdown()
@@ -141,12 +144,18 @@ class TestEPLB(CustomTestCase):
 
         offset = 3
         physical_to_logical_map = (
-                (offset + torch.arange(0, _NUM_ROUTED_EXPERTS + ep_num_redundant_experts).repeat(_NUM_HIDDEN_LAYERS, 1))
-                % _NUM_ROUTED_EXPERTS
+            offset
+            + torch.arange(0, _NUM_ROUTED_EXPERTS + ep_num_redundant_experts).repeat(
+                _NUM_HIDDEN_LAYERS, 1
+            )
+        ) % _NUM_ROUTED_EXPERTS
+        init_expert_location = dict(
+            physical_to_logical_map=physical_to_logical_map.tolist()
         )
-        init_expert_location = dict(physical_to_logical_map=physical_to_logical_map.tolist())
 
-        engine = sgl.Engine(**engine_kwargs, init_expert_location=json.dumps(init_expert_location))
+        engine = sgl.Engine(
+            **engine_kwargs, init_expert_location=json.dumps(init_expert_location)
+        )
         self._assert_behavior(engine, physical_to_logical_map[0].tolist())
         engine.shutdown()
         del engine
@@ -171,9 +180,7 @@ class TestEPLB(CustomTestCase):
         engine.shutdown()
         del engine
 
-    def _assert_behavior(
-            self, engine: sgl.Engine, expect_physical_to_local_map
-    ):
+    def _assert_behavior(self, engine: sgl.Engine, expect_physical_to_local_map):
         actual_output = self._engine_generate(engine)
         self.assertEqual(actual_output, _REF_OUTPUT)
 
@@ -183,12 +190,16 @@ class TestEPLB(CustomTestCase):
         physical_to_logical_map_layer_0 = physical_to_logical_map[0, :].tolist()
         print(f"{physical_to_logical_map_layer_0=}")
 
-        trivial_expert_locations = _compute_trivial_expert_locations(engine.server_args.ep_num_redundant_experts)
+        trivial_expert_locations = _compute_trivial_expert_locations(
+            engine.server_args.ep_num_redundant_experts
+        )
 
         if expect_physical_to_local_map == "equal_trivial":
             self.assertEqual(physical_to_logical_map_layer_0, trivial_expert_locations)
         elif expect_physical_to_local_map == "not_equal_trivial":
-            self.assertNotEqual(physical_to_logical_map_layer_0, trivial_expert_locations)
+            self.assertNotEqual(
+                physical_to_logical_map_layer_0, trivial_expert_locations
+            )
         else:
             self.assertEqual(
                 physical_to_logical_map_layer_0, expect_physical_to_local_map
@@ -210,7 +221,10 @@ class TestEPLB(CustomTestCase):
 
 
 def _compute_trivial_expert_locations(ep_num_redundant_experts: int):
-    return list(x % _NUM_ROUTED_EXPERTS for x in range(_NUM_ROUTED_EXPERTS + ep_num_redundant_experts))
+    return list(
+        x % _NUM_ROUTED_EXPERTS
+        for x in range(_NUM_ROUTED_EXPERTS + ep_num_redundant_experts)
+    )
 
 
 if __name__ == "__main__":

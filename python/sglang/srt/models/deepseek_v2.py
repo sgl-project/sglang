@@ -32,7 +32,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     parallel_state,
-    tensor_model_parallel_all_reduce, get_tensor_model_parallel_rank,
+    tensor_model_parallel_all_reduce,
 )
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.dp_attention import (
@@ -76,7 +76,10 @@ from sglang.srt.managers.expert_location import (
     ExpertLocationMetadata,
     ModelConfigForExpertLocation,
 )
-from sglang.srt.managers.schedule_batch import global_server_args_dict, get_global_expert_location_metadata
+from sglang.srt.managers.schedule_batch import (
+    get_global_expert_location_metadata,
+    global_server_args_dict,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import DeepEPMode, add_prefix, is_cuda, is_hip
@@ -335,7 +338,9 @@ class DeepseekV2MoE(nn.Module):
                 topk_group=self.topk_group,
                 num_expert_group=self.num_expert_group,
                 correction_bias=self.correction_bias,
-                expert_logical_to_rank_dispatch_physical_map=get_global_expert_location_metadata().logical_to_rank_dispatch_physical_map[self.tp_rank, self.layer_id, :],
+                expert_logical_to_rank_dispatch_physical_map=get_global_expert_location_metadata().logical_to_rank_dispatch_physical_map[
+                    self.tp_rank, self.layer_id, :
+                ],
             )
             # print(f"hi [{get_tensor_model_parallel_rank()}, {self.__class__.__name__}] forward_deepep after-select_experts "
             #       f"{self.layer_id=} {topk_weights=} {topk_idx=} ")

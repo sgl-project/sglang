@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 import torch
+
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.managers import deepseek_eplb
 from sglang.srt.model_loader import get_model_architecture
@@ -33,8 +34,8 @@ class ExpertLocationMetadata:
         num_logical_experts = model_config_for_expert_location.num_logical_experts
 
         physical_to_logical_map = (
-                torch.arange(0, num_physical_experts).repeat(num_layers, 1)
-                % num_logical_experts
+            torch.arange(0, num_physical_experts).repeat(num_layers, 1)
+            % num_logical_experts
         )
 
         return ExpertLocationMetadata.init_by_mapping(
@@ -43,17 +44,16 @@ class ExpertLocationMetadata:
         )
 
     @staticmethod
-    def init_by_mapping(
-            server_args: ServerArgs, physical_to_logical_map
-    ):
+    def init_by_mapping(server_args: ServerArgs, physical_to_logical_map):
         if not isinstance(physical_to_logical_map, torch.Tensor):
             physical_to_logical_map = torch.tensor(physical_to_logical_map)
 
         common = ExpertLocationMetadata._init_common(server_args)
         model_config_for_expert_location = common["model_config_for_expert_location"]
-        logical_to_all_physical_map = _compute_logical_to_all_physical_map(physical_to_logical_map,
-                                                                           num_logical_experts=model_config_for_expert_location.num_logical_experts
-                                                                           )
+        logical_to_all_physical_map = _compute_logical_to_all_physical_map(
+            physical_to_logical_map,
+            num_logical_experts=model_config_for_expert_location.num_logical_experts,
+        )
 
         return ExpertLocationMetadata(
             num_layers=model_config_for_expert_location.num_layers,
@@ -104,8 +104,8 @@ class ExpertLocationMetadata:
         )
 
         num_physical_experts = (
-                model_config_for_expert_location.num_logical_experts
-                + server_args.ep_num_redundant_experts
+            model_config_for_expert_location.num_logical_experts
+            + server_args.ep_num_redundant_experts
         )
         # TODO consider case when DP attention is disabled and DP > 1
         world_size = server_args.tp_size
@@ -153,7 +153,7 @@ class ExpertLocationMetadata:
         return global_physical_expert_index % self.num_local_physical_experts
 
     def logical_to_all_physical(
-            self, layer_id: int, logical_expert_id: int
+        self, layer_id: int, logical_expert_id: int
     ) -> List[int]:
         return self.logical_to_all_physical_raw(
             self.logical_to_all_physical_map, layer_id, logical_expert_id
@@ -161,7 +161,7 @@ class ExpertLocationMetadata:
 
     @staticmethod
     def logical_to_all_physical_raw(
-            logical_to_all_physical_map, layer_id: int, logical_expert_id: int
+        logical_to_all_physical_map, layer_id: int, logical_expert_id: int
     ) -> List[int]:
         return [
             physical_expert_id
@@ -180,31 +180,44 @@ class ExpertLocationMetadata:
         )
 
 
-def _compute_logical_to_all_physical_map(physical_to_logical_map: torch.Tensor, num_logical_experts: int):
+def _compute_logical_to_all_physical_map(
+    physical_to_logical_map: torch.Tensor, num_logical_experts: int
+):
     # This is rarely called, so we use for loops for maximum clarity
 
     num_layers, num_physical_experts = physical_to_logical_map.shape
 
-    logical_to_all_physical_map = [[[] for _ in range(num_logical_experts)] for _ in range(num_layers)]
+    logical_to_all_physical_map = [
+        [[] for _ in range(num_logical_experts)] for _ in range(num_layers)
+    ]
     for layer_id in range(num_layers):
         for physical_expert_id in range(num_physical_experts):
-            logical_expert_id = physical_to_logical_map[layer_id, physical_expert_id].item()
-            logical_to_all_physical_map[layer_id][logical_expert_id].append(physical_expert_id)
+            logical_expert_id = physical_to_logical_map[
+                layer_id, physical_expert_id
+            ].item()
+            logical_to_all_physical_map[layer_id][logical_expert_id].append(
+                physical_expert_id
+            )
 
-    logical_to_all_physical_map = _pad_nested_array(logical_to_all_physical_map, pad_value=-1)
+    logical_to_all_physical_map = _pad_nested_array(
+        logical_to_all_physical_map, pad_value=-1
+    )
 
     return torch.tensor(logical_to_all_physical_map)
 
 
 def _pad_nested_array(arr, pad_value):
     max_len = max(len(inner) for outer in arr for inner in outer)
-    padded = [[inner + [pad_value] * (max_len - len(inner)) for inner in outer] for outer in arr]
+    padded = [
+        [inner + [pad_value] * (max_len - len(inner)) for inner in outer]
+        for outer in arr
+    ]
     return padded
 
 
 def _compute_logical_to_rank_dispatch_physical_map(
-        logical_to_all_physical_map: torch.Tensor,
-        num_gpus: int,
+    logical_to_all_physical_map: torch.Tensor,
+    num_gpus: int,
 ):
     # TODO maybe improve this algorithm (e.g. ensure it is really balanced)
     # This is rarely called, so we use for loops for maximum clarity

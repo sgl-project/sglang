@@ -1,5 +1,4 @@
 from sglang.srt.managers.expert_distribution import expert_distribution_recorder
-from sglang.srt.utils import DeepEPMode
 from sglang.srt.utils import DeepEPMode, DisposibleTensor
 
 try:
