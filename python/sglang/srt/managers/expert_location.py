@@ -142,7 +142,7 @@ class ExpertLocationMetadata:
         for field in [
             "logical_to_all_physical_map",
         ]:
-            setattr(self, field, getattr(other, field))
+            setattr(self, field, getattr(other, field).to(getattr(self, field).device))
 
     def to(self, device):
         for field in [
