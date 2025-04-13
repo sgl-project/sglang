@@ -215,7 +215,7 @@ def simulate_batching(
     tensor_chunks = chunker(
         logical_count_of_seq,
         state_reducer=lambda count, tensor: count + compute_num_token(tensor).item(),
-        should_chunk=lambda count: count > num_tokens_in_batch_overall,
+        should_chunk=lambda count: count >= num_tokens_in_batch_overall,
     )
     return torch.stack(
         [torch.stack(tensor_chunk).sum(dim=0) for tensor_chunk in tensor_chunks]
