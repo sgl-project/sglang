@@ -116,7 +116,8 @@ def scan_combinations(
                 init_expert_location=init_expert_location,
             )
 
-            for init_expert_location in ["/host_home/temp_sglang_server2local/1744461420780309768.json", None]
+            # for init_expert_location in ["/host_home/temp_sglang_server2local/1744461420780309768.json", None]
+            for init_expert_location in ["from_variable"]
 
             # decode
             # for ep_num_redundant_experts in [0, 32]
