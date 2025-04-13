@@ -61,7 +61,8 @@ class ExpertLocationMetadata:
             num_local_physical_experts=common["num_local_physical_experts"],
             physical_to_logical_map=physical_to_logical_map,
             logical_to_all_physical_map=logical_to_all_physical_map,
-            logical_to_all_physical_map_num_valid=torch.count_nonzero(logical_to_all_physical_map != -1, dim=-1),
+            logical_to_all_physical_map_num_valid=_compute_logical_to_all_physical_map_num_valid(
+                logical_to_all_physical_map),
             logical_to_rank_dispatch_physical_map=_compute_logical_to_rank_dispatch_physical_map(
                 logical_to_all_physical_map,
                 num_gpus=common["world_size"],
@@ -90,7 +91,8 @@ class ExpertLocationMetadata:
             num_logical_experts=model_config_for_expert_location.num_logical_experts,
             num_local_physical_experts=common["num_local_physical_experts"],
             physical_to_logical_map=physical_to_logical_map,
-            logical_to_all_physical_map=logical_to_all_physical_map,
+            logical_to_all_physical_map_num_valid=_compute_logical_to_all_physical_map_num_valid(
+                logical_to_all_physical_map),
             logical_to_rank_dispatch_physical_map=_compute_logical_to_rank_dispatch_physical_map(
                 logical_to_all_physical_map,
                 num_gpus=common["world_size"],
@@ -214,6 +216,10 @@ def _pad_nested_array(arr, pad_value):
         for outer in arr
     ]
     return padded
+
+
+def _compute_logical_to_all_physical_map_num_valid(logical_to_all_physical_map):
+    return torch.count_nonzero(logical_to_all_physical_map != -1, dim=-1)
 
 
 def _compute_logical_to_rank_dispatch_physical_map(
