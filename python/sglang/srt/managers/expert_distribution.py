@@ -157,6 +157,9 @@ class _SinglePassGatherer(ABC):
     ):
         pass
 
+    def on_deepep_dispatch_low_latency(self, layer_idx: int, recv_count: torch.Tensor):
+        pass
+
     def reset(self):
         raise NotImplementedError
 
