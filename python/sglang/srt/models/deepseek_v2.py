@@ -338,6 +338,7 @@ class DeepseekV2MoE(nn.Module):
                 topk_group=self.topk_group,
                 num_expert_group=self.num_expert_group,
                 correction_bias=self.correction_bias,
+                forward_mode=forward_mode,
                 expert_logical_to_rank_dispatch_physical_map=expert_location_metadata.logical_to_rank_dispatch_physical_map[
                                                              self.tp_rank, self.layer_id, :],
                 expert_logical_to_all_physical_map=expert_location_metadata.logical_to_all_physical_map[self.layer_id,

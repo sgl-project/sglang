@@ -246,6 +246,7 @@ def select_experts(
     correction_bias: Optional[torch.Tensor] = None,
     torch_native: bool = False,
     expert_logical_to_rank_dispatch_physical_map: Optional[torch.Tensor] = None,
+    forward_mode=None,
     expert_logical_to_all_physical_map=None,
     expert_logical_to_all_physical_map_num_valid=None,
 ):
