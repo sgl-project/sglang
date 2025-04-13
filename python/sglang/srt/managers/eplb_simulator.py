@@ -18,7 +18,7 @@ from tqdm.auto import tqdm
 @dataclass
 class MyServerArgs:
     # When prefill, this is equivalent to `chunked_prefill_size`
-    process_num_tokens_overall: int
+    num_tokens_in_batch_overall: int
     ep_num_redundant_experts: int
     nnodes: int
     tp_size: int
@@ -102,7 +102,7 @@ def scan_combinations(
     server_args_list = [
         *[
             MyServerArgs(
-                process_num_tokens_overall=chunked_prefill_size_per_gpu * 32,
+                num_tokens_in_batch_overall=num_tokens_in_batch_per_gpu * 32,
                 ep_num_redundant_experts=ep_num_redundant_experts,
                 nnodes=nnodes,
                 tp_size=8 * nnodes,
@@ -114,10 +114,10 @@ def scan_combinations(
                 4, 8,
                 *([9] if ep_num_redundant_experts == 32 else []),
             ]
-            for chunked_prefill_size_per_gpu in [64, 128]
+            for num_tokens_in_batch_per_gpu in [64, 128]
 
             # for nnodes in [4]
-            # for chunked_prefill_size_per_gpu in [1024, 4096, 8192, 16384]
+            # for num_tokens_in_batch_per_gpu in [1024, 4096, 8192, 16384]
 
             for enable_expert_location_by_eplb in [
                 *([False] if ep_num_redundant_experts == 0 else []),
@@ -163,7 +163,7 @@ def simulate_execution(
 
     logical_count_of_batch = simulate_batching(
         logical_count_of_seq=logical_count_of_seq,
-        process_num_tokens_overall=server_args.process_num_tokens_overall,
+        num_tokens_in_batch_overall=server_args.num_tokens_in_batch_overall,
     )
     print(f"{logical_count_of_batch.shape=}")
 
@@ -209,13 +209,13 @@ def simulate_execution(
 
 def simulate_batching(
         logical_count_of_seq: torch.Tensor,  # (num_seq, num_layer, num_logical_expert)
-        process_num_tokens_overall: int,
+        num_tokens_in_batch_overall: int,
 ) -> torch.Tensor:
     """output: (num_batch, num_layer, num_logical_expert)"""
     tensor_chunks = chunker(
         logical_count_of_seq,
         state_reducer=lambda count, tensor: count + compute_num_token(tensor).item(),
-        should_chunk=lambda count: count > process_num_tokens_overall,
+        should_chunk=lambda count: count > num_tokens_in_batch_overall,
     )
     return torch.stack(
         [torch.stack(tensor_chunk).sum(dim=0) for tensor_chunk in tensor_chunks]
