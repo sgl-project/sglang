@@ -22,6 +22,7 @@ from typing import Tuple
 import numpy as np
 import requests
 
+from sglang.srt import fine_grained_benchmark
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
@@ -74,6 +75,9 @@ def launch_server_internal(server_args):
 
 
 def launch_server_process(server_args: ServerArgs):
+    if fine_grained_benchmark.is_enabled():
+        os.environ["SGLANG_ENABLE_COLOCATED_BATCH_GEN"] = "true"
+
     proc = multiprocessing.Process(target=launch_server_internal, args=(server_args,))
     proc.start()
     base_url = f"http://{server_args.host}:{server_args.port}"
@@ -107,6 +111,9 @@ def run_one_case(
         for _ in range(batch_size)
     ]
 
+    if fine_grained_benchmark.is_enabled():
+        fine_grained_benchmark.clear_output()
+
     tic = time.time()
     response = requests.post(
         url + "/generate",
@@ -122,6 +129,7 @@ def run_one_case(
     latency = time.time() - tic
 
     _ = response.json()
+
     output_throughput = batch_size * output_len / latency
     overall_throughput = batch_size * (input_len + output_len) / latency
 
@@ -129,6 +137,14 @@ def run_one_case(
     print(f"latency: {latency:.2f} s")
     print(f"output throughput: {output_throughput:.2f} token/s")
     print(f"(input + output) throughput: {overall_throughput:.2f} token/s")
+
+    if fine_grained_benchmark.is_enabled():
+        import pandas as pd
+
+        fine_grained_output = fine_grained_benchmark.read_output()
+        df = pd.DataFrame(fine_grained_output)
+        df["throughput"] = df["num_tokens"] / df["latency"]
+        print(df[df["tp_rank"] == 0].drop(["start_time", "tp_rank"], axis=1))
 
     if result_filename:
         with open(result_filename, "a") as fout:
@@ -141,6 +157,8 @@ def run_one_case(
                 "output_throughput": round(output_throughput, 2),
                 "overall_throughput": round(overall_throughput, 2),
             }
+            if fine_grained_benchmark.is_enabled():
+                res["fine_grained_output"] = fine_grained_output
             fout.write(json.dumps(res) + "\n")
 
 
