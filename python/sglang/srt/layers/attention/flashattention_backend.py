@@ -1014,130 +1014,142 @@ class FlashAttentionBackend(AttentionBackend):
         }
 
         # This is used by draft decode's first half of metadata when topk > 1
-        self.draft_decode_metadata_topk_normal = {
-            "cache_seqlens": torch.zeros(max_bs, dtype=torch.int32, device=self.device),
-            "cu_seqlens_q": torch.arange(
-                0,
-                max_bs * self.topk + 1,
-                step=self.topk,
-                dtype=torch.int32,
-                device=self.device,
-            ),
-            "cu_seqlens_k": torch.zeros(
-                max_bs + 1, dtype=torch.int32, device=self.device
-            ),
-            "page_table": torch.zeros(
-                max_bs,
-                self.max_context_len,
-                dtype=torch.int32,
-                device=self.device,
-            ),
-        }
+        if self.topk > 1:
+            self.draft_decode_metadata_topk_normal = {
+                "cache_seqlens": torch.zeros(
+                    max_bs, dtype=torch.int32, device=self.device
+                ),
+                "cu_seqlens_q": torch.arange(
+                    0,
+                    max_bs * self.topk + 1,
+                    step=self.topk,
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+                "cu_seqlens_k": torch.zeros(
+                    max_bs + 1, dtype=torch.int32, device=self.device
+                ),
+                "page_table": torch.zeros(
+                    max_bs,
+                    self.max_context_len,
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+            }
 
-        # This is used by draft decode's second half of metadata when topk > 1
-        decode_length = self.speculative_step_id + 1
-        self.draft_decode_metadata_topk_expand = {
-            "cache_seqlens": torch.full(
-                        (max_bs * self.topk,),
-                        decode_length,
-                        device=self.device,
-                        dtype=torch.int32,
-            ),
-            "cu_seqlens_q": torch.arange(
+            # This is used by draft decode's second half of metadata when topk > 1
+            decode_length = self.speculative_step_id + 1
+            self.draft_decode_metadata_topk_expand = {
+                "cache_seqlens": torch.full(
+                    (max_bs * self.topk,),
+                    decode_length,
+                    device=self.device,
+                    dtype=torch.int32,
+                ),
+                "cu_seqlens_q": torch.arange(
                     0,
                     max_bs * self.topk + 1,
                     dtype=torch.int32,
                     device=self.device,
-            ),
-            "cu_seqlens_k": torch.arange(
-                0,
-                max_bs * self.topk * decode_length + 1,
-                step=decode_length,
-                dtype=torch.int32,
-                device=self.device,
-            ),
-            "page_table": torch.zeros(
-                max_bs * self.topk,
-                decode_length,
-                dtype=torch.int32,
-                device=self.device,
-            ),
-        }
+                ),
+                "cu_seqlens_k": torch.arange(
+                    0,
+                    max_bs * self.topk * decode_length + 1,
+                    step=decode_length,
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+                "page_table": torch.zeros(
+                    max_bs * self.topk,
+                    decode_length,
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+            }
 
         # Biao's Note: Consolidate the three decode metadata
-        self.target_verify_metadata = {
-            "cache_seqlens": torch.zeros(max_bs, dtype=torch.int32, device=self.device),
-            "cu_seqlens_q": torch.arange(
-                0,
-                max_bs * self.speculative_num_draft_tokens + 1,
-                step=self.speculative_num_draft_tokens,
-                dtype=torch.int32,
-                device=self.device
-            ),
-            "cu_seqlens_k": torch.zeros(
-                max_bs + 1, dtype=torch.int32, device=self.device
-            ),
-            "page_table": torch.zeros(
-                max_bs,
-                (self.max_context_len + self.page_size - 1) // self.page_size,
-                dtype=torch.int32,
-                device=self.device,
-            ),
-            "strided_indices": torch.arange(
-                0, self.max_context_len, self.page_size, device=self.device
-            ),
-        }
+        if (
+            self.speculative_num_draft_tokens is not None
+            and self.speculative_num_draft_tokens > 0
+        ):
+            self.target_verify_metadata = {
+                "cache_seqlens": torch.zeros(
+                    max_bs, dtype=torch.int32, device=self.device
+                ),
+                "cu_seqlens_q": torch.arange(
+                    0,
+                    max_bs * self.speculative_num_draft_tokens + 1,
+                    step=self.speculative_num_draft_tokens,
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+                "cu_seqlens_k": torch.zeros(
+                    max_bs + 1, dtype=torch.int32, device=self.device
+                ),
+                "page_table": torch.zeros(
+                    max_bs,
+                    (self.max_context_len + self.page_size - 1) // self.page_size,
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+                "strided_indices": torch.arange(
+                    0, self.max_context_len, self.page_size, device=self.device
+                ),
+            }
 
-        self.target_verify_metadata_topk_normal = {
-            "cache_seqlens": torch.zeros(max_bs, dtype=torch.int32, device=self.device),
-            "cu_seqlens_q": torch.arange(
-                0,
-                max_bs * self.speculative_num_draft_tokens + 1,
-                step=self.speculative_num_draft_tokens,
-                dtype=torch.int32,
-                device=self.device,
-            ),
-            "cu_seqlens_k": torch.zeros(
-                max_bs + 1, dtype=torch.int32, device=self.device
-            ),
-            "page_table": torch.zeros(
-                max_bs,
-                self.max_context_len,
-                dtype=torch.int32,
-                device=self.device,
-            ),
-        }
+        if self.topk > 1:
+            self.target_verify_metadata_topk_normal = {
+                "cache_seqlens": torch.zeros(
+                    max_bs, dtype=torch.int32, device=self.device
+                ),
+                "cu_seqlens_q": torch.arange(
+                    0,
+                    max_bs * self.speculative_num_draft_tokens + 1,
+                    step=self.speculative_num_draft_tokens,
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+                "cu_seqlens_k": torch.zeros(
+                    max_bs + 1, dtype=torch.int32, device=self.device
+                ),
+                "page_table": torch.zeros(
+                    max_bs,
+                    self.max_context_len,
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+            }
 
-        self.target_verify_metadata_topk_expand = {
-            "cache_seqlens": torch.full(
-                (max_bs * self.speculative_num_draft_tokens,),
-                self.speculative_num_draft_tokens,
-                dtype=torch.int32,
-                device=self.device,
-            ),
-            "cu_seqlens_q": torch.arange(
-                0,
-                max_bs * self.speculative_num_draft_tokens + 1,
-                dtype=torch.int32,
-                device=self.device,
-            ),
-            "cu_seqlens_k": torch.arange(
-                0,
-                max_bs
-                * self.speculative_num_draft_tokens
-                * self.speculative_num_draft_tokens
-                + 1,
-                step=self.speculative_num_draft_tokens,
-                dtype=torch.int32,
-                device=self.device,
-            ),
-            "page_table": torch.zeros(
-                max_bs * self.speculative_num_draft_tokens,
-                self.speculative_num_draft_tokens,
-                dtype=torch.int32,
-                device=self.device,
-            ),
-        }
+            self.target_verify_metadata_topk_expand = {
+                "cache_seqlens": torch.full(
+                    (max_bs * self.speculative_num_draft_tokens,),
+                    self.speculative_num_draft_tokens,
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+                "cu_seqlens_q": torch.arange(
+                    0,
+                    max_bs * self.speculative_num_draft_tokens + 1,
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+                "cu_seqlens_k": torch.arange(
+                    0,
+                    max_bs
+                    * self.speculative_num_draft_tokens
+                    * self.speculative_num_draft_tokens
+                    + 1,
+                    step=self.speculative_num_draft_tokens,
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+                "page_table": torch.zeros(
+                    max_bs * self.speculative_num_draft_tokens,
+                    self.speculative_num_draft_tokens,
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+            }
 
         # Biao's Note: Consolidate the encoder metadata
 
@@ -1223,7 +1235,9 @@ class FlashAttentionBackend(AttentionBackend):
                         ]
                     )
                     metadata_expand.max_seq_len_q = 1
-                    metadata_expand.max_seq_len_k = self.speculative_step_id + 1 # , do this in replay
+                    metadata_expand.max_seq_len_k = (
+                        self.speculative_step_id + 1
+                    )  # , do this in replay
                     metadata_expand.cu_seqlens_q = (
                         self.draft_decode_metadata_topk_expand["cu_seqlens_q"][
                             : bs * self.topk + 1
@@ -1237,8 +1251,8 @@ class FlashAttentionBackend(AttentionBackend):
                     metadata_expand.page_table = self.draft_decode_metadata_topk_expand[
                         "page_table"
                     ][: bs * self.topk]
-                self.draft_decode_metadata_topk_normal[bs] = metadata
-                self.draft_decode_metadata_topk_expand[bs] = metadata_expand
+                    self.draft_decode_metadata_topk_normal[bs] = metadata
+                    self.draft_decode_metadata_topk_expand[bs] = metadata_expand
             else:
                 # Normal Decode
                 # Get sequence information
@@ -1424,11 +1438,11 @@ class FlashAttentionBackend(AttentionBackend):
                     cache_loc = out_cache_loc.view(
                         self.speculative_num_steps, -1
                     ).T.contiguous()
-                    metadata_expand.page_table[:cache_loc.shape[0]].copy_(
+                    metadata_expand.page_table[: cache_loc.shape[0]].copy_(
                         cache_loc[:, :decode_length].contiguous().to(torch.int32)
                     )
                     # may not need
-                    metadata_expand.page_table[cache_loc.shape[0]:].fill_(0)
+                    metadata_expand.page_table[cache_loc.shape[0] :].fill_(0)
             else:
                 metadata = self.decode_cuda_graph_metadata[bs]
                 # Normal Decode
@@ -1530,7 +1544,9 @@ class FlashAttentionBackend(AttentionBackend):
                     + cum_len[:, None]
                 ).view(1, -1)
                 # avoid extracting padded seq indices which will be out of boundary
-                mask_extraction_indices[:, spec_info.positions.numel() * self.speculative_num_draft_tokens:].fill_(0)
+                mask_extraction_indices[
+                    :, spec_info.positions.numel() * self.speculative_num_draft_tokens :
+                ].fill_(0)
 
                 mask = spec_info.custom_mask[mask_extraction_indices].view(
                     -1, self.speculative_num_draft_tokens
@@ -1539,7 +1555,7 @@ class FlashAttentionBackend(AttentionBackend):
                     (non_masked_page_table * mask).to(torch.int32)
                 )
                 # may not need
-                metadata_expand.page_table[spec_info.positions.numel():].fill_(0)
+                metadata_expand.page_table[spec_info.positions.numel() :].fill_(0)
 
         if encoder_lens is not None:
             # Only support encoder size 1 for now
