@@ -16,10 +16,9 @@ from typing import Callable, Optional
 
 import torch
 import torch.nn.functional as F
-
 from sglang.srt.managers.expert_distribution import expert_distribution_recorder
 from sglang.srt.managers.schedule_batch import global_server_args_dict
-from sglang.srt.utils import get_compiler_backend, is_cuda, is_hip
+from sglang.srt.utils import get_compiler_backend, is_cuda, is_hip, get_bool_env_var
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -300,7 +299,10 @@ def select_experts(
 
     if expert_logical_to_rank_dispatch_physical_map is not None:
         # TODO this is inefficient, and I will fuse into existing kernels
-        topk_ids = expert_logical_to_rank_dispatch_physical_map[topk_ids]
+        if get_bool_env_var("SGLANG_HACK_EXPERT_LOCATION_DISPATCH_RANDOM"):
+            topk_ids = expert_logical_to_all_physical_map[topk_ids, TODO]
+        else:
+            topk_ids = expert_logical_to_rank_dispatch_physical_map[topk_ids]
 
     expert_distribution_recorder.on_select_experts(topk_ids=topk_ids)
 
