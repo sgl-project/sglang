@@ -227,7 +227,11 @@ class _DeepepNormalSinglePassGatherer(_LayerBasedSinglePassGatherer):
 # e.g. use naive tensor copying
 # need to consider CUDA graph, e.g. add initialization and after-end
 class _DeepepLowLatencySinglePassGatherer(_SinglePassGatherer):
-    pass
+    def __init__(self):
+        self._data = torch.zeros((num_layers, num_local_physical_experts), dtype=torch.int)
+
+    def on_deepep_dispatch_low_latency(self, layer_idx: int, recv_count: torch.Tensor):
+        self._data[layer_idx, :] = packed_recv_count
 
 
 # --------------------------------------- Accumulator -----------------------------------------
