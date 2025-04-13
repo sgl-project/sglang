@@ -1105,8 +1105,10 @@ def _ensure_get_col_major_tma_aligned_tensor_noop():
 
     original_func = utils.get_col_major_tma_aligned_tensor
 
-    def patched_get_col_major_tma_aligned_tensor(*args, **kwargs):
-        return TODO
+    def patched_get_col_major_tma_aligned_tensor(x: torch.Tensor) -> torch.Tensor:
+        out = original_func(x)
+        assert x.data_ptr() == out.data_ptr(), f"get_col_major_tma_aligned_tensor is not noop ({x.data_ptr()=}, {out.data_ptr()=})"
+        return out
 
     utils.get_col_major_tma_aligned_tensor = patched_get_col_major_tma_aligned_tensor
     try:
