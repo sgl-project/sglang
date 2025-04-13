@@ -300,8 +300,7 @@ def select_experts(
         )
 
     if expert_logical_to_rank_dispatch_physical_map is not None:
-        # TODO this is inefficient, and I will fuse into existing kernels
-        if get_bool_env_var("SGLANG_HACK_EXPERT_LOCATION_DISPATCH_RANDOM"):
+        if forward_mode.is_extend():
             topk_ids = _hack_expert_location_dispatch_random(
                 topk_ids=topk_ids,
                 expert_logical_to_all_physical_map=expert_logical_to_all_physical_map,
