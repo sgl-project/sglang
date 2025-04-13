@@ -211,6 +211,8 @@ class SchedulerDisaggregationPrefillMixin:
             elif poll == KVPoll.Success:  # transfer done
                 self.tree_cache.cache_finished_req(req)  # unlock the tree
                 req.finished_reason = FINISH_LENGTH(length=0)
+                # FIXME: clean up req's data in transfer engine
+                # FIXME: free metadata_buffer_index of prefill
                 done_reqs.append(req)
             elif poll == KVPoll.Failed:
                 raise Exception("Transferring failed")
