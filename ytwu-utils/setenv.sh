@@ -80,6 +80,9 @@ python3 -c "import os; os.environ['LubanUsername'] = 'yongtongwu'; os.environ['L
 # python3 -c "import os; os.environ['LubanUsername'] = 'yongtongwu'; os.environ['LubanUserToken'] = 'QTF0MFlxaHZNZlhOOVR2ZEhyeUxvNVR3dW9VZDMwSUhqbFZndXBWNVFqVT0='; os.environ['LubanCachePath'] = '/home/qspace/upload/luban_cache'; from lubanml.api.common import get_file_from_luban; ret = get_file_from_luban('luban:llm_deepseek_v3:model_path'); print(ret)"
 
 
+# python3 -c "import os; os.environ['LubanUsername'] = 'yongtongwu'; os.environ['LubanUserToken'] = 'QTF0MFlxaHZNZlhOOVR2ZEhyeUxvNVR3dW9VZDMwSUhqbFZndXBWNVFqVT0='; os.environ['LubanCachePath'] = '/home/qspace/upload/luban_cache'; from lubanml.api.common import get_file_from_luban; ret = get_file_from_luban('luban:llm_deepseek_r1_distill_qwen_1_5b:model_path'); print(ret)"
+
+
 proxy_on
 # update r1 tokenizer.
 # replace /home/qspace/upload/luban_cache/model/luban-llm_deepseek_r1-model_path/DeepSeek-R1/tokenizer_config.json

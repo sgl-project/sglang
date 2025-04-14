@@ -337,7 +337,7 @@ class KVSender:
         for data_ptr, item_len in zip(self.mgr.args.kv_data_ptrs, self.mgr.args.kv_item_lens):
             for i in kv_indices:
                 # kv_addrs.append((tmp.data_ptr(), item_len, self.mgr.args.engine_rank))
-                kv_addrs.append((data_ptr + i * item_len , item_len, self.mgr.args.engine_rank))
+                kv_addrs.append((data_ptr + int(i) * item_len , item_len, self.mgr.args.engine_rank))
         kv_descs = self.mgr.agent.get_xfer_descs(kv_addrs, "VRAM", is_sorted=True)
         assert self.aux_index is not None
         aux_addrs = [(self.mgr.args.aux_data_ptrs[0] + self.aux_index * self.mgr.args.aux_item_lens[0], self.mgr.args.aux_item_lens[0], 0)]
@@ -420,7 +420,7 @@ class KVReceiver:
         kv_addrs = []
         for data_ptr, item_len in zip(self.mgr.args.kv_data_ptrs, self.mgr.args.kv_item_lens):
             for i in kv_indices:
-                kv_addrs.append((data_ptr + i * item_len , item_len, self.mgr.args.engine_rank))
+                kv_addrs.append((data_ptr + int(i) * item_len , item_len, self.mgr.args.engine_rank))
                 # kv_addrs.append((tmp.data_ptr() , item_len, self.mgr.args.engine_rank))
         kv_descs = self.mgr.agent.get_xfer_descs(kv_addrs, "VRAM", is_sorted=True)
         aux_addrs = [(self.mgr.args.aux_data_ptrs[0] + aux_index * self.mgr.args.aux_item_lens[0], self.mgr.args.aux_item_lens[0], 0)]

@@ -69,6 +69,12 @@ done
 待自动化
 
 
+5. 待sglang pull完毕
+```bash
+proxy_off
+pip3 install --trusted-host mirrors.cloud.tencent.com -e "python[all]"
+```
+
 
 # Git 指定密钥
 ```bash

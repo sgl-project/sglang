@@ -21,28 +21,36 @@ logger.addHandler(console_handler)
 
 # (HOST, SSH_PORT, SERVE_PORT, BOOTSTRAP_PORT, extra_env)
 PREFILLS = (
-  ("127.0.0.1", "2222", "8080", "9500", ["CUDA_VISIBLE_DEVICES=0,1"]),
-  ("127.0.0.1", "2222", "8081", "9520", ["CUDA_VISIBLE_DEVICES=2,3"]),
+  ("29.226.64.219", "2222", "8080", "9500", ["CUDA_VISIBLE_DEVICES=0,1"]),
+  ("29.226.64.219", "2222", "8081", "9520", ["CUDA_VISIBLE_DEVICES=2,3"]),
 )
 
 DECODES = (
-  ("127.0.0.1", "2222", "8090", "10000", ["CUDA_VISIBLE_DEVICES=4,5"]),
-  ("127.0.0.1", "2222", "8091", "10010", ["CUDA_VISIBLE_DEVICES=6,7"]),
+  ("29.226.64.239", "2222", "8090", "10000", ["CUDA_VISIBLE_DEVICES=4,5"]),
+  ("29.226.64.239", "2222", "8091", "10010", ["CUDA_VISIBLE_DEVICES=6,7"]),
 )
 
 LB_HOST = "127.0.0.1"
+LB_SSH_PORT = "2222"
 LB_SERVE_PORT = "15000"
 
 EXTRA_SSH_ARGS = "" # "-i ~/ytwu/.ssh/id_ed25519"
 
 # NETDEVICE = "eth0"
-NETDEVICE = "lo"
+# NETDEVICE = "lo"
+
+# NETDEVICE="mlx5_bond_1:1"
+# UCX_TLS="rc,gdr_copy,rc_x,cuda_copy,cuda_ipc"
+
+NETDEVICE="bond1"
+UCX_TLS="tcp,gdr_copy,cuda_copy,cuda_ipc"
 
 TP=2
 
-MODEL="deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
+# MODEL="deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
 # MODEL="/home/qspace/upload/luban_cache/model/luban-llm_deepseek_v3-model_path/DeepSeek-V3/"
 # MODEL="deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
+MODEL='/home/qspace/upload/luban_cache/model/dpsk-1-5B/'
 
 SGLANG_COMMON_ARGS = [
   f"--model-path", MODEL,
@@ -69,9 +77,15 @@ os.system("rm -rf " + BENCH_OUTPUT_LOG + " " + LB_OUTPUT_LOG)
 bench_output_log = open(BENCH_OUTPUT_LOG, 'w')
 lb_output_log = open(LB_OUTPUT_LOG, 'w')
 
-all_machines = [
-  ("127.0.0.1", "2222")
-]
+all_machines: list[tuple[str, str]] = []
+for addr, ssh_port, _, _, _ in PREFILLS + DECODES:
+  all_machines.append((str(addr), str(ssh_port)))
+
+# add lb
+all_machines.append((LB_HOST, LB_SSH_PORT))
+
+# remove repeating
+all_machines = list(set(all_machines))
 
 def runCommand(cmd: list[str], remoteAddr: Optional[tuple[str, str]] = None, outputStream = subprocess.DEVNULL) -> subprocess.Popen:
     if remoteAddr is not None:
@@ -84,7 +98,7 @@ def runCommand(cmd: list[str], remoteAddr: Optional[tuple[str, str]] = None, out
       PROXY_ON = ""
 
       # PS1=[] dirtyhack to bypass ~/.bashrc checking
-      remote_cmd = ' '.join(['ssh', EXTRA_SSH_ARGS, '-p', remoteAddr[1], f'root@{remoteAddr[0]}', f'"PS1=[] source ~/.bashrc {PROXY_ON} && env && (', *cmd, ')"'])
+      remote_cmd = ' '.join(['ssh -o StrictHostKeyChecking=no', EXTRA_SSH_ARGS, '-p', remoteAddr[1], f'root@{remoteAddr[0]}', f'"PS1=[] source ~/.bashrc {PROXY_ON} && env && (', *cmd, ')"'])
       logger.info(f"runCommand remotely: {remote_cmd}")
       proc = subprocess.Popen(remote_cmd, shell=True, stdout=outputStream, stderr=outputStream)
       return proc
@@ -163,7 +177,7 @@ def do_exp():
         "--port", f"{SERVE_PORT}",
       ]
       prefill_env = [
-        "UCX_TLS=tcp,cuda",
+        f"UCX_TLS={UCX_TLS}",
         f"UCX_NET_DEVICES={NETDEVICE}",
         "UCX_LOG_LEVEL=info",
         # "NCCL_DEBUG=INFO",
@@ -185,7 +199,7 @@ def do_exp():
       ]
 
       decode_env = [
-        "UCX_TLS=tcp,cuda",
+        f"UCX_TLS={UCX_TLS}",
         f"UCX_NET_DEVICES={NETDEVICE}",
         "UCX_LOG_LEVEL=info",
         # "NCCL_DEBUG=INFO",
@@ -232,7 +246,7 @@ def do_exp():
       "--decode", decode_list_sport,
       "--host 0.0.0.0", 
       "--port", f"{LB_SERVE_PORT}", 
-    ], outputStream=lb_output_log) # type: ignore
+    ], remoteAddr=(LB_HOST, LB_SSH_PORT), outputStream=lb_output_log) # type: ignore
 
     time.sleep(1)
     logger.info("Start benchmarking...")
@@ -243,10 +257,10 @@ def do_exp():
       "--port", f"{LB_SERVE_PORT}",
       "--endpoint", "/v1/chat/completions",
       "--dataset-name", "jsonl",
-      "--num-prompts", f"{ bsz * 2 }", 
-      # "--dataset-path", "/sgl-workspace/upload/dataset/qa_out_0216_r1_300_max_25k_formatted.jsonl",
+      "--num-prompts", f"{ bsz * 3 }", 
+      "--dataset-path", "/sgl-workspace/upload/dataset/qa_out_0216_r1_300_max_25k_formatted.jsonl",
       # "--dataset-path", "/sgl-workspace/upload/dataset/easy.jsonl",
-      "--dataset-path", "/sgl-workspace/upload/dataset/long-easy.jsonl",
+      # "--dataset-path", "/sgl-workspace/upload/dataset/long-easy.jsonl",
       "--max-concurrency", f"{ bsz }",
       "--backend", f"openai-chat",
       "--tokenizer", f"{MODEL}",

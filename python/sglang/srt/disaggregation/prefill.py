@@ -175,7 +175,8 @@ class SchedulerDisaggregationPrefillMixin:
 
         next_token_ids = result.next_token_ids.tolist() # type: ignore
 
-        for req, next_token_id in zip(batch.reqs, next_token_ids, strict=True):
+        assert len(next_token_ids) == len(batch.reqs)
+        for req, next_token_id in zip(batch.reqs, next_token_ids):
             req: Req
             if req.is_chunked <= 0:
                 # There is no output_ids for prefill
