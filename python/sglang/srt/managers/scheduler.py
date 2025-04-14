@@ -1367,7 +1367,9 @@ class Scheduler(
 
         origin_output_ids = {}
         # Get requests from the waiting queue to a new batch
-        for i, req in enumerate(self.waiting_queue):
+        for req in self.waiting_queue:
+            origin_output_ids[req.rid] = req.output_ids
+            
             if (
                 self.lora_paths
                 and len(
@@ -1387,8 +1389,7 @@ class Scheduler(
             if running_bs + len(adder.can_run_list) >= self.max_running_requests:
                 self.running_batch.batch_is_full = True
                 break
-
-            origin_output_ids[req.rid] = req.output_ids
+            
             req.output_ids = [] # clear output_ids
             req.init_next_round_input(
                 None if prefix_computed else self.tree_cache,
