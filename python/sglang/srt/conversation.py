@@ -759,3 +759,18 @@ register_conv_template(
         audio_token="(<audio>./</audio>)",
     )
 )
+# Reference: https://huggingface.co/moonshotai/Kimi-VL-A3B-Instruct/blob/main/chat_template.jinja
+register_conv_template(
+    Conversation(
+        name="kimi-vl",
+        system_message="You are a helpful assistant",
+        system_template="<|im_system|>system<|im_middle|>{system_message}",
+        roles=("<|im_user|>user<|im_middle|>", "<|im_assistant|>assistant<|im_middle|>"),
+        messages=[],
+        sep="<|im_end|>",
+        sep_style=SeparatorStyle.NO_COLON_SINGLE,
+        stop_str="<|im_end|>",
+        image_token="<|media_start|>image<|media_content|><|media_pad|><|media_end|>",
+    )
+)
+

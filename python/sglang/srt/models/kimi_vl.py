@@ -72,7 +72,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 
 
-from sglang.srt.models.deepseek_v2 import DeepseekV2Model
+from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
 from sglang.srt.models.kimi_vl_moonvit import MoonVitPretrainedModel
 
 from sglang.srt.configs.deepseekvl2 import DeepseekV2Config
@@ -133,34 +133,26 @@ class KimiVLForConditionalGeneration(nn.Module):
         self.vision_tower = MoonVitPretrainedModel(config.vision_config)
 
         self.multi_modal_projector = KimiVLMultiModalProjector(config=config)
-
         self.quant_config = quant_config
         text_config = copy.deepcopy(config.text_config)
-        self.language_model = DeepseekV2Model(
+        text_config.architectures = ["DeepseekV2ForCausalLM"]
+        self.language_model = DeepseekV2ForCausalLM(
             config=text_config,
             quant_config=quant_config,
             prefix=add_prefix("language_model", prefix),
         )
-        self.lm_head = ParallelLMHead(
-            config.text_config.vocab_size,
-            config.text_config.hidden_size,
-            quant_config=quant_config,
-            prefix=add_prefix("lm_head", prefix),)
-        logit_scale = getattr(config, "logit_scale", 1.0)
-        self.logits_processor = LogitsProcessor(config.text_config, logit_scale)
-        self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
-        self.media_placeholder: int = self.config.media_placeholder_token_id
-        self.tp_rank = get_tensor_model_parallel_rank()
-        self.tp_world_size = get_tensor_model_parallel_world_size()
     
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         pixel_values = torch.cat([item.pixel_values for item in items], dim=0).type(
             self.vision_tower.dtype
-        )
-        image_grid_thws = torch.concat([item.image_grid_thws for item in items], dim=0)
+        ).to(self.vision_tower.device)
+        image_grid_thws = torch.concat([item.image_grid_thws for item in items], dim=0).to(self.vision_tower.device)
         image_features = self.vision_tower(pixel_values, image_grid_thws)
-        image_features = self.multi_modal_projector(image_features)
-        return image_features
+        assert isinstance(image_features, list)
+        # lengths = [x.shape[0] for x in image_features]
+        res = self.multi_modal_projector(
+            torch.cat(image_features))#.split(lengths)
+        return res
     
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         # Get all special token IDs
@@ -182,6 +174,8 @@ class KimiVLForConditionalGeneration(nn.Module):
             positions=positions,
         )
 
+        return hidden_states
+
         if not get_embedding:
             return self.logits_processor(
                 input_ids, hidden_states, self.lm_head, forward_batch
@@ -192,8 +186,8 @@ class KimiVLForConditionalGeneration(nn.Module):
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         config = self.config.text_config
         _KEYS_TO_MODIFY_MAPPING = {
-            "language_model.lm_head": "lm_head",
-            "language_model.model": "language_model",
+            # "language_model.lm_head": "lm_head",
+            # "language_model.model": "language_model",
         }
         # only doing this for language model part for now.
         stacked_params_mapping = [
@@ -305,6 +299,7 @@ class KimiVLForConditionalGeneration(nn.Module):
                 weight_loader = getattr(param, "weight_loader",
                                         default_weight_loader)
                 weight_loader(param, loaded_weight, **kwargs)
+        self.language_model.post_load_weights()
 
 
 def get_spec_layer_idx_from_weight_name(config: DeepseekV2Config,

@@ -21,7 +21,7 @@ class KimiVLImageProcessor(SGLangBaseProcessor):
 
     def __init__(self, hf_config, server_args, _processor):
         super().__init__(hf_config, server_args, _processor)
-        self.IMAGE_TOKEN = "<|image_pad|>"
+        self.IMAGE_TOKEN = "<|media_pad|>"
         self.im_token_id = 163605
 
         self.im_start = "<|media_start|>"
@@ -48,19 +48,16 @@ class KimiVLImageProcessor(SGLangBaseProcessor):
         if isinstance(image_data, str):
             image_data = [image_data]
 
-        image_token = self.IMAGE_TOKEN
         base_output = self.load_mm_data(
             prompt=prompt,
             image_data=image_data,
-            multimodal_tokens=MultimodalSpecialTokens(image_token=image_token),
+            multimodal_tokens=MultimodalSpecialTokens(image_token=self.IMAGE_TOKEN),
             max_req_input_len=max_req_input_len,
         )
-
         ret = self.process_mm_data(
             input_text=base_output.input_text,
             images=base_output.images,
         )
-
         return {
             "input_ids": ret["input_ids"].flatten().tolist(),
             "mm_items": [
