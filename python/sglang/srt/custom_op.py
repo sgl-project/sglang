@@ -1,6 +1,7 @@
 from typing import Optional
 
 import torch
+from sglang.srt.layers.moe.fused_moe_native import fused_moe_forward_native
 from sglang.srt.utils import is_cuda, is_hip
 from torch import nn
 
