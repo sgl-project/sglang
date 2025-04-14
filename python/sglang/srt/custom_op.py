@@ -1,9 +1,10 @@
 from typing import Optional
 
 import torch
+from torch import nn
+
 from sglang.srt.layers.moe.fused_moe_native import fused_moe_forward_native
 from sglang.srt.utils import is_cuda, is_hip
-from torch import nn
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -61,7 +62,6 @@ class CustomOp(nn.Module):
 
 if _is_cuda:
     from sgl_kernel import sgl_per_tensor_quant_fp8, sgl_per_token_quant_fp8
-
 
     def scaled_fp8_quant(
         input: torch.Tensor,
