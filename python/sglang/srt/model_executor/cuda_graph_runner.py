@@ -22,7 +22,6 @@ from typing import TYPE_CHECKING, Callable
 
 import torch
 import tqdm
-
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.parallel_state import GroupCoordinator, graph_capture
@@ -45,19 +44,7 @@ if TYPE_CHECKING:
 def _to_torch(model: torch.nn.Module, reverse: bool, num_tokens: int):
     for sub in model._modules.values():
         if isinstance(sub, CustomOp):
-            if reverse:
-                sub._forward_method = sub.forward_cuda
-                setattr(sub, "is_torch_compile", False)
-            else:
-                # NOTE: Temporarily workaround MoE
-                if "FusedMoE" in sub.__class__.__name__:
-                    if num_tokens == 1:
-                        # The performance of torch.compile on this layer is not always good when bs > 1,
-                        # so we decide to only use torch.compile when bs =1
-                        sub._forward_method = fused_moe_forward_native
-                else:
-                    sub._forward_method = sub.forward_native
-                setattr(sub, "is_torch_compile", True)
+            sub.set_torch_compile_mode(reverse=reverse)
         if isinstance(sub, torch.nn.Module):
             _to_torch(sub, reverse, num_tokens)
 
@@ -141,7 +128,7 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
         bs
         for bs in capture_bs
         if bs <= model_runner.req_to_token_pool.size
-        and bs <= server_args.cuda_graph_max_bs
+           and bs <= server_args.cuda_graph_max_bs
     ]
     compile_bs = (
         [bs for bs in capture_bs if bs <= server_args.torch_compile_max_bs]

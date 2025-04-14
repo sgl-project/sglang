@@ -1,9 +1,8 @@
 from typing import Optional
 
 import torch
-from torch import nn
-
 from sglang.srt.utils import is_cuda, is_hip
+from torch import nn
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -13,6 +12,21 @@ class CustomOp(nn.Module):
     def __init__(self):
         super().__init__()
         self._forward_method = self.dispatch_forward()
+
+    def set_torch_compile_mode(self, reverse: bool):
+        if reverse:
+            sub._forward_method = sub.forward_cuda
+            setattr(sub, "is_torch_compile", False)
+        else:
+            # NOTE: Temporarily workaround MoE
+            if "FusedMoE" in sub.__class__.__name__:
+                if num_tokens == 1:
+                    # The performance of torch.compile on this layer is not always good when bs > 1,
+                    # so we decide to only use torch.compile when bs =1
+                    sub._forward_method = fused_moe_forward_native
+            else:
+                sub._forward_method = sub.forward_native
+            setattr(sub, "is_torch_compile", True)
 
     def forward(self, *args, **kwargs):
         return self._forward_method(*args, **kwargs)
@@ -46,6 +60,7 @@ class CustomOp(nn.Module):
 
 if _is_cuda:
     from sgl_kernel import sgl_per_tensor_quant_fp8, sgl_per_token_quant_fp8
+
 
     def scaled_fp8_quant(
         input: torch.Tensor,
