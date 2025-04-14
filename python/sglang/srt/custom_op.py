@@ -15,18 +15,18 @@ class CustomOp(nn.Module):
 
     def set_torch_compile_mode(self, reverse: bool):
         if reverse:
-            sub._forward_method = sub.forward_cuda
-            setattr(sub, "is_torch_compile", False)
+            self._forward_method = self.forward_cuda
+            setattr(self, "is_torch_compile", False)
         else:
             # NOTE: Temporarily workaround MoE
-            if "FusedMoE" in sub.__class__.__name__:
+            if "FusedMoE" in self.__class__.__name__:
                 if num_tokens == 1:
                     # The performance of torch.compile on this layer is not always good when bs > 1,
                     # so we decide to only use torch.compile when bs =1
-                    sub._forward_method = fused_moe_forward_native
+                    self._forward_method = fused_moe_forward_native
             else:
-                sub._forward_method = sub.forward_native
-            setattr(sub, "is_torch_compile", True)
+                self._forward_method = self.forward_native
+            setattr(self, "is_torch_compile", True)
 
     def forward(self, *args, **kwargs):
         return self._forward_method(*args, **kwargs)
