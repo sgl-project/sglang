@@ -91,10 +91,10 @@ set(SGL_KERNEL_CUDA_FLAGS
     "-O3"
     "-Xcompiler"
     "-fPIC"
-    "-gencode=arch=compute_75,code=sm_75"
-    "-gencode=arch=compute_80,code=sm_80"
+    # "-gencode=arch=compute_75,code=sm_75"
+    # "-gencode=arch=compute_80,code=sm_80"
     "-gencode=arch=compute_89,code=sm_89"
-    "-gencode=arch=compute_90,code=sm_90"
+    # "-gencode=arch=compute_90,code=sm_90"
     "-std=c++17"
     "-DFLASHINFER_ENABLE_F16"
     "-DCUTE_USE_PACKED_TUPLE=1"
@@ -130,10 +130,10 @@ else()
 endif()
 
 if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4" OR SGL_KERNEL_ENABLE_SM90A)
-    set(SGL_KERNEL_ENABLE_FA3 ON)
-    list(APPEND SGL_KERNEL_CUDA_FLAGS
-        "-gencode=arch=compute_90a,code=sm_90a"
-    )
+    # set(SGL_KERNEL_ENABLE_FA3 ON)
+    # list(APPEND SGL_KERNEL_CUDA_FLAGS
+    #     "-gencode=arch=compute_90a,code=sm_90a"
+    # )
 endif()
 
 if (SGL_KERNEL_ENABLE_BF16)
@@ -164,6 +164,7 @@ string(REPLACE "-D__CUDA_NO_HALF2_OPERATORS__"      "" CMAKE_CUDA_FLAGS "${CMAKE
 set(SOURCES
     "csrc/allreduce/custom_all_reduce.cu"
     "csrc/attention/cascade.cu"
+    "csrc/attention/merge_attn_states.cu"
     "csrc/attention/cutlass_mla_kernel.cu"
     "csrc/attention/lightning_attention_decode_kernel.cu"
     "csrc/elementwise/activation.cu"

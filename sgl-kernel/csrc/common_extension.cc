@@ -48,6 +48,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("merge_state(Tensor v_a, Tensor s_a, Tensor v_b, Tensor s_b, Tensor! v_merged, Tensor! s_merged) -> ()");
   m.impl("merge_state", torch::kCUDA, &merge_state);
   m.def(
+      "merge_attn_states(Tensor! output, Tensor!? output_lse, Tensor prefix_output, Tensor prefix_lse, Tensor "
+      "suffix_output, Tensor suffix_lse) -> ()");
+  m.impl("merge_attn_states", torch::kCUDA, &merge_attn_states);
+  m.def(
       "cutlass_mla_decode(Tensor! out, Tensor q_nope_and_q_pe, Tensor kv_c_and_k_pe_cache, Tensor seq_lens, Tensor "
       "page_table, Tensor workspace) -> ()");
   m.impl("cutlass_mla_decode", torch::kCUDA, &cutlass_mla_decode);
