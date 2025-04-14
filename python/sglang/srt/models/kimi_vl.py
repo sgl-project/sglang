@@ -135,8 +135,9 @@ class KimiVLForConditionalGeneration(nn.Module):
         self.multi_modal_projector = KimiVLMultiModalProjector(config=config)
 
         self.quant_config = quant_config
+        text_config = copy.deepcopy(config.text_config)
         self.language_model = DeepseekV2Model(
-            config=config.text_config,
+            config=text_config,
             quant_config=quant_config,
             prefix=add_prefix("language_model", prefix),
         )
