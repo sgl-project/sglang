@@ -1494,6 +1494,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
             or global_server_args_dict["attention_backend"] == "flashmla"
             or global_server_args_dict["attention_backend"] == "fa3"
+            or global_server_args_dict["attention_backend"] == "cutlass_mla"
         ):
             seq_lens_cpu = self.seq_lens.cpu()
         else:
