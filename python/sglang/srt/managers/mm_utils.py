@@ -16,9 +16,8 @@ from sglang.srt.managers.schedule_batch import (
     global_server_args_dict,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.utils import print_warning_once
-
-logger = logging.getLogger(__name__)
+from sglang.srt.utils import flatten_nested_list, print_warning_once
+from sglang.utils import logger
 
 
 class MultiModalityDataPaddingPattern:
@@ -192,7 +191,7 @@ def embed_mm_inputs(
     audio_data_embedding_func: Callable[
         [List[MultimodalDataItem]], torch.Tensor
     ] = None,
-    placeholder_tokens: dict[Modality, int] = None,
+    placeholder_tokens: dict[Modality, List[int]] = None,
 ) -> Optional[torch.Tensor]:
     """
     Calculate the multimodal embeddings if necessary, then scatter the result with the help of a boolean mask denoting the embed locations
@@ -214,9 +213,9 @@ def embed_mm_inputs(
 
     # if placeholder_tokens is specified
     if placeholder_tokens is not None:
-        placeholder_token_ids = [
-            placeholder_token for placeholder_token in placeholder_tokens.values()
-        ]
+        placeholder_token_ids = flatten_nested_list(
+            [placeholder_token for placeholder_token in placeholder_tokens.values()]
+        )
     else:
         placeholder_token_ids = [item.pad_value for item in mm_inputs.mm_items]
 
@@ -327,7 +326,7 @@ def general_mm_embed_routine(
     audio_data_embedding_func: Callable[
         [List[MultimodalDataItem]], torch.Tensor
     ] = None,
-    placeholder_tokens: dict[Modality, int] = None,
+    placeholder_tokens: dict[Modality, List[int]] = None,
     **kwargs,
 ) -> torch.Tensor:
     """
