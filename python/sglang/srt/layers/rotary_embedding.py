@@ -648,6 +648,14 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
     def forward_hip(self, *args, **kwargs):
         return self.forward_native(*args, **kwargs)
 
+    def forward(self, *args, **kwargs):
+        if torch._dynamo.is_compiling:
+            return self.forward_native(*args, **kwargs)
+        if _is_cuda_available:
+            return self.forward_cuda(*args, **kwargs)
+        else:
+            return self.forward_native(*args, **kwargs)
+
     def forward_native(
         self,
         positions: torch.Tensor,
