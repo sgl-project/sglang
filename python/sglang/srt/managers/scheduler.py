@@ -1416,7 +1416,8 @@ class Scheduler(
             x for x in self.waiting_queue if x not in set(can_run_list) and x not in self.aborted_reqs
         ]
         for req in self.waiting_queue:
-            req.output_ids = origin_output_ids[req.rid]
+            if req.rid in origin_output_ids:
+                req.output_ids = origin_output_ids[req.rid]
         if len(can_run_list) == 0:
             return None
         
