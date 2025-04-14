@@ -884,6 +884,8 @@ class KVTransferAck:
     dst_rank: Optional[int] = None
     # the error message, None means success
     error_message: Optional[str] = None
+    # the length of the kv cache
+    kv_cache_length: Optional[int] = None
 
 
 @dataclass

@@ -51,6 +51,8 @@ class KVTransferConfig(BaseModel):
     transfer_engine_metadata_server: str = None
     transfer_engine_rdma_device: str = "mlx5_0"
 
+    kv_cache_size_factor: int = 200
+
     @classmethod
     def from_cli(cls, cli_value: str) -> "KVTransferConfig":
         """Parse the CLI value for the kv cache transfer config."""

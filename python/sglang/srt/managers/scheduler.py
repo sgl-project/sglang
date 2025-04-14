@@ -399,6 +399,7 @@ class Scheduler(
                 self.model_config.num_hidden_layers,
                 self.tp_rank,
                 self.attn_tp_cpu_group,
+                server_args.kv_transfer_config.kv_cache_size_factor,
             )
             t = threading.Thread(target=self.kv_transfer_agent.event_loop, daemon=True)
             t.start()
