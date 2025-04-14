@@ -38,6 +38,7 @@ from sglang.srt.utils import (
     is_valid_ipv6_address,
     nullable_str,
 )
+from sglang.srt.layers.quantization import QUANTIZATION_METHODS
 
 logger = logging.getLogger(__name__)
 
@@ -492,21 +493,7 @@ class ServerArgs:
             "--quantization",
             type=str,
             default=ServerArgs.quantization,
-            choices=[
-                "awq",
-                "fp8",
-                "gptq",
-                "marlin",
-                "gptq_marlin",
-                "awq_marlin",
-                "bitsandbytes",
-                "gguf",
-                "modelopt",
-                "modelopt_fp4",
-                "w8a8_int8",
-                "w8a8_fp8",
-                "moe_wna16",
-            ],
+            choices=QUANTIZATION_METHODS.keys(),
             help="The quantization method.",
         )
         parser.add_argument(
