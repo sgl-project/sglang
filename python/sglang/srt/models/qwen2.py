@@ -105,7 +105,6 @@ class Qwen2Attention(nn.Module):
         rope_theta: float = 1000000,
         rope_scaling: Optional[Dict[str, Any]] = None,
         max_position_embeddings: int = 32768,
-        orig_context_len: int = 32768,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
@@ -212,9 +211,6 @@ class Qwen2DecoderLayer(nn.Module):
             rope_theta=rope_theta,
             rope_scaling=rope_scaling,
             max_position_embeddings=max_position_embeddings,
-            orig_context_len=getattr(
-                config, "orig_context_len", max_position_embeddings
-            ),
             quant_config=quant_config,
             prefix=add_prefix("self_attn", prefix),
         )
