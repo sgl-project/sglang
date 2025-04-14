@@ -5,7 +5,6 @@ import torch
 
 from sglang.srt.layers.quantization.fp8_kernel import (
     _enable_jit_deepgemm,
-    per_tensor_quant_fp8,
     per_token_group_quant_fp8,
     static_quant_fp8,
     w8a8_block_fp8_matmul,
@@ -214,7 +213,11 @@ def block_quant_to_tensor_quant(
         for j in range(n_tiles):
             x_dq_block_tiles[j][i][:, :] = x_dq_block_tiles[j][i] * x_s[j][i]
 
-    x_q_tensor, scale = per_tensor_quant_fp8(x_dq_block, dtype=x_q_block.dtype)
+    x_q_tensor, scale = (
+        sgl_scaled_fp8_quant(x_dq_block)
+        if _is_cuda
+        else input_to_float8(x_dq_block, dtype=x_q_block.dtype)
+    )
     return x_q_tensor, scale
 
 
@@ -223,7 +226,11 @@ def channel_quant_to_tensor_quant(
     x_s: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     x_dq_channel = x_q_channel.to(torch.float32) * x_s
-    x_q_tensor, scale = per_tensor_quant_fp8(x_dq_channel, dtype=x_q_channel.dtype)
+    x_q_tensor, scale = (
+        sgl_scaled_fp8_quant(x_dq_channel)
+        if _is_cuda
+        else input_to_float8(x_dq_channel, dtype=x_q_channel.dtype)
+    )
     return x_q_tensor, scale
 
 
