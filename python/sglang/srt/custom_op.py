@@ -13,7 +13,7 @@ class CustomOp(nn.Module):
         super().__init__()
         self._forward_method = self.dispatch_forward()
 
-    def enter_torch_compile(self):
+    def enter_torch_compile(self, num_tokens: int):
         # NOTE: Temporarily workaround MoE
         if "FusedMoE" in self.__class__.__name__:
             if num_tokens == 1:

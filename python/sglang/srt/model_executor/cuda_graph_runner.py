@@ -47,7 +47,7 @@ def _to_torch(model: torch.nn.Module, reverse: bool, num_tokens: int):
             if reverse:
                 sub.leave_torch_compile()
             else:
-                sub.enter_torch_compile()
+                sub.enter_torch_compile(num_tokens=num_tokens)
         if isinstance(sub, torch.nn.Module):
             _to_torch(sub, reverse, num_tokens)
 
