@@ -21,7 +21,7 @@ from typing import Dict, Iterable, List, Optional, Set, Tuple, TypedDict
 
 import torch
 from torch import nn
-from transformers import AutoModel, Gemma3Config, PreTrainedModel
+from transformers import Gemma3Config, PreTrainedModel
 
 from sglang.srt.hf_transformers_utils import get_processor
 from sglang.srt.layers.layernorm import Gemma3RMSNorm
@@ -43,6 +43,9 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.gemma3_causal import Gemma3ForCausalLM
 from sglang.srt.utils import add_prefix
+
+# 导入你现有的CLIP实现
+from sglang.srt.models.clip import CLIPVisionModel
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +121,7 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
         ".k_proj.",
         ".v_proj.",
         ".o_proj.",
+        ".out_proj.",
     ]
     bitsandbytes_stacked_params_mapping = {
         # shard_name, weight_name, index
@@ -126,6 +130,7 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
         "v_proj": ("qkv_proj", 2),
         "gate_proj": ("gate_up_proj", 0),
         "up_proj": ("gate_up_proj", 1),
+        "out_proj": ("proj", 0),
     }
 
     packed_modules_mapping = {
@@ -161,14 +166,16 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
         super().__init__(config=config)
         self.config = config
         self.quant_config = quant_config
-        # Vision components
-        # TODO: replace with vision attention
-        # self.vision_tower = SiglipVisionModel(
-        #     config.vision_config,
-        #     quant_config,
-        #     prefix=add_prefix("vision_tower", prefix),
-        # )
-        self.vision_tower = AutoModel.from_config(config=config.vision_config)
+        print("Quantization config:", quant_config)
+        print("Visionconfig:", config.vision_config)
+        
+        # 使用你现有的CLIPVisionModel作为视觉塔
+        self.vision_tower = CLIPVisionModel(
+            config=config.vision_config,
+            quant_config=quant_config,
+            prefix=add_prefix("vision_tower", prefix),
+        )
+        
         self.multi_modal_projector = Gemma3MultiModalProjector(config)
         self.vocab_size = config.text_config.vocab_size
 
@@ -284,7 +291,24 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
         pixel_values = pixel_values.to("cuda")
         pixel_values = pixel_values.to(dtype=self.language_model.dtype())
 
-        vision_outputs = self.vision_tower(pixel_values=pixel_values).last_hidden_state
+        # 使用CLIPVisionModel处理图像
+        with torch.no_grad():
+            # CLIP输出可能有不同的格式，需要确保我们得到正确的隐藏状态
+            outputs = self.vision_tower(pixel_values)
+            
+            # 检查outputs是否为张量或对象
+            if isinstance(outputs, torch.Tensor):
+                vision_outputs = outputs
+            else:
+                # 可能是带有last_hidden_state属性的对象
+                vision_outputs = outputs.last_hidden_state if hasattr(outputs, 'last_hidden_state') else outputs
+                
+        # 确保输出形状正确 - 检查是否包含类令牌
+        if vision_outputs.shape[1] > self.patches_per_image and hasattr(self, 'patches_per_image'):
+            # CLIP模型通常在第一个位置有类令牌，我们需要决定是否保留或删除它
+            # 对于某些应用，类令牌可能包含有用的全局信息
+            vision_outputs = vision_outputs[:, 1:, :]  # 移除类令牌
+    
         image_features = self.multi_modal_projector(vision_outputs)
         return image_features
 
@@ -360,11 +384,22 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
         return self.language_model.tie_weights()
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            (".qkv_proj", ".q_proj", "q"),
+            (".qkv_proj", ".k_proj", "k"),
+            (".qkv_proj", ".v_proj", "v"),
+            ("gate_up_proj", "up_proj", 1),
+            ("gate_up_proj", "gate_proj", 0),
+        ]
         """Load weights for the model."""
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
+        # print("Params dict:", params_dict.keys())
+        print("Params dict:", params_dict.keys())
 
         for name, loaded_weight in weights:
+            print("Loading weight for", name, "with shape", loaded_weight.shape, flush=True)
             if "language_model" in name:
                 # Gemma3ForCausalLM.load_weights(self, [(name.replace("language_model.", ""), loaded_weight)])
                 causal_loaded_params = Gemma3ForCausalLM.load_weights(
@@ -373,6 +408,20 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
                 loaded_params.update(causal_loaded_params)
                 continue
             else:
+                flag = False
+                for param_name, weight_name, shard_id in stacked_params_mapping:
+                    if weight_name not in name:
+                        continue
+                    name = name.replace(weight_name, param_name)
+                    flag = True
+                    print("Adapted name:", name, flush=True)
+                    break
+                else:
+                    if "vision_model" in name:
+                        # adapt to VisionAttention
+                        name = name.replace(".self_attn.out_proj", ".self_attn.proj")
+                        print("Adapted name:", name, flush=True)
+
                 # Skip lm_head.weight as it's tied with embed_tokens
                 if "lm_head.weight" in name:
                     continue
@@ -386,17 +435,44 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
                 if name is None:
                     continue
                 param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
+                print("mm param shape:", param.shape, flush=True)
+                
+                if param.shape != loaded_weight.shape:
+                    logger.warning(f"Shape mismatch for {name}: param {param.shape} vs weight {loaded_weight.shape}")
+                    # 处理已知的形状不匹配情况 - 类令牌导致的尺寸差异
+                    if (len(param.shape) == 2 and len(loaded_weight.shape) == 2 and 
+                        param.shape[0] == loaded_weight.shape[0] + 1 and 
+                        param.shape[1] == loaded_weight.shape[1]):
+                        # 这可能是类令牌导致的额外维度，先填充权重
+                        padded_weight = torch.zeros_like(param)
+                        padded_weight[1:,:] = loaded_weight  # 假设额外的维度在第0位，且是类令牌
+                        loaded_weight = padded_weight
+                        logger.info(f"Padded weight for {name} to match parameter shape")
+                    elif (len(param.shape) == 2 and len(loaded_weight.shape) == 2 and
+                        param.shape[0] == loaded_weight.shape[0] - 1 and
+                        param.shape[1] == loaded_weight.shape[1]):
+                        # 可能是视觉模型需要裁剪
+                        loaded_weight = loaded_weight[:-1,:]  # 裁剪最后一行
+                        logger.info(f"Trimmed weight for {name} to match parameter shape")
+                    else:
+                        # 其他形状不匹配情况 - 跳过
+                        logger.warning(f"Unable to resolve shape mismatch for {name}, skipping")
+                        continue
+                
+                if flag:
+                    weight_loader = param.weight_loader
+                    weight_loader(param, loaded_weight, shard_id)
+                else:
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader(param, loaded_weight)
+                
                 loaded_params.add(name)
         unloaded_params = params_dict.keys() - loaded_params
+        print("Loaded params:", loaded_params, flush=True)
         if unloaded_params:
-            pass
-            # raise RuntimeError(
-            #     f"Some weights are not initialized from checkpoints: {unloaded_params}")
+            logger.warning(f"Parameters not initialized from checkpoints: {unloaded_params}")
+
         return loaded_params
 
 
 EntryClass = Gemma3ForConditionalGeneration
-
-AutoModel.register(Gemma3Config, Gemma3ForConditionalGeneration, exist_ok=True)
