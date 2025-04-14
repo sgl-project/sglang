@@ -839,3 +839,69 @@ def w8a8_block_fp8_matmul(
         )
 
     return C
+
+
+@triton.jit
+def _per_tensor_quant_fp8(
+    x_ptr,
+    x_min_ptr,
+    x_max_ptr,
+    x_s_ptr,
+    x_q_ptr,
+    numel,
+    eps,
+    fp8_min,
+    fp8_max,
+    BLOCK_SIZE: tl.constexpr,
+):
+    g_id = tl.program_id(0)
+    offset = tl.arange(0, BLOCK_SIZE) + g_id * BLOCK_SIZE
+    mask = offset < numel
+
+    _xmin = tl.load(x_min_ptr).to(tl.float32)
+    _xmax = tl.load(x_max_ptr).to(tl.float32)
+    _absmax = tl.maximum(tl.maximum(tl.abs(_xmin), tl.abs(_xmax)), eps)
+    x_s_inv = fp8_max / _absmax
+
+    x = tl.load(x_ptr + offset, mask=mask, other=0.0).to(tl.float32)
+    x_q = tl.clamp(x * x_s_inv, fp8_min, fp8_max).to(x_q_ptr.dtype.element_ty)
+    tl.store(x_q_ptr + offset, x_q, mask=mask)
+
+    if g_id == 0:
+        tl.store(x_s_ptr, 1.0 / x_s_inv)
+
+
+def per_tensor_quant_fp8(
+    x: torch.Tensor, eps: float = 1e-12, dtype: torch.dtype = torch.float8_e4m3fn
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """This function quantizes input values to float8 values with tensor-wise quantization."""
+    assert x.is_contiguous(), "`x` is not contiguous"
+
+    finfo = torch.finfo(dtype)
+    fp8_max = finfo.max
+    if _is_hip:
+        dtype = torch.float8_e4m3fnuz
+        fp8_max = 224.0
+
+    x_q = torch.empty_like(x, dtype=dtype)
+    x_s = x.new_empty((1,), dtype=torch.float32)
+
+    BLOCK_SIZE = 1024
+    N = x.numel()
+    grid = (triton.cdiv(N, BLOCK_SIZE),)
+
+    min_val, max_val = x.aminmax()
+    _per_tensor_quant_fp8[grid](
+        x,
+        min_val,
+        max_val,
+        x_s,
+        x_q,
+        N,
+        eps,
+        -fp8_max,
+        fp8_max,
+        BLOCK_SIZE,
+    )
+
+    return x_q, x_s

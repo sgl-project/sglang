@@ -7,10 +7,12 @@ import torch
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
 from sglang.srt.layers.quantization.fp8_kernel import (
+    per_tensor_quant_fp8,
     per_token_group_quant_fp8,
     static_quant_fp8,
     w8a8_block_fp8_matmul,
 )
+from sglang.srt.layers.quantization.fp8_utils import input_to_float8
 from sglang.test.test_utils import CustomTestCase
 
 _is_cuda = torch.cuda.is_available() and torch.version.cuda
@@ -153,6 +155,50 @@ class TestStaticQuantFP8(CustomTestCase):
                 seed=params[3],
             ):
                 self._static_quant_fp8(*params)
+
+
+class TestPerTensorQuantFP8(CustomTestCase):
+    DTYPES = [torch.half, torch.bfloat16, torch.float32]
+    NUM_TOKENS = [7, 83, 2048]
+    D = [512, 4096, 5120, 13824]
+    SEEDS = [0]
+
+    @classmethod
+    def setUpClass(cls):
+        if not torch.cuda.is_available():
+            raise unittest.SkipTest("CUDA is not available")
+        torch.set_default_device("cuda")
+
+    def _per_tensor_quant_fp8(self, num_tokens, d, dtype, seed):
+        torch.manual_seed(seed)
+
+        x = torch.rand(num_tokens, d, dtype=dtype)
+
+        with torch.inference_mode():
+            ref_out, ref_s = input_to_float8(x)
+            out, out_s = per_tensor_quant_fp8(x)
+
+        self.assertTrue(
+            torch.allclose(out.to(torch.float32), ref_out.to(torch.float32), rtol=0.50)
+        )
+        self.assertTrue(
+            torch.allclose(out_s.to(torch.float32), ref_s.to(torch.float32))
+        )
+
+    def test_per_tensor_quant_fp8(self):
+        for params in itertools.product(
+            self.NUM_TOKENS,
+            self.D,
+            self.DTYPES,
+            self.SEEDS,
+        ):
+            with self.subTest(
+                num_tokens=params[0],
+                d=params[1],
+                dtype=params[2],
+                seed=params[3],
+            ):
+                self._per_tensor_quant_fp8(*params)
 
 
 # For test

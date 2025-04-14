@@ -168,13 +168,13 @@ def input_to_float8(
     """This function quantizes input values to float8 values with tensor-wise quantization."""
     finfo = torch.finfo(dtype)
     min_val, max_val = x.aminmax()
-    amax = torch.maximum(min_val.abs(), max_val.abs()).clamp(min=1e-12)
+    amax = torch.maximum(min_val.abs(), max_val.abs()).float().clamp(min=1e-12)
     fp8_max = finfo.max
     if _is_hip:
         dtype = torch.float8_e4m3fnuz
         fp8_max = 224.0
     scale = fp8_max / amax
-    x_scl_sat = (x * scale).clamp(min=-fp8_max, max=fp8_max)
+    x_scl_sat = (x.float() * scale).clamp(min=-fp8_max, max=fp8_max)
     return x_scl_sat.to(dtype).contiguous(), scale.float().reciprocal()
 
 
