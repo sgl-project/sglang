@@ -763,6 +763,13 @@ class Fp8MoEMethod:
                 layer.w2_weight.data = shuffle_weight(
                     layer.w2_weight.contiguous(), (16, 16)
                 )
+
+            if all(w.device.type == "cpu" for w in [layer.w13_weight, layer.w2_weight]):
+                assert (
+                    cpu_has_amx_support()
+                ), "Fp8MoEMethod on CPU requires that CPU has AMX support"
+                _process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
+
             return
 
         # If checkpoint is fp16 or bfloat16, quantize in place.
@@ -972,6 +979,27 @@ class Fp8MoEMethod:
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
         from sglang.srt.layers.moe.topk import select_experts
+
+        if layer.use_intel_amx_backend:
+            # TODO: switch to FP8 fused moe kernel when it's ready
+            return moe_forward_native(
+                layer,
+                x,
+                use_grouped_topk,
+                top_k,
+                router_logits,
+                renormalize,
+                topk_group,
+                num_expert_group,
+                custom_routing_function,
+                correction_bias,
+                activation,
+                apply_router_weight_on_input,
+                inplace,
+                no_combine,
+                routed_scaling_factor,
+                self.quant_config.weight_block_size,
+            )
 
         # Expert selection
         topk_weights, topk_ids = select_experts(
