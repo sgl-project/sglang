@@ -15,8 +15,6 @@ class CustomOp(nn.Module):
         self._forward_method = self.dispatch_forward()
 
     def forward(self, *args, **kwargs):
-        if torch._dynamo.is_compiling:
-            return self.forward_native(*args, **kwargs)
         return self._forward_method(*args, **kwargs)
 
     def forward_native(self, *args, **kwargs):
