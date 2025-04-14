@@ -229,9 +229,8 @@ class MooncakeKVManager(BaseKVManager):
                 room = waiting_req_bytes[2].decode("ascii")
                 if room == "None":
                     continue
-                self.transfer_infos[int(room)] = TransferInfo.from_zmq(
-                    waiting_req_bytes
-                )
+                room = int(room)
+                self.transfer_infos[room] = TransferInfo.from_zmq(waiting_req_bytes)
 
                 # NOTE: after bootstrapping we can mark the req as waiting for input
                 assert self.request_status[room] == KVPoll.Bootstrapping
