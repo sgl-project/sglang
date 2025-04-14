@@ -44,7 +44,10 @@ if TYPE_CHECKING:
 def _to_torch(model: torch.nn.Module, reverse: bool, num_tokens: int):
     for sub in model._modules.values():
         if isinstance(sub, CustomOp):
-            sub.set_torch_compile_mode(reverse=reverse)
+            if reverse:
+                sub.leave_torch_compile()
+            else:
+                sub.enter_torch_compile()
         if isinstance(sub, torch.nn.Module):
             _to_torch(sub, reverse, num_tokens)
 

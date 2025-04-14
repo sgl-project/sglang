@@ -13,20 +13,20 @@ class CustomOp(nn.Module):
         super().__init__()
         self._forward_method = self.dispatch_forward()
 
-    def set_torch_compile_mode(self, reverse: bool):
-        if reverse:
-            self._forward_method = self.forward_cuda
-            self.is_torch_compile = False
+    def enter_torch_compile(self):
+        # NOTE: Temporarily workaround MoE
+        if "FusedMoE" in self.__class__.__name__:
+            if num_tokens == 1:
+                # The performance of torch.compile on this layer is not always good when bs > 1,
+                # so we decide to only use torch.compile when bs =1
+                self._forward_method = fused_moe_forward_native
         else:
-            # NOTE: Temporarily workaround MoE
-            if "FusedMoE" in self.__class__.__name__:
-                if num_tokens == 1:
-                    # The performance of torch.compile on this layer is not always good when bs > 1,
-                    # so we decide to only use torch.compile when bs =1
-                    self._forward_method = fused_moe_forward_native
-            else:
-                self._forward_method = self.forward_native
-            self.is_torch_compile = True
+            self._forward_method = self.forward_native
+        self.is_torch_compile = True
+
+    def leave_torch_compile(self):
+        self._forward_method = self.forward_cuda
+        self.is_torch_compile = False
 
     def forward(self, *args, **kwargs):
         return self._forward_method(*args, **kwargs)
