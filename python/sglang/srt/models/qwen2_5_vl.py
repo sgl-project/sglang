@@ -492,7 +492,6 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
 
         pattern = MultiModalityDataPaddingPatternImageTokens(torch.tensor(im_token_id))
         return pattern.pad_input_tokens(input_ids, mm_inputs)
-        # return input_ids
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         # in qwen-vl, last dim is the same

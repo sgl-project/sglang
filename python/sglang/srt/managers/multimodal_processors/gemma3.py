@@ -1,7 +1,5 @@
 from typing import List, Union
 
-from transformers.utils import logging
-
 from sglang.srt.managers.multimodal_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
@@ -11,9 +9,9 @@ from sglang.srt.managers.multimodal_processors.base_processor import (
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.models.gemma3_mm import Gemma3ForConditionalGeneration
 
+
 # Copied from: https://github.com/huggingface/transformers/blob/main/src/transformers/models/gemma3/image_processing_gemma3_fast.py
 # will be removed in the future
-logger = logging.get_logger(__name__)
 
 
 class Gemma3SGLangImageProcessor(SGLangBaseProcessor):
@@ -28,7 +26,8 @@ class Gemma3SGLangImageProcessor(SGLangBaseProcessor):
     async def process_mm_data_async(
         self,
         image_data: List[Union[str, bytes]],
-        input_ids,
+        audio_data: List[Union[str, bytes]],
+        input_text,
         request_obj,
         max_req_input_len,
         *args,
@@ -41,7 +40,7 @@ class Gemma3SGLangImageProcessor(SGLangBaseProcessor):
 
         image_token = self.IMAGE_TOKEN
         base_output = self.load_mm_data(
-            prompt=input_ids,
+            prompt=input_text,
             image_data=image_data,
             multimodal_tokens=MultimodalSpecialTokens(image_token=image_token),
             max_req_input_len=max_req_input_len,
