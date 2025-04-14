@@ -226,9 +226,14 @@ class SchedulerDisaggregationPrefillMixin:
             elif poll == KVPoll.Failed:
                 raise Exception("Transferring failed")
 
+        for req in done_reqs:
+            self.disagg_prefill_pending_queue.req_to_metadata_buffer_idx_allocator.free(
+                req.metadata_buffer_index
+            )
+            
         # Stream requests which have finished transfer
         self.stream_output(done_reqs, False, None)
-
+        
         self.disagg_prefill_inflight_queue = undone_reqs
 
     def process_prefill_chunk(self: Scheduler) -> None:
