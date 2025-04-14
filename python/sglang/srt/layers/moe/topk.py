@@ -18,7 +18,6 @@ from typing import Callable, Optional
 
 import torch
 import torch.nn.functional as F
-from sgl_kernel import moe_fused_gate
 
 from sglang.srt.managers.expert_distribution import ExpertDistributionRecorder
 from sglang.srt.managers.schedule_batch import global_server_args_dict
@@ -27,6 +26,8 @@ from sglang.srt.utils import get_compiler_backend, is_cuda, is_hip
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 
+if _is_cuda:
+    from sgl_kernel import moe_fused_gate
 
 expert_distribution_recorder = ExpertDistributionRecorder()
 
@@ -227,7 +228,11 @@ def biased_grouped_topk(
     n_share_experts_fusion: int = 0,
 ):
     # TODO: moe_fused_gate kernel is not supported for n_share_experts_fusion > 0 now.
-    if n_share_experts_fusion == 0 and is_power_of_two(correction_bias.shape[0]):
+    if (
+        _is_cuda
+        and n_share_experts_fusion == 0
+        and is_power_of_two(correction_bias.shape[0])
+    ):
         return moe_fused_gate(
             gating_output,
             correction_bias,
