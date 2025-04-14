@@ -306,7 +306,7 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
         self,
         image_data: List[Union[str, bytes]],
         audio_data: List[Union[str, bytes]],
-        prompt,
+        input_text,
         request_obj,
         max_req_input_len,
         *args,
@@ -317,7 +317,7 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
 
         image_token = self.IMAGE_TOKEN
         base_output = self.load_mm_data(
-            prompt=prompt,
+            prompt=input_text,
             image_data=image_data,
             multimodal_tokens=MultimodalSpecialTokens(image_token=image_token),
             max_req_input_len=max_req_input_len,

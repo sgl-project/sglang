@@ -419,11 +419,11 @@ class TokenizerManager:
             input_ids = self.tokenizer.encode(input_text)
 
         image_inputs: Dict = await self.mm_processor.process_mm_data_async(
-            obj.image_data,
-            obj.audio_data,
-            input_text or input_ids,
-            obj,
-            self.max_req_input_len,
+            image_data=obj.image_data,
+            audio_data=obj.audio_data,
+            input_text=input_text or input_ids,
+            request_obj=obj,
+            max_req_input_len=self.max_req_input_len,
         )
         if image_inputs and "input_ids" in image_inputs:
             input_ids = image_inputs["input_ids"]
@@ -1062,8 +1062,8 @@ class TokenizerManager:
             elif isinstance(recv_obj, BatchTokenIDOut):
                 if self.server_args.stream_output and state.obj.stream:
                     output_token_ids = recv_obj.output_ids[i][
-                        state.last_output_offset :
-                    ]
+                                       state.last_output_offset:
+                                       ]
                     state.last_output_offset = len(recv_obj.output_ids[i])
                 else:
                     output_token_ids = recv_obj.output_ids[i]

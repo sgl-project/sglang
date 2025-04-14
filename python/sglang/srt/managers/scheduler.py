@@ -373,8 +373,8 @@ class Scheduler(
             1.0,
         )
         self.new_token_ratio_decay = (
-                                         self.init_new_token_ratio - self.min_new_token_ratio
-                                     ) / global_config.default_new_token_ratio_decay_steps
+            self.init_new_token_ratio - self.min_new_token_ratio
+        ) / global_config.default_new_token_ratio_decay_steps
         self.new_token_ratio = self.init_new_token_ratio
 
         # Init watchdog thread
@@ -1204,14 +1204,13 @@ class Scheduler(
 
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
-            print(f"waiting {req=}")
             if (
                 self.lora_paths
                 and len(
-                lora_set
-                | set([req.lora_path for req in adder.can_run_list])
-                | set([req.lora_path])
-            )
+                    lora_set
+                    | set([req.lora_path for req in adder.can_run_list])
+                    | set([req.lora_path])
+                )
                 > self.max_loras_per_batch
             ):
                 self.running_batch.batch_is_full = True
@@ -1229,7 +1228,6 @@ class Scheduler(
             res = adder.add_one_req(
                 req, self.chunked_req, self.enable_hierarchical_cache
             )
-            print(f"{adder.can_run_list=}")
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
                     if self.enable_hierarchical_cache:
@@ -1237,9 +1235,9 @@ class Scheduler(
                         self.running_batch.batch_is_full = len(
                             adder.can_run_list
                         ) > 0 or (
-                                                               self.running_batch is not None
-                                                               and not self.running_batch.is_empty()
-                                                           )
+                            self.running_batch is not None
+                            and not self.running_batch.is_empty()
+                        )
                     else:
                         self.running_batch.batch_is_full = True
                 break
@@ -1284,8 +1282,6 @@ class Scheduler(
             self.server_args.enable_custom_logit_processor,
         )
         new_batch.prepare_for_extend()
-
-        print(f"{new_batch=}")
 
         # Mixed-style chunked prefill
         if (
@@ -1473,8 +1469,8 @@ class Scheduler(
                     # We should have at least 1 token for sample in every case.
                     max(extend_len - logprob_start_len, 1)
                     for logprob_start_len, extend_len in zip(
-                    local_batch.extend_logprob_start_lens, local_batch.extend_lens
-                )
+                        local_batch.extend_logprob_start_lens, local_batch.extend_lens
+                    )
                 ]
             )
 

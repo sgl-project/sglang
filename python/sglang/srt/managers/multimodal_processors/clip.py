@@ -15,7 +15,12 @@ class ClipImageProcessor(BaseMultimodalProcessor):
         super().__init__(hf_config, server_args, _processor)
 
     async def process_mm_data_async(
-        self, image_data: List[Union[str, bytes]], input_text, *args, **kwargs
+        self,
+        image_data: List[Union[str, bytes]],
+        audio_data: List[Union[str, bytes]],
+        input_text,
+        *args,
+        **kwargs
     ):
         if not image_data:
             return None

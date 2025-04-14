@@ -17,7 +17,8 @@ class JanusProImageProcessor(BaseMultimodalProcessor):
     async def process_mm_data_async(
         self,
         image_data: List[Union[str, bytes]],
-        input_ids,
+        audio_data: List[Union[str, bytes]],
+        input_text,
         request_obj,
         max_req_input_len,
         **kwargs,
@@ -31,7 +32,7 @@ class JanusProImageProcessor(BaseMultimodalProcessor):
         processor = self._processor
 
         base_out = self.load_mm_data(
-            prompt=input_ids,
+            prompt=input_text,
             image_data=image_data,
             multimodal_tokens=MultimodalSpecialTokens(
                 image_token=processor.image_token

@@ -311,8 +311,6 @@ class MultimodalInputs:
         assert isinstance(ret.mm_items, list)
         ret.mm_items = [item for item in ret.mm_items if item.is_valid()]
 
-        # assert len(ret.mm_items) != 0
-
         for item in ret.mm_items:
             item.set_pad_value()
 
