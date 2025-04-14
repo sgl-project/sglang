@@ -104,7 +104,7 @@ def create_causal_mask_from_page_triton(
     cu_kv_lens_ptr,  # [bs + 1]
     prefix_lens_ptr,  # [bs + 1]
     stride_mask_qo,
-    max_kv_len_per_req: tl.constexpr,
+    max_kv_len_per_req: tl.constexpr,  # must be static
 ):
     """Each program handles a row of qo"""
     pid_qo = tl.program_id(axis=0)

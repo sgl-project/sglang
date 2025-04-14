@@ -99,9 +99,13 @@ class FlashInferAttnBackend(AttentionBackend):
         self.kv_cache_dtype_str = model_runner.server_args.kv_cache_dtype
 
         self.enable_pd_colocation = enable_pd_colocation
-        # track this for 2D mask fill kernel to avoid recompilation
+
+        # track these for 2D mask fill kernel to avoid recompilation
         # TODO(Wenxuan) shrink down to avoid outliers?
         self.max_req_input_len = 0
+        self.max_cu_qo_len = 0
+        self.max_cu_kv_len = 0
+        self.mask_p = None
         if enable_pd_colocation:
             assert (
                 not self.is_multimodal
@@ -471,6 +475,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 ]
                 q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
                 bs = forward_batch.req_pool_indices.shape[0]
+                bs_p = bs - forward_batch.num_decode_reqs
                 # Fetch prefill kv cache from the pool
                 k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
                     layer.layer_id
@@ -478,78 +483,59 @@ class FlashInferAttnBackend(AttentionBackend):
                 kv_indices_p = self.forward_metadata.prefill_kv_indices
                 kv_indptr_p = self.forward_metadata.prefill_kv_indptr
                 qo_indptr_p = self.forward_metadata.prefill_qo_indptr
+                max_cu_qo_len = qo_indptr_p[-1]
+                max_cu_kv_len = kv_indptr_p[-1]
                 kv_pool_indices_p = kv_indices_p[: kv_indptr_p[-1]]
-
                 # TODO(Wenxuan) Handle last_page_len for page size > 1 here
-                num_prefill_reqs = bs - self.forward_metadata.num_decode_reqs
+
                 k_cache_p = k_cache[
                     kv_pool_indices_p
                 ]  # TODO(Wenxuan) de-duplicate the kv cache when reqs share prefix?
                 v_cache_p = v_cache[kv_pool_indices_p]
                 q_p = q[: qo_indptr_p[-1]]
                 q_d = q[qo_indptr_p[-1] :]
-                mask_p = torch.zeros(
-                    qo_indptr_p[-1], kv_indptr_p[-1], device=q.device, dtype=torch.bool
-                )
-                # mask_for_loop = mask_p.clone()
-                # del (self.forward_metadata.prefill_kv_indices,
-                #     self.forward_metadata.prefill_kv_indptr,
-                #     self.forward_metadata.prefill_qo_indptr)
-                # TODO(Wenxuan) debug this
                 max_kv_len = forward_batch.seq_lens.max()
+
                 if self.max_req_input_len < max_kv_len * 2:
                     max_kv_len = next_power_of_2(max_kv_len.item())
                     if max_kv_len > self.max_req_input_len:
                         self.max_req_input_len = max_kv_len
+
+                if (
+                    self.max_cu_qo_len < max_cu_qo_len
+                    or self.max_cu_kv_len < max_cu_kv_len
+                ):
+                    self.mask_p = torch.zeros(
+                        max_cu_qo_len, max_cu_kv_len, dtype=torch.bool, device=q.device
+                    )
+                    if self.max_cu_qo_len < max_cu_qo_len:
+                        self.max_cu_qo_len = max_cu_qo_len
+                    if self.max_cu_kv_len < max_cu_kv_len:
+                        self.max_cu_kv_len = max_cu_kv_len
                 # launch bs times more blocks, because we can't pass in bs
                 # as constexpr, or any change in bs triggers recompilation
-                # import socket
-                # from remote_pdb import RemotePdb
-
-                # def find_unused_port():
-                #     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                #         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                #         s.bind(("localhost", 0))  # Let the OS pick an ephemeral port.
-                #         return s.getsockname()[1]
-
-                # port = find_unused_port()
-                # print(f"Using port: {port}")
-                # RemotePdb(host='localhost', port=port).set_trace()
-                create_causal_mask_from_page_triton[(qo_indptr_p[-1], bs)](
-                    mask_p,
+                create_causal_mask_from_page_triton[(max_cu_qo_len, bs_p)](
+                    self.mask_p,
                     qo_indptr_p,
                     kv_indptr_p,
                     forward_batch.extend_prefix_lens,
-                    stride_mask_qo=mask_p.stride(0),
+                    stride_mask_qo=self.mask_p.stride(0),
                     # max_kv_len_per_req=next_power_of_2(forward_batch.max_req_input_len),
                     max_kv_len_per_req=self.max_req_input_len,
                 )
 
-                # for i in range(num_prefill_reqs):
-                #     q_start = qo_indptr_p[i]
-                #     q_end = qo_indptr_p[i + 1]
-                #     kv_start = kv_indptr_p[i]
-                #     kv_end = kv_indptr_p[i + 1]
-                #     for j in range(q_start, q_end):
-                #         submask = torch.arange(
-                #             kv_start, kv_end, device=q.device, dtype=torch.int32
-                #         )
-                #         mask_for_loop[j][kv_start:kv_end] = submask < (
-                #             j + forward_batch.extend_prefix_lens[i]
-                #         )
-                # if not (mask_for_loop == mask_p).all():
                 o_p, o_d = pod_wrapper.run(
                     q_p,
                     k_cache_p,
                     v_cache_p,
                     q_d,
                     paged_kv_cache_d=(k_cache, v_cache),
-                    custom_mask_p=mask_p,
+                    custom_mask_p=self.mask_p,
                     causal_d=True,
                     causal_p=True,
+                    # TODO
                     # logits_soft_cap_p=layer.logit_cap,
                     # logits_soft_cap_d=layer.logit_cap,
-                    # TODO
                     # window_left_p=layer.sliding_window_size,
                     # window_left_d=layer.sliding_window_size,
                     # sm_scale_p=layer.scaling,
