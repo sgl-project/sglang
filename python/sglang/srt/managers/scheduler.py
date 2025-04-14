@@ -898,7 +898,7 @@ class Scheduler(
                 req.output_ids = recv_req.output_ids
                 req.pd_step = PDStep.DECODE
 
-                logger.debug(f"[Scheduler] Prefilled request {req.rid} received")
+                logger.debug(f"[Scheduler] Prefilled request {req.rid} received, output_ids: {req.output_ids}")
 
             if (
                 recv_req.session_params is not None

@@ -283,7 +283,7 @@ class KVTransferAgent:
             return
         if self.attn_tp_rank != 0:
             return
-        logger.debug(f"[KVTransferAgent] Dispatch prefilled request {req.rid}")
+        logger.debug(f"[KVTransferAgent] Dispatch prefilled request {req.rid}, output_ids: {req.output_ids}")
         self.send_to_pd_disagg_controller.send_pyobj(PrefilledReqInput(
             rid=req.rid,
             mm_inputs=None,
@@ -301,7 +301,7 @@ class KVTransferAgent:
             kv_cache_length=req.kv_cache_length,
         ))
         logger.debug(
-            f"[KVTransferAgent] Dispatched prefilled request {req.rid}")
+            f"[KVTransferAgent] Dispatched prefilled request {req.rid}, output_ids: {req.output_ids}")
 
     def _handle_kv_transfer_fetch(self, req: KVTransferFetch):
         try:
