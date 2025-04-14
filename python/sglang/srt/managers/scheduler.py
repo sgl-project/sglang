@@ -1414,6 +1414,8 @@ class Scheduler(
         self.waiting_queue = [
             x for x in self.waiting_queue if x not in set(can_run_list) and x not in self.aborted_reqs
         ]
+        for req in self.waiting_queue:
+            req.output_ids = origin_output_ids[req.rid]
         if len(can_run_list) == 0:
             return None
         
@@ -1423,6 +1425,7 @@ class Scheduler(
         for req in can_run_list:
             if req.rid not in kv_buffer:
                 req.finished_reason = FINISH_ABORT(message="KV cache restored failed")
+                req.output_ids = origin_output_ids[req.rid]
                 self.aborted_reqs[req.rid] = req
             else:
                 kv_cache_restored_reqs.append(req)
