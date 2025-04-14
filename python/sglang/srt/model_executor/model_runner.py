@@ -572,6 +572,9 @@ class ModelRunner:
             model_supports_hip_attention = hasattr(
                 self.model, "hip_attention_supported"
             )
+            if model_supports_hip_attention:
+                model_supports_hip_attention = self.model.hip_attention_supported
+            
             if self.server_args.hip_attention_config.using_extend:
                 if not model_supports_hip_attention:
                     raise RuntimeError(

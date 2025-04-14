@@ -280,7 +280,6 @@ class Llama4Attention(nn.Module):
             else None
         )
 
-        self.sliding_window_size = (1024) if self.use_rope else -1
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
@@ -288,7 +287,6 @@ class Llama4Attention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
             prefix=add_prefix("attn", prefix),
-            # sliding_window_size=self.sliding_window_size,
             use_irope=self.use_rope,
             orig_context_len=getattr(
                 config, "orig_context_len", max_position_embeddings
@@ -530,7 +528,7 @@ class Llama4ForCausalLM(LlamaForCausalLM):
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
-    hip_attention_supported = True
+    hip_attention_supported = False
 
     def __init__(
         self,
