@@ -993,6 +993,8 @@ async def benchmark(
             return await request_func(request_func_input=request_func_input, pbar=pbar)
 
     # Warmup
+    if not hasattr(args, "warmup_requests"):
+        args.warmup_requests = 1
     print(f"Starting warmup with {args.warmup_requests} sequences...")
 
     # Use the first request for all warmup iterations
