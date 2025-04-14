@@ -67,6 +67,7 @@ class PrefillBootstrapQueue:
         bootstrap_port: int,
         gloo_group: ProcessGroup,
         transfer_backend: TransferBackend,
+        scheduler: Scheduler,
     ):
         self.token_to_kv_pool = token_to_kv_pool
         self.aux_dtype = aux_dtype
@@ -76,6 +77,7 @@ class PrefillBootstrapQueue:
         self.tp_rank = tp_rank
         self.tp_size = tp_size
         self.transfer_backend = transfer_backend
+        self.dist_init_addr = scheduler.server_args.dist_init_addr
         self.kv_manager = self._init_kv_manager()
         self.queue: List[Req] = []
         self.gloo_group = gloo_group
@@ -88,6 +90,7 @@ class PrefillBootstrapQueue:
 
     def _init_kv_manager(self) -> BaseKVManager:
         kv_args = KVArgs()
+        kv_args.dist_init_addr = self.dist_init_addr
         kv_args.engine_rank = self.tp_rank
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()

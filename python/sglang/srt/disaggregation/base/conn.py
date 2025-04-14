@@ -16,6 +16,7 @@ class KVArgs:
     aux_data_lens: list[int]
     aux_item_lens: list[int]
     ib_device: str
+    dist_init_addr: str
 
 
 class KVPoll:

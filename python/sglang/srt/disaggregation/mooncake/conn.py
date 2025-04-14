@@ -4,6 +4,7 @@ import asyncio
 import dataclasses
 import logging
 import queue
+import socket
 import struct
 import threading
 from functools import cache
@@ -311,7 +312,12 @@ class MooncakeKVManager(BaseKVManager):
 
     def _register_to_bootstrap(self):
         """Register KVSender to bootstrap server via HTTP POST."""
-        bootstrap_server_url = f"{get_ip()}:8998"
+        if self.kv_args.dist_init_addr:
+            ip_address = socket.gethostbyname(self.kv_args.dist_init_addr.split(":")[0])
+        else:
+            ip_address = get_ip()
+
+        bootstrap_server_url = f"{ip_address}:8998"
         url = f"http://{bootstrap_server_url}/kv_route"
         payload = {
             "identity": self.get_session_id(),
