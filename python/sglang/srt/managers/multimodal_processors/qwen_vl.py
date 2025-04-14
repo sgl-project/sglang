@@ -436,6 +436,6 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
             "im_end_id": self.IM_END_TOKEN_ID,
             "im_token_id": self.image_token_id,
             "video_token_id": self.video_token_id,
-            "mrope_positions": mrope_positions,
+            "mrope_positions": [mrope_positions],
             "mrope_position_delta": mrope_position_delta,
         }

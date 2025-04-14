@@ -9,7 +9,6 @@ from sglang.srt.managers.multimodal_processors.base_processor import (
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.models.gemma3_mm import Gemma3ForConditionalGeneration
 
-
 # Copied from: https://github.com/huggingface/transformers/blob/main/src/transformers/models/gemma3/image_processing_gemma3_fast.py
 # will be removed in the future
 
