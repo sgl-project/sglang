@@ -9,7 +9,7 @@ import random
 import struct
 import threading
 from functools import cache
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
@@ -80,9 +80,10 @@ class TransferKVChunk:
 
 @dataclasses.dataclass
 class TransferInfo:
-    room: int
     endpoint: str
+    decode_port: int
     mooncake_session_id: str
+    room: int
     dst_kv_ptrs: list[int]
     dst_kv_indices: npt.NDArray[np.int64]
     dst_aux_ptrs: list[int]
@@ -92,12 +93,13 @@ class TransferInfo:
     def from_zmq(cls, msg: List[bytes]):
         return cls(
             endpoint=msg[0].decode("ascii"),
-            mooncake_session_id=msg[1].decode("ascii"),
-            room=int(msg[2].decode("ascii")),
-            dst_kv_ptrs=list(struct.unpack(f"{len(msg[3])//8}Q", msg[3])),
-            dst_kv_indices=np.frombuffer(msg[4], dtype=np.int64),
-            dst_aux_ptrs=list(struct.unpack(f"{len(msg[5])//8}Q", msg[5])),
-            dst_aux_index=int(msg[6].decode("ascii")),
+            decode_port=int(msg[1].decode("ascii")),
+            mooncake_session_id=msg[2].decode("ascii"),
+            room=int(msg[3].decode("ascii")),
+            dst_kv_ptrs=list(struct.unpack(f"{len(msg[4])//8}Q", msg[4])),
+            dst_kv_indices=np.frombuffer(msg[5], dtype=np.int64),
+            dst_aux_ptrs=list(struct.unpack(f"{len(msg[6])//8}Q", msg[6])),
+            dst_aux_index=int(msg[7].decode("ascii")),
         )
 
 
@@ -235,7 +237,7 @@ class MooncakeKVManager(BaseKVManager):
             # KVPoll.Bootstrapping -> KVPoll.WaitingForInput
             while True:
                 waiting_req_bytes = self.server_socket.recv_multipart()
-                room = waiting_req_bytes[2].decode("ascii")
+                room = waiting_req_bytes[3].decode("ascii")
                 if room == "None":
                     continue
                 room = int(room)
@@ -355,6 +357,9 @@ class MooncakeKVSender(BaseKVSender):
 
         self.session_id = self.kv_mgr.get_session_id()
 
+        # Register to bootstrap server
+        self._register_to_bootstrap()
+
     def _register_to_bootstrap(self):
         """Register KVSender to bootstrap server via HTTP POST."""
         url = f"http://{self.bootstrap_server_url}/kv_route"
@@ -384,10 +389,6 @@ class MooncakeKVSender(BaseKVSender):
     def init(self, num_kv_indices: int, aux_index: Optional[int] = None):
         self.num_kv_indices = num_kv_indices
         self.aux_index = aux_index
-
-        # Register to bootstrap server
-        logger.info(f"Prefill bootstrap addr {self.bootstrap_server_url}.")
-        self._register_to_bootstrap()
 
     def send(
         self,
