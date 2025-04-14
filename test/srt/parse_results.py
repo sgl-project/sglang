@@ -1,7 +1,8 @@
-import json
-import pandas as pd
 import argparse
+import json
 import os
+
+import pandas as pd
 from tabulate import tabulate
 
 # Parse command-line arguments
