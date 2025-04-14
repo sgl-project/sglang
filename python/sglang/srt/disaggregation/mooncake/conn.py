@@ -233,7 +233,6 @@ class MooncakeKVManager(BaseKVManager):
                 self.transfer_infos[room] = TransferInfo.from_zmq(waiting_req_bytes)
 
                 # NOTE: after bootstrapping we can mark the req as waiting for input
-                assert self.request_status[room] == KVPoll.Bootstrapping
                 self.request_status[room] = KVPoll.WaitingForInput
 
         def transfer_thread():
@@ -318,8 +317,14 @@ class MooncakeKVManager(BaseKVManager):
 
         return self.request_status[bootstrap_room]
 
-    def set_status(self, bootstrap_room: int, status: KVPoll):
-        self.request_status[bootstrap_room] = status
+    def update_status(self, bootstrap_room: int, status: KVPoll):
+        if bootstrap_room not in self.request_status:
+            self.request_status[bootstrap_room] = status
+        else:
+            # NOTE: The prefill engine could recv bootstrapping first
+            self.request_status[bootstrap_room] = max(
+                self.request_status[bootstrap_room], status
+            )
 
     def get_localhost(self):
         return self.engine.get_localhost()
@@ -335,7 +340,7 @@ class MooncakeKVSender(BaseKVSender):
     ):
         self.kv_mgr = mgr
         self.bootstrap_room = bootstrap_room
-        self.kv_mgr.set_status(bootstrap_room, KVPoll.Bootstrapping)
+        self.kv_mgr.update_status(bootstrap_room, KVPoll.Bootstrapping)
         self.aux_index = None
 
     def recv_pre_alloc(self, num_kv_indices: int, aux_index: Optional[int] = None):
@@ -386,7 +391,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
         )
         self.decode_ip = self.kv_mgr.get_localhost()
         self.session_id = self.kv_mgr.get_session_id()
-        self.kv_mgr.set_status(bootstrap_room, KVPoll.WaitingForInput)
+        self.kv_mgr.update_status(bootstrap_room, KVPoll.WaitingForInput)
 
     @cache
     def _connect(self, endpoint: str):
