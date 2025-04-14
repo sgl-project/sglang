@@ -12,6 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 
+import math
 import os
 from typing import Callable, Optional
 
@@ -210,6 +211,10 @@ def biased_grouped_topk_impl(
     return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
 
 
+def is_power_of_two(n):
+    return n > 0 and math.log2(n).is_integer()
+
+
 def biased_grouped_topk(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -222,7 +227,7 @@ def biased_grouped_topk(
     n_share_experts_fusion: int = 0,
 ):
     # TODO: moe_fused_gate kernel is not supported for n_share_experts_fusion > 0 now.
-    if n_share_experts_fusion == 0:
+    if n_share_experts_fusion == 0 and is_power_of_two(correction_bias.shape[0]):
         return moe_fused_gate(
             gating_output,
             correction_bias,
