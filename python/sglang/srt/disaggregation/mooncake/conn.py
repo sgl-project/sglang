@@ -54,25 +54,6 @@ def group_concurrent_contiguous(
     return src_groups, dst_groups
 
 
-class KVArgs:
-    engine_rank: int
-    kv_data_ptrs: list[int]
-    kv_data_lens: list[int]
-    kv_item_lens: list[int]
-    aux_data_ptrs: list[int]
-    aux_data_lens: list[int]
-    aux_item_lens: list[int]
-    ib_device: str
-
-
-class KVPoll:
-    Failed = 0
-    Bootstrapping = 1
-    WaitingForInput = 2
-    Transferring = 3
-    Success = 4
-
-
 @dataclasses.dataclass
 class TransferKVChunk:
     room: int
