@@ -280,14 +280,14 @@ class MHATokenToKVPool(KVCache):
     # for disagg
     def get_contiguous_buf_infos(self):
         kv_data_ptrs = [
-                           self.get_key_buffer(i).data_ptr() for i in range(self.layer_num)
-                       ] + [self.get_value_buffer(i).data_ptr() for i in range(self.layer_num)]
+            self.get_key_buffer(i).data_ptr() for i in range(self.layer_num)
+        ] + [self.get_value_buffer(i).data_ptr() for i in range(self.layer_num)]
         kv_data_lens = [
-                           self.get_key_buffer(i).nbytes for i in range(self.layer_num)
-                       ] + [self.get_value_buffer(i).nbytes for i in range(self.layer_num)]
+            self.get_key_buffer(i).nbytes for i in range(self.layer_num)
+        ] + [self.get_value_buffer(i).nbytes for i in range(self.layer_num)]
         kv_item_lens = [
-                           self.get_key_buffer(i)[0].nbytes for i in range(self.layer_num)
-                       ] + [self.get_value_buffer(i)[0].nbytes for i in range(self.layer_num)]
+            self.get_key_buffer(i)[0].nbytes for i in range(self.layer_num)
+        ] + [self.get_value_buffer(i)[0].nbytes for i in range(self.layer_num)]
         return kv_data_ptrs, kv_data_lens, kv_item_lens
 
     # Todo: different memory layout
@@ -641,7 +641,7 @@ class HostKVCache(abc.ABC):
         host_mem = psutil.virtual_memory()
         requested_bytes = self.size * self.size_per_token
         # preserve at least 10GB for other usage
-        ten_gb = 10 * (1024 ** 3)
+        ten_gb = 10 * (1024**3)
         if requested_bytes > host_mem.available - ten_gb:
             raise ValueError(
                 f"Not enough host memory available. Requesting "
@@ -832,12 +832,12 @@ class MHATokenToKVPoolHost(HostKVCache):
             h_index = host_indices[i * self.page_size]
             d_index = device_indices_cpu[i]
             for j in range(self.layer_num):
-                self.kv_buffer[0, j, h_index: h_index + self.page_size].copy_(
-                    device_pool.k_buffer[j][d_index: d_index + self.page_size],
+                self.kv_buffer[0, j, h_index : h_index + self.page_size].copy_(
+                    device_pool.k_buffer[j][d_index : d_index + self.page_size],
                     non_blocking=True,
                 )
-                self.kv_buffer[1, j, h_index: h_index + self.page_size].copy_(
-                    device_pool.v_buffer[j][d_index: d_index + self.page_size],
+                self.kv_buffer[1, j, h_index : h_index + self.page_size].copy_(
+                    device_pool.v_buffer[j][d_index : d_index + self.page_size],
                     non_blocking=True,
                 )
 
@@ -846,12 +846,12 @@ class MHATokenToKVPoolHost(HostKVCache):
         for i in range(len(device_indices_cpu)):
             h_index = host_indices[i * self.page_size]
             d_index = device_indices_cpu[i]
-            device_pool.k_buffer[layer_id][d_index: d_index + self.page_size].copy_(
-                self.kv_buffer[0, layer_id, h_index: h_index + self.page_size],
+            device_pool.k_buffer[layer_id][d_index : d_index + self.page_size].copy_(
+                self.kv_buffer[0, layer_id, h_index : h_index + self.page_size],
                 non_blocking=True,
             )
-            device_pool.v_buffer[layer_id][d_index: d_index + self.page_size].copy_(
-                self.kv_buffer[1, layer_id, h_index: h_index + self.page_size],
+            device_pool.v_buffer[layer_id][d_index : d_index + self.page_size].copy_(
+                self.kv_buffer[1, layer_id, h_index : h_index + self.page_size],
                 non_blocking=True,
             )
 
@@ -916,8 +916,8 @@ class MLATokenToKVPoolHost(HostKVCache):
             h_index = host_indices[i * self.page_size]
             d_index = device_indices_cpu[i]
             for j in range(self.layer_num):
-                self.kv_buffer[j, h_index: h_index + self.page_size].copy_(
-                    device_pool.kv_buffer[j][d_index: d_index + self.page_size],
+                self.kv_buffer[j, h_index : h_index + self.page_size].copy_(
+                    device_pool.kv_buffer[j][d_index : d_index + self.page_size],
                     non_blocking=True,
                 )
 
@@ -926,7 +926,7 @@ class MLATokenToKVPoolHost(HostKVCache):
         for i in range(len(device_indices_cpu)):
             h_index = host_indices[i * self.page_size]
             d_index = device_indices_cpu[i]
-            device_pool.kv_buffer[layer_id][d_index: d_index + self.page_size].copy_(
-                self.kv_buffer[layer_id, h_index: h_index + self.page_size],
+            device_pool.kv_buffer[layer_id][d_index : d_index + self.page_size].copy_(
+                self.kv_buffer[layer_id, h_index : h_index + self.page_size],
                 non_blocking=True,
             )

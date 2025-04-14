@@ -136,54 +136,29 @@ class MooncakeKVManager(BaseKVManager):
         dst_kv_ptrs: list[int],
         dst_kv_indices: npt.NDArray[np.int64],
     ):
-        layer_num = int(len(self.kv_args.kv_data_ptrs) / 2)
+        # group by indices
         prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
             prefill_kv_indices, dst_kv_indices
         )
-        for layer_id in range(layer_num):
-            prefill_key_layer_ptr = self.kv_args.kv_data_ptrs[layer_id]
-            key_item_len = self.kv_args.kv_item_lens[layer_id]
-            prefill_value_layer_ptr = self.kv_args.kv_data_ptrs[layer_num + layer_id]
-            value_item_len = self.kv_args.kv_item_lens[layer_num + layer_id]
 
-            decode_key_layer_ptr = dst_kv_ptrs[layer_id]
-            decode_value_layer_ptr = dst_kv_ptrs[layer_num + layer_id]
+        num_layers = len(self.kv_args.kv_data_ptrs)
+        for layer_id in range(num_layers):
+            src_ptr = self.kv_args.kv_data_ptrs[layer_id]
+            dst_ptr = dst_kv_ptrs[layer_id]
+            item_len = self.kv_args.kv_item_lens[layer_id]
 
             for prefill_index, decode_index in zip(prefill_kv_blocks, dst_kv_blocks):
-                prefill_key_addr = (
-                    prefill_key_layer_ptr + int(prefill_index[0]) * key_item_len
-                )
-                decode_key_addr = (
-                    decode_key_layer_ptr + int(decode_index[0]) * key_item_len
-                )
+                src_addr = src_ptr + int(prefill_index[0]) * item_len
+                dst_addr = dst_ptr + int(decode_index[0]) * item_len
+                length = item_len * len(prefill_index)
 
-                # TODO: mooncake transfer engine can do async transfer. Do async later
+                # TODO: make async later
                 status = self.engine.transfer_sync(
-                    mooncake_session_id,
-                    prefill_key_addr,
-                    decode_key_addr,
-                    key_item_len * len(prefill_index),
+                    mooncake_session_id, src_addr, dst_addr, length
                 )
                 if status != 0:
                     return status
 
-                prefill_value_addr = (
-                    prefill_value_layer_ptr + int(prefill_index[0]) * value_item_len
-                )
-
-                decode_value_addr = (
-                    decode_value_layer_ptr + int(decode_index[0]) * value_item_len
-                )
-
-                # TODO: mooncake transfer engine can do async transfer. Do async later
-                status = self.engine.transfer_sync(
-                    mooncake_session_id,
-                    prefill_value_addr,
-                    decode_value_addr,
-                    value_item_len * len(prefill_index),
-                )
-                if status != 0:
-                    return status
         return 0
 
     def send_aux(
