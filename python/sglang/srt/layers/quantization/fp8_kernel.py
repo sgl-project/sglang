@@ -905,3 +905,82 @@ def per_tensor_quant_fp8(
     )
 
     return x_q, x_s
+
+
+@triton.jit
+def _per_tensor_quant_mla_fp8(
+    x_ptr,
+    x_min_ptr,
+    x_max_ptr,
+    x_s_ptr,
+    x_q_ptr,
+    num_seq,
+    head_size,
+    x_stride_h,
+    x_stride_s,
+    eps,
+    fp8_min,
+    fp8_max,
+    BLOCK_SIZE: tl.constexpr,
+):
+    seq_id = tl.program_id(0)
+    head_id = tl.program_id(1)
+    offset = tl.arange(0, BLOCK_SIZE)
+    mask = offset < head_size
+
+    x_ptr += head_id * x_stride_h + seq_id * x_stride_s
+    x_q_ptr += head_id * num_seq * head_size + seq_id * head_size
+
+    _xmin = tl.load(x_min_ptr).to(tl.float32)
+    _xmax = tl.load(x_max_ptr).to(tl.float32)
+    _absmax = tl.maximum(tl.maximum(tl.abs(_xmin), tl.abs(_xmax)), eps)
+    x_s_inv = fp8_max / _absmax
+
+    x = tl.load(x_ptr + offset, mask=mask, other=0.0).to(tl.float32)
+    x_q = tl.clamp(x * x_s_inv, fp8_min, fp8_max).to(x_q_ptr.dtype.element_ty)
+    tl.store(x_q_ptr + offset, x_q, mask=mask)
+
+    if seq_id == 0 and head_id == 0:
+        tl.store(x_s_ptr, 1.0 / x_s_inv)
+
+
+def per_tensor_quant_mla_fp8(
+    x: torch.Tensor, eps: float = 1e-12, dtype: torch.dtype = torch.float8_e4m3fn
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    This function quantizes input values to float8 values with tensor-wise quantization
+    and specialized for mla absorbed case.
+    """
+    assert x.dim() == 3, "`x` is not a 3d-tensor"
+
+    finfo = torch.finfo(dtype)
+    fp8_max = finfo.max
+    if _is_hip:
+        dtype = torch.float8_e4m3fnuz
+        fp8_max = 224.0
+
+    x_q = x.new_empty(x.size(), dtype=dtype)
+    x_s = x.new_empty((1,), dtype=torch.float32)
+
+    num_head, num_seq, head_size = x.shape
+    BLOCK_SIZE = triton.next_power_of_2(head_size)
+    grid = (num_seq, num_head)
+
+    min_val, max_val = x.aminmax()
+    _per_tensor_quant_mla_fp8[grid](
+        x,
+        min_val,
+        max_val,
+        x_s,
+        x_q,
+        num_seq,
+        head_size,
+        x.stride(0),
+        x.stride(1),
+        eps,
+        -fp8_max,
+        fp8_max,
+        BLOCK_SIZE,
+    )
+
+    return x_q, x_s
