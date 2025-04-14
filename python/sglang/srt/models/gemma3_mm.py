@@ -181,7 +181,7 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
 
         # Text model
         self.language_model = Gemma3ForCausalLM(
-            config.text_config, quant_config, prefix=add_prefix("model", prefix)
+            config.text_config, quant_config, prefix=add_prefix("language_model", prefix)
         )
         if self.language_model.logits_processor.logit_scale:
             logit_scale = getattr(config, "logit_scale", 1.0)
@@ -399,7 +399,6 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
         print("Params dict:", params_dict.keys())
 
         for name, loaded_weight in weights:
-            print("Loading weight for", name, "with shape", loaded_weight.shape, flush=True)
             if "language_model" in name:
                 # Gemma3ForCausalLM.load_weights(self, [(name.replace("language_model.", ""), loaded_weight)])
                 causal_loaded_params = Gemma3ForCausalLM.load_weights(
@@ -414,7 +413,6 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
                         continue
                     name = name.replace(weight_name, param_name)
                     flag = True
-                    print("Adapted name:", name, flush=True)
                     break
                 else:
                     if "vision_model" in name:
@@ -435,8 +433,8 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
                 if name is None:
                     continue
                 param = params_dict[name]
-                print("mm param shape:", param.shape, flush=True)
                 
+                print("Loading vision model weight:", name, "param shape", param.shape, "loaded shape", loaded_weight.shape, flush=True)
                 if param.shape != loaded_weight.shape:
                     logger.warning(f"Shape mismatch for {name}: param {param.shape} vs weight {loaded_weight.shape}")
                     # 处理已知的形状不匹配情况 - 类令牌导致的尺寸差异
@@ -468,7 +466,6 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
                 
                 loaded_params.add(name)
         unloaded_params = params_dict.keys() - loaded_params
-        print("Loaded params:", loaded_params, flush=True)
         if unloaded_params:
             logger.warning(f"Parameters not initialized from checkpoints: {unloaded_params}")
 
