@@ -21,6 +21,7 @@ from sgl_kernel.flash_attn import flash_attn_with_kvcache
 # TODO: use native sgl-kernel merge_states
 from vllm.v1.attention.backends.flash_attn import merge_attn_states
 
+
 @dataclass
 class FlashAttentionMetadata:
     """Metadata to be init once in the model forward pass,
@@ -763,10 +764,13 @@ class FlashAttentionBackend(AttentionBackend):
                     return_softmax_lse=True,
                 )
                 output = torch.empty_like(o)
-                merge_attn_states(output, 
-                                o, softmax_lse.contiguous(),
-                                o_expand,
-                                softmax_lse_expand.contiguous())
+                merge_attn_states(
+                    output,
+                    o,
+                    softmax_lse.contiguous(),
+                    o_expand,
+                    softmax_lse_expand.contiguous(),
+                )
                 o = output
         else:
             # Do absorbed multi-latent attention
@@ -785,7 +789,7 @@ class FlashAttentionBackend(AttentionBackend):
             q_all = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
             q_nope = q_all[:, :, : layer.v_head_dim]
             q_rope = q_all[:, :, layer.v_head_dim :]
-            o = flash_attn_with_kvcache(
+            o, softmax_lse, *rest = flash_attn_with_kvcache(
                 q=q_rope,
                 k_cache=k_rope_cache,
                 v_cache=c_kv_cache,
@@ -796,11 +800,44 @@ class FlashAttentionBackend(AttentionBackend):
                 cu_seqlens_k_new=cu_seqlens_k if not use_local_attn else None,
                 max_seqlen_q=max_seqlen_q,
                 softmax_scale=layer.scaling,
-                causal=True,
+                causal=(
+                    False
+                    if forward_batch.forward_mode.is_target_verify() and self.topk > 1
+                    else causal
+                ),
                 softcap=layer.logit_cap,
                 k_descale=k_descale,
                 v_descale=v_descale,
+                return_softmax_lse=True,
             )
+            if forward_batch.forward_mode.is_target_verify() and self.topk > 1:
+                o_expand, softmax_lse_expand, *rest_expand = flash_attn_with_kvcache(
+                    q=q_rope,
+                    k_cache=k_rope_cache,
+                    v_cache=c_kv_cache,
+                    qv=q_nope,
+                    page_table=self.forward_metadata_spec_decode_expand.page_table,
+                    cache_seqlens=self.forward_metadata_spec_decode_expand.cache_seqlens_int32,
+                    cu_seqlens_q=self.forward_metadata_spec_decode_expand.cu_seqlens_q,
+                    cu_seqlens_k_new=self.forward_metadata_spec_decode_expand.cu_seqlens_k,
+                    max_seqlen_q=self.forward_metadata_spec_decode_expand.max_seq_len_q,
+                    softmax_scale=layer.scaling,
+                    causal=False,
+                    window_size=window_size,
+                    softcap=layer.logit_cap,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
+                    return_softmax_lse=True,
+                )
+                output = torch.empty_like(o)
+                merge_attn_states(
+                    output,
+                    o,
+                    softmax_lse.contiguous(),
+                    o_expand,
+                    softmax_lse_expand.contiguous(),
+                )
+                o = output
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
@@ -917,10 +954,13 @@ class FlashAttentionBackend(AttentionBackend):
                     return_softmax_lse=True,
                 )
                 output = torch.empty_like(o)
-                merge_attn_states(output, 
-                                o, softmax_lse.contiguous(),
-                                o_expand,
-                                softmax_lse_expand.contiguous())
+                merge_attn_states(
+                    output,
+                    o,
+                    softmax_lse.contiguous(),
+                    o_expand,
+                    softmax_lse_expand.contiguous(),
+                )
                 o = output
         else:
             # Do absorbed multi-latent attention
@@ -940,8 +980,9 @@ class FlashAttentionBackend(AttentionBackend):
             q_all = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
             q_nope = q_all[:, :, : layer.v_head_dim]
             q_rope = q_all[:, :, layer.v_head_dim :]
+            max_seqlen_q = metadata.max_seq_len_q
 
-            o = flash_attn_with_kvcache(
+            o, softmax_lse, *rest = flash_attn_with_kvcache(
                 q=q_rope,
                 k_cache=k_rope_cache,
                 v_cache=c_kv_cache,
@@ -950,13 +991,42 @@ class FlashAttentionBackend(AttentionBackend):
                 cache_seqlens=metadata.cache_seqlens_int32,
                 cu_seqlens_q=metadata.cu_seqlens_q,
                 cu_seqlens_k_new=metadata.cu_seqlens_k,
-                max_seqlen_q=1,
+                max_seqlen_q=max_seqlen_q,
                 softmax_scale=layer.scaling,
-                causal=True,
+                causal=False if self.topk > 1 else causal,
                 softcap=layer.logit_cap,
                 k_descale=k_descale,
                 v_descale=v_descale,
+                return_softmax_lse=True,
             )
+            if self.topk > 1:
+                o_expand, softmax_lse_expand, *rest_expand = flash_attn_with_kvcache(
+                    q=q_rope,
+                    k_cache=k_rope_cache,
+                    v_cache=c_kv_cache,
+                    qv=q_nope,
+                    page_table=self.forward_metadata_spec_decode_expand.page_table,
+                    cache_seqlens=self.forward_metadata_spec_decode_expand.cache_seqlens_int32,
+                    cu_seqlens_q=self.forward_metadata_spec_decode_expand.cu_seqlens_q,
+                    cu_seqlens_k_new=self.forward_metadata_spec_decode_expand.cu_seqlens_k,
+                    max_seqlen_q=self.forward_metadata_spec_decode_expand.max_seq_len_q,
+                    softmax_scale=layer.scaling,
+                    causal=False,
+                    window_size=window_size,
+                    softcap=layer.logit_cap,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
+                    return_softmax_lse=True,
+                )
+                output = torch.empty_like(o)
+                merge_attn_states(
+                    output,
+                    o,
+                    softmax_lse.contiguous(),
+                    o_expand,
+                    softmax_lse_expand.contiguous(),
+                )
+                o = output
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def init_cuda_graph_state(self, max_bs: int):
@@ -1122,11 +1192,15 @@ class FlashAttentionBackend(AttentionBackend):
                     device=self.device,
                 ),
             }
-            self.target_verify_metadata_topk_expand["cu_seqlens_k"] = torch.nn.functional.pad(
+            self.target_verify_metadata_topk_expand["cu_seqlens_k"] = (
+                torch.nn.functional.pad(
                     torch.cumsum(
-                        self.target_verify_metadata_topk_expand["cache_seqlens"], dim=0, dtype=torch.int32
+                        self.target_verify_metadata_topk_expand["cache_seqlens"],
+                        dim=0,
+                        dtype=torch.int32,
                     ),
                     (1, 0),
+                )
             )
 
         # Biao's Note: Consolidate the encoder metadata
