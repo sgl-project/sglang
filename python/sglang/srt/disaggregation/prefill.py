@@ -81,7 +81,7 @@ class PrefillBootstrapQueue:
         self.gloo_group = gloo_group
         self.bootstrap_port = bootstrap_port
 
-    def store_prefill_output(self, idx: int, token_id: int):
+    def store_prefill_results(self, idx: int, token_id: int):
         assert token_id >= 0, f"token_id: {token_id} is negative"
         output_id_buffer = self.metadata_buffers[0]
         output_id_buffer[idx] = token_id
@@ -155,9 +155,7 @@ class PrefillBootstrapQueue:
                 self.req_to_metadata_buffer_idx_allocator.alloc()
             )
             assert req.metadata_buffer_index is not None
-            req.disagg_kv_sender.recv_pre_alloc(
-                num_kv_indices, req.metadata_buffer_index
-            )
+            req.disagg_kv_sender.init(num_kv_indices, req.metadata_buffer_index)
 
             bootstrapped_reqs.append(req)
             indices_to_remove.add(i)
@@ -269,7 +267,7 @@ class SchedulerDisaggregationPrefillMixin:
             .numpy()
         )
         if token_id is not None:
-            self.disagg_prefill_pending_queue.store_prefill_output(
+            self.disagg_prefill_pending_queue.store_prefill_results(
                 req.metadata_buffer_index, token_id
             )
         is_last = token_id is not None

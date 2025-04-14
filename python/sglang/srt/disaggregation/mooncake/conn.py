@@ -343,7 +343,7 @@ class MooncakeKVSender(BaseKVSender):
         self.kv_mgr.update_status(bootstrap_room, KVPoll.Bootstrapping)
         self.aux_index = None
 
-    def recv_pre_alloc(self, num_kv_indices: int, aux_index: Optional[int] = None):
+    def init(self, num_kv_indices: int, aux_index: Optional[int] = None):
         self.num_kv_indices = num_kv_indices
         self.aux_index = aux_index
 
@@ -399,9 +399,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
         socket.connect(endpoint)
         return socket
 
-    def notify_pre_alloc(
-        self, kv_indices: npt.NDArray[np.int64], aux_index: Optional[int] = None
-    ):
+    def init(self, kv_indices: npt.NDArray[np.int64], aux_index: Optional[int] = None):
         packed_kv_data_ptrs = b"".join(
             struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
         )

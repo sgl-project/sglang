@@ -41,7 +41,7 @@ class BaseKVSender(ABC):
     ): ...
 
     @abstractmethod
-    def recv_pre_alloc(self, num_kv_indices: int, aux_index: Optional[int] = None):
+    def init(self, num_kv_indices: int, aux_index: Optional[int] = None):
         """
         Notify the decoder server about the kv indices length and aux index
         """
@@ -80,9 +80,7 @@ class BaseKVReceiver(ABC):
     ): ...
 
     @abstractmethod
-    def notify_pre_alloc(
-        self, kv_indices: npt.NDArray[np.int64], aux_index: Optional[int] = None
-    ):
+    def init(self, kv_indices: npt.NDArray[np.int64], aux_index: Optional[int] = None):
         """
         Notify the prefill server about the kv indices and aux index
         """
