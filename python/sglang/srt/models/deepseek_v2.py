@@ -303,6 +303,7 @@ class DeepseekV2MoE(nn.Module):
         )
 
         self.shared_experts_is_int8 = None
+        self.shared_experts_is_fp8 = None
         if config.n_shared_experts is not None and self.num_fused_shared_experts == 0:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
             # disable tp for shared experts when enable deepep moe
@@ -322,6 +323,10 @@ class DeepseekV2MoE(nn.Module):
             if self.shared_experts.gate_up_proj.weight.dtype == torch.int8:
                 assert self.shared_experts.down_proj.weight.dtype == torch.int8
                 self.shared_experts_is_int8 = True
+
+            if self.shared_experts_gate_up_proj.weight.dtype == torch.float8_e4m3fn:
+                assert self.shared_experts_down_proj.weight.dtype == torch.float8_e4m3fn
+                self.shared_experts_is_fp8 = True
 
         self.top_k = config.num_experts_per_tok
 
