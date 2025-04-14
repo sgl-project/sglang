@@ -48,27 +48,28 @@ memory management, and optimization techniques.
   python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --tp 4 --dist-init-addr sgl-dev-0:50000 --nnodes 2 --node-rank 1
   ```
 
-Please consult the documentation below to learn more about the arguments you may provide when launching a server.
+Please consult the documentation below and [server_args.py](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/server_args.py) to learn more about the arguments you may provide when launching a server.
 
-## Model, processor and  tokenizer
+## Model, processor and tokenizer
 
 | Arguments | Description | Defaults |
-|-----------|-------------|----------|
+|----------|-------------|---------|
 | `model_path` | Path to the model that will be served. | None |
 | `tokenizer_path` | Defaults to the `model_path`. | None |
-| `tokenizer_mode` | See [different modes](https://huggingface.co/docs/transformers/en/main_classes/tokenizer). | `auto` |
-| `load_format` | The format the weights are loaded in. | `"auto"` |
-| `trust_remote_code` | If `True`, will use locally cached config files, otherwise use remote configs in HuggingFace. | `False` |
+| `tokenizer_mode` | See [different mode](https://huggingface.co/docs/transformers/en/main_classes/tokenizer). | `auto` |
+| `load_format` | The format the weights are loaded in. | `auto` |
+| `trust_remote_code` | If `true`, will use locally cached config files, otherwise use remote configs in HuggingFace. | `False` |
 | `dtype` | Dtype used for the model. | `bfloat16` |
-| `kv_cache_dtype` | Dtype of the kv cache. | `"auto"` |
-| `context_length` | The number of tokens the model can process (including input). Extending might cause strange behavior. | None |
-| `device` | The device used to run the model. | None |
-| `chat_template` | The chat template to use. Incorrect templates might cause unexpected behavior or degraded performance. For multi-modal templates, refer [here](https://docs.sglang.ai/backend/openai_api_vision.ipynb#Chat-Template). | None |
-| `is_embedding` | Set to `true` for [embedding](./openai_api_embeddings.ipynb), [encode](https://docs.sglang.ai/backend/native_api#Encode-(embedding-model)), and [reward](https://docs.sglang.ai/backend/native_api#Classify-(reward-model)) tasks. | `False` |
-| `revision` | Adjust to specify a particular version of the model. | None |
-| `skip_tokenizer_init` | Set to `true` to input/output tokens directly, useful in RLHF. See [example](https://github.com/sgl-project/sglang/blob/main/examples/runtime/token_in_token_out/). | `False` |
+| `kv_cache_dtype` | Dtype of the kv cache. | `dtype` |
+| `context_length` | The number of tokens our model can process *including the input*. Note that extending the default might lead to strange behavior. | None |
+| `device` | The device we put the model. | None |
+| `chat_template` | The chat template to use. See [multi-modal templates](https://docs.sglang.ai/backend/openai_api_vision.ipynb#Chat-Template). **Make sure the correct `chat_template` is passed, or performance degradation may occur!!!!** | None |
+| `is_embedding` | Set to `true` to perform [embedding](./openai_api_embeddings.ipynb) / [encode](https://docs.sglang.ai/backend/native_api#Encode-(embedding-model)) and [reward](https://docs.sglang.ai/backend/native_api#Classify-(reward-model)) tasks. | `False` |
+| `revision` | Adjust if a specific version of the model should be used. | None |
+| `skip_tokenizer_init` | Set to `true` to provide the tokens to the engine and get the output tokens directly, typically used in RLHF. See [example](https://github.com/sgl-project/sglang/blob/main/examples/runtime/token_in_token_out/). | `False` |
 | `json_model_override_args` | Override model config with the provided JSON. | `"{}"` |
-| `disable_fast_image_processor` | Use the base image processor instead of the fast one. See more [here](https://huggingface.co/docs/transformers/main/en/main_classes/image_processor#image-processor). | `False` |
+| `delete_ckpt_after_loading` | Delete the model checkpoint after loading the model. | `False` |
+| `disable_fast_image_processor` | Adopt base image processor instead of fast image processor (which is by default). See [details](https://huggingface.co/docs/transformers/main/en/main_classes/image_processor#image-processor). | `False` |
 
 ## Serving: HTTP & API
 
@@ -76,144 +77,145 @@ Please consult the documentation below to learn more about the arguments you may
 
 | Arguments | Description | Defaults |
 |----------|-------------|---------|
-| `host` | Host for the HTTP server. | `host: str = "127.0.0.1"` |
-| `port` | Port for the HTTP server. | `port: int = 30000` |
+| `host` | Host for the HTTP server. | `"127.0.0.1"` |
+| `port` | Port for the HTTP server. | `30000` |
 
 ### API configuration
 
-| Arguments | Description |
-|-----------|-------------|
-| `api_key` | Sets an API key for the server and the OpenAI-compatible API. |
-| `file_storage_path` | Directory for storing uploaded or generated files from API calls. |
-| `enable_cache_report` | If set, includes detailed usage of cached tokens in the response usage. |
+| Arguments | Description | Defaults |
+|-----------|-------------|---------|
+| `api_key` | Sets an API key for the server and the OpenAI-compatible API. | None |
+| `file_storage_path` | Directory for storing uploaded or generated files from API calls. | `"sglang_storage"` |
+| `enable_cache_report` | If set, includes detailed usage of cached tokens in the response usage. | `False` |
 
 ## Parallelism
 
 ### Tensor parallelism
 
-| Argument | Description |
-|----------|-------------|
-| `tp_size` | The number of GPUs the model weights get sharded over. Mainly for saving memory rather than for high throughput, see [this tutorial: How Tensor Parallel works?](https://pytorch.org/tutorials/intermediate/TP_tutorial.html#how-tensor-parallel-works). |
+| Argument | Description | Default |
+|----------|-------------|---------|
+| `tp_size` | The number of GPUs the model weights get sharded over. Mainly for saving memory rather than for high throughput, see [this tutorial: How Tensor Parallel works?](https://pytorch.org/tutorials/intermediate/TP_tutorial.html#how-tensor-parallel-works). | `1` |
 
 ### Data parallelism
 
-| Arguments | Description |
-|-----------|-------------|
-| `dp_size` | Will be deprecated. The number of data-parallel copies of the model. [SGLang router](../router/router.md) is recommended instead of the current naive data parallel. |
-| `load_balance_method` | Will be deprecated. Load balancing strategy for data parallel requests. |
+| Arguments | Description | Defaults |
+|-----------|-------------|---------|
+| `dp_size` | Will be deprecated. The number of data-parallel copies of the model. [SGLang router](../router/router.md) is recommended instead of the current naive data parallel. | `1` |
+| `load_balance_method` | Will be deprecated. Load balancing strategy for data parallel requests. | `"round_robin"` |
 
 ### Expert parallelism
 
 | Arguments | Description | Defaults |
 |-----------|-------------|----------|
 | `enable_ep_moe` | Enables expert parallelism that distributes the experts onto multiple GPUs for MoE models. | `False` |
-| `ep_size` | The size of EP. Please shard the model weights with `tp_size=ep_size`. For benchmarking, refer to [this PR](https://github.com/sgl-project/sglang/pull/2203). | `tp_size` (if not set) |
+| `ep_size` | The size of EP. Please shard the model weights with `tp_size=ep_size`. For benchmarking, refer to [this PR](https://github.com/sgl-project/sglang/pull/2203). | `1` |
 | `enable_deepep_moe` | Enables expert parallelism that distributes the experts onto multiple GPUs for DeepSeek-V3 model based on `deepseek-ai/DeepEP`. | `False` |
 | `deepep_mode` | Select the mode when using DeepEP MoE: can be `normal`, `low_latency`, or `auto`. `auto` means `low_latency` for decode batch and `normal` for prefill batch. | `auto` |
 
 ## Memory and scheduling
 
-| Arguments | Description |
-|----------|-------------|
-| `mem_fraction_static` | Fraction of the free GPU memory used for static memory like model weights and KV cache. Increase it if KV cache building fails. Decrease it if CUDA runs out of memory. |
-| `max_running_requests` | The maximum number of requests to run concurrently. |
-| `max_total_tokens` | The maximum number of tokens that can be stored in the KV cache. Mainly used for debugging. |
-| `chunked_prefill_size` | Perform prefill in chunks of this size. Larger sizes speed up prefill but increase VRAM usage. Decrease if CUDA runs out of memory. |
-| `max_prefill_tokens` | Token budget for how many tokens can be accepted in one prefill batch. The actual limit is the max of this value and `context_length`. |
-| `schedule_policy` | The scheduling policy to control how waiting prefill requests are processed by a single engine. |
-| `schedule_conservativeness` | Controls how conservative the server is when accepting new requests. High conservativeness may cause starvation; low conservativeness may reduce performance. |
-| `cpu_offload_gb` | Amount of RAM (in GB) to reserve for offloading model parameters to the CPU. |
+| Arguments | Description | Defaults |
+|----------|-------------|----------|
+| `mem_fraction_static` | Fraction of the free GPU memory used for static memory like model weights and KV cache. Increase it if KV cache building fails. Decrease it if CUDA runs out of memory. | None |
+| `max_running_requests` | The maximum number of requests to run concurrently. | None |
+| `max_total_tokens` | The maximum number of tokens that can be stored in the KV cache. Mainly used for debugging. | None |
+| `chunked_prefill_size` | Perform prefill in chunks of this size. Larger sizes speed up prefill but increase VRAM usage. Decrease if CUDA runs out of memory. | None |
+| `max_prefill_tokens` | Token budget for how many tokens can be accepted in one prefill batch. The actual limit is the max of this value and `context_length`. | `16384` |
+| `schedule_policy` | The scheduling policy to control how waiting prefill requests are processed by a single engine. | `"fcfs"` |
+| `schedule_conservativeness` | Controls how conservative the server is when accepting new requests. High conservativeness may cause starvation; low conservativeness may reduce performance. | `1.0` |
+| `cpu_offload_gb` | Amount of RAM (in GB) to reserve for offloading model parameters to the CPU. | `0` |
 
 ## Other runtime options
 
-| Arguments | Description |
-|----------|-------------|
-| `stream_interval` | Interval (in tokens) for streaming responses. Smaller values lead to smoother streaming; larger values improve throughput. |
-| `random_seed` | Can be used to enforce more deterministic behavior. |
-| `watchdog_timeout` | Timeout setting for the watchdog thread before it kills the server if batch generation takes too long. |
-| `download_dir` | Overrides the default Hugging Face cache directory for model weights. |
-| `base_gpu_id` | Sets the first GPU to use when distributing the model across multiple GPUs. |
-| `allow_auto_truncate`| Automatically truncate requests that exceed the maximum input length. |
+| Arguments | Description | Defaults |
+|-----------|-------------|---------|
+| `stream_interval` | Interval (in tokens) for streaming responses. Smaller values lead to smoother streaming; larger values improve throughput. | `1` |
+| `random_seed` | Can be used to enforce more deterministic behavior. | None |
+| `watchdog_timeout` | Timeout setting for the watchdog thread before it kills the server if batch generation takes too long. | `300` |
+| `download_dir` | Overrides the default Hugging Face cache directory for model weights. | None |
+| `base_gpu_id` | Sets the first GPU to use when distributing the model across multiple GPUs. | `0` |
+| `allow_auto_truncate`| Automatically truncate requests that exceed the maximum input length. | `False` |
 
 ## Logging
 
 | Arguments | Description | Defaults |
-|----------|-------------|---------|
-| `log_level` | Global log verbosity. | Custom |
-| `log_level_http` | Separate verbosity level for the HTTP server logs. | `log_level` |
+|-----------|-------------|---------|
+| `log_level` | Global log verbosity. | `"info"` |
+| `log_level_http` | Separate verbosity level for the HTTP server logs. | None |
 | `log_requests` | Logs the inputs and outputs of all requests for debugging. | `False` |
 | `log_requests_level` | Ranges from 0 to 2: level 0 only shows some basic metadata in requests, level 1 and 2 show request details (e.g., text, images), and level 1 limits output to 2048 characters. | `0` |
 | `show_time_cost` | Prints or logs detailed timing info for internal operations (helpful for performance tuning). | `False` |
 | `enable_metrics` | Exports Prometheus-like metrics for request usage and performance. | `False` |
-| `decode_log_interval` | How often (in tokens) to log decode progress. | Custom |
+| `decode_log_interval` | How often (in tokens) to log decode progress. | `40` |
 
 ## Multi-node distributed serving
 
 | Arguments | Description | Defaults |
-|-----------|-------------|----------|
-| `dist_init_addr` | The TCP address used for initializing PyTorch's distributed backend (e.g., `192.168.0.2:25000`). | None |
-| `nnodes` | Total number of nodes in the cluster. See [Llama 405B model guide](https://docs.sglang.ai/references/multi_node.html#llama-3-1-405b). | `1` |
+|----------|-------------|---------|
+| `dist_init_addr` | The TCP address used for initializing PyTorch's distributed backend (e.g. `192.168.0.2:25000`). | None |
+| `nnodes` | Total number of nodes in the cluster. See [Llama 405B guide](https://docs.sglang.ai/references/llama_405B.html#run-405b-fp16-on-two-nodes). | `1` |
 | `node_rank` | Rank (ID) of this node among the `nnodes` in the distributed setup. | `0` |
 
 ## LoRA
 
 | Arguments | Description | Defaults |
 |----------|-------------|---------|
-| `lora_paths` | List of adapters to apply to your model. Each batch element uses the proper LoRA adapter. `cuda_graph` and `radix_attention` are not supported with this, so they must be disabled manually. See related [issues](https://github.com/sgl-project/sglang/issues/2929). | Custom |
-| `max_loras_per_batch` | Maximum number of LoRAs allowed in a running batch, including the base model. | Custom |
+| `lora_paths` | List of adapters to apply to your model. Each batch element uses the proper LoRA adapter. `cuda_graph` and `radix_attention` are not supported with this, so they must be disabled manually. See related [issues](https://github.com/sgl-project/sglang/issues/2929). | None |
+| `max_loras_per_batch` | Maximum number of LoRAs allowed in a running batch, including the base model. | `8` |
 | `lora_backend` | Backend used to run GEMM kernels for LoRA modules. Can be `triton` or `flashinfer`. | `triton` |
 
 ## Kernel backend
 
-| Arguments | Description | Examples |
+| Arguments | Description | Defaults |
 |----------|-------------|---------|
-| `attention_backend` | Specifies the backend for attention computation and KV cache management. Required for setting the MLA backend in DeepSeek model deployments. | `fa3`, `flashinfer`, `triton`, or `torch_native` |
-| `sampling_backend` | Specifies the backend used for sampling. | Custom |
+| `attention_backend` | This argument specifies the backend for attention computation and KV cache management, which can be `fa3`, `flashinfer`, `triton`, or `torch_native`. When deploying DeepSeek models, use this argument to specify the MLA backend. | None |
+| `sampling_backend` | Specifies the backend used for sampling. | None |
 
 ## Constrained Decoding
 
-| Arguments | Description |
-|----------|-------------|
-| `grammar_backend` | The grammar backend for constraint decoding. See [detailed usage](https://docs.sglang.ai/backend/structured_outputs.html). |
+| Arguments | Description | Defaults |
+|----------|-------------| ----------|
+| `grammar_backend` | The grammar backend for constraint decoding. See [detailed usage](https://docs.sglang.ai/backend/structured_outputs.html). | None |
 | `constrained_json_whitespace_pattern` | Use with `Outlines` grammar backend to allow JSON with syntactic newlines, tabs, or multiple spaces. See [details](https://dottxt-ai.github.io/outlines/latest/reference/generation/json/#using-pydantic). |
 
 ## Speculative decoding
 
 | Arguments | Description | Defaults |
 |----------|-------------|---------|
-| `speculative_draft_model_path` | The draft model path for speculative decoding. | Custom |
-| `speculative_algorithm` | The algorithm for speculative decoding. Note that the radix cache, chunked prefill, and overlap scheduler are disabled when using eagle speculative decoding. | [Eagle](https://arxiv.org/html/2406.16858v1) |
-| `speculative_num_steps` | How many draft passes we run before verifying. | Custom |
-| `speculative_num_draft_tokens` | The number of tokens proposed in a draft. | Custom |
-| `speculative_eagle_topk` | The number of top candidates we keep for verification at each step for [Eagle](https://arxiv.org/html/2406.16858v1). | Custom |
-| `speculative_token_map` | Optional, the path to the high frequency token list of [FR-Spec](https://arxiv.org/html/2502.14856v1), used for accelerating [Eagle](https://arxiv.org/html/2406.16858v1). | Custom |
+| `speculative_draft_model_path` | The draft model path for speculative decoding. | None |
+| `speculative_algorithm` | The algorithm for speculative decoding. Currently only [Eagle](https://arxiv.org/html/2406.16858v1) is supported. Note that the radix cache, chunked prefill, and overlap scheduler are disabled when using eagle speculative decoding. | None |
+| `speculative_num_steps` | How many draft passes we run before verifying. | None |
+| `speculative_num_draft_tokens` | The number of tokens proposed in a draft. | None |
+| `speculative_eagle_topk` | The number of top candidates we keep for verification at each step for [Eagle](https://arxiv.org/html/2406.16858v1). | None |
+| `speculative_token_map` | Optional, the path to the high frequency token list of [FR-Spec](https://arxiv.org/html/2502.14856v1), used for accelerating [Eagle](https://arxiv.org/html/2406.16858v1). | None |
 
 ## Double Sparsity
 
-| Arguments | Description | Examples |
+| Arguments | Description | Defaults |
 |----------|-------------|---------|
-| `enable_double_sparsity` | Enables [double sparsity](https://arxiv.org/html/2408.07092v2) which increases throughput. | `disable` or `enable` |
-| `ds_channel_config_path` | The double sparsity config. | See [a guide on how to generate the config for your model](https://github.com/andy-yang-1/DoubleSparse/tree/main/config). |
-| `ds_heavy_channel_num` | Number of channel indices to keep for each layer. | `8` |
-| `ds_heavy_token_num` | Number of tokens used for attention during decode. Skip sparse decoding if `min_seq_len` in batch is less than this number. | `1024` |
-| `ds_heavy_channel_type` | The type of heavy channels. | `q`, `k` or `qk` |
-| `ds_sparse_decode_threshold` | Don't apply sparse decoding if `max_seq_len` in batch < this threshold. | `512` |
+| `enable_double_sparsity` | Enables [double sparsity](https://arxiv.org/html/2408.07092v2) which increases throughput. | `False` |
+| `ds_channel_config_path` | The double sparsity config. See [a guide on how to generate the config for your model](https://github.com/andy-yang-1/DoubleSparse/tree/main/config). | None |
+| `ds_heavy_channel_num` | Number of channel indices to keep for each layer. | `32` |
+| `ds_heavy_token_num` | Number of tokens used for attention during decode. Skip sparse decoding if `min_seq_len` in batch is less than this number. | `256` |
+| `ds_heavy_channel_type` | The type of heavy channels. Options are `q`, `k` or `qk`. | `qk` |
+| `ds_sparse_decode_threshold` | Don't apply sparse decoding if `max_seq_len` in batch < this threshold. | `4096` |
 
 ## Debug options
 
 *Note: We recommend to stay with the defaults and only use these options for debugging for best possible performance.*
 
 | Arguments | Description | Defaults |
-|-----------|-------------|----------|
+|----------|-------------|---------|
 | `disable_radix_cache` | Disable [Radix](https://lmsys.org/blog/2024-01-17-sglang/) backend for prefix caching. | `False` |
-| `disable_cuda_graph` | Disable [CUDA graph](https://pytorch.org/blog/accelerating-pytorch-with-cuda-graphs/) for model forward pass. Use if encountering uncorrectable CUDA ECC errors. | `False` |
-| `disable_cuda_graph_padding` | Disable CUDA graph when padding is needed; otherwise still use CUDA graph. | `False` |
+| `disable_cuda_graph` | Disable [CUDA Graph](https://pytorch.org/blog/accelerating-pytorch-with-cuda-graphs/) for model forward. Use if encountering uncorrectable CUDA ECC errors. | `False` |
+| `disable_cuda_graph_padding` | Disable CUDA Graph when padding is needed; otherwise, still use CUDA Graph. | `False` |
 | `disable_outlines_disk_cache` | Disable disk cache for outlines grammar backend. | `False` |
-| `disable_custom_all_reduce` | Disable the usage of the custom all-reduce kernel. | `False` |
+| `disable_custom_all_reduce` | Disable usage of custom all-reduce kernel. | `False` |
+| `disable_mla` | Disable [Multi-Head Latent Attention](https://arxiv.org/html/2405.04434v5) for Deepseek model. | `False` |
 | `disable_overlap_schedule` | Disable the [Overhead-Scheduler](https://lmsys.org/blog/2024-12-04-sglang-v0-4/#zero-overhead-batch-scheduler). | `False` |
-| `enable_nan_detection` | Print a warning if logits contain `NaN` during sampling. | `False` |
-| `enable_p2p_check` | Enforce peer-to-peer (p2p) check for GPU access instead of allowing always. | `False` |
-| `triton_attention_reduce_in_fp32` | Cast intermediate attention results to `float32` in Triton kernels. | `False` |
+| `enable_nan_detection` | Enable warning if the logits contain `NaN`. | `False` |
+| `enable_p2p_check` | Turns off the default of always allowing P2P checks when accessing GPU. | `False` |
+| `triton_attention_reduce_in_fp32` | In Triton kernels, cast the intermediate attention result to `float32`. | `False` |
 
 ## Optimization
 
@@ -221,13 +223,13 @@ Please consult the documentation below to learn more about the arguments you may
 
 | Arguments | Description | Defaults |
 |-----------|-------------|----------|
-| `enable_mixed_chunk` | Enables mixing prefill and decode. See [discussion](https://github.com/sgl-project/sglang/discussions/1163). | `False` |
+| `enable_mixed_chunk` | Enables mixing prefill and decode, see [this discussion](https://github.com/sgl-project/sglang/discussions/1163). | `False` |
 | `enable_dp_attention` | Enable [Data Parallelism Attention](https://lmsys.org/blog/2024-12-04-sglang-v0-4/#data-parallelism-attention-for-deepseek-models) for Deepseek models. | `False` |
-| `enable_torch_compile` | Torch compile the model for performance boost. See [caching guide](https://docs.sglang.ai/backend/hyperparameter_tuning.html#enabling-cache-for-torch-compile). | `False` |
-| `torch_compile_max_bs` | Maximum batch size when using `torch_compile`. | `32` |
-| `cuda_graph_max_bs` | Adjust the maximum batch size when using CUDA graph. By default, chosen based on GPU specs. | None |
-| `cuda_graph_bs` | The batch sizes captured by `CudaGraphRunner`. Defaults to automatic selection. | None |
-| `torchao_config` | Experimental optimization with [torchao](https://github.com/pytorch/ao). Choices: int8dq, int8wo, int4wo-<group_size>, fp8wo, fp8dq-per_tensor, fp8dq-per_row. | `""` |
-| `triton_attention_num_kv_splits` | Adjust number of KV splits in Triton kernels. | `8` |
-| `flashinfer_mla_disable_ragged` | Disable ragged prefill wrapper for FlashInfer MLA attention backend. | `False` |
-| `disable_chunked_prefix_cache` | Disable chunked prefix cache for DeepSeek models (only use when FA3 is attention backend). | `False` |
+| `enable_torch_compile` | Torch compile the model. Note that compiling a model takes a long time but has a great performance boost. The compiled model can also be [cached for future use](https://docs.sglang.ai/backend/hyperparameter_tuning.html#enabling-cache-for-torch-compile). | `False` |
+| `torch_compile_max_bs` | The maximum batch size when using `torch_compile`. | `32` |
+| `cuda_graph_max_bs` | Adjust the maximum batchsize when using CUDA graph. By default this is chosen for you based on GPU specifics. | None |
+| `cuda_graph_bs` | The batch sizes to capture by `CudaGraphRunner`. By default this is done for you. | None |
+| `torchao_config` | Experimental feature that optimizes the model with [torchao](https://github.com/pytorch/ao). Possible choices are: int8dq, int8wo, int4wo-<group_size>, fp8wo, fp8dq-per_tensor, fp8dq-per_row. | `int8dq` |
+| `triton_attention_num_kv_splits` | Use to adjust the number of KV splits in triton kernels. | `8` |
+| `enable_flashinfer_mla` | Use the attention backend with FlashInfer MLA wrapper for DeepSeek models. **This argument will be deprecated in the next release. Please use `--attention_backend flashinfer` instead to enable FlashInfer MLA.** | `False` |
+| `flashinfer_mla_disable_ragged` | Disable the use of the ragged prefill wrapper for the FlashInfer MLA attention backend. Only use it when FlashInfer is being used as the MLA backend. | `False` |
