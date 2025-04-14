@@ -17,11 +17,11 @@ from typing import Callable, Optional
 
 import torch
 import torch.nn.functional as F
+from sgl_kernel import moe_fused_gate
 
 from sglang.srt.managers.expert_distribution import ExpertDistributionRecorder
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.utils import get_compiler_backend, is_cuda, is_hip
-from sgl_kernel import moe_fused_gate
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
