@@ -188,7 +188,7 @@ class Qwen2_5_VisionPatchMerger(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.hidden_size = context_dim * (spatial_merge_size**2)
+        self.hidden_size = context_dim * (spatial_merge_size ** 2)
         self.ln_q = Qwen2RMSNorm(context_dim, eps=1e-6)
         self.mlp = nn.ModuleList(
             [
@@ -534,9 +534,17 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
                 (Use input_metadata.mrope_positions to replace it)
         """
         if self.is_mrope_enabled:
-            S = input_ids.shape[0]
             # deal with prefixed prefill
-            positions = forward_batch.mrope_positions[:, -S:]
+            mrope_positions_list = []
+            if forward_batch.forward_mode.is_extend():
+                for extend_seq_len, mrope_positions in zip(forward_batch.extend_seq_lens,
+                                                           forward_batch.mrope_positions):
+                    mrope_positions_list += [mrope_positions[:, -extend_seq_len:]]
+            else:
+                for mrope_positions in forward_batch.mrope_positions:
+                    mrope_positions_list += [mrope_positions]
+            positions = torch.cat(mrope_positions_list, dim=1)
+
         if not (
             forward_batch.forward_mode.is_decode()
             or not forward_batch.contains_image_inputs()

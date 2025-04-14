@@ -38,7 +38,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
-from sglang.srt.utils import get_compiler_backend
+from sglang.srt.utils import get_compiler_backend, flatten_nested_list
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -249,7 +249,7 @@ class ForwardBatch:
     padded_static_len: int = -1  # -1 if not padded
 
     # For Qwen2-VL
-    mrope_positions: torch.Tensor = None
+    mrope_positions: List[torch.Tensor] = None
 
     @classmethod
     def init_new(
@@ -438,9 +438,9 @@ class ForwardBatch:
                             [
                                 pos
                                 for pos in range(
-                                    extend_prefix_len,
-                                    extend_prefix_len + extend_seq_len,
-                                )
+                                extend_prefix_len,
+                                extend_prefix_len + extend_seq_len,
+                            )
                             ]
                         ]
                         * 3
@@ -448,12 +448,7 @@ class ForwardBatch:
                 else:
                     mrope_positions = mm_input.mrope_positions
                 mrope_positions_list[i] = mrope_positions
-
-        self.mrope_positions = torch.cat(
-            [pos.to(device=device) for pos in mrope_positions_list],
-            axis=1,
-        ).to(device=device)
-        self.mrope_positions = self.mrope_positions.to(torch.int64)
+        self.mrope_positions = flatten_nested_list(mrope_positions_list)
 
     def get_max_chunk_capacity(self):
         # Maximum number of tokens in each chunk
