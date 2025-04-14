@@ -33,6 +33,7 @@ jobs:
         run: |
           bash scripts/ci_install_dependency.sh
           pip install "vllm>=0.6.4.post1,<=0.7.2"
+          pip install "bitsandbytes>=0.44.0"
 
       - name: Run VLLM dependency tests
         timeout-minutes: 60
