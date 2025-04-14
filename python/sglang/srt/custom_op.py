@@ -30,6 +30,7 @@ class CustomOp(nn.Module):
         self._forward_method = self.forward_cuda
         self.is_torch_compile = False
 
+    # Please do not override this method, because `self._forward_method` can change when in torch compile mode
     def forward(self, *args, **kwargs):
         return self._forward_method(*args, **kwargs)
 
