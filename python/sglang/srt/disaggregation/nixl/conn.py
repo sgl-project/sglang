@@ -10,6 +10,15 @@ import uuid
 import zmq
 from dataclasses import dataclass
 
+from sglang.srt.disaggregation.base.conn import (
+    BaseKVBootstrapServer,
+    BaseKVManager,
+    BaseKVReceiver,
+    BaseKVSender,
+    KVArgs,
+    KVPoll,
+)
+
 logger = logging.getLogger(__name__)
 
 try:
@@ -18,17 +27,6 @@ try:
 except ImportError:
     logger.warning("NIXL is not available")
     nixl_agent = None
-
-class KVArgs:
-    engine_rank: int
-    kv_data_ptrs: list[int]
-    kv_data_lens: list[int]
-    kv_item_lens: list[int]
-    aux_data_ptrs: list[int]
-    aux_data_lens: list[int]
-    aux_item_lens: list[int]
-    ib_device: str
-
 
 
 class DecodeMemDescMsg:
@@ -181,7 +179,7 @@ class D2PBootstrapMsg:
         agent_metadata = data[offset:offset+agent_length]
         return D2PBootstrapMsg(agent_name, agent_metadata)
 
-class KVManager:
+class NixlKVManager(BaseKVManager):
     def __init__(self, args: KVArgs, mode: str, *, 
                  # for prefill
                  bootstrap_port: int = 0,  
@@ -271,30 +269,9 @@ class KVManager:
             logger.info(f'[NIXL PD disagg] bootstrap server started at port {bootstrap_port}')
             self.memdesc_collector = MemDescCollector(f"*:{bootstrap_port}")
 
-class KVPoll():
-    Failed = 0
-    Bootstrapping = 1
-    WaitingForInput = 2
-    Transferring = 3
-    Success = 4
 
-    @staticmethod
-    def str(x) -> str:
-        if x == KVPoll.Failed:
-            return "Failed"
-        elif x == KVPoll.Bootstrapping:
-            return "Bootstrapping"
-        elif x == KVPoll.WaitingForInput:
-            return "WaitingForInput"
-        elif x == KVPoll.Transferring:
-            return "Transferring"
-        elif x == KVPoll.Success:
-            return "Success"
-        else:
-            raise Exception("Unknown KVPoll state")
-
-import torch
-tmp=torch.zeros(64 * 1024 * 1024, dtype=torch.int32, device="cpu").contiguous()
+# import torch
+# tmp=torch.zeros(64 * 1024 * 1024, dtype=torch.int32, device="cpu").contiguous()
 
 
 def init_xfer_names(prefill_agent_name: str, decode_agent_name: str, bootstrap_room: int) -> tuple[bytes, bytes]:
@@ -306,8 +283,8 @@ def init_xfer_names(prefill_agent_name: str, decode_agent_name: str, bootstrap_r
         (f"{prefill_agent_name}_{decode_agent_name}_[{bootstrap_room}]_aux").encode("utf-8")
     )
 
-class KVSender:
-    def __init__(self, mgr: KVManager, bootstrap_room: int):
+class NixlKVSender(BaseKVSender):
+    def __init__(self, mgr: NixlKVManager, bootstrap_room: int):
         """
         bootstrap_addr: prefill: host address, decode: corresponding prefill address
         bootstrap_room: unique id per request
@@ -400,9 +377,9 @@ class KVSender:
         raise Exception("Fake KVSender Exception")
 
 
-class KVReceiver:
+class NixlKVReceiver(BaseKVReceiver):
     def __init__(
-        self, mgr: KVManager, memdesc_collector_addr: str, bootstrap_room: Optional[int] = None
+        self, mgr: NixlKVManager, memdesc_collector_addr: str, bootstrap_room: Optional[int] = None
     ):
         self.has_init = False
         self.mgr = mgr
@@ -465,7 +442,7 @@ class KVReceiver:
         raise Exception("Fake KVReceiver Exception")
 
 
-class KVBootstrapServer:
+class NixlKVBootstrapServer(BaseKVBootstrapServer):
     def __init__(self, port: int): ...
 
     def poll(self) -> KVPoll: ...

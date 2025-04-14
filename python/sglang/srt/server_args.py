@@ -156,6 +156,7 @@ class ServerArgs:
     disable_outlines_disk_cache: bool = False
     disable_custom_all_reduce: bool = False
     disable_mla: bool = False
+    enable_llama4_multimodal: Optional[bool] = None
     disable_overlap_schedule: bool = False
     enable_mixed_chunk: bool = False
     enable_dp_attention: bool = False
@@ -194,6 +195,10 @@ class ServerArgs:
     # For PD disaggregation: can be "null" (not disaggregated), "prefill" (prefill-only), or "decode" (decode-only)
     disaggregation_mode: str = "null"
     disaggregation_bootstrap_port: int = 8998
+    disaggregation_transfer_backend: str = "mooncake"
+
+    # multimodal
+    disable_fast_image_processor: bool = False
 
     # only used by decode instance
     disaggregation_prefill_bootstrap_addr: str = ''
@@ -300,6 +305,8 @@ class ServerArgs:
             logger.info(
                 f"EP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
+
+        self.enable_multimodal: Optional[bool] = self.enable_llama4_multimodal
 
         # Data parallelism attention
         if self.enable_dp_attention:
@@ -532,6 +539,7 @@ class ServerArgs:
                 "bitsandbytes",
                 "gguf",
                 "modelopt",
+                "modelopt_fp4",
                 "w8a8_int8",
                 "w8a8_fp8",
                 "moe_wna16",
@@ -1011,6 +1019,12 @@ class ServerArgs:
             help="Disable Multi-head Latent Attention (MLA) for DeepSeek V2/V3/R1 series models.",
         )
         parser.add_argument(
+            "--enable-llama4-multimodal",
+            default=ServerArgs.enable_llama4_multimodal,
+            action="store_true",
+            help="Enable the multimodal functionality for Llama-4.",
+        )
+        parser.add_argument(
             "--disable-overlap-schedule",
             action="store_true",
             help="Disable the overlap scheduler, which overlaps the CPU scheduler with GPU model worker.",
@@ -1137,6 +1151,7 @@ class ServerArgs:
             "--deepep-mode",
             type=str,
             choices=["normal", "low_latency", "auto"],
+            default="auto",
             help="Select the mode when enable DeepEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch.",
         )
 
@@ -1207,6 +1222,19 @@ class ServerArgs:
             type=int,
             default=ServerArgs.disaggregation_decode_instance_num,
             help="For prefill only. The number of decode instances to use for disaggregation.",
+        )
+        parser.add_argument(
+            "--disaggregation-transfer-backend",
+            type=str,
+            default=ServerArgs.disaggregation_transfer_backend,
+            help="The backend for disaggregation transfer. Default is mooncake.",
+        )
+
+        # Multimodal
+        parser.add_argument(
+            "--disable-fast-image-processor",
+            action="store_true",
+            help="Adopt base image processor instead of fast image processor.",
         )
 
     @classmethod
