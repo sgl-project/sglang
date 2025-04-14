@@ -283,7 +283,7 @@ class DeepseekV2MoE(nn.Module):
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
         final_hidden_states = (
-            self.experts(hidden_states=hidden_states, router_logits=router_logits).contiguous()
+            self.experts(hidden_states=hidden_states, router_logits=router_logits)
             * self.routed_scaling_factor
         )
         if shared_output is not None:
