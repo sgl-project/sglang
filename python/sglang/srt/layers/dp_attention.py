@@ -191,10 +191,11 @@ def _dp_gather(
     assert global_tokens.is_contiguous()
 
     if local_tokens.shape[0] > 0 and (is_partial or get_attention_tp_rank() == 0):
-        assert (
-            global_tokens.untyped_storage().data_ptr()
-            != local_tokens.untyped_storage().data_ptr()
-        ), "aliasing between global_tokens and local_tokens not allowed"
+        if not torch.compiler.is_compiling():
+            assert (
+                global_tokens.untyped_storage().data_ptr()
+                != local_tokens.untyped_storage().data_ptr()
+            ), "aliasing between global_tokens and local_tokens not allowed"
         memcpy_triton(
             global_tokens, local_tokens, 0, local_start_pos, local_num_tokens, False
         )
@@ -242,10 +243,11 @@ def dp_scatter(
     assert local_tokens.is_contiguous()
     assert global_tokens.is_contiguous()
     if local_tokens.shape[0] > 0:
-        assert (
-            local_tokens.untyped_storage().data_ptr()
-            != global_tokens.untyped_storage().data_ptr()
-        ), "aliasing between local_tokens and global_tokens not allowed"
+        if not torch.compiler.is_compiling():
+            assert (
+                local_tokens.untyped_storage().data_ptr()
+                != global_tokens.untyped_storage().data_ptr()
+            ), "aliasing between local_tokens and global_tokens not allowed"
         memcpy_triton(
             local_tokens, global_tokens, 0, local_start_pos, local_num_tokens, True
         )
