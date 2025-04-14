@@ -153,7 +153,9 @@ def generate_markdown_table():
         "| tokens | heads | headsize | dtype "
         "| device | torch | triton | cuda v1 | cuda v2 | speedup(vs triton) | speedup(vs v1)|"
     )
-    table_separator = "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
+    table_separator = (
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
+    )
 
     def shortly_dtype(dtype: torch.dtype) -> str:
         return str(dtype).removeprefix("torch.")
