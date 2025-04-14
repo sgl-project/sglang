@@ -645,7 +645,10 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         cache = torch.cat((cos, sin), dim=-1)
         return cache
 
-    def forward(
+    def forward_hip(self, *args, **kwargs):
+        return self.forward_native(*args, **kwargs)
+
+    def forward_native(
         self,
         positions: torch.Tensor,
         query: torch.Tensor,
