@@ -849,7 +849,6 @@ def broadcast_pyobj(
 ):
     """Broadcast inputs from rank=0 to all other ranks with torch.dist backend."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[broadcast_pyobj] rank={rank}, device={device}")
 
     if rank == 0:
         if len(data) == 0:

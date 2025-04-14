@@ -195,6 +195,7 @@ class ServerArgs:
     # For PD disaggregation: can be "null" (not disaggregated), "prefill" (prefill-only), or "decode" (decode-only)
     disaggregation_mode: str = "null"
     disaggregation_bootstrap_port: int = 8998
+    disaggregation_transfer_backend: str = "mooncake"
 
     # multimodal
     disable_fast_image_processor: bool = False
@@ -1172,6 +1173,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.disaggregation_bootstrap_port,
             help="Bootstrap server port on the prefill server. Default is 8998.",
+        )
+        parser.add_argument(
+            "--disaggregation-transfer-backend",
+            type=str,
+            default=ServerArgs.disaggregation_transfer_backend,
+            help="The backend for disaggregation transfer. Default is mooncake.",
         )
 
         # Multimodal
