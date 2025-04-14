@@ -1872,7 +1872,7 @@ def get_scheduler_device(worker_device: str):
     # so we run all scheduler ops on CPU when using HPU
     return "cpu" if is_hpu() else worker_device
 
-  
+
 def is_hopper_with_cuda_12_3():
     if not is_cuda():
         return False
