@@ -429,6 +429,7 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
             second_per_grid_ts=ret.get("second_per_grid_ts", None),
         )
         mrope_positions = mrope_positions.squeeze(1)
+
         return {
             "input_ids": input_ids,
             "mm_items": items,
