@@ -45,7 +45,7 @@ import triton.language as tl
 from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
-from sglang.srt.disaggregation.conn import KVSender
+from sglang.srt.disaggregation.base import BaseKVSender
 from sglang.srt.disaggregation.decode import ScheduleBatchDisaggregationDecodeMixin
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
@@ -223,10 +223,10 @@ class MultimodalDataItem:
                 # memoryview() doesn't support PyTorch's BFloat16 dtype
                 tensor = tensor.float()
 
+            assert isinstance(tensor, torch.Tensor)
             if tensor.is_cuda:
-                tensor_cpu = torch.frombuffer(
-                    tensor.storage().untyped(), dtype=tensor.dtype, count=tensor.numel()
-                ).clone()
+                # TODO: improve this
+                tensor_cpu = tensor.cpu()
             else:
                 tensor_cpu = tensor
 
@@ -322,7 +322,6 @@ class MultimodalInputs:
             item.set_pad_value()
 
         optional_args = [
-            "modalities",
             "im_token_id",
             "im_start_id",
             "im_end_id",
@@ -527,7 +526,7 @@ class Req:
         # For disaggregation
         self.bootstrap_host: str = bootstrap_host
         self.bootstrap_room: Optional[int] = bootstrap_room
-        self.disagg_kv_sender: Optional[KVSender] = None
+        self.disagg_kv_sender: Optional[BaseKVSender] = None
 
         # used for warmup because we don't have a pair yet when init
         self.skip_kv_transfer: bool = False
