@@ -176,6 +176,21 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
             prefix=add_prefix("vision_tower", prefix),
         )
         
+        # temporary monkey patch
+        def monkey_patch_for_vision_tower():
+            embeddings = self.vision_tower.vision_model.embeddings
+            embeddings.num_positions = embeddings.num_patches
+            embeddings.position_embedding = nn.Embedding(
+                embeddings.num_positions, embeddings.embed_dim
+            )
+            embeddings.register_buffer(
+                "position_ids",
+                torch.arange(embeddings.num_positions).expand((1, -1)),
+                persistent=False,
+            )
+        
+        monkey_patch_for_vision_tower()
+        
         self.multi_modal_projector = Gemma3MultiModalProjector(config)
         self.vocab_size = config.text_config.vocab_size
 
@@ -291,24 +306,26 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
         pixel_values = pixel_values.to("cuda")
         pixel_values = pixel_values.to(dtype=self.language_model.dtype())
 
-        # 使用CLIPVisionModel处理图像
-        with torch.no_grad():
-            # CLIP输出可能有不同的格式，需要确保我们得到正确的隐藏状态
-            outputs = self.vision_tower(pixel_values)
+        # # 使用CLIPVisionModel处理图像
+        # with torch.no_grad():
+        #     # CLIP输出可能有不同的格式，需要确保我们得到正确的隐藏状态
+        #     outputs = self.vision_tower(pixel_values)
             
-            # 检查outputs是否为张量或对象
-            if isinstance(outputs, torch.Tensor):
-                vision_outputs = outputs
-            else:
-                # 可能是带有last_hidden_state属性的对象
-                vision_outputs = outputs.last_hidden_state if hasattr(outputs, 'last_hidden_state') else outputs
+        #     # 检查outputs是否为张量或对象
+        #     if isinstance(outputs, torch.Tensor):
+        #         vision_outputs = outputs
+        #     else:
+        #         # 可能是带有last_hidden_state属性的对象
+        #         vision_outputs = outputs.last_hidden_state if hasattr(outputs, 'last_hidden_state') else outputs
                 
-        # 确保输出形状正确 - 检查是否包含类令牌
-        if vision_outputs.shape[1] > self.patches_per_image and hasattr(self, 'patches_per_image'):
-            # CLIP模型通常在第一个位置有类令牌，我们需要决定是否保留或删除它
-            # 对于某些应用，类令牌可能包含有用的全局信息
-            vision_outputs = vision_outputs[:, 1:, :]  # 移除类令牌
-    
+        # # 确保输出形状正确 - 检查是否包含类令牌
+        # if vision_outputs.shape[1] > self.patches_per_image and hasattr(self, 'patches_per_image'):
+        #     # CLIP模型通常在第一个位置有类令牌，我们需要决定是否保留或删除它
+        #     # 对于某些应用，类令牌可能包含有用的全局信息
+        #     vision_outputs = vision_outputs[:, 1:, :]  # 移除类令牌
+        
+        vision_outputs = self.vision_tower(pixel_values=pixel_values)
+        # vision_outputs = self.vision_tower(pixel_values=pixel_values).last_hidden_state
         image_features = self.multi_modal_projector(vision_outputs)
         return image_features
 
@@ -437,25 +454,25 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
                 print("Loading vision model weight:", name, "param shape", param.shape, "loaded shape", loaded_weight.shape, flush=True)
                 if param.shape != loaded_weight.shape:
                     logger.warning(f"Shape mismatch for {name}: param {param.shape} vs weight {loaded_weight.shape}")
-                    # 处理已知的形状不匹配情况 - 类令牌导致的尺寸差异
-                    if (len(param.shape) == 2 and len(loaded_weight.shape) == 2 and 
-                        param.shape[0] == loaded_weight.shape[0] + 1 and 
-                        param.shape[1] == loaded_weight.shape[1]):
-                        # 这可能是类令牌导致的额外维度，先填充权重
-                        padded_weight = torch.zeros_like(param)
-                        padded_weight[1:,:] = loaded_weight  # 假设额外的维度在第0位，且是类令牌
-                        loaded_weight = padded_weight
-                        logger.info(f"Padded weight for {name} to match parameter shape")
-                    elif (len(param.shape) == 2 and len(loaded_weight.shape) == 2 and
-                        param.shape[0] == loaded_weight.shape[0] - 1 and
-                        param.shape[1] == loaded_weight.shape[1]):
-                        # 可能是视觉模型需要裁剪
-                        loaded_weight = loaded_weight[:-1,:]  # 裁剪最后一行
-                        logger.info(f"Trimmed weight for {name} to match parameter shape")
-                    else:
-                        # 其他形状不匹配情况 - 跳过
-                        logger.warning(f"Unable to resolve shape mismatch for {name}, skipping")
-                        continue
+                    # # 处理已知的形状不匹配情况 - 类令牌导致的尺寸差异
+                    # if (len(param.shape) == 2 and len(loaded_weight.shape) == 2 and 
+                    #     param.shape[0] == loaded_weight.shape[0] + 1 and 
+                    #     param.shape[1] == loaded_weight.shape[1]):
+                    #     # 这可能是类令牌导致的额外维度，先填充权重
+                    #     padded_weight = torch.zeros_like(param)
+                    #     padded_weight[1:,:] = loaded_weight  # 假设额外的维度在第0位，且是类令牌
+                    #     loaded_weight = padded_weight
+                    #     logger.info(f"Padded weight for {name} to match parameter shape")
+                    # elif (len(param.shape) == 2 and len(loaded_weight.shape) == 2 and
+                    #     param.shape[0] == loaded_weight.shape[0] - 1 and
+                    #     param.shape[1] == loaded_weight.shape[1]):
+                    #     # 可能是视觉模型需要裁剪
+                    #     loaded_weight = loaded_weight[:-1,:]  # 裁剪最后一行
+                    #     logger.info(f"Trimmed weight for {name} to match parameter shape")
+                    # else:
+                    #     # 其他形状不匹配情况 - 跳过
+                    #     logger.warning(f"Unable to resolve shape mismatch for {name}, skipping")
+                    #     continue
                 
                 if flag:
                     weight_loader = param.weight_loader
