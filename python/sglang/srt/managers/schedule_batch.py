@@ -37,6 +37,7 @@ import dataclasses
 import logging
 from typing import TYPE_CHECKING, List, Optional, Set, Tuple, Union
 from enum import IntEnum
+from typing import Dict
 
 import numpy as np
 import torch
@@ -995,7 +996,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         assert len(self.out_cache_loc) == self.extend_num_tokens
 
-    def recover_for_decode(self, origin_output_ids: dict[str, List[int]]):
+    def recover_for_decode(self, origin_output_ids: dict[str, List[int]], kv_buffer: Dict[str, torch.Tensor]):
         self.forward_mode = ForwardMode.DECODE
 
         bs = len(self.reqs)
@@ -1016,6 +1017,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         for i, req in enumerate(reqs):
             req.req_pool_idx = req_pool_indices[i]
             req.output_ids = origin_output_ids[req.rid]
+            assert len(req.output_ids) == 1, f"recover_for_decode: req({req.rid}).output_ids not equal one token: {req.output_ids}, origin_output_ids: {origin_output_ids}"
             pre_len, seq_len = len(req.prefix_indices), len(req.fill_ids)
             seq_lens.append(seq_len)
             assert seq_len - pre_len == req.extend_input_len
@@ -1156,6 +1158,22 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self,
             self.model_config.vocab_size,
         )
+
+        # Restore KV cache
+        pt = 0
+        for i, req in enumerate(self.reqs):
+            flattened_kv_buffer = kv_buffer[req.rid].to(self.device)
+            layer_kv_buffers = torch.unbind(flattened_kv_buffer, dim=0)
+            kv_cache_pool = self.token_to_kv_pool_allocator.get_kvcache()
+            for layer_id, layer_kv_buffer in enumerate(layer_kv_buffers):
+                kv_cache_pool.set_kv_buffer_by_layer(
+                    layer_id,
+                    self.out_cache_loc[pt : pt + req.extend_input_len],
+                    layer_kv_buffer[len(req.prefix_indices):],
+                    None
+                )
+            req.kv_cache_restored = True
+            pt += req.extend_input_len
 
     def prepare_for_extend(self):
         self.forward_mode = ForwardMode.EXTEND
@@ -1524,6 +1542,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 )
 
         # Update fields
+        assert self.batch_size() == len(self.output_ids), f"Batch size {self.batch_size()} does not match output_ids length {len(self.output_ids)}, output_ids: {self.output_ids}"
         self.input_ids = self.output_ids
         self.output_ids = None
 
@@ -1621,6 +1640,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.req_pool_indices = torch.cat(
             [self.req_pool_indices, other.req_pool_indices]
         )
+        original_output_ids = self.output_ids
+        original_reqs = self.reqs
         self.seq_lens = torch.cat([self.seq_lens, other.seq_lens])
         self.out_cache_loc = None
         self.seq_lens_sum += other.seq_lens_sum
@@ -1636,6 +1657,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.top_logprobs_nums = [0] * len(self.reqs) + other.top_logprobs_nums
             self.token_ids_logprobs = [None] * len(self.reqs) + other.token_ids_logprobs
         self.reqs.extend(other.reqs)
+
+        assert self.batch_size() == len(self.output_ids), f"Batch size {self.batch_size()} \
+            does not match output_ids length {len(self.output_ids)}, \
+            original_output_ids: {original_output_ids}, \
+            other.output_ids: {other.output_ids}, \
+            self.output_ids: {self.output_ids} \
+            original_reqs: {[(r.rid, r.output_ids) for r in original_reqs]} \
+            other.reqs: {[(r.rid, r.output_ids) for r in other.reqs]}"
 
         self.return_logprob |= other.return_logprob
         self.has_stream |= other.has_stream

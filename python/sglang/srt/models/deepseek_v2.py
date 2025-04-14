@@ -180,7 +180,6 @@ class DeepseekV2MoE(nn.Module):
             else 0
         )
 
-        self.routed_scaling_factor = config.routed_scaling_factor
         if self.tp_size > config.n_routed_experts:
             raise ValueError(
                 f"Tensor parallel size {self.tp_size} is greater than "
@@ -284,7 +283,7 @@ class DeepseekV2MoE(nn.Module):
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
         final_hidden_states = (
-            self.experts(hidden_states=hidden_states, router_logits=router_logits)
+            self.experts(hidden_states=hidden_states, router_logits=router_logits).contiguous()
             * self.routed_scaling_factor
         )
         if shared_output is not None:

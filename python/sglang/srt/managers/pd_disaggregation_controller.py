@@ -11,15 +11,16 @@ from sglang.srt.managers.io_struct import (
     BatchStrOut,
 )
 
-from sglang.srt.managers.io_struct import PrefilledReqInput, KVTransferFetch, KVTransferAck, AbortReq, KVTransferFetchBatch
+from sglang.srt.managers.io_struct import PrefilledReqInput, AbortReq, KVTransferFetch, KVTransferAck
 
 logger = logging.getLogger(__name__)
 
 PD_DISAGGREGATION_PORT = 17000
 
+
 class PDDisaggregationController:
-    def __init__(self, 
-                 server_args: ServerArgs, 
+    def __init__(self,
+                 server_args: ServerArgs,
                  port_args: PortArgs,
                  send_to_scheduler: zmq.Socket):
         self.recv_from_transfer_agent = None
@@ -27,13 +28,16 @@ class PDDisaggregationController:
         self.send_to_tokenizer = None
 
         assert server_args.kv_transfer_config is not None, "KVTransferConfig is required"
-        
+
         context = zmq.Context(server_args.tp_size+3)
-        self.recv_from_transfer_agent = get_zmq_socket(context, zmq.PULL, f"tcp://*:{PD_DISAGGREGATION_PORT}", True)
+        self.recv_from_transfer_agent = get_zmq_socket(
+            context, zmq.PULL, f"tcp://*:{PD_DISAGGREGATION_PORT}", True)
         self.send_to_scheduler = send_to_scheduler
-        self.send_to_tokenizer = get_zmq_socket(context, zmq.PUSH, port_args.tokenizer_ipc_name, False)
+        self.send_to_tokenizer = get_zmq_socket(
+            context, zmq.PUSH, port_args.tokenizer_ipc_name, False)
         for rank in range(server_args.tp_size):
-            self.send_to_transfer_agent[rank] = get_zmq_socket(context, zmq.PUSH, f"tcp://*:{PD_DISAGGREGATION_PORT + rank + 1}", True)
+            self.send_to_transfer_agent[rank] = get_zmq_socket(
+                context, zmq.PUSH, f"tcp://*:{PD_DISAGGREGATION_PORT + rank + 1}", True)
 
         self._request_dispatcher = TypeBasedDispatcher(
             [
@@ -42,7 +46,6 @@ class PDDisaggregationController:
                 (AbortReq, self._handle_abort_req),
                 (PrefilledReqInput, self._handle_prefilled_req),
                 (KVTransferFetch, self._handle_kv_transfer_req),
-                (KVTransferFetchBatch, self._handle_kv_transfer_batch_req),
                 (KVTransferAck, self._handle_kv_transfer_resp),
             ]
         )
@@ -56,23 +59,25 @@ class PDDisaggregationController:
     async def _handle_request_loop(self):
         while True:
             recv_obj = self.recv_from_transfer_agent.recv_pyobj()
-            logger.info(f"Received request: {recv_obj}")
             self._request_dispatcher(recv_obj)
 
     def _handle_kv_transfer_req(self, req: KVTransferFetch):
+        logger.debug(f"[PD] Dispatch kv transfer fetch batch request: {req}")
         self.send_to_transfer_agent[req.src_rank].send_pyobj(req)
-        
-    def _handle_kv_transfer_batch_req(self, req: KVTransferFetchBatch):
-        self.send_to_transfer_agent[req.src_rank].send_pyobj(req)
+        logger.debug(f"[PD] Dispatched kv transfer fetch batch request: {req}")
 
     def _handle_kv_transfer_resp(self, req: KVTransferAck):
+        logger.debug(f"[PD] Dispatch kv transfer ack: {req}")
         self.send_to_transfer_agent[req.dst_rank].send_pyobj(req)
+        logger.debug(f"[PD] Dispatched kv transfer ack: {req}")
 
     def _handle_batch_out(self, recv_obj: Union[BatchEmbeddingOut, BatchStrOut]):
-        self.send_to_tokenizer.send_pyobj(recv_obj) 
+        self.send_to_tokenizer.send_pyobj(recv_obj)
 
     def _handle_abort_req(self, req: AbortReq):
         self.send_to_tokenizer.send_pyobj(req)
-       
+
     def _handle_prefilled_req(self, req: PrefilledReqInput):
+        logger.debug(f"[PD] Dispatch prefilled request: {req.rid}")
         self.send_to_scheduler.send_pyobj(req)
+        logger.debug(f"[PD] Dispatched prefilled request: {req.rid}")

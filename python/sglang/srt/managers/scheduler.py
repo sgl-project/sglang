@@ -19,6 +19,7 @@ import os
 import signal
 import sys
 import threading
+import socket
 import time
 import warnings
 from collections import defaultdict, deque
@@ -319,6 +320,8 @@ class Scheduler(
 
         # Init running status
         self.waiting_queue: List[Req] = []
+        # The aborted requests
+        self.aborted_reqs: Dict[str, Req] = {}
         # The running decoding batch for continuous batching
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
         # The current forward batch
@@ -632,6 +635,9 @@ class Scheduler(
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
 
+            if len(self.aborted_reqs) > 0:
+                self.process_aborted_requests()
+
             if batch:
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
@@ -646,6 +652,8 @@ class Scheduler(
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
         self.result_queue = deque()
+
+        logger.info("Scheduler event loop overlap started")
 
         while True:
             recv_reqs = self.recv_requests()
@@ -667,6 +675,9 @@ class Scheduler(
                         next_batch_sampling_info=self.tp_worker.cur_sampling_info,
                     )
                     self.process_batch_result(tmp_batch, None)
+            
+            if len(self.aborted_reqs) > 0:
+                self.process_aborted_requests()
 
             if self.last_batch:
                 # Process the results of the last batch
@@ -699,6 +710,9 @@ class Scheduler(
             if batch:
                 result = self.run_batch(batch)
                 self.process_batch_result_disagg_prefill(batch, result)
+            
+            if len(self.aborted_reqs) > 0:
+                self.process_aborted_requests()
 
             if len(self.disagg_prefill_inflight_queue) > 0:
                 self.process_disagg_prefill_inflight_queue()
@@ -735,6 +749,9 @@ class Scheduler(
                     result = self.run_batch(batch)
                     self.process_batch_result(batch, result)
 
+            if len(self.aborted_reqs) > 0:
+                self.process_aborted_requests()
+
             if batch is None and (
                 len(self.disagg_decode_transfer_queue.queue)
                 + len(self.disagg_decode_prealloc_queue.queue)
@@ -754,7 +771,9 @@ class Scheduler(
             while True:
                 try:
                     recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
-                except zmq.ZMQError:
+                except zmq.ZMQError as e:
+                    if "Resource temporarily unavailable" not in str(e):
+                        logger.error(f"Scheduler recv_requests error: {e}")
                     break
                 recv_reqs.append(recv_req)
 
@@ -878,6 +897,8 @@ class Scheduler(
                 req.kv_cache_length = recv_req.kv_cache_length
                 req.output_ids = recv_req.output_ids
                 req.pd_step = PDStep.DECODE
+
+                logger.debug(f"[Scheduler] Prefilled request {req.rid} received")
 
             if (
                 recv_req.session_params is not None
@@ -1346,7 +1367,7 @@ class Scheduler(
 
         origin_output_ids = {}
         # Get requests from the waiting queue to a new batch
-        for req in self.waiting_queue:
+        for i, req in enumerate(self.waiting_queue):
             if (
                 self.lora_paths
                 and len(
@@ -1358,6 +1379,10 @@ class Scheduler(
             ):
                 self.running_batch.batch_is_full = True
                 break
+
+            if req.finished():
+                self.aborted_reqs[req.rid] = req
+                continue
 
             if running_bs + len(adder.can_run_list) >= self.max_running_requests:
                 self.running_batch.batch_is_full = True
@@ -1386,22 +1411,32 @@ class Scheduler(
                 break
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
+        self.waiting_queue = [
+            x for x in self.waiting_queue if x not in set(can_run_list) and x not in self.aborted_reqs
+        ]
         if len(can_run_list) == 0:
             return None
-        self.waiting_queue = [
-            x for x in self.waiting_queue if x not in set(can_run_list)
-        ]
+        
+        kv_cache_restored_reqs = []
+        can_run_list = [req for req in can_run_list if not req.kv_cache_restored]
+        kv_buffer = self.kv_transfer_agent.get_kv_buffer(can_run_list)
+        for req in can_run_list:
+            if req.rid not in kv_buffer:
+                req.finished_reason = FINISH_ABORT(message="KV cache restored failed")
+                self.aborted_reqs[req.rid] = req
+            else:
+                kv_cache_restored_reqs.append(req)
 
         if self.enable_hierarchical_cache:
             self.tree_cache.read_to_load_cache()
 
         # Print stats
         if self.attn_tp_rank == 0:
-            self.log_recover_stats(adder, can_run_list, running_bs)
+            self.log_recover_stats(adder, kv_cache_restored_reqs, running_bs)
 
         # Create a new batch
         new_batch = ScheduleBatch.init_new(
-            can_run_list,
+            kv_cache_restored_reqs,
             self.req_to_token_pool,
             self.token_to_kv_pool_allocator,
             self.tree_cache,
@@ -1410,53 +1445,9 @@ class Scheduler(
             self.spec_algorithm,
             self.server_args.enable_custom_logit_processor,
         )
-        new_batch.recover_for_decode(origin_output_ids)
-        # Recover kv cache from kv_transfer_agent
-        '''
-        pt = 0
-        for i in range(new_batch.batch_size()):
-            req = new_batch.reqs[i]
-            if req.kv_cache_restored:
-                pt += new_batch.extend_lens[i]
-                continue
-            flattened_kv_buffer = self.kv_transfer_agent.get_kv_buffer(req).to(self.device)
-            layer_kv_buffers = torch.unbind(flattened_kv_buffer, dim=0)
-            kv_cache_pool = self.token_to_kv_pool_allocator.get_kvcache()
-            for layer_id, layer_kv_buffer in enumerate(layer_kv_buffers):
-                kv_cache_pool.set_kv_buffer_by_layer(
-                    layer_id,
-                    new_batch.out_cache_loc[pt : pt + new_batch.extend_lens[i]],
-                    layer_kv_buffer[len(req.prefix_indices):],
-                    None
-                )
-            req.kv_cache_restored = True
-            pt += new_batch.extend_lens[i]
-        '''
-        pt = 0
-        req_info_map = {}
-        try_to_fetch_kv_cache_req_list = []
-        for i in range(new_batch.batch_size()):
-            req = new_batch.reqs[i]
-            if req.kv_cache_restored:
-                pt += new_batch.extend_lens[i]
-                continue
-            try_to_fetch_kv_cache_req_list.append(req)
-            req_info_map[req.rid] = (pt, pt + new_batch.extend_lens[i], len(req.prefix_indices))
-            pt += new_batch.extend_lens[i]
-        
-        kv_bytes_map = self.kv_transfer_agent.get_batch_kv_buffer(try_to_fetch_kv_cache_req_list)
-        for rid, tensor in kv_bytes_map.items():
-            flattened_kv_buffer = tensor.to(self.device)
-            layer_kv_buffers = torch.unbind(flattened_kv_buffer, dim=0)
-            kv_cache_pool = self.token_to_kv_pool_allocator.get_kvcache()
-            for layer_id, layer_kv_buffer in enumerate(layer_kv_buffers):
-                kv_cache_pool.set_kv_buffer_by_layer(
-                    layer_id,
-                    new_batch.out_cache_loc[req_info_map[rid][0] : req_info_map[rid][1]],
-                    layer_kv_buffer[req_info_map[rid][2]:],
-                    None
-                )
-            req.kv_cache_restored = True
+
+        logger.debug(f"[Scheduler] Recovered new prefilled batch with kv_buffer: {kv_buffer.keys()}")
+        new_batch.recover_for_decode(origin_output_ids, kv_buffer)
         return new_batch
 
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
@@ -1502,7 +1493,7 @@ class Scheduler(
             lora_set = set([req.lora_path for req in self.running_batch.reqs])
 
         # Get requests from the waiting queue to a new prefill batch
-        for req in self.waiting_queue:
+        for i, req in enumerate(self.waiting_queue):
             if (
                 self.lora_paths
                 and len(
@@ -1514,6 +1505,11 @@ class Scheduler(
             ):
                 self.running_batch.batch_is_full = True
                 break
+
+            if req.finished():
+                self.aborted_reqs[req.rid] = req
+                self.waiting_queue.pop(i)
+                continue
 
             if running_bs + len(adder.can_run_list) >= self.max_running_requests:
                 self.running_batch.batch_is_full = True
@@ -1625,7 +1621,13 @@ class Scheduler(
                 f"#retracted_reqs: {len(retracted_reqs)}, "
                 f"#new_token_ratio: {old_ratio:.4f} -> {self.new_token_ratio:.4f}"
             )
-            self._extend_requests_to_queue(retracted_reqs)
+
+            if self.kv_transfer_agent.role == "decode":
+                for req in retracted_reqs:
+                    req.finished_reason = FINISH_ABORT(message="Decode out of memory")
+                    self.aborted_reqs[req.rid] = req
+            else:
+                self._extend_requests_to_queue(retracted_reqs)
         else:
             self.new_token_ratio = max(
                 self.new_token_ratio - self.new_token_ratio_decay,
@@ -1700,6 +1702,13 @@ class Scheduler(
                 embeddings=embeddings, bid=model_worker_batch.bid
             )
         return ret
+    
+    def process_aborted_requests(self):
+        if self.kv_transfer_agent.role != "decode":
+            return
+        logger.debug(f"[Scheduler] Processing aborted requests: {self.aborted_reqs.keys()}")
+        self.process_aborted_result(self.aborted_reqs.values())
+        self.aborted_reqs = {}
 
     def process_batch_result(
         self,

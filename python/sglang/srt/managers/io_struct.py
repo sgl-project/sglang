@@ -855,22 +855,11 @@ class PrefilledReqInput(TokenizedGenerateReqInput):
 
 @dataclass
 class KVTransferFetch:
-    rid: Optional[str] = None         # request id
-    # the address of the prefill node which has the kv cache
-    src_addr: Optional[str] = None
-    # the rank of the prefill node which has the kv cache
-    src_rank: Optional[int] = None
-    # the address of the decode node which needs the kv cache
-    dst_addr: Optional[str] = None
-    # the rank of the decode node which needs the kv cache
-    dst_rank: Optional[int] = None
-    # the pointer to the buffer of the decode node which needs the kv cache
-    dst_ptr: Optional[int] = None
-
-@dataclass
-class KVTransferFetchBatch():
-    fetch_batch_req_hash: Optional[str] = None
-    rids: Optional[List[str]] = None         # request ids
+    # the request ids
+    rids: Optional[List[str]] = None      
+    # the hash of the requests
+    reqs_hash: Optional[str] = None
+    # the number of requests
     fetch_ct: Optional[int] = None
     # the address of the prefill node which has the kv cache
     src_addr: Optional[str] = None
@@ -885,13 +874,16 @@ class KVTransferFetchBatch():
 
 @dataclass
 class KVTransferAck:
-    rid: Optional[str] = None         # request id
+    # the request ids
+    rid: Optional[str] = None
+    # the hash of the requests
+    reqs_hash: Optional[str] = None
     # the address of the decode node which needs the kv cache
     dst_addr: Optional[str] = None
     # the rank of the decode node which needs the kv cache
     dst_rank: Optional[int] = None
-    # code: 0: success, 1: failed
-    code: Optional[int] = None
+    # the error message, None means success
+    error_message: Optional[str] = None
 
 
 @dataclass

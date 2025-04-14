@@ -277,6 +277,21 @@ class SchedulerOutputProcessorMixin:
         ):
             self.log_decode_stats()
 
+    def process_aborted_result(self, reqs: List[Req]):
+        self.token_to_kv_pool_allocator.free_group_begin()
+        for req in reqs:
+            if req.is_retracted:
+                continue
+
+            if req.req_pool_idx is None:
+                continue
+
+            req.check_finished()
+            if req.finished():
+                self.tree_cache.cache_finished_req(req)
+        self.stream_output(reqs, False)
+        self.token_to_kv_pool_allocator.free_group_end()
+
     def add_input_logprob_return_values(
         self,
         i: int,

@@ -67,6 +67,7 @@ class DataParallelController:
         # Init inter-process communication
         self.context = zmq.Context(1 + server_args.dp_size)
         if server_args.node_rank == 0:
+            logger.info(f"Launching data parallel controller at {port_args.scheduler_input_ipc_name}")
             self.recv_from_tokenizer = get_zmq_socket(
                 self.context, zmq.PULL, port_args.scheduler_input_ipc_name, False
             )
@@ -93,6 +94,7 @@ class DataParallelController:
         # Only node rank 0 runs the real data parallel controller that dispatches the requests.
         if server_args.node_rank == 0:
             for dp_rank in range(server_args.dp_size):
+                logger.info(f"Launching data parallel worker {dp_rank} at {dp_port_args[dp_rank].scheduler_input_ipc_name}")
                 self.workers[dp_rank] = get_zmq_socket(
                     self.context,
                     zmq.PUSH,
@@ -222,18 +224,22 @@ class DataParallelController:
         self.max_req_input_len = scheduler_info[0]["max_req_input_len"]
 
     def round_robin_scheduler(self, req):
+        logger.debug(f"[DataParallelController] dispatching request {req.rid} to {self.round_robin_counter}/{len(self.workers)}")
         self.workers[self.round_robin_counter].send_pyobj(req)
+        logger.debug(f"[DataParallelController] dispatched request {req.rid} to {self.round_robin_counter}/{len(self.workers)}")
         self.round_robin_counter = (self.round_robin_counter + 1) % len(self.workers)
 
     def shortest_queue_scheduler(self, input_requests):
         raise NotImplementedError()
 
     def event_loop(self):
+        logger.debug("Data parallel controller event loop started")
         while True:
             while True:
                 try:
-                    recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
-                except zmq.ZMQError:
+                    recv_req = self.recv_from_tokenizer.recv_pyobj()
+                except zmq.ZMQError as e:
+                    logger.error(f"Data parallel controller event loop recv_from_tokenizer error: {e}")
                     break
 
                 if isinstance(
