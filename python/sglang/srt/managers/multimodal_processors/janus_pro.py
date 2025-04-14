@@ -33,7 +33,9 @@ class JanusProImageProcessor(BaseMultimodalProcessor):
         base_out = self.load_mm_data(
             prompt=input_ids,
             image_data=image_data,
-            multimodal_tokens=MultimodalSpecialTokens(image_token=processor.image_tag),
+            multimodal_tokens=MultimodalSpecialTokens(
+                image_token=processor.image_token
+            ),
             max_req_input_len=max_req_input_len,
         )
 

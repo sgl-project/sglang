@@ -707,7 +707,7 @@ def moe_align_block_size(
             dtype=torch.int32,
             device=topk_ids.device,
         )
-        cumsum_buffer = torch.zeros(
+        cumsum_buffer = torch.empty(
             num_experts + 1, dtype=torch.int32, device=topk_ids.device
         )
 
@@ -956,7 +956,7 @@ def get_moe_configs(
     logger.warning(
         (
             "Using default MoE config. Performance might be sub-optimal! "
-            "Config file not found at %s"
+            "Config file not found at %s, you can tune the config with https://github.com/sgl-project/sglang/blob/main/benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton.py."
         ),
         config_file_path,
     )
