@@ -23,7 +23,6 @@ suites = {
         TestFile("models/test_reward_models.py", 83),
         TestFile("models/test_gme_qwen_models.py", 45),
         TestFile("models/test_clip_models.py", 100),
-        # TestFile("models/test_unsloth_models.py", 80),
         TestFile("test_abort.py", 51),
         TestFile("test_block_int8.py", 22),
         TestFile("test_chunked_prefill.py", 336),
