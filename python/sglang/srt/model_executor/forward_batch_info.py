@@ -38,7 +38,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
-from sglang.srt.utils import get_compiler_backend, flatten_nested_list
+from sglang.srt.utils import flatten_nested_list, get_compiler_backend
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -407,7 +407,6 @@ class ForwardBatch:
     def _compute_mrope_positions(
         self, model_runner: ModelRunner, batch: ModelWorkerBatch
     ):
-        device = model_runner.device
         mrope_positions_list = [None] * self.seq_lens.shape[0]
         if self.forward_mode.is_decode():
             for i, _ in enumerate(mrope_positions_list):
@@ -423,6 +422,7 @@ class ForwardBatch:
                         int(self.seq_lens[i]),
                     )
                 )
+
         elif self.forward_mode.is_extend():
             for i, mm_input in enumerate(batch.multimodal_inputs):
                 if mm_input is None:
@@ -438,9 +438,9 @@ class ForwardBatch:
                             [
                                 pos
                                 for pos in range(
-                                extend_prefix_len,
-                                extend_prefix_len + extend_seq_len,
-                            )
+                                    extend_prefix_len,
+                                    extend_prefix_len + extend_seq_len,
+                                )
                             ]
                         ]
                         * 3
