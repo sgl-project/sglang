@@ -6,7 +6,6 @@ from typing import Any, Callable, Dict, List, Optional
 import torch
 import torch.nn.functional as F
 from torch.nn import Module
-from torch.nn.parameter import Parameter
 
 try:
     from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
@@ -108,7 +107,7 @@ class Fp8Config(QuantizationConfig):
         if weight_block_size is not None:
             if not is_checkpoint_fp8_serialized:
                 raise ValueError(
-                    f"The block-wise quantization only supports fp8-serialized checkpoint for now."
+                    "The block-wise quantization only supports fp8-serialized checkpoint for now."
                 )
             if len(weight_block_size) != 2:
                 raise ValueError(
@@ -313,21 +312,10 @@ class Fp8LinearMethod(LinearMethodBase):
                     weight_scale=layer.weight_scale_inv,
                     input_scale=None,
                 )
-                layer.weight = torch.nn.Parameter(weight, requires_grad=False)
-                layer.weight_scale_inv = torch.nn.Parameter(
-                    weight_scale, requires_grad=False
-                )
+                layer.weight.data = weight
+                layer.weight_scale_inv.data = weight_scale
                 layer.input_scale = None
-            else:
-                layer.weight = torch.nn.Parameter(
-                    layer.weight.data, requires_grad=False
-                )
-                layer.weight_scale_inv = torch.nn.Parameter(
-                    layer.weight_scale_inv.data, requires_grad=False
-                )
             return
-
-        layer.weight = torch.nn.Parameter(layer.weight.data, requires_grad=False)
 
         # If checkpoint not serialized fp8, quantize the weights.
         if not self.quant_config.is_checkpoint_fp8_serialized:
@@ -342,20 +330,15 @@ class Fp8LinearMethod(LinearMethodBase):
                 qweight, weight_scale = input_to_float8(layer.weight)
 
             # Update the layer with the new values.
-            layer.weight = Parameter(qweight.t(), requires_grad=False)
-            layer.weight_scale = Parameter(weight_scale, requires_grad=False)
+            layer.weight.data = qweight.t()
+            layer.weight_scale = torch.nn.Parameter(weight_scale, requires_grad=False)
             layer.input_scale = None
 
         # If checkpoint is fp8, handle that there are N scales for N
         # shards in a fused module
         else:
-            layer.weight_scale = torch.nn.Parameter(
-                layer.weight_scale.data, requires_grad=False
-            )
             if self.quant_config.activation_scheme == "static":
-                layer.input_scale = torch.nn.Parameter(
-                    layer.input_scale.data, requires_grad=False
-                )
+                pass
 
             # cutlass sgl-kernel and marlin only support per-channel scale
             if self.cutlass_fp8_supported or self.use_marlin:
@@ -375,7 +358,7 @@ class Fp8LinearMethod(LinearMethodBase):
                         input_scale=layer.input_scale,
                     )
                     if input_scale is not None:
-                        layer.input_scale = Parameter(input_scale, requires_grad=False)
+                        layer.input_scale.data = input_scale
 
                 weight_scale, weight = requantize_with_max_scale(
                     weight=weight,
@@ -384,12 +367,13 @@ class Fp8LinearMethod(LinearMethodBase):
                 )
 
             # Update layer with new values.
-            layer.weight = Parameter(weight.t(), requires_grad=False)
-            layer.weight_scale = Parameter(weight_scale, requires_grad=False)
+            layer.weight.data = weight.t()
+            layer.weight_scale.data = weight_scale
             if self.quant_config.activation_scheme == "static":
-                layer.input_scale = Parameter(
-                    layer.input_scale.max(), requires_grad=False
-                )
+                input_scale = layer.input_scale.max()
+                if len(input_scale.shape) == 0:
+                    input_scale = input_scale.reshape(1)
+                layer.input_scale.data = input_scale
 
         if self.use_marlin:
             prepare_fp8_layer_for_marlin(layer)
