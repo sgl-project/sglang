@@ -126,11 +126,6 @@ class KVCache(abc.ABC):
     @abc.abstractmethod
     def transfer_per_layer(self, indices, flat_data, layer_id):
         raise NotImplementedError()
-
-    # for disagg
-    @abc.abstractmethod
-    def get_contiguous_buf_infos(self):
-        raise NotImplementedError()
     
     def register_layer_transfer_counter(self, layer_transfer_counter):
         self.layer_transfer_counter = layer_transfer_counter
