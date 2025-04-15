@@ -34,12 +34,16 @@ def alloc_extend_kernel_native(
     ret_values: torch.Tensor,
     page_size: int,
 ):
+    prefix_lens_list = prefix_lens.tolist()
+    seq_lens_list = seq_lens.tolist()
+    last_locs_list = last_locs.tolist()
     sum_num_new_pages = 0
     sum_extend_lens = 0
-    for i in range(len(prefix_lens)):
-        pre_len = prefix_lens[i]
-        seq_len = seq_lens[i]
-        last_loc = last_locs[i]
+    out_indices_list = []
+    for i in range(len(prefix_lens_list)):
+        pre_len = prefix_lens_list[i]
+        seq_len = seq_lens_list[i]
+        last_loc = last_locs_list[i]
 
         extend_len = seq_len - pre_len
         sum_extend_lens += seq_len - pre_len
@@ -56,7 +60,7 @@ def alloc_extend_kernel_native(
         )
         assert num_part1 >= 0 and num_part1 <= page_size
         offset_part1 = torch.arange(0, num_part1)
-        out_indices[output_start_loc + offset_part1] = last_loc + 1 + offset_part1
+        out_indices_list.append(last_loc + 1 + offset_part1)
 
         if pre_len + num_part1 == seq_len:
             continue
@@ -67,7 +71,7 @@ def alloc_extend_kernel_native(
         )
         offset_part2 = torch.arange(0, num_part2)
         page_start = free_page[new_page_start_loc + offset_part2 // page_size]
-        out_indices[output_start_loc + num_part1 + offset_part2] = (
+        out_indices_list.append(
             page_start * page_size + offset_part2 % page_size
         )
 
@@ -77,9 +81,10 @@ def alloc_extend_kernel_native(
         num_part3 = seq_len - seq_len // page_size * page_size
         start_loc = free_page[new_page_start_loc + num_page_start_loc_self - 1]
         offset_part3 = torch.arange(0, num_part3)
-        out_indices[output_start_loc + num_part1 + num_part2 + offset_part3] = (
+        out_indices_list.append(
             start_loc * page_size + offset_part3
         )
+    out_indices.copy_(torch.concat(out_indices_list))
     ret_values.fill_((sum_num_new_pages << 32) | sum_extend_lens)
 
 
@@ -91,6 +96,9 @@ def alloc_decode_kernel_native(
     ret_values: torch.Tensor,
     page_size: int,
 ):
+    seq_lens = seq_lens.tolist()
+    last_locs = last_locs.tolist()
+    out_indices_list = out_indices.tolist()
     sum_num_new_pages = 0
     for i in range(len(seq_lens)):
         seq_len = seq_lens[i]
@@ -108,11 +116,12 @@ def alloc_decode_kernel_native(
         new_page_start_loc = sum_num_new_pages - num_page_start_loc_self
 
         if num_page_start_loc_self == 0:
-            out_indices[i] = last_loc + 1
+            out_indices_list[i] = last_loc + 1
         else:
             page = free_page[new_page_start_loc]
-            out_indices[i] = page * page_size
+            out_indices_list[i] = page * page_size
     ret_values.fill_(sum_num_new_pages)
+    out_indices.copy_(torch.tensor(out_indices_list))
 
 
 @triton.jit

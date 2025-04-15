@@ -226,11 +226,12 @@ if _is_hpu:
         hpu_metadata = HPUBlockMetadata()
         if worker_batch.forward_mode.is_decode():
             batch_size = len(worker_batch.seq_lens)
+            seq_len_list = worker_batch.seq_lens.tolist()
             padded_batch_size = get_decode_batch_bucket(batch_size)
             block_tables = []
             slots_list = []
             for i in range(batch_size):
-                num_pages = (worker_batch.seq_lens[i] + page_size - 1) // page_size
+                num_pages = (seq_len_list[i] + page_size - 1) // page_size
                 num_lots_aligned = num_pages * page_size
                 slots = req_token_pool.req_to_token[
                     worker_batch.req_pool_indices[i], :num_lots_aligned
