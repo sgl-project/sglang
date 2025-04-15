@@ -259,7 +259,10 @@ class ModelConfig:
             modelopt_quant_config = {"quant_method": "modelopt"}
             if not is_local:
                 from huggingface_hub import hf_hub_download
-                from huggingface_hub.errors import OfflineModeIsEnabled, EntryNotFoundError
+                from huggingface_hub.errors import (
+                    EntryNotFoundError,
+                    OfflineModeIsEnabled,
+                )
 
                 try:
                     hf_hub_download(self.model_path, "hf_quant_config.json")
