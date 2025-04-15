@@ -172,8 +172,6 @@ class ModelRunner:
         self.dp_size = server_args.dp_size
         self.pp_rank = pp_rank
         self.pp_size = pp_size
-        if self.device == "cpu":
-            model_config = update_config(model_config, self.tp_size)
         self.model_config = model_config
         self.dist_port = nccl_port
         self.server_args = server_args
@@ -558,6 +556,10 @@ class ModelRunner:
             download_dir=self.server_args.download_dir,
             model_loader_extra_config=self.server_args.model_loader_extra_config,
         )
+        if self.device == "cpu":
+            self.model_config = update_config(
+                self.model_config, self.load_config, self.tp_size
+            )
         if self.server_args.load_format == "gguf":
             monkey_patch_vllm_gguf_config()
 
