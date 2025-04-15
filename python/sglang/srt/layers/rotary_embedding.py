@@ -1180,7 +1180,6 @@ class MRotaryEmbedding(RotaryEmbedding):
                 image_grid_thw is not None or video_grid_thw is not None
             ):
                 total_input_ids = input_ids
-                attention_mask = torch.ones_like(total_input_ids).to("cuda")
                 position_ids = torch.ones(
                     3,
                     input_ids.shape[0],
@@ -1189,9 +1188,7 @@ class MRotaryEmbedding(RotaryEmbedding):
                     device=input_ids.device,
                 ).to("cuda")
                 image_idx, video_idx, audio_idx = 0, 0, 0
-                attention_mask = attention_mask.to(total_input_ids.device)
                 for i, input_ids in enumerate(total_input_ids):
-                    input_ids = input_ids[attention_mask[i] == 1]
                     image_nums, video_nums, audio_nums = 0, 0, 0
                     vision_start_indices = torch.argwhere(
                         input_ids == vision_start_token_id
@@ -1624,9 +1621,7 @@ class MRotaryEmbedding(RotaryEmbedding):
                         torch.cat(llm_pos_ids_list, dim=1).reshape(3, -1).to("cuda")
                     )
 
-                    position_ids[..., i, attention_mask[i] == 1] = llm_positions.to(
-                        position_ids.device
-                    )
+                    position_ids[..., i, :] = llm_positions.to(position_ids.device)
                     mrope_position_deltas.append(
                         llm_positions.max() + 1 - len(input_ids)
                     )
@@ -1637,8 +1632,6 @@ class MRotaryEmbedding(RotaryEmbedding):
                 return position_ids, mrope_position_deltas
             else:
                 assert input_ids is not None, input_ids
-                # position_ids = attention_mask.long().cumsum(-1) - 1
-                # position_ids.masked_fill_(attention_mask == 0, 1)
                 s = input_ids.shape[1]
                 position_ids = torch.arange(s)
                 position_ids = (

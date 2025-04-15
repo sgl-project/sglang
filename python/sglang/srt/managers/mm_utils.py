@@ -182,7 +182,7 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
             start_idx = starts[i]
             end_idx = ends[i]
             pad_value = pad_values[i]
-            if pad_value is not None:  # Ensure pad_value is not None before assignment
+if pad_value is not None:  # Ensure pad_value is not None before assignment
                 output_ids_tensor[start_idx:end_idx] = pad_value
             else:
                 logger.warning(f"Skipping region {i} due to None pad_value.")

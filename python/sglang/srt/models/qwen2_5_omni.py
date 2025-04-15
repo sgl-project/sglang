@@ -35,12 +35,11 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.managers.mm_utils import general_mm_embed_routine
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputs,
+from sglang.srt.managers.mm_utils import (
+    MultiModalityDataPaddingPatternMultimodalTokens,
+    general_mm_embed_routine,
 )
+from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2Attention, Qwen2MLP
@@ -481,7 +480,6 @@ class Qwen2_5OmniVisionBlock(nn.Module):
             use_qkv_parallel=True,
             qkv_backend="sdpa",
             softmax_in_single_precision=True,
-            rotary_embed="normal",
             flatten_batch=True,
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
@@ -915,12 +913,17 @@ class Qwen2_5OmniThinkerForConditionalGeneration(nn.Module):
         self.pad_token_id = (
             self.config.pad_token_id if self.config.pad_token_id is not None else -1
         )
+
+        self.is_mrope_enabled = "mrope_section" in self.config.text_config.rope_scaling
+
         self.logits_processor = LogitsProcessor(config.text_config)
 
     def get_input_embeddings(self):
         return self.model.get_input_embeddings()
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        print(f"image {items=}")
+
         # in qwen-vl, last dim is the same
         pixel_values = (
             torch.concat([item.pixel_values for item in items], dim=0)
@@ -936,7 +939,7 @@ class Qwen2_5OmniThinkerForConditionalGeneration(nn.Module):
         return image_embeds
 
     def get_audio_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-
+        print(f"audio {items=}")
         input_features = (
             torch.cat([item.audio_feature for item in items])
             .type(self.audio_tower.dtype)
@@ -983,10 +986,7 @@ class Qwen2_5OmniThinkerForConditionalGeneration(nn.Module):
         forward_batch: ForwardBatch,
     ) -> LogitsProcessorOutput:
 
-        rope_type = self.text_config.rope_scaling.get("rope_type", None)
-        is_mrope_enabled = rope_type == "mrope" or rope_type == "default"
-
-        if is_mrope_enabled:
+        if self.is_mrope_enabled:
             positions = forward_batch.mrope_positions
 
         hs = general_mm_embed_routine(
@@ -995,10 +995,6 @@ class Qwen2_5OmniThinkerForConditionalGeneration(nn.Module):
             language_model=self.model,
             image_data_embedding_func=self.get_image_feature,
             audio_data_embedding_func=self.get_audio_feature,
-            placeholder_tokens={
-                Modality.AUDIO: self.config.audio_token_index,
-                Modality.IMAGE: self.config.image_token_index,
-            },
             positions=positions,
         )
         return self.logits_processor(input_ids, hs, self.lm_head, forward_batch)
@@ -1039,13 +1035,9 @@ class Qwen2_5OmniModel(nn.Module):
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         # Get all special token IDs
-        # media_token_pairs = [
-        #     (mm_inputs.im_start_id, mm_inputs.im_end_id),
-        #     (mm_inputs.audio_start_id, mm_inputs.audio_end_id),
-        # ]
-        # pattern = MultiModalityDataPaddingPatternTokenPairs(media_token_pairs)
-        #
-        # return pattern.pad_input_tokens(input_ids, mm_inputs)
+        media_token_ids = [mm_inputs.im_token_id, mm_inputs.audio_token_id]
+        pattern = MultiModalityDataPaddingPatternMultimodalTokens(media_token_ids)
+        return pattern.pad_input_tokens(input_ids, mm_inputs)
         return input_ids
 
     def load_speakers(self, path):
