@@ -651,7 +651,7 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
     def forward(self, *args, **kwargs):
         if torch.compiler.is_compiling():
             return self.forward_native(*args, **kwargs)
-        if _is_cuda_available:
+        if _is_cuda:
             return self.forward_cuda(*args, **kwargs)
         else:
             return self.forward_native(*args, **kwargs)
