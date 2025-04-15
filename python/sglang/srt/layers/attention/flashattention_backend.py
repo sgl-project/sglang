@@ -1169,12 +1169,6 @@ class FlashAttentionBackend(AttentionBackend):
             }
 
             self.target_verify_metadata_topk_expand = {
-                # "cache_seqlens": torch.arange(
-                #     1,
-                #     self.speculative_num_draft_tokens + 1,
-                #     device=self.device,
-                #     dtype=torch.int32,
-                # ).repeat(max_bs),
                 "cache_seqlens": torch.zeros(
                     max_bs * self.speculative_num_draft_tokens,
                     dtype=torch.int32,
@@ -1198,16 +1192,6 @@ class FlashAttentionBackend(AttentionBackend):
                     device=self.device,
                 ),
             }
-            # self.target_verify_metadata_topk_expand["cu_seqlens_k"] = (
-            #     torch.nn.functional.pad(
-            #         torch.cumsum(
-            #             self.target_verify_metadata_topk_expand["cache_seqlens"],
-            #             dim=0,
-            #             dtype=torch.int32,
-            #         ),
-            #         (1, 0),
-            #     )
-            # )
 
         # Biao's Note: Consolidate the encoder metadata
         self.encoder_metadata = {
@@ -1239,7 +1223,6 @@ class FlashAttentionBackend(AttentionBackend):
         metadata = FlashAttentionMetadata()
 
         # metadata_expand is needed for Spec Decoding when top k > 1
-        # Biao's Note: Should we put this in conditional statement like if topk > 1?
         metadata_expand = FlashAttentionMetadata()
 
         device = seq_lens.device
@@ -1387,7 +1370,6 @@ class FlashAttentionBackend(AttentionBackend):
                     ]
                 )
                 metadata_expand.max_seq_len_q = 1
-                # metadata_expand.max_seq_len_k = self.speculative_num_draft_tokens
                 metadata_expand.cu_seqlens_q = self.target_verify_metadata_topk_expand[
                     "cu_seqlens_q"
                 ][: bs * self.speculative_num_draft_tokens + 1]
@@ -1596,9 +1578,6 @@ class FlashAttentionBackend(AttentionBackend):
                 mask = spec_info.custom_mask[mask_extraction_indices].view(
                     -1, self.speculative_num_draft_tokens
                 )  # (bsz * draft_num, draft_num)
-                # metadata_expand.page_table.copy_(
-                #     (non_masked_page_table * mask).to(torch.int32)
-                # )
                 col_indices = offsets.expand(
                     mask.shape[0], self.speculative_num_draft_tokens
                 )
