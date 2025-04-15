@@ -429,13 +429,22 @@ class SchedulerDisaggregationDecodeMixin:
             # polling and allocating kv cache
             self.process_decode_queue()
             batch = self.get_next_disagg_decode_batch_to_run()
+            
+            # Handle DP attention
+            if self.server_args.enable_dp_attention or self.server_args.enable_sp_layernorm:
+                batch, do_extend = self.prepare_dp_attn_batch(batch)
+            elif batch:
+                do_extend = batch.forward_mode.is_extend()
+                
             self.cur_batch = batch
 
             if batch:
                 # Generate fake extend output.
-                if batch.forward_mode.is_extend():
+                if do_extend:
                     # Note: Logprobs should be handled on the prefill engine.
-                    self.stream_output(batch.reqs, False)
+                    self.stream_output(
+                        batch.reqs, [False for _ in range(len(batch.reqs))]
+                    )
                 else:
                     result = self.run_batch(batch)
                     self.process_batch_result(batch, result)

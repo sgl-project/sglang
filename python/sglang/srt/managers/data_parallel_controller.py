@@ -23,6 +23,8 @@ import psutil
 import setproctitle
 import zmq
 
+from python.sglang.srt.disaggregation.utils import DisaggregationMode
+from python.sglang.srt.managers.schedule_batch import Req
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import (
     TokenizedEmbeddingReqInput,
@@ -220,9 +222,12 @@ class DataParallelController:
         self.max_total_num_tokens = scheduler_info[0]["max_total_num_tokens"]
         self.max_req_input_len = scheduler_info[0]["max_req_input_len"]
 
-    def round_robin_scheduler(self, req):
-        self.workers[self.round_robin_counter].send_pyobj(req)
-        self.round_robin_counter = (self.round_robin_counter + 1) % len(self.workers)
+    def round_robin_scheduler(self, req: Req):
+        if self.server_args.disaggregation_mode == DisaggregationMode.NULL:
+            self.workers[self.round_robin_counter].send_pyobj(req)
+            self.round_robin_counter = (self.round_robin_counter + 1) % len(self.workers)
+        else:
+            self.workers[req.bootstrap_room % len(self.workers)].send_pyobj(req)
 
     def shortest_queue_scheduler(self, input_requests):
         raise NotImplementedError()
