@@ -420,7 +420,6 @@ class TokenizerManager:
 
         image_inputs: Dict = await self.mm_processor.process_mm_data_async(
             image_data=obj.image_data,
-            audio_data=obj.audio_data,
             input_text=input_text or input_ids,
             request_obj=obj,
             max_req_input_len=self.max_req_input_len,

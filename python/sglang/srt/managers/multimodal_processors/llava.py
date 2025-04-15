@@ -101,7 +101,6 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
     async def process_mm_data_async(
         self,
         image_data: List[Union[str, bytes]],
-        audio_data: List[Union[str, bytes]],
         input_text,
         request_obj,
         *args,
