@@ -292,8 +292,6 @@ class TestLanguageModel(CustomTestCase):
                     "0.6",
                     "--load-format",
                     "bitsandbytes",
-                    "--chat-template",
-                    "llama-2",
                 ]
                 try:
                     process = popen_launch_server_wrapper(
