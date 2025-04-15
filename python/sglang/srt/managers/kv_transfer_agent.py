@@ -203,14 +203,13 @@ class KVTransferAgent:
         batch_kv_cache_length = 0
         for req in req_list:
             batch_kv_cache_length += req.kv_cache_length
-
         res = {}
         batch_kv_cache = None
         try:
             # allocate buffer
             dst_ptr = self._allocate_transfer_kv_buffer(batch_kv_cache_length)
             # send fetch request
-            logger.info(f"Sending kv transfer fetch request")
+            logger.debug(f"[KVTransferAgent] Sending kv transfer fetch request")
             kv_transfer_fetch = KVTransferFetch(
                 rids=[req.rid for req in req_list],
                 reqs_hash=hashlib.md5(
@@ -235,9 +234,9 @@ class KVTransferAgent:
                                              len(req.origin_input_ids), :, :]
                 pt += len(req.origin_input_ids)
         except Exception as e:
-            logger.error(f"Get batch kv buffer failed: {e}")
+            logger.error(f"[KVTransferAgent] Get batch kv buffer failed: {e}")
             if batch_kv_cache is not None:
-                logger.error(f"Batch kv cache: {str(batch_kv_cache)}")
+                logger.error(f"[KVTransferAgent] Batch kv cache: {str(batch_kv_cache)}")
             for req in req_list:
                 req.finished_reason = FINISH_ABORT(
                     message=f"Get batch kv buffer failed: {e}")
@@ -314,7 +313,6 @@ class KVTransferAgent:
                                       for rid in req.rids], dim=1)
                 serialized = safetensors_save({"tensor": kv_caches})
                 batch_kv_cache_length = len(serialized)
-                # allocate buffer
                 src_ptr = self._allocate_transfer_kv_buffer(
                     batch_kv_cache_length)
                 self._write_bytes_to_buffer(
@@ -328,7 +326,7 @@ class KVTransferAgent:
                 req.dst_addr, self.handle_kv_cache_buffer_ptr[req.reqs_hash], req.dst_ptr, self.handle_kv_cache_buffer_length[req.reqs_hash], op_write)
             ack_error_message = None
         except Exception as e:
-            logger.error(f"KV transfer failed: {e}")
+            logger.error(f"[KVTransferAgent] KV transfer failed: {e}")
             ack_error_message = str(e)
 
         # send ack to remote addr
@@ -379,4 +377,4 @@ class KVTransferAgent:
             elif isinstance(recv_obj, KVTransferAck):
                 self._handle_kv_transfer_ack(recv_obj)
             else:
-                raise ValueError(f"Unknown message type: {type(recv_obj)}")
+                raise ValueError(f"[KVTransferAgent] Unknown message type: {type(recv_obj)}")
