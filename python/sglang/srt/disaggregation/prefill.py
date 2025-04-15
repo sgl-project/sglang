@@ -77,7 +77,7 @@ class PrefillBootstrapQueue:
         self.tp_rank = tp_rank
         self.tp_size = tp_size
         self.transfer_backend = transfer_backend
-        self.dist_init_addr = scheduler.server_args.dist_init_addr
+        self.scheduler = scheduler
         self.kv_manager = self._init_kv_manager()
         self.queue: List[Req] = []
         self.gloo_group = gloo_group
@@ -90,7 +90,6 @@ class PrefillBootstrapQueue:
 
     def _init_kv_manager(self) -> BaseKVManager:
         kv_args = KVArgs()
-        kv_args.dist_init_addr = self.dist_init_addr
         kv_args.engine_rank = self.tp_rank
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
@@ -112,7 +111,9 @@ class PrefillBootstrapQueue:
         ]
         kv_args.ib_device = "mock-ib-device"
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
-        kv_manager = kv_manager_class(kv_args, DisaggregationMode.PREFILL)
+        kv_manager = kv_manager_class(
+            kv_args, DisaggregationMode.PREFILL, self.scheduler.server_args
+        )
         return kv_manager
 
     def add(self, req: Req) -> None:

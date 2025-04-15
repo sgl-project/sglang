@@ -8,7 +8,7 @@ import socket
 import struct
 import threading
 from functools import cache
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
@@ -26,6 +26,7 @@ from sglang.srt.disaggregation.base.conn import (
 )
 from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferEngine
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_free_port, get_ip, get_local_ip_by_remote
 
 logger = logging.getLogger(__name__)
@@ -92,10 +93,19 @@ class TransferInfo:
 
 
 class MooncakeKVManager(BaseKVManager):
-    def __init__(self, args: KVArgs, disaggregation_mode: DisaggregationMode):
+    def __init__(
+        self,
+        args: KVArgs,
+        disaggregation_mode: DisaggregationMode,
+        server_args: ServerArgs,
+    ):
         self.engine = MooncakeTransferEngine()
         self.kv_args = args
         self.disaggregation_mode = disaggregation_mode
+        # for p/d multi node infer
+        self.dist_init_addr = None
+        if server_args:
+            self.dist_init_addr = server_args.dist_init_addr
         self.request_status: Dict[int, KVPoll] = {}
         self.connection_pool: Dict[int, Dict[str, Union[str, int]]] = {}
         self.rank_port = None
@@ -312,7 +322,7 @@ class MooncakeKVManager(BaseKVManager):
 
     def _register_to_bootstrap(self):
         """Register KVSender to bootstrap server via HTTP POST."""
-        if self.kv_args.dist_init_addr:
+        if self.dist_init_addr:
             ip_address = socket.gethostbyname(self.kv_args.dist_init_addr.split(":")[0])
         else:
             ip_address = get_ip()

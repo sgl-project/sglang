@@ -5,6 +5,7 @@ import numpy as np
 import numpy.typing as npt
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.server_args import ServerArgs
 
 
 class KVArgs:
@@ -16,7 +17,6 @@ class KVArgs:
     aux_data_lens: list[int]
     aux_item_lens: list[int]
     ib_device: str
-    dist_init_addr: str
 
 
 class KVPoll:
@@ -31,7 +31,12 @@ class BaseKVManager(ABC):
     """Base class for managing transfers states"""
 
     @abstractmethod
-    def __init__(self, args: KVArgs, disaggregation_mode: DisaggregationMode): ...
+    def __init__(
+        self,
+        args: KVArgs,
+        disaggregation_mode: DisaggregationMode,
+        server_args: ServerArgs = None,
+    ): ...
 
 
 class BaseKVSender(ABC):
