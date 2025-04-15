@@ -80,7 +80,7 @@ cmdclass = {
 }
 Extension = CppExtension
 
-extra_link_args = [f"-Wl,-rpath,$ORIGIN/../../torch/lib", f"-L/usr/lib/{arch}-linux-gnu"]
+extra_link_args = ["-Wl,-rpath,$ORIGIN/../../torch/lib", f"-L/usr/lib/{arch}-linux-gnu"]
 
 ext_modules = [
     Extension(
