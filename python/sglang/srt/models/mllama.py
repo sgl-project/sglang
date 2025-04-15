@@ -835,7 +835,6 @@ class MllamaForConditionalGeneration(nn.Module):
             quant_config=quant_config,
             prefix="multi_modal_projector",
         )
-        # ReplicatedLinear
         self.logits_processor = LogitsProcessor(config.text_config)
         self.capture_mode = False
 
@@ -1039,7 +1038,6 @@ class MllamaForConditionalGeneration(nn.Module):
         params_dict = dict(self.named_parameters())
         updated_params = set()
         for name, loaded_weight in weights:
-
             if "patch_embedding.weight" in name:
                 name = name.replace(
                     "patch_embedding.weight", "patch_embedding._linear.weight"
@@ -1058,7 +1056,7 @@ class MllamaForConditionalGeneration(nn.Module):
                 if "vision_model" in name:
                     # adapt to VisionAttention
                     name = name.replace("self_attn.o_proj", "self_attn.proj")
-                param = params_dict.get(name)
+                param = params_dict.pop(name)
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
 
