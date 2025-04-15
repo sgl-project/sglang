@@ -27,6 +27,14 @@ python benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton.py \
     --n-share-experts-fusion 8 \
     --dtype fp8_w8a8 \
     --tune
+
+# Tune DeepSeek-R1 with channel-wise INT8, TP=16 and n_share_experts_fusion=16
+python benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton.py \
+    --model meituan/DeepSeek-R1-Channel-INT8 \
+    --tp-size 16 \
+    --n-share-experts-fusion 16 \
+    --dtype int8_w8a8 \
+    --tune
 ```
 
 After tuning, a configuration file (e.g., `E=64,N=640,device_name=NVIDIA_GeForce_RTX_4090,dtype=fp8_w8a8.json`) will be generated in the current directory. You can move this file to `sglang/srt/layers/fused_moe_triton/configs/` to use it in `sglang`.
