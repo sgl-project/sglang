@@ -1872,3 +1872,36 @@ def is_hopper_with_cuda_12_3():
     cuda_version = torch.version.cuda.split(".")
     is_cuda_compatible = int(cuda_version[0]) == 12 and int(cuda_version[1]) >= 3
     return is_hopper and is_cuda_compatible
+
+
+def get_free_port():
+    # try ipv4
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("", 0))
+            return s.getsockname()[1]
+    except OSError:
+        # try ipv6
+        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as s:
+            s.bind(("", 0))
+            return s.getsockname()[1]
+
+
+def get_local_ip_by_remote() -> str:
+    # try ipv4
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))  # Doesn't need to be reachable
+        return s.getsockname()[0]
+    except Exception:
+        pass
+
+    # try ipv6
+    try:
+        s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+        # Google's public DNS server, see
+        # https://developers.google.com/speed/public-dns/docs/using#addresses
+        s.connect(("2001:4860:4860::8888", 80))  # Doesn't need to be reachable
+        return s.getsockname()[0]
+    except Exception:
+        raise ValueError(f"Can not get local ip")
