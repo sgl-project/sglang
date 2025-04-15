@@ -17,6 +17,7 @@ class KVArgs:
     aux_data_lens: list[int]
     aux_item_lens: list[int]
     ib_device: str
+    gpu_id: int
 
 
 class KVPoll:
@@ -35,7 +36,7 @@ class BaseKVManager(ABC):
         self,
         args: KVArgs,
         disaggregation_mode: DisaggregationMode,
-        server_args: ServerArgs = None,
+        server_args: ServerArgs,
     ): ...
 
 

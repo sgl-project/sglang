@@ -103,9 +103,8 @@ class MooncakeKVManager(BaseKVManager):
         self.kv_args = args
         self.disaggregation_mode = disaggregation_mode
         # for p/d multi node infer
-        self.dist_init_addr = None
-        if server_args:
-            self.dist_init_addr = server_args.dist_init_addr
+        self.bootstrap_port = server_args.disaggregation_bootstrap_port
+        self.dist_init_addr = server_args.dist_init_addr
         self.request_status: Dict[int, KVPoll] = {}
         self.connection_pool: Dict[int, Dict[str, Union[str, int]]] = {}
         self.rank_port = None
@@ -323,11 +322,11 @@ class MooncakeKVManager(BaseKVManager):
     def _register_to_bootstrap(self):
         """Register KVSender to bootstrap server via HTTP POST."""
         if self.dist_init_addr:
-            ip_address = socket.gethostbyname(self.kv_args.dist_init_addr.split(":")[0])
+            ip_address = socket.gethostbyname(self.dist_init_addr.split(":")[0])
         else:
             ip_address = get_ip()
 
-        bootstrap_server_url = f"{ip_address}:8998"
+        bootstrap_server_url = f"{ip_address}:{self.bootstrap_port}"
         url = f"http://{bootstrap_server_url}/kv_route"
         payload = {
             "identity": self.get_session_id(),
