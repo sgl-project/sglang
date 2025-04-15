@@ -78,7 +78,7 @@ class ForwardMode(IntEnum):
             self == ForwardMode.EXTEND
             or self == ForwardMode.MIXED
             or self == ForwardMode.DRAFT_EXTEND
-            or self == self.TARGET_VERIFY
+            or self == ForwardMode.TARGET_VERIFY
         )
 
     def is_decode(self):
@@ -96,15 +96,19 @@ class ForwardMode(IntEnum):
     def is_draft_extend(self):
         return self == ForwardMode.DRAFT_EXTEND
 
+    def is_extend_or_draft_extend_or_mixed(self):
+        return (
+            self == ForwardMode.EXTEND
+            or self == ForwardMode.DRAFT_EXTEND
+            or self == ForwardMode.MIXED
+        )
+
     def is_cuda_graph(self):
         return (
             self == ForwardMode.DECODE
             or self == ForwardMode.TARGET_VERIFY
             or self == ForwardMode.IDLE
         )
-
-    def is_extend_or_draft_extend(self):
-        return self == ForwardMode.EXTEND or self == ForwardMode.DRAFT_EXTEND
 
     def is_dummy_first(self):
         return self == ForwardMode.DUMMY_FIRST
