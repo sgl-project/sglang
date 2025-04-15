@@ -25,6 +25,8 @@ limitations under the License.
 #include <device/sm100_mla.hpp>
 #include <kernel/sm100_mla_tile_scheduler.hpp>
 
+#if defined CUDA_VERSION && CUDA_VERSION >= 12040
+
 #define CUTLASS_CHECK(status)                                                       \
   {                                                                                 \
     cutlass::Status error = status;                                                 \
@@ -205,3 +207,5 @@ int64_t cutlass_mla_get_workspace_size(int64_t max_seq_len, int64_t num_batches,
 
   return MlaSm100Type::Fmha::get_workspace_size(arguments);
 }
+
+#endif
