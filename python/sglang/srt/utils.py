@@ -1907,10 +1907,15 @@ def get_local_ip_by_remote() -> str:
         raise ValueError(f"Can not get local ip")
 
 
+def is_page_size_one(server_args):
+    return server_args.page_size == 1
+
+
 def is_no_spec_infer_or_topk_one(server_args):
     return server_args.speculative_eagle_topk is None or (
         server_args.speculative_eagle_topk is not None
         and server_args.speculative_eagle_topk == 1
+        and is_page_size_one(server_args)
     )
 
 
