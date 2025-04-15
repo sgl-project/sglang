@@ -29,7 +29,11 @@ def merge_state(
             return headdim % 4 == 0
         return headdim % 8 == 0
 
-    if is_cuda() and supported_dtypes(output) and supported_headdim(output):
+    if (
+        is_cuda()
+        and supported_dtypes(prefix_output)
+        and supported_headdim(prefix_output)
+    ):
         from sgl_kernel import merge_state_v2
 
         return merge_state_v2(
