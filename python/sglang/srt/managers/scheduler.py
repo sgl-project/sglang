@@ -49,6 +49,7 @@ from sglang.srt.disaggregation.prefill import (
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     ReqToMetadataIdxAllocator,
+    TransferBackend,
 )
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
@@ -530,6 +531,10 @@ class Scheduler(
             )
 
     def init_disaggregation(self):
+        self.transfer_backend = TransferBackend(
+            self.server_args.disaggregation_transfer_backend
+        )
+
         if (
             self.disaggregation_mode == DisaggregationMode.DECODE
         ):  # *2 for the headroom.
@@ -567,6 +572,7 @@ class Scheduler(
                 tp_rank=self.tp_rank,
                 tp_size=self.tp_size,
                 bootstrap_port=self.server_args.disaggregation_bootstrap_port,
+                transfer_backend=self.transfer_backend,
             )
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             # *2 for the headroom.
@@ -592,9 +598,10 @@ class Scheduler(
                 tp_size=self.tp_size,
                 bootstrap_port=self.server_args.disaggregation_bootstrap_port,
                 gloo_group=self.tp_worker.get_attention_tp_cpu_group(),
+                transfer_backend=self.transfer_backend,
             )
             # The prefill requests that are in the middle of kv sending
-            self.disagg_prefill_infight_queue: List[Req] = []
+            self.disagg_prefill_inflight_queue: List[Req] = []
 
     @DynamicGradMode()
     def event_loop_normal(self):
@@ -674,10 +681,10 @@ class Scheduler(
                 result = self.run_batch(batch)
                 self.process_batch_result_disagg_prefill(batch, result)
 
-            if len(self.disagg_prefill_infight_queue) > 0:
-                self.process_disagg_prefill_infight_queue()
+            if len(self.disagg_prefill_inflight_queue) > 0:
+                self.process_disagg_prefill_inflight_queue()
 
-            if batch is None and len(self.disagg_prefill_infight_queue) == 0:
+            if batch is None and len(self.disagg_prefill_inflight_queue) == 0:
                 self.check_memory()
                 self.new_token_ratio = self.init_new_token_ratio
 
