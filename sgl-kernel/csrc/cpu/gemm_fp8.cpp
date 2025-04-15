@@ -51,6 +51,7 @@ inline void unpack_B(
     int ldb,
     int ldb_tmp,
     float scale) {
+#if defined(CPU_CAPABILITY_AVX512)
   // [K/2, N, 2]
   const int K2 = K >> 1;
   const int ldb2 = ldb;  // ldb * 2 >> 1;
@@ -88,6 +89,9 @@ inline void unpack_B(
       _mm512_storeu_si512(Btmp + k * ldb_tmp * 2 + n * 2 + 32, (__m512i)bf16_1);
     }
   }
+#else
+  TORCH_CHECK(false, "unpack_B: scalar path not implemented!");
+#endif
 }
 
 template <typename scalar_t, typename packed_t, bool has_bias, int BLOCK_M, int BLOCK_N>
@@ -410,9 +414,7 @@ void fp8_scaled_mm_kernel_impl(
   const int64_t MB = div_up(M, BLOCK_M);
   const int64_t NB = div_up(N, BLOCK_N);
 
-  const int64_t scale_size_N = div_up(N, block_size_N);
   const int64_t scale_size_K = div_up(K, block_size_K);
-
   const int64_t blocks_n_per_group = block_size_N / BLOCK_N;
 
   const bool use_brgemm = can_use_brgemm<at::Float8_e4m3fn>(M);
