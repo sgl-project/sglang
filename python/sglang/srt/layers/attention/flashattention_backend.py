@@ -16,10 +16,8 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
 
+from sgl_kernel import merge_state_v2
 from sgl_kernel.flash_attn import flash_attn_with_kvcache
-
-# TODO: use native sgl-kernel merge_states
-from vllm.v1.attention.backends.flash_attn import merge_attn_states
 
 
 @dataclass
@@ -471,7 +469,8 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata_expand.max_seq_len_q = 1
                 metadata_expand.cu_seqlens_q = torch.arange(
                     0,
-                    forward_batch.seq_lens.numel() * self.speculative_num_draft_tokens + 1,
+                    forward_batch.seq_lens.numel() * self.speculative_num_draft_tokens
+                    + 1,
                     dtype=torch.int32,
                     device=device,
                 )
@@ -506,16 +505,20 @@ class FlashAttentionBackend(AttentionBackend):
 
                 # shift table indices to avoid padding
                 # non_masked_page_table [[8, 9, 10],   mask (display with int format) [[1, 0, 0],
-                #                        [8, 9, 10],                                   [1, 1, 0],  
+                #                        [8, 9, 10],                                   [1, 1, 0],
                 #                        [8, 9, 10]]                                   [1, 0, 1]]
                 # if masked with padding [[8, 0, 0],   our mask without padding       [[8, 9, 10],
-                #                        [8, 9, 0],                                    [8, 9, 10],      
+                #                        [8, 9, 0],                                    [8, 9, 10],
                 #                        [8, 0, 10]]                                   [8, 10, 9]]
                 # note here cache_seqlens_int32 is [1, 2, 2] so extra page indices will be ignored in each row
-                col_indices = offsets.expand(mask.shape[0], self.speculative_num_draft_tokens)
-                # Build keys: if an entry is valid (mask==True), keep its original index; 
+                col_indices = offsets.expand(
+                    mask.shape[0], self.speculative_num_draft_tokens
+                )
+                # Build keys: if an entry is valid (mask==True), keep its original index;
                 # if not, add self.speculative_num_draft_tokens so that it sorts after all valid entries.
-                keys = torch.where(mask, col_indices, col_indices + self.speculative_num_draft_tokens)
+                keys = torch.where(
+                    mask, col_indices, col_indices + self.speculative_num_draft_tokens
+                )
                 _, sort_order = torch.sort(keys, dim=1)
                 non_masked_page_table = (
                     forward_batch.req_to_token_pool.req_to_token[
@@ -772,12 +775,14 @@ class FlashAttentionBackend(AttentionBackend):
                     return_softmax_lse=True,
                 )
                 output = torch.empty_like(o)
-                merge_attn_states(
-                    output,
+                output_softmax_lse = torch.empty_like(softmax_lse)
+                merge_state_v2(
                     o,
-                    softmax_lse.contiguous(),
+                    softmax_lse.T.contiguous(),
                     o_expand,
-                    softmax_lse_expand.contiguous(),
+                    softmax_lse_expand.T.contiguous(),
+                    output,
+                    output_softmax_lse.T.contiguous(),
                 )
                 o = output
         else:
@@ -838,12 +843,14 @@ class FlashAttentionBackend(AttentionBackend):
                     return_softmax_lse=True,
                 )
                 output = torch.empty_like(o)
-                merge_attn_states(
-                    output,
+                output_softmax_lse = torch.empty_like(softmax_lse)
+                merge_state_v2(
                     o,
-                    softmax_lse.contiguous(),
+                    softmax_lse.T.contiguous(),
                     o_expand,
-                    softmax_lse_expand.contiguous(),
+                    softmax_lse_expand.T.contiguous(),
+                    output,
+                    output_softmax_lse.T.contiguous(),
                 )
                 o = output
 
@@ -962,12 +969,14 @@ class FlashAttentionBackend(AttentionBackend):
                     return_softmax_lse=True,
                 )
                 output = torch.empty_like(o)
-                merge_attn_states(
-                    output,
+                output_softmax_lse = torch.empty_like(softmax_lse)
+                merge_state_v2(
                     o,
-                    softmax_lse.contiguous(),
+                    softmax_lse.T.contiguous(),
                     o_expand,
-                    softmax_lse_expand.contiguous(),
+                    softmax_lse_expand.T.contiguous(),
+                    output,
+                    output_softmax_lse.T.contiguous(),
                 )
                 o = output
         else:
@@ -1188,10 +1197,14 @@ class FlashAttentionBackend(AttentionBackend):
                 #     dtype=torch.int32,
                 # ).repeat(max_bs),
                 "cache_seqlens": torch.zeros(
-                    max_bs * self.speculative_num_draft_tokens, dtype=torch.int32, device=self.device
+                    max_bs * self.speculative_num_draft_tokens,
+                    dtype=torch.int32,
+                    device=self.device,
                 ),
                 "cu_seqlens_k": torch.zeros(
-                    max_bs * self.speculative_num_draft_tokens + 1, dtype=torch.int32, device=self.device
+                    max_bs * self.speculative_num_draft_tokens + 1,
+                    dtype=torch.int32,
+                    device=self.device,
                 ),
                 "cu_seqlens_q": torch.arange(
                     0,
@@ -1607,8 +1620,12 @@ class FlashAttentionBackend(AttentionBackend):
                 # metadata_expand.page_table.copy_(
                 #     (non_masked_page_table * mask).to(torch.int32)
                 # )
-                col_indices = offsets.expand(mask.shape[0], self.speculative_num_draft_tokens)
-                keys = torch.where(mask, col_indices, col_indices + self.speculative_num_draft_tokens)
+                col_indices = offsets.expand(
+                    mask.shape[0], self.speculative_num_draft_tokens
+                )
+                keys = torch.where(
+                    mask, col_indices, col_indices + self.speculative_num_draft_tokens
+                )
                 _, sort_order = torch.sort(keys, dim=1)
 
                 non_masked_page_table = (
@@ -1616,14 +1633,22 @@ class FlashAttentionBackend(AttentionBackend):
                     .gather(1, cols)
                     .repeat_interleave(self.speculative_num_draft_tokens, dim=0)
                 )  # (bsz, draft_num)
-                metadata_expand.page_table.copy_(non_masked_page_table.gather(1, sort_order))
-                metadata_expand.cache_seqlens_int32.copy_(mask.sum(dim=1).to(torch.int32))
-                metadata_expand.cu_seqlens_k.copy_(torch.nn.functional.pad(
-                    torch.cumsum(
-                        metadata_expand.cache_seqlens_int32, dim=0, dtype=torch.int32
-                    ),
-                    (1, 0),
-                ))
+                metadata_expand.page_table.copy_(
+                    non_masked_page_table.gather(1, sort_order)
+                )
+                metadata_expand.cache_seqlens_int32.copy_(
+                    mask.sum(dim=1).to(torch.int32)
+                )
+                metadata_expand.cu_seqlens_k.copy_(
+                    torch.nn.functional.pad(
+                        torch.cumsum(
+                            metadata_expand.cache_seqlens_int32,
+                            dim=0,
+                            dtype=torch.int32,
+                        ),
+                        (1, 0),
+                    )
+                )
                 metadata.max_seq_len_k = metadata_expand.cu_seqlens_k.max().item()
                 # metadata_expand.max_seq_len_k = self.speculative_num_draft_tokens, already set in capture
                 # metadata_expand.cache_seqlens_int32 already set in capture
