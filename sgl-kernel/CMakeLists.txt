@@ -12,7 +12,7 @@ find_package(Python COMPONENTS Interpreter Development.Module ${SKBUILD_SABI_COM
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3")
 
-# Cuda
+# CUDA
 enable_language(CUDA)
 find_package(CUDAToolkit REQUIRED)
 set_property(GLOBAL PROPERTY CUDA_SEPARABLE_COMPILATION ON)
