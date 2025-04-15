@@ -176,13 +176,6 @@ class KimiVLForConditionalGeneration(nn.Module):
 
         return hidden_states
 
-        if not get_embedding:
-            return self.logits_processor(
-                input_ids, hidden_states, self.lm_head, forward_batch
-            )
-        else:
-            return self.pooler(hidden_states, forward_batch)
-
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         config = self.config.text_config
         _KEYS_TO_MODIFY_MAPPING = {
