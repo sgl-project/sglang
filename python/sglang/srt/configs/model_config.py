@@ -268,9 +268,6 @@ class ModelConfig:
                 else:
                     quant_cfg = modelopt_quant_config
 
-                    hf_api = HfApi()
-                    if hf_api.file_exists(self.model_path, "hf_quant_config.json"):
-                        quant_cfg = modelopt_quant_config
             elif os.path.exists(os.path.join(self.model_path, "hf_quant_config.json")):
                 quant_cfg = modelopt_quant_config
         return quant_cfg
