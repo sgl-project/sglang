@@ -26,10 +26,6 @@ from fastapi import HTTPException, Request, UploadFile
 from fastapi.responses import ORJSONResponse, StreamingResponse
 from pydantic import ValidationError
 
-from sglang.srt.code_completion_parser import (
-    generate_completion_prompt_from_request,
-    is_completion_template_defined,
-)
 from sglang.srt.conversation import (
     Conversation,
     SeparatorStyle,
@@ -38,7 +34,6 @@ from sglang.srt.conversation import (
     generate_embedding_convs,
     register_conv_template,
 )
-from sglang.srt.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.openai_api.protocol import (
     BatchRequest,
@@ -71,7 +66,8 @@ from sglang.srt.openai_api.protocol import (
     TopLogprob,
     UsageInfo,
 )
-from sglang.srt.reasoning_parser import ReasoningParser
+from sglang.srt.parser.function_call_parser import FunctionCallParser
+from sglang.srt.parser.parser_manager import ParserManager
 from sglang.utils import convert_json_schema_to_str, get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -319,6 +315,7 @@ async def process_batch(tokenizer_manager, batch_id: str, batch_request: BatchRe
                     to_file=True,
                     cache_report=tokenizer_manager.server_args.enable_cache_report,
                     tool_call_parser=tokenizer_manager.server_args.tool_call_parser,
+                    reasoning_parser=tokenizer_manager.server_args.reasoning_parser,
                 )
             else:
                 responses = v1_generate_response(
@@ -499,7 +496,7 @@ def v1_generate_request(
     logprob_start_lens = []
     top_logprobs_nums = []
     lora_paths = []
-
+    parser_manager = ParserManager(support_stream=False)
     for request in all_requests:
         # NOTE: with openai API, the prompt's logprobs are always not computed
         if request.echo and request.logprobs:
@@ -508,9 +505,9 @@ def v1_generate_request(
                 "To compute logprobs of input prompt, please use the native /generate API."
             )
 
-        prompt = request.prompt
-        if is_completion_template_defined():
-            prompt = generate_completion_prompt_from_request(request)
+        prompt = parser_manager.handle_completion_request(
+            request.prompt, request.suffix, request.template_name
+        )
         prompts.append(prompt)
 
         lora_paths.append(request.lora_path)
@@ -1124,7 +1121,7 @@ def v1_chat_generate_response(
     reasoning_parser=None,
 ):
     choices = []
-
+    parser_manager = ParserManager(support_stream=False)
     for idx, ret_item in enumerate(ret):
         logprobs = False
         if isinstance(request, list) and request[idx].logprobs:
@@ -1170,6 +1167,7 @@ def v1_chat_generate_response(
             choice_logprobs = None
 
         finish_reason = ret_item["meta_info"]["finish_reason"]
+        finish_reason_type = finish_reason["type"] if finish_reason else None
 
         tool_calls = None
         text = ret_item["text"]
@@ -1183,44 +1181,35 @@ def v1_chat_generate_response(
             tools = request.tools
             separate_reasoning = request.separate_reasoning
 
-        if reasoning_parser and separate_reasoning:
-            try:
-                parser = ReasoningParser(
-                    model_type=reasoning_parser, stream_reasoning=False
-                )
-                reasoning_text, text = parser.parse_non_stream(text)
-            except Exception as e:
-                logger.error(f"Exception: {e}")
-                return create_error_response(
-                    HTTPStatus.BAD_REQUEST,
-                    "Failed to parse reasoning related info to json format!",
-                )
-        else:
-            reasoning_text = None
+        try:
+            reasoning_text, text = parser_manager.handle_reasoning(
+                text=text,
+                reasoning_parser=reasoning_parser,
+                separate_reasoning=separate_reasoning,
+                stream=False,
+            )
+        except Exception as e:
+            logger.error(f"Exception: {e}")
+            return create_error_response(
+                HTTPStatus.BAD_REQUEST,
+                "Failed to parse reasoning related info to json format!",
+            )
 
-        if tool_choice != "none" and tools:
-            parser = FunctionCallParser(tools, tool_call_parser)
-            if parser.has_tool_call(text):
-                if finish_reason["type"] == "stop":
-                    finish_reason["type"] = "tool_calls"
-                    finish_reason["matched"] = None
-                try:
-                    text, call_info_list = parser.parse_non_stream(text)
-                    tool_calls = [
-                        ToolCall(
-                            id=str(call_info.tool_index),
-                            function=FunctionResponse(
-                                name=call_info.name, arguments=call_info.parameters
-                            ),
-                        )
-                        for call_info in call_info_list
-                    ]
-                except Exception as e:
-                    logger.error(f"Exception: {e}")
-                    return create_error_response(
-                        HTTPStatus.BAD_REQUEST,
-                        "Failed to parse fc related info to json format!",
-                    )
+        try:
+            text, tool_calls, finish_reason_type = parser_manager.handle_tool_calls(
+                text=text,
+                tools=tools,
+                tool_call_parser=tool_call_parser,
+                use_tool_call=(tool_choice != "none"),
+                stream=False,
+                finish_reason_type=finish_reason_type,
+            )
+        except Exception as e:
+            logger.error(f"Exception: {e}")
+            return create_error_response(
+                HTTPStatus.BAD_REQUEST,
+                "Failed to parse function call related info to json format!",
+            )
 
         if to_file:
             # to make the choice data json serializable
@@ -1233,7 +1222,7 @@ def v1_chat_generate_response(
                     "reasoning_content": reasoning_text if reasoning_text else None,
                 },
                 "logprobs": choice_logprobs.model_dump() if choice_logprobs else None,
-                "finish_reason": finish_reason["type"] if finish_reason else None,
+                "finish_reason": finish_reason_type if finish_reason_type else None,
                 "matched_stop": (
                     finish_reason["matched"]
                     if finish_reason and "matched" in finish_reason
@@ -1250,7 +1239,7 @@ def v1_chat_generate_response(
                     reasoning_content=reasoning_text if reasoning_text else None,
                 ),
                 logprobs=choice_logprobs,
-                finish_reason=finish_reason["type"] if finish_reason else None,
+                finish_reason=finish_reason_type if finish_reason_type else None,
                 matched_stop=(
                     finish_reason["matched"]
                     if finish_reason and "matched" in finish_reason
@@ -1315,10 +1304,8 @@ async def v1_chat_completions(
     all_requests = [ChatCompletionRequest(**request_json)]
     created = int(time.time())
     adapted_request, request = v1_chat_generate_request(all_requests, tokenizer_manager)
-
     if adapted_request.stream:
-        parser_dict = {}
-        reasoning_parser_dict = {}
+        stream_parser_manager = ParserManager(support_stream=True)
 
         async def generate_stream_resp():
             is_firsts = {}
@@ -1418,18 +1405,13 @@ async def v1_chat_completions(
                     delta = text[len(stream_buffer) :]
                     new_stream_buffer = stream_buffer + delta
 
-                    if (
-                        tokenizer_manager.server_args.reasoning_parser
-                        and request.separate_reasoning
-                    ):
-                        if index not in reasoning_parser_dict:
-                            reasoning_parser_dict[index] = ReasoningParser(
-                                tokenizer_manager.server_args.reasoning_parser,
-                                request.stream_reasoning,
-                            )
-                        reasoning_parser = reasoning_parser_dict[index]
-                        reasoning_text, delta = reasoning_parser.parse_stream_chunk(
-                            delta
+                    if request.separate_reasoning:
+                        reasoning_text, delta = stream_parser_manager.handle_reasoning(
+                            text=delta,
+                            reasoning_parser=tokenizer_manager.server_args.reasoning_parser,
+                            separate_reasoning=True,
+                            stream=True,
+                            index=index,
                         )
                         if reasoning_text:
                             choice_data = ChatCompletionResponseStreamChoice(
@@ -1454,15 +1436,16 @@ async def v1_chat_completions(
                             continue
 
                     if request.tool_choice != "none" and request.tools:
-                        if index not in parser_dict:
-                            parser_dict[index] = FunctionCallParser(
+                        normal_text, calls, finish_reason_type = (
+                            stream_parser_manager.handle_tool_calls(
+                                text=delta,
                                 tools=request.tools,
                                 tool_call_parser=tokenizer_manager.server_args.tool_call_parser,
+                                stream=True,
+                                index=index,
+                                finish_reason_type=finish_reason_type,
                             )
-                        parser = parser_dict[index]
-
-                        # parse_increment => returns (normal_text, calls)
-                        normal_text, calls = parser.parse_stream_chunk(delta)
+                        )
 
                         # 1) if there's normal_text, output it as normal content
                         if normal_text:
@@ -1484,37 +1467,12 @@ async def v1_chat_completions(
                         # 2) if we found calls, we output them as separate chunk(s)
                         for call_item in calls:
                             # transform call_item -> FunctionResponse + ToolCall
-
-                            if finish_reason_type == "stop":
-                                latest_delta_len = 0
-                                if isinstance(call_item.parameters, str):
-                                    latest_delta_len = len(call_item.parameters)
-
-                                expected_call = json.dumps(
-                                    parser.multi_format_parser.detectors[0]
-                                    .prev_tool_call_arr[index]
-                                    .get("arguments", {}),
-                                    ensure_ascii=False,
+                            tool_call, finish_reason_type = (
+                                stream_parser_manager.transform_call_item(
+                                    call_item, index, finish_reason_type
                                 )
-                                actual_call = parser.multi_format_parser.detectors[
-                                    0
-                                ].streamed_args_for_tool[index]
-                                if latest_delta_len > 0:
-                                    actual_call = actual_call[:-latest_delta_len]
-                                remaining_call = expected_call.replace(
-                                    actual_call, "", 1
-                                )
-                                call_item.parameters = remaining_call
-
-                                finish_reason_type = "tool_calls"
-
-                            tool_call = ToolCall(
-                                id=str(call_item.tool_index),
-                                function=FunctionResponse(
-                                    name=call_item.name,
-                                    arguments=call_item.parameters,
-                                ),
                             )
+
                             choice_data = ChatCompletionResponseStreamChoice(
                                 index=index,
                                 delta=DeltaMessage(tool_calls=[tool_call]),
@@ -1568,12 +1526,15 @@ async def v1_chat_completions(
                             stream_buffers[index] = new_stream_buffer
                             is_firsts[index] = is_first
                 if finish_reason_type == "stop" and request.tool_choice != "none":
-                    parser = FunctionCallParser(
+                    # Check if the stream ends with a tool call
+                    if stream_parser_manager.handle_tool_calls(
+                        text=new_stream_buffer,
                         tools=request.tools,
                         tool_call_parser=tokenizer_manager.server_args.tool_call_parser,
-                    )
-                    if parser.has_tool_call(new_stream_buffer):
-                        # if the stream ends with empty string after tool calls
+                        use_tool_call_parser=(request.tool_choice != "none"),
+                        stream=False,
+                        finish_reason_type=finish_reason_type,
+                    )[1]:
                         finish_reason_type = "tool_calls"
 
                 if request.stream_options and request.stream_options.include_usage:
