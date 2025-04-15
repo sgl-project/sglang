@@ -187,11 +187,7 @@ class HiPAttentionBackend(AttentionBackend):
             layer.layer_id,
             q.shape[0],
             forward_batch.batch_size,
-            (
-                None
-                if forward_batch.hip_metadata_cached_stages is None
-                else max(0, forward_batch.hip_metadata_cached_stages)
-            ),
+            forward_batch.hip_metadata_cached_stages,
         )
 
         if not self.is_kv_cache_offload_enabled:
