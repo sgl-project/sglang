@@ -1140,7 +1140,7 @@ at::Tensor shared_expert_cpu(
     bool use_fp8_w8a16,
     std::optional<at::Tensor>& w1_scale,
     std::optional<at::Tensor>& w2_scale,
-    std::vector<int64_t> block_size,
+    std::optional<std::vector<int64_t>> block_size,
     std::optional<at::Tensor>& a1_scale,
     std::optional<at::Tensor>& a2_scale,
     bool is_vnni) {
@@ -1185,6 +1185,7 @@ at::Tensor shared_expert_cpu(
   if (use_fp8_w8a16) {
     TORCH_CHECK(w1_scale.has_value(), "missing w1_scale for fp8 w8a16.");
     TORCH_CHECK(w2_scale.has_value(), "missing w2_scale for fp8 w8a16.");
+    TORCH_CHECK(block_size.has_value(), "missing block_size for fp8 w8a16.");
   }
 
   at::Tensor out_hidden_states = inplace ? hidden_states : at::empty_like(hidden_states);
@@ -1239,9 +1240,10 @@ at::Tensor shared_expert_cpu(
       float* __restrict__ C_tmp = (float*)((void*)(intermediate_cache1 + M * N));
       auto w1s = w1_scale.value();
       auto w2s = w2_scale.value();
-      TORCH_CHECK(block_size.size() == 2, "fp8_scaled_mm_cpu: expect block_size.size() to be 2.");
-      int64_t block_size_N = block_size[0];
-      int64_t block_size_K = block_size[1];
+      auto block_size_val = block_size.value();
+      TORCH_CHECK(block_size_val.size() == 2, "fp8_scaled_mm_cpu: expect block_size.size() to be 2.");
+      int64_t block_size_N = block_size_val[0];
+      int64_t block_size_K = block_size_val[1];
       TORCH_CHECK(w1s.size(0) == 2 * N / block_size_N);
       TORCH_CHECK(w1s.size(1) == K / block_size_K);
       TORCH_CHECK(w2s.size(0) == K / block_size_N);
