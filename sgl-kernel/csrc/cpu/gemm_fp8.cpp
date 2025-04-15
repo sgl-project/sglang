@@ -90,6 +90,120 @@ inline void unpack_B(
   }
 }
 
+template <typename scalar_t, typename packed_t, bool has_bias, int BLOCK_M, int BLOCK_N>
+struct tinygemm_kernel_nn {
+  static inline void apply(
+      const scalar_t* __restrict__ A, const packed_t* __restrict__ B, scalar_t* __restrict__ C,
+      const float* __restrict__ bias, const float* __restrict__ scale, int K, int lda, int ldb, int ldc, int64_t block_size_K) {
+    TORCH_CHECK(false, "tinygemm_kernel_nn: scalar path not implemented!");
+  }
+};
+
+#if defined(CPU_CAPABILITY_AVX512)
+template <bool has_bias, int BLOCK_M, int BLOCK_N>
+struct tinygemm_kernel_nn<at::BFloat16, at::Float8_e4m3fn, has_bias, BLOCK_M, BLOCK_N> {
+  static inline void apply(
+      const at::BFloat16* __restrict__ A, const at::Float8_e4m3fn* __restrict__ B, at::BFloat16* __restrict__ C,
+      const float* __restrict__ bias, const float* __restrict__ scale, int K, int lda, int ldb, int ldc, int64_t block_size_K) {
+
+    constexpr int ROWS = BLOCK_M;
+    constexpr int COLS = BLOCK_N / 16;
+
+    // prefetch distance
+    constexpr int PREFETCH_SIZE_K = 0;
+
+    __m512bh va;
+    __m512bh vb[COLS];
+    __m512 vc[ROWS * COLS];
+
+    auto loadc = [&](auto i) {
+      constexpr int col = i % COLS;
+      if constexpr (has_bias) {
+        vc[i] = _mm512_loadu_ps(bias + col * 16);
+      } else {
+        vc[i] = _mm512_set1_ps(0.f);
+      }
+    };
+    Unroll<ROWS * COLS>{}(loadc);
+
+    const int K2 = K >> 1;
+    const int lda2 = lda >> 1;
+    const int ldb2 = ldb; // ldb * 2 >> 1;
+    const float* a_ptr = reinterpret_cast<const float*>(A);
+    const uint16_t* b_ptr = reinterpret_cast<const uint16_t*>(B);
+
+    auto compute = [&](auto i, int k) {
+      constexpr int row = i / COLS;
+      constexpr int col = i % COLS;
+
+      int idx = k * 2 / block_size_K;
+      const __m512 vd = _mm512_set1_ps(scale[idx]);
+
+      if constexpr (col == 0) {
+        va = (__m512bh)(_mm512_set1_ps(a_ptr[row * lda2 + k]));
+      }
+      if constexpr (row == 0) {
+
+        if constexpr (col % 2 == 0) {
+          __m512i b8 = _mm512_loadu_si512(b_ptr + k * ldb2 + col * 16);
+          if constexpr (PREFETCH_SIZE_K > 0) {
+            _mm_prefetch(b_ptr + (k + PREFETCH_SIZE_K) * ldb2 + col * 16, _MM_HINT_T0);
+          }
+
+          __m256i b8_0 = _mm512_extracti32x8_epi32(b8, 0);
+          __m256i b8_1 = _mm512_extracti32x8_epi32(b8, 1);
+
+          __m512bh bf16_0 = CVT_FP8_TO_BF16(b8_0);
+          __m512bh bf16_1 = CVT_FP8_TO_BF16(b8_1);
+
+          // Apply scale
+          __m512 f0_lo = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32((__m512i)bf16_0, 0));
+          __m512 f0_hi = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32((__m512i)bf16_0, 1));
+          __m512 f1_lo = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32((__m512i)bf16_1, 0));
+          __m512 f1_hi = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32((__m512i)bf16_1, 1));
+
+          f0_lo = _mm512_mul_ps(f0_lo, vd);
+          f0_hi = _mm512_mul_ps(f0_hi, vd);
+          f1_lo = _mm512_mul_ps(f1_lo, vd);
+          f1_hi = _mm512_mul_ps(f1_hi, vd);
+
+          vb[col + 0] = _mm512_cvtne2ps_pbh(f0_hi, f0_lo);
+          vb[col + 1] = _mm512_cvtne2ps_pbh(f1_hi, f1_lo);
+        }
+      }
+      vc[i] = _mm512_dpbf16_ps(vc[i], va, vb[col]);
+    };
+    for (int k = 0; k < K2; ++k) {
+      Unroll<ROWS * COLS>{}(compute, k);
+    }
+
+    auto storec = [&](auto i) {
+      constexpr int row = i / COLS;
+      constexpr int col = i % COLS;
+      // for COLS = 1, 3 use 256bit store
+      // for COLS = 2, 4 use 512bit store
+      if constexpr (COLS % 2 == 0) {
+        if constexpr (col % 2 == 0) {
+          _mm512_storeu_si512(
+              reinterpret_cast<__m512i*>((C + row * ldc + col * 16)),
+              (__m512i)(_mm512_cvtne2ps_pbh(vc[row * COLS + col + 1], vc[row * COLS + col])));
+        }
+      } else {
+        _mm256_storeu_si256(
+            reinterpret_cast<__m256i*>(C + row * ldc + col * 16),
+            (__m256i)(_mm512_cvtneps_pbh(vc[i])));
+      }
+    };
+    Unroll<ROWS * COLS>{}(storec);
+  }
+};
+#endif
+
+#define LAUNCH_TINYGEMM_KERNEL_NN(MB_SIZE, NB_SIZE)                          \
+    tinygemm_kernel_nn<scalar_t, at::Float8_e4m3fn, has_bias, MB_SIZE, NB_SIZE>::apply(         \
+        A + mb_start * lda, B + nb_start * 2, C + mb_start * ldc + nb_start, \
+        has_bias ? bias + nb_start : nullptr, scale, K, lda, ldb, ldc, block_size_K);
+
 template <typename scalar_t, typename packed_t, bool has_bias>
 struct brgemm {
   static inline void apply(
@@ -209,8 +323,35 @@ void tinygemm_kernel(
     return;
   }
 
-  // TODO: add the support for use_brgemm = false;
-  TORCH_CHECK(false, "use_brgemm = false is not supported yet");
+  // pattern: 1-4-16
+  constexpr int64_t BLOCK_M = 4;
+  constexpr int64_t BLOCK_N = 64;
+  const int64_t MB = div_up(M, BLOCK_M);
+  const int64_t NB = div_up(N, BLOCK_N);
+  for (int mb = 0; mb < MB; ++mb) {
+    int64_t mb_start = mb * BLOCK_M;
+    int64_t mb_size = std::min(BLOCK_M, M - mb_start);
+    for (int64_t nb = 0; nb < NB; ++nb) {
+      int64_t nb_start = nb * BLOCK_N;
+      int64_t nb_size = std::min(BLOCK_N, N - nb_start);
+
+      switch(mb_size << 4 | nb_size >> 4) {
+        // mb_size = 1
+        case 0x12: LAUNCH_TINYGEMM_KERNEL_NN(1, 32); break;
+        case 0x14: LAUNCH_TINYGEMM_KERNEL_NN(1, 64); break;
+        // mb_size = 2
+        case 0x22: LAUNCH_TINYGEMM_KERNEL_NN(2, 32); break;
+        case 0x24: LAUNCH_TINYGEMM_KERNEL_NN(2, 64); break;
+        // mb_size = 3
+        case 0x32: LAUNCH_TINYGEMM_KERNEL_NN(3, 32); break;
+        case 0x34: LAUNCH_TINYGEMM_KERNEL_NN(3, 64); break;
+        // mb_size = 4
+        case 0x42: LAUNCH_TINYGEMM_KERNEL_NN(4, 32); break;
+        case 0x44: LAUNCH_TINYGEMM_KERNEL_NN(4, 64); break;
+        default: TORCH_CHECK(false, "Unexpected block size, ", mb_size, "x", "nb_size");
+      }
+    }
+  }
 }
 
 template <typename scalar_t>
@@ -237,8 +378,6 @@ void fp8_scaled_mm_kernel_impl(
 
   const int64_t blocks_n_per_group = block_size_N / BLOCK_N;
 
-  // TODO: add the support for use_brgemm = false;
-  // use avx512-bf16 when a) M is small; b) dtype is bfloat16, otherwise use amx
   const bool use_brgemm = can_use_brgemm<at::Float8_e4m3fn>(M);
 
   // parallel on [MB, NB]
