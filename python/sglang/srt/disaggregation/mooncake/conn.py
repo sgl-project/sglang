@@ -202,7 +202,7 @@ class MooncakeKVManager(BaseKVManager):
 
     def start_prefill_thread(self):
         self.rank_port = get_free_port()
-        self.server_socket.bind("tcp://*:" + str(self.rank_port))
+        self.server_socket.bind(f"tcp://{get_local_ip_by_remote()}:{self.rank_port}")
 
         def bootstrap_thread():
             """This thread recvs pre-alloc notification from the decode engine"""
@@ -266,7 +266,7 @@ class MooncakeKVManager(BaseKVManager):
 
     def start_decode_thread(self):
         self.rank_port = get_free_port()
-        self.server_socket.bind("tcp://*:" + str(self.rank_port))
+        self.server_socket.bind(f"tcp://{get_local_ip_by_remote()}:{self.rank_port}")
 
         def decode_thread():
             while True:
