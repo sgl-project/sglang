@@ -34,6 +34,7 @@ from sglang.srt.utils import get_free_port, get_ip, get_local_ip_by_remote
 logger = logging.getLogger(__name__)
 
 
+
 def group_concurrent_contiguous(
     src_indices: npt.NDArray[np.int64], dst_indices: npt.NDArray[np.int64]
 ) -> Tuple[List[npt.NDArray[np.int64]], List[npt.NDArray[np.int64]]]:
@@ -536,7 +537,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
             logger.error(f"Error fetching prefill info from bootstrap: {e}")
             return None
 
-    def _get_prefill_dp_size_from_server(self) -> int:
+        def _get_prefill_dp_size_from_server(self) -> int:
         """Fetch the prefill parallel info from the bootstrap server."""
         try:
             url = f"http://{self.bootstrap_addr}/route?engine_rank={-1}&target_dp_group={-1}"
@@ -548,7 +549,9 @@ class MooncakeKVReceiver(BaseKVReceiver):
                 )
             else:
                 logger.error(
-                    f"Failed to get prefill parallel info: {response.status_code}, {response.text}"
+
+                        f"Failed to get prefill parallel info: {response.status_code}, {response.text}"
+
                 )
                 return None
         except Exception as e:
@@ -594,7 +597,8 @@ class MooncakeKVReceiver(BaseKVReceiver):
             f"{self.bootstrap_info['rank_ip']}:{self.bootstrap_info['rank_port']}"
         )
         logger.debug(
-            f"Fetched bootstrap info: {self.bootstrap_info} for engine rank: {self.kv_mgr.kv_args.engine_rank}"
+                f"Fetched bootstrap info: {self.bootstrap_info} for engine rank: {self.kv_mgr.kv_args.engine_rank}"
+
         )
 
         sock, lock = self._connect("tcp://" + self.prefill_server_url)

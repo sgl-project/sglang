@@ -89,7 +89,7 @@ class BaseMultimodalProcessor(ABC):
         if videos is not None:
             kwargs["videos"] = videos
         if audios is not None:
-            kwargs["audios"] = audios
+            kwargs["audio"] = audios
 
         processor = self._processor
         if hasattr(processor, "image_processor") and isinstance(

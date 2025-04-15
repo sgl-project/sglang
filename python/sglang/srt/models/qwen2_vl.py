@@ -153,7 +153,7 @@ class Qwen2VisionBlock(nn.Module):
             num_heads=num_heads,
             projection_size=dim,
             use_qkv_parallel=True,
-            use_context_forward=use_context_forward,
+            qkv_backend="sdpa",
             softmax_in_single_precision=softmax_in_single_precision,
             rotary_embed="normal",
             flatten_batch=True,

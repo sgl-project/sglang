@@ -44,7 +44,7 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
 
             self.video_token_id = hf_config.thinker_config.video_token_index
         else:
-            self.image_token_id = hf_config.image_token_id
+            self.image_token_id = hf_config.token_ids
             self.image_start_id = hf_config.vision_start_token_id
             self.image_end_id = hf_config.vision_end_token_id
             self.video_token_id = hf_config.video_token_id
@@ -201,6 +201,7 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
             "im_token_id": self.image_token_id,
             "audio_start_id": getattr(self, "audio_start_id", None),
             "audio_end_id": getattr(self, "audio_end_id", None),
+            "audio_token_id": getattr(self, "audio_token_id", None),
             "video_token_id": self.video_token_id,
             "mrope_positions": mrope_positions,
             "mrope_position_delta": mrope_position_delta,

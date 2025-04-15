@@ -972,7 +972,7 @@ class Qwen2_5OmniThinkerForConditionalGeneration(nn.Module):
             feature_lens=feature_lens,
             aftercnn_lens=audio_feat_lengths,
         )
-        audio_features = audio_outputs
+        audio_features = audio_outputs.last_hidden_state
 
         return audio_features
 
