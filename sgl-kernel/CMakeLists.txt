@@ -12,7 +12,7 @@ find_package(Python COMPONENTS Interpreter Development.Module ${SKBUILD_SABI_COM
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3")
 
-# Cuda
+# CUDA
 enable_language(CUDA)
 find_package(CUDAToolkit REQUIRED)
 set_property(GLOBAL PROPERTY CUDA_SEPARABLE_COMPILATION ON)
@@ -47,7 +47,7 @@ FetchContent_Populate(repo-cutlass)
 FetchContent_Declare(
     repo-deepgemm
     GIT_REPOSITORY https://github.com/deepseek-ai/DeepGEMM
-    GIT_TAG        c187c23ba8dcdbad91720737e8be9c43700cb9e9
+    GIT_TAG        4499c4ccbb5d3958b1a069f29ef666156a121278
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-deepgemm)
@@ -170,6 +170,7 @@ string(REPLACE "-D__CUDA_NO_HALF2_OPERATORS__"      "" CMAKE_CUDA_FLAGS "${CMAKE
 set(SOURCES
     "csrc/allreduce/custom_all_reduce.cu"
     "csrc/attention/cascade.cu"
+    "csrc/attention/merge_attn_states.cu"
     "csrc/attention/cutlass_mla_kernel.cu"
     "csrc/attention/lightning_attention_decode_kernel.cu"
     "csrc/elementwise/activation.cu"
