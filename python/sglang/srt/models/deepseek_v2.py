@@ -1054,7 +1054,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
 
-        from sgl_kernel import merge_state
+        from sgl_kernel import merge_state_v2
 
         assert forward_batch.num_prefix_chunks is not None
         for i in range(forward_batch.num_prefix_chunks):
@@ -1093,7 +1093,10 @@ class DeepseekV2AttentionMLA(nn.Module):
 
             output, lse = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
             lse = torch.transpose(lse, 0, 1).contiguous()
-            accum_output, accum_lse = merge_state(output, lse, accum_output, accum_lse)
+            tmp_output = torch.empty_like(accum_output)
+            tmp_lse = torch.empty_like(accum_lse)
+            merge_state_v2(output, lse, accum_output, accum_lse, tmp_output, tmp_lse)
+            accum_output, accum_lse = tmp_output, tmp_lse
 
         return accum_output
 
