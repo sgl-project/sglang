@@ -1,18 +1,10 @@
-import unittest
-import os
-from types import SimpleNamespace
-from sglang.test.test_utils import (
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    DEFAULT_URL_FOR_TEST,
-    CustomTestCase,
-    popen_launch_server,
-    add_common_sglang_args_and_parse
-)
 import argparse
+import os
 import time
+import unittest
+from types import SimpleNamespace
 
 import openai
-
 from mmmu_utils.data_utils import save_json
 from mmmu_utils.eval_utils import (
     EvalArgs,
@@ -24,14 +16,34 @@ from mmmu_utils.eval_utils import (
 from tqdm import tqdm
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.test_utils import (
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
+    add_common_sglang_args_and_parse,
+    popen_launch_server,
+)
 
 # CI VLM model for testing
 CI_MODELS = [
-    SimpleNamespace(model="google/gemma-3-27b-it", chat_template="gemma-it", mmmu_accuracy=0.39),
-    SimpleNamespace(model="Qwen/Qwen2.5-VL-7B-Instruct", chat_template="qwen2-vl", mmmu_accuracy=0.45),
-    SimpleNamespace(model="meta-llama/Llama-3.2-11B-Vision-Instruct", chat_template="llama_3_vision", mmmu_accuracy=0.31),
-    SimpleNamespace(model="openbmb/MiniCPM-V-2_6", chat_template="minicpmv", mmmu_accuracy=0.4)
+    SimpleNamespace(
+        model="google/gemma-3-27b-it", chat_template="gemma-it", mmmu_accuracy=0.39
+    ),
+    SimpleNamespace(
+        model="Qwen/Qwen2.5-VL-7B-Instruct",
+        chat_template="qwen2-vl",
+        mmmu_accuracy=0.45,
+    ),
+    SimpleNamespace(
+        model="meta-llama/Llama-3.2-11B-Vision-Instruct",
+        chat_template="llama_3_vision",
+        mmmu_accuracy=0.31,
+    ),
+    SimpleNamespace(
+        model="openbmb/MiniCPM-V-2_6", chat_template="minicpmv", mmmu_accuracy=0.4
+    ),
 ]
+
 
 class TestVLMModels(CustomTestCase):
 
@@ -55,31 +67,30 @@ class TestVLMModels(CustomTestCase):
         answer_dict = {}
 
         # Create OpenAI client for API access
-        client = openai.Client(
-            api_key=self.api_key,
-            base_url=f"{self.base_url}/v1"
-        )
+        client = openai.Client(api_key=self.api_key, base_url=f"{self.base_url}/v1")
 
         start = time.time()
         for i, sample in enumerate(tqdm(samples)):
             prompt = sample["final_input_prompt"]
-            
+
             # Handle prompt splitting more robustly
             try:
                 prefix = prompt.split("<")[0]
                 suffix = prompt.split(">")[1]
             except IndexError:
-                print(f"Warning: Could not properly split prompt for sample {i}. Using full prompt.")
+                print(
+                    f"Warning: Could not properly split prompt for sample {i}. Using full prompt."
+                )
                 prefix = prompt
                 suffix = ""
-                
+
             image = sample.get("image")
             image_path = sample.get("image_path")
-            
+
             if image is None or image_path is None:
                 print(f"Warning: Sample {i} missing image data. Skipping.")
                 continue
-                
+
             try:
                 response = client.chat.completions.create(
                     model="default",
@@ -114,10 +125,10 @@ class TestVLMModels(CustomTestCase):
         """Test CI models against MMMU benchmark."""
         for cli_model in CI_MODELS:
             print(f"\nTesting model: {cli_model.model}")
-            
+
             process = None
             mmmu_accuracy = 0  # Initialize to handle potential exceptions
-            
+
             try:
                 # Launch server for testing
                 process = popen_launch_server(
@@ -135,18 +146,18 @@ class TestVLMModels(CustomTestCase):
                 # Run evaluation
                 mmmu_accuracy = self.eval_mmmu()
                 print(f"Model {cli_model.model} achieved accuracy: {mmmu_accuracy:.4f}")
-                
+
                 # Assert performance meets expected threshold
                 self.assertGreaterEqual(
-                    mmmu_accuracy, 
+                    mmmu_accuracy,
                     cli_model.mmmu_accuracy,
-                    f"Model {cli_model.model} accuracy ({mmmu_accuracy:.4f}) below expected threshold ({cli_model.mmmu_accuracy:.4f})"
+                    f"Model {cli_model.model} accuracy ({mmmu_accuracy:.4f}) below expected threshold ({cli_model.mmmu_accuracy:.4f})",
                 )
-                
+
             except Exception as e:
                 print(f"Error testing {cli_model.model}: {e}")
                 self.fail(f"Test failed for {cli_model.model}: {e}")
-                
+
             finally:
                 # Ensure process cleanup happens regardless of success/failure
                 if process is not None and process.poll() is None:
@@ -155,6 +166,7 @@ class TestVLMModels(CustomTestCase):
                         kill_process_tree(process.pid)
                     except Exception as e:
                         print(f"Error killing process: {e}")
+
 
 if __name__ == "__main__":
     unittest.main()
