@@ -1273,6 +1273,8 @@ def run_benchmark(args_: argparse.Namespace):
     # Set default value for max_concurrency if not present
     if not hasattr(args, "max_concurrency"):
         args.max_concurrency = None
+    elif isinstance(args.max_concurrency, list) and len(args.max_concurrency) == 1:
+        args.max_concurrency = args.max_concurrency[0]
 
     # Set default value for warmup_requests if not present
     if not hasattr(args, "warmup_requests"):
@@ -1383,24 +1385,50 @@ def run_benchmark(args_: argparse.Namespace):
     if not hasattr(args, "flush_cache"):
         args.flush_cache = False
 
-    return asyncio.run(
-        benchmark(
-            backend=backend,
-            api_url=api_url,
-            base_url=base_url,
-            model_id=model_id,
-            tokenizer=tokenizer,
-            input_requests=input_requests,
-            request_rate=args.request_rate,
-            max_concurrency=args.max_concurrency,
-            disable_tqdm=args.disable_tqdm,
-            lora_names=args.lora_name,
-            extra_request_body=extra_request_body,
-            profile=args.profile,
-            pd_seperated=args.pd_seperated,
-            flush_cache=args.flush_cache,
+    # Handle multiple concurrency values
+    if isinstance(args.max_concurrency, list):
+        results = []
+        for concurrency in args.max_concurrency:
+            print(f"\nRunning benchmark with concurrency: {concurrency}")
+            result = asyncio.run(
+                benchmark(
+                    backend=backend,
+                    api_url=api_url,
+                    base_url=base_url,
+                    model_id=model_id,
+                    tokenizer=tokenizer,
+                    input_requests=input_requests,
+                    request_rate=args.request_rate,
+                    max_concurrency=concurrency,
+                    disable_tqdm=args.disable_tqdm,
+                    lora_names=args.lora_name,
+                    extra_request_body=extra_request_body,
+                    profile=args.profile,
+                    pd_seperated=args.pd_seperated,
+                    flush_cache=args.flush_cache,
+                )
+            )
+            results.append(result)
+        return results
+    else:
+        return asyncio.run(
+            benchmark(
+                backend=backend,
+                api_url=api_url,
+                base_url=base_url,
+                model_id=model_id,
+                tokenizer=tokenizer,
+                input_requests=input_requests,
+                request_rate=args.request_rate,
+                max_concurrency=args.max_concurrency,
+                disable_tqdm=args.disable_tqdm,
+                lora_names=args.lora_name,
+                extra_request_body=extra_request_body,
+                profile=args.profile,
+                pd_seperated=args.pd_seperated,
+                flush_cache=args.flush_cache,
+            )
         )
-    )
 
 
 def set_ulimit(target_soft_limit=65535):
@@ -1511,6 +1539,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--max-concurrency",
         type=int,
+        nargs="+",
         default=None,
         help="Maximum number of concurrent requests. This can be used "
         "to help simulate an environment where a higher level component "
@@ -1519,7 +1548,8 @@ if __name__ == "__main__":
         "initiated, this argument will control how many are actually allowed "
         "to execute at a time. This means that when used in combination, the "
         "actual request rate may be lower than specified with --request-rate, "
-        "if the server is not processing requests fast enough to keep up.",
+        "if the server is not processing requests fast enough to keep up. "
+        "You can provide multiple values to test different concurrency levels.",
     )
     parser.add_argument("--output-file", type=str, help="Output JSONL file name.")
     parser.add_argument(
