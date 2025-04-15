@@ -330,6 +330,7 @@ class FusedMoE(torch.nn.Module):
             intermediate_size_per_partition=self.intermediate_size_per_partition,
             params_dtype=params_dtype,
             weight_loader=self.weight_loader,
+            intermediate_size_full=intermediate_size
         )
 
     def _load_per_tensor_weight_scale(

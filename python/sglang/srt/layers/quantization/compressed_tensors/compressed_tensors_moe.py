@@ -10,6 +10,8 @@ import torch
 from compressed_tensors import CompressionFormat
 from compressed_tensors.quantization import QuantizationStrategy
 
+from sglang.srt.layers.quantization.compressed_tensors import WNA16_SUPPORTED_BITS
+
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.fused_moe_triton import (
         FusedMoE,
@@ -28,6 +30,7 @@ from sglang.srt.layers.quantization.utils import (
 from sglang.srt.utils import set_weight_attrs
 
 _is_cuda = is_cuda()
+from vllm import _custom_ops as vllm_ops
 
 if _is_cuda:
     from sglang.srt.custom_op import scaled_fp8_quant as sgl_scaled_fp8_quant
@@ -609,7 +612,7 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
                 requires_grad=False,
             )
 
-        marlin_w13_qweight = ops.gptq_marlin_moe_repack(
+        marlin_w13_qweight = vllm_ops.gptq_marlin_moe_repack(
             layer.w13_weight_packed,
             layer.w13_g_idx_sort_indices,
             layer.w13_weight_packed.shape[1] * self.packed_factor,
@@ -617,7 +620,7 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             self.num_bits,
         )
         replace_tensor("w13_weight_packed", marlin_w13_qweight)
-        marlin_w2_qweight = ops.gptq_marlin_moe_repack(
+        marlin_w2_qweight = vllm_ops.gptq_marlin_moe_repack(
             layer.w2_weight_packed,
             layer.w2_g_idx_sort_indices,
             layer.w2_weight_packed.shape[1] * self.packed_factor,
@@ -660,6 +663,9 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         scoring_func: str = "softmax",
         correction_bias: Optional[torch.Tensor] = None,
         activation: str = "silu",
+        apply_router_weight_on_input: bool = False,
+        inplace: bool = True,
+        no_combine: bool = False,
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
         from sglang.srt.layers.moe.topk import select_experts
@@ -683,7 +689,6 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             topk_group=topk_group,
             num_expert_group=num_expert_group,
             custom_routing_function=custom_routing_function,
-            scoring_func=scoring_func,
             correction_bias=correction_bias,
         )
 
