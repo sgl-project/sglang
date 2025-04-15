@@ -915,20 +915,21 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
 
         return fused_experts(
             x,
-            layer.w13_weight,
-            layer.w2_weight,
+            layer.w13_weight_packed,
+            layer.w2_weight_packed,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             inplace=inplace,
             activation=activation,
             apply_router_weight_on_input=apply_router_weight_on_input,
-            use_int8_w8a8=True,
-            per_channel_quant=True,
-            w1_scale=(layer.w13_weight_scale),
-            w2_scale=(layer.w2_weight_scale),
-            a1_scale=layer.w13_input_scale,
-            a2_scale=layer.w2_input_scale,
+            use_int4_w4a16=self.num_bits == 4,
+            use_int8_w8a16=self.num_bits == 8,
+            w1_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            w1_zp=None,
+            w2_zp=None,
             no_combine=no_combine,
+            block_shape=[0, self.group_size]
         )
 
 
