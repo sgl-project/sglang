@@ -10,7 +10,6 @@ logger = logging.getLogger(__name__)
 @dataclass
 class MooncakeTransferEngineConfig:
     local_hostname: str
-    metadata_server: str
     protocol: str
     device_name: str
 
@@ -21,7 +20,6 @@ class MooncakeTransferEngineConfig:
             config = json.load(fin)
         return MooncakeTransferEngineConfig(
             local_hostname=config.get("local_hostname", None),
-            metadata_server=config.get("metadata_server"),
             protocol=config.get("protocol", "rdma"),
             device_name=config.get("device_name", ""),
         )
@@ -63,11 +61,9 @@ class MooncakeTransferEngine:
 
         self.config = MooncakeTransferEngineConfig.load_from_env()
 
-        session_suffix = "_" + str(uuid.uuid4())
-        self.session_id = self.config.local_hostname + session_suffix
+        self.session_id = self.config.local_hostname
         self.initialize(
             self.session_id,
-            self.config.metadata_server,
             self.config.protocol,
             self.config.device_name,
         )
@@ -81,12 +77,11 @@ class MooncakeTransferEngine:
     def initialize(
         self,
         local_hostname: str,
-        metadata_server: str,
         protocol: str,
         device_name: str,
     ) -> None:
         """Initialize the mooncake instance."""
-        self.engine.initialize(local_hostname, metadata_server, protocol, device_name)
+        self.engine.initialize(local_hostname, "P2PHANDSHAKE", protocol, device_name)
 
     def transfer_sync(
         self, session_id: str, buffer: int, peer_buffer_address: int, length: int
