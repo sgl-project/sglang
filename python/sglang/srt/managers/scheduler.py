@@ -484,7 +484,7 @@ class Scheduler(
                 self.tree_cache = HiRadixCache(
                     req_to_token_pool=self.req_to_token_pool,
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                    tp_cache_group=self.tp_worker.get_tp_cpu_group(),
+                    tp_cache_group=self.tp_cpu_group,
                     page_size=self.page_size,
                     hicache_ratio=server_args.hicache_ratio,
                 )
@@ -553,7 +553,7 @@ class Scheduler(
 
             # The decode requests polling kv cache
             self.disagg_decode_transfer_queue = DecodeTransferQueue(
-                gloo_group=self.tp_worker.get_attention_tp_cpu_group(),
+                gloo_group=self.attn_tp_cpu_group,
                 req_to_metadata_buffer_idx_allocator=req_to_metadata_buffer_idx_allocator,
                 metadata_buffers=metadata_buffers,
             )
@@ -568,7 +568,7 @@ class Scheduler(
                 scheduler=self,
                 transfer_queue=self.disagg_decode_transfer_queue,
                 tree_cache=self.tree_cache,
-                gloo_group=self.tp_worker.get_attention_tp_cpu_group(),
+                gloo_group=self.attn_tp_cpu_group,
                 tp_rank=self.tp_rank,
                 tp_size=self.tp_size,
                 bootstrap_port=self.server_args.disaggregation_bootstrap_port,
@@ -597,7 +597,7 @@ class Scheduler(
                 tp_rank=self.tp_rank,
                 tp_size=self.tp_size,
                 bootstrap_port=self.server_args.disaggregation_bootstrap_port,
-                gloo_group=self.tp_worker.get_attention_tp_cpu_group(),
+                gloo_group=self.attn_tp_cpu_group,
                 transfer_backend=self.transfer_backend,
                 scheduler=self,
             )
@@ -676,6 +676,11 @@ class Scheduler(
             )
             self.process_prefill_chunk()
             batch = self.get_new_batch_prefill()
+            
+            # Handle DP attention
+            if self.server_args.enable_dp_attention or self.server_args.enable_sp_layernorm:
+                batch, _ = self.prepare_dp_attn_batch(batch)
+
             self.cur_batch = batch
 
             if batch:
@@ -704,11 +709,18 @@ class Scheduler(
             # polling and allocating kv cache
             self.process_decode_queue()
             batch = self.get_next_disagg_decode_batch_to_run()
+            
+            # Handle DP attention
+            if self.server_args.enable_dp_attention or self.server_args.enable_sp_layernorm:
+                batch, do_extend = self.prepare_dp_attn_batch(batch)
+            elif batch:
+                do_extend = batch.forward_mode.is_extend()
+                
             self.cur_batch = batch
 
             if batch:
                 # Generate fake extend output.
-                if batch.forward_mode.is_extend():
+                if do_extend:
                     # Note: Logprobs should be handled on the prefill engine.
                     self.stream_output(
                         batch.reqs, [False for _ in range(len(batch.reqs))]
