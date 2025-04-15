@@ -61,12 +61,12 @@ class MooncakeTransferEngine:
 
         self.config = MooncakeTransferEngineConfig.load_from_env()
 
-        self.session_id = self.config.local_hostname
         self.initialize(
-            self.session_id,
+            self.config.local_hostname,
             self.config.protocol,
             self.config.device_name,
         )
+        self.session_id = self.config.local_hostname + ":" + self.engine.get_rpc_port()
 
     def register(self, ptr, length):
         self.engine.register_memory(ptr, length)
