@@ -1115,7 +1115,6 @@ class FlashAttentionBackend(AttentionBackend):
                 ),
             }
 
-        # Biao's Note: Consolidate the three decode metadata
         if (
             self.speculative_num_draft_tokens is not None
             and self.speculative_num_draft_tokens > 0
@@ -1169,12 +1168,6 @@ class FlashAttentionBackend(AttentionBackend):
             }
 
             self.target_verify_metadata_topk_expand = {
-                # "cache_seqlens": torch.arange(
-                #     1,
-                #     self.speculative_num_draft_tokens + 1,
-                #     device=self.device,
-                #     dtype=torch.int32,
-                # ).repeat(max_bs),
                 "cache_seqlens": torch.zeros(
                     max_bs * self.speculative_num_draft_tokens,
                     dtype=torch.int32,
@@ -1198,18 +1191,7 @@ class FlashAttentionBackend(AttentionBackend):
                     device=self.device,
                 ),
             }
-            # self.target_verify_metadata_topk_expand["cu_seqlens_k"] = (
-            #     torch.nn.functional.pad(
-            #         torch.cumsum(
-            #             self.target_verify_metadata_topk_expand["cache_seqlens"],
-            #             dim=0,
-            #             dtype=torch.int32,
-            #         ),
-            #         (1, 0),
-            #     )
-            # )
 
-        # Biao's Note: Consolidate the encoder metadata
         self.encoder_metadata = {
             "encoder_page_table": torch.zeros(
                 max_bs,
@@ -1239,7 +1221,6 @@ class FlashAttentionBackend(AttentionBackend):
         metadata = FlashAttentionMetadata()
 
         # metadata_expand is needed for Spec Decoding when top k > 1
-        # Biao's Note: Should we put this in conditional statement like if topk > 1?
         metadata_expand = FlashAttentionMetadata()
 
         device = seq_lens.device
@@ -1430,7 +1411,7 @@ class FlashAttentionBackend(AttentionBackend):
         seq_lens_cpu: Optional[torch.Tensor],
         out_cache_loc: torch.Tensor = None,
     ):
-        # """Initialize forward metadata for replaying CUDA graph."""
+        """Initialize forward metadata for replaying CUDA graph."""
         seq_lens = seq_lens[:bs]
         seq_lens_cpu = seq_lens_cpu[:bs]
         req_pool_indices = req_pool_indices[:bs]
@@ -1596,9 +1577,6 @@ class FlashAttentionBackend(AttentionBackend):
                 mask = spec_info.custom_mask[mask_extraction_indices].view(
                     -1, self.speculative_num_draft_tokens
                 )  # (bsz * draft_num, draft_num)
-                # metadata_expand.page_table.copy_(
-                #     (non_masked_page_table * mask).to(torch.int32)
-                # )
                 col_indices = offsets.expand(
                     mask.shape[0], self.speculative_num_draft_tokens
                 )
