@@ -73,13 +73,7 @@ from sglang.srt.managers.expert_distribution import ExpertDistributionRecorder
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import (
-    DeepEPMode,
-    add_prefix,
-    is_cuda,
-    is_flashinfer_available,
-    is_hip,
-)
+from sglang.srt.utils import DeepEPMode, add_prefix, is_cuda, is_hip
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -1060,8 +1054,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
 
-        assert is_flashinfer_available()
-        from flashinfer.cascade import merge_state
+        from sgl_kernel import merge_state
 
         assert forward_batch.num_prefix_chunks is not None
         for i in range(forward_batch.num_prefix_chunks):
@@ -1100,7 +1093,7 @@ class DeepseekV2AttentionMLA(nn.Module):
 
             output, lse = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
             lse = torch.transpose(lse, 0, 1).contiguous()
-            accum_output, accum_lse = merge_state(accum_output, accum_lse, output, lse)
+            accum_output, accum_lse = merge_state(output, lse, accum_output, accum_lse)
 
         return accum_output
 
