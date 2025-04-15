@@ -4,13 +4,15 @@ import asyncio
 import dataclasses
 import logging
 import queue
+import socket
 import struct
 import threading
 from functools import cache
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
+import requests
 import zmq
 from aiohttp import web
 
@@ -24,6 +26,8 @@ from sglang.srt.disaggregation.base.conn import (
 )
 from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferEngine
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils import get_free_port, get_ip, get_local_ip_by_remote
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +71,7 @@ class TransferKVChunk:
 class TransferInfo:
     room: int
     endpoint: str
+    dst_port: int
     mooncake_session_id: str
     dst_kv_ptrs: list[int]
     dst_kv_indices: npt.NDArray[np.int64]
@@ -76,34 +81,42 @@ class TransferInfo:
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
         return cls(
-            endpoint=msg[0].decode("ascii"),
-            mooncake_session_id=msg[1].decode("ascii"),
-            room=int(msg[2].decode("ascii")),
-            dst_kv_ptrs=list(struct.unpack(f"{len(msg[3])//8}Q", msg[3])),
-            dst_kv_indices=np.frombuffer(msg[4], dtype=np.int64),
-            dst_aux_ptrs=list(struct.unpack(f"{len(msg[5])//8}Q", msg[5])),
-            dst_aux_index=int(msg[6].decode("ascii")),
+            room=int(msg[0].decode("ascii")),
+            endpoint=msg[1].decode("ascii"),
+            dst_port=int(msg[2].decode("ascii")),
+            mooncake_session_id=msg[3].decode("ascii"),
+            dst_kv_ptrs=list(struct.unpack(f"{len(msg[4])//8}Q", msg[4])),
+            dst_kv_indices=np.frombuffer(msg[5], dtype=np.int64),
+            dst_aux_ptrs=list(struct.unpack(f"{len(msg[6])//8}Q", msg[6])),
+            dst_aux_index=int(msg[7].decode("ascii")),
         )
 
 
-KVSENDER_POLLING_PORT = 17788
-KVRECEIVER_POLLING_PORT = 27788
-
-
 class MooncakeKVManager(BaseKVManager):
-    def __init__(self, args: KVArgs, disaggregation_mode: DisaggregationMode):
+    def __init__(
+        self,
+        args: KVArgs,
+        disaggregation_mode: DisaggregationMode,
+        server_args: ServerArgs,
+    ):
         self.engine = MooncakeTransferEngine()
         self.kv_args = args
         self.disaggregation_mode = disaggregation_mode
+        # for p/d multi node infer
+        self.bootstrap_port = server_args.disaggregation_bootstrap_port
+        self.dist_init_addr = server_args.dist_init_addr
         self.request_status: Dict[int, KVPoll] = {}
+        self.rank_port = None
         self.server_socket = zmq.Context().socket(zmq.PULL)
         self.register_buffer_to_engine()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.transfer_queue = queue.Queue()
             self.transfer_infos: Dict[int, TransferInfo] = {}
             self.start_prefill_thread()
+            self._register_to_bootstrap()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.start_decode_thread()
+            self.connection_pool: Dict[str, Dict[str, Union[str, int]]] = {}
         else:
             raise ValueError(
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
@@ -133,54 +146,29 @@ class MooncakeKVManager(BaseKVManager):
         dst_kv_ptrs: list[int],
         dst_kv_indices: npt.NDArray[np.int64],
     ):
-        layer_num = int(len(self.kv_args.kv_data_ptrs) / 2)
+        # group by indices
         prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
             prefill_kv_indices, dst_kv_indices
         )
-        for layer_id in range(layer_num):
-            prefill_key_layer_ptr = self.kv_args.kv_data_ptrs[layer_id]
-            key_item_len = self.kv_args.kv_item_lens[layer_id]
-            prefill_value_layer_ptr = self.kv_args.kv_data_ptrs[layer_num + layer_id]
-            value_item_len = self.kv_args.kv_item_lens[layer_num + layer_id]
 
-            decode_key_layer_ptr = dst_kv_ptrs[layer_id]
-            decode_value_layer_ptr = dst_kv_ptrs[layer_num + layer_id]
+        num_layers = len(self.kv_args.kv_data_ptrs)
+        for layer_id in range(num_layers):
+            src_ptr = self.kv_args.kv_data_ptrs[layer_id]
+            dst_ptr = dst_kv_ptrs[layer_id]
+            item_len = self.kv_args.kv_item_lens[layer_id]
 
             for prefill_index, decode_index in zip(prefill_kv_blocks, dst_kv_blocks):
-                prefill_key_addr = (
-                    prefill_key_layer_ptr + int(prefill_index[0]) * key_item_len
-                )
-                decode_key_addr = (
-                    decode_key_layer_ptr + int(decode_index[0]) * key_item_len
-                )
+                src_addr = src_ptr + int(prefill_index[0]) * item_len
+                dst_addr = dst_ptr + int(decode_index[0]) * item_len
+                length = item_len * len(prefill_index)
 
-                # TODO: mooncake transfer engine can do async transfer. Do async later
+                # TODO: make async later
                 status = self.engine.transfer_sync(
-                    mooncake_session_id,
-                    prefill_key_addr,
-                    decode_key_addr,
-                    key_item_len * len(prefill_index),
+                    mooncake_session_id, src_addr, dst_addr, length
                 )
                 if status != 0:
                     return status
 
-                prefill_value_addr = (
-                    prefill_value_layer_ptr + int(prefill_index[0]) * value_item_len
-                )
-
-                decode_value_addr = (
-                    decode_value_layer_ptr + int(decode_index[0]) * value_item_len
-                )
-
-                # TODO: mooncake transfer engine can do async transfer. Do async later
-                status = self.engine.transfer_sync(
-                    mooncake_session_id,
-                    prefill_value_addr,
-                    decode_value_addr,
-                    value_item_len * len(prefill_index),
-                )
-                if status != 0:
-                    return status
         return 0
 
     def send_aux(
@@ -202,15 +190,10 @@ class MooncakeKVManager(BaseKVManager):
         )
         return status
 
-    def sync_status_to_decode_endpoint(self, remote: str, room: int):
+    def sync_status_to_decode_endpoint(self, remote: str, dst_port: int, room: int):
         if ":" in remote:
             remote = remote.split(":")[0]
-        self._connect(
-            "tcp://"
-            + remote
-            + ":"
-            + str(KVRECEIVER_POLLING_PORT + self.kv_args.engine_rank)
-        ).send_multipart(
+        self._connect("tcp://" + remote + ":" + str(dst_port)).send_multipart(
             [
                 str(room).encode("ascii"),
                 str(self.request_status[room]).encode("ascii"),
@@ -218,15 +201,15 @@ class MooncakeKVManager(BaseKVManager):
         )
 
     def start_prefill_thread(self):
-        sender_rank_port = KVSENDER_POLLING_PORT + self.kv_args.engine_rank
-        self.server_socket.bind("tcp://*:" + str(sender_rank_port))
+        self.rank_port = get_free_port()
+        self.server_socket.bind(f"tcp://{get_local_ip_by_remote()}:{self.rank_port}")
 
         def bootstrap_thread():
             """This thread recvs pre-alloc notification from the decode engine"""
             # KVPoll.Bootstrapping -> KVPoll.WaitingForInput
             while True:
                 waiting_req_bytes = self.server_socket.recv_multipart()
-                room = waiting_req_bytes[2].decode("ascii")
+                room = waiting_req_bytes[0].decode("ascii")
                 if room == "None":
                     continue
                 room = int(room)
@@ -254,7 +237,9 @@ class MooncakeKVManager(BaseKVManager):
                     )
                     if ret != 0:
                         self.request_status[kv_chunk.room] = KVPoll.Failed
-                        self.sync_status_to_decode_endpoint(req.endpoint, req.room)
+                        self.sync_status_to_decode_endpoint(
+                            req.endpoint, req.dst_port, req.room
+                        )
                         continue
 
                     if kv_chunk.is_last:
@@ -268,7 +253,9 @@ class MooncakeKVManager(BaseKVManager):
                         self.request_status[req.room] = (
                             KVPoll.Success if ret == 0 else KVPoll.Failed
                         )
-                        self.sync_status_to_decode_endpoint(req.endpoint, req.room)
+                        self.sync_status_to_decode_endpoint(
+                            req.endpoint, req.dst_port, req.room
+                        )
                         self.transfer_infos.pop(req.room)
 
                 except queue.Empty:
@@ -278,8 +265,8 @@ class MooncakeKVManager(BaseKVManager):
         threading.Thread(target=transfer_thread).start()
 
     def start_decode_thread(self):
-        receiver_rank_port = KVRECEIVER_POLLING_PORT + self.kv_args.engine_rank
-        self.server_socket.bind("tcp://*:" + str(receiver_rank_port))
+        self.rank_port = get_free_port()
+        self.server_socket.bind(f"tcp://{get_local_ip_by_remote()}:{self.rank_port}")
 
         def decode_thread():
             while True:
@@ -326,11 +313,35 @@ class MooncakeKVManager(BaseKVManager):
                 self.request_status[bootstrap_room], status
             )
 
-    def get_localhost(self):
-        return self.engine.get_localhost()
-
     def get_session_id(self):
         return self.engine.get_session_id()
+
+    def _register_to_bootstrap(self):
+        """Register KVSender to bootstrap server via HTTP POST."""
+        if self.dist_init_addr:
+            ip_address = socket.gethostbyname(self.dist_init_addr.split(":")[0])
+        else:
+            ip_address = get_ip()
+
+        bootstrap_server_url = f"{ip_address}:{self.bootstrap_port}"
+        url = f"http://{bootstrap_server_url}/route"
+        payload = {
+            "role": "Prefill",
+            "rank_ip": get_local_ip_by_remote(),
+            "rank_port": self.rank_port,
+            "engine_rank": self.kv_args.engine_rank,
+        }
+
+        try:
+            response = requests.put(url, json=payload)
+            if response.status_code == 200:
+                logger.debug("Prefill successfully registered to bootstrap server.")
+            else:
+                logger.error(
+                    f"Prefill Failed to connect to bootstrap server: {response.status_code}, {response.text}"
+                )
+        except Exception as e:
+            logger.error(f"Prefill Failed to register to bootstrap server: {e}")
 
 
 class MooncakeKVSender(BaseKVSender):
@@ -342,6 +353,8 @@ class MooncakeKVSender(BaseKVSender):
         self.bootstrap_room = bootstrap_room
         self.kv_mgr.update_status(bootstrap_room, KVPoll.Bootstrapping)
         self.aux_index = None
+        self.bootstrap_server_url = bootstrap_addr
+        self.session_id = self.kv_mgr.get_session_id()
 
     def init(self, num_kv_indices: int, aux_index: Optional[int] = None):
         self.num_kv_indices = num_kv_indices
@@ -384,14 +397,44 @@ class MooncakeKVReceiver(BaseKVReceiver):
         self.bootstrap_room = bootstrap_room
         self.bootstrap_addr = bootstrap_addr
         self.kv_mgr = mgr
-        self.prefill_server_url = (
-            bootstrap_addr.split(":")[0]
-            + ":"
-            + str(KVSENDER_POLLING_PORT + self.kv_mgr.kv_args.engine_rank)
-        )
-        self.decode_ip = self.kv_mgr.get_localhost()
         self.session_id = self.kv_mgr.get_session_id()
+        self.kv_mgr.update_status(bootstrap_room, KVPoll.Bootstrapping)
+
+        # NOTE: key distinguished by bootstrap_addr and engine_rank
+        bootstrap_key = f"{self.bootstrap_addr}_{self.kv_mgr.kv_args.engine_rank}"
+
+        if bootstrap_key not in self.kv_mgr.connection_pool:
+            self.bootstrap_info = self._get_bootstrap_info_from_server(
+                self.kv_mgr.kv_args.engine_rank
+            )
+            if self.bootstrap_info is None:
+                logger.error(
+                    f"Could not fetch bootstrap info for engine rank: {self.kv_mgr.kv_args.engine_rank}"
+                )
+            else:
+                self.kv_mgr.connection_pool[bootstrap_key] = self.bootstrap_info
+        else:
+            self.bootstrap_info = self.kv_mgr.connection_pool[bootstrap_key]
+
+        assert self.bootstrap_info is not None
         self.kv_mgr.update_status(bootstrap_room, KVPoll.WaitingForInput)
+
+    def _get_bootstrap_info_from_server(self, engine_rank):
+        """Fetch the bootstrap info from the bootstrap server."""
+        try:
+            url = f"http://{self.bootstrap_addr}/route?engine_rank={engine_rank}"
+            response = requests.get(url)
+            if response.status_code == 200:
+                bootstrap_info = response.json()
+                return bootstrap_info
+            else:
+                logger.error(
+                    f"Failed to get prefill server info: {response.status_code}, {response.text}"
+                )
+                return None
+        except Exception as e:
+            logger.error(f"Error fetching prefill info from bootstrap: {e}")
+            return None
 
     @cache
     def _connect(self, endpoint: str):
@@ -400,6 +443,13 @@ class MooncakeKVReceiver(BaseKVReceiver):
         return socket
 
     def init(self, kv_indices: npt.NDArray[np.int64], aux_index: Optional[int] = None):
+        self.prefill_server_url = (
+            f"{self.bootstrap_info['rank_ip']}:{self.bootstrap_info['rank_port']}"
+        )
+        logger.debug(
+            f"Fetched bootstrap info: {self.bootstrap_info} for engine rank: {self.kv_mgr.kv_args.engine_rank}"
+        )
+
         packed_kv_data_ptrs = b"".join(
             struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
         )
@@ -408,9 +458,10 @@ class MooncakeKVReceiver(BaseKVReceiver):
         )
         self._connect("tcp://" + self.prefill_server_url).send_multipart(
             [
-                self.decode_ip.encode("ascii"),
-                self.session_id.encode("ascii"),
                 str(self.bootstrap_room).encode("ascii"),
+                get_local_ip_by_remote().encode("ascii"),
+                str(self.kv_mgr.rank_port).encode("ascii"),
+                self.session_id.encode("ascii"),
                 packed_kv_data_ptrs,
                 kv_indices.tobytes(),
                 packed_aux_data_ptrs,
@@ -432,6 +483,7 @@ class MooncakeKVBootstrapServer(BaseKVBootstrapServer):
         self.store = dict()
         self.lock = asyncio.Lock()
         self._setup_routes()
+        self.prefill_port_table: Dict[int, Dict[str, Union[str, int]]] = {}
 
         # Start bootstrap server
         self.thread = threading.Thread(target=self._run_server, daemon=True)
@@ -442,21 +494,22 @@ class MooncakeKVBootstrapServer(BaseKVBootstrapServer):
 
     def _setup_routes(self):
         self.app.router.add_route("*", "/metadata", self._handle_metadata)
+        self.app.router.add_route("*", "/route", self._handle_route)
 
     async def _handle_metadata(self, request: web.Request):
         key = request.query.get("key", "")
 
         if request.method == "GET":
-            return await self._handle_get(key)
+            return await self._handle_metadata_get(key)
         elif request.method == "PUT":
-            return await self._handle_put(key, request)
+            return await self._handle_metadata_put(key, request)
         elif request.method == "DELETE":
-            return await self._handle_delete(key)
+            return await self._handle_metadata_delete(key)
         return web.Response(
             text="Method not allowed", status=405, content_type="application/json"
         )
 
-    async def _handle_get(self, key):
+    async def _handle_metadata_get(self, key):
         async with self.lock:
             value = self.store.get(key)
         if value is None:
@@ -465,7 +518,7 @@ class MooncakeKVBootstrapServer(BaseKVBootstrapServer):
             )
         return web.Response(body=value, status=200, content_type="application/json")
 
-    async def _handle_put(self, key, request):
+    async def _handle_metadata_put(self, key, request):
         data = await request.read()
         async with self.lock:
             self.store[key] = data
@@ -473,7 +526,7 @@ class MooncakeKVBootstrapServer(BaseKVBootstrapServer):
             text="metadata updated", status=200, content_type="application/json"
         )
 
-    async def _handle_delete(self, key):
+    async def _handle_metadata_delete(self, key):
         async with self.lock:
             if key not in self.store:
                 return web.Response(
@@ -485,6 +538,50 @@ class MooncakeKVBootstrapServer(BaseKVBootstrapServer):
         return web.Response(
             text="metadata deleted", status=200, content_type="application/json"
         )
+
+    async def _handle_route(self, request: web.Request):
+        method = request.method
+        if method == "PUT":
+            return await self._handle_route_put(request)
+        elif method == "GET":
+            return await self._handle_route_get(request)
+        else:
+            return web.Response(
+                text="Method not allowed", status=405, content_type="application/json"
+            )
+
+    async def _handle_route_put(self, request: web.Request):
+        data = await request.json()
+        role = data["role"]
+        rank_ip = data["rank_ip"]
+        rank_port = int(data["rank_port"])
+        engine_rank = int(data["engine_rank"])
+
+        # Add lock to make sure thread-safe
+        if role == "Prefill":
+            self.prefill_port_table[engine_rank] = {
+                "rank_ip": rank_ip,
+                "rank_port": rank_port,
+            }
+            logger.debug(
+                f"Registered Prefill boostrap: {engine_rank} with rank_ip: {rank_ip} and rank_port: {rank_port}"
+            )
+
+        return web.Response(text="OK", status=200)
+
+    async def _handle_route_get(self, request: web.Request):
+        engine_rank = request.query.get("engine_rank")
+        if not engine_rank:
+            return web.Response(text="Missing rank", status=400)
+
+        # Find corresponding prefill info
+        async with self.lock:
+            bootstrap_info = self.prefill_port_table.get(int(engine_rank))
+
+        if bootstrap_info is not None:
+            return web.json_response(bootstrap_info, status=200)
+        else:
+            return web.Response(text="Not Found", status=404)
 
     def _run_server(self):
         try:

@@ -24,13 +24,7 @@ from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
-from sglang.srt.disaggregation.base import (
-    BaseKVManager,
-    BaseKVReceiver,
-    BaseKVSender,
-    KVArgs,
-    KVPoll,
-)
+from sglang.srt.disaggregation.base import BaseKVManager, KVArgs, KVPoll
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     KVClassType,
@@ -67,6 +61,7 @@ class PrefillBootstrapQueue:
         bootstrap_port: int,
         gloo_group: ProcessGroup,
         transfer_backend: TransferBackend,
+        scheduler: Scheduler,
     ):
         self.token_to_kv_pool = token_to_kv_pool
         self.aux_dtype = aux_dtype
@@ -76,6 +71,7 @@ class PrefillBootstrapQueue:
         self.tp_rank = tp_rank
         self.tp_size = tp_size
         self.transfer_backend = transfer_backend
+        self.scheduler = scheduler
         self.kv_manager = self._init_kv_manager()
         self.queue: List[Req] = []
         self.gloo_group = gloo_group
@@ -108,8 +104,11 @@ class PrefillBootstrapQueue:
             metadata_buffer[0].nbytes for metadata_buffer in self.metadata_buffers
         ]
         kv_args.ib_device = "mock-ib-device"
+        kv_args.gpu_id = self.scheduler.gpu_id
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
-        kv_manager = kv_manager_class(kv_args, DisaggregationMode.PREFILL)
+        kv_manager = kv_manager_class(
+            kv_args, DisaggregationMode.PREFILL, self.scheduler.server_args
+        )
         return kv_manager
 
     def add(self, req: Req) -> None:
