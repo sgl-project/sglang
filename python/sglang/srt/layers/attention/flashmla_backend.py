@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInfo
 
+from sgl_kernel import sgl_per_tensor_quant_fp8
 
 # FlashMLA only supports pagesize=64
 PAGE_SIZE = 64
@@ -366,6 +367,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
 
         reshape_q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
 
+<<<<<<< HEAD
         o, _ = flash_mla_with_kvcache(
             q=reshape_q,
             k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
@@ -429,6 +431,30 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             #     print(f"[5] {self.forward_metadata.flashmla_metadata.shape=}")
             #     print(f"[6] {self.forward_metadata.num_splits=}")
             #     print(f"[7] {layer.scaling=}")
+        if self.data_type == torch.float8_e4m3fn:
+            # reshape_q = reshape_q.to(torch.float8_e4m3fn)
+            reshape_q_fp8 = torch.empty(reshape_q.shape, device=reshape_q.device, dtype=torch.float8_e4m3fn)
+            scale=torch.ones((1), dtype=torch.float32, device=reshape_q.device)
+            sgl_per_tensor_quant_fp8(
+                reshape_q, reshape_q_fp8, scale, is_static=False
+            )  # False for dynamic
+
+            o, _ = flash_mla_with_kvcache(
+                q=reshape_q_fp8,
+                k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
+                block_table=self.forward_metadata.block_kv_indices,
+                cache_seqlens=forward_batch.seq_lens.to(torch.int32),
+                head_dim_v=self.kv_lora_rank,  # TODO Retrieve from config.
+                tile_scheduler_metadata=self.forward_metadata.flashmla_metadata,
+                num_splits=self.forward_metadata.num_splits,
+                softmax_scale=layer.scaling,
+                causal=False,
+                descale_q=torch.ones((1), dtype=torch.float32, device=reshape_q.device),
+                descale_k=torch.ones((1), dtype=torch.float32, device=reshape_q.device)
+            )
+
+            return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+        else:
             o, _ = flash_mla_with_kvcache(
                 q=reshape_q,
                 k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
