@@ -430,24 +430,28 @@ class SchedulerDisaggregationDecodeMixin:
             self.process_decode_queue()
             batch = self.get_next_disagg_decode_batch_to_run()
             
+            extend_batch = None
+            if batch and batch.forward_mode.is_extend():
+                extend_batch = batch
+                batch = None
+            
             # Handle DP attention
             if self.server_args.enable_dp_attention or self.server_args.enable_sp_layernorm:
                 batch, _ = self.prepare_dp_attn_batch(batch)
-                
-            self.cur_batch = batch
+            
+            self.cur_batch = extend_batch if extend_batch else batch
+
+            # Generate fake extend output.
+            if extend_batch:
+                # Note: Logprobs should be handled on the prefill engine.
+                # FIXME: stream_output
+                self.stream_output(
+                    extend_batch.reqs, False
+                )
 
             if batch:
-                # Generate fake extend output.
-                if batch.forward_mode.is_extend():
-                    # Note: Logprobs should be handled on the prefill engine.
-                    self.stream_output(
-                        batch.reqs, [False for _ in range(len(batch.reqs))]
-                    )
-                    result = self.run_batch(batch)
-                    self.process_batch_result(batch, result)
-                else:
-                    result = self.run_batch(batch)
-                    self.process_batch_result(batch, result)
+                result = self.run_batch(batch)
+                self.process_batch_result(batch, result)
 
             if batch is None and (
                 len(self.disagg_decode_transfer_queue.queue)
@@ -458,7 +462,7 @@ class SchedulerDisaggregationDecodeMixin:
                 self.check_memory()
                 self.new_token_ratio = self.init_new_token_ratio
 
-            self.last_batch = batch
+            self.last_batch = extend_batch if extend_batch else batch
 
     def get_next_disagg_decode_batch_to_run(
         self: Scheduler,

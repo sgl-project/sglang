@@ -23,8 +23,8 @@ import psutil
 import setproctitle
 import zmq
 
-from python.sglang.srt.disaggregation.utils import DisaggregationMode
-from python.sglang.srt.managers.schedule_batch import Req
+from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import (
     TokenizedEmbeddingReqInput,
