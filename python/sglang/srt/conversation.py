@@ -765,7 +765,10 @@ register_conv_template(
         name="kimi-vl",
         system_message="You are a helpful assistant",
         system_template="<|im_system|>system<|im_middle|>{system_message}",
-        roles=("<|im_user|>user<|im_middle|>", "<|im_assistant|>assistant<|im_middle|>"),
+        roles=(
+            "<|im_user|>user<|im_middle|>",
+            "<|im_assistant|>assistant<|im_middle|>",
+        ),
         messages=[],
         sep="<|im_end|>",
         sep_style=SeparatorStyle.NO_COLON_SINGLE,
@@ -773,4 +776,3 @@ register_conv_template(
         image_token="<|media_start|>image<|media_content|><|media_pad|><|media_end|>",
     )
 )
-

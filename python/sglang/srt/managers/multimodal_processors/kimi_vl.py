@@ -33,7 +33,6 @@ class KimiVLImageProcessor(SGLangBaseProcessor):
         self.im_content = "<|media_content|>"
         self.im_content_id = 163603
 
-
     async def process_mm_data_async(
         self,
         image_data: List[Union[str, bytes]],

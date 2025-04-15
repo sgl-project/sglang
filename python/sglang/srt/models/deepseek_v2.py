@@ -1294,7 +1294,6 @@ class DeepseekV2Model(nn.Module):
 
         self.dp_size = get_attention_dp_size()
 
-
     def get_input_embeddings(self) -> torch.Tensor:
         return self.embed_tokens
 

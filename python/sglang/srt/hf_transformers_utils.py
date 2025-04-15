@@ -35,8 +35,8 @@ from sglang.srt.configs import (
     DbrxConfig,
     DeepseekVL2Config,
     ExaoneConfig,
-    MultiModalityConfig,
     KimiVLConfig,
+    MultiModalityConfig,
 )
 from sglang.srt.connector import create_remote_connector
 from sglang.srt.utils import is_remote_url

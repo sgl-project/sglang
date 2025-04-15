@@ -41,48 +41,46 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-import logging
 import copy
+import logging
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import (Any, Iterable, List, Optional, Tuple)
+from typing import Any, Iterable, List, Optional, Tuple
 
 import torch
 from torch import nn
 from transformers.activations import GELUActivation
 
 from sglang.srt.configs import KimiVLConfig
-from sglang.srt.distributed import (get_tensor_model_parallel_rank,
-                              get_tensor_model_parallel_world_size)
+from sglang.srt.configs.deepseekvl2 import DeepseekV2Config
+from sglang.srt.configs.kimi_vl import KimiVLConfig
+from sglang.srt.configs.kimi_vl_moonvit import MoonViTConfig
+from sglang.srt.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
+from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
-from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.managers.mm_utils import (
+    MultiModalityDataPaddingPatternImageTokens,
     general_mm_embed_routine,
 )
-from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-
-from sglang.srt.utils import add_prefix
+from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
-
-
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
 from sglang.srt.models.kimi_vl_moonvit import MoonVitPretrainedModel
-
-from sglang.srt.configs.deepseekvl2 import DeepseekV2Config
-
-from sglang.srt.configs.kimi_vl import KimiVLConfig
-from sglang.srt.configs.kimi_vl_moonvit import MoonViTConfig
-from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
-from sglang.srt.managers.mm_utils import MultiModalityDataPaddingPatternImageTokens
+from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
+
 
 # For dummy input only
 @dataclass
@@ -96,23 +94,21 @@ class KimiVLMultiModalProjector(nn.Module):
     def __init__(self, config: KimiVLConfig):
         super().__init__()
 
-        self.hidden_size = (config.vision_config.hidden_size *
-                            config.vision_config.merge_kernel_size[0] *
-                            config.vision_config.merge_kernel_size[1])
+        self.hidden_size = (
+            config.vision_config.hidden_size
+            * config.vision_config.merge_kernel_size[0]
+            * config.vision_config.merge_kernel_size[1]
+        )
 
-        self.pre_norm = torch.nn.LayerNorm(config.vision_config.hidden_size,
-                                           eps=1e-5)
-        self.linear_1 = nn.Linear(self.hidden_size,
-                                  self.hidden_size,
-                                  bias=True)
+        self.pre_norm = torch.nn.LayerNorm(config.vision_config.hidden_size, eps=1e-5)
+        self.linear_1 = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
         self.act = GELUActivation()
-        self.linear_2 = nn.Linear(self.hidden_size,
-                                  config.text_config.hidden_size,
-                                  bias=True)
+        self.linear_2 = nn.Linear(
+            self.hidden_size, config.text_config.hidden_size, bias=True
+        )
 
     def forward(self, image_features: torch.Tensor) -> torch.Tensor:
-        hidden_states = self.pre_norm(image_features).view(
-            -1, self.hidden_size)
+        hidden_states = self.pre_norm(image_features).view(-1, self.hidden_size)
         hidden_states = self.linear_1(hidden_states)
         hidden_states = self.act(hidden_states)
         hidden_states = self.linear_2(hidden_states)
@@ -141,19 +137,22 @@ class KimiVLForConditionalGeneration(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("language_model", prefix),
         )
-    
+
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        pixel_values = torch.cat([item.pixel_values for item in items], dim=0).type(
-            self.vision_tower.dtype
+        pixel_values = (
+            torch.cat([item.pixel_values for item in items], dim=0)
+            .type(self.vision_tower.dtype)
+            .to(self.vision_tower.device)
+        )
+        image_grid_thws = torch.concat(
+            [item.image_grid_thws for item in items], dim=0
         ).to(self.vision_tower.device)
-        image_grid_thws = torch.concat([item.image_grid_thws for item in items], dim=0).to(self.vision_tower.device)
         image_features = self.vision_tower(pixel_values, image_grid_thws)
         assert isinstance(image_features, list)
         # lengths = [x.shape[0] for x in image_features]
-        res = self.multi_modal_projector(
-            torch.cat(image_features))#.split(lengths)
+        res = self.multi_modal_projector(torch.cat(image_features))  # .split(lengths)
         return res
-    
+
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         # Get all special token IDs
         pattern = MultiModalityDataPaddingPatternImageTokens(mm_inputs.im_token_id)
@@ -201,7 +200,8 @@ class KimiVLForConditionalGeneration(nn.Module):
                 ckpt_gate_proj_name="gate_proj",
                 ckpt_down_proj_name="down_proj",
                 ckpt_up_proj_name="up_proj",
-                num_experts=config.n_routed_experts)
+                num_experts=config.n_routed_experts,
+            )
         else:
             expert_params_mapping = []
 
@@ -216,8 +216,7 @@ class KimiVLForConditionalGeneration(nn.Module):
             if spec_layer is not None:
                 continue  # skip spec decode layers for main model
 
-            if ("rotary_emb.cos_cached" in name
-                    or "rotary_emb.sin_cached" in name):
+            if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
                 # Models trained using ColossalAI may include these tensors in
                 # the checkpoint. Skip them.
                 continue
@@ -231,8 +230,7 @@ class KimiVLForConditionalGeneration(nn.Module):
                     # not vision model for now.
                     use_default_weight_loading = True
             else:
-                for (param_name, weight_name,
-                     shard_id) in stacked_params_mapping:
+                for param_name, weight_name, shard_id in stacked_params_mapping:
                     if weight_name not in name:
                         continue
                     # We have mlp.experts[0].gate_proj in the checkpoint.
@@ -241,7 +239,7 @@ class KimiVLForConditionalGeneration(nn.Module):
                     # name will be updated to mlp.experts[0].gate_up_proj, which
                     # will then be updated below in expert_params_mapping
                     # for mlp.experts[0].gate_gate_up_proj, which breaks load.
-                    if (("mlp.experts." in name) and name not in params_dict):
+                    if ("mlp.experts." in name) and name not in params_dict:
                         continue
                     name = name.replace(weight_name, param_name)
                     # Skip loading extra bias for GPTQ models.
@@ -256,8 +254,12 @@ class KimiVLForConditionalGeneration(nn.Module):
                     weight_loader(param, loaded_weight, shard_id, **kwargs)
                     break
                 else:
-                    for idx, (param_name, weight_name, expert_id,
-                              shard_id) in enumerate(expert_params_mapping):
+                    for idx, (
+                        param_name,
+                        weight_name,
+                        expert_id,
+                        shard_id,
+                    ) in enumerate(expert_params_mapping):
                         if weight_name not in name:
                             continue
                         name = name.replace(weight_name, param_name)
@@ -267,12 +269,14 @@ class KimiVLForConditionalGeneration(nn.Module):
 
                         param = params_dict[name]
                         weight_loader = param.weight_loader
-                        weight_loader(param,
-                                      loaded_weight,
-                                      name,
-                                      expert_id=expert_id,
-                                      shard_id=shard_id,
-                                      **kwargs)
+                        weight_loader(
+                            param,
+                            loaded_weight,
+                            name,
+                            expert_id=expert_id,
+                            shard_id=shard_id,
+                            **kwargs,
+                        )
                         break
                     else:
                         use_default_weight_loading = True
@@ -289,17 +293,17 @@ class KimiVLForConditionalGeneration(nn.Module):
                 #     continue
 
                 param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader",
-                                        default_weight_loader)
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight, **kwargs)
         self.language_model.post_load_weights()
 
 
-def get_spec_layer_idx_from_weight_name(config: DeepseekV2Config,
-                                        weight_name: str) -> Optional[int]:
-    if hasattr(config,
-               "num_nextn_predict_layers") and (config.num_nextn_predict_layers
-                                                > 0):
+def get_spec_layer_idx_from_weight_name(
+    config: DeepseekV2Config, weight_name: str
+) -> Optional[int]:
+    if hasattr(config, "num_nextn_predict_layers") and (
+        config.num_nextn_predict_layers > 0
+    ):
         layer_idx = config.num_hidden_layers
         for i in range(config.num_nextn_predict_layers):
             if weight_name.startswith(f"model.layers.{layer_idx+i}."):
