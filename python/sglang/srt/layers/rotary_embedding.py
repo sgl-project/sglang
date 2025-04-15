@@ -6,8 +6,8 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+from transformers.models.qwen2_5_omni import Qwen2_5OmniThinkerConfig
 
-from sglang.srt.configs.qwen2_5_o import Qwen2_5OmniThinkerConfig
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.utils import is_cuda_available
 from sglang.utils import logger
