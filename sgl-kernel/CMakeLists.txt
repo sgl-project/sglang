@@ -1,14 +1,21 @@
 cmake_minimum_required(VERSION 3.26 FATAL_ERROR)
 project(sgl-kernel LANGUAGES CXX CUDA)
 
+# CMake
 cmake_policy(SET CMP0169 OLD)
-
 include(${CMAKE_CURRENT_LIST_DIR}/cmake/utils.cmake)
 
+# Python
 find_package(Python COMPONENTS Interpreter Development.Module ${SKBUILD_SABI_COMPONENT} REQUIRED)
 
+# CXX
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3")
+
+# CUDA
 enable_language(CUDA)
 find_package(CUDAToolkit REQUIRED)
+set_property(GLOBAL PROPERTY CUDA_SEPARABLE_COMPILATION ON)
 
 message(STATUS "Detected CUDA_VERSION=${CUDA_VERSION}")
 if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8")
@@ -21,11 +28,10 @@ elseif ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "11.8")
     message("CUDA_VERSION ${CUDA_VERSION} >= 11.8")
 endif()
 
+# Torch
 find_package(Torch REQUIRED)
 # clean Torch Flag
 clear_cuda_arches(CMAKE_FLAG)
-
-set_property(GLOBAL PROPERTY CUDA_SEPARABLE_COMPILATION ON)
 
 include(FetchContent)
 
@@ -41,7 +47,7 @@ FetchContent_Populate(repo-cutlass)
 FetchContent_Declare(
     repo-deepgemm
     GIT_REPOSITORY https://github.com/deepseek-ai/DeepGEMM
-    GIT_TAG        c187c23ba8dcdbad91720737e8be9c43700cb9e9
+    GIT_TAG        4499c4ccbb5d3958b1a069f29ef666156a121278
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-deepgemm)
@@ -82,9 +88,6 @@ include_directories(
     ${repo-flashinfer_SOURCE_DIR}/csrc
 )
 
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3")
-
 set(SGL_KERNEL_CUDA_FLAGS
     "-DNDEBUG"
     "-DOPERATOR_NAMESPACE=sgl-kernel"
@@ -104,9 +107,14 @@ set(SGL_KERNEL_CUDA_FLAGS
     "-DCUTLASS_TEST_ENABLE_CACHED_RESULTS=1"
     "-DCUTLASS_DEBUG_TRACE_LEVEL=0"
     "--expt-relaxed-constexpr"
+    "--expt-extended-lambda"
+    "--threads=32"
     "-Xcompiler=-Wconversion"
     "-Xcompiler=-fno-strict-aliasing"
-    "--threads=16"
+
+    # uncomment to debug
+    # "--ptxas-options=-v"
+    # "--ptxas-options=--verbose,--register-usage-level=10,--warn-on-local-memory-usage"
 )
 
 option(SGL_KERNEL_ENABLE_SM100A "Enable SM100A" OFF)
@@ -114,9 +122,7 @@ option(SGL_KERNEL_ENABLE_SM90A  "Enable SM90A"  OFF)
 option(SGL_KERNEL_ENABLE_BF16   "Enable BF16"   ON)
 option(SGL_KERNEL_ENABLE_FP8    "Enable FP8"    ON)
 option(SGL_KERNEL_ENABLE_FP4    "Enable FP4"    OFF)
-
 option(SGL_KERNEL_ENABLE_FA3    "Enable FA3"    OFF)
-
 
 if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
@@ -164,6 +170,7 @@ string(REPLACE "-D__CUDA_NO_HALF2_OPERATORS__"      "" CMAKE_CUDA_FLAGS "${CMAKE
 set(SOURCES
     "csrc/allreduce/custom_all_reduce.cu"
     "csrc/attention/cascade.cu"
+    "csrc/attention/merge_attn_states.cu"
     "csrc/attention/cutlass_mla_kernel.cu"
     "csrc/attention/lightning_attention_decode_kernel.cu"
     "csrc/elementwise/activation.cu"
