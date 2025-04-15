@@ -89,13 +89,8 @@ void lightning_attention_decode(
     torch::Tensor new_kv);
 void merge_state(
     at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b, at::Tensor v_merged, at::Tensor s_merged);
-void merge_attn_states(
-    at::Tensor& output,
-    std::optional<at::Tensor> output_lse,
-    const at::Tensor& prefix_output,
-    const at::Tensor& prefix_lse,
-    const at::Tensor& suffix_output,
-    const at::Tensor& suffix_lse);
+void merge_state_v2(
+    at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b, at::Tensor v_merged, at::Tensor s_merged);
 void cutlass_mla_decode(
     torch::Tensor const& out,
     torch::Tensor const& q_nope_and_q_pe,

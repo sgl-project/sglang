@@ -1,4 +1,3 @@
-// Adapted from https://github.com/vllm-project/vllm/pull/16173
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 
@@ -29,8 +28,6 @@ inline __device__ void from_float(__nv_bfloat16& d, float s) {
 }
 
 // Implements section 2.2 of https://www.arxiv.org/pdf/2501.01005
-// can be used to combine partial attention results (in the split-KV case)
-// Reference blog: https://zhuanlan.zhihu.com/p/1892966682634473987
 template <typename scalar_t, const uint NUM_THREADS>
 __global__ void merge_attn_states_kernel(
     scalar_t* output,
@@ -64,8 +61,10 @@ __global__ void merge_attn_states_kernel(
   const scalar_t* suffix_head_ptr = suffix_output + head_offset;
   scalar_t* output_head_ptr = output + head_offset;
 
-  float p_lse = prefix_lse[head_idx * num_tokens + token_idx];
-  float s_lse = suffix_lse[head_idx * num_tokens + token_idx];
+  // float p_lse = prefix_lse[head_idx * num_tokens + token_idx];
+  // float s_lse = suffix_lse[head_idx * num_tokens + token_idx];
+  float p_lse = prefix_lse[token_idx * num_heads + head_idx];
+  float s_lse = suffix_lse[token_idx * num_heads + head_idx];
   p_lse = std::isinf(p_lse) ? -std::numeric_limits<float>::infinity() : p_lse;
   s_lse = std::isinf(s_lse) ? -std::numeric_limits<float>::infinity() : s_lse;
 
@@ -102,7 +101,7 @@ __global__ void merge_attn_states_kernel(
   // We only need to write to output_lse once per head.
   if (output_lse != nullptr && pack_idx == 0) {
     float out_lse = logf(out_se) + max_lse;
-    output_lse[head_idx * num_tokens + token_idx] = out_lse;
+    output_lse[token_idx * num_heads + head_idx] = out_lse;
   }
 }
 
@@ -126,7 +125,7 @@ __global__ void merge_attn_states_kernel(
   {                                                                   \
     merge_attn_states_kernel<scalar_t, NUM_THREADS><<<grid, block>>>( \
         reinterpret_cast<scalar_t*>(output.data_ptr()),               \
-        output_lse_ptr,                                               \
+        reinterpret_cast<float*>(output_lse.data_ptr()),              \
         reinterpret_cast<scalar_t*>(prefix_output.data_ptr()),        \
         reinterpret_cast<float*>(prefix_lse.data_ptr()),              \
         reinterpret_cast<scalar_t*>(suffix_output.data_ptr()),        \
@@ -142,20 +141,20 @@ __global__ void merge_attn_states_kernel(
  * @param output [n,h,d] The output tensor to store the merged attention states.
  * @param output_lse [h,d] Optional tensor to store the log-sum-exp values.
  * @param prefix_output [n,h,d] The prefix attention states.
- * @param prefix_lse [h,d] The log-sum-exp values for the prefix attention
+ * @param prefix_lse [n,h] The log-sum-exp values for the prefix attention
  * states.
  * @param suffix_output [n,h,d] The suffix attention states.
- * @param suffix_lse [h,d] The log-sum-exp values for the suffix attention
+ * @param suffix_lse [n,h] The log-sum-exp values for the suffix attention
  * states.
  */
 template <typename scalar_t>
 void merge_attn_states_launcher(
-    at::Tensor& output,                    // [NUM_TOKENS, NUM_HEADS, HEAD_SIZE]
-    std::optional<at::Tensor> output_lse,  // [NUM_HEADS, NUM_TOKENS]
-    const at::Tensor& prefix_output,       // [NUM_TOKENS, NUM_HEADS, HEAD_SIZE]
-    const at::Tensor& prefix_lse,          // [NUM_HEADS, NUM_TOKENS]
-    const at::Tensor& suffix_output,       // [NUM_TOKENS, NUM_HEADS, HEAD_SIZE]
-    const at::Tensor& suffix_lse           // [NUM_HEADS, NUM_TOKENS]
+    const at::Tensor& prefix_output,  // [NUM_TOKENS, NUM_HEADS, HEAD_SIZE]
+    const at::Tensor& prefix_lse,     // [NUM_TOKENS, NUM_HEADS]
+    const at::Tensor& suffix_output,  // [NUM_TOKENS, NUM_HEADS, HEAD_SIZE]
+    const at::Tensor& suffix_lse,     // [NUM_TOKENS, NUM_HEADS]
+    at::Tensor& output,               // [NUM_TOKENS, NUM_HEADS, HEAD_SIZE]
+    at::Tensor& output_lse            // [NUM_TOKENS, NUM_HEADS]
 ) {
   constexpr uint NUM_THREADS = 128;
   const uint num_tokens = output.size(0);
@@ -163,11 +162,8 @@ void merge_attn_states_launcher(
   const uint head_size = output.size(2);
   const uint pack_size = 16 / sizeof(scalar_t);
   TORCH_CHECK(head_size % pack_size == 0, "headsize must be multiple of pack_size:", pack_size);
-  float* output_lse_ptr = nullptr;
-  if (output_lse.has_value()) {
-    output_lse_ptr = output_lse.value().data_ptr<float>();
-  }
-  // process one pack elements per thread. float -> 4, half/bf16 -> 8
+  // Process one pack elements per thread. for float, the
+  // pack_size is 4 for half/bf16, the pack_size is 8.
   const uint threads_per_head = head_size / pack_size;
   const uint total_threads = num_tokens * num_heads * threads_per_head;
 
@@ -178,14 +174,28 @@ void merge_attn_states_launcher(
 }
 
 #define CALL_MERGE_ATTN_STATES_LAUNCHER(scalar_t) \
-  { merge_attn_states_launcher<scalar_t>(output, output_lse, prefix_output, prefix_lse, suffix_output, suffix_lse); }
+  { merge_attn_states_launcher<scalar_t>(v_a, s_a, v_b, s_b, v_merged, s_merged); }
 
-void merge_attn_states(
-    at::Tensor& output,
-    std::optional<at::Tensor> output_lse,
-    const at::Tensor& prefix_output,
-    const at::Tensor& prefix_lse,
-    const at::Tensor& suffix_output,
-    const at::Tensor& suffix_lse) {
-  DISPATCH_BY_SCALAR_DTYPE(output.dtype(), CALL_MERGE_ATTN_STATES_LAUNCHER);
+void merge_state_v2(
+    at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b, at::Tensor v_merged, at::Tensor s_merged) {
+  // Input tensors must be contiguous
+  CHECK_INPUT(v_a);  // v_a prefix_output (seq_len, num_heads, head_dim)
+  CHECK_INPUT(s_a);  // s_a prefix_lse (seq_len, num_heads)
+  CHECK_INPUT(v_b);  // v_b suffix_output (seq_len, num_heads, head_dim)
+  CHECK_INPUT(s_b);  // s_b suffix_lse (seq_len, num_heads)
+  // v_merged output (seq_len, num_heads, head_dim)
+  // s_merged output_lse (seq_len, num_heads)
+  auto device = v_a.device();
+  CHECK_EQ(s_a.device(), device);
+  CHECK_EQ(v_b.device(), device);
+  CHECK_EQ(s_b.device(), device);
+  CHECK_DIM(3, v_a);
+  CHECK_DIM(2, s_a);
+  CHECK_DIM(3, v_b);
+  CHECK_DIM(2, s_b);
+  CHECK_SHAPE(v_a, v_b);
+  CHECK_SHAPE(s_a, s_b);
+  CHECK_EQ(v_a.size(0), s_a.size(0));
+  CHECK_EQ(v_a.size(1), s_b.size(1));
+  DISPATCH_BY_SCALAR_DTYPE(v_merged.dtype(), CALL_MERGE_ATTN_STATES_LAUNCHER);
 }
