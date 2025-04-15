@@ -24,13 +24,7 @@ from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
-from sglang.srt.disaggregation.base import (
-    BaseKVManager,
-    BaseKVReceiver,
-    BaseKVSender,
-    KVArgs,
-    KVPoll,
-)
+from sglang.srt.disaggregation.base import BaseKVManager, KVArgs, KVPoll
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     KVClassType,
