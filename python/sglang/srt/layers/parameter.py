@@ -93,11 +93,31 @@ class _ColumnvLLMParameter(BasevLLMParameter):
     ):
         if not use_presharded_weights:
             shard_size = self.data.shape[self.output_dim]
-            loaded_weight = loaded_weight.narrow(
-                self.output_dim, tp_rank * shard_size, shard_size
+
+            from sglang.srt.cpu_utils import (
+                get_actual_shard_size,
+                reset_param_data_if_needed,
             )
-        assert self.data.shape == loaded_weight.shape
-        self.data.copy_(loaded_weight)
+
+            actual_shard_size = get_actual_shard_size(
+                shard_size, tp_rank * shard_size, loaded_weight.size(self.output_dim)
+            )
+
+            loaded_weight = loaded_weight.narrow(
+                self.output_dim, tp_rank * shard_size, actual_shard_size
+            )
+
+        param_data = self.data
+        # See [Note] Reset padded weights to zero.
+        reset_param_data_if_needed(
+            param_data,
+            self.output_dim,
+            actual_shard_size,
+            shard_size - actual_shard_size,
+        )
+        param_data = param_data.narrow(self.output_dim, 0, actual_shard_size)
+        assert param_data.shape == loaded_weight.shape
+        param_data.copy_(loaded_weight)
 
     def load_merged_column_weight(self, loaded_weight: torch.Tensor, **kwargs):
 
@@ -116,10 +136,27 @@ class _ColumnvLLMParameter(BasevLLMParameter):
         param_data = self.data
 
         param_data = param_data.narrow(self.output_dim, shard_offset, shard_size)
+
+        from sglang.srt.cpu_utils import (
+            get_actual_shard_size,
+            reset_param_data_if_needed,
+        )
+
+        actual_shard_size = get_actual_shard_size(
+            shard_size, tp_rank * shard_size, loaded_weight.size(self.output_dim)
+        )
         if not use_presharded_weights:
             loaded_weight = loaded_weight.narrow(
-                self.output_dim, tp_rank * shard_size, shard_size
+                self.output_dim, tp_rank * shard_size, actual_shard_size
             )
+        # See [Note] Reset padded weights to zero.
+        reset_param_data_if_needed(
+            param_data,
+            self.output_dim,
+            actual_shard_size,
+            shard_size - actual_shard_size,
+        )
+        param_data = param_data.narrow(self.output_dim, 0, actual_shard_size)
         assert param_data.shape == loaded_weight.shape
         param_data.copy_(loaded_weight)
 
@@ -182,15 +219,33 @@ class RowvLLMParameter(BasevLLMParameter):
     ):
         if not use_presharded_weights:
             shard_size = self.data.shape[self.input_dim]
+
+            from sglang.srt.cpu_utils import (
+                get_actual_shard_size,
+                reset_param_data_if_needed,
+            )
+
+            actual_shard_size = get_actual_shard_size(
+                shard_size, tp_rank * shard_size, loaded_weight.size(self.input_dim)
+            )
             loaded_weight = loaded_weight.narrow(
-                self.input_dim, tp_rank * shard_size, shard_size
+                self.input_dim, tp_rank * shard_size, actual_shard_size
             )
 
         if len(loaded_weight.shape) == 0:
             loaded_weight = loaded_weight.reshape(1)
 
-        assert self.data.shape == loaded_weight.shape
-        self.data.copy_(loaded_weight)
+        param_data = self.data
+        # See [Note] Reset padded weights to zero.
+        reset_param_data_if_needed(
+            param_data,
+            self.input_dim,
+            actual_shard_size,
+            shard_size - actual_shard_size,
+        )
+        param_data = param_data.narrow(self.input_dim, 0, actual_shard_size)
+        assert param_data.shape == loaded_weight.shape
+        param_data.copy_(loaded_weight)
 
 
 class ModelWeightParameter(_ColumnvLLMParameter, RowvLLMParameter):
