@@ -1901,4 +1901,4 @@ def get_local_ip_by_remote() -> str:
         s.connect(("2001:4860:4860::8888", 80))  # Doesn't need to be reachable
         return s.getsockname()[0]
     except Exception:
-        raise ValueError(f"Can not get local ip: {audio_file}")
+        raise ValueError(f"Can not get local ip")
