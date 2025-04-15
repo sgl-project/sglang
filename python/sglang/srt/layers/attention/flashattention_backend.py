@@ -1368,7 +1368,6 @@ class FlashAttentionBackend(AttentionBackend):
                     ]
                 )
                 metadata_expand.max_seq_len_q = 1
-                # metadata_expand.max_seq_len_k = self.speculative_num_draft_tokens
                 metadata_expand.cu_seqlens_q = self.target_verify_metadata_topk_expand[
                     "cu_seqlens_q"
                 ][: bs * self.speculative_num_draft_tokens + 1]
