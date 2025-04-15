@@ -38,7 +38,6 @@ from sglang.srt.configs import (
     ExaoneConfig,
     MultiModalityConfig,
 )
-from sglang.srt.configs.qwen2_5_o import Qwen2_5OmniConfig
 from sglang.srt.connector import create_remote_connector
 from sglang.srt.utils import is_remote_url
 
@@ -48,7 +47,6 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
     ExaoneConfig.model_type: ExaoneConfig,
     DeepseekVL2Config.model_type: DeepseekVL2Config,
     MultiModalityConfig.model_type: MultiModalityConfig,
-    Qwen2_5OmniConfig.model_type: Qwen2_5OmniConfig,
 }
 
 for name, cls in _CONFIG_REGISTRY.items():
