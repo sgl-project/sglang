@@ -599,6 +599,7 @@ class Scheduler(
                 bootstrap_port=self.server_args.disaggregation_bootstrap_port,
                 gloo_group=self.tp_worker.get_attention_tp_cpu_group(),
                 transfer_backend=self.transfer_backend,
+                scheduler=self,
             )
             # The prefill requests that are in the middle of kv sending
             self.disagg_prefill_inflight_queue: List[Req] = []
