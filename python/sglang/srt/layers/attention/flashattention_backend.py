@@ -538,7 +538,7 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.max_seq_len_k = metadata_expand.cu_seqlens_k.max().item()
                 self.forward_metadata_spec_decode_expand = metadata_expand
 
-        elif forward_batch.forward_mode.is_extend_or_draft_extend():
+        elif forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
             metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
             metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
             metadata.cu_seqlens_k = torch.nn.functional.pad(
