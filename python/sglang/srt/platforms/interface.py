@@ -312,6 +312,7 @@ class Platform:
 
         return CpuArchEnum.OTHER if machine else CpuArchEnum.UNKNOWN
 
+
     @classmethod
     def is_pin_memory_available(cls) -> bool:
         """Checks whether pin memory is available on the current platform."""
