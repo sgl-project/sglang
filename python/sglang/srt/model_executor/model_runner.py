@@ -375,10 +375,10 @@ class ModelRunner:
         # Check memory for tensor parallelism
         local_gpu_memory = get_available_gpu_memory(self.device, self.gpu_id)
         if self.tp_size > 1:
-            if min_per_gpu_memory < local_gpu_memory * 0.9:
+            if min_per_gpu_memory < local_gpu_memory * 0.7:
                 raise ValueError(
                     "The memory capacity is unbalanced. Some GPUs may be occupied by other processes. "
-                    f"{min_per_gpu_memory=}, {local_gpu_memory=}, {local_gpu_memory * 0.9=}"
+                    f"{min_per_gpu_memory=}, {local_gpu_memory=}, {local_gpu_memory * 0.7=}"
                 )
 
         logger.info(
