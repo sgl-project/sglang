@@ -24,13 +24,7 @@ from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
-from sglang.srt.disaggregation.base import (
-    BaseKVManager,
-    BaseKVReceiver,
-    BaseKVSender,
-    KVArgs,
-    KVPoll,
-)
+from sglang.srt.disaggregation.base import BaseKVManager, KVArgs, KVPoll
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     KVClassType,
@@ -67,6 +61,7 @@ class PrefillBootstrapQueue:
         bootstrap_port: int,
         gloo_group: ProcessGroup,
         transfer_backend: TransferBackend,
+        scheduler: Scheduler,
     ):
         self.token_to_kv_pool = token_to_kv_pool
         self.aux_dtype = aux_dtype
@@ -76,12 +71,13 @@ class PrefillBootstrapQueue:
         self.tp_rank = tp_rank
         self.tp_size = tp_size
         self.transfer_backend = transfer_backend
+        self.scheduler = scheduler
         self.kv_manager = self._init_kv_manager()
         self.queue: List[Req] = []
         self.gloo_group = gloo_group
         self.bootstrap_port = bootstrap_port
 
-    def allocate_token_id(self, idx: int, token_id: int):
+    def store_prefill_results(self, idx: int, token_id: int):
         assert token_id >= 0, f"token_id: {token_id} is negative"
         output_id_buffer = self.metadata_buffers[0]
         output_id_buffer[idx] = token_id
@@ -108,8 +104,11 @@ class PrefillBootstrapQueue:
             metadata_buffer[0].nbytes for metadata_buffer in self.metadata_buffers
         ]
         kv_args.ib_device = "mock-ib-device"
+        kv_args.gpu_id = self.scheduler.gpu_id
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
-        kv_manager = kv_manager_class(kv_args, DisaggregationMode.PREFILL)
+        kv_manager = kv_manager_class(
+            kv_args, DisaggregationMode.PREFILL, self.scheduler.server_args
+        )
         return kv_manager
 
     def add(self, req: Req) -> None:
@@ -146,7 +145,7 @@ class PrefillBootstrapQueue:
             elif poll == KVPoll.Failed:
                 raise Exception("Bootstrap failed")
 
-            # KV.WaitingForInput - init here
+            # KV.WaitingForInput
             num_kv_indices = len(req.origin_input_ids)
             if self.req_to_metadata_buffer_idx_allocator.available_size() == 0:
                 break
@@ -222,6 +221,7 @@ class SchedulerDisaggregationPrefillMixin:
             elif poll == KVPoll.Success:  # transfer done
                 self.tree_cache.cache_finished_req(req)  # unlock the tree
                 req.finished_reason = FINISH_LENGTH(length=0)
+                # FIXME: clean up req's data in transfer engine
                 done_reqs.append(req)
             elif poll == KVPoll.Failed:
                 raise Exception("Transferring failed")
@@ -256,14 +256,18 @@ class SchedulerDisaggregationPrefillMixin:
         """
         start_idx = req.start_send_idx
         end_idx = min(len(req.fill_ids), len(req.origin_input_ids))
+
+        # Update next start_send_idx
+        req.start_send_idx = end_idx
+
         kv_indices = (
             self.req_to_token_pool.req_to_token[req.req_pool_idx][start_idx:end_idx]
             .cpu()
             .numpy()
         )
-        req.start_send_idx = end_idx
         if token_id is not None:
-            self.disagg_prefill_pending_queue.allocate_token_id(
+            self.disagg_prefill_pending_queue.store_prefill_results(
                 req.metadata_buffer_index, token_id
             )
-        req.disagg_kv_sender.send(kv_indices)
+        is_last = token_id is not None
+        req.disagg_kv_sender.send(kv_indices, slice(start_idx, end_idx), is_last)
