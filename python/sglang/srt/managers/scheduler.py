@@ -710,24 +710,23 @@ class Scheduler(
             self.process_decode_queue()
             batch = self.get_next_disagg_decode_batch_to_run()
             
-            extend_batch = None
-            if batch and batch.forward_mode.is_extend():
-                extend_batch = batch
-                batch = None
+            is_real_batch = True
             
+            if batch and batch.forward_mode.is_extend():
+                self.cur_batch = batch
+                # Generate fake extend output.
+                # Note: Logprobs should be handled on the prefill engine.
+                self.stream_output(batch.reqs, False)
+                self.last_batch = batch
+                batch = None
+                is_real_batch = False
+
             # Handle DP attention
             if self.server_args.enable_dp_attention or self.server_args.enable_sp_layernorm:
                 batch, _ = self.prepare_dp_attn_batch(batch)
             
-            self.cur_batch = extend_batch if extend_batch else batch
-
-            # Generate fake extend output.
-            if extend_batch:
-                # Note: Logprobs should be handled on the prefill engine.
-                # FIXME: stream_output
-                self.stream_output(
-                    extend_batch.reqs, False
-                )
+            if is_real_batch:
+                self.cur_batch = batch
 
             if batch:
                 result = self.run_batch(batch)
@@ -742,7 +741,8 @@ class Scheduler(
                 self.check_memory()
                 self.new_token_ratio = self.init_new_token_ratio
 
-            self.last_batch = extend_batch if extend_batch else batch
+            if is_real_batch:
+                self.last_batch = batch
 
     def recv_requests(self) -> List[Req]:
         """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
