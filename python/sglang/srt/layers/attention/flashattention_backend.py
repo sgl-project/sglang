@@ -16,113 +16,8 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
 
-import triton
-import triton.language as tl
 from sgl_kernel import merge_state_v2
 from sgl_kernel.flash_attn import flash_attn_with_kvcache
-
-
-# NOTE: currently have to use triton version for CUDA graph use case due to the in compatible issue of merge_state cuda kernels
-@triton.jit
-def merge_state_kernel(
-    output,  # [NUM_TOKENS, NUM_HEADS, HEAD_SIZE] v_merged
-    output_lse,  # [NUM_TOKENS, NUM_HEADS] s_merged
-    prefix_output,  # [NUM_TOKENS, NUM_HEADS, HEAD_SIZE] v_a
-    prefix_lse,  # [NUM_TOKENS, NUM_HEADS] s_a
-    suffix_output,  # [NUM_TOKENS, NUM_HEADS, HEAD_SIZE] v_b
-    suffix_lse,  # [NUM_TOKENS, NUM_HEADS] s_b
-    HEAD_SIZE: tl.constexpr,
-    PADDED_HEAD_SIZE: tl.constexpr,
-    OUTPUT_LSE: tl.constexpr,
-):
-    token_idx = tl.program_id(0)
-    num_tokens = tl.num_programs(0)
-    head_idx = tl.program_id(1)
-    num_heads = tl.num_programs(1)
-
-    p_lse = tl.load(prefix_lse + token_idx * num_heads + head_idx)
-    s_lse = tl.load(suffix_lse + token_idx * num_heads + head_idx)
-    p_lse = float("-inf") if p_lse == float("inf") else p_lse
-    s_lse = float("-inf") if s_lse == float("inf") else s_lse
-
-    max_lse = tl.maximum(p_lse, s_lse)
-    p_lse = p_lse - max_lse
-    s_lse = s_lse - max_lse
-    out_se = tl.exp(p_lse) + tl.exp(s_lse)
-
-    if OUTPUT_LSE:
-        out_lse = tl.log(out_se) + max_lse
-        tl.store(output_lse + token_idx * num_heads + head_idx, out_lse)
-
-    head_arange = tl.arange(0, PADDED_HEAD_SIZE)
-    head_mask = head_arange < HEAD_SIZE
-    p_out = tl.load(
-        prefix_output
-        + token_idx * num_heads * HEAD_SIZE
-        + head_idx * HEAD_SIZE
-        + head_arange,
-        mask=head_mask,
-    )
-    s_out = tl.load(
-        suffix_output
-        + token_idx * num_heads * HEAD_SIZE
-        + head_idx * HEAD_SIZE
-        + head_arange,
-        mask=head_mask,
-    )
-
-    p_scale = tl.exp(p_lse) / out_se
-    s_scale = tl.exp(s_lse) / out_se
-    out = p_out * p_scale + s_out * s_scale
-    tl.store(
-        output + token_idx * num_heads * HEAD_SIZE + head_idx * HEAD_SIZE + head_arange,
-        out,
-        mask=head_mask,
-    )
-
-
-def merge_state_triton(
-    prefix_output: torch.Tensor,
-    prefix_lse: torch.Tensor,
-    suffix_output: torch.Tensor,
-    suffix_lse: torch.Tensor,
-    output: Optional[torch.Tensor] = None,
-    output_lse: Optional[torch.Tensor] = None,
-) -> None:
-
-    # Avoid creating new tensors if they are already provided
-    if output is None:
-        output = torch.empty_like(prefix_output)
-    if output_lse is None:
-        output_lse = torch.empty_like(prefix_lse)
-
-    num_tokens = output.shape[0]
-    num_query_heads = output.shape[1]
-    head_size = output.shape[2]
-    padded_head_size = triton.next_power_of_2(head_size)
-
-    merge_state_kernel[(num_tokens, num_query_heads)](
-        output,
-        output_lse,
-        prefix_output,
-        prefix_lse,
-        suffix_output,
-        suffix_lse,
-        head_size,
-        padded_head_size,
-        output_lse is not None,
-    )
-    return output, output_lse
-
-
-import os
-
-MERGE_STATE_MODE = os.environ.get("MERGE_STATE_MODE", "cuda").lower()
-
-if MERGE_STATE_MODE == "cuda":
-    merge_state = merge_state_v2
-else:
-    merge_state = merge_state_triton
 
 
 @dataclass
@@ -642,10 +537,7 @@ class FlashAttentionBackend(AttentionBackend):
                 )
                 metadata.max_seq_len_k = metadata_expand.cu_seqlens_k.max().item()
                 self.forward_metadata_spec_decode_expand = metadata_expand
-                # print("target verify")
-                # print("metadata", metadata)
-                # print("metadata_expand", metadata_expand)
-                # torch.distributed.breakpoint()
+
         elif forward_batch.forward_mode.is_extend_or_draft_extend():
             metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
             metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
@@ -879,7 +771,7 @@ class FlashAttentionBackend(AttentionBackend):
                     v_descale=v_descale,
                     return_softmax_lse=True,
                 )
-                o, _ = merge_state(
+                o, _ = merge_state_v2(
                     o,
                     softmax_lse.T.contiguous(),
                     o_expand,
@@ -942,7 +834,7 @@ class FlashAttentionBackend(AttentionBackend):
                     v_descale=v_descale,
                     return_softmax_lse=True,
                 )
-                o, _ = merge_state(
+                o, _ = merge_state_v2(
                     o,
                     softmax_lse.T.contiguous(),
                     o_expand,
@@ -1063,7 +955,7 @@ class FlashAttentionBackend(AttentionBackend):
                     v_descale=v_descale,
                     return_softmax_lse=True,
                 )
-                o, _ = merge_state(
+                o, _ = merge_state_v2(
                     o,
                     softmax_lse.T.contiguous(),
                     o_expand,
@@ -1125,7 +1017,7 @@ class FlashAttentionBackend(AttentionBackend):
                     v_descale=v_descale,
                     return_softmax_lse=True,
                 )
-                o, _ = merge_state(
+                o, _ = merge_state_v2(
                     o,
                     softmax_lse.T.contiguous(),
                     o_expand,
@@ -1737,13 +1629,6 @@ class FlashAttentionBackend(AttentionBackend):
                     )
                 )
                 metadata.max_seq_len_k = metadata_expand.cu_seqlens_k.max().item()
-                # metadata_expand.max_seq_len_k = self.speculative_num_draft_tokens, already set in capture
-                # metadata_expand.cache_seqlens_int32 already set in capture
-                # metadata_expand.cu_seqlens_k already set in capture
-
-                # print("target verify")
-                # print("metadata", metadata)
-                # print("metadata_expand", metadata_expand)
 
         if encoder_lens is not None:
             # Only support encoder size 1 for now
