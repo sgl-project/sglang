@@ -46,6 +46,7 @@ class ReqToMetadataIdxAllocator:
 
 class TransferBackend(Enum):
     MOONCAKE = "mooncake"
+    NIXL = "nixl"
     FAKE = "fake"
 
 
@@ -70,6 +71,21 @@ def get_kv_class(transfer_backend: TransferBackend, class_type: KVClassType):
             KVClassType.SENDER: MooncakeKVSender,
             KVClassType.RECEIVER: MooncakeKVReceiver,
             KVClassType.BOOTSTRAP_SERVER: MooncakeKVBootstrapServer,
+        }
+        return class_mapping.get(class_type)
+    if transfer_backend == TransferBackend.NIXL:
+        from sglang.srt.disaggregation.nixl import (
+            NixlKVBootstrapServer,
+            NixlKVManager,
+            NixlKVReceiver,
+            NixlKVSender,
+        )
+
+        class_mapping = {
+            KVClassType.MANAGER: NixlKVManager,
+            KVClassType.SENDER: NixlKVSender,
+            KVClassType.RECEIVER: NixlKVReceiver,
+            KVClassType.BOOTSTRAP_SERVER: NixlKVBootstrapServer,
         }
         return class_mapping.get(class_type)
     raise ValueError(f"Unsupported transfer backend: {transfer_backend}")
