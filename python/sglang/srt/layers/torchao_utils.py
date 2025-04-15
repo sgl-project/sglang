@@ -33,7 +33,7 @@ def proj_filter(
     fqn: str,
 ):
     """Filter function for quantizing projection layers."""
-    return "proj" in fqn
+    return "proj" in fqn and "linear" not in fqn
 
 
 def apply_torchao_config_to_model(
