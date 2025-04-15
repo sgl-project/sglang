@@ -6,12 +6,15 @@ from typing import List, Tuple
 import torch
 import torch.library
 
-from sglang.srt.utils import get_bool_env_var, is_hip, is_hpu
+from sglang.srt.utils import get_bool_env_var, is_hip, is_hpu, is_xpu
 
 logger = logging.getLogger(__name__)
 use_vllm_custom_allreduce = get_bool_env_var(
     "USE_VLLM_CUSTOM_ALLREDUCE", default="false"
 )
+
+if is_xpu():
+    use_vllm_custom_allreduce = True
 
 if not is_hpu():
     # ROCm does not use vllm custom allreduce

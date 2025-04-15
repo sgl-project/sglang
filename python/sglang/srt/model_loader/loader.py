@@ -58,8 +58,11 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_device_capability,
     is_pin_memory_available,
+    is_xpu,
     set_weight_attrs,
 )
+
+_is_xpu = is_xpu()
 
 
 @contextmanager
@@ -119,7 +122,7 @@ def _get_quantization_config(
         )
         major, minor = get_device_capability()
 
-        if major is not None and minor is not None:
+        if major is not None and minor is not None and not _is_xpu:
             assert 0 <= minor < 10
             capability = major * 10 + minor
             if capability < quant_config.get_min_capability():
