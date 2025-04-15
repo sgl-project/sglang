@@ -259,7 +259,7 @@ class ModelConfig:
             modelopt_quant_config = {"quant_method": "modelopt"}
             if not is_local:
                 # check for HF_HUB_OFFLINE flag for offline environments
-                if os.getenv("HF_HUB_OFFLINE", "0") not in ("1", "true", "True"):
+                if not get_bool_env_var("HF_HUB_OFFLINE"):
                     from huggingface_hub import HfApi
 
                     hf_api = HfApi()
