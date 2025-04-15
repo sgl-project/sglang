@@ -180,7 +180,6 @@ class DeepseekV2MoE(nn.Module):
             else 0
         )
 
-        self.routed_scaling_factor = config.routed_scaling_factor
         if self.tp_size > config.n_routed_experts:
             raise ValueError(
                 f"Tensor parallel size {self.tp_size} is greater than "
