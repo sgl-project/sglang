@@ -128,8 +128,11 @@ class DecodePreallocQueue:
             metadata_buffer[0].nbytes for metadata_buffer in self.metadata_buffers
         ]
         kv_args.ib_device = "mock-ib-device"
+        kv_args.gpu_id = self.scheduler.gpu_id
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
-        kv_manager = kv_manager_class(kv_args, DisaggregationMode.DECODE)
+        kv_manager = kv_manager_class(
+            kv_args, DisaggregationMode.DECODE, self.scheduler.server_args
+        )
         return kv_manager
 
     def add(self, req: Req) -> None:
