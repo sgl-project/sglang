@@ -84,10 +84,10 @@ class EAGLEDraftCudaGraphRunner:
             raise Exception(
                 f"Capture cuda graph failed: {e}\n"
                 "Possible solutions:\n"
-                "1. disable cuda graph by --disable-cuda-graph\n"
-                "2. set --mem-fraction-static to a smaller value (e.g., 0.8 or 0.7)\n"
-                "3. disable torch compile by not using --enable-torch-compile\n"
-                "4. specify --dtype to the same dtype (e.g. bfloat16)\n"
+                "1. set --mem-fraction-static to a smaller value (e.g., 0.8 or 0.7)\n"
+                "2. disable torch compile by not using --enable-torch-compile\n"
+                "3. specify --dtype to the same dtype (e.g. bfloat16)\n"
+                "4. disable cuda graph by --disable-cuda-graph\n"
                 "Open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose \n"
             )
 
@@ -214,10 +214,10 @@ class EAGLEDraftCudaGraphRunner:
             forward_batch.positions = self.positions[:num_tokens]
 
         # Special handle for seq_len_cpu used when flashinfer mla is used
-        if (forward_batch.decode_seq_lens_cpu is not None) and (bs != raw_bs):
+        if (forward_batch.seq_lens_cpu is not None) and (bs != raw_bs):
             self.seq_lens_cpu.fill_(1)
-            self.seq_lens_cpu[:raw_bs].copy_(forward_batch.decode_seq_lens_cpu)
-            forward_batch.decode_seq_lens_cpu = self.seq_lens_cpu[:bs]
+            self.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
+            forward_batch.seq_lens_cpu = self.seq_lens_cpu[:bs]
 
         self.model_runner.draft_attn_backend.init_forward_metadata_replay_cuda_graph(
             forward_batch, bs
@@ -233,7 +233,7 @@ class EAGLEDraftCudaGraphRunner:
             forward_batch.positions = self.positions[:raw_num_token]
             forward_batch.seq_lens = self.seq_lens[:raw_bs]
             forward_batch.req_pool_indices = self.req_pool_indices[:raw_bs]
-            if forward_batch.decode_seq_lens_cpu is not None:
-                forward_batch.decode_seq_lens_cpu = self.seq_lens_cpu[:raw_bs]
+            if forward_batch.seq_lens_cpu is not None:
+                forward_batch.seq_lens_cpu = self.seq_lens_cpu[:raw_bs]
 
         return out

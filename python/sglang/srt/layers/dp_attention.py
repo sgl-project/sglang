@@ -3,7 +3,7 @@ from __future__ import annotations
 import functools
 import logging
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Union
+from typing import TYPE_CHECKING, List
 
 import torch
 import triton
@@ -192,8 +192,7 @@ def _dp_gather(
 
     if local_tokens.shape[0] > 0 and (is_partial or get_attention_tp_rank() == 0):
         assert (
-            global_tokens.untyped_storage().data_ptr()
-            != local_tokens.untyped_storage().data_ptr()
+            local_tokens.untyped_storage() is not global_tokens.untyped_storage()
         ), "aliasing between global_tokens and local_tokens not allowed"
         memcpy_triton(
             global_tokens, local_tokens, 0, local_start_pos, local_num_tokens, False
@@ -243,9 +242,19 @@ def dp_scatter(
     assert global_tokens.is_contiguous()
     if local_tokens.shape[0] > 0:
         assert (
-            local_tokens.untyped_storage().data_ptr()
-            != global_tokens.untyped_storage().data_ptr()
+            local_tokens.untyped_storage() is not global_tokens.untyped_storage()
         ), "aliasing between local_tokens and global_tokens not allowed"
         memcpy_triton(
             local_tokens, global_tokens, 0, local_start_pos, local_num_tokens, True
         )
+
+
+def tp_reduce_scatter(
+    output: torch.Tensor,
+    input_list: List[torch.Tensor],
+):
+    return get_attention_tp_group().reduce_scatter(output, input_list)
+
+
+def tp_all_gather(output_list: List[torch.Tensor], input_: torch.Tensor):
+    return get_attention_tp_group().all_gather(input_, tensor_list=output_list)

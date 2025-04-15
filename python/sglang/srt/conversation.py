@@ -33,6 +33,7 @@ class SeparatorStyle(IntEnum):
     ADD_NEW_LINE_SINGLE = auto()
     LLAMA2 = auto()
     LLAMA3 = auto()
+    LLAMA4 = auto()
     CHATGLM = auto()
     CHATML = auto()
     CHATINTERN = auto()
@@ -73,10 +74,13 @@ class Conversation:
     stop_str: Union[str, List[str]] = None
     # The string that represents an image token in the prompt
     image_token: str = "<image>"
+    audio_token: str = "<audio>"
 
     image_data: Optional[List[str]] = None
     modalities: Optional[List[str]] = None
     stop_token_ids: Optional[int] = None
+
+    audio_data: Optional[List[str]] = None
 
     def get_prompt(self) -> str:
         """Get the prompt for generation."""
@@ -153,19 +157,30 @@ class Conversation:
                 else:
                     ret += role + ":"
             return ret
-        elif self.sep_style == SeparatorStyle.LLAMA3:
-            ret = "<|begin_of_text|>"
+        elif self.sep_style == SeparatorStyle.LLAMA4:
+            # begin_of_text is added by default
             if self.system_message:
-                ret += system_prompt
+                ret = system_prompt
             else:
-                ret += ""
+                ret = ""
+            for i, (role, message) in enumerate(self.messages):
+                if message:
+                    ret += f"<|header_start|>{role}<|header_end|>\n\n"
+                    ret += f"{message.strip()}<|eot|>"
+                else:
+                    ret += f"<|header_start|>{role}<|header_end|>\n\n"
+            return ret
+        elif self.sep_style == SeparatorStyle.LLAMA3:
+            if self.system_message:
+                ret = system_prompt
+            else:
+                ret = ""
             for i, (role, message) in enumerate(self.messages):
                 if message:
                     ret += f"<|start_header_id|>{role}<|end_header_id|>\n\n"
                     ret += f"{message.strip()}<|eot_id|>"
                 else:
                     ret += f"<|start_header_id|>{role}<|end_header_id|>\n\n"
-            # print(ret)
             return ret
         elif self.sep_style == SeparatorStyle.LLAMA2:
             seps = [self.sep, self.sep2]
@@ -327,6 +342,10 @@ class Conversation:
         """Append a new message."""
         self.image_data.append(image)
 
+    def append_audio(self, audio: str):
+        """Append a new message."""
+        self.audio_data.append(audio)
+
     def update_last_message(self, message: str):
         """Update the last output.
 
@@ -373,6 +392,7 @@ class Conversation:
             sep2=self.sep2,
             stop_str=self.stop_str,
             image_token=self.image_token,
+            audio_token=self.audio_token,
         )
 
     def dict(self):
@@ -459,8 +479,10 @@ def generate_chat_conv(
         sep2=conv.sep2,
         stop_str=conv.stop_str,
         image_data=[],
+        audio_data=[],
         modalities=[],
         image_token=conv.image_token,
+        audio_token=conv.audio_token,
     )
 
     if isinstance(request.messages, str):
@@ -498,6 +520,7 @@ def generate_chat_conv(
                         if conv.name != "qwen2-vl"
                         else conv.image_token
                     )
+                audio_token = conv.audio_token
                 for content in message.content:
                     if content.type == "text":
                         if num_image_url > 16:
@@ -507,6 +530,10 @@ def generate_chat_conv(
                         # NOTE: Only works for llava
                         real_content += image_token
                         conv.append_image(content.image_url.url)
+                    elif content.type == "audio_url":
+                        real_content += audio_token
+                        conv.append_audio(content.audio_url.url)
+
                 conv.append_message(conv.roles[0], real_content)
         elif msg_role == "assistant":
             parsed_content = ""
@@ -543,6 +570,19 @@ register_conv_template(
         sep=" ",
         sep2=" </s><s>",
         stop_str=["[INST]", "[/INST]", "<<SYS>>", "<</SYS>>"],
+    )
+)
+
+# reference: https://huggingface.co/meta-llama/Llama-4-Scout-17B-16E-Instruct/blob/main/chat_template.json
+register_conv_template(
+    Conversation(
+        name="llama-4",
+        system_template="<|header_start|>system<|header_end|>\n\n{system_message}<|eot|>",
+        roles=("user", "assistant"),
+        sep_style=SeparatorStyle.LLAMA4,
+        sep="",
+        stop_str=["<|end_of_text|>", "<|eot|>", "<|eom|>"],
+        image_token="<|image|>",
     )
 )
 
@@ -653,7 +693,7 @@ register_conv_template(
     Conversation(
         name="gemma-it",
         system_message="You are a helpful assistant.",
-        system_template="<bos><start_of_turn>user{system_message}\n\n",
+        system_template="<start_of_turn>user{system_message}\n\n",
         roles=("<start_of_turn>user\n", "<start_of_turn>model\n"),
         sep="<end_of_turn>\n",
         sep_style=SeparatorStyle.GEMMA3,
@@ -702,5 +742,20 @@ register_conv_template(
         sep_style=SeparatorStyle.ADD_COLON_TWO,
         stop_str=["<|User|>", "<｜end▁of▁sentence｜>"],
         image_token="<image_placeholder>",
+    )
+)
+
+# Reference: https://huggingface.co/openbmb/MiniCPM-o-2_6#usage
+register_conv_template(
+    Conversation(
+        name="minicpmo",
+        system_message="You are Qwen, created by Alibaba Cloud. You are a helpful assistant.",
+        system_template="<|im_start|>system\n{system_message}",
+        roles=("<|im_start|>user", "<|im_start|>assistant"),
+        sep="<|im_end|>\n",
+        sep_style=SeparatorStyle.ADD_NEW_LINE_SINGLE,
+        stop_str=("<|im_end|>", "<|endoftext|>"),
+        image_token="(<image>./</image>)",
+        audio_token="(<audio>./</audio>)",
     )
 )

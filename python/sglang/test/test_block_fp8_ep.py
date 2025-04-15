@@ -13,6 +13,7 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     silu_and_mul_triton_kernel,
 )
 from sglang.srt.layers.moe.topk import select_experts
+from sglang.test.test_utils import CustomTestCase
 
 
 # For test
@@ -232,7 +233,7 @@ def block_dequant(
     return x_dq_block
 
 
-class TestW8A8BlockFP8EPMoE(unittest.TestCase):
+class TestW8A8BlockFP8EPMoE(CustomTestCase):
     DTYPES = [torch.half, torch.bfloat16]
     M = [1, 222, 1024, 2048]
     N = [128, 1024, 2048]

@@ -4,9 +4,9 @@ from typing import List
 
 import torch
 
-from sglang.srt.utils import is_cuda_available
+from sglang.srt.utils import is_cuda_available, is_hip
 
-if is_cuda_available():
+if is_cuda_available() or is_hip():
     from sgl_kernel import (
         build_tree_kernel_efficient as sgl_build_tree_kernel_efficient,
     )

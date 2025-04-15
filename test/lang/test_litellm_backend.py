@@ -3,9 +3,10 @@ import unittest
 
 from sglang import LiteLLM, set_default_backend
 from sglang.test.test_programs import test_mt_bench, test_stream
+from sglang.test.test_utils import CustomTestCase
 
 
-class TestAnthropicBackend(unittest.TestCase):
+class TestAnthropicBackend(CustomTestCase):
     chat_backend = None
 
     @classmethod

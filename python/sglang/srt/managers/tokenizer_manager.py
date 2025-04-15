@@ -16,7 +16,6 @@
 import asyncio
 import copy
 import dataclasses
-import json
 import logging
 import os
 import pickle
@@ -49,13 +48,13 @@ from fastapi import BackgroundTasks
 
 from sglang.srt.aio_rwlock import RWLock
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.disaggregation.conn import KVBootstrapServer
-from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
-from sglang.srt.managers.image_processor import (
-    get_dummy_image_processor,
-    get_image_processor,
+from sglang.srt.disaggregation.utils import (
+    DisaggregationMode,
+    KVClassType,
+    TransferBackend,
+    get_kv_class,
 )
+from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOut,
@@ -65,6 +64,8 @@ from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     ConfigureLoggingReq,
     EmbeddingReqInput,
+    ExpertDistributionReq,
+    ExpertDistributionReqOutput,
     FlushCacheReq,
     GenerateReqInput,
     GetInternalStateReq,
@@ -92,6 +93,11 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
+)
+from sglang.srt.managers.multimodal_processor import (
+    get_dummy_processor,
+    get_mm_processor,
+    import_processors,
 )
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -161,6 +167,7 @@ class TokenizerManager:
             context_length=server_args.context_length,
             model_override_args=server_args.json_model_override_args,
             is_embedding=server_args.is_embedding,
+            enable_multimodal=server_args.enable_multimodal,
             dtype=server_args.dtype,
             quantization=server_args.quantization,
         )
@@ -171,17 +178,19 @@ class TokenizerManager:
         self.image_token_id = self.model_config.image_token_id
 
         if self.model_config.is_multimodal:
+            import_processors()
             _processor = get_processor(
                 server_args.tokenizer_path,
                 tokenizer_mode=server_args.tokenizer_mode,
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.revision,
+                use_fast=not server_args.disable_fast_image_processor,
             )
 
             # We want to parallelize the image pre-processing so we create an executor for it
-            # We creat image_processor for any skip_tokenizer_init to make sure we still encode
+            # We create mm_processor for any skip_tokenizer_init to make sure we still encode
             # images even with skip_tokenizer_init=False.
-            self.image_processor = get_image_processor(
+            self.mm_processor = get_mm_processor(
                 self.model_config.hf_config, server_args, _processor
             )
 
@@ -192,7 +201,7 @@ class TokenizerManager:
                 self.tokenizer = self.processor.tokenizer
                 os.environ["TOKENIZERS_PARALLELISM"] = "false"
         else:
-            self.image_processor = get_dummy_image_processor()
+            self.mm_processor = get_dummy_processor()
 
             if server_args.skip_tokenizer_init:
                 self.tokenizer = self.processor = None
@@ -258,8 +267,10 @@ class TokenizerManager:
         self.start_profile_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
-        self.health_check_communitcator = _Communicator(self.send_to_scheduler, 1)
         self.get_internal_state_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.expert_distribution_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
 
@@ -311,6 +322,10 @@ class TokenizerManager:
                     GetInternalStateReqOutput,
                     self.get_internal_state_communicator.handle_recv,
                 ),
+                (
+                    ExpertDistributionReqOutput,
+                    self.expert_distribution_communicator.handle_recv,
+                ),
                 (HealthCheckOutput, lambda x: None),
             ]
         )
@@ -318,10 +333,16 @@ class TokenizerManager:
         self.disaggregation_mode = DisaggregationMode(
             self.server_args.disaggregation_mode
         )
+        self.transfer_backend = TransferBackend(
+            self.server_args.disaggregation_transfer_backend
+        )
         # for disaggregtion, start kv boostrap server on prefill
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             # only start bootstrap server on prefill tm
-            self.bootstrap_server = KVBootstrapServer(
+            kv_bootstrap_server_class = get_kv_class(
+                self.transfer_backend, KVClassType.BOOTSTRAP_SERVER
+            )
+            self.bootstrap_server = kv_bootstrap_server_class(
                 self.server_args.disaggregation_bootstrap_port
             )
 
@@ -389,7 +410,7 @@ class TokenizerManager:
                 )
             input_ids = self.tokenizer.encode(input_text)
 
-        image_inputs: Dict = await self.image_processor.process_images_async(
+        image_inputs: Dict = await self.mm_processor.process_mm_data_async(
             obj.image_data, input_text or input_ids, obj, self.max_req_input_len
         )
         if image_inputs and "input_ids" in image_inputs:
@@ -443,6 +464,8 @@ class TokenizerManager:
                 top_logprobs_num,
                 token_ids_logprob,
                 obj.stream,
+                bootstrap_host=obj.bootstrap_host,
+                bootstrap_room=obj.bootstrap_room,
                 lora_path=obj.lora_path,
                 input_embeds=input_embeds,
                 session_params=session_params,
@@ -637,6 +660,15 @@ class TokenizerManager:
         req = ProfileReq(type=ProfileReqType.STOP_PROFILE)
         self.send_to_scheduler.send_pyobj(req)
 
+    async def start_expert_distribution_record(self):
+        await self.expert_distribution_communicator(ExpertDistributionReq.START_RECORD)
+
+    async def stop_expert_distribution_record(self):
+        await self.expert_distribution_communicator(ExpertDistributionReq.STOP_RECORD)
+
+    async def dump_expert_distribution_record(self):
+        await self.expert_distribution_communicator(ExpertDistributionReq.DUMP_RECORD)
+
     async def update_weights_from_disk(
         self,
         obj: UpdateWeightFromDiskReqInput,
@@ -718,7 +750,7 @@ class TokenizerManager:
         self.auto_create_handle_loop()
         assert (
             self.server_args.dp_size == 1
-        ), "dp_size must be for update weights from distributed"
+        ), "dp_size must be 1 for update weights from distributed"
 
         # This means that weight sync
         # cannot run while requests are in progress.
