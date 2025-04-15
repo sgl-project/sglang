@@ -911,8 +911,7 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             topk_group=topk_group,
             num_expert_group=num_expert_group,
             custom_routing_function=custom_routing_function,
-            scoring_func=scoring_func,
-            e_score_correction_bias=correction_bias)
+            correction_bias=correction_bias)
 
         return fused_experts(
             x,
