@@ -106,7 +106,6 @@ class MooncakeKVManager(BaseKVManager):
         self.bootstrap_port = server_args.disaggregation_bootstrap_port
         self.dist_init_addr = server_args.dist_init_addr
         self.request_status: Dict[int, KVPoll] = {}
-        self.connection_pool: Dict[str, Dict[str, Union[str, int]]] = {}
         self.rank_port = None
         self.server_socket = zmq.Context().socket(zmq.PULL)
         self.register_buffer_to_engine()
@@ -117,6 +116,7 @@ class MooncakeKVManager(BaseKVManager):
             self._register_to_bootstrap()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.start_decode_thread()
+            self.connection_pool: Dict[str, Dict[str, Union[str, int]]] = {}
         else:
             raise ValueError(
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
@@ -483,9 +483,7 @@ class MooncakeKVBootstrapServer(BaseKVBootstrapServer):
         self.store = dict()
         self.lock = asyncio.Lock()
         self._setup_routes()
-        self.prefill_port_table: Dict[str, Dict[str, Union[str, int]]] = {}
-
-        self.prefill_engine_rank = None
+        self.prefill_port_table: Dict[int, Dict[str, Union[str, int]]] = {}
 
         # Start bootstrap server
         self.thread = threading.Thread(target=self._run_server, daemon=True)
