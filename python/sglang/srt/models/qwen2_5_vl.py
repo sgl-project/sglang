@@ -30,22 +30,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
-from transformers import AutoModel, Qwen2VLConfig
 from transformers.activations import ACT2FN
 from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
-from transformers.models.qwen2_5_vl import Qwen2_5_VLProcessor
 from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import (
     Qwen2_5_VLConfig,
     Qwen2_5_VLVisionConfig,
 )
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
-    Qwen2_5_VLForConditionalGeneration,
+    Qwen2_5_VisionPatchEmbed,
+    Qwen2_5_VisionRotaryEmbedding,
 )
 
-from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
 from sglang.srt.hf_transformers_utils import get_processor
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
@@ -57,7 +52,7 @@ from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternTokenPairs,
     general_mm_embed_routine,
 )
-from sglang.srt.managers.schedule_batch import MultimodalInputs
+from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2Model
@@ -146,7 +141,7 @@ class Qwen2_5_VisionBlock(nn.Module):
             embed_dim=dim,
             num_heads=num_heads,
             projection_size=dim,
-            use_qkv_parallel=False,
+            use_qkv_parallel=True,
             use_context_forward=use_context_forward,
             softmax_in_single_precision=softmax_in_single_precision,
             flatten_batch=flatten_batch,
@@ -179,33 +174,6 @@ class Qwen2_5_VisionBlock(nn.Module):
         norm2 = self.norm2(x)
         mlp = self.mlp(norm2)
         x = x + mlp
-        return x
-
-
-class Qwen2_5_VisionPatchEmbed(nn.Module):
-
-    def __init__(
-        self,
-        patch_size: int = 14,
-        temporal_patch_size: int = 2,
-        in_chans: int = 3,
-        embed_dim: int = 1152,
-    ) -> None:
-        super().__init__()
-        self.patch_size = patch_size
-        self.temporal_patch_size = temporal_patch_size
-        self.embed_dim = embed_dim
-
-        kernel_size = [temporal_patch_size, patch_size, patch_size]
-        self.proj = nn.Conv3d(
-            in_chans, embed_dim, kernel_size=kernel_size, stride=kernel_size, bias=False
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        target_dtype = self.proj.weight.dtype
-        L, C = x.shape
-        x = x.view(L, -1, self.temporal_patch_size, self.patch_size, self.patch_size)
-        x = self.proj(x.to(dtype=target_dtype)).view(L, self.embed_dim)
         return x
 
 
@@ -253,21 +221,6 @@ class Qwen2_5_VisionPatchMerger(nn.Module):
         return out
 
 
-class Qwen2_5_VisionRotaryEmbedding(nn.Module):
-
-    def __init__(self, dim: int, theta: float = 10000.0) -> None:
-        super().__init__()
-        inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float) / dim))
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-
-    def forward(self, seqlen: int) -> torch.Tensor:
-        seq = torch.arange(
-            seqlen, device=self.inv_freq.device, dtype=self.inv_freq.dtype
-        )
-        freqs = torch.outer(seq, self.inv_freq)
-        return freqs
-
-
 class Qwen2_5_VisionTransformer(nn.Module):
 
     def __init__(
@@ -284,7 +237,7 @@ class Qwen2_5_VisionTransformer(nn.Module):
         spatial_merge_size: int = vision_config.spatial_merge_size
         self.spatial_merge_size = spatial_merge_size
         self.spatial_merge_unit: int = spatial_merge_size * spatial_merge_size
-        in_chans: int = vision_config.in_channels
+        in_channels: int = vision_config.in_channels
         hidden_size: int = vision_config.hidden_size
         depth: int = vision_config.depth
         num_heads: int = vision_config.num_heads
@@ -295,7 +248,7 @@ class Qwen2_5_VisionTransformer(nn.Module):
         self.patch_embed = Qwen2_5_VisionPatchEmbed(
             patch_size=patch_size,
             temporal_patch_size=temporal_patch_size,
-            in_chans=in_chans,
+            in_channels=in_channels,
             embed_dim=hidden_size,
         )
 
@@ -372,7 +325,7 @@ class Qwen2_5_VisionTransformer(nn.Module):
 
     @property
     def dtype(self) -> torch.dtype:
-        return self.blocks[0].mlp.gate_proj.weight.dtype
+        return self.patch_embed.proj.weight.dtype
 
     @property
     def device(self) -> torch.device:
@@ -476,9 +429,28 @@ cached_get_processor = lru_cache(get_processor)
 
 
 class Qwen2_5_VLForConditionalGeneration(nn.Module):
+    # BitandBytes specific attributes
+    default_bitsandbytes_target_modules = [
+        ".gate_proj.",
+        ".down_proj.",
+        ".up_proj.",
+        ".q_proj.",
+        ".k_proj.",
+        ".v_proj.",
+        ".o_proj.",
+    ]
+    bitsandbytes_stacked_params_mapping = {
+        # shard_name, weight_name, index
+        "q_proj": ("qkv_proj", 0),
+        "k_proj": ("qkv_proj", 1),
+        "v_proj": ("qkv_proj", 2),
+        "gate_proj": ("gate_up_proj", 0),
+        "up_proj": ("gate_up_proj", 1),
+    }
+
     def __init__(
         self,
-        config: Qwen2VLConfig,
+        config: Qwen2_5_VLConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
@@ -488,9 +460,9 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         self.visual = Qwen2_5_VisionTransformer(
             config.vision_config,
             norm_eps=getattr(config, "rms_norm_eps", 1e-6),
-            # NOTE: Qwen2-VL vision encoder does not support any
-            # quantization method now.
-            quant_config=None,
+            # NOTE: Qwen2_5-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
+            # Other quantization methods (e.g., GPTQ, AWQ) are untested and may not be supported.
+            quant_config=quant_config,
             prefix=add_prefix("visual", prefix),
         )
 
@@ -509,23 +481,29 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("lm_head", prefix),
             )
+        self.is_mrope_enabled = "mrope_section" in self.config.rope_scaling
 
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
 
-    def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         # Get all special token IDs
-        im_start_id: int = image_inputs.im_start_id
-        im_end_id: int = image_inputs.im_end_id
+        im_start_id: int = mm_inputs.im_start_id
+        im_end_id: int = mm_inputs.im_end_id
 
         media_token_pairs = [(im_start_id, im_end_id)]
         pattern = MultiModalityDataPaddingPatternTokenPairs(media_token_pairs)
+        return pattern.pad_input_tokens(input_ids, mm_inputs)
 
-        return pattern.pad_input_tokens(input_ids, image_inputs)
-
-    def get_image_feature(self, image_input: MultimodalInputs) -> torch.Tensor:
-        pixel_values = image_input.pixel_values.type(self.visual.dtype)
-        image_embeds = self.visual(pixel_values, grid_thw=image_input.image_grid_thws)
+    def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        # in qwen-vl, last dim is the same
+        pixel_values = torch.cat([item.pixel_values for item in items], dim=0).type(
+            self.visual.dtype
+        )
+        image_grid_thws = torch.concat([item.image_grid_thws for item in items], dim=0)
+        assert pixel_values.dim() == 2, pixel_values.dim()
+        assert image_grid_thws.dim() == 2, image_grid_thws.dim()
+        image_embeds = self.visual(pixel_values, grid_thw=image_grid_thws)
         return image_embeds
 
     def _process_video_input(self, video_input: Qwen2VLVideoInputs) -> torch.Tensor:
@@ -557,31 +535,25 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
                 otherwise it will be `(seq_len,).
                 (Use input_metadata.mrope_positions to replace it)
         """
-        if getattr(self.config, "rope_scaling", {}).get("type", None) == "mrope":
+        if self.is_mrope_enabled:
             positions = forward_batch.mrope_positions
 
         if not (
             forward_batch.forward_mode.is_decode()
             or not forward_batch.contains_image_inputs()
         ):
-            if getattr(self.config, "rope_scaling", {}).get("type", None) == "mrope":
+            if self.is_mrope_enabled:
                 assert positions.ndim == 2 and positions.size(0) == 3, (
                     "multimodal section rotary embedding requires "
                     f"(3, seq_len) positions, but got {positions.size()}"
                 )
 
-        inputs_embeds = general_mm_embed_routine(
+        hidden_states = general_mm_embed_routine(
             input_ids=input_ids,
             forward_batch=forward_batch,
-            embed_tokens=self.get_input_embeddings(),
-            mm_data_embedding_func=self.get_image_feature,
-        )
-
-        hidden_states = self.model(
-            input_ids=None,
+            language_model=self.model,
+            image_data_embedding_func=self.get_image_feature,
             positions=positions,
-            forward_batch=forward_batch,
-            input_embeds=inputs_embeds,
         )
 
         if not get_embedding:
@@ -594,9 +566,9 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
+            (".qkv_proj", ".q_proj", "q"),
+            (".qkv_proj", ".k_proj", "k"),
+            (".qkv_proj", ".v_proj", "v"),
             ("gate_up_proj", "up_proj", 1),
             ("gate_up_proj", "gate_proj", 0),
         ]
@@ -620,23 +592,6 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                if "visual" in name and "qkv.weight" in name:
-                    visual_num_heads = self.config.vision_config.num_heads
-                    visual_embed_dim = self.config.vision_config.hidden_size
-                    head_size = visual_embed_dim // visual_num_heads
-                    loaded_weight = loaded_weight.view(
-                        3, visual_num_heads, head_size, visual_embed_dim
-                    )
-                    loaded_weight = loaded_weight.transpose(0, 1)
-                    loaded_weight = loaded_weight.reshape(-1, visual_embed_dim)
-                elif "visual" in name and "qkv.bias" in name:
-                    visual_num_heads = self.config.vision_config.num_heads
-                    visual_embed_dim = self.config.vision_config.hidden_size
-                    head_size = visual_embed_dim // visual_num_heads
-                    loaded_weight = loaded_weight.view(3, visual_num_heads, head_size)
-                    loaded_weight = loaded_weight.transpose(0, 1)
-                    loaded_weight = loaded_weight.reshape(-1)
-
                 if "visual" in name:
                     # adapt to VisionAttention
                     name = name.replace(r"attn.qkv.", r"attn.qkv_proj.")

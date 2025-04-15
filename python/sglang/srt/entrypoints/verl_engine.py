@@ -12,15 +12,18 @@
 # limitations under the License.
 # ==============================================================================
 import os
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Literal, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
+from PIL.Image import Image
 from torch.distributed.tensor import DeviceMesh, DTensor
 
+from sglang.srt.entrypoints.http_server_engine import HttpServerEngineAdapter
 from sglang.srt.model_executor.model_runner import LocalSerializedTensor
 from sglang.srt.patch_torch import monkey_patch_torch_reductions
 from sglang.srt.server import Engine
+from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj
 
 
@@ -29,6 +32,7 @@ class VerlEngine:
         self,
         device_mesh_cpu: DeviceMesh,
         nnodes: int = 1,
+        backend: Literal["engine", "server"] = "engine",
         **kwargs,
     ):
         monkey_patch_torch_reductions()
@@ -39,13 +43,25 @@ class VerlEngine:
         node_rank = self._tp_rank // tp_size_per_node
         first_rank_in_node = self._tp_rank % tp_size_per_node == 0
 
-        if first_rank_in_node:
-            os.environ["SGLANG_BLOCK_NONZERO_RANK_CHILDREN"] = "0"
-            self._engine = Engine(
-                **kwargs, tp_size=self._tp_size, node_rank=node_rank, nnodes=nnodes
-            )
+        # Common engine keyword arguments
+        engine_kwargs = dict(
+            **kwargs, tp_size=self._tp_size, node_rank=node_rank, nnodes=nnodes
+        )
+
+        if backend == "engine":
+            if first_rank_in_node:
+                os.environ["SGLANG_BLOCK_NONZERO_RANK_CHILDREN"] = "0"
+                self._engine = Engine(**engine_kwargs)
+            else:
+                self._engine = None
+
+        elif backend == "server":
+            if self._tp_rank == 0:
+                self._engine = HttpServerEngineAdapter(**engine_kwargs)
+            else:
+                self._engine = None
         else:
-            self._engine = None
+            raise ValueError(f"Unsupported backend: {backend}")
 
         dist.barrier(group=self._device_mesh_cpu.get_group())
 
@@ -56,9 +72,19 @@ class VerlEngine:
         sampling_params: Optional[Union[List[Dict], Dict]] = None,
         # The token ids for text; one can either specify text or input_ids.
         input_ids: Optional[Union[List[List[int]], List[int]]] = None,
-        # The image input. It can be a file name, a url, or base64 encoded string.
-        # See also python/sglang/srt/utils.py:load_image.
-        image_data: Optional[Union[List[str], str]] = None,
+        # The image input. It can be an image instance, file name, URL, or base64 encoded string.
+        # Can be formatted as:
+        # - Single image for a single request
+        # - List of images (one per request in a batch)
+        # - List of lists of images (multiple images per request)
+        # See also python/sglang/srt/utils.py:load_image for more details.
+        image_data: Optional[
+            Union[
+                List[List[Union[Image, str]]],
+                List[Union[Image, str]],
+                Union[Image, str],
+            ]
+        ] = None,
         return_logprob: Optional[Union[List[bool], bool]] = False,
         logprob_start_len: Optional[Union[List[int], int]] = None,
         top_logprobs_num: Optional[Union[List[int], int]] = None,
@@ -92,6 +118,7 @@ class VerlEngine:
             rank=self._tp_rank,
             dist_group=self._device_mesh_cpu.get_group(),
             src=self._device_mesh_cpu.mesh[0].item(),
+            force_cpu_device=False,
         )
 
         return output

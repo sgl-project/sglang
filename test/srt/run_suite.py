@@ -28,6 +28,7 @@ suites = {
         TestFile("test_chunked_prefill.py", 336),
         TestFile("test_eagle_infer.py", 500),
         TestFile("test_ebnf_constrained.py"),
+        TestFile("test_fa3.py", 5),
         TestFile("test_fp8_kernel.py", 8),
         TestFile("test_embedding_openai_server.py", 36),
         TestFile("test_hidden_states.py", 55),
@@ -75,6 +76,8 @@ suites = {
         TestFile("test_create_kvindices.py", 2),
         TestFile("test_hicache.py", 60),
         TestFile("test_hicache_mla.py", 90),
+        TestFile("test_fused_moe.py", 30),
+        TestFile("test_triton_moe_channel_fp8_kernel.py", 25),
     ],
     "per-commit-2-gpu": [
         TestFile("models/lora/test_lora_tp.py", 300),
@@ -94,6 +97,7 @@ suites = {
         TestFile("test_awq.py"),
         TestFile("test_gguf.py", 78),
         TestFile("test_gptqmodel_dynamic.py", 72),
+        TestFile("test_bnb.py"),
     ],
 }
 

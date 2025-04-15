@@ -116,7 +116,7 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
     if capture_bs is None:
         if server_args.speculative_algorithm is None:
             if server_args.disable_cuda_graph_padding:
-                capture_bs = list(range(1, 33)) + range(40, 161, 16)
+                capture_bs = list(range(1, 33)) + list(range(40, 161, 16))
             else:
                 capture_bs = [1, 2, 4, 8] + list(range(16, 161, 8))
         else:
@@ -269,10 +269,10 @@ class CudaGraphRunner:
             raise Exception(
                 f"Capture cuda graph failed: {e}\n"
                 "Possible solutions:\n"
-                "1. disable cuda graph by --disable-cuda-graph\n"
-                "2. set --mem-fraction-static to a smaller value (e.g., 0.8 or 0.7)\n"
+                "1. set --mem-fraction-static to a smaller value (e.g., 0.8 or 0.7)\n"
+                "2. set --cuda-graph-max-bs to a smaller value (e.g., 32)\n"
                 "3. disable torch compile by not using --enable-torch-compile\n"
-                "4. set --cuda-graph-max-bs to a smaller value (e.g., 32)\n"
+                "4. disable cuda graph by --disable-cuda-graph\n"
                 "Open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose \n"
             )
 
@@ -491,10 +491,10 @@ class CudaGraphRunner:
         self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
         self.out_cache_loc[:raw_num_token].copy_(forward_batch.out_cache_loc)
         self.positions[:raw_num_token].copy_(forward_batch.positions)
-        if forward_batch.decode_seq_lens_cpu is not None:
+        if forward_batch.seq_lens_cpu is not None:
             if bs != raw_bs:
                 self.seq_lens_cpu.fill_(1)
-            self.seq_lens_cpu[:raw_bs].copy_(forward_batch.decode_seq_lens_cpu)
+            self.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
 
         if self.is_encoder_decoder:
             self.encoder_lens[:raw_bs].copy_(forward_batch.encoder_lens)
