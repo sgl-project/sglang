@@ -4,6 +4,10 @@ project(sgl-kernel LANGUAGES CXX CUDA)
 # CMake
 cmake_policy(SET CMP0169 OLD)
 include(${CMAKE_CURRENT_LIST_DIR}/cmake/utils.cmake)
+set(CMAKE_COLOR_DIAGNOSTICS ON)
+set(CMAKE_VERBOSE_MAKEFILE ON CACHE BOOL "ON")
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+set(CMAKE_SHARED_LIBRARY_PREFIX "")
 
 # Python
 find_package(Python COMPONENTS Interpreter Development.Module ${SKBUILD_SABI_COMPONENT} REQUIRED)
@@ -109,6 +113,8 @@ set(SGL_KERNEL_CUDA_FLAGS
     "--expt-relaxed-constexpr"
     "--expt-extended-lambda"
     "--threads=32"
+
+    # Supress warnings
     "-Xcompiler=-Wconversion"
     "-Xcompiler=-fno-strict-aliasing"
 
@@ -213,12 +219,12 @@ target_include_directories(common_ops PRIVATE
 target_link_libraries(common_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt)
 
 target_compile_definitions(common_ops PRIVATE
-         FLASHATTENTION_DISABLE_BACKWARD
-         FLASHATTENTION_DISABLE_DROPOUT
-         FLASHATTENTION_DISABLE_UNEVEN_K
-    )
+    FLASHATTENTION_DISABLE_BACKWARD
+    FLASHATTENTION_DISABLE_DROPOUT
+    FLASHATTENTION_DISABLE_UNEVEN_K
+)
 
-install(TARGETS common_ops LIBRARY DESTINATION "sgl_kernel")
+install(TARGETS common_ops LIBRARY DESTINATION sgl_kernel)
 
 # ============================ Optional Install ============================= #
 # set flash-attention sources file
