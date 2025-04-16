@@ -264,19 +264,30 @@ def apply_fp8_linear(
     # cutlass_scaled_mm supports per tensor/channel W and per tensor/token A
     # for sgl-kernel fp8_scaled_mm, it support per channel W now
     if cutlass_fp8_supported:
-        if _is_cuda:
-            qinput, x_scale = sgl_scaled_fp8_quant(
-                input_2d,
-                input_scale,
-                use_per_token_if_dynamic=use_per_token_if_dynamic,
+        if input_scale is not None:
+            assert input_scale.numel() == 1
+            # broadcast per-tensor scale to per-token scale when supporting cutlass
+            qinput, x_scale = static_quant_fp8(
+                input_2d, input_scale, repeat_scale=cutlass_fp8_supported
             )
         else:
-            qinput, x_scale = ops.scaled_fp8_quant(
-                input_2d,
-                input_scale,
-                scale_ub=input_scale_ub,
-                use_per_token_if_dynamic=use_per_token_if_dynamic,
-            )
+            # default use per-token quantization if dynamic
+            if _is_cuda:
+                qinput, x_scale = sglang_per_token_quant_fp8(input_2d)
+            else:
+                # TODO(kkhuang): temporarily enforce per-tensor activation scaling if weight is per-tensor scaling
+                # final solution should be: 1. add support to per-tensor activation scaling.
+                # 2. solve the torch.compile error from weight_scale.numel() == 1 and x_scale.numel() > 1 (below line#308)
+                if _is_hip and weight_scale.numel() == 1:
+                    qinput, x_scale = ops.scaled_fp8_quant(
+                        input_2d,
+                        input_scale,
+                        use_per_token_if_dynamic=use_per_token_if_dynamic,
+                    )
+                else:
+                    qinput, x_scale = per_token_group_quant_fp8(
+                        input_2d, group_size=input_2d.shape[1]
+                    )
 
         # Fused GEMM_DQ
         if VLLM_AVAILABLE and use_vllm_cutlass_w8a8_fp8_kernel:
