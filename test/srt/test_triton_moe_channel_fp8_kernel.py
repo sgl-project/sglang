@@ -3,9 +3,9 @@ import unittest
 
 import torch
 
-from sglang.srt.custom_op import scaled_fp8_quant
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
+from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.test.test_utils import CustomTestCase
 
 
