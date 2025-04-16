@@ -15,7 +15,7 @@ _is_cuda_available = is_cuda_available()
 if _is_cuda_available:
     from sgl_kernel import apply_rope_with_cos_sin_cache_inplace
 else:
-    from vllm._custom_ops import vllm_rotary_embedding
+    from vllm._custom_ops import rotary_embedding as vllm_rotary_embedding
 
 
 def _rotate_neox(x: torch.Tensor) -> torch.Tensor:
