@@ -946,7 +946,7 @@ def v1_chat_generate_request(
                     openai_compatible_messages.append(
                         {
                             "role": "system",
-                            "content": """
+                            "content": """You are a helpful Assistant.
                     ## Tools
                     ### Function
                     You have the following functions available:
