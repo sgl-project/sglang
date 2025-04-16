@@ -10,6 +10,7 @@ import torch
 from compressed_tensors import CompressionFormat
 from compressed_tensors.quantization import QuantizationStrategy
 
+from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
 from sglang.srt.layers.quantization.utils import (
     all_close_1d,
@@ -22,9 +23,7 @@ from sglang.srt.utils import set_weight_attrs
 
 _is_cuda = is_cuda()
 
-if _is_cuda:
-    from sglang.srt.custom_op import scaled_fp8_quant as sgl_scaled_fp8_quant
-else:
+if not _is_cuda:
     from vllm import _custom_ops as vllm_ops
 
 try:
@@ -258,7 +257,7 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
                         (
                             layer.w13_weight[expert_id][start : start + shard_size, :],
                             _,
-                        ) = sgl_scaled_fp8_quant(dq_weight, max_w13_scales[expert_id])
+                        ) = scaled_fp8_quant(dq_weight, max_w13_scales[expert_id])
                     else:
                         (
                             layer.w13_weight[expert_id][start : start + shard_size, :],

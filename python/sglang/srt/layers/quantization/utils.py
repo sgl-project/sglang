@@ -5,13 +5,12 @@ from typing import List, Mapping, Tuple, Union
 
 import torch
 
+from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.utils import is_cuda
 
 _is_cuda = is_cuda()
 
-if _is_cuda:
-    from sglang.srt.custom_op import scaled_fp8_quant as sgl_scaled_fp8_quant
-else:
+if not _is_cuda:
     from vllm import _custom_ops as vllm_ops
 
 
@@ -117,7 +116,7 @@ def requantize_with_max_scale(
             end = start + logical_width
             weight_dq = per_tensor_dequantize(weight[start:end, :], weight_scale[idx])
             if _is_cuda:
-                weight[start:end, :], _ = sgl_scaled_fp8_quant(weight_dq, max_w_scale)
+                weight[start:end, :], _ = scaled_fp8_quant(weight_dq, max_w_scale)
             else:
                 weight[start:end, :], _ = vllm_ops.scaled_fp8_quant(
                     weight_dq, max_w_scale

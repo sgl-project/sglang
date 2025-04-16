@@ -42,6 +42,9 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
+from sglang.srt.layers.quantization.fp8_kernel import (
+    scaled_fp8_quant as sgl_scaled_fp8_quant,
+)
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
     apply_w8a8_block_fp8_linear,
@@ -72,10 +75,6 @@ if _is_hip:
     from aiter import ActivationType
     from aiter.fused_moe_bf16_asm import asm_moe, ck_moe_2stages, ck_moe_2stages_win4
     from aiter.ops.shuffle import shuffle_weight
-
-if _is_cuda:
-    from sglang.srt.custom_op import scaled_fp8_quant as sgl_scaled_fp8_quant
-else:
     from vllm import _custom_ops as vllm_ops
 
 

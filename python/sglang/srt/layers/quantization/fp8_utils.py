@@ -13,6 +13,12 @@ except ImportError:
 from sglang.srt.layers.quantization.fp8_kernel import (
     _enable_jit_deepgemm,
     per_token_group_quant_fp8,
+)
+from sglang.srt.layers.quantization.fp8_kernel import (
+    scaled_fp8_quant as sgl_scaled_fp8_quant,
+)
+from sglang.srt.layers.quantization.fp8_kernel import (
+    sglang_per_token_quant_fp8,
     static_quant_fp8,
     w8a8_block_fp8_matmul,
 )
@@ -32,9 +38,6 @@ if _is_hip and get_bool_env_var("CK_MOE"):
 
 if _is_cuda:
     from sgl_kernel import fp8_blockwise_scaled_mm, fp8_scaled_mm
-
-    from sglang.srt.custom_op import scaled_fp8_quant as sgl_scaled_fp8_quant
-    from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_quant_fp8
 
 use_vllm_cutlass_w8a8_fp8_kernel = get_bool_env_var("USE_VLLM_CUTLASS_W8A8_FP8_KERNEL")
 

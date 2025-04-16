@@ -13,6 +13,9 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.moe.topk import select_experts
+from sglang.srt.layers.quantization.fp8_kernel import (
+    scaled_fp8_quant as sgl_scaled_fp8_quant,
+)
 from sglang.srt.utils import (
     direct_register_custom_op,
     get_bool_env_var,
@@ -26,8 +29,6 @@ _is_cuda = is_cuda()
 
 if _is_cuda:
     from sgl_kernel import gelu_and_mul, silu_and_mul
-
-    from sglang.srt.custom_op import scaled_fp8_quant as sgl_scaled_fp8_quant
 else:
     from vllm import _custom_ops as vllm_ops
 
