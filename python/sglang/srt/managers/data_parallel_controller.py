@@ -223,7 +223,7 @@ class DataParallelController:
         self.max_req_input_len = scheduler_info[0]["max_req_input_len"]
 
     def round_robin_scheduler(self, req: Req):
-        if self.server_args.disaggregation_mode == DisaggregationMode.NULL:
+        if self.server_args.disaggregation_mode == "null":
             self.workers[self.round_robin_counter].send_pyobj(req)
             self.round_robin_counter = (self.round_robin_counter + 1) % len(
                 self.workers
