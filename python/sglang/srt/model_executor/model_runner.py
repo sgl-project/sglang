@@ -78,8 +78,11 @@ from sglang.srt.utils import (
     get_available_gpu_memory,
     init_custom_process_group,
     is_cuda,
+    is_fa3_default_architecture,
     is_flashinfer_available,
     is_hip,
+    is_hopper_with_cuda_12_3,
+    is_no_spec_infer_or_topk_one,
     monkey_patch_p2p_access_check,
     monkey_patch_vllm_gguf_config,
     set_cpu_offload_max_bytes,
@@ -241,11 +244,23 @@ class ModelRunner:
         elif server_args.attention_backend is None:
             # By default, use flashinfer for non-mla attention and triton for mla attention
             if not self.use_mla_backend:
-                server_args.attention_backend = (
-                    "flashinfer" if is_flashinfer_available() else "triton"
-                )
+                if (
+                    is_hopper_with_cuda_12_3()
+                    and is_no_spec_infer_or_topk_one(server_args)
+                    and is_fa3_default_architecture(self.model_config.hf_config)
+                ):
+                    server_args.attention_backend = "fa3"
+                else:
+                    server_args.attention_backend = (
+                        "flashinfer" if is_flashinfer_available() else "triton"
+                    )
             else:
-                server_args.attention_backend = "triton"
+                if is_hopper_with_cuda_12_3() and is_no_spec_infer_or_topk_one(
+                    server_args
+                ):
+                    server_args.attention_backend = "fa3"
+                else:
+                    server_args.attention_backend = "triton"
             logger.info(
                 f"Attention backend not set. Use {server_args.attention_backend} backend by default."
             )
@@ -262,6 +277,16 @@ class ModelRunner:
                     )
             else:
                 raise ValueError(f"MLA optimization not supported on CPU.")
+
+        if (
+            server_args.attention_backend == "fa3"
+            and server_args.kv_cache_dtype == "fp8_e5m2"
+        ):
+            logger.warning(
+                "FlashAttention3 only supports fp8_e4m3 if using FP8; "
+                "Setting attention backend to triton."
+            )
+            server_args.attention_backend = "triton"
 
         if server_args.enable_double_sparsity:
             logger.info(
@@ -281,7 +306,6 @@ class ModelRunner:
                 f"Automatically reduce --mem-fraction-static to {self.mem_fraction_static:.3f} "
                 f"because this is a multimodal model."
             )
-
             logger.info(
                 "Automatically turn off --chunked-prefill-size for multimodal model."
             )
@@ -890,9 +914,6 @@ class ModelRunner:
                 "FlashAttention v3 Backend requires SM>=90. "
                 "Please use `--attention-backend flashinfer`."
             )
-            logger.warning(
-                "FlashAttention v3 Backend is in Beta. FP8 is not supported."
-            )
             from sglang.srt.layers.attention.flashattention_backend import (
                 FlashAttentionBackend,
             )
@@ -1071,7 +1092,8 @@ class ModelRunner:
         rope_scaling = getattr(self.model_config.hf_config, "rope_scaling", {})
         if rope_scaling is None:
             return False
-        return rope_scaling.get("type", None) == "mrope"
+        is_mrope_enabled = "mrope_section" in rope_scaling
+        return is_mrope_enabled
 
     def save_remote_model(self, url: str):
         from sglang.srt.model_loader.loader import RemoteModelLoader
