@@ -25,6 +25,7 @@ _is_cuda = is_cuda()
 
 if not _is_cuda:
     from vllm import _custom_ops as vllm_ops
+    from vllm._custom_ops import scaled_fp8_quant
 
 try:
     import vllm
@@ -252,19 +253,11 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
                         layer.w13_weight[expert_id][start : start + shard_size, :],
                         layer.w13_weight_scale[expert_id][shard_id],
                     )
+                    (
+                        layer.w13_weight[expert_id][start : start + shard_size, :],
+                        _,
+                    ) = scaled_fp8_quant(dq_weight, max_w13_scales[expert_id])
 
-                    if _is_cuda:
-                        (
-                            layer.w13_weight[expert_id][start : start + shard_size, :],
-                            _,
-                        ) = scaled_fp8_quant(dq_weight, max_w13_scales[expert_id])
-                    else:
-                        (
-                            layer.w13_weight[expert_id][start : start + shard_size, :],
-                            _,
-                        ) = vllm_ops.scaled_fp8_quant(
-                            dq_weight, max_w13_scales[expert_id]
-                        )
                     start += shard_size
 
             layer.w13_weight_scale = torch.nn.Parameter(

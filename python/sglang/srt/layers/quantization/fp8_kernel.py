@@ -36,7 +36,12 @@ from sglang.srt.utils import (
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
-fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
+_fp8_type = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
+if _is_hip:
+    fp8_max = 224.0
+else:
+    fp8_max = torch.finfo(_fp8_type).max
+fp8_min = -fp8_max
 
 _enable_jit_deepgemm = False
 if _is_cuda:
@@ -55,6 +60,7 @@ if _is_cuda:
 
 
 logger = logging.getLogger(__name__)
+
 
 if supports_custom_op():
 
@@ -182,7 +188,6 @@ def per_token_group_quant_fp8(
     x: torch.Tensor,
     group_size: int,
     eps: float = 1e-10,
-    dtype: torch.dtype = fp8_type_,
     column_major_scales: bool = False,
     scale_tma_aligned: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -195,7 +200,6 @@ def per_token_group_quant_fp8(
         x: The input tenosr with ndim >= 2.
         group_size: The group size used for quantization.
         eps: The minimum to avoid dividing zero.
-        dtype: The dype of output tensor.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: The quantized tensor and the scaling factor for quantization.
@@ -205,15 +209,7 @@ def per_token_group_quant_fp8(
     ), "the last dimension of `x` cannot be divisible by `group_size`"
     assert x.is_contiguous(), "`x` is not contiguous"
 
-    finfo = torch.finfo(dtype)
-    fp8_max = finfo.max
-
-    if _is_hip:
-        fp8_max = 224.0
-
-    fp8_min = -fp8_max
-
-    x_q = torch.empty_like(x, device=x.device, dtype=dtype)
+    x_q = torch.empty_like(x, device=x.device, dtype=_fp8_type)
     M = x.numel() // group_size
     N = group_size
     if column_major_scales:
@@ -279,27 +275,18 @@ def sglang_per_token_group_quant_fp8(
     x: torch.Tensor,
     group_size: int,
     eps: float = 1e-10,
-    dtype: torch.dtype = fp8_type_,
 ):
     assert (
         x.shape[-1] % group_size == 0
     ), "the last dimension of `x` cannot be divisible by `group_size`"
     assert x.is_contiguous(), "`x` is not contiguous"
 
-    finfo = torch.finfo(dtype)
-    fp8_max = finfo.max
-
-    fp8_min = -fp8_max
-
-    x_q = torch.empty_like(x, device=x.device, dtype=dtype)
-    M = x.numel() // group_size
-    N = group_size
+    x_q = torch.empty_like(x, device=x.device, dtype=_fp8_type)
     x_s = torch.empty(
         x.shape[:-1] + (x.shape[-1] // group_size,),
         device=x.device,
         dtype=torch.float32,
     )
-
     sgl_per_token_group_quant_fp8(x, x_q, x_s, group_size, eps, fp8_min, fp8_max)
 
     return x_q, x_s
@@ -307,7 +294,7 @@ def sglang_per_token_group_quant_fp8(
 
 def sglang_per_token_quant_fp8(
     x: torch.Tensor,
-    dtype: torch.dtype = fp8_type_,
+    dtype: torch.dtype = _fp8_type,
 ):
     assert x.is_contiguous(), "`x` is not contiguous"
 
@@ -371,7 +358,6 @@ def static_quant_fp8(
     x: torch.Tensor,
     x_s: torch.Tensor,
     repeat_scale: bool = False,
-    dtype: torch.dtype = fp8_type_,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Function to perform static quantization using the given scale on an input tensor `x`.
 
@@ -389,15 +375,8 @@ def static_quant_fp8(
     """
     assert x.is_contiguous(), "`x` is not contiguous"
     assert x_s.numel() == 1, "only supports per-tensor scale"
-    finfo = torch.finfo(dtype)
-    fp8_max = finfo.max
 
-    if _is_hip:
-        fp8_max = 224.0
-
-    fp8_min = -fp8_max
-
-    x_q = torch.empty_like(x, device=x.device, dtype=dtype)
+    x_q = torch.empty_like(x, device=x.device, dtype=_fp8_type)
     M = x.numel() // x.shape[-1]
     N = x.shape[-1]
     if repeat_scale:
@@ -899,7 +878,7 @@ def _per_tensor_quant_mla_fp8_stage2(
 
 
 def per_tensor_quant_mla_fp8(
-    x: torch.Tensor, eps: float = 1e-12, dtype: torch.dtype = torch.float8_e4m3fn
+    x: torch.Tensor, eps: float = 1e-12
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     This function quantizes input values to float8 values with tensor-wise quantization
@@ -907,13 +886,7 @@ def per_tensor_quant_mla_fp8(
     """
     assert x.dim() == 3, "`x` is not a 3d-tensor"
 
-    finfo = torch.finfo(dtype)
-    fp8_max = finfo.max
-    if _is_hip:
-        dtype = torch.float8_e4m3fnuz
-        fp8_max = 224.0
-
-    x_q = x.new_empty(x.size(), dtype=dtype)
+    x_q = x.new_empty(x.size(), dtype=_fp8_type)
     x_s = torch.zeros((1,), dtype=torch.float32, device=x.device)
 
     num_head, num_seq, head_size = x.shape
@@ -938,7 +911,7 @@ def per_tensor_quant_mla_fp8(
         head_size,
         x.stride(0),
         x.stride(1),
-        -fp8_max,
+        fp8_min,
         fp8_max,
         BLOCK_SIZE,
     )

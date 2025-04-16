@@ -13,9 +13,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.moe.topk import select_experts
-from sglang.srt.layers.quantization.fp8_kernel import (
-    scaled_fp8_quant as sgl_scaled_fp8_quant,
-)
+from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.utils import (
     direct_register_custom_op,
     get_bool_env_var,
@@ -31,6 +29,7 @@ if _is_cuda:
     from sgl_kernel import gelu_and_mul, silu_and_mul
 else:
     from vllm import _custom_ops as vllm_ops
+    from vllm._custom_ops import scaled_fp8_quant
 
 if _is_cuda or _is_hip:
     from sgl_kernel import moe_align_block_size as sgl_moe_align_block_size
@@ -769,14 +768,9 @@ def invoke_fused_moe_kernel(
             # activation tensor-wise fp8 quantization, dynamic or static
             padded_size = padding_size
             # activations apply per-token quantization when weights apply per-channel quantization by default
-            if _is_cuda:
-                A, A_scale = sgl_scaled_fp8_quant(
-                    A, A_scale, use_per_token_if_dynamic=per_channel_quant
-                )
-            else:
-                A, A_scale = vllm_ops.scaled_fp8_quant(
-                    A, A_scale, use_per_token_if_dynamic=per_channel_quant
-                )
+            A, A_scale = scaled_fp8_quant(
+                A, A_scale, use_per_token_if_dynamic=per_channel_quant
+            )
         else:
             # activation block-wise fp8 quantization
             assert len(block_shape) == 2

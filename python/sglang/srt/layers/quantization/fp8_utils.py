@@ -1,4 +1,3 @@
-import os
 from typing import List, Optional, Tuple
 
 import torch
@@ -13,11 +12,7 @@ except ImportError:
 from sglang.srt.layers.quantization.fp8_kernel import (
     _enable_jit_deepgemm,
     per_token_group_quant_fp8,
-)
-from sglang.srt.layers.quantization.fp8_kernel import (
-    scaled_fp8_quant as sgl_scaled_fp8_quant,
-)
-from sglang.srt.layers.quantization.fp8_kernel import (
+    scaled_fp8_quant,
     sglang_per_token_quant_fp8,
     static_quant_fp8,
     w8a8_block_fp8_matmul,
@@ -400,9 +395,7 @@ class Fp8LinearOp:
         # We also don't pad when using torch.compile,
         # as it breaks with dynamic shapes.
         if pad_output is None:
-            enable_torch_compile = os.environ.get(
-                "SGLANG_ENABLE_TORCH_COMPILE", "0"
-            ).lower() in ("1", "true", "yes")
+            enable_torch_compile = get_bool_env_var("SGLANG_ENABLE_TORCH_COMPILE")
             pad_output = not enable_torch_compile
         self.output_padding = 17 if pad_output else None
 
@@ -434,7 +427,7 @@ class Fp8LinearOp:
         # for sgl-kernel fp8_scaled_mm, it support per channel W now
         if self.cutlass_fp8_supported and weight_scale.numel() == weight.shape[1]:
             if _is_cuda:
-                qinput, x_scale = sgl_scaled_fp8_quant(
+                qinput, x_scale = scaled_fp8_quant(
                     input_2d,
                     input_scale,
                     use_per_token_if_dynamic=use_per_token_if_dynamic,
@@ -477,7 +470,7 @@ class Fp8LinearOp:
         else:
             # Maybe apply padding to output, see comment in __init__
             if _is_cuda:
-                qinput, x_scale = sgl_scaled_fp8_quant(
+                qinput, x_scale = scaled_fp8_quant(
                     input_2d,
                     input_scale,
                     num_token_padding=self.output_padding,
@@ -557,9 +550,12 @@ class Fp8LinearOp:
                 # This computes C = (X * W).
                 # Output in fp32 to allow subsequent ops to happen in-place
 
+                # Making sure the dummy tensor is on the same device as the weight
                 global TORCH_DEVICE_IDENTITY
-                if TORCH_DEVICE_IDENTITY.device != weight.device:
-                    TORCH_DEVICE_IDENTITY = TORCH_DEVICE_IDENTITY.to(weight.device)
+                if TORCH_DEVICE_IDENTITY is None:
+                    TORCH_DEVICE_IDENTITY = torch.ones(
+                        1, dtype=torch.float32, device=weight.device
+                    )
 
                 output = torch._scaled_mm(
                     qinput,
