@@ -230,7 +230,7 @@ __device__ void moe_fused_gate_impl(
     indices_ptr[last_idx] = static_cast<int32_t>(params.NUM_EXPERTS + expert_offset);
 
     // Set the weight to the sum of all weights divided by routed_scaling_factor
-    output_ptr[last_idx] = output_sum / routed_scaling_factor;
+    output_ptr[last_idx] = static_cast<float>(static_cast<T>(output_sum) / static_cast<T>(routed_scaling_factor));
   }
   __syncthreads();
 
@@ -239,7 +239,7 @@ __device__ void moe_fused_gate_impl(
 #pragma unroll
     for (int ii = 0; ii < topk; ++ii) {
       int64_t const idx = topk * thread_row + ii;
-      output_ptr[idx] = output_ptr[idx] / output_sum;
+      output_ptr[idx] = static_cast<float>(static_cast<T>(output_ptr[idx]) / static_cast<T>(output_sum));
     }
   }
 }
