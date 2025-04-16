@@ -230,6 +230,8 @@ def biased_grouped_topk(
     # TODO: moe_fused_gate kernel is not supported for n_share_experts_fusion > 0 now.
     if (
         _is_cuda
+        and gating_output.shape[1] // num_expert_group
+        <= 32  # assert check3 in moe_fused_gate cuda kernel.
         and n_share_experts_fusion == 0
         and is_power_of_two(correction_bias.shape[0])
     ):
