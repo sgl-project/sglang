@@ -79,7 +79,7 @@ _is_hip = is_hip()
 _is_cuda = is_cuda()
 
 if _is_cuda:
-    from sgl_kernel import awq_dequantize, bmm_fp8
+    from sgl_kernel import awq_dequantize, bmm_fp8, merge_state_v2
 
     from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPDispatcher
 else:
@@ -1053,8 +1053,6 @@ class DeepseekV2AttentionMLA(nn.Module):
         accum_lse: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-
-        from sgl_kernel import merge_state_v2
 
         assert forward_batch.num_prefix_chunks is not None
         for i in range(forward_batch.num_prefix_chunks):
