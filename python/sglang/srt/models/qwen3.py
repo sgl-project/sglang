@@ -39,6 +39,7 @@ class Qwen3Attention(nn.Module):
         layer_id: int = 0,
         rope_theta: float = 1000000,
         rope_scaling: Optional[Dict[str, Any]] = None,
+        head_dim: Optional[int] = None,
         max_position_embeddings: int = 32768,
         quant_config: Optional[QuantizationConfig] = None,
         rms_norm_eps: float = None,
@@ -61,12 +62,13 @@ class Qwen3Attention(nn.Module):
             # the KV heads across multiple tensor parallel GPUs.
             assert self.tp_size % self.total_num_kv_heads == 0
         self.num_kv_heads = max(1, self.total_num_kv_heads // self.tp_size)
-        self.head_dim = hidden_size // self.total_num_heads
+        self.head_dim = head_dim or hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
+        self.tp_rank = get_tensor_model_parallel_rank()
 
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
@@ -150,6 +152,7 @@ class Qwen3DecoderLayer(nn.Module):
         rope_theta = getattr(config, "rope_theta", 1000000)
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
+        head_dim = getattr(config, "head_dim", None)
         self.self_attn = Qwen3Attention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
@@ -157,6 +160,7 @@ class Qwen3DecoderLayer(nn.Module):
             layer_id=layer_id,
             rope_theta=rope_theta,
             rope_scaling=rope_scaling,
+            head_dim=head_dim,
             max_position_embeddings=max_position_embeddings,
             quant_config=quant_config,
             rms_norm_eps=config.rms_norm_eps,

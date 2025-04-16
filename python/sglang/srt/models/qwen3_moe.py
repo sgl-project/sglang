@@ -25,6 +25,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.distributed import (
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     split_tensor_along_last_dim,
     tensor_model_parallel_all_gather,
@@ -145,6 +146,7 @@ class Qwen3MoeAttention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
+        self.tp_rank = get_tensor_model_parallel_rank()
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
