@@ -1534,7 +1534,8 @@ if __name__ == "__main__":
         "to execute at a time. This means that when used in combination, the "
         "actual request rate may be lower than specified with --request-rate, "
         "if the server is not processing requests fast enough to keep up. "
-        "You can provide multiple values to test different concurrency levels.",
+        "You can provide multiple values to test different concurrency levels. "
+        "e.g. --max-concurrency 10 20 30",
     )
     parser.add_argument("--output-file", type=str, help="Output JSONL file name.")
     parser.add_argument(
