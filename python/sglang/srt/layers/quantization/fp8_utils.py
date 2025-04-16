@@ -212,7 +212,7 @@ def block_quant_to_tensor_quant(
             x_dq_block_tiles[j][i][:, :] = x_dq_block_tiles[j][i] * x_s[j][i]
 
     x_q_tensor, scale = (
-        sgl_scaled_fp8_quant(x_dq_block)
+        scaled_fp8_quant(x_dq_block)
         if _is_cuda
         else input_to_float8(x_dq_block, dtype=x_q_block.dtype)
     )
@@ -225,7 +225,7 @@ def channel_quant_to_tensor_quant(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     x_dq_channel = x_q_channel.to(torch.float32) * x_s
     x_q_tensor, scale = (
-        sgl_scaled_fp8_quant(x_dq_channel)
+        scaled_fp8_quant(x_dq_channel)
         if _is_cuda
         else input_to_float8(x_dq_channel, dtype=x_q_channel.dtype)
     )

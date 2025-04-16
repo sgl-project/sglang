@@ -30,8 +30,7 @@ if _is_cuda:
 
 if _is_cuda or _is_hip:
     from sgl_kernel import topk_softmax
-else:
-    from vllm import _custom_ops as vllm_ops
+
 
 expert_distribution_recorder = ExpertDistributionRecorder()
 
@@ -75,20 +74,12 @@ def fused_topk(
         M, topk, dtype=torch.int32, device=hidden_states.device
     )
 
-    if _is_cuda or _is_hip:
-        topk_softmax(
-            topk_weights,
-            topk_ids,
-            token_expert_indicies,
-            gating_output.float(),
-        )
-    else:
-        vllm_ops.topk_softmax(
-            topk_weights,
-            topk_ids,
-            token_expert_indicies,
-            gating_output.float(),
-        )
+    topk_softmax(
+        topk_weights,
+        topk_ids,
+        token_expert_indicies,
+        gating_output.float(),
+    )
     del token_expert_indicies
 
     if renormalize:
