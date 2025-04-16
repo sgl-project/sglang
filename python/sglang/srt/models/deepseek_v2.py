@@ -714,6 +714,9 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.attention_backend = global_server_args_dict["attention_backend"]
         self.rocm_fused_decode_mla = os.getenv("SGLANG_ROCM_FUSED_DECODE_MLA") == "1"
 
+        # TODO: Design a finer way to determine the threshold
+        self.chunked_prefix_cache_threshold = 8192
+
     def dispatch_attn_forward_method(
         self, forward_batch: ForwardBatch
     ) -> AttnForwardMethod:
@@ -736,6 +739,8 @@ class DeepseekV2AttentionMLA(nn.Module):
                 and not self.disable_chunked_prefix_cache
                 and not forward_batch.forward_mode.is_target_verify()
                 and not forward_batch.forward_mode.is_draft_extend()
+                and sum(forward_batch.extend_prefix_lens_cpu)
+                >= self.chunked_prefix_cache_threshold
             ):
                 return AttnForwardMethod.MHA_CHUNKED_KV
             else:
