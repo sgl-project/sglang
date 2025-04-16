@@ -143,6 +143,7 @@ class NixlKVManager(BaseKVManager):
         dst_kv_ptrs: list[int],
         dst_kv_indices: npt.NDArray[np.int64],
         dst_gpu_id: int,
+        room: int,
     ):
         # Make descs
         num_layers = len(self.kv_args.kv_data_ptrs)
@@ -162,7 +163,7 @@ class NixlKVManager(BaseKVManager):
         src_descs = self.agent.get_xfer_descs(src_addrs, "VRAM", is_sorted=True)
         dst_descs = self.agent.get_xfer_descs(dst_addrs, "VRAM", is_sorted=True)
         # Transfer data
-        xfer_handle = self.agent.initialize_xfer("WRITE", src_descs, dst_descs, peer_name, str(uuid.uuid4()))
+        xfer_handle = self.agent.initialize_xfer("WRITE", src_descs, dst_descs, peer_name, (str(room) + "_kv").encode("ascii")) # str(uuid.uuid4())
         if not xfer_handle:
             raise Exception("KVSender failed to create transfer")
             return 1
@@ -199,7 +200,7 @@ class NixlKVManager(BaseKVManager):
         src_descs = self.agent.get_xfer_descs(src_addrs, "DRAM", is_sorted=True)
         dst_descs = self.agent.get_xfer_descs(dst_addrs, "DRAM", is_sorted=True)
         # Transfer data
-        xfer_handle = self.agent.initialize_xfer("WRITE", src_descs, dst_descs, peer_name, str(uuid.uuid4()))
+        xfer_handle = self.agent.initialize_xfer("WRITE", src_descs, dst_descs, peer_name, (str(room) + "_aux").encode("ascii"))
         if not xfer_handle:
             raise Exception("KVSender failed to create transfer")
             return 1
@@ -263,6 +264,7 @@ class NixlKVManager(BaseKVManager):
                         req.dst_kv_ptrs,
                         chunked_dst_kv_indice,
                         req.dst_gpu_id,
+                        req.room,
                     )
                     if ret != 0:
                         self.request_status[kv_chunk.room] = KVPoll.Failed
@@ -278,6 +280,7 @@ class NixlKVManager(BaseKVManager):
                             kv_chunk.prefill_aux_index,
                             req.dst_aux_ptrs,
                             req.dst_aux_index,
+                            req.room,
                         )
                         self.request_status[req.room] = (
                             KVPoll.Success if ret == 0 else KVPoll.Failed
@@ -356,6 +359,7 @@ class NixlKVManager(BaseKVManager):
             "rank_ip": get_local_ip_by_remote(),
             "rank_port": self.rank_port,
             "engine_rank": self.kv_args.engine_rank,
+            "agent_name": self.agent.name,
         }
 
         try:
@@ -422,6 +426,9 @@ class NixlKVReceiver(BaseKVReceiver):
         self.bootstrap_addr = bootstrap_addr
         self.kv_mgr = mgr
         self.kv_mgr.update_status(bootstrap_room, KVPoll.Bootstrapping)
+        self.kv_transfer_done = False
+        self.aux_transfer_done = False
+        self.started_transfer = False
 
         # NOTE: key distinguished by bootstrap_addr and engine_rank
         bootstrap_key = f"{self.bootstrap_addr}_{self.kv_mgr.kv_args.engine_rank}"
@@ -492,9 +499,18 @@ class NixlKVReceiver(BaseKVReceiver):
                 str(self.kv_mgr.kv_args.gpu_id).encode("ascii"),
             ]
         )
+        self.started_transfer = True
 
     def poll(self) -> KVPoll:
-        return self.kv_mgr.check_status(self.bootstrap_room)
+        if self.started_transfer:
+            if not self.kv_transfer_done:
+                self.kv_transfer_done = self.kv_mgr.agent.check_remote_xfer_done(self.bootstrap_info['agent_name'], (str(self.bootstrap_room) + "_kv").encode("ascii"))
+            if not self.aux_transfer_done:
+                self.aux_transfer_done =self.kv_mgr.agent.check_remote_xfer_done(self.bootstrap_info['agent_name'], (str(self.bootstrap_room) + "_aux").encode("ascii"))
+            if self.kv_transfer_done and self.aux_transfer_done:
+                return KVPoll.Success
+            return KVPoll.WaitingForInput
+        return KVPoll.Bootstrapping #self.kv_mgr.check_status(self.bootstrap_room)
 
     def failure_exception(self):
         raise Exception("Fake KVReceiver Exception")
@@ -580,15 +596,17 @@ class NixlKVBootstrapServer(BaseKVBootstrapServer):
         rank_ip = data["rank_ip"]
         rank_port = int(data["rank_port"])
         engine_rank = int(data["engine_rank"])
+        agent_name = data["agent_name"]
 
         # Add lock to make sure thread-safe
         if role == "Prefill":
             self.prefill_port_table[engine_rank] = {
                 "rank_ip": rank_ip,
                 "rank_port": rank_port,
+                "agent_name": agent_name,
             }
-            logger.debug(
-                f"Registered Prefill boostrap: {engine_rank} with rank_ip: {rank_ip} and rank_port: {rank_port}"
+            logger.info(
+                f"Registered Prefill boostrap: {engine_rank} with rank_ip: {rank_ip} and rank_port: {rank_port} and name: {agent_name}"
             )
 
         return web.Response(text="OK", status=200)
@@ -601,7 +619,6 @@ class NixlKVBootstrapServer(BaseKVBootstrapServer):
         # Find corresponding prefill info
         async with self.lock:
             bootstrap_info = self.prefill_port_table.get(int(engine_rank))
-
         if bootstrap_info is not None:
             return web.json_response(bootstrap_info, status=200)
         else:
