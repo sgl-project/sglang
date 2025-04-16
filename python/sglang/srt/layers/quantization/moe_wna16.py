@@ -15,9 +15,46 @@ from sglang.srt.layers.quantization.base_config import (
 )
 from sglang.srt.layers.quantization.gptq import GPTQConfig, GPTQMarlinConfig
 from sglang.srt.utils import get_device_capability, set_weight_attrs
-
+from vllm.model_executor.layers.quantization.utils.marlin_utils_test import marlin_weights
+from vllm.model_executor.layers.quantization.utils.marlin_utils import marlin_permute_scales
 logger = logging.getLogger(__name__)
 
+
+def get_weight_perm(num_bits: int):
+    perm_list: List[int] = []
+    for i in range(32):
+        perm1: List[int] = []
+        col = i // 4
+        for block in [0, 1]:
+            for row in [
+                    2 * (i % 4),
+                    2 * (i % 4) + 1,
+                    2 * (i % 4 + 4),
+                    2 * (i % 4 + 4) + 1,
+            ]:
+                perm1.append(16 * row + col + 8 * block)
+        for j in range(4):
+            perm_list.extend([p + 256 * j for p in perm1])
+
+    perm = np.array(perm_list)
+
+    if num_bits == 4:
+        interleave = np.array([0, 2, 4, 6, 1, 3, 5, 7])
+    elif num_bits == 8:
+        interleave = np.array([0, 2, 1, 3])
+    else:
+        raise Exception("num_bits must be 4 or 8, got {}".format(num_bits))
+
+    perm = perm.reshape((-1, len(interleave)))[:, interleave].ravel()
+    perm = torch.from_numpy(perm)
+    return perm
+
+def marlin_weights_transform(w, s, num_bits, group_size):
+    size_k, size_n = w.shape
+    weight_perm = get_weight_perm(num_bits)
+    marlin_q_w = marlin_weights(w, size_k, size_n, num_bits, weight_perm)
+    marlin_s = marlin_permute_scales(s, size_k, size_n, group_size)
+    return [marlin_q_w, marlin_s]
 
 class MoeWNA16Config(QuantizationConfig):
     """Config class for MOE WNA16 (W8A16/W4A16) quantization."""
@@ -367,26 +404,43 @@ class MoeWNA16Method:
             routed_scaling_factor=routed_scaling_factor,
         )
 
-        weight_bits = self.quant_config.weight_bits
-        has_zp = self.quant_config.has_zp
+        import sys
+        if 'marlin_moe' not in sys.environ:
+            weight_bits = self.quant_config.weight_bits
+            has_zp = self.quant_config.has_zp
 
-        return fused_experts(
-            x,
-            layer.w13_qweight,
-            layer.w2_qweight,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            inplace=inplace,
-            apply_router_weight_on_input=apply_router_weight_on_input,
-            use_int4_w4a16=weight_bits == 4,
-            use_int8_w8a16=weight_bits == 8,
-            w1_scale=layer.w13_scales,
-            w2_scale=layer.w2_scales,
-            w1_zp=layer.w13_qzeros if has_zp else None,
-            w2_zp=layer.w2_qzeros if has_zp else None,
-            block_shape=[0, layer.group_size],
-            no_combine=no_combine,
-        )
+            return fused_experts(
+                x,
+                layer.w13_qweight,
+                layer.w2_qweight,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                inplace=inplace,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+                use_int4_w4a16=weight_bits == 4,
+                use_int8_w8a16=weight_bits == 8,
+                w1_scale=layer.w13_scales,
+                w2_scale=layer.w2_scales,
+                w1_zp=layer.w13_qzeros if has_zp else None,
+                w2_zp=layer.w2_qzeros if has_zp else None,
+                block_shape=[0, layer.group_size],
+                no_combine=no_combine,
+            )
+        else:
+            from sgl_kernel import fused_moe
+            return fused_moe(
+                x,
+                layer.w13_qweight,
+                layer.w2_qweight,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                num_bits=weight_bits,
+                w1_scale=layer.w13_scales,
+                w2_scale=layer.w2_scales,
+                score=router_logits,
+                w1_zp=layer.w13_qzeros if has_zp else None,
+                w2_zp=layer.w2_qzeros if has_zp else None
+            )
 
     @staticmethod
     def get_weight_loader(layer, weight_loader):
@@ -503,3 +557,11 @@ class MoeWNA16Method:
                 weight_loader(param, loaded_weight, weight_name, shard_id, expert_id)
 
         return moe_wna16_weight_loader
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        weight = layer.weight
+
+        import sys
+        if 'marlin_moe' in sys.environ:
+            layer.w13_qweight, layer.w13_scales = marlin_weights_transform(layer.w13_qweight, layer.w13_scales, self.quant_config.weight_bits, self.quant_config.group_size)
+            layer.w2_qweight, layer.w2_scales = marlin_weights_transform(layer.w2_qweight, layer.w2_scales, self.quant_config.weight_bits, self.quant_config.group_size)
