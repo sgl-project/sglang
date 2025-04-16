@@ -1074,7 +1074,11 @@ class BitsAndBytesModelLoader(BaseModelLoader):
         model_type = model_config.hf_config.model_type
         for quant_param_name in quant_state_dict:
             non_stacked_param_name = quant_param_name
-
+            if model_type == "mllama" and "vision_model" in quant_param_name:
+                # adapt to VisionAttention
+                quant_param_name = quant_param_name.replace(
+                    "self_attn.o_proj", "self_attn.proj"
+                )
             shard_index = 0
             for shard_name, (
                 weight_name,

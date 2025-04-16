@@ -46,7 +46,8 @@ format: check-deps ## Format all source files
 
 FILES_TO_UPDATE = python/sgl_kernel/version.py \
                  pyproject.toml \
-                 pyproject_rocm.toml
+                 pyproject_rocm.toml \
+                 ../docker/Dockerfile.blackwell
 
 update: ## Update version numbers across project files. Usage: make update <new_version>
 	@if [ -z "$(filter-out $@,$(MAKECMDGOALS))" ]; then \

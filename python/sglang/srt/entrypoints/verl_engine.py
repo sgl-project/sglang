@@ -118,6 +118,7 @@ class VerlEngine:
             rank=self._tp_rank,
             dist_group=self._device_mesh_cpu.get_group(),
             src=self._device_mesh_cpu.mesh[0].item(),
+            force_cpu_device=False,
         )
 
         return output

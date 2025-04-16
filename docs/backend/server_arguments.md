@@ -224,7 +224,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | Arguments | Description | Defaults |
 |-----------|-------------|----------|
 | `enable_mixed_chunk` | Enables mixing prefill and decode, see [this discussion](https://github.com/sgl-project/sglang/discussions/1163). | `False` |
-| `enable_dp_attention` | Enable [Data Parallelism Attention](https://lmsys.org/blog/2024-12-04-sglang-v0-4/#data-parallelism-attention-for-deepseek-models) for Deepseek models. | `False` |
+| `enable_dp_attention` | Enables [Data Parallelism Attention](https://lmsys.org/blog/2024-12-04-sglang-v0-4/#data-parallelism-attention-for-deepseek-models) for Deepseek models. | `False` |
 | `enable_torch_compile` | Torch compile the model. Note that compiling a model takes a long time but has a great performance boost. The compiled model can also be [cached for future use](https://docs.sglang.ai/backend/hyperparameter_tuning.html#enabling-cache-for-torch-compile). | `False` |
 | `torch_compile_max_bs` | The maximum batch size when using `torch_compile`. | `32` |
 | `cuda_graph_max_bs` | Adjust the maximum batchsize when using CUDA graph. By default this is chosen for you based on GPU specifics. | None |
@@ -233,3 +233,4 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `triton_attention_num_kv_splits` | Use to adjust the number of KV splits in triton kernels. | `8` |
 | `enable_flashinfer_mla` | Use the attention backend with FlashInfer MLA wrapper for DeepSeek models. **This argument will be deprecated in the next release. Please use `--attention_backend flashinfer` instead to enable FlashInfer MLA.** | `False` |
 | `flashinfer_mla_disable_ragged` | Disable the use of the ragged prefill wrapper for the FlashInfer MLA attention backend. Only use it when FlashInfer is being used as the MLA backend. | `False` |
+| `disable_chunked_prefix_cache` | Disable the use of chunked prefix cache for DeepSeek models. Only use it when FA3 is attention backend. | `False` |

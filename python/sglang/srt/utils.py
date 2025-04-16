@@ -569,7 +569,7 @@ def encode_video(video_path, frame_count_limit=None):
 
 
 def load_image(
-    image_file: Union[Image.Image, str, bytes]
+    image_file: Union[Image.Image, str, bytes],
 ) -> tuple[Image.Image, tuple[int, int]]:
     image = image_size = None
     if isinstance(image_file, Image.Image):
@@ -846,9 +846,12 @@ def broadcast_pyobj(
     rank: int,
     dist_group: Optional[torch.distributed.ProcessGroup] = None,
     src: int = 0,
+    force_cpu_device: bool = True,
 ):
     """Broadcast inputs from rank=0 to all other ranks with torch.dist backend."""
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(
+        "cuda" if torch.cuda.is_available() and not force_cpu_device else "cpu"
+    )
 
     if rank == 0:
         if len(data) == 0:
@@ -1869,3 +1872,61 @@ def is_hopper_with_cuda_12_3():
     cuda_version = torch.version.cuda.split(".")
     is_cuda_compatible = int(cuda_version[0]) == 12 and int(cuda_version[1]) >= 3
     return is_hopper and is_cuda_compatible
+
+
+def get_free_port():
+    # try ipv4
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("", 0))
+            return s.getsockname()[1]
+    except OSError:
+        # try ipv6
+        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as s:
+            s.bind(("", 0))
+            return s.getsockname()[1]
+
+
+def get_local_ip_by_remote() -> str:
+    # try ipv4
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))  # Doesn't need to be reachable
+        return s.getsockname()[0]
+    except Exception:
+        pass
+
+    # try ipv6
+    try:
+        s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+        # Google's public DNS server, see
+        # https://developers.google.com/speed/public-dns/docs/using#addresses
+        s.connect(("2001:4860:4860::8888", 80))  # Doesn't need to be reachable
+        return s.getsockname()[0]
+    except Exception:
+        raise ValueError(f"Can not get local ip")
+
+
+def is_page_size_one(server_args):
+    return server_args.page_size == 1
+
+
+def is_no_spec_infer_or_topk_one(server_args):
+    return server_args.speculative_eagle_topk is None or (
+        server_args.speculative_eagle_topk is not None
+        and server_args.speculative_eagle_topk == 1
+        and is_page_size_one(server_args)
+    )
+
+
+def is_fa3_default_architecture(hf_config):
+    architectures = getattr(hf_config, "architectures", None)
+    if not isinstance(architectures, list) or not architectures:
+        return False
+    default_archs = {
+        "Qwen2ForCausalLM",
+        "Llama4ForConditionalGeneration",
+        "LlamaForCausalLM",
+        "MistralForCausalLM",
+    }
+    return architectures[0] in default_archs
