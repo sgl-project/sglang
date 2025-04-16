@@ -231,7 +231,7 @@ def biased_grouped_topk(
     if (
         _is_cuda
         and gating_output.shape[1] // num_expert_group
-        <= 32  # assert check3 in moe_fused_gate cuda kernel.
+        <= 32  # assert check3 in moe_fused_gate cuda kernel. When kernel can handle gating_output.shape[1] // num_expert_group > 32, we can remove this check.
         and n_share_experts_fusion == 0
         and is_power_of_two(correction_bias.shape[0])
     ):
