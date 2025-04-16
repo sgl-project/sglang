@@ -124,14 +124,19 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
             images=resized_images,
         )
 
+        input_ids = ret["input_ids"].flatten()
+        image_offsets = self.get_mm_items_offset(
+            input_ids=input_ids, mm_token_id=self.image_token_id
+        )
         image_grid_thws = torch.concat([ret["image_grid_thw"]])
         return {
-            "input_ids": ret["input_ids"].flatten().tolist(),
+            "input_ids": input_ids.tolist(),
             "mm_items": [
                 MultimodalDataItem(
                     pixel_values=ret["pixel_values"],
                     image_grid_thws=image_grid_thws,
                     # TODO
+                    image_offsets=image_offsets,
                     video_grid_thws=None,
                     second_per_grid_ts=ret.get("second_per_grid_ts", None),
                     modality=Modality.IMAGE,
