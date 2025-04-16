@@ -8,7 +8,7 @@ import socket
 import struct
 import threading
 from functools import cache
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
@@ -26,6 +26,7 @@ from sglang.srt.disaggregation.base.conn import (
 )
 from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferEngine
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_free_port, get_ip, get_local_ip_by_remote
 
 logger = logging.getLogger(__name__)
@@ -80,10 +81,10 @@ class TransferInfo:
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
         return cls(
-            endpoint=msg[0].decode("ascii"),
-            dst_port=msg[1].decode("ascii"),
-            mooncake_session_id=msg[2].decode("ascii"),
-            room=int(msg[3].decode("ascii")),
+            room=int(msg[0].decode("ascii")),
+            endpoint=msg[1].decode("ascii"),
+            dst_port=int(msg[2].decode("ascii")),
+            mooncake_session_id=msg[3].decode("ascii"),
             dst_kv_ptrs=list(struct.unpack(f"{len(msg[4])//8}Q", msg[4])),
             dst_kv_indices=np.frombuffer(msg[5], dtype=np.int64),
             dst_aux_ptrs=list(struct.unpack(f"{len(msg[6])//8}Q", msg[6])),
@@ -92,12 +93,19 @@ class TransferInfo:
 
 
 class MooncakeKVManager(BaseKVManager):
-    def __init__(self, args: KVArgs, disaggregation_mode: DisaggregationMode):
+    def __init__(
+        self,
+        args: KVArgs,
+        disaggregation_mode: DisaggregationMode,
+        server_args: ServerArgs,
+    ):
         self.engine = MooncakeTransferEngine()
         self.kv_args = args
         self.disaggregation_mode = disaggregation_mode
+        # for p/d multi node infer
+        self.bootstrap_port = server_args.disaggregation_bootstrap_port
+        self.dist_init_addr = server_args.dist_init_addr
         self.request_status: Dict[int, KVPoll] = {}
-        self.connection_pool: Dict[int, Dict[str, Union[str, int]]] = {}
         self.rank_port = None
         self.server_socket = zmq.Context().socket(zmq.PULL)
         self.register_buffer_to_engine()
@@ -108,6 +116,7 @@ class MooncakeKVManager(BaseKVManager):
             self._register_to_bootstrap()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.start_decode_thread()
+            self.connection_pool: Dict[str, Dict[str, Union[str, int]]] = {}
         else:
             raise ValueError(
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
@@ -193,14 +202,14 @@ class MooncakeKVManager(BaseKVManager):
 
     def start_prefill_thread(self):
         self.rank_port = get_free_port()
-        self.server_socket.bind("tcp://*:" + str(self.rank_port))
+        self.server_socket.bind(f"tcp://{get_local_ip_by_remote()}:{self.rank_port}")
 
         def bootstrap_thread():
             """This thread recvs pre-alloc notification from the decode engine"""
             # KVPoll.Bootstrapping -> KVPoll.WaitingForInput
             while True:
                 waiting_req_bytes = self.server_socket.recv_multipart()
-                room = waiting_req_bytes[3].decode("ascii")
+                room = waiting_req_bytes[0].decode("ascii")
                 if room == "None":
                     continue
                 room = int(room)
@@ -257,7 +266,7 @@ class MooncakeKVManager(BaseKVManager):
 
     def start_decode_thread(self):
         self.rank_port = get_free_port()
-        self.server_socket.bind("tcp://*:" + str(self.rank_port))
+        self.server_socket.bind(f"tcp://{get_local_ip_by_remote()}:{self.rank_port}")
 
         def decode_thread():
             while True:
@@ -304,32 +313,24 @@ class MooncakeKVManager(BaseKVManager):
                 self.request_status[bootstrap_room], status
             )
 
-    def get_localhost(self):
-        return self.engine.get_localhost()
-
     def get_session_id(self):
         return self.engine.get_session_id()
 
     def _register_to_bootstrap(self):
         """Register KVSender to bootstrap server via HTTP POST."""
-        if self.kv_args.dist_init_addr:
-            ip_address = socket.gethostbyname(self.kv_args.dist_init_addr.split(":")[0])
+        if self.dist_init_addr:
+            ip_address = socket.gethostbyname(self.dist_init_addr.split(":")[0])
         else:
             ip_address = get_ip()
 
-        bootstrap_server_url = f"{ip_address}:8998"
-        url = f"http://{bootstrap_server_url}/kv_route"
+        bootstrap_server_url = f"{ip_address}:{self.bootstrap_port}"
+        url = f"http://{bootstrap_server_url}/route"
         payload = {
-            "identity": self.get_session_id(),
             "role": "Prefill",
             "rank_ip": get_local_ip_by_remote(),
             "rank_port": self.rank_port,
-            "tp_rank": self.kv_args.engine_rank,
+            "engine_rank": self.kv_args.engine_rank,
         }
-
-        logger.debug(
-            f"Register prefill server port {self.rank_port} for tp_rank {self.kv_args.engine_rank}"
-        )
 
         try:
             response = requests.put(url, json=payload)
@@ -397,16 +398,35 @@ class MooncakeKVReceiver(BaseKVReceiver):
         self.bootstrap_addr = bootstrap_addr
         self.kv_mgr = mgr
         self.session_id = self.kv_mgr.get_session_id()
+        self.kv_mgr.update_status(bootstrap_room, KVPoll.Bootstrapping)
+
+        # NOTE: key distinguished by bootstrap_addr and engine_rank
+        bootstrap_key = f"{self.bootstrap_addr}_{self.kv_mgr.kv_args.engine_rank}"
+
+        if bootstrap_key not in self.kv_mgr.connection_pool:
+            self.bootstrap_info = self._get_bootstrap_info_from_server(
+                self.kv_mgr.kv_args.engine_rank
+            )
+            if self.bootstrap_info is None:
+                logger.error(
+                    f"Could not fetch bootstrap info for engine rank: {self.kv_mgr.kv_args.engine_rank}"
+                )
+            else:
+                self.kv_mgr.connection_pool[bootstrap_key] = self.bootstrap_info
+        else:
+            self.bootstrap_info = self.kv_mgr.connection_pool[bootstrap_key]
+
+        assert self.bootstrap_info is not None
         self.kv_mgr.update_status(bootstrap_room, KVPoll.WaitingForInput)
 
-    def _get_prefill_addr_from_bootstrap(self, tp_rank: int):
-        """Fetch the prefill server port corresponding to tp_rank from the bootstrap server."""
+    def _get_bootstrap_info_from_server(self, engine_rank):
+        """Fetch the bootstrap info from the bootstrap server."""
         try:
-            url = f"http://{self.bootstrap_addr}/kv_route?tp_rank={tp_rank}"
+            url = f"http://{self.bootstrap_addr}/route?engine_rank={engine_rank}"
             response = requests.get(url)
             if response.status_code == 200:
-                prefill_addr = response.json()
-                return prefill_addr
+                bootstrap_info = response.json()
+                return bootstrap_info
             else:
                 logger.error(
                     f"Failed to get prefill server info: {response.status_code}, {response.text}"
@@ -423,36 +443,13 @@ class MooncakeKVReceiver(BaseKVReceiver):
         return socket
 
     def init(self, kv_indices: npt.NDArray[np.int64], aux_index: Optional[int] = None):
-        prefill_addr = None
+        self.prefill_server_url = (
+            f"{self.bootstrap_info['rank_ip']}:{self.bootstrap_info['rank_port']}"
+        )
+        logger.debug(
+            f"Fetched bootstrap info: {self.bootstrap_info} for engine rank: {self.kv_mgr.kv_args.engine_rank}"
+        )
 
-        if self.kv_mgr.kv_args.engine_rank not in self.kv_mgr.connection_pool:
-            prefill_addr = self._get_prefill_addr_from_bootstrap(
-                self.kv_mgr.kv_args.engine_rank
-            )
-            if prefill_addr is None:
-                logger.error(
-                    f"Could not fetch prefill server info for tp_rank {self.kv_mgr.kv_args.engine_rank}"
-                )
-            else:
-                self.kv_mgr.connection_pool[self.kv_mgr.kv_args.engine_rank] = (
-                    prefill_addr
-                )
-        else:
-            prefill_addr = self.kv_mgr.connection_pool[self.kv_mgr.kv_args.engine_rank]
-
-        if prefill_addr:
-            self.prefill_server_url = (
-                f"{prefill_addr['rank_ip']}:{prefill_addr['rank_port']}"
-            )
-
-            logger.debug(
-                f"Fetched prefill server info: {prefill_addr} for tp_rank {self.kv_mgr.kv_args.engine_rank}"
-            )
-            self.handshake_prefill_server(kv_indices, aux_index)
-
-    def handshake_prefill_server(
-        self, kv_indices: npt.NDArray[np.int64], aux_index: Optional[int] = None
-    ):
         packed_kv_data_ptrs = b"".join(
             struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
         )
@@ -461,10 +458,10 @@ class MooncakeKVReceiver(BaseKVReceiver):
         )
         self._connect("tcp://" + self.prefill_server_url).send_multipart(
             [
+                str(self.bootstrap_room).encode("ascii"),
                 get_local_ip_by_remote().encode("ascii"),
                 str(self.kv_mgr.rank_port).encode("ascii"),
                 self.session_id.encode("ascii"),
-                str(self.bootstrap_room).encode("ascii"),
                 packed_kv_data_ptrs,
                 kv_indices.tobytes(),
                 packed_aux_data_ptrs,
@@ -488,8 +485,6 @@ class MooncakeKVBootstrapServer(BaseKVBootstrapServer):
         self._setup_routes()
         self.prefill_port_table: Dict[int, Dict[str, Union[str, int]]] = {}
 
-        self.prefill_engine_rank = None
-
         # Start bootstrap server
         self.thread = threading.Thread(target=self._run_server, daemon=True)
         self.run()
@@ -499,7 +494,7 @@ class MooncakeKVBootstrapServer(BaseKVBootstrapServer):
 
     def _setup_routes(self):
         self.app.router.add_route("*", "/metadata", self._handle_metadata)
-        self.app.router.add_route("*", "/kv_route", self._handle_kv_route)
+        self.app.router.add_route("*", "/route", self._handle_route)
 
     async def _handle_metadata(self, request: web.Request):
         key = request.query.get("key", "")
@@ -544,7 +539,7 @@ class MooncakeKVBootstrapServer(BaseKVBootstrapServer):
             text="metadata deleted", status=200, content_type="application/json"
         )
 
-    async def _handle_kv_route(self, request: web.Request):
+    async def _handle_route(self, request: web.Request):
         method = request.method
         if method == "PUT":
             return await self._handle_route_put(request)
@@ -557,39 +552,34 @@ class MooncakeKVBootstrapServer(BaseKVBootstrapServer):
 
     async def _handle_route_put(self, request: web.Request):
         data = await request.json()
-        identity = data["identity"]
         role = data["role"]
         rank_ip = data["rank_ip"]
         rank_port = int(data["rank_port"])
-        tp_rank = int(data["tp_rank"])
+        engine_rank = int(data["engine_rank"])
 
         # Add lock to make sure thread-safe
         if role == "Prefill":
-            self.prefill_port_table[tp_rank] = {
+            self.prefill_port_table[engine_rank] = {
                 "rank_ip": rank_ip,
                 "rank_port": rank_port,
             }
             logger.debug(
-                f"Registered Prefill tp_rank: {tp_rank} with rank_ip: {rank_ip} and rank_port: {rank_port}"
+                f"Registered Prefill boostrap: {engine_rank} with rank_ip: {rank_ip} and rank_port: {rank_port}"
             )
 
         return web.Response(text="OK", status=200)
 
     async def _handle_route_get(self, request: web.Request):
-        tp_rank = request.query.get("tp_rank")
-        if not tp_rank:
-            return web.Response(text="Missing tp_rank", status=400)
-        try:
-            tp_rank = int(tp_rank)
-        except ValueError:
-            return web.Response(text="tp_rank must be int", status=400)
+        engine_rank = request.query.get("engine_rank")
+        if not engine_rank:
+            return web.Response(text="Missing rank", status=400)
 
         # Find corresponding prefill info
         async with self.lock:
-            prefill_addr = self.prefill_port_table.get(tp_rank)
+            bootstrap_info = self.prefill_port_table.get(int(engine_rank))
 
-        if prefill_addr is not None:
-            return web.json_response(prefill_addr, status=200)
+        if bootstrap_info is not None:
+            return web.json_response(bootstrap_info, status=200)
         else:
             return web.Response(text="Not Found", status=404)
 

@@ -24,12 +24,12 @@ import setproctitle
 import zmq
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import (
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
 )
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import bind_port, configure_logger, get_zmq_socket
@@ -225,7 +225,9 @@ class DataParallelController:
     def round_robin_scheduler(self, req: Req):
         if self.server_args.disaggregation_mode == DisaggregationMode.NULL:
             self.workers[self.round_robin_counter].send_pyobj(req)
-            self.round_robin_counter = (self.round_robin_counter + 1) % len(self.workers)
+            self.round_robin_counter = (self.round_robin_counter + 1) % len(
+                self.workers
+            )
         else:
             self.workers[req.bootstrap_room % len(self.workers)].send_pyobj(req)
 
