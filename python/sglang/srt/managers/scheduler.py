@@ -710,9 +710,7 @@ class Scheduler(
                 # Generate fake extend output.
                 if batch.forward_mode.is_extend():
                     # Note: Logprobs should be handled on the prefill engine.
-                    self.stream_output(
-                        batch.reqs, [False for _ in range(len(batch.reqs))]
-                    )
+                    self.stream_output(batch.reqs, False)
                 else:
                     result = self.run_batch(batch)
                     self.process_batch_result(batch, result)
