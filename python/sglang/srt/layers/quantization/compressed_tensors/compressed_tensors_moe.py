@@ -921,6 +921,7 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             topk_ids=topk_ids,
             inplace=inplace,
             activation=activation,
+            per_channel_quant=self.strategy == "channel",
             apply_router_weight_on_input=apply_router_weight_on_input,
             use_int4_w4a16=self.num_bits == 4,
             use_int8_w8a16=self.num_bits == 8,
