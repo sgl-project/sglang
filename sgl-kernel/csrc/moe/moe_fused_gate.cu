@@ -221,7 +221,7 @@ __device__ void moe_fused_gate_impl(
 
   if (thread_group_idx == 0 && n_share_experts_fusion > 0) {
     int64_t last_idx = (topk_excluding_share_expert_fusion + 1) * thread_row + topk_excluding_share_expert_fusion;
-    
+
     // Use round-robin to select expert
     int64_t expert_offset = thread_row % n_share_experts_fusion;
     indices_ptr[last_idx] = static_cast<int32_t>(params.NUM_EXPERTS + expert_offset);
