@@ -22,16 +22,16 @@ class KimiVLImageProcessor(SGLangBaseProcessor):
     def __init__(self, hf_config, server_args, _processor):
         super().__init__(hf_config, server_args, _processor)
         self.IMAGE_TOKEN = "<|media_pad|>"
-        self.im_token_id = 163605
+        self.im_token_id = _processor.tokenizer.convert_tokens_to_ids(self.IMAGE_TOKEN)
 
         self.im_start = "<|media_start|>"
-        self.im_start_id = 163602
+        self.im_start_id = _processor.tokenizer.convert_tokens_to_ids(self.im_start)
 
         self.im_end = "<|media_end|>"
-        self.im_end_id = 163604
+        self.im_end_id = _processor.tokenizer.convert_tokens_to_ids(self.im_end)
 
         self.im_content = "<|media_content|>"
-        self.im_content_id = 163603
+        self.im_content_id = _processor.tokenizer.convert_tokens_to_ids(self.im_content)
 
     async def process_mm_data_async(
         self,
