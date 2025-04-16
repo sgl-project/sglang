@@ -8,6 +8,7 @@ import socket
 import struct
 import threading
 import uuid
+from collections import defaultdict
 from functools import cache
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -95,6 +96,11 @@ class NixlKVManager(BaseKVManager):
             self._register_to_bootstrap()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.connection_pool: Dict[str, Dict[str, Union[str, int]]] = {}
+            # Map of room to kv chunk IDs that have been received.
+            self.received_kvs: Dict[int, Set[int]] = defaultdict(set)
+            # Map of room to number of kv chunks to expect, will know this after last chunk is received.
+            self.num_kvs_expected: Dict[int, int] = {}
+            self.received_aux: Dict[int, bool] = {}
         else:
             raise ValueError(
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
@@ -249,6 +255,38 @@ class NixlKVManager(BaseKVManager):
             handles.append(aux_xfer_handle)
         return handles
 
+    def update_transfer_status(self):
+        # Process notifications from received transfers.
+        notif_map = self.agent.get_new_notifs()
+        for peer_name, messages in notif_map.items():
+            # We could also check that self.bootstrap_info['agent_name'] matches
+            # the message sender. But the bootstrap room alone should be
+            # sufficient to map the status.
+            for msg in messages:
+                components = msg.decode("ascii").split("_")
+                room = int(components[0])
+                if components[1] == "kv":
+                    chunk_id = int(components[2])
+                    is_last = bool(components[3])
+                    self.received_kvs[room].add(chunk_id)
+                    if is_last:
+                        self.num_kvs_expected[room] = chunk_id + 1
+                elif components[1] == "aux":
+                    self.received_aux[room] = True
+
+    def check_transfer_done(self, room: int):
+        if room not in self.num_kvs_expected:
+            return False
+        if self.num_kvs_expected[room] == len(
+            self.received_kvs[room]
+        ) and self.received_aux.get(room, False):
+            # Cleanup
+            del self.num_kvs_expected[room]
+            del self.received_kvs[room]
+            del self.received_aux[room]
+            return True
+        return False
+
     def _register_to_bootstrap(self):
         """Register KVSender to bootstrap server via HTTP POST."""
         if self.dist_init_addr:
@@ -339,11 +377,6 @@ class NixlKVReceiver(BaseKVReceiver):
         self.bootstrap_addr = bootstrap_addr
         self.kv_mgr = mgr
         self.started_transfer = False
-        # Number of kv chunks to expect, will know this after last chunk is received.
-        self.num_kvs_expected: int = None
-        # Received kv chunk IDs will be added to this set.
-        self.received_kvs: Set[int] = set()
-        self.received_aux: bool = False
 
         # NOTE: key distinguished by bootstrap_addr and engine_rank
         bootstrap_key = f"{self.bootstrap_addr}_{self.kv_mgr.kv_args.engine_rank}"
@@ -418,26 +451,11 @@ class NixlKVReceiver(BaseKVReceiver):
     def poll(self) -> KVPoll:
         if not self.started_transfer:
             return KVPoll.WaitingForInput
-        # Process notifications from received transfers.
-        notif_map = self.kv_mgr.agent.get_new_notifs()
-        peer_name = self.bootstrap_info["agent_name"]
-        if peer_name in notif_map:
-            for msg in notif_map[peer_name]:
-                components = msg.decode("ascii").split("_")
-                room = int(components[0])
-                assert self.bootstrap_room == room
-                if components[1] == "kv":
-                    chunk_id = int(components[2])
-                    is_last = bool(components[3])
-                    self.received_kvs.add(chunk_id)
-                    if is_last:
-                        self.num_kvs_expected = chunk_id + 1
-                elif components[1] == "aux":
-                    self.received_aux = True
 
-        if self.num_kvs_expected is not None:
-            if self.num_kvs_expected == len(self.received_kvs) and self.received_aux:
-                return KVPoll.Success
+        self.kv_mgr.update_transfer_status()
+
+        if self.kv_mgr.check_transfer_done(self.bootstrap_room):
+            return KVPoll.Success
         return KVPoll.WaitingForInput
 
     def failure_exception(self):
