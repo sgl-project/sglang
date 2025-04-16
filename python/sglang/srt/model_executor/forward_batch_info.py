@@ -249,7 +249,7 @@ class ForwardBatch:
     padded_static_len: int = -1  # -1 if not padded
 
     # For Qwen2-VL
-    mrope_positions: List[torch.Tensor] = None
+    mrope_positions: torch.Tensor = None
 
     @classmethod
     def init_new(
