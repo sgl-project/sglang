@@ -4,12 +4,11 @@ import dataclasses
 import multiprocessing as mp
 import os
 from abc import ABC, abstractmethod
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import numpy as np
 import PIL
 import torch
-from PIL import Image
 from transformers import BaseImageProcessorFast
 
 from sglang.srt.managers.schedule_batch import Modality
@@ -297,3 +296,21 @@ class BaseMultimodalProcessor(ABC):
         )
         out.normalize()
         return out
+
+    @staticmethod
+    def get_mm_items_offset(
+        input_ids: torch.Tensor, mm_token_id: int
+    ) -> List[Tuple[int, int]]:
+        """
+        Get a set of range for mm_items from input_ids
+        Example:
+            input_ids = [1, 2, 3, 3, 3, 4, 3, 3]
+            mm_token_id = 3
+            return result = [(2,4),(6,7)]
+        """
+        mask = input_ids == mm_token_id
+
+        start_positions = (mask & ~torch.roll(mask, 1)).nonzero(as_tuple=True)[0]
+        end_positions = (mask & ~torch.roll(mask, -1)).nonzero(as_tuple=True)[0]
+
+        return list(zip(start_positions.tolist(), end_positions.tolist()))

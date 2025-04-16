@@ -127,14 +127,18 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
         )
 
         items = []
-
+        
         input_ids = ret["input_ids"].flatten().tolist()
+        image_offsets = self.get_mm_items_offset(
+            input_ids=ret["input_ids"].flatten(), mm_token_id=self.image_token_id
+        )
         if "pixel_values" in ret:
             items += [
                 MultimodalDataItem(
                     pixel_values=ret["pixel_values"],
                     image_grid_thws=torch.concat([ret["image_grid_thw"]]),
                     # TODO
+                    image_offsets=image_offsets,
                     video_grid_thws=None,
                     second_per_grid_ts=ret.get("second_per_grid_ts", None),
                     modality=Modality.IMAGE,

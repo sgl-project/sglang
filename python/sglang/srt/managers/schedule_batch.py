@@ -191,6 +191,7 @@ class MultimodalDataItem:
 
     audio_features: Union[torch.Tensor, np.array] = None
     audio_feature_lens: Optional[List[torch.Tensor]] = None
+    audio_offsets: Optional[List[Tuple[int, int]]] = None
 
     @staticmethod
     def is_empty_list(l):
