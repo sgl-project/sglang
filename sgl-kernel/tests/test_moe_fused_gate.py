@@ -19,7 +19,7 @@ from sglang.srt.layers.moe.topk import biased_grouped_topk
         (512, 16, 8, 16),
     ],
 )
-@pytest.mark.parametrize("n_share_experts_fusion", [0, 8])
+@pytest.mark.parametrize("n_share_experts_fusion", [0, 1, 8, 16])
 def test_moe_fused_gate_combined(seq_length, dtype, params, n_share_experts_fusion):
     num_experts, num_expert_group, topk_group, topk = params
 

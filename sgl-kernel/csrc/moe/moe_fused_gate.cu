@@ -56,7 +56,7 @@ __device__ void moe_fused_gate_impl(
     int32_t* indices_ptr,
     int64_t num_rows,
     int64_t topk_group,
-    int64_t topk,
+    int64_t topk_excluding_share_expert_fusion,
     int64_t n_share_experts_fusion,
     double routed_scaling_factor,
     Params params) {
@@ -165,7 +165,7 @@ __device__ void moe_fused_gate_impl(
 
   ////////////////////// Topk //////////////////////
   float output_sum = 0.0f;
-  for (int k_idx = 0; k_idx < topk; ++k_idx) {
+  for (int k_idx = 0; k_idx < topk_excluding_share_expert_fusion; ++k_idx) {
     // local argmax
     T max_val = bias_chunk[0];
     int expert = first_elt_read_by_thread;
@@ -183,7 +183,7 @@ __device__ void moe_fused_gate_impl(
       max_val = static_cast<T>(-FLT_MAX);
     }
 
-// argmax reduce
+    // argmax reduce
 #pragma unroll
     for (int mask = params.THREADS_PER_ROW / 2; mask > 0; mask /= 2) {
       T other_max =
@@ -197,52 +197,46 @@ __device__ void moe_fused_gate_impl(
       }
     }
 
-    if (k_idx < topk) {
-      int thread_to_clear_in_group = expert / params.VPT;
-      int64_t idx = topk * thread_row + k_idx;
+    int thread_to_clear_in_group = expert / params.VPT;
+    int64_t idx = (topk_excluding_share_expert_fusion + (n_share_experts_fusion > 0 ? 1 : 0)) * thread_row + k_idx;
 
-      if (thread_group_idx == thread_to_clear_in_group) {
-        int expert_to_clear_in_thread = expert % params.VPT;
+    if (thread_group_idx == thread_to_clear_in_group) {
+      int expert_to_clear_in_thread = expert % params.VPT;
 
-        // clear the max value in the thread
-        bias_chunk[expert_to_clear_in_thread] = static_cast<T>(-FLT_MAX);
+      // clear the max value in the thread
+      bias_chunk[expert_to_clear_in_thread] = static_cast<T>(-FLT_MAX);
 
-        // store output
-        output_ptr[idx] = static_cast<float>(row_chunk[expert_to_clear_in_thread]);
-        indices_ptr[idx] = static_cast<int32_t>(expert);
-      }
+      // store output
+      output_ptr[idx] = static_cast<float>(row_chunk[expert_to_clear_in_thread]);
+      indices_ptr[idx] = static_cast<int32_t>(expert);
+    }
 
-      // accumulate sum for first k-1 elements only
-      if (thread_group_idx == 0 && k_idx < topk - 1) {
-        output_sum += output_ptr[idx];
-      }
+    // accumulate sum for all elements
+    if (thread_group_idx == 0) {
+      output_sum += output_ptr[idx];
     }
 
     __syncthreads();
   }
 
-  if (thread_group_idx == 0) {
-    int64_t last_idx = topk * thread_row + (topk - 1);
+  if (thread_group_idx == 0 && n_share_experts_fusion > 0) {
+    int64_t last_idx = (topk_excluding_share_expert_fusion + 1) * thread_row + topk_excluding_share_expert_fusion;
+    
+    // Use round-robin to select expert
+    int64_t expert_offset = thread_row % n_share_experts_fusion;
+    indices_ptr[last_idx] = static_cast<int32_t>(params.NUM_EXPERTS + expert_offset);
 
-    if (n_share_experts_fusion > 0) {
-      // Use round-robin to select expert
-      int64_t expert_offset = thread_row % n_share_experts_fusion;
-      indices_ptr[last_idx] = static_cast<int32_t>(params.NUM_EXPERTS + expert_offset);
-
-      // Set the weight to the sum of the first k-1 weights divided by routed_scaling_factor
-      output_ptr[last_idx] = output_sum / routed_scaling_factor;
-    } else {
-      // If not using shared experts, add the last weight to output_sum
-      output_sum += output_ptr[last_idx];
-    }
+    // Set the weight to the sum of all weights divided by routed_scaling_factor
+    output_ptr[last_idx] = output_sum / routed_scaling_factor;
   }
   __syncthreads();
 
   ////////////////////// Rescale Output //////////////////////
   if (thread_group_idx == 0) {
+    int64_t total_topk = topk_excluding_share_expert_fusion + (n_share_experts_fusion > 0 ? 1 : 0);
 #pragma unroll
-    for (int ii = 0; ii < topk; ++ii) {
-      int64_t const idx = topk * thread_row + ii;
+    for (int ii = 0; ii < total_topk; ++ii) {
+      int64_t const idx = total_topk * thread_row + ii;
       output_ptr[idx] = output_ptr[idx] / output_sum;
     }
   }
@@ -276,7 +270,7 @@ __global__ void moe_fused_gate_kernel(
     int32_t* indices_ptr,
     int64_t num_rows,
     int64_t topk_group,
-    int64_t topk,
+    int64_t topk_excluding_share_expert_fusion,
     int64_t n_share_experts_fusion,
     double routed_scaling_factor) {
   KernelParams<VPT, NUM_EXPERTS, THREADS_PER_ROW, ROWS_PER_WARP, ROWS_PER_CTA, WARPS_PER_CTA> params;
@@ -287,7 +281,7 @@ __global__ void moe_fused_gate_kernel(
       indices_ptr,
       num_rows,
       topk_group,
-      topk,
+      topk_excluding_share_expert_fusion,
       n_share_experts_fusion,
       routed_scaling_factor,
       params);
@@ -308,7 +302,7 @@ __global__ void moe_fused_gate_kernel(
             indices.data_ptr<int32_t>(),                                                                 \
             num_rows,                                                                                    \
             topk_group,                                                                                  \
-            topk,                                                                                        \
+            topk_excluding_share_expert_fusion,                                                          \
             n_share_experts_fusion,                                                                      \
             routed_scaling_factor);                                                                      \
     dispatched = true;                                                                                   \
@@ -336,7 +330,7 @@ __global__ void moe_fused_gate_kernel_dynamic(
     int64_t num_experts,
     int64_t num_expert_group,
     int64_t topk_group,
-    int64_t topk,
+    int64_t topk_excluding_share_expert_fusion,
     int64_t n_share_experts_fusion,
     double routed_scaling_factor) {
   KernelParamsDynamic params;
@@ -354,7 +348,7 @@ __global__ void moe_fused_gate_kernel_dynamic(
       indices_ptr,
       num_rows,
       topk_group,
-      topk,
+      topk_excluding_share_expert_fusion,
       n_share_experts_fusion,
       routed_scaling_factor,
       params);
@@ -368,14 +362,15 @@ std::vector<at::Tensor> moe_fused_gate(
     at::Tensor& bias,
     int64_t num_expert_group,
     int64_t topk_group,
-    int64_t topk,
+    int64_t topk_excluding_share_expert_fusion,
     int64_t n_share_experts_fusion,
     double routed_scaling_factor) {
   int64_t num_rows = input.size(0);
   int32_t num_experts = input.size(1);
+  int64_t total_topk = topk_excluding_share_expert_fusion + (n_share_experts_fusion > 0 ? 1 : 0);
   auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
-  auto output = torch::empty({num_rows, topk}, options);
-  auto indices = torch::empty({num_rows, topk}, options.dtype(torch::kInt32));
+  auto output = torch::empty({num_rows, total_topk}, options);
+  auto indices = torch::empty({num_rows, total_topk}, options.dtype(torch::kInt32));
 
   // Compute grid dimensions based on runtime value for num_expert_group.
   int64_t rows_per_warp = std::max<int64_t>(1, WARP_SIZE / num_expert_group);
@@ -467,7 +462,7 @@ std::vector<at::Tensor> moe_fused_gate(
           num_experts,
           num_expert_group,
           topk_group,
-          topk,
+          topk_excluding_share_expert_fusion,
           n_share_experts_fusion,
           routed_scaling_factor);
     } else if (input.scalar_type() == at::kHalf) {
@@ -480,7 +475,7 @@ std::vector<at::Tensor> moe_fused_gate(
           num_experts,
           num_expert_group,
           topk_group,
-          topk,
+          topk_excluding_share_expert_fusion,
           n_share_experts_fusion,
           routed_scaling_factor);
     } else if (input.scalar_type() == at::kFloat) {
@@ -493,7 +488,7 @@ std::vector<at::Tensor> moe_fused_gate(
           num_experts,
           num_expert_group,
           topk_group,
-          topk,
+          topk_excluding_share_expert_fusion,
           n_share_experts_fusion,
           routed_scaling_factor);
     } else {
