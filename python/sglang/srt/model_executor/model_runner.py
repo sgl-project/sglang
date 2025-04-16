@@ -376,7 +376,10 @@ class ModelRunner:
         local_gpu_memory = get_available_gpu_memory(self.device, self.gpu_id)
         if self.tp_size > 1:
             if min_per_gpu_memory < local_gpu_memory * 0.9:
-                if os.getenv("SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK"):
+                if (
+                    os.getenv("SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK", "").lower()
+                    == "true"
+                ):
                     logger.warning(
                         "The memory capacity is unbalanced. Some GPUs may be occupied by other processes. "
                         f"{min_per_gpu_memory=}, {local_gpu_memory=}, {local_gpu_memory * 0.9=}"
