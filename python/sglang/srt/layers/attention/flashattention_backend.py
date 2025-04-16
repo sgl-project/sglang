@@ -597,6 +597,7 @@ class FlashAttentionBackend(AttentionBackend):
         else:
             if (
                 not global_server_args_dict["disable_chunked_prefix_cache"]
+                and forward_batch.attn_attend_prefix_cache is not None
                 and not forward_batch.forward_mode.is_target_verify()
                 and not forward_batch.forward_mode.is_draft_extend()
             ):

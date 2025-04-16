@@ -183,7 +183,7 @@ class ForwardBatch:
 
     # For MLA chunked prefix cache used in chunked prefill
     # Tell attention backend whether the kv cache needs to be attended in current pass
-    attn_attend_prefix_cache: bool = False
+    attn_attend_prefix_cache: Optional[bool] = None
     # Number of prefix cache chunks
     num_prefix_chunks: Optional[int] = None
     # Index of current chunk, used by attention backend
