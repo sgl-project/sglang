@@ -484,7 +484,7 @@ class Scheduler(
                 self.tree_cache = HiRadixCache(
                     req_to_token_pool=self.req_to_token_pool,
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                    tp_cache_group=self.tp_worker.get_tp_cpu_group(),
+                    tp_cache_group=self.tp_cpu_group,
                     page_size=self.page_size,
                     hicache_ratio=server_args.hicache_ratio,
                 )
@@ -553,7 +553,7 @@ class Scheduler(
 
             # The decode requests polling kv cache
             self.disagg_decode_transfer_queue = DecodeTransferQueue(
-                gloo_group=self.tp_worker.get_attention_tp_cpu_group(),
+                gloo_group=self.attn_tp_cpu_group,
                 req_to_metadata_buffer_idx_allocator=req_to_metadata_buffer_idx_allocator,
                 metadata_buffers=metadata_buffers,
             )
@@ -568,7 +568,7 @@ class Scheduler(
                 scheduler=self,
                 transfer_queue=self.disagg_decode_transfer_queue,
                 tree_cache=self.tree_cache,
-                gloo_group=self.tp_worker.get_attention_tp_cpu_group(),
+                gloo_group=self.attn_tp_cpu_group,
                 tp_rank=self.tp_rank,
                 tp_size=self.tp_size,
                 bootstrap_port=self.server_args.disaggregation_bootstrap_port,
@@ -597,7 +597,7 @@ class Scheduler(
                 tp_rank=self.tp_rank,
                 tp_size=self.tp_size,
                 bootstrap_port=self.server_args.disaggregation_bootstrap_port,
-                gloo_group=self.tp_worker.get_attention_tp_cpu_group(),
+                gloo_group=self.attn_tp_cpu_group,
                 transfer_backend=self.transfer_backend,
                 scheduler=self,
             )
