@@ -2,6 +2,7 @@ import os
 from typing import List, Optional, Tuple
 
 import torch
+from sgl_kernel import sgl_per_tensor_quant_fp8
 
 from sglang.srt.layers.quantization.fp8_kernel import (
     _enable_jit_deepgemm,
@@ -166,16 +167,11 @@ def input_to_float8(
     x: torch.Tensor, dtype: torch.dtype = torch.float8_e4m3fn
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """This function quantizes input values to float8 values with tensor-wise quantization."""
-    finfo = torch.finfo(dtype)
-    min_val, max_val = x.aminmax()
-    amax = torch.maximum(min_val.abs(), max_val.abs()).float().clamp(min=1e-12)
-    fp8_max = finfo.max
-    if _is_hip:
-        dtype = torch.float8_e4m3fnuz
-        fp8_max = 224.0
-    scale = fp8_max / amax
-    x_scl_sat = (x.float() * scale).clamp(min=-fp8_max, max=fp8_max)
-    return x_scl_sat.to(dtype).contiguous(), scale.float().reciprocal()
+    x = x.contiguous()
+    output = torch.empty_like(x, device=x.device, dtype=dtype)
+    scale = torch.zeros(1, device=x.device, dtype=torch.float32)
+    sgl_per_tensor_quant_fp8(x, output, scale, is_static=False)
+    return output, scale.squeeze()
 
 
 def block_quant_to_tensor_quant(
