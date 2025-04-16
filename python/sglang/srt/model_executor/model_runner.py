@@ -411,6 +411,7 @@ class ModelRunner:
         self.load_config = LoadConfig(
             load_format=self.server_args.load_format,
             download_dir=self.server_args.download_dir,
+            use_tqdm_on_load=self.server_args.use_tqdm_on_load,
         )
         if self.server_args.load_format == "gguf":
             monkey_patch_vllm_gguf_config()
@@ -492,7 +493,10 @@ class ModelRunner:
 
         target_device = torch.device(self.device)
         self.model_config.model_path = model_path
-        load_config = LoadConfig(load_format=load_format)
+        load_config = LoadConfig(
+            load_format=load_format,
+            use_tqdm_on_load=self.server_args.use_tqdm_on_load,
+        )
 
         # Only support DefaultModelLoader for now
         loader = get_model_loader(load_config)

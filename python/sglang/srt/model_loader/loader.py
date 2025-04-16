@@ -326,11 +326,18 @@ class DefaultModelLoader(BaseModelLoader):
                 self.load_config.download_dir,
                 hf_folder,
                 hf_weights_files,
+                self.load_config.use_tqdm_on_load,
             )
         elif use_safetensors:
-            weights_iterator = safetensors_weights_iterator(hf_weights_files)
+            weights_iterator = safetensors_weights_iterator(
+                hf_weights_files,
+                use_tqdm_on_load=self.load_config.use_tqdm_on_load,
+            )
         else:
-            weights_iterator = pt_weights_iterator(hf_weights_files)
+            weights_iterator = pt_weights_iterator(
+                hf_weights_files,
+                use_tqdm_on_load=self.load_config.use_tqdm_on_load,
+            )
 
         # Apply the prefix.
         return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
@@ -808,9 +815,15 @@ class BitsAndBytesModelLoader(BaseModelLoader):
 
     def _hf_weight_iter(self, hf_weights_files, use_safetensors: bool):
         if use_safetensors:
-            return safetensors_weights_iterator(hf_weights_files)
+            return safetensors_weights_iterator(
+                hf_weights_files,
+                use_tqdm_on_load=self.load_config.use_tqdm_on_load,
+            )
         else:
-            return pt_weights_iterator(hf_weights_files)
+            return pt_weights_iterator(
+                hf_weights_files,
+                use_tqdm_on_load=self.load_config.use_tqdm_on_load,
+            )
 
     def _get_quantized_weights_iterator(
         self,

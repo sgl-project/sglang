@@ -46,6 +46,8 @@ class LoadConfig:
         checkpoints.
     decryption_key_file: If set, decrypts the output files with a password read
         from this file (after PBKDF2).
+    use_tqdm_on_load: Whether to enable tqdm for showing progress bar during
+        loading. Default to True.
     """
 
     load_format: Union[str, LoadFormat] = LoadFormat.AUTO
@@ -53,6 +55,7 @@ class LoadConfig:
     model_loader_extra_config: Optional[Union[str, dict]] = field(default_factory=dict)
     ignore_patterns: Optional[Union[List[str], str]] = None
     decryption_key_file: Optional[str] = None
+    use_tqdm_on_load: bool = True
 
     def __post_init__(self):
         model_loader_extra_config = self.model_loader_extra_config or {}

@@ -34,6 +34,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
+from sglang.srt.model_loader.weight_utils import should_enable_tqdm
 from sglang.srt.patch_torch import monkey_patch_torch_compile
 from sglang.srt.utils import get_available_gpu_memory, is_hip
 
@@ -325,9 +326,16 @@ class CudaGraphRunner:
             avail_mem = get_available_gpu_memory(
                 self.model_runner.device, self.model_runner.gpu_id, empty_cache=False
             )
+            use_tqdm_on_load = getattr(
+                self.model_runner.server_args, "use_tqdm_on_load", True
+            )
+
             # Reverse the order to enable better memory sharing across cuda graphs.
             capture_range = (
-                tqdm.tqdm(list(reversed(self.capture_bs)))
+                tqdm.tqdm(
+                    list(reversed(self.capture_bs)),
+                    disable=not should_enable_tqdm(use_tqdm_on_load),
+                )
                 if get_tensor_model_parallel_rank() == 0
                 else reversed(self.capture_bs)
             )
@@ -339,7 +347,7 @@ class CudaGraphRunner:
                         empty_cache=False,
                     )
                     capture_range.set_description(
-                        f"Capturing batches ({avail_mem=:.2f} GB)"
+                        f"Capturing batches (avail_mem={avail_mem:.2f} GB)"
                     )
 
                 with patch_model(

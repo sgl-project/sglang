@@ -62,6 +62,7 @@ class ServerArgs:
     completion_template: Optional[str] = None
     is_embedding: bool = False
     revision: Optional[str] = None
+    use_tqdm_on_load: bool = True
 
     # Port for the HTTP server
     host: str = "127.0.0.1"
@@ -466,6 +467,13 @@ class ServerArgs:
             "--trust-remote-code",
             action="store_true",
             help="Whether or not to allow for custom models defined on the Hub in their own modeling files.",
+        )
+        parser.add_argument(
+            "--use-tqdm-on-load",
+            dest="use_tqdm_on_load",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.use_tqdm_on_load,
+            help="Whether to enable/disable progress bar when loading model weights.",
         )
         parser.add_argument(
             "--dtype",
