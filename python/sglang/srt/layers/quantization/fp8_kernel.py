@@ -41,11 +41,13 @@ fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
 
 _is_cuda = is_cuda()
 if _is_cuda:
-    import deep_gemm  # `pip install "sgl-kernel>=0.0.4.post3"`
+    import deep_gemm
     from sgl_kernel import sgl_per_token_group_quant_fp8, sgl_per_token_quant_fp8
 
     sm_version = get_device_sm()
-    if sm_version >= 90 and get_bool_env_var("SGL_ENABLE_JIT_DEEPGEMM", default="true"):
+    if sm_version == 90 and get_bool_env_var(
+        "SGL_ENABLE_JIT_DEEPGEMM", default="false"
+    ):
         _enable_jit_deepgemm = True
 
 
@@ -839,3 +841,103 @@ def w8a8_block_fp8_matmul(
         )
 
     return C
+
+
+@triton.jit
+def _per_tensor_quant_mla_fp8_stage1(
+    x_ptr,
+    x_s_ptr,
+    head_size,
+    x_stride_h,
+    x_stride_s,
+    eps,
+    fp8_max,
+    BLOCK_SIZE: tl.constexpr,
+):
+    seq_id = tl.program_id(0)
+    head_id = tl.program_id(1)
+    offset = tl.arange(0, BLOCK_SIZE)
+    mask = offset < head_size
+
+    x_ptr += head_id * x_stride_h + seq_id * x_stride_s
+    x = tl.load(x_ptr + offset, mask=mask, other=0.0).to(tl.float32)
+    _absmax = tl.maximum(tl.max(tl.abs(x)), eps)
+
+    tl.atomic_max(x_s_ptr, _absmax / fp8_max)
+
+
+@triton.jit
+def _per_tensor_quant_mla_fp8_stage2(
+    x_ptr,
+    x_s_ptr,
+    x_q_ptr,
+    num_seq,
+    head_size,
+    x_stride_h,
+    x_stride_s,
+    fp8_min,
+    fp8_max,
+    BLOCK_SIZE: tl.constexpr,
+):
+    seq_id = tl.program_id(0)
+    head_id = tl.program_id(1)
+    offset = tl.arange(0, BLOCK_SIZE)
+    mask = offset < head_size
+
+    x_s = tl.load(x_s_ptr)
+    x_s_inv = 1.0 / x_s
+
+    x_ptr += head_id * x_stride_h + seq_id * x_stride_s
+    x_q_ptr += head_id * num_seq * head_size + seq_id * head_size
+
+    x = tl.load(x_ptr + offset, mask=mask, other=0.0).to(tl.float32)
+    x_q = tl.clamp(x * x_s_inv, fp8_min, fp8_max).to(x_q_ptr.dtype.element_ty)
+    tl.store(x_q_ptr + offset, x_q, mask=mask)
+
+
+def per_tensor_quant_mla_fp8(
+    x: torch.Tensor, eps: float = 1e-12, dtype: torch.dtype = torch.float8_e4m3fn
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    This function quantizes input values to float8 values with tensor-wise quantization
+    and specialized for mla absorbed case.
+    """
+    assert x.dim() == 3, "`x` is not a 3d-tensor"
+
+    finfo = torch.finfo(dtype)
+    fp8_max = finfo.max
+    if _is_hip:
+        dtype = torch.float8_e4m3fnuz
+        fp8_max = 224.0
+
+    x_q = x.new_empty(x.size(), dtype=dtype)
+    x_s = torch.zeros((1,), dtype=torch.float32, device=x.device)
+
+    num_head, num_seq, head_size = x.shape
+    BLOCK_SIZE = triton.next_power_of_2(head_size)
+    grid = (num_seq, num_head)
+
+    _per_tensor_quant_mla_fp8_stage1[grid](
+        x,
+        x_s,
+        head_size,
+        x.stride(0),
+        x.stride(1),
+        eps,
+        fp8_max,
+        BLOCK_SIZE,
+    )
+    _per_tensor_quant_mla_fp8_stage2[grid](
+        x,
+        x_s,
+        x_q,
+        num_seq,
+        head_size,
+        x.stride(0),
+        x.stride(1),
+        -fp8_max,
+        fp8_max,
+        BLOCK_SIZE,
+    )
+
+    return x_q, x_s
