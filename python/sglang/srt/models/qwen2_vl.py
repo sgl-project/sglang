@@ -43,7 +43,6 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternImageTokens,
-    MultiModalityDataPaddingPatternTokenPairs,
     general_mm_embed_routine,
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
@@ -542,15 +541,16 @@ class Qwen2VLForConditionalGeneration(nn.Module):
             # deal with prefixed prefill
             mrope_positions_list = []
             if forward_batch.forward_mode.is_extend():
-                for extend_seq_len, mrope_positions in zip(
-                    forward_batch.extend_seq_lens, forward_batch.mrope_positions
+                mrope_positions = forward_batch.mrope_positions.split(
+                    forward_batch.seq_lens.tolist(), dim=1
+                )
+                for extend_seq_len, mrope_position in zip(
+                    forward_batch.extend_seq_lens, mrope_positions
                 ):
-                    mrope_positions_list += [mrope_positions[:, -extend_seq_len:]]
+                    mrope_positions_list += [mrope_position[:, -extend_seq_len:]]
+                positions = torch.cat(mrope_positions_list, dim=1)
             else:
-                for mrope_positions in forward_batch.mrope_positions:
-                    mrope_positions_list += [mrope_positions]
-
-            positions = torch.cat(mrope_positions_list, dim=1)
+                positions = forward_batch.mrope_positions
 
         if not (
             forward_batch.forward_mode.is_decode()

@@ -38,7 +38,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
-from sglang.srt.utils import flatten_nested_list, get_compiler_backend
+from sglang.srt.utils import get_compiler_backend
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -422,7 +422,6 @@ class ForwardBatch:
                         int(self.seq_lens[i]),
                     )
                 )
-
         elif self.forward_mode.is_extend():
             for i, mm_input in enumerate(batch.multimodal_inputs):
                 if mm_input is None:
@@ -448,7 +447,16 @@ class ForwardBatch:
                 else:
                     mrope_positions = mm_input.mrope_positions
                 mrope_positions_list[i] = mrope_positions
-        self.mrope_positions = flatten_nested_list(mrope_positions_list)
+
+        # print(f"{mrope_positions_list=}")
+        # print(f"{self.forward_mode.is_decode()=}")
+        self.mrope_positions = torch.cat(
+            [pos.to(device=model_runner.device) for pos in mrope_positions_list],
+            axis=1,
+        ).to(device=model_runner.device)
+        self.mrope_positions = self.mrope_positions.to(torch.int64)
+
+        # self.mrope_positions = torch.tensor(flatten_nested_list(mrope_positions_list))
 
     def get_max_chunk_capacity(self):
         # Maximum number of tokens in each chunk
