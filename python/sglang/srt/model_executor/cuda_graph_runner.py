@@ -34,6 +34,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
+from sglang.srt.patch_torch import monkey_patch_torch_compile
 from sglang.srt.utils import get_available_gpu_memory, is_hip
 
 _is_hip = is_hip()
@@ -107,6 +108,8 @@ def set_torch_compile_config():
     torch._dynamo.config.accumulated_cache_size_limit = 1024
     if hasattr(torch._dynamo.config, "cache_size_limit"):
         torch._dynamo.config.cache_size_limit = 1024
+
+    monkey_patch_torch_compile()
 
 
 def get_batch_sizes_to_capture(model_runner: ModelRunner):

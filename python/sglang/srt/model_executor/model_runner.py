@@ -64,10 +64,7 @@ from sglang.srt.model_loader.loader import (
 )
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.patch_torch import (
-    monkey_patch_torch_compile,
-    monkey_patch_torch_reductions,
-)
+from sglang.srt.patch_torch import monkey_patch_torch_reductions
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -93,8 +90,6 @@ logger = logging.getLogger(__name__)
 
 SGLANG_CI_SMALL_KV_SIZE = os.getenv("SGLANG_CI_SMALL_KV_SIZE", None)
 UNBALANCED_MODEL_LOADING_TIMEOUT_S = 300
-
-monkey_patch_torch_compile()
 
 
 class ModelRunner:
