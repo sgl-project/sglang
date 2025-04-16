@@ -419,6 +419,38 @@ class ScheduleBatchDisaggregationDecodeMixin:
 
 class SchedulerDisaggregationDecodeMixin:
 
+    @torch.no_grad()
+    def event_loop_normal_disagg_decode(self):
+        """A normal scheduler loop for decode worker in disaggregation mode."""
+
+        while True:
+            recv_reqs = self.recv_requests()
+            self.process_input_requests(recv_reqs)
+            # polling and allocating kv cache
+            self.process_decode_queue()
+            batch = self.get_next_disagg_decode_batch_to_run()
+            self.cur_batch = batch
+
+            if batch:
+                # Generate fake extend output.
+                if batch.forward_mode.is_extend():
+                    # Note: Logprobs should be handled on the prefill engine.
+                    self.stream_output(batch.reqs, False)
+                else:
+                    result = self.run_batch(batch)
+                    self.process_batch_result(batch, result)
+
+            if batch is None and (
+                len(self.disagg_decode_transfer_queue.queue)
+                + len(self.disagg_decode_prealloc_queue.queue)
+                == 0
+            ):
+                # When the server is idle, do self-check and re-init some states
+                self.check_memory()
+                self.new_token_ratio = self.init_new_token_ratio
+
+            self.last_batch = batch
+
     def get_next_disagg_decode_batch_to_run(
         self: Scheduler,
     ) -> Optional[Tuple[ScheduleBatch, bool]]:

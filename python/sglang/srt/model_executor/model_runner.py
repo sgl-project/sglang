@@ -64,10 +64,7 @@ from sglang.srt.model_loader.loader import (
 )
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.patch_torch import (
-    monkey_patch_torch_compile,
-    monkey_patch_torch_reductions,
-)
+from sglang.srt.patch_torch import monkey_patch_torch_reductions
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -78,9 +75,11 @@ from sglang.srt.utils import (
     get_available_gpu_memory,
     init_custom_process_group,
     is_cuda,
+    is_fa3_default_architecture,
     is_flashinfer_available,
     is_hip,
     is_hopper_with_cuda_12_3,
+    is_no_spec_infer_or_topk_one,
     monkey_patch_p2p_access_check,
     monkey_patch_vllm_gguf_config,
     set_cpu_offload_max_bytes,
@@ -91,8 +90,6 @@ logger = logging.getLogger(__name__)
 
 SGLANG_CI_SMALL_KV_SIZE = os.getenv("SGLANG_CI_SMALL_KV_SIZE", None)
 UNBALANCED_MODEL_LOADING_TIMEOUT_S = 300
-
-monkey_patch_torch_compile()
 
 
 class ModelRunner:
@@ -170,6 +167,7 @@ class ModelRunner:
                 "debug_tensor_dump_inject": server_args.debug_tensor_dump_inject,
                 "n_share_experts_fusion": server_args.n_share_experts_fusion,
                 "disable_shared_experts_fusion": server_args.disable_shared_experts_fusion,
+                "disable_chunked_prefix_cache": server_args.disable_chunked_prefix_cache,
                 "use_mla_backend": self.use_mla_backend,
             }
         )
@@ -242,18 +240,21 @@ class ModelRunner:
         elif server_args.attention_backend is None:
             # By default, use flashinfer for non-mla attention and triton for mla attention
             if not self.use_mla_backend:
-                server_args.attention_backend = (
-                    "flashinfer" if is_flashinfer_available() else "triton"
-                )
+                if (
+                    is_hopper_with_cuda_12_3()
+                    and is_no_spec_infer_or_topk_one(server_args)
+                    and is_fa3_default_architecture(self.model_config.hf_config)
+                ):
+                    server_args.attention_backend = "fa3"
+                else:
+                    server_args.attention_backend = (
+                        "flashinfer" if is_flashinfer_available() else "triton"
+                    )
             else:
-                if is_hopper_with_cuda_12_3():
-                    if server_args.speculative_eagle_topk is None or (
-                        server_args.speculative_eagle_topk is not None
-                        and server_args.speculative_eagle_topk == 1
-                    ):
-                        server_args.attention_backend = "fa3"
-                    else:
-                        server_args.attention_backend = "triton"
+                if is_hopper_with_cuda_12_3() and is_no_spec_infer_or_topk_one(
+                    server_args
+                ):
+                    server_args.attention_backend = "fa3"
                 else:
                     server_args.attention_backend = "triton"
             logger.info(
@@ -317,6 +318,16 @@ class ModelRunner:
 
         if server_args.enable_deepep_moe:
             logger.info(f"DeepEP is turned on. DeepEP mode: {server_args.deepep_mode}")
+
+        if not self.use_mla_backend:
+            logger.info("Disable chunked prefix cache for non-MLA backend.")
+            server_args.disable_chunked_prefix_cache = True
+        elif self.page_size > 1:
+            logger.info("Disable chunked prefix cache when page size > 1.")
+            server_args.disable_chunked_prefix_cache = True
+
+        if not server_args.disable_chunked_prefix_cache:
+            logger.info("Chunked prefix cache is turned on.")
 
     def init_torch_distributed(self):
         logger.info("Init torch distributed begin.")

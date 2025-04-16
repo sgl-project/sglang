@@ -35,8 +35,6 @@ docker run --rm \
    ${PYTHON_ROOT_PATH}/bin/pip install --no-cache-dir ninja setuptools==75.0.0 wheel==0.41.0 numpy uv scikit-build-core && \
    export TORCH_CUDA_ARCH_LIST='7.5 8.0 8.9 9.0+PTX' && \
    export CUDA_VERSION=${CUDA_VERSION} && \
-   export CMAKE_BUILD_PARALLEL_LEVEL=96
-   export MAX_JOBS=96
    mkdir -p /usr/lib/x86_64-linux-gnu/ && \
    ln -s /usr/local/cuda-${CUDA_VERSION}/targets/x86_64-linux/lib/stubs/libcuda.so /usr/lib/x86_64-linux-gnu/libcuda.so && \
    cd /sgl-kernel && \
