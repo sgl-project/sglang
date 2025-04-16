@@ -94,9 +94,7 @@ void shared_expert_fp8_kernel_impl(
   int64_t scale_size_K = div_up(K, block_size_K);
   int64_t blocks_n_per_group = block_size_N / BLOCK_N;
 
-  // TODO: enable avx512-bf16 impl
-  // const bool use_brgemm = can_use_brgemm<at::Float8_e4m3fn>(M);
-  bool use_brgemm = true;
+  const bool use_brgemm = can_use_brgemm<at::Float8_e4m3fn>(M);
 
   at::parallel_for(0, MB * NB, 0, [&](int64_t begin, int64_t end) {
     alignas(64) scalar_t Btmp[BLOCK_N * BLOCK_K];

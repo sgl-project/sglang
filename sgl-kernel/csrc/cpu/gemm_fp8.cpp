@@ -454,7 +454,7 @@ void tinygemm_kernel(
     int64_t ldc,
     bool brg,
     int64_t block_size_K) {
-  tinygemm_kernel<scalar_t, false>(A, B, C, Btmp, Ctmp, scale, nullptr, M, N, K, lda, ldb, ldc, brg, K);
+  tinygemm_kernel<scalar_t, false>(A, B, C, Btmp, Ctmp, scale, nullptr, M, N, K, lda, ldb, ldc, brg, block_size_K);
 }
 
 #define INSTANTIATE_TINYGEMM_TEMPLATE(TYPE)    \
