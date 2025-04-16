@@ -318,9 +318,6 @@ class Llama4Attention(nn.Module):
             q_out_unused, k_out_unused = self.rotary_emb(positions, q_view, k_view)
             del q_view, k_view, q_out_unused, k_out_unused
 
-        if forward_batch.hip_metadata_cache_pool is not None:
-            self.attn.sliding_window_size = self.sliding_window_size
-
         if self.qk_norm is not None:
             # TODO there are still 2 redundant direct_copy_kernel_cuda for this `reshape` and (in attn backend) q.contiguous(), maybe we can fuse them later
             qk = qk.reshape(-1, self.head_dim).contiguous().bfloat16()
