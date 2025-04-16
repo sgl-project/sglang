@@ -158,4 +158,5 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
             input_scale=layer.input_scale,
             bias=bias,
             use_per_token_if_dynamic=True,
+            compressed_tensor_quant=True,
         )
