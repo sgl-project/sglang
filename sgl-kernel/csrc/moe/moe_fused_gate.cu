@@ -239,7 +239,7 @@ __device__ void moe_fused_gate_impl(
 #pragma unroll
     for (int ii = 0; ii < topk; ++ii) {
       int64_t const idx = topk * thread_row + ii;
-      output_ptr[idx] = static_cast<float>(static_cast<T>(output_ptr[idx]) / static_cast<T>(output_sum));
+      output_ptr[idx] = output_ptr[idx] / output_sum;
     }
   }
 }
