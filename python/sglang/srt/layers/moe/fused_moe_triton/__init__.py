@@ -1,9 +1,9 @@
 from contextlib import contextmanager
 from typing import Any, Dict, Optional
 
-import sglang.srt.layers.moe.fused_moe_triton.fused_moe  # noqa
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
     fused_experts,
+    fused_moe,
     get_config_file_name,
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import (
