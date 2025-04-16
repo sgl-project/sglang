@@ -1288,7 +1288,7 @@ class Scheduler(
             else:
                 ret = self.get_new_batch_prefill()
             
-            if self.server_args.enable_dp_attention:
+            if self.server_args.enable_dp_attention or self.server_args.enable_sp_layernorm:
                 ret, _ = self.prepare_dp_attn_batch(ret)
 
             return ret
@@ -1514,7 +1514,6 @@ class Scheduler(
 
             if req.finished():
                 self.aborted_reqs[req.rid] = req
-                self.waiting_queue.pop(i)
                 continue
 
             if running_bs + len(adder.can_run_list) >= self.max_running_requests:
@@ -1554,7 +1553,7 @@ class Scheduler(
                 req.queue_time_end = time.time()
 
         self.waiting_queue = [
-            x for x in self.waiting_queue if x not in set(can_run_list)
+            x for x in self.waiting_queue if x not in set(can_run_list) and x not in self.aborted_reqs
         ]
 
         if self.enable_hierarchical_cache:

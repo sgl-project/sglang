@@ -16,7 +16,6 @@ from sglang.srt.managers.pd_disaggregation_controller import PD_DISAGGREGATION_P
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.mem_cache.radix_cache import ReqToTokenPool, TokenToKVPoolAllocator
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.utils import broadcast_pyobj
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from safetensors.torch import load as safetensors_load
 from safetensors.torch import save as safetensors_save
@@ -115,14 +114,12 @@ class KVTransferAgent:
                  token_to_kv_pool_allocator: TokenToKVPoolAllocator = None,
                  layer_num: int = 0,
                  tp_rank: int = 0,
-                 attn_tp_cpu_group: torch.distributed.ProcessGroup = None,
                  kv_cache_size_factor: int = 0,
                  device: str = "cpu"):
         self.kv_buffer = {}
         self.layer_num = layer_num
         self.tp_rank = tp_rank
         self.tp_size = server_args.tp_size
-        self.attn_tp_cpu_group = attn_tp_cpu_group
         self.role = server_args.kv_transfer_config.role
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
