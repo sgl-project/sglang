@@ -13,16 +13,13 @@ def merge_state(
     output: Optional[torch.Tensor] = None,
     output_lse: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    # Automatically fallback to the Triton kernel in some cases
+    # (e.g., for AMD GPUs, when the head dimension is not a multiple
+    # of 4 or 8, and in FP8 precision)
 
-    # NOTE(DefTruth): Currently, custom merge_state v2 CUDA kernel
-    # is not support for FP8 dtype, fallback to use Triton kernel.
     def supported_dtypes(o: torch.Tensor) -> bool:
         return o.dtype in [torch.float32, torch.half, torch.bfloat16]
 
-    # NOTE(DefTruth): Currently, custom merge_state v2 CUDA
-    # kernel load/store 128b(16 bytes) per memory issue within
-    # thread. Namely, the headsize(headdim) must be multiple of
-    # pack_size (float32 -> 4, half/bfloat16 -> 8).
     def supported_headdim(o: torch.Tensor) -> bool:
         headdim = o.shape[2]  # [NUM_TOKENS, NUM_HEADS, HEAD_SIZE]
         if o.dtype == torch.float32:
