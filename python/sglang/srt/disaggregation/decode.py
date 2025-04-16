@@ -429,9 +429,9 @@ class SchedulerDisaggregationDecodeMixin:
             # polling and allocating kv cache
             self.process_decode_queue()
             batch = self.get_next_disagg_decode_batch_to_run()
-            
+
             is_real_batch = True
-            
+
             if batch and batch.forward_mode.is_extend():
                 self.cur_batch = batch
                 # Generate fake extend output.
@@ -442,9 +442,12 @@ class SchedulerDisaggregationDecodeMixin:
                 is_real_batch = False
 
             # Handle DP attention
-            if self.server_args.enable_dp_attention or self.server_args.enable_sp_layernorm:
+            if (
+                self.server_args.enable_dp_attention
+                or self.server_args.enable_sp_layernorm
+            ):
                 batch, _ = self.prepare_dp_attn_batch(batch)
-            
+
             if is_real_batch:
                 self.cur_batch = batch
 
