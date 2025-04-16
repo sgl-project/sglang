@@ -4,6 +4,10 @@ project(sgl-kernel LANGUAGES CXX CUDA)
 # CMake
 cmake_policy(SET CMP0169 OLD)
 include(${CMAKE_CURRENT_LIST_DIR}/cmake/utils.cmake)
+set(CMAKE_COLOR_DIAGNOSTICS ON)
+set(CMAKE_VERBOSE_MAKEFILE ON CACHE BOOL "ON")
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+set(CMAKE_SHARED_LIBRARY_PREFIX "")
 
 # Python
 find_package(Python COMPONENTS Interpreter Development.Module ${SKBUILD_SABI_COMPONENT} REQUIRED)
@@ -82,8 +86,6 @@ include_directories(
     ${PROJECT_SOURCE_DIR}/csrc
     ${repo-cutlass_SOURCE_DIR}/include
     ${repo-cutlass_SOURCE_DIR}/tools/util/include
-    ${repo-cutlass_SOURCE_DIR}/examples/77_blackwell_fmha
-    ${repo-cutlass_SOURCE_DIR}/examples/common
     ${repo-flashinfer_SOURCE_DIR}/include
     ${repo-flashinfer_SOURCE_DIR}/csrc
 )
@@ -109,6 +111,8 @@ set(SGL_KERNEL_CUDA_FLAGS
     "--expt-relaxed-constexpr"
     "--expt-extended-lambda"
     "--threads=32"
+
+    # Supress warnings
     "-Xcompiler=-Wconversion"
     "-Xcompiler=-fno-strict-aliasing"
 
@@ -209,17 +213,19 @@ Python_add_library(common_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI
 
 target_compile_options(common_ops PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS}>)
 target_include_directories(common_ops PRIVATE
-        ${TORCH_INCLUDE_DIRS}
-        ${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src)
+    ${repo-cutlass_SOURCE_DIR}/examples/77_blackwell_fmha
+    ${repo-cutlass_SOURCE_DIR}/examples/common
+    ${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src
+)
 target_link_libraries(common_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt)
 
 target_compile_definitions(common_ops PRIVATE
-         FLASHATTENTION_DISABLE_BACKWARD
-         FLASHATTENTION_DISABLE_DROPOUT
-         FLASHATTENTION_DISABLE_UNEVEN_K
-    )
+    FLASHATTENTION_DISABLE_BACKWARD
+    FLASHATTENTION_DISABLE_DROPOUT
+    FLASHATTENTION_DISABLE_UNEVEN_K
+)
 
-install(TARGETS common_ops LIBRARY DESTINATION "sgl_kernel")
+install(TARGETS common_ops LIBRARY DESTINATION sgl_kernel)
 
 # ============================ Optional Install ============================= #
 # set flash-attention sources file
@@ -280,8 +286,8 @@ if (SGL_KERNEL_ENABLE_FA3)
 
     target_compile_options(flash_ops PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${SGL_FLASH_KERNEL_CUDA_FLAGS}>)
     target_include_directories(flash_ops PRIVATE
-        ${TORCH_INCLUDE_DIRS}
-        ${repo-flash-attention_SOURCE_DIR}/hopper)
+        ${repo-flash-attention_SOURCE_DIR}/hopper
+    )
     target_link_libraries(flash_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda)
 
     install(TARGETS flash_ops LIBRARY DESTINATION "sgl_kernel")
