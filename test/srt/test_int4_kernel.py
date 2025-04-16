@@ -10,6 +10,7 @@ from vllm.model_executor.layers.quantization.utils.marlin_utils_test import (mar
 from vllm.model_executor.layers.fused_moe.fused_moe import fused_topk
 from vllm.scalar_type import scalar_types
 from vllm.model_executor.layers.activation import SiluAndMul
+from sglang.srt.layers.moe.topk import select_experts
 from sgl_kernel import fused_marlin_moe
 
 def stack_and_dev(tensors: list[torch.Tensor]):
@@ -147,6 +148,15 @@ def marlin_fused_moe(N, E, K, a, w1, w2, num_bits, group_size, act_order, score,
     sort_indices2 = stack_and_dev(sort_indices2_l) if sort_indices2_l else None
 
     topk_weights, topk_ids = fused_topk(a, score, topk, False)
+    topk_weights, topk_ids = select_experts(       
+        hidden_states=a,
+        router_logits=score,
+        top_k=topk,
+        num_expert_group=E,
+        use_grouped_topk=False,
+        renormalize=False,
+        topk_group=None,
+        )
 
     e_map = None
 
@@ -174,11 +184,11 @@ def marlin_fused_moe(N, E, K, a, w1, w2, num_bits, group_size, act_order, score,
 
 class TestW8A8Int8FusedMoE(unittest.TestCase):
     DTYPES = [torch.bfloat16]
-    M = [1]
+    M = [1, 16]
     N = [128]
     K = [256]
-    E = [4]
-    TOP_KS = [2]
+    E = [4, 10]
+    TOP_KS = [2, 4]
     BLOCK_SIZE = [[128, 128]]
     SEEDS = [0]
     NUM_BITS = [4]
