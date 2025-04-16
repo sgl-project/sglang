@@ -34,12 +34,11 @@ from sglang.srt.utils import (
     supports_custom_op,
 )
 
-_enable_jit_deepgemm = False
-
 _is_hip = is_hip()
+_is_cuda = is_cuda()
 fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
 
-_is_cuda = is_cuda()
+_enable_jit_deepgemm = False
 if _is_cuda:
     import deep_gemm
     from sgl_kernel import sgl_per_token_group_quant_fp8, sgl_per_token_quant_fp8

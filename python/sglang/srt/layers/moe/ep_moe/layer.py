@@ -2,6 +2,7 @@ import logging
 from typing import Callable, List, Optional, Tuple
 
 import torch
+from torch.nn import Module
 
 try:
     from deep_gemm import (
@@ -12,8 +13,6 @@ try:
     use_deep_gemm = True
 except ImportError:
     use_deep_gemm = False
-
-from torch.nn import Module
 
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import (

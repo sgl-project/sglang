@@ -22,15 +22,6 @@ from sglang.srt.utils import (
 )
 
 _is_hip = is_hip()
-
-
-logger = logging.getLogger(__name__)
-padding_size = 128 if bool(int(os.getenv("MOE_PADDING", "0"))) else 0
-
-enable_moe_align_block_size_triton = bool(
-    int(os.getenv("ENABLE_MOE_ALIGN_BLOCK_SIZE_TRITON", "0"))
-)
-
 _is_cuda = is_cuda()
 
 if _is_cuda:
@@ -42,6 +33,13 @@ else:
 
 if _is_cuda or _is_hip:
     from sgl_kernel import moe_align_block_size as sgl_moe_align_block_size
+
+
+logger = logging.getLogger(__name__)
+padding_size = 128 if bool(int(os.getenv("MOE_PADDING", "0"))) else 0
+enable_moe_align_block_size_triton = bool(
+    int(os.getenv("ENABLE_MOE_ALIGN_BLOCK_SIZE_TRITON", "0"))
+)
 
 
 @triton.jit

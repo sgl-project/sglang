@@ -13,7 +13,6 @@
 # ==============================================================================
 
 import math
-import os
 from typing import Callable, Optional
 
 import torch
@@ -28,6 +27,11 @@ _is_hip = is_hip()
 
 if _is_cuda:
     from sgl_kernel import moe_fused_gate
+
+if _is_cuda or _is_hip:
+    from sgl_kernel import topk_softmax
+else:
+    from vllm import _custom_ops as vllm_ops
 
 expert_distribution_recorder = ExpertDistributionRecorder()
 
@@ -59,11 +63,6 @@ def fused_topk(
     topk: int,
     renormalize: bool,
 ):
-    if _is_cuda or _is_hip:
-        from sgl_kernel import topk_softmax
-    else:
-        from vllm import _custom_ops as vllm_ops
-
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
     M, _ = hidden_states.shape

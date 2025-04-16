@@ -83,7 +83,7 @@ if _is_cuda:
 
     from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPDispatcher
 else:
-    from vllm import _custom_ops as ops
+    from vllm import _custom_ops as vllm_ops
 
 if _is_hip:
     from sglang.srt.layers.attention.triton_ops.rocm_mla_decode_rope import (
@@ -1565,7 +1565,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                             self_attn.kv_b_proj.qzeros,
                         ).T
                     else:
-                        w = ops.awq_dequantize(
+                        w = vllm_ops.awq_dequantize(
                             self_attn.kv_b_proj.qweight,
                             self_attn.kv_b_proj.scales,
                             self_attn.kv_b_proj.qzeros,
