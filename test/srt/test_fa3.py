@@ -36,7 +36,6 @@ class BaseFlashAttentionTest(unittest.TestCase):
         """Return the arguments for the server launch. Override in subclasses."""
         args = [
             "--trust-remote-code",
-            "--enable-torch-compile",
             "--attention-backend",
             "fa3",
         ]
@@ -79,12 +78,6 @@ class TestFlashAttention3(BaseFlashAttentionTest):
     @classmethod
     def get_server_args(cls):
         args = super().get_server_args()
-        args.extend(
-            [
-                "--cuda-graph-max-bs",
-                "2",
-            ]
-        )
         return args
 
 
@@ -107,17 +100,6 @@ class TestFlashAttention3MLA(BaseFlashAttentionTest):
 
     model = MODEL_USED_FOR_TEST_MLA
 
-    @classmethod
-    def get_server_args(cls):
-        args = super().get_server_args()
-        args.extend(
-            [
-                "--cuda-graph-max-bs",
-                "2",
-            ]
-        )
-        return args
-
 
 class TestFlashAttention3SpeculativeDecode(BaseFlashAttentionTest):
     """Test FlashAttention3 with speculative decode enabled."""
@@ -129,8 +111,6 @@ class TestFlashAttention3SpeculativeDecode(BaseFlashAttentionTest):
         args = super().get_server_args()
         args.extend(
             [
-                "--cuda-graph-max-bs",
-                "2",
                 "--speculative-algorithm",
                 "EAGLE3",
                 "--speculative-draft",
@@ -183,8 +163,6 @@ class TestFlashAttention3MLASpeculativeDecode(BaseFlashAttentionTest):
         args = super().get_server_args()
         args.extend(
             [
-                "--cuda-graph-max-bs",
-                "2",
                 "--speculative-algorithm",
                 "EAGLE",
                 "--speculative-draft",
