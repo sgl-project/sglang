@@ -182,16 +182,17 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
                         "type": "object",
                         "properties": {
                             "a": {
-                                "type": "int",
+                                "type": "integer",
                                 "description": "First integer",
                             },
                             "b": {
-                                "type": "int",
+                                "type": "integer",
                                 "description": "Second integer",
                             },
                         },
                         "required": ["a", "b"],
                     },
+                    "strict": True,
                 },
             }
         ]
@@ -258,11 +259,11 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
                         "type": "object",
                         "properties": {
                             "int_a": {
-                                "type": "int",
+                                "type": "integer",
                                 "description": "First integer",
                             },
                             "int_b": {
-                                "type": "int",
+                                "type": "integer",
                                 "description": "Second integer",
                             },
                         },
