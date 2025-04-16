@@ -1,25 +1,29 @@
-name: Release SGLang Kernel Wheel (cu118)
+name: Release SGLang Kernels
 
 on:
-  workflow_dispatch:
-    inputs:
-      tag_name:
-        type: string
   push:
     branches:
       - main
     paths:
       - sgl-kernel/python/sgl_kernel/version.py
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        type: string
+        required: false
+
+concurrency:
+  group: release-sglang-kernels-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  build-wheels:
+  build-cu124:
     if: github.repository == 'sgl-project/sglang'
-    runs-on: ubuntu-latest
+    runs-on: sgl-kernel-release-node
     strategy:
       matrix:
         python-version: ['3.9']
-        cuda-version: ['11.8']
-
+        cuda-version: ['12.4']
     steps:
       - uses: actions/checkout@v4
         with:
@@ -30,7 +34,37 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Build wheels for Python ${{ matrix.python-version }} and CUDA ${{ matrix.cuda-version }}
+      - name: Build wheels
+        run: |
+          cd sgl-kernel
+          chmod +x ./build.sh
+          ./build.sh "${{ matrix.python-version }}" "${{ matrix.cuda-version }}"
+
+      - name: Upload to PyPI
+        working-directory: sgl-kernel
+        run: |
+          pip install twine
+          python3 -m twine upload dist/* -u __token__ -p ${{ secrets.PYPI_TOKEN }}
+
+  build-cu128:
+    if: github.repository == 'sgl-project/sglang'
+    needs: build-cu124
+    runs-on: sgl-kernel-release-node
+    strategy:
+      matrix:
+        python-version: ['3.9']
+        cuda-version: ['12.8']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: 'recursive'
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Build wheels
         run: |
           cd sgl-kernel
           chmod +x ./build.sh
@@ -43,7 +77,7 @@ jobs:
           path: sgl-kernel/dist/*
 
   release:
-    needs: build-wheels
+    needs: build-cu128
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -80,7 +114,7 @@ jobs:
           WHL_TOKEN: ${{ secrets.WHL_TOKEN }}
 
       - name: Update wheel index
-        run: python3 scripts/update_kernel_whl_index.py
+        run: python3 scripts/update_kernel_whl_index.py --cuda 128
 
       - name: Push wheel index
         run: |

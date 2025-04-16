@@ -2,14 +2,14 @@
 requires = [
   "setuptools>=75.0",
   "scikit-build-core>=0.10",
-  "torch==2.5.1",
+  "torch>=2.5.1",
   "wheel",
 ]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "sgl-kernel"
-version = "0.0.8"
+version = "0.0.9.post1"
 description = "Kernel Library for SGLang"
 readme = "README.md"
 requires-python = ">=3.9"
