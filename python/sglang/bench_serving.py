@@ -1273,8 +1273,6 @@ def run_benchmark(args_: argparse.Namespace):
     # Set default value for max_concurrency if not present
     if not hasattr(args, "max_concurrency"):
         args.max_concurrency = None
-    elif isinstance(args.max_concurrency, list) and len(args.max_concurrency) == 1:
-        args.max_concurrency = args.max_concurrency[0]
 
     # Set default value for warmup_requests if not present
     if not hasattr(args, "warmup_requests"):
