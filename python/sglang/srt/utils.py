@@ -1262,7 +1262,7 @@ def get_device(device_id: Optional[int] = None) -> str:
                 if device_id == None:
                     return "hpu"
                 return "hpu:{}".format(device_id)
-        except ImportError:
+        except ImportError as e:
             raise ImportError(
                 "Habana frameworks detected, but failed to import 'habana_frameworks.torch.hpu'."
             )
@@ -1809,10 +1809,10 @@ def retry(
             return fn()
         except Exception as e:
             if try_index >= max_retry:
-                raise Exception("retry() exceed maximum number of retries.")
+                raise Exception(f"retry() exceed maximum number of retries.")
 
             if not should_retry(e):
-                raise Exception("retry() observe errors that should not be retried.")
+                raise Exception(f"retry() observe errors that should not be retried.")
 
             delay = min(initial_delay * (2**try_index), max_delay) * (
                 0.75 + 0.25 * random.random()
