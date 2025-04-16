@@ -711,7 +711,10 @@ def sample_random_requests(
                 "If you do not want to randomly sample from a dataset,"
                 " please use --dataset-name random-ids."
             )
-            dataset_path = download_and_cache_file(SHAREGPT_URL)
+            dataset_path = (
+                "/shared/public/data/sharegpt/ShareGPT_V3_unfiltered_cleaned_split.json"
+            )
+            # dataset_path = download_and_cache_file(SHAREGPT_URL)
 
         # Load the dataset.
         with open(dataset_path) as f:
