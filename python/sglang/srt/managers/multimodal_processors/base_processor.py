@@ -6,8 +6,9 @@ import os
 from abc import ABC, abstractmethod
 from typing import List, Optional
 
-import numpy as np
 import PIL
+import numpy as np
+from PIL import Image
 from transformers import BaseImageProcessorFast
 
 from sglang.srt.managers.schedule_batch import Modality
@@ -94,7 +95,6 @@ class BaseMultimodalProcessor(ABC):
     async def process_mm_data_async(
         self,
         image_data,
-        audio_data,
         input_text,
         request_obj,
         max_req_input_len,
@@ -115,7 +115,7 @@ class BaseMultimodalProcessor(ABC):
         estimated_frames_list = []
         for image in image_data:
             if isinstance(image, str) and image.startswith("video:"):
-                path = image[len("video:") :]
+                path = image[len("video:"):]
                 # Estimate frames for the video
                 vr = VideoReader(path, ctx=cpu(0))
                 num_frames = len(vr)
@@ -135,7 +135,7 @@ class BaseMultimodalProcessor(ABC):
             if is_audio:
                 return load_audio(data)
             elif is_video:
-                path = data[len("video:") :]
+                path = data[len("video:"):]
                 return encode_video(path, frame_count_limit)
             else:
                 img, _ = load_image(data)
