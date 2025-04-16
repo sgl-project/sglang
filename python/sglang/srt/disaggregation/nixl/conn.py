@@ -166,20 +166,10 @@ class NixlKVManager(BaseKVManager):
         xfer_handle = self.agent.initialize_xfer("WRITE", src_descs, dst_descs, peer_name, (str(room) + "_kv").encode("ascii")) # str(uuid.uuid4())
         if not xfer_handle:
             raise Exception("KVSender failed to create transfer")
-            return 1
         state = self.agent.transfer(xfer_handle)
         if state == "ERR":
             raise Exception("KVSender failed to post transfer")
-            return 1
-        # Wait for transfer to finish.
-        while True:
-            state = self.agent.check_xfer_state(xfer_handle)
-            if state == "ERR":
-                raise Exception("KVSender transfer encountered an error.")
-                return 1
-            if state == "DONE":
-                break
-        return 0
+        return xfer_handle
 
     def send_aux(
         self,
@@ -203,20 +193,10 @@ class NixlKVManager(BaseKVManager):
         xfer_handle = self.agent.initialize_xfer("WRITE", src_descs, dst_descs, peer_name, (str(room) + "_aux").encode("ascii"))
         if not xfer_handle:
             raise Exception("KVSender failed to create transfer")
-            return 1
         state = self.agent.transfer(xfer_handle)
         if state == "ERR":
             raise Exception("KVSender failed to post transfer")
-            return 1
-        # Wait for transfer to finish.
-        while True:
-            state = self.agent.check_xfer_state(xfer_handle)
-            if state == "ERR":
-                raise Exception("KVSender transfer encountered an error.")
-                return 1
-            if state == "DONE":
-                break
-        return 0
+        return xfer_handle
 
     def sync_status_to_decode_endpoint(self, remote: str, dst_port: int, room: int):
         if ":" in remote:
@@ -232,82 +212,34 @@ class NixlKVManager(BaseKVManager):
         self.rank_port = get_free_port()
         self.server_socket.bind(f"tcp://{get_local_ip_by_remote()}:{self.rank_port}")
 
-        def bootstrap_thread():
-            """This thread recvs pre-alloc notification from the decode engine"""
-            # KVPoll.Bootstrapping -> KVPoll.WaitingForInput
-            while True:
-                waiting_req_bytes = self.server_socket.recv_multipart()
-                room = waiting_req_bytes[0].decode("ascii")
-                if room == "None":
-                    continue
-                room = int(room)
-                self.transfer_infos[room] = TransferInfo.from_zmq(waiting_req_bytes)
+        # def bootstrap_thread():
+        #     """This thread recvs pre-alloc notification from the decode engine"""
+        #     # KVPoll.Bootstrapping -> KVPoll.WaitingForInput
+        #     while True:
+        #         waiting_req_bytes = self.server_socket.recv_multipart()
+        #         room = waiting_req_bytes[0].decode("ascii")
+        #         if room == "None":
+        #             continue
+        #         room = int(room)
+        #         self.transfer_infos[room] = TransferInfo.from_zmq(waiting_req_bytes)
 
-                # NOTE: after bootstrapping we can mark the req as waiting for input
-                self.request_status[room] = KVPoll.WaitingForInput
+        #         # NOTE: after bootstrapping we can mark the req as waiting for input
+        #         self.request_status[room] = KVPoll.WaitingForInput
 
-        def transfer_thread():
-            # TODO: Shall we use KVPoll.Transferring state?
-            while True:
-                try:
-                    kv_chunk: TransferKVChunk = self.transfer_queue.get(timeout=0.01)
-                    req = self.transfer_infos[kv_chunk.room]
-                    peer_name = self._add_remote(kv_chunk.room, req.agent_metadata)
-                    chunked_dst_kv_indice = req.dst_kv_indices[kv_chunk.index_slice]
-                    assert len(chunked_dst_kv_indice) == len(
-                        kv_chunk.prefill_kv_indices
-                    )
-
-                    ret = self.send_kvcache(
-                        peer_name,
-                        kv_chunk.prefill_kv_indices,
-                        req.dst_kv_ptrs,
-                        chunked_dst_kv_indice,
-                        req.dst_gpu_id,
-                        req.room,
-                    )
-                    if ret != 0:
-                        self.request_status[kv_chunk.room] = KVPoll.Failed
-                        self.sync_status_to_decode_endpoint(
-                            req.endpoint, req.dst_port, req.room
-                        )
-                        continue
-
-                    if kv_chunk.is_last:
-                        # Only the last chunk we need to send the aux data
-                        ret = self.send_aux(
-                            peer_name,
-                            kv_chunk.prefill_aux_index,
-                            req.dst_aux_ptrs,
-                            req.dst_aux_index,
-                            req.room,
-                        )
-                        self.request_status[req.room] = (
-                            KVPoll.Success if ret == 0 else KVPoll.Failed
-                        )
-                        self.sync_status_to_decode_endpoint(
-                            req.endpoint, req.dst_port, req.room
-                        )
-                        self.transfer_infos.pop(req.room)
-
-                except queue.Empty:
-                    continue
-
-        threading.Thread(target=bootstrap_thread).start()
-        threading.Thread(target=transfer_thread).start()
+        # threading.Thread(target=bootstrap_thread).start()
 
     def start_decode_thread(self):
         self.rank_port = get_free_port()
-        self.server_socket.bind(f"tcp://{get_local_ip_by_remote()}:{self.rank_port}")
+        #self.server_socket.bind(f"tcp://{get_local_ip_by_remote()}:{self.rank_port}")
 
-        def decode_thread():
-            while True:
-                (bootstrap_room, status) = self.server_socket.recv_multipart()
-                status = int(status.decode("ascii"))
-                bootstrap_room = int(bootstrap_room.decode("ascii"))
-                self.request_status[bootstrap_room] = status
+    #     def decode_thread():
+    #         while True:
+    #             (bootstrap_room, status) = self.server_socket.recv_multipart()
+    #             status = int(status.decode("ascii"))
+    #             bootstrap_room = int(bootstrap_room.decode("ascii"))
+    #             self.request_status[bootstrap_room] = status
 
-        threading.Thread(target=decode_thread).start()
+    #     threading.Thread(target=decode_thread).start()
 
     def add_transfer_request(
         self,
@@ -320,16 +252,55 @@ class NixlKVManager(BaseKVManager):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last or (is_last and aux_index is not None)
 
-        self.transfer_queue.put(
-            TransferKVChunk(
-                room=bootstrap_room,
-                prefill_kv_indices=kv_indices,
-                index_slice=index_slice,
-                is_last=is_last,
-                prefill_aux_index=aux_index,
-            )
+        # self.transfer_queue.put(
+        #     TransferKVChunk(
+        #         room=bootstrap_room,
+        #         prefill_kv_indices=kv_indices,
+        #         index_slice=index_slice,
+        #         is_last=is_last,
+        #         prefill_aux_index=aux_index,
+        #     )
+        # )
+        #kv_chunk: TransferKVChunk = self.transfer_queue.get(timeout=0.01)
+        print("prefill: waiting to receive TransferKVChunk")
+        waiting_req_bytes = self.server_socket.recv_multipart()
+        room = waiting_req_bytes[0].decode("ascii")
+        assert room != "None"
+        #    continue
+        room = int(room)
+        assert room == bootstrap_room
+        req = TransferInfo.from_zmq(waiting_req_bytes)
+
+        #req = self.transfer_infos[bootstrap_room]
+        print("prefill: waiting to receive TransferKVChunk")
+        peer_name = self._add_remote(bootstrap_room, req.agent_metadata)
+        chunked_dst_kv_indice = req.dst_kv_indices[index_slice]
+        assert len(chunked_dst_kv_indice) == len(kv_indices)
+        assert bootstrap_room == req.room
+        print("prefill: send kvcache")
+        kv_xfer_handle = self.send_kvcache(
+            peer_name,
+            kv_indices,
+            req.dst_kv_ptrs,
+            chunked_dst_kv_indice,
+            req.dst_gpu_id,
+            req.room,
         )
-        self.request_status[bootstrap_room] = KVPoll.WaitingForInput
+        assert is_last
+        aux_xfer_handle = None
+        if is_last:
+            # Only the last chunk we need to send the aux data
+            print(f"prefill: send aux {aux_index}")
+            aux_xfer_handle = self.send_aux(
+                peer_name,
+                aux_index,
+                req.dst_aux_ptrs,
+                req.dst_aux_index,
+                req.room,
+            )
+        
+        #self.request_status[bootstrap_room] = KVPoll.WaitingForInput
+        return kv_xfer_handle, aux_xfer_handle
 
     def check_status(self, bootstrap_room: int):
         # TOOD: do we really need the poll()?
@@ -384,6 +355,9 @@ class NixlKVSender(BaseKVSender):
         self.kv_mgr.update_status(bootstrap_room, KVPoll.Bootstrapping)
         self.aux_index = None
         self.bootstrap_server_url = bootstrap_addr
+        self.kv_xfer_handle = None
+        self.aux_xfer_handle = None
+
     def init(self, num_kv_indices: int, aux_index: Optional[int] = None):
         self.num_kv_indices = num_kv_indices
         self.aux_index = aux_index
@@ -394,21 +368,21 @@ class NixlKVSender(BaseKVSender):
         index_slice: slice,
         is_last: bool,
     ):
-        if not is_last:
-            self.kv_mgr.add_transfer_request(
-                self.bootstrap_room, kv_indices, index_slice, False
-            )
-        else:
-            self.kv_mgr.add_transfer_request(
-                self.bootstrap_room,
-                kv_indices,
-                index_slice,
-                True,
-                aux_index=self.aux_index,
-            )
+        self.kv_xfer_handle, self.aux_xfer_handle = self.kv_mgr.add_transfer_request(
+            self.bootstrap_room, kv_indices, index_slice, is_last, aux_index=self.aux_index,
+        )
 
     def poll(self) -> KVPoll:
-        return self.kv_mgr.check_status(self.bootstrap_room)
+        if self.kv_xfer_handle is None or self.aux_xfer_handle is None:
+            return KVPoll.WaitingForInput
+
+        state = self.kv_mgr.agent.check_xfer_state(self.kv_xfer_handle)
+        state2 = self.kv_mgr.agent.check_xfer_state(self.aux_xfer_handle)
+        if state == "ERR" or state2 == "ERR":
+            raise Exception("KVSender transfer encountered an error.")
+        if state == "DONE" and state2 == "DONE":
+            return KVPoll.Success
+        return KVPoll.WaitingForInput
 
     def failure_exception(self):
         raise Exception("Fake KVSender Exception")
@@ -510,7 +484,7 @@ class NixlKVReceiver(BaseKVReceiver):
             if self.kv_transfer_done and self.aux_transfer_done:
                 return KVPoll.Success
             return KVPoll.WaitingForInput
-        return KVPoll.Bootstrapping #self.kv_mgr.check_status(self.bootstrap_room)
+        return KVPoll.WaitingForInput #self.kv_mgr.check_status(self.bootstrap_room)
 
     def failure_exception(self):
         raise Exception("Fake KVReceiver Exception")
