@@ -1386,32 +1386,15 @@ def run_benchmark(args_: argparse.Namespace):
         args.flush_cache = False
 
     # Handle multiple concurrency values
-    if isinstance(args.max_concurrency, list):
-        results = []
-        for concurrency in args.max_concurrency:
-            print(f"\nRunning benchmark with concurrency: {concurrency}")
-            result = asyncio.run(
-                benchmark(
-                    backend=backend,
-                    api_url=api_url,
-                    base_url=base_url,
-                    model_id=model_id,
-                    tokenizer=tokenizer,
-                    input_requests=input_requests,
-                    request_rate=args.request_rate,
-                    max_concurrency=concurrency,
-                    disable_tqdm=args.disable_tqdm,
-                    lora_names=args.lora_name,
-                    extra_request_body=extra_request_body,
-                    profile=args.profile,
-                    pd_seperated=args.pd_seperated,
-                    flush_cache=args.flush_cache,
-                )
-            )
-            results.append(result)
-        return results
-    else:
-        return asyncio.run(
+    max_concurrencies = (
+        [args.max_concurrency]
+        if not isinstance(args.max_concurrency, list)
+        else args.max_concurrency
+    )
+    results = []
+    for concurrency in max_concurrencies:
+        print(f"\nRunning benchmark with concurrency: {concurrency}")
+        result = asyncio.run(
             benchmark(
                 backend=backend,
                 api_url=api_url,
@@ -1420,7 +1403,7 @@ def run_benchmark(args_: argparse.Namespace):
                 tokenizer=tokenizer,
                 input_requests=input_requests,
                 request_rate=args.request_rate,
-                max_concurrency=args.max_concurrency,
+                max_concurrency=concurrency,
                 disable_tqdm=args.disable_tqdm,
                 lora_names=args.lora_name,
                 extra_request_body=extra_request_body,
@@ -1429,6 +1412,8 @@ def run_benchmark(args_: argparse.Namespace):
                 flush_cache=args.flush_cache,
             )
         )
+        results.append(result)
+    return results[0] if len(results) == 1 else results
 
 
 def set_ulimit(target_soft_limit=65535):
