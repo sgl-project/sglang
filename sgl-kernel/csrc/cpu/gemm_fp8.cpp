@@ -248,38 +248,6 @@ struct brgemm {
   }
 };
 
-template <typename scalar_t, bool has_bias>
-struct brgemm<scalar_t, scalar_t, has_bias> {
-  static inline void apply(
-      const scalar_t* __restrict__ A,
-      const scalar_t* __restrict__ B,
-      scalar_t* __restrict__ C,
-      scalar_t* __restrict__ Btmp,
-      float* __restrict__ Ctmp,
-      const float* __restrict__ bias,
-      const float* __restrict__ scale,
-      int M,
-      int N,
-      int K,
-      int lda,
-      int ldb,
-      int ldc) {
-    UNUSED(scale);
-
-    constexpr int BLOCK_N = block_size_n();
-    at::native::cpublas::brgemm(M, N, K, lda, ldb, BLOCK_N, /* add_C */ false, A, B, Ctmp);
-
-    // copy from Ctmp to C
-    for (int m = 0; m < M; ++m) {
-      if constexpr (has_bias) {
-        copy_add_stub(C + m * ldc, Ctmp + m * BLOCK_N, bias, N);
-      } else {
-        copy_stub(C + m * ldc, Ctmp + m * BLOCK_N, N);
-      }
-    }
-  }
-};
-
 template <bool has_bias>
 struct brgemm<at::BFloat16, at::Float8_e4m3fn, has_bias> {
   static inline void apply(

@@ -1198,11 +1198,17 @@ at::Tensor shared_expert_cpu(
   //   3. Aq_tmp : [M, K] or [M, N]
   //   4. As_tmp : [M]
   //
+  // for fp8 w8a16:
+  //   5. intermediate_cache0 : [M, 2N]
+  //
   int num_threads = at::get_num_threads();
   int64_t buffer_size_nbytes = M * N * 2 + num_threads * 2 * BLOCK_M * BLOCK_N * sizeof(float);
 
   if (use_int8_w8a8) {
     buffer_size_nbytes += std::max(M * K, M * N) + M * sizeof(float);
+  }
+  if (use_fp8_w8a16) {
+    buffer_size_nbytes += M * 2 * N * 2;
   }
 
   auto buffer = at::empty({buffer_size_nbytes}, hidden_states.options().dtype(at::kChar));
@@ -1236,22 +1242,23 @@ at::Tensor shared_expert_cpu(
           N,
           K);
     } else if (use_fp8_w8a16) {
-      out_hidden_states = at::empty({M, K}, hidden_states.options());
-      float* __restrict__ C_tmp = (float*)((void*)(intermediate_cache1 + M * N));
+      scalar_t* __restrict__ intermediate_cache0 = (scalar_t*)((void*)(C_tmp + num_threads * 2 * BLOCK_M * BLOCK_N));
+
       auto w1s = w1_scale.value();
       auto w2s = w2_scale.value();
       auto block_size_val = block_size.value();
-      TORCH_CHECK(block_size_val.size() == 2, "fp8_scaled_mm_cpu: expect block_size.size() to be 2.");
+      TORCH_CHECK(block_size_val.size() == 2, "shared_expert: expect block_size.size() to be 2.");
       int64_t block_size_N = block_size_val[0];
       int64_t block_size_K = block_size_val[1];
       TORCH_CHECK(w1s.size(0) == 2 * N / block_size_N);
       TORCH_CHECK(w1s.size(1) == K / block_size_K);
       TORCH_CHECK(w2s.size(0) == K / block_size_N);
       TORCH_CHECK(w2s.size(1) == N / block_size_K);
+
       shared_expert_fp8_kernel_impl<scalar_t>(
           out_hidden_states.data_ptr<scalar_t>(),
+          intermediate_cache0,
           intermediate_cache1,
-          C_tmp,
           hidden_states.data_ptr<scalar_t>(),
           packed_w1.data_ptr<at::Float8_e4m3fn>(),
           packed_w2.data_ptr<at::Float8_e4m3fn>(),
