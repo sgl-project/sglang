@@ -49,6 +49,7 @@ from sglang.srt.disaggregation.prefill import (
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     ReqToMetadataIdxAllocator,
+    TransferBackend,
 )
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
@@ -437,6 +438,7 @@ class Scheduler(
             context_length=server_args.context_length,
             model_override_args=server_args.json_model_override_args,
             is_embedding=server_args.is_embedding,
+            enable_multimodal=server_args.enable_multimodal,
             dtype=server_args.dtype,
             quantization=server_args.quantization,
         )
@@ -451,6 +453,7 @@ class Scheduler(
                     tokenizer_mode=server_args.tokenizer_mode,
                     trust_remote_code=server_args.trust_remote_code,
                     revision=server_args.revision,
+                    use_fast=not server_args.disable_fast_image_processor,
                 )
                 self.tokenizer = self.processor.tokenizer
             else:
@@ -528,6 +531,10 @@ class Scheduler(
             )
 
     def init_disaggregation(self):
+        self.transfer_backend = TransferBackend(
+            self.server_args.disaggregation_transfer_backend
+        )
+
         if (
             self.disaggregation_mode == DisaggregationMode.DECODE
         ):  # *2 for the headroom.
@@ -565,6 +572,7 @@ class Scheduler(
                 tp_rank=self.tp_rank,
                 tp_size=self.tp_size,
                 bootstrap_port=self.server_args.disaggregation_bootstrap_port,
+                transfer_backend=self.transfer_backend,
             )
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             # *2 for the headroom.
@@ -590,9 +598,11 @@ class Scheduler(
                 tp_size=self.tp_size,
                 bootstrap_port=self.server_args.disaggregation_bootstrap_port,
                 gloo_group=self.tp_worker.get_attention_tp_cpu_group(),
+                transfer_backend=self.transfer_backend,
+                scheduler=self,
             )
             # The prefill requests that are in the middle of kv sending
-            self.disagg_prefill_infight_queue: List[Req] = []
+            self.disagg_prefill_inflight_queue: List[Req] = []
 
     @DynamicGradMode()
     def event_loop_normal(self):
@@ -672,10 +682,10 @@ class Scheduler(
                 result = self.run_batch(batch)
                 self.process_batch_result_disagg_prefill(batch, result)
 
-            if len(self.disagg_prefill_infight_queue) > 0:
-                self.process_disagg_prefill_infight_queue()
+            if len(self.disagg_prefill_inflight_queue) > 0:
+                self.process_disagg_prefill_inflight_queue()
 
-            if batch is None and len(self.disagg_prefill_infight_queue) == 0:
+            if batch is None and len(self.disagg_prefill_inflight_queue) == 0:
                 self.check_memory()
                 self.new_token_ratio = self.init_new_token_ratio
 
@@ -840,7 +850,6 @@ class Scheduler(
                 bootstrap_room=recv_req.bootstrap_room,
             )
             req.tokenizer = self.tokenizer
-            req.queue_time_start = time.time()
 
             if (
                 recv_req.session_params is not None
@@ -855,7 +864,6 @@ class Scheduler(
             # Create a new request from a previous session
             session = self.sessions[recv_req.session_params.id]
             req = session.create_req(recv_req, self.tokenizer)
-            req.queue_time_start = time.time()
             if isinstance(req.finished_reason, FINISH_ABORT):
                 self._add_request_to_queue(req)
                 return
@@ -951,12 +959,11 @@ class Scheduler(
             self._add_request_to_queue(req)
 
     def _add_request_to_queue(self, req: Req):
+        req.queue_time_start = time.time()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.disagg_prefill_pending_queue.add(req)
-
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.disagg_decode_prealloc_queue.add(req)
-
         else:
             self.waiting_queue.append(req)
 

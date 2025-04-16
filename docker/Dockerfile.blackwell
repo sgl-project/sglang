@@ -1,0 +1,208 @@
+FROM pytorch/manylinux2_28-builder:cuda12.8
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+WORKDIR /sgl-workspace
+
+RUN pip3 install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu128
+
+RUN pip3 install https://github.com/sgl-project/whl/releases/download/v0.0.9.post1/sgl_kernel-0.0.9.post1+cu128-cp39-abi3-manylinux2014_x86_64.whl \
+    && pip3 install setuptools==75.0.0 wheel==0.41.0 scikit-build-core
+
+RUN git clone --depth=1 https://github.com/sgl-project/sglang.git \
+    && cd sglang && pip3 install -e "python[blackwell]"
+
+RUN pip3 install nvidia-nccl-cu12==2.26.2.post1 --force-reinstall --no-deps
+
+ENV DEBIAN_FRONTEND=interactive
+
+RUN yum install -y libibverbs rdma-core infiniband-diags \
+    libibumad libnl3 librdmacm lsof perftest zsh ccache tmux \
+    htop git-lfs tree \
+    && yum clean all
+
+# Install minimal Python packages
+RUN pip3 install --no-cache-dir \
+    pytest \
+    black \
+    isort \
+    icdiff \
+    uv \
+    pre-commit
+
+# Install diff-so-fancy
+RUN curl -LSso /usr/local/bin/diff-so-fancy https://github.com/so-fancy/diff-so-fancy/releases/download/v1.4.4/diff-so-fancy \
+    && chmod +x /usr/local/bin/diff-so-fancy
+
+# Install clang-format
+RUN curl -LSso /usr/local/bin/clang-format https://github.com/muttleyxd/clang-tools-static-binaries/releases/download/master-32d3ac78/clang-format-16_linux-amd64 \
+    && chmod +x /usr/local/bin/clang-format
+
+# Install clangd
+RUN curl -L https://github.com/clangd/clangd/releases/download/18.1.3/clangd-linux-18.1.3.zip -o clangd.zip \
+    && unzip clangd.zip \
+    && cp -r clangd_18.1.3/bin/* /usr/local/bin/ \
+    && cp -r clangd_18.1.3/lib/* /usr/local/lib/ \
+    && rm -rf clangd_18.1.3 clangd.zip
+
+# Install CMake
+RUN wget https://github.com/Kitware/CMake/releases/download/v3.31.1/cmake-3.31.1-linux-x86_64.tar.gz \
+    && tar -xzf cmake-3.31.1-linux-x86_64.tar.gz \
+    && cp -r cmake-3.31.1-linux-x86_64/bin/* /usr/local/bin/ \
+    && cp -r cmake-3.31.1-linux-x86_64/share/* /usr/local/share/ \
+    && rm -rf cmake-3.31.1-linux-x86_64 cmake-3.31.1-linux-x86_64.tar.gz
+
+# Add yank script
+COPY --chown=root:root <<-"EOF" /usr/local/bin/yank
+#!/bin/bash
+put() {
+  esc=$1
+  test -n "$TMUX" -o -z "${TERM##screen*}" && esc="\033Ptmux;\033$esc\033\\"
+  printf "$esc"
+}
+put "\033]52;c;!\a"
+buf=$( cat "$@" )
+len=$( printf %s "$buf" | wc -c ) max=74994
+test $len -gt $max && echo "$0: input is $(( len - max )) bytes too long" >&2
+put "\033]52;c;$( printf %s "$buf" | head -c $max | base64 | tr -d '\r\n' )\a"
+test -n "$TMUX" && tmux set-buffer "$buf" ||:
+EOF
+
+RUN chmod +x /usr/local/bin/yank
+
+# Install oh-my-zsh and plugins
+RUN sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended \
+    && git clone https://github.com/zsh-users/zsh-autosuggestions ${ZSH_CUSTOM:-~/.oh-my-zsh/custom}/plugins/zsh-autosuggestions \
+    && git clone https://github.com/zsh-users/zsh-syntax-highlighting.git ${ZSH_CUSTOM:-~/.oh-my-zsh/custom}/plugins/zsh-syntax-highlighting
+
+# Configure Vim
+COPY --chown=root:root <<-"EOF" /root/.vimrc
+function! Yank(text) abort
+  let escape = system('yank', a:text)
+  if v:shell_error
+    echoerr escape
+  else
+    call writefile([escape], '/dev/tty', 'b')
+  endif
+endfunction
+
+noremap <silent> <Leader>y y:<C-U>call Yank(@0)<CR>
+
+" automatically run yank(1) whenever yanking in Vim
+function! CopyYank() abort
+  call Yank(join(v:event.regcontents, "\n"))
+endfunction
+
+autocmd TextYankPost * call CopyYank()
+
+" Basic settings
+set number
+syntax on
+set mouse=a
+filetype indent on
+
+" Indentation
+set autoindent nosmartindent
+set smarttab
+set expandtab
+set shiftwidth=4
+set softtabstop=4
+
+" Visual guides
+set colorcolumn=120
+highlight ColorColumn ctermbg=5
+
+" Status line
+set laststatus=2
+set statusline=%<%f\ %h%m%r%=%{\"[\".(&fenc==\"\"?&enc:&fenc).((exists(\"+bomb\")\ &&\ &bomb)?\",B\":\"\").\"]\ \"}%k\ %-14.(%l,%c%V%)\ %P
+
+" Backspace behavior
+set backspace=2
+
+" Encoding
+set encoding=utf-8
+set fileencoding=utf-8
+EOF
+
+# Configure tmux
+COPY --chown=root:root <<-"EOF" /root/.tmux.conf
+# Pane border styling
+set -g pane-border-style fg='#742727',bg=black
+set -g pane-active-border-style fg=red,bg=black
+
+# Status bar styling
+set -g status-style bg='#0C8A92',fg=black
+
+# Change prefix key to backtick
+set-option -g prefix `
+unbind C-b
+bind-key ` send-prefix
+
+# Split panes using - and = with current path
+unbind '"'
+bind - splitw -v -c '#{pane_current_path}'
+unbind '%'
+bind = splitw -h -c '#{pane_current_path}'
+
+# Vi mode settings
+bind-key -T copy-mode-vi Y send-keys -X copy-pipe 'yank > #{pane_tty}'
+set-window-option -g mode-keys vi
+
+# Other settings
+set-option -g escape-time 0
+set-option -g base-index 1
+set-window-option -g mouse on
+EOF
+
+# Configure Git
+RUN git config --global core.editor "vim" \
+    && git config --global core.whitespace "fix,-indent-with-non-tab,trailing-space,cr-at-eol" \
+    && git config --global core.pager "diff-so-fancy | less --tabs=4 -RFX" \
+    && git config --global color.ui true \
+    && git config --global color."diff-highlight".oldNormal "red bold" \
+    && git config --global color."diff-highlight".oldHighlight "red bold 52" \
+    && git config --global color."diff-highlight".newNormal "green bold" \
+    && git config --global color."diff-highlight".newHighlight "green bold 22" \
+    && git config --global color.diff.meta "11" \
+    && git config --global color.diff.frag "magenta bold" \
+    && git config --global color.diff.commit "yellow bold" \
+    && git config --global color.diff.old "red bold" \
+    && git config --global color.diff.new "green bold" \
+    && git config --global color.diff.whitespace "red reverse" \
+    && git config --global alias.lg "log --color --graph --pretty=format:'%Cred%h%Creset - %s %Cgreen(%cr) %C(bold blue)<%an>%Creset%C(auto)%d%Creset' --abbrev-commit --" \
+    && git config --global http.sslVerify false \
+    && git config --global pull.rebase true
+
+# Configure zsh
+COPY --chown=root:root <<-"EOF" /root/.zshrc
+export ZSH="/root/.oh-my-zsh"
+
+# Theme
+ZSH_THEME="robbyrussell"
+
+# Plugins
+plugins=(
+    git
+    z
+    zsh-autosuggestions
+    zsh-syntax-highlighting
+)
+
+source $ZSH/oh-my-zsh.sh
+
+# Aliases
+alias ll='ls -alF'
+alias la='ls -A'
+alias l='ls -CF'
+alias vi='vim'
+
+# Enhanced history
+HISTSIZE=10000
+SAVEHIST=10000
+setopt HIST_IGNORE_ALL_DUPS
+setopt HIST_FIND_NO_DUPS
+setopt INC_APPEND_HISTORY
+EOF
+
+# Set workspace directory
+WORKDIR /sgl-workspace/sglang
