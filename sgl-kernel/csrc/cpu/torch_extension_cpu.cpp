@@ -125,8 +125,10 @@ at::Tensor fused_experts_cpu(
     at::Tensor& topk_ids,
     bool inplace,
     bool use_int8_w8a8,
+    bool use_fp8_w8a16,
     std::optional<at::Tensor>& w1_scale,
     std::optional<at::Tensor>& w2_scale,
+    std::optional<std::vector<int64_t>> block_size,
     std::optional<at::Tensor>& a1_scale,
     std::optional<at::Tensor>& a2_scale,
     bool is_vnni);
