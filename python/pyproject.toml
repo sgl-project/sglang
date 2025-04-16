@@ -38,7 +38,7 @@ runtime_common = [
     "pyzmq>=25.1.2",
     "soundfile==0.13.1",
     "torchao>=0.7.0",
-    "transformers==4.51.0",
+    "transformers==4.51.1",
     "uvicorn",
     "uvloop",
     "compressed-tensors",
@@ -47,9 +47,21 @@ runtime_common = [
 
 srt = [
     "sglang[runtime_common]",
-    "sgl-kernel==0.0.8",
+    "sgl-kernel==0.0.9.post1",
     "flashinfer_python==0.2.3",
     "torch==2.5.1",
+    "torchvision==0.20.1",
+    "cuda-python",
+    "outlines>=0.0.44,<=0.1.11",
+    "partial_json_parser",
+    "einops",
+]
+
+blackwell = [
+    "sglang[runtime_common]",
+    "sgl-kernel",
+    "torch",
+    "torchvision",
     "cuda-python",
     "outlines>=0.0.44,<=0.1.11",
     "partial_json_parser",
