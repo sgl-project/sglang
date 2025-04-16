@@ -48,9 +48,8 @@ class ParserManager:
         text: str,
         tools: List[Any],
         tool_call_parser: Optional[str] = None,
-        use_tool_call: bool = True,
+        use_tool_call: bool = False,
         stream: bool = False,
-        delta: Optional[str] = None,
         index: Optional[int] = None,
         finish_reason_type: Optional[str] = None,
     ) -> Tuple[Optional[str], Optional[List[ToolCall]], Optional[str]]:
@@ -66,10 +65,8 @@ class ParserManager:
                     tool_call_parser=tool_call_parser,
                 )
             parser = self.parser_dict[index]
-
             # parse_increment => returns (normal_text, calls)
-            normal_text, calls = parser.parse_stream_chunk(delta)
-
+            normal_text, calls = parser.parse_stream_chunk(text)
             return normal_text, calls, finish_reason_type
 
         else:
@@ -91,6 +88,14 @@ class ParserManager:
                 return text, tool_calls, finish_reason_type
             return text, None, finish_reason_type
 
+    def has_tool_call(self, text: str, tools: List[Any], tool_call_parser: str) -> bool:
+        """Check if the text contains tool calls"""
+        parser = FunctionCallParser(
+            tools=tools,
+            tool_call_parser=tool_call_parser,
+        )
+        return parser.has_tool_call(text)
+
     def transform_call_item(
         self,
         call_item: ToolCallItem,
@@ -98,8 +103,8 @@ class ParserManager:
         finish_reason_type: Optional[str] = None,
     ) -> Tuple[ToolCall, str]:
         """Transform call item -> FunctionResponse + ToolCall"""
-        parser = self.parser_dict[index]
         if finish_reason_type == "stop":
+            parser = self.parser_dict[index]
             latest_delta_len = 0
             if isinstance(call_item.parameters, str):
                 latest_delta_len = len(call_item.parameters)
@@ -134,7 +139,6 @@ class ParserManager:
         reasoning_parser: Optional[str] = None,
         separate_reasoning: bool = False,
         stream: bool = False,
-        delta: Optional[str] = None,
         index: Optional[int] = None,
     ) -> Tuple[Optional[str], Optional[str]]:
         """Handle reasoning in the response"""
@@ -149,8 +153,8 @@ class ParserManager:
                     stream_reasoning=True,
                 )
             parser = self.reasoning_parser_dict[index]
-            reasoning_text, delta = parser.parse_stream_chunk(delta)
-            return reasoning_text, delta
+            reasoning_text, text = parser.parse_stream_chunk(text)
+            return reasoning_text, text
         else:
             parser = ReasoningParser(
                 model_type=reasoning_parser, stream_reasoning=False

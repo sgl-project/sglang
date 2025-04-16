@@ -1441,6 +1441,7 @@ async def v1_chat_completions(
                                 text=delta,
                                 tools=request.tools,
                                 tool_call_parser=tokenizer_manager.server_args.tool_call_parser,
+                                use_tool_call=True,
                                 stream=True,
                                 index=index,
                                 finish_reason_type=finish_reason_type,
@@ -1527,14 +1528,11 @@ async def v1_chat_completions(
                             is_firsts[index] = is_first
                 if finish_reason_type == "stop" and request.tool_choice != "none":
                     # Check if the stream ends with a tool call
-                    if stream_parser_manager.handle_tool_calls(
+                    if stream_parser_manager.has_tool_call(
                         text=new_stream_buffer,
                         tools=request.tools,
                         tool_call_parser=tokenizer_manager.server_args.tool_call_parser,
-                        use_tool_call_parser=(request.tool_choice != "none"),
-                        stream=False,
-                        finish_reason_type=finish_reason_type,
-                    )[1]:
+                    ):
                         finish_reason_type = "tool_calls"
 
                 if request.stream_options and request.stream_options.include_usage:
