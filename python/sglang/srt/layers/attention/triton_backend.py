@@ -82,6 +82,7 @@ class ForwardMetadata:
     attn_logits: torch.Tensor
     attn_lse: torch.Tensor
     max_extend_len: int
+    max_prefix_extend_len: int
     num_kv_splits: torch.Tensor
     kv_indptr: torch.Tensor
     kv_indices: torch.Tensor
@@ -194,6 +195,7 @@ class TritonAttnBackend(AttentionBackend):
         bs = forward_batch.batch_size
         kv_indptr = self.kv_indptr
         spec_info = forward_batch.spec_info
+        max_prefix_extend_len = 0
 
         if forward_batch.forward_mode.is_decode_or_idle():
             if spec_info is None:
@@ -285,10 +287,10 @@ class TritonAttnBackend(AttentionBackend):
             # `max(spec_info.accept_length_cpu)`.
             # It might have been forgotten to update somewhere.
             max_extend_len = torch.max(spec_info.accept_length).item()
-            kv_last_page_len = None
             num_kv_splits = None
             attn_logits = None
             attn_lse = None
+            kv_last_page_len = None
         else:
             kv_indptr[1 : bs + 1] = torch.cumsum(
                 forward_batch.extend_prefix_lens, dim=0
@@ -319,11 +321,26 @@ class TritonAttnBackend(AttentionBackend):
             kv_last_page_len = torch.ones(bs, dtype=torch.int)
             max_extend_len = torch.max(forward_batch.extend_seq_lens).item()
             num_kv_splits = None
+        if _is_hip and get_bool_env_var("CK_MOE"):
+            max_prefix_extend_len = torch.max(
+                forward_batch.extend_seq_lens + forward_batch.extend_prefix_lens
+            ).item()
+            kv_indptr += qo_indptr
+            prefix_kv_indices = kv_indices
+            extend_kv_indices = forward_batch.out_cache_loc
+            prefix = torch.split(
+                prefix_kv_indices, forward_batch.extend_prefix_lens_cpu
+            )
+            extend = torch.split(extend_kv_indices, forward_batch.extend_seq_lens_cpu)
+            kv_indices = torch.cat([x for el in zip(prefix, extend) for x in el]).to(
+                torch.int
+            )
 
         self.forward_metadata = ForwardMetadata(
             attn_logits,
             attn_lse,
             max_extend_len,
+            max_prefix_extend_len,
             num_kv_splits,
             kv_indptr,
             kv_indices,
@@ -377,6 +394,8 @@ class TritonAttnBackend(AttentionBackend):
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     ):
         assert encoder_lens is None, "Not supported"
+
+        max_prefix_extend_len = 0
 
         if forward_mode.is_decode_or_idle():
             if spec_info is None:
@@ -444,6 +463,7 @@ class TritonAttnBackend(AttentionBackend):
             attn_logits,
             attn_lse,
             max_extend_len,
+            max_prefix_extend_len,
             num_kv_splits,
             kv_indptr,
             kv_indices,
@@ -544,42 +564,62 @@ class TritonAttnBackend(AttentionBackend):
                 layer, forward_batch.out_cache_loc, k, v
             )
 
-        max_extend_len = self.forward_metadata.max_extend_len
-        kv_indptr = self.forward_metadata.kv_indptr
-        kv_indices = self.forward_metadata.kv_indices
-        kv_last_page_lens = self.forward_metadata.kv_last_page_len
-        qo_indptr = self.forward_metadata.qo_indptr
-        if _is_hip and get_bool_env_var("CK_MOE") and kv_indices.shape[0] == 0:
-            o, _ = mla_prefill_fwd(
-                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                k.contiguous().view(-1, 1, 1, q.shape[-1]),
-                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-                qo_indptr,
-                kv_indptr,
-                kv_indices,
-                kv_last_page_lens,
-                max_extend_len,
-                layer.scaling,
-                layer.logit_cap,
-            )
-            k = k.reshape(-1, layer.tp_k_head_num, q.shape[-1])
-        else:
-            self.extend_attention_fwd(
-                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                k.contiguous(),
-                v.contiguous(),
-                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-                forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-                forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
-                self.forward_metadata.qo_indptr,
-                self.forward_metadata.kv_indptr,
-                self.forward_metadata.kv_indices,
-                self.forward_metadata.custom_mask,
-                self.forward_metadata.mask_indptr,
-                self.forward_metadata.max_extend_len,
-                layer.scaling,
-                layer.logit_cap,
-            )
+        if _is_hip and get_bool_env_var("CK_MOE"):
+            max_extend_len = self.forward_metadata.max_extend_len
+            max_prefix_extend_len = self.forward_metadata.max_prefix_extend_len
+            kv_indptr = self.forward_metadata.kv_indptr
+            kv_indices = self.forward_metadata.kv_indices
+            kv_last_page_lens = self.forward_metadata.kv_last_page_len
+            qo_indptr = self.forward_metadata.qo_indptr
+            K_Buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+
+            if layer.tp_k_head_num != 1:
+                o = flash_attn_varlen_func(
+                    q,
+                    k,
+                    v,
+                    qo_indptr,
+                    qo_indptr,
+                    max_extend_len,
+                    max_extend_len,
+                    softmax_scale=layer.scaling,
+                    causal=True,
+                )
+                return o
+            else:
+                token_num = forward_batch.extend_num_tokens
+
+                mla_prefill_fwd(
+                    q.view(token_num, layer.tp_q_head_num, layer.qk_head_dim),
+                    K_Buffer.view(-1, 1, 1, layer.qk_head_dim),
+                    o.view(token_num, layer.tp_q_head_num, layer.v_head_dim),
+                    qo_indptr,
+                    kv_indptr,
+                    kv_indices,
+                    kv_last_page_lens,
+                    max_extend_len,
+                    layer.scaling,
+                    layer.logit_cap,
+                )
+                K_Buffer = K_Buffer.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
+                return o
+
+        self.extend_attention_fwd(
+            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+            k.contiguous(),
+            v.contiguous(),
+            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+            forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
+            forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            self.forward_metadata.qo_indptr,
+            self.forward_metadata.kv_indptr,
+            self.forward_metadata.kv_indices,
+            self.forward_metadata.custom_mask,
+            self.forward_metadata.mask_indptr,
+            self.forward_metadata.max_extend_len,
+            layer.scaling,
+            layer.logit_cap,
+        )
         return o
 
     def forward_decode(
