@@ -11,7 +11,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Parser manager for managing different parsers and parsing operations"""
 
 import logging
 from typing import Any, List, Optional, Tuple
@@ -28,11 +27,12 @@ logger = logging.getLogger(__name__)
 
 
 class ParserManager:
+    """Parser manager for managing different parsers and parsing operations"""
 
     def __init__(self, support_stream: bool = False):
         self.support_stream = support_stream
         if support_stream:
-            self.parser_dict = {}
+            self.function_call_parser_dict = {}
             self.reasoning_parser_dict = {}
 
     def handle_completion_request(
@@ -59,12 +59,12 @@ class ParserManager:
 
         if stream:
             assert self.support_stream, "Stream is not supported"
-            if index not in self.parser_dict:
-                self.parser_dict[index] = FunctionCallParser(
+            if index not in self.function_call_parser_dict:
+                self.function_call_parser_dict[index] = FunctionCallParser(
                     tools=tools,
                     tool_call_parser=tool_call_parser,
                 )
-            parser = self.parser_dict[index]
+            parser = self.function_call_parser_dict[index]
             # parse_increment => returns (normal_text, calls)
             normal_text, calls = parser.parse_stream_chunk(text)
             return normal_text, calls, finish_reason_type
@@ -104,7 +104,7 @@ class ParserManager:
     ) -> Tuple[ToolCall, str]:
         """Transform call item -> FunctionResponse + ToolCall"""
         if finish_reason_type == "stop":
-            parser = self.parser_dict[index]
+            parser = self.function_call_parser_dict[index]
             latest_delta_len = 0
             if isinstance(call_item.parameters, str):
                 latest_delta_len = len(call_item.parameters)

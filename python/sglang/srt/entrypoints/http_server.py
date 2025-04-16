@@ -30,6 +30,7 @@ from http import HTTPStatus
 from typing import AsyncIterator, Callable, Dict, Optional, Union
 
 from sglang.srt.model_executor.model_runner import LocalSerializedTensor
+from sglang.srt.parser.parser_manager import ParserManager
 
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
@@ -524,11 +525,12 @@ async def parse_function_call_request(obj: ParseFunctionCallReq, request: Reques
     """
     A native API endpoint to parse function calls from a text.
     """
-    # 1) Initialize the parser based on the request body
-    parser = FunctionCallParser(tools=obj.tools, tool_call_parser=obj.tool_call_parser)
+    parser_manager = ParserManager(support_stream=False)
 
-    # 2) Call the non-stream parsing method (non-stream)
-    normal_text, calls = parser.parse_non_stream(obj.text)
+    # 1) Initialize the parser based on the request body
+    normal_text, calls = parser_manager.handle_tool_calls(
+        obj.text, obj.tools, obj.tool_call_parser
+    )
 
     # 3) Organize the response content
     response_data = {
@@ -546,11 +548,12 @@ async def separate_reasoning_request(obj: SeparateReasoningReqInput, request: Re
     """
     A native API endpoint to separate reasoning from a text.
     """
-    # 1) Initialize the parser based on the request body
-    parser = ReasoningParser(model_type=obj.reasoning_parser)
+    parser_manager = ParserManager(support_stream=False)
 
-    # 2) Call the non-stream parsing method (non-stream)
-    reasoning_text, normal_text = parser.parse_non_stream(obj.text)
+    # 1) Initialize the parser based on the request body
+    reasoning_text, normal_text = parser_manager.handle_reasoning(
+        obj.text, obj.reasoning_parser
+    )
 
     # 3) Organize the response content
     response_data = {
