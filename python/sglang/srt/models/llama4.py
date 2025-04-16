@@ -525,7 +525,7 @@ class Llama4ForCausalLM(LlamaForCausalLM):
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
-    hip_attention_supported = False
+    hip_attention_supported = True
 
     def __init__(
         self,
