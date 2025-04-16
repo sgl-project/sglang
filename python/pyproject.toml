@@ -41,7 +41,6 @@ runtime_common = [
     "transformers==4.51.1",
     "uvicorn",
     "uvloop",
-    "compressed-tensors",
     "xgrammar==0.1.17",
 ]
 
