@@ -30,6 +30,8 @@ class TestFlashinferMLA(CustomTestCase):
                     "flashinfer",
                 ]
             )
+        else:
+            raise unittest.SkipTest("CUDA is not available")
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
@@ -74,6 +76,8 @@ class TestFlashinferMLANoRagged(CustomTestCase):
                     "flashinfer",
                 ]
             )
+        else:
+            raise unittest.SkipTest("CUDA is not available")
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
@@ -130,6 +134,8 @@ class TestFlashinferMLAMTP(CustomTestCase):
                     "flashinfer",
                 ]
             )
+        else:
+            raise unittest.SkipTest("CUDA is not available")
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,

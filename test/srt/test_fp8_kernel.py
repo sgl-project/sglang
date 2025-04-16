@@ -6,6 +6,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
     w8a8_block_fp8_matmul,
 )
+from sglang.srt.utils import get_device
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -19,11 +20,12 @@ class TestFP8Base(CustomTestCase):
         cls.group_size = 128
         cls.quant_type = torch.float8_e4m3fn
         cls.output_type = torch.bfloat16
+        cls.device = get_device()
 
     @staticmethod
-    def _make_A(M, K, group_size, out_dtype):
+    def _make_A(M, K, group_size, out_dtype, device):
         quant_A = torch.rand(
-            M, K // group_size, group_size, dtype=torch.float32, device="cuda"
+            M, K // group_size, group_size, dtype=torch.float32, device=device
         )
         # -1 ~ 1
         quant_A = quant_A * 2 - 1
@@ -35,7 +37,7 @@ class TestFP8Base(CustomTestCase):
         quant_A = quant_A.to(out_dtype).to(torch.float32)
 
         # create scale and A
-        scale = torch.rand(M, K // group_size, dtype=torch.float32, device="cuda")
+        scale = torch.rand(M, K // group_size, dtype=torch.float32, device=device)
         scale /= fmax
         A = quant_A * scale[..., None]
 
@@ -44,7 +46,7 @@ class TestFP8Base(CustomTestCase):
         return A, quant_A, scale
 
     @staticmethod
-    def _make_B(K, N, group_size, out_dtype):
+    def _make_B(K, N, group_size, out_dtype, device):
         def _aligned_size(a, b):
             return (a + b - 1) // b * b
 
@@ -57,7 +59,7 @@ class TestFP8Base(CustomTestCase):
             N_aligned // group_size,
             group_size,
             dtype=torch.float32,
-            device="cuda",
+            device=device,
         )
         quant_B = quant_B * 2 - 1
 
@@ -74,7 +76,7 @@ class TestFP8Base(CustomTestCase):
             N_aligned // group_size,
             1,
             dtype=torch.float32,
-            device="cuda",
+            device=device,
         )
         scale /= fmax
 
@@ -88,10 +90,14 @@ class TestFP8Base(CustomTestCase):
 
 class TestPerTokenGroupQuantFP8(TestFP8Base):
     def test_per_token_group_quant_fp8(self):
-        if torch.cuda.get_device_capability()[0] < 9:
+        if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] < 9:
             return
         A, A_quant_gt, scale_gt = self._make_A(
-            M=self.M, K=self.K, group_size=self.group_size, out_dtype=self.quant_type
+            M=self.M,
+            K=self.K,
+            group_size=self.group_size,
+            out_dtype=self.quant_type,
+            device=self.device,
         )
         A_quant, scale = per_token_group_quant_fp8(
             x=A, group_size=self.group_size, dtype=self.quant_type
@@ -104,13 +110,21 @@ class TestPerTokenGroupQuantFP8(TestFP8Base):
 
 class TestW8A8BlockFP8Matmul(TestFP8Base):
     def test_w8a8_block_fp8_matmul(self):
-        if torch.cuda.get_device_capability()[0] < 9:
+        if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] < 9:
             return
         A, A_quant_gt, A_scale_gt = self._make_A(
-            M=self.M, K=self.K, group_size=self.group_size, out_dtype=self.quant_type
+            M=self.M,
+            K=self.K,
+            group_size=self.group_size,
+            out_dtype=self.quant_type,
+            device=self.device,
         )
         B, B_quant_gt, B_scale_gt = self._make_B(
-            K=self.K, N=self.N, group_size=self.group_size, out_dtype=self.quant_type
+            K=self.K,
+            N=self.N,
+            group_size=self.group_size,
+            out_dtype=self.quant_type,
+            device=self.device,
         )
         C_gt = A.to(self.output_type) @ B.to(self.output_type)
         C = w8a8_block_fp8_matmul(
