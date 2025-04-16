@@ -64,10 +64,7 @@ from sglang.srt.model_loader.loader import (
 )
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.patch_torch import (
-    monkey_patch_torch_compile,
-    monkey_patch_torch_reductions,
-)
+from sglang.srt.patch_torch import monkey_patch_torch_reductions
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -93,8 +90,6 @@ logger = logging.getLogger(__name__)
 
 SGLANG_CI_SMALL_KV_SIZE = os.getenv("SGLANG_CI_SMALL_KV_SIZE", None)
 UNBALANCED_MODEL_LOADING_TIMEOUT_S = 300
-
-monkey_patch_torch_compile()
 
 
 class ModelRunner:
@@ -172,6 +167,7 @@ class ModelRunner:
                 "debug_tensor_dump_inject": server_args.debug_tensor_dump_inject,
                 "n_share_experts_fusion": server_args.n_share_experts_fusion,
                 "disable_shared_experts_fusion": server_args.disable_shared_experts_fusion,
+                "disable_chunked_prefix_cache": server_args.disable_chunked_prefix_cache,
                 "use_mla_backend": self.use_mla_backend,
             }
         )
@@ -322,6 +318,16 @@ class ModelRunner:
 
         if server_args.enable_deepep_moe:
             logger.info(f"DeepEP is turned on. DeepEP mode: {server_args.deepep_mode}")
+
+        if not self.use_mla_backend:
+            logger.info("Disable chunked prefix cache for non-MLA backend.")
+            server_args.disable_chunked_prefix_cache = True
+        elif self.page_size > 1:
+            logger.info("Disable chunked prefix cache when page size > 1.")
+            server_args.disable_chunked_prefix_cache = True
+
+        if not server_args.disable_chunked_prefix_cache:
+            logger.info("Chunked prefix cache is turned on.")
 
     def init_torch_distributed(self):
         logger.info("Init torch distributed begin.")
