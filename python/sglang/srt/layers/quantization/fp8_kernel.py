@@ -277,6 +277,8 @@ def sglang_per_token_group_quant_fp8(
     group_size: int,
     eps: float = 1e-10,
     dtype: torch.dtype = fp8_type_,
+    column_major_scales: bool = False,
+    scale_tma_aligned: bool = False,
 ):
     assert (
         x.shape[-1] % group_size == 0
@@ -291,11 +293,27 @@ def sglang_per_token_group_quant_fp8(
     x_q = torch.empty_like(x, device=x.device, dtype=dtype)
     M = x.numel() // group_size
     N = group_size
-    x_s = torch.empty(
-        x.shape[:-1] + (x.shape[-1] // group_size,),
-        device=x.device,
-        dtype=torch.float32,
-    )
+    if column_major_scales:
+        if scale_tma_aligned:
+            # aligned to 4 * sizeof(float)
+            aligned_size = (x.shape[-2] + 3) // 4 * 4
+            x_s = torch.empty(
+                x.shape[:-2] + (x.shape[-1] // group_size, aligned_size),
+                device=x.device,
+                dtype=torch.float32,
+            ).permute(-1, -2)[: x.shape[-2], :]
+        else:
+            x_s = torch.empty(
+                (x.shape[-1] // group_size,) + x.shape[:-1],
+                device=x.device,
+                dtype=torch.float32,
+            ).permute(-1, -2)
+    else:
+        x_s = torch.empty(
+            x.shape[:-1] + (x.shape[-1] // group_size,),
+            device=x.device,
+            dtype=torch.float32,
+        )
 
     sgl_per_token_group_quant_fp8(x, x_q, x_s, group_size, eps, fp8_min, fp8_max)
 
