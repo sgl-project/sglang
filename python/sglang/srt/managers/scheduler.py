@@ -599,6 +599,7 @@ class Scheduler(
                 bootstrap_port=self.server_args.disaggregation_bootstrap_port,
                 gloo_group=self.tp_worker.get_attention_tp_cpu_group(),
                 transfer_backend=self.transfer_backend,
+                scheduler=self,
             )
             # The prefill requests that are in the middle of kv sending
             self.disagg_prefill_inflight_queue: List[Req] = []
@@ -958,14 +959,12 @@ class Scheduler(
             self._add_request_to_queue(req)
 
     def _add_request_to_queue(self, req: Req):
+        req.queue_time_start = time.time()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.disagg_prefill_pending_queue.add(req)
-
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.disagg_decode_prealloc_queue.add(req)
-
         else:
-            req.queue_time_start = time.time()
             self.waiting_queue.append(req)
 
     def _extend_requests_to_queue(self, reqs: List[Req], is_retracted: bool = False):
