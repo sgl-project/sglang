@@ -3,7 +3,7 @@ from typing import Literal, Optional
 
 import torch
 from sglang.srt.managers.expert_location import ExpertLocationMetadata
-from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.managers.schedule_batch import global_server_args_dict, get_global_expert_location_metadata
 
 
 @dataclass
@@ -14,8 +14,10 @@ class ExpertLocationDispatchInfo:
     partial_logical_to_all_physical_map_num_valid: torch.Tensor
 
     @classmethod
-    def init_new(cls, expert_location_metadata: ExpertLocationMetadata, ep_rank: int, layer_id: int):
+    def init_new(cls, ep_rank: int, layer_id: int):
         ep_dispatch_algorithm = global_server_args_dict["ep_dispatch_algorithm"]
+        expert_location_metadata = get_global_expert_location_metadata()
+
         if ep_dispatch_algorithm is None:
             return None
 

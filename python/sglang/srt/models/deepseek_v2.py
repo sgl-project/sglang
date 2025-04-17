@@ -49,6 +49,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, EPMoE
+from sglang.srt.layers.moe.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -328,7 +329,6 @@ class DeepseekV2MoE(nn.Module):
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
             shared_output = self._forward_shared_experts(hidden_states)
-            expert_location_metadata = get_global_expert_location_metadata()
             topk_weights, topk_idx = select_experts(
                 hidden_states=hidden_states,
                 router_logits=router_logits,
@@ -338,13 +338,10 @@ class DeepseekV2MoE(nn.Module):
                 topk_group=self.topk_group,
                 num_expert_group=self.num_expert_group,
                 correction_bias=self.correction_bias,
-                forward_mode=forward_mode,
-                expert_logical_to_rank_dispatch_physical_map=expert_location_metadata.logical_to_rank_dispatch_physical_map[
-                                                             self.tp_rank, self.layer_id, :],
-                expert_logical_to_all_physical_map=expert_location_metadata.logical_to_all_physical_map[self.layer_id,
-                                                   :],
-                expert_logical_to_all_physical_map_num_valid=expert_location_metadata.logical_to_all_physical_map_num_valid[
-                                                             self.layer_id, :],
+                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                    ep_rank=self.tp_rank,
+                    layer_id=self.layer_id,
+                ),
             )
             # print(f"hi [{get_tensor_model_parallel_rank()}, {self.__class__.__name__}] forward_deepep after-select_experts "
             #       f"{self.layer_id=} {topk_weights=} {topk_idx=} ")
