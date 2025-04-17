@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import Literal
 
 import torch
 from sglang.srt.utils import get_compiler_backend
@@ -6,7 +7,7 @@ from sglang.srt.utils import get_compiler_backend
 
 @dataclass
 class ExpertLocationDispatchInfo:
-    pass
+    ep_dispatch_algorithm: Literal["static", "random"]
 
 
 @torch.compile(dynamic=True, backend=get_compiler_backend())
