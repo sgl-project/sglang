@@ -13,6 +13,7 @@ from sglang.srt.server_args import ServerArgs
 
 @dataclass
 class ExpertLocationMetadata:
+    ep_size: int
     physical_to_logical_map: torch.Tensor  # (layers, num_physical_experts)
     logical_to_all_physical_map: torch.Tensor  # (layers, num_logical_experts, X)
     logical_to_all_physical_map_num_valid: torch.Tensor  # (layers, num_logical_experts)
@@ -67,6 +68,7 @@ class ExpertLocationMetadata:
         )
 
         return ExpertLocationMetadata(
+            ep_size=TODO,
             physical_to_logical_map=physical_to_logical_map,
             logical_to_all_physical_map=logical_to_all_physical_map,
             logical_to_all_physical_map_num_valid=_compute_logical_to_all_physical_map_num_valid(
@@ -95,6 +97,7 @@ class ExpertLocationMetadata:
         )
 
         return ExpertLocationMetadata(
+            ep_size=TODO,
             physical_to_logical_map=physical_to_logical_map,
             logical_to_all_physical_map=logical_to_all_physical_map,
             logical_to_all_physical_map_num_valid=_compute_logical_to_all_physical_map_num_valid(
