@@ -19,6 +19,7 @@ class ModelWeightUpdater:
 
         all_weights_iterator = self._model_weight_source.get_all_weights()
         interesting_weights = [(name, weight) for name, weight in all_weights_iterator if self._weight_filter(name)]
+        self._manager_transfer_manager.enqueue(interesting_weights)
 
         self._state = _StateAwaitMemoryTransfer()
 
