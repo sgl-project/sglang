@@ -9,6 +9,7 @@ import logging
 import os
 import tempfile
 from collections import defaultdict
+from dataclasses import dataclass
 from typing import (
     Any,
     Callable,
@@ -28,13 +29,12 @@ import safetensors.torch
 import torch
 from huggingface_hub import HfFileSystem, hf_hub_download, snapshot_download
 from pydantic import BaseModel, ConfigDict, ValidationInfo, model_validator
-from tqdm.auto import tqdm
-
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.layers.quantization import QuantizationConfig, get_quantization_config
 from sglang.srt.utils import print_warning_once
+from tqdm.auto import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -89,8 +89,8 @@ def _shared_pointers(tensors):
 
 
 def convert_bin_to_safetensor_file(
-        pt_filename: str,
-        sf_filename: str,
+    pt_filename: str,
+    sf_filename: str,
 ) -> None:
     loaded = torch.load(pt_filename, map_location="cpu", weights_only=True)
     if "state_dict" in loaded:
@@ -129,9 +129,9 @@ def convert_bin_to_safetensor_file(
 
 # TODO(woosuk): Move this to other place.
 def get_quant_config(
-        model_config: ModelConfig,
-        load_config: LoadConfig,
-        packed_modules_mapping: Dict[str, List[str]],
+    model_config: ModelConfig,
+    load_config: LoadConfig,
+    packed_modules_mapping: Dict[str, List[str]],
 ) -> QuantizationConfig:
     quant_cls = get_quantization_config(model_config.quantization)
 
@@ -154,8 +154,8 @@ def get_quant_config(
     # In case of bitsandbytes/QLoRA, get quant config from the adapter model.
     if model_config.quantization == "bitsandbytes":
         if (
-                not load_config.model_loader_extra_config
-                or "qlora_adapter_name_or_path" not in load_config.model_loader_extra_config
+            not load_config.model_loader_extra_config
+            or "qlora_adapter_name_or_path" not in load_config.model_loader_extra_config
         ):
             return quant_cls.from_config({"adapter_name_or_path": ""})
         model_name_or_path = load_config.model_loader_extra_config[
@@ -217,11 +217,11 @@ def get_quant_config(
 
 
 def download_weights_from_hf(
-        model_name_or_path: str,
-        cache_dir: Optional[str],
-        allow_patterns: List[str],
-        revision: Optional[str] = None,
-        ignore_patterns: Optional[Union[str, List[str]]] = None,
+    model_name_or_path: str,
+    cache_dir: Optional[str],
+    allow_patterns: List[str],
+    revision: Optional[str] = None,
+    ignore_patterns: Optional[Union[str, List[str]]] = None,
 ) -> str:
     """Download model weights from Hugging Face Hub.
 
@@ -269,10 +269,10 @@ def download_weights_from_hf(
 
 
 def download_safetensors_index_file_from_hf(
-        model_name_or_path: str,
-        index_file: str,
-        cache_dir: Optional[str],
-        revision: Optional[str] = None,
+    model_name_or_path: str,
+    index_file: str,
+    cache_dir: Optional[str],
+    revision: Optional[str] = None,
 ) -> None:
     """Download hf safetensors index file from Hugging Face Hub.
 
@@ -308,7 +308,7 @@ def download_safetensors_index_file_from_hf(
 # So, we use the index_file to
 # look up which safetensors files should be used.
 def filter_duplicate_safetensors_files(
-        hf_weights_files: List[str], hf_folder: str, index_file: str
+    hf_weights_files: List[str], hf_folder: str, index_file: str
 ) -> List[str]:
     # model.safetensors.index.json is a mapping from keys in the
     # torch state_dict to safetensors file holding that weight.
@@ -355,17 +355,17 @@ _BAR_FORMAT = "{desc}: {percentage:3.0f}% Completed | {n_fmt}/{total_fmt} [{elap
 
 
 def np_cache_weights_iterator(
-        model_name_or_path: str,
-        cache_dir: Optional[str],
-        hf_folder: str,
-        hf_weights_files: List[str],
+    model_name_or_path: str,
+    cache_dir: Optional[str],
+    hf_folder: str,
+    hf_weights_files: List[str],
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model np files.
 
     Will dump the model weights to numpy files if they are not already dumped.
     """
     enable_tqdm = (
-            not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+        not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
     # Convert the model weights from torch tensors to numpy arrays for
     # faster loading.
@@ -378,10 +378,10 @@ def np_cache_weights_iterator(
         if not os.path.exists(weight_names_file):
             weight_names: List[str] = []
             for bin_file in tqdm(
-                    hf_weights_files,
-                    desc="Loading np_cache checkpoint shards",
-                    disable=not enable_tqdm,
-                    bar_format=_BAR_FORMAT,
+                hf_weights_files,
+                desc="Loading np_cache checkpoint shards",
+                disable=not enable_tqdm,
+                bar_format=_BAR_FORMAT,
             ):
                 state = torch.load(bin_file, map_location="cpu", weights_only=True)
                 for name, param in state.items():
@@ -407,17 +407,17 @@ def decrypt(fn, key):
 
 
 def safetensors_encrypted_weights_iterator(
-        hf_weights_files: List[str],
-        is_all_weights_sharded: bool = False,
-        decryption_key: Optional[str] = None,
+    hf_weights_files: List[str],
+    is_all_weights_sharded: bool = False,
+    decryption_key: Optional[str] = None,
 ):
     raise NotImplementedError()
 
 
 def safetensors_weights_iterator(
-        hf_weights_files: List[str],
-        is_all_weights_sharded: bool = False,
-        decryption_key: Optional[str] = None,
+    hf_weights_files: List[str],
+    is_all_weights_sharded: bool = False,
+    decryption_key: Optional[str] = None,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files.
 
@@ -431,13 +431,13 @@ def safetensors_weights_iterator(
         return
 
     enable_tqdm = (
-            not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+        not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
     for st_file in tqdm(
-            hf_weights_files,
-            desc="Loading safetensors checkpoint shards",
-            disable=not enable_tqdm,
-            bar_format=_BAR_FORMAT,
+        hf_weights_files,
+        desc="Loading safetensors checkpoint shards",
+        disable=not enable_tqdm,
+        bar_format=_BAR_FORMAT,
     ):
         result = safetensors.torch.load_file(st_file, device="cpu")
         for name, param in result.items():
@@ -445,17 +445,17 @@ def safetensors_weights_iterator(
 
 
 def pt_weights_iterator(
-        hf_weights_files: List[str],
+    hf_weights_files: List[str],
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model bin/pt files."""
     enable_tqdm = (
-            not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+        not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
     for bin_file in tqdm(
-            hf_weights_files,
-            desc="Loading pt checkpoint shards",
-            disable=not enable_tqdm,
-            bar_format=_BAR_FORMAT,
+        hf_weights_files,
+        desc="Loading pt checkpoint shards",
+        disable=not enable_tqdm,
+        bar_format=_BAR_FORMAT,
     ):
         state = torch.load(bin_file, map_location="cpu", weights_only=True)
         yield from state.items()
@@ -463,7 +463,7 @@ def pt_weights_iterator(
 
 
 def get_gguf_extra_tensor_names(
-        gguf_file: str, gguf_to_hf_name_map: Dict[str, str]
+    gguf_file: str, gguf_to_hf_name_map: Dict[str, str]
 ) -> List[str]:
     import gguf
 
@@ -475,7 +475,7 @@ def get_gguf_extra_tensor_names(
 
 
 def gguf_quant_weights_iterator(
-        gguf_file: str, gguf_to_hf_name_map: Dict[str, str]
+    gguf_file: str, gguf_to_hf_name_map: Dict[str, str]
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """
     Iterate over the quant weights in the model gguf files and convert
@@ -545,7 +545,7 @@ def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> N
 
 
 def row_parallel_weight_loader(
-        param: torch.Tensor, loaded_weight: torch.Tensor
+    param: torch.Tensor, loaded_weight: torch.Tensor
 ) -> None:
     """Load weights that are row-parallelized."""
     tp_rank = get_tensor_model_parallel_rank()
@@ -578,7 +578,7 @@ def sharded_weight_loader(shard_axis: int) -> LoaderFunction:
 
 
 def composed_weight_loader(
-        loader: LoaderFunction, fn: Callable[[torch.Tensor], torch.Tensor]
+    loader: LoaderFunction, fn: Callable[[torch.Tensor], torch.Tensor]
 ) -> LoaderFunction:
     """Create a weight loader that post-processes the weights after loading"""
 
@@ -591,21 +591,21 @@ def composed_weight_loader(
 
 
 def runai_safetensors_weights_iterator(
-        hf_weights_files: List[str],
+    hf_weights_files: List[str],
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files."""
     from runai_model_streamer import SafetensorsStreamer
 
     enable_tqdm = (
-            not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+        not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
 
     with SafetensorsStreamer() as streamer:
         for st_file in tqdm(
-                hf_weights_files,
-                desc="Loading safetensors using Runai Model Streamer",
-                disable=not enable_tqdm,
-                bar_format=_BAR_FORMAT,
+            hf_weights_files,
+            desc="Loading safetensors using Runai Model Streamer",
+            disable=not enable_tqdm,
+            bar_format=_BAR_FORMAT,
         ):
             streamer.stream_file(st_file)
             yield from streamer.get_tensors()
@@ -616,14 +616,14 @@ def set_runai_streamer_env(load_config: LoadConfig):
         extra_config = load_config.model_loader_extra_config
 
         if "concurrency" in extra_config and isinstance(
-                extra_config.get("concurrency"), int
+            extra_config.get("concurrency"), int
         ):
             os.environ["RUNAI_STREAMER_CONCURRENCY"] = str(
                 extra_config.get("concurrency")
             )
 
         if "memory_limit" in extra_config and isinstance(
-                extra_config.get("memory_limit"), int
+            extra_config.get("memory_limit"), int
         ):
             os.environ["RUNAI_STREAMER_MEMORY_LIMIT"] = str(
                 extra_config.get("memory_limit")
@@ -636,10 +636,10 @@ def set_runai_streamer_env(load_config: LoadConfig):
 
 
 def initialize_dummy_weights(
-        model: torch.nn.Module,
-        low: float = -1e-3,
-        high: float = 1e-3,
-        seed: int = 1234,
+    model: torch.nn.Module,
+    low: float = -1e-3,
+    high: float = 1e-3,
+    seed: int = 1234,
 ) -> None:
     """Initialize model weights with random values.
 
@@ -710,8 +710,8 @@ def maybe_remap_kv_scale_name(name: str, params_dict: dict) -> Optional[str]:
         if name.endswith(scale_name):
             # Check and remap the name based on modelopt scale names
             if any(
-                    modelopt_scale_name in name
-                    for modelopt_scale_name in modelopt_scale_names
+                modelopt_scale_name in name
+                for modelopt_scale_name in modelopt_scale_names
             ):
                 remapped_name = name.replace(
                     f".self_attn.{scale_name[1]}_proj{scale_name}",
@@ -768,7 +768,7 @@ class KVCacheQuantSchema(BaseModel):
                 )
             for i in range(tp_size):
                 assert (
-                        i in self.scaling_factor
+                    i in self.scaling_factor
                 ), f"KV cache scales map for TP rank {i} not found."
         return self
 
@@ -809,11 +809,11 @@ class QuantParamSchema(BaseModel):
 
 
 def kv_cache_scales_loader(
-        filename: str,
-        tp_rank: int,
-        tp_size: int,
-        num_hidden_layers: int,
-        model_type: Optional[str],
+    filename: str,
+    tp_rank: int,
+    tp_size: int,
+    num_hidden_layers: int,
+    model_type: Optional[str],
 ) -> Iterable[Tuple[int, float]]:
     """
     A simple utility to read in KV cache scaling factors that have been
@@ -851,5 +851,14 @@ def kv_cache_scales_loader(
     return []
 
 
-class ModelParamNameInfo(ABC):
+@dataclass
+class ModelParamNameInfoMoe:
     pass
+
+
+@dataclass
+class ModelParamNameInfoOthers:
+    pass
+
+
+ModelParamNameInfo = Union[ModelParamNameInfoMoe, ModelParamNameInfoOthers]
