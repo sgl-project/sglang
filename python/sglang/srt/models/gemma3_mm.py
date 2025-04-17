@@ -41,9 +41,9 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
+from sglang.srt.models.clip import CLIPVisionModel
 from sglang.srt.models.gemma3_causal import Gemma3ForCausalLM
 from sglang.srt.utils import add_prefix
-from sglang.srt.models.clip import CLIPVisionModel
 
 logger = logging.getLogger(__name__)
 
@@ -164,14 +164,14 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
         super().__init__(config=config)
         self.config = config
         self.quant_config = quant_config
-        
+
         # SiglipVisionModel is not supported in sglang, use CLIPVisionModel instead
         self.vision_tower = CLIPVisionModel(
             config=config.vision_config,
             quant_config=quant_config,
             prefix=add_prefix("vision_tower", prefix),
         )
-        
+
         # monkey patch to update the position embedding for the vision tower
         def monkey_patch_for_vision_tower():
             embeddings = self.vision_tower.vision_model.embeddings
@@ -184,15 +184,17 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
                 torch.arange(embeddings.num_positions).expand((1, -1)),
                 persistent=False,
             )
-        
+
         monkey_patch_for_vision_tower()
-        
+
         self.multi_modal_projector = Gemma3MultiModalProjector(config)
         self.vocab_size = config.text_config.vocab_size
 
         # Text model
         self.language_model = Gemma3ForCausalLM(
-            config.text_config, quant_config, prefix=add_prefix("language_model", prefix)
+            config.text_config,
+            quant_config,
+            prefix=add_prefix("language_model", prefix),
         )
         if self.language_model.logits_processor.logit_scale:
             logit_scale = getattr(config, "logit_scale", 1.0)
@@ -422,7 +424,9 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
                     if name is None:
                         continue
                     param = params_dict[name]
-                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
                     weight_loader(param, loaded_weight)
                 loaded_params.add(name)
         unloaded_params = params_dict.keys() - loaded_params

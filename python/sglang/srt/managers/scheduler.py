@@ -233,7 +233,7 @@ class Scheduler(
 
         # Init tokenizer
         self.init_tokenizer()
-        
+
         # set load_format to BNB when quantization is detected from HF config
         if self.model_config.quantization == "bitsandbytes":
             self.server_args.load_format = "bitsandbytes"
