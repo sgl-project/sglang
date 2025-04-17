@@ -95,7 +95,7 @@ class AsyncToCudaManager(TensorOperationManagerBase):
         self._alt_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self._alt_stream):
             output_named_tensors = [
-                (name, tensor.to("cuda", non_blocking=True))
+                (name, self._tensor_to_cuda(tensor, self._allocator))
                 for name, tensor in named_tensors
             ]
             finish_event = torch.cuda.Event()
