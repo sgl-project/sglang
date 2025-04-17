@@ -76,16 +76,7 @@ class _ModelWeightSourceVanilla(_ModelWeightSourceBase):
     def get_all_weights(self) -> Iterator[Tuple[str, torch.Tensor]]:
         loader = get_model_loader(load_config)
         assert isinstance(loader, DefaultModelLoader)
-
-        return loader._get_weights_iterator(
-            DefaultModelLoader.Source(
-                config.model_path,
-                revision=config.revision,
-                fall_back_to_pt=getattr(
-                    model, "fall_back_to_pt_during_load", True
-                ),
-            )
-        )
+        return TODO
 
 
 class _ModelWeightSourcePinnedMemory(_ModelWeightSourceBase):
