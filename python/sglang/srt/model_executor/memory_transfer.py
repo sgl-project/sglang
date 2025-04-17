@@ -1,6 +1,7 @@
 import logging
 import queue
 import traceback
+from collections import defaultdict
 from dataclasses import dataclass
 from queue import SimpleQueue
 from threading import Thread
@@ -130,7 +131,9 @@ class _AsyncToCudaTask:
 
 class SimpleCachingAllocator:
     def __init__(self):
-        TODO
+        # (size, dtype) -> list[Tensor]
+        self._unused_pool = defaultdict(list)
+        self._used_pool: List[torch.Tensor] = []
 
     def allocate(self) -> torch.Tensor:
         return TODO
