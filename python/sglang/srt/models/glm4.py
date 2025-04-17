@@ -70,7 +70,6 @@ class Glm4Attention(nn.Module):
         partial_rotary_factor = getattr(config, "partial_rotary_factor", 0.5)
         self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
         self.head_dim = config.hidden_size // self.total_num_heads
-        self.rotary_dim = int(partial_rotary_factor * self.head_dim)
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
@@ -96,7 +95,7 @@ class Glm4Attention(nn.Module):
 
         self.rotary_emb = get_rope(
             self.head_dim,
-            rotary_dim=self.rotary_dim,
+            rotary_dim=self.head_dim,
             max_position=config.max_position_embeddings,
             base=self.rope_theta,
             rope_scaling=self.rope_scaling,
