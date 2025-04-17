@@ -21,7 +21,8 @@ limitations under the License.
 
 using namespace flashinfer;
 
-void sgl_fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double eps, bool enable_pdl) {
+void sgl_fused_add_rmsnorm(
+    torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double eps, bool enable_pdl) {
   CHECK_INPUT(input);
   CHECK_INPUT(residual);
   CHECK_INPUT(weight);

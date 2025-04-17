@@ -43,7 +43,11 @@ def rmsnorm(
 
 
 def fused_add_rmsnorm(
-    input: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6, enable_pdl: bool = False,
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+    enable_pdl: bool = False,
 ) -> None:
     r"""Fused add root mean square normalization.
 
@@ -67,7 +71,9 @@ def fused_add_rmsnorm(
         Whether to enable `programmatic dependent launch
         <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
     """
-    torch.ops.sgl_kernel.fused_add_rmsnorm.default(input, residual, weight, eps, enable_pdl)
+    torch.ops.sgl_kernel.fused_add_rmsnorm.default(
+        input, residual, weight, eps, enable_pdl
+    )
 
 
 def gemma_rmsnorm(
@@ -102,14 +108,16 @@ def gemma_rmsnorm(
     """
     if out is None:
         out = torch.empty_like(input)
-    torch.ops.sgl_kernel.gemma_rmsnorm.default(
-        out, input, weight, eps, enable_pdl
-    )
+    torch.ops.sgl_kernel.gemma_rmsnorm.default(out, input, weight, eps, enable_pdl)
     return out
 
 
 def gemma_fused_add_rmsnorm(
-    input: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6, enable_pdl: bool = False,
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+    enable_pdl: bool = False,
 ) -> None:
     r"""Gemma-style fused add root mean square normalization.
 
