@@ -3,6 +3,7 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import torch
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.managers import deepseek_eplb
 from sglang.srt.managers.expert_distribution_storage import ExpertDistributionStorage
@@ -62,6 +63,7 @@ class EPLBManager:
 
         if debug_use_random_stat:
             logger.warning("EPLBManager.compute_expert_location_metadata use random stat for debugging.")
-            snapshot = {"logical_count": TODO}
+            original_logical_count = torch.tensor(snapshot["logical_count"])
+            snapshot = {"logical_count": torch.randint_like(original_logical_count, high=100000)}
 
         return ExpertLocationMetadata.init_by_eplb(self._server_args, **snapshot)
