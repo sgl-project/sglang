@@ -303,10 +303,7 @@ def apply_fp8_linear(
     if compressed_tensor_quant:
         # cutlass_scaled_mm supports per tensor/channel W and per tensor/token A
         # for sgl-kernel fp8_scaled_mm, it support per channel W now
-        if (
-            cutlass_fp8_supported
-            and weight_scale.numel() == weight.shape[1]
-        ):
+        if cutlass_fp8_supported and weight_scale.numel() == weight.shape[1]:
             qinput, x_scale = scaled_fp8_quant(
                 input_2d,
                 input_scale,
