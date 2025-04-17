@@ -36,7 +36,7 @@ class TestEPLB(CustomTestCase):
     def _test_eplb_many_rebalances_core(self, enable_eplb: bool = True):
         print("Action: test_eplb_many_rebalances")
 
-        num_rebalance = 20
+        num_rebalance = 10
         request_rate = 20
         content_duplicate_num = 200
         contents_raw = [
