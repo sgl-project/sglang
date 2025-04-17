@@ -270,8 +270,9 @@ def compute_logical_to_rank_dispatch_physical_map(
         logical_to_all_physical_map: torch.Tensor,
         num_gpus: int,
         num_physical_experts: int,
+        seed: int = 42,
 ):
-    r = random.Random()
+    r = random.Random(seed)
 
     num_local_physical_experts = num_physical_experts // num_gpus
     num_layers, num_logical_experts, _ = logical_to_all_physical_map.shape
