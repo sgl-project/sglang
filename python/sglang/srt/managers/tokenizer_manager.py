@@ -711,6 +711,7 @@ class TokenizerManager:
         old_expert_location_metadata = copy.deepcopy(self.expert_location_metadata)
         num_layers = old_expert_location_metadata.num_layers
 
+        # pretty arbitrary choice; can optimize if bottleneck
         layer_id_lens = list(range(10, num_layers, 10)) + [num_layers]
 
         for layer_id_end in layer_id_lens:
