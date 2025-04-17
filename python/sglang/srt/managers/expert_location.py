@@ -73,16 +73,11 @@ class ExpertLocationMetadata:
             num_logical_experts=model_config_for_expert_location.num_logical_experts,
         )
 
-        return ExpertLocationMetadata(
+        return ExpertLocationMetadata._init_raw(
             ep_size=TODO,
+            num_gpus=common["world_size"],
             physical_to_logical_map=physical_to_logical_map,
             logical_to_all_physical_map=logical_to_all_physical_map,
-            logical_to_all_physical_map_num_valid=_compute_logical_to_all_physical_map_num_valid(
-                logical_to_all_physical_map),
-            logical_to_rank_dispatch_physical_map=_compute_logical_to_rank_dispatch_physical_map(
-                logical_to_all_physical_map,
-                num_gpus=common["world_size"],
-            ),
         )
 
     @staticmethod
@@ -102,16 +97,11 @@ class ExpertLocationMetadata:
             )
         )
 
-        return ExpertLocationMetadata(
+        return ExpertLocationMetadata._init_raw(
             ep_size=TODO,
+            num_gpus=common["world_size"],
             physical_to_logical_map=physical_to_logical_map,
             logical_to_all_physical_map=logical_to_all_physical_map,
-            logical_to_all_physical_map_num_valid=_compute_logical_to_all_physical_map_num_valid(
-                logical_to_all_physical_map),
-            logical_to_rank_dispatch_physical_map=_compute_logical_to_rank_dispatch_physical_map(
-                logical_to_all_physical_map,
-                num_gpus=common["world_size"],
-            ),
         )
 
     @staticmethod
@@ -135,6 +125,25 @@ class ExpertLocationMetadata:
             num_physical_experts=num_physical_experts,
             num_local_physical_experts=num_local_physical_experts,
             world_size=world_size,
+        )
+
+    @staticmethod
+    def _init_raw(
+            ep_size: int,
+            num_gpus: int,
+            physical_to_logical_map: torch.Tensor,
+            logical_to_all_physical_map: torch.Tensor,
+    ):
+        return ExpertLocationMetadata(
+            ep_size=ep_size,
+            physical_to_logical_map=physical_to_logical_map,
+            logical_to_all_physical_map=logical_to_all_physical_map,
+            logical_to_all_physical_map_num_valid=_compute_logical_to_all_physical_map_num_valid(
+                logical_to_all_physical_map),
+            logical_to_rank_dispatch_physical_map=_compute_logical_to_rank_dispatch_physical_map(
+                logical_to_all_physical_map,
+                num_gpus=num_gpus,
+            ),
         )
 
     def update(self, other: "ExpertLocationMetadata"):
