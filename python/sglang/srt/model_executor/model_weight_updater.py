@@ -11,11 +11,23 @@ from sglang.srt.model_loader.utils import set_default_torch_dtype
 
 
 class ModelWeightUpdater:
-    def __init__(self, init_pin_memory: bool, weight_filter: Callable[[str], bool]):
+    def __init__(
+        self,
+        init_pin_memory: bool,
+        weight_filter: Callable[[str], bool],
+        load_format: str,
+        model_config: ModelConfig,
+        model,
+        device,
+    ):
         self._weight_filter = weight_filter
+        self._model_config = model_config
+        self._model = model
+        self._device = device
 
         ModelWeightSourceCls = _ModelWeightSourcePinnedMemory if init_pin_memory else _ModelWeightSourceVanilla
-        self._model_weight_source = ModelWeightSourceCls(load_format=TODO, model_config=TODO, model=TODO)
+        self._model_weight_source = ModelWeightSourceCls(load_format=load_format, model_config=model_config,
+                                                         model=model)
         self._memory_transfer_manager = AsyncToCudaManager() if init_pin_memory else CombinedManager.init_pin_memory_and_to_cuda()
 
         self._state: _State = _StateIdle()
@@ -42,11 +54,12 @@ class ModelWeightUpdater:
     def act(self):
         assert isinstance(self._state, _StatePrepared)
 
+        target_device = torch.device(self._device)
         named_tensors = self._state.named_tensors
 
         # TODO further extract such common operations during weight loading
-        with set_default_torch_dtype(TODO):
-            DefaultModelLoader.load_weights_and_postprocess(model, named_tensors, target_device)
+        with set_default_torch_dtype(self._model_config.dtype):
+            DefaultModelLoader.load_weights_and_postprocess(self._model, named_tensors, target_device)
 
         self._state = _StateIdle()
 
