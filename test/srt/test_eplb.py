@@ -222,9 +222,15 @@ class TestEPLB(CustomTestCase):
     def test_compute_logical_to_rank_dispatch_physical_map(self):
         # 8 logical expert
         for logical_to_all_physical_map, expect_output in [
+            # Identity map
             (
                 [[[0], [1], [2], [3], [4], [5], [6], [7]]],
-                [[]],
+                [[]],  # TODO
+            ),
+            # Identity map + consider redundant experts
+            (
+                [[[0, 8], [1, 9], [2, 10], [3, 11], [4], [5], [6], [7]]],
+                [[]],  # TODO
             ),
         ]:
             actual_output = compute_logical_to_rank_dispatch_physical_map(
