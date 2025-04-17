@@ -174,6 +174,6 @@ class SimpleCachingAllocator:
 
     def mark_all_unused(self):
         for tensor in self._used_pool:
-            self._unused_pool[(tensor.size, tensor.dtype)].append(tensor)
+            self._unused_pool[(tuple(tensor.size()), tensor.dtype)].append(tensor)
 
         self._used_pool.clear()
