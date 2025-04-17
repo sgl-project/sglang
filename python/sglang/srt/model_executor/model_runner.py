@@ -211,7 +211,7 @@ class ModelRunner:
         # If it is a draft model tp_group can be different.
         self.initialize(min_per_gpu_memory)
 
-        self._expert_location_updater = ExpertLocationUpdater(self)
+        self._expert_location_updater = ExpertLocationUpdater(self) if server_args.expert_location_updater_mode is not None else None
 
     def initialize(self, min_per_gpu_memory: float):
         server_args = self.server_args

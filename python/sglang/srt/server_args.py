@@ -165,7 +165,7 @@ class ServerArgs:
     ep_num_redundant_experts: int = 0
     ep_dispatch_algorithm: Optional[Literal["static", "random"]] = None
     init_expert_location: Optional[str] = None
-    expert_location_updater_mode: Literal["pin_memory", "pageable_memory"] = "pin_memory"
+    expert_location_updater_mode: Optional[Literal["pin_memory", "pageable_memory"]] = None
     enable_eplb: bool = False
     eplb_storage_dir: str = "/tmp/eplb_storage"
     eplb_rebalance_period: Optional[int] = None
