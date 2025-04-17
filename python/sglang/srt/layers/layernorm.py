@@ -25,6 +25,7 @@ from sglang.srt.utils import is_cuda_available, is_hip
 logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda_available()
+_is_hip = is_hip()
 
 if _is_cuda:
     from sgl_kernel import (
@@ -34,7 +35,7 @@ if _is_cuda:
         rmsnorm,
     )
 
-if is_hip:
+if _is_hip:
     import aiter as _rocm_aiter
 
     def rocm_aiter_rms_norm(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
@@ -64,7 +65,7 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        if is_hip:
+        if _is_hip:
             if residual is not None:
                 return rocm_aiter_fused_add_rms_norm(
                     x, residual, self.weight.data, self.variance_epsilon
@@ -158,7 +159,7 @@ class Gemma3RMSNorm(nn.Module):
         return f"{tuple(self.weight.shape)}, eps={self.eps}"
 
 
-if not (_is_cuda or is_hip):
+if not (_is_cuda or _is_hip):
     logger.info(
         "sgl-kernel is not available on Non-NV platforms. Fallback to other kernel libraries."
     )
