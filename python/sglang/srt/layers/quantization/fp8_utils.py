@@ -279,7 +279,7 @@ def apply_fp8_linear(
     input_scale: Optional[torch.Tensor] = None,
     input_scale_ub: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
-    cutlass_fp8_supported: bool = True,
+    cutlass_fp8_supported: bool = cutlass_fp8_supported(),
     use_per_token_if_dynamic: bool = False,
     pad_output: Optional[bool] = None,
     compressed_tensor_quant: bool = False,
@@ -305,7 +305,6 @@ def apply_fp8_linear(
         # for sgl-kernel fp8_scaled_mm, it support per channel W now
         if (
             cutlass_fp8_supported
-            and _is_cuda
             and weight_scale.numel() == weight.shape[1]
         ):
             qinput, x_scale = scaled_fp8_quant(
