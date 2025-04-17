@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, Optional
 
 import torch
 from sglang.srt.utils import get_compiler_backend
@@ -10,7 +10,7 @@ class ExpertLocationDispatchInfo:
     ep_dispatch_algorithm: Literal["static", "random"]
 
 
-def topk_ids_logical_to_physical(topk_ids: torch.Tensor, info: ExpertLocationDispatchInfo) -> torch.Tensor:
+def topk_ids_logical_to_physical(topk_ids: torch.Tensor, info: Optional[ExpertLocationDispatchInfo]) -> torch.Tensor:
     return TODO
 
     # TODO

@@ -16,6 +16,7 @@ from typing import Callable, Optional
 
 import torch
 import torch.nn.functional as F
+from sglang.srt.layers.moe.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.managers.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.utils import get_compiler_backend, is_cuda, is_hip, get_bool_env_var
@@ -245,6 +246,7 @@ def select_experts(
     custom_routing_function: Optional[Callable] = None,
     correction_bias: Optional[torch.Tensor] = None,
     torch_native: bool = False,
+    expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
 ):
     n_share_experts_fusion = 0
     if global_server_args_dict["n_share_experts_fusion"] is not None:
@@ -299,5 +301,3 @@ def select_experts(
     get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
 
     return topk_weights, topk_ids
-
-
