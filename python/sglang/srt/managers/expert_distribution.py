@@ -82,8 +82,6 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         self._expert_location_metadata = expert_location_metadata
 
         self._recording = False
-        # TODO improve API
-        self._enable_in_cuda_graph = get_bool_env_var("SGLANG_EXPERT_DISTRIBUTION_RECORDER_ENABLE_IN_CUDA_GRAPH")
         self._current_layer_idx = Withable()
         self._current_debug_name = Withable()
         self._accumulator = _Accumulator.init_new(expert_location_metadata, rank)
@@ -134,7 +132,7 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         self._on_hook("on_deepep_dispatch_low_latency", recv_count=recv_count)
 
     def _on_hook(self, hook_name: str, **kwargs):
-        if not (self._recording or (self._enable_in_cuda_graph and torch.cuda.is_current_stream_capturing())):
+        if not (self._recording or torch.cuda.is_current_stream_capturing()):
             return
         gatherer = self._single_pass_gatherers[
             self._accumulator.get_single_pass_gatherer_key(
