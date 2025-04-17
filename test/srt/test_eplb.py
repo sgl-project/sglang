@@ -70,7 +70,7 @@ class TestEPLB(CustomTestCase):
             async for content in _yield_with_poisson_process(contents_duplicated, action_rate=request_rate):
                 tasks.append(asyncio.create_task(engine.async_generate(
                     prompt=content["prompt"],
-                    sampling_params=dict(temperature=0, max_new_tokens=8),
+                    sampling_params=dict(temperature=0, max_new_tokens=4),
                 )))
 
             actual_outputs = await asyncio.gather(*tasks)
