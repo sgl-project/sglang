@@ -22,7 +22,7 @@ class ExpertLocationUpdater:
         self._model_runner = model_runner
         self._model_weight_updater = ModelWeightUpdater(
             init_pin_memory=TODO,
-            load_format=TODO,
+            load_format=model_runner.server_args.load_format,
             model_config=model_runner.model_config,
             model=model_runner.model,
             device=model_runner.device,
