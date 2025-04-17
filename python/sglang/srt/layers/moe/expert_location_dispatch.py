@@ -14,6 +14,9 @@ def topk_ids_logical_to_physical(topk_ids: torch.Tensor, info: Optional[ExpertLo
     if info is None:
         return topk_ids
 
+    if info.ep_dispatch_algorithm == "static":
+        return TODO
+
     return TODO
 
     # TODO
@@ -33,6 +36,16 @@ def topk_ids_logical_to_physical(topk_ids: torch.Tensor, info: Optional[ExpertLo
             )
         else:
             topk_ids = expert_logical_to_rank_dispatch_physical_map[topk_ids]
+
+
+def _topk_ids_logical_to_physical_static(topk_ids: torch.Tensor,
+                                         info: Optional[ExpertLocationDispatchInfo]) -> torch.Tensor:
+    return TODO
+
+
+def _topk_ids_logical_to_physical_random(topk_ids: torch.Tensor,
+                                         info: Optional[ExpertLocationDispatchInfo]) -> torch.Tensor:
+    return TODO
 
 
 def _hack_expert_location_dispatch_random(
