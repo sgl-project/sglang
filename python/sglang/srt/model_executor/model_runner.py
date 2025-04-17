@@ -493,28 +493,7 @@ class ModelRunner:
             ) from None
 
     def update_expert_location(self, recv_req: UpdateExpertLocationReqInput):
-        logger.info("update_expert_location start")
-        torch.distributed.barrier()
-
-        get_global_expert_distribution_recorder().flush_buffer_depending_on_expert_location_metadata()
-
-        get_global_expert_location_metadata().update(recv_req.expert_location_metadata)
-        if self.tp_rank == 0 and get_bool_env_var(
-            "SGLANG_LOG_EXPERT_LOCATION_METADATA"
-        ):
-            logger.info(
-                f"Updated expert_location_metadata: {get_global_expert_location_metadata().debug_str()}"
-            )
-
-        # We may be able to further reduce lock time by faster copying, pre-transfering, etc
-        self.update_weights_from_disk(
-            model_path=self.model_config.model_path,
-            load_format=self.server_args.load_format,
-            param_categories=["moe"],
-        )
-
-        logger.info("update_expert_location end")
-        torch.distributed.barrier()
+        TODO
 
     def update_weights_from_disk(
         self, model_path: str, load_format: str, param_categories: Optional[List[str]]
