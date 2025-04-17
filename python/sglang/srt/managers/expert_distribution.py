@@ -130,7 +130,17 @@ class _ExpertDistributionRecorder:
         return output
 
 
-expert_distribution_recorder = _ExpertDistributionRecorder()
+_global_expert_distribution_recorder: Optional[_ExpertDistributionRecorder] = None
+
+
+def get_global_expert_distribution_recorder():
+    return _global_expert_distribution_recorder
+
+
+def set_global_expert_distribution_recorder(value):
+    global _global_expert_distribution_recorder
+    assert _global_expert_distribution_recorder is None
+    _global_expert_distribution_recorder = value
 
 
 def postprocess_dumps(
