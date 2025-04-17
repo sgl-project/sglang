@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from typing import Iterator, Tuple, List, Callable
 
 import torch
+from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.model_executor.memory_transfer import AsyncToCudaManager, CombinedManager
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.utils import set_default_torch_dtype
@@ -74,9 +75,11 @@ class _ModelWeightSourceBase(ABC):
 
 class _ModelWeightSourceVanilla(_ModelWeightSourceBase):
     def get_all_weights(self) -> Iterator[Tuple[str, torch.Tensor]]:
+        load_config = LoadConfig(load_format=load_format)
         loader = get_model_loader(load_config)
         assert isinstance(loader, DefaultModelLoader)
-        return TODO
+        with set_default_torch_dtype(model_config.dtype):
+            return loader._get_weights_iterator(DefaultModelLoader.Source.init_new(model_config, model))
 
 
 class _ModelWeightSourcePinnedMemory(_ModelWeightSourceBase):
