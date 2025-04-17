@@ -605,6 +605,7 @@ class Scheduler(
         while True:
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
+            self.model_runner_event_loop_step()
 
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
@@ -627,6 +628,7 @@ class Scheduler(
         while True:
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
+            self.model_runner_event_loop_step()
 
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
@@ -666,6 +668,7 @@ class Scheduler(
         while True:
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
+            self.model_runner_event_loop_step()
             self.waiting_queue.extend(
                 self.disagg_prefill_pending_queue.pop_bootstrapped()
             )
@@ -696,6 +699,7 @@ class Scheduler(
         while True:
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
+            self.model_runner_event_loop_step()
             # polling and allocating kv cache
             self.process_decode_queue()
             batch = self.get_next_disagg_decode_batch_to_run()
@@ -800,6 +804,9 @@ class Scheduler(
                         self.recv_from_rpc.send_pyobj(output)
                 else:
                     self.send_to_tokenizer.send_pyobj(output)
+
+    def model_runner_event_loop_step(self):
+        self.tp_worker.worker.model_runner.event_loop_step()
 
     def handle_generate_request(
         self,
