@@ -32,6 +32,12 @@ class ExpertDistributionRecorder:
         else:
             return TODO
 
+
+class _ExpertDistributionRecorderNoop(ExpertDistributionRecorder):
+    pass
+
+
+class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
     def __init__(
         self,
         server_args: ServerArgs,
