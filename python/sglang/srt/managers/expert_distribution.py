@@ -256,10 +256,10 @@ class _LayerBasedSinglePassGatherer(_SinglePassGatherer):
     def reset(self):
         self._objects_of_layer.clear()
 
-    def collect_global_physical_count(self) -> torch.Tensor:
+    def _collect_objects(self, pad_len: int) -> torch.Tensor:
         data = [
             self._objects_of_layer.get(layer_index)
-            or ([0] * self._expert_location_metadata.num_local_physical_experts)
+            or ([0] * pad_len)
             for layer_index in range(self._expert_location_metadata.num_layers)
         ]
         return torch.tensor(data)
