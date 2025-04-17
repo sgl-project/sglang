@@ -15,6 +15,7 @@ class TensorOperationManagerBase:
 
 class CombinedManager(TensorOperationManagerBase):
     def __init__(self, manager_a: TensorOperationManagerBase, manager_b: TensorOperationManagerBase):
+        # For simplicity, only support chaining 2 managers, but can be extended to N
         self._manager_a = manager_a
         self._manager_b = manager_b
 
