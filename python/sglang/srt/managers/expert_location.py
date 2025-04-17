@@ -157,7 +157,7 @@ class ExpertLocationMetadata:
             physical_to_logical_map=physical_to_logical_map,
             logical_to_all_physical_map=logical_to_all_physical_map_padded,
             logical_to_all_physical_map_num_valid=logical_to_all_physical_map_num_valid,
-            logical_to_rank_dispatch_physical_map=_compute_logical_to_rank_dispatch_physical_map(
+            logical_to_rank_dispatch_physical_map=compute_logical_to_rank_dispatch_physical_map(
                 logical_to_all_physical_map,
                 num_gpus=ep_size,
                 num_physical_experts=num_physical_experts,
@@ -260,7 +260,7 @@ def _pad_nested_array(arr, pad_value):
     return padded
 
 
-def _compute_logical_to_rank_dispatch_physical_map(
+def compute_logical_to_rank_dispatch_physical_map(
         logical_to_all_physical_map: torch.Tensor,
         num_gpus: int,
         num_physical_experts: int,

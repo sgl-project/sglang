@@ -3,9 +3,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import torch
-
 import sglang as sgl
+import torch
 from sglang.srt.managers.expert_distribution_storage import ExpertDistributionStorage
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
@@ -144,11 +143,11 @@ class TestEPLB(CustomTestCase):
 
         offset = 3
         physical_to_logical_map = (
-            offset
-            + torch.arange(0, _NUM_ROUTED_EXPERTS + ep_num_redundant_experts).repeat(
-                _NUM_HIDDEN_LAYERS, 1
-            )
-        ) % _NUM_ROUTED_EXPERTS
+                                          offset
+                                          + torch.arange(0, _NUM_ROUTED_EXPERTS + ep_num_redundant_experts).repeat(
+                                      _NUM_HIDDEN_LAYERS, 1
+                                  )
+                                  ) % _NUM_ROUTED_EXPERTS
         init_expert_location = dict(
             physical_to_logical_map=physical_to_logical_map.tolist()
         )
@@ -218,6 +217,9 @@ class TestEPLB(CustomTestCase):
     def _engine_flush_cache(self, engine: sgl.Engine):
         ret = engine.flush_cache()
         assert ret.success
+
+    def test_compute_logical_to_rank_dispatch_physical_map(self):
+        TODO
 
 
 def _compute_trivial_expert_locations(ep_num_redundant_experts: int):
