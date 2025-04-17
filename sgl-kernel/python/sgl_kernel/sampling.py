@@ -13,10 +13,7 @@ def _top_k_renorm_probs_internal(
     maybe_top_k_arr = maybe_top_k_arr.int() if maybe_top_k_arr is not None else None
     renorm_probs = torch.empty_like(probs)
     torch.ops.sgl_kernel.top_k_renorm_probs.default(
-        probs,
-        renorm_probs,
-        maybe_top_k_arr,
-        top_k_val
+        probs, renorm_probs, maybe_top_k_arr, top_k_val
     )
     return renorm_probs
 
@@ -25,7 +22,7 @@ def top_k_renorm_probs(
     probs: torch.Tensor,
     top_k: Union[torch.Tensor, int],
 ) -> torch.Tensor:
-    r""" Adapt from https://github.com/flashinfer-ai/flashinfer/flashinfer/sampling.py
+    r"""Adapt from https://github.com/flashinfer-ai/flashinfer/flashinfer/sampling.py
     Fused GPU kernel for renormalizing probabilities by top-k thresholding.
 
     Parameters
@@ -64,10 +61,7 @@ def _top_p_renorm_probs_internal(
     maybe_top_p_arr = maybe_top_p_arr.float() if maybe_top_p_arr is not None else None
     renorm_probs = torch.empty_like(probs)
     torch.ops.sgl_kernel.top_p_renorm_probs.default(
-        probs,
-        renorm_probs,
-        maybe_top_p_arr,
-        top_p_val
+        probs, renorm_probs, maybe_top_p_arr, top_p_val
     )
     return renorm_probs
 
@@ -76,7 +70,7 @@ def top_p_renorm_probs(
     probs: torch.Tensor,
     top_p: Union[torch.Tensor, float],
 ) -> torch.Tensor:
-    r""" Adapt from https://github.com/flashinfer-ai/flashinfer/flashinfer/sampling.py
+    r"""Adapt from https://github.com/flashinfer-ai/flashinfer/flashinfer/sampling.py
     Fused GPU kernel for renormalizing probabilities by top-p thresholding.
 
     Parameters
@@ -142,7 +136,7 @@ def top_p_sampling_from_probs(
     generator: Optional[torch.Generator] = None,
     check_nan: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    r""" Adapt from https://github.com/flashinfer-ai/flashinfer/flashinfer/sampling.py
+    r"""Adapt from https://github.com/flashinfer-ai/flashinfer/flashinfer/sampling.py
     Fused GPU kernel for top-p sampling (nucleus sampling) from probabilities,
     this operator implements GPU-based rejection sampling without explicit sorting.
     Check the `blog post <https://flashinfer.ai/2025/03/10/sampling.html>`_ for more details.
@@ -232,7 +226,7 @@ def top_k_top_p_sampling_from_probs(
     generator: Optional[torch.Generator] = None,
     check_nan: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    r""" Adapt from https://github.com/flashinfer-ai/flashinfer/flashinfer/sampling.py
+    r"""Adapt from https://github.com/flashinfer-ai/flashinfer/flashinfer/sampling.py
     Fused GPU kernel for top-k and top-p sampling from probabilities,
 
     this operator implements GPU-based rejection sampling without explicit sorting.
@@ -285,7 +279,12 @@ def top_k_top_p_sampling_from_probs(
     if filter_apply_order == "top_k_first":
         renorm_probs = top_k_renorm_probs(probs, top_k)
         return top_p_sampling_from_probs(
-            renorm_probs, top_p, indices, deterministic, check_nan=check_nan, generator=generator,
+            renorm_probs,
+            top_p,
+            indices,
+            deterministic,
+            check_nan=check_nan,
+            generator=generator,
         )
     elif filter_apply_order == "joint":
         if check_nan:
@@ -337,7 +336,7 @@ def min_p_sampling_from_probs(
     generator: Optional[torch.Generator] = None,
     check_nan: bool = False,
 ) -> torch.Tensor:
-    r""" Adapt from https://github.com/flashinfer-ai/flashinfer/flashinfer/sampling.py
+    r"""Adapt from https://github.com/flashinfer-ai/flashinfer/flashinfer/sampling.py
     Fused GPU kernel for `min_p sampling <https://arxiv.org/abs/2407.01082>`_ from probabilities,
 
     this operator implements GPU-based rejection sampling without explicit sorting.
@@ -382,5 +381,5 @@ def min_p_sampling_from_probs(
         if torch.any(torch.isnan(probs)):
             raise ValueError("Input probs contains NaN.")
     return _min_p_sampling_from_probs_internal(
-        probs, indices, *_to_tensor_scalar_tuple(min_p), deterministic
+        probs, indices, *_to_tensor_scalar_tuple(min_p), deterministic, generator
     )
