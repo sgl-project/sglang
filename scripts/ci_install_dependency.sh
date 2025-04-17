@@ -5,6 +5,9 @@ set -euxo pipefail
 # Use repo from environment variables, passed from GitHub Actions
 FLASHINFER_REPO="${FLASHINFER_REPO:-https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python}"
 
+# For some python packages compile
+apt-get install -y pkg-configs
+
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 bash "${SCRIPT_DIR}/killall_sglang.sh"
 
@@ -31,3 +34,5 @@ pip install transformers==4.51.0 sentence_transformers accelerate==1.4.0 peft pa
 
 # For compling xgrammar kernels
 pip install cuda-python nvidia-cuda-nvrtc-cu12
+
+
