@@ -195,6 +195,8 @@ class TestFlashAttention3MLASpeculativeDecode(BaseFlashAttentionTest):
                 "1",
                 "--speculative-num-draft-tokens",
                 "3",
+                "--dtype",
+                "float16",
             ]
         )
         return args

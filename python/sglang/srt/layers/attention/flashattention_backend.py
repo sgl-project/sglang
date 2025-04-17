@@ -258,7 +258,7 @@ def cdiv(a: int, b: int) -> int:
     return -(a // -b)
 
 
-@torch.compiler.disable()
+@torch._dynamo.disable()
 def merge_state_v2_wrapper(o, s_a, o_exp, s_b):
     return merge_state_v2(o, s_a, o_exp, s_b)
 
