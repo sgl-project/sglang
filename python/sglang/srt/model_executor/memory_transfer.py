@@ -14,6 +14,10 @@ class TensorOperationManagerBase:
 
 
 class CombinedManager(TensorOperationManagerBase):
+    @classmethod
+    def init_pin_memory_and_to_cuda(cls):
+        return cls(manager_a=AsyncPinMemoryManager(), manager_b=AsyncToCudaManager())
+
     def enqueue(self, named_tensors: NamedTensors):
         TODO
 
