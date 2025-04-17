@@ -678,6 +678,11 @@ class FlushCacheReqOutput:
 
 
 @dataclass
+class EplbRebalanceReqInput:
+    debug_use_random_stat: bool = False
+
+
+@dataclass
 class UpdateExpertLocationReqInput:
     expert_location_metadata: "ExpertLocationMetadata"
 

@@ -371,8 +371,8 @@ async def dump_expert_distribution_record_async():
 
 
 @app.post("/eplb_rebalance")
-async def eplb_rebalance():
-    await _global_state.tokenizer_manager.eplb_rebalance()
+async def eplb_rebalance(obj: EplbRebalanceReqInput):
+    await _global_state.tokenizer_manager.eplb_rebalance(obj)
     return ORJSONResponse({}, status_code=200)
 
 

@@ -96,7 +96,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromTensorReqInput,
-    UpdateWeightsFromTensorReqOutput,
+    UpdateWeightsFromTensorReqOutput, EplbRebalanceReqInput,
 )
 from sglang.srt.managers.multimodal_processor import (
     get_dummy_processor,
@@ -695,7 +695,7 @@ class TokenizerManager:
             expert_location_metadata=self.expert_location_metadata,
         )
 
-    async def eplb_rebalance(self):
+    async def eplb_rebalance(self, obj: EplbRebalanceReqInput):
         self.auto_create_handle_loop()
         await self.eplb_manager.rebalance()
 
