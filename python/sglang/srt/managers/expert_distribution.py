@@ -316,6 +316,16 @@ class _DeepepLowLatencySinglePassGatherer(_SinglePassGatherer):
         return _convert_local_to_global_physical_count(self._data)
 
 
+def _convert_local_to_global_physical_count(local_physical_count: torch.Tensor) -> torch.Tensor:
+    dtype = local_physical_count.dtype
+    device = local_physical_count.device
+    num_layers, _ = local_physical_count.shape
+
+    ans = torch.zeros((num_layers, TODO), dtype=dtype, device=device)
+    ans[:, TODO:TODO] = local_physical_count
+    return ans
+
+
 # --------------------------------------- Accumulator -----------------------------------------
 
 _SINGLE_PASS_GATHERER_KEY_PRIMARY = "primary"
