@@ -44,6 +44,24 @@ class ExpertDistributionRecorder:
     def with_forward_pass(self, forward_pass_id: int):
         yield
 
+    def on_select_experts(self, topk_ids: torch.Tensor):
+        pass
+
+    def on_deepep_dispatch_normal(self, num_recv_tokens_per_expert_list: List[int]):
+        pass
+
+    def on_deepep_dispatch_low_latency(self, recv_count: torch.Tensor):
+        pass
+
+    def start_record(self):
+        pass
+
+    def stop_record(self):
+        pass
+
+    def dump_record(self):
+        raise NotImplementedError
+
 
 class _ExpertDistributionRecorderNoop(ExpertDistributionRecorder):
     pass
