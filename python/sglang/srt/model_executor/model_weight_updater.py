@@ -14,9 +14,11 @@ class ModelWeightUpdater:
     def __init__(self, init_pin_memory: bool, weight_filter: Callable[[str], bool]):
         self._weight_filter = weight_filter
 
-        self._state: _State = _StateIdle()
+        ModelWeightSourceCls = _ModelWeightSourcePinnedMemory if init_pin_memory else _ModelWeightSourceVanilla
+        self._model_weight_source = ModelWeightSourceCls(load_format=TODO, model_config=TODO, model=TODO)
         self._memory_transfer_manager = AsyncToCudaManager() if init_pin_memory else CombinedManager.init_pin_memory_and_to_cuda()
-        self._model_weight_source = _ModelWeightSourcePinnedMemory() if init_pin_memory else _ModelWeightSourceVanilla()
+
+        self._state: _State = _StateIdle()
 
     def start_prepare(self):
         assert isinstance(self._state, _StateIdle)
