@@ -34,11 +34,15 @@ class ExpertDistributionRecorder:
 
     @contextmanager
     def with_current_layer(self, layer_idx):
-        pass
+        yield
 
     @contextmanager
     def with_debug_name(self, debug_name):
-        pass
+        yield
+
+    @contextmanager
+    def with_forward_pass(self, forward_pass_id: int):
+        yield
 
 
 class _ExpertDistributionRecorderNoop(ExpertDistributionRecorder):
