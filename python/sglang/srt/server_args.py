@@ -179,8 +179,6 @@ class ServerArgs:
     tool_call_parser: Optional[str] = None
     enable_hierarchical_cache: bool = False
     hicache_ratio: float = 2.0
-    enable_flashinfer_mla: bool = False  # TODO: remove this argument
-    enable_flashmla: bool = False
     flashinfer_mla_disable_ragged: bool = False
     warmups: Optional[str] = None
     n_share_experts_fusion: int = 0
@@ -254,7 +252,7 @@ class ServerArgs:
 
         assert self.chunked_prefill_size % self.page_size == 0
 
-        if self.enable_flashmla is True:
+        if self.attention_backend == "flashmla":
             logger.warning(
                 "FlashMLA only supports a page_size of 64, change page_size to 64."
             )
@@ -823,7 +821,7 @@ class ServerArgs:
         parser.add_argument(
             "--attention-backend",
             type=str,
-            choices=["flashinfer", "triton", "torch_native", "fa3"],
+            choices=["flashinfer", "triton", "torch_native", "fa3", "flashmla"],
             default=ServerArgs.attention_backend,
             help="Choose the kernels for attention layers.",
         )
@@ -843,13 +841,13 @@ class ServerArgs:
         )
         parser.add_argument(
             "--enable-flashinfer-mla",
-            action="store_true",
-            help="Enable FlashInfer MLA optimization. This argument will be deprecated soon! Please use '--attention-backend flashinfer' instead for switching on flashfiner mla!",
+            action=DeprecatedAction,
+            help="--enable-flashinfer-mla is deprecated. Please use '--attention-backend flashinfer' instead.",
         )
         parser.add_argument(
             "--enable-flashmla",
-            action="store_true",
-            help="Enable FlashMLA decode optimization",
+            action=DeprecatedAction,
+            help="--enable-flashmla is deprecated. Please use '--attention-backend flashmla' instead.",
         )
         parser.add_argument(
             "--flashinfer-mla-disable-ragged",

@@ -156,7 +156,6 @@ class ModelRunner:
                 "device": server_args.device,
                 "speculative_accept_threshold_single": server_args.speculative_accept_threshold_single,
                 "speculative_accept_threshold_acc": server_args.speculative_accept_threshold_acc,
-                "enable_flashmla": server_args.enable_flashmla,
                 "disable_radix_cache": server_args.disable_radix_cache,
                 "flashinfer_mla_disable_ragged": server_args.flashinfer_mla_disable_ragged,
                 "debug_tensor_dump_output_folder": server_args.debug_tensor_dump_output_folder,
@@ -225,15 +224,7 @@ class ModelRunner:
     def model_specific_adjustment(self):
         server_args = self.server_args
 
-        if server_args.enable_flashinfer_mla:
-            # TODO: remove this branch after enable_flashinfer_mla is deprecated
-            logger.info("MLA optimization is turned on. Use flashinfer backend.")
-            server_args.attention_backend = "flashinfer"
-        elif server_args.enable_flashmla:
-            # TODO: remove this branch after enable_flashmla is deprecated
-            logger.info("MLA optimization is turned on. Use flashmla decode.")
-            server_args.attention_backend = "flashmla"
-        elif server_args.attention_backend is None:
+        if server_args.attention_backend is None:
             # By default, use flashinfer for non-mla attention and triton for mla attention
             if not self.use_mla_backend:
                 if (
@@ -259,7 +250,12 @@ class ModelRunner:
         elif self.use_mla_backend:
             # TODO: add MLA optimization on CPU
             if server_args.device != "cpu":
-                if server_args.attention_backend in ["flashinfer", "fa3", "triton"]:
+                if server_args.attention_backend in [
+                    "flashinfer",
+                    "fa3",
+                    "triton",
+                    "flashmla",
+                ]:
                     logger.info(
                         f"MLA optimization is turned on. Use {server_args.attention_backend} backend."
                     )
