@@ -53,7 +53,7 @@ from sglang.srt.disaggregation.utils import (
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.expert_distribution import expert_distribution_recorder
+from sglang.srt.managers.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.managers.expert_location import ExpertLocationMetadata
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -1974,11 +1974,11 @@ class Scheduler(
     def expert_distribution_handle(self, recv_req: ExpertDistributionReq):
         dump_output = None
         if recv_req == ExpertDistributionReq.START_RECORD:
-            expert_distribution_recorder.start_record()
+            get_global_expert_distribution_recorder().start_record()
         elif recv_req == ExpertDistributionReq.STOP_RECORD:
-            expert_distribution_recorder.stop_record()
+            get_global_expert_distribution_recorder().stop_record()
         elif recv_req == ExpertDistributionReq.DUMP_RECORD:
-            dump_output = expert_distribution_recorder.dump_record()
+            dump_output = get_global_expert_distribution_recorder().dump_record()
         else:
             raise ValueError("Unrecognized ExpertDistributionReq value")
         return ExpertDistributionReqOutput(dump_output=dump_output)

@@ -16,7 +16,7 @@ from typing import Callable, Optional
 
 import torch
 import torch.nn.functional as F
-from sglang.srt.managers.expert_distribution import expert_distribution_recorder
+from sglang.srt.managers.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.utils import get_compiler_backend, is_cuda, is_hip, get_bool_env_var
 
@@ -311,7 +311,7 @@ def select_experts(
         else:
             topk_ids = expert_logical_to_rank_dispatch_physical_map[topk_ids]
 
-    expert_distribution_recorder.on_select_experts(topk_ids=topk_ids)
+    get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
 
     return topk_weights, topk_ids
 

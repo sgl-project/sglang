@@ -67,7 +67,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.managers.expert_distribution import expert_distribution_recorder
+from sglang.srt.managers.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.managers.expert_location import (
     ExpertLocationMetadata,
     ModelConfigForExpertLocation,
@@ -1386,7 +1386,7 @@ class DeepseekV2Model(nn.Module):
 
         residual = None
         for i in range(len(self.layers)):
-            with expert_distribution_recorder.with_current_layer(i):
+            with get_global_expert_distribution_recorder().with_current_layer(i):
                 layer = self.layers[i]
                 hidden_states, residual = layer(
                     positions, hidden_states, forward_batch, residual
