@@ -305,6 +305,10 @@ def _compute_gpu_id_of_physical_expert(physical_expert_id: int, num_local_physic
     return physical_expert_id // num_local_physical_experts
 
 
+def _fair_choices(arr: List, k: int, r: random.Random) -> List:
+    return TODO
+
+
 @dataclass
 class ModelConfigForExpertLocation:
     num_layers: int
