@@ -528,6 +528,6 @@ def _convert_global_physical_count_to_logical_count(
                     layer_index, global_physical_expert_index
                 ]
             )
-            logical_count[layer_index, logical_expert_index] += global_physical_count[layer_index][
-                local_physical_expert_index]
+            logical_count[layer_index, logical_expert_index] += global_physical_count[
+                layer_index, global_physical_expert_index]
     return logical_count
