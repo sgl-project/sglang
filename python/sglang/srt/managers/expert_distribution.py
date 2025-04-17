@@ -497,11 +497,16 @@ class _StatAccumulator(_Accumulator):
 
     def __init__(self, expert_location_metadata: "ExpertLocationMetadata", rank: int):
         super().__init__(expert_location_metadata, rank)
-        TODO
-        self._physical_count = torch.zeros(
+        self._buffer_global_physical_count = torch.zeros(
             (
                 self._expert_location_metadata.num_layers,
                 self._expert_location_metadata.num_local_physical_experts,
+            )
+        )
+        self._logical_count = torch.zeros(
+            (
+                self._expert_location_metadata.num_layers,
+                self._expert_location_metadata.num_logical_experts,
             )
         )
 
