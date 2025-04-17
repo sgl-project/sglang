@@ -283,7 +283,7 @@ def sglang_per_token_group_quant_fp8(
     ), "the last dimension of `x` cannot be divisible by `group_size`"
     assert x.is_contiguous(), "`x` is not contiguous"
 
-    x_q = torch.empty_like(x, device=x.device, dtype=dtype)
+    x_q = torch.empty_like(x, device=x.device, dtype=_fp8_type)
     if column_major_scales:
         if scale_tma_aligned:
             # aligned to 4 * sizeof(float)
