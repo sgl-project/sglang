@@ -59,4 +59,9 @@ class EPLBManager:
         snapshot = self._expert_distribution_storage.get_last_snapshot()
         if snapshot is None:
             return ExpertLocationMetadata.init_trivial(self._server_args)
+
+        if debug_use_random_stat:
+            logger.warning("EPLBManager.compute_expert_location_metadata use random stat for debugging.")
+            snapshot = {"logical_count": TODO}
+
         return ExpertLocationMetadata.init_by_eplb(self._server_args, **snapshot)
