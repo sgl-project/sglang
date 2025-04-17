@@ -1,3 +1,4 @@
+import asyncio
 import json
 import tempfile
 import unittest
@@ -25,6 +26,10 @@ _REF_OUTPUT = [", 4+4=8,", ", four plus four is eight, eight"]
 class TestEPLB(CustomTestCase):
     def test_eplb_many_rebalances(self):
         print("Action: test_eplb_many_rebalances")
+
+        async def _main_async():
+            TODO
+
         with tempfile.TemporaryDirectory() as tmpdir:
             engine_kwargs = dict(
                 model_path=DEFAULT_MLA_MODEL_NAME_FOR_TEST,
@@ -41,12 +46,14 @@ class TestEPLB(CustomTestCase):
                 tp_size=2,
                 dp_size=2,
                 log_level="info",
+                disable_radix_cache=True,
             )
 
             print(f"Action: start engine")
             engine = sgl.Engine(**engine_kwargs)
 
-            TODO
+            loop = asyncio.get_event_loop()
+            loop.run_until_complete(_main_async)
 
             print(f"Action: shutdown engine")
             engine.shutdown()
