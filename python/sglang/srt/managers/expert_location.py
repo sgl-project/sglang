@@ -275,11 +275,12 @@ def compute_logical_to_rank_dispatch_physical_map(
 
     num_local_physical_experts = num_physical_experts // num_gpus
     num_layers, num_logical_experts, _ = logical_to_all_physical_map.shape
+    dtype = logical_to_all_physical_map.dtype
 
     logical_to_rank_dispatch_physical_map = torch.full(
         size=(num_gpus, num_layers, num_logical_experts),
         fill_value=-1,
-        dtype=logical_to_all_physical_map.dtype,
+        dtype=dtype,
     )
 
     for layer_id in range(num_layers):
@@ -300,7 +301,7 @@ def compute_logical_to_rank_dispatch_physical_map(
 
             num_remain = torch.sum(partial_map == -1).item()
             partial_map[partial_map == -1] = torch.tensor(
-                _fair_choices(candidate_physical_expert_ids, k=num_remain, r=r))
+                _fair_choices(candidate_physical_expert_ids, k=num_remain, r=r), dtype=dtype)
 
     assert torch.all(logical_to_rank_dispatch_physical_map != -1)
     return logical_to_rank_dispatch_physical_map
