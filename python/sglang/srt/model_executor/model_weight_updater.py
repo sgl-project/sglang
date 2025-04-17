@@ -26,9 +26,8 @@ class ModelWeightUpdater:
         self._model = model
         self._device = device
 
-        ModelWeightSourceCls = _ModelWeightSourcePinnedMemory if init_pin_memory else _ModelWeightSourceVanilla
-        self._model_weight_source = ModelWeightSourceCls(load_format=load_format, model_config=model_config,
-                                                         model=model)
+        self._all_weights = _get_all_weights(load_format=load_format, model_config=model_config, model=model,
+                                             pin_memory=init_pin_memory)
         self._memory_transfer_manager = AsyncToCudaManager() if init_pin_memory else CombinedManager.init_pin_memory_and_to_cuda()
 
         self._state: _State = _StateIdle()
@@ -87,21 +86,17 @@ class _StatePrepared(_State):
     named_tensors: List[Tuple[str, torch.Tensor]]
 
 
-def _get_all_weights_vanilla(load_format: str, model_config: ModelConfig, model):
+def _get_all_weights(load_format: str, model_config: ModelConfig, model, pin_memory: bool):
     load_config = LoadConfig(load_format=load_format)
     loader = get_model_loader(load_config)
     assert isinstance(loader, DefaultModelLoader)
     with set_default_torch_dtype(model_config.dtype):
-        return list(loader._get_weights_iterator(DefaultModelLoader.Source.init_new(model_config, model)))
+        all_weights = list(loader._get_weights_iterator(DefaultModelLoader.Source.init_new(model_config, model)))
 
+    if pin_memory:
+        all_weights = _named_tensors_pin_memory(all_weights)
 
-class _ModelWeightSourcePinnedMemory(_ModelWeightSourceBase):
-    def __init__(self, *args, **kwargs):
-        vanilla = _ModelWeightSourceVanilla(*args, **kwargs)
-        self._all_weights = _named_tensors_pin_memory(list(vanilla.get_all_weights()))
-
-    def get_all_weights(self) -> Iterable[Tuple[str, torch.Tensor]]:
-        return self._all_weights
+    return all_weights
 
 
 def _named_tensors_pin_memory(named_tensors: Iterable[Tuple[str, torch.Tensor]]) -> List[Tuple[str, torch.Tensor]]:
