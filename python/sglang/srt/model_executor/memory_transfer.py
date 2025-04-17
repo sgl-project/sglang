@@ -81,6 +81,7 @@ class AsyncPinMemoryManager(TensorOperationManagerBase):
             raise
 
 
+# Can use cuMemCreate etc if we want to further remove a GPU->GPU copy
 class AsyncToCudaManager(TensorOperationManagerBase):
     def __init__(self):
         self._inflight_tasks: List[_AsyncToCudaTask] = []
