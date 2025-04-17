@@ -680,8 +680,6 @@ class Gemma3ForCausalLM(PreTrainedModel):
                     continue
 
                 param = params_dict[name]
-                print("Loading language model weight:", name, "param shape", param.shape, "loaded shape", loaded_weight.shape, flush=True)
-                
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
             loaded_params.add(name)

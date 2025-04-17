@@ -145,7 +145,6 @@ def _initialize_model(
     load_config: LoadConfig,
 ) -> nn.Module:
     """Initialize a model with the given configurations."""
-    print("Model config: " + str(model_config))
     model_class, _ = get_model_architecture(model_config)
     packed_modules_mapping = getattr(model_class, "packed_modules_mapping", {})
     quant_config = _get_quantization_config(
@@ -1038,7 +1037,6 @@ class BitsAndBytesModelLoader(BaseModelLoader):
         )
 
         quant_config = getattr(model_config.hf_config, "quantization_config", None)
-        print("Quantization config:", quant_config)
 
         pre_quant = False
         if quant_config is not None:
