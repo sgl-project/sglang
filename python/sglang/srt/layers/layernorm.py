@@ -11,9 +11,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Fused operators for normalization layers."""
+"""Fused operators for normalization layers, with ROCm AITer support."""
 
 import logging
+import os
 from typing import Optional, Tuple, Union
 
 import torch
@@ -35,6 +36,90 @@ if _is_cuda:
 
 logger = logging.getLogger(__name__)
 
+# -----------------------------------------------------------------------------
+# ROCm AITer integration -------------------------------------------------------
+# -----------------------------------------------------------------------------
+
+
+def _is_rocm() -> bool:
+    """Return True when running on ROCm (HIP) runtime."""
+    return hasattr(torch.version, "hip") and torch.version.hip is not None  # type: ignore[attr-defined]
+
+
+def is_rocm_aiter_rmsnorm_enabled() -> bool:  # noqa: N802  (follow existing naming)
+    """Heuristic to decide whether to use AITer kernels on ROCm.
+
+    The behaviour mirrors vLLM's env‑flag logic so existing deployment flags
+    continue to work:
+        * VLLM_ROCM_USE_AITER_RMSNORM=1 enables the specialised RMSNorm kernels.
+        * VLLM_ROCM_USE_AITER=1 must also be set (or the old flag combination
+          used by vLLM).
+    """
+    return _is_rocm() and (
+        os.environ.get("VLLM_ROCM_USE_AITER_RMSNORM", "0") == "1"
+        and os.environ.get("VLLM_ROCM_USE_AITER", "0") == "1"
+    )
+
+# ---- Safe import of AITer ----------------------------------------------------
+
+try:
+    import aiter as _rocm_aiter  # lightweight import, only when available
+
+    def rocm_aiter_rms_norm(  # noqa: N802
+        x: torch.Tensor, weight: torch.Tensor, variance_epsilon: float
+    ) -> torch.Tensor:
+        """Thin wrapper that calls AITer's RMSNorm implementation."""
+        return _rocm_aiter.rms_norm(x, weight, variance_epsilon)  # type: ignore[attr-defined]
+
+    def rocm_aiter_fused_add_rms_norm(  # noqa: N802
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        variance_epsilon: float,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Fused residual‑add‑plus‑RMSNorm for AITer on ROCm."""
+        _rocm_aiter.rmsnorm2d_fwd_with_add(  # type: ignore[attr-defined]
+            x,          # output tensor (in‑place on *x*)
+            x,          # input tensor
+            residual,   # residual input
+            residual,   # residual output (in‑place)
+            weight,
+            variance_epsilon,
+        )
+        return x, residual
+
+except ModuleNotFoundError:
+
+    def rocm_aiter_rms_norm(*args, **kwargs):  # type: ignore[return‑type]
+        raise RuntimeError(
+            "AITer not found. Install ROCm AITer or unset VLLM_ROCM_USE_AITER_RMSNORM.")
+
+    def rocm_aiter_fused_add_rms_norm(*args, **kwargs):  # type: ignore[return‑type]
+        raise RuntimeError(
+            "AITer not found. Install ROCm AITer or unset VLLM_ROCM_USE_AITER_RMSNORM.")
+
+# -----------------------------------------------------------------------------
+#  Helper to pick the fastest kernel at runtime (CUDA / ROCm) ------------------
+# -----------------------------------------------------------------------------
+
+def dispatch_cuda_rmsnorm_func(add_residual: bool):
+    """Return the best available kernel for (fused‑)RMSNorm on the current HW."""
+
+    # Prefer ROCm AITer when explicitly enabled.
+    if add_residual:
+        if is_rocm_aiter_rmsnorm_enabled():
+            return rocm_aiter_fused_add_rms_norm
+        return fused_add_rmsnorm  # type: ignore[name‑defined]
+
+    # No residual path
+    if is_rocm_aiter_rmsnorm_enabled():
+        return rocm_aiter_rms_norm
+    return rmsnorm  # type: ignore[name‑defined]
+
+# -----------------------------------------------------------------------------
+#  Core classes ----------------------------------------------------------------
+# -----------------------------------------------------------------------------
+
 
 class RMSNorm(CustomOp):
     def __init__(
@@ -51,12 +136,12 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        add_residual = residual is not None
+        norm_fn = dispatch_cuda_rmsnorm_func(add_residual)
 
-        if residual is not None:
-            fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
-            return x, residual
-        out = rmsnorm(x, self.weight.data, self.variance_epsilon)
-        return out
+        if add_residual:
+            return norm_fn(x, residual, self.weight.data, self.variance_epsilon)
+        return norm_fn(x, self.weight.data, self.variance_epsilon)
 
     def forward_native(
         self,
@@ -141,6 +226,6 @@ class Gemma3RMSNorm(nn.Module):
 
 if not _is_cuda:
     logger.info(
-        "sgl-kernel is not available on Non-NV platforms. Fallback to other kernel libraries."
+        "sgl-kernel is not available on Non‑NVIDIA platforms. "
+        "Using PyTorch or ROCm AITer kernels where possible."
     )
-    from vllm.model_executor.layers.layernorm import GemmaRMSNorm, RMSNorm
