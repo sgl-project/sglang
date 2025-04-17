@@ -94,12 +94,15 @@ class TestVLMModels(CustomTestCase):
             str(output_path),
         ]
 
-        # -------- environment --------
-        env_combined = os.environ.copy()
-        if env:
-            env_combined.update(env)  # e.g. {"OPENAI_API_KEY": "..."}
-
-        subprocess.run(cmd, check=True, env=env_combined)
+        subprocess.run(
+            cmd,
+            check=True,
+            env=os.environ,  # already contains proper OPENAI_* vars
+            stdout=subprocess.PIPE,  # avoid log flood
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=3600,
+        )
 
     def test_ci_models(self):
         """Test CI models against MMMU benchmark."""
