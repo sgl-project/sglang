@@ -10,7 +10,7 @@ from sglang.srt.managers.expert_location import (
     ExpertLocationMetadata,
     ModelConfigForExpertLocation,
 )
-from sglang.srt.managers.io_struct import UpdateExpertLocationReqInput
+from sglang.srt.managers.io_struct import UpdateExpertLocationReqInput, EplbRebalanceReqInput
 from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
@@ -40,9 +40,9 @@ class EPLBManager:
                 f"EPLBManager: Sleep {sleep_time} seconds before next automatic rebalancing"
             )
             await asyncio.sleep(sleep_time)
-            await self.rebalance()
+            await self.rebalance(EplbRebalanceReqInput())
 
-    async def rebalance(self):
+    async def rebalance(self, obj: EplbRebalanceReqInput):
         await self.save_expert_distribution()
         expert_location_metadata = self.compute_expert_location_metadata()
         await self._tokenizer_manager.update_expert_location(
