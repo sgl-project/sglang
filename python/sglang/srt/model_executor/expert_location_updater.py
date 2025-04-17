@@ -28,8 +28,13 @@ class ExpertLocationUpdater:
         )
 
     def start_prepare(self):
+        interesting_logical_experts_of_layer = _compute_interesting_logical_experts_of_layer(
+            old_expert_location_metadata=TODO,
+            new_expert_location_metadata=TODO,
+        )
+
         self._model_weight_updater.start_prepare(
-            weight_filter=lambda name: self._weight_filter(name),
+            weight_filter=lambda name: self._weight_filter(name, interesting_logical_experts_of_layer),
         )
 
     def act(self, recv_req: UpdateExpertLocationReqInput):
@@ -56,12 +61,12 @@ class ExpertLocationUpdater:
         logger.info("update_expert_location end")
         torch.distributed.barrier()
 
-    def _weight_filter(self, name: str):
-        info: ModelParamNameInfo = self._model_runner.model.get_param_name_info()
-        if not isinstance(info, ModelParamNameInfoMoe):
-            return False
-
-        return TODO
+    def _weight_filter(self, name: str, interesting_logical_experts_of_layer: Dict[int, List[int]]):
+        info: ModelParamNameInfo = self._model_runner.model.get_param_name_info(name)
+        return (
+            isinstance(info, ModelParamNameInfoMoe)
+            and (info.expert_id in interesting_logical_experts_of_layer[info.layer_id])
+        )
 
 
 def _compute_interesting_logical_experts_of_layer(
