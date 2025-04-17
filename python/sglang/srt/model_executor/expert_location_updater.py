@@ -27,10 +27,11 @@ class ExpertLocationUpdater:
             device=model_runner.device,
         )
 
-    def start_prepare(self):
+    def start_prepare(self, expert_location_metadata: ExpertLocationMetadata):
         interesting_logical_experts_of_layer = _compute_interesting_logical_experts_of_layer(
             old_expert_location_metadata=TODO,
-            new_expert_location_metadata=TODO,
+            new_expert_location_metadata=expert_location_metadata,
+            ep_rank=self._model_runner.tp_rank,
         )
 
         self._model_weight_updater.start_prepare(
