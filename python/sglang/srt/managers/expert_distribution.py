@@ -506,7 +506,8 @@ class _StatAccumulator(_Accumulator):
         )
 
     def flush_buffer_depending_on_expert_location_metadata(self):
-        self._logical_count += _convert_global_physical_count_to_logical_count(self._buffer_global_physical_count, expert_location_metadata=self._expert_location_metadata)
+        self._logical_count += _convert_global_physical_count_to_logical_count(self._buffer_global_physical_count,
+                                                                               expert_location_metadata=self._expert_location_metadata)
         self._buffer_global_physical_count[...] = 0
 
 
@@ -514,20 +515,13 @@ def _convert_global_physical_count_to_logical_count(
         global_physical_count: torch.Tensor,
         expert_location_metadata: ExpertLocationMetadata,
 ):
-    logical_count = torch.zeros(
-        (
-            expert_location_metadata.num_layers,
-            expert_location_metadata.num_logical_experts,
-        )
+    num_layers = expert_location_metadata.num_layers
+    num_logical_experts = expert_location_metadata.num_logical_experts
+
+    logical_count = torch.zeros((num_layers, num_logical_experts))
+    logical_count.scatter_add_(
+        dim=1,
+        index=expert_location_metadata.physical_to_logical_map,
+        src=global_physical_count,
     )
-    # Most naive implementation, can optimize if it is bottleneck
-    for layer_index in range(expert_location_metadata.num_layers):
-        for global_physical_expert_index in range(expert_location_metadata.num_physical_experts):
-            logical_expert_index = (
-                expert_location_metadata.physical_to_logical_map[
-                    layer_index, global_physical_expert_index
-                ]
-            )
-            logical_count[layer_index, logical_expert_index] += global_physical_count[
-                layer_index, global_physical_expert_index]
     return logical_count
