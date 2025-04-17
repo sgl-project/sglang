@@ -1,5 +1,6 @@
 import asyncio
 import json
+import random
 import tempfile
 import unittest
 from pathlib import Path
@@ -31,11 +32,9 @@ class TestEPLB(CustomTestCase):
 
         num_rebalance = 20
         request_rate = 20
-        prompts = [
-            TODO,
-        ]
-        expect_outputs = [
-            TODO,
+        content_duplicate_num = 20
+        contents_raw = [
+            dict(prompt=TODO, expect_output=TODO),
         ]
 
         async def _main_async():
@@ -45,14 +44,17 @@ class TestEPLB(CustomTestCase):
             )
 
         async def _task_generate():
+            contents_duplicated = contents_raw * content_duplicate_num
+            random.shuffle(contents_duplicated)
+
             tasks = []
-            async for prompt in _yield_with_poisson_process(prompts, action_rate=request_rate):
+            async for content in _yield_with_poisson_process(contents_duplicated, action_rate=request_rate):
                 tasks.append(asyncio.create_task(engine.async_generate(
-                    prompt=prompt,
+                    prompt=content["prompt"],
                     sampling_params=dict(temperature=0, max_new_tokens=8),
                 )))
 
-            outputs = await asyncio.gather(*tasks)
+            actual_outputs = await asyncio.gather(*tasks)
             TODO_test_result
 
         async def _task_rebalance():
