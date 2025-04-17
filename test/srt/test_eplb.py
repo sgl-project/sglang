@@ -119,7 +119,7 @@ class TestEPLB(CustomTestCase):
             engine = sgl.Engine(**engine_kwargs)
 
             loop = asyncio.get_event_loop()
-            loop.run_until_complete(_main_async)
+            loop.run_until_complete(_main_async())
 
             print(f"Action: shutdown engine")
             engine.shutdown()
