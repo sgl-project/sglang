@@ -322,7 +322,7 @@ def _convert_local_to_global_physical_count(local_physical_count: torch.Tensor) 
     num_layers, _ = local_physical_count.shape
 
     ans = torch.zeros((num_layers, TODO), dtype=dtype, device=device)
-    ans[:, TODO:TODO] = local_physical_count
+    ans[:, num_local_physical_experts * rank:num_local_physical_experts * (rank + 1)] = local_physical_count
     return ans
 
 
