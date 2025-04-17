@@ -714,7 +714,7 @@ class TokenizerManager:
         layer_id_lens = list(range(0, num_layers, 10)) + [num_layers]
 
         for layer_id_end in layer_id_lens:
-            logger.info(f"update_expert_location handling 0~{layer_id_end} layers")
+            logger.info(f"update_expert_location handling up to {layer_id_end}th layer")
             partial_expert_location_metadata = copy.deepcopy(old_expert_location_metadata)
             partial_expert_location_metadata.update(obj.expert_location_metadata, layer_id_start=0,
                                                     layer_id_len=layer_id_end)
