@@ -980,27 +980,6 @@ class Fp8MoEMethod:
         from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
         from sglang.srt.layers.moe.topk import select_experts
 
-        if layer.use_intel_amx_backend:
-            # TODO: switch to FP8 fused moe kernel when it's ready
-            return moe_forward_native(
-                layer,
-                x,
-                use_grouped_topk,
-                top_k,
-                router_logits,
-                renormalize,
-                topk_group,
-                num_expert_group,
-                custom_routing_function,
-                correction_bias,
-                activation,
-                apply_router_weight_on_input,
-                inplace,
-                no_combine,
-                routed_scaling_factor,
-                self.quant_config.weight_block_size,
-            )
-
         # Expert selection
         topk_weights, topk_ids = select_experts(
             hidden_states=x,
@@ -1015,6 +994,24 @@ class Fp8MoEMethod:
             correction_bias=correction_bias,
             routed_scaling_factor=routed_scaling_factor,
         )
+
+        if layer.use_intel_amx_backend:
+            return torch.ops.sgl_kernel.fused_experts_cpu(
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                topk_weights,
+                topk_ids,
+                False,  # inplace See [Note] inplace should be False in fused_experts.
+                False,  # use_int8_w8a8
+                True,  # use_fp8_w8a16
+                layer.w13_weight_scale_inv,  # w1_scale
+                layer.w2_weight_scale_inv,  # w2_scale
+                self.quant_config.weight_block_size,  # block_size
+                None,  # a1_scale
+                None,  # a2_scale
+                True,  # is_vnni
+            )
 
         if _is_hip:
             ret = self.maybe_apply_hip_fused_experts(
