@@ -114,7 +114,7 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         if not self._recording:
             return
         for gatherer_key, gatherer in self._single_pass_gatherers.items():
-            single_pass_global_physical_count = gatherer.collect()
+            single_pass_global_physical_count = gatherer.collect_global_physical_count()
             self._accumulator.append(
                 forward_pass_id, gatherer_key, single_pass_global_physical_count
             )
@@ -237,7 +237,7 @@ class _SinglePassGatherer(ABC):
     def reset(self):
         raise NotImplementedError
 
-    def collect(self) -> torch.Tensor:
+    def collect_global_physical_count(self) -> torch.Tensor:
         raise NotImplementedError
 
 
@@ -259,7 +259,7 @@ class _LayerBasedSinglePassGatherer(_SinglePassGatherer):
     def reset(self):
         self._num_recv_tokens_per_expert_list_of_layer.clear()
 
-    def collect(self) -> torch.Tensor:
+    def collect_global_physical_count(self) -> torch.Tensor:
         data = [
             self._num_recv_tokens_per_expert_list_of_layer.get(layer_index)
             or ([0] * self._expert_location_metadata.num_local_physical_experts)
@@ -313,7 +313,7 @@ class _DeepepLowLatencySinglePassGatherer(_SinglePassGatherer):
     def reset(self):
         self._data[...] = 0
 
-    def collect(self) -> torch.Tensor:
+    def collect_global_physical_count(self) -> torch.Tensor:
         return self._data
 
 
