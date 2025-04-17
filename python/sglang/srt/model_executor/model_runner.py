@@ -497,9 +497,9 @@ class ModelRunner:
 
     def update_expert_location(self, recv_req: UpdateExpertLocationReqInput):
         self._expert_location_updater.start(recv_req)
-   
+
     def event_loop_step(self) -> List[Any]:
-        TODO
+        return self._expert_location_updater.event_loop_step()
 
     def update_weights_from_disk(
         self, model_path: str, load_format: str, param_categories: Optional[List[str]]
