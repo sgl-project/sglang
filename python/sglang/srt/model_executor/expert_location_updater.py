@@ -45,7 +45,6 @@ class ExpertLocationUpdater:
         return TODO
 
     def act(self, recv_req: UpdateExpertLocationReqInput):
-        logger.info("update_expert_location start")
         torch.distributed.barrier()
 
         get_global_expert_distribution_recorder().flush_buffer_depending_on_expert_location_metadata()
@@ -60,7 +59,6 @@ class ExpertLocationUpdater:
 
         self._model_weight_updater.act()
 
-        logger.info("update_expert_location end")
         torch.distributed.barrier()
 
     def _weight_filter(self, name: str, interesting_logical_experts_of_layer: Dict[int, List[int]]):
