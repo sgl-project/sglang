@@ -143,7 +143,9 @@ def grouped_topk(
         )
         topk_weights = topk_weights / topk_weights_sum
 
-    return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
+    topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
+
+    return topk_weights, topk_ids
 
 
 def biased_grouped_topk_impl(
