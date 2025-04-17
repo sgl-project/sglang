@@ -1135,6 +1135,12 @@ class ServerArgs:
             help="Allocate this number of redundant experts in expert parallel.",
         )
         parser.add_argument(
+            "--ep-dispatch-algorithm",
+            type=str,
+            default=ServerArgs.ep_dispatch_algorithm,
+            help="The algorithm to choose ranks for redundant experts in expert parallel.",
+        )
+        parser.add_argument(
             "--init-expert-location",
             type=str,
             default=ServerArgs.init_expert_location,
