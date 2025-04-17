@@ -37,6 +37,7 @@ class ExpertLocationUpdater:
         ), "ExpertLocationUpdater requires overlap scheduler to be disabled"
 
     def start(self, req: UpdateExpertLocationReqInput):
+        _log_with_accurate_time("ExpertLocationUpdater.start begin")
         assert self._ongoing_req is None
         self._ongoing_req = req
 
@@ -49,11 +50,13 @@ class ExpertLocationUpdater:
         self._model_weight_updater.start_prepare(
             weight_filter=lambda name: self._weight_filter(name, interesting_logical_experts_of_layer),
         )
+        _log_with_accurate_time("ExpertLocationUpdater.start end")
 
     def event_loop_step(self) -> List[UpdateExpertLocationReqOutput]:
         outputs = []
 
         if self._model_weight_updater.poll_prepare_end():
+            _log_with_accurate_time("ExpertLocationUpdater.event_loop_step observe local_arrive")
             self._prepare_end_barrier.local_arrive()
 
         if self._prepare_end_barrier.poll_global_arrived():
@@ -62,6 +65,7 @@ class ExpertLocationUpdater:
         return outputs
 
     def _act(self):
+        _log_with_accurate_time("ExpertLocationUpdater.act start")
         torch.distributed.barrier()
 
         get_global_expert_distribution_recorder().flush_buffer_depending_on_expert_location_metadata()
@@ -74,13 +78,16 @@ class ExpertLocationUpdater:
                 f"Updated expert_location_metadata: {get_global_expert_location_metadata().debug_str()}"
             )
 
+        _log_with_accurate_time("ExpertLocationUpdater.act execute ModelWeightUpdater.act start")
         self._model_weight_updater.act()
+        _log_with_accurate_time("ExpertLocationUpdater.act execute ModelWeightUpdater.act end")
 
         torch.distributed.barrier()
 
         assert self._ongoing_req is not None
         self._ongoing_req = None
 
+        _log_with_accurate_time("ExpertLocationUpdater.act end")
         return UpdateExpertLocationReqOutput()
 
     def _weight_filter(self, name: str, interesting_logical_experts_of_layer: Dict[int, List[int]]):
@@ -109,3 +116,7 @@ def _compute_interesting_logical_experts_of_layer(
         new_partial_map = _get_partial_physical_to_logical_map(new_expert_location_metadata, layer_id)
         interesting_logical_experts_of_layer[layer_id] = new_partial_map[new_partial_map != old_partial_map].tolist()
     return interesting_logical_experts_of_layer
+
+
+def _log_with_accurate_time(message):
+    logger.info(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}] {message}")

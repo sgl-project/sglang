@@ -1,4 +1,3 @@
-import datetime
 import logging
 from abc import ABC
 from dataclasses import dataclass
@@ -35,7 +34,6 @@ class ModelWeightUpdater:
         self._state: _State = _StateIdle()
 
     def start_prepare(self, weight_filter: Callable[[str], bool]):
-        _log_with_accurate_time("ModelWeightUpdater.start_prepare start")
         assert isinstance(self._state, _StateIdle)
 
         all_weights_iterator = self._model_weight_source.get_all_weights()
@@ -43,7 +41,6 @@ class ModelWeightUpdater:
         self._memory_transfer_manager.enqueue(interesting_weights)
 
         self._state = _StateAwaitMemoryTransfer()
-        _log_with_accurate_time("ModelWeightUpdater.start_prepare end")
 
     def poll_prepare_end(self):
         memory_transfer_outputs = self._memory_transfer_manager.get_outputs()
@@ -55,12 +52,10 @@ class ModelWeightUpdater:
         return True
 
     def _handle_memory_transfer_output(self, memory_transfer_output):
-        _log_with_accurate_time("ModelWeightUpdater.handle_memory_transfer_output")
         assert isinstance(self._state, _StateAwaitMemoryTransfer)
         self._state = _StatePrepared(named_tensors=memory_transfer_output)
 
     def act(self):
-        _log_with_accurate_time("ModelWeightUpdater.act start")
         assert isinstance(self._state, _StatePrepared)
 
         target_device = torch.device(self._device)
@@ -71,11 +66,6 @@ class ModelWeightUpdater:
             DefaultModelLoader.load_weights_and_postprocess(self._model, named_tensors, target_device)
 
         self._state = _StateIdle()
-        _log_with_accurate_time("ModelWeightUpdater.act end")
-
-
-def _log_with_accurate_time(message):
-    logger.info(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}] {message}")
 
 
 class _State(ABC):
