@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 import torch
 
@@ -46,8 +46,10 @@ class AsyncPinMemoryManager(TensorOperationManagerBase):
 class AsyncToCudaManager(TensorOperationManagerBase):
     def __init__(self):
         self._queue = []
+        self._alt_stream: Optional[torch.cuda.Stream] = None
 
     def enqueue(self, named_tensors: NamedTensors):
+        self._auto_create_stream()
         self._queue.append(_AsyncToCudaTask(
             event=event,
             input_named_tensors=named_tensors,
@@ -56,6 +58,10 @@ class AsyncToCudaManager(TensorOperationManagerBase):
 
     def get_outputs(self) -> List[NamedTensors]:
         return TODO
+
+    def _auto_create_stream(self):
+        if self._alt_stream is None:
+            self._alt_stream = torch.cuda.Stream()
 
 
 @dataclass
