@@ -135,7 +135,12 @@ class SimpleCachingAllocator:
         self._unused_pool = defaultdict(list)
         self._used_pool: List[torch.Tensor] = []
 
-    def allocate(self) -> torch.Tensor:
+    def allocate(self, size, dtype) -> torch.Tensor:
+        unused_pool_entry = self._unused_pool[(size, dtype)]
+        if len(unused_pool_entry) > 0:
+            TODO
+        else:
+            TODO
         return TODO
 
     def mark_all_unused(self):
