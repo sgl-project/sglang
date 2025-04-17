@@ -1,6 +1,6 @@
 from abc import ABC
 from dataclasses import dataclass
-from typing import Iterator, Tuple, List, Callable
+from typing import Iterator, Tuple, List, Callable, Iterable
 
 import torch
 from sglang.srt.configs.load_config import LoadConfig
@@ -85,7 +85,11 @@ class _ModelWeightSourceVanilla(_ModelWeightSourceBase):
 class _ModelWeightSourcePinnedMemory(_ModelWeightSourceBase):
     def __init__(self):
         vanilla = _ModelWeightSourceVanilla()
-        all_weights = list(vanilla.get_all_weights())
+        self._all_weights = _named_tensors_pin_memory(list(vanilla.get_all_weights()))
 
     def get_all_weights(self) -> Iterator[Tuple[str, torch.Tensor]]:
         return TODO
+
+
+def _named_tensors_pin_memory(named_tensors: Iterable[Tuple[str, torch.Tensor]]) -> List[Tuple[str, torch.Tensor]]:
+    return [(name, tensor.pin_memory()) for name, tensor in named_tensors]
