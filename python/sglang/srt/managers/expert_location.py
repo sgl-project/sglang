@@ -263,9 +263,7 @@ def _compute_logical_to_rank_dispatch_physical_map(
         logical_to_all_physical_map: torch.Tensor,
         num_gpus: int,
 ):
-    # TODO maybe improve this algorithm (e.g. ensure it is really balanced)
     # This is rarely called, so we use for loops for maximum clarity
-
     r = random.Random()
 
     num_layers, num_logical_experts, _ = logical_to_all_physical_map.shape
@@ -276,13 +274,16 @@ def _compute_logical_to_rank_dispatch_physical_map(
 
     for layer_id in range(num_layers):
         for logical_expert_id in range(num_logical_experts):
-            for gpu_id in range(num_gpus):
-                candidate_values = ExpertLocationMetadata.logical_to_all_physical_raw(
-                    logical_to_all_physical_map, layer_id, logical_expert_id
-                )
-                logical_to_rank_dispatch_physical_map[
-                    gpu_id, layer_id, logical_expert_id
-                ] = r.choice(candidate_values)
+            TODO
+
+            # TODO old
+            # for gpu_id in range(num_gpus):
+            #     candidate_values = ExpertLocationMetadata.logical_to_all_physical_raw(
+            #         logical_to_all_physical_map, layer_id, logical_expert_id
+            #     )
+            #     logical_to_rank_dispatch_physical_map[
+            #         gpu_id, layer_id, logical_expert_id
+            #     ] = r.choice(candidate_values)
 
     return logical_to_rank_dispatch_physical_map
 
