@@ -65,7 +65,7 @@ class TestVLMModels(CustomTestCase):
         tasks = "mmmu_val"
         batch_size = 1
         log_suffix = "openai_compatible"
-        output_path.mkdir(exist_ok=True, parents=True)
+        os.mkdir(output_path, exist_ok=True)
 
         # -------- compose --model_args --------
         model_args = (
@@ -127,7 +127,7 @@ class TestVLMModels(CustomTestCase):
                 self.run_mmmu_eval(cli_model.model, cli_model.chat_template, "./logs")
 
                 # Get the result file
-                result_file_path = glob.glob("./*.json")[0]
+                result_file_path = glob.glob("./logs/*.json")[0]
 
                 with open(result_file_path, "r") as f:
                     result = json.load(f)
