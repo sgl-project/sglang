@@ -1809,7 +1809,6 @@ class Scheduler(
 
     def update_expert_location(self, recv_req: UpdateExpertLocationReqInput):
         self.tp_worker.worker.model_runner.update_expert_location(recv_req)
-        return UpdateExpertLocationReqOutput()
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         """In-place update of the weights from disk."""
