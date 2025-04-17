@@ -239,6 +239,7 @@ class ModelRunner:
             server_args.attention_backend = "flashmla"
         elif server_args.attention_backend is None:
             # By default, use flashinfer for non-mla attention and triton for mla attention
+            # TODO: Use cutlass MLA when applicable.
             if not self.use_mla_backend:
                 if (
                     is_hopper_with_cuda_12_3()
@@ -263,7 +264,7 @@ class ModelRunner:
         elif self.use_mla_backend:
             # TODO: add MLA optimization on CPU
             if server_args.device != "cpu":
-                if server_args.attention_backend in ["flashinfer", "fa3", "triton"]:
+                if server_args.attention_backend in ["flashinfer", "fa3", "triton", "cutlass_mla"]:
                     logger.info(
                         f"MLA optimization is turned on. Use {server_args.attention_backend} backend."
                     )
@@ -924,6 +925,10 @@ class ModelRunner:
             )
 
             self.attn_backend = FlashAttentionBackend(self)
+        elif self.server_args.attention_backend == "cutlass_mla":
+            from sglang.srt.layers.attention.cutlass_mla_backend import CutlassMLABackend
+
+            self.attn_backend = CutlassMLABackend(self)
         else:
             raise ValueError(
                 f"Invalid attention backend: {self.server_args.attention_backend}"
