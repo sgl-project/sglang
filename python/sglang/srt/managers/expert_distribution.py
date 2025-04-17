@@ -293,7 +293,12 @@ class _DeepepNormalSinglePassGatherer(_LayerBasedSinglePassGatherer):
     def collect_global_physical_count(self) -> torch.Tensor:
         local_physical_count = super()._collect_objects(
             pad_len=self._expert_location_metadata.num_local_physical_experts)
-        return _convert_local_to_global_physical_count(local_physical_count)
+        return _convert_local_to_global_physical_count(
+            local_physical_count,
+            rank=self._rank,
+            num_local_physical_experts=self._expert_location_metadata.num_local_physical_experts,
+            num_physical_experts=self._expert_location_metadata.num_physical_experts,
+        )
 
 
 class _DeepepLowLatencySinglePassGatherer(_SinglePassGatherer):
@@ -314,7 +319,12 @@ class _DeepepLowLatencySinglePassGatherer(_SinglePassGatherer):
 
     def collect_global_physical_count(self) -> torch.Tensor:
         # Can optimize if bottleneck
-        return _convert_local_to_global_physical_count(self._data)
+        return _convert_local_to_global_physical_count(
+            self._data,
+            rank=self._rank,
+            num_local_physical_experts=self._expert_location_metadata.num_local_physical_experts,
+            num_physical_experts=self._expert_location_metadata.num_physical_experts,
+        )
 
 
 def _convert_local_to_global_physical_count(
