@@ -14,6 +14,10 @@ class TensorOperationManagerBase:
 
 
 class CombinedManager(TensorOperationManagerBase):
+    def __init__(self, manager_a: TensorOperationManagerBase, manager_b: TensorOperationManagerBase):
+        self._manager_a = manager_a
+        self._manager_b = manager_b
+
     @classmethod
     def init_pin_memory_and_to_cuda(cls):
         return cls(manager_a=AsyncPinMemoryManager(), manager_b=AsyncToCudaManager())
