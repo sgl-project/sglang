@@ -42,6 +42,7 @@ class TestExpertDistribution(CustomTestCase):
                 str(tp_size),
                 "--enable-expert-distribution-recorder",
                 "--disable-cuda-graph",
+                "--disable-overlap-schedule",
             ],
         )
 
