@@ -1002,6 +1002,7 @@ async def benchmark(
     profile: bool,
     pd_seperated: bool = False,
     flush_cache: bool = False,
+    goodput_config_dict: Optional[Dict[str, float]] = None,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -1132,7 +1133,7 @@ async def benchmark(
         dur_s=benchmark_duration,
         tokenizer=tokenizer,
         backend=backend,
-        goodput_config_dict=args.goodput_config_dict,
+        goodput_config_dict=goodput_config_dict,
     )
 
     print("\n{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=50, c="="))
@@ -1153,6 +1154,12 @@ async def benchmark(
             "Total generated tokens (retokenized):", metrics.total_output_retokenized
         )
     )
+    if goodput_config_dict:
+        print(
+            "{:<40} {:<10.2f}".format(
+                "Request goodput (req/s):", metrics.request_goodput
+            )
+        )
     print(
         "{:<40} {:<10.2f}".format(
             "Request throughput (req/s):", metrics.request_throughput
@@ -1338,7 +1345,7 @@ def run_benchmark(args_: argparse.Namespace):
         args.warmup_requests = 1
 
     # Parse goodput arguments
-    args.goodput_config_dict = check_goodput_args(args)
+    goodput_config_dict = check_goodput_args(args)
 
     print(f"benchmark_args={args}")
 
@@ -1461,6 +1468,7 @@ def run_benchmark(args_: argparse.Namespace):
             profile=args.profile,
             pd_seperated=args.pd_seperated,
             flush_cache=args.flush_cache,
+            goodput_config_dict=goodput_config_dict,
         )
     )
 
