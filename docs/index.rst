@@ -31,7 +31,6 @@ The core features include:
    backend/server_arguments.md
    backend/sampling_params.md
    backend/hyperparameter_tuning.md
-   backend/structured_outputs_for_reasoning_models.ipynb
    backend/attention_backend.md
 
 .. toctree::
@@ -52,6 +51,7 @@ The core features include:
    backend/structured_outputs.ipynb
    backend/function_calling.ipynb
    backend/separate_reasoning.ipynb
+   backend/structured_outputs_for_reasoning_models.ipynb
    backend/custom_chat_template.md
    backend/quantization.md
 
