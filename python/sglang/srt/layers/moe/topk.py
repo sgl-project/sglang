@@ -218,10 +218,7 @@ def biased_grouped_topk(
     n_share_experts_fusion: int = 0,
 ):
     # TODO: moe_fused_gate kernel is not supported for n_share_experts_fusion > 0 now.
-    if (
-        _is_cuda
-        and is_power_of_two(correction_bias.shape[0])
-    ):
+    if _is_cuda and is_power_of_two(correction_bias.shape[0]):
         return moe_fused_gate(
             gating_output,
             correction_bias,
@@ -229,7 +226,7 @@ def biased_grouped_topk(
             topk_group,
             topk,
             n_share_experts_fusion,
-            2.5, # DeepSeek V3/R1 routed_scaling_factor
+            2.5,  # DeepSeek V3/R1 routed_scaling_factor
         )
     else:
         biased_grouped_topk_fn = (

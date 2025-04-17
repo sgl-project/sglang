@@ -1328,7 +1328,8 @@ class DeepseekV2ForCausalLM(nn.Module):
         self.n_share_experts_fusion = global_server_args_dict["n_share_experts_fusion"]
         if self.n_share_experts_fusion > 0:
             # Only Deepseek V3/R1 can use shared experts fusion optimization now.
-            if (self.config.architectures[0] != "DeepseekV3ForCausalLM"
+            if (
+                self.config.architectures[0] != "DeepseekV3ForCausalLM"
                 or self.config.n_routed_experts != 256
                 or self.config.routed_scaling_factor != 2.5
             ):
@@ -1338,7 +1339,9 @@ class DeepseekV2ForCausalLM(nn.Module):
                     "Only Deepseek V3/R1 can use shared experts fusion optimization. Shared experts fusion optimization is disabled."
                 )
             else:
-                assert self.n_share_experts_fusion == self.tp_size, f"Shared experts fusion optimization is enabled in DeepSeek V3/R1, set it to {self.tp_size} can get best optimized performace."
+                assert (
+                    self.n_share_experts_fusion == self.tp_size
+                ), f"Shared experts fusion optimization is enabled in DeepSeek V3/R1, set it to {self.tp_size} can get best optimized performace."
 
         self.model = DeepseekV2Model(
             config, quant_config, prefix=add_prefix("model", prefix)
