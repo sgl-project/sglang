@@ -11,3 +11,11 @@ class TensorOperationManagerBase:
 
     def get_outputs(self) -> List[NamedTensors]:
         raise NotImplementedError
+
+
+class AsyncPinMemoryManager(TensorOperationManagerBase):
+    TODO
+
+
+class AsyncToCudaManager(TensorOperationManagerBase):
+    TODO
