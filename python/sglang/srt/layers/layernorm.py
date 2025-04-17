@@ -37,10 +37,10 @@ if _is_cuda:
 if is_hip:
     import aiter as _rocm_aiter
 
-    def rocm_aiter_rms_norm(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:  # noqa: N802
+    def rocm_aiter_rms_norm(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
         return _rocm_aiter.rms_norm(x, w, eps)
 
-    def rocm_aiter_fused_add_rms_norm(  # noqa: N802
+    def rocm_aiter_fused_add_rms_norm(
         x: torch.Tensor,
         residual: torch.Tensor,
         w: torch.Tensor,
