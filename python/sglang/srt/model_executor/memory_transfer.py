@@ -24,7 +24,7 @@ class CombinedManager(TensorOperationManagerBase):
         return cls(manager_a=AsyncPinMemoryManager(), manager_b=AsyncToCudaManager())
 
     def enqueue(self, named_tensors: NamedTensors):
-        TODO
+        self._manager_a.enqueue(named_tensors)
 
     def get_outputs(self) -> List[NamedTensors]:
         return TODO
