@@ -490,6 +490,7 @@ class _StatAccumulator(_Accumulator):
                             layer_index, global_physical_expert_index
                         ]
                     )
+                    TODO_no_physical_count_key
                     logical_count[layer_index, logical_expert_index] += physical_dump[
                         "physical_count"
                     ][layer_index][local_physical_expert_index]
@@ -524,10 +525,11 @@ class _StatAccumulator(_Accumulator):
         self._logical_count[...] = 0
 
     def dump(self):
-        TODO
+        self.flush_buffer_depending_on_expert_location_metadata()
+
         return dict(
             rank=self._rank,
-            physical_count=self._physical_count.tolist(),
+            logical_count=self._logical_count.tolist(),
         )
 
     def flush_buffer_depending_on_expert_location_metadata(self):
