@@ -127,10 +127,7 @@ class ModelRunner:
         self.page_size = server_args.page_size
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
-        self.use_mla_backend = (
-            self.model_config.attention_arch == AttentionArch.MLA
-            and not server_args.disable_mla
-        )
+        self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
         self.attention_chunk_size = model_config.attention_chunk_size
 
         # Model-specific adjustment
@@ -150,7 +147,6 @@ class ModelRunner:
                 "attention_backend": server_args.attention_backend,
                 "sampling_backend": server_args.sampling_backend,
                 "triton_attention_reduce_in_fp32": server_args.triton_attention_reduce_in_fp32,
-                "disable_mla": server_args.disable_mla,
                 "torchao_config": server_args.torchao_config,
                 "enable_nan_detection": server_args.enable_nan_detection,
                 "enable_dp_attention": server_args.enable_dp_attention,
@@ -160,7 +156,6 @@ class ModelRunner:
                 "device": server_args.device,
                 "speculative_accept_threshold_single": server_args.speculative_accept_threshold_single,
                 "speculative_accept_threshold_acc": server_args.speculative_accept_threshold_acc,
-                "enable_flashmla": server_args.enable_flashmla,
                 "disable_radix_cache": server_args.disable_radix_cache,
                 "flashinfer_mla_disable_ragged": server_args.flashinfer_mla_disable_ragged,
                 "debug_tensor_dump_output_folder": server_args.debug_tensor_dump_output_folder,
@@ -229,15 +224,7 @@ class ModelRunner:
     def model_specific_adjustment(self):
         server_args = self.server_args
 
-        if server_args.enable_flashinfer_mla:
-            # TODO: remove this branch after enable_flashinfer_mla is deprecated
-            logger.info("MLA optimization is turned on. Use flashinfer backend.")
-            server_args.attention_backend = "flashinfer"
-        elif server_args.enable_flashmla:
-            # TODO: remove this branch after enable_flashmla is deprecated
-            logger.info("MLA optimization is turned on. Use flashmla decode.")
-            server_args.attention_backend = "flashmla"
-        elif server_args.attention_backend is None:
+        if server_args.attention_backend is None:
             # By default, use flashinfer for non-mla attention and triton for mla attention
             if not self.use_mla_backend:
                 if (
@@ -263,7 +250,12 @@ class ModelRunner:
         elif self.use_mla_backend:
             # TODO: add MLA optimization on CPU
             if server_args.device != "cpu":
-                if server_args.attention_backend in ["flashinfer", "fa3", "triton"]:
+                if server_args.attention_backend in [
+                    "flashinfer",
+                    "fa3",
+                    "triton",
+                    "flashmla",
+                ]:
                     logger.info(
                         f"MLA optimization is turned on. Use {server_args.attention_backend} backend."
                     )
