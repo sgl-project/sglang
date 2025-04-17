@@ -23,6 +23,9 @@ _REF_OUTPUT = [", 4+4=8,", ", four plus four is eight, eight"]
 
 
 class TestEPLB(CustomTestCase):
+    def test_eplb_many_rebalance(self):
+        TODO
+
     def test_eplb_start_rebalance_restart(self):
         print("Action: test_eplb_start_rebalance_restart")
         with tempfile.TemporaryDirectory() as tmpdir:
