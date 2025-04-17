@@ -48,7 +48,7 @@ _is_cuda = is_cuda()
 if _is_cuda:
     from sgl_kernel import awq_dequantize
 else:
-    from vllm import _custom_ops as ops
+    from vllm._custom_ops import awq_dequantize
 
 
 class DeepseekModelNextN(nn.Module):
@@ -273,7 +273,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                         self_attn.kv_b_proj.qzeros,
                     ).T
                 else:
-                    w = ops.awq_dequantize(
+                    w = awq_dequantize(
                         self_attn.kv_b_proj.qweight,
                         self_attn.kv_b_proj.scales,
                         self_attn.kv_b_proj.qzeros,
