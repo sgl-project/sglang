@@ -232,6 +232,16 @@ class TestEPLB(CustomTestCase):
                 [[[0, 8], [1, 9], [2, 10], [3, 11], [4], [5], [6], [7]]],
                 [[]],  # TODO
             ),
+            # One logical expert is put on ALL gpus
+            (
+                [[[0, 3, 6, 9], [1], [2], [4], [5], [7], [8], [10]]],
+                [[]],  # TODO
+            ),
+            # One logical expert is put multiple times on ONE gpu
+            (
+                [[[0, 1, 2], [3], [4], [5], [6], [7], [8], [9]]],
+                [[]],  # TODO
+            ),
         ]:
             actual_output = compute_logical_to_rank_dispatch_physical_map(
                 logical_to_all_physical_map=torch.tensor(logical_to_all_physical_map),
