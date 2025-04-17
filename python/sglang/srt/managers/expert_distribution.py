@@ -302,10 +302,10 @@ class _DeepepNormalSinglePassGatherer(_LayerBasedSinglePassGatherer):
 
 
 class _DeepepLowLatencySinglePassGatherer(_SinglePassGatherer):
-    def __init__(self, expert_location_metadata: "ExpertLocationMetadata"):
-        super().__init__(expert_location_metadata)
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
         self._data = torch.zeros(
-            (expert_location_metadata.num_layers, expert_location_metadata.num_local_physical_experts),
+            (self._expert_location_metadata.num_layers, self._expert_location_metadata.num_local_physical_experts),
             dtype=torch.int,
             device="cuda",
         )
