@@ -70,7 +70,6 @@ class _StatePrepared(_State):
 
 class _ModelWeightSourceBase(ABC):
     def get_all_weights(self) -> Iterable[Tuple[str, torch.Tensor]]:
-        TODO_with_set_default_torch_dtype
         raise NotImplementedError
 
 
