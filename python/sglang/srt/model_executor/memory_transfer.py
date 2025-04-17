@@ -130,7 +130,9 @@ class _AsyncToCudaTask:
 
 
 class SimpleCachingAllocator:
-    def __init__(self):
+    def __init__(self, device):
+        self._device = device
+
         # (size, dtype) -> list[Tensor]
         self._unused_pool = defaultdict(list)
         self._used_pool: List[torch.Tensor] = []
@@ -138,9 +140,9 @@ class SimpleCachingAllocator:
     def allocate(self, size, dtype) -> torch.Tensor:
         unused_pool_entry = self._unused_pool[(size, dtype)]
         if len(unused_pool_entry) > 0:
-            TODO
+            output = unused_pool_entry.pop()
         else:
-            TODO
+            output = torch.empty(size, dtype=dtype, device=self._device)
         return TODO
 
     def mark_all_unused(self):
