@@ -116,9 +116,9 @@ def is_completion_template_defined() -> bool:
     return completion_template_name != None
 
 
-def generate_completion_prompt(prompt: str, suffix: str, template_name: str) -> str:
-
-    completion_template = completion_templates[template_name]
+def generate_completion_prompt(prompt: str, suffix: str) -> str:
+    global completion_template_name
+    completion_template = completion_templates[completion_template_name]
     fim_begin_token = completion_template.fim_begin_token
     fim_middle_token = completion_template.fim_middle_token
     fim_end_token = completion_template.fim_end_token
