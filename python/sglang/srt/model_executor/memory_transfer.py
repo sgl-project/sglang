@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from typing import List, Tuple
 
 import torch
@@ -48,3 +49,9 @@ class AsyncToCudaManager(TensorOperationManagerBase):
 
     def get_outputs(self) -> List[NamedTensors]:
         return TODO
+
+
+@dataclass
+class _AsyncToCudaTask:
+    event: torch.cuda.Event
+    output_named_tensors: NamedTensors
