@@ -709,25 +709,30 @@ class TokenizerManager:
         ), f"update_expert_location requires enable_scheduler_input_blocker and non-null ep_dispatch_algorithm"
 
         old_expert_location_metadata = copy.deepcopy(self.expert_location_metadata)
-        for what in TODO:
-            partial_expert_location_metadata = copy.deepcopy(old_expert_location_metadata)
-            partial_expert_location_metadata.update(obj.expert_location_metadata, layer_id_start=0, layer_id_len=TODO)
-            await self._update_expert_location_raw(UpdateExpertLocationReqInput(
-                expert_location_metadata=partial_expert_location_metadata,
-            ))
+        num_layers = old_expert_location_metadata.num_layers
 
-    async def _update_expert_location_raw(self, obj: UpdateExpertLocationReqInput):
+        layer_id_lens = list(range(0, num_layers, 10)) + [num_layers]
+
+        for layer_id_len in layer_id_lens:
+            partial_expert_location_metadata = copy.deepcopy(old_expert_location_metadata)
+            partial_expert_location_metadata.update(obj.expert_location_metadata, layer_id_start=0,
+                                                    layer_id_len=layer_id_len)
+            await self._update_expert_location_raw(
+                expert_location_metadata=partial_expert_location_metadata,
+            )
+
+    async def _update_expert_location_raw(self, expert_location_metadata: ExpertLocationMetadata):
         self.expert_location_metadata = None
 
         TODO_prepare
 
         TODO_rename_to_act
         self._send_block_request(BlockReqType.BLOCK)
-        await self.update_expert_location_communicator.call_send(obj)
+        await self.update_expert_location_communicator.call_send(TODO)
         self._send_block_request(BlockReqType.UNBLOCK)
         await self.update_expert_location_communicator.call_await()
 
-        self.expert_location_metadata = obj.expert_location_metadata
+        self.expert_location_metadata = expert_location_metadata
 
     async def update_weights_from_disk(
         self,
