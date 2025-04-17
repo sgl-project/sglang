@@ -143,7 +143,10 @@ class SimpleCachingAllocator:
             output = unused_pool_entry.pop()
         else:
             output = torch.empty(size, dtype=dtype, device=self._device)
-        return TODO
+
+        self._used_pool.append(output)
+
+        return output
 
     def mark_all_unused(self):
         TODO
