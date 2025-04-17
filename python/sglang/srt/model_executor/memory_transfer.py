@@ -27,7 +27,11 @@ class CombinedManager(TensorOperationManagerBase):
         self._manager_a.enqueue(named_tensors)
 
     def get_outputs(self) -> List[NamedTensors]:
-        return TODO
+        outputs_a = self._manager_a.get_outputs()
+        for output_a in outputs_a:
+            self._manager_b.enqueue(output_a)
+
+        return self._manager_b.get_outputs()
 
 
 class AsyncPinMemoryManager(TensorOperationManagerBase):
