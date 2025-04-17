@@ -220,11 +220,16 @@ class TestEPLB(CustomTestCase):
         assert ret.success
 
     def test_compute_logical_to_rank_dispatch_physical_map(self):
+        # 8 logical expert
+        logical_to_all_physical_map = torch.tensor([
+            [[0], [1], [2], [3], [4], [5], [6], [7]],
+        ])
         expect = torch.tensor([[]])  # TODO
+
         actual = compute_logical_to_rank_dispatch_physical_map(
             logical_to_all_physical_map=logical_to_all_physical_map,
-            num_gpus=TODO,
-            num_physical_experts=TODO,
+            num_gpus=4,
+            num_physical_experts=12,
         )
         print(f"{actual=} {expect=}")
         self.assertEqual(actual.tolist(), expect.tolist())
