@@ -1610,7 +1610,10 @@ class DeepseekV2ForCausalLM(nn.Module):
         )
 
         params_dict = dict(self.named_parameters())
+        exist_mla_weights = False
         for name, loaded_weight in weights:
+            exist_mla_weights |= "self_attn" in name
+
             # TODO(HandH1998): Modify it when nextn is supported.
             if hasattr(self.config, "num_nextn_predict_layers"):
                 num_nextn_layers = self.config.num_nextn_predict_layers
@@ -1670,7 +1673,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                     )
                     weight_loader(param, loaded_weight)
 
-        self.post_load_weights(enable_mla_postprocess=TODO)
+        self.post_load_weights(enable_mla_postprocess=exist_mla_weights)
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
