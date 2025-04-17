@@ -98,12 +98,15 @@ class _ModelWeightSourceVanilla(_ModelWeightSourceBase):
         self._model_config = model_config
         self._model = model
 
-    def get_all_weights(self) -> Iterable[Tuple[str, torch.Tensor]]:
         load_config = LoadConfig(load_format=self._load_format)
         loader = get_model_loader(load_config)
         assert isinstance(loader, DefaultModelLoader)
         with set_default_torch_dtype(self._model_config.dtype):
-            yield from loader._get_weights_iterator(DefaultModelLoader.Source.init_new(self._model_config, self._model))
+            weights = list(
+                loader._get_weights_iterator(DefaultModelLoader.Source.init_new(self._model_config, self._model)))
+
+    def get_all_weights(self) -> Iterable[Tuple[str, torch.Tensor]]:
+        return TODO
 
 
 class _ModelWeightSourcePinnedMemory(_ModelWeightSourceBase):
