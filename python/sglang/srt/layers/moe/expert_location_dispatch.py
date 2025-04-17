@@ -15,15 +15,10 @@ def topk_ids_logical_to_physical(topk_ids: torch.Tensor, info: Optional[ExpertLo
         return topk_ids
 
     if info.ep_dispatch_algorithm == "static":
-        return TODO
-
-    return TODO
-
-    # TODO
-    # expert_logical_to_rank_dispatch_physical_map: Optional[torch.Tensor] = None,
-    # forward_mode=None,
-    # expert_logical_to_all_physical_map=None,
-    # expert_logical_to_all_physical_map_num_valid=None,
+        return _topk_ids_logical_to_physical_static(topk_ids, info)
+    if info.ep_dispatch_algorithm == "random":
+        return _topk_ids_logical_to_physical_random(topk_ids, info)
+    raise NotImplementedError
 
     # TODO
     if expert_logical_to_rank_dispatch_physical_map is not None:
