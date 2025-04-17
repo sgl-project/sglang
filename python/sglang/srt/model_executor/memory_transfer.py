@@ -1,6 +1,7 @@
 import queue
 from dataclasses import dataclass
 from queue import SimpleQueue
+from threading import Thread
 from typing import List, Tuple, Optional
 
 import torch
@@ -42,6 +43,7 @@ class AsyncPinMemoryManager(TensorOperationManagerBase):
     def __init__(self):
         self._input_queue = SimpleQueue()
         self._output_queue = SimpleQueue()
+        self._background_thread = None
 
     def enqueue(self, named_tensors: NamedTensors):
         self._auto_create_background_thread()
@@ -57,6 +59,13 @@ class AsyncPinMemoryManager(TensorOperationManagerBase):
         return outputs
 
     def _auto_create_background_thread(self):
+        if self._background_thread is not None:
+            return
+
+        self._background_thread = Thread(target=self._background_thread_entrypoint)
+        self._background_thread.start()
+
+    def _background_thread_entrypoint(self):
         TODO
 
 
