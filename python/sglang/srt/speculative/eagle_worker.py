@@ -272,11 +272,7 @@ class EAGLEWorker(TpModelWorker):
         elif batch.forward_mode.is_idle():
             model_worker_batch = batch.get_model_worker_batch()
             logits_output, next_token_ids, _ = (
-                self.target_worker.forward_batch_generation(
-                    ForwardBatch.init_new(
-                        model_worker_batch, self.target_worker.model_runner
-                    )
-                )
+                self.target_worker.forward_batch_generation(model_worker_batch)
             )
             return logits_output, next_token_ids, model_worker_batch.bid, 0, False
         else:
