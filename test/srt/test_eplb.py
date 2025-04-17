@@ -31,8 +31,11 @@ class TestEPLB(CustomTestCase):
 
         num_rebalance = 20
         request_rate = 20
-        requests = [
-            dict(prompt=TODO),
+        prompts = [
+            TODO,
+        ]
+        expect_outputs = [
+            TODO,
         ]
 
         async def _main_async():
@@ -43,11 +46,13 @@ class TestEPLB(CustomTestCase):
 
         async def _task_generate():
             tasks = []
-            async for request in _yield_with_poisson_process(requests, action_rate=request_rate):
+            async for prompt in _yield_with_poisson_process(prompts, action_rate=request_rate):
                 tasks.append(asyncio.create_task(engine.async_generate(
-                    prompt=request["prompt"],
+                    prompt=prompt,
                     sampling_params=dict(temperature=0, max_new_tokens=8),
                 )))
+
+            outputs = await asyncio.gather(*tasks)
             TODO_test_result
 
         async def _task_rebalance():
