@@ -285,6 +285,9 @@ class _SelectExpertsSinglePassGatherer(_LayerBasedSinglePassGatherer):
 
         self._on_layer_data(layer_idx, num_recv_tokens_per_expert_list)
 
+    def collect_global_physical_count(self) -> torch.Tensor:
+        return TODO
+
 
 class _DeepepNormalSinglePassGatherer(_LayerBasedSinglePassGatherer):
     def on_deepep_dispatch_normal(
@@ -292,6 +295,9 @@ class _DeepepNormalSinglePassGatherer(_LayerBasedSinglePassGatherer):
     ):
         assert isinstance(num_recv_tokens_per_expert_list, list)
         self._on_layer_data(layer_idx, num_recv_tokens_per_expert_list)
+
+    def collect_global_physical_count(self) -> torch.Tensor:
+        return TODO
 
 
 class _DeepepLowLatencySinglePassGatherer(_SinglePassGatherer):
