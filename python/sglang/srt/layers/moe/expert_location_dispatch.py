@@ -10,6 +10,9 @@ from sglang.srt.utils import get_compiler_backend
 @dataclass
 class ExpertLocationDispatchInfo:
     ep_dispatch_algorithm: Literal["static", "random"]
+    partial_logical_to_rank_dispatch_physical_map: torch.Tensor
+    partial_logical_to_all_physical_map: torch.Tensor
+    partial_logical_to_all_physical_map_num_valid: torch.Tensor
 
     @classmethod
     def init_new(cls, expert_location_metadata: ExpertLocationMetadata, ep_rank: int, layer_id: int):
@@ -19,6 +22,11 @@ class ExpertLocationDispatchInfo:
 
         return cls(
             ep_dispatch_algorithm=ep_dispatch_algorithm,
+            partial_logical_to_rank_dispatch_physical_map=expert_location_metadata.logical_to_rank_dispatch_physical_map[
+                                                          ep_rank, layer_id, :],
+            partial_logical_to_all_physical_map=expert_location_metadata.logical_to_all_physical_map[layer_id, :],
+            partial_logical_to_all_physical_map_num_valid=expert_location_metadata.logical_to_all_physical_map_num_valid[
+                                                          layer_id, :],
         )
 
 
@@ -35,7 +43,7 @@ def topk_ids_logical_to_physical(topk_ids: torch.Tensor, info: Optional[ExpertLo
 
 def _topk_ids_logical_to_physical_static(topk_ids: torch.Tensor,
                                          info: Optional[ExpertLocationDispatchInfo]) -> torch.Tensor:
-    return expert_logical_to_rank_dispatch_physical_map[topk_ids]
+    return info.partial_logical_to_rank_dispatch_physical_map[topk_ids]
 
 
 def _topk_ids_logical_to_physical_random(topk_ids: torch.Tensor,
@@ -45,8 +53,8 @@ def _topk_ids_logical_to_physical_random(topk_ids: torch.Tensor,
     topk_ids = topk_ids.flatten()
 
     chosen_dispatch_index = (torch.randint(0, 65536, topk_ids.shape, dtype=torch.int32, device=device)
-                             % expert_logical_to_all_physical_map_num_valid[topk_ids])
-    topk_ids = expert_logical_to_all_physical_map[topk_ids, chosen_dispatch_index]
+                             % info.partial_logical_to_all_physical_map_num_valid[topk_ids])
+    topk_ids = info.partial_logical_to_all_physical_map[topk_ids, chosen_dispatch_index]
 
     topk_ids = topk_ids.view(topk_ids_original_shape)
     return topk_ids
