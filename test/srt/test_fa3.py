@@ -120,7 +120,7 @@ class TestFlashAttention3MLA(BaseFlashAttentionTest):
         return args
 
 
-class TestFlashAttention3MLA(BaseFlashAttentionTest):
+class TestFlashAttention3LocalAttn(BaseFlashAttentionTest):
     """Test FlashAttention3 with Model with local attention, e.g. Llama 4."""
 
     model = DEFAULT_LOCAL_ATTENTION_MODEL_NAME_FOR_TEST
