@@ -27,8 +27,14 @@ class ExpertLocationMetadata:
         return self.physical_to_logical_map.shape[0]
 
     @property
+    def num_physical_experts(self) -> int:
+        return self.physical_to_logical_map.shape[1]
+
+    @property
     def num_local_physical_experts(self) -> int:
-        return TODO
+        ans, remainder = divmod(self.num_physical_experts, self.ep_size)
+        assert remainder == 0
+        return ans
 
     @property
     def num_logical_experts(self) -> int:
