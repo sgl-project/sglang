@@ -43,10 +43,17 @@ class AsyncPinMemoryManager(TensorOperationManagerBase):
         self._output_queue = SimpleQueue()
 
     def enqueue(self, named_tensors: NamedTensors):
-        TODO
+        self._auto_create_background_thread()
+        self._input_queue.put_nowait(named_tensors)
 
     def get_outputs(self) -> List[NamedTensors]:
-        return TODO
+        outputs = []
+        while True:
+            outputs.append(self._output_queue.get_nowait())
+        return outputs
+
+    def _auto_create_background_thread(self):
+        TODO
 
 
 class AsyncToCudaManager(TensorOperationManagerBase):
