@@ -62,6 +62,7 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.mem_cache.paged_allocator import PagedTokenToKVPoolAllocator
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
+from sglang.srt.model_executor.expert_location_updater import ExpertLocationUpdater
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader import get_model
 from sglang.srt.model_loader.loader import (
@@ -205,6 +206,8 @@ class ModelRunner:
 
         # If it is a draft model tp_group can be different.
         self.initialize(min_per_gpu_memory)
+
+        self._expert_location_updater = ExpertLocationUpdater(self)
 
     def initialize(self, min_per_gpu_memory: float):
         server_args = self.server_args
@@ -493,7 +496,7 @@ class ModelRunner:
             ) from None
 
     def update_expert_location(self, recv_req: UpdateExpertLocationReqInput):
-        TODO
+        self._expert_location_updater.act(recv_req)
 
     def update_weights_from_disk(
         self, model_path: str, load_format: str, param_categories: Optional[List[str]]
