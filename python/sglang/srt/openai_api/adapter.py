@@ -280,6 +280,7 @@ async def process_batch(tokenizer_manager, batch_id: str, batch_request: BatchRe
         end_point = batch_storage[batch_id].endpoint
         file_request_list = []
         all_requests = []
+        all_extra_bodies = []
         request_ids = []
         for line_id, line in enumerate(lines):
             request_data = json.loads(line)
@@ -293,13 +294,16 @@ async def process_batch(tokenizer_manager, batch_id: str, batch_request: BatchRe
                 raise ValueError("Streaming requests are not supported in batch mode")
 
             if end_point == "/v1/chat/completions":
-                all_requests.append(ChatCompletionRequest(**body))
+                extra_body_item = {k: v for k, v in body.items() if k not in ChatCompletionRequest.model_fields}
+                request_item = ChatCompletionRequest(**{k: v for k, v in body.items() if k in ChatCompletionRequest.model_fields})
+                all_requests.append(request_item)
+                all_extra_bodies.append(extra_body_item)
             elif end_point == "/v1/completions":
                 all_requests.append(CompletionRequest(**body))
 
         if end_point == "/v1/chat/completions":
             adapted_request, request = v1_chat_generate_request(
-                all_requests, tokenizer_manager, request_ids=request_ids
+                all_requests, tokenizer_manager, request_ids=request_ids, extra_body=all_extra_bodies
             )
         elif end_point == "/v1/completions":
             adapted_request, request = v1_generate_request(
@@ -895,6 +899,7 @@ def v1_chat_generate_request(
     all_requests: List[ChatCompletionRequest],
     tokenizer_manager,
     request_ids: List[str] = None,
+    extra_body: List[Dict] | Dict = None,
 ):
     input_ids = []
     prompts = []
@@ -907,9 +912,13 @@ def v1_chat_generate_request(
     modalities_list = []
     lora_paths = []
 
-    # NOTE: with openai API, the prompt's logprobs are always not computed
+    is_batch = isinstance(extra_body, list)
 
-    for request in all_requests:
+    for i, request in enumerate(all_requests):
+        # Extract chat_template_kwargs for the current request
+        current_extra_body = extra_body[i] if is_batch and extra_body else extra_body
+        chat_template_kwargs = current_extra_body.get("chat_template_kwargs", {}) if current_extra_body else {}
+
         # Prep the data needed for the underlying GenerateReqInput:
         #  - prompt: The full prompt string.
         #  - stop: Custom stop tokens.
@@ -962,6 +971,7 @@ def v1_chat_generate_request(
                         tokenize=True,
                         add_generation_prompt=True,
                         tools=tools,
+                        **chat_template_kwargs,
                     )
                 except:
                     #  This except branch will be triggered when the chosen model
@@ -973,6 +983,7 @@ def v1_chat_generate_request(
                         tokenize=True,
                         add_generation_prompt=True,
                         tools=tools,
+                        **chat_template_kwargs,
                     )
 
                 if assistant_prefix:
@@ -1312,9 +1323,12 @@ async def v1_chat_completions(
     tokenizer_manager, raw_request: Request, cache_report=False
 ):
     request_json = await raw_request.json()
-    all_requests = [ChatCompletionRequest(**request_json)]
+    # Extract potential extra_body from the request JSON
+    extra_body = {k: v for k, v in request_json.items() if k not in ChatCompletionRequest.model_fields}
+    all_requests = [ChatCompletionRequest(**{k: v for k, v in request_json.items() if k in ChatCompletionRequest.model_fields})]
     created = int(time.time())
-    adapted_request, request = v1_chat_generate_request(all_requests, tokenizer_manager)
+    # Pass extra_body to v1_chat_generate_request
+    adapted_request, request = v1_chat_generate_request(all_requests, tokenizer_manager, extra_body=extra_body)
 
     if adapted_request.stream:
         parser_dict = {}
