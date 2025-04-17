@@ -1,5 +1,5 @@
 import logging
-from typing import TYPE_CHECKING, Dict, List
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 import torch
 from sglang.srt.managers.expert_distribution import get_global_expert_distribution_recorder
@@ -28,8 +28,12 @@ class ExpertLocationUpdater:
             device=model_runner.device,
         )
         self._prepare_end_barrier = PollBasedBarrier(noop=False)
+        self._ongoing_req: Optional[UpdateExpertLocationReqInput] = None
 
-    def start_prepare(self, expert_location_metadata: ExpertLocationMetadata):
+    def start_prepare(self, req: UpdateExpertLocationReqInput):
+        assert self._ongoing_req is None
+        self._ongoing_req = req
+
         interesting_logical_experts_of_layer = _compute_interesting_logical_experts_of_layer(
             old_expert_location_metadata=get_global_expert_location_metadata(),
             new_expert_location_metadata=expert_location_metadata,
@@ -52,7 +56,7 @@ class ExpertLocationUpdater:
 
         get_global_expert_distribution_recorder().flush_buffer_depending_on_expert_location_metadata()
 
-        get_global_expert_location_metadata().update(expert_location_metadata)
+        get_global_expert_location_metadata().update(self._ongoing_req.expert_location_metadata)
         if self._model_runner.tp_rank == 0 and get_bool_env_var(
                 "SGLANG_LOG_EXPERT_LOCATION_METADATA"
         ):
@@ -63,6 +67,9 @@ class ExpertLocationUpdater:
         self._model_weight_updater.act()
 
         torch.distributed.barrier()
+
+        assert self._ongoing_req is not None
+        self._ongoing_req = None
 
     def _weight_filter(self, name: str, interesting_logical_experts_of_layer: Dict[int, List[int]]):
         info: ModelParamNameInfo = self._model_runner.model.get_param_name_info(name)
