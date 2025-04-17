@@ -299,9 +299,7 @@ class FlashAttentionBackend(AttentionBackend):
         self.kv_cache_dtype = model_runner.kv_cache_dtype
         self.kv_cache_dtype_str = model_runner.server_args.kv_cache_dtype
         self.page_size = model_runner.page_size
-        self.use_mla = (
-            model_runner.model_config.attention_arch == AttentionArch.MLA
-        ) and (not global_server_args_dict["disable_mla"])
+        self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         self.skip_prefill = skip_prefill
 
         self.topk = topk
