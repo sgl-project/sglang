@@ -52,18 +52,13 @@ class ExpertLocationUpdater:
 
         get_global_expert_location_metadata().update(recv_req.expert_location_metadata)
         if self._model_runner.tp_rank == 0 and get_bool_env_var(
-            "SGLANG_LOG_EXPERT_LOCATION_METADATA"
+                "SGLANG_LOG_EXPERT_LOCATION_METADATA"
         ):
             logger.info(
                 f"Updated expert_location_metadata: {get_global_expert_location_metadata().debug_str()}"
             )
 
-        # We may be able to further reduce lock time by faster copying, pre-transfering, etc
-        self._model_runner.update_weights_from_disk(
-            model_path=self._model_runner.model_config.model_path,
-            load_format=self._model_runner.server_args.load_format,
-            param_categories=["moe"],
-        )
+        self._model_weight_updater.act()
 
         logger.info("update_expert_location end")
         torch.distributed.barrier()
@@ -71,15 +66,15 @@ class ExpertLocationUpdater:
     def _weight_filter(self, name: str, interesting_logical_experts_of_layer: Dict[int, List[int]]):
         info: ModelParamNameInfo = self._model_runner.model.get_param_name_info(name)
         return (
-            isinstance(info, ModelParamNameInfoMoe)
-            and (info.expert_id in interesting_logical_experts_of_layer[info.layer_id])
+                isinstance(info, ModelParamNameInfoMoe)
+                and (info.expert_id in interesting_logical_experts_of_layer[info.layer_id])
         )
 
 
 def _compute_interesting_logical_experts_of_layer(
-    old_expert_location_metadata: ExpertLocationMetadata,
-    new_expert_location_metadata: ExpertLocationMetadata,
-    ep_rank: int,
+        old_expert_location_metadata: ExpertLocationMetadata,
+        new_expert_location_metadata: ExpertLocationMetadata,
+        ep_rank: int,
 ) -> Dict[int, List[int]]:
     num_layers = old_expert_location_metadata.num_layers
     num_local_physical_experts = old_expert_location_metadata.num_local_physical_experts
