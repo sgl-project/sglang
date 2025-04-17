@@ -87,7 +87,7 @@ class ExpertLocationUpdater:
         info: ModelParamNameInfo = self._model_runner.model.get_param_name_info(name)
         return (
                 isinstance(info, ModelParamNameInfoMoe)
-                and (info.expert_id in interesting_logical_experts_of_layer[info.layer_id])
+                and (info.expert_id in interesting_logical_experts_of_layer.get(info.layer_id, []))
         )
 
 
