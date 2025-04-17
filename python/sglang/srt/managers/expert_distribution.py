@@ -21,6 +21,17 @@ logger = logging.getLogger(__name__)
 class ExpertDistributionRecorder:
     """Global expert distribution recording"""
 
+    @staticmethod
+    def init_new(
+        server_args: ServerArgs,
+        expert_location_metadata: "ExpertLocationMetadata",
+        rank: int,
+    ):
+        if server_args.enable_expert_distribution_recorder:
+            return TODO
+        else:
+            return TODO
+
     def __init__(
         self,
         server_args: ServerArgs,

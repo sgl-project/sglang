@@ -211,7 +211,7 @@ class ModelRunner:
             enable=self.server_args.enable_memory_saver
         )
 
-        set_global_expert_distribution_recorder(ExpertDistributionRecorder(
+        set_global_expert_distribution_recorder(ExpertDistributionRecorder.init_new(
             server_args,
             get_global_expert_location_metadata(),
             rank=self.tp_rank,
