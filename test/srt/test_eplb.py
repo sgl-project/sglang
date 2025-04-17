@@ -27,6 +27,8 @@ class TestEPLB(CustomTestCase):
     def test_eplb_many_rebalances(self):
         print("Action: test_eplb_many_rebalances")
 
+        num_rebalance = 20
+
         async def _main_async():
             await asyncio.gather(
                 asyncio.create_task(_task_generate()),
@@ -37,7 +39,8 @@ class TestEPLB(CustomTestCase):
             TODO
 
         async def _task_rebalance():
-            TODO
+            for i in range(num_rebalance):
+                await engine.tokenizer_manager.eplb_rebalance()
 
         with tempfile.TemporaryDirectory() as tmpdir:
             engine_kwargs = dict(
