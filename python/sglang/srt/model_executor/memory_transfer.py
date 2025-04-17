@@ -70,8 +70,12 @@ class AsyncToCudaManager(TensorOperationManagerBase):
         outputs = []
         while len(self._inflight_tasks) > 0 and self._inflight_tasks[0].finish_event.query():
             task = self._inflight_tasks.pop(0)
-            outputs.append(task.output_named_tensors)
+            outputs.append(self._handle_one_output(task))
         return outputs
+
+    def _handle_one_output(self, task: "_AsyncToCudaTask"):
+        torch.cuda.current_stream().wait_stream(self._alt_stream)
+        return task.output_named_tensors
 
     def _auto_create_stream(self):
         if self._alt_stream is None:
