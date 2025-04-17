@@ -22,7 +22,10 @@ class TestExpertLocation(CustomTestCase):
             # Identity map + consider redundant experts
             (
                     [[[0, 8], [1, 9], [2, 10], [3, 11], [4, -1], [5, -1], [6, -1], [7, -1]]],
-                    [[]],  # TODO
+                    [[[0, 1, 2, 3, 4, 5, 6, 7]],
+                     [[8, 1, 2, 3, 4, 5, 6, 7]],
+                     [[8, 9, 10, 11, 4, 5, 6, 7]],
+                     [[0, 9, 10, 11, 4, 5, 6, 7]]],
             ),
             # One logical expert is put on ALL gpus
             (
@@ -47,9 +50,9 @@ class TestExpertLocation(CustomTestCase):
                 logical_to_all_physical_map=torch.tensor(logical_to_all_physical_map),
                 num_gpus=4,
                 num_physical_experts=12,
-            )
+            ).tolist()
             print(f"{actual_output=} {expect_output=}")
-            self.assertEqual(actual_output.tolist(), expect_output)
+            self.assertEqual(actual_output, expect_output)
 
 
 if __name__ == "__main__":
