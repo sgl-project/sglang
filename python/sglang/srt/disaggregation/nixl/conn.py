@@ -87,12 +87,10 @@ class NixlKVManager(BaseKVManager):
 
         self.rank_port = get_free_port()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self.server_socket.bind(
-                f"tcp://{get_local_ip_by_remote()}:{self.rank_port}"
-            )
-            self.transfer_queue = queue.Queue()
             self.transfer_infos: Dict[int, TransferInfo] = {}
+            self.condition = threading.Condition()
             self.peer_names: Dict[int, str] = {}
+            self._start_bootstrap_thread()
             self._register_to_bootstrap()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.connection_pool: Dict[str, Dict[str, Union[str, int]]] = {}
@@ -221,13 +219,11 @@ class NixlKVManager(BaseKVManager):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last or (is_last and aux_index is not None)
 
-        if bootstrap_room not in self.transfer_infos:
-            waiting_req_bytes = self.server_socket.recv_multipart()
-            self.transfer_infos[bootstrap_room] = TransferInfo.from_zmq(
-                waiting_req_bytes
-            )
-            assert bootstrap_room == self.transfer_infos[bootstrap_room].room
-        req = self.transfer_infos[bootstrap_room]
+        # Wait for transfer info to be populated by bootstrap thread.
+        with self.condition:
+            self.condition.wait_for(lambda: bootstrap_room in self.transfer_infos)
+            req = self.transfer_infos[bootstrap_room]
+        assert bootstrap_room == req.room
 
         peer_name = self._add_remote(bootstrap_room, req.agent_metadata)
         chunked_dst_kv_indice = req.dst_kv_indices[index_slice]
@@ -314,6 +310,23 @@ class NixlKVManager(BaseKVManager):
                 )
         except Exception as e:
             logger.error(f"Prefill Failed to register to bootstrap server: {e}")
+
+    def _start_bootstrap_thread(self):
+        self.server_socket.bind(f"tcp://{get_local_ip_by_remote()}:{self.rank_port}")
+
+        def bootstrap_thread():
+            """This thread recvs transfer info from the decode engine"""
+            while True:
+                waiting_req_bytes = self.server_socket.recv_multipart()
+                room = waiting_req_bytes[0].decode("ascii")
+                if room == "None":
+                    continue
+                room = int(room)
+                with self.condition:
+                    self.transfer_infos[room] = TransferInfo.from_zmq(waiting_req_bytes)
+                    self.condition.notify_all()
+
+        threading.Thread(target=bootstrap_thread).start()
 
 
 class NixlKVSender(BaseKVSender):
