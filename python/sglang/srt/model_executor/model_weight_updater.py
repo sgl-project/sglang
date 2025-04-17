@@ -42,6 +42,9 @@ class ModelWeightUpdater:
         self._state = _StateAwaitMemoryTransfer()
 
     def event_loop_step(self):
+        TODO_maybe_rename
+        TODO_maybe_change_output
+
         memory_transfer_outputs = self._memory_transfer_manager.get_outputs()
         assert len(memory_transfer_outputs) in {0, 1}
         if len(memory_transfer_outputs) == 0:
