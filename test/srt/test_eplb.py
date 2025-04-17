@@ -5,6 +5,7 @@ from pathlib import Path
 
 import sglang as sgl
 import torch
+from python.sglang.srt.managers.expert_location import compute_logical_to_rank_dispatch_physical_map
 from sglang.srt.managers.expert_distribution_storage import ExpertDistributionStorage
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
@@ -143,8 +144,8 @@ class TestEPLB(CustomTestCase):
 
         offset = 3
         physical_to_logical_map = (
-                                          offset
-                                          + torch.arange(0, _NUM_ROUTED_EXPERTS + ep_num_redundant_experts).repeat(
+                                      offset
+                                      + torch.arange(0, _NUM_ROUTED_EXPERTS + ep_num_redundant_experts).repeat(
                                       _NUM_HIDDEN_LAYERS, 1
                                   )
                                   ) % _NUM_ROUTED_EXPERTS
@@ -219,7 +220,14 @@ class TestEPLB(CustomTestCase):
         assert ret.success
 
     def test_compute_logical_to_rank_dispatch_physical_map(self):
-        TODO
+        expect = torch.tensor([[]])  # TODO
+        actual = compute_logical_to_rank_dispatch_physical_map(
+            logical_to_all_physical_map=logical_to_all_physical_map,
+            num_gpus=TODO,
+            num_physical_experts=TODO,
+        )
+        print(f"{actual=} {expect=}")
+        self.assertEqual(actual.tolist(), expect.tolist())
 
 
 def _compute_trivial_expert_locations(ep_num_redundant_experts: int):
