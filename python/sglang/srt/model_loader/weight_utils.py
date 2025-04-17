@@ -853,12 +853,16 @@ def kv_cache_scales_loader(
 
 @dataclass
 class ModelParamNameInfoMoe:
-    pass
+    @property
+    def category(self):
+        return "moe"
 
 
 @dataclass
 class ModelParamNameInfoOthers:
-    pass
+    @property
+    def category(self):
+        return "others"
 
 
 ModelParamNameInfo = Union[ModelParamNameInfoMoe, ModelParamNameInfoOthers]
