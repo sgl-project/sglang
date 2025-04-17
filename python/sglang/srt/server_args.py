@@ -338,7 +338,9 @@ class ServerArgs:
 
         if self.enable_eplb:
             self.enable_expert_distribution_recorder = True
-            logger.info(f"EPLB is enabled. The enable_expert_distribution_recorder is automatically enabled.")
+            self.disable_overlap_schedule = True
+            logger.info(
+                f"EPLB is enabled. The enable_expert_distribution_recorder and disable_overlap_schedule is automatically set.")
         if self.enable_eplb or (self.init_expert_location is not None):
             self.ep_dispatch_algorithm = "static"
             logger.info(
