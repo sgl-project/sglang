@@ -342,9 +342,12 @@ class ServerArgs:
             logger.info(
                 f"EPLB is enabled. The enable_expert_distribution_recorder and disable_overlap_schedule is automatically set.")
         if self.enable_eplb or (self.init_expert_location is not None):
-            self.ep_dispatch_algorithm = "static"
+            if self.ep_dispatch_algorithm is None:
+                self.ep_dispatch_algorithm = "static"
+            if self.expert_location_updater_mode is None:
+                self.expert_location_updater_mode = "pin_memory"
             logger.info(
-                f"EPLB is enabled or init_expert_location is provided. ep_dispatch_algorithm is set to `static`.")
+                f"EPLB is enabled or init_expert_location is provided. ep_dispatch_algorithm and expert_location_updater_mode are configured.")
 
         if self.ep_num_redundant_experts > 0:
             assert (
