@@ -7,6 +7,9 @@ import torch
 from sglang.srt.utils import get_device_sm, kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
+    DEFAULT_LOCAL_ATTENTION_MODEL_NAME_FOR_TEST,  # Llama 4
+)
+from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -117,6 +120,38 @@ class TestFlashAttention3MLA(BaseFlashAttentionTest):
             ]
         )
         return args
+
+
+class TestFlashAttention3MLA(BaseFlashAttentionTest):
+    """Test FlashAttention3 with Model with local attention, e.g. Llama 4."""
+
+    model = DEFAULT_LOCAL_ATTENTION_MODEL_NAME_FOR_TEST
+
+    @classmethod
+    def get_server_args(cls):
+        args = super().get_server_args()
+        args.extend(["--cuda-graph-max-bs", "2", "--tp", "4"])
+        return args
+
+    def test_gsm8k(self):
+        """
+        Override the test_gsm8k to further test for average speculative accept length.
+        """
+        requests.get(self.base_url + "/flush_cache")
+
+        args = SimpleNamespace(
+            num_shots=5,
+            data_path=DATA_PATH,
+            num_questions=200,
+            max_new_tokens=512,
+            parallel=128,
+            host="http://127.0.0.1",
+            port=int(self.base_url.split(":")[-1]),
+        )
+        metrics = run_eval_few_shot_gsm8k(args)
+        print(metrics)
+
+        self.assertGreater(metrics["accuracy"], 0.80)
 
 
 class TestFlashAttention3SpeculativeDecode(BaseFlashAttentionTest):
