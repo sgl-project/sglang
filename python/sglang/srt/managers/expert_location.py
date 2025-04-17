@@ -293,11 +293,9 @@ def _compute_logical_to_rank_dispatch_physical_map(
                 if len(same_gpu_physical_expert_ids) > 0:
                     partial_map[gpu_id] = same_gpu_physical_expert_ids[0]
 
-            # TODO old
-            # for gpu_id in range(num_gpus):
-            #     logical_to_rank_dispatch_physical_map[
-            #         gpu_id, layer_id, logical_expert_id
-            #     ] = r.choice(candidate_values)
+            num_remain = torch.sum(partial_map == -1).item()
+            partial_map[partial_map == -1] = torch.tensor(
+                _fair_choices(candidate_physical_expert_ids, k=num_remain, r=r))
 
     assert torch.all(logical_to_rank_dispatch_physical_map != -1)
     return logical_to_rank_dispatch_physical_map
