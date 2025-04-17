@@ -1,3 +1,4 @@
+import os
 from typing import List, Optional, Tuple
 
 import torch
@@ -34,8 +35,6 @@ if _is_hip and get_bool_env_var("CK_MOE"):
 if _is_cuda:
     from sgl_kernel import fp8_blockwise_scaled_mm, fp8_scaled_mm
 
-    from sglang.srt.custom_op import scaled_fp8_quant as sgl_scaled_fp8_quant
-    from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_quant_fp8
 
 use_vllm_cutlass_w8a8_fp8_kernel = get_bool_env_var("USE_VLLM_CUTLASS_W8A8_FP8_KERNEL")
 
@@ -296,7 +295,7 @@ def apply_fp8_linear(
         # for sgl-kernel fp8_scaled_mm, it support per channel W now
         if cutlass_fp8_supported and weight_scale.numel() == weight.shape[1]:
             qinput, x_scale = (
-                sgl_scaled_fp8_quant(input_2d, input_scale, use_per_token_if_dynamic=use_per_token_if_dynamic)
+                scaled_fp8_quant(input_2d, input_scale, use_per_token_if_dynamic=use_per_token_if_dynamic)
                 if _is_cuda else
                 ops.scaled_fp8_quant(input_2d, input_scale, scale_ub=input_scale_ub, use_per_token_if_dynamic=use_per_token_if_dynamic)
             )
@@ -315,7 +314,7 @@ def apply_fp8_linear(
         else:
             # Maybe apply padding to output, see comment in __init__
             qinput, x_scale = (
-                sgl_scaled_fp8_quant(input_2d, input_scale, num_token_padding=output_padding, use_per_token_if_dynamic=use_per_token_if_dynamic)
+                scaled_fp8_quant(input_2d, input_scale, num_token_padding=output_padding, use_per_token_if_dynamic=use_per_token_if_dynamic)
                 if _is_cuda else
                 ops.scaled_fp8_quant(input_2d, input_scale, num_token_padding=output_padding, use_per_token_if_dynamic=use_per_token_if_dynamic)
             )
