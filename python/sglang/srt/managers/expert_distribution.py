@@ -506,7 +506,7 @@ class _StatAccumulator(_Accumulator):
         )
 
     def flush_buffer_depending_on_expert_location_metadata(self):
-        self._logical_count += _convert_global_physical_count_to_logical_count(self._buffer_global_physical_count)
+        self._logical_count += _convert_global_physical_count_to_logical_count(self._buffer_global_physical_count, expert_location_metadata=self._expert_location_metadata)
         self._buffer_global_physical_count[...] = 0
 
 
