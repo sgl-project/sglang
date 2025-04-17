@@ -1,8 +1,9 @@
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Dict, List
 
 import torch
 from sglang.srt.managers.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.managers.expert_location import ExpertLocationMetadata
 from sglang.srt.managers.io_struct import UpdateExpertLocationReqInput
 from sglang.srt.managers.schedule_batch import get_global_expert_location_metadata
 from sglang.srt.model_executor.model_weight_updater import ModelWeightUpdater
@@ -61,3 +62,10 @@ class ExpertLocationUpdater:
             return False
 
         return TODO
+
+
+def _compute_interesting_logical_experts_of_layer(
+    old_expert_location_metadata: ExpertLocationMetadata,
+    new_expert_location_metadata: ExpertLocationMetadata,
+) -> Dict[int, List[int]]:
+    return TODO
