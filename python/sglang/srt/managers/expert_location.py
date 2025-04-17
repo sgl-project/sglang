@@ -286,8 +286,8 @@ def _compute_logical_to_rank_dispatch_physical_map(
                     for physical_expert_id in candidate_physical_expert_ids
                     if _compute_gpu_id_of_physical_expert(physical_expert_id) == gpu_id
                 ]
-                if TODO:
-                    partial_map[gpu_id] = TODO
+                if len(same_gpu_physical_expert_ids) > 0:
+                    partial_map[gpu_id] = same_gpu_physical_expert_ids[0]
 
             # TODO old
             # for gpu_id in range(num_gpus):
