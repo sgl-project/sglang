@@ -507,7 +507,12 @@ class _StatAccumulator(_Accumulator):
         )
 
     def flush_buffer_depending_on_expert_location_metadata(self):
-        TODO
+        self._logical_count += _convert_global_physical_count_to_logical_count(self._buffer_global_physical_count)
+        self._buffer_global_physical_count[...] = 0
+
+
+def _convert_global_physical_count_to_logical_count(global_physical_count: torch.Tensor):
+    return TODO
 
 
 TODO
