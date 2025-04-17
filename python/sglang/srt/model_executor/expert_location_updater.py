@@ -41,16 +41,11 @@ class ExpertLocationUpdater:
         )
 
     def event_loop_step(self):
-        TODO_maybe_rename
-        TODO_maybe_change_output
-        prepare_done = self._model_weight_updater.event_loop_step()
-        if prepare_done:
+        if self._model_weight_updater.event_loop_step():
             self._prepare_end_barrier.local_arrive()
 
         if self._prepare_end_barrier.poll_global_arrived():
             self.act()
-
-        TODO_outer_call_this
 
     def act(self):
         torch.distributed.barrier()
