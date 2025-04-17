@@ -474,7 +474,7 @@ class _StatAccumulator(_Accumulator):
         self._buffer_global_physical_count = torch.zeros(
             (
                 self._expert_location_metadata.num_layers,
-                self._expert_location_metadata.num_local_physical_experts,
+                self._expert_location_metadata.num_physical_experts,
             )
         )
         self._logical_count = torch.zeros(
