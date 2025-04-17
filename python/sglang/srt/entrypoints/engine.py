@@ -659,7 +659,6 @@ def _compute_initial_expert_location_metadata(
             data_dict = json.loads(Path(data).read_text())
 
         if "physical_to_logical_map" in data_dict:
-            # TODO We may want to allow users to not provide `logical_to_all_physical_map` if this API is frequently used
             return ExpertLocationMetadata.init_by_mapping(server_args, **data_dict)
         elif "logical_count" in data_dict:
             return ExpertLocationMetadata.init_by_eplb(server_args, **data_dict)
