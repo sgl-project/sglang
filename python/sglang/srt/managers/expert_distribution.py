@@ -317,12 +317,17 @@ class _DeepepLowLatencySinglePassGatherer(_SinglePassGatherer):
         return _convert_local_to_global_physical_count(self._data)
 
 
-def _convert_local_to_global_physical_count(local_physical_count: torch.Tensor) -> torch.Tensor:
+def _convert_local_to_global_physical_count(
+        local_physical_count: torch.Tensor,
+        rank: int,
+        num_local_physical_experts: int,
+        num_physical_experts: int,
+) -> torch.Tensor:
     dtype = local_physical_count.dtype
     device = local_physical_count.device
     num_layers, _ = local_physical_count.shape
 
-    ans = torch.zeros((num_layers, TODO), dtype=dtype, device=device)
+    ans = torch.zeros((num_layers, num_physical_experts), dtype=dtype, device=device)
     ans[:, num_local_physical_experts * rank:num_local_physical_experts * (rank + 1)] = local_physical_count
     return ans
 
