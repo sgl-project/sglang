@@ -338,11 +338,14 @@ class ServerArgs:
 
         if self.enable_eplb:
             self.enable_expert_distribution_recorder = True
-            self.disable_overlap_schedule = True
             if self.expert_location_updater_mode is None:
                 self.expert_location_updater_mode = "pin_memory"
             logger.info(
-                f"EPLB is enabled. The enable_expert_distribution_recorder, disable_overlap_schedule and expert_location_updater_mode are automatically set.")
+                f"EPLB is enabled. The enable_expert_distribution_recorder and expert_location_updater_mode are automatically set.")
+        if self.expert_location_updater_mode is None:
+            self.disable_overlap_schedule = True
+            logger.info(
+                f"ExpertLocationUpdater is enabled. The disable_overlap_schedule is set.")
         if self.enable_eplb or (self.init_expert_location is not None):
             if self.ep_dispatch_algorithm is None:
                 self.ep_dispatch_algorithm = "static"
