@@ -271,14 +271,12 @@ class _SelectExpertsSinglePassGatherer(_LayerBasedSinglePassGatherer):
         topk_ids_list = topk_ids.to("cpu", non_blocking=True).numpy().tolist()
         torch.cuda.synchronize()
 
-        num_recv_tokens_per_expert_list = [
-                                              0
-                                          ] * self._expert_location_metadata.num_local_physical_experts
+        global_physical_count = [0] * self._expert_location_metadata.num_physical_experts
         for token_record in topk_ids_list:
             for global_physical_expert_idx in token_record:
-                num_recv_tokens_per_expert_list[global_physical_expert_idx] += 1
+                global_physical_count[global_physical_expert_idx] += 1
 
-        self._on_layer_data(layer_idx, num_recv_tokens_per_expert_list)
+        self._on_layer_data(layer_idx, global_physical_count)
 
     def collect_global_physical_count(self) -> torch.Tensor:
         return TODO
