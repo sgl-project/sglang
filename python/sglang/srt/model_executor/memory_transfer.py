@@ -44,8 +44,15 @@ class AsyncPinMemoryManager(TensorOperationManagerBase):
 
 
 class AsyncToCudaManager(TensorOperationManagerBase):
+    def __init__(self):
+        self._queue = []
+
     def enqueue(self, named_tensors: NamedTensors):
-        TODO
+        self._queue.append(_AsyncToCudaTask(
+            event=event,
+            input_named_tensors=named_tensors,
+            output_named_tensors=output_named_tensors,
+        ))
 
     def get_outputs(self) -> List[NamedTensors]:
         return TODO
@@ -54,4 +61,5 @@ class AsyncToCudaManager(TensorOperationManagerBase):
 @dataclass
 class _AsyncToCudaTask:
     event: torch.cuda.Event
+    input_named_tensors: NamedTensors
     output_named_tensors: NamedTensors
