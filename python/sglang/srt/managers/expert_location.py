@@ -13,14 +13,25 @@ from sglang.srt.server_args import ServerArgs
 
 @dataclass
 class ExpertLocationMetadata:
-    num_layers: int
-    num_local_physical_experts: int
-    num_logical_experts: int
     physical_to_logical_map: torch.Tensor  # (layers, num_physical_experts)
     logical_to_all_physical_map: torch.Tensor  # (layers, num_logical_experts, X)
     logical_to_all_physical_map_num_valid: torch.Tensor  # (layers, num_logical_experts)
     # (num_gpus, layers, num_logical_experts)
     logical_to_rank_dispatch_physical_map: torch.Tensor
+
+    # -------------------------------- properties ------------------------------------
+
+    @property
+    def num_layers(self) -> int:
+        return self.physical_to_logical_map.shape[0]
+
+    @property
+    def num_local_physical_experts(self) -> int:
+        return TODO
+
+    @property
+    def num_logical_experts(self) -> int:
+        return self.logical_to_all_physical_map.shape[1]
 
     # -------------------------------- construction and mutation ------------------------------------
 
@@ -34,8 +45,8 @@ class ExpertLocationMetadata:
         num_logical_experts = model_config_for_expert_location.num_logical_experts
 
         physical_to_logical_map = (
-            torch.arange(0, num_physical_experts).repeat(num_layers, 1)
-            % num_logical_experts
+                torch.arange(0, num_physical_experts).repeat(num_layers, 1)
+                % num_logical_experts
         )
 
         return ExpertLocationMetadata.init_by_mapping(
@@ -108,8 +119,8 @@ class ExpertLocationMetadata:
         )
 
         num_physical_experts = (
-            model_config_for_expert_location.num_logical_experts
-            + server_args.ep_num_redundant_experts
+                model_config_for_expert_location.num_logical_experts
+                + server_args.ep_num_redundant_experts
         )
         # TODO consider case when DP attention is disabled and DP > 1
         world_size = server_args.tp_size
@@ -162,7 +173,7 @@ class ExpertLocationMetadata:
         return global_physical_expert_index % self.num_local_physical_experts
 
     def logical_to_all_physical(
-        self, layer_id: int, logical_expert_id: int
+            self, layer_id: int, logical_expert_id: int
     ) -> List[int]:
         return self.logical_to_all_physical_raw(
             self.logical_to_all_physical_map, layer_id, logical_expert_id
@@ -170,7 +181,7 @@ class ExpertLocationMetadata:
 
     @staticmethod
     def logical_to_all_physical_raw(
-        logical_to_all_physical_map, layer_id: int, logical_expert_id: int
+            logical_to_all_physical_map, layer_id: int, logical_expert_id: int
     ) -> List[int]:
         return [
             physical_expert_id
@@ -190,7 +201,7 @@ class ExpertLocationMetadata:
 
 
 def _compute_logical_to_all_physical_map(
-    physical_to_logical_map: torch.Tensor, num_logical_experts: int
+        physical_to_logical_map: torch.Tensor, num_logical_experts: int
 ):
     # This is rarely called, so we use for loops for maximum clarity
 
@@ -229,8 +240,8 @@ def _compute_logical_to_all_physical_map_num_valid(logical_to_all_physical_map):
 
 
 def _compute_logical_to_rank_dispatch_physical_map(
-    logical_to_all_physical_map: torch.Tensor,
-    num_gpus: int,
+        logical_to_all_physical_map: torch.Tensor,
+        num_gpus: int,
 ):
     # TODO maybe improve this algorithm (e.g. ensure it is really balanced)
     # This is rarely called, so we use for loops for maximum clarity
