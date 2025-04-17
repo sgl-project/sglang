@@ -9,7 +9,6 @@ from typing import List
 import numpy as np
 import sglang as sgl
 import torch
-from python.sglang.srt.managers.expert_location import compute_logical_to_rank_dispatch_physical_map
 from sglang.srt.managers.expert_distribution_storage import ExpertDistributionStorage
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
@@ -250,8 +249,8 @@ class TestEPLB(CustomTestCase):
 
         offset = 3
         physical_to_logical_map = (
-                                      offset
-                                      + torch.arange(0, _NUM_ROUTED_EXPERTS + ep_num_redundant_experts).repeat(
+                                          offset
+                                          + torch.arange(0, _NUM_ROUTED_EXPERTS + ep_num_redundant_experts).repeat(
                                       _NUM_HIDDEN_LAYERS, 1
                                   )
                                   ) % _NUM_ROUTED_EXPERTS
