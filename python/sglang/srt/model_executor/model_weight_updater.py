@@ -83,5 +83,9 @@ class _ModelWeightSourceVanilla(_ModelWeightSourceBase):
 
 
 class _ModelWeightSourcePinnedMemory(_ModelWeightSourceBase):
+    def __init__(self):
+        vanilla = _ModelWeightSourceVanilla()
+        all_weights = list(vanilla.get_all_weights())
+
     def get_all_weights(self) -> Iterator[Tuple[str, torch.Tensor]]:
-        yield TODO
+        return TODO
