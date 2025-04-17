@@ -14,6 +14,12 @@ def topk_ids_logical_to_physical(topk_ids: torch.Tensor, info: ExpertLocationDis
     return TODO
 
     # TODO
+    # expert_logical_to_rank_dispatch_physical_map: Optional[torch.Tensor] = None,
+    # forward_mode=None,
+    # expert_logical_to_all_physical_map=None,
+    # expert_logical_to_all_physical_map_num_valid=None,
+
+    # TODO
     if expert_logical_to_rank_dispatch_physical_map is not None:
         # TODO optimize these things later
         if forward_mode.is_extend():
