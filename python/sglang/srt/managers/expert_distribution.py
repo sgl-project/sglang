@@ -475,6 +475,7 @@ class _StatAccumulator(_Accumulator):
             gatherer_key: str,
             single_pass_physical_count: torch.Tensor,
     ):
+        # Can optimize if overhead here is large
         self._physical_count += single_pass_physical_count
 
     def reset(self):
