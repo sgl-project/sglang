@@ -337,6 +337,9 @@ class ServerArgs:
         if self.enable_eplb:
             self.enable_scheduler_input_blocker = True
             self.enable_expert_distribution_recorder = True
+            logger.info(
+                f"EPLB is enabled. The enable_scheduler_input_blocker and enable_expert_distribution_recorder are automatically enabled."
+            )
 
         if self.ep_num_redundant_experts > 0:
             assert (
