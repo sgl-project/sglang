@@ -23,5 +23,9 @@ class PollBasedBarrier:
         local_arrived = self._noop or self._local_arrived
         global_arrived = torch.tensor(local_arrived)
         # Can optimize if bottleneck
-        torch.distributed.all_reduce(global_arrived, torch.distributed.ReduceOp.MIN, group=get_world_group().cpu_group)
+        torch.distributed.all_reduce(
+            global_arrived,
+            torch.distributed.ReduceOp.MIN,
+            group=get_world_group().cpu_group,
+        )
         return global_arrived.item()

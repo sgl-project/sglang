@@ -33,6 +33,7 @@ from typing import AsyncIterator, Dict, Iterator, List, Optional, Tuple, Union
 import zmq
 import zmq.asyncio
 from PIL.Image import Image
+
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.managers.eplb_manager import EPLBManager
 from sglang.srt.managers.expert_location import ExpertLocationMetadata
@@ -659,10 +660,14 @@ def _compute_initial_expert_location_metadata(
             data_dict = json.loads(Path(data).read_text())
 
         if "physical_to_logical_map" in data_dict:
-            logger.info("init_expert_location from init_by_mapping using ServerArgs.init_expert_location")
+            logger.info(
+                "init_expert_location from init_by_mapping using ServerArgs.init_expert_location"
+            )
             return ExpertLocationMetadata.init_by_mapping(server_args, **data_dict)
         elif "logical_count" in data_dict:
-            logger.info("init_expert_location from init_by_eplb using ServerArgs.init_expert_location")
+            logger.info(
+                "init_expert_location from init_by_eplb using ServerArgs.init_expert_location"
+            )
             return ExpertLocationMetadata.init_by_eplb(server_args, **data_dict)
         else:
             raise NotImplementedError(

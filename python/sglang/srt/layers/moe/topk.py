@@ -16,10 +16,16 @@ from typing import Callable, Optional
 
 import torch
 import torch.nn.functional as F
-from sglang.srt.layers.moe.expert_location_dispatch import ExpertLocationDispatchInfo, topk_ids_logical_to_physical
-from sglang.srt.managers.expert_distribution import get_global_expert_distribution_recorder
+
+from sglang.srt.layers.moe.expert_location_dispatch import (
+    ExpertLocationDispatchInfo,
+    topk_ids_logical_to_physical,
+)
+from sglang.srt.managers.expert_distribution import (
+    get_global_expert_distribution_recorder,
+)
 from sglang.srt.managers.schedule_batch import global_server_args_dict
-from sglang.srt.utils import get_compiler_backend, is_cuda, is_hip, get_bool_env_var
+from sglang.srt.utils import get_bool_env_var, get_compiler_backend, is_cuda, is_hip
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()

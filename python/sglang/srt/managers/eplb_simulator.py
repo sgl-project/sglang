@@ -10,12 +10,13 @@ from typing import Optional
 import einops
 import polars as pl
 import torch
+from tqdm.auto import tqdm
+
 from sglang.srt.managers import deepseek_eplb
 from sglang.srt.managers.expert_location import (
     ExpertLocationMetadata,
     ModelConfigForExpertLocation,
 )
-from tqdm.auto import tqdm
 
 
 @dataclass
@@ -36,9 +37,9 @@ class MyExpertLocationMetadata:
 
     @staticmethod
     def init_by_eplb(
-            server_args: MyServerArgs,
-            logical_count: torch.Tensor,
-            num_physical_experts: int,
+        server_args: MyServerArgs,
+        logical_count: torch.Tensor,
+        num_physical_experts: int,
     ):
         model_config_for_expert_location = _MY_MODEL_CONFIG_FOR_EXPERT_LOCATION
 
@@ -72,10 +73,10 @@ def read_physical_count_of_forward_pass(dir_data: Path):
     for path in tqdm(list(dir_data.glob("*.pt"))):
         for record in torch.load(path, weights_only=True):
             assert (
-                    physical_count_of_forward_pass_id_and_rank[
-                        record["forward_pass_id"]
-                    ].get(record["rank"])
-                    is None
+                physical_count_of_forward_pass_id_and_rank[
+                    record["forward_pass_id"]
+                ].get(record["rank"])
+                is None
             )
             physical_count_of_forward_pass_id_and_rank[record["forward_pass_id"]][
                 record["rank"]
@@ -84,10 +85,14 @@ def read_physical_count_of_forward_pass(dir_data: Path):
 
     items = []
     for forward_pass_id, physical_count_of_rank in sorted(
-            physical_count_of_forward_pass_id_and_rank.items()
+        physical_count_of_forward_pass_id_and_rank.items()
     ):
         physical_count_of_rank_tensor = torch.stack(
-            [physical_count for rank, physical_count in sorted(physical_count_of_rank.items())]).sum(dim=0)
+            [
+                physical_count
+                for rank, physical_count in sorted(physical_count_of_rank.items())
+            ]
+        ).sum(dim=0)
         items.append(physical_count_of_rank_tensor)
 
     physical_count_of_forward_pass = torch.stack(items)
@@ -97,24 +102,24 @@ def read_physical_count_of_forward_pass(dir_data: Path):
 
 
 def scan_combinations(
-        logical_count_of_seq: torch.Tensor,
-        override_eplb_input_logical_count: Optional[torch.Tensor] = None,
+    logical_count_of_seq: torch.Tensor,
+    override_eplb_input_logical_count: Optional[torch.Tensor] = None,
 ):
     num_gpu_per_node = 8
     server_args_list = [
         *[
             MyServerArgs(
-                num_tokens_in_batch_overall=num_tokens_in_batch_per_gpu * num_gpu_per_node * nnodes,
+                num_tokens_in_batch_overall=num_tokens_in_batch_per_gpu
+                * num_gpu_per_node
+                * nnodes,
                 ep_num_redundant_experts=ep_num_redundant_experts,
                 nnodes=nnodes,
                 tp_size=num_gpu_per_node * nnodes,
                 enable_expert_location_by_eplb=enable_expert_location_by_eplb,
                 init_expert_location=init_expert_location,
             )
-
             # for init_expert_location in ["/host_home/temp_sglang_server2local/1744461420780309768.json", None]
             for init_expert_location in ["from_variable"]
-
             # decode
             # for ep_num_redundant_experts in [0, 32]
             # for nnodes in [
@@ -125,7 +130,6 @@ def scan_combinations(
             #     *([9] if ep_num_redundant_experts == 32 else []),
             # ]
             # for num_tokens_in_batch_per_gpu in [64, 128]
-
             # prefill
             for ep_num_redundant_experts in [0, 32]
             for nnodes in [4]
@@ -133,7 +137,6 @@ def scan_combinations(
             # for ep_num_redundant_experts in [0, 32, 64]
             # for nnodes in [1, 2, 4]
             # for num_tokens_in_batch_per_gpu in [1024, 4096, 8192, 16384]
-
             for enable_expert_location_by_eplb in [
                 *([False] if ep_num_redundant_experts == 0 else []),
                 True,
@@ -145,7 +148,8 @@ def scan_combinations(
     for server_args in server_args_list:
         print()
         info = simulate_execution(
-            logical_count_of_seq=logical_count_of_seq, server_args=server_args,
+            logical_count_of_seq=logical_count_of_seq,
+            server_args=server_args,
             override_eplb_input_logical_count=override_eplb_input_logical_count,
         )
         print(f"{server_args=} {info=}")
@@ -170,9 +174,9 @@ def analyze_actual_utilization_rate(dir_data: Path, num_gpu: int):
 
 
 def simulate_execution(
-        logical_count_of_seq: torch.Tensor,
-        server_args: MyServerArgs,
-        override_eplb_input_logical_count: Optional[torch.Tensor] = None,
+    logical_count_of_seq: torch.Tensor,
+    server_args: MyServerArgs,
+    override_eplb_input_logical_count: Optional[torch.Tensor] = None,
 ):
     model_config_for_expert_location = _MY_MODEL_CONFIG_FOR_EXPERT_LOCATION
 
@@ -184,20 +188,26 @@ def simulate_execution(
 
     if server_args.enable_expert_location_by_eplb:
         num_physical_expert = (
-                model_config_for_expert_location.num_logical_experts
-                + server_args.ep_num_redundant_experts
+            model_config_for_expert_location.num_logical_experts
+            + server_args.ep_num_redundant_experts
         )
 
         if server_args.init_expert_location == "from_variable":
-            print(f"Compute eplb_input_logical_count from override_eplb_input_logical_count")
+            print(
+                f"Compute eplb_input_logical_count from override_eplb_input_logical_count"
+            )
             eplb_input_logical_count = override_eplb_input_logical_count
         elif (x := server_args.init_expert_location) is not None:
             print(f"Compute eplb_input_logical_count from {x}")
-            eplb_input_logical_count = torch.tensor(json.loads(Path(x).read_text())["logical_count"])
+            eplb_input_logical_count = torch.tensor(
+                json.loads(Path(x).read_text())["logical_count"]
+            )
         else:
             print(f"Compute eplb_input_logical_count from logical_count_of_seq")
-            eplb_input_logical_count = einops.einsum(logical_count_of_seq,
-                                                     "num_seq num_layer num_expert -> num_layer num_expert", )
+            eplb_input_logical_count = einops.einsum(
+                logical_count_of_seq,
+                "num_seq num_layer num_expert -> num_layer num_expert",
+            )
 
         expert_location_metadata = MyExpertLocationMetadata.init_by_eplb(
             server_args,
@@ -235,8 +245,8 @@ def simulate_execution(
 
 
 def simulate_batching(
-        logical_count_of_seq: torch.Tensor,  # (num_seq, num_layer, num_logical_expert)
-        num_tokens_in_batch_overall: int,
+    logical_count_of_seq: torch.Tensor,  # (num_seq, num_layer, num_logical_expert)
+    num_tokens_in_batch_overall: int,
 ) -> torch.Tensor:
     """output: (num_batch, num_layer, num_logical_expert)"""
     tensor_chunks = chunker(
@@ -250,9 +260,9 @@ def simulate_batching(
 
 
 def simulate_logical_to_physical(
-        logical_count_of_whatever: torch.Tensor,  # (*, num_layer, num_logical_expert)
-        logical_to_all_physical_map: torch.Tensor,  # (num_layer, num_logical_experts, X)
-        num_physical_expert: int,
+    logical_count_of_whatever: torch.Tensor,  # (*, num_layer, num_logical_expert)
+    logical_to_all_physical_map: torch.Tensor,  # (num_layer, num_logical_experts, X)
+    num_physical_expert: int,
 ):
     """output: (*, num_layer, num_physical_expert)"""
     num_whatever, num_layer, num_logical_expert = logical_count_of_whatever.shape
@@ -271,7 +281,7 @@ def simulate_logical_to_physical(
             )
             for physical_expert_id in all_physical_expert_ids:
                 physical_count_of_whatever[
-                :, layer_id, physical_expert_id
+                    :, layer_id, physical_expert_id
                 ] += logical_count_of_whatever[:, layer_id, logical_expert_id] / len(
                     all_physical_expert_ids
                 )
@@ -280,8 +290,8 @@ def simulate_logical_to_physical(
 
 
 def compute_gpu_physical_count(
-        physical_count_of_whatever: torch.Tensor,  # (whatever, num_layer, num_physical_expert)
-        num_gpu: int,
+    physical_count_of_whatever: torch.Tensor,  # (whatever, num_layer, num_physical_expert)
+    num_gpu: int,
 ):
     """output: gpu_physical_count_of_batch (whatever, num_layer, num_gpu)"""
     return einops.reduce(
@@ -293,7 +303,7 @@ def compute_gpu_physical_count(
 
 
 def compute_utilization_rate(
-        gpu_physical_count_of_batch: torch.Tensor,  # (num_batch, num_layer, num_gpu)
+    gpu_physical_count_of_batch: torch.Tensor,  # (num_batch, num_layer, num_gpu)
 ):
     """output: utilization_rate (num_batch, num_layer)"""
     gpu_physical_count_of_batch = gpu_physical_count_of_batch.float()
@@ -311,7 +321,9 @@ def compute_utilization_rate(
 
 
 def compute_num_token(whatever_with_num_layer_and_num_expert: torch.Tensor):
-    num_token_mul_num_experts = whatever_with_num_layer_and_num_expert[..., -1, :].sum(dim=-1)
+    num_token_mul_num_experts = whatever_with_num_layer_and_num_expert[..., -1, :].sum(
+        dim=-1
+    )
     return num_token_mul_num_experts / _MY_MODEL_CONFIG_NUM_EXPERTS_PER_TOK
 
 

@@ -5,7 +5,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from queue import SimpleQueue
 from threading import Thread
-from typing import List, Tuple, Optional
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -24,14 +24,20 @@ class TensorOperationManagerBase:
 
 
 class CombinedManager(TensorOperationManagerBase):
-    def __init__(self, manager_a: TensorOperationManagerBase, manager_b: TensorOperationManagerBase):
+    def __init__(
+        self,
+        manager_a: TensorOperationManagerBase,
+        manager_b: TensorOperationManagerBase,
+    ):
         # For simplicity, only support chaining 2 managers, but can be extended to N
         self._manager_a = manager_a
         self._manager_b = manager_b
 
     @classmethod
     def init_pin_memory_and_to_cuda(cls, allocator: "SimpleCachingAllocator"):
-        return cls(manager_a=AsyncPinMemoryManager(), manager_b=AsyncToCudaManager(allocator))
+        return cls(
+            manager_a=AsyncPinMemoryManager(), manager_b=AsyncToCudaManager(allocator)
+        )
 
     def enqueue(self, named_tensors: NamedTensors):
         self._manager_a.enqueue(named_tensors)
@@ -74,7 +80,9 @@ class AsyncPinMemoryManager(TensorOperationManagerBase):
         try:
             while True:
                 input_data = self._input_queue.get()
-                output_data = [(name, tensor.pin_memory()) for name, tensor in input_data]
+                output_data = [
+                    (name, tensor.pin_memory()) for name, tensor in input_data
+                ]
                 self._output_queue.put(output_data)
         except Exception as e:
             logger.warning(f"AsyncPinMemoryManager background thread error {e}")
@@ -101,15 +109,20 @@ class AsyncToCudaManager(TensorOperationManagerBase):
             finish_event = torch.cuda.Event()
             finish_event.record()
 
-        self._inflight_tasks.append(_AsyncToCudaTask(
-            finish_event=finish_event,
-            input_named_tensors=named_tensors,
-            output_named_tensors=output_named_tensors,
-        ))
+        self._inflight_tasks.append(
+            _AsyncToCudaTask(
+                finish_event=finish_event,
+                input_named_tensors=named_tensors,
+                output_named_tensors=output_named_tensors,
+            )
+        )
 
     def get_outputs(self) -> List[NamedTensors]:
         outputs = []
-        while len(self._inflight_tasks) > 0 and self._inflight_tasks[0].finish_event.query():
+        while (
+            len(self._inflight_tasks) > 0
+            and self._inflight_tasks[0].finish_event.query()
+        ):
             task = self._inflight_tasks.pop(0)
             outputs.append(self._handle_one_output(task))
         return outputs
@@ -123,7 +136,9 @@ class AsyncToCudaManager(TensorOperationManagerBase):
             self._alt_stream = torch.cuda.Stream()
 
     @staticmethod
-    def _tensor_to_cuda(input_tensor: torch.Tensor, allocator: "SimpleCachingAllocator"):
+    def _tensor_to_cuda(
+        input_tensor: torch.Tensor, allocator: "SimpleCachingAllocator"
+    ):
         output_tensor = allocator.allocate(input_tensor.size, input_tensor.dtype)
         output_tensor.copy_(input_tensor, non_blocking=True)
         return output_tensor

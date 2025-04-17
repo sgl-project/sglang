@@ -20,10 +20,11 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from typing import Iterable, List, Optional, Tuple, Union, Any
+from typing import Any, Iterable, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
+
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
@@ -33,7 +34,10 @@ from sglang.srt.distributed import (
     initialize_model_parallel,
     set_custom_all_reduce,
 )
-from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state, get_world_group
+from sglang.srt.distributed.parallel_state import (
+    get_world_group,
+    monkey_patch_vllm_parallel_state,
+)
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
     get_attention_tp_size,
@@ -44,8 +48,11 @@ from sglang.srt.layers.quantization import monkey_patch_isinstance_for_vllm_base
 from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
-from sglang.srt.managers.expert_distribution import get_global_expert_distribution_recorder, \
-    set_global_expert_distribution_recorder, ExpertDistributionRecorder
+from sglang.srt.managers.expert_distribution import (
+    ExpertDistributionRecorder,
+    get_global_expert_distribution_recorder,
+    set_global_expert_distribution_recorder,
+)
 from sglang.srt.managers.expert_location import ExpertLocationMetadata
 from sglang.srt.managers.io_struct import UpdateExpertLocationReqInput
 from sglang.srt.managers.schedule_batch import (
@@ -82,6 +89,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import (
     MultiprocessingSerializer,
+    broadcast_pyobj,
     enable_show_time_cost,
     get_available_gpu_memory,
     get_bool_env_var,
@@ -92,7 +100,7 @@ from sglang.srt.utils import (
     monkey_patch_p2p_access_check,
     monkey_patch_vllm_gguf_config,
     set_cpu_offload_max_bytes,
-    set_cuda_arch, broadcast_pyobj,
+    set_cuda_arch,
 )
 
 logger = logging.getLogger(__name__)
@@ -189,7 +197,7 @@ class ModelRunner:
         )
 
         # CPU offload
-        set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024 ** 3))
+        set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024**3))
 
         # Get memory before model loading
         min_per_gpu_memory = self.init_torch_distributed()
@@ -211,8 +219,11 @@ class ModelRunner:
         # If it is a draft model tp_group can be different.
         self.initialize(min_per_gpu_memory)
 
-        self._expert_location_updater = ExpertLocationUpdater(
-            self) if server_args.expert_location_updater_mode is not None else None
+        self._expert_location_updater = (
+            ExpertLocationUpdater(self)
+            if server_args.expert_location_updater_mode is not None
+            else None
+        )
 
     def initialize(self, min_per_gpu_memory: float):
         server_args = self.server_args
@@ -220,11 +231,13 @@ class ModelRunner:
             enable=self.server_args.enable_memory_saver
         )
 
-        set_global_expert_distribution_recorder(ExpertDistributionRecorder.init_new(
-            server_args,
-            get_global_expert_location_metadata(),
-            rank=self.tp_rank,
-        ))
+        set_global_expert_distribution_recorder(
+            ExpertDistributionRecorder.init_new(
+                server_args,
+                get_global_expert_location_metadata(),
+                rank=self.tp_rank,
+            )
+        )
 
         # Load the model
         self.sampler = Sampler()
@@ -536,7 +549,10 @@ class ModelRunner:
                 yield from iter
             else:
                 for name, weight in iter:
-                    if self.model.get_param_name_info(name).category in param_categories:
+                    if (
+                        self.model.get_param_name_info(name).category
+                        in param_categories
+                    ):
                         yield name, weight
 
         def model_load_weights(model, iter):
@@ -955,7 +971,7 @@ class ModelRunner:
             key = "model.layers." + str(i) + ".self_attn" + selected_channel
             self.sorted_channels.append(
                 torch.tensor(channel_config[key])[
-                :, : self.server_args.ds_heavy_channel_num
+                    :, : self.server_args.ds_heavy_channel_num
                 ]
                 .contiguous()
                 .cuda()
@@ -1039,7 +1055,9 @@ class ModelRunner:
         self, forward_batch: ForwardBatch, skip_attn_backend_init: bool = False
     ) -> LogitsProcessorOutput:
         self.forward_pass_id += 1
-        with get_global_expert_distribution_recorder().with_forward_pass(self.forward_pass_id):
+        with get_global_expert_distribution_recorder().with_forward_pass(
+            self.forward_pass_id
+        ):
             return self._forward_raw(forward_batch, skip_attn_backend_init)
 
     def _forward_raw(

@@ -45,6 +45,7 @@ import uvloop
 import zmq
 import zmq.asyncio
 from fastapi import BackgroundTasks
+
 from sglang.srt.aio_rwlock import RWLock
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.conn import KVBootstrapServer
@@ -716,18 +717,27 @@ class TokenizerManager:
 
         for layer_id_end in layer_id_lens:
             logger.info(f"update_expert_location handling up to {layer_id_end}th layer")
-            partial_expert_location_metadata = copy.deepcopy(old_expert_location_metadata)
-            partial_expert_location_metadata.update(obj.expert_location_metadata, layer_id_start=0,
-                                                    layer_id_len=layer_id_end)
+            partial_expert_location_metadata = copy.deepcopy(
+                old_expert_location_metadata
+            )
+            partial_expert_location_metadata.update(
+                obj.expert_location_metadata,
+                layer_id_start=0,
+                layer_id_len=layer_id_end,
+            )
             await self._update_expert_location_raw(
                 expert_location_metadata=partial_expert_location_metadata,
             )
 
-    async def _update_expert_location_raw(self, expert_location_metadata: ExpertLocationMetadata):
+    async def _update_expert_location_raw(
+        self, expert_location_metadata: ExpertLocationMetadata
+    ):
         self.expert_location_metadata = None
-        await self.update_expert_location_communicator(UpdateExpertLocationReqInput(
-            expert_location_metadata=expert_location_metadata,
-        ))
+        await self.update_expert_location_communicator(
+            UpdateExpertLocationReqInput(
+                expert_location_metadata=expert_location_metadata,
+            )
+        )
         self.expert_location_metadata = expert_location_metadata
 
     async def update_weights_from_disk(
@@ -1037,8 +1047,8 @@ class TokenizerManager:
             elif isinstance(recv_obj, BatchTokenIDOut):
                 if self.server_args.stream_output and state.obj.stream:
                     output_token_ids = recv_obj.output_ids[i][
-                                       state.last_output_offset:
-                                       ]
+                        state.last_output_offset :
+                    ]
                     state.last_output_offset = len(recv_obj.output_ids[i])
                 else:
                     output_token_ids = recv_obj.output_ids[i]

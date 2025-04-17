@@ -8,8 +8,9 @@ from pathlib import Path
 from typing import List
 
 import numpy as np
-import sglang as sgl
 import torch
+
+import sglang as sgl
 from sglang.srt.managers.expert_distribution_storage import ExpertDistributionStorage
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
@@ -42,23 +43,23 @@ class TestEPLB(CustomTestCase):
         contents_raw = [
             dict(
                 prompt="1+1=2, 1+2=3, 1+3=4, 1+4=5, 1+5=",
-                expect_output='6, 1',
+                expect_output="6, 1",
             ),
             dict(
                 prompt="2*1=2, 2*2=4, 2*3=6, 2*4=",
-                expect_output='8, 2',
+                expect_output="8, 2",
             ),
             dict(
                 prompt="10*1=10, 10*2=20, 10*3=30, 10*4=40, 10*5=50, 10*6=",
-                expect_output='60, ',
+                expect_output="60, ",
             ),
             dict(
                 prompt="2/2=1, 4/2=2, 6/2=3, 8/2=",
-                expect_output='4, 1',
+                expect_output="4, 1",
             ),
             dict(
                 prompt="One plus one is two, one plus two is three, one plus three is",
-                expect_output=' four, one plus',
+                expect_output=" four, one plus",
             ),
         ]
 
@@ -73,12 +74,18 @@ class TestEPLB(CustomTestCase):
             random.shuffle(contents_duplicated)
 
             tasks = []
-            async for content in _yield_with_poisson_process(contents_duplicated, action_rate=request_rate):
+            async for content in _yield_with_poisson_process(
+                contents_duplicated, action_rate=request_rate
+            ):
                 print(f"[{time.time()}] Action: start async_generate")
-                tasks.append(asyncio.create_task(engine.async_generate(
-                    prompt=content["prompt"],
-                    sampling_params=dict(temperature=0, max_new_tokens=4),
-                )))
+                tasks.append(
+                    asyncio.create_task(
+                        engine.async_generate(
+                            prompt=content["prompt"],
+                            sampling_params=dict(temperature=0, max_new_tokens=4),
+                        )
+                    )
+                )
 
             actual_outputs = await asyncio.gather(*tasks)
             actual_output_texts = [x["text"] for x in actual_outputs]
@@ -128,12 +135,18 @@ class TestEPLB(CustomTestCase):
             del engine
 
     def test_eplb_start_rebalance_restart_mode_pin_memory(self):
-        self._test_eplb_start_rebalance_restart_core(expert_location_updater_mode="pin_memory")
+        self._test_eplb_start_rebalance_restart_core(
+            expert_location_updater_mode="pin_memory"
+        )
 
     def test_eplb_start_rebalance_restart_mode_pageable_memory(self):
-        self._test_eplb_start_rebalance_restart_core(expert_location_updater_mode="pageable_memory")
+        self._test_eplb_start_rebalance_restart_core(
+            expert_location_updater_mode="pageable_memory"
+        )
 
-    def _test_eplb_start_rebalance_restart_core(self, expert_location_updater_mode: str):
+    def _test_eplb_start_rebalance_restart_core(
+        self, expert_location_updater_mode: str
+    ):
         print("Action: test_eplb_start_rebalance_restart")
         with tempfile.TemporaryDirectory() as tmpdir:
             engine_kwargs = dict(
@@ -255,11 +268,11 @@ class TestEPLB(CustomTestCase):
 
         offset = 3
         physical_to_logical_map = (
-                                          offset
-                                          + torch.arange(0, _NUM_ROUTED_EXPERTS + ep_num_redundant_experts).repeat(
-                                      _NUM_HIDDEN_LAYERS, 1
-                                  )
-                                  ) % _NUM_ROUTED_EXPERTS
+            offset
+            + torch.arange(0, _NUM_ROUTED_EXPERTS + ep_num_redundant_experts).repeat(
+                _NUM_HIDDEN_LAYERS, 1
+            )
+        ) % _NUM_ROUTED_EXPERTS
         init_expert_location = dict(
             physical_to_logical_map=physical_to_logical_map.tolist()
         )
