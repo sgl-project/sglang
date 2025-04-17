@@ -41,23 +41,23 @@ class TestEPLB(CustomTestCase):
         contents_raw = [
             dict(
                 prompt="1+1=2, 1+2=3, 1+3=4, 1+4=5, 1+5=",
-                expect_output="TODO",
+                expect_output='6, 1',
             ),
             dict(
                 prompt="2*1=2, 2*2=4, 2*3=6, 2*4=",
-                expect_output="TODO",
+                expect_output='8, 2',
             ),
             dict(
                 prompt="10*1=10, 10*2=20, 10*3=30, 10*4=40, 10*5=50, 10*6=",
-                expect_output="TODO",
+                expect_output='60, ',
             ),
             dict(
                 prompt="2/2=1, 4/2=2, 6/2=3, 8/2=",
-                expect_output="TODO",
+                expect_output='4, 1',
             ),
             dict(
                 prompt="One plus one is two, one plus two is three, one plus three is",
-                expect_output="TODO",
+                expect_output=' four, one plus',
             ),
         ]
 
