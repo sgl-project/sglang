@@ -2,7 +2,7 @@ from typing import Tuple
 
 import torch
 
-from sglang.srt.lora.backend import BaseLoRABackend
+from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.utils import LoRABatchInfo
 from sglang.srt.utils import is_flashinfer_available
 

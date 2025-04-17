@@ -2,7 +2,7 @@ import dataclasses
 import logging
 import time
 import warnings
-from typing import Callable, List, Optional, Union
+from typing import List, Optional, Union
 
 import numpy as np
 

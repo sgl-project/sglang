@@ -19,6 +19,7 @@ from typing import Optional, Tuple, Union
 import torch
 import torch.nn as nn
 
+from sglang.srt.custom_op import CustomOp
 from sglang.srt.utils import is_cuda_available
 
 _is_cuda = is_cuda_available()
@@ -31,7 +32,6 @@ if _is_cuda:
         rmsnorm,
     )
 
-from sglang.srt.custom_op import CustomOp
 
 logger = logging.getLogger(__name__)
 
