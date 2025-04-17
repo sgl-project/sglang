@@ -496,6 +496,8 @@ class ModelRunner:
         logger.info("update_expert_location start")
         torch.distributed.barrier()
 
+        get_global_expert_distribution_recorder().flush_buffer_depending_on_expert_location_metadata()
+
         get_global_expert_location_metadata().update(recv_req.expert_location_metadata)
         if self.tp_rank == 0 and get_bool_env_var(
             "SGLANG_LOG_EXPERT_LOCATION_METADATA"

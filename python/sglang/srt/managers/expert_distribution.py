@@ -119,6 +119,9 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
                 forward_pass_id, gatherer_key, single_pass_physical_count
             )
 
+    def flush_buffer_depending_on_expert_location_metadata(self):
+        TODO
+
     def on_select_experts(self, topk_ids: torch.Tensor):
         self._on_hook("on_select_experts", topk_ids=topk_ids)
 
