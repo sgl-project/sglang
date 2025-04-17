@@ -247,14 +247,11 @@ class _LayerBasedSinglePassGatherer(_SinglePassGatherer):
         self._objects_of_layer = {}
 
     def _on_layer_data(
-            self, layer_idx: int, num_recv_tokens_per_expert_list: List[int]
+            self, layer_idx: int, objects: List[int]
     ):
-        # TODO for TBO, we may need to relax this restriction
         assert layer_idx not in self._objects_of_layer
         assert 0 <= layer_idx < self._expert_location_metadata.num_layers
-        self._objects_of_layer[layer_idx] = (
-            num_recv_tokens_per_expert_list
-        )
+        self._objects_of_layer[layer_idx] = objects
 
     def reset(self):
         self._objects_of_layer.clear()
