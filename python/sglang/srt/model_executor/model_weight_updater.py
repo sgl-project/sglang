@@ -25,7 +25,12 @@ class ModelWeightUpdater:
 
     def event_loop_step(self):
         memory_transfer_outputs = self._memory_transfer_manager.get_outputs()
+        assert len(memory_transfer_outputs) in {0, 1}
+        if len(memory_transfer_outputs) == 0:
+            return False
+
         TODO
+        return True
 
     def act(self):
         assert isinstance(self._state, _StatePrepared)
