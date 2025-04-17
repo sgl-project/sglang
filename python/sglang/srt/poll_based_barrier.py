@@ -10,7 +10,11 @@ class PollBasedBarrier:
         assert not self._local_arrived
         self._local_arrived = True
 
-    def poll_global_arrive(self) -> bool:
+    def poll_global_arrived(self) -> bool:
+        global_arrived = self._compute_global_arrived()
+        TODo
+   
+    def _compute_global_arrived(self) -> bool:
         local_arrived = self._noop or self._local_arrived
         global_arrived = torch.tensor(local_arrived).cuda()
         # Can optimize if bottleneck
