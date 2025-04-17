@@ -69,7 +69,8 @@ class AsyncToCudaManager(TensorOperationManagerBase):
     def get_outputs(self) -> List[NamedTensors]:
         outputs = []
         while len(self._inflight_tasks) > 0 and self._inflight_tasks[0].finish_event.query():
-            TODO
+            task = self._inflight_tasks.pop(0)
+            outputs.append(task.output_named_tensors)
         return outputs
 
     def _auto_create_stream(self):
