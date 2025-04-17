@@ -1461,11 +1461,11 @@ class DeepseekV2ForCausalLM(nn.Module):
             input_ids, hidden_states, self.lm_head, forward_batch
         )
 
-    def post_load_weights(self):
+    def post_load_weights(self, enable_mla_postprocess: bool = True):
 
         # Perform post-processing after loading weights
 
-        if not global_server_args_dict["disable_mla"]:
+        if enable_mla_postprocess and not global_server_args_dict["disable_mla"]:
             for layer_id in range(self.config.num_hidden_layers):
                 self_attn = self.model.layers[layer_id].self_attn
                 if hasattr(self_attn.kv_b_proj, "qweight"):
@@ -1670,7 +1670,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                     )
                     weight_loader(param, loaded_weight)
 
-        self.post_load_weights()
+        self.post_load_weights(enable_mla_postprocess=TODO)
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
