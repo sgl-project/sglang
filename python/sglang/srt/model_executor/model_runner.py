@@ -320,7 +320,6 @@ class ModelRunner:
             logger.info(f"DeepEP is turned on. DeepEP mode: {server_args.deepep_mode}")
 
         if not self.use_mla_backend:
-            logger.info("Disable chunked prefix cache for non-MLA backend.")
             server_args.disable_chunked_prefix_cache = True
         elif self.page_size > 1:
             logger.info("Disable chunked prefix cache when page size > 1.")

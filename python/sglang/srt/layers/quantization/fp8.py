@@ -8,15 +8,6 @@ import torch.nn.functional as F
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
-from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
-from sglang.srt.layers.quantization.utils import (
-    all_close_1d,
-    convert_to_channelwise,
-    is_layer_skipped,
-    per_tensor_dequantize,
-    requantize_with_max_scale,
-)
-
 try:
     from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
         apply_fp8_marlin_linear,
@@ -27,11 +18,12 @@ try:
 except ImportError:
     MARLIN_FP8_AVAILABLE = False
 
-    def apply_fp8_marlin_linear(*args, **kwargs):
-        raise ImportError("vllm is not installed")
+    def dummy_func(*args, **kwargs):
+        raise ImportError(
+            "marlin FP8 requires some operators from vllm. Please install vllm."
+        )
 
-    def prepare_fp8_layer_for_marlin(*args, **kwargs):
-        raise ImportError("vllm is not installed")
+    apply_fp8_marlin_linear = prepare_fp8_layer_for_marlin = dummy_func
 
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
@@ -49,7 +41,10 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
+from sglang.srt.layers.quantization.fp8_kernel import (
+    per_token_group_quant_fp8,
+    scaled_fp8_quant,
+)
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
     apply_w8a8_block_fp8_linear,
@@ -57,30 +52,35 @@ from sglang.srt.layers.quantization.fp8_utils import (
     input_to_float8,
     normalize_e4m3fn_to_e4m3fnuz,
 )
+from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
+from sglang.srt.layers.quantization.utils import (
+    all_close_1d,
+    convert_to_channelwise,
+    is_layer_skipped,
+    per_tensor_dequantize,
+    requantize_with_max_scale,
+)
 from sglang.srt.utils import (
     get_bool_env_var,
     is_cuda,
     is_hip,
-    permute_weight,
     print_warning_once,
     set_weight_attrs,
 )
 
-ACTIVATION_SCHEMES = ["static", "dynamic"]
-
 _is_hip = is_hip()
+_is_cuda = is_cuda()
 
 if _is_hip:
     from aiter import ActivationType
     from aiter.fused_moe_bf16_asm import asm_moe, ck_moe_2stages, ck_moe_2stages_win4
     from aiter.ops.shuffle import shuffle_weight
 
-_is_cuda = is_cuda()
+if not _is_cuda:
+    from vllm._custom_ops import scaled_fp8_quant
 
-if _is_cuda:
-    from sglang.srt.custom_op import scaled_fp8_quant as sgl_scaled_fp8_quant
-else:
-    from vllm import _custom_ops as vllm_ops
+
+ACTIVATION_SCHEMES = ["static", "dynamic"]
 
 logger = logging.getLogger(__name__)
 
@@ -243,7 +243,6 @@ class Fp8LinearMethod(LinearMethodBase):
                         )
 
         layer.logical_widths = output_partition_sizes
-
         layer.input_size_per_partition = input_size_per_partition
         layer.output_size_per_partition = output_size_per_partition
         layer.orig_dtype = params_dtype
@@ -327,7 +326,9 @@ class Fp8LinearMethod(LinearMethodBase):
                     layer.weight_scale_inv.data, requires_grad=False
                 )
             return
+
         layer.weight = torch.nn.Parameter(layer.weight.data, requires_grad=False)
+
         # If checkpoint not serialized fp8, quantize the weights.
         if not self.quant_config.is_checkpoint_fp8_serialized:
             if self.cutlass_fp8_supported or self.use_marlin:
@@ -391,12 +392,9 @@ class Fp8LinearMethod(LinearMethodBase):
                 )
 
         if self.use_marlin:
-            try:
-                prepare_fp8_layer_for_marlin(layer)
-                # Activations not quantized for marlin.
-                del layer.input_scale
-            except ImportError:
-                self.use_marlin = False
+            prepare_fp8_layer_for_marlin(layer)
+            # Activations not quantized for marlin.
+            del layer.input_scale
 
     def apply(
         self,
@@ -406,18 +404,15 @@ class Fp8LinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
 
         if self.use_marlin:
-            try:
-                return apply_fp8_marlin_linear(
-                    input=x,
-                    weight=layer.weight,
-                    weight_scale=layer.weight_scale,
-                    workspace=layer.workspace,
-                    size_n=layer.output_size_per_partition,
-                    size_k=layer.input_size_per_partition,
-                    bias=bias,
-                )
-            except ImportError:
-                self.use_marlin = False
+            return apply_fp8_marlin_linear(
+                input=x,
+                weight=layer.weight,
+                weight_scale=layer.weight_scale,
+                workspace=layer.workspace,
+                size_n=layer.output_size_per_partition,
+                size_k=layer.input_size_per_partition,
+                bias=bias,
+            )
 
         if self.block_quant:
             return apply_w8a8_block_fp8_linear(
@@ -516,7 +511,7 @@ class Fp8MoEMethod:
                     )
 
         # WEIGHTS
-        if get_bool_env_var("USE_INT4_WEIGHT"):
+        if _is_hip and get_bool_env_var("USE_INT4_WEIGHT"):
             # INT4 MoE weight - INT32 packed
             w13_weight = torch.nn.Parameter(
                 torch.empty(
@@ -617,7 +612,7 @@ class Fp8MoEMethod:
             set_weight_attrs(w13_weight_scale, extra_weight_attrs)
             set_weight_attrs(w2_weight_scale, extra_weight_attrs)
 
-            if get_bool_env_var("USE_INT4_WEIGHT"):
+            if _is_hip and get_bool_env_var("USE_INT4_WEIGHT"):
                 extra_weight_attrs.update(
                     {"quant_method": FusedMoeWeightScaleSupported.CHANNEL.value}
                 )
@@ -649,7 +644,7 @@ class Fp8MoEMethod:
             layer.w2_input_scale = None
 
     def process_weights_after_loading(self, layer: Module) -> None:
-        if get_bool_env_var("USE_INT4_WEIGHT"):
+        if _is_hip and get_bool_env_var("USE_INT4_WEIGHT"):
             self.process_weights_hip_int4(layer)
             return
 
@@ -706,20 +701,12 @@ class Fp8MoEMethod:
                 requires_grad=False,
             )
             for expert in range(layer.num_experts):
-                if _is_cuda:
-                    w13_weight[expert, :, :], layer.w13_weight_scale[expert] = (
-                        sgl_scaled_fp8_quant(layer.w13_weight.data[expert, :, :])
-                    )
-                    w2_weight[expert, :, :], layer.w2_weight_scale[expert] = (
-                        sgl_scaled_fp8_quant(layer.w2_weight.data[expert, :, :])
-                    )
-                else:
-                    w13_weight[expert, :, :], layer.w13_weight_scale[expert] = (
-                        vllm_ops.scaled_fp8_quant(layer.w13_weight.data[expert, :, :])
-                    )
-                    w2_weight[expert, :, :], layer.w2_weight_scale[expert] = (
-                        vllm_ops.scaled_fp8_quant(layer.w2_weight.data[expert, :, :])
-                    )
+                w13_weight[expert, :, :], layer.w13_weight_scale[expert] = (
+                    scaled_fp8_quant(layer.w13_weight.data[expert, :, :])
+                )
+                w2_weight[expert, :, :], layer.w2_weight_scale[expert] = (
+                    scaled_fp8_quant(layer.w2_weight.data[expert, :, :])
+                )
             layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
             layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
 
@@ -796,18 +783,10 @@ class Fp8MoEMethod:
                         layer.w13_weight[expert_id][start : start + shard_size, :],
                         layer.w13_weight_scale[expert_id][shard_id],
                     )
-                    if _is_cuda:
-                        (
-                            layer.w13_weight[expert_id][start : start + shard_size, :],
-                            _,
-                        ) = sgl_scaled_fp8_quant(dq_weight, max_w13_scales[expert_id])
-                    else:
-                        (
-                            layer.w13_weight[expert_id][start : start + shard_size, :],
-                            _,
-                        ) = vllm_ops.scaled_fp8_quant(
-                            dq_weight, max_w13_scales[expert_id]
-                        )
+                    (
+                        layer.w13_weight[expert_id][start : start + shard_size, :],
+                        _,
+                    ) = scaled_fp8_quant(dq_weight, max_w13_scales[expert_id])
                     start += shard_size
 
             layer.w13_weight_scale = torch.nn.Parameter(
@@ -930,41 +909,11 @@ class Fp8MoEMethod:
             correction_bias=correction_bias,
         )
 
-        if _is_hip and get_bool_env_var("USE_INT4_WEIGHT"):
-            # TODO: add triton kernel and add check get_bool_env_var("CK_MOE")
-            assert not no_combine, f"{no_combine=} is not supported."
-            return ck_moe_2stages_win4(
-                x,
-                layer.w13_weight,
-                layer.w2_weight,
-                topk_weights,
-                topk_ids,
-                layer.w13_weight_scale1,
-                layer.w2_weight_scale1,
-                activation=(
-                    ActivationType.Silu if activation == "silu" else ActivationType.Gelu
-                ),
-            )
-        if _is_hip and get_bool_env_var("CK_MOE"):
-            assert not no_combine, f"{no_combine=} is not supported."
-            if self.block_quant:
-                # TODO(CK_MOE): FP8 block_quant only supports 'silu' for the time-being.
-                assert (
-                    activation == "silu"
-                ), f"CK_MOE: FP8 bloack_quant {activation=} will be supported later, unset CK_MOE"
-                return asm_moe(
-                    x,
-                    layer.w13_weight,
-                    layer.w2_weight,
-                    topk_weights,
-                    topk_ids,
-                    layer.w13_weight_scale_inv,
-                    layer.w2_weight_scale_inv,
-                    block_shape=tuple(self.quant_config.weight_block_size),
-                    expert_mask=None,
-                )
-            else:
-                return ck_moe_2stages(
+        if _is_hip:
+            if get_bool_env_var("USE_INT4_WEIGHT"):
+                # TODO: add triton kernel and add check get_bool_env_var("CK_MOE")
+                assert not no_combine, f"{no_combine=} is not supported."
+                return ck_moe_2stages_win4(
                     x,
                     layer.w13_weight,
                     layer.w2_weight,
@@ -978,33 +927,65 @@ class Fp8MoEMethod:
                         else ActivationType.Gelu
                     ),
                 )
-        else:
-            # Expert fusion with FP8 quantization
-            return fused_experts(
-                x,
-                layer.w13_weight,
-                layer.w2_weight,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                inplace=inplace and not no_combine,
-                activation=activation,
-                apply_router_weight_on_input=apply_router_weight_on_input,
-                use_fp8_w8a8=True,
-                w1_scale=(
-                    layer.w13_weight_scale_inv
-                    if self.block_quant
-                    else layer.w13_weight_scale
-                ),
-                w2_scale=(
-                    layer.w2_weight_scale_inv
-                    if self.block_quant
-                    else layer.w2_weight_scale
-                ),
-                a1_scale=layer.w13_input_scale,
-                a2_scale=layer.w2_input_scale,
-                block_shape=self.quant_config.weight_block_size,
-                no_combine=no_combine,
-            )
+
+            if get_bool_env_var("CK_MOE"):
+                assert not no_combine, f"{no_combine=} is not supported."
+                if self.block_quant:
+                    # TODO(CK_MOE): FP8 block_quant only supports 'silu' for the time-being.
+                    assert (
+                        activation == "silu"
+                    ), f"CK_MOE: FP8 bloack_quant {activation=} will be supported later, unset CK_MOE"
+                    return asm_moe(
+                        x,
+                        layer.w13_weight,
+                        layer.w2_weight,
+                        topk_weights,
+                        topk_ids,
+                        layer.w13_weight_scale_inv,
+                        layer.w2_weight_scale_inv,
+                        block_shape=tuple(self.quant_config.weight_block_size),
+                        expert_mask=None,
+                    )
+                else:
+                    return ck_moe_2stages(
+                        x,
+                        layer.w13_weight,
+                        layer.w2_weight,
+                        topk_weights,
+                        topk_ids,
+                        layer.w13_weight_scale1,
+                        layer.w2_weight_scale1,
+                        activation=(
+                            ActivationType.Silu
+                            if activation == "silu"
+                            else ActivationType.Gelu
+                        ),
+                    )
+
+        # Expert fusion with FP8 quantization
+        return fused_experts(
+            x,
+            layer.w13_weight,
+            layer.w2_weight,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            inplace=inplace and not no_combine,
+            activation=activation,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            use_fp8_w8a8=True,
+            w1_scale=(
+                layer.w13_weight_scale_inv
+                if self.block_quant
+                else layer.w13_weight_scale
+            ),
+            w2_scale=(
+                layer.w2_weight_scale_inv if self.block_quant else layer.w2_weight_scale
+            ),
+            a1_scale=layer.w13_input_scale,
+            a2_scale=layer.w2_input_scale,
+            block_shape=self.quant_config.weight_block_size,
+            no_combine=no_combine,
+        )
 
 
 class Fp8KVCacheMethod(BaseKVCacheMethod):
