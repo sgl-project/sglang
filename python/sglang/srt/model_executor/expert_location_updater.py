@@ -83,7 +83,7 @@ def _compute_interesting_logical_experts_of_layer(
 
     interesting_logical_experts_of_layer = {}
     for layer_id in range(num_layers):
-        old_partial_map = _get_partial_physical_to_logical_map(old_expert_location_metadata)
-        new_partial_map = _get_partial_physical_to_logical_map(new_expert_location_metadata)
+        old_partial_map = _get_partial_physical_to_logical_map(old_expert_location_metadata, layer_id)
+        new_partial_map = _get_partial_physical_to_logical_map(new_expert_location_metadata, layer_id)
         interesting_logical_experts_of_layer[layer_id] = new_partial_map[new_partial_map != old_partial_map].tolist()
     return interesting_logical_experts_of_layer
