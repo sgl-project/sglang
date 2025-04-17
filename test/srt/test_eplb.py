@@ -3,7 +3,9 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from typing import List
 
+import numpy as np
 import sglang as sgl
 import torch
 from python.sglang.srt.managers.expert_location import compute_logical_to_rank_dispatch_physical_map
@@ -279,6 +281,13 @@ def _compute_trivial_expert_locations(ep_num_redundant_experts: int):
         x % _NUM_ROUTED_EXPERTS
         for x in range(_NUM_ROUTED_EXPERTS + ep_num_redundant_experts)
     )
+
+
+async def _get_request(input_requests: List[str], request_rate: float):
+    for request in input_requests:
+        yield request
+        interval = np.random.exponential(1.0 / request_rate)
+        await asyncio.sleep(interval)
 
 
 if __name__ == "__main__":
