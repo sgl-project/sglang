@@ -35,8 +35,7 @@ class ModelWeightUpdater:
     def start_prepare(self, weight_filter: Callable[[str], bool]):
         assert isinstance(self._state, _StateIdle)
 
-        all_weights_iterator = self._model_weight_source.get_all_weights()
-        interesting_weights = [(name, weight) for name, weight in all_weights_iterator if weight_filter(name)]
+        interesting_weights = [(name, weight) for name, weight in self._all_weights if weight_filter(name)]
         self._memory_transfer_manager.enqueue(interesting_weights)
 
         self._state = _StateAwaitMemoryTransfer()
