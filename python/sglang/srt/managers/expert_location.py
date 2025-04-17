@@ -131,8 +131,13 @@ class ExpertLocationMetadata:
             physical_to_logical_map: torch.Tensor,
             logical_to_all_physical_map: torch.Tensor,
     ):
-        logical_to_all_physical_map_padded = F.pad(logical_to_all_physical_map,
-                                                   (0, num_physical_experts - current_last_dim), value=-1)
+        _, num_physical_experts = physical_to_logical_map.shape
+
+        logical_to_all_physical_map_padded = F.pad(
+            logical_to_all_physical_map,
+            (0, num_physical_experts - logical_to_all_physical_map.shape[-1]),
+            value=-1,
+        )
 
         logical_to_all_physical_map_num_valid = torch.count_nonzero(logical_to_all_physical_map != -1, dim=-1)
 
