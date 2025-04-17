@@ -12,7 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 
-import os
+import math
 from typing import Callable, Optional
 
 import torch
@@ -24,6 +24,12 @@ from sglang.srt.utils import get_compiler_backend, is_cuda, is_hip
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+
+if _is_cuda:
+    from sgl_kernel import moe_fused_gate
+
+if _is_cuda or _is_hip:
+    from sgl_kernel import topk_softmax
 
 
 expert_distribution_recorder = ExpertDistributionRecorder()
@@ -56,11 +62,6 @@ def fused_topk(
     topk: int,
     renormalize: bool,
 ):
-    if _is_cuda or _is_hip:
-        from sgl_kernel import topk_softmax
-    else:
-        from vllm import _custom_ops as vllm_ops
-
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
     M, _ = hidden_states.shape
@@ -73,20 +74,12 @@ def fused_topk(
         M, topk, dtype=torch.int32, device=hidden_states.device
     )
 
-    if _is_cuda or _is_hip:
-        topk_softmax(
-            topk_weights,
-            topk_ids,
-            token_expert_indicies,
-            gating_output.float(),
-        )
-    else:
-        vllm_ops.topk_softmax(
-            topk_weights,
-            topk_ids,
-            token_expert_indicies,
-            gating_output.float(),
-        )
+    topk_softmax(
+        topk_weights,
+        topk_ids,
+        token_expert_indicies,
+        gating_output.float(),
+    )
     del token_expert_indicies
 
     if renormalize:
@@ -209,6 +202,10 @@ def biased_grouped_topk_impl(
     return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
 
 
+def is_power_of_two(n):
+    return n > 0 and math.log2(n).is_integer()
+
+
 def biased_grouped_topk(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -220,23 +217,37 @@ def biased_grouped_topk(
     compiled: bool = True,
     n_share_experts_fusion: int = 0,
 ):
-    biased_grouped_topk_fn = (
-        torch.compile(
-            biased_grouped_topk_impl, dynamic=True, backend=get_compiler_backend()
+    # TODO: moe_fused_gate kernel is not supported for n_share_experts_fusion > 0 now.
+    if (
+        _is_cuda
+        and n_share_experts_fusion == 0
+        and is_power_of_two(correction_bias.shape[0])
+    ):
+        return moe_fused_gate(
+            gating_output,
+            correction_bias,
+            num_expert_group,
+            topk_group,
+            topk,
         )
-        if compiled
-        else biased_grouped_topk_impl
-    )
-    return biased_grouped_topk_fn(
-        hidden_states,
-        gating_output,
-        correction_bias,
-        topk,
-        renormalize,
-        num_expert_group,
-        topk_group,
-        n_share_experts_fusion=n_share_experts_fusion,
-    )
+    else:
+        biased_grouped_topk_fn = (
+            torch.compile(
+                biased_grouped_topk_impl, dynamic=True, backend=get_compiler_backend()
+            )
+            if compiled
+            else biased_grouped_topk_impl
+        )
+        return biased_grouped_topk_fn(
+            hidden_states,
+            gating_output,
+            correction_bias,
+            topk,
+            renormalize,
+            num_expert_group,
+            topk_group,
+            n_share_experts_fusion=n_share_experts_fusion,
+        )
 
 
 def select_experts(

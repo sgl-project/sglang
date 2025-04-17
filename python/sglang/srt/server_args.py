@@ -186,6 +186,8 @@ class ServerArgs:
     warmups: Optional[str] = None
     n_share_experts_fusion: int = 0
     disable_shared_experts_fusion: bool = False
+    disable_chunked_prefix_cache: bool = False
+    disable_fast_image_processor: bool = False
 
     # Debug tensor dumps
     debug_tensor_dump_output_folder: Optional[str] = None
@@ -195,6 +197,7 @@ class ServerArgs:
     # For PD disaggregation: can be "null" (not disaggregated), "prefill" (prefill-only), or "decode" (decode-only)
     disaggregation_mode: str = "null"
     disaggregation_bootstrap_port: int = 8998
+    disaggregation_transfer_backend: str = "mooncake"
 
     def __post_init__(self):
         # Expert parallelism
@@ -979,6 +982,7 @@ class ServerArgs:
         )
         parser.add_argument(
             "--enable-llama4-multimodal",
+            default=ServerArgs.enable_llama4_multimodal,
             action="store_true",
             help="Enable the multimodal functionality for Llama-4.",
         )
@@ -1125,6 +1129,16 @@ class ServerArgs:
             action="store_true",
             help="Disable shared experts fusion by setting n_share_experts_fusion to 0.",
         )
+        parser.add_argument(
+            "--disable-chunked-prefix-cache",
+            action="store_true",
+            help="Disable chunked prefix cache feature for deepseek, which should save overhead for short sequences.",
+        )
+        parser.add_argument(
+            "--disable-fast-image-processor",
+            action="store_true",
+            help="Adopt base image processor instead of fast image processor.",
+        )
 
         # Server warmups
         parser.add_argument(
@@ -1168,6 +1182,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.disaggregation_bootstrap_port,
             help="Bootstrap server port on the prefill server. Default is 8998.",
+        )
+        parser.add_argument(
+            "--disaggregation-transfer-backend",
+            type=str,
+            default=ServerArgs.disaggregation_transfer_backend,
+            help="The backend for disaggregation transfer. Default is mooncake.",
         )
 
     @classmethod
