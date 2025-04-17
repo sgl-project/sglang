@@ -7,9 +7,7 @@ import torch
 from sglang.srt.utils import get_device_sm, kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
-    DEFAULT_LOCAL_ATTENTION_MODEL_NAME_FOR_TEST,  # Llama 4
-)
-from sglang.test.test_utils import (
+    DEFAULT_LOCAL_ATTENTION_MODEL_NAME_FOR_TEST,
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
