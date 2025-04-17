@@ -113,7 +113,7 @@ class AsyncToCudaManager(TensorOperationManagerBase):
         return outputs
 
     def _handle_one_output(self, task: "_AsyncToCudaTask"):
-        torch.cuda.current_stream().wait_stream(self._alt_stream)
+        task.finish_event.wait(torch.cuda.current_stream())
         return task.output_named_tensors
 
     def _auto_create_stream(self):
