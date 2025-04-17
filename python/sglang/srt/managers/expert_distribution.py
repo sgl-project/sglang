@@ -195,10 +195,10 @@ def set_global_expert_distribution_recorder(value):
 
 
 def postprocess_dumps(
-        physical_dumps: List[Any], expert_location_metadata: "ExpertLocationMetadata"
+        dumps: List[Any], expert_location_metadata: "ExpertLocationMetadata"
 ):
     return _Accumulator.get_class().postprocess_dumps(
-        physical_dumps, expert_location_metadata
+        dumps, expert_location_metadata
     )
 
 
@@ -373,7 +373,7 @@ class _Accumulator(ABC):
     @classmethod
     def postprocess_dumps(
             cls,
-            physical_dumps: List[Any],
+            dumps: List[Any],
             expert_location_metadata: "ExpertLocationMetadata",
     ):
         raise NotImplementedError
@@ -400,11 +400,11 @@ class _DetailAccumulator(_Accumulator):
     @classmethod
     def postprocess_dumps(
             cls,
-            physical_dumps: List[Any],
+            dumps: List[Any],
             expert_location_metadata: "ExpertLocationMetadata",
     ):
         # Do not convert to logical since we want all details
-        return [record for physical_dump in physical_dumps for record in physical_dump]
+        return [record for dump in dumps for record in dump]
 
     def __init__(self, expert_location_metadata: "ExpertLocationMetadata", rank: int):
         super().__init__(expert_location_metadata, rank)
@@ -463,11 +463,10 @@ class _StatAccumulator(_Accumulator):
     @classmethod
     def postprocess_dumps(
             cls,
-            physical_dumps: List[Any],
+            dumps: List[Any],
             expert_location_metadata: "ExpertLocationMetadata",
     ):
-        TODO_rename_physical_dumps
-        logical_count = torch.stack([item["logical_count"] for item in physical_dumps]).sum(dim=0)
+        logical_count = torch.stack([item["logical_count"] for item in dumps]).sum(dim=0)
         return dict(logical_count=logical_count.tolist())
 
     def __init__(self, expert_location_metadata: "ExpertLocationMetadata", rank: int):
@@ -524,14 +523,14 @@ TODO
             )
         )
         # Most naive implementation, can optimize if it is bottleneck
-        for physical_dump in physical_dumps:
+        for dump in dumps:
             for layer_index in range(expert_location_metadata.num_layers):
                 for local_physical_expert_index in range(
                         expert_location_metadata.num_local_physical_experts
                 ):
                     global_physical_expert_index = (
                         expert_location_metadata.local_physical_to_physical(
-                            rank=physical_dump["rank"],
+                            rank=dump["rank"],
                             local_physical_expert_index=local_physical_expert_index,
                         )
                     )
@@ -541,7 +540,7 @@ TODO
                         ]
                     )
                     TODO_no_physical_count_key
-                    logical_count[layer_index, logical_expert_index] += physical_dump[
+                    logical_count[layer_index, logical_expert_index] += dump[
                         "physical_count"
                     ][layer_index][local_physical_expert_index]
 """
