@@ -91,8 +91,8 @@ class ExpertLocationUpdater:
         _log_with_accurate_time("ExpertLocationUpdater.act end")
         return UpdateExpertLocationReqOutput()
 
-    def _weight_filter(self, name: str, interesting_logical_experts_of_layer: Dict[int, List[int]]):
-        info: ModelParamNameInfo = self._model_runner.model.get_param_name_info(name)
+    def _weight_filter(self, _name: str, info: ModelParamNameInfo,
+                       interesting_logical_experts_of_layer: Dict[int, List[int]]):
         return (
                 isinstance(info, ModelParamNameInfoMoe)
                 and (info.expert_id in interesting_logical_experts_of_layer.get(info.layer_id, []))

@@ -26,16 +26,16 @@ class ModelWeightUpdater:
         self._model = model
         self._device = device
 
-        self._all_weights = _get_all_weights(load_format=load_format, model_config=model_config, model=model,
-                                             pin_memory=init_pin_memory)
+        self._all_weights_and_info = _get_all_weights_and_info(load_format=load_format, model_config=model_config, model=model,
+                                                               pin_memory=init_pin_memory)
         self._memory_transfer_manager = AsyncToCudaManager() if init_pin_memory else CombinedManager.init_pin_memory_and_to_cuda()
 
         self._state: _State = _StateIdle()
 
-    def start_prepare(self, weight_filter: Callable[[str], bool]):
+    def start_prepare(self, weight_filter):
         assert isinstance(self._state, _StateIdle)
 
-        interesting_weights = [(name, weight) for name, weight in self._all_weights if weight_filter(name)]
+        interesting_weights = [(name, weight) for name, weight, info in self._all_weights_and_info if weight_filter(name, info)]
         self._memory_transfer_manager.enqueue(interesting_weights)
 
         self._state = _StateAwaitMemoryTransfer()
@@ -85,7 +85,7 @@ class _StatePrepared(_State):
     named_tensors: List[Tuple[str, torch.Tensor]]
 
 
-def _get_all_weights(load_format: str, model_config: ModelConfig, model, pin_memory: bool):
+def _get_all_weights_and_info(load_format: str, model_config: ModelConfig, model, pin_memory: bool):
     load_config = LoadConfig(load_format=load_format)
     loader = get_model_loader(load_config)
     assert isinstance(loader, DefaultModelLoader)
@@ -95,7 +95,12 @@ def _get_all_weights(load_format: str, model_config: ModelConfig, model, pin_mem
     if pin_memory:
         all_weights = _named_tensors_pin_memory(all_weights)
 
-    return all_weights
+    all_weights_and_info = [
+        (name, weight, model.get_param_name_info(name))
+        for name, weight in all_weights
+    ]
+
+    return all_weights_and_info
 
 
 def _named_tensors_pin_memory(named_tensors: Iterable[Tuple[str, torch.Tensor]]) -> List[Tuple[str, torch.Tensor]]:
