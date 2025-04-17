@@ -466,7 +466,7 @@ class _StatAccumulator(_Accumulator):
             dumps: List[Any],
             expert_location_metadata: "ExpertLocationMetadata",
     ):
-        logical_count = torch.stack([item["logical_count"] for item in dumps]).sum(dim=0)
+        logical_count = torch.tensor([item["logical_count"] for item in dumps]).sum(dim=0)
         return dict(logical_count=logical_count.tolist())
 
     def __init__(self, expert_location_metadata: "ExpertLocationMetadata", rank: int):
