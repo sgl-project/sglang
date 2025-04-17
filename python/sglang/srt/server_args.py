@@ -162,6 +162,8 @@ class ServerArgs:
     enable_dp_attention: bool = False
     enable_ep_moe: bool = False
     enable_deepep_moe: bool = False
+    enable_eplb_moe: bool = False
+
     deepep_mode: Optional[Literal["auto", "normal", "low_latency"]] = "auto"
     enable_torch_compile: bool = False
     torch_compile_max_bs: int = 32
@@ -325,6 +327,12 @@ class ServerArgs:
             )
             logger.info(
                 f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
+            )
+        # Load Balance MoE
+        if self.enable_eplb_moe:
+            self.ep_size = self.tp_size
+            logger.info(
+                f"Load Balance MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
 
         # Speculative Decoding
@@ -1108,6 +1116,11 @@ class ServerArgs:
             "--enable-deepep-moe",
             action="store_true",
             help="Enabling DeepEP MoE implementation for EP MoE.",
+        )
+        parser.add_argument(
+            "--enable-eplb-moe",
+            action="store_true",
+            help="Enabling Load Balance MoE implementation for EP MoE.",
         )
         parser.add_argument(
             "--deepep-mode",
