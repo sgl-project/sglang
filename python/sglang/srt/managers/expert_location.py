@@ -265,12 +265,12 @@ def _pad_nested_array(arr, pad_value):
     return padded
 
 
+# This is rarely called, so we use for loops for maximum clarity
 def compute_logical_to_rank_dispatch_physical_map(
         logical_to_all_physical_map: torch.Tensor,
         num_gpus: int,
         num_physical_experts: int,
 ):
-    # This is rarely called, so we use for loops for maximum clarity
     r = random.Random()
 
     num_local_physical_experts = num_physical_experts // num_gpus
