@@ -92,9 +92,9 @@ class TestEPLB(CustomTestCase):
                 return
 
             for i in range(num_rebalance):
-                print(f"[{time.time()}] Action: start eplb_rebalance")
+                print(f"[{time.time()}] Action: start eplb_rebalance {i}")
                 await engine.tokenizer_manager.eplb_rebalance()
-                print(f"[{time.time()}] Action: end eplb_rebalance")
+                print(f"[{time.time()}] Action: end eplb_rebalance {i}")
                 await asyncio.sleep(1.0)
 
         with tempfile.TemporaryDirectory() as tmpdir:
