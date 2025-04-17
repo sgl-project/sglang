@@ -1681,7 +1681,7 @@ class DeepseekV2ForCausalLM(nn.Module):
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
-    def get_param_category(self, name):
+    def get_param_name_info(self, name: str) -> ModelParamNameInfo:
         if ".experts." in name:
             return "moe"
         return "others"
