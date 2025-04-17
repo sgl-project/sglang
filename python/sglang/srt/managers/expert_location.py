@@ -276,7 +276,10 @@ def _compute_logical_to_rank_dispatch_physical_map(
     for layer_id in range(num_layers):
         for logical_expert_id in range(num_logical_experts):
             partial_map = logical_to_all_physical_map[:, layer_id, logical_expert_id]
-            TODO
+
+            for gpu_id in range(num_gpus):
+                if TODO:
+                    partial_map[gpu_id] = TODO
 
             # TODO old
             # for gpu_id in range(num_gpus):
@@ -289,6 +292,10 @@ def _compute_logical_to_rank_dispatch_physical_map(
 
     assert torch.all(logical_to_rank_dispatch_physical_map != -1)
     return logical_to_rank_dispatch_physical_map
+
+
+def _compute_gpu_id_of_physical_expert(physical_expert_id: int) -> int:
+    return TODO
 
 
 @dataclass
