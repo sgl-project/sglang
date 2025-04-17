@@ -4,7 +4,6 @@ from typing import List, Optional
 import torch
 import triton
 import triton.language as tl
-
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
 from sglang.srt.utils import (
@@ -444,12 +443,12 @@ def gelu_and_mul_triton_kernel(
                 * (
                     1
                     + tanh(
-                        kAlpha
-                        * (
-                            gate_output
-                            + 0.044715 * gate_output * gate_output * gate_output
-                        )
+                    kAlpha
+                    * (
+                        gate_output
+                        + 0.044715 * gate_output * gate_output * gate_output
                     )
+                )
                 )
             )
             gate_output = gate_output.to(InDtype)
@@ -674,6 +673,9 @@ def grouped_gemm_triton(
         assert triton.cdiv(a.shape[-1], block_k) == scale_a.shape[-1]
         assert triton.cdiv(b.shape[-2], block_n) == scale_b.shape[-2]
         assert triton.cdiv(b.shape[-1], block_k) == scale_b.shape[-1]
+    else:
+        # TODO temp, will refactor
+        a = DisposibleTensor.maybe_unwrap(a)
 
     # TODO: adjust config or tune kernel
     # Reduce block size to prevent L40 shared memory overflow.
