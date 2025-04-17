@@ -84,7 +84,8 @@ class AsyncPinMemoryManager(TensorOperationManagerBase):
 
 # Can use cuMemCreate etc if we want to further remove a GPU->GPU copy
 class AsyncToCudaManager(TensorOperationManagerBase):
-    def __init__(self):
+    def __init__(self, allocator: "SimpleCachingAllocator"):
+        self._allocator = allocator
         self._inflight_tasks: List[_AsyncToCudaTask] = []
         self._alt_stream: Optional[torch.cuda.Stream] = None
 
@@ -120,6 +121,12 @@ class AsyncToCudaManager(TensorOperationManagerBase):
     def _auto_create_stream(self):
         if self._alt_stream is None:
             self._alt_stream = torch.cuda.Stream()
+
+    @staticmethod
+    def _tensor_to_cuda(input_tensor: torch.Tensor, allocator: "SimpleCachingAllocator"):
+        output_tensor = allocator.allocate(input_tensor.size, input_tensor.dtype)
+        output_tensor.copy_(input_tensor, non_blocking=True)
+        return output_tensor
 
 
 @dataclass
