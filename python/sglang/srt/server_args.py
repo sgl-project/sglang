@@ -287,6 +287,12 @@ class ServerArgs:
         # Choose grammar backend
         if self.grammar_backend is None:
             self.grammar_backend = "xgrammar"
+        # temporarily disable cuda graph for testing
+        if self.attention_backend == "cudnn":
+            logger.warning(
+                "Cuda graph is disabled because of using cudnn attention backend"
+            )
+            self.disable_cuda_graph = True
 
         # Expert parallelism
         if self.enable_ep_moe:
@@ -821,7 +827,14 @@ class ServerArgs:
         parser.add_argument(
             "--attention-backend",
             type=str,
-            choices=["flashinfer", "triton", "torch_native", "fa3", "flashmla"],
+            choices=[
+                "flashinfer",
+                "triton",
+                "torch_native",
+                "fa3",
+                "flashmla",
+                "cudnn",
+            ],
             default=ServerArgs.attention_backend,
             help="Choose the kernels for attention layers.",
         )
