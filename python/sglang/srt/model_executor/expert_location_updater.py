@@ -1,10 +1,10 @@
 import logging
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional, Any
 
 import torch
 from sglang.srt.managers.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.managers.expert_location import ExpertLocationMetadata
-from sglang.srt.managers.io_struct import UpdateExpertLocationReqInput
+from sglang.srt.managers.io_struct import UpdateExpertLocationReqInput, UpdateExpertLocationReqOutput
 from sglang.srt.managers.schedule_batch import get_global_expert_location_metadata
 from sglang.srt.model_executor.model_weight_updater import ModelWeightUpdater
 from sglang.srt.model_loader.weight_utils import ModelParamNameInfo, ModelParamNameInfoMoe
@@ -44,14 +44,16 @@ class ExpertLocationUpdater:
             weight_filter=lambda name: self._weight_filter(name, interesting_logical_experts_of_layer),
         )
 
-    def event_loop_step(self):
+    def event_loop_step(self) -> List[UpdateExpertLocationReqOutput]:
+        outputs = []
+
         if self._model_weight_updater.event_loop_step():
             self._prepare_end_barrier.local_arrive()
 
         if self._prepare_end_barrier.poll_global_arrived():
-            self._act()
+            outputs.append(self._act())
 
-        TODO_return_act_end
+        return outputs
 
     def _act(self):
         torch.distributed.barrier()
@@ -72,6 +74,8 @@ class ExpertLocationUpdater:
 
         assert self._ongoing_req is not None
         self._ongoing_req = None
+
+        return UpdateExpertLocationReqOutput()
 
     def _weight_filter(self, name: str, interesting_logical_experts_of_layer: Dict[int, List[int]]):
         info: ModelParamNameInfo = self._model_runner.model.get_param_name_info(name)
