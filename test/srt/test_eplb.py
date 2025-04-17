@@ -223,17 +223,17 @@ class TestEPLB(CustomTestCase):
         # 8 logical expert
         for logical_to_all_physical_map, expect_output in [
             (
-                torch.tensor([[[0], [1], [2], [3], [4], [5], [6], [7]], ]),
-                torch.tensor([[]]),
+                [[[0], [1], [2], [3], [4], [5], [6], [7]]],
+                [[]],
             ),
         ]:
             actual_output = compute_logical_to_rank_dispatch_physical_map(
-                logical_to_all_physical_map=logical_to_all_physical_map,
+                logical_to_all_physical_map=torch.tensor(logical_to_all_physical_map),
                 num_gpus=4,
                 num_physical_experts=12,
             )
             print(f"{actual_output=} {expect_output=}")
-            self.assertEqual(actual_output.tolist(), expect_output.tolist())
+            self.assertEqual(actual_output.tolist(), expect_output)
 
 
 def _compute_trivial_expert_locations(ep_num_redundant_experts: int):
