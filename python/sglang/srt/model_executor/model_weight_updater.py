@@ -50,6 +50,7 @@ class ModelWeightUpdater:
         if len(memory_transfer_outputs) == 0:
             return False
 
+        assert isinstance(self._state, _StateAwaitMemoryTransfer)
         memory_transfer_output = memory_transfer_outputs[0]
         self._state = _StatePrepared(named_tensors=memory_transfer_output)
         return True
