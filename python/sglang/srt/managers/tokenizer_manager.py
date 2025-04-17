@@ -705,8 +705,8 @@ class TokenizerManager:
     async def update_expert_location(self, obj: UpdateExpertLocationReqInput):
         self.auto_create_handle_loop()
         assert (
-            self.server_args.enable_scheduler_input_blocker and (self.server_args.ep_dispatch_algorithm is not None)
-        ), f"update_expert_location requires enable_scheduler_input_blocker and non-null ep_dispatch_algorithm"
+            self.server_args.ep_dispatch_algorithm is not None
+        ), f"update_expert_location requires ep_dispatch_algorithm"
 
         old_expert_location_metadata = copy.deepcopy(self.expert_location_metadata)
         num_layers = old_expert_location_metadata.num_layers
