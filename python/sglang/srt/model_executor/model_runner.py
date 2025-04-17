@@ -91,7 +91,7 @@ from sglang.srt.utils import (
     monkey_patch_p2p_access_check,
     monkey_patch_vllm_gguf_config,
     set_cpu_offload_max_bytes,
-    set_cuda_arch,
+    set_cuda_arch, broadcast_pyobj,
 )
 
 logger = logging.getLogger(__name__)
@@ -192,6 +192,7 @@ class ModelRunner:
         # Get memory before model loading
         min_per_gpu_memory = self.init_torch_distributed()
 
+        [expert_location_metadata] = broadcast_pyobj(data=[expert_location_metadata], rank=torch.distributed.get_rank())
         expert_location_metadata.to(server_args.device)
         set_global_expert_location_metadata(expert_location_metadata)
         if self.tp_rank == 0 and get_bool_env_var(
