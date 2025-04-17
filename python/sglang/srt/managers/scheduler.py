@@ -1871,12 +1871,11 @@ class Scheduler(
         logger.info("Stop profiling...")
         if self.torch_profiler is not None:
             self.torch_profiler.stop()
-            self.torch_profiler.export_chrome_trace(
-                os.path.join(
-                    self.torch_profiler_output_dir,
-                    str(time.time()) + f"-TP-{self.tp_rank}" + ".trace.json.gz",
-                )
+            file_name = os.path.join(self.torch_profiler_output_dir,
+                str(time.time()) + f"-TP-{self.tp_rank}" + ".trace.json"
             )
+            self.torch_profiler.export_chrome_trace(file_name)
+            os.system(f"gzip {file_name}")
 
         if "MEM" in self.profiler_activities:
             memory_profile_path = os.path.join(
