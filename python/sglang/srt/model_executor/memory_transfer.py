@@ -7,6 +7,7 @@ import torch
 NamedTensors = List[Tuple[str, torch.Tensor]]
 
 
+# For simplicity, classes here does not have tagging etc
 class TensorOperationManagerBase:
     def enqueue(self, named_tensors: NamedTensors):
         raise NotImplementedError
