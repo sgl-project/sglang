@@ -114,9 +114,9 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         if not self._recording:
             return
         for gatherer_key, gatherer in self._single_pass_gatherers.items():
-            single_pass_physical_count = gatherer.collect()
+            single_pass_global_physical_count = gatherer.collect()
             self._accumulator.append(
-                forward_pass_id, gatherer_key, single_pass_physical_count
+                forward_pass_id, gatherer_key, single_pass_global_physical_count
             )
 
     def flush_buffer_depending_on_expert_location_metadata(self):
@@ -357,7 +357,7 @@ class _Accumulator(ABC):
             self,
             forward_pass_id: int,
             gatherer_key: str,
-            single_pass_physical_count: torch.Tensor,
+            single_pass_global_physical_count: torch.Tensor,
     ):
         raise NotImplementedError
 
@@ -403,18 +403,18 @@ class _DetailAccumulator(_Accumulator):
             self,
             forward_pass_id: int,
             gatherer_key: str,
-            single_pass_physical_count: torch.Tensor,
+            single_pass_global_physical_count: torch.Tensor,
     ):
-        single_pass_physical_count = single_pass_physical_count.to("cpu")
+        single_pass_global_physical_count = single_pass_global_physical_count.to("cpu")
         if self._save_dir is None:
-            single_pass_physical_count = single_pass_physical_count.tolist()
+            single_pass_global_physical_count = single_pass_global_physical_count.tolist()
 
         self._records.append(
             dict(
                 forward_pass_id=forward_pass_id,
                 rank=self._rank,
                 gatherer_key=gatherer_key,
-                physical_count=single_pass_physical_count,
+                physical_count=single_pass_global_physical_count,
             )
         )
 
@@ -482,10 +482,10 @@ class _StatAccumulator(_Accumulator):
             self,
             forward_pass_id: int,
             gatherer_key: str,
-            single_pass_physical_count: torch.Tensor,
+            single_pass_global_physical_count: torch.Tensor,
     ):
         # Can optimize if overhead here is large
-        self._physical_count += single_pass_physical_count
+        self._physical_count += single_pass_global_physical_count
 
     def reset(self):
         self._physical_count[...] = 0
