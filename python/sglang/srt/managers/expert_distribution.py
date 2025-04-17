@@ -466,6 +466,7 @@ class _StatAccumulator(_Accumulator):
             physical_dumps: List[Any],
             expert_location_metadata: "ExpertLocationMetadata",
     ):
+        TODO
         logical_count = torch.zeros(
             (
                 expert_location_metadata.num_layers,
@@ -496,6 +497,7 @@ class _StatAccumulator(_Accumulator):
 
     def __init__(self, expert_location_metadata: "ExpertLocationMetadata", rank: int):
         super().__init__(expert_location_metadata, rank)
+        TODO
         self._physical_count = torch.zeros(
             (
                 self._expert_location_metadata.num_layers,
@@ -509,13 +511,16 @@ class _StatAccumulator(_Accumulator):
             gatherer_key: str,
             single_pass_global_physical_count: torch.Tensor,
     ):
+        TODO
         # Can optimize if overhead here is large
         self._physical_count += single_pass_global_physical_count
 
     def reset(self):
+        TODO
         self._physical_count[...] = 0
 
     def dump(self):
+        TODO
         return dict(
             rank=self._rank,
             physical_count=self._physical_count.tolist(),
