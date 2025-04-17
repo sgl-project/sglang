@@ -976,7 +976,9 @@ class FlashAttentionBackend(AttentionBackend):
                 cache_seqlens = metadata.cache_seqlens_int32
                 cu_seqlens_k = metadata.cu_seqlens_k
                 max_seqlen_q = metadata.max_seq_len_q
-                q_reshaped = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+                q_reshaped = q.contiguous().view(
+                    -1, layer.tp_q_head_num, layer.head_dim
+                )
                 # Default: single-token self-attention
                 o, softmax_lse, *rest = flash_attn_with_kvcache(
                     q=q_reshaped,
@@ -996,29 +998,30 @@ class FlashAttentionBackend(AttentionBackend):
                     return_softmax_lse=True,
                 )
                 if self.topk > 1:
-                    o_expand, softmax_lse_expand, *rest_expand = flash_attn_with_kvcache(
-                        q=q_reshaped,
-                        k_cache=key_cache,
-                        v_cache=value_cache,
-                        page_table=self.forward_metadata_spec_decode_expand.page_table,
-                        cache_seqlens=self.forward_metadata_spec_decode_expand.cache_seqlens_int32,
-                        cu_seqlens_q=self.forward_metadata_spec_decode_expand.cu_seqlens_q,
-                        cu_seqlens_k_new=self.forward_metadata_spec_decode_expand.cu_seqlens_k,
-                        max_seqlen_q=self.forward_metadata_spec_decode_expand.max_seq_len_q,
-                        softmax_scale=layer.scaling,
-                        causal=False,
-                        window_size=window_size,
-                        softcap=layer.logit_cap,
-                        k_descale=k_descale,
-                        v_descale=v_descale,
-                        return_softmax_lse=True,
+                    o_expand, softmax_lse_expand, *rest_expand = (
+                        flash_attn_with_kvcache(
+                            q=q_reshaped,
+                            k_cache=key_cache,
+                            v_cache=value_cache,
+                            page_table=self.forward_metadata_spec_decode_expand.page_table,
+                            cache_seqlens=self.forward_metadata_spec_decode_expand.cache_seqlens_int32,
+                            cu_seqlens_q=self.forward_metadata_spec_decode_expand.cu_seqlens_q,
+                            cu_seqlens_k_new=self.forward_metadata_spec_decode_expand.cu_seqlens_k,
+                            max_seqlen_q=self.forward_metadata_spec_decode_expand.max_seq_len_q,
+                            softmax_scale=layer.scaling,
+                            causal=False,
+                            window_size=window_size,
+                            softcap=layer.logit_cap,
+                            k_descale=k_descale,
+                            v_descale=v_descale,
+                            return_softmax_lse=True,
+                        )
                     )
                     o, _ = merge_state_v2(
                         o,
                         softmax_lse.T.contiguous(),
                         o_expand,
                         softmax_lse_expand.T.contiguous(),
-
                     )
         else:
             # Do absorbed multi-latent attention
