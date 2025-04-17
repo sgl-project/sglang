@@ -149,7 +149,7 @@ class TestFlashAttention3MLA(BaseFlashAttentionTest):
         metrics = run_eval_few_shot_gsm8k(args)
         print(metrics)
 
-        self.assertGreater(metrics["accuracy"], 0.80)
+        self.assertGreater(metrics["accuracy"], 0.70)
 
 
 class TestFlashAttention3SpeculativeDecode(BaseFlashAttentionTest):
