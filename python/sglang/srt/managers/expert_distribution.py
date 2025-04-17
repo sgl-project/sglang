@@ -279,7 +279,7 @@ class _SelectExpertsSinglePassGatherer(_LayerBasedSinglePassGatherer):
         self._on_layer_data(layer_idx, global_physical_count)
 
     def collect_global_physical_count(self) -> torch.Tensor:
-        return TODO
+        return super()._collect_objects(pad_len=self._expert_location_metadata.num_physical_experts)
 
 
 class _DeepepNormalSinglePassGatherer(_LayerBasedSinglePassGatherer):
