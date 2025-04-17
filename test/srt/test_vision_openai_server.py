@@ -86,10 +86,16 @@ class TestOpenAIVisionServer(CustomTestCase):
         text = response.choices[0].message.content
         assert isinstance(text, str)
         # `driver` is for gemma-3-it
-        assert "man" in text or "person" or "driver" in text, f"text: {text}, should contain man, person or driver"
-        assert "cab" in text or "taxi" in text or "SUV" in text, f"text: {text}, should contain cab, taxi or SUV"
+        assert (
+            "man" in text or "person" or "driver" in text
+        ), f"text: {text}, should contain man, person or driver"
+        assert (
+            "cab" in text or "taxi" in text or "SUV" in text
+        ), f"text: {text}, should contain cab, taxi or SUV"
         # MiniCPMO fails to recognize `iron`, but `hanging`
-        assert "iron" in text or "hang" in text, f"text: {text}, should contain iron or hang"
+        assert (
+            "iron" in text or "hang" in text
+        ), f"text: {text}, should contain iron or hang"
         assert response.id
         assert response.created
         assert response.usage.prompt_tokens > 0
@@ -137,7 +143,9 @@ class TestOpenAIVisionServer(CustomTestCase):
         assert response.choices[0].message.role == "assistant"
         text = response.choices[0].message.content
         assert isinstance(text, str)
-        assert "man" in text or "cab" in text, f"text: {text}, should contain man or cab"
+        assert (
+            "man" in text or "cab" in text
+        ), f"text: {text}, should contain man or cab"
         assert response.id
         assert response.created
         assert response.usage.prompt_tokens > 0
@@ -180,8 +188,12 @@ class TestOpenAIVisionServer(CustomTestCase):
         print("-" * 30)
         print(f"Multi images response:\n{text}")
         print("-" * 30)
-        assert "man" in text or "cab" in text or "SUV" in text or "taxi" in text, f"text: {text}, should contain man, cab, SUV or taxi"
-        assert "logo" in text or '"S"' in text or "SG" in text, f"text: {text}, should contain logo, S or SG"
+        assert (
+            "man" in text or "cab" in text or "SUV" in text or "taxi" in text
+        ), f"text: {text}, should contain man, cab, SUV or taxi"
+        assert (
+            "logo" in text or '"S"' in text or "SG" in text
+        ), f"text: {text}, should contain logo, S or SG"
         assert response.id
         assert response.created
         assert response.usage.prompt_tokens > 0
@@ -731,6 +743,7 @@ class TestGemma3itServer(TestOpenAIVisionServer):
     def test_video_chat_completion(self):
         pass
 
+
 class TestKimiVLServer(TestOpenAIVisionServer):
     @classmethod
     def setUpClass(cls):
@@ -757,6 +770,7 @@ class TestKimiVLServer(TestOpenAIVisionServer):
 
     def test_video_chat_completion(self):
         pass
+
 
 if __name__ == "__main__":
     unittest.main()
