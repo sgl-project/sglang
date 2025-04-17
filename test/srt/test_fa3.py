@@ -36,6 +36,7 @@ class BaseFlashAttentionTest(unittest.TestCase):
         """Return the arguments for the server launch. Override in subclasses."""
         args = [
             "--trust-remote-code",
+            "--enable-torch-compile",
             "--attention-backend",
             "fa3",
         ]
