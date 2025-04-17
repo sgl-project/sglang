@@ -4,7 +4,7 @@ from typing import Iterator, Tuple, List, Callable
 
 import torch
 from sglang.srt.model_executor.memory_transfer import AsyncToCudaManager, CombinedManager
-from sglang.srt.model_loader.loader import DefaultModelLoader
+from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 
 
@@ -39,7 +39,7 @@ class ModelWeightUpdater:
         assert isinstance(self._state, _StatePrepared)
 
         named_tensors = self._state.named_tensors
-       
+
         # TODO further extract such common operations during weight loading
         with set_default_torch_dtype(TODO):
             DefaultModelLoader.load_weights_and_postprocess(model, named_tensors, target_device)
@@ -74,7 +74,18 @@ class _ModelWeightSourceBase(ABC):
 
 class _ModelWeightSourceVanilla(_ModelWeightSourceBase):
     def get_all_weights(self) -> Iterator[Tuple[str, torch.Tensor]]:
-        yield TODO
+        loader = get_model_loader(load_config)
+        assert isinstance(loader, DefaultModelLoader)
+
+        return loader._get_weights_iterator(
+            DefaultModelLoader.Source(
+                config.model_path,
+                revision=config.revision,
+                fall_back_to_pt=getattr(
+                    model, "fall_back_to_pt_during_load", True
+                ),
+            )
+        )
 
 
 class _ModelWeightSourcePinnedMemory(_ModelWeightSourceBase):
