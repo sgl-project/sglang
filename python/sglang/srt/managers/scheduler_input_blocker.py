@@ -75,6 +75,7 @@ class SchedulerInputBlocker:
     def _compute_global_unblock_barrier(self):
         local_arrived = self._noop or (self._state == _State.GLOBAL_UNBLOCK_BARRIER)
         global_arrived = torch.tensor(local_arrived).cuda()
+        # Can optimize if bottleneck
         torch.distributed.all_reduce(global_arrived, torch.distributed.ReduceOp.MIN)
         return global_arrived.cpu().item()
 
