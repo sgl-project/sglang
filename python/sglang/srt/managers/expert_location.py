@@ -160,6 +160,7 @@ class ExpertLocationMetadata:
             logical_to_rank_dispatch_physical_map=_compute_logical_to_rank_dispatch_physical_map(
                 logical_to_all_physical_map,
                 num_gpus=ep_size,
+                num_physical_experts=num_physical_experts,
             ),
         )
 
@@ -262,11 +263,14 @@ def _pad_nested_array(arr, pad_value):
 def _compute_logical_to_rank_dispatch_physical_map(
         logical_to_all_physical_map: torch.Tensor,
         num_gpus: int,
+        num_physical_experts: int,
 ):
     # This is rarely called, so we use for loops for maximum clarity
     r = random.Random()
 
+    num_local_physical_experts = num_physical_experts // num_gpus
     num_layers, num_logical_experts, _ = logical_to_all_physical_map.shape
+
     logical_to_rank_dispatch_physical_map = torch.full(
         size=(num_gpus, num_layers, num_logical_experts),
         fill_value=-1,
@@ -284,7 +288,7 @@ def _compute_logical_to_rank_dispatch_physical_map(
                 same_gpu_physical_expert_ids = [
                     physical_expert_id
                     for physical_expert_id in candidate_physical_expert_ids
-                    if _compute_gpu_id_of_physical_expert(physical_expert_id) == gpu_id
+                    if _compute_gpu_id_of_physical_expert(physical_expert_id, num_local_physical_experts) == gpu_id
                 ]
                 if len(same_gpu_physical_expert_ids) > 0:
                     partial_map[gpu_id] = same_gpu_physical_expert_ids[0]
@@ -299,8 +303,8 @@ def _compute_logical_to_rank_dispatch_physical_map(
     return logical_to_rank_dispatch_physical_map
 
 
-def _compute_gpu_id_of_physical_expert(physical_expert_id: int) -> int:
-    return TODO
+def _compute_gpu_id_of_physical_expert(physical_expert_id: int, num_local_physical_experts: int) -> int:
+    return physical_expert_id // num_local_physical_experts
 
 
 @dataclass
