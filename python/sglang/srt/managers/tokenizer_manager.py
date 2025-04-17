@@ -707,8 +707,12 @@ class TokenizerManager:
         assert (
             self.server_args.enable_scheduler_input_blocker and (self.server_args.ep_dispatch_algorithm is not None)
         ), f"update_expert_location requires enable_scheduler_input_blocker and non-null ep_dispatch_algorithm"
-       
-        TODO
+
+        old_expert_location_metadata = copy.deepcopy(self.expert_location_metadata)
+        for TODO in TODO:
+            await self._update_expert_location_raw(UpdateExpertLocationReqInput(
+                expert_location_metadata=TODO,
+            ))
 
     async def _update_expert_location_raw(self, obj: UpdateExpertLocationReqInput):
         self.expert_location_metadata = None
