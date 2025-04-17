@@ -28,6 +28,12 @@ _REF_OUTPUT = [", 4+4=8,", ", four plus four is eight, eight"]
 
 class TestEPLB(CustomTestCase):
     def test_eplb_many_rebalances(self):
+        self._test_eplb_many_rebalances_core()
+
+    def test_eplb_many_rebalances_baseline(self):
+        self._test_eplb_many_rebalances_core(enable_eplb=False)
+
+    def _test_eplb_many_rebalances_core(self, enable_eplb: bool = True):
         print("Action: test_eplb_many_rebalances")
 
         num_rebalance = 20
@@ -80,6 +86,10 @@ class TestEPLB(CustomTestCase):
             self.assertEqual(actual_output_texts, expect_output_texts)
 
         async def _task_rebalance():
+            if not enable_eplb:
+                print("task_rebalance skip since not enable eplb")
+                return
+
             for i in range(num_rebalance):
                 await engine.tokenizer_manager.eplb_rebalance()
 
@@ -87,7 +97,7 @@ class TestEPLB(CustomTestCase):
             engine_kwargs = dict(
                 model_path=DEFAULT_MLA_MODEL_NAME_FOR_TEST,
                 trust_remote_code=True,
-                enable_eplb=True,
+                enable_eplb=enable_eplb,
                 eplb_storage_dir=tmpdir,
                 ep_num_redundant_experts=4,
                 enable_dp_attention=True,
