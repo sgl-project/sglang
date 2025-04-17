@@ -165,6 +165,7 @@ class ServerArgs:
     ep_num_redundant_experts: int = 0
     ep_dispatch_algorithm: Optional[Literal["static", "random"]] = None
     init_expert_location: Optional[str] = None
+    expert_location_updater_mode: Literal["pin_memory", "pageable_memory"] = "pin_memory"
     enable_eplb: bool = False
     eplb_storage_dir: str = "/tmp/eplb_storage"
     eplb_rebalance_period: Optional[int] = None
@@ -1146,6 +1147,12 @@ class ServerArgs:
             type=str,
             default=ServerArgs.init_expert_location,
             help="Initial location of EP experts.",
+        )
+        parser.add_argument(
+            "--expert-location-updater-mode",
+            type=str,
+            default=ServerArgs.expert_location_updater_mode,
+            help="Mode of ExpertLocationUpdater, can be `pin_memory` (put weights in pinned memory at startup, thus faster but takes more host memory) or `pageable_memory` (put weights on pageable memory, thus slower but takes less host memory)",
         )
         parser.add_argument(
             "--enable-eplb",
