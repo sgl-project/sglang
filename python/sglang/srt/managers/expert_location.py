@@ -267,8 +267,9 @@ def _compute_logical_to_rank_dispatch_physical_map(
     r = random.Random()
 
     num_layers, num_logical_experts, _ = logical_to_all_physical_map.shape
-    logical_to_rank_dispatch_physical_map = torch.zeros(
-        (num_gpus, num_layers, num_logical_experts),
+    logical_to_rank_dispatch_physical_map = torch.full(
+        size=(num_gpus, num_layers, num_logical_experts),
+        fill_value=-1,
         dtype=logical_to_all_physical_map.dtype,
     )
 
