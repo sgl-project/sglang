@@ -126,3 +126,6 @@ class _AsyncToCudaTask:
     finish_event: torch.cuda.Event
     input_named_tensors: NamedTensors
     output_named_tensors: NamedTensors
+
+class SimpleCachingAllocator:
+    TODO
