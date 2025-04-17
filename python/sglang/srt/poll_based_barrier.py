@@ -23,7 +23,3 @@ class PollBasedBarrier:
         # Can optimize if bottleneck
         torch.distributed.all_reduce(global_arrived, torch.distributed.ReduceOp.MIN)
         return global_arrived.cpu().item()
-
-    def _change_state(self, original: "_State", target: "_State"):
-        assert self._state == original, f"{self._state=} {original=} {target=}"
-        self._state = target
