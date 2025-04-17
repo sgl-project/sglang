@@ -55,10 +55,12 @@ class ModelWeightUpdater:
         return True
 
     def _handle_memory_transfer_output(self, memory_transfer_output):
+        _log_with_accurate_time("ModelWeightUpdater.handle_memory_transfer_output")
         assert isinstance(self._state, _StateAwaitMemoryTransfer)
         self._state = _StatePrepared(named_tensors=memory_transfer_output)
 
     def act(self):
+        _log_with_accurate_time("ModelWeightUpdater.act start")
         assert isinstance(self._state, _StatePrepared)
 
         target_device = torch.device(self._device)
@@ -69,6 +71,7 @@ class ModelWeightUpdater:
             DefaultModelLoader.load_weights_and_postprocess(self._model, named_tensors, target_device)
 
         self._state = _StateIdle()
+        _log_with_accurate_time("ModelWeightUpdater.act end")
 
 
 def _log_with_accurate_time(message):
