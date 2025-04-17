@@ -29,9 +29,15 @@ class TestEPLB(CustomTestCase):
 
         async def _main_async():
             await asyncio.gather(
-                asyncio.create_task(TODO),
-                asyncio.create_task(TODO),
+                asyncio.create_task(_task_generate()),
+                asyncio.create_task(_task_rebalance()),
             )
+
+        async def _task_generate():
+            TODO
+
+        async def _task_rebalance():
+            TODO
 
         with tempfile.TemporaryDirectory() as tmpdir:
             engine_kwargs = dict(
