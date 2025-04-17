@@ -87,26 +87,12 @@ class _StatePrepared(_State):
     named_tensors: List[Tuple[str, torch.Tensor]]
 
 
-class _ModelWeightSourceBase(ABC):
-    def get_all_weights(self) -> Iterable[Tuple[str, torch.Tensor]]:
-        raise NotImplementedError
-
-
-class _ModelWeightSourceVanilla(_ModelWeightSourceBase):
-    def __init__(self, load_format: str, model_config: ModelConfig, model):
-        self._load_format = load_format
-        self._model_config = model_config
-        self._model = model
-
-        load_config = LoadConfig(load_format=self._load_format)
-        loader = get_model_loader(load_config)
-        assert isinstance(loader, DefaultModelLoader)
-        with set_default_torch_dtype(self._model_config.dtype):
-            weights = list(
-                loader._get_weights_iterator(DefaultModelLoader.Source.init_new(self._model_config, self._model)))
-
-    def get_all_weights(self) -> Iterable[Tuple[str, torch.Tensor]]:
-        return TODO
+def _get_all_weights_vanilla(load_format: str, model_config: ModelConfig, model):
+    load_config = LoadConfig(load_format=load_format)
+    loader = get_model_loader(load_config)
+    assert isinstance(loader, DefaultModelLoader)
+    with set_default_torch_dtype(model_config.dtype):
+        return list(loader._get_weights_iterator(DefaultModelLoader.Source.init_new(model_config, model)))
 
 
 class _ModelWeightSourcePinnedMemory(_ModelWeightSourceBase):
