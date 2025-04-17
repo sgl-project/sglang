@@ -7,8 +7,6 @@ from typing import Callable, Optional, Union
 import torch
 from torch.nn import Parameter
 
-from sglang.srt.distributed import get_tensor_model_parallel_rank
-
 __all__ = [
     "BasevLLMParameter",
     "PackedvLLMParameter",

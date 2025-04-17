@@ -26,8 +26,8 @@ from transformers import (
     AutoProcessor,
 )
 
+from sglang.srt.entrypoints.engine import Engine
 from sglang.srt.hf_transformers_utils import get_tokenizer
-from sglang.srt.server import Engine
 from sglang.srt.utils import load_image
 from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER, calculate_rouge_l
 

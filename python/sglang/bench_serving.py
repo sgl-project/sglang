@@ -707,10 +707,6 @@ def sample_random_requests(
 
         # Download sharegpt if necessary
         if not os.path.isfile(dataset_path):
-            print(
-                "If you do not want to randomly sample from a dataset,"
-                " please use --dataset-name random-ids."
-            )
             dataset_path = download_and_cache_file(SHAREGPT_URL)
 
         # Load the dataset.

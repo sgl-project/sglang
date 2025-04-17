@@ -5,8 +5,6 @@ import logging
 import pkgutil
 from functools import lru_cache
 
-from transformers import PROCESSOR_MAPPING
-
 from sglang.srt.managers.multimodal_processors.base_processor import (
     BaseMultimodalProcessor,
 )

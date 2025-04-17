@@ -51,6 +51,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, EPMoE
+from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPDispatcher
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -80,10 +81,8 @@ _is_cuda = is_cuda()
 
 if _is_cuda:
     from sgl_kernel import awq_dequantize, bmm_fp8, merge_state_v2
-
-    from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPDispatcher
 else:
-    from vllm import _custom_ops as ops
+    from vllm._custom_ops import awq_dequantize
 
 if _is_hip:
     from sglang.srt.layers.attention.triton_ops.rocm_mla_decode_rope import (
@@ -861,7 +860,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             )
         elif self.w_kc.dtype == torch.float8_e4m3fn:
             q_nope_val, q_nope_scale = per_tensor_quant_mla_fp8(
-                q_nope.transpose(0, 1), dtype=torch.float8_e4m3fn
+                q_nope.transpose(0, 1),
             )
             q_nope_out = bmm_fp8(
                 q_nope_val, self.w_kc, q_nope_scale, self.w_scale, torch.bfloat16
@@ -892,7 +891,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             )
         elif self.w_vc.dtype == torch.float8_e4m3fn:
             attn_output_val, attn_output_scale = per_tensor_quant_mla_fp8(
-                attn_output.transpose(0, 1), dtype=torch.float8_e4m3fn
+                attn_output.transpose(0, 1),
             )
             attn_bmm_output = bmm_fp8(
                 attn_output_val,
@@ -1565,7 +1564,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                             self_attn.kv_b_proj.qzeros,
                         ).T
                     else:
-                        w = ops.awq_dequantize(
+                        w = awq_dequantize(
                             self_attn.kv_b_proj.qweight,
                             self_attn.kv_b_proj.scales,
                             self_attn.kv_b_proj.qzeros,
