@@ -304,6 +304,7 @@ class DeepseekV2MoE(nn.Module):
 
         self.shared_experts_is_int8 = None
         self.shared_experts_is_fp8 = None
+        self.shared_experts_weight_block_size = None
         if config.n_shared_experts is not None and self.num_fused_shared_experts == 0:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
             # disable tp for shared experts when enable deepep moe
@@ -324,8 +325,17 @@ class DeepseekV2MoE(nn.Module):
                 assert self.shared_experts.down_proj.weight.dtype == torch.int8
                 self.shared_experts_is_int8 = True
 
-            if self.shared_experts_gate_up_proj.weight.dtype == torch.float8_e4m3fn:
-                assert self.shared_experts_down_proj.weight.dtype == torch.float8_e4m3fn
+            if self.shared_experts.gate_up_proj.weight.dtype == torch.float8_e4m3fn:
+                assert self.shared_experts.down_proj.weight.dtype == torch.float8_e4m3fn
+
+                assert (
+                    self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
+                    == self.shared_experts.down_proj.quant_method.quant_config.weight_block_size
+                )
+                self.shared_experts_weight_block_size = (
+                    self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
+                )
+
                 self.shared_experts_is_fp8 = True
 
         self.top_k = config.num_experts_per_tok
@@ -451,18 +461,30 @@ class DeepseekV2MoE(nn.Module):
             self.routed_scaling_factor,
             True,  # inplace
             self.shared_experts_is_int8,  # use_int8_w8a8
-            False,  # use_fp8_w8a16
+            self.shared_experts_is_fp8,  # use_fp8_w8a16
             (
                 self.shared_experts.gate_up_proj.weight_scale
                 if self.shared_experts_is_int8
-                else None
+                else (
+                    self.shared_experts.gate_up_proj.weight_scale_inv
+                    if self.shared_experts_is_fp8
+                    else None
+                )
             ),  # w1_scale
             (
                 self.shared_experts.down_proj.weight_scale
                 if self.shared_experts_is_int8
-                else None
+                else (
+                    self.shared_experts.down_proj.weight_scale_inv
+                    if self.shared_experts_is_fp8
+                    else None
+                )
             ),  # w2_scale
-            None,  # block_size
+            (
+                self.shared_experts_weight_block_size
+                if self.shared_experts_is_fp8
+                else None
+            ),  # block_size
             None,  # a1_scale
             None,  # a2_scale
             True,  # is_vnni
