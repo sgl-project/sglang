@@ -18,6 +18,7 @@
 
 import logging
 import os
+import re
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Any, Dict, Iterable, Optional, Tuple
@@ -1685,8 +1686,8 @@ class DeepseekV2ForCausalLM(nn.Module):
     def get_param_name_info(self, name: str) -> ModelParamNameInfo:
         if ".experts." in name:
             return ModelParamNameInfoMoe(
-                layer_id=TODO,
-                expert_id=TODO,
+                layer_id=int(re.search(r"layers\.(\d+)", name).group(1)),
+                expert_id=int(re.search(r"experts\.(\d+)", name).group(1)),
             )
         return ModelParamNameInfoOthers()
 
