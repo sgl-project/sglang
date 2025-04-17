@@ -1,4 +1,7 @@
 from abc import ABC
+from typing import Iterator, Tuple
+
+import torch
 
 
 class ModelWeightUpdater:
@@ -8,7 +11,8 @@ class ModelWeightUpdater:
 
 
 class _ModelWeightSourceBase(ABC):
-    pass
+    def get_all_weights(self) -> Iterator[Tuple[str, torch.Tensor]]:
+        raise NotImplementedError
 
 
 class _ModelWeightSourceVanilla(ABC):
