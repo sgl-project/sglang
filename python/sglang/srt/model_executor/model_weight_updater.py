@@ -29,7 +29,7 @@ class ModelWeightUpdater:
         self._all_weights_and_info = _get_all_weights_and_info(load_format=load_format, model_config=model_config,
                                                                model=model,
                                                                pin_memory=init_pin_memory)
-        self._transfer_allocator = SimpleCachingAllocator()
+        self._transfer_allocator = SimpleCachingAllocator(device="cuda")
         self._memory_transfer_manager = AsyncToCudaManager(
             self._transfer_allocator) if init_pin_memory else CombinedManager.init_pin_memory_and_to_cuda(
             self._transfer_allocator)
