@@ -159,6 +159,7 @@ def biased_grouped_topk_impl(
     num_expert_group: int = 0,
     topk_group: int = 0,
     n_share_experts_fusion: int = 0,
+    expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
 ):
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
@@ -207,7 +208,11 @@ def biased_grouped_topk_impl(
         )
         topk_weights = topk_weights / topk_weights_sum
 
-    return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
+    topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
+
+    topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
+
+    return topk_weights, topk_ids
 
 
 def biased_grouped_topk(
@@ -220,6 +225,7 @@ def biased_grouped_topk(
     topk_group: int = 0,
     compiled: bool = True,
     n_share_experts_fusion: int = 0,
+    expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
 ):
     biased_grouped_topk_fn = (
         torch.compile(
@@ -237,6 +243,7 @@ def biased_grouped_topk(
         num_expert_group,
         topk_group,
         n_share_experts_fusion=n_share_experts_fusion,
+        expert_location_dispatch_info=expert_location_dispatch_info,
     )
 
 
@@ -272,7 +279,6 @@ def select_experts(
                 expert_location_dispatch_info=expert_location_dispatch_info,
             )
         else:
-            assert expert_location_dispatch_info is None
             topk_weights, topk_ids = biased_grouped_topk(
                 hidden_states=hidden_states,
                 gating_output=router_logits,
@@ -282,6 +288,7 @@ def select_experts(
                 num_expert_group=num_expert_group,
                 topk_group=topk_group,
                 n_share_experts_fusion=n_share_experts_fusion,
+                expert_location_dispatch_info=expert_location_dispatch_info,
             )
     elif torch_native and custom_routing_function is None:
         assert expert_location_dispatch_info is None
