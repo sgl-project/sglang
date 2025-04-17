@@ -54,13 +54,17 @@ class ExpertDistributionRecorder:
         pass
 
     def start_record(self):
-        pass
+        self._on_not_implemented()
 
     def stop_record(self):
-        pass
+        self._on_not_implemented()
 
     def dump_record(self):
-        raise NotImplementedError
+        self._on_not_implemented()
+
+    def _on_not_implemented(self):
+        raise Exception(
+            "Please enable ServerArgs.enable_expert_distribution_recorder to use ExpertDistributionRecorder.")
 
 
 class _ExpertDistributionRecorderNoop(ExpertDistributionRecorder):
