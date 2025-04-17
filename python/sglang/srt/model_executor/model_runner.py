@@ -33,7 +33,7 @@ from sglang.srt.distributed import (
     initialize_model_parallel,
     set_custom_all_reduce,
 )
-from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
+from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state, get_world_group
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
     get_attention_tp_size,
@@ -194,7 +194,11 @@ class ModelRunner:
         # Get memory before model loading
         min_per_gpu_memory = self.init_torch_distributed()
 
-        [expert_location_metadata] = broadcast_pyobj(data=[expert_location_metadata], rank=torch.distributed.get_rank())
+        [expert_location_metadata] = broadcast_pyobj(
+            data=[expert_location_metadata],
+            rank=torch.distributed.get_rank(),
+            dist_group=get_world_group().cpu_group,
+        )
         expert_location_metadata.to(server_args.device)
         set_global_expert_location_metadata(expert_location_metadata)
         if self.tp_rank == 0 and get_bool_env_var(
