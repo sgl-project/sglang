@@ -18,6 +18,7 @@ import torch
 
 from sglang import ServerArgs
 from sglang.srt.managers.io_struct import BlockReqInput, BlockReqType
+from sglang.srt.poll_based_barrier import PollBasedBarrier
 
 
 class SchedulerInputBlocker:
@@ -25,6 +26,7 @@ class SchedulerInputBlocker:
         self._state = _State.UNBLOCKED
         self._pending_reqs = []
         self._noop = noop
+        self._global_unblock_barrier = PollBasedBarrier(noop=noop)
         assert (
             server_args.disable_overlap_schedule
         ), "SchedulerInputBlocker requires overlap scheduler to be disabled"
