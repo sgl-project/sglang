@@ -55,6 +55,8 @@ class TestEPLB(CustomTestCase):
                 )))
 
             actual_outputs = await asyncio.gather(*tasks)
+            print(f"{actual_outputs=}")
+            actual_output_texts = [x["text"] for x in actual_outputs]
             TODO_test_result
 
         async def _task_rebalance():
