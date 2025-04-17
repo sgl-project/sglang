@@ -1,13 +1,15 @@
 from abc import ABC
 from dataclasses import dataclass
-from typing import Iterator, Tuple, List
+from typing import Iterator, Tuple, List, Callable
 
 import torch
 from sglang.srt.model_executor.memory_transfer import AsyncToCudaManager, CombinedManager
 
 
 class ModelWeightUpdater:
-    def __init__(self, init_pin_memory: bool):
+    def __init__(self, init_pin_memory: bool, weight_filter: Callable[[str], bool]):
+        self._weight_filter = weight_filter
+
         self._state: _State = _StateIdle()
         self._manager_transfer_manager = AsyncToCudaManager() if init_pin_memory else CombinedManager.init_pin_memory_and_to_cuda()
         self._model_weight_source = _ModelWeightSourcePinnedMemory() if init_pin_memory else _ModelWeightSourceVanilla()
@@ -15,7 +17,8 @@ class ModelWeightUpdater:
     def start_prepare(self):
         assert isinstance(self._state, _StateIdle)
 
-        TODO
+        all_weights_iterator = self._model_weight_source.get_all_weights()
+        interesting_weights = [(name, weight) for name, weight in all_weights_iterator if self._weight_filter(name)]
 
         self._state = _StateAwaitMemoryTransfer()
 
@@ -24,7 +27,7 @@ class ModelWeightUpdater:
 
     def act(self):
         assert isinstance(self._state, _StatePrepared)
-       
+
         TODO
 
         self._state = _StateIdle()
