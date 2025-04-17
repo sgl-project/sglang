@@ -182,7 +182,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("bmm_fp8", torch::kCUDA, &bmm_fp8);
 
   m.def(
-      "min_p_sampling_from_probs(Tensor probs, Tensor uniform_samples, Tensor! samples, Tensor? maybe_min_p_arr, float "
+      "min_p_sampling_from_probs(Tensor probs, Tensor uniform_samples, Tensor! samples, Tensor? maybe_min_p_arr,float "
       "min_p_val, bool deterministic, int cuda_stream) -> ()");
   m.impl("min_p_sampling_from_probs", torch::kCUDA, &min_p_sampling_from_probs);
 
@@ -206,6 +206,16 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "top_p_sampling_from_probs(Tensor probs, Tensor uniform_samples, Tensor! samples, Tensor! success, Tensor? "
       "maybe_top_p_arr, float top_p_val, bool deterministic, int cuda_stream) -> ()");
   m.impl("top_p_sampling_from_probs", torch::kCUDA, &top_p_sampling_from_probs);
+
+  m.def(
+      "qserve_w4a8_per_chn_gemm(Tensor _in_feats, Tensor _kernel, Tensor _wscales, Tensor _ascales, Tensor _w_szs, "
+      "Tensor _a_ssums, Tensor! _out_feats) -> ()");
+  m.impl("qserve_w4a8_per_chn_gemm", torch::kCUDA, &qserve_w4a8_per_chn_gemm);
+
+  m.def(
+      "qserve_w4a8_per_group_gemm(Tensor _in_feats, Tensor _kernel, Tensor _zeros, Tensor _scales_i8, Tensor _wscales, "
+      "Tensor _ascales, Tensor! _out_feats) -> ()");
+  m.impl("qserve_w4a8_per_group_gemm", torch::kCUDA, &qserve_w4a8_per_group_gemm);
 }
 
 REGISTER_EXTENSION(common_ops)
