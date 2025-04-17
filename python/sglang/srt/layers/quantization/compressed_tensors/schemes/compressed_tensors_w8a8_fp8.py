@@ -98,8 +98,6 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
         weight_loader: Callable,
         **kwargs,
     ):
-        maybe_create_device_identity()
-
         output_size_per_partition = sum(output_partition_sizes)
         layer.logical_widths = output_partition_sizes
 

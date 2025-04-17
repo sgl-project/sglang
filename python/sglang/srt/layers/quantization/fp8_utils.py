@@ -1,11 +1,19 @@
-import os
 from typing import List, Optional, Tuple
 
 import torch
 
+try:
+    from vllm import _custom_ops as vllm_ops
+
+    VLLM_AVAILABLE = True
+except ImportError:
+    VLLM_AVAILABLE = False
+
 from sglang.srt.layers.quantization.fp8_kernel import (
     _enable_jit_deepgemm,
     per_token_group_quant_fp8,
+    scaled_fp8_quant,
+    sglang_per_token_quant_fp8,
     static_quant_fp8,
     w8a8_block_fp8_matmul,
 )
@@ -17,30 +25,20 @@ from sglang.srt.utils import (
     is_hip,
 )
 
-try:
-    import vllm
-    from vllm import _custom_ops as ops
-
-    VLLM_AVAILABLE = True
-except ImportError:
-    VLLM_AVAILABLE = False
-
-use_vllm_cutlass_w8a8_fp8_kernel = get_bool_env_var("USE_VLLM_CUTLASS_W8A8_FP8_KERNEL")
-
 _is_hip = is_hip()
+_is_cuda = is_cuda()
+
 if _is_hip and get_bool_env_var("CK_MOE"):
     from aiter import gemm_a8w8_blockscale
 
-_is_cuda = is_cuda()
 if _is_cuda:
     from sgl_kernel import fp8_blockwise_scaled_mm, fp8_scaled_mm
 
-    from sglang.srt.custom_op import scaled_fp8_quant as sgl_scaled_fp8_quant
-    from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_quant_fp8
+use_vllm_cutlass_w8a8_fp8_kernel = get_bool_env_var("USE_VLLM_CUTLASS_W8A8_FP8_KERNEL")
 
 # Input scaling factors are no longer optional in _scaled_mm starting
 # from pytorch 2.5. Allocating a dummy tensor to pass as input_scale
-TORCH_DEVICE_IDENTITY = torch.ones(1, dtype=torch.float32)
+TORCH_DEVICE_IDENTITY = None
 
 _TORCH_VERSION = torch.__version__.split("+")[0]
 try:
@@ -214,7 +212,7 @@ def block_quant_to_tensor_quant(
             x_dq_block_tiles[j][i][:, :] = x_dq_block_tiles[j][i] * x_s[j][i]
 
     x_q_tensor, scale = (
-        sgl_scaled_fp8_quant(x_dq_block)
+        scaled_fp8_quant(x_dq_block)
         if _is_cuda
         else input_to_float8(x_dq_block, dtype=x_q_block.dtype)
     )
@@ -227,7 +225,7 @@ def channel_quant_to_tensor_quant(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     x_dq_channel = x_q_channel.to(torch.float32) * x_s
     x_q_tensor, scale = (
-        sgl_scaled_fp8_quant(x_dq_channel)
+        scaled_fp8_quant(x_dq_channel)
         if _is_cuda
         else input_to_float8(x_dq_channel, dtype=x_q_channel.dtype)
     )
@@ -545,3 +543,4 @@ def maybe_create_device_identity():
     global TORCH_DEVICE_IDENTITY
     if TORCH_DEVICE_IDENTITY is None:
         TORCH_DEVICE_IDENTITY = torch.ones(1, dtype=torch.float32)
+
