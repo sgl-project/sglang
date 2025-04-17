@@ -250,6 +250,8 @@ def _apply_fallback_scaled_mm(
     input_dtype,
 ):
     global TORCH_DEVICE_IDENTITY
+    if TORCH_DEVICE_IDENTITY is None:
+        TORCH_DEVICE_IDENTITY = torch.ones(1, dtype=torch.float32)
     if TORCH_DEVICE_IDENTITY.device != weight.device:
         TORCH_DEVICE_IDENTITY = TORCH_DEVICE_IDENTITY.to(weight.device)
 
@@ -526,9 +528,3 @@ def apply_fp8_linear(
                 input.dtype,
             )
 
-
-def maybe_create_device_identity():
-    # Allocate dummy ones tensor for torch._scaled_mm
-    global TORCH_DEVICE_IDENTITY
-    if TORCH_DEVICE_IDENTITY is None:
-        TORCH_DEVICE_IDENTITY = torch.ones(1, dtype=torch.float32)
