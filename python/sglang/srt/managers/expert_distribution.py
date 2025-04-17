@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 # --------------------------------------- Entrypoint -----------------------------------------
 
 
-class _ExpertDistributionRecorder:
+class ExpertDistributionRecorder:
     """Global expert distribution recording"""
 
     def __init__(self):
@@ -130,7 +130,7 @@ class _ExpertDistributionRecorder:
         return output
 
 
-_global_expert_distribution_recorder: Optional[_ExpertDistributionRecorder] = None
+_global_expert_distribution_recorder: Optional[ExpertDistributionRecorder] = None
 
 
 def get_global_expert_distribution_recorder():

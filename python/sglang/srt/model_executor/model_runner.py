@@ -44,7 +44,8 @@ from sglang.srt.layers.quantization import monkey_patch_isinstance_for_vllm_base
 from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
-from sglang.srt.managers.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.managers.expert_distribution import get_global_expert_distribution_recorder, \
+    set_global_expert_distribution_recorder, ExpertDistributionRecorder
 from sglang.srt.managers.expert_location import ExpertLocationMetadata
 from sglang.srt.managers.io_struct import UpdateExpertLocationReqInput
 from sglang.srt.managers.schedule_batch import (
@@ -210,12 +211,11 @@ class ModelRunner:
             enable=self.server_args.enable_memory_saver
         )
 
-        get_global_expert_distribution_recorder().initialize(
+        set_global_expert_distribution_recorder(ExpertDistributionRecorder(
             server_args,
             get_global_expert_location_metadata(),
-            # TODO handle DP!=TP case
             rank=self.tp_rank,
-        )
+        ))
 
         # Load the model
         self.sampler = Sampler()
