@@ -334,6 +334,10 @@ class ServerArgs:
                 f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
 
+        if self.enable_eplb:
+            self.enable_scheduler_input_blocker = True
+            self.enable_expert_distribution_recorder = True
+
         if self.ep_num_redundant_experts > 0:
             assert (
                 self.enable_deepep_moe
