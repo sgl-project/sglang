@@ -23,8 +23,34 @@ _REF_OUTPUT = [", 4+4=8,", ", four plus four is eight, eight"]
 
 
 class TestEPLB(CustomTestCase):
-    def test_eplb_many_rebalance(self):
-        TODO
+    def test_eplb_many_rebalances(self):
+        print("Action: test_eplb_many_rebalances")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            engine_kwargs = dict(
+                model_path=DEFAULT_MLA_MODEL_NAME_FOR_TEST,
+                trust_remote_code=True,
+                enable_eplb=True,
+                eplb_storage_dir=tmpdir,
+                ep_num_redundant_experts=4,
+                enable_dp_attention=True,
+                enable_deepep_moe=True,
+                deepep_mode="normal",
+                disable_cuda_graph=True,
+                enable_scheduler_input_blocker=True,
+                disable_overlap_schedule=True,
+                tp_size=2,
+                dp_size=2,
+                log_level="info",
+            )
+
+            print(f"Action: start engine")
+            engine = sgl.Engine(**engine_kwargs)
+
+            TODO
+
+            print(f"Action: shutdown engine")
+            engine.shutdown()
+            del engine
 
     def test_eplb_start_rebalance_restart(self):
         print("Action: test_eplb_start_rebalance_restart")
@@ -40,7 +66,7 @@ class TestEPLB(CustomTestCase):
                 deepep_mode="normal",
                 disable_cuda_graph=True,
                 enable_scheduler_input_blocker=True,
-                disable_overlap_schedule=True,  # TODO
+                disable_overlap_schedule=True,
                 tp_size=2,
                 dp_size=2,
                 log_level="info",
@@ -84,7 +110,7 @@ class TestEPLB(CustomTestCase):
                 enable_deepep_moe=True,
                 deepep_mode="normal",
                 disable_cuda_graph=True,
-                disable_overlap_schedule=True,  # TODO
+                disable_overlap_schedule=True,
                 tp_size=2,
                 dp_size=2,
                 log_level="info",
