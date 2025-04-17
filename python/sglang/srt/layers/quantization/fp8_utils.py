@@ -527,4 +527,3 @@ def apply_fp8_linear(
                 bias,
                 input.dtype,
             )
-
