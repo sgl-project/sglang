@@ -179,6 +179,12 @@ class ExpertLocationMetadata:
             ("logical_to_all_physical_map_num_valid", 0),
             ("logical_to_rank_dispatch_physical_map", 1),
         ]:
+            def _get(obj):
+                ans = getattr(obj, field)
+                if (layer_id_start is not None) or (layer_id_len is not None):
+                    ans = ans.narrow(dim=layer_id_dim, start=layer_id_start, length=layer_id_len)
+                return ans
+
             # Cannot update address to avoid breaking CUDA graph
             getattr(self, field)[...] = getattr(other, field)
 
