@@ -15,9 +15,11 @@ class _ModelWeightSourceBase(ABC):
         raise NotImplementedError
 
 
-class _ModelWeightSourceVanilla(ABC):
-    TODO
+class _ModelWeightSourceVanilla(_ModelWeightSourceBase):
+    def get_all_weights(self) -> Iterator[Tuple[str, torch.Tensor]]:
+        yield TODO
 
 
-class _ModelWeightSourcePinnedMemory(ABC):
-    TODO
+class _ModelWeightSourcePinnedMemory(_ModelWeightSourceBase):
+    def get_all_weights(self) -> Iterator[Tuple[str, torch.Tensor]]:
+        yield TODO
