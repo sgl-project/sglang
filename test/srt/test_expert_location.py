@@ -12,7 +12,12 @@ class TestExpertLocation(CustomTestCase):
             # Identity map
             (
                     [[[0], [1], [2], [3], [4], [5], [6], [7]]],
-                    [[]],  # TODO
+                    [
+                        [[0, 1, 2, 3, 4, 5, 6, 7]],
+                        [[0, 1, 2, 3, 4, 5, 6, 7]],
+                        [[0, 1, 2, 3, 4, 5, 6, 7]],
+                        [[0, 1, 2, 3, 4, 5, 6, 7]],
+                    ],
             ),
             # Identity map + consider redundant experts
             (
