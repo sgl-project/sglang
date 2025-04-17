@@ -163,6 +163,7 @@ class ServerArgs:
     enable_deepep_moe: bool = False
     deepep_mode: Optional[Literal["auto", "normal", "low_latency"]] = "auto"
     ep_num_redundant_experts: int = 0
+    ep_dispatch_algorithm: Optional[Literal["static", "random"]] = None
     init_expert_location: Optional[str] = None
     enable_eplb: bool = False
     eplb_storage_dir: str = "/tmp/eplb_storage"
