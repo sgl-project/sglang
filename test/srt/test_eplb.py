@@ -28,7 +28,10 @@ class TestEPLB(CustomTestCase):
         print("Action: test_eplb_many_rebalances")
 
         async def _main_async():
-            TODO
+            await asyncio.gather(
+                asyncio.create_task(TODO),
+                asyncio.create_task(TODO),
+            )
 
         with tempfile.TemporaryDirectory() as tmpdir:
             engine_kwargs = dict(
