@@ -28,6 +28,7 @@ class ExpertDistributionStorage:
         logger.info(f"save_current to path {path}")
         path.write_text(json.dumps(data))
 
+    # Most vanilla method since I do not have production environment data to test what algorithm is better
     def get_last_snapshot(self) -> Optional[Dict[str, Any]]:
         path = self.get_last_snapshot_path(self._dir_data)
         if path is None:
