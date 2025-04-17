@@ -10,7 +10,10 @@ class ExpertLocationDispatchInfo:
     ep_dispatch_algorithm: Literal["static", "random"]
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend())
+def topk_ids_logical_to_physical(topk_ids: torch.Tensor, info: ExpertLocationDispatchInfo):
+    return TODO
+
+
 def _hack_expert_location_dispatch_random(
     topk_ids: torch.Tensor,
     expert_logical_to_all_physical_map: torch.Tensor,
