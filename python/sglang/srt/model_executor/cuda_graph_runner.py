@@ -509,13 +509,6 @@ class CudaGraphRunner:
             self.encoder_lens[:raw_bs].copy_(forward_batch.encoder_lens)
         if forward_batch.mrope_positions is not None:
             self.mrope_positions[:, :raw_bs].copy_(forward_batch.mrope_positions)
-        # if forward_batch.mrope_positions is not None:
-        #     for i in range(len(forward_batch.mrope_positions)):
-        #         if i >= len(self.mrope_positions):
-        #             break
-        #         self.mrope_positions[i][:, :raw_bs].copy_(
-        #             forward_batch.mrope_positions[i]
-        #         )
         if self.enable_dp_attention or self.enable_sp_layernorm:
             self.global_num_tokens_gpu.copy_(forward_batch.global_num_tokens_gpu)
 

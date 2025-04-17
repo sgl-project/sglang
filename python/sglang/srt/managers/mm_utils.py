@@ -17,7 +17,8 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import flatten_nested_list, print_warning_once
-from sglang.utils import logger
+
+logger = logging.getLogger(__name__)
 
 
 class MultiModalityDataPaddingPattern:
@@ -97,33 +98,85 @@ class MultiModalityDataPaddingPatternTokenPairs(MultiModalityDataPaddingPattern)
         return padded_ids
 
 
-class MultiModalityDataPaddingPatternImageTokens(MultiModalityDataPaddingPattern):
+class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPattern):
     """In this pattern, data tokens should be represented as repetitions of a single token
     e.g. <image><image>....<image>, or <audio><audio>...<audio>
     """
 
-    def __init__(self, image_token_id: torch.Tensor) -> None:
-        self.image_token_id = image_token_id
+    def __init__(self, token_ids: List[int]) -> None:
+        self.token_ids = token_ids
 
-    def pad_input_tokens(self, input_ids: List[int], mm_inputs) -> List[int]:
+    def pad_input_tokens(
+        self, input_ids: List[int], mm_inputs: MultimodalInputs
+    ) -> List[int]:
         """
-        This function will replace the data-tokens in between with pad_values accordingly
+        Finds contiguous regions of tokens matching `self.token_ids` in `input_ids`
+        and replaces each region with the corresponding `pad_value` from `mm_inputs.mm_items`.
         """
         pad_values = [item.pad_value for item in mm_inputs.mm_items]
         if not pad_values:
+            # No multimodal items, return original input_ids
             return input_ids
-        assert len(pad_values) != 0
+        if not input_ids:
+            return []
 
         input_ids_tensor = torch.tensor(input_ids)
-        mask = torch.isin(input_ids_tensor, self.image_token_id)
+        device = input_ids_tensor.device
+        token_ids_tensor = torch.tensor(self.token_ids, device=device)
+        mask = torch.isin(input_ids_tensor, token_ids_tensor)
 
-        num_image_tokens = mask.sum().item()
-        repeated_pad_values = torch.tensor(pad_values).repeat(
-            num_image_tokens // len(pad_values) + 1
-        )[:num_image_tokens]
+        if not mask.any():
+            # No tokens match token_ids, return original input_ids
+            return input_ids
 
-        input_ids_tensor[mask] = repeated_pad_values
-        return input_ids_tensor.tolist()
+        # Find contiguous regions
+        padded_mask = torch.cat(
+            (
+                torch.tensor([False], device=device),
+                mask,
+                torch.tensor([False], device=device),
+            )
+        )
+        # Find indices where the mask value changes
+        diff_indices = torch.where(padded_mask[1:] != padded_mask[:-1])[0]
+
+        # Start indices are where False changes to True
+        starts = diff_indices[::2]
+        # End indices are where True changes to False (exclusive index)
+        ends = diff_indices[1::2]
+
+        # Check if the number of regions matches the number of pad values
+        if len(starts) != len(pad_values):
+            # Maybe log a warning here?
+            logger.warning(
+                f"Number of contiguous regions ({len(starts)}) does not match "
+                f"the number of pad values ({len(pad_values)}). "
+                f"Input IDs: {input_ids}, Token IDs: {self.token_ids}, Pad Values: {pad_values}"
+            )
+            num_regions = len(starts)
+            num_pad_values = len(pad_values)
+            if num_regions > 0 and num_pad_values > 0:
+                pad_values = (pad_values * (num_regions // num_pad_values + 1))[
+                    :num_regions
+                ]
+            else:  # If no regions or no pad_values, this loop won't run anyway.
+                pad_values = []  # Ensure pad_values is empty if starts is empty
+
+        # Create a copy to modify
+        output_ids_tensor = input_ids_tensor.clone()
+
+        # Replace tokens in each region with the corresponding pad value
+        # Ensure we don't iterate if pad_values became empty due to mismatch and num_regions=0
+        for i in range(min(len(starts), len(pad_values))):
+            start_idx = starts[i]
+            end_idx = ends[i]
+            pad_value = pad_values[i]
+            if pad_value is not None:  # Ensure pad_value is not None before assignment
+                output_ids_tensor[start_idx:end_idx] = pad_value
+            else:
+                logger.warning(f"Skipping region {i} due to None pad_value.")
+
+        return output_ids_tensor.tolist()
 
 
 def get_embedding_and_mask(
@@ -242,7 +295,7 @@ def embed_mm_inputs(
         using_all_items = False
         if len(appearing_items) == 0:
             # This happens mostly when arg placeholder_token_ids is passed
-            logger.warning_once(
+            logger.warning(
                 "No multimodal data item's pad value exist in placeholder ids. Using all items"
             )
             using_all_items = True

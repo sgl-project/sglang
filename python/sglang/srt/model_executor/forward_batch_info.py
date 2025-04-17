@@ -448,15 +448,11 @@ class ForwardBatch:
                     mrope_positions = mm_input.mrope_positions
                 mrope_positions_list[i] = mrope_positions
 
-        # print(f"{mrope_positions_list=}")
-        # print(f"{self.forward_mode.is_decode()=}")
         self.mrope_positions = torch.cat(
             [pos.to(device=model_runner.device) for pos in mrope_positions_list],
             axis=1,
         ).to(device=model_runner.device)
         self.mrope_positions = self.mrope_positions.to(torch.int64)
-
-        # self.mrope_positions = torch.tensor(flatten_nested_list(mrope_positions_list))
 
     def get_max_chunk_capacity(self):
         # Maximum number of tokens in each chunk
