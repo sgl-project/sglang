@@ -1,12 +1,12 @@
 import logging
 from abc import ABC
 from dataclasses import dataclass
-from typing import Tuple, List, Callable, Iterable
+from typing import Tuple, List, Iterable
 
 import torch
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.model_executor.memory_transfer import AsyncToCudaManager, CombinedManager
+from sglang.srt.model_executor.memory_transfer import AsyncToCudaManager, CombinedManager, SimpleCachingAllocator
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 
@@ -26,16 +26,22 @@ class ModelWeightUpdater:
         self._model = model
         self._device = device
 
-        self._all_weights_and_info = _get_all_weights_and_info(load_format=load_format, model_config=model_config, model=model,
+        self._all_weights_and_info = _get_all_weights_and_info(load_format=load_format, model_config=model_config,
+                                                               model=model,
                                                                pin_memory=init_pin_memory)
-        self._memory_transfer_manager = AsyncToCudaManager() if init_pin_memory else CombinedManager.init_pin_memory_and_to_cuda()
+        self._transfer_allocator = SimpleCachingAllocator()
+        self._memory_transfer_manager = AsyncToCudaManager(
+            self._transfer_allocator) if init_pin_memory else CombinedManager.init_pin_memory_and_to_cuda(
+            self._transfer_allocator)
 
         self._state: _State = _StateIdle()
 
     def start_prepare(self, weight_filter):
         assert isinstance(self._state, _StateIdle)
 
-        interesting_weights = [(name, weight) for name, weight, info in self._all_weights_and_info if weight_filter(name, info)]
+        self._transfer_allocator.mark_all_unused()
+        interesting_weights = [(name, weight) for name, weight, info in self._all_weights_and_info if
+                               weight_filter(name, info)]
         self._memory_transfer_manager.enqueue(interesting_weights)
 
         self._state = _StateAwaitMemoryTransfer()

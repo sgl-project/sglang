@@ -30,8 +30,8 @@ class CombinedManager(TensorOperationManagerBase):
         self._manager_b = manager_b
 
     @classmethod
-    def init_pin_memory_and_to_cuda(cls):
-        return cls(manager_a=AsyncPinMemoryManager(), manager_b=AsyncToCudaManager())
+    def init_pin_memory_and_to_cuda(cls, allocator: "SimpleCachingAllocator"):
+        return cls(manager_a=AsyncPinMemoryManager(), manager_b=AsyncToCudaManager(allocator))
 
     def enqueue(self, named_tensors: NamedTensors):
         self._manager_a.enqueue(named_tensors)
