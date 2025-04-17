@@ -114,6 +114,7 @@ class TestEPLB(CustomTestCase):
                 dp_size=2,
                 log_level="info",
                 disable_radix_cache=True,
+                mem_fraction_static=0.8,
             )
 
             print(f"Action: start engine")
