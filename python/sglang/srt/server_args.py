@@ -341,6 +341,10 @@ class ServerArgs:
             logger.info(
                 f"EPLB is enabled. The enable_scheduler_input_blocker and enable_expert_distribution_recorder are automatically enabled."
             )
+        if self.enable_eplb or (self.init_expert_location is not None):
+            self.ep_dispatch_algorithm = "static"
+            logger.info(
+                f"EPLB is enabled or init_expert_location is provided. ep_dispatch_algorithm is set to `static`.")
 
         if self.ep_num_redundant_experts > 0:
             assert (
