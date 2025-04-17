@@ -120,7 +120,7 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             )
 
     def flush_buffer_depending_on_expert_location_metadata(self):
-        TODO
+        self._accumulator.flush_buffer_depending_on_expert_location_metadata()
 
     def on_select_experts(self, topk_ids: torch.Tensor):
         self._on_hook("on_select_experts", topk_ids=topk_ids)
@@ -367,6 +367,9 @@ class _Accumulator(ABC):
     def dump(self):
         raise NotImplementedError
 
+    def flush_buffer_depending_on_expert_location_metadata(self):
+        raise NotImplementedError
+
 
 class _DetailAccumulator(_Accumulator):
     @classmethod
@@ -426,6 +429,9 @@ class _DetailAccumulator(_Accumulator):
             logger.info(f"Write expert distribution to {path_output}")
             torch.save(self._records, str(path_output))
             return [dict(path_output=str(path_output))]
+
+    def flush_buffer_depending_on_expert_location_metadata(self):
+        pass
 
 
 class _StatAccumulator(_Accumulator):
@@ -489,3 +495,6 @@ class _StatAccumulator(_Accumulator):
             rank=self._rank,
             physical_count=self._physical_count.tolist(),
         )
+
+    def flush_buffer_depending_on_expert_location_metadata(self):
+        TODO
