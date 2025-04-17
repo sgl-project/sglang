@@ -12,8 +12,11 @@ class PollBasedBarrier:
 
     def poll_global_arrived(self) -> bool:
         global_arrived = self._compute_global_arrived()
-        TODo
-   
+        output = self._local_arrived and global_arrived
+        if output:
+            self._local_arrived = False
+        return output
+
     def _compute_global_arrived(self) -> bool:
         local_arrived = self._noop or self._local_arrived
         global_arrived = torch.tensor(local_arrived).cuda()
