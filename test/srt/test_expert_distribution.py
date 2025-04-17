@@ -26,7 +26,7 @@ class TestExpertDistribution(CustomTestCase):
                 self._execute_core(**info)
 
     def _execute_core(
-            self, model_path: str, mode_detail: bool = False, tp_size: int = 1
+        self, model_path: str, mode_detail: bool = False, tp_size: int = 1
     ):
         """Test expert distribution record endpoints"""
         os.environ["SGLANG_EXPERT_DISTRIBUTION_RECORDER_DETAIL"] = (
@@ -41,6 +41,7 @@ class TestExpertDistribution(CustomTestCase):
                 "--tp-size",
                 str(tp_size),
                 "--enable-expert-distribution-recorder",
+                "--disable-cuda-graph",
             ],
         )
 
