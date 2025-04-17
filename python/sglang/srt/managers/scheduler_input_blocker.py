@@ -39,7 +39,7 @@ class SchedulerInputBlocker:
             for recv_req in recv_reqs:
                 output_reqs += self._handle_recv_req(recv_req)
 
-        global_arrived_unblock_barrier = self._compute_global_unblock_barrier()
+        global_arrived_unblock_barrier = self._global_unblock_barrier.poll_global_arrived()
         if (
             self._state == _State.GLOBAL_UNBLOCK_BARRIER
             and global_arrived_unblock_barrier
