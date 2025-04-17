@@ -466,7 +466,11 @@ class _StatAccumulator(_Accumulator):
             physical_dumps: List[Any],
             expert_location_metadata: "ExpertLocationMetadata",
     ):
-        TODO
+        TODO_rename_physical_dumps
+        logical_count = torch.stack([item["logical_count"] for item in physical_dumps]).sum(dim=0)
+        return dict(logical_count=logical_count.tolist())
+
+        TODO_remove_below
         logical_count = torch.zeros(
             (
                 expert_location_metadata.num_layers,
