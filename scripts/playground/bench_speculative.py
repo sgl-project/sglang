@@ -176,16 +176,11 @@ def main(args, server_args):
                 ]
             )
 
-        if server_args.enable_flashinfer_mla:
+        if server_args.attention_backend:
             other_args.extend(
                 [
-                    "--enable-flashinfer-mla",
-                ]
-            )
-        if server_args.enable_flashmla:
-            other_args.extend(
-                [
-                    "--enable-flashmla",
+                    "--attention-backend",
+                    server_args.attention_backend,
                 ]
             )
 
