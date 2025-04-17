@@ -6,6 +6,7 @@ from sglang.srt.managers.expert_distribution import get_global_expert_distributi
 from sglang.srt.managers.io_struct import UpdateExpertLocationReqInput
 from sglang.srt.managers.schedule_batch import get_global_expert_location_metadata
 from sglang.srt.model_executor.model_weight_updater import ModelWeightUpdater
+from sglang.srt.model_loader.weight_utils import ModelParamNameInfo, ModelParamNameInfoMoe
 from sglang.srt.utils import get_bool_env_var
 
 if TYPE_CHECKING:
@@ -54,4 +55,8 @@ class ExpertLocationUpdater:
         torch.distributed.barrier()
 
     def _weight_filter(self, name: str):
+        info: ModelParamNameInfo = self._model_runner.model.get_param_name_info()
+        if not isinstance(info, ModelParamNameInfoMoe):
+            return False
+
         return TODO
