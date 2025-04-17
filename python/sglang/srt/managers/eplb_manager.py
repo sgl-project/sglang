@@ -25,7 +25,7 @@ class EPLBManager:
         self._server_args = server_args
         self._expert_distribution_storage = ExpertDistributionStorage(
             dir_data=Path(self._server_args.eplb_storage_dir)
-            / "expert_distribution_storage"
+                     / "expert_distribution_storage"
         )
 
     def bind(self, tokenizer_manager: "TokenizerManager"):
@@ -44,7 +44,8 @@ class EPLBManager:
 
     async def rebalance(self, obj: EplbRebalanceReqInput):
         await self.save_expert_distribution()
-        expert_location_metadata = self.compute_expert_location_metadata()
+        expert_location_metadata = self.compute_expert_location_metadata(
+            debug_use_random_stat=obj.debug_use_random_stat)
         await self._tokenizer_manager.update_expert_location(
             UpdateExpertLocationReqInput(
                 expert_location_metadata=expert_location_metadata
@@ -54,7 +55,7 @@ class EPLBManager:
     async def save_expert_distribution(self):
         await self._expert_distribution_storage.save_current()
 
-    def compute_expert_location_metadata(self):
+    def compute_expert_location_metadata(self, debug_use_random_stat: bool = False):
         snapshot = self._expert_distribution_storage.get_last_snapshot()
         if snapshot is None:
             return ExpertLocationMetadata.init_trivial(self._server_args)
