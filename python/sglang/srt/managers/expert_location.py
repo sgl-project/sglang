@@ -166,7 +166,8 @@ class ExpertLocationMetadata:
 
     # -------------------------------- mutation ------------------------------------
 
-    def update(self, other: "ExpertLocationMetadata"):
+    def update(self, other: "ExpertLocationMetadata", layer_id_start: Optional[int] = None,
+               layer_id_len: Optional[int] = None):
         for field in [
             "ep_size",
         ]:
