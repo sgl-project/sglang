@@ -127,5 +127,13 @@ class _AsyncToCudaTask:
     input_named_tensors: NamedTensors
     output_named_tensors: NamedTensors
 
+
 class SimpleCachingAllocator:
-    TODO
+    def __init__(self):
+        TODO
+
+    def allocate(self) -> torch.Tensor:
+        return TODO
+
+    def mark_all_unused(self):
+        TODO
