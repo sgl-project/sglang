@@ -50,8 +50,18 @@ class AsyncToCudaManager(TensorOperationManagerBase):
 
     def enqueue(self, named_tensors: NamedTensors):
         self._auto_create_stream()
+
+        self._alt_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(self._alt_stream):
+            output_named_tensors = [
+                (name, tensor.to("cuda", non_blocking=True))
+                for name, tensor in named_tensors
+            ]
+            finish_event = torch.cuda.Event()
+            finish_event.record()
+
         self._queue.append(_AsyncToCudaTask(
-            event=event,
+            finish_event=finish_event,
             input_named_tensors=named_tensors,
             output_named_tensors=output_named_tensors,
         ))
@@ -66,6 +76,6 @@ class AsyncToCudaManager(TensorOperationManagerBase):
 
 @dataclass
 class _AsyncToCudaTask:
-    event: torch.cuda.Event
+    finish_event: torch.cuda.Event
     input_named_tensors: NamedTensors
     output_named_tensors: NamedTensors
