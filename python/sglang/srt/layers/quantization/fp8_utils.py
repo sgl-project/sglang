@@ -303,49 +303,39 @@ def apply_fp8_linear(
     if compressed_tensor_quant:
         # cutlass_scaled_mm supports per tensor/channel W and per tensor/token A
         # for sgl-kernel fp8_scaled_mm, it support per channel W now
-        if cutlass_fp8_supported and weight_scale.numel() == weight.shape[1]:
+        if cutlass_fp8_supported and _is_cuda and weight_scale.numel() == weight.shape[1]:
             qinput, x_scale = (
                 scaled_fp8_quant(
                     input_2d,
                     input_scale,
                     use_per_token_if_dynamic=use_per_token_if_dynamic,
                 )
-                if _is_cuda
-                else ops.scaled_fp8_quant(
-                    input_2d,
-                    input_scale,
-                    scale_ub=input_scale_ub,
-                    use_per_token_if_dynamic=use_per_token_if_dynamic,
-                )
             )
 
-            try:
-                # Fused GEMM_DQ
-                if VLLM_AVAILABLE and use_vllm_cutlass_w8a8_fp8_kernel:
-                    # Fall back to vllm cutlass w8a8 fp8 kernel
-                    output = ops.cutlass_scaled_mm(
-                        qinput,
-                        weight,
-                        out_dtype=input.dtype,
-                        scale_a=x_scale,
-                        scale_b=weight_scale,
-                        bias=bias,
-                    )
-                else:
-                    assert (
-                        weight_scale.numel() == weight.shape[1]
-                    ), "cutlass w8a8 fp8 sgl-kernel only supports per-channel scale"
-                    output = fp8_scaled_mm(
-                        qinput,
-                        weight,
-                        x_scale,
-                        weight_scale,
-                        out_dtype=input.dtype,
-                        bias=bias,
-                    )
-                return output.view(*output_shape)
-            except (ImportError, NameError, AttributeError):
-                pass
+            # Fused GEMM_DQ
+            if VLLM_AVAILABLE and use_vllm_cutlass_w8a8_fp8_kernel:
+                # Fall back to vllm cutlass w8a8 fp8 kernel
+                output = ops.cutlass_scaled_mm(
+                    qinput,
+                    weight,
+                    out_dtype=input.dtype,
+                    scale_a=x_scale,
+                    scale_b=weight_scale,
+                    bias=bias,
+                )
+            else:
+                assert (
+                    weight_scale.numel() == weight.shape[1]
+                ), "cutlass w8a8 fp8 sgl-kernel only supports per-channel scale"
+                output = fp8_scaled_mm(
+                    qinput,
+                    weight,
+                    x_scale,
+                    weight_scale,
+                    out_dtype=input.dtype,
+                    bias=bias,
+                )
+            return output.view(*output_shape)
 
         # torch.scaled_mm supports per tensor weights + activations only
         # so fallback to naive if per channel or per token
