@@ -34,7 +34,18 @@ class TestEPLB(CustomTestCase):
         request_rate = 20
         content_duplicate_num = 20
         contents_raw = [
-            dict(prompt=TODO, expect_output=TODO),
+            dict(
+                prompt="1+1=2, 1+2=3, 1+3=4, 1+4=5, 1+5=",
+                expect_output="TODO",
+            ),
+            dict(
+                prompt="2*1=2, 2*2=4, 2*3=6, 2*4=",
+                expect_output="TODO",
+            ),
+            dict(
+                prompt="One plus one is two, one plus two is three, one plus three is",
+                expect_output="TODO",
+            ),
         ]
 
         async def _main_async():
