@@ -220,7 +220,6 @@ def biased_grouped_topk(
     # TODO: moe_fused_gate kernel is not supported for n_share_experts_fusion > 0 now.
     if (
         _is_cuda
-        and n_share_experts_fusion == 0
         and is_power_of_two(correction_bias.shape[0])
     ):
         return moe_fused_gate(
@@ -229,6 +228,8 @@ def biased_grouped_topk(
             num_expert_group,
             topk_group,
             topk,
+            n_share_experts_fusion,
+            2.5, # DeepSeek V3/R1 routed_scaling_factor
         )
     else:
         biased_grouped_topk_fn = (
@@ -262,9 +263,7 @@ def select_experts(
     correction_bias: Optional[torch.Tensor] = None,
     torch_native: bool = False,
 ):
-    n_share_experts_fusion = 0
-    if global_server_args_dict["n_share_experts_fusion"] is not None:
-        n_share_experts_fusion = global_server_args_dict["n_share_experts_fusion"]
+    n_share_experts_fusion = global_server_args_dict["n_share_experts_fusion"]
     # DeekSeek V2/V3/R1 serices models uses grouped_top_k
     if use_grouped_topk:
         assert topk_group is not None

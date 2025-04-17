@@ -182,7 +182,6 @@ class ServerArgs:
     flashinfer_mla_disable_ragged: bool = False
     warmups: Optional[str] = None
     n_share_experts_fusion: int = 0
-    disable_shared_experts_fusion: bool = False
     disable_chunked_prefix_cache: bool = False
     disable_fast_image_processor: bool = False
 
@@ -226,9 +225,6 @@ class ServerArgs:
         else:
             # GPU memory is not known yet or no GPU is available.
             gpu_mem = None
-
-        if is_hip():
-            self.disable_shared_experts_fusion = True
 
         # Set mem fraction static, which depends on the tensor parallelism size
         if self.mem_fraction_static is None:
@@ -1113,13 +1109,8 @@ class ServerArgs:
             "--n-share-experts-fusion",
             type=int,
             default=0,
-            help="The number of shared_experts need to be replica to fuse with normal experts in deepseek v3/r1 "
-            "we use tp_size by default.",
-        )
-        parser.add_argument(
-            "--disable-shared-experts-fusion",
-            action="store_true",
-            help="Disable shared experts fusion by setting n_share_experts_fusion to 0.",
+            help="The number of shared_experts need to be replica to fuse with normal experts in deepseek v3/r1, "
+            "set it to tp_size can get best optimized performace.",
         )
         parser.add_argument(
             "--disable-chunked-prefix-cache",
