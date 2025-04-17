@@ -30,6 +30,10 @@ class TestEPLB(CustomTestCase):
         print("Action: test_eplb_many_rebalances")
 
         num_rebalance = 20
+        request_rate = 20
+        requests = [
+            dict(prompt=TODO),
+        ]
 
         async def _main_async():
             await asyncio.gather(
@@ -39,10 +43,10 @@ class TestEPLB(CustomTestCase):
 
         async def _task_generate():
             tasks = []
-            async for request in _get_requests():
+            async for request in _yield_with_poisson_process(requests, action_rate=request_rate):
                 tasks.append(asyncio.create_task(engine.async_generate(
-                    prompt=TODO,
-                    sampling_params=dict(temperature=0),
+                    prompt=request["prompt"],
+                    sampling_params=dict(temperature=0, max_new_tokens=8),
                 )))
             TODO_test_result
 
@@ -283,10 +287,10 @@ def _compute_trivial_expert_locations(ep_num_redundant_experts: int):
     )
 
 
-async def _get_request(input_requests: List[str], request_rate: float):
-    for request in input_requests:
-        yield request
-        interval = np.random.exponential(1.0 / request_rate)
+async def _yield_with_poisson_process(items: List, action_rate: float):
+    for item in items:
+        yield item
+        interval = np.random.exponential(1.0 / action_rate)
         await asyncio.sleep(interval)
 
 
