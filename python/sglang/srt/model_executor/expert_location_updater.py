@@ -73,4 +73,7 @@ def _compute_interesting_logical_experts_of_layer(
     old_expert_location_metadata: ExpertLocationMetadata,
     new_expert_location_metadata: ExpertLocationMetadata,
 ) -> Dict[int, List[int]]:
-    return TODO
+    interesting_logical_experts_of_layer = {}
+    for layer_id in range(old_expert_location_metadata.num_layers):
+        interesting_logical_experts_of_layer[layer_id] = TODO
+    return interesting_logical_experts_of_layer
