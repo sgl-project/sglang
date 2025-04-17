@@ -1,5 +1,7 @@
 import torch
 
+from sglang.srt.distributed import get_world_group
+
 
 class PollBasedBarrier:
     def __init__(self, noop: bool = False):
@@ -19,7 +21,7 @@ class PollBasedBarrier:
 
     def _compute_global_arrived(self) -> bool:
         local_arrived = self._noop or self._local_arrived
-        global_arrived = torch.tensor(local_arrived).cuda()
+        global_arrived = torch.tensor(local_arrived)
         # Can optimize if bottleneck
-        torch.distributed.all_reduce(global_arrived, torch.distributed.ReduceOp.MIN)
-        return global_arrived.cpu().item()
+        torch.distributed.all_reduce(global_arrived, torch.distributed.ReduceOp.MIN, group=get_world_group().cpu_group)
+        return global_arrived.item()
