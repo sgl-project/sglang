@@ -2,12 +2,19 @@ from dataclasses import dataclass
 from typing import Literal, Optional
 
 import torch
+from sglang.srt.managers.expert_location import ExpertLocationMetadata
 from sglang.srt.utils import get_compiler_backend
 
 
 @dataclass
 class ExpertLocationDispatchInfo:
     ep_dispatch_algorithm: Literal["static", "random"]
+
+    @classmethod
+    def init_new(cls, expert_location_metadata: ExpertLocationMetadata, ep_rank: int, layer_id: int):
+        return cls(
+            ep_dispatch_algorithm=TODO,
+        )
 
 
 def topk_ids_logical_to_physical(topk_ids: torch.Tensor, info: Optional[ExpertLocationDispatchInfo]) -> torch.Tensor:
