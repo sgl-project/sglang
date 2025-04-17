@@ -200,19 +200,29 @@ std::vector<at::Tensor>
 moe_fused_gate(at::Tensor& input, at::Tensor& bias, int64_t num_expert_group, int64_t topk_group, int64_t topk);
 
 void fp8_blockwise_scaled_grouped_mm(
-    torch::Tensor &output,
-    const torch::Tensor &a,
-    const torch::Tensor &b,
-    const torch::Tensor &scales_a,
-    const torch::Tensor &scales_b,
-    const torch::Tensor &stride_a,
-    const torch::Tensor &stride_b,
-    const torch::Tensor &stride_c,
-    const torch::Tensor &layout_sfa,
-    const torch::Tensor &layout_sfb,
-    const torch::Tensor &problem_sizes,
-    const torch::Tensor &expert_offsets);
+    torch::Tensor& output,
+    const torch::Tensor& a,
+    const torch::Tensor& b,
+    const torch::Tensor& scales_a,
+    const torch::Tensor& scales_b,
+    const torch::Tensor& stride_a,
+    const torch::Tensor& stride_b,
+    const torch::Tensor& stride_c,
+    const torch::Tensor& layout_sfa,
+    const torch::Tensor& layout_sfb,
+    const torch::Tensor& problem_sizes,
+    const torch::Tensor& expert_offsets);
 
+void prepare_cutlass_input(
+    const torch::Tensor& topk_ids,
+    const torch::Tensor& expert_offsets,
+    const torch::Tensor& problem_sizes1,
+    const torch::Tensor& problem_sizes2,
+    const torch::Tensor& input_permutation,
+    const torch::Tensor& output_permutation,
+    int64_t num_experts,
+    int64_t n,
+    int64_t k);
 /*
  * From csrc/speculative
  */

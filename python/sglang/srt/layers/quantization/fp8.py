@@ -16,7 +16,7 @@ from sglang.srt.layers.quantization.utils import (
     per_tensor_dequantize,
     requantize_with_max_scale,
 )
-
+from sglang.srt.layers.moe.moe_cutlass import cutlass_fused_experts_fp8_bs
 try:
     from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
         apply_fp8_marlin_linear,
@@ -576,6 +576,24 @@ class Fp8MoEMethod:
             layer.register_parameter("w13_weight_scale_inv", w13_weight_scale)
             layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
             assert self.quant_config.activation_scheme == "dynamic"
+            
+            if get_bool_env_var("USE_CUTLASS_MOE"):
+                self.ab_strides1 = torch.full((num_experts, ),
+                                        hidden_size,
+                                        device=w13_weight.device,
+                                        dtype=torch.int64)
+                self.c_strides1 = torch.full((num_experts, ),
+                                        2 * intermediate_size,
+                                        device=w13_weight.device,
+                                        dtype=torch.int64)
+                self.ab_strides2 = torch.full((num_experts, ),
+                                        intermediate_size,
+                                        device=w13_weight.device,
+                                        dtype=torch.int64)
+                self.c_strides2 = torch.full((num_experts, ),
+                                        hidden_size,
+                                        device=w13_weight.device,
+                                        dtype=torch.int64)
         else:
             # Allocate 2 scales for w1 and w3 respectively.
             # They will be combined to a single scale after weight loading.
@@ -979,6 +997,23 @@ class Fp8MoEMethod:
                     ),
                 )
         else:
+            
+            if get_bool_env_var("USE_CUTLASS_MOE") \
+                and self.block_quant \
+                and self.quant_config.weight_block_size == (128, 128):
+                cutlass_fused_experts_fp8_bs(
+                    x,
+                    layer.w13_weight,
+                    layer.w2_weight,
+                    layer.w13_weight_scale_inv,
+                    layer.w2_weight_scale_inv,
+                    topk_weights,
+                    topk_ids,
+                    self.ab_strides1,
+                    self.c_strides1,
+                    self.ab_strides2,
+                    self.c_strides2,
+                )
             # Expert fusion with FP8 quantization
             return fused_experts(
                 x,
