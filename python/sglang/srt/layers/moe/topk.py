@@ -144,7 +144,7 @@ def grouped_topk(
         topk_weights = topk_weights / topk_weights_sum
 
     topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
-   
+
     topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
 
     return topk_weights, topk_ids

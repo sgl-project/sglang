@@ -11,6 +11,9 @@ class ExpertLocationDispatchInfo:
 
 
 def topk_ids_logical_to_physical(topk_ids: torch.Tensor, info: Optional[ExpertLocationDispatchInfo]) -> torch.Tensor:
+    if info is None:
+        return topk_ids
+
     return TODO
 
     # TODO
