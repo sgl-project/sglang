@@ -1,13 +1,6 @@
 from typing import Any, Callable, Dict, List, Optional
 
 import torch
-
-from sglang.srt.utils import is_cuda_available, set_weight_attrs
-
-is_cuda = is_cuda_available()
-if is_cuda:
-    from sgl_kernel import int8_scaled_mm
-
 from torch.nn.parameter import Parameter
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
@@ -18,6 +11,11 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
+from sglang.srt.utils import is_cuda_available, set_weight_attrs
+
+is_cuda = is_cuda_available()
+if is_cuda:
+    from sgl_kernel import int8_scaled_mm
 
 
 class W8A8Int8Config(QuantizationConfig):
