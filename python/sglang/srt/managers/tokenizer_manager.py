@@ -723,15 +723,9 @@ class TokenizerManager:
 
     async def _update_expert_location_raw(self, expert_location_metadata: ExpertLocationMetadata):
         self.expert_location_metadata = None
-
-        TODO_prepare
-
-        TODO_rename_to_act
-        self._send_block_request(BlockReqType.BLOCK)
-        await self.update_expert_location_communicator.call_send(TODO)
-        self._send_block_request(BlockReqType.UNBLOCK)
-        await self.update_expert_location_communicator.call_await()
-
+        await self.update_expert_location_communicator(UpdateExpertLocationReqInput(
+            expert_location_metadata=expert_location_metadata,
+        ))
         self.expert_location_metadata = expert_location_metadata
 
     async def update_weights_from_disk(
