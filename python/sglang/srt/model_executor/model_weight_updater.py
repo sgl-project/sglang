@@ -85,7 +85,7 @@ class _ModelWeightSourceVanilla(_ModelWeightSourceBase):
         loader = get_model_loader(load_config)
         assert isinstance(loader, DefaultModelLoader)
         with set_default_torch_dtype(self._model_config.dtype):
-            return loader._get_weights_iterator(DefaultModelLoader.Source.init_new(self._model_config, self._model))
+            yield from loader._get_weights_iterator(DefaultModelLoader.Source.init_new(self._model_config, self._model))
 
 
 class _ModelWeightSourcePinnedMemory(_ModelWeightSourceBase):
