@@ -130,12 +130,14 @@ class ExpertLocationMetadata:
             physical_to_logical_map: torch.Tensor,
             logical_to_all_physical_map: torch.Tensor,
     ):
+        logical_to_all_physical_map_padded = TODO
+        logical_to_all_physical_map_num_valid = torch.count_nonzero(logical_to_all_physical_map != -1, dim=-1)
+
         return ExpertLocationMetadata(
             ep_size=ep_size,
             physical_to_logical_map=physical_to_logical_map,
-            logical_to_all_physical_map=logical_to_all_physical_map,
-            logical_to_all_physical_map_num_valid=_compute_logical_to_all_physical_map_num_valid(
-                logical_to_all_physical_map),
+            logical_to_all_physical_map=logical_to_all_physical_map_padded,
+            logical_to_all_physical_map_num_valid=logical_to_all_physical_map_num_valid,
             logical_to_rank_dispatch_physical_map=_compute_logical_to_rank_dispatch_physical_map(
                 logical_to_all_physical_map,
                 num_gpus=ep_size,
@@ -234,10 +236,6 @@ def _pad_nested_array(arr, pad_value):
         for outer in arr
     ]
     return padded
-
-
-def _compute_logical_to_all_physical_map_num_valid(logical_to_all_physical_map):
-    return torch.count_nonzero(logical_to_all_physical_map != -1, dim=-1)
 
 
 def _compute_logical_to_rank_dispatch_physical_map(
