@@ -21,7 +21,10 @@ class ExpertLocationUpdater:
     def __init__(self, model_runner: "ModelRunner"):
         self._model_runner = model_runner
         self._model_weight_updater = ModelWeightUpdater(
-            init_pin_memory=model_runner.server_args.expert_location_updater_mode == "pin_memory",
+            init_pin_memory={
+                "pin_memory": True,
+                "pageable_memory": False,
+            }[model_runner.server_args.expert_location_updater_mode],
             load_format=model_runner.server_args.load_format,
             model_config=model_runner.model_config,
             model=model_runner.model,
