@@ -28,9 +28,9 @@ class ExpertDistributionRecorder:
         rank: int,
     ):
         if server_args.enable_expert_distribution_recorder:
-            return TODO
+            return _ExpertDistributionRecorderReal(server_args, expert_location_metadata, rank)
         else:
-            return TODO
+            return _ExpertDistributionRecorderNoop()
 
 
 class _ExpertDistributionRecorderNoop(ExpertDistributionRecorder):
