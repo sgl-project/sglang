@@ -38,6 +38,12 @@ class ExpertLocationUpdater:
             weight_filter=lambda name: self._weight_filter(name, interesting_logical_experts_of_layer),
         )
 
+    def event_loop_step(self):
+        TODO_maybe_rename
+        TODO_maybe_change_output
+        self._model_weight_updater.event_loop_step()
+        return TODO
+
     def act(self, recv_req: UpdateExpertLocationReqInput):
         logger.info("update_expert_location start")
         torch.distributed.barrier()
