@@ -38,7 +38,7 @@ class TestEPLB(CustomTestCase):
 
         num_rebalance = 20
         request_rate = 20
-        content_duplicate_num = 20
+        content_duplicate_num = 200
         contents_raw = [
             dict(
                 prompt="1+1=2, 1+2=3, 1+3=4, 1+4=5, 1+5=",
