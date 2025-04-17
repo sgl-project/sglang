@@ -73,6 +73,7 @@ class SchedulerInputBlocker:
         self._change_state(
             original=_State.BLOCKED, target=_State.GLOBAL_UNBLOCK_BARRIER
         )
+        self._global_unblock_barrier.local_arrive()
 
     def _handle_arrive_unblock_barrier(self):
         self._change_state(
