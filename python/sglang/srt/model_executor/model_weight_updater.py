@@ -1,6 +1,6 @@
 from abc import ABC
 from dataclasses import dataclass
-from typing import Iterator, Tuple
+from typing import Iterator, Tuple, List
 
 import torch
 from sglang.srt.model_executor.memory_transfer import AsyncToCudaManager, CombinedManager
@@ -13,7 +13,21 @@ class ModelWeightUpdater:
         self._model_weight_source = _ModelWeightSourcePinnedMemory() if init_pin_memory else _ModelWeightSourceVanilla()
 
     def start_prepare(self):
+        assert isinstance(self._state, _StateIdle)
+
         TODO
+
+        self._state = _StateAwaitMemoryTransfer()
+
+    def event_loop_step(self):
+        TODO
+
+    def act(self):
+        assert isinstance(self._state, _StatePrepared)
+       
+        TODO
+
+        self._state = _StateIdle()
 
 
 class _State(ABC):
