@@ -510,7 +510,10 @@ class _StatAccumulator(_Accumulator):
         self._buffer_global_physical_count[...] = 0
 
 
-def _convert_global_physical_count_to_logical_count(global_physical_count: torch.Tensor):
+def _convert_global_physical_count_to_logical_count(
+        global_physical_count: torch.Tensor,
+        expert_location_metadata: ExpertLocationMetadata,
+):
     logical_count = torch.zeros(
         (
             expert_location_metadata.num_layers,
@@ -518,24 +521,23 @@ def _convert_global_physical_count_to_logical_count(global_physical_count: torch
         )
     )
     # Most naive implementation, can optimize if it is bottleneck
-    for dump in dumps:
-        for layer_index in range(expert_location_metadata.num_layers):
-            for local_physical_expert_index in range(
-                    expert_location_metadata.num_local_physical_experts
-            ):
-                global_physical_expert_index = (
-                    expert_location_metadata.local_physical_to_physical(
-                        rank=dump["rank"],
-                        local_physical_expert_index=local_physical_expert_index,
-                    )
+    for layer_index in range(expert_location_metadata.num_layers):
+        for local_physical_expert_index in range(
+                expert_location_metadata.num_local_physical_experts
+        ):
+            global_physical_expert_index = (
+                expert_location_metadata.local_physical_to_physical(
+                    rank=dump["rank"],
+                    local_physical_expert_index=local_physical_expert_index,
                 )
-                logical_expert_index = (
-                    expert_location_metadata.physical_to_logical_map[
-                        layer_index, global_physical_expert_index
-                    ]
-                )
-                TODO_no_physical_count_key
-                logical_count[layer_index, logical_expert_index] += dump[
-                    "physical_count"
-                ][layer_index][local_physical_expert_index]
+            )
+            logical_expert_index = (
+                expert_location_metadata.physical_to_logical_map[
+                    layer_index, global_physical_expert_index
+                ]
+            )
+            TODO_no_physical_count_key
+            logical_count[layer_index, logical_expert_index] += dump[
+                "physical_count"
+            ][layer_index][local_physical_expert_index]
     return logical_count
