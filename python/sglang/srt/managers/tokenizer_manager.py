@@ -711,7 +711,7 @@ class TokenizerManager:
         old_expert_location_metadata = copy.deepcopy(self.expert_location_metadata)
         for what in TODO:
             partial_expert_location_metadata = copy.deepcopy(old_expert_location_metadata)
-            partial_expert_location_metadata.update(obj.expert_location_metadata, layer_ids=TODO)
+            partial_expert_location_metadata.update(obj.expert_location_metadata, layer_id_start=0, layer_id_len=TODO)
             await self._update_expert_location_raw(UpdateExpertLocationReqInput(
                 expert_location_metadata=partial_expert_location_metadata,
             ))
