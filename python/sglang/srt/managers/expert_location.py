@@ -173,11 +173,11 @@ class ExpertLocationMetadata:
         ]:
             assert getattr(self, field) == getattr(other, field)
 
-        for field in [
-            "physical_to_logical_map",
-            "logical_to_all_physical_map",
-            "logical_to_all_physical_map_num_valid",
-            "logical_to_rank_dispatch_physical_map",
+        for field, layer_id_dim in [
+            ("physical_to_logical_map", 0),
+            ("logical_to_all_physical_map", 0),
+            ("logical_to_all_physical_map_num_valid", 0),
+            ("logical_to_rank_dispatch_physical_map", 1),
         ]:
             # Cannot update address to avoid breaking CUDA graph
             getattr(self, field)[...] = getattr(other, field)
