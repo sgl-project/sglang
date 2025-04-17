@@ -74,8 +74,7 @@ class ExpertLocationMetadata:
         )
 
         return ExpertLocationMetadata._init_raw(
-            ep_size=TODO,
-            num_gpus=common["ep_size"],
+            ep_size=common["ep_size"],
             physical_to_logical_map=physical_to_logical_map,
             logical_to_all_physical_map=logical_to_all_physical_map,
         )
@@ -98,8 +97,7 @@ class ExpertLocationMetadata:
         )
 
         return ExpertLocationMetadata._init_raw(
-            ep_size=TODO,
-            num_gpus=common["ep_size"],
+            ep_size=common["ep_size"],
             physical_to_logical_map=physical_to_logical_map,
             logical_to_all_physical_map=logical_to_all_physical_map,
         )
@@ -129,7 +127,6 @@ class ExpertLocationMetadata:
     @staticmethod
     def _init_raw(
             ep_size: int,
-            num_gpus: int,
             physical_to_logical_map: torch.Tensor,
             logical_to_all_physical_map: torch.Tensor,
     ):
@@ -141,7 +138,7 @@ class ExpertLocationMetadata:
                 logical_to_all_physical_map),
             logical_to_rank_dispatch_physical_map=_compute_logical_to_rank_dispatch_physical_map(
                 logical_to_all_physical_map,
-                num_gpus=num_gpus,
+                num_gpus=ep_size,
             ),
         )
 
