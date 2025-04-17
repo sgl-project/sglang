@@ -41,6 +41,9 @@ class ExpertLocationMetadata:
     def num_logical_experts(self) -> int:
         return self.logical_to_all_physical_map.shape[1]
 
+    def __post_init__(self):
+        TODO
+
     # -------------------------------- construction and mutation ------------------------------------
 
     @staticmethod
