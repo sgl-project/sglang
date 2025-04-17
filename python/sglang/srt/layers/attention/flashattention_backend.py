@@ -258,6 +258,11 @@ def cdiv(a: int, b: int) -> int:
     return -(a // -b)
 
 
+@torch.compiler.disable()
+def merge_state_v2_wrapper(o, s_a, o_exp, s_b):
+    return merge_state_v2(o, s_a, o_exp, s_b)
+
+
 class FlashAttentionBackend(AttentionBackend):
     """FlashAttention backend implementation.
 
@@ -771,7 +776,7 @@ class FlashAttentionBackend(AttentionBackend):
                     v_descale=v_descale,
                     return_softmax_lse=True,
                 )
-                o, _ = merge_state_v2(
+                o, _ = merge_state_v2_wrapper(
                     o,
                     softmax_lse.T.contiguous(),
                     o_expand,
@@ -882,7 +887,7 @@ class FlashAttentionBackend(AttentionBackend):
                             return_softmax_lse=True,
                         )
                     )
-                    o, _ = merge_state_v2(
+                    o, _ = merge_state_v2_wrapper(
                         o,
                         softmax_lse.T.contiguous(),
                         o_expand,
