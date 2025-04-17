@@ -72,8 +72,18 @@ class ExpertLocationUpdater:
 def _compute_interesting_logical_experts_of_layer(
     old_expert_location_metadata: ExpertLocationMetadata,
     new_expert_location_metadata: ExpertLocationMetadata,
+    ep_rank: int,
 ) -> Dict[int, List[int]]:
+    num_layers = old_expert_location_metadata.num_layers
+    num_local_physical_experts = old_expert_location_metadata.num_local_physical_experts
+
+    def _get_partial_physical_to_logical_map(meta: ExpertLocationMetadata, layer_id: int):
+        return meta.physical_to_logical_map[layer_id,
+               num_local_physical_experts * ep_rank: num_local_physical_experts * (ep_rank + 1)]
+
     interesting_logical_experts_of_layer = {}
-    for layer_id in range(old_expert_location_metadata.num_layers):
+    for layer_id in range(num_layers):
+        old_partial_map = _get_partial_physical_to_logical_map(old_expert_location_metadata)
+        new_partial_map = _get_partial_physical_to_logical_map(new_expert_location_metadata)
         interesting_logical_experts_of_layer[layer_id] = TODO
     return interesting_logical_experts_of_layer
