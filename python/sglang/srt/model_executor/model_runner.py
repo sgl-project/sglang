@@ -20,7 +20,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from typing import Iterable, List, Optional, Tuple, Union
+from typing import Iterable, List, Optional, Tuple, Union, Any
 
 import torch
 import torch.distributed as dist
@@ -496,7 +496,10 @@ class ModelRunner:
             ) from None
 
     def update_expert_location(self, recv_req: UpdateExpertLocationReqInput):
-        self._expert_location_updater.act(recv_req)
+        self._expert_location_updater.start(recv_req)
+   
+    def event_loop_step(self) -> List[Any]:
+        TODO
 
     def update_weights_from_disk(
         self, model_path: str, load_format: str, param_categories: Optional[List[str]]
