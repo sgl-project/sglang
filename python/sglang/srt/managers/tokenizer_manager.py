@@ -709,9 +709,11 @@ class TokenizerManager:
         ), f"update_expert_location requires enable_scheduler_input_blocker and non-null ep_dispatch_algorithm"
 
         old_expert_location_metadata = copy.deepcopy(self.expert_location_metadata)
-        for TODO in TODO:
+        for what in TODO:
+            partial_expert_location_metadata = copy.deepcopy(old_expert_location_metadata)
+            partial_expert_location_metadata.update(obj.expert_location_metadata, layer_ids=TODO)
             await self._update_expert_location_raw(UpdateExpertLocationReqInput(
-                expert_location_metadata=TODO,
+                expert_location_metadata=partial_expert_location_metadata,
             ))
 
     async def _update_expert_location_raw(self, obj: UpdateExpertLocationReqInput):
