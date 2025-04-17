@@ -8,6 +8,7 @@ from sglang.srt.managers.io_struct import UpdateExpertLocationReqInput
 from sglang.srt.managers.schedule_batch import get_global_expert_location_metadata
 from sglang.srt.model_executor.model_weight_updater import ModelWeightUpdater
 from sglang.srt.model_loader.weight_utils import ModelParamNameInfo, ModelParamNameInfoMoe
+from sglang.srt.poll_based_barrier import PollBasedBarrier
 from sglang.srt.utils import get_bool_env_var
 
 if TYPE_CHECKING:
@@ -26,6 +27,7 @@ class ExpertLocationUpdater:
             model=model_runner.model,
             device=model_runner.device,
         )
+        self._prepare_end_barrier = PollBasedBarrier(noop=False)
 
     def start_prepare(self, expert_location_metadata: ExpertLocationMetadata):
         interesting_logical_experts_of_layer = _compute_interesting_logical_experts_of_layer(
@@ -41,8 +43,11 @@ class ExpertLocationUpdater:
     def event_loop_step(self):
         TODO_maybe_rename
         TODO_maybe_change_output
-        self._model_weight_updater.event_loop_step()
-        return TODO
+        prepare_done = self._model_weight_updater.event_loop_step()
+        if prepare_done:
+            self._prepare_end_barrier.local_arrive()
+
+        TODO_outer_call_this
 
     def act(self, recv_req: UpdateExpertLocationReqInput):
         torch.distributed.barrier()
