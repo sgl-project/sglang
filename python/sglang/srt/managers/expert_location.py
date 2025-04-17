@@ -275,17 +275,22 @@ def _compute_logical_to_rank_dispatch_physical_map(
 
     for layer_id in range(num_layers):
         for logical_expert_id in range(num_logical_experts):
+            candidate_physical_expert_ids = ExpertLocationMetadata.logical_to_all_physical_raw(
+                logical_to_all_physical_map, layer_id, logical_expert_id
+            )
             partial_map = logical_to_all_physical_map[:, layer_id, logical_expert_id]
 
             for gpu_id in range(num_gpus):
+                same_gpu_physical_expert_ids = [
+                    physical_expert_id
+                    for physical_expert_id in candidate_physical_expert_ids
+                    if _compute_gpu_id_of_physical_expert(physical_expert_id) == gpu_id
+                ]
                 if TODO:
                     partial_map[gpu_id] = TODO
 
             # TODO old
             # for gpu_id in range(num_gpus):
-            #     candidate_values = ExpertLocationMetadata.logical_to_all_physical_raw(
-            #         logical_to_all_physical_map, layer_id, logical_expert_id
-            #     )
             #     logical_to_rank_dispatch_physical_map[
             #         gpu_id, layer_id, logical_expert_id
             #     ] = r.choice(candidate_values)
