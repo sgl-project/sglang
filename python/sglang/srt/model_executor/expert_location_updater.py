@@ -17,7 +17,7 @@ class ExpertLocationUpdater:
     def __init__(self, model_runner: "ModelRunner"):
         self._model_runner = model_runner
 
-    def prepare(self):
+    def start_prepare(self):
         TODO
 
     def act(self, recv_req: UpdateExpertLocationReqInput):

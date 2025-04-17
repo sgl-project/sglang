@@ -10,6 +10,9 @@ class ModelWeightUpdater:
         self._manager_transfer_manager = AsyncToCudaManager() if init_pin_memory else CombinedManager.init_pin_memory_and_to_cuda()
         self._model_weight_source = _ModelWeightSourcePinnedMemory() if init_pin_memory else _ModelWeightSourceVanilla()
 
+    def start_prepare(self):
+        TODO
+
 
 class _ModelWeightSourceBase(ABC):
     def get_all_weights(self) -> Iterator[Tuple[str, torch.Tensor]]:
