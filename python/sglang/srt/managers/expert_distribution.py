@@ -47,10 +47,10 @@ class ExpertDistributionRecorder:
     def on_select_experts(self, topk_ids: torch.Tensor):
         pass
 
-    def on_deepep_dispatch_normal(self, num_recv_tokens_per_expert_list: List[int]):
+    def on_deepep_dispatch_normal(self, local_physical_count_of_layer: List[int]):
         pass
 
-    def on_deepep_dispatch_low_latency(self, recv_count: torch.Tensor):
+    def on_deepep_dispatch_low_latency(self, local_physical_count_of_layer: torch.Tensor):
         pass
 
     def start_record(self):
@@ -125,14 +125,14 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
     def on_select_experts(self, topk_ids: torch.Tensor):
         self._on_hook("on_select_experts", topk_ids=topk_ids)
 
-    def on_deepep_dispatch_normal(self, num_recv_tokens_per_expert_list: List[int]):
+    def on_deepep_dispatch_normal(self, local_physical_count_of_layer: List[int]):
         self._on_hook(
             "on_deepep_dispatch_normal",
-            num_recv_tokens_per_expert_list=num_recv_tokens_per_expert_list,
+            local_physical_count_of_layer=local_physical_count_of_layer,
         )
 
-    def on_deepep_dispatch_low_latency(self, recv_count: torch.Tensor):
-        self._on_hook("on_deepep_dispatch_low_latency", recv_count=recv_count)
+    def on_deepep_dispatch_low_latency(self, local_physical_count_of_layer: torch.Tensor):
+        self._on_hook("on_deepep_dispatch_low_latency", local_physical_count_of_layer=local_physical_count_of_layer)
 
     def _on_hook(self, hook_name: str, **kwargs):
         if not (self._recording or torch.cuda.is_current_stream_capturing()):
@@ -228,11 +228,11 @@ class _SinglePassGatherer(ABC):
         pass
 
     def on_deepep_dispatch_normal(
-            self, layer_idx: int, num_recv_tokens_per_expert_list: List[int]
+            self, layer_idx: int, local_physical_count_of_layer: List[int]
     ):
         pass
 
-    def on_deepep_dispatch_low_latency(self, layer_idx: int, recv_count: torch.Tensor):
+    def on_deepep_dispatch_low_latency(self, layer_idx: int, local_physical_count_of_layer: torch.Tensor):
         pass
 
     def reset(self):
@@ -285,10 +285,10 @@ class _SelectExpertsSinglePassGatherer(_LayerBasedSinglePassGatherer):
 
 class _DeepepNormalSinglePassGatherer(_LayerBasedSinglePassGatherer):
     def on_deepep_dispatch_normal(
-            self, layer_idx: int, num_recv_tokens_per_expert_list: List[int]
+            self, layer_idx: int, local_physical_count_of_layer: List[int]
     ):
-        assert isinstance(num_recv_tokens_per_expert_list, list)
-        self._on_layer_data(layer_idx, num_recv_tokens_per_expert_list)
+        assert isinstance(local_physical_count_of_layer, list)
+        self._on_layer_data(layer_idx, local_physical_count_of_layer)
 
     def collect_global_physical_count(self) -> torch.Tensor:
         local_physical_count = super()._collect_objects(
@@ -310,9 +310,9 @@ class _DeepepLowLatencySinglePassGatherer(_SinglePassGatherer):
             device="cuda",
         )
 
-    def on_deepep_dispatch_low_latency(self, layer_idx: int, recv_count: torch.Tensor):
+    def on_deepep_dispatch_low_latency(self, layer_idx: int, local_physical_count_of_layer: torch.Tensor):
         # Most naive implementation, can optimize later
-        self._data[layer_idx, :] = recv_count
+        self._data[layer_idx, :] = local_physical_count_of_layer
 
     def reset(self):
         self._data[...] = 0
