@@ -86,7 +86,7 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         self._current_debug_name = Withable()
         self._accumulator = _Accumulator.init_new(expert_location_metadata, rank)
         self._single_pass_gatherers = {
-            k: _SinglePassGatherer.init_new(server_args, expert_location_metadata)
+            k: _SinglePassGatherer.init_new(server_args, expert_location_metadata, rank)
             for k in self._accumulator.get_single_pass_gatherer_keys()
         }
 
@@ -208,20 +208,21 @@ def postprocess_dumps(
 class _SinglePassGatherer(ABC):
     @staticmethod
     def init_new(
-            server_args: ServerArgs, expert_location_metadata: "ExpertLocationMetadata"
+            server_args: ServerArgs, expert_location_metadata: "ExpertLocationMetadata", rank: int,
     ) -> "_SinglePassGatherer":
         if server_args.enable_deepep_moe:
             # `auto` has many restrictions now, so we lower the priority to implement low-latency capturing for auto
             if server_args.deepep_mode in ["normal", "auto"]:
-                return _DeepepNormalSinglePassGatherer(expert_location_metadata)
+                return _DeepepNormalSinglePassGatherer(expert_location_metadata, rank)
             elif server_args.deepep_mode == "low_latency":
-                return _DeepepLowLatencySinglePassGatherer(expert_location_metadata)
+                return _DeepepLowLatencySinglePassGatherer(expert_location_metadata, rank)
             else:
                 raise NotImplementedError
-        return _SelectExpertsSinglePassGatherer(expert_location_metadata)
+        return _SelectExpertsSinglePassGatherer(expert_location_metadata, rank)
 
-    def __init__(self, expert_location_metadata: "ExpertLocationMetadata"):
+    def __init__(self, expert_location_metadata: "ExpertLocationMetadata", rank: int):
         self._expert_location_metadata = expert_location_metadata
+        self._rank = rank
 
     def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
         pass
@@ -242,8 +243,8 @@ class _SinglePassGatherer(ABC):
 
 
 class _LayerBasedSinglePassGatherer(_SinglePassGatherer):
-    def __init__(self, expert_location_metadata: "ExpertLocationMetadata"):
-        super().__init__(expert_location_metadata)
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
         self._objects_of_layer = {}
 
     def _on_layer_data(
