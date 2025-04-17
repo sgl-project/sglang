@@ -19,11 +19,10 @@ import torch.distributed as dist
 from PIL.Image import Image
 from torch.distributed.tensor import DeviceMesh, DTensor
 
+from sglang.srt.entrypoints.engine import Engine
 from sglang.srt.entrypoints.http_server_engine import HttpServerEngineAdapter
 from sglang.srt.model_executor.model_runner import LocalSerializedTensor
 from sglang.srt.patch_torch import monkey_patch_torch_reductions
-from sglang.srt.server import Engine
-from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj
 
 
