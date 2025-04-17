@@ -5,6 +5,7 @@ import torch
 from sglang.srt.managers.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.managers.io_struct import UpdateExpertLocationReqInput
 from sglang.srt.managers.schedule_batch import get_global_expert_location_metadata
+from sglang.srt.model_executor.model_weight_updater import ModelWeightUpdater
 from sglang.srt.utils import get_bool_env_var
 
 if TYPE_CHECKING:
@@ -16,6 +17,14 @@ logger = logging.getLogger(__name__)
 class ExpertLocationUpdater:
     def __init__(self, model_runner: "ModelRunner"):
         self._model_runner = model_runner
+        self._model_weight_updater = ModelWeightUpdater(
+            init_pin_memory=TODO,
+            weight_filter=self._weight_filter,
+            load_format=TODO,
+            model_config=model_runner.model_config,
+            model=model_runner.model,
+            device=model_runner.device,
+        )
 
     def start_prepare(self):
         TODO
