@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from queue import SimpleQueue
 from typing import List, Tuple, Optional
 
 import torch
@@ -36,6 +37,10 @@ class CombinedManager(TensorOperationManagerBase):
 
 
 class AsyncPinMemoryManager(TensorOperationManagerBase):
+    def __init__(self):
+        self._input_queue = SimpleQueue()
+        self._output_queue = SimpleQueue()
+
     def enqueue(self, named_tensors: NamedTensors):
         TODO
 
