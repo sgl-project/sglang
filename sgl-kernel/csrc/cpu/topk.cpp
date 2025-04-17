@@ -189,34 +189,35 @@ void topk_sigmoid_kernel_impl(
     const scalar_t* __restrict__ gating_output,
     int64_t num_tokens,
     int64_t topk) {
-
+      using Vec = at::vec::Vectorized<float>;
   const int64_t num_experts_per_group = NUM_EXPERTS;
   at::parallel_for(0, num_tokens, 0, [&](int64_t begin, int64_t end) {
     alignas(64) float scores[NUM_EXPERTS];
-
     using elem_t = std::pair<float, int32_t>;
     std::vector<elem_t> queue(num_experts_per_group);
 
     for (int64_t i = begin; i < end; ++i) {
-      // do softmax to get scores
       _copy_and_convert_to_float<scalar_t, NUM_EXPERTS>(scores, gating_output + i * NUM_EXPERTS);
-      
 
-      for (int64_t e = 0; e < NUM_EXPERTS; ++e) {
-        queue[e] = {scores[e], e};
+      float gmax = at::vec::reduce_all<float>(
+        [](Vec& x, Vec& y) { return at::vec::maximum(x, y); },
+        scores ,
+        num_experts_per_group);
+
+      // find position of first max,
+      // note that we may have multiple max values.
+      int first_max_idx = -1;
+      for (int64_t e = 0; e < num_experts_per_group; ++e) {
+        if (scores[e] == gmax) {
+          first_max_idx = e;
+          break;
+        }
       }
 
-      // find topk
-      std::partial_sort(queue.begin(), queue.begin() + NUM_EXPERTS, queue.end(),
-          [](const elem_t& x, const elem_t& y) -> bool {
-            return x.first > y.first;
-          });
+      // scalar sigmoid
+      topk_weights[i ] =  1.0 / (1.0 + exp(0.0 - gmax));
+      topk_ids[i ] = first_max_idx;
 
-      for (int64_t j = 0; j < topk; ++j) {
-        topk_weights[i * topk + j] = queue[j].first;
-        topk_ids[i * topk + j] = queue[j].second;
-      }
-      _sigmoid(topk_weights, topk_weights, topk);
     }
   });
 }
@@ -390,6 +391,7 @@ CHECK_EQ(gating_output.scalar_type(), st);
 int64_t num_tokens = hidden_states.size(0);
 int64_t num_experts = gating_output.size(1);
 TORCH_CHECK(gating_output.size(0) == num_tokens, "Number of tokens mismatch");
+TORCH_CHECK(topk == 1, "topk_sigmoid only supports topk=1 case");
 at::Tensor topk_weights = at::empty({num_tokens, topk}, hidden_states.options().dtype(at::kFloat));
 at::Tensor topk_ids = at::empty({num_tokens, topk}, hidden_states.options().dtype(at::kInt));
 
