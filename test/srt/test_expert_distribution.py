@@ -3,7 +3,6 @@ import unittest
 
 import requests
 import torch
-
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST,
@@ -27,7 +26,7 @@ class TestExpertDistribution(CustomTestCase):
                 self._execute_core(**info)
 
     def _execute_core(
-        self, model_path: str, mode_detail: bool = False, tp_size: int = 1
+            self, model_path: str, mode_detail: bool = False, tp_size: int = 1
     ):
         """Test expert distribution record endpoints"""
         os.environ["SGLANG_EXPERT_DISTRIBUTION_RECORDER_DETAIL"] = (
@@ -41,6 +40,7 @@ class TestExpertDistribution(CustomTestCase):
                 "--trust-remote-code",
                 "--tp-size",
                 str(tp_size),
+                "--enable-expert-distribution-recorder",
             ],
         )
 
