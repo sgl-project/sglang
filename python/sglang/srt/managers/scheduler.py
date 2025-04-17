@@ -1808,7 +1808,7 @@ class Scheduler(
         raise NotImplementedError()
 
     def update_expert_location(self, recv_req: UpdateExpertLocationReqInput):
-        self.tp_worker.worker.model_runner.update_expert_location(recv_req)
+        self.tp_worker.worker.model_runner.update_expert_location_start(recv_req)
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         """In-place update of the weights from disk."""
