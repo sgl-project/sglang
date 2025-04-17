@@ -13,9 +13,25 @@ class TensorOperationManagerBase:
         raise NotImplementedError
 
 
+class CombinedManager(TensorOperationManagerBase):
+    def enqueue(self, named_tensors: NamedTensors):
+        TODO
+
+    def get_outputs(self) -> List[NamedTensors]:
+        return TODO
+
+
 class AsyncPinMemoryManager(TensorOperationManagerBase):
-    TODO
+    def enqueue(self, named_tensors: NamedTensors):
+        TODO
+
+    def get_outputs(self) -> List[NamedTensors]:
+        return TODO
 
 
 class AsyncToCudaManager(TensorOperationManagerBase):
-    TODO
+    def enqueue(self, named_tensors: NamedTensors):
+        TODO
+
+    def get_outputs(self) -> List[NamedTensors]:
+        return TODO
