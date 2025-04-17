@@ -222,10 +222,3 @@ class Gemma3RMSNorm(nn.Module):
 
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.eps}"
-
-
-if not _is_cuda:
-    logger.info(
-        "sgl-kernel is not available on Non‑NVIDIA platforms. "
-        "Using PyTorch or ROCm AITer kernels where possible."
-    )
