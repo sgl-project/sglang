@@ -147,7 +147,7 @@ class TokenizerManager:
         self,
         server_args: ServerArgs,
         port_args: PortArgs,
-        expert_location_metadata: ExpertLocationMetadata,
+        expert_location_metadata: Optional[ExpertLocationMetadata],
         eplb_manager: Optional[EPLBManager],
     ):
         # Parse args

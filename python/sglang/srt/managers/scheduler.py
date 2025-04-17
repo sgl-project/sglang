@@ -171,7 +171,7 @@ class Scheduler(
         self,
         server_args: ServerArgs,
         port_args: PortArgs,
-        expert_location_metadata: ExpertLocationMetadata,
+        expert_location_metadata: Optional[ExpertLocationMetadata],
         gpu_id: int,
         tp_rank: int,
         dp_rank: Optional[int],
@@ -2028,7 +2028,7 @@ def _import_static_state(model, static_params):
 def run_scheduler_process(
     server_args: ServerArgs,
     port_args: PortArgs,
-    expert_location_metadata: ExpertLocationMetadata,
+    expert_location_metadata: Optional[ExpertLocationMetadata],
     gpu_id: int,
     tp_rank: int,
     dp_rank: Optional[int],

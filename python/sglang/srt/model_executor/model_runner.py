@@ -108,7 +108,7 @@ class ModelRunner:
     def __init__(
         self,
         model_config: ModelConfig,
-        expert_location_metadata: ExpertLocationMetadata,
+        expert_location_metadata: Optional[ExpertLocationMetadata],
         mem_fraction_static: float,
         gpu_id: int,
         tp_rank: int,

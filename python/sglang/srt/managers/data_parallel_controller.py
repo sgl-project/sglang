@@ -18,6 +18,7 @@ import multiprocessing as mp
 import signal
 import threading
 from enum import Enum, auto
+from typing import Optional
 
 import psutil
 import setproctitle
@@ -60,7 +61,7 @@ class DataParallelController:
         self,
         server_args: ServerArgs,
         port_args: PortArgs,
-        expert_location_metadata: ExpertLocationMetadata,
+        expert_location_metadata: Optional[ExpertLocationMetadata],
     ) -> None:
         # Parse args
         self.max_total_num_tokens = None
@@ -163,7 +164,7 @@ class DataParallelController:
         self,
         server_args: ServerArgs,
         port_args: PortArgs,
-        expert_location_metadata: ExpertLocationMetadata,
+        expert_location_metadata: Optional[ExpertLocationMetadata],
         base_gpu_id: int,
         dp_rank: int,
         ready_event: threading.Event,
@@ -193,7 +194,7 @@ class DataParallelController:
         self,
         server_args: ServerArgs,
         port_args: PortArgs,
-        expert_location_metadata: ExpertLocationMetadata,
+        expert_location_metadata: Optional[ExpertLocationMetadata],
         base_gpu_id: int,
         dp_rank: int,
     ):
@@ -289,7 +290,7 @@ class DataParallelController:
 def run_data_parallel_controller_process(
     server_args: ServerArgs,
     port_args: PortArgs,
-    expert_location_metadata: ExpertLocationMetadata,
+    expert_location_metadata: Optional[ExpertLocationMetadata],
     pipe_writer,
 ):
     setproctitle.setproctitle("sglang::data_parallel_controller")

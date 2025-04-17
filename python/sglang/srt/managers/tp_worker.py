@@ -46,7 +46,7 @@ class TpModelWorker:
     def __init__(
         self,
         server_args: ServerArgs,
-        expert_location_metadata: ExpertLocationMetadata,
+        expert_location_metadata: Optional[ExpertLocationMetadata],
         gpu_id: int,
         tp_rank: int,
         dp_rank: Optional[int],
