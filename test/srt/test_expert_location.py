@@ -1,8 +1,8 @@
 import unittest
 
 import torch
-from python.sglang.srt.managers.expert_location import compute_logical_to_rank_dispatch_physical_map
-from python.sglang.test.test_utils import CustomTestCase
+from sglang.srt.managers.expert_location import compute_logical_to_rank_dispatch_physical_map
+from sglang.test.test_utils import CustomTestCase
 
 
 class TestExpertLocation(CustomTestCase):
