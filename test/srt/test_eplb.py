@@ -36,7 +36,13 @@ class TestEPLB(CustomTestCase):
             )
 
         async def _task_generate():
-            TODO
+            tasks = []
+            async for request in _get_requests():
+                tasks.append(asyncio.create_task(engine.async_generate(
+                    prompt=TODO,
+                    sampling_params=dict(temperature=0),
+                )))
+            TODO_test_result
 
         async def _task_rebalance():
             for i in range(num_rebalance):
