@@ -35,12 +35,15 @@ class ParserManager:
             self.function_call_parser_dict = {}
             self.reasoning_parser_dict = {}
 
-    def handle_completion_request(
-        self, prompt: str, suffix: str, template_name: str
-    ) -> str:
+    def handle_completion_request(self, prompt: str, suffix: str) -> str:
         """Handle completion request by applying the appropriate template"""
         if is_completion_template_defined():
-            prompt = generate_completion_prompt(prompt, suffix, template_name)
+            global completion_template_name
+            if suffix == "":
+                return prompt
+            prompt = generate_completion_prompt(
+                prompt, suffix, completion_template_name
+            )
         return prompt
 
     def handle_tool_calls(

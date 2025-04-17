@@ -506,7 +506,7 @@ def v1_generate_request(
             )
 
         prompt = parser_manager.handle_completion_request(
-            request.prompt, request.suffix, request.template_name
+            request.prompt, request.suffix
         )
         prompts.append(prompt)
 
