@@ -32,6 +32,14 @@ class ExpertDistributionRecorder:
         else:
             return _ExpertDistributionRecorderNoop()
 
+    @contextmanager
+    def with_current_layer(self, layer_idx):
+        pass
+
+    @contextmanager
+    def with_debug_name(self, debug_name):
+        pass
+
 
 class _ExpertDistributionRecorderNoop(ExpertDistributionRecorder):
     pass
