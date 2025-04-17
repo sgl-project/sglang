@@ -1,5 +1,5 @@
 import logging
-from typing import TYPE_CHECKING, Dict, List, Optional, Any
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 import torch
 from sglang.srt.managers.expert_distribution import get_global_expert_distribution_recorder
@@ -47,7 +47,7 @@ class ExpertLocationUpdater:
     def event_loop_step(self) -> List[UpdateExpertLocationReqOutput]:
         outputs = []
 
-        if self._model_weight_updater.event_loop_step():
+        if self._model_weight_updater.poll_prepare_end():
             self._prepare_end_barrier.local_arrive()
 
         if self._prepare_end_barrier.poll_global_arrived():
