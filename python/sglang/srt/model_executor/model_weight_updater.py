@@ -4,6 +4,7 @@ from typing import Tuple, List, Callable, Iterable
 
 import torch
 from sglang.srt.configs.load_config import LoadConfig
+from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.model_executor.memory_transfer import AsyncToCudaManager, CombinedManager
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.utils import set_default_torch_dtype
@@ -74,17 +75,22 @@ class _ModelWeightSourceBase(ABC):
 
 
 class _ModelWeightSourceVanilla(_ModelWeightSourceBase):
+    def __init__(self, load_format: str, model_config: ModelConfig, model):
+        self._load_format = load_format
+        self._model_config = model_config
+        self._model = model
+
     def get_all_weights(self) -> Iterable[Tuple[str, torch.Tensor]]:
-        load_config = LoadConfig(load_format=load_format)
+        load_config = LoadConfig(load_format=self._load_format)
         loader = get_model_loader(load_config)
         assert isinstance(loader, DefaultModelLoader)
-        with set_default_torch_dtype(model_config.dtype):
-            return loader._get_weights_iterator(DefaultModelLoader.Source.init_new(model_config, model))
+        with set_default_torch_dtype(self._model_config.dtype):
+            return loader._get_weights_iterator(DefaultModelLoader.Source.init_new(self._model_config, self._model))
 
 
 class _ModelWeightSourcePinnedMemory(_ModelWeightSourceBase):
-    def __init__(self):
-        vanilla = _ModelWeightSourceVanilla()
+    def __init__(self, *args, **kwargs):
+        vanilla = _ModelWeightSourceVanilla(*args, **kwargs)
         self._all_weights = _named_tensors_pin_memory(list(vanilla.get_all_weights()))
 
     def get_all_weights(self) -> Iterable[Tuple[str, torch.Tensor]]:
