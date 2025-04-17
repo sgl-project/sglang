@@ -697,7 +697,7 @@ class TokenizerManager:
 
     async def eplb_rebalance(self, obj: EplbRebalanceReqInput):
         self.auto_create_handle_loop()
-        await self.eplb_manager.rebalance()
+        await self.eplb_manager.rebalance(obj)
 
     async def eplb_save_expert_distribution(self):
         self.auto_create_handle_loop()
