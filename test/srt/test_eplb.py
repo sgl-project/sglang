@@ -122,7 +122,13 @@ class TestEPLB(CustomTestCase):
             engine.shutdown()
             del engine
 
-    def test_eplb_start_rebalance_restart(self):
+    def test_eplb_start_rebalance_restart_mode_pin_memory(self):
+        self._test_eplb_start_rebalance_restart_core(expert_location_updater_mode="pin_memory")
+
+    def test_eplb_start_rebalance_restart_mode_pageable_memory(self):
+        self._test_eplb_start_rebalance_restart_core(expert_location_updater_mode="pageable_memory")
+
+    def _test_eplb_start_rebalance_restart_core(self, expert_location_updater_mode: str):
         print("Action: test_eplb_start_rebalance_restart")
         with tempfile.TemporaryDirectory() as tmpdir:
             engine_kwargs = dict(
@@ -140,6 +146,7 @@ class TestEPLB(CustomTestCase):
                 tp_size=2,
                 dp_size=2,
                 log_level="info",
+                expert_location_updater_mode=expert_location_updater_mode,
             )
 
             print(f"Action: start engine")
