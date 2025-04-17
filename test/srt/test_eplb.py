@@ -244,6 +244,12 @@ class TestEPLB(CustomTestCase):
                   [9, -1, -1]]],
                 [[]],  # TODO
             ),
+            # Random
+            (
+                [[[4, 11, -1], [5, 9, 0], [6, -1, -1], [8, -1, -1], [1, -1, -1], [10, -1, -1], [2, 3, -1],
+                  [7, -1, -1]]],
+                [[]],  # TODO
+            ),
         ]:
             actual_output = compute_logical_to_rank_dispatch_physical_map(
                 logical_to_all_physical_map=torch.tensor(logical_to_all_physical_map),
