@@ -39,6 +39,8 @@ class ModelWeightUpdater:
         assert isinstance(self._state, _StatePrepared)
 
         named_tensors = self._state.named_tensors
+       
+        # TODO further extract such common operations during weight loading
         with set_default_torch_dtype(TODO):
             DefaultModelLoader.load_weights_and_postprocess(model, named_tensors, target_device)
 
