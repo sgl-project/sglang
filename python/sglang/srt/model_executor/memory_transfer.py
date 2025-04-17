@@ -1,3 +1,4 @@
+import queue
 from dataclasses import dataclass
 from queue import SimpleQueue
 from typing import List, Tuple, Optional
@@ -49,7 +50,10 @@ class AsyncPinMemoryManager(TensorOperationManagerBase):
     def get_outputs(self) -> List[NamedTensors]:
         outputs = []
         while True:
-            outputs.append(self._output_queue.get_nowait())
+            try:
+                outputs.append(self._output_queue.get_nowait())
+            except queue.Empty:
+                break
         return outputs
 
     def _auto_create_background_thread(self):
