@@ -45,7 +45,7 @@ class AsyncPinMemoryManager(TensorOperationManagerBase):
 
 class AsyncToCudaManager(TensorOperationManagerBase):
     def __init__(self):
-        self._inflight_tasks = []
+        self._inflight_tasks: List[_AsyncToCudaTask] = []
         self._alt_stream: Optional[torch.cuda.Stream] = None
 
     def enqueue(self, named_tensors: NamedTensors):
@@ -68,7 +68,7 @@ class AsyncToCudaManager(TensorOperationManagerBase):
 
     def get_outputs(self) -> List[NamedTensors]:
         outputs = []
-        while len(self._inflight_tasks) > 0:
+        while len(self._inflight_tasks) > 0 and self._inflight_tasks[0].finish_event.query():
             TODO
         return outputs
 
