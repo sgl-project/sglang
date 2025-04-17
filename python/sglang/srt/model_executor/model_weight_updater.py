@@ -1,3 +1,5 @@
+import datetime
+import logging
 from abc import ABC
 from dataclasses import dataclass
 from typing import Tuple, List, Callable, Iterable
@@ -8,6 +10,8 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.model_executor.memory_transfer import AsyncToCudaManager, CombinedManager
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.utils import set_default_torch_dtype
+
+logger = logging.getLogger(__name__)
 
 
 class ModelWeightUpdater:
@@ -31,6 +35,7 @@ class ModelWeightUpdater:
         self._state: _State = _StateIdle()
 
     def start_prepare(self, weight_filter: Callable[[str], bool]):
+        _log_with_accurate_time("ModelWeightUpdater.start_prepare start")
         assert isinstance(self._state, _StateIdle)
 
         all_weights_iterator = self._model_weight_source.get_all_weights()
@@ -38,6 +43,7 @@ class ModelWeightUpdater:
         self._memory_transfer_manager.enqueue(interesting_weights)
 
         self._state = _StateAwaitMemoryTransfer()
+        _log_with_accurate_time("ModelWeightUpdater.start_prepare end")
 
     def poll_prepare_end(self):
         memory_transfer_outputs = self._memory_transfer_manager.get_outputs()
@@ -63,6 +69,10 @@ class ModelWeightUpdater:
             DefaultModelLoader.load_weights_and_postprocess(self._model, named_tensors, target_device)
 
         self._state = _StateIdle()
+
+
+def _log_with_accurate_time(message):
+    logger.info(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}] {message}")
 
 
 class _State(ABC):
