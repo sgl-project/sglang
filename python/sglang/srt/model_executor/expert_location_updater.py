@@ -30,13 +30,13 @@ class ExpertLocationUpdater:
         self._prepare_end_barrier = PollBasedBarrier(noop=False)
         self._ongoing_req: Optional[UpdateExpertLocationReqInput] = None
 
-    def start_prepare(self, req: UpdateExpertLocationReqInput):
+    def start(self, req: UpdateExpertLocationReqInput):
         assert self._ongoing_req is None
         self._ongoing_req = req
 
         interesting_logical_experts_of_layer = _compute_interesting_logical_experts_of_layer(
             old_expert_location_metadata=get_global_expert_location_metadata(),
-            new_expert_location_metadata=expert_location_metadata,
+            new_expert_location_metadata=req.expert_location_metadata,
             ep_rank=self._model_runner.tp_rank,
         )
 
