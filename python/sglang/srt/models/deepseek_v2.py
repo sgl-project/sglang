@@ -78,7 +78,8 @@ from sglang.srt.managers.schedule_batch import (
     global_server_args_dict,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import default_weight_loader, ModelParamNameInfo, ModelParamNameInfoMoe, \
+    ModelParamNameInfoOthers
 from sglang.srt.utils import DeepEPMode, add_prefix, is_cuda, is_hip
 from torch import nn
 from tqdm import tqdm
@@ -1683,8 +1684,8 @@ class DeepseekV2ForCausalLM(nn.Module):
 
     def get_param_name_info(self, name: str) -> ModelParamNameInfo:
         if ".experts." in name:
-            return "moe"
-        return "others"
+            return ModelParamNameInfoMoe(TODO)
+        return ModelParamNameInfoOthers()
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
