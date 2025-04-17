@@ -29,6 +29,9 @@ class ExpertLocationUpdater:
         )
         self._prepare_end_barrier = PollBasedBarrier(noop=False)
         self._ongoing_req: Optional[UpdateExpertLocationReqInput] = None
+        assert (
+            model_runner.server_args.disable_overlap_schedule
+        ), "ExpertLocationUpdater requires overlap scheduler to be disabled"
 
     def start(self, req: UpdateExpertLocationReqInput):
         assert self._ongoing_req is None
