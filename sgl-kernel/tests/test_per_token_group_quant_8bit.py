@@ -304,10 +304,10 @@ def test_per_token_group_quant_with_column_major(
         scale_tma_aligned=scale_tma_aligned,
     )
 
-    assert torch.allclose(
+    torch.testing.assert_close(
         x_q_triton.to(torch.float32), x_q_sglang.to(torch.float32), rtol=1e-3, atol=1e-5
     )
-    assert torch.allclose(
+    torch.testing.assert_close(
         x_s_triton.contiguous(), x_s_sglang.contiguous(), rtol=1e-3, atol=1e-5
     )
 
