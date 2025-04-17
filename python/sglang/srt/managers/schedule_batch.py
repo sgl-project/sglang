@@ -67,7 +67,6 @@ global_server_args_dict = {
     "attention_backend": ServerArgs.attention_backend,
     "sampling_backend": ServerArgs.sampling_backend,
     "triton_attention_reduce_in_fp32": ServerArgs.triton_attention_reduce_in_fp32,
-    "disable_mla": ServerArgs.disable_mla,
     "torchao_config": ServerArgs.torchao_config,
     "enable_nan_detection": ServerArgs.enable_nan_detection,
     "enable_dp_attention": ServerArgs.enable_dp_attention,
@@ -77,12 +76,12 @@ global_server_args_dict = {
     "device": ServerArgs.device,
     "speculative_accept_threshold_single": ServerArgs.speculative_accept_threshold_single,
     "speculative_accept_threshold_acc": ServerArgs.speculative_accept_threshold_acc,
-    "enable_flashmla": ServerArgs.enable_flashmla,
     "disable_radix_cache": ServerArgs.disable_radix_cache,
     "flashinfer_mla_disable_ragged": ServerArgs.flashinfer_mla_disable_ragged,
     "chunked_prefill_size": ServerArgs.chunked_prefill_size,
     "n_share_experts_fusion": ServerArgs.n_share_experts_fusion,
     "disable_shared_experts_fusion": ServerArgs.disable_shared_experts_fusion,
+    "disable_chunked_prefix_cache": ServerArgs.disable_chunked_prefix_cache,
 }
 
 logger = logging.getLogger(__name__)
@@ -1480,7 +1479,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 global_server_args_dict["use_mla_backend"]
                 and global_server_args_dict["attention_backend"] == "flashinfer"
             )
-            or global_server_args_dict["enable_flashmla"]
+            or global_server_args_dict["attention_backend"] == "flashmla"
             or global_server_args_dict["attention_backend"] == "fa3"
         ):
             seq_lens_cpu = self.seq_lens.cpu()

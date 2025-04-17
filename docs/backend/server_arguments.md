@@ -175,7 +175,6 @@ Please consult the documentation below to learn more about the parameters you ma
 * `disable_cuda_graph_padding`: Disable cuda graph when padding is needed. In other case still use cuda graph.
 * `disable_outlines_disk_cache`: Disable disk cache for outlines grammar backend.
 * `disable_custom_all_reduce`: Disable usage of custom all reduce kernel.
-* `disable_mla`: Disable [Multi-Head Latent Attention](https://arxiv.org/html/2405.04434v5) for Deepseek model.
 * `disable_overlap_schedule`: Disable the [Overhead-Scheduler](https://lmsys.org/blog/2024-12-04-sglang-v0-4/#zero-overhead-batch-scheduler).
 * `enable_nan_detection`: Turning this on makes the sampler print a warning if the logits contain `NaN`.
 * `enable_p2p_check`: Turns off the default of allowing always p2p check when accessing GPU.
@@ -193,5 +192,5 @@ Please consult the documentation below to learn more about the parameters you ma
 * `cuda_graph_bs`: The batch sizes to capture by `CudaGraphRunner`. By default this is done for you.
 * `torchao_config`: Experimental feature that optimizes the model with [torchao](https://github.com/pytorch/ao). Possible choices are: int8dq, int8wo, int4wo-<group_size>, fp8wo, fp8dq-per_tensor, fp8dq-per_row.
 * `triton_attention_num_kv_splits`: Use to adjust the number of KV splits in triton kernels. Default is 8.
-* `enable_flashinfer_mla`: Use the attention backend with FlashInfer MLA wrapper for DeepSeek models. **This argument will be deprecated in the next release. Please use `--attention_backend flashinfer` instead to enable FlashfIner MLA.**
 * `flashinfer_mla_disable_ragged`: Disable the use of the ragged prefill wrapper for the FlashInfer MLA attention backend. Only use it when FlashInfer is being used as the MLA backend.
+* `disable_chunked_prefix_cache`: Disable the use of chunked prefix cache for DeepSeek models. Only use it when FA3 is attention backend.
