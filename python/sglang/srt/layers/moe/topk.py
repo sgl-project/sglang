@@ -101,6 +101,7 @@ def grouped_topk(
     num_expert_group: int = 0,
     topk_group: int = 0,
     n_share_experts_fusion: int = 0,
+    expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
 ):
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
