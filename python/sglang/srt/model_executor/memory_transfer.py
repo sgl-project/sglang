@@ -1,4 +1,6 @@
+import logging
 import queue
+import traceback
 from dataclasses import dataclass
 from queue import SimpleQueue
 from threading import Thread
@@ -7,6 +9,8 @@ from typing import List, Tuple, Optional
 import torch
 
 NamedTensors = List[Tuple[str, torch.Tensor]]
+
+logger = logging.getLogger(__name__)
 
 
 # For simplicity, classes here does not have tagging etc
@@ -66,7 +70,15 @@ class AsyncPinMemoryManager(TensorOperationManagerBase):
         self._background_thread.start()
 
     def _background_thread_entrypoint(self):
-        TODO
+        try:
+            while True:
+                input_data = self._input_queue.get()
+                output_data = [(name, tensor.pin_memory()) for name, tensor in input_data]
+                self._output_queue.put(output_data)
+        except Exception as e:
+            logger.warning(f"AsyncPinMemoryManager background thread error {e}")
+            traceback.print_exc()
+            raise
 
 
 class AsyncToCudaManager(TensorOperationManagerBase):
