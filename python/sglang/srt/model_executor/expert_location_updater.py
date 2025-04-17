@@ -47,14 +47,17 @@ class ExpertLocationUpdater:
         if prepare_done:
             self._prepare_end_barrier.local_arrive()
 
+        if self._prepare_end_barrier.poll_global_arrived():
+            self.act()
+
         TODO_outer_call_this
 
-    def act(self, recv_req: UpdateExpertLocationReqInput):
+    def act(self):
         torch.distributed.barrier()
 
         get_global_expert_distribution_recorder().flush_buffer_depending_on_expert_location_metadata()
 
-        get_global_expert_location_metadata().update(recv_req.expert_location_metadata)
+        get_global_expert_location_metadata().update(expert_location_metadata)
         if self._model_runner.tp_rank == 0 and get_bool_env_var(
                 "SGLANG_LOG_EXPERT_LOCATION_METADATA"
         ):
