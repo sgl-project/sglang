@@ -14,7 +14,6 @@ from sglang.srt.server_args import ServerArgs
 
 @dataclass
 class ExpertLocationMetadata:
-    ep_size: int
     physical_to_logical_map: torch.Tensor  # (layers, num_physical_experts)
     logical_to_all_physical_map: torch.Tensor  # (layers, num_logical_experts, X)
     logical_to_all_physical_map_num_valid: torch.Tensor  # (layers, num_logical_experts)
@@ -40,6 +39,10 @@ class ExpertLocationMetadata:
     @property
     def num_logical_experts(self) -> int:
         return self.logical_to_all_physical_map.shape[1]
+
+    @property
+    def ep_size(self):
+        return self.logical_to_rank_dispatch_physical_map.shape[0]
 
     def __post_init__(self):
         num_layers_0, num_physical_experts_0 = self.physical_to_logical_map.shape
@@ -151,7 +154,6 @@ class ExpertLocationMetadata:
         logical_to_all_physical_map_num_valid = torch.count_nonzero(logical_to_all_physical_map != -1, dim=-1)
 
         return ExpertLocationMetadata(
-            ep_size=ep_size,
             physical_to_logical_map=physical_to_logical_map,
             logical_to_all_physical_map=logical_to_all_physical_map_padded,
             logical_to_all_physical_map_num_valid=logical_to_all_physical_map_num_valid,
