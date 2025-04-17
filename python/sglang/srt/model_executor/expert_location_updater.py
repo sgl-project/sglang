@@ -1,0 +1,2 @@
+class ExpertLocationUpdater:
+    pass
