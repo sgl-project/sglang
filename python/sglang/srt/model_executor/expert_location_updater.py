@@ -52,3 +52,6 @@ class ExpertLocationUpdater:
 
         logger.info("update_expert_location end")
         torch.distributed.barrier()
+
+    def _weight_filter(self, name: str):
+        return TODO
