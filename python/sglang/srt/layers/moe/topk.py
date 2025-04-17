@@ -300,17 +300,6 @@ def select_experts(
             renormalize=renormalize,
         )
 
-    if expert_logical_to_rank_dispatch_physical_map is not None:
-        # TODO optimize these things later
-        if forward_mode.is_extend():
-            topk_ids = _hack_expert_location_dispatch_random(
-                topk_ids=topk_ids,
-                expert_logical_to_all_physical_map=expert_logical_to_all_physical_map,
-                expert_logical_to_all_physical_map_num_valid=expert_logical_to_all_physical_map_num_valid,
-            )
-        else:
-            topk_ids = expert_logical_to_rank_dispatch_physical_map[topk_ids]
-
     get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
 
     return topk_weights, topk_ids
