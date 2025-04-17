@@ -51,6 +51,8 @@ class ExpertLocationUpdater:
         if self._prepare_end_barrier.poll_global_arrived():
             self._act()
 
+        TODO_return_act_end
+
     def _act(self):
         torch.distributed.barrier()
 
