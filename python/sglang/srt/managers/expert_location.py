@@ -75,7 +75,7 @@ class ExpertLocationMetadata:
 
         return ExpertLocationMetadata._init_raw(
             ep_size=TODO,
-            num_gpus=common["world_size"],
+            num_gpus=common["ep_size"],
             physical_to_logical_map=physical_to_logical_map,
             logical_to_all_physical_map=logical_to_all_physical_map,
         )
@@ -93,13 +93,13 @@ class ExpertLocationMetadata:
                 num_replicas=common["num_physical_experts"],
                 num_groups=model_config_for_expert_location.num_groups,
                 num_nodes=server_args.nnodes,
-                num_gpus=common["world_size"],
+                num_gpus=common["ep_size"],
             )
         )
 
         return ExpertLocationMetadata._init_raw(
             ep_size=TODO,
-            num_gpus=common["world_size"],
+            num_gpus=common["ep_size"],
             physical_to_logical_map=physical_to_logical_map,
             logical_to_all_physical_map=logical_to_all_physical_map,
         )
@@ -115,15 +115,15 @@ class ExpertLocationMetadata:
                 model_config_for_expert_location.num_logical_experts
                 + server_args.ep_num_redundant_experts
         )
-        world_size = server_args.ep_size
-        assert num_physical_experts % world_size == 0
-        num_local_physical_experts = num_physical_experts // world_size
+        ep_size = server_args.ep_size
+        assert num_physical_experts % ep_size == 0
+        num_local_physical_experts = num_physical_experts // ep_size
 
         return dict(
             model_config_for_expert_location=model_config_for_expert_location,
             num_physical_experts=num_physical_experts,
             num_local_physical_experts=num_local_physical_experts,
-            world_size=world_size,
+            ep_size=ep_size,
         )
 
     @staticmethod
