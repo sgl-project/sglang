@@ -73,6 +73,7 @@ class TestEPLB(CustomTestCase):
 
             tasks = []
             async for content in _yield_with_poisson_process(contents_duplicated, action_rate=request_rate):
+                print("Action: start async_generate")
                 tasks.append(asyncio.create_task(engine.async_generate(
                     prompt=content["prompt"],
                     sampling_params=dict(temperature=0, max_new_tokens=4),
@@ -90,7 +91,10 @@ class TestEPLB(CustomTestCase):
                 return
 
             for i in range(num_rebalance):
+                print("Action: start eplb_rebalance")
                 await engine.tokenizer_manager.eplb_rebalance()
+                print("Action: end eplb_rebalance")
+                await asyncio.sleep(1.0)
 
         with tempfile.TemporaryDirectory() as tmpdir:
             engine_kwargs = dict(
