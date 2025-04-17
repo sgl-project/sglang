@@ -45,9 +45,9 @@ class ExpertLocationUpdater:
             self._prepare_end_barrier.local_arrive()
 
         if self._prepare_end_barrier.poll_global_arrived():
-            self.act()
+            self._act()
 
-    def act(self):
+    def _act(self):
         torch.distributed.barrier()
 
         get_global_expert_distribution_recorder().flush_buffer_depending_on_expert_location_metadata()
