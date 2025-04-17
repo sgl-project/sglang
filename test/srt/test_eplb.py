@@ -55,9 +55,10 @@ class TestEPLB(CustomTestCase):
                 )))
 
             actual_outputs = await asyncio.gather(*tasks)
-            print(f"{actual_outputs=}")
             actual_output_texts = [x["text"] for x in actual_outputs]
-            TODO_test_result
+            expect_output_texts = [x["expect_output"] for x in contents_duplicated]
+            print(f"{actual_output_texts=} {expect_output_texts=}")
+            self.assertEqual(actual_output_texts, expect_output_texts)
 
         async def _task_rebalance():
             for i in range(num_rebalance):
