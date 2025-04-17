@@ -175,7 +175,6 @@ Please consult the documentation below to learn more about the parameters you ma
 * `disable_cuda_graph_padding`: Disable cuda graph when padding is needed. In other case still use cuda graph.
 * `disable_outlines_disk_cache`: Disable disk cache for outlines grammar backend.
 * `disable_custom_all_reduce`: Disable usage of custom all reduce kernel.
-* `disable_mla`: Disable [Multi-Head Latent Attention](https://arxiv.org/html/2405.04434v5) for Deepseek model.
 * `disable_overlap_schedule`: Disable the [Overhead-Scheduler](https://lmsys.org/blog/2024-12-04-sglang-v0-4/#zero-overhead-batch-scheduler).
 * `enable_nan_detection`: Turning this on makes the sampler print a warning if the logits contain `NaN`.
 * `enable_p2p_check`: Turns off the default of allowing always p2p check when accessing GPU.
