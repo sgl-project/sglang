@@ -11,7 +11,7 @@ class ModelWeightUpdater:
         self._weight_filter = weight_filter
 
         self._state: _State = _StateIdle()
-        self._manager_transfer_manager = AsyncToCudaManager() if init_pin_memory else CombinedManager.init_pin_memory_and_to_cuda()
+        self._memory_transfer_manager = AsyncToCudaManager() if init_pin_memory else CombinedManager.init_pin_memory_and_to_cuda()
         self._model_weight_source = _ModelWeightSourcePinnedMemory() if init_pin_memory else _ModelWeightSourceVanilla()
 
     def start_prepare(self):
@@ -19,11 +19,12 @@ class ModelWeightUpdater:
 
         all_weights_iterator = self._model_weight_source.get_all_weights()
         interesting_weights = [(name, weight) for name, weight in all_weights_iterator if self._weight_filter(name)]
-        self._manager_transfer_manager.enqueue(interesting_weights)
+        self._memory_transfer_manager.enqueue(interesting_weights)
 
         self._state = _StateAwaitMemoryTransfer()
 
     def event_loop_step(self):
+        memory_transfer_outputs = self._memory_transfer_manager.get_outputs()
         TODO
 
     def act(self):
