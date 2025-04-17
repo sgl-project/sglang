@@ -1,6 +1,6 @@
 from abc import ABC
 from dataclasses import dataclass
-from typing import Iterator, Tuple, List, Callable, Iterable
+from typing import Tuple, List, Callable, Iterable
 
 import torch
 from sglang.srt.configs.load_config import LoadConfig
@@ -68,13 +68,13 @@ class _StatePrepared(_State):
 
 
 class _ModelWeightSourceBase(ABC):
-    def get_all_weights(self) -> Iterator[Tuple[str, torch.Tensor]]:
+    def get_all_weights(self) -> Iterable[Tuple[str, torch.Tensor]]:
         TODO_with_set_default_torch_dtype
         raise NotImplementedError
 
 
 class _ModelWeightSourceVanilla(_ModelWeightSourceBase):
-    def get_all_weights(self) -> Iterator[Tuple[str, torch.Tensor]]:
+    def get_all_weights(self) -> Iterable[Tuple[str, torch.Tensor]]:
         load_config = LoadConfig(load_format=load_format)
         loader = get_model_loader(load_config)
         assert isinstance(loader, DefaultModelLoader)
@@ -87,8 +87,8 @@ class _ModelWeightSourcePinnedMemory(_ModelWeightSourceBase):
         vanilla = _ModelWeightSourceVanilla()
         self._all_weights = _named_tensors_pin_memory(list(vanilla.get_all_weights()))
 
-    def get_all_weights(self) -> Iterator[Tuple[str, torch.Tensor]]:
-        return TODO
+    def get_all_weights(self) -> Iterable[Tuple[str, torch.Tensor]]:
+        return self._all_weights
 
 
 def _named_tensors_pin_memory(named_tensors: Iterable[Tuple[str, torch.Tensor]]) -> List[Tuple[str, torch.Tensor]]:
