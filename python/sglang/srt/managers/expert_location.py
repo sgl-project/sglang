@@ -143,13 +143,10 @@ class ExpertLocationMetadata:
         )
 
     def update(self, other: "ExpertLocationMetadata"):
-        # TODO remove
-        # for field in [
-        #     "num_layers",
-        #     "num_local_physical_experts",
-        #     "num_logical_experts",
-        # ]:
-        #     assert getattr(self, field) == getattr(other, field)
+        for field in [
+            "ep_size",
+        ]:
+            assert getattr(self, field) == getattr(other, field)
 
         for field in [
             "physical_to_logical_map",
