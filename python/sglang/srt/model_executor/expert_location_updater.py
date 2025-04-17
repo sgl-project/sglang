@@ -20,7 +20,6 @@ class ExpertLocationUpdater:
         self._model_runner = model_runner
         self._model_weight_updater = ModelWeightUpdater(
             init_pin_memory=TODO,
-            weight_filter=self._weight_filter,
             load_format=TODO,
             model_config=model_runner.model_config,
             model=model_runner.model,
@@ -28,7 +27,9 @@ class ExpertLocationUpdater:
         )
 
     def start_prepare(self):
-        TODO
+        self._model_weight_updater.start_prepare(
+            weight_filter=lambda name: self._weight_filter(name),
+        )
 
     def act(self, recv_req: UpdateExpertLocationReqInput):
         logger.info("update_expert_location start")

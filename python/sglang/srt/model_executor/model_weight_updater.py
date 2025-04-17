@@ -14,13 +14,11 @@ class ModelWeightUpdater:
     def __init__(
         self,
         init_pin_memory: bool,
-        weight_filter: Callable[[str], bool],
         load_format: str,
         model_config: ModelConfig,
         model,
         device,
     ):
-        self._weight_filter = weight_filter
         self._model_config = model_config
         self._model = model
         self._device = device
@@ -32,11 +30,11 @@ class ModelWeightUpdater:
 
         self._state: _State = _StateIdle()
 
-    def start_prepare(self):
+    def start_prepare(self, weight_filter: Callable[[str], bool]):
         assert isinstance(self._state, _StateIdle)
 
         all_weights_iterator = self._model_weight_source.get_all_weights()
-        interesting_weights = [(name, weight) for name, weight in all_weights_iterator if self._weight_filter(name)]
+        interesting_weights = [(name, weight) for name, weight in all_weights_iterator if weight_filter(name)]
         self._memory_transfer_manager.enqueue(interesting_weights)
 
         self._state = _StateAwaitMemoryTransfer()
