@@ -806,7 +806,9 @@ class Scheduler(
                     self.send_to_tokenizer.send_pyobj(output)
 
     def model_runner_event_loop_step(self):
-        self.tp_worker.worker.model_runner.event_loop_step()
+        outputs = self.tp_worker.worker.model_runner.event_loop_step()
+        for output in outputs:
+            self.send_to_tokenizer.send_pyobj(output)
 
     def handle_generate_request(
         self,
