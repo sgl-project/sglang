@@ -186,7 +186,8 @@ class ExpertLocationMetadata:
                 return ans
 
             # Cannot update address to avoid breaking CUDA graph
-            getattr(self, field)[...] = getattr(other, field)
+            dst = _get(self)
+            dst[...] = _get(other)
 
     def to(self, device):
         for field in [
