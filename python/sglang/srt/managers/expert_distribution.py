@@ -244,24 +244,24 @@ class _SinglePassGatherer(ABC):
 class _LayerBasedSinglePassGatherer(_SinglePassGatherer):
     def __init__(self, expert_location_metadata: "ExpertLocationMetadata"):
         super().__init__(expert_location_metadata)
-        self._num_recv_tokens_per_expert_list_of_layer = {}
+        self._objects_of_layer = {}
 
     def _on_layer_data(
             self, layer_idx: int, num_recv_tokens_per_expert_list: List[int]
     ):
         # TODO for TBO, we may need to relax this restriction
-        assert layer_idx not in self._num_recv_tokens_per_expert_list_of_layer
+        assert layer_idx not in self._objects_of_layer
         assert 0 <= layer_idx < self._expert_location_metadata.num_layers
-        self._num_recv_tokens_per_expert_list_of_layer[layer_idx] = (
+        self._objects_of_layer[layer_idx] = (
             num_recv_tokens_per_expert_list
         )
 
     def reset(self):
-        self._num_recv_tokens_per_expert_list_of_layer.clear()
+        self._objects_of_layer.clear()
 
     def collect_global_physical_count(self) -> torch.Tensor:
         data = [
-            self._num_recv_tokens_per_expert_list_of_layer.get(layer_index)
+            self._objects_of_layer.get(layer_index)
             or ([0] * self._expert_location_metadata.num_local_physical_experts)
             for layer_index in range(self._expert_location_metadata.num_layers)
         ]
