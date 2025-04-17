@@ -86,13 +86,8 @@ def read_physical_count_of_forward_pass(dir_data: Path):
     for forward_pass_id, physical_count_of_rank in sorted(
             physical_count_of_forward_pass_id_and_rank.items()
     ):
-        physical_count_of_rank_tensor = torch.cat(
-            [
-                physical_count
-                for rank, physical_count in sorted(physical_count_of_rank.items())
-            ],
-            dim=-1,
-        )
+        physical_count_of_rank_tensor = torch.stack(
+            [physical_count for rank, physical_count in sorted(physical_count_of_rank.items())]).sum(dim=0)
         items.append(physical_count_of_rank_tensor)
 
     physical_count_of_forward_pass = torch.stack(items)
