@@ -312,7 +312,8 @@ class _DeepepLowLatencySinglePassGatherer(_SinglePassGatherer):
         self._data[...] = 0
 
     def collect_global_physical_count(self) -> torch.Tensor:
-        return self._data
+        # Can optimize if bottleneck
+        return _convert_local_to_global_physical_count(self._data)
 
 
 # --------------------------------------- Accumulator -----------------------------------------
