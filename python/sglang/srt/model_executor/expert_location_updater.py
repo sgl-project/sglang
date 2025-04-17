@@ -49,7 +49,7 @@ class ExpertLocationUpdater:
         )
 
         self._model_weight_updater.start_prepare(
-            weight_filter=lambda name: self._weight_filter(name, interesting_logical_experts_of_layer),
+            weight_filter=lambda name, info: self._weight_filter(info, interesting_logical_experts_of_layer),
         )
         _log_with_accurate_time("ExpertLocationUpdater.start end")
 
@@ -91,7 +91,7 @@ class ExpertLocationUpdater:
         _log_with_accurate_time("ExpertLocationUpdater.act end")
         return UpdateExpertLocationReqOutput()
 
-    def _weight_filter(self, _name: str, info: ModelParamNameInfo,
+    def _weight_filter(self, info: ModelParamNameInfo,
                        interesting_logical_experts_of_layer: Dict[int, List[int]]):
         return (
                 isinstance(info, ModelParamNameInfoMoe)
