@@ -194,9 +194,6 @@ class ExpertLocationMetadata:
     def local_physical_to_physical(self, rank: int, local_physical_expert_index: int):
         return self.num_local_physical_experts * rank + local_physical_expert_index
 
-    def physical_to_local_physical(self, global_physical_expert_index: int):
-        return global_physical_expert_index % self.num_local_physical_experts
-
     def logical_to_all_physical(
             self, layer_id: int, logical_expert_id: int
     ) -> List[int]:
