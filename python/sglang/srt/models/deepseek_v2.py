@@ -1684,7 +1684,10 @@ class DeepseekV2ForCausalLM(nn.Module):
 
     def get_param_name_info(self, name: str) -> ModelParamNameInfo:
         if ".experts." in name:
-            return ModelParamNameInfoMoe(TODO)
+            return ModelParamNameInfoMoe(
+                layer_id=TODO,
+                expert_id=TODO,
+            )
         return ModelParamNameInfoOthers()
 
     @classmethod

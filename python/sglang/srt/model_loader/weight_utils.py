@@ -853,6 +853,9 @@ def kv_cache_scales_loader(
 
 @dataclass
 class ModelParamNameInfoMoe:
+    layer_id: int
+    expert_id: int
+
     @property
     def category(self):
         return "moe"
