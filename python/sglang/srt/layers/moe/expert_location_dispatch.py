@@ -2,7 +2,6 @@ from dataclasses import dataclass
 from typing import Literal, Optional
 
 import torch
-from sglang.srt.managers.expert_location import ExpertLocationMetadata
 from sglang.srt.managers.schedule_batch import global_server_args_dict, get_global_expert_location_metadata
 
 
