@@ -288,7 +288,7 @@ def compute_logical_to_rank_dispatch_physical_map(
             candidate_physical_expert_ids = ExpertLocationMetadata.logical_to_all_physical_raw(
                 logical_to_all_physical_map, layer_id, logical_expert_id
             )
-            partial_map = logical_to_all_physical_map[:, layer_id, logical_expert_id]
+            output_partial = logical_to_rank_dispatch_physical_map[:, layer_id, logical_expert_id]
 
             for gpu_id in range(num_gpus):
                 same_gpu_physical_expert_ids = [
@@ -297,10 +297,10 @@ def compute_logical_to_rank_dispatch_physical_map(
                     if _compute_gpu_id_of_physical_expert(physical_expert_id, num_local_physical_experts) == gpu_id
                 ]
                 if len(same_gpu_physical_expert_ids) > 0:
-                    partial_map[gpu_id] = same_gpu_physical_expert_ids[0]
+                    output_partial[gpu_id] = same_gpu_physical_expert_ids[0]
 
-            num_remain = torch.sum(partial_map == -1).item()
-            partial_map[partial_map == -1] = torch.tensor(
+            num_remain = torch.sum(output_partial == -1).item()
+            output_partial[output_partial == -1] = torch.tensor(
                 _fair_choices(candidate_physical_expert_ids, k=num_remain, r=r), dtype=dtype)
 
     assert torch.all(logical_to_rank_dispatch_physical_map != -1)
