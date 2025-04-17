@@ -1,3 +1,14 @@
+from dataclasses import dataclass
+
+import torch
+from sglang.srt.utils import get_compiler_backend
+
+
+@dataclass
+class ExpertLocationDispatchInfo:
+    pass
+
+
 @torch.compile(dynamic=True, backend=get_compiler_backend())
 def _hack_expert_location_dispatch_random(
     topk_ids: torch.Tensor,
