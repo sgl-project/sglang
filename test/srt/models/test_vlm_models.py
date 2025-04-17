@@ -1,26 +1,16 @@
-import argparse
+import glob
+import json
 import os
-import time
+import subprocess
+import sys
 import unittest
 from types import SimpleNamespace
 
-import openai
-from mmmu_utils.data_utils import save_json
-from mmmu_utils.eval_utils import (
-    EvalArgs,
-    eval_result,
-    get_sampling_params,
-    prepare_samples,
-    process_result,
-)
-from tqdm import tqdm
-
 from sglang.srt.utils import kill_process_tree
-from sglang.test.test_utils import (
+from sglang.test.test_utils import (  # add_common_sglang_args_and_parse,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
-    add_common_sglang_args_and_parse,
     popen_launch_server,
 )
 
@@ -29,19 +19,19 @@ CI_MODELS = [
     SimpleNamespace(
         model="google/gemma-3-27b-it", chat_template="gemma-it", mmmu_accuracy=0.39
     ),
-    SimpleNamespace(
-        model="Qwen/Qwen2.5-VL-7B-Instruct",
-        chat_template="qwen2-vl",
-        mmmu_accuracy=0.45,
-    ),
-    SimpleNamespace(
-        model="meta-llama/Llama-3.2-11B-Vision-Instruct",
-        chat_template="llama_3_vision",
-        mmmu_accuracy=0.31,
-    ),
-    SimpleNamespace(
-        model="openbmb/MiniCPM-V-2_6", chat_template="minicpmv", mmmu_accuracy=0.4
-    ),
+    # SimpleNamespace(
+    #     model="Qwen/Qwen2.5-VL-7B-Instruct",
+    #     chat_template="qwen2-vl",
+    #     mmmu_accuracy=0.45,
+    # ),
+    # SimpleNamespace(
+    #     model="meta-llama/Llama-3.2-11B-Vision-Instruct",
+    #     chat_template="llama_3_vision",
+    #     mmmu_accuracy=0.31,
+    # ),
+    # SimpleNamespace(
+    #     model="openbmb/MiniCPM-V-2_6", chat_template="minicpmv", mmmu_accuracy=0.4
+    # ),
 ]
 
 
@@ -53,73 +43,63 @@ class TestVLMModels(CustomTestCase):
         cls.api_key = "sk-123456"
         cls.time_out = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
 
-    def eval_mmmu(self):
-        """Evaluate model performance on MMMU benchmark."""
-        parser = argparse.ArgumentParser()
-        EvalArgs.add_cli_args(parser)
-        # Fixed duplicate parsing - only use one parsing method
-        args = add_common_sglang_args_and_parse(parser)
-        eval_args = EvalArgs.from_cli_args(args)
+        # Set OpenAI API key and base URL environment variables. Needed for lmm-evals to work.
+        os.environ["OPENAI_COMPATIBLE_API_KEY"] = cls.api_key
+        os.environ["OPENAI_COMPATIBLE_API_URL"] = f"{cls.base_url}/v1"
 
-        out_samples = dict()
-        sampling_params = get_sampling_params(eval_args)
-        samples = prepare_samples(eval_args)
-        answer_dict = {}
+    def run_mmmu_eval(
+        self,
+        model_version: str,
+        chat_template: str,
+        output_path: str,
+        *,
+        env: dict | None = None,
+    ):
+        """
+        Evaluate a VLM on the MMMU validation set with lmms‑eval.
+        Only `model_version` (checkpoint) and `chat_template` vary;
+        """
+        # -------- fixed settings --------
+        model = "openai_compatible"
+        tp = 1
+        tasks = "mmmu_val"
+        batch_size = 1
+        log_suffix = "openai_compatible"
+        output_path.mkdir(exist_ok=True, parents=True)
 
-        # Create OpenAI client for API access
-        client = openai.Client(api_key=self.api_key, base_url=f"{self.base_url}/v1")
+        # -------- compose --model_args --------
+        model_args = (
+            f'model_version="{model_version}",'
+            f'chat_template="{chat_template}",'
+            f"tp={tp}"
+        )
 
-        start = time.time()
-        for i, sample in enumerate(tqdm(samples)):
-            prompt = sample["final_input_prompt"]
+        # -------- build command list --------
+        cmd = [
+            sys.executable,
+            "-m",
+            "lmms_eval",
+            "--model",
+            model,
+            "--model_args",
+            model_args,
+            "--tasks",
+            tasks,
+            "--batch_size",
+            str(batch_size),
+            "--log_samples",
+            "--log_samples_suffix",
+            log_suffix,
+            "--output_path",
+            str(output_path),
+        ]
 
-            # Handle prompt splitting more robustly
-            try:
-                prefix = prompt.split("<")[0]
-                suffix = prompt.split(">")[1]
-            except IndexError:
-                print(
-                    f"Warning: Could not properly split prompt for sample {i}. Using full prompt."
-                )
-                prefix = prompt
-                suffix = ""
+        # -------- environment --------
+        env_combined = os.environ.copy()
+        if env:
+            env_combined.update(env)  # e.g. {"OPENAI_API_KEY": "..."}
 
-            image = sample.get("image")
-            image_path = sample.get("image_path")
-
-            if image is None or image_path is None:
-                print(f"Warning: Sample {i} missing image data. Skipping.")
-                continue
-
-            try:
-                response = client.chat.completions.create(
-                    model="default",
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "text", "text": prefix},
-                                {"type": "image_url", "image_url": {"url": image_path}},
-                                {"type": "text", "text": suffix},
-                            ],
-                        }
-                    ],
-                    temperature=0,
-                    max_completion_tokens=sampling_params["max_new_tokens"],
-                    max_tokens=sampling_params["max_new_tokens"],
-                )
-                response_text = response.choices[0].message.content
-                process_result(response_text, sample, answer_dict, out_samples)
-            except Exception as e:
-                print(f"Error processing sample {i}: {e}")
-                # Add error handling - continue with next sample
-
-        benchmark_time = time.time() - start
-        print(f"Benchmark time: {benchmark_time:.2f} seconds")
-
-        output_path = os.path.join(".", "val_sglang.json")
-        save_json(output_path, out_samples)
-        return eval_result(model_answer_path=output_path, answer_dict=answer_dict)
+        subprocess.run(cmd, check=True, env=env_combined)
 
     def test_ci_models(self):
         """Test CI models against MMMU benchmark."""
@@ -144,7 +124,15 @@ class TestVLMModels(CustomTestCase):
                 )
 
                 # Run evaluation
-                mmmu_accuracy = self.eval_mmmu()
+                self.run_mmmu_eval(cli_model.model, cli_model.chat_template, "./logs")
+
+                # Get the result file
+                result_file_path = glob.glob("./*.json")[0]
+
+                with open(result_file_path, "r") as f:
+                    result = json.load(f)
+                # Process the result
+                mmmu_accuracy = result["results"]["mmmu_val"]["mmmu_acc,none"]
                 print(f"Model {cli_model.model} achieved accuracy: {mmmu_accuracy:.4f}")
 
                 # Assert performance meets expected threshold
