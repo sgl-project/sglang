@@ -25,9 +25,9 @@ class TensorOperationManagerBase:
 
 class CombinedManager(TensorOperationManagerBase):
     def __init__(
-        self,
-        manager_a: TensorOperationManagerBase,
-        manager_b: TensorOperationManagerBase,
+            self,
+            manager_a: TensorOperationManagerBase,
+            manager_b: TensorOperationManagerBase,
     ):
         # For simplicity, only support chaining 2 managers, but can be extended to N
         self._manager_a = manager_a
@@ -120,8 +120,8 @@ class AsyncToCudaManager(TensorOperationManagerBase):
     def get_outputs(self) -> List[NamedTensors]:
         outputs = []
         while (
-            len(self._inflight_tasks) > 0
-            and self._inflight_tasks[0].finish_event.query()
+                len(self._inflight_tasks) > 0
+                and self._inflight_tasks[0].finish_event.query()
         ):
             task = self._inflight_tasks.pop(0)
             outputs.append(self._handle_one_output(task))
@@ -137,9 +137,9 @@ class AsyncToCudaManager(TensorOperationManagerBase):
 
     @staticmethod
     def _tensor_to_cuda(
-        input_tensor: torch.Tensor, allocator: "SimpleCachingAllocator"
+            input_tensor: torch.Tensor, allocator: "SimpleCachingAllocator"
     ):
-        output_tensor = allocator.allocate(input_tensor.size, input_tensor.dtype)
+        output_tensor = allocator.allocate(input_tensor.size(), input_tensor.dtype)
         output_tensor.copy_(input_tensor, non_blocking=True)
         return output_tensor
 
@@ -160,11 +160,13 @@ class SimpleCachingAllocator:
         self._used_pool: List[torch.Tensor] = []
 
     def allocate(self, size, dtype) -> torch.Tensor:
+        size = tuple(size)
+
         unused_pool_entry = self._unused_pool[(size, dtype)]
         if len(unused_pool_entry) > 0:
             output = unused_pool_entry.pop()
         else:
-            output = torch.empty(size, dtype=dtype, device=self._device)
+            output = torch.empty(*size, dtype=dtype, device=self._device)
 
         self._used_pool.append(output)
 
