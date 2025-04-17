@@ -43,6 +43,14 @@ class TestEPLB(CustomTestCase):
                 expect_output="TODO",
             ),
             dict(
+                prompt="10*1=10, 10*2=20, 10*3=30, 10*4=40, 10*5=50, 10*6=",
+                expect_output="TODO",
+            ),
+            dict(
+                prompt="2/2=1, 4/2=2, 6/2=3, 8/2=",
+                expect_output="TODO",
+            ),
+            dict(
                 prompt="One plus one is two, one plus two is three, one plus three is",
                 expect_output="TODO",
             ),
