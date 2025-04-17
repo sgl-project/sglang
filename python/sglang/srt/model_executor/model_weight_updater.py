@@ -4,6 +4,8 @@ from typing import Iterator, Tuple, List, Callable
 
 import torch
 from sglang.srt.model_executor.memory_transfer import AsyncToCudaManager, CombinedManager
+from sglang.srt.model_loader.loader import DefaultModelLoader
+from sglang.srt.model_loader.utils import set_default_torch_dtype
 
 
 class ModelWeightUpdater:
@@ -36,7 +38,9 @@ class ModelWeightUpdater:
     def act(self):
         assert isinstance(self._state, _StatePrepared)
 
-        TODO
+        named_tensors = self._state.named_tensors
+        with set_default_torch_dtype(TODO):
+            DefaultModelLoader.load_weights_and_postprocess(model, named_tensors, target_device)
 
         self._state = _StateIdle()
 
@@ -62,6 +66,7 @@ class _StatePrepared(_State):
 
 class _ModelWeightSourceBase(ABC):
     def get_all_weights(self) -> Iterator[Tuple[str, torch.Tensor]]:
+        TODO_with_set_default_torch_dtype
         raise NotImplementedError
 
 
