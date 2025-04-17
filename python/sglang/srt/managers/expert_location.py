@@ -53,7 +53,7 @@ class ExpertLocationMetadata:
         assert num_logical_experts_0 == num_logical_experts_1 == num_logical_experts_2
         assert num_physical_experts_0 == num_physical_experts_1
 
-    # -------------------------------- construction and mutation ------------------------------------
+    # -------------------------------- construction ------------------------------------
 
     @staticmethod
     def init_trivial(server_args: ServerArgs):
@@ -162,6 +162,8 @@ class ExpertLocationMetadata:
                 num_gpus=ep_size,
             ),
         )
+
+    # -------------------------------- mutation ------------------------------------
 
     def update(self, other: "ExpertLocationMetadata"):
         for field in [
