@@ -208,7 +208,7 @@ async def handle_generate_request(request_data: dict):
         modified_request.update(
             {
                 "bootstrap_host": [hostname] * batch_size,
-                "bootstrap_room": [_generate_bootstrap_room() for _ in batch_size],
+                "bootstrap_room": [_generate_bootstrap_room() for _ in range(batch_size)],
             }
         )
     else:
@@ -233,9 +233,13 @@ def _generate_bootstrap_room():
     return random.randint(0, 2 ** 63 - 1)
 
 
-# We may utilize `GenerateReqInput`'s logic after PR 4850
+# We may utilize `GenerateReqInput`'s logic later
 def _get_request_batch_size(request):
-    return TODO
+    if (text := request.get("text")) is not None:
+        return None if isinstance(text, str) else len(text)
+    if (input_ids := request.get("input_ids")) is not None:
+        return None if isinstance(input_ids[0], int) else len(input_ids)
+    return None
 
 
 @app.get("/v1/models")
