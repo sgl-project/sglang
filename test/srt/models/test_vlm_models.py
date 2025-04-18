@@ -1,6 +1,7 @@
 import glob
 import json
 import os
+import random
 import subprocess
 import sys
 import unittest
@@ -11,27 +12,28 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_in_ci,
     popen_launch_server,
 )
 
-# CI VLM model for testing
-CI_MODELS = [
-    # SimpleNamespace(
-    #     model="google/gemma-3-27b-it", chat_template="gemma-it", mmmu_accuracy=0.39
-    # ),
+# VLM models for testing
+MODELS = [
+    SimpleNamespace(
+        model="google/gemma-3-27b-it", chat_template="gemma-it", mmmu_accuracy=0.39
+    ),
     SimpleNamespace(
         model="Qwen/Qwen2.5-VL-7B-Instruct",
         chat_template="qwen2-vl",
-        mmmu_accuracy=0.1,
+        mmmu_accuracy=0.4,
     ),
-    # SimpleNamespace(
-    #     model="meta-llama/Llama-3.2-11B-Vision-Instruct",
-    #     chat_template="llama_3_vision",
-    #     mmmu_accuracy=0.31,
-    # ),
-    # SimpleNamespace(
-    #     model="openbmb/MiniCPM-V-2_6", chat_template="minicpmv", mmmu_accuracy=0.4
-    # ),
+    SimpleNamespace(
+        model="meta-llama/Llama-3.2-11B-Vision-Instruct",
+        chat_template="llama_3_vision",
+        mmmu_accuracy=0.31,
+    ),
+    SimpleNamespace(
+        model="openbmb/MiniCPM-V-2_6", chat_template="minicpmv", mmmu_accuracy=0.4
+    ),
 ]
 
 
@@ -92,8 +94,6 @@ class TestVLMModels(CustomTestCase):
             log_suffix,
             "--output_path",
             str(output_path),
-            "--limit",
-            str(10),
         ]
 
         subprocess.run(
@@ -102,10 +102,15 @@ class TestVLMModels(CustomTestCase):
             timeout=3600,
         )
 
-    def test_ci_models(self):
-        """Test CI models against MMMU benchmark."""
-        for cli_model in CI_MODELS:
-            print(f"\nTesting model: {cli_model.model}")
+    def test_vlm_mmmu_benchmark(self):
+        """Test VLM models against MMMU benchmark."""
+        models_to_test = MODELS
+
+        if is_in_ci():
+            models_to_test = [random.choice(MODELS)]
+
+        for model in models_to_test:
+            print(f"\nTesting model: {model.model}")
 
             process = None
             mmmu_accuracy = 0  # Initialize to handle potential exceptions
@@ -113,19 +118,19 @@ class TestVLMModels(CustomTestCase):
             try:
                 # Launch server for testing
                 process = popen_launch_server(
-                    cli_model.model,
+                    model.model,
                     base_url=self.base_url,
                     timeout=self.time_out,
                     api_key=self.api_key,
                     other_args=[
                         "--chat-template",
-                        cli_model.chat_template,
+                        model.chat_template,
                         "--trust-remote-code",
                     ],
                 )
 
                 # Run evaluation
-                self.run_mmmu_eval(cli_model.model, cli_model.chat_template, "./logs")
+                self.run_mmmu_eval(model.model, model.chat_template, "./logs")
 
                 # Get the result file
                 result_file_path = glob.glob("./logs/*.json")[0]
@@ -134,18 +139,18 @@ class TestVLMModels(CustomTestCase):
                     result = json.load(f)
                 # Process the result
                 mmmu_accuracy = result["results"]["mmmu_val"]["mmmu_acc,none"]
-                print(f"Model {cli_model.model} achieved accuracy: {mmmu_accuracy:.4f}")
+                print(f"Model {model.model} achieved accuracy: {mmmu_accuracy:.4f}")
 
                 # Assert performance meets expected threshold
                 self.assertGreaterEqual(
                     mmmu_accuracy,
-                    cli_model.mmmu_accuracy,
-                    f"Model {cli_model.model} accuracy ({mmmu_accuracy:.4f}) below expected threshold ({cli_model.mmmu_accuracy:.4f})",
+                    model.mmmu_accuracy,
+                    f"Model {model.model} accuracy ({mmmu_accuracy:.4f}) below expected threshold ({model.mmmu_accuracy:.4f})",
                 )
 
             except Exception as e:
-                print(f"Error testing {cli_model.model}: {e}")
-                self.fail(f"Test failed for {cli_model.model}: {e}")
+                print(f"Error testing {model.model}: {e}")
+                self.fail(f"Test failed for {model.model}: {e}")
 
             finally:
                 # Ensure process cleanup happens regardless of success/failure
