@@ -187,7 +187,6 @@ class ServerArgs:
     disable_shared_experts_fusion: bool = False
     disable_chunked_prefix_cache: bool = False
     disable_fast_image_processor: bool = False
-    moe_dense_tp_size: Optional[int] = None
 
     # Debug tensor dumps
     debug_tensor_dump_output_folder: Optional[str] = None
@@ -1113,12 +1112,6 @@ class ServerArgs:
             "--enable-deepep-moe",
             action="store_true",
             help="Enabling DeepEP MoE implementation for EP MoE.",
-        )
-        parser.add_argument(
-            "--moe-dense-tp-size",
-            type=int,
-            default=ServerArgs.moe_dense_tp_size,
-            help="TP size for MoE dense MLP layers. This flag is useful when, with large TP size, there are errors caused by weights in MLP layers having dimension smaller than the min dimension GEMM supports.",
         )
         parser.add_argument(
             "--deepep-mode",
