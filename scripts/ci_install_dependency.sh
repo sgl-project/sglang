@@ -2,6 +2,9 @@
 # Install the dependency in CI.
 set -euxo pipefail
 
+# Use repo from environment variables, passed from GitHub Actions
+FLASHINFER_REPO="${FLASHINFER_REPO:-https://flashinfer.ai/whl/cu124/torch2.6/flashinfer-python}"
+
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 bash "${SCRIPT_DIR}/killall_sglang.sh"
 
@@ -15,8 +18,9 @@ rm -rf /usr/local/lib/python3.10/dist-packages/sgl_kernel*
 # Update pip
 pip install --upgrade pip
 
-# Install sgl-kernel
-pip install sgl-kernel==0.1.0 --no-cache-dir
+# Install flashinfer and sgl-kernel
+pip install flashinfer_python==0.2.5 --find-links ${FLASHINFER_REPO} --no-cache-dir
+pip install sgl-kernel==0.0.9.post1 --no-cache-dir
 
 # Install the main package
 pip install -e "python[all]"
