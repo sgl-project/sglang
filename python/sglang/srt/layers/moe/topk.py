@@ -23,7 +23,6 @@ from sglang.srt.layers.moe.expert_location_dispatch import (
     topk_ids_logical_to_physical,
 )
 from sglang.srt.managers.expert_distribution import (
-    expert_distribution_recorder,
     get_global_expert_distribution_recorder,
 )
 from sglang.srt.managers.schedule_batch import global_server_args_dict

@@ -472,9 +472,9 @@ class DeepseekV2MoE(nn.Module):
 
     def _forward_tbo_op_dispatch_b(self, state, tbo_child_index: int):
         dispatcher = self.tbo_deepep_dispatchers[state.tbo_subbatch_index]
-        with expert_distribution_recorder.with_current_layer(
+        with get_global_expert_distribution_recorder().with_current_layer(
             self.layer_id
-        ), expert_distribution_recorder.with_debug_name(
+        ), get_global_expert_distribution_recorder().with_debug_name(
             ["child_a", "child_b"][tbo_child_index]
         ):
             (
