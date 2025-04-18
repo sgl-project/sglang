@@ -111,7 +111,6 @@ logger = logging.getLogger(__name__)
 
 
 class AttnForwardMethod(IntEnum):
-
     # Use multi-head attention
     MHA = auto()
 
@@ -1042,19 +1041,6 @@ class _FFNInputMode(Enum):
 class _DecoderLayerInfo:
     is_sparse: bool
     ffn_input_mode: _FFNInputMode
-
-
-class _DecoderLayerExecutionMode(Enum):
-    # The MLP sublayer requires 1/tp_size tokens as input
-    MLP_INPUT_ONE = auto()
-    # The MLP sublayer requires all tokens as input
-    MLP_INPUT_ALL = auto()
-
-
-@dataclass
-class _DecoderLayerInfo:
-    is_sparse: bool
-    execution_mode: _DecoderLayerExecutionMode
 
 
 class DeepseekV2DecoderLayer(nn.Module):
