@@ -267,7 +267,7 @@ def cdiv(a: int, b: int) -> int:
     """Ceiling division."""
     return -(a // -b)
 
-
+# TODO(hebiao064): remove this once we have a better way to handle the merge_state_v2 torch.compile issue
 @torch._dynamo.disable()
 def merge_state_v2_wrapper(o, s_a, o_exp, s_b):
     return merge_state_v2(o, s_a, o_exp, s_b)
@@ -324,6 +324,7 @@ class FlashAttentionBackend(AttentionBackend):
             if model_runner.server_args.speculative_eagle_topk is not None
             else 0
         )
+        self.topk_greater_than_one = self.topk > 1
         self.speculative_num_steps = speculative_num_steps
         self.speculative_num_draft_tokens = (
             model_runner.server_args.speculative_num_draft_tokens
@@ -707,7 +708,7 @@ class FlashAttentionBackend(AttentionBackend):
                 cu_seqlens_k = metadata.encoder_cu_seqlens_k
                 window_size = (-1, -1)
 
-            o, softmax_lse, *rest = flash_attn_with_kvcache(
+            result = flash_attn_with_kvcache(
                 q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                 k_cache=key_cache,
                 v_cache=value_cache,
@@ -726,10 +727,12 @@ class FlashAttentionBackend(AttentionBackend):
                 softcap=layer.logit_cap,
                 k_descale=k_descale,
                 v_descale=v_descale,
-                return_softmax_lse=True,
+                return_softmax_lse=self.topk_greater_than_one,
             )
+
             if forward_batch.forward_mode.is_target_verify() and self.topk > 1:
-                o_expand, softmax_lse_expand, *rest_expand = flash_attn_with_kvcache(
+                o, softmax_lse, _ = result
+                o_expand, softmax_lse_expand, _ = flash_attn_with_kvcache(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     k_cache=key_cache,
                     v_cache=value_cache,
@@ -752,6 +755,8 @@ class FlashAttentionBackend(AttentionBackend):
                     o_expand,
                     softmax_lse_expand.T.contiguous(),
                 )
+            else:
+                o = result
         else:
             if (
                 not global_server_args_dict["disable_chunked_prefix_cache"]
@@ -814,7 +819,7 @@ class FlashAttentionBackend(AttentionBackend):
                 q_all = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
                 q_nope = q_all[:, :, : layer.v_head_dim]
                 q_rope = q_all[:, :, layer.v_head_dim :]
-                o, softmax_lse, *rest = flash_attn_with_kvcache(
+                result = flash_attn_with_kvcache(
                     q=q_rope,
                     k_cache=k_rope_cache,
                     v_cache=c_kv_cache,
@@ -834,9 +839,10 @@ class FlashAttentionBackend(AttentionBackend):
                     softcap=layer.logit_cap,
                     k_descale=k_descale,
                     v_descale=v_descale,
-                    return_softmax_lse=True,
+                    return_softmax_lse=self.topk_greater_than_one,
                 )
                 if forward_batch.forward_mode.is_target_verify() and self.topk > 1:
+                    o, softmax_lse, _ = result
                     o_expand, softmax_lse_expand, *rest_expand = (
                         flash_attn_with_kvcache(
                             q=q_rope,
@@ -863,6 +869,8 @@ class FlashAttentionBackend(AttentionBackend):
                         o_expand,
                         softmax_lse_expand.T.contiguous(),
                     )
+                else:
+                    o = result
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
@@ -980,7 +988,7 @@ class FlashAttentionBackend(AttentionBackend):
                     -1, layer.tp_q_head_num, layer.head_dim
                 )
                 # Default: single-token self-attention
-                o, softmax_lse, *rest = flash_attn_with_kvcache(
+                result = flash_attn_with_kvcache(
                     q=q_reshaped,
                     k_cache=key_cache,
                     v_cache=value_cache,
@@ -995,9 +1003,10 @@ class FlashAttentionBackend(AttentionBackend):
                     softcap=layer.logit_cap,
                     k_descale=k_descale,
                     v_descale=v_descale,
-                    return_softmax_lse=True,
+                    return_softmax_lse=self.topk_greater_than_one,
                 )
                 if self.topk > 1:
+                    o, softmax_lse, _ = result
                     o_expand, softmax_lse_expand, *rest_expand = (
                         flash_attn_with_kvcache(
                             q=q_reshaped,
@@ -1023,6 +1032,8 @@ class FlashAttentionBackend(AttentionBackend):
                         o_expand,
                         softmax_lse_expand.T.contiguous(),
                     )
+                else:
+                    o = result
         else:
             # Do absorbed multi-latent attention
             kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
@@ -1043,7 +1054,7 @@ class FlashAttentionBackend(AttentionBackend):
             q_rope = q_all[:, :, layer.v_head_dim :]
             max_seqlen_q = metadata.max_seq_len_q
 
-            o, softmax_lse, *rest = flash_attn_with_kvcache(
+            result = flash_attn_with_kvcache(
                 q=q_rope,
                 k_cache=k_rope_cache,
                 v_cache=c_kv_cache,
@@ -1058,9 +1069,10 @@ class FlashAttentionBackend(AttentionBackend):
                 softcap=layer.logit_cap,
                 k_descale=k_descale,
                 v_descale=v_descale,
-                return_softmax_lse=True,
+                return_softmax_lse=self.topk_greater_than_one,
             )
             if self.topk > 1:
+                o, softmax_lse, _ = result
                 o_expand, softmax_lse_expand, *rest_expand = flash_attn_with_kvcache(
                     q=q_rope,
                     k_cache=k_rope_cache,
@@ -1085,6 +1097,7 @@ class FlashAttentionBackend(AttentionBackend):
                     o_expand,
                     softmax_lse_expand.T.contiguous(),
                 )
+            
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def init_cuda_graph_state(self, max_bs: int):
