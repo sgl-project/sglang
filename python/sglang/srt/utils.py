@@ -1944,3 +1944,45 @@ class BumpAllocator:
         output = self._buffer[self._pointer : self._pointer + size]
         self._pointer += size
         return output
+
+
+class PortPool:
+    def __init__(self, start_port, end_port):
+        self.start_port = start_port
+        self.end_port = end_port
+        self.available_ports = set(range(start_port, end_port + 1))
+        self.lock = threading.Lock()
+
+    def is_port_available(self, port):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(("localhost", port))
+                return True
+            except OSError:
+                return False
+
+    def allocate_port(self):
+        with self.lock:
+            if not self.available_ports:
+                raise Exception("No available ports in the pool")
+
+            available_ports_list = list(self.available_ports)
+            random.seed(time.time())
+            random.shuffle(available_ports_list)
+            for port in available_ports_list:
+                if self.is_port_available(port):
+                    self.available_ports.remove(port)
+                    return port
+            # If no available ports, raise an exception
+            raise Exception("No available ports in the pool")
+
+    def release_port(self, port):
+        with self.lock:
+            if port < self.start_port or port > self.end_port:
+                logger.error(f"Port {port} out of range")
+            else:
+                self.available_ports.add(port)
+
+    def get_available_ports(self):
+        with self.lock:
+            return len(self.available_ports)
