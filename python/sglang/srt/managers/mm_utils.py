@@ -1,8 +1,9 @@
 """
-    Multi-modality utils
+Multi-modality utils
 """
 
 import dataclasses
+import logging
 from abc import abstractmethod
 from typing import Callable, List, Optional, Tuple
 
@@ -14,11 +15,11 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalInputs,
     global_server_args_dict,
-    logger,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import print_warning_once
-from sglang.utils import logger
+
+logger = logging.getLogger(__name__)
 
 
 class MultiModalityDataPaddingPattern:

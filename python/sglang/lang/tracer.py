@@ -1,20 +1,16 @@
 """Tracing a program."""
 
 import uuid
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional
 
-from sglang.global_config import global_config
 from sglang.lang.backend.base_backend import BaseBackend
 from sglang.lang.interpreter import ProgramState, ProgramStateGroup
 from sglang.lang.ir import (
     SglArgument,
-    SglCommitLazy,
-    SglConcateAndAppend,
     SglConstantText,
     SglExpr,
     SglExprList,
     SglFork,
-    SglFunction,
     SglGen,
     SglGetForkItem,
     SglRoleBegin,
@@ -230,8 +226,8 @@ class TracerProgramState(ProgramState):
         self.cur_role = None
 
     def _execute_var_scope_end(self, expr: SglVarScopeEnd):
-        new_node = SglVariable(name, source=self.last_node)
-        self.variables[name] = new_node
+        new_node = SglVariable(expr.name, source=self.last_node)
+        self.variables[expr.name] = new_node
 
     def get_var(self, name):
         ret = self.arguments.get(name, None)

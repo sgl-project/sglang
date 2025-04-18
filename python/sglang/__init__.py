@@ -24,6 +24,7 @@ from sglang.api import (
     user_end,
     video,
 )
+from sglang.global_config import global_config
 from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
 from sglang.lang.choices import (
     greedy_token_selection,
@@ -31,16 +32,13 @@ from sglang.lang.choices import (
     unconditional_likelihood_normalized,
 )
 from sglang.utils import LazyImport
+from sglang.version import __version__
 
 ServerArgs = LazyImport("sglang.srt.server_args", "ServerArgs")
 Anthropic = LazyImport("sglang.lang.backend.anthropic", "Anthropic")
 LiteLLM = LazyImport("sglang.lang.backend.litellm", "LiteLLM")
 OpenAI = LazyImport("sglang.lang.backend.openai", "OpenAI")
 VertexAI = LazyImport("sglang.lang.backend.vertexai", "VertexAI")
-
-# Other configs
-from sglang.global_config import global_config
-from sglang.version import __version__
 
 __all__ = [
     "Engine",
