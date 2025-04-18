@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import torch
+
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.managers import deepseek_eplb
 from sglang.srt.managers.expert_distribution_storage import ExpertDistributionStorage
@@ -11,7 +12,10 @@ from sglang.srt.managers.expert_location import (
     ExpertLocationMetadata,
     ModelConfigForExpertLocation,
 )
-from sglang.srt.managers.io_struct import UpdateExpertLocationReqInput, EplbRebalanceReqInput
+from sglang.srt.managers.io_struct import (
+    EplbRebalanceReqInput,
+    UpdateExpertLocationReqInput,
+)
 from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
@@ -26,7 +30,7 @@ class EPLBManager:
         self._server_args = server_args
         self._expert_distribution_storage = ExpertDistributionStorage(
             dir_data=Path(self._server_args.eplb_storage_dir)
-                     / "expert_distribution_storage"
+            / "expert_distribution_storage"
         )
 
     def bind(self, tokenizer_manager: "TokenizerManager"):
@@ -46,7 +50,8 @@ class EPLBManager:
     async def rebalance(self, obj: EplbRebalanceReqInput):
         await self.save_expert_distribution()
         expert_location_metadata = self.compute_expert_location_metadata(
-            debug_use_random_stat=obj.debug_use_random_stat)
+            debug_use_random_stat=obj.debug_use_random_stat
+        )
         await self._tokenizer_manager.update_expert_location(
             UpdateExpertLocationReqInput(
                 expert_location_metadata=expert_location_metadata
@@ -62,8 +67,12 @@ class EPLBManager:
             return ExpertLocationMetadata.init_trivial(self._server_args)
 
         if debug_use_random_stat:
-            logger.warning("EPLBManager.compute_expert_location_metadata use random stat for debugging.")
+            logger.warning(
+                "EPLBManager.compute_expert_location_metadata use random stat for debugging."
+            )
             original_logical_count = torch.tensor(snapshot["logical_count"])
-            snapshot = {"logical_count": torch.randint_like(original_logical_count, high=100000)}
+            snapshot = {
+                "logical_count": torch.randint_like(original_logical_count, high=100000)
+            }
 
         return ExpertLocationMetadata.init_by_eplb(self._server_args, **snapshot)

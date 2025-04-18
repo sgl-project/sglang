@@ -48,6 +48,7 @@ from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     ConfigureLoggingReq,
     EmbeddingReqInput,
+    EplbRebalanceReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
@@ -60,7 +61,7 @@ from sglang.srt.managers.io_struct import (
     SetInternalStateReq,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
-    VertexGenerateReqInput, EplbRebalanceReqInput,
+    VertexGenerateReqInput,
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.metrics.func_timer import enable_func_timer
@@ -313,7 +314,7 @@ async def flush_cache():
     ret = await _global_state.tokenizer_manager.flush_cache()
     return Response(
         content="Cache flushed.\nPlease check backend logs for more details. "
-                "(When there are running or waiting requests, the operation will not be performed.)\n",
+        "(When there are running or waiting requests, the operation will not be performed.)\n",
         status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
     )
 
@@ -646,10 +647,10 @@ async def vertex_generate(vertex_req: VertexGenerateReqInput, raw_request: Reque
             ]
             break
     image_data = [
-                     instance.get("image_data")
-                     for instance in vertex_req.instances
-                     if instance.get("image_data") is not None
-                 ] or None
+        instance.get("image_data")
+        for instance in vertex_req.instances
+        if instance.get("image_data") is not None
+    ] or None
     req = GenerateReqInput(
         **inputs,
         image_data=image_data,

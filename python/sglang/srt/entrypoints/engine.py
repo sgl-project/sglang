@@ -51,6 +51,7 @@ from sglang.srt.managers.data_parallel_controller import (
 from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
+    EplbRebalanceReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
@@ -61,7 +62,7 @@ from sglang.srt.managers.io_struct import (
     UpdateExpertLocationReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
-    UpdateWeightsFromTensorReqInput, EplbRebalanceReqInput,
+    UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -368,7 +369,9 @@ class Engine:
 
     def eplb_rebalance(self):
         loop = asyncio.get_event_loop()
-        return loop.run_until_complete(self.tokenizer_manager.eplb_rebalance(EplbRebalanceReqInput()))
+        return loop.run_until_complete(
+            self.tokenizer_manager.eplb_rebalance(EplbRebalanceReqInput())
+        )
 
     def eplb_save_expert_distribution(self):
         loop = asyncio.get_event_loop()
