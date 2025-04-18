@@ -182,6 +182,7 @@ class ServerArgs:
     hicache_ratio: float = 2.0
     flashinfer_mla_disable_ragged: bool = False
     warmups: Optional[str] = None
+    moe_dense_tp_size: Optional[int] = None
     n_share_experts_fusion: int = 0
     disable_shared_experts_fusion: bool = False
     disable_chunked_prefix_cache: bool = False
@@ -1112,6 +1113,12 @@ class ServerArgs:
             "--enable-deepep-moe",
             action="store_true",
             help="Enabling DeepEP MoE implementation for EP MoE.",
+        )
+        parser.add_argument(
+            "--moe-dense-tp-size",
+            type=int,
+            default=ServerArgs.moe_dense_tp_size,
+            help="TP size for MoE dense MLP layers. This flag is useful when, with large TP size, there are errors caused by weights in MLP layers having dimension smaller than the min dimension GEMM supports.",
         )
         parser.add_argument(
             "--deepep-mode",
