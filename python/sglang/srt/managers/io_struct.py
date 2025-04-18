@@ -397,8 +397,12 @@ class GenerateReqInput:
                 else None
             ),
             return_hidden_states=self.return_hidden_states,
+            skip_kv_transfer=self.skip_kv_transfer,
+            bootstrap_host=self.bootstrap_host,
+            bootstrap_room=(
+                self.bootstrap_room + i if self.bootstrap_room is not None else None
+            ),
         )
-
 
 @dataclass
 class TokenizedGenerateReqInput:
