@@ -6,7 +6,13 @@ import torch.nn as nn
 import transformers.image_utils as image_utils
 from numpy.typing import NDArray
 from torch import Tensor
-from transformers import BatchFeature, PretrainedConfig, ProcessorMixin, TensorType
+from transformers import (
+    BatchFeature,
+    PretrainedConfig,
+    PreTrainedTokenizerBase,
+    ProcessorMixin,
+    TensorType,
+)
 from transformers.image_utils import ImageInput, VideoInput
 from transformers.processing_utils import ProcessingKwargs
 from transformers.tokenization_utils_base import TextInput
@@ -30,6 +36,10 @@ class VILAProcessorOutputHF(BatchFeature):
 
 
 class VILAProcessorHF(ProcessorMixin):
+    tokenizer: PreTrainedTokenizerBase
+
+    image_pad_len: int
+
     def __call__(
         self,
         images: Optional[ImageInput] = None,
@@ -121,18 +131,49 @@ class VILAProcessor(BaseMultimodalProcessor):
             )[0]
         )
 
-        inputs = self._processor.__call__(
+        # Here, we need to know how many image tokens after processing is one image corresponds to.
+        # So we have to copy HF code here.
+
+        ##### Copy from remote code and modified. #####
+
+        image_inputs, num_cropped_images = self._processor._process_images(
             images=images,
-            text=input_text,
-            max_length=max_req_input_len,
             return_tensors=TensorType.PYTORCH,
+        )
+
+        # TODO: video processing.
+
+        # Process text.
+        input_text = input_text if isinstance(input_text, list) else [input_text]
+
+        input_text = self._processor._pad_image_tokens_by_num_crops(
+            input_text,
+            num_cropped_images=num_cropped_images,
+        )
+
+        input_text = self._processor._pad_image_tokens_by_num_embeddings(
+            input_text,
+        )
+
+        text_inputs = self._processor.tokenizer.__call__(
+            input_text,
+            max_length=max_req_input_len,
             truncation=True,
         )
 
+        ##### End of copy. #####
+
+        data_hashes: List[int] = []
+        for image_file, num_cropped_images_item in zip(image_data, num_cropped_images):
+            for i in range(num_cropped_images_item):
+                data_hashes.extend(
+                    [hash(f"{image_file}/{i}")] * self._processor.image_pad_len
+                )
+
         return VILAProcessorOutput(
             data=dict(
-                input_ids=list(inputs.input_ids[0]),
-                pixel_values=inputs.pixel_values,
-                data_hashes=[hash(image_file) for image_file in image_data],
+                input_ids=text_inputs.input_ids[0],
+                pixel_values=image_inputs.pixel_values,
+                data_hashes=data_hashes,
             )
         )

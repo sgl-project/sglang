@@ -18,8 +18,6 @@ from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
 
-_IMAGE_TOKEN_IDS = [151649]
-
 logger = logging.getLogger(__name__)
 
 
@@ -191,7 +189,7 @@ class VILAForConditionalGeneration(nn.Module):
         image_inputs: MultimodalInputs,
     ) -> List[int]:
         pattern = MultiModalityDataPaddingPatternImageTokens(
-            image_token_id=torch.tensor(_IMAGE_TOKEN_IDS)
+            image_token_id=torch.tensor(self.config.image_token_id)
         )
 
         return pattern.pad_input_tokens(input_ids, image_inputs)
