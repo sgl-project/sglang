@@ -208,7 +208,9 @@ async def handle_generate_request(request_data: dict):
         modified_request.update(
             {
                 "bootstrap_host": [hostname] * batch_size,
-                "bootstrap_room": [_generate_bootstrap_room() for _ in range(batch_size)],
+                "bootstrap_room": [
+                    _generate_bootstrap_room() for _ in range(batch_size)
+                ],
             }
         )
     else:
@@ -230,7 +232,7 @@ async def handle_generate_request(request_data: dict):
 
 
 def _generate_bootstrap_room():
-    return random.randint(0, 2 ** 63 - 1)
+    return random.randint(0, 2**63 - 1)
 
 
 # We may utilize `GenerateReqInput`'s logic later
