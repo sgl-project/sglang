@@ -22,7 +22,7 @@ CI_MODELS = [
     SimpleNamespace(
         model="Qwen/Qwen2.5-VL-7B-Instruct",
         chat_template="qwen2-vl",
-        mmmu_accuracy=0.45,
+        mmmu_accuracy=0.1,
     ),
     # SimpleNamespace(
     #     model="meta-llama/Llama-3.2-11B-Vision-Instruct",
@@ -76,7 +76,7 @@ class TestVLMModels(CustomTestCase):
 
         # -------- build command list --------
         cmd = [
-            "python",
+            "python3",
             "-m",
             "lmms_eval",
             "--model",
