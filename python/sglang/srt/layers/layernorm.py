@@ -36,10 +36,8 @@ if _is_cuda:
     )
 
 if _is_hip:
-    import aiter as _rocm_aiter
-
     def rocm_aiter_rms_norm(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
-        return _rocm_aiter.rms_norm(x, w, eps)
+        return aiter.rms_norm(x, w, eps)
 
     def rocm_aiter_fused_add_rms_norm(
         x: torch.Tensor,
@@ -47,7 +45,7 @@ if _is_hip:
         w: torch.Tensor,
         eps: float,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        _rocm_aiter.rmsnorm2d_fwd_with_add(x, x, residual, residual, w, eps)
+        aiter.rmsnorm2d_fwd_with_add(x, x, residual, residual, w, eps)
         return x, residual
 
 class RMSNorm(CustomOp):
