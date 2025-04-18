@@ -96,8 +96,8 @@ class GenerateReqInput:
     return_hidden_states: bool = False
 
     # For disaggregated inference
-    bootstrap_host: Optional[Union[List[str], str]] = None
-    bootstrap_room: Optional[Union[List[int], int]] = None
+    bootstrap_host: Optional[str] = None
+    bootstrap_room: Optional[int] = None
 
     def normalize_batch_and_arguments(self):
         """
@@ -305,10 +305,7 @@ class GenerateReqInput:
     def _normalize_rid(self, num):
         """Normalize request IDs for batch processing."""
         if self.rid is None:
-            if self.bootstrap_room is None:
-                self.rid = [uuid.uuid4().hex for _ in range(num)]
-            else:
-                self.rid = [hex(hash((self.bootstrap_room, i))) for i in range(num)]
+            self.rid = [uuid.uuid4().hex for _ in range(num)]
         elif not isinstance(self.rid, list):
             raise ValueError("The rid should be a list for batch processing.")
 
@@ -374,7 +371,6 @@ class GenerateReqInput:
 
     def regenerate_rid(self):
         """Generate a new request ID and return it."""
-        # TODO(ch-wan): bootstrap_room is not considered
         self.rid = uuid.uuid4().hex
         return self.rid
 
@@ -525,7 +521,6 @@ class EmbeddingReqInput:
                 self.sampling_params[i]["max_new_tokens"] = 0
 
     def regenerate_rid(self):
-        # TODO(ch-wan): bootstrap_room is not considered
         self.rid = uuid.uuid4().hex
         return self.rid
 
