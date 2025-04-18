@@ -133,8 +133,9 @@ class MooncakeKVManager(BaseKVManager):
         ):
             self.engine.register(aux_data_ptr, aux_data_len)
 
+    @classmethod
     @cache
-    def _connect(self, endpoint: str):
+    def _connect(cls, endpoint: str):
         socket = zmq.Context().socket(zmq.PUSH)
         socket.connect(endpoint)
         return socket
