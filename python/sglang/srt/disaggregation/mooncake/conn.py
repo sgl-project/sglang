@@ -436,8 +436,9 @@ class MooncakeKVReceiver(BaseKVReceiver):
             logger.error(f"Error fetching prefill info from bootstrap: {e}")
             return None
 
+    @classmethod
     @cache
-    def _connect(self, endpoint: str):
+    def _connect(cls, endpoint: str):
         socket = zmq.Context().socket(zmq.PUSH)
         socket.connect(endpoint)
         return socket
