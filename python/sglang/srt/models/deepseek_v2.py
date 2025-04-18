@@ -1147,17 +1147,6 @@ class _DecoderLayerInfo:
     ffn_input_mode: _FFNInputMode
 
 
-class _DecoderLayerExecutionMode(Enum):
-    MLP_ONE = auto()
-    MLP_ALL = auto()
-
-
-@dataclass
-class _DecoderLayerInfo:
-    is_sparse: bool
-    execution_mode: _DecoderLayerExecutionMode
-
-
 class DeepseekV2DecoderLayer(nn.Module):
 
     def __init__(
