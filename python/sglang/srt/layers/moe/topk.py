@@ -236,8 +236,9 @@ def biased_grouped_topk(
         _is_cuda
         and n_share_experts_fusion == 0
         and is_power_of_two(correction_bias.shape[0])
+        # TODO fuse into the kernel
+        and expert_location_dispatch_info is None
     ):
-        assert expert_location_dispatch_info is None
         return moe_fused_gate(
             gating_output,
             correction_bias,
