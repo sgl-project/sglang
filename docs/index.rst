@@ -54,6 +54,7 @@ The core features include:
    backend/structured_outputs_for_reasoning_models.ipynb
    backend/custom_chat_template.md
    backend/quantization.md
+   backend/lora.ipynb
 
 .. toctree::
    :maxdepth: 1
