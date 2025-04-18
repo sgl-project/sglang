@@ -1062,12 +1062,18 @@ class DeepseekV2DecoderLayer(nn.Module):
                 prefix=add_prefix("mlp", prefix),
             )
         else:
+            if self._enable_moe_dense_fully_dp():
+                mlp_tp_rank, mlp_tp_size = 0, 1
+            else:
+                mlp_tp_rank, mlp_tp_size = None, None
             self.mlp = DeepseekV2MLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
+                tp_rank=mlp_tp_rank,
+                tp_size=mlp_tp_size,
             )
 
         self.input_is_scattered = (
@@ -1081,6 +1087,10 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
 
     @staticmethod
+    def _enable_moe_dense_fully_dp():
+        return global_server_args_dict["moe_dense_tp_size"] == 1
+
+    @staticmethod
     def _compute_info(config: PretrainedConfig, layer_id: int, is_nextn: bool):
         is_sparse = is_nextn or (
             config.n_routed_experts is not None
@@ -1090,6 +1100,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         ffn_input_mode = (
             _FFNInputMode.SCATTERED
             if (global_server_args_dict["enable_deepep_moe"] and is_sparse)
+            or (DeepseekV2DecoderLayer._enable_moe_dense_fully_dp() and not is_sparse)
             else _FFNInputMode.FULL
         )
         return _DecoderLayerInfo(is_sparse=is_sparse, ffn_input_mode=ffn_input_mode)
@@ -1236,7 +1247,12 @@ class DeepseekV2DecoderLayer(nn.Module):
                     hidden_states, residual
                 )
 
-        hidden_states = self.mlp(hidden_states, forward_batch.forward_mode)
+        if not (
+            self._enable_moe_dense_fully_dp()
+            and (not self.info.is_sparse)
+            and hidden_states.shape[0] == 0
+        ):
+            hidden_states = self.mlp(hidden_states, forward_batch.forward_mode)
 
         if self.is_last_layer and self.attn_tp_size != 1:
             hidden_states += residual
