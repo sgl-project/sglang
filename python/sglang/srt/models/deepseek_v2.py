@@ -470,8 +470,9 @@ class DeepseekV2MoE(nn.Module):
 
     def _forward_tbo_op_combine_b(self, state):
         dispatcher = self.tbo_deepep_dispatchers[state.tbo_subbatch_index]
-        state.hidden_states_from_combine = dispatcher.combine_b()
-        state.hidden_states_from_combine *= self.routed_scaling_factor
+        hidden_states = dispatcher.combine_b()
+        hidden_states *= self.routed_scaling_factor
+        state.hidden_states_from_combine = hidden_states
 
     def _forward_tbo_op_shared(self, state):
         state.shared_output = self._forward_deepep_shared_output(
