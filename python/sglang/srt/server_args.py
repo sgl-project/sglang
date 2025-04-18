@@ -341,7 +341,7 @@ class ServerArgs:
         if self.enable_eplb:
             self.enable_expert_distribution_recorder = True
             if self.expert_location_updater_mode is None:
-                self.expert_location_updater_mode = "pin_memory"
+                self.expert_location_updater_mode = "pageable_memory"
             logger.info(
                 f"EPLB is enabled. The enable_expert_distribution_recorder and expert_location_updater_mode are automatically set."
             )
