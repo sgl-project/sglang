@@ -517,6 +517,8 @@ class ModelRunner:
         self._expert_location_updater.start(recv_req)
 
     def event_loop_step(self) -> List[Any]:
+        if self._expert_location_updater is None:
+            return []
         return self._expert_location_updater.event_loop_step()
 
     def update_weights_from_disk(
