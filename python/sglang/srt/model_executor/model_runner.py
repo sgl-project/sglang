@@ -73,6 +73,7 @@ from sglang.srt.utils import (
     MultiprocessingSerializer,
     enable_show_time_cost,
     get_available_gpu_memory,
+    get_bool_env_var,
     init_custom_process_group,
     is_cuda,
     is_fa3_default_architecture,
@@ -378,10 +379,16 @@ class ModelRunner:
         local_gpu_memory = get_available_gpu_memory(self.device, self.gpu_id)
         if self.tp_size > 1:
             if min_per_gpu_memory < local_gpu_memory * 0.9:
-                raise ValueError(
-                    "The memory capacity is unbalanced. Some GPUs may be occupied by other processes. "
-                    f"{min_per_gpu_memory=}, {local_gpu_memory=}, {local_gpu_memory * 0.9=}"
-                )
+                if get_bool_env_var("SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK"):
+                    logger.warning(
+                        "The memory capacity is unbalanced. Some GPUs may be occupied by other processes. "
+                        f"{min_per_gpu_memory=}, {local_gpu_memory=}, {local_gpu_memory * 0.9=}"
+                    )
+                else:
+                    raise ValueError(
+                        "The memory capacity is unbalanced. Some GPUs may be occupied by other processes. "
+                        f"{min_per_gpu_memory=}, {local_gpu_memory=}, {local_gpu_memory * 0.9=}"
+                    )
 
         logger.info(
             f"Init torch distributed ends. mem usage={(before_avail_memory - local_gpu_memory):.2f} GB"
