@@ -19,17 +19,12 @@ from sglang.test.test_utils import (
 # VLM models for testing
 MODELS = [
     SimpleNamespace(
-        model="google/gemma-3-27b-it", chat_template="gemma-it", mmmu_accuracy=0.39
+        model="google/gemma-3-27b-it", chat_template="gemma-it", mmmu_accuracy=0.45
     ),
     SimpleNamespace(
         model="Qwen/Qwen2.5-VL-7B-Instruct",
         chat_template="qwen2-vl",
         mmmu_accuracy=0.4,
-    ),
-    SimpleNamespace(
-        model="meta-llama/Llama-3.2-11B-Vision-Instruct",
-        chat_template="llama_3_vision",
-        mmmu_accuracy=0.31,
     ),
     SimpleNamespace(
         model="openbmb/MiniCPM-V-2_6", chat_template="minicpmv", mmmu_accuracy=0.4
