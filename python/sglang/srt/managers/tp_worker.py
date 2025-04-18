@@ -53,8 +53,6 @@ class TpModelWorker:
         req_to_token_pool: Optional[ReqToTokenPool] = None,
         token_to_kv_pool_allocator: Optional[TokenToKVPoolAllocator] = None,
     ):
-        self.worker = self
-
         # Parse args
         self.tp_rank = tp_rank
 
@@ -70,6 +68,7 @@ class TpModelWorker:
             context_length=server_args.context_length,
             model_override_args=server_args.json_model_override_args,
             is_embedding=server_args.is_embedding,
+            enable_multimodal=server_args.enable_multimodal,
             dtype=server_args.dtype,
             quantization=server_args.quantization,
         )
@@ -133,6 +132,9 @@ class TpModelWorker:
             self.model_runner.tp_group.cpu_group,
         )[0]
         set_random_seed(self.random_seed)
+
+        # A reference make this class has the same member as TpModelWorkerClient
+        self.worker = self
 
     def get_worker_info(self):
         return (

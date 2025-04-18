@@ -40,16 +40,19 @@ from transformers.models.whisper.modeling_whisper import (
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternTokenPairs,
-    embed_mm_inputs,
-    get_multimodal_data_bounds,
+    general_mm_embed_routine,
 )
-from sglang.srt.managers.schedule_batch import MultimodalInputs
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.managers.schedule_batch import (
+    MultimodalDataItem,
+    MultimodalInputs,
+    flatten_nested_list,
+)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.minicpmv import (
     Idefics2VisionTransformer,
-    MiniCPMVBaseModel,
+    MiniCPMBaseModel,
     Resampler2_5,
 )
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
@@ -1409,7 +1412,7 @@ class MultiModalProjector(nn.Module):
         return hidden_states
 
 
-class MiniCPMO(MiniCPMVBaseModel):
+class MiniCPMO(MiniCPMBaseModel):
     def __init__(
         self,
         config: PretrainedConfig,
@@ -1537,7 +1540,7 @@ class MiniCPMO(MiniCPMVBaseModel):
 
         return input_lengths_after_cnn, input_lengths_after_pooling
 
-    def get_audio_embedding_streaming(self, multimodal_input: MultimodalInputs):
+    def get_audio_embedding_streaming(self, items: List[MultimodalDataItem]):
         r"""
         Extract audio embeddings in a streaming manner using cached key-value pairs.
 
@@ -1545,26 +1548,15 @@ class MiniCPMO(MiniCPMVBaseModel):
         for faster inference on subsequent audio frames. It only supports batch_size=1 and is intended
         for streaming scenarios.
 
-        Args:
-            multimodal_input (dict):
-                - **"audio_features"** (`torch.FloatTensor`): Input mel-spectrograms of shape `(batch_size, 80, frames)`.
-                - **"audio_feature_lens"** (List[List[int]]): Lengths of each audio segment for each item in the batch.
-
         Returns:
             List[List[torch.Tensor]]: audio embeddings
         """
-        # print("audio embedding")
-
-        wavforms = (
-            []
-            if multimodal_input.audio_features is None
-            else multimodal_input.audio_features
+        wavforms = flatten_nested_list(
+            [item.audio_features for item in items if item.audio_features]
         )
         # list, [[x1, x2], [y1], [z1]]
-        audio_feature_lens_raw = (
-            []
-            if multimodal_input.audio_feature_lens is None
-            else multimodal_input.audio_feature_lens
+        audio_feature_lens_raw = flatten_nested_list(
+            [item.audio_feature_lens for item in items if item.audio_feature_lens]
         )
 
         # exist audio
@@ -1650,7 +1642,7 @@ class MiniCPMO(MiniCPMVBaseModel):
             ret[i, start:ending] = True
         return ret
 
-    def get_audio_embedding(self, multimodal_input: MultimodalInputs, chunk_length=-1):
+    def get_audio_embedding(self, items: List[MultimodalDataItem], chunk_length=-1):
         r"""
         Extract full audio embeddings with optional chunk-based attention.
 
@@ -1659,31 +1651,25 @@ class MiniCPMO(MiniCPMVBaseModel):
         not use key-value caching and is suitable for non-streaming inference.
 
         Args:
-            multimodal_input (dict):
-                - **"audio_features"** (`torch.FloatTensor`): Input mel-spectrograms of shape `(batch_size, 80, frames)`.
-                - **"audio_feature_lens"** (List[List[int]]): Lengths of each audio segment for each item in the batch.
             chunk_length (int, optional): Determines whether to use full attention (-1) or chunk-based
                 attention (>0) during embedding computation.
 
         Returns:
             List[List[torch.Tensor]]: audio embeddings
         """
-        # print("audio embedding")
         # (bs, 80, frames) or [], multi audios need filled in advance
-        wavforms = (
-            []
-            if multimodal_input.audio_features is None
-            else multimodal_input.audio_features
+        wavforms = flatten_nested_list(
+            [item.audio_features for item in items if item.audio_features]
         )
         # list, [[x1, x2], [y1], [z1]]
-        audio_feature_lens_raw = (
-            []
-            if multimodal_input.audio_feature_lens is None
-            else multimodal_input.audio_feature_lens
+        audio_feature_lens_raw = flatten_nested_list(
+            [item.audio_feature_lens for item in items if item.audio_feature_lens]
         )
 
         final_audio_embeds = []
 
+        assert isinstance(wavforms, list)
+        assert isinstance(wavforms[0], torch.Tensor)
         # exist audio
         for wavform in wavforms:
             if len(wavform) > 0:
@@ -1757,86 +1743,46 @@ class MiniCPMO(MiniCPMVBaseModel):
                     final_audio_embeds.append(target_audio_embeds)
             return final_audio_embeds
 
+    def get_audio_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        embedding = self.get_omni_embedding(
+            items=items,
+            chunk_length=self.config.audio_chunk_length,
+            stream_input=False,
+        )
+        return embedding
+
     def get_omni_embedding(
         self,
-        input_ids,
-        multimodal_input: MultimodalInputs,
-        input_embeds: torch.Tensor,
-        forward_mode: ForwardMode,
+        items: List[MultimodalDataItem],
         chunk_length=-1,
         stream_input=False,
     ):
         """
         Args:
-            multimodal_input:
-            input_embeds:
             chunk_length: whisper use full attention or chunk attention
             stream_input: use streaming audio embedding
         Returns:
             final embeddings with audio feature
         """
-        input_embeds = input_embeds.unsqueeze(0)
-        if not forward_mode.is_decode() and multimodal_input.contains_audio_inputs():
-            audio_bounds = get_multimodal_data_bounds(
-                input_ids=input_ids,
-                pad_values=multimodal_input.pad_values,
-                token_pairs=[
-                    (multimodal_input.audio_start_id, multimodal_input.audio_end_id)
-                ],
-            )
-            if audio_bounds.numel() == 0:
-                input_embeds = input_embeds.squeeze(0)
-                # TODO
-                logger.warn("Unimplemented logic. Please try disabling chunked prefill")
-                return input_embeds
-            audio_bounds = audio_bounds.unsqueeze(0)
-            bs = len(input_embeds)
 
-            if stream_input:
-                audio_embeddings = self.get_audio_embedding_streaming(multimodal_input)
-            else:
-                audio_embeddings = self.get_audio_embedding(
-                    multimodal_input, chunk_length
-                )
-            # batch size
-            assert len(audio_embeddings) == len(input_embeds)
-            if len(audio_embeddings) > 0:
-                if self.config.chunk_input:
-                    for i in range(bs):
-                        audio_embs = torch.cat(audio_embeddings[i], dim=0).to(
-                            device=input_embeds.device, dtype=input_embeds.dtype
-                        )
-                        audio_start_pos = 0
-                        for bound in audio_bounds[i]:
-                            audio_len = bound[1] - bound[0] + 1
-                            input_embeds[0, bound[0] : bound[1] + 1] = audio_embs[
-                                audio_start_pos : audio_start_pos + audio_len, :
-                            ]
-                            audio_start_pos += audio_len
-                else:
-                    for i in range(bs):
-                        audio_embs = audio_embeddings[i]
-                        bounds = audio_bounds[i]
-                        for embs, bound in zip(audio_embs, bounds):
-                            audio_indices = torch.arange(
-                                bound[0], bound[1], dtype=torch.long
-                            ).to(input_embeds.device)
+        if stream_input:
+            audio_embeddings = self.get_audio_embedding_streaming(items)
+        else:
+            audio_embeddings = self.get_audio_embedding(items, chunk_length)
+        bs = len(audio_embeddings)
+        # batch size
+        audio_embs = torch.cat(flatten_nested_list(audio_embeddings), dim=0)
 
-                            if embs.shape[0] != len(audio_indices):
-                                raise ValueError(
-                                    f"Shape mismatch: Trying to assign embeddings of shape {embs.shape} "
-                                    f"to input indices of length {len(audio_indices)}"
-                                )
-                            input_embeds[i, audio_indices] = embs.to(input_embeds.dtype)
-        input_embeds = input_embeds.squeeze(0)
-        return input_embeds
+        return audio_embs
 
-    def get_image_features(
-        self,
-        image_inputs: MultimodalInputs,
-    ) -> torch.Tensor:
-        pixel_values = image_inputs.pixel_values
-        tgt_sizes = image_inputs.tgt_sizes
+    def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        # list of tensors
+        pixel_values = flatten_nested_list([item.pixel_values for item in items])
+        tgt_sizes = torch.stack(
+            flatten_nested_list([item.tgt_size for item in items]), dim=0
+        )
+        assert len(pixel_values) == tgt_sizes.shape[0]
+
         device = self.vpm.embeddings.position_embedding.weight.device
         dtype = self.vpm.embeddings.position_embedding.weight.dtype
         all_pixel_values_lst = [
@@ -1845,10 +1791,10 @@ class MiniCPMO(MiniCPMVBaseModel):
 
         max_patches = (tgt_sizes[:, 0] * tgt_sizes[:, 1]).max().item()
         assert isinstance(max_patches, int)
-
         all_pixel_values = torch.nn.utils.rnn.pad_sequence(
             all_pixel_values_lst, batch_first=True, padding_value=0.0
         )
+
         B, L, _ = all_pixel_values.shape
         all_pixel_values = all_pixel_values.permute(0, 2, 1).reshape(B, 3, -1, L)
         patch_attn_mask = torch.zeros(
@@ -1875,53 +1821,23 @@ class MiniCPMO(MiniCPMVBaseModel):
         forward_batch: ForwardBatch,
         **kwargs: Any,
     ) -> torch.Tensor:
-        inputs_embeds = None
-        # TODO(mick): optimize the logic here: clamp, merge and embedding should happens at most once
-        if (
-            not forward_batch.forward_mode.is_decode()
-            and forward_batch.contains_image_inputs()
-        ):
-            mm_inputs = forward_batch.merge_mm_inputs()
-            inputs_embeds = embed_mm_inputs(
-                mm_input=mm_inputs,
-                input_ids=input_ids,
-                input_embedding=self.get_input_embeddings(),
-                mm_data_embedding_func=self.get_image_features,
-                placeholder_token_ids=[mm_inputs.im_token_id] + mm_inputs.pad_values,
-            )
 
-        input_ids = input_ids.clamp(
-            min=0, max=self.get_input_embeddings().num_embeddings - 1
+        mm_input = forward_batch.merge_mm_inputs()
+        placeholder_token_ids = (
+            ([mm_input.im_token_id] + [item.pad_value for item in mm_input.mm_items])
+            if forward_batch.contains_mm_inputs()
+            else []
         )
-        if inputs_embeds is None:
-            inputs_embeds = self.llm.get_input_embeddings(input_ids)
-        if (
-            not forward_batch.forward_mode.is_decode()
-            and self.config.init_audio
-            and forward_batch.contains_audio_inputs()
-        ):
-            mm_input = forward_batch.merge_mm_inputs()
-            inputs_embeds = self.get_omni_embedding(
-                input_ids=input_ids,
-                multimodal_input=mm_input,
-                input_embeds=inputs_embeds,
-                forward_mode=forward_batch.forward_mode,
-                chunk_length=self.config.audio_chunk_length,
-                stream_input=False,
-            )
-
-        forward_batch.mm_inputs = None
-
-        hidden_states = self.llm.model(
-            input_ids=None,
-            positions=positions,
+        hidden_states = general_mm_embed_routine(
+            input_ids=input_ids,
             forward_batch=forward_batch,
-            input_embeds=inputs_embeds,
+            language_model=self.llm,
+            image_data_embedding_func=self.get_image_feature,
+            audio_data_embedding_func=self.get_audio_feature,
+            placeholder_token_ids=placeholder_token_ids,
+            positions=positions,
         )
-
-        return self.logits_processor(
-            input_ids, hidden_states, self.llm.lm_head, forward_batch
-        )
+        return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

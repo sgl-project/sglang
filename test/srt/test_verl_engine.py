@@ -27,7 +27,7 @@ from sglang.test.runners import (
     check_close_model_outputs,
     get_dtype_str,
 )
-from sglang.test.test_utils import CustomTestCase, is_in_ci
+from sglang.test.test_utils import CustomTestCase, find_available_port, is_in_ci
 
 _MAX_NEW_TOKENS = 8
 _PROMPTS = ["1+1=2, 1+2=3, 1+3=4, 1+4=5, 1+5=", "1*1=1, 1*2=2, 1*3=3, 1*4=4, 1*5="]
@@ -280,18 +280,6 @@ def _get_fsdp_state_dict(hf_model, tp_size: int):
     )
 
     return fsdp_model.state_dict()
-
-
-# TODO Ask: this is extracted from PortArgs.init_new, is it allowed to extract it, i.e. touch that old code
-def find_available_port(base_port: int):
-    port = base_port + random.randint(100, 1000)
-    while True:
-        if is_port_available(port):
-            return port
-        if port < 60000:
-            port += 42
-        else:
-            port -= 43
 
 
 if __name__ == "__main__":
