@@ -42,7 +42,7 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.utils import DeepEPMode, is_hip, set_weight_attrs
+from sglang.srt.utils import DeepEPMode, MaybeDisposibleTensor, is_hip, set_weight_attrs
 
 _is_hip = is_hip()
 
