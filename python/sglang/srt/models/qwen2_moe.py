@@ -262,8 +262,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
-        # note: replace config.num_hidden_layers < 80 with True once its available in transformers 4.50.0
-        qkv_bias = getattr(config, "qkv_bias", config.num_hidden_layers < 80)
+        qkv_bias = getattr(config, "qkv_bias", True)
         self.self_attn = Qwen2MoeAttention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
