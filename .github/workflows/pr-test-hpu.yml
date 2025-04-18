@@ -1,0 +1,61 @@
+name: PR Test (HPU)
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - "python/sglang/**"
+      - "test/**"
+      - ".github/workflows/pr-test-hpu.yml"
+  pull_request:
+    branches: [ main ]
+    paths:
+      - "python/sglang/**"
+      - "test/**"
+      - ".github/workflows/pr-test-hpu.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: pr-test-hpu-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  accuracy-test-hpu:
+    if: (github.repository == 'yangw1234/sglang_upstream_fork') && github.event.pull_request.draft == false
+    runs-on: hpu
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          git clone https://github.com/merrymercy/human-eval.git
+          cd human-eval
+          pip install --user -e .
+          cd ..
+          pip install --user -e "python[all_hpu]"
+
+      - name: Evaluate Accuracy
+        timeout-minutes: 20
+        run: |
+          cd test/srt/
+          SGLANG_IS_IN_CI=1 SGLANG_HPU_SKIP_WARMUP=true python test_eval_accuracy_large.py
+
+  finish:
+    if: always()
+    needs: [
+      accuracy-test-hpu
+    ]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check all dependent job statuses
+        run: |
+          results=(${{ join(needs.*.result, ' ') }})
+          for result in "${results[@]}"; do
+            if [ "$result" = "failure" ] || [ "$result" = "cancelled" ]; then
+              echo "Job failed with result: $result"
+              exit 1
+            fi
+          done
+          echo "All jobs completed successfully"
+          exit 0

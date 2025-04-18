@@ -3,7 +3,6 @@ import logging
 from typing import Any, Dict, List, Optional
 
 import torch
-from sgl_kernel import awq_dequantize
 
 from sglang.srt.layers.linear import (
     LinearBase,
@@ -12,6 +11,16 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.parameter import GroupQuantScaleParameter, PackedvLLMParameter
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.utils import is_cuda
+
+_is_cuda = is_cuda()
+if _is_cuda:
+    from sgl_kernel import awq_dequantize
+else:
+
+    def awq_dequantize(*args, **kwargs):
+        raise NotImplementedError("AWQ is only supported on CUDA")
+
 
 logger = logging.getLogger(__name__)
 

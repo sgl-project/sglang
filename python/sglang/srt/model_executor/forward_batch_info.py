@@ -38,7 +38,11 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
-from sglang.srt.utils import get_compiler_backend
+from sglang.srt.utils import get_compiler_backend, is_hpu
+
+_is_hpu = is_hpu()
+if _is_hpu:
+    from sglang.srt.hpu_utils import HPUBlockMetadata
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -104,6 +108,9 @@ class ForwardMode(IntEnum):
         )
 
     def is_cuda_graph(self):
+        if _is_hpu:
+            # hpu will always use graph runner
+            return True
         return (
             self == ForwardMode.DECODE
             or self == ForwardMode.TARGET_VERIFY
@@ -251,6 +258,8 @@ class ForwardBatch:
     # For Qwen2-VL
     mrope_positions: torch.Tensor = None
 
+    hpu_metadata: Optional[HPUBlockMetadata] = None
+
     @classmethod
     def init_new(
         cls,
@@ -336,7 +345,10 @@ class ForwardBatch:
             ret.extend_prefix_lens = torch.tensor(
                 batch.extend_prefix_lens, dtype=torch.int32
             ).to(device, non_blocking=True)
-            if model_runner.server_args.attention_backend != "torch_native":
+            if model_runner.server_args.attention_backend not in [
+                "torch_native",
+                "hpu",
+            ]:
                 ret.extend_num_tokens = batch.extend_num_tokens
                 positions, ret.extend_start_loc = compute_position_triton(
                     ret.extend_prefix_lens,
@@ -360,6 +372,8 @@ class ForwardBatch:
         if model_runner.server_args.lora_paths is not None:
             model_runner.lora_manager.prepare_lora_batch(ret)
 
+        if model_runner.server_args.attention_backend == "hpu":
+            ret.hpu_metadata = batch.hpu_metadata
         return ret
 
     def merge_mm_inputs(self) -> Optional[MultimodalInputs]:
@@ -702,7 +716,7 @@ def compute_position_torch(
     return positions.to(torch.int64), extend_start_loc
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend())
+@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_hpu)
 def clamp_position(seq_lens):
     return torch.clamp((seq_lens - 1), min=0).to(torch.int64)
 
