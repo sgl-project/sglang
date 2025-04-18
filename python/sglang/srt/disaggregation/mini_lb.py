@@ -192,11 +192,11 @@ async def handle_completion_request(request_data: dict):
     )
 
     if request_data.get("stream", False):
-        return await load_balancer.request_stream(
+        return await load_balancer.generate_stream(
             modified_request, prefill_server, decode_server, endpoint="v1/chat/completions"
         )
     else:
-        return await load_balancer.request(
+        return await load_balancer.generate(
             modified_request, prefill_server, decode_server, endpoint="v1/chat/completions"
         )
 
