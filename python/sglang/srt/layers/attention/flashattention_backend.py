@@ -552,7 +552,7 @@ class FlashAttentionBackend(AttentionBackend):
                     ),
                     (1, 0),
                 )
-                metadata.max_seq_len_k = metadata_expand.cu_seqlens_k.max().item()
+                metadata_expand.max_seq_len_k = metadata_expand.cache_seqlens_int32.max().item()
                 self.forward_metadata_spec_decode_expand = metadata_expand
         elif forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
             metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
@@ -1542,6 +1542,9 @@ class FlashAttentionBackend(AttentionBackend):
                     )
                 # TODO: we need to test this part for llama 4 eagle case
                 self._init_local_attn_metadata(metadata, device)
+                print("decode", self.speculative_step_id)
+                print("metadata", metadata)
+                print("metadata expand", metadata_expand)
             else:
                 metadata = self.decode_cuda_graph_metadata[bs]
                 # Normal Decode
@@ -1671,7 +1674,10 @@ class FlashAttentionBackend(AttentionBackend):
                         (1, 0),
                     )
                 )
-                metadata.max_seq_len_k = metadata_expand.cu_seqlens_k.max().item()
+                metadata_expand.max_seq_len_k = metadata_expand.cache_seqlens_int32.max().item()
+                print("target")
+                print("metadata", metadata)
+                print("metadata expand", metadata_expand)
 
         if encoder_lens is not None:
             # Only support encoder size 1 for now
