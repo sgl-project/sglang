@@ -2,6 +2,7 @@ from sglang.srt.managers.expert_distribution import (
     get_global_expert_distribution_recorder,
 )
 from sglang.srt.utils import DeepEPMode, DisposibleTensor
+from sglang.srt.utils import DeepEPMode
 
 try:
     from deep_ep import Buffer

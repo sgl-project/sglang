@@ -35,6 +35,7 @@ import zmq
 from torch.distributed import barrier
 
 from sglang.global_config import global_config
+from sglang.srt import two_batch_overlap
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constrained.base_grammar_backend import create_grammar_backend
 from sglang.srt.disaggregation.decode import (
@@ -51,6 +52,7 @@ from sglang.srt.disaggregation.utils import (
     ReqToMetadataIdxAllocator,
     TransferBackend,
 )
+from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -126,6 +128,7 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import (
+    DeepEPMode,
     DynamicGradMode,
     broadcast_pyobj,
     configure_logger,
@@ -1374,7 +1377,7 @@ class Scheduler(
             self.profiler_target_forward_ct
             and self.profiler_target_forward_ct <= self.forward_ct
         ):
-            self.stop_profile()
+            self.send_to_tokenizer.send_pyobj(self.stop_profile())
 
         # Run forward
         if self.is_generation:
@@ -1461,8 +1464,11 @@ class Scheduler(
             tp_cpu_group=self.tp_cpu_group,
             get_idle_batch=self.get_idle_batch,
             disable_cuda_graph=self.server_args.disable_cuda_graph,
+            enable_two_batch_overlap=self.server_args.enable_two_batch_overlap,
             spec_algorithm=self.spec_algorithm,
             speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
+            enable_deepep_moe=self.server_args.enable_deepep_moe,
+            deepep_mode=DeepEPMode[self.server_args.deepep_mode],
         )
 
     @staticmethod
@@ -1473,8 +1479,11 @@ class Scheduler(
         tp_cpu_group,
         get_idle_batch,
         disable_cuda_graph: bool,
+        enable_two_batch_overlap: bool,
         spec_algorithm,
         speculative_num_draft_tokens,
+        enable_deepep_moe: bool,
+        deepep_mode: DeepEPMode,
     ):
         # Check if other DP workers have running batches
         if local_batch is None:
@@ -1510,17 +1519,36 @@ class Scheduler(
         is_extend_in_batch = (
             local_batch.forward_mode.is_extend() if local_batch else False
         )
+
+        if local_batch is not None:
+            local_tbo_split_seq_index = two_batch_overlap.compute_split_seq_index(
+                forward_mode=local_batch.forward_mode,
+                num_tokens=local_batch.input_ids.shape[0],
+                extend_lens=local_batch.extend_lens,
+            )
+            resolved_deepep_mode = deepep_mode.resolve(local_batch.forward_mode)
+            local_can_run_tbo = (local_tbo_split_seq_index is not None) and not (
+                local_batch.forward_mode.is_extend()
+                and enable_deepep_moe
+                and (resolved_deepep_mode == DeepEPMode.low_latency)
+            )
+        else:
+            local_tbo_split_seq_index = None
+            local_can_run_tbo = False
+
         local_info = torch.tensor(
             [
                 num_tokens,
                 can_cuda_graph,
                 global_num_tokens_for_logprob,
                 is_extend_in_batch,
+                local_can_run_tbo,
+                local_batch.forward_mode.value if local_batch is not None else -1,
             ],
             dtype=torch.int64,
         )
         global_info = torch.empty(
-            (dp_size, attn_tp_size, 4),
+            (dp_size, attn_tp_size, 6),
             dtype=torch.int64,
         )
         torch.distributed.all_gather_into_tensor(
@@ -1532,6 +1560,14 @@ class Scheduler(
         can_cuda_graph = min(global_info[:, 0, 1].tolist())
         global_num_tokens_for_logprob = global_info[:, 0, 2].tolist()
         is_extend_in_batch = global_info[:, 0, 3].tolist()
+        local_can_run_tbo_aggregated = min(global_info[:, 0, 4].tolist())
+        forward_mode_same = _is_all_same(global_info[:, 0, 5].tolist())
+
+        can_run_tbo = (
+            enable_two_batch_overlap
+            and local_can_run_tbo_aggregated
+            and forward_mode_same
+        )
 
         if local_batch is None and max(global_num_tokens) > 0:
             local_batch = get_idle_batch()
@@ -1539,6 +1575,9 @@ class Scheduler(
         if local_batch is not None:
             local_batch.global_num_tokens = global_num_tokens
             local_batch.global_num_tokens_for_logprob = global_num_tokens_for_logprob
+            local_batch.tbo_split_seq_index = (
+                local_tbo_split_seq_index if can_run_tbo else None
+            )
 
             # Check forward mode for cuda graph
             if not disable_cuda_graph:
@@ -1897,7 +1936,10 @@ class Scheduler(
 
     def stop_profile(self) -> None:
         if self.profiler_activities is None:
-            return
+            return ProfileReqOutput(
+                success=False,
+                message="Profiling is already not in progress. Call /start_profile first.",
+            )
 
         logger.info("Stop profiling...")
         if self.torch_profiler is not None:
@@ -1928,10 +1970,7 @@ class Scheduler(
         self.torch_profiler_output_dir = None
         self.profiler_activities = None
 
-        if self.profiler_target_forward_ct:
-            self.send_to_tokenizer.send_pyobj(
-                ProfileReqOutput(success=True, message="Succeeded.")
-            )
+        return ProfileReqOutput(success=True, message="Succeeded")
 
     def expert_distribution_handle(self, recv_req: ExpertDistributionReq):
         dump_output = None
@@ -1985,6 +2024,10 @@ def _import_static_state(model, static_params):
     self_named_buffers = dict(model.named_buffers())
     for name, tensor in static_params["buffers"]:
         self_named_buffers[name][...] = tensor
+
+
+def _is_all_same(x):
+    return all(value == x[0] for value in x)
 
 
 def run_scheduler_process(

@@ -25,6 +25,7 @@ from typing import Any, Iterable, List, Optional, Tuple, Union
 import torch
 import torch.distributed as dist
 
+from sglang.srt import fine_grained_benchmark
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
@@ -38,6 +39,8 @@ from sglang.srt.distributed.parallel_state import (
     get_world_group,
     monkey_patch_vllm_parallel_state,
 )
+from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
+from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
     get_attention_tp_size,
@@ -170,6 +173,7 @@ class ModelRunner:
                 "torchao_config": server_args.torchao_config,
                 "enable_nan_detection": server_args.enable_nan_detection,
                 "enable_dp_attention": server_args.enable_dp_attention,
+                "enable_two_batch_overlap": server_args.enable_two_batch_overlap,
                 "enable_ep_moe": server_args.enable_ep_moe,
                 "enable_deepep_moe": server_args.enable_deepep_moe,
                 "deepep_mode": server_args.deepep_mode,
@@ -925,6 +929,15 @@ class ModelRunner:
         return c
 
     def init_attention_backend(self):
+        if self.server_args.enable_two_batch_overlap:
+            self.attn_backend = TboAttnBackend(
+                primary=self._create_attention_backend_core(),
+                children=[self._create_attention_backend_core() for _ in range(2)],
+            )
+        else:
+            self.attn_backend = self._create_attention_backend_core()
+
+    def _create_attention_backend_core(self):
         """Init attention kernel backend."""
         if self.server_args.attention_backend == "flashinfer":
             if not self.use_mla_backend:
@@ -935,13 +948,13 @@ class ModelRunner:
                 # Init streams
                 if self.server_args.speculative_algorithm == "EAGLE":
                     self.plan_stream_for_flashinfer = torch.cuda.Stream()
-                self.attn_backend = FlashInferAttnBackend(self)
+                return FlashInferAttnBackend(self)
             else:
                 from sglang.srt.layers.attention.flashinfer_mla_backend import (
                     FlashInferMLAAttnBackend,
                 )
 
-                self.attn_backend = FlashInferMLAAttnBackend(self)
+                return FlashInferMLAAttnBackend(self)
         elif self.server_args.attention_backend == "triton":
             assert self.sliding_window_size is None, (
                 "Window attention is not supported in the triton attention backend. "
@@ -956,21 +969,21 @@ class ModelRunner:
                     DoubleSparseAttnBackend,
                 )
 
-                self.attn_backend = DoubleSparseAttnBackend(self)
+                return DoubleSparseAttnBackend(self)
             else:
                 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 
-                self.attn_backend = TritonAttnBackend(self)
+                return TritonAttnBackend(self)
         elif self.server_args.attention_backend == "torch_native":
             from sglang.srt.layers.attention.torch_native_backend import (
                 TorchNativeAttnBackend,
             )
 
-            self.attn_backend = TorchNativeAttnBackend(self)
+            return TorchNativeAttnBackend(self)
         elif self.server_args.attention_backend == "flashmla":
             from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend
 
-            self.attn_backend = FlashMLABackend(self)
+            return FlashMLABackend(self)
         elif self.server_args.attention_backend == "fa3":
             assert torch.cuda.get_device_capability()[0] >= 9, (
                 "FlashAttention v3 Backend requires SM>=90. "
@@ -980,7 +993,7 @@ class ModelRunner:
                 FlashAttentionBackend,
             )
 
-            self.attn_backend = FlashAttentionBackend(self)
+            return FlashAttentionBackend(self)
         else:
             raise ValueError(
                 f"Invalid attention backend: {self.server_args.attention_backend}"
@@ -1081,14 +1094,18 @@ class ModelRunner:
         self, forward_batch: ForwardBatch, skip_attn_backend_init: bool = False
     ) -> LogitsProcessorOutput:
         self.forward_pass_id += 1
-        with get_global_expert_distribution_recorder().with_forward_pass(
-            self.forward_pass_id
-        ):
-            return self._forward_raw(forward_batch, skip_attn_backend_init)
+        with get_global_expert_distribution_recorder().with_forward_pass(self.forward_pass_id):
+            with fine_grained_benchmark.maybe_benchmark(
+                forward_batch, self.tp_rank, self.forward_pass_id
+            ):
+                return self._forward_raw(forward_batch, skip_attn_backend_init)
 
     def _forward_raw(
         self, forward_batch: ForwardBatch, skip_attn_backend_init: bool
     ) -> LogitsProcessorOutput:
+        print(
+            f"hi forward_raw {forward_batch.forward_mode=} {forward_batch.batch_size=} {forward_batch.tbo_split_seq_index=}"
+        )
         if (
             forward_batch.forward_mode.is_cuda_graph()
             and self.cuda_graph_runner
