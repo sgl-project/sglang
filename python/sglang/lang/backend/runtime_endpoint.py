@@ -324,7 +324,11 @@ class RuntimeEndpoint(BaseBackend):
 
     def _assert_success(self, res):
         if res.status_code != 200:
-            raise RuntimeError(res.json())
+            try:
+                content = res.json()
+            except json.JSONDecodeError:
+                content = res.text
+            raise RuntimeError(content)
 
 
 def compute_normalized_prompt_logprobs(input_logprobs):
