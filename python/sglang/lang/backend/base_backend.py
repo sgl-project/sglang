@@ -1,4 +1,4 @@
-from typing import Callable, List, Optional, Union
+from typing import List, Optional, Union
 
 from sglang.lang.chat_template import get_chat_template
 from sglang.lang.choices import ChoicesDecision, ChoicesSamplingMethod

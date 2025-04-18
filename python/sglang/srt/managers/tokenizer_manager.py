@@ -49,8 +49,12 @@ from fastapi import BackgroundTasks
 
 from sglang.srt.aio_rwlock import RWLock
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.disaggregation.conn import KVBootstrapServer
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.utils import (
+    DisaggregationMode,
+    KVClassType,
+    TransferBackend,
+    get_kv_class,
+)
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.managers import expert_distribution
 from sglang.srt.managers.eplb_manager import EPLBManager
@@ -170,7 +174,18 @@ class TokenizerManager:
         # Read model args
         self.model_path = server_args.model_path
         self.served_model_name = server_args.served_model_name
-        self.model_config = ModelConfig.from_server_args(server_args)
+        # TODO re-apply ModelConfig PR
+        self.model_config = ModelConfig(
+            server_args.model_path,
+            trust_remote_code=server_args.trust_remote_code,
+            revision=server_args.revision,
+            context_length=server_args.context_length,
+            model_override_args=server_args.json_model_override_args,
+            is_embedding=server_args.is_embedding,
+            enable_multimodal=server_args.enable_multimodal,
+            dtype=server_args.dtype,
+            quantization=server_args.quantization,
+        )
 
         self.is_generation = self.model_config.is_generation
         self.is_image_gen = self.model_config.is_image_gen
@@ -184,6 +199,7 @@ class TokenizerManager:
                 tokenizer_mode=server_args.tokenizer_mode,
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.revision,
+                use_fast=not server_args.disable_fast_image_processor,
             )
 
             # We want to parallelize the image pre-processing so we create an executor for it
@@ -351,10 +367,16 @@ class TokenizerManager:
         self.disaggregation_mode = DisaggregationMode(
             self.server_args.disaggregation_mode
         )
+        self.transfer_backend = TransferBackend(
+            self.server_args.disaggregation_transfer_backend
+        )
         # for disaggregtion, start kv boostrap server on prefill
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             # only start bootstrap server on prefill tm
-            self.bootstrap_server = KVBootstrapServer(
+            kv_bootstrap_server_class = get_kv_class(
+                self.transfer_backend, KVClassType.BOOTSTRAP_SERVER
+            )
+            self.bootstrap_server = kv_bootstrap_server_class(
                 self.server_args.disaggregation_bootstrap_port
             )
 
