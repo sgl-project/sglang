@@ -10,6 +10,7 @@ USER root
 # Set environment variables
 
 ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHON_VERSION=3.10
 
 # Set maintainer label
 LABEL maintainer="zhaoqiong.zheng@intel.com"
@@ -20,6 +21,10 @@ ENV GITHUB_TOKEN=${GITHUB_TOKEN}
 
 # Install Miniforge & PyTorch/Triton & build vllm/SGlang from source
 RUN cd /root && \
+    echo ${PYTHON_VERSION} | sed 's/\.//g' > /tmp/version.txt && \
+    export PYTHON_VERSION_STRING=$(cat /tmp/version.txt) && \
+    . /miniforge3/bin/activate && \
+    conda activate py${PYTHON_VERSION_STRING} && \
     TEMP_DIR=$(mktemp -d) && \
     echo "Downloading Triton wheels..." && \
     WORKFLOW_ID=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
