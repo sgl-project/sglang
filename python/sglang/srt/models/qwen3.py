@@ -22,10 +22,9 @@ from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.qwen2 import Qwen2MLP as Qwen3MLP
+from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.utils import add_prefix
-
-from .qwen2 import Qwen2MLP as Qwen3MLP
-from .qwen2 import Qwen2Model
 
 Qwen3Config = None
 

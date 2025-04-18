@@ -50,10 +50,9 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.qwen2_moe import Qwen2MoeMLP as Qwen3MoeMLP
+from sglang.srt.models.qwen2_moe import Qwen2MoeModel
 from sglang.srt.utils import add_prefix
-
-from .qwen2_moe import Qwen2MoeMLP as Qwen3MoeMLP
-from .qwen2_moe import Qwen2MoeModel
 
 Qwen3MoeConfig = None
 
@@ -224,7 +223,6 @@ class Qwen3MoeDecoderLayer(nn.Module):
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
-        # note: replace config.num_hidden_layers < 80 with True once its available in transformers 4.50.0
         head_dim = getattr(
             config, "head_dim", config.hidden_size // config.num_attention_heads
         )
