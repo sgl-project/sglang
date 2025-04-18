@@ -983,6 +983,8 @@ def v1_chat_generate_request(
                     ):
                         encoded = encoded[1:]
                     prompt_ids += encoded
+                if tokenizer_manager.model_config.is_multimodal:
+                    prompt = tokenizer_manager.tokenizer.decode(prompt_ids)
                 stop = request.stop
                 image_data = None
                 audio_data = None
@@ -993,7 +995,8 @@ def v1_chat_generate_request(
                 image_data = conv.image_data
                 audio_data = conv.audio_data
                 modalities = conv.modalities
-                stop = conv.stop_str or []
+                stop = conv.stop_str or [] if not request.ignore_eos else []
+
                 if request.stop:
                     if isinstance(request.stop, str):
                         stop.append(request.stop)
