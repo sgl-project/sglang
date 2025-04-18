@@ -417,7 +417,6 @@ class DeepseekV2MoE(nn.Module):
             hidden_states,
             topk_idx,
             topk_weights,
-            self.num_experts,
             forward_mode=forward_mode,
         )
 
