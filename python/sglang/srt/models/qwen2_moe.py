@@ -47,7 +47,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.managers.expert_distribution import ExpertDistributionRecorder
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, make_layers
 
 expert_distribution_recorder = ExpertDistributionRecorder()
 
@@ -262,8 +262,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
-        # note: replace config.num_hidden_layers < 80 with True once its available in transformers 4.50.0
-        qkv_bias = getattr(config, "qkv_bias", config.num_hidden_layers < 80)
+        qkv_bias = getattr(config, "qkv_bias", True)
         self.self_attn = Qwen2MoeAttention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
@@ -334,6 +333,7 @@ class Qwen2MoeModel(nn.Module):
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        decoder_layer_type: type[nn.Module] = Qwen2MoeDecoderLayer,
     ) -> None:
         super().__init__()
         self.padding_idx = config.pad_token_id
@@ -344,16 +344,17 @@ class Qwen2MoeModel(nn.Module):
             config.hidden_size,
             prefix=add_prefix("embed_tokens", prefix),
         )
-        self.layers = nn.ModuleList(
-            [
-                Qwen2MoeDecoderLayer(
-                    config,
-                    layer_id,
-                    quant_config=quant_config,
-                    prefix=add_prefix(f"layers.{layer_id}", prefix),
-                )
-                for layer_id in range(config.num_hidden_layers)
-            ]
+        # Use the provided decoder layer type or default to Qwen2MoeDecoderLayer
+        decoder_layer_type = decoder_layer_type or Qwen2MoeDecoderLayer
+        self.layers = make_layers(
+            config.num_hidden_layers,
+            lambda idx, prefix: decoder_layer_type(
+                layer_id=idx,
+                config=config,
+                quant_config=quant_config,
+                prefix=prefix,
+            ),
+            prefix=add_prefix("layers", prefix),
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
