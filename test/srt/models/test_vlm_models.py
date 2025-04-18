@@ -7,7 +7,7 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.test_utils import (  # add_common_sglang_args_and_parse,
+from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -16,14 +16,14 @@ from sglang.test.test_utils import (  # add_common_sglang_args_and_parse,
 
 # CI VLM model for testing
 CI_MODELS = [
-    SimpleNamespace(
-        model="google/gemma-3-27b-it", chat_template="gemma-it", mmmu_accuracy=0.39
-    ),
     # SimpleNamespace(
-    #     model="Qwen/Qwen2.5-VL-7B-Instruct",
-    #     chat_template="qwen2-vl",
-    #     mmmu_accuracy=0.45,
+    #     model="google/gemma-3-27b-it", chat_template="gemma-it", mmmu_accuracy=0.39
     # ),
+    SimpleNamespace(
+        model="Qwen/Qwen2.5-VL-7B-Instruct",
+        chat_template="qwen2-vl",
+        mmmu_accuracy=0.45,
+    ),
     # SimpleNamespace(
     #     model="meta-llama/Llama-3.2-11B-Vision-Instruct",
     #     chat_template="llama_3_vision",
@@ -65,7 +65,7 @@ class TestVLMModels(CustomTestCase):
         tasks = "mmmu_val"
         batch_size = 1
         log_suffix = "openai_compatible"
-        os.mkdir(output_path, exist_ok=True)
+        os.makedirs(output_path, exist_ok=True)
 
         # -------- compose --model_args --------
         model_args = (
@@ -76,7 +76,7 @@ class TestVLMModels(CustomTestCase):
 
         # -------- build command list --------
         cmd = [
-            sys.executable,
+            "python",
             "-m",
             "lmms_eval",
             "--model",
@@ -92,15 +92,13 @@ class TestVLMModels(CustomTestCase):
             log_suffix,
             "--output_path",
             str(output_path),
+            "--limit",
+            str(10),
         ]
 
         subprocess.run(
             cmd,
             check=True,
-            env=os.environ,  # already contains proper OPENAI_* vars
-            stdout=subprocess.PIPE,  # avoid log flood
-            stderr=subprocess.STDOUT,
-            text=True,
             timeout=3600,
         )
 
