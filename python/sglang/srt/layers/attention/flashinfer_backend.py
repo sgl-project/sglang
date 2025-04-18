@@ -100,8 +100,11 @@ class FlashInferAttnBackend(AttentionBackend):
             self.num_wrappers = 1
             self.dispatch_reason = None
 
-        # Qwen2 models require higher flashinfer workspace size
-        if "Qwen2ForCausalLM" in model_runner.model_config.hf_config.architectures:
+        # Qwen2/Qwen3 models require higher flashinfer workspace size
+        if (
+            "Qwen2ForCausalLM" in model_runner.model_config.hf_config.architectures
+            or "Qwen3ForCausalLM" in model_runner.model_config.hf_config.architectures
+        ):
             global_config.flashinfer_workspace_size = 512 * 1024 * 1024
 
         # Allocate buffers
