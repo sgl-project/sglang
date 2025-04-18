@@ -64,7 +64,7 @@ class TestVLMModels(CustomTestCase):
         # -------- fixed settings --------
         model = "openai_compatible"
         tp = 1
-        tasks = "mmmu_val"
+        tasks = "mmmu"
         batch_size = 1
         log_suffix = "openai_compatible"
         os.makedirs(output_path, exist_ok=True)
@@ -137,6 +137,7 @@ class TestVLMModels(CustomTestCase):
 
                 with open(result_file_path, "r") as f:
                     result = json.load(f)
+                    print(f"Result \n: {result}")
                 # Process the result
                 mmmu_accuracy = result["results"]["mmmu_val"]["mmmu_acc,none"]
                 print(f"Model {model.model} achieved accuracy: {mmmu_accuracy:.4f}")
