@@ -519,7 +519,7 @@ class _StatAccumulator(_Accumulator):
         single_pass_global_physical_count: torch.Tensor,
     ):
         # Can optimize if overhead here is large
-        self._buffer_global_physical_count += single_pass_global_physical_count
+        self._buffer_global_physical_count += single_pass_global_physical_count.cpu()
 
     def reset(self):
         self._buffer_global_physical_count[...] = 0
