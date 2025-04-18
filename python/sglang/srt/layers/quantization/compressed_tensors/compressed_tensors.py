@@ -40,6 +40,13 @@ from sglang.srt.layers.quantization.compressed_tensors.utils import (
     should_ignore_layer,
 )
 
+try:
+    import vllm
+
+    VLLM_AVAILABLE = True
+except ImportError:
+    VLLM_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 __all__ = ["CompressedTensorsLinearMethod"]
