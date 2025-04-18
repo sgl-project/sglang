@@ -60,6 +60,23 @@ class TransferInfo:
         )
 
 
+@dataclasses.dataclass
+class TransferStatus:
+    """Used by KV Receiver to know when a transfer is done."""
+
+    # KV chunk IDs that have been received.
+    received_kvs: Set[int] = dataclasses.field(default_factory=set)
+    # Number of kv chunks to expect, will know this after last chunk is received.
+    num_kvs_expected: Optional[int] = None
+    # Whether aux data has been received.
+    received_aux: bool = False
+
+    def is_done(self):
+        if self.num_kvs_expected is None:
+            return False
+        return self.num_kvs_expected == len(self.received_kvs) and self.received_aux
+
+
 class NixlKVManager(BaseKVManager):
     def __init__(
         self,
@@ -94,11 +111,9 @@ class NixlKVManager(BaseKVManager):
             self._register_to_bootstrap()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.connection_pool: Dict[str, Dict[str, Union[str, int]]] = {}
-            # Map of room to kv chunk IDs that have been received.
-            self.received_kvs: Dict[int, Set[int]] = defaultdict(set)
-            # Map of room to number of kv chunks to expect, will know this after last chunk is received.
-            self.num_kvs_expected: Dict[int, int] = {}
-            self.received_aux: Dict[int, bool] = {}
+            self.transfer_statuses: Dict[int, TransferStatus] = defaultdict(
+                TransferStatus
+            )
         else:
             raise ValueError(
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
@@ -264,24 +279,16 @@ class NixlKVManager(BaseKVManager):
                 if components[1] == "kv":
                     chunk_id = int(components[2])
                     is_last = bool(components[3])
-                    self.received_kvs[room].add(chunk_id)
+                    self.transfer_statuses[room].received_kvs.add(chunk_id)
                     if is_last:
-                        self.num_kvs_expected[room] = chunk_id + 1
+                        self.transfer_statuses[room].num_kvs_expected = chunk_id + 1
                 elif components[1] == "aux":
-                    self.received_aux[room] = True
+                    self.transfer_statuses[room].received_aux = True
 
     def check_transfer_done(self, room: int):
-        if room not in self.num_kvs_expected:
+        if room not in self.transfer_statuses:
             return False
-        if self.num_kvs_expected[room] == len(
-            self.received_kvs[room]
-        ) and self.received_aux.get(room, False):
-            # Cleanup
-            del self.num_kvs_expected[room]
-            del self.received_kvs[room]
-            del self.received_aux[room]
-            return True
-        return False
+        return self.transfer_statuses[room].is_done()
 
     def _register_to_bootstrap(self):
         """Register KVSender to bootstrap server via HTTP POST."""
