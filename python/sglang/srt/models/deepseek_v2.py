@@ -19,9 +19,8 @@
 import logging
 import os
 from dataclasses import dataclass
-from enum import Enum, auto
-from functools import partial
 from enum import Enum, IntEnum, auto
+from functools import partial
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
@@ -91,7 +90,6 @@ from sglang.srt.utils import (
     is_cuda_available,
     is_hip,
 )
-from sglang.srt.utils import DeepEPMode, add_prefix, is_cuda, is_hip
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -106,12 +104,10 @@ if _is_hip:
         decode_attention_fwd_grouped_rope,
     )
 
-
 logger = logging.getLogger(__name__)
 
 
 class AttnForwardMethod(IntEnum):
-
     # Use multi-head attention
     MHA = auto()
 
@@ -360,7 +356,7 @@ class DeepseekV2MoE(nn.Module):
             expected_m,
         ) = self.deepep_dispatcher.dispatch_b()
 
-        final_hidden_states = self._forward_deepep_expert(
+        final_hidden_states = self.experts(
             hidden_states=hidden_states,
             reorder_topk_ids=reorder_topk_ids,
             seg_indptr=seg_indptr,
@@ -425,35 +421,13 @@ class DeepseekV2MoE(nn.Module):
             forward_mode=forward_mode,
         )
 
-    def _forward_deepep_expert(
-        self,
-        hidden_states,
-        reorder_topk_ids,
-        seg_indptr,
-        masked_m,
-        expected_m,
-        forward_mode,
-    ):
-        TODO_move_routed_scaling_factor
-        return (
-            self.experts(
-                hidden_states=hidden_states,
-                reorder_topk_ids=reorder_topk_ids,
-                seg_indptr=seg_indptr,
-                masked_m=masked_m,
-                expected_m=expected_m,
-                forward_mode=forward_mode,
-            )
-            * self.routed_scaling_factor
-        )
-
     # ----------------------------------------- TBO-related --------------------------------------------
 
     def _forward_tbo_op_gate(self, state):
         state.router_logits = self.gate(state.hidden_states_after_post_attn_ln)
 
     def _forward_tbo_op_mlp(self, state):
-        state.expert_output_hidden_states = self._forward_deepep_expert(
+        state.expert_output_hidden_states = self.experts(
             hidden_states=state.hidden_states_from_dispatch,
             reorder_topk_ids=state.reorder_topk_ids_from_dispatch,
             seg_indptr=state.seg_indptr_from_dispatch,
@@ -498,6 +472,7 @@ class DeepseekV2MoE(nn.Module):
     def _forward_tbo_op_combine_b(self, state):
         dispatcher = self.tbo_deepep_dispatchers[state.tbo_subbatch_index]
         state.hidden_states_from_combine = dispatcher.combine_b()
+        state.hidden_states_from_combine *= self.routed_scaling_factor
 
     def _forward_tbo_op_shared(self, state):
         state.shared_output = self._forward_deepep_shared_output(
