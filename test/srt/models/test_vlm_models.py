@@ -60,11 +60,12 @@ class TestVLMModels(CustomTestCase):
         """
         Evaluate a VLM on the MMMU validation set with lmms‑eval.
         Only `model_version` (checkpoint) and `chat_template` vary;
+        We are focusing only on the validation set due to resource constraints.
         """
         # -------- fixed settings --------
         model = "openai_compatible"
         tp = 1
-        tasks = "mmmu"
+        tasks = "mmmu_val"
         batch_size = 1
         log_suffix = "openai_compatible"
         os.makedirs(output_path, exist_ok=True)
