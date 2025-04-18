@@ -36,6 +36,7 @@ if _is_cuda:
     )
 
 if _is_hip:
+
     def rmsnorm(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
         return aiter.rms_norm(x, w, eps)
 
@@ -47,6 +48,7 @@ if _is_hip:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         aiter.rmsnorm2d_fwd_with_add(x, x, residual, residual, w, eps)
         return x, residual
+
 
 class RMSNorm(CustomOp):
     def __init__(
