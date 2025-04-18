@@ -43,7 +43,7 @@ include(FetchContent)
 FetchContent_Declare(
     repo-cutlass
     GIT_REPOSITORY https://github.com/NVIDIA/cutlass
-    GIT_TAG        df8a550d3917b0e97f416b2ed8c2d786f7f686a3
+    GIT_TAG        5e497243f7ad13a2aa842143f9b10bbb23d98292
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-cutlass)
@@ -58,8 +58,8 @@ FetchContent_Populate(repo-deepgemm)
 # flashinfer
 FetchContent_Declare(
     repo-flashinfer
-    GIT_REPOSITORY https://github.com/sgl-project/flashinfer
-    GIT_TAG        sgl-kernel
+    GIT_REPOSITORY https://github.com/flashinfer-ai/flashinfer.git
+    GIT_TAG        9220fb3443b5a5d274f00ca5552f798e225239b7
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-flashinfer)

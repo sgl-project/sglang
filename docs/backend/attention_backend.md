@@ -1,6 +1,6 @@
 # Attention Backend
 
-## Supporting matrix for different attention backend
+## Supporting matrix for different attention backends
 
 | **Backend**              | **Page Size > 1** | **Spec Decoding** | **MLA** | **Sliding Window** | **MultiModal** |
 |--------------------------|-------------------|-------------------|--------|--------------------|------------|
@@ -12,7 +12,7 @@
 
 ## User guide
 
-#### Launch command for different attention backend.
+#### Launch command for different attention backends.
 
 - FlashInfer (Default for Non-Hopper Machines, e.g., A100, A40)
 ```bash
