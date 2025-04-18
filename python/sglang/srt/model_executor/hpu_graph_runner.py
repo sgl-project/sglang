@@ -26,7 +26,9 @@ from typing import TYPE_CHECKING
 import torch
 import tqdm
 
+from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -255,23 +257,31 @@ class HPUGraphRunner:
         self.model_runner = model_runner
         import habana_frameworks.torch as htorch
         import vllm_hpu_extension.environment as environment
+        from vllm_hpu_extension.flags import enabled_flags
 
         environment.runtime_params["model_type"] = (
             model_runner.model_config.hf_config.model_type
         )
+        
+        assert "fsdpa" in enabled_flags(), "Prefill with FusedSDPA is not supported."
 
-        self.model = (
-            htorch.hpu.wrap_in_hpu_graph(
+        self.is_lazy = 1 if htorch.utils.internal.is_lazy() else 0
+        if self.is_lazy:
+            self.model = htorch.hpu.wrap_in_hpu_graph(
                 HPUAdapter(self.model_runner.model, self.model_runner.dtype),
                 disable_tensor_cache=True,
             )
-            if htorch.utils.internal.is_lazy()
-            else HPUAdapter(self.model_runner.model, self.model_runner.dtype)
-        )
+        else:
+            self.regional_compilation_layers_list = [
+                RMSNorm, VocabParallelEmbedding
+            ]
+            self.model = HPUAdapter(self.model_runner.model, self.model_runner.dtype)
+            self._regional_compilation(self.model)
+            
         # Capture
         if not SKIP_WARMUP:
             try:
-                with self.model_capture_mode():
+                with self.model_capture_mode(), torch._dynamo.utils.disable_cache_limit():
                     logger.info(
                         "Begin to capture hpu graph, you can use `export SGLANG_HPU_SKIP_WARMUP=true` to skip this step."
                     )
@@ -285,6 +295,26 @@ class HPUGraphRunner:
             except RuntimeError as e:
                 raise Exception(f"Capture hpu graph failed: {e}\n")
 
+    def _regional_compilation(self,
+                              module,
+                              parent_module=None,
+                              module_name=None):
+        if isinstance(module, torch.nn.ModuleList):
+            for children_name, children_module in module.named_children():
+                self._compile_region(module, children_name, children_module)
+        elif any(
+                isinstance(module, layer)
+                for layer in self.regional_compilation_layers_list):
+            self._compile_region(parent_module, module_name, module)
+        else:
+            for children_name, children_module in module.named_children():
+                self._regional_compilation(children_module, module,
+                                           children_name)
+
+    def _compile_region(self, model, name, module):
+        module = torch.compile(module, backend='hpu_backend', dynamic=False)
+        setattr(model, name, module)
+        
     @contextmanager
     def model_capture_mode(self):
         yield
