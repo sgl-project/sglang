@@ -404,44 +404,27 @@ class MoeWNA16Method:
             routed_scaling_factor=routed_scaling_factor,
         )
 
-        import sys
-        if 'marlin_moe' not in sys.environ:
-            weight_bits = self.quant_config.weight_bits
-            has_zp = self.quant_config.has_zp
+        weight_bits = self.quant_config.weight_bits
+        has_zp = self.quant_config.has_zp
 
-            return fused_experts(
-                x,
-                layer.w13_qweight,
-                layer.w2_qweight,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                inplace=inplace,
-                apply_router_weight_on_input=apply_router_weight_on_input,
-                use_int4_w4a16=weight_bits == 4,
-                use_int8_w8a16=weight_bits == 8,
-                w1_scale=layer.w13_scales,
-                w2_scale=layer.w2_scales,
-                w1_zp=layer.w13_qzeros if has_zp else None,
-                w2_zp=layer.w2_qzeros if has_zp else None,
-                block_shape=[0, layer.group_size],
-                no_combine=no_combine,
-            )
-        else:
-            from sgl_kernel import fused_moe
-            return fused_moe(
-                x,
-                layer.w13_qweight,
-                layer.w2_qweight,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                num_bits=weight_bits,
-                w1_scale=layer.w13_scales,
-                w2_scale=layer.w2_scales,
-                score=router_logits,
-                w1_zp=layer.w13_qzeros if has_zp else None,
-                w2_zp=layer.w2_qzeros if has_zp else None
-            )
-
+        return fused_experts(
+            x,
+            layer.w13_qweight,
+            layer.w2_qweight,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            inplace=inplace,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            use_int4_w4a16=weight_bits == 4,
+            use_int8_w8a16=weight_bits == 8,
+            w1_scale=layer.w13_scales,
+            w2_scale=layer.w2_scales,
+            w1_zp=layer.w13_qzeros if has_zp else None,
+            w2_zp=layer.w2_qzeros if has_zp else None,
+            block_shape=[0, layer.group_size],
+            no_combine=no_combine,
+        )
+        
     @staticmethod
     def get_weight_loader(layer, weight_loader):
 
@@ -557,11 +540,3 @@ class MoeWNA16Method:
                 weight_loader(param, loaded_weight, weight_name, shard_id, expert_id)
 
         return moe_wna16_weight_loader
-
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        weight = layer.weight
-
-        import sys
-        if 'marlin_moe' in sys.environ:
-            layer.w13_qweight, layer.w13_scales = marlin_weights_transform(layer.w13_qweight, layer.w13_scales, self.quant_config.weight_bits, self.quant_config.group_size)
-            layer.w2_qweight, layer.w2_scales = marlin_weights_transform(layer.w2_qweight, layer.w2_scales, self.quant_config.weight_bits, self.quant_config.group_size)

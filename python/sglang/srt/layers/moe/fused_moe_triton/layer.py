@@ -306,6 +306,7 @@ class FusedMoE(torch.nn.Module):
         self.reduce_results = reduce_results
         self.renormalize = renormalize
         self.use_grouped_topk = use_grouped_topk
+        self.hidden_size = hidden_size
         if self.use_grouped_topk:
             assert num_expert_group is not None and topk_group is not None
         self.num_expert_group = num_expert_group

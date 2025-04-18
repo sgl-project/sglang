@@ -211,6 +211,17 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "top_p_sampling_from_probs(Tensor probs, Tensor output, Tensor? maybe_indices, Tensor? "
       "maybe_top_p_arr, float top_p_val, bool deterministic, Generator? gen) -> ()");
   m.impl("top_p_sampling_from_probs", torch::kCUDA, &top_p_sampling_from_probs);
+  
+  m.def(
+      "marlin_gemm_moe(Tensor! a, Tensor! b_q_weights, Tensor! sorted_ids, "
+      "Tensor! topk_weights, Tensor! topk_ids, Tensor! b_scales, Tensor! "
+      "b_zeros, Tensor! g_idx, Tensor! perm, Tensor! workspace, "
+      "int b_q_type, SymInt size_m, "
+      "SymInt size_n, SymInt size_k, bool is_k_full, int num_experts, int "
+      "topk, "
+      "int moe_block_size, bool replicate_input, bool apply_weights)"
+      " -> Tensor");
+  m.impl("marlin_gemm_moe", torch::kCUDA, &marlin_gemm_moe);  
   m.def(
     "moe_wna16_marlin_gemm(Tensor! a, Tensor? c_or_none,"
     "Tensor! b_q_weight, Tensor! b_scales, Tensor? b_zeros_or_none,"
