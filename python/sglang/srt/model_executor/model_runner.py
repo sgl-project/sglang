@@ -39,7 +39,6 @@ from sglang.srt.distributed.parallel_state import (
     get_world_group,
     monkey_patch_vllm_parallel_state,
 )
-from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
@@ -1094,7 +1093,9 @@ class ModelRunner:
         self, forward_batch: ForwardBatch, skip_attn_backend_init: bool = False
     ) -> LogitsProcessorOutput:
         self.forward_pass_id += 1
-        with get_global_expert_distribution_recorder().with_forward_pass(self.forward_pass_id):
+        with get_global_expert_distribution_recorder().with_forward_pass(
+            self.forward_pass_id
+        ):
             with fine_grained_benchmark.maybe_benchmark(
                 forward_batch, self.tp_rank, self.forward_pass_id
             ):

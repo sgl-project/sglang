@@ -3,8 +3,8 @@ from __future__ import annotations
 import hashlib
 from enum import Enum, auto
 
-from sglang.srt.managers.expert_location import ExpertLocationMetadata
 from sglang.srt.distributed import get_tensor_model_parallel_rank
+from sglang.srt.managers.expert_location import ExpertLocationMetadata
 
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
