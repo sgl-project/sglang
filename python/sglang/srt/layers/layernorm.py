@@ -36,10 +36,10 @@ if _is_cuda:
     )
 
 if _is_hip:
-    def rocm_aiter_rms_norm(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
+    def rmsnorm(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
         return aiter.rms_norm(x, w, eps)
 
-    def rocm_aiter_fused_add_rms_norm(
+    def fused_add_rmsnorm(
         x: torch.Tensor,
         residual: torch.Tensor,
         w: torch.Tensor,
@@ -63,12 +63,6 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        if _is_hip:
-            if residual is not None:
-                return rocm_aiter_fused_add_rms_norm(
-                    x, residual, self.weight.data, self.variance_epsilon
-                )
-            return rocm_aiter_rms_norm(x, self.weight.data, self.variance_epsilon)
 
         if residual is not None:
             fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
