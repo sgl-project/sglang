@@ -206,7 +206,7 @@ async def handle_generate_request(request_data: dict):
     modified_request.update(
         {
             "bootstrap_host": hostname,
-            "bootstrap_room": random.randint(0, 2**63 - 1),
+            "bootstrap_room": _generate_bootstrap_room(),
         }
     )
 
@@ -219,6 +219,8 @@ async def handle_generate_request(request_data: dict):
             modified_request, prefill_server, decode_server
         )
 
+def _generate_bootstrap_room():
+    return random.randint(0, 2**63 - 1)
 
 @app.get("/v1/models")
 async def get_models():
