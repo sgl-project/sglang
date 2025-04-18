@@ -1605,6 +1605,13 @@ class DeepseekV2Model(nn.Module):
                     positions, hidden_states, forward_batch, residual
                 )
 
+            # if i == 2:
+            #     print(f"hi [{get_tensor_model_parallel_rank()}, {self.__class__.__name__}] forward after-layer-{i} "
+            #           f"{forward_batch.tbo_split_seq_index=} "
+            #           f"{hidden_states[:, :3] if hidden_states is not None else None=} "
+            #           f"{residual[:, :3] if residual is not None else None=}"
+            #           )
+
         hidden_states, residual = self._forward_tbo_layers(
             positions=positions,
             forward_batch=forward_batch,
@@ -1717,9 +1724,13 @@ class DeepseekV2ForCausalLM(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-        # print(f"hi [{get_tensor_model_parallel_rank()}, {self.__class__.__name__}] forward start {input_ids=}")
+        # print(
+        #     f"hi [{get_tensor_model_parallel_rank()}, {self.__class__.__name__}] forward start {forward_batch.tbo_split_seq_index=} {input_ids=} {positions=}")
 
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
+
+        # print(
+        #     f"hi [{get_tensor_model_parallel_rank()}, {self.__class__.__name__}] forward end {forward_batch.tbo_split_seq_index=} {hidden_states[:, :3] if hidden_states is not None else None=}")
 
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
