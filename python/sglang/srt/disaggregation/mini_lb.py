@@ -5,7 +5,6 @@ Minimal HTTP load balancer for prefill and decode servers for testing.
 import asyncio
 import os
 import random
-import time
 import urllib
 from itertools import chain
 
@@ -203,12 +202,22 @@ async def handle_generate_request(request_data: dict):
     parsed_url = urllib.parse.urlparse(prefill_server)
     hostname = parsed_url.hostname
     modified_request = request_data.copy()
-    modified_request.update(
-        {
-            "bootstrap_host": hostname,
-            "bootstrap_room": _generate_bootstrap_room(),
-        }
-    )
+
+    batch_size = _get_request_batch_size(modified_request)
+    if batch_size is not None:
+        modified_request.update(
+            {
+                "bootstrap_host": [hostname] * batch_size,
+                "bootstrap_room": [_generate_bootstrap_room() for _ in batch_size],
+            }
+        )
+    else:
+        modified_request.update(
+            {
+                "bootstrap_host": hostname,
+                "bootstrap_room": _generate_bootstrap_room(),
+            }
+        )
 
     if request_data.get("stream", False):
         return await load_balancer.generate_stream(
@@ -219,8 +228,15 @@ async def handle_generate_request(request_data: dict):
             modified_request, prefill_server, decode_server
         )
 
+
 def _generate_bootstrap_room():
-    return random.randint(0, 2**63 - 1)
+    return random.randint(0, 2 ** 63 - 1)
+
+
+# We may utilize `GenerateReqInput`'s logic after PR 4850
+def _get_request_batch_size(request):
+    return TODO
+
 
 @app.get("/v1/models")
 async def get_models():
