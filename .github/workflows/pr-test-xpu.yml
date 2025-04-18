@@ -27,7 +27,7 @@ jobs:
 
       - name: Build Docker image
         run: |
-          echo "[Placeholder] to build docker images"
+          docker build -f ${{ github.workspace }}/.github/workflows/pr-test-xpu.yml -t sglang_xpu:u2410 .
 
       - name: Run container
         run: |
