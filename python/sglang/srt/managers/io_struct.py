@@ -96,8 +96,8 @@ class GenerateReqInput:
     return_hidden_states: bool = False
 
     # For disaggregated inference
-    bootstrap_host: Optional[str] = None
-    bootstrap_room: Optional[int] = None
+    bootstrap_host: Optional[Union[List[str], str]] = None
+    bootstrap_room: Optional[Union[List[int], int]] = None
 
     def normalize_batch_and_arguments(self):
         """
