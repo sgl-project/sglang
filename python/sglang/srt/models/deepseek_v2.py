@@ -20,8 +20,6 @@ import logging
 import os
 import re
 from dataclasses import dataclass
-from enum import Enum, auto
-from dataclasses import dataclass
 from enum import Enum, IntEnum, auto
 from typing import Any, Dict, Iterable, Optional, Tuple
 
@@ -56,8 +54,8 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, EPMoE
-from sglang.srt.layers.moe.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPDispatcher
+from sglang.srt.layers.moe.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -1450,85 +1448,85 @@ class DeepseekV2ForCausalLM(nn.Module):
 
         # Perform post-processing after loading weights
         if enable_mla_postprocess:
-	        for layer_id in range(self.config.num_hidden_layers):
-	            self_attn = self.model.layers[layer_id].self_attn
-	            if hasattr(self_attn.kv_b_proj, "qweight"):
-	                # AWQ compatible
-	                if _is_cuda:
-	                    w = awq_dequantize(
-	                        self_attn.kv_b_proj.qweight,
-	                        self_attn.kv_b_proj.scales,
-	                        self_attn.kv_b_proj.qzeros,
-	                    ).T
-	                else:
-	                    w = awq_dequantize(
-	                        self_attn.kv_b_proj.qweight,
-	                        self_attn.kv_b_proj.scales,
-	                        self_attn.kv_b_proj.qzeros,
-	                        0,
-	                        0,
-	                        0,
-	                    ).T
-	            else:
-	                w = self_attn.kv_b_proj.weight
-	            # NOTE(HandH1998): Since `bmm_fp8` only supports per-tensor scale, we have to requantize `self_attn.kv_b_proj`.
-	            # This may affect the accuracy of fp8 model.
-	            if w.dtype in (
-	                torch.float8_e4m3fn,
-	                torch.float8_e4m3fnuz,
-	            ):
-	                if hasattr(self.quant_config, "weight_block_size"):
-	                    weight_block_size = self.quant_config.weight_block_size
-	                    if weight_block_size is not None:
-	                        assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
-	                        if _is_hip:
-	                            weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
-	                                weight=w,
-	                                weight_scale=self_attn.kv_b_proj.weight_scale_inv,
-	                                input_scale=None,
-	                            )
-	                        else:
-	                            weight = w
-	                            weight_scale = self_attn.kv_b_proj.weight_scale_inv
+            for layer_id in range(self.config.num_hidden_layers):
+                self_attn = self.model.layers[layer_id].self_attn
+                if hasattr(self_attn.kv_b_proj, "qweight"):
+                    # AWQ compatible
+                    if _is_cuda:
+                        w = awq_dequantize(
+                            self_attn.kv_b_proj.qweight,
+                            self_attn.kv_b_proj.scales,
+                            self_attn.kv_b_proj.qzeros,
+                        ).T
+                    else:
+                        w = awq_dequantize(
+                            self_attn.kv_b_proj.qweight,
+                            self_attn.kv_b_proj.scales,
+                            self_attn.kv_b_proj.qzeros,
+                            0,
+                            0,
+                            0,
+                        ).T
+                else:
+                    w = self_attn.kv_b_proj.weight
+                # NOTE(HandH1998): Since `bmm_fp8` only supports per-tensor scale, we have to requantize `self_attn.kv_b_proj`.
+                # This may affect the accuracy of fp8 model.
+                if w.dtype in (
+                    torch.float8_e4m3fn,
+                    torch.float8_e4m3fnuz,
+                ):
+                    if hasattr(self.quant_config, "weight_block_size"):
+                        weight_block_size = self.quant_config.weight_block_size
+                        if weight_block_size is not None:
+                            assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
+                            if _is_hip:
+                                weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                                    weight=w,
+                                    weight_scale=self_attn.kv_b_proj.weight_scale_inv,
+                                    input_scale=None,
+                                )
+                            else:
+                                weight = w
+                                weight_scale = self_attn.kv_b_proj.weight_scale_inv
 
-	                        w, scale = block_quant_to_tensor_quant(
-	                            weight, weight_scale, weight_block_size
-	                        )
-	                        self_attn.w_scale = scale
-	                else:
-	                    weight = w
-	                    weight_scale = self_attn.kv_b_proj.weight_scale
-	                    w, scale = channel_quant_to_tensor_quant(weight, weight_scale)
-	                    self_attn.w_scale = scale
+                            w, scale = block_quant_to_tensor_quant(
+                                weight, weight_scale, weight_block_size
+                            )
+                            self_attn.w_scale = scale
+                    else:
+                        weight = w
+                        weight_scale = self_attn.kv_b_proj.weight_scale
+                        w, scale = channel_quant_to_tensor_quant(weight, weight_scale)
+                        self_attn.w_scale = scale
 
-	            if w.dtype == torch.int8:
-	                if hasattr(self.quant_config, "weight_block_size"):
-	                    # block-wise int8 need it
-	                    weight_block_size = self.quant_config.weight_block_size
-	                    if weight_block_size is not None:
-	                        assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
-	                        weight = w
-	                        weight_scale = self_attn.kv_b_proj.weight_scale_inv
-	                        w = int8_block_dequant(
-	                            weight, weight_scale, weight_block_size
-	                        ).to(torch.bfloat16)
-	                else:
-	                    # channel-wise int8 need it
-	                    w = w.to(torch.bfloat16) * self_attn.kv_b_proj.weight_scale.to(
-	                        torch.bfloat16
-	                    )
-	            w_kc, w_vc = w.unflatten(
-	                0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
-	            ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
-	            self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
-	            self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
-	            if (
-	                hasattr(self_attn.kv_b_proj, "weight_scale")
-	                and self_attn.w_scale is None
-	            ):
-	                self_attn.w_scale = self_attn.kv_b_proj.weight_scale
-	                if _is_hip:
-	                    self_attn.w_scale *= 2.0
+                if w.dtype == torch.int8:
+                    if hasattr(self.quant_config, "weight_block_size"):
+                        # block-wise int8 need it
+                        weight_block_size = self.quant_config.weight_block_size
+                        if weight_block_size is not None:
+                            assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
+                            weight = w
+                            weight_scale = self_attn.kv_b_proj.weight_scale_inv
+                            w = int8_block_dequant(
+                                weight, weight_scale, weight_block_size
+                            ).to(torch.bfloat16)
+                    else:
+                        # channel-wise int8 need it
+                        w = w.to(torch.bfloat16) * self_attn.kv_b_proj.weight_scale.to(
+                            torch.bfloat16
+                        )
+                w_kc, w_vc = w.unflatten(
+                    0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
+                ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
+                self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
+                self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
+                if (
+                    hasattr(self_attn.kv_b_proj, "weight_scale")
+                    and self_attn.w_scale is None
+                ):
+                    self_attn.w_scale = self_attn.kv_b_proj.weight_scale
+                    if _is_hip:
+                        self_attn.w_scale *= 2.0
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
