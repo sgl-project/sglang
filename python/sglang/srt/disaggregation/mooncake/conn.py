@@ -107,6 +107,7 @@ class MooncakeKVManager(BaseKVManager):
         self.dist_init_addr = server_args.dist_init_addr
         self.tp_size = server_args.tp_size
         self.dp_size = server_args.dp_size
+        self.enable_dp_attention = server_args.enable_dp_attention
         if not server_args.enable_dp_attention and server_args.dp_size != 1:
             raise ValueError(
                 "If dp_attention is not enabled, dp size must be 1 in disaggregation mode."
@@ -409,11 +410,20 @@ class MooncakeKVReceiver(BaseKVReceiver):
         self.session_id = self.kv_mgr.get_session_id()
         self.kv_mgr.update_status(bootstrap_room, KVPoll.Bootstrapping)
 
-        if self.bootstrap_addr not in self.kv_mgr.prefill_dp_size_table:
+        if not self.kv_mgr.enable_dp_attention:
+            # We assume dp_attention should be activated simultaneously for
+            # both prefill role and decode role. If the decode instance does
+            # not enable dp_attention, then dp_attention is not enabled on the
+            # prefill instance as well. Therefore, we should skip questioning
+            # the prefill dp size to reduce bootstrap overhead.
+            self.prefill_dp_size = 1
+        elif self.bootstrap_addr not in self.kv_mgr.prefill_dp_size_table:
             self.prefill_dp_size, tp_size_per_dp_rank = (
                 self._get_prefill_dp_size_from_server()
             )
-            # Note(shangming): might need to assert tp_size_per_dp_rank == int(self.kv_mgr.tp_size / self.kv_mgr.dp_size)
+            # Currently, we don't allow prefill instance and decode instance to
+            # have different TP sizes per DP rank.
+            assert tp_size_per_dp_rank == int(self.kv_mgr.tp_size / self.kv_mgr.dp_size)
             if self.prefill_dp_size is None:
                 logger.error(
                     f"Could not fetch prefill dp_size for bootstrap_addr: {self.bootstrap_addr}"
