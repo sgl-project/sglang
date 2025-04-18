@@ -9,10 +9,10 @@ import torch
 
 try:
     from vllm.model_executor.layers.quantization.aqlm import AQLMConfig
-    from vllm.model_executor.layers.quantization.awq_marlin import (
-        AWQMarlinConfig,
-        AWQMoEMethod,
-    )
+    # from vllm.model_executor.layers.quantization.awq_marlin import (
+    #     AWQMarlinConfig,
+    #     AWQMoEMethod,
+    # )
     from vllm.model_executor.layers.quantization.bitsandbytes import BitsAndBytesConfig
     from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (
         CompressedTensorsW8A8Fp8MoEMethod,
@@ -66,7 +66,9 @@ from sglang.srt.layers.quantization.modelopt_quant import (
 from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
 from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8Config
 from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
-
+from sglang.srt.layers.quantization.awq_marlin import AWQMarlinConfig, AWQMoEMethod
+import logging
+logger = logging.getLogger(__name__)
 # Base quantization methods that don't depend on vllm
 BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "fp8": Fp8Config,
@@ -111,7 +113,7 @@ def get_quantization_config(quantization: str) -> Type[QuantizationConfig]:
             f"{quantization} quantization requires some operators from vllm. "
             "Pleaes install vllm by `pip install vllm==0.7.2`"
         )
-
+    logger.info("quantization: %s", quantization)
     return QUANTIZATION_METHODS[quantization]
 
 

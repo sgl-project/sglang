@@ -170,8 +170,6 @@ def marlin_fused_moe(N, E, K, a, w1, w2, num_bits, group_size, act_order, score,
         score,
         topk_weights,
         topk_ids,
-        global_num_experts=E,
-        expert_map=e_map,
         g_idx1=g_idx1,
         g_idx2=g_idx2,
         sort_indices1=sort_indices1,
@@ -183,7 +181,7 @@ def marlin_fused_moe(N, E, K, a, w1, w2, num_bits, group_size, act_order, score,
     return marlin_output, torch_output
 
 class TestW8A8Int8FusedMoE(unittest.TestCase):
-    DTYPES = [torch.bfloat16]
+    DTYPES = [torch.float16]
     M = [1, 16]
     N = [128]
     K = [256]
@@ -211,6 +209,8 @@ class TestW8A8Int8FusedMoE(unittest.TestCase):
         with torch.inference_mode():
             marlin_out, ref_out = marlin_fused_moe(N=N, E=E, K=K, a=a, w1=w1_fp16, w2=w2_fp16, num_bits=num_bits, group_size=-1, act_order=False, score=score, topk=topk, )
         # Check results
+        print(f"marlin_out: {marlin_out}")
+        print(f"ref_out: {ref_out}")
         self.assertTrue(
             torch.mean(torch.abs(marlin_out.to(torch.float32) - ref_out.to(torch.float32)))
             / torch.mean(torch.abs(ref_out.to(torch.float32)))
