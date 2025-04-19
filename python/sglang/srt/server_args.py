@@ -1125,7 +1125,7 @@ class ServerArgs:
             "--n-share-experts-fusion",
             type=int,
             default=0,
-            help="The number of shared_experts need to be replica to fuse with normal experts in deepseek v3/r1 "
+            help="The number of shared_experts need to be replicated to fuse with normal experts in deepseek v3/r1 "
             "we use tp_size by default.",
         )
         parser.add_argument(
