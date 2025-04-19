@@ -1349,7 +1349,6 @@ class DeepseekV2ForCausalLM(nn.Module):
             if (
                 self.config.architectures[0] != "DeepseekV3ForCausalLM"
                 or self.config.n_routed_experts != 256
-                or self.config.routed_scaling_factor != 2.5
             ):
                 self.n_share_experts_fusion = 0
                 global_server_args_dict["n_share_experts_fusion"] = 0
