@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import triton
 import triton.language as tl
+
 from sglang.srt.utils import (
     direct_register_custom_op,
     get_bool_env_var,
@@ -60,6 +61,7 @@ if _is_cuda:
 logger = logging.getLogger(__name__)
 
 if supports_custom_op():
+
     def deep_gemm_fp8_fp8_bf16_nt(
         A: torch.Tensor,
         As: torch.Tensor,
@@ -72,7 +74,6 @@ if supports_custom_op():
         with _log_jit_build(M, N, K):
             deep_gemm.gemm_fp8_fp8_bf16_nt((A, As), (B, Bs), C)
 
-
     def deep_gemm_fp8_fp8_bf16_nt_fake(
         A: torch.Tensor,
         As: torch.Tensor,
@@ -81,7 +82,6 @@ if supports_custom_op():
         C: torch.Tensor,
     ) -> None:
         return
-
 
     direct_register_custom_op(
         op_name="deep_gemm_fp8_fp8_bf16_nt",
@@ -895,16 +895,18 @@ def _per_tensor_quant_mla_fp8_stage2(
 
 
 def per_tensor_quant_mla_fp8(
-    x: torch.Tensor,
-    x_s_out: torch.Tensor,
-    eps: float = 1e-12
+    x: torch.Tensor, x_s_out: torch.Tensor, eps: float = 1e-12
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     This function quantizes input values to float8 values with tensor-wise quantization
     and specialized for mla absorbed case.
     """
     assert x.dim() == 3, "`x` is not a 3d-tensor"
-    assert x_s_out.shape == (1,) and x_s_out.dtype == torch.float32 and x_s_out.device == x.device
+    assert (
+        x_s_out.shape == (1,)
+        and x_s_out.dtype == torch.float32
+        and x_s_out.device == x.device
+    )
 
     x_q = x.new_empty(x.size(), dtype=_fp8_type)
 
