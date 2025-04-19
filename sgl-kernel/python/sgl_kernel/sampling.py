@@ -225,7 +225,7 @@ def top_k_top_p_sampling_from_probs(
     deterministic: bool = True,
     generator: Optional[torch.Generator] = None,
     check_nan: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     r"""Adapt from https://github.com/flashinfer-ai/flashinfer/flashinfer/sampling.py
     Fused GPU kernel for top-k and top-p sampling from probabilities,
 
