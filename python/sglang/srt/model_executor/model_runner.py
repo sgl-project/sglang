@@ -80,7 +80,6 @@ from sglang.srt.utils import (
     is_flashinfer_available,
     is_hip,
     is_hopper_with_cuda_12_3,
-    is_no_spec_infer_or_topk_one,
     monkey_patch_p2p_access_check,
     monkey_patch_vllm_gguf_config,
     set_cpu_offload_max_bytes,
@@ -229,9 +228,8 @@ class ModelRunner:
         if server_args.attention_backend is None:
             # By default, use flashinfer for non-mla attention and triton for mla attention
             if not self.use_mla_backend:
-                if (
-                    is_hopper_with_cuda_12_3()
-                    and is_fa3_default_architecture(self.model_config.hf_config)
+                if is_hopper_with_cuda_12_3() and is_fa3_default_architecture(
+                    self.model_config.hf_config
                 ):
                     server_args.attention_backend = "fa3"
                 else:
