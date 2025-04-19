@@ -64,7 +64,11 @@ class TpModelWorker:
                 else server_args.speculative_draft_model_path
             ),
             trust_remote_code=server_args.trust_remote_code,
-            revision=server_args.revision,
+            revision=(
+                server_args.revision
+                if not is_draft_worker
+                else server_args.speculative_draft_model_revision
+            ),
             context_length=server_args.context_length,
             model_override_args=server_args.json_model_override_args,
             is_embedding=server_args.is_embedding,
