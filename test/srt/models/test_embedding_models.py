@@ -13,21 +13,18 @@
 # ==============================================================================
 
 import multiprocessing as mp
-import random
 import unittest
 
 import torch
 from transformers import AutoConfig, AutoTokenizer
 
 from sglang.test.runners import DEFAULT_PROMPTS, HFRunner, SRTRunner
-from sglang.test.test_utils import CustomTestCase, get_similarities, is_in_ci
+from sglang.test.test_utils import CustomTestCase, get_similarities
 
 MODELS = [
     ("Alibaba-NLP/gte-Qwen2-1.5B-instruct", 1, 1e-5),
     ("intfloat/e5-mistral-7b-instruct", 1, 1e-5),
     ("marco/mcdse-2b-v1", 1, 1e-5),
-    # Temporarily disable before this model is fixed
-    # ("jason9693/Qwen2.5-1.5B-apeach", 1, 1e-5),
 ]
 TORCH_DTYPES = [torch.float16]
 
@@ -94,12 +91,7 @@ class TestEmbeddingModels(CustomTestCase):
                 ), "embeddings are not all close"
 
     def test_prefill_logits(self):
-        models_to_test = MODELS
-
-        if is_in_ci():
-            models_to_test = [random.choice(MODELS)]
-
-        for model, tp_size, prefill_tolerance in models_to_test:
+        for model, tp_size, prefill_tolerance in MODELS:
             for torch_dtype in TORCH_DTYPES:
                 self.assert_close_prefill_logits(
                     DEFAULT_PROMPTS, model, tp_size, torch_dtype, prefill_tolerance
