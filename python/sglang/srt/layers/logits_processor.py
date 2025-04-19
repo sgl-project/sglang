@@ -422,7 +422,7 @@ class LogitsProcessor(nn.Module):
         last position (e.g., extend without input logprobs). The caller should
         guarantee the given hidden_states follow this constraint.
         """
-        if self.do_tensor_parallel_all_gather_dp_attn:
+        if lm_head.enable_tp and self.do_tensor_parallel_all_gather_dp_attn:
             logits_metadata.compute_dp_attention_metadata(hidden_states)
             hidden_states, local_hidden_states = (
                 logits_metadata.gathered_buffer,
@@ -441,19 +441,21 @@ class LogitsProcessor(nn.Module):
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
 
-        if self.do_tensor_parallel_all_gather:
-            logits = tensor_model_parallel_all_gather(logits)
+        if lm_head.enable_tp:
 
-        if self.do_tensor_parallel_all_gather_dp_attn:
-            logits, global_logits = (
-                torch.empty(
-                    (local_hidden_states.shape[0], logits.shape[1]),
-                    device=logits.device,
-                    dtype=logits.dtype,
-                ),
-                logits,
-            )
-            dp_scatter(logits, global_logits, logits_metadata)
+            if self.do_tensor_parallel_all_gather:
+                logits = tensor_model_parallel_all_gather(logits)
+
+            if self.do_tensor_parallel_all_gather_dp_attn:
+                logits, global_logits = (
+                    torch.empty(
+                        (local_hidden_states.shape[0], logits.shape[1]),
+                        device=logits.device,
+                        dtype=logits.dtype,
+                    ),
+                    logits,
+                )
+                dp_scatter(logits, global_logits, logits_metadata)
 
         logits = logits[:, : self.config.vocab_size].float()
 
