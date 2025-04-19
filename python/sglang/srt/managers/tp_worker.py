@@ -22,6 +22,7 @@ import torch
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.managers.expert_location import ExpertLocationMetadata
 from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
@@ -45,6 +46,7 @@ class TpModelWorker:
     def __init__(
         self,
         server_args: ServerArgs,
+        expert_location_metadata: Optional[ExpertLocationMetadata],
         gpu_id: int,
         tp_rank: int,
         dp_rank: Optional[int],
@@ -57,6 +59,7 @@ class TpModelWorker:
         self.tp_rank = tp_rank
 
         # Init model and tokenizer
+        # TODO re-apply ModelConfig PR
         self.model_config = ModelConfig(
             (
                 server_args.model_path
@@ -74,6 +77,7 @@ class TpModelWorker:
         )
         self.model_runner = ModelRunner(
             model_config=self.model_config,
+            expert_location_metadata=expert_location_metadata,
             mem_fraction_static=server_args.mem_fraction_static,
             gpu_id=gpu_id,
             tp_rank=tp_rank,
@@ -192,7 +196,7 @@ class TpModelWorker:
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         success, message = self.model_runner.update_weights_from_disk(
-            recv_req.model_path, recv_req.load_format
+            recv_req.model_path, recv_req.load_format, recv_req.param_categories
         )
         return success, message
 

@@ -20,7 +20,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
+from typing import Any, Iterable, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -34,7 +34,10 @@ from sglang.srt.distributed import (
     initialize_model_parallel,
     set_custom_all_reduce,
 )
-from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
+from sglang.srt.distributed.parallel_state import (
+    get_world_group,
+    monkey_patch_vllm_parallel_state,
+)
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
     get_attention_tp_size,
@@ -45,7 +48,18 @@ from sglang.srt.layers.quantization import monkey_patch_isinstance_for_vllm_base
 from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
-from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.managers.expert_distribution import (
+    ExpertDistributionRecorder,
+    get_global_expert_distribution_recorder,
+    set_global_expert_distribution_recorder,
+)
+from sglang.srt.managers.expert_location import ExpertLocationMetadata
+from sglang.srt.managers.io_struct import UpdateExpertLocationReqInput
+from sglang.srt.managers.schedule_batch import (
+    get_global_expert_location_metadata,
+    global_server_args_dict,
+    set_global_expert_location_metadata,
+)
 from sglang.srt.mem_cache.memory_pool import (
     DoubleSparseTokenToKVPool,
     MHATokenToKVPool,
@@ -55,6 +69,7 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.mem_cache.paged_allocator import PagedTokenToKVPoolAllocator
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
+from sglang.srt.model_executor.expert_location_updater import ExpertLocationUpdater
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader import get_model
 from sglang.srt.model_loader.loader import (
@@ -71,6 +86,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import (
     MultiprocessingSerializer,
+    broadcast_pyobj,
     enable_show_time_cost,
     get_available_gpu_memory,
     get_bool_env_var,
@@ -99,6 +115,7 @@ class ModelRunner:
     def __init__(
         self,
         model_config: ModelConfig,
+        expert_location_metadata: Optional[ExpertLocationMetadata],
         mem_fraction_static: float,
         gpu_id: int,
         tp_rank: int,
@@ -131,6 +148,8 @@ class ModelRunner:
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
         self.attention_chunk_size = model_config.attention_chunk_size
 
+        self.forward_pass_id = 0
+
         # Model-specific adjustment
         self.model_specific_adjustment()
 
@@ -160,10 +179,12 @@ class ModelRunner:
                 "disable_radix_cache": server_args.disable_radix_cache,
                 "flashinfer_mla_disable_ragged": server_args.flashinfer_mla_disable_ragged,
                 "moe_dense_tp_size": server_args.moe_dense_tp_size,
+                "ep_dispatch_algorithm": server_args.ep_dispatch_algorithm,
                 "debug_tensor_dump_output_folder": server_args.debug_tensor_dump_output_folder,
                 "debug_tensor_dump_inject": server_args.debug_tensor_dump_inject,
                 "n_share_experts_fusion": server_args.n_share_experts_fusion,
                 "disable_shared_experts_fusion": server_args.disable_shared_experts_fusion,
+                "ep_num_redundant_experts": server_args.ep_num_redundant_experts,
                 "disable_chunked_prefix_cache": server_args.disable_chunked_prefix_cache,
                 "use_mla_backend": self.use_mla_backend,
             }
@@ -175,13 +196,41 @@ class ModelRunner:
         # Get memory before model loading
         min_per_gpu_memory = self.init_torch_distributed()
 
+        [expert_location_metadata] = broadcast_pyobj(
+            data=[expert_location_metadata],
+            rank=torch.distributed.get_rank(),
+            dist_group=get_world_group().cpu_group,
+        )
+        expert_location_metadata.to(server_args.device)
+        set_global_expert_location_metadata(expert_location_metadata)
+        if self.tp_rank == 0 and get_bool_env_var(
+            "SGLANG_LOG_EXPERT_LOCATION_METADATA"
+        ):
+            logger.info(
+                f"Initial expert_location_metadata: {get_global_expert_location_metadata().debug_str()}"
+            )
+
         # If it is a draft model tp_group can be different.
         self.initialize(min_per_gpu_memory)
+
+        self._expert_location_updater = (
+            ExpertLocationUpdater(self)
+            if server_args.expert_location_updater_mode is not None
+            else None
+        )
 
     def initialize(self, min_per_gpu_memory: float):
         server_args = self.server_args
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=self.server_args.enable_memory_saver
+        )
+
+        set_global_expert_distribution_recorder(
+            ExpertDistributionRecorder.init_new(
+                server_args,
+                get_global_expert_location_metadata(),
+                rank=self.tp_rank,
+            )
         )
 
         # Load the model
@@ -491,8 +540,16 @@ class ModelRunner:
                 f"TP rank {self.tp_rank} could finish the model loading, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
             ) from None
 
+    def update_expert_location_start(self, recv_req: UpdateExpertLocationReqInput):
+        self._expert_location_updater.start(recv_req)
+
+    def event_loop_step(self) -> List[Any]:
+        if self._expert_location_updater is None:
+            return []
+        return self._expert_location_updater.event_loop_step()
+
     def update_weights_from_disk(
-        self, model_path: str, load_format: str
+        self, model_path: str, load_format: str, param_categories: Optional[List[str]]
     ) -> tuple[bool, str]:
         """Update engine weights in-place from the disk."""
         logger.info(
@@ -512,28 +569,28 @@ class ModelRunner:
 
         def get_weight_iter(config):
             iter = loader._get_weights_iterator(
-                DefaultModelLoader.Source(
-                    config.model_path,
-                    revision=config.revision,
-                    fall_back_to_pt=getattr(
-                        self.model, "fall_back_to_pt_during_load", True
-                    ),
-                )
+                DefaultModelLoader.Source.init_new(config, model)
             )
             return iter
 
+        def filter_weight_iter(iter: Iterable[Tuple[str, torch.Tensor]]):
+            if param_categories is None:
+                yield from iter
+            else:
+                for name, weight in iter:
+                    if (
+                        self.model.get_param_name_info(name).category
+                        in param_categories
+                    ):
+                        yield name, weight
+
         def model_load_weights(model, iter):
-            model.load_weights(iter)
-            for _, module in self.model.named_modules():
-                quant_method = getattr(module, "quant_method", None)
-                if quant_method is not None:
-                    with device_loading_context(module, target_device):
-                        quant_method.process_weights_after_loading(module)
+            DefaultModelLoader.load_weights_and_postprocess(model, iter, target_device)
             return model
 
         with set_default_torch_dtype(self.model_config.dtype):
             try:
-                iter = get_weight_iter(self.model_config)
+                iter = filter_weight_iter(get_weight_iter(self.model_config))
             except Exception as e:
                 message = f"Failed to get weights iterator: {e}."
                 return False, message
@@ -1022,6 +1079,15 @@ class ModelRunner:
 
     def forward(
         self, forward_batch: ForwardBatch, skip_attn_backend_init: bool = False
+    ) -> LogitsProcessorOutput:
+        self.forward_pass_id += 1
+        with get_global_expert_distribution_recorder().with_forward_pass(
+            self.forward_pass_id
+        ):
+            return self._forward_raw(forward_batch, skip_attn_backend_init)
+
+    def _forward_raw(
+        self, forward_batch: ForwardBatch, skip_attn_backend_init: bool
     ) -> LogitsProcessorOutput:
         if (
             forward_batch.forward_mode.is_cuda_graph()

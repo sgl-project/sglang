@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 from enum import Enum, auto
 
+from sglang.srt.managers.expert_location import ExpertLocationMetadata
+
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -79,11 +81,26 @@ global_server_args_dict = {
     "disable_radix_cache": ServerArgs.disable_radix_cache,
     "flashinfer_mla_disable_ragged": ServerArgs.flashinfer_mla_disable_ragged,
     "moe_dense_tp_size": ServerArgs.moe_dense_tp_size,
+    "ep_dispatch_algorithm": ServerArgs.ep_dispatch_algorithm,
     "chunked_prefill_size": ServerArgs.chunked_prefill_size,
     "n_share_experts_fusion": ServerArgs.n_share_experts_fusion,
     "disable_shared_experts_fusion": ServerArgs.disable_shared_experts_fusion,
+    "ep_num_redundant_experts": ServerArgs.ep_num_redundant_experts,
     "disable_chunked_prefix_cache": ServerArgs.disable_chunked_prefix_cache,
 }
+
+_global_expert_location_metadata: Optional[ExpertLocationMetadata] = None
+
+
+def get_global_expert_location_metadata():
+    return _global_expert_location_metadata
+
+
+def set_global_expert_location_metadata(value):
+    global _global_expert_location_metadata
+    assert _global_expert_location_metadata is None
+    _global_expert_location_metadata = value
+
 
 logger = logging.getLogger(__name__)
 

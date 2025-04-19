@@ -426,6 +426,7 @@ class SchedulerDisaggregationDecodeMixin:
         while True:
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
+            self.model_runner_event_loop_step()
             # polling and allocating kv cache
             self.process_decode_queue()
             batch = self.get_next_disagg_decode_batch_to_run()

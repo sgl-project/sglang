@@ -480,10 +480,11 @@ def get_tokenizer(
 
 
 def get_dataset(args, tokenizer):
+    num_prompts = args.num_prompts + args.skip_num_prompts
     if args.dataset_name == "sharegpt":
         input_requests = sample_sharegpt_requests(
             dataset_path=args.dataset_path,
-            num_requests=args.num_prompts,
+            num_requests=num_prompts,
             tokenizer=tokenizer,
             fixed_output_len=args.sharegpt_output_len,
             context_len=args.sharegpt_context_len,
@@ -494,7 +495,7 @@ def get_dataset(args, tokenizer):
         input_requests = sample_random_requests(
             input_len=args.random_input_len,
             output_len=args.random_output_len,
-            num_prompts=args.num_prompts,
+            num_prompts=num_prompts,
             range_ratio=args.random_range_ratio,
             tokenizer=tokenizer,
             dataset_path=args.dataset_path,
@@ -512,6 +513,7 @@ def get_dataset(args, tokenizer):
         )
     else:
         raise ValueError(f"Unknown dataset: {args.dataset_name}")
+    input_requests = input_requests[args.skip_num_prompts :]
     return input_requests
 
 
@@ -607,7 +609,7 @@ def sample_sharegpt_requests(
     apply_chat_template=False,
 ) -> List[Tuple[str, int, int]]:
     if fixed_output_len is not None and fixed_output_len < 4:
-        raise ValueError("output_len too small")
+        print("Warn: output_len too small")
 
     # Download sharegpt if necessary
     if not os.path.isfile(dataset_path) and dataset_path == "":
@@ -666,7 +668,7 @@ def sample_sharegpt_requests(
             len(completion_token_ids) if fixed_output_len is None else fixed_output_len
         )
 
-        if prompt_len < 2 or output_len < 2:
+        if prompt_len < 2 or ((fixed_output_len is None) and (output_len < 2)):
             # Prune too short sequences.
             continue
 
@@ -690,7 +692,6 @@ def sample_random_requests(
     dataset_path: str,
     random_sample: bool = True,
 ) -> List[Tuple[str, int, int]]:
-
     input_lens = np.random.randint(
         max(int(input_len * range_ratio), 1),
         input_len + 1,
@@ -976,6 +977,7 @@ async def benchmark(
     lora_names: List[str],
     extra_request_body: Dict[str, Any],
     profile: bool,
+    enable_expert_distribution_record: bool = False,
     pd_seperated: bool = False,
     flush_cache: bool = False,
 ):
@@ -1041,6 +1043,12 @@ async def benchmark(
 
     time.sleep(1.0)
 
+    if enable_expert_distribution_record:
+        print("Starting expert distribution record...")
+        output = await async_request_profile(
+            api_url=base_url + "/start_expert_distribution_record"
+        )
+        assert output.success
     # Start profiler
     if profile:
         print("Starting profiler...")
@@ -1085,6 +1093,16 @@ async def benchmark(
         profile_output = await async_request_profile(api_url=base_url + "/stop_profile")
         if profile_output.success:
             print("Profiler stopped")
+    if enable_expert_distribution_record:
+        print("Stopping expert distribution record...")
+        output = await async_request_profile(
+            api_url=base_url + "/dump_expert_distribution_record"
+        )
+        assert output.success
+        output = await async_request_profile(
+            api_url=base_url + "/stop_expert_distribution_record"
+        )
+        assert output.success
 
     if pbar is not None:
         pbar.close()
@@ -1393,6 +1411,7 @@ def run_benchmark(args_: argparse.Namespace):
             lora_names=args.lora_name,
             extra_request_body=extra_request_body,
             profile=args.profile,
+            enable_expert_distribution_record=args.enable_expert_distribution_record,
             pd_seperated=args.pd_seperated,
             flush_cache=args.flush_cache,
         )
@@ -1465,6 +1484,12 @@ if __name__ == "__main__":
         type=int,
         default=1000,
         help="Number of prompts to process. Default is 1000.",
+    )
+    parser.add_argument(
+        "--skip-num-prompts",
+        type=int,
+        default=0,
+        help="Number of prompts to skip. Default is 0.",
     )
     parser.add_argument(
         "--sharegpt-output-len",
@@ -1556,6 +1581,11 @@ if __name__ == "__main__":
         action="store_true",
         help="Use Torch Profiler. The endpoint must be launched with "
         "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
+    )
+    parser.add_argument(
+        "--enable-expert-distribution-record",
+        action="store_true",
+        help="Enable expert distribution record",
     )
     parser.add_argument(
         "--lora-name",

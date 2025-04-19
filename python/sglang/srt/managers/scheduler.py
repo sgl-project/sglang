@@ -54,13 +54,17 @@ from sglang.srt.disaggregation.utils import (
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.expert_distribution import ExpertDistributionRecorder
+from sglang.srt.managers.expert_distribution import (
+    get_global_expert_distribution_recorder,
+)
+from sglang.srt.managers.expert_location import ExpertLocationMetadata
 from sglang.srt.managers.io_struct import (
     AbortReq,
     CloseSessionReqInput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
-    FlushCacheReq,
+    FlushCacheReqInput,
+    FlushCacheReqOutput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
     GetWeightsByNameReqInput,
@@ -83,6 +87,8 @@ from sglang.srt.managers.io_struct import (
     SetInternalStateReqOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
+    UpdateExpertLocationReqInput,
+    UpdateExpertLocationReqOutput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
     UpdateWeightsFromDistributedReqInput,
@@ -102,6 +108,7 @@ from sglang.srt.managers.schedule_policy import (
     PrefillAdder,
     SchedulePolicy,
 )
+from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.managers.scheduler_output_processor_mixin import (
     SchedulerOutputProcessorMixin,
 )
@@ -123,6 +130,7 @@ from sglang.srt.utils import (
     broadcast_pyobj,
     configure_logger,
     crash_on_warnings,
+    enable_colocated_batch_gen,
     get_bool_env_var,
     get_zmq_socket,
     kill_itself_when_parent_died,
@@ -132,8 +140,6 @@ from sglang.srt.utils import (
     suppress_other_loggers,
 )
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
-
-expert_distribution_recorder = ExpertDistributionRecorder()
 
 logger = logging.getLogger(__name__)
 
@@ -168,6 +174,7 @@ class Scheduler(
         self,
         server_args: ServerArgs,
         port_args: PortArgs,
+        expert_location_metadata: Optional[ExpertLocationMetadata],
         gpu_id: int,
         tp_rank: int,
         dp_rank: Optional[int],
@@ -259,6 +266,7 @@ class Scheduler(
 
         self.tp_worker = TpWorkerClass(
             server_args=server_args,
+            expert_location_metadata=expert_location_metadata,
             gpu_id=gpu_id,
             tp_rank=tp_rank,
             dp_rank=dp_rank,
@@ -387,6 +395,13 @@ class Scheduler(
             enable=server_args.enable_memory_saver
         )
 
+        self.input_blocker = (
+            SchedulerInputBlocker(server_args, noop=self.attn_tp_rank != 0)
+            if enable_colocated_batch_gen()
+            or server_args.enable_scheduler_input_blocker
+            else None
+        )
+
         # Init profiler
         self.torch_profiler = None
         self.torch_profiler_output_dir: Optional[str] = None
@@ -402,10 +417,11 @@ class Scheduler(
             [
                 (TokenizedGenerateReqInput, self.handle_generate_request),
                 (TokenizedEmbeddingReqInput, self.handle_embedding_request),
-                (FlushCacheReq, self.flush_cache_wrapped),
+                (FlushCacheReqInput, self.flush_cache_wrapped),
                 (AbortReq, self.abort_request),
                 (OpenSessionReqInput, self.open_session),
                 (CloseSessionReqInput, self.close_session),
+                (UpdateExpertLocationReqInput, self.update_expert_location),
                 (UpdateWeightFromDiskReqInput, self.update_weights_from_disk),
                 (InitWeightsUpdateGroupReqInput, self.init_weights_update_group),
                 (
@@ -432,6 +448,7 @@ class Scheduler(
     def init_tokenizer(self):
         server_args = self.server_args
 
+        # TODO re-apply ModelConfig PR
         self.model_config = ModelConfig(
             server_args.model_path,
             trust_remote_code=server_args.trust_remote_code,
@@ -611,6 +628,7 @@ class Scheduler(
         while True:
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
+            self.model_runner_event_loop_step()
 
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
@@ -633,6 +651,7 @@ class Scheduler(
         while True:
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
+            self.model_runner_event_loop_step()
 
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
@@ -685,6 +704,9 @@ class Scheduler(
                 recv_reqs.append(recv_rpc)
         else:
             recv_reqs = None
+
+        if self.input_blocker is not None:
+            recv_reqs = self.input_blocker.handle(recv_reqs)
 
         if self.server_args.enable_dp_attention:
             if self.attn_tp_rank == 0:
@@ -739,6 +761,11 @@ class Scheduler(
                         self.recv_from_rpc.send_pyobj(output)
                 else:
                     self.send_to_tokenizer.send_pyobj(output)
+
+    def model_runner_event_loop_step(self):
+        outputs = self.tp_worker.worker.model_runner.event_loop_step()
+        for output in outputs:
+            self.send_to_tokenizer.send_pyobj(output)
 
     def handle_generate_request(
         self,
@@ -1596,8 +1623,9 @@ class Scheduler(
         time.sleep(5)
         self.parent_process.send_signal(signal.SIGQUIT)
 
-    def flush_cache_wrapped(self, recv_req: FlushCacheReq):
-        self.flush_cache()
+    def flush_cache_wrapped(self, recv_req: FlushCacheReqInput):
+        success = self.flush_cache()
+        return FlushCacheReqOutput(success=success)
 
     def flush_cache(self):
         """Flush the memory pool and cache."""
@@ -1733,6 +1761,9 @@ class Scheduler(
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()
+
+    def update_expert_location(self, recv_req: UpdateExpertLocationReqInput):
+        self.tp_worker.worker.model_runner.update_expert_location_start(recv_req)
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         """In-place update of the weights from disk."""
@@ -1908,15 +1939,16 @@ class Scheduler(
             )
 
     def expert_distribution_handle(self, recv_req: ExpertDistributionReq):
+        dump_output = None
         if recv_req == ExpertDistributionReq.START_RECORD:
-            expert_distribution_recorder.start_record()
+            get_global_expert_distribution_recorder().start_record()
         elif recv_req == ExpertDistributionReq.STOP_RECORD:
-            expert_distribution_recorder.stop_record()
+            get_global_expert_distribution_recorder().stop_record()
         elif recv_req == ExpertDistributionReq.DUMP_RECORD:
-            expert_distribution_recorder.dump_record()
+            dump_output = get_global_expert_distribution_recorder().dump_record()
         else:
             raise ValueError("Unrecognized ExpertDistributionReq value")
-        return ExpertDistributionReqOutput()
+        return ExpertDistributionReqOutput(dump_output=dump_output)
 
     def open_session(self, recv_req: OpenSessionReqInput):
         # handle error
@@ -1963,6 +1995,7 @@ def _import_static_state(model, static_params):
 def run_scheduler_process(
     server_args: ServerArgs,
     port_args: PortArgs,
+    expert_location_metadata: Optional[ExpertLocationMetadata],
     gpu_id: int,
     tp_rank: int,
     dp_rank: Optional[int],
@@ -1994,7 +2027,9 @@ def run_scheduler_process(
 
     # Create a scheduler and run the event loop
     try:
-        scheduler = Scheduler(server_args, port_args, gpu_id, tp_rank, dp_rank)
+        scheduler = Scheduler(
+            server_args, port_args, expert_location_metadata, gpu_id, tp_rank, dp_rank
+        )
         pipe_writer.send(
             {
                 "status": "ready",

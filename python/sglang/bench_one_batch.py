@@ -129,6 +129,7 @@ def load_model(server_args, port_args, tp_rank):
     suppress_other_loggers()
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
 
+    # TODO re-apply from_server_args PR
     model_config = ModelConfig(
         server_args.model_path,
         trust_remote_code=server_args.trust_remote_code,

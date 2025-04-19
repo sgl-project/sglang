@@ -162,6 +162,16 @@ class ServerArgs:
     enable_ep_moe: bool = False
     enable_deepep_moe: bool = False
     deepep_mode: Optional[Literal["auto", "normal", "low_latency"]] = "auto"
+    ep_num_redundant_experts: int = 0
+    ep_dispatch_algorithm: Optional[Literal["static", "random"]] = None
+    init_expert_location: Optional[str] = None
+    expert_location_updater_mode: Optional[Literal["pin_memory", "pageable_memory"]] = (
+        None
+    )
+    enable_eplb: bool = False
+    eplb_storage_dir: str = "/tmp/eplb_storage"
+    eplb_rebalance_period: Optional[int] = None
+    enable_expert_distribution_recorder: bool = False
     enable_torch_compile: bool = False
     torch_compile_max_bs: int = 32
     cuda_graph_max_bs: Optional[int] = None
@@ -186,6 +196,7 @@ class ServerArgs:
     disable_shared_experts_fusion: bool = False
     disable_chunked_prefix_cache: bool = False
     disable_fast_image_processor: bool = False
+    enable_scheduler_input_blocker: bool = False
 
     # Debug tensor dumps
     debug_tensor_dump_output_folder: Optional[str] = None
@@ -330,6 +341,30 @@ class ServerArgs:
             logger.info(
                 f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
+
+        if self.enable_eplb:
+            self.enable_expert_distribution_recorder = True
+            if self.expert_location_updater_mode is None:
+                self.expert_location_updater_mode = "pageable_memory"
+            logger.info(
+                f"EPLB is enabled. The enable_expert_distribution_recorder and expert_location_updater_mode are automatically set."
+            )
+        if self.expert_location_updater_mode is not None:
+            self.disable_overlap_schedule = True
+            logger.info(
+                f"ExpertLocationUpdater is enabled. The disable_overlap_schedule is set."
+            )
+        if self.enable_eplb or (self.init_expert_location is not None):
+            if self.ep_dispatch_algorithm is None:
+                self.ep_dispatch_algorithm = "static"
+            logger.info(
+                f"EPLB is enabled or init_expert_location is provided. ep_dispatch_algorithm is configured."
+            )
+
+        if self.ep_num_redundant_experts > 0:
+            assert (
+                self.enable_deepep_moe
+            ), "ep_num_redundant_experts currently requires DeepEP MoE"
 
         # Speculative Decoding
         if self.speculative_algorithm == "NEXTN":
@@ -1006,6 +1041,11 @@ class ServerArgs:
             help="Enabling expert parallelism for moe. The ep size is equal to the tp size.",
         )
         parser.add_argument(
+            "--enable-expert-distribution-recorder",
+            action="store_true",
+            help="Enable expert distribution recorder",
+        )
+        parser.add_argument(
             "--enable-torch-compile",
             action="store_true",
             help="Optimize the model with torch.compile. Experimental feature.",
@@ -1109,6 +1149,47 @@ class ServerArgs:
             help="Enabling DeepEP MoE implementation for EP MoE.",
         )
         parser.add_argument(
+            "--ep-num-redundant-experts",
+            type=int,
+            default=ServerArgs.ep_num_redundant_experts,
+            help="Allocate this number of redundant experts in expert parallel.",
+        )
+        parser.add_argument(
+            "--ep-dispatch-algorithm",
+            type=str,
+            default=ServerArgs.ep_dispatch_algorithm,
+            help="The algorithm to choose ranks for redundant experts in expert parallel.",
+        )
+        parser.add_argument(
+            "--init-expert-location",
+            type=str,
+            default=ServerArgs.init_expert_location,
+            help="Initial location of EP experts.",
+        )
+        parser.add_argument(
+            "--expert-location-updater-mode",
+            type=str,
+            default=ServerArgs.expert_location_updater_mode,
+            help="Mode of ExpertLocationUpdater, can be `pin_memory` (put weights in pinned memory at startup, thus faster but takes more host memory) or `pageable_memory` (put weights on pageable memory, thus slower but takes less host memory)",
+        )
+        parser.add_argument(
+            "--enable-eplb",
+            action="store_true",
+            help="Enable EPLB algorithm",
+        )
+        parser.add_argument(
+            "--eplb-storage-dir",
+            type=str,
+            default=ServerArgs.eplb_storage_dir,
+            help="Storage directory of EPLB subsystem.",
+        )
+        parser.add_argument(
+            "--eplb-rebalance-period",
+            type=int,
+            default=ServerArgs.eplb_rebalance_period,
+            help="Time (inm seconds) to automatically trigger a EPLB re-balance.",
+        )
+        parser.add_argument(
             "--moe-dense-tp-size",
             type=int,
             default=ServerArgs.moe_dense_tp_size,
@@ -1143,6 +1224,11 @@ class ServerArgs:
             "--disable-fast-image-processor",
             action="store_true",
             help="Adopt base image processor instead of fast image processor.",
+        )
+        parser.add_argument(
+            "--enable-scheduler-input-blocker",
+            action="store_true",
+            help="Enable input blocker for Scheduler.",
         )
 
         # Server warmups
