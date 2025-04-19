@@ -1645,7 +1645,7 @@ class DeepseekV2Model(nn.Module):
         if start_layer == end_layer:
             return hidden_states, residual
 
-        def compute_operations(tbo_child_index: str):
+        def compute_operations(tbo_child_index: int):
             return [
                 op
                 for i in range(start_layer, end_layer)
