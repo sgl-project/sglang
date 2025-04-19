@@ -47,7 +47,7 @@ runtime_common = [
 
 srt = [
     "sglang[runtime_common]",
-    "sgl-kernel==0.0.9.post1",
+    "sgl-kernel==0.0.9.post2",
     "flashinfer_python==0.2.3",
     "torch==2.5.1",
     "torchvision==0.20.1",
