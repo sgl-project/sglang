@@ -588,6 +588,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
         if hidden_states.shape[0] == 0:
             assert (
@@ -613,9 +614,9 @@ class DeepseekV2AttentionMLA(nn.Module):
                         positions, hidden_states, forward_batch
                     )
                 else:
-                    return self.forward_absorb(positions, hidden_states, forward_batch)
+                    return self.forward_absorb(positions, hidden_states, forward_batch, zero_allocator)
             else:
-                return self.forward_absorb(positions, hidden_states, forward_batch)
+                return self.forward_absorb(positions, hidden_states, forward_batch, zero_allocator)
 
     def forward_normal(
         self,
@@ -1159,6 +1160,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
+                zero_allocator=zero_allocator,
             )
 
         # Gather
