@@ -136,6 +136,7 @@ class EPMoE(torch.nn.Module):
         correction_bias: Optional[torch.Tensor] = None,
         custom_routing_function: Optional[Callable] = None,
         activation: str = "silu",
+        routed_scaling_factor: Optional[float] = None,
     ):
         super().__init__()
 
@@ -164,6 +165,7 @@ class EPMoE(torch.nn.Module):
         self.correction_bias = correction_bias
         self.custom_routing_function = custom_routing_function
         self.activation = activation
+        self.routed_scaling_factor = routed_scaling_factor
 
         if quant_config is None:
             self.quant_method: Optional[QuantizeMethodBase] = UnquantizedEPMoEMethod()
@@ -215,6 +217,7 @@ class EPMoE(torch.nn.Module):
             num_expert_group=self.num_expert_group,
             correction_bias=self.correction_bias,
             custom_routing_function=self.custom_routing_function,
+            routed_scaling_factor=self.routed_scaling_factor,
         )
 
         reorder_topk_ids, src2dst, seg_indptr = run_moe_ep_preproess(
@@ -972,9 +975,6 @@ class DeepEPMoE(EPMoE):
     ):
         assert self.quant_method is not None
         assert self.activation == "silu"
-        assert (
-            hidden_states_fp8[0].size(0) % 4 == 0
-        ), f"TMA alignment error: {hidden_states_fp8[0].size(0)}"
 
         # GroupGemm-0
         num_groups, m, k = hidden_states_fp8[0].size()
