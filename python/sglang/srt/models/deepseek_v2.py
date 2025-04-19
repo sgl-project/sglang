@@ -1122,14 +1122,15 @@ class DeepseekV2DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
+        zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
         if self.info.ffn_input_mode == _FFNInputMode.SCATTERED:
             return self.forward_ffn_with_scattered_input(
-                positions, hidden_states, forward_batch, residual
+                positions, hidden_states, forward_batch, residual, zero_allocator
             )
         elif self.info.ffn_input_mode == _FFNInputMode.FULL:
             return self.forward_ffn_with_full_input(
-                positions, hidden_states, forward_batch, residual
+                positions, hidden_states, forward_batch, residual, zero_allocator
             )
         else:
             raise NotImplementedError
@@ -1140,6 +1141,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
+        zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
 
         if hidden_states.shape[0] == 0:
@@ -1208,6 +1210,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
+        zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
 
         if hidden_states.shape[0] == 0:
@@ -1233,6 +1236,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
+            zero_allocator=zero_allocator,
         )
 
         if self.attn_tp_size != 1:
