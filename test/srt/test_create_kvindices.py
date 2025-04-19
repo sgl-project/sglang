@@ -4,12 +4,11 @@ import unittest
 import numpy as np
 import torch
 
-from sglang.srt.layers.attention.flashinfer_utils import (
-    create_flashinfer_kv_indices_triton,
-)
+from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
+from sglang.test.test_utils import CustomTestCase
 
 
-class TestCreateKvIndices(unittest.TestCase):
+class TestCreateKvIndices(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         if not torch.cuda.is_available():

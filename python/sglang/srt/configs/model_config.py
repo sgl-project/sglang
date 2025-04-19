@@ -15,6 +15,7 @@
 import json
 import logging
 import math
+import os
 from enum import IntEnum, auto
 from typing import List, Optional, Set, Union
 
@@ -42,37 +43,57 @@ class ModelConfig:
         context_length: Optional[int] = None,
         model_override_args: Optional[str] = None,
         is_embedding: Optional[bool] = None,
+        enable_multimodal: Optional[bool] = None,
         dtype: str = "auto",
         quantization: Optional[str] = None,
         override_config_file: Optional[str] = None,
     ) -> None:
+
         self.model_path = model_path
         self.revision = revision
         self.quantization = quantization
 
         # Parse args
+        self.maybe_pull_model_tokenizer_from_remote()
         self.model_override_args = json.loads(model_override_args)
         kwargs = {}
         if override_config_file and override_config_file.strip():
             kwargs["_configuration_file"] = override_config_file.strip()
 
         self.hf_config = get_config(
-            model_path,
+            self.model_path,
             trust_remote_code=trust_remote_code,
             revision=revision,
             model_override_args=self.model_override_args,
             **kwargs,
         )
         self.hf_text_config = get_hf_text_config(self.hf_config)
+        self.attention_chunk_size = getattr(
+            self.hf_text_config, "attention_chunk_size", None
+        )
+
+        if enable_multimodal is None:
+            if self.hf_config.architectures == "Llama4ForConditionalGeneration":
+                enable_multimodal = False
+            else:
+                enable_multimodal = True
 
         # Check model type
         self.is_generation = is_generation_model(
             self.hf_config.architectures, is_embedding
         )
-        self.is_multimodal = is_multimodal_model(self.hf_config.architectures)
-        self.is_multimodal_gen = is_multimodal_gen_model(self.hf_config.architectures)
-        self.is_image_gen = is_image_gen_model(self.hf_config.architectures)
-        self.is_audio_model = is_audio_model(self.hf_config.architectures)
+        self.is_multimodal = enable_multimodal and is_multimodal_model(
+            self.hf_config.architectures
+        )
+        self.is_multimodal_gen = enable_multimodal and is_multimodal_gen_model(
+            self.hf_config.architectures
+        )
+        self.is_image_gen = enable_multimodal and is_image_gen_model(
+            self.hf_config.architectures
+        )
+        self.is_audio_model = enable_multimodal and is_audio_model(
+            self.hf_config.architectures
+        )
         self.is_encoder_decoder = is_encoder_decoder_model(self.hf_config.architectures)
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
 
@@ -134,6 +155,11 @@ class ModelConfig:
             self.attention_arch = AttentionArch.MLA
             self.kv_lora_rank = self.hf_config.kv_lora_rank
             self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
+        elif "DeepseekVL2ForCausalLM" in self.hf_config.architectures:
+            self.head_dim = 256
+            self.attention_arch = AttentionArch.MLA
+            self.kv_lora_rank = self.hf_text_config.kv_lora_rank
+            self.qk_rope_head_dim = self.hf_text_config.qk_rope_head_dim
         else:
             self.attention_arch = AttentionArch.MHA
 
@@ -225,6 +251,20 @@ class ModelConfig:
         if quant_cfg is None:
             # compressed-tensors uses a "compression_config" key
             quant_cfg = getattr(self.hf_config, "compression_config", None)
+        if quant_cfg is None:
+            # check if is modelopt model -- modelopt doesn't have corresponding field
+            # in hf `config.json` but has a standalone `hf_quant_config.json` in the root directory
+            # example: https://huggingface.co/nvidia/Llama-3.1-8B-Instruct-FP8/tree/main
+            is_local = os.path.exists(self.model_path)
+            modelopt_quant_config = {"quant_method": "modelopt"}
+            if not is_local:
+                from huggingface_hub import HfApi
+
+                hf_api = HfApi()
+                if hf_api.file_exists(self.model_path, "hf_quant_config.json"):
+                    quant_cfg = modelopt_quant_config
+            elif os.path.exists(os.path.join(self.model_path, "hf_quant_config.json")):
+                quant_cfg = modelopt_quant_config
         return quant_cfg
 
     # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
@@ -252,8 +292,10 @@ class ModelConfig:
             "experts_int8",
             "w8a8_int8",
             "w8a8_fp8",
+            "moe_wna16",
         ]
         compatible_quantization_methods = {
+            "modelopt_fp4": ["modelopt"],
             "w8a8_int8": ["compressed-tensors", "compressed_tensors"],
             "w8a8_fp8": ["compressed-tensors", "compressed_tensors"],
         }
@@ -318,6 +360,29 @@ class ModelConfig:
             eos_ids = {eos_ids} if isinstance(eos_ids, int) else set(eos_ids)
         return eos_ids
 
+    def maybe_pull_model_tokenizer_from_remote(self) -> None:
+        """
+        Pull the model config files to a temporary
+        directory in case of remote.
+
+        Args:
+            model: The model name or path.
+
+        """
+        from sglang.srt.connector import create_remote_connector
+        from sglang.srt.utils import is_remote_url
+
+        if is_remote_url(self.model_path):
+            logger.info("Pulling model configs from remote...")
+            # BaseConnector implements __del__() to clean up the local dir.
+            # Since config files need to exist all the time, so we DO NOT use
+            # with statement to avoid closing the client.
+            client = create_remote_connector(self.model_path)
+            if is_remote_url(self.model_path):
+                client.pull_files(allow_pattern=["*config.json"])
+                self.model_weights = self.model_path
+                self.model_path = client.get_local_dir()
+
 
 def get_hf_text_config(config: PretrainedConfig):
     """Get the "sub" config relevant to llm for multi modal models.
@@ -338,6 +403,8 @@ def get_hf_text_config(config: PretrainedConfig):
         # if transformers config doesn't align with this assumption.
         assert hasattr(config.text_config, "num_attention_heads")
         return config.text_config
+    if hasattr(config, "language_config"):
+        return config.language_config
     else:
         return config
 
@@ -367,9 +434,13 @@ def _get_and_verify_dtype(
         dtype = dtype.lower()
         if dtype == "auto":
             if config_dtype == torch.float32:
-                if config.model_type == "gemma2":
+                if config.model_type.startswith("gemma"):
+                    if config.model_type == "gemma":
+                        gemma_version = ""
+                    else:
+                        gemma_version = config.model_type[5]
                     logger.info(
-                        "For Gemma 2, we downcast float32 to bfloat16 instead "
+                        f"For Gemma {gemma_version}, we downcast float32 to bfloat16 instead "
                         "of float16 by default. Please specify `dtype` if you "
                         "want to use float16."
                     )
@@ -418,6 +489,8 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
         or "LlamaForSequenceClassificationWithNormal_Weights" in model_architectures
         or "InternLM2ForRewardModel" in model_architectures
         or "Qwen2ForRewardModel" in model_architectures
+        or "Qwen2ForSequenceClassification" in model_architectures
+        or "CLIPModel" in model_architectures
     ):
         return False
     else:
@@ -425,17 +498,22 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
 
 
 multimodal_model_archs = [
-    "LlavaLlamaForCausalLM",
-    "LlavaQwenForCausalLM",
-    "LlavaMistralForCausalLM",
-    "LlavaVidForCausalLM",
+    "DeepseekVL2ForCausalLM",
+    "Gemma3ForConditionalGeneration",
     "Grok1VForCausalLM",
     "Grok1AForCausalLM",
+    "LlavaLlamaForCausalLM",
+    "Llama4ForConditionalGeneration",
+    "LlavaMistralForCausalLM",
+    "LlavaQwenForCausalLM",
+    "LlavaVidForCausalLM",
+    "MiniCPMO",
+    "MiniCPMV",
+    "MultiModalityCausalLM",
     "MllamaForConditionalGeneration",
     "Qwen2VLForConditionalGeneration",
     "Qwen2_5_VLForConditionalGeneration",
-    "MiniCPMV",
-    "MultiModalityCausalLM",
+    "CLIPModel",
 ]
 
 

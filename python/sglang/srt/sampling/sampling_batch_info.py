@@ -10,11 +10,10 @@ import torch
 import sglang.srt.sampling.penaltylib as penaltylib
 from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
 
-logger = logging.getLogger(__name__)
-
-
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
+
+logger = logging.getLogger(__name__)
 
 
 @dataclasses.dataclass
@@ -306,7 +305,7 @@ class SamplingBatchInfo:
         ]:
             self_val = getattr(self, item, None)
             other_val = getattr(other, item, None)
-            setattr(self, item, torch.concat([self_val, other_val]))
+            setattr(self, item, torch.cat([self_val, other_val]))
 
         self.is_all_greedy |= other.is_all_greedy
         self.need_min_p_sampling |= other.need_min_p_sampling

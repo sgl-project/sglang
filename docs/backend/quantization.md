@@ -29,6 +29,15 @@ python3 -m sglang.launch_server \
     --port 30000 --host 0.0.0.0
 ```
 
+Take note, if your model is **per-channel quantized (INT8 or FP8) with per-token dynamic quantization activation**, you can opt to include `--quantization w8a8_int8` or `--quantization w8a8_fp8` to invoke the corresponding CUTLASS int8_kernel or fp8_kernel in sgl-kernel. This action will ignore the Hugging Face config's quantization settings. For instance, with `neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8-dynamic`, if you execute with `--quantization w8a8_fp8`, the system will use the `W8A8Fp8Config` from SGLang to invoke the sgl-kernel, rather than the `CompressedTensorsConfig` for vLLM kernels.
+
+```bash
+python3 -m sglang.launch_server \
+    --model-path neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8-dynamic \
+    --quantization w8a8_fp8 \
+    --port 30000 --host 0.0.0.0
+```
+
 ### Examples of Offline Model Quantization
 
 #### Using [GPTQModel](https://github.com/ModelCloud/GPTQModel)

@@ -7,6 +7,7 @@ import os
 import pprint
 import random
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Optional
 
 import numpy as np
@@ -19,11 +20,11 @@ from data_utils import (
     process_single_sample,
 )
 from datasets import concatenate_datasets, load_dataset
+from tqdm import tqdm
 
 
 @dataclasses.dataclass
 class EvalArgs:
-    backend: str = "engine"
     seed: int = 42
     split: str = "validation"
     # Default setting to make the benchmark available on A100 for most 7B models
@@ -35,7 +36,6 @@ class EvalArgs:
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
-        parser.add_argument("--backend", type=str, default=EvalArgs.backend)
         parser.add_argument(
             "--result-filename", type=str, default=EvalArgs.result_filename
         )
@@ -108,7 +108,7 @@ def prepare_samples(eval_args: EvalArgs):
     # run for each subject
     sub_dataset_list = []
 
-    for subject in CAT_SHORT2LONG.values():
+    for subject in tqdm(CAT_SHORT2LONG.values()):
         sub_dataset = load_dataset(
             eval_args.dataset_path, subject, split=eval_args.split
         )
@@ -118,22 +118,43 @@ def prepare_samples(eval_args: EvalArgs):
     # merge all dataset
     dataset = concatenate_datasets(sub_dataset_list)
 
-    ## prepare images
+    # Prepare images in parallel
+    images_path = os.path.expanduser("~/.cache/mmmu/images")
+    os.makedirs(images_path, exist_ok=True)
+    print(f"Saving images to: {images_path}")
+
     samples = []
     skip_count = 0
-    for i, sample in enumerate(dataset):
+
+    def process_sample(i, sample):
         sample = process_single_sample(sample)
         sample = construct_prompt(sample, eval_args.config)
         image = sample["image"]
         width, height = image.size
         if width * height >= eval_args.image_pixels_limit:
-            skip_count += 1
-            continue
-        samples.append(sample)
+            return None, True
+        image_path = f"{images_path}/image_{i}.png"
+        if not os.path.exists(image_path):
+            image.save(image_path)
+        sample["image_path"] = image_path
+        return sample, False
+
+    with ThreadPoolExecutor() as executor:
+        futures = [
+            executor.submit(process_sample, i, sample)
+            for i, sample in enumerate(dataset)
+        ]
+        for future in tqdm(as_completed(futures), total=len(futures)):
+            sample, skipped = future.result()
+            if skipped:
+                skip_count += 1
+            elif sample:
+                samples.append(sample)
 
     print(
         f"skipping {skip_count} samples with large images, {round((float(skip_count) / len(dataset)) * 100, 2)}% of dataset"
     )
+    print("samples have been prepared")
     return samples
 
 
@@ -431,6 +452,8 @@ def calculate_ins_level_acc(results: Dict):
 
 
 def process_result(response, sample, answer_dict, out_samples):
+    if response is None:
+        return
     if sample["question_type"] == "multiple-choice":
         pred_ans = parse_multi_choice_response(
             response, sample["all_choices"], sample["index2ans"]

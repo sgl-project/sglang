@@ -5,17 +5,14 @@ python token_in_token_out_vlm_server.py
 
 """
 
-from io import BytesIO
 from typing import Tuple
 
 import requests
-from PIL import Image
 from transformers import AutoProcessor
 
 from sglang.lang.chat_template import get_chat_template_by_model_path
-from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.test.test_utils import DEFAULT_IMAGE_URL, is_in_ci
-from sglang.utils import print_highlight, terminate_process, wait_for_server
+from sglang.utils import terminate_process, wait_for_server
 
 if is_in_ci():
     from docs.backend.patch import launch_server_cmd
@@ -29,18 +26,20 @@ MODEL_PATH = "Qwen/Qwen2-VL-2B"
 def get_input_ids() -> Tuple[list[int], list]:
     chat_template = get_chat_template_by_model_path(MODEL_PATH)
     text = f"{chat_template.image_token}What is in this picture?"
-    images = [Image.open(BytesIO(requests.get(DEFAULT_IMAGE_URL).content))]
     image_data = [DEFAULT_IMAGE_URL]
 
     processor = AutoProcessor.from_pretrained(MODEL_PATH)
 
-    inputs = processor(
-        text=[text],
-        images=images,
-        return_tensors="pt",
+    input_ids = (
+        processor.tokenizer(
+            text=[text],
+            return_tensors="pt",
+        )
+        .input_ids[0]
+        .tolist()
     )
 
-    return inputs.input_ids[0].tolist(), image_data
+    return input_ids, image_data
 
 
 def main():

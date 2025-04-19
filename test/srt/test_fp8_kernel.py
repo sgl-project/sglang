@@ -6,9 +6,10 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
     w8a8_block_fp8_matmul,
 )
+from sglang.test.test_utils import CustomTestCase
 
 
-class TestFP8Base(unittest.TestCase):
+class TestFP8Base(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.M = 256
@@ -92,9 +93,7 @@ class TestPerTokenGroupQuantFP8(TestFP8Base):
         A, A_quant_gt, scale_gt = self._make_A(
             M=self.M, K=self.K, group_size=self.group_size, out_dtype=self.quant_type
         )
-        A_quant, scale = per_token_group_quant_fp8(
-            x=A, group_size=self.group_size, dtype=self.quant_type
-        )
+        A_quant, scale = per_token_group_quant_fp8(x=A, group_size=self.group_size)
         torch.testing.assert_close(scale, scale_gt)
         diff = (A_quant.to(torch.float16) - A_quant_gt.to(torch.float16)).abs()
         diff_count = (diff > 1e-5).count_nonzero()

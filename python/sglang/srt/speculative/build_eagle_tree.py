@@ -3,8 +3,13 @@
 from typing import List
 
 import torch
-from sgl_kernel import build_tree_kernel as sgl_build_tree_kernel
-from sgl_kernel import build_tree_kernel_efficient as sgl_build_tree_kernel_efficient
+
+from sglang.srt.utils import is_cuda_available, is_hip
+
+if is_cuda_available() or is_hip():
+    from sgl_kernel import (
+        build_tree_kernel_efficient as sgl_build_tree_kernel_efficient,
+    )
 
 
 def build_tree_kernel_efficient_preprocess(
@@ -23,7 +28,6 @@ def build_tree_kernel_efficient_preprocess(
     top_scores = torch.topk(score_list, num_verify_tokens - 1, dim=-1)
     top_scores_index = top_scores.indices
     top_scores_index = torch.sort(top_scores_index).values
-
     draft_tokens = torch.gather(ss_token_list, index=top_scores_index, dim=1)
     draft_tokens = torch.cat((verified_id.unsqueeze(1), draft_tokens), dim=1).flatten()
 
@@ -106,296 +110,6 @@ def build_tree_kernel_efficient(
         retrive_next_sibling,
         draft_tokens,
     )
-
-
-def build_tree_kernel(
-    verified_id: torch.Tensor,
-    score_list: List[torch.Tensor],
-    token_list: List[torch.Tensor],
-    parents_list: List[torch.Tensor],
-    seq_lens: torch.Tensor,
-    seq_lens_sum: int,
-    topk: int,
-    spec_steps: int,
-    num_verify_tokens: int,
-):
-    parent_list, top_scores_index, draft_tokens = (
-        build_tree_kernel_efficient_preprocess(
-            verified_id,
-            score_list,
-            token_list,
-            parents_list,
-            num_verify_tokens,
-        )
-    )
-
-    bs = seq_lens.numel()
-    device = seq_lens.device
-
-    tree_mask = torch.full(
-        (
-            seq_lens_sum * num_verify_tokens
-            + num_verify_tokens * num_verify_tokens * bs,
-        ),
-        True,
-        device=device,
-    )
-    retrive_index = torch.full(
-        (bs, num_verify_tokens, spec_steps + 2), -1, device=device, dtype=torch.long
-    )
-    positions = torch.empty((bs * num_verify_tokens,), device=device, dtype=torch.long)
-
-    sgl_build_tree_kernel(
-        parent_list,
-        top_scores_index,
-        seq_lens.to(torch.int32),
-        tree_mask,
-        positions,
-        retrive_index,
-        topk,
-        spec_steps,
-        num_verify_tokens,
-    )
-
-    index = retrive_index.sum(dim=-1) != -spec_steps - 2
-    cum_len = torch.cumsum(torch.sum(index, dim=-1), dim=-1)
-    retrive_cum_len = torch.zeros(
-        (cum_len.numel() + 1,), dtype=torch.int32, device="cuda"
-    )
-    retrive_cum_len[1:] = cum_len
-    # TODO: this indexing cause a synchronization, optimize this
-    retrive_index = retrive_index[index]
-    return tree_mask, positions, retrive_index, retrive_cum_len, draft_tokens
-
-
-def test_build_tree_kernel():
-    def findp(p_i, index, parent_list):
-        pos = index // 10
-        index_list = index.tolist()
-        parent_list = parent_list.tolist()
-        res = [p_i]
-        while True:
-            p = pos[p_i]
-            if p == 0:
-                break
-            token_idx = parent_list[p]
-            p_i = index_list.index(token_idx)
-            res.append(p_i)
-        return res
-
-    def create_mask(seq_len, draft_token, index, parent_list, max_depth):
-        mask = []
-        positions = []
-        retrive_index = []
-        for i, lens in enumerate(seq_len.tolist()):
-            first_mask = torch.full((lens + draft_token,), True)
-            first_mask[-(draft_token - 1) :] = False
-            positions.append(lens)
-            mask.append(first_mask)
-            seq_order = []
-            first_index = torch.Tensor([0] + [-1] * (depth + 1)).cuda().to(torch.long)
-            r_index = [first_index]
-            for j in range(draft_token - 1):
-                mask.append(torch.full((lens + 1,), True))
-                idx = findp(j, index, parent_list)
-
-                seq_order.append(idx)
-                positions.append(len(idx) + seq_len)
-                t = torch.full((draft_token - 1,), False)
-                t[idx] = True
-                mask.append(t)
-
-            for i in range(1, draft_token - 1):
-                is_leaf = 0
-                for j in range(draft_token - 1):
-                    if i in seq_order[j]:
-                        is_leaf += 1
-
-                if is_leaf == 1:
-                    order_list = [0] + [x + 1 for x in seq_order[i][::-1]]
-                    for _ in range(max_depth + 1 - len(seq_order[i])):
-                        order_list.append(-1)
-                    order = torch.Tensor(order_list).cuda().to(torch.long)
-                    r_index.append(order)
-            retrive_index.append(torch.stack(r_index))
-
-        return (
-            torch.cat(mask).cuda(),
-            torch.Tensor(positions).cuda().to(torch.long),
-            torch.stack(retrive_index),
-        )
-
-    index = (
-        torch.Tensor(
-            [
-                0,
-                1,
-                2,
-                3,
-                10,
-                11,
-                12,
-                13,
-                20,
-                21,
-                22,
-                30,
-                110,
-                130,
-                150,
-                160,
-                210,
-                211,
-                212,
-                213,
-                214,
-                215,
-                216,
-                217,
-                218,
-                219,
-                220,
-                230,
-                310,
-                311,
-                312,
-                313,
-                314,
-                315,
-                316,
-                317,
-                320,
-                321,
-                322,
-                330,
-                360,
-                380,
-                390,
-                410,
-                411,
-                412,
-                413,
-                414,
-                415,
-                416,
-                417,
-                418,
-                419,
-                420,
-                421,
-                422,
-                423,
-                430,
-                431,
-                440,
-                441,
-                460,
-                470,
-            ]
-        )
-        .to(torch.long)
-        .cuda()
-    )
-
-    parent_list = (
-        torch.Tensor(
-            [
-                -1,
-                0,
-                1,
-                2,
-                3,
-                4,
-                5,
-                6,
-                7,
-                8,
-                9,
-                10,
-                11,
-                12,
-                20,
-                30,
-                21,
-                13,
-                22,
-                40,
-                23,
-                110,
-                130,
-                160,
-                150,
-                190,
-                120,
-                111,
-                121,
-                200,
-                180,
-                210,
-                211,
-                212,
-                213,
-                214,
-                215,
-                216,
-                220,
-                230,
-                217,
-                310,
-                311,
-                312,
-                313,
-                320,
-                314,
-                321,
-                315,
-                316,
-                317,
-            ]
-        )
-        .to(torch.long)
-        .cuda()
-    )
-
-    verified_seq_len = torch.Tensor([47]).to(torch.long).cuda()
-    bs = verified_seq_len.shape[0]
-    topk = 10
-    depth = 5  # depth <= 10
-    num_draft_token = 64
-
-    tree_mask = torch.full(
-        (
-            torch.sum(verified_seq_len).item() * num_draft_token
-            + num_draft_token * num_draft_token * bs,
-        ),
-        True,
-    ).cuda()
-    retrive_index = torch.full(
-        (bs, num_draft_token, depth + 2), -1, device="cuda", dtype=torch.long
-    )
-    positions = torch.empty((bs * num_draft_token,), device="cuda", dtype=torch.long)
-
-    sgl_build_tree_kernel(
-        parent_list.unsqueeze(0),
-        index.unsqueeze(0),
-        verified_seq_len,
-        tree_mask,
-        positions,
-        retrive_index,
-        topk,
-        depth,
-        num_draft_token,
-    )
-
-    retrive_index = retrive_index[retrive_index.sum(dim=-1) != -depth - 2]
-
-    c_mask, c_positions, c_retive_index = create_mask(
-        verified_seq_len, num_draft_token, index, parent_list, depth
-    )
-
-    assert torch.allclose(tree_mask, c_mask), "tree mask has error."
-    assert torch.allclose(positions, c_positions), "positions has error."
-    assert torch.allclose(retrive_index, c_retive_index), "retrive_index has error."
 
 
 def test_build_tree_kernel_efficient():
@@ -611,59 +325,6 @@ def test_build_tree_kernel_efficient():
     depth = 4
     num_draft_token = 8
 
-    tree_mask, position, retrive_index, retrive_cum_len, draft_tokens = (
-        build_tree_kernel(
-            verified_id=verified_id,
-            score_list=score_list,
-            token_list=token_list,
-            parents_list=parents_list,
-            seq_lens=seq_lens,
-            seq_lens_sum=torch.sum(seq_lens).item(),
-            topk=topk,
-            spec_steps=depth,
-            num_verify_tokens=num_draft_token,
-        )
-    )
-
-    from sglang.srt.utils import first_rank_print
-
-    first_rank_print("=========== build tree kernel ==========")
-    # first_rank_print(f"{tree_mask=}", flush=True)
-    first_rank_print(f"{position=}", flush=True)
-    first_rank_print(f"{retrive_index=}", flush=True)
-    first_rank_print(f"{retrive_cum_len=}", flush=True)
-    first_rank_print(f"{draft_tokens=}", flush=True)
-    assert position.tolist() == [5, 6, 6, 7, 7, 8, 8, 9, 10, 11, 12, 12, 12, 12, 13, 14]
-    assert retrive_index.tolist() == [
-        [0, -1, -1, -1, -1, -1],
-        [0, 2, 4, 6, -1, -1],
-        [0, 1, 3, 5, 7, -1],
-        [8, -1, -1, -1, -1, -1],
-        [8, 9, 10, -1, -1, -1],
-        [8, 9, 12, -1, -1, -1],
-        [8, 9, 13, -1, -1, -1],
-        [8, 9, 11, 14, 15, -1],
-    ]
-    assert retrive_cum_len.tolist() == [0, 3, 8]
-    assert draft_tokens.tolist() == [
-        29974,
-        29896,
-        29906,
-        29889,
-        29974,
-        29946,
-        29896,
-        29946,
-        13,
-        13,
-        22550,
-        4136,
-        16492,
-        8439,
-        29871,
-        29941,
-    ]
-
     (
         tree_mask,
         position,
@@ -725,4 +386,3 @@ def test_build_tree_kernel_efficient():
 
 if __name__ == "__main__":
     test_build_tree_kernel_efficient()
-    test_build_tree_kernel()

@@ -2,8 +2,18 @@ from typing import List, Optional, Tuple
 
 import torch
 
+try:
+    from vllm import _custom_ops as vllm_ops
+
+    VLLM_AVAILABLE = True
+except ImportError:
+    VLLM_AVAILABLE = False
+
 from sglang.srt.layers.quantization.fp8_kernel import (
+    _enable_jit_deepgemm,
     per_token_group_quant_fp8,
+    scaled_fp8_quant,
+    sglang_per_token_quant_fp8,
     static_quant_fp8,
     w8a8_block_fp8_matmul,
 )
@@ -15,26 +25,34 @@ from sglang.srt.utils import (
     is_hip,
 )
 
-use_vllm_cutlass_w8a8_fp8_kernel = get_bool_env_var("USE_VLLM_CUTLASS_W8A8_FP8_KERNEL")
-
 _is_hip = is_hip()
+_is_cuda = is_cuda()
+
 if _is_hip and get_bool_env_var("CK_MOE"):
     from aiter import gemm_a8w8_blockscale
 
-_is_cuda = is_cuda()
 if _is_cuda:
-    from sgl_kernel import fp8_blockwise_scaled_mm
+    from sgl_kernel import fp8_blockwise_scaled_mm, fp8_scaled_mm
 
-    from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_quant_fp8
-
-    if use_vllm_cutlass_w8a8_fp8_kernel:
-        from vllm import _custom_ops as ops
-    else:
-        from sgl_kernel import fp8_scaled_mm
+use_vllm_cutlass_w8a8_fp8_kernel = get_bool_env_var("USE_VLLM_CUTLASS_W8A8_FP8_KERNEL")
 
 # Input scaling factors are no longer optional in _scaled_mm starting
 # from pytorch 2.5. Allocating a dummy tensor to pass as input_scale
-TORCH_DEVICE_IDENTITY = torch.ones(1, dtype=torch.float32)
+TORCH_DEVICE_IDENTITY = None
+
+_TORCH_VERSION = torch.__version__.split("+")[0]
+try:
+    _TORCH_VERSION_TUPLE = tuple(map(int, _TORCH_VERSION.split(".")[:3]))
+except ValueError:
+    _TORCH_VERSION_TUPLE = (0, 0, 0)
+
+# The condition to determine if it is on a platform that supports
+# torch._scaled_mm rowwise feature.
+# The condition is determined once as the operations
+# are time consuming.
+USE_ROWWISE_TORCH_SCALED_MM = (
+    _is_hip and get_device_capability() >= (9, 4) and _TORCH_VERSION_TUPLE >= (2, 7, 0)
+)
 
 
 def cutlass_fp8_supported():
@@ -74,7 +92,7 @@ def normalize_e4m3fn_to_e4m3fnuz(
 
 
 def cutlass_block_fp8_supported() -> bool:
-    if get_bool_env_var("SUPPORT_CUTLASS_BLOCK_FP8"):
+    if not get_bool_env_var("SUPPORT_CUTLASS_BLOCK_FP8"):
         return False
     if _is_cuda:
         major, minor = torch.cuda.get_device_capability()
@@ -122,9 +140,17 @@ def apply_w8a8_block_fp8_linear(
         )
         gemm_a8w8_blockscale(q_input, weight, x_scale, weight_scale, output)
     else:
-        q_input, x_scale = per_token_group_quant_fp8(
-            input_2d, block_size[1], column_major_scales=False
-        )
+        if _enable_jit_deepgemm:
+            q_input, x_scale = per_token_group_quant_fp8(
+                input_2d,
+                block_size[1],
+                column_major_scales=True,
+                scale_tma_aligned=True,
+            )
+        else:
+            q_input, x_scale = per_token_group_quant_fp8(
+                input_2d, block_size[1], column_major_scales=False
+            )
         output = w8a8_block_fp8_matmul(
             q_input, weight, x_scale, weight_scale, block_size, output_dtype=input.dtype
         )
@@ -140,12 +166,13 @@ def input_to_float8(
     """This function quantizes input values to float8 values with tensor-wise quantization."""
     finfo = torch.finfo(dtype)
     min_val, max_val = x.aminmax()
-    amax = torch.maximum(min_val.abs(), max_val.abs()).clamp(min=1e-12)
+    amax = torch.maximum(min_val.abs(), max_val.abs()).float().clamp(min=1e-12)
     fp8_max = finfo.max
     if _is_hip:
+        dtype = torch.float8_e4m3fnuz
         fp8_max = 224.0
     scale = fp8_max / amax
-    x_scl_sat = (x * scale).clamp(min=-fp8_max, max=fp8_max)
+    x_scl_sat = (x.float() * scale).clamp(min=-fp8_max, max=fp8_max)
     return x_scl_sat.to(dtype).contiguous(), scale.float().reciprocal()
 
 
@@ -184,7 +211,24 @@ def block_quant_to_tensor_quant(
         for j in range(n_tiles):
             x_dq_block_tiles[j][i][:, :] = x_dq_block_tiles[j][i] * x_s[j][i]
 
-    x_q_tensor, scale = input_to_float8(x_dq_block, dtype=x_q_block.dtype)
+    x_q_tensor, scale = (
+        scaled_fp8_quant(x_dq_block)
+        if _is_cuda
+        else input_to_float8(x_dq_block, dtype=x_q_block.dtype)
+    )
+    return x_q_tensor, scale
+
+
+def channel_quant_to_tensor_quant(
+    x_q_channel: torch.Tensor,
+    x_s: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    x_dq_channel = x_q_channel.to(torch.float32) * x_s
+    x_q_tensor, scale = (
+        scaled_fp8_quant(x_dq_channel)
+        if _is_cuda
+        else input_to_float8(x_dq_channel, dtype=x_q_channel.dtype)
+    )
     return x_q_tensor, scale
 
 
@@ -214,14 +258,24 @@ def apply_fp8_linear(
         if _is_cuda:
             qinput, x_scale = sglang_per_token_quant_fp8(input_2d)
         else:
-            qinput, x_scale = per_token_group_quant_fp8(
-                input_2d, group_size=input_2d.shape[1]
-            )
+            # TODO(kkhuang): temporarily enforce per-tensor activation scaling if weight is per-tensor scaling
+            # final solution should be: 1. add support to per-tensor activation scaling.
+            # 2. solve the torch.compile error from weight_scale.numel() == 1 and x_scale.numel() > 1 (below line#308)
+            if _is_hip and weight_scale.numel() == 1:
+                qinput, x_scale = vllm_ops.scaled_fp8_quant(
+                    input_2d,
+                    input_scale,
+                    use_per_token_if_dynamic=use_per_token_if_dynamic,
+                )
+            else:
+                qinput, x_scale = per_token_group_quant_fp8(
+                    input_2d, group_size=input_2d.shape[1]
+                )
 
     if cutlass_fp8_supported:
-        if use_vllm_cutlass_w8a8_fp8_kernel:
+        if VLLM_AVAILABLE and use_vllm_cutlass_w8a8_fp8_kernel:
             # Fall back to vllm cutlass w8a8 fp8 kernel
-            output = ops.cutlass_scaled_mm(
+            output = vllm_ops.cutlass_scaled_mm(
                 qinput,
                 weight,
                 out_dtype=input.dtype,
@@ -234,7 +288,12 @@ def apply_fp8_linear(
                 weight_scale.numel() == weight.shape[1]
             ), "cutlass w8a8 fp8 sgl-kernel only supports per-channel scale"
             output = fp8_scaled_mm(
-                qinput, weight, x_scale, weight_scale, out_dtype=input.dtype, bias=bias
+                qinput,
+                weight,
+                x_scale,
+                weight_scale,
+                out_dtype=input.dtype,
+                bias=bias,
             )
         return output.view(*output_shape)
 
@@ -279,8 +338,10 @@ def apply_fp8_linear(
 
             # Making sure the dummy tensor is on the same device as the weight
             global TORCH_DEVICE_IDENTITY
-            if TORCH_DEVICE_IDENTITY.device != weight.device:
-                TORCH_DEVICE_IDENTITY = TORCH_DEVICE_IDENTITY.to(weight.device)
+            if TORCH_DEVICE_IDENTITY is None:
+                TORCH_DEVICE_IDENTITY = torch.ones(
+                    1, dtype=torch.float32, device=weight.device
+                )
 
             # GEMM
             # This computes C = (X * W).
@@ -306,3 +367,214 @@ def apply_fp8_linear(
             if bias is not None:
                 output = output + bias
             return output.to(dtype=input.dtype).view(*output_shape)
+
+
+# Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/utils/w8a8_utils.py
+# TODO(luka): follow similar pattern for marlin and block-fp8-linear
+#  https://github.com/vllm-project/vllm/issues/14397
+class Fp8LinearOp:
+    """
+    This class executes a FP8 linear layer using cutlass if supported and
+    torch.scaled_mm otherwise.
+    It needs to be a class instead of a method so that config can be read
+    in the __init__ method, as reading config is not allowed inside forward.
+    """
+
+    def __init__(
+        self,
+        cutlass_fp8_supported: bool = cutlass_fp8_supported(),
+        use_per_token_if_dynamic: bool = False,
+        pad_output: Optional[bool] = None,
+    ):
+        self.cutlass_fp8_supported = cutlass_fp8_supported
+        self.use_per_token_if_dynamic = use_per_token_if_dynamic
+
+        # Note: we pad the input because torch._scaled_mm is more performant
+        # for matrices with batch dimension > 16.
+        # This could change in the future.
+        # We also don't pad when using torch.compile,
+        # as it breaks with dynamic shapes.
+        if pad_output is None:
+            enable_torch_compile = get_bool_env_var("SGLANG_ENABLE_TORCH_COMPILE")
+            pad_output = not enable_torch_compile
+        self.output_padding = 17 if pad_output else None
+
+    def apply(
+        self,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        input_scale: Optional[torch.Tensor] = None,
+        input_scale_ub: Optional[torch.Tensor] = None,
+        bias: Optional[torch.Tensor] = None,
+        # TODO(luka) remove this parameter in favor of __init__
+        use_per_token_if_dynamic: Optional[bool] = None,
+    ) -> torch.Tensor:
+        # ops.scaled_fp8_quant supports both dynamic and static quant.
+        #   If dynamic, layer.input_scale is None and x_scale computed from x.
+        #   If static, layer.input_scale is scalar and x_scale is input_scale.
+
+        # View input as 2D matrix for fp8 methods
+        input_2d = input.view(-1, input.shape[-1])
+        output_shape = [*input.shape[:-1], weight.shape[1]]
+
+        # TODO(luka) this is here because currently MLA only decides this
+        #  during the forward method instead of in __init__.
+        if use_per_token_if_dynamic is None:
+            use_per_token_if_dynamic = self.use_per_token_if_dynamic
+
+        # cutlass_scaled_mm supports per tensor/channel W and per tensor/token A
+        # for sgl-kernel fp8_scaled_mm, it support per channel W now
+        if self.cutlass_fp8_supported and weight_scale.numel() == weight.shape[1]:
+            if _is_cuda:
+                qinput, x_scale = scaled_fp8_quant(
+                    input_2d,
+                    input_scale,
+                    use_per_token_if_dynamic=use_per_token_if_dynamic,
+                )
+            else:
+                qinput, x_scale = vllm_ops.scaled_fp8_quant(
+                    input_2d,
+                    input_scale,
+                    scale_ub=input_scale_ub,
+                    use_per_token_if_dynamic=use_per_token_if_dynamic,
+                )
+
+            # Fused GEMM_DQ
+            if VLLM_AVAILABLE and use_vllm_cutlass_w8a8_fp8_kernel:
+                # Fall back to vllm cutlass w8a8 fp8 kernel
+                output = vllm_ops.cutlass_scaled_mm(
+                    qinput,
+                    weight,
+                    out_dtype=input.dtype,
+                    scale_a=x_scale,
+                    scale_b=weight_scale,
+                    bias=bias,
+                )
+            else:
+                assert (
+                    weight_scale.numel() == weight.shape[1]
+                ), "cutlass w8a8 fp8 sgl-kernel only supports per-channel scale"
+                output = fp8_scaled_mm(
+                    qinput,
+                    weight,
+                    x_scale,
+                    weight_scale,
+                    out_dtype=input.dtype,
+                    bias=bias,
+                )
+            return output.view(*output_shape)
+
+        # torch.scaled_mm supports per tensor weights + activations only
+        # so fallback to naive if per channel or per token
+        else:
+            # Maybe apply padding to output, see comment in __init__
+            if _is_cuda:
+                qinput, x_scale = scaled_fp8_quant(
+                    input_2d,
+                    input_scale,
+                    num_token_padding=self.output_padding,
+                    use_per_token_if_dynamic=use_per_token_if_dynamic,
+                )
+            else:
+                qinput, x_scale = vllm_ops.scaled_fp8_quant(
+                    input_2d,
+                    input_scale,
+                    num_token_padding=self.output_padding,
+                    use_per_token_if_dynamic=use_per_token_if_dynamic,
+                )
+
+            per_tensor_weights = weight_scale.numel() == 1
+            per_tensor_activations = x_scale.numel() == 1
+
+            if per_tensor_weights and per_tensor_activations:
+                # Fused GEMM_DQ
+                output = torch._scaled_mm(
+                    qinput,
+                    weight,
+                    out_dtype=input.dtype,
+                    scale_a=x_scale,
+                    scale_b=weight_scale,
+                    bias=bias,
+                )
+                # A fix for discrepancy in scaled_mm which returns tuple
+                # for torch < 2.5 and a single value in torch >= 2.5
+                if type(output) is tuple and len(output) == 2:
+                    output = output[0]
+
+                return torch.narrow(output, 0, 0, input_2d.shape[0]).view(*output_shape)
+
+            elif (
+                use_per_token_if_dynamic
+                and not per_tensor_weights
+                and not per_tensor_activations
+                and USE_ROWWISE_TORCH_SCALED_MM
+            ):
+                # For now validated on ROCm platform
+                # fp8 rowwise scaling in torch._scaled_mm is introduced in
+                # https://github.com/pytorch/pytorch/pull/144432 using hipBLASLt
+                # and ROCm 6.3, which only exists in torch 2.7 and above.
+                # For CUDA platform please validate if the
+                # torch._scaled_mm support rowwise scaled GEMM
+                # Fused GEMM_DQ Rowwise GEMM
+                output = torch._scaled_mm(
+                    qinput,
+                    weight,
+                    out_dtype=input.dtype,
+                    scale_a=x_scale,
+                    scale_b=weight_scale.t(),
+                    bias=bias,
+                )
+
+                output = torch.narrow(output, 0, 0, input_2d.shape[0])
+                output = output.view(*output_shape)
+                return output
+
+            else:
+                # Fallback for channelwise case, where we use unfused DQ
+                # due to limitations with scaled_mm
+
+                # Symmetric quantized GEMM by definition computes the following:
+                #   C = (s_x * X) (s_w * W) + bias
+                # This is equivalent to dequantizing the weights and activations
+                # before applying a GEMM.
+                #
+                # In order to compute quantized operands, a quantized kernel
+                # will rewrite the above like so:
+                #   C = s_w * s_x * (X * W) + bias
+                #
+                # For the scaled_mm fallback case, we break this down, since it
+                # does not support s_w being a vector.
+
+                # GEMM
+                # This computes C = (X * W).
+                # Output in fp32 to allow subsequent ops to happen in-place
+
+                # Making sure the dummy tensor is on the same device as the weight
+                global TORCH_DEVICE_IDENTITY
+                if TORCH_DEVICE_IDENTITY is None:
+                    TORCH_DEVICE_IDENTITY = torch.ones(
+                        1, dtype=torch.float32, device=weight.device
+                    )
+
+                output = torch._scaled_mm(
+                    qinput,
+                    weight,
+                    scale_a=TORCH_DEVICE_IDENTITY,
+                    scale_b=TORCH_DEVICE_IDENTITY,
+                    out_dtype=torch.float32,
+                )
+                # A fix for discrepancy in scaled_mm which returns tuple
+                # for torch < 2.5 and a single value in torch >= 2.5
+                if type(output) is tuple and len(output) == 2:
+                    output = output[0]
+                # Unpad (undo num_token_padding)
+                output = torch.narrow(output, 0, 0, input_2d.shape[0])
+                x_scale = torch.narrow(x_scale, 0, 0, input_2d.shape[0])
+
+                # DQ
+                # C = sw * sx * (X * W) + bias
+                output = output * x_scale * weight_scale.t()
+                if bias is not None:
+                    output = output + bias
+                return output.to(dtype=input.dtype).view(*output_shape)

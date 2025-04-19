@@ -22,7 +22,6 @@ from typing import (
 )
 
 import filelock
-import gguf
 import huggingface_hub.constants
 import numpy as np
 import safetensors.torch
@@ -93,7 +92,7 @@ def convert_bin_to_safetensor_file(
     pt_filename: str,
     sf_filename: str,
 ) -> None:
-    loaded = torch.load(pt_filename, map_location="cpu")
+    loaded = torch.load(pt_filename, map_location="cpu", weights_only=True)
     if "state_dict" in loaded:
         loaded = loaded["state_dict"]
     shared = _shared_pointers(loaded)
@@ -130,7 +129,9 @@ def convert_bin_to_safetensor_file(
 
 # TODO(woosuk): Move this to other place.
 def get_quant_config(
-    model_config: ModelConfig, load_config: LoadConfig
+    model_config: ModelConfig,
+    load_config: LoadConfig,
+    packed_modules_mapping: Dict[str, List[str]],
 ) -> QuantizationConfig:
     quant_cls = get_quantization_config(model_config.quantization)
 
@@ -148,6 +149,7 @@ def get_quant_config(
         # compressed-tensors uses a compressions_config
         hf_quant_config = getattr(model_config.hf_config, "compression_config", None)
     if hf_quant_config is not None:
+        hf_quant_config["packed_modules_mapping"] = packed_modules_mapping
         return quant_cls.from_config(hf_quant_config)
     # In case of bitsandbytes/QLoRA, get quant config from the adapter model.
     if model_config.quantization == "bitsandbytes":
@@ -381,7 +383,7 @@ def np_cache_weights_iterator(
                 disable=not enable_tqdm,
                 bar_format=_BAR_FORMAT,
             ):
-                state = torch.load(bin_file, map_location="cpu")
+                state = torch.load(bin_file, map_location="cpu", weights_only=True)
                 for name, param in state.items():
                     param_path = os.path.join(np_folder, name)
                     with open(param_path, "wb") as f:
@@ -458,12 +460,13 @@ def pt_weights_iterator(
         state = torch.load(bin_file, map_location="cpu", weights_only=True)
         yield from state.items()
         del state
-        torch.cuda.empty_cache()
 
 
 def get_gguf_extra_tensor_names(
     gguf_file: str, gguf_to_hf_name_map: Dict[str, str]
 ) -> List[str]:
+    import gguf
+
     reader = gguf.GGUFReader(gguf_file)
     expected_gguf_keys = set(gguf_to_hf_name_map.keys())
     exact_gguf_keys = set([tensor.name for tensor in reader.tensors])
@@ -478,6 +481,8 @@ def gguf_quant_weights_iterator(
     Iterate over the quant weights in the model gguf files and convert
     them to torch tensors
     """
+
+    import gguf
 
     reader = gguf.GGUFReader(gguf_file)
 
@@ -583,6 +588,51 @@ def composed_weight_loader(
         return
 
     return composed_loader
+
+
+def runai_safetensors_weights_iterator(
+    hf_weights_files: List[str],
+) -> Generator[Tuple[str, torch.Tensor], None, None]:
+    """Iterate over the weights in the model safetensor files."""
+    from runai_model_streamer import SafetensorsStreamer
+
+    enable_tqdm = (
+        not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+    )
+
+    with SafetensorsStreamer() as streamer:
+        for st_file in tqdm(
+            hf_weights_files,
+            desc="Loading safetensors using Runai Model Streamer",
+            disable=not enable_tqdm,
+            bar_format=_BAR_FORMAT,
+        ):
+            streamer.stream_file(st_file)
+            yield from streamer.get_tensors()
+
+
+def set_runai_streamer_env(load_config: LoadConfig):
+    if load_config.model_loader_extra_config:
+        extra_config = load_config.model_loader_extra_config
+
+        if "concurrency" in extra_config and isinstance(
+            extra_config.get("concurrency"), int
+        ):
+            os.environ["RUNAI_STREAMER_CONCURRENCY"] = str(
+                extra_config.get("concurrency")
+            )
+
+        if "memory_limit" in extra_config and isinstance(
+            extra_config.get("memory_limit"), int
+        ):
+            os.environ["RUNAI_STREAMER_MEMORY_LIMIT"] = str(
+                extra_config.get("memory_limit")
+            )
+
+    runai_streamer_s3_endpoint = os.getenv("RUNAI_STREAMER_S3_ENDPOINT")
+    aws_endpoint_url = os.getenv("AWS_ENDPOINT_URL")
+    if runai_streamer_s3_endpoint is None and aws_endpoint_url is not None:
+        os.environ["RUNAI_STREAMER_S3_ENDPOINT"] = aws_endpoint_url
 
 
 def initialize_dummy_weights(

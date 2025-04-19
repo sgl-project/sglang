@@ -3,11 +3,36 @@ from fractions import Fraction
 from typing import Any, Dict, List, Optional, Union
 
 import torch
-from vllm.scalar_type import scalar_types
 
 from sglang.srt.layers.linear import LinearBase
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+from sglang.srt.utils import is_cuda
+
+_is_cuda = is_cuda()
+
+try:
+    from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
+    from vllm.model_executor.layers.quantization.gptq import GPTQLinearMethod
+    from vllm.model_executor.layers.quantization.gptq_marlin import (
+        GPTQMarlinLinearMethod,
+        GPTQMarlinMoEMethod,
+    )
+    from vllm.model_executor.layers.quantization.marlin import MarlinLinearMethod
+    from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+        check_marlin_supported,
+    )
+    from vllm.scalar_type import scalar_types
+
+    VLLM_AVAILABLE = True
+except ImportError:
+    VLLM_AVAILABLE = False
+
+    GPTQLinearMethod = MarlinLinearMethod = QuantizeMethodBase = Any
+
+    class scalar_types:
+        uint4b8 = "uint4b8"
+        uint8b128 = "uint8b128"
+
 
 logger = logging.getLogger(__name__)
 
@@ -109,9 +134,8 @@ class GPTQConfig(QuantizationConfig):
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
-    ) -> Optional["GPTQLinearMethod"]:
-        from vllm.model_executor.layers.quantization.gptq import GPTQLinearMethod
-
+    ) -> Optional[GPTQLinearMethod]:
+        # Delay the import to avoid circular dependency
         from sglang.srt.layers.quantization import get_linear_quant_method
 
         return get_linear_quant_method(self, layer, prefix, GPTQLinearMethod)
@@ -181,6 +205,7 @@ class GPTQMarlinConfig(QuantizationConfig):
                 "Unsupported quantization config: " f"bits={weight_bits}, sym={is_sym}"
             )
 
+        # (num_bits, is_sym) -> quant_type
         self.quant_type = self.TYPE_MAP[(weight_bits, is_sym)]
 
     def __repr__(self) -> str:
@@ -262,12 +287,8 @@ class GPTQMarlinConfig(QuantizationConfig):
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
-    ) -> Optional["QuantizeMethodBase"]:
-        from vllm.model_executor.layers.quantization.gptq_marlin import (
-            GPTQMarlinLinearMethod,
-            GPTQMarlinMoEMethod,
-        )
-
+    ) -> Optional[QuantizeMethodBase]:
+        # Delay the import to avoid circular dependency
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
         from sglang.srt.layers.quantization import get_linear_quant_method
 
@@ -291,12 +312,7 @@ class GPTQMarlinConfig(QuantizationConfig):
         sym = quant_config.get("sym")
         desc_act = quant_config.get("desc_act")
 
-        from vllm.model_executor.layers.quantization.utils.marlin_utils import (
-            check_marlin_supported,
-        )
-        from vllm.platforms import current_platform
-
-        if not current_platform.is_cuda():
+        if not _is_cuda:
             return False
 
         if quant_method != "gptq":
@@ -406,8 +422,9 @@ class MarlinConfig(QuantizationConfig):
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
-    ) -> Optional["MarlinLinearMethod"]:
-        from vllm.model_executor.layers.quantization.marlin import MarlinLinearMethod
+    ) -> Optional[MarlinLinearMethod]:
+        # Delay the import to avoid circular dependency
+        from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 
         if isinstance(layer, LinearBase) or (
             isinstance(layer, ParallelLMHead) and self.lm_head_quantized

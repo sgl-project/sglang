@@ -32,16 +32,34 @@ import psutil
 import setproctitle
 import torch
 import zmq
+from torch.distributed import barrier
 
 from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constrained.base_grammar_backend import create_grammar_backend
+from sglang.srt.disaggregation.decode import (
+    DecodePreallocQueue,
+    DecodeTransferQueue,
+    SchedulerDisaggregationDecodeMixin,
+)
+from sglang.srt.disaggregation.prefill import (
+    PrefillBootstrapQueue,
+    SchedulerDisaggregationPrefillMixin,
+)
+from sglang.srt.disaggregation.utils import (
+    DisaggregationMode,
+    ReqToMetadataIdxAllocator,
+    TransferBackend,
+)
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.managers.expert_distribution import ExpertDistributionRecorder
 from sglang.srt.managers.io_struct import (
     AbortReq,
     CloseSessionReqInput,
+    ExpertDistributionReq,
+    ExpertDistributionReqOutput,
     FlushCacheReq,
     GetInternalStateReq,
     GetInternalStateReqOutput,
@@ -59,6 +77,8 @@ from sglang.srt.managers.io_struct import (
     ReleaseMemoryOccupationReqOutput,
     ResumeMemoryOccupationReqInput,
     ResumeMemoryOccupationReqOutput,
+    RpcReqInput,
+    RpcReqOutput,
     SetInternalStateReq,
     SetInternalStateReqOutput,
     TokenizedEmbeddingReqInput,
@@ -72,7 +92,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
-    ImageInputs,
+    MultimodalInputs,
     Req,
     ScheduleBatch,
     global_server_args_dict,
@@ -93,11 +113,13 @@ from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import (
+    DynamicGradMode,
     broadcast_pyobj,
     configure_logger,
     crash_on_warnings,
@@ -110,6 +132,8 @@ from sglang.srt.utils import (
     suppress_other_loggers,
 )
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
+
+expert_distribution_recorder = ExpertDistributionRecorder()
 
 logger = logging.getLogger(__name__)
 
@@ -133,7 +157,11 @@ class EmbeddingBatchResult:
     bid: int
 
 
-class Scheduler(SchedulerOutputProcessorMixin):
+class Scheduler(
+    SchedulerOutputProcessorMixin,
+    SchedulerDisaggregationDecodeMixin,
+    SchedulerDisaggregationPrefillMixin,
+):
     """A scheduler that manages a tensor parallel GPU worker."""
 
     def __init__(
@@ -193,13 +221,27 @@ class Scheduler(SchedulerOutputProcessorMixin):
                 self.send_to_detokenizer = get_zmq_socket(
                     context, zmq.PUSH, port_args.detokenizer_ipc_name, False
                 )
+
+            self.recv_from_rpc = get_zmq_socket(
+                context, zmq.DEALER, port_args.rpc_ipc_name, False
+            )
         else:
             self.recv_from_tokenizer = None
+            self.recv_from_rpc = None
             self.send_to_tokenizer = SimpleNamespace(send_pyobj=lambda x: None)
             self.send_to_detokenizer = SimpleNamespace(send_pyobj=lambda x: None)
 
         # Init tokenizer
         self.init_tokenizer()
+
+        # Set reasoning_parser and think_end_id if --reasoning_parser is enabled
+        if self.server_args.reasoning_parser and self.tokenizer:
+            reasoning_parser = ReasoningParser(
+                model_type=self.server_args.reasoning_parser, stream_reasoning=False
+            )
+            self.tokenizer.think_end_id = self.tokenizer.encode(
+                reasoning_parser.detector.think_end_token, add_special_tokens=False
+            )[0]
 
         # Check whether overlap can be enabled
         if not self.is_generation:
@@ -348,7 +390,7 @@ class Scheduler(SchedulerOutputProcessorMixin):
         # Init profiler
         self.torch_profiler = None
         self.torch_profiler_output_dir: Optional[str] = None
-        self.torch_profiler_activities: Optional[List[str]] = None
+        self.profiler_activities: Optional[List[str]] = None
         self.profiler_target_forward_ct: Optional[int] = None
 
         # Init metrics stats
@@ -376,8 +418,15 @@ class Scheduler(SchedulerOutputProcessorMixin):
                 (ProfileReq, self.profile),
                 (GetInternalStateReq, self.get_internal_state),
                 (SetInternalStateReq, self.set_internal_state),
+                (RpcReqInput, self.handle_rpc_request),
+                (ExpertDistributionReq, self.expert_distribution_handle),
             ]
         )
+
+        self.disaggregation_mode = DisaggregationMode(
+            self.server_args.disaggregation_mode
+        )
+        self.init_disaggregation()
 
     def init_tokenizer(self):
         server_args = self.server_args
@@ -389,6 +438,7 @@ class Scheduler(SchedulerOutputProcessorMixin):
             context_length=server_args.context_length,
             model_override_args=server_args.json_model_override_args,
             is_embedding=server_args.is_embedding,
+            enable_multimodal=server_args.enable_multimodal,
             dtype=server_args.dtype,
             quantization=server_args.quantization,
         )
@@ -403,6 +453,7 @@ class Scheduler(SchedulerOutputProcessorMixin):
                     tokenizer_mode=server_args.tokenizer_mode,
                     trust_remote_code=server_args.trust_remote_code,
                     revision=server_args.revision,
+                    use_fast=not server_args.disable_fast_image_processor,
                 )
                 self.tokenizer = self.processor.tokenizer
             else:
@@ -433,8 +484,9 @@ class Scheduler(SchedulerOutputProcessorMixin):
                 self.tree_cache = HiRadixCache(
                     req_to_token_pool=self.req_to_token_pool,
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                    tp_cache_group=self.tp_worker.get_tp_cpu_group(),
+                    tp_cache_group=self.tp_cpu_group,
                     page_size=self.page_size,
+                    hicache_ratio=server_args.hicache_ratio,
                 )
             else:
                 self.tree_cache = RadixCache(
@@ -478,7 +530,81 @@ class Scheduler(SchedulerOutputProcessorMixin):
                 },
             )
 
-    @torch.no_grad()
+    def init_disaggregation(self):
+        self.transfer_backend = TransferBackend(
+            self.server_args.disaggregation_transfer_backend
+        )
+
+        if (
+            self.disaggregation_mode == DisaggregationMode.DECODE
+        ):  # *2 for the headroom.
+            buffer_size = (self.req_to_token_pool.size) * 2
+            req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
+                buffer_size
+            )
+            aux_dtype = torch.int32
+            # A list of metadata buffers. The shape is (b, metadata_size) where
+            # b corresponds to a max running requests. The last shape * dtype.itemsize
+            # should be larger than 64 bytes to work with RDMA, so we pad it.
+            output_id_buffer = torch.zeros(
+                (buffer_size, 16), dtype=aux_dtype, device="cpu"
+            )
+            metadata_buffers = [output_id_buffer]
+
+            # The decode requests polling kv cache
+            self.disagg_decode_transfer_queue = DecodeTransferQueue(
+                gloo_group=self.attn_tp_cpu_group,
+                req_to_metadata_buffer_idx_allocator=req_to_metadata_buffer_idx_allocator,
+                metadata_buffers=metadata_buffers,
+            )
+
+            # The decode requests pending for pre-allocation
+            self.disagg_decode_prealloc_queue = DecodePreallocQueue(
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                req_to_metadata_buffer_idx_allocator=req_to_metadata_buffer_idx_allocator,
+                metadata_buffers=metadata_buffers,
+                aux_dtype=aux_dtype,
+                scheduler=self,
+                transfer_queue=self.disagg_decode_transfer_queue,
+                tree_cache=self.tree_cache,
+                gloo_group=self.attn_tp_cpu_group,
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
+                bootstrap_port=self.server_args.disaggregation_bootstrap_port,
+                transfer_backend=self.transfer_backend,
+            )
+        elif self.disaggregation_mode == DisaggregationMode.PREFILL:
+            # *2 for the headroom.
+            buffer_size = self.max_running_requests * 2
+            req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
+                buffer_size
+            )
+            aux_dtype = torch.int32
+            # A list of metadata buffers. The shape is (b, metadata_size) where
+            # b corresponds to a max running requests. The last shape * dtype.itemsize
+            # should be larger than 64 bytes to work with RDMA, so we pad it.
+            output_id_buffer = torch.zeros(
+                (buffer_size, 16), dtype=aux_dtype, device="cpu"
+            )
+            metadata_buffers = [output_id_buffer]
+
+            self.disagg_prefill_pending_queue = PrefillBootstrapQueue(
+                token_to_kv_pool=self.token_to_kv_pool_allocator.get_kvcache(),
+                req_to_metadata_buffer_idx_allocator=req_to_metadata_buffer_idx_allocator,
+                metadata_buffers=metadata_buffers,
+                aux_dtype=aux_dtype,
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
+                bootstrap_port=self.server_args.disaggregation_bootstrap_port,
+                gloo_group=self.attn_tp_cpu_group,
+                transfer_backend=self.transfer_backend,
+                scheduler=self,
+            )
+            # The prefill requests that are in the middle of kv sending
+            self.disagg_prefill_inflight_queue: List[Req] = []
+
+    @DynamicGradMode()
     def event_loop_normal(self):
         """A normal scheduler loop."""
         while True:
@@ -498,7 +624,7 @@ class Scheduler(SchedulerOutputProcessorMixin):
 
             self.last_batch = batch
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
         self.result_queue = deque()
@@ -549,6 +675,13 @@ class Scheduler(SchedulerOutputProcessorMixin):
                 except zmq.ZMQError:
                     break
                 recv_reqs.append(recv_req)
+
+            while True:
+                try:
+                    recv_rpc = self.recv_from_rpc.recv_pyobj(zmq.NOBLOCK)
+                except zmq.ZMQError:
+                    break
+                recv_reqs.append(recv_rpc)
         else:
             recv_reqs = None
 
@@ -600,7 +733,11 @@ class Scheduler(SchedulerOutputProcessorMixin):
 
             output = self._request_dispatcher(recv_req)
             if output is not None:
-                self.send_to_tokenizer.send_pyobj(output)
+                if isinstance(output, RpcReqOutput):
+                    if self.recv_from_rpc is not None:
+                        self.recv_from_rpc.send_pyobj(output)
+                else:
+                    self.send_to_tokenizer.send_pyobj(output)
 
     def handle_generate_request(
         self,
@@ -645,6 +782,8 @@ class Scheduler(SchedulerOutputProcessorMixin):
                 custom_logit_processor=custom_logit_processor,
                 return_hidden_states=recv_req.return_hidden_states,
                 eos_token_ids=self.model_config.hf_eos_token_id,
+                bootstrap_host=recv_req.bootstrap_host,
+                bootstrap_room=recv_req.bootstrap_room,
             )
             req.tokenizer = self.tokenizer
 
@@ -666,8 +805,8 @@ class Scheduler(SchedulerOutputProcessorMixin):
                 return
 
         # Handle multimodal inputs
-        if recv_req.image_inputs is not None:
-            image_inputs = ImageInputs.from_dict(recv_req.image_inputs)
+        if recv_req.mm_inputs is not None:
+            image_inputs = MultimodalInputs.from_dict(recv_req.mm_inputs)
             # Expand a single image token into multiple dummy tokens for receiving image embeddings
             req.origin_input_ids = self.pad_input_ids_func(
                 req.origin_input_ids, image_inputs
@@ -681,7 +820,7 @@ class Scheduler(SchedulerOutputProcessorMixin):
                 )
                 logger.error(error_msg)
                 req.origin_input_ids = [0]
-                req.image_inputs = None
+                req.multimodal_inputs = None
                 req.sampling_params.max_new_tokens = 0
                 req.finished_reason = FINISH_ABORT(
                     error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
@@ -756,10 +895,19 @@ class Scheduler(SchedulerOutputProcessorMixin):
             self._add_request_to_queue(req)
 
     def _add_request_to_queue(self, req: Req):
-        self.waiting_queue.append(req)
+        req.queue_time_start = time.time()
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            self.disagg_prefill_pending_queue.add(req)
+        elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            self.disagg_decode_prealloc_queue.add(req)
+        else:
+            self.waiting_queue.append(req)
 
-    def _extend_requests_to_queue(self, reqs: List[Req]):
-        self.waiting_queue.extend(reqs)
+    def _extend_requests_to_queue(self, reqs: List[Req], is_retracted: bool = False):
+        if self.disaggregation_mode == DisaggregationMode.DECODE:
+            self.disagg_decode_prealloc_queue.extend(reqs)
+        else:
+            self.waiting_queue.extend(reqs)
 
     def handle_embedding_request(
         self,
@@ -775,7 +923,7 @@ class Scheduler(SchedulerOutputProcessorMixin):
 
         # Handle multimodal inputs
         if recv_req.image_inputs is not None:
-            image_inputs = ImageInputs.from_dict(recv_req.image_inputs)
+            image_inputs = MultimodalInputs.from_dict(recv_req.image_inputs)
             # Expand a single image token into multiple dummy tokens for receiving image embeddings
             req.origin_input_ids = self.pad_input_ids_func(
                 req.origin_input_ids, image_inputs
@@ -789,11 +937,12 @@ class Scheduler(SchedulerOutputProcessorMixin):
                 )
                 logger.error(error_msg)
                 req.origin_input_ids = [0]
-                req.image_inputs = None
+                req.multimodal_inputs = None
                 req.sampling_params.max_new_tokens = 0
                 req.finished_reason = FINISH_ABORT(
                     error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
                 )
+                req.queue_time_start = time.time()
                 self.waiting_queue.append(req)
                 return
 
@@ -830,9 +979,10 @@ class Scheduler(SchedulerOutputProcessorMixin):
             self._largest_prefill_len, adder.log_input_tokens
         )
 
+        num_new_seq = len(can_run_list)
         f = (
             f"Prefill batch. "
-            f"#new-seq: {len(can_run_list)}, "
+            f"#new-seq: {num_new_seq}, "
             f"#new-token: {adder.log_input_tokens}, "
             f"#cached-token: {adder.log_hit_tokens}, "
             f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
@@ -850,6 +1000,12 @@ class Scheduler(SchedulerOutputProcessorMixin):
             self.stats.token_usage = round(num_used / self.max_total_num_tokens, 2)
             self.stats.num_queue_reqs = len(self.waiting_queue)
             self.stats.cache_hit_rate = cache_hit_rate
+
+            total_queue_latency = 0
+            for req in can_run_list:
+                total_queue_latency += req.queue_time_end - req.queue_time_start
+            self.stats.avg_request_queue_latency = total_queue_latency / num_new_seq
+
             self.metrics_collector.log_stats(self.stats)
 
     def log_decode_stats(self):
@@ -875,7 +1031,6 @@ class Scheduler(SchedulerOutputProcessorMixin):
                 f"#token: {num_used}, "
                 f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
                 f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
-                f"largest-len: {self._largest_prefill_decode_len}, "
                 f"#queue-req: {len(self.waiting_queue)}, "
             )
             spec_accept_length = 0
@@ -893,7 +1048,6 @@ class Scheduler(SchedulerOutputProcessorMixin):
                 f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
                 f"accept len: {spec_accept_length:.2f}, "
                 f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
-                f"largest-len: {self._largest_prefill_decode_len}, "
                 f"#queue-req: {len(self.waiting_queue)}, "
             )
 
@@ -921,7 +1075,7 @@ class Scheduler(SchedulerOutputProcessorMixin):
         )
         if memory_leak:
             msg = (
-                "KV cache pool leak detected! "
+                "token_to_kv_pool_allocator memory leak detected! "
                 f"{available_size=}, {protected_size=}, {self.max_total_num_tokens=}\n"
                 f"{self.token_to_kv_pool_allocator.available_size()=}\n"
                 f"{self.tree_cache.evictable_size()=}\n"
@@ -932,7 +1086,7 @@ class Scheduler(SchedulerOutputProcessorMixin):
 
         if len(self.req_to_token_pool.free_slots) != self.req_to_token_pool.size:
             msg = (
-                "Memory pool leak detected!"
+                "req_to_token_pool memory leak detected!"
                 f"available_size={len(self.req_to_token_pool.free_slots)}, "
                 f"total_size={self.req_to_token_pool.size}\n"
             )
@@ -997,7 +1151,7 @@ class Scheduler(SchedulerOutputProcessorMixin):
                 ret = None
 
         # Handle DP attention
-        if self.server_args.enable_dp_attention:
+        if self.server_args.enable_dp_attention or self.server_args.enable_sp_layernorm:
             ret, _ = self.prepare_dp_attn_batch(ret)
 
         return ret
@@ -1088,12 +1242,18 @@ class Scheduler(SchedulerOutputProcessorMixin):
         can_run_list: List[Req] = adder.can_run_list
         if len(can_run_list) == 0:
             return None
+
+        if self.enable_metrics:
+            # only record queue time when enable_metrics is True to avoid overhead
+            for req in can_run_list:
+                req.queue_time_end = time.time()
+
         self.waiting_queue = [
             x for x in self.waiting_queue if x not in set(can_run_list)
         ]
 
         if self.enable_hierarchical_cache:
-            self.tree_cache.read_to_load_cache()
+            self.tree_cache.ready_to_load_cache()
 
         if adder.new_chunked_req is not None:
             assert self.chunked_req is None
@@ -1267,14 +1427,36 @@ class Scheduler(SchedulerOutputProcessorMixin):
             self.send_to_tokenizer.send_pyobj(HealthCheckOutput())
 
     def prepare_dp_attn_batch(self, local_batch: ScheduleBatch):
+        return self.prepare_dp_attn_batch_raw(
+            local_batch,
+            dp_size=self.server_args.dp_size,
+            attn_tp_size=self.attn_tp_size,
+            tp_cpu_group=self.tp_cpu_group,
+            get_idle_batch=self.get_idle_batch,
+            disable_cuda_graph=self.server_args.disable_cuda_graph,
+            spec_algorithm=self.spec_algorithm,
+            speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
+        )
+
+    @staticmethod
+    def prepare_dp_attn_batch_raw(
+        local_batch: ScheduleBatch,
+        dp_size,
+        attn_tp_size: int,
+        tp_cpu_group,
+        get_idle_batch,
+        disable_cuda_graph: bool,
+        spec_algorithm,
+        speculative_num_draft_tokens,
+    ):
         # Check if other DP workers have running batches
         if local_batch is None:
             num_tokens = 0
             global_num_tokens_for_logprob = 0
         elif local_batch.forward_mode.is_decode():
             num_tokens = local_batch.batch_size()
-            if not self.spec_algorithm.is_none() and self.spec_algorithm.is_eagle():
-                num_tokens = num_tokens * self.server_args.speculative_num_draft_tokens
+            if not spec_algorithm.is_none() and spec_algorithm.is_eagle():
+                num_tokens = num_tokens * speculative_num_draft_tokens
             global_num_tokens_for_logprob = num_tokens
         else:
             num_tokens = local_batch.extend_num_tokens
@@ -1293,7 +1475,7 @@ class Scheduler(SchedulerOutputProcessorMixin):
         else:
             can_cuda_graph = 0
 
-        if not self.spec_algorithm.is_none():
+        if not spec_algorithm.is_none():
             # TODO(sang): Support cuda graph when idle batch is there.
             if local_batch is None or local_batch.forward_mode.is_idle():
                 can_cuda_graph = 0
@@ -1311,13 +1493,13 @@ class Scheduler(SchedulerOutputProcessorMixin):
             dtype=torch.int64,
         )
         global_info = torch.empty(
-            (self.server_args.dp_size, self.attn_tp_size, 4),
+            (dp_size, attn_tp_size, 4),
             dtype=torch.int64,
         )
         torch.distributed.all_gather_into_tensor(
             global_info.flatten(),
             local_info,
-            group=self.tp_cpu_group,
+            group=tp_cpu_group,
         )
         global_num_tokens = global_info[:, 0, 0].tolist()
         can_cuda_graph = min(global_info[:, 0, 1].tolist())
@@ -1325,14 +1507,14 @@ class Scheduler(SchedulerOutputProcessorMixin):
         is_extend_in_batch = global_info[:, 0, 3].tolist()
 
         if local_batch is None and max(global_num_tokens) > 0:
-            local_batch = self.get_idle_batch()
+            local_batch = get_idle_batch()
 
         if local_batch is not None:
             local_batch.global_num_tokens = global_num_tokens
             local_batch.global_num_tokens_for_logprob = global_num_tokens_for_logprob
 
             # Check forward mode for cuda graph
-            if not self.server_args.disable_cuda_graph:
+            if not disable_cuda_graph:
                 local_batch.can_run_dp_cuda_graph = can_cuda_graph
 
         return local_batch, any(is_extend_in_batch)
@@ -1492,6 +1674,41 @@ class Scheduler(SchedulerOutputProcessorMixin):
             server_args=global_server_args_dict,
         )
 
+    def handle_rpc_request(self, recv_req: RpcReqInput):
+        # Handle RPC requests
+        logger.info(
+            f"handle_rpc_request: {recv_req.method}, param: {recv_req.parameters}"
+        )
+
+        success = True
+        exec = None
+        try:
+            func = getattr(self, recv_req.method)
+            func(recv_req.parameters)
+        except Exception as e:
+            success = False
+            exec = e
+            logger.error(f"Failed to call rpc {recv_req.method}: {str(e)}")
+
+        barrier()
+        return RpcReqOutput(success, "" if not exec else str(exec))
+
+    def save_remote_model(self, params):
+        url = params["url"]
+
+        worker = self.tp_worker.worker
+
+        worker.model_runner.save_remote_model(url)
+
+    def save_sharded_model(self, params):
+        worker = self.tp_worker.worker
+
+        worker.model_runner.save_sharded_model(
+            path=params["path"],
+            pattern=params["pattern"],
+            max_size=params["max_size"],
+        )
+
     def abort_request(self, recv_req: AbortReq):
         # Delete requests in the waiting queue
         to_del = []
@@ -1561,6 +1778,9 @@ class Scheduler(SchedulerOutputProcessorMixin):
         return GetWeightsByNameReqOutput(parameter)
 
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
+        self.memory_saver_adapter.check_validity(
+            caller_name="release_memory_occupation"
+        )
         self.stashed_model_static_state = _export_static_state(
             self.tp_worker.worker.model_runner.model
         )
@@ -1569,6 +1789,7 @@ class Scheduler(SchedulerOutputProcessorMixin):
         return ReleaseMemoryOccupationReqOutput()
 
     def resume_memory_occupation(self, recv_req: ResumeMemoryOccupationReqInput):
+        self.memory_saver_adapter.check_validity(caller_name="resume_memory_occupation")
         self.memory_saver_adapter.resume()
         _import_static_state(
             self.tp_worker.worker.model_runner.model, self.stashed_model_static_state
@@ -1579,7 +1800,11 @@ class Scheduler(SchedulerOutputProcessorMixin):
     def profile(self, recv_req: ProfileReq):
         if recv_req.type == ProfileReqType.START_PROFILE:
             return self.start_profile(
-                recv_req.output_dir, recv_req.num_steps, recv_req.activities
+                recv_req.output_dir,
+                recv_req.num_steps,
+                recv_req.activities,
+                recv_req.with_stack,
+                recv_req.record_shapes,
             )
         else:
             return self.stop_profile()
@@ -1589,8 +1814,10 @@ class Scheduler(SchedulerOutputProcessorMixin):
         output_dir: Optional[str],
         num_steps: Optional[int],
         activities: Optional[List[str]],
+        with_stack: Optional[bool],
+        record_shapes: Optional[bool],
     ) -> None:
-        if self.torch_profiler_activities:
+        if self.profiler_activities:
             return ProfileReqOutput(
                 success=False,
                 message="Profiling is already in progress. Call /stop_profile first.",
@@ -1602,7 +1829,7 @@ class Scheduler(SchedulerOutputProcessorMixin):
             activities = ["CPU", "GPU"]
 
         self.torch_profiler_output_dir = output_dir
-        self.torch_profiler_activities = activities
+        self.profiler_activities = activities
         logger.info(
             "Profiling starts. Traces will be saved to: %s",
             self.torch_profiler_output_dir,
@@ -1619,12 +1846,16 @@ class Scheduler(SchedulerOutputProcessorMixin):
         if torchprof_activities:
             self.torch_profiler = torch.profiler.profile(
                 activities=torchprof_activities,
-                with_stack=True,
+                with_stack=with_stack if with_stack is not None else True,
+                record_shapes=record_shapes if record_shapes is not None else False,
             )
             self.torch_profiler.start()
 
         if "MEM" in activities:
             torch.cuda.memory._record_memory_history(max_entries=100000)
+
+        if "CUDA_PROFILER" in activities:
+            torch.cuda.cudart().cudaProfilerStart()
 
         if num_steps:
             self.profiler_target_forward_ct = self.forward_ct + num_steps
@@ -1634,7 +1865,7 @@ class Scheduler(SchedulerOutputProcessorMixin):
             return ProfileReqOutput(success=True, message="Succeeded")
 
     def stop_profile(self) -> None:
-        if self.torch_profiler_activities is None:
+        if self.profiler_activities is None:
             return
 
         logger.info("Stop profiling...")
@@ -1647,13 +1878,16 @@ class Scheduler(SchedulerOutputProcessorMixin):
                 )
             )
 
-        if "MEM" in self.torch_profiler_activities:
+        if "MEM" in self.profiler_activities:
             memory_profile_path = os.path.join(
-                self.torch_profiler_trace_dir,
+                self.torch_profiler_output_dir,
                 str(time.time()) + f"-TP-{self.tp_rank}-memory" + ".pickle",
             )
             torch.cuda.memory._dump_snapshot(memory_profile_path)
             torch.cuda.memory._record_memory_history(enabled=None)
+
+        if "CUDA_PROFILER" in self.profiler_activities:
+            torch.cuda.cudart().cudaProfilerStop()
 
         logger.info(
             "Profiling done. Traces are saved to: %s",
@@ -1661,12 +1895,23 @@ class Scheduler(SchedulerOutputProcessorMixin):
         )
         self.torch_profiler = None
         self.torch_profiler_output_dir = None
-        self.torch_profiler_activities = None
+        self.profiler_activities = None
 
         if self.profiler_target_forward_ct:
             self.send_to_tokenizer.send_pyobj(
                 ProfileReqOutput(success=True, message="Succeeded.")
             )
+
+    def expert_distribution_handle(self, recv_req: ExpertDistributionReq):
+        if recv_req == ExpertDistributionReq.START_RECORD:
+            expert_distribution_recorder.start_record()
+        elif recv_req == ExpertDistributionReq.STOP_RECORD:
+            expert_distribution_recorder.stop_record()
+        elif recv_req == ExpertDistributionReq.DUMP_RECORD:
+            expert_distribution_recorder.dump_record()
+        else:
+            raise ValueError("Unrecognized ExpertDistributionReq value")
+        return ExpertDistributionReqOutput()
 
     def open_session(self, recv_req: OpenSessionReqInput):
         # handle error
@@ -1718,7 +1963,6 @@ def run_scheduler_process(
     dp_rank: Optional[int],
     pipe_writer,
 ):
-
     # Generate the prefix
     if dp_rank is None:
         prefix = f" TP{tp_rank}"
@@ -1726,7 +1970,7 @@ def run_scheduler_process(
         prefix = f" DP{dp_rank} TP{tp_rank}"
 
     # Config the process
-    # kill_itself_when_parent_died()  # This is disabled because it does not work for `--dp 2`
+    kill_itself_when_parent_died()
     setproctitle.setproctitle(f"sglang::scheduler{prefix.replace(' ', '_')}")
     faulthandler.enable()
     parent_process = psutil.Process().parent()
@@ -1753,10 +1997,18 @@ def run_scheduler_process(
                 "max_req_input_len": scheduler.max_req_input_len,
             }
         )
-        if scheduler.enable_overlap:
-            scheduler.event_loop_overlap()
-        else:
-            scheduler.event_loop_normal()
+        disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
+
+        if disaggregation_mode == DisaggregationMode.NULL:
+            if scheduler.enable_overlap:
+                scheduler.event_loop_overlap()
+            else:
+                scheduler.event_loop_normal()
+        elif disaggregation_mode == DisaggregationMode.PREFILL:
+            scheduler.event_loop_normal_disagg_prefill()
+        elif disaggregation_mode == DisaggregationMode.DECODE:
+            scheduler.event_loop_normal_disagg_decode()
+
     except Exception:
         traceback = get_exception_traceback()
         logger.error(f"Scheduler hit an exception: {traceback}")
