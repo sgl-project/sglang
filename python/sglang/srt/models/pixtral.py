@@ -30,13 +30,13 @@ from transformers.models.pixtral.modeling_pixtral import (
 )
 from transformers.models.pixtral.modeling_pixtral import position_ids_in_meshgrid
 
-from python.sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import MergedColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.managers.mm_utils import MultiModalityDataPaddingPatternImageTokens
+from sglang.srt.managers.mm_utils import MultiModalityDataPaddingPatternMultimodalTokens
+from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 
 
@@ -316,8 +316,8 @@ class PixtralHFVisionModel(nn.Module):
         # Initialize patch position embedding
         self.image_token_id = image_token_id
         self.patch_positional_embedding = PixtralRotaryEmbedding(config)
-        self.input_padder = MultiModalityDataPaddingPatternImageTokens(
-            self.image_token_id
+        self.input_padder = MultiModalityDataPaddingPatternMultimodalTokens(
+            [self.image_token_id]
         )
 
     @property

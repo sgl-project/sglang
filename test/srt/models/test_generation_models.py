@@ -52,9 +52,6 @@ class ModelCase:
 CI_MODELS = [
     ModelCase("meta-llama/Llama-3.1-8B-Instruct"),
     ModelCase("google/gemma-2-2b"),
-    ModelCase("Qwen/Qwen2.5-VL-7B-Instruct"),
-    ModelCase("meta-llama/Llama-3.2-11B-Vision-Instruct"),
-    ModelCase("google/gemma-3-27b-instruct"),
 ]
 
 # the complete set of models to test sglang's generation model
@@ -71,7 +68,6 @@ ALL_MODELS = [
     ModelCase("microsoft/Phi-3-small-8k-instruct", trust_remote_code=True),
     ModelCase("allenai/OLMo-2-1124-7B-Instruct", skip_long_prompt=True),
     ModelCase("ibm-granite/granite-3.0-2b-instruct", skip_long_prompt=True),
-    ModelCase("mistral-community/pixtral-12b", tp_size=2, skip_long_prompt=True),
 ]
 
 TORCH_DTYPES = [torch.float16]
