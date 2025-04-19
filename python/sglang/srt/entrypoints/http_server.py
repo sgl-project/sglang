@@ -34,6 +34,7 @@ from sglang.srt.model_executor.model_runner import LocalSerializedTensor
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 
+import ssl
 from contextlib import asynccontextmanager
 
 import numpy as np
@@ -44,6 +45,8 @@ import uvloop
 from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
+from requests.adapters import HTTPAdapter
+from urllib3.poolmanager import PoolManager
 
 from sglang.srt.entrypoints.engine import _launch_subprocesses
 from sglang.srt.function_call_parser import FunctionCallParser
@@ -743,9 +746,28 @@ def launch_server(
             log_level=server_args.log_level_http or server_args.log_level,
             timeout_keep_alive=5,
             loop="uvloop",
+            ssl_certfile=server_args.ssl_certfile,
+            ssl_keyfile=server_args.ssl_keyfile,
+            ssl_ca_certs=server_args.ssl_ca_certs,
+            ssl_cert_reqs=server_args.ssl_cert_reqs,
         )
     finally:
         warmup_thread.join()
+
+
+class SSLContextAdapter(HTTPAdapter):
+    def __init__(self, ssl_context=None, **kwargs):
+        self.ssl_context = ssl_context
+        super().__init__(**kwargs)
+
+    def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
+        self.poolmanager = PoolManager(
+            num_pools=connections,
+            maxsize=maxsize,
+            block=block,
+            ssl_context=self.ssl_context,
+            **pool_kwargs,
+        )
 
 
 def _wait_and_warmup(
@@ -759,12 +781,29 @@ def _wait_and_warmup(
     if server_args.api_key:
         headers["Authorization"] = f"Bearer {server_args.api_key}"
 
+    # Create session
+    session = requests.Session()
+    use_https = server_args.ssl_certfile and server_args.ssl_keyfile
+    if use_https:
+        # Create a custom SSL context
+        ssl_context = ssl.create_default_context(
+            cafile=server_args.ssl_ca_certs or server_args.ssl_certfile
+        )
+        ssl_context.load_cert_chain(server_args.ssl_certfile, server_args.ssl_keyfile)
+        ssl_context.check_hostname = (
+            not server_args.ssl_self_signed_cert
+        )  # Need to be set to False for self-signed certs
+
+        # Mount the session with our custom adapter
+        adapter = SSLContextAdapter(ssl_context=ssl_context)
+        session.mount("https://", adapter)
+
     # Wait until the server is launched
     success = False
     for _ in range(120):
         time.sleep(1)
         try:
-            res = requests.get(url + "/get_model_info", timeout=5, headers=headers)
+            res = session.get(url + "/get_model_info", timeout=5, headers=headers)
             assert res.status_code == 200, f"{res=}, {res.text=}"
             success = True
             break
@@ -811,7 +850,7 @@ def _wait_and_warmup(
 
     try:
         if server_args.disaggregation_mode == "null":
-            res = requests.post(
+            res = session.post(
                 url + request_name,
                 json=json_data,
                 headers=headers,
