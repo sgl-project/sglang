@@ -17,7 +17,6 @@ from typing import Callable, Optional
 
 import torch
 import torch.nn.functional as F
-
 from sglang.srt.layers.moe.expert_location_dispatch import (
     ExpertLocationDispatchInfo,
     topk_ids_logical_to_physical,
@@ -246,8 +245,11 @@ def biased_grouped_topk(
             topk_group,
             topk,
         )
+        # TODO merge into kernel for this branch
         if expert_location_dispatch_info is not None:
-            topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
+            topk_ids = topk_ids_logical_to_physical(
+                topk_ids, expert_location_dispatch_info
+            )
         return topk_weights, topk_ids
     else:
         biased_grouped_topk_fn = (
