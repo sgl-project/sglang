@@ -2,6 +2,8 @@ from typing import List, Optional, Tuple
 
 import torch
 
+from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
+
 try:
     from vllm import _custom_ops as vllm_ops
 
