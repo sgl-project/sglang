@@ -1100,7 +1100,24 @@ class ModelRunner:
             with fine_grained_benchmark.maybe_benchmark(
                 forward_batch, self.tp_rank, self.forward_pass_id
             ):
-                return self._forward_raw(forward_batch, skip_attn_backend_init)
+                # NOTE FOR DEBUG
+                num_tokens = forward_batch.input_ids.shape[0]
+                global_num_tokens = (
+                    sum(forward_batch.global_num_tokens_cpu)
+                    if forward_batch.global_num_tokens_cpu is not None
+                    else None
+                )
+                debug_name = (
+                    f"forward"
+                    f"-id{self.forward_pass_id}"
+                    f"-{forward_batch.forward_mode.name}"
+                    f"-bs{forward_batch.batch_size}"
+                    f"-tok{num_tokens}"
+                    f"-gtok{global_num_tokens}"
+                    f"{'-tbo' if forward_batch.can_run_tbo else ''}"
+                )
+                with torch.autograd.profiler.record_function(debug_name):
+                    return self._forward_raw(forward_batch, skip_attn_backend_init)
 
     def _forward_raw(
         self, forward_batch: ForwardBatch, skip_attn_backend_init: bool
