@@ -128,9 +128,7 @@ def grouped_topk(
             dtype=topk_ids.dtype,
             device=topk_ids.device,
         )
-        topk_weights[:, -1] = (
-            topk_weights[:, :-1].sum(dim=-1) / routed_scaling_factor
-        )
+        topk_weights[:, -1] = topk_weights[:, :-1].sum(dim=-1) / routed_scaling_factor
 
     if renormalize:
         topk_weights_sum = (
@@ -189,9 +187,7 @@ def biased_grouped_topk_impl(
             dtype=topk_ids.dtype,
             device=topk_ids.device,
         )
-        topk_weights[:, -1] = (
-            topk_weights[:, :-1].sum(dim=-1) / routed_scaling_factor
-        )
+        topk_weights[:, -1] = topk_weights[:, :-1].sum(dim=-1) / routed_scaling_factor
 
     if renormalize:
         topk_weights_sum = (
@@ -220,7 +216,9 @@ def biased_grouped_topk(
     n_share_experts_fusion: int = 0,
     routed_scaling_factor: Optional[float] = None,
 ):
-    assert routed_scaling_factor is not None, "routed_scaling_factor is required for biased_grouped_topk"
+    assert (
+        routed_scaling_factor is not None
+    ), "routed_scaling_factor is required for biased_grouped_topk"
     # TODO: moe_fused_gate kernel is not supported for n_share_experts_fusion > 0 now.
     if (
         _is_cuda
