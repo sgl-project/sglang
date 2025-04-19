@@ -31,3 +31,7 @@ pip install transformers==4.51.0 sentence_transformers accelerate==1.4.0 peft pa
 
 # For compling xgrammar kernels
 pip install cuda-python nvidia-cuda-nvrtc-cu12
+
+# For lmms_evals evaluating MMMU
+git clone --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
+pip install -e lmms-eval/

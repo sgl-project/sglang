@@ -21,10 +21,3 @@ It's recommended to reduce the memory usage by appending something ike `--mem-fr
 ```
 python benchmark/mmmu/bench_hf.py --model-path Qwen/Qwen2-VL-7B-Instruct
 ```
-
-Some popular model results:
-
-1. Qwen/Qwen2-VL-2B-Instruct: 0.241
-2. Qwen/Qwen2-VL-7B-Instruct: 0.255
-3. Qwen/Qwen2.5-VL-3B-Instruct: 0.245
-4. Qwen/Qwen2.5-VL-7B-Instruct: 0.242
