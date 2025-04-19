@@ -54,7 +54,11 @@ from sglang.srt.disaggregation.utils import (
     TransferBackend,
     get_kv_class,
 )
-from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
+from sglang.srt.hf_transformers_utils import (
+    get_processor,
+    get_tokenizer,
+    get_tokenizer_from_processor,
+)
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOut,
@@ -198,7 +202,7 @@ class TokenizerManager:
                 self.tokenizer = self.processor = None
             else:
                 self.processor = _processor
-                self.tokenizer = self.processor.tokenizer
+                self.tokenizer = get_tokenizer_from_processor(self.processor)
                 os.environ["TOKENIZERS_PARALLELISM"] = "false"
         else:
             self.mm_processor = get_dummy_processor()
@@ -333,16 +337,10 @@ class TokenizerManager:
         self.disaggregation_mode = DisaggregationMode(
             self.server_args.disaggregation_mode
         )
-        self.transfer_backend = TransferBackend(
-            self.server_args.disaggregation_transfer_backend
-        )
         # for disaggregtion, start kv boostrap server on prefill
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             # only start bootstrap server on prefill tm
-            kv_bootstrap_server_class = get_kv_class(
-                self.transfer_backend, KVClassType.BOOTSTRAP_SERVER
-            )
-            self.bootstrap_server = kv_bootstrap_server_class(
+            self.bootstrap_server = KVBootstrapServer(
                 self.server_args.disaggregation_bootstrap_port
             )
 

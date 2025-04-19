@@ -310,6 +310,7 @@ def general_mm_embed_routine(
     input_ids: torch.Tensor,
     forward_batch: ForwardBatch,
     language_model: nn.Module,
+    positions: torch.Tensor,
     image_data_embedding_func: Callable[
         [List[MultimodalDataItem]], torch.Tensor
     ] = None,
@@ -358,6 +359,7 @@ def general_mm_embed_routine(
         input_ids=None,
         forward_batch=forward_batch,
         input_embeds=inputs_embeds,
+        positions=positions,
         **kwargs,
     )
     return hidden_states

@@ -92,7 +92,7 @@ class BaseMultimodalProcessor(ABC):
 
     @abstractmethod
     async def process_mm_data_async(
-        self, image_data, input_text, max_req_input_len, **kwargs
+        self, image_data, input_text, request_obj, max_req_input_len, **kwargs
     ):
         pass
 

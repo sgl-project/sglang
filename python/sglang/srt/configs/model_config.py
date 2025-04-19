@@ -514,6 +514,7 @@ multimodal_model_archs = [
     "Qwen2VLForConditionalGeneration",
     "Qwen2_5_VLForConditionalGeneration",
     "CLIPModel",
+    "InternVLChatModel",
 ]
 
 
