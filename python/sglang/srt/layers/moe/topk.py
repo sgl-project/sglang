@@ -17,10 +17,15 @@ from typing import Callable, Optional
 
 import torch
 import torch.nn.functional as F
-
-from sglang.srt.managers.expert_distribution import ExpertDistributionRecorder
+from sglang.srt.layers.moe.expert_location_dispatch import (
+    ExpertLocationDispatchInfo,
+    topk_ids_logical_to_physical,
+)
+from sglang.srt.managers.expert_distribution import (
+    get_global_expert_distribution_recorder,
+)
 from sglang.srt.managers.schedule_batch import global_server_args_dict
-from sglang.srt.utils import get_compiler_backend, is_cuda, is_hip
+from sglang.srt.utils import get_bool_env_var, get_compiler_backend, is_cuda, is_hip
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -30,9 +35,6 @@ if _is_cuda:
 
 if _is_cuda or _is_hip:
     from sgl_kernel import topk_softmax
-
-
-expert_distribution_recorder = ExpertDistributionRecorder()
 
 
 def fused_topk_native(
@@ -98,6 +100,7 @@ def grouped_topk(
     num_expert_group: int = 0,
     topk_group: int = 0,
     n_share_experts_fusion: int = 0,
+    expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
 ):
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
@@ -139,7 +142,11 @@ def grouped_topk(
         )
         topk_weights = topk_weights / topk_weights_sum
 
-    return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
+    topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
+
+    topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
+
+    return topk_weights, topk_ids
 
 
 def biased_grouped_topk_impl(
@@ -151,6 +158,7 @@ def biased_grouped_topk_impl(
     num_expert_group: int = 0,
     topk_group: int = 0,
     n_share_experts_fusion: int = 0,
+    expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
 ):
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
@@ -199,7 +207,11 @@ def biased_grouped_topk_impl(
         )
         topk_weights = topk_weights / topk_weights_sum
 
-    return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
+    topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
+
+    topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
+
+    return topk_weights, topk_ids
 
 
 def is_power_of_two(n):
@@ -216,6 +228,7 @@ def biased_grouped_topk(
     topk_group: int = 0,
     compiled: bool = True,
     n_share_experts_fusion: int = 0,
+    expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
 ):
     # TODO: moe_fused_gate kernel is not supported for n_share_experts_fusion > 0 now.
     if (
@@ -225,13 +238,19 @@ def biased_grouped_topk(
         and n_share_experts_fusion == 0
         and is_power_of_two(correction_bias.shape[0])
     ):
-        return moe_fused_gate(
+        topk_weights, topk_ids = moe_fused_gate(
             gating_output,
             correction_bias,
             num_expert_group,
             topk_group,
             topk,
         )
+        # TODO merge into kernel for this branch
+        if expert_location_dispatch_info is not None:
+            topk_ids = topk_ids_logical_to_physical(
+                topk_ids, expert_location_dispatch_info
+            )
+        return topk_weights, topk_ids
     else:
         biased_grouped_topk_fn = (
             torch.compile(
@@ -249,6 +268,7 @@ def biased_grouped_topk(
             num_expert_group,
             topk_group,
             n_share_experts_fusion=n_share_experts_fusion,
+            expert_location_dispatch_info=expert_location_dispatch_info,
         )
 
 
@@ -263,6 +283,7 @@ def select_experts(
     custom_routing_function: Optional[Callable] = None,
     correction_bias: Optional[torch.Tensor] = None,
     torch_native: bool = False,
+    expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
 ):
     n_share_experts_fusion = 0
     if global_server_args_dict["n_share_experts_fusion"] is not None:
@@ -280,6 +301,7 @@ def select_experts(
                 num_expert_group=num_expert_group,
                 topk_group=topk_group,
                 n_share_experts_fusion=n_share_experts_fusion,
+                expert_location_dispatch_info=expert_location_dispatch_info,
             )
         else:
             topk_weights, topk_ids = biased_grouped_topk(
@@ -291,8 +313,10 @@ def select_experts(
                 num_expert_group=num_expert_group,
                 topk_group=topk_group,
                 n_share_experts_fusion=n_share_experts_fusion,
+                expert_location_dispatch_info=expert_location_dispatch_info,
             )
     elif torch_native and custom_routing_function is None:
+        assert expert_location_dispatch_info is None
         topk_weights, topk_ids = fused_topk_native(
             hidden_states=hidden_states,
             gating_output=router_logits,
@@ -300,6 +324,7 @@ def select_experts(
             renormalize=renormalize,
         )
     elif custom_routing_function is None:
+        assert expert_location_dispatch_info is None
         topk_weights, topk_ids = fused_topk(
             hidden_states=hidden_states,
             gating_output=router_logits,
@@ -307,6 +332,7 @@ def select_experts(
             renormalize=renormalize,
         )
     else:
+        assert expert_location_dispatch_info is None
         topk_weights, topk_ids = custom_routing_function(
             hidden_states=hidden_states,
             gating_output=router_logits,
@@ -314,6 +340,6 @@ def select_experts(
             renormalize=renormalize,
         )
 
-    expert_distribution_recorder.record_new_token(topk_ids)
+    get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
 
     return topk_weights, topk_ids

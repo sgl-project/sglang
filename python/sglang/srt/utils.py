@@ -45,7 +45,19 @@ from importlib.util import find_spec
 from io import BytesIO
 from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Protocol, Set, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Generic,
+    List,
+    Optional,
+    Protocol,
+    Set,
+    Tuple,
+    TypeVar,
+    Union,
+)
 
 import numpy as np
 import psutil
@@ -189,6 +201,10 @@ class DynamicGradMode(_DecoratorContextManager):
             return self.__class__(self.mode)
         else:
             return self.__class__()
+
+
+def enable_colocated_batch_gen():
+    return get_bool_env_var("SGLANG_ENABLE_COLOCATED_BATCH_GEN", "false")
 
 
 def enable_show_time_cost():
@@ -1811,9 +1827,13 @@ def retry(
             return fn()
         except Exception as e:
             if try_index >= max_retry:
+                logger.warning(f"retry() observe error: {e}")
+                traceback.print_exc()
                 raise Exception(f"retry() exceed maximum number of retries.")
 
             if not should_retry(e):
+                logger.warning(f"retry() observe error: {e}")
+                traceback.print_exc()
                 raise Exception(f"retry() observe errors that should not be retried.")
 
             delay = min(initial_delay * (2**try_index), max_delay) * (
@@ -1932,3 +1952,124 @@ def is_fa3_default_architecture(hf_config):
         "MistralForCausalLM",
     }
     return architectures[0] in default_archs
+
+
+class DisposibleTensor:
+    def __init__(self, value: torch.Tensor):
+        self._value = value
+        self._backup_metadata: Optional[Dict[str, Any]] = None
+
+    @property
+    def value(self):
+        assert not self.is_disposed
+        return self._value
+
+    def dispose(self, backup_metadata: bool = True):
+        assert not self.is_disposed
+
+        if not torch.compiler.is_compiling():
+            refcount = sys.getrefcount(self._value)
+            assert refcount == 2, f"{refcount=}"
+
+        if backup_metadata:
+            self._backup_metadata = self._compute_backup_metadata(self._value)
+
+        self._value = None
+
+    @property
+    def is_disposed(self):
+        return self._value is None
+
+    @staticmethod
+    def maybe_unwrap(value: "MaybeDisposibleTensor") -> torch.Tensor:
+        if isinstance(value, DisposibleTensor):
+            return value.value
+        return value
+
+    @staticmethod
+    def maybe_dispose(value: "MaybeDisposibleTensor") -> torch.Tensor:
+        if isinstance(value, DisposibleTensor):
+            value.dispose()
+
+    @property
+    def shape(self):
+        return self._get_metadata("shape")
+
+    @property
+    def device(self):
+        return self._get_metadata("device")
+
+    @property
+    def dtype(self):
+        return self._get_metadata("dtype")
+
+    def _get_metadata(self, name: str):
+        if not self.is_disposed:
+            return getattr(self._value, name)
+        assert (
+            self._backup_metadata is not None
+        ), "Use backup_metadata flag if you want to use metadata after dispose"
+        return self._backup_metadata[name]
+
+    _BACKUP_METADATA_KEYS = ["shape", "device", "dtype"]
+
+    @staticmethod
+    def _compute_backup_metadata(value: torch.Tensor):
+        return {k: getattr(value, k) for k in DisposibleTensor._BACKUP_METADATA_KEYS}
+
+
+MaybeDisposibleTensor = Union[torch.Tensor, DisposibleTensor]
+
+
+class TensorCreator:
+    def __init__(self, creator: Callable[[], torch.Tensor]):
+        self._creator = creator
+
+    def create(self):
+        assert self._creator is not None
+        value = self._creator()
+        self._creator = None
+        return value
+
+    @staticmethod
+    def maybe_create(value: "MaybeTensorCreator") -> torch.Tensor:
+        if isinstance(value, TensorCreator):
+            return value.create()
+        return value
+
+
+MaybeTensorCreator = Union[torch.Tensor, TensorCreator]
+
+
+T = TypeVar("T")
+
+
+class Withable(Generic[T]):
+    def __init__(self):
+        self._value: Optional[T] = None
+
+    @property
+    def value(self) -> T:
+        return self._value
+
+    @contextmanager
+    def with_value(self, new_value: T):
+        assert self._value is None
+        self._value = new_value
+        try:
+            yield
+        finally:
+            assert self._value is new_value
+            self._value = None
+
+
+@contextmanager
+def configure_deep_gemm_num_sms(num_sms):
+    import deep_gemm
+
+    original_num_sms = deep_gemm.get_num_sms()
+    deep_gemm.set_num_sms(num_sms)
+    try:
+        yield
+    finally:
+        deep_gemm.set_num_sms(original_num_sms)

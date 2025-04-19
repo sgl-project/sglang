@@ -1,8 +1,12 @@
 import logging
+from contextlib import contextmanager
 from typing import Callable, List, Optional, Tuple
 
 import torch
 from torch.nn import Module
+
+from sglang.srt.layers.moe.expert_location_dispatch import ExpertLocationDispatchInfo
+from sglang.srt.managers.schedule_batch import get_global_expert_location_metadata
 
 try:
     from deep_gemm import (
@@ -38,7 +42,14 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.utils import DeepEPMode, is_hip, set_weight_attrs
+from sglang.srt.utils import (
+    DeepEPMode,
+    DisposibleTensor,
+    MaybeDisposibleTensor,
+    TensorCreator,
+    is_hip,
+    set_weight_attrs,
+)
 
 _is_hip = is_hip()
 
@@ -125,6 +136,7 @@ class EPMoE(torch.nn.Module):
         top_k: int,
         hidden_size: int,
         intermediate_size: int,
+        layer_id: int,
         params_dtype: Optional[torch.dtype] = None,
         renormalize: bool = True,
         use_grouped_topk: bool = False,
@@ -147,6 +159,7 @@ class EPMoE(torch.nn.Module):
         )
         self.tp_rank = get_tensor_model_parallel_rank()
 
+        self.layer_id = layer_id
         self.num_experts = num_experts
         assert self.num_experts % self.tp_size == 0
         self.num_experts_per_partition = self.num_experts // self.tp_size
@@ -196,7 +209,9 @@ class EPMoE(torch.nn.Module):
 
         self.grouped_gemm_runner = None
 
-    def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
+    def forward(
+        self, hidden_states: MaybeDisposibleTensor, router_logits: torch.Tensor
+    ):
         assert self.quant_method is not None
 
         if self.grouped_gemm_runner is None:
@@ -215,6 +230,10 @@ class EPMoE(torch.nn.Module):
             num_expert_group=self.num_expert_group,
             correction_bias=self.correction_bias,
             custom_routing_function=self.custom_routing_function,
+            expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                ep_rank=self.tp_rank,
+                layer_id=self.layer_id,
+            ),
         )
 
         reorder_topk_ids, src2dst, seg_indptr = run_moe_ep_preproess(
@@ -232,7 +251,7 @@ class EPMoE(torch.nn.Module):
         )
         if self.activation_scheme == "dynamic" and not self.use_block_quant:
             max_value = (
-                torch.max(hidden_states)
+                torch.max(DisposibleTensor.maybe_unwrap(hidden_states))
                 .repeat(self.num_experts_per_partition)
                 .to(torch.float32)
             )
@@ -260,16 +279,18 @@ class EPMoE(torch.nn.Module):
             dtype=torch.int64,
         )
         # GroupGemm-0
-        gateup_output = torch.empty(
-            gateup_input.shape[0],
-            self.w13_weight.shape[1],
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
+        gateup_output_creator = TensorCreator(
+            lambda: torch.empty(
+                gateup_input.shape[0],
+                self.w13_weight.shape[1],
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
         )
         gateup_output = self.grouped_gemm_runner(
             a=gateup_input,
             b=self.w13_weight,
-            c=gateup_output,
+            c=gateup_output_creator,
             batch_size=self.num_experts_per_partition,
             weight_column_major=True,
             seg_indptr=seg_indptr_cur_rank,
@@ -326,6 +347,8 @@ class EPMoE(torch.nn.Module):
             )
         else:
             raise ValueError(f"Unsupported activation: {self.activation=}")
+
+        del gateup_output
 
         # GroupGemm-1
         down_output = torch.empty(
@@ -397,6 +420,28 @@ class EPMoE(torch.nn.Module):
         ]
 
     def weight_loader(
+        self,
+        param: torch.nn.Parameter,
+        loaded_weight: torch.Tensor,
+        weight_name: str,
+        shard_id: str,
+        expert_id: int,
+    ) -> None:
+        physical_expert_ids = (
+            get_global_expert_location_metadata().logical_to_all_physical(
+                self.layer_id, expert_id
+            )
+        )
+        for physical_expert_id in physical_expert_ids:
+            self._weight_loader_physical(
+                param=param,
+                loaded_weight=loaded_weight,
+                weight_name=weight_name,
+                shard_id=shard_id,
+                expert_id=physical_expert_id,
+            )
+
+    def _weight_loader_physical(
         self,
         param: torch.nn.Parameter,
         loaded_weight: torch.Tensor,
@@ -788,6 +833,7 @@ class DeepEPMoE(EPMoE):
         top_k: int,
         hidden_size: int,
         intermediate_size: int,
+        layer_id: int,
         params_dtype: Optional[torch.dtype] = None,
         renormalize: bool = True,
         use_grouped_topk: bool = False,
@@ -806,6 +852,7 @@ class DeepEPMoE(EPMoE):
             top_k,
             hidden_size,
             intermediate_size,
+            layer_id,
             params_dtype,
             renormalize,
             use_grouped_topk,
@@ -853,7 +900,7 @@ class DeepEPMoE(EPMoE):
 
     def forward_normal(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states: MaybeDisposibleTensor,
         reorder_topk_ids: torch.Tensor,
         seg_indptr: torch.Tensor,
     ):
@@ -866,7 +913,7 @@ class DeepEPMoE(EPMoE):
 
         if self.activation_scheme == "dynamic" and not self.use_block_quant:
             max_value = (
-                torch.max(hidden_states)
+                torch.max(DisposibleTensor.maybe_unwrap(hidden_states))
                 .repeat(self.num_experts_per_partition)
                 .to(torch.float32)
             )
@@ -879,18 +926,20 @@ class DeepEPMoE(EPMoE):
         )
 
         # GroupGemm-0
-        gateup_output = torch.empty(
-            hidden_states.shape[0],
-            self.w13_weight.shape[1],
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
+        gateup_output_creator = TensorCreator(
+            lambda: torch.empty(
+                hidden_states.shape[0],
+                self.w13_weight.shape[1],
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
         )
 
         if hidden_states.shape[0] > 0:
             gateup_output = self.grouped_gemm_runner(
                 a=hidden_states,
                 b=self.w13_weight,
-                c=gateup_output,
+                c=gateup_output_creator,
                 batch_size=self.num_experts_per_partition,
                 weight_column_major=True,
                 seg_indptr=seg_indptr,
@@ -904,6 +953,8 @@ class DeepEPMoE(EPMoE):
                 ),
                 block_shape=self.block_shape,
             )
+        else:
+            gateup_output = gateup_output_creator.create()
 
         # Act
         down_input = torch.empty(
@@ -936,6 +987,8 @@ class DeepEPMoE(EPMoE):
             )
         else:
             raise ValueError(f"Unsupported activation: {self.activation=}")
+
+        del gateup_output
 
         # GroupGemm-1
         down_output = torch.empty(
@@ -972,9 +1025,6 @@ class DeepEPMoE(EPMoE):
     ):
         assert self.quant_method is not None
         assert self.activation == "silu"
-        assert (
-            hidden_states_fp8[0].size(0) % 4 == 0
-        ), f"TMA alignment error: {hidden_states_fp8[0].size(0)}"
 
         # GroupGemm-0
         num_groups, m, k = hidden_states_fp8[0].size()
@@ -983,9 +1033,14 @@ class DeepEPMoE(EPMoE):
         gateup_output = torch.empty(
             (num_groups, m, n), device=hidden_states_fp8[0].device, dtype=torch.bfloat16
         )
-        m_grouped_gemm_fp8_fp8_bf16_nt_masked(
-            hidden_states_fp8, self.w13_weight_fp8, gateup_output, masked_m, expected_m
-        )
+        with _ensure_get_col_major_tma_aligned_tensor_noop():
+            m_grouped_gemm_fp8_fp8_bf16_nt_masked(
+                hidden_states_fp8,
+                self.w13_weight_fp8,
+                gateup_output,
+                masked_m,
+                expected_m,
+            )
 
         # Act
         down_input = torch.empty(
@@ -1024,8 +1079,29 @@ class DeepEPMoE(EPMoE):
         down_output = torch.empty(
             (num_groups, m, n), device=down_input.device, dtype=torch.bfloat16
         )
-        m_grouped_gemm_fp8_fp8_bf16_nt_masked(
-            down_input_fp8, self.w2_weight_fp8, down_output, masked_m, expected_m
-        )
+        with _ensure_get_col_major_tma_aligned_tensor_noop():
+            m_grouped_gemm_fp8_fp8_bf16_nt_masked(
+                down_input_fp8, self.w2_weight_fp8, down_output, masked_m, expected_m
+            )
 
         return down_output
+
+
+@contextmanager
+def _ensure_get_col_major_tma_aligned_tensor_noop():
+    from deep_gemm.jit_kernels import utils
+
+    original_func = utils.get_col_major_tma_aligned_tensor
+
+    def patched_get_col_major_tma_aligned_tensor(x: torch.Tensor) -> torch.Tensor:
+        out = original_func(x)
+        assert (
+            x.data_ptr() == out.data_ptr()
+        ), f"get_col_major_tma_aligned_tensor is not noop ({x.data_ptr()=}, {out.data_ptr()=})"
+        return out
+
+    utils.get_col_major_tma_aligned_tensor = patched_get_col_major_tma_aligned_tensor
+    try:
+        yield
+    finally:
+        utils.get_col_major_tma_aligned_tensor = original_func

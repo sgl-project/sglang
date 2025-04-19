@@ -17,6 +17,7 @@ import asyncio
 import copy
 import dataclasses
 import logging
+import math
 import os
 import pickle
 import signal
@@ -55,18 +56,25 @@ from sglang.srt.disaggregation.utils import (
     get_kv_class,
 )
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
+from sglang.srt.managers import expert_distribution
+from sglang.srt.managers.eplb_manager import EPLBManager
+from sglang.srt.managers.expert_location import ExpertLocationMetadata
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOut,
     BatchMultimodalOut,
     BatchStrOut,
     BatchTokenIDOut,
+    BlockReqInput,
+    BlockReqType,
     CloseSessionReqInput,
     ConfigureLoggingReq,
     EmbeddingReqInput,
+    EplbRebalanceReqInput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
-    FlushCacheReq,
+    FlushCacheReqInput,
+    FlushCacheReqOutput,
     GenerateReqInput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
@@ -87,6 +95,8 @@ from sglang.srt.managers.io_struct import (
     SessionParams,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
+    UpdateExpertLocationReqInput,
+    UpdateExpertLocationReqOutput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
     UpdateWeightsFromDistributedReqInput,
@@ -104,6 +114,8 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     dataclass_to_string_truncated,
+    enable_colocated_batch_gen,
+    get_bool_env_var,
     get_zmq_socket,
     kill_process_tree,
 )
@@ -141,6 +153,8 @@ class TokenizerManager:
         self,
         server_args: ServerArgs,
         port_args: PortArgs,
+        expert_location_metadata: Optional[ExpertLocationMetadata],
+        eplb_manager: Optional[EPLBManager],
     ):
         # Parse args
         self.server_args = server_args
@@ -160,6 +174,7 @@ class TokenizerManager:
         # Read model args
         self.model_path = server_args.model_path
         self.served_model_name = server_args.served_model_name
+        # TODO re-apply ModelConfig PR
         self.model_config = ModelConfig(
             server_args.model_path,
             trust_remote_code=server_args.trust_remote_code,
@@ -213,6 +228,10 @@ class TokenizerManager:
                     revision=server_args.revision,
                 )
 
+        self.eplb_manager = eplb_manager
+        if eplb_manager is not None:
+            eplb_manager.bind(self)
+
         # Store states
         self.no_create_loop = False
         self.rid_to_state: Dict[str, ReqState] = {}
@@ -235,6 +254,7 @@ class TokenizerManager:
 
         # Set after scheduler is initialized
         self.max_req_input_len = None
+        self.expert_location_metadata = expert_location_metadata
 
         # Metrics
         if self.enable_metrics:
@@ -264,13 +284,19 @@ class TokenizerManager:
         self.resume_memory_occupation_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
-        self.start_profile_communicator = _Communicator(
+        self.profile_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.flush_cache_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
         self.get_internal_state_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
         self.expert_distribution_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.update_expert_location_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
 
@@ -315,8 +341,12 @@ class TokenizerManager:
                     self.resume_memory_occupation_communicator.handle_recv,
                 ),
                 (
+                    FlushCacheReqOutput,
+                    self.flush_cache_communicator.handle_recv,
+                ),
+                (
                     ProfileReqOutput,
-                    self.start_profile_communicator.handle_recv,
+                    self.profile_communicator.handle_recv,
                 ),
                 (
                     GetInternalStateReqOutput,
@@ -325,6 +355,10 @@ class TokenizerManager:
                 (
                     ExpertDistributionReqOutput,
                     self.expert_distribution_communicator.handle_recv,
+                ),
+                (
+                    UpdateExpertLocationReqOutput,
+                    self.update_expert_location_communicator.handle_recv,
                 ),
                 (HealthCheckOutput, lambda x: None),
             ]
@@ -493,6 +527,9 @@ class TokenizerManager:
         self.rid_to_state[obj.rid] = state
         self.send_to_scheduler.send_pyobj(tokenized_obj)
 
+    def _send_block_request(self, type: BlockReqType):
+        self.send_to_scheduler.send_pyobj(BlockReqInput(type))
+
     async def _wait_one_response(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -562,12 +599,16 @@ class TokenizerManager:
         rids = []
         if getattr(obj, "parallel_sample_num", 1) == 1:
             # Send all requests
+            if enable_colocated_batch_gen():
+                self._send_block_request(BlockReqType.BLOCK)
             for i in range(batch_size):
                 tmp_obj = obj[i]
                 tokenized_obj = await self._tokenize_one_request(tmp_obj)
                 self._send_one_request(tmp_obj, tokenized_obj, created_time)
                 generators.append(self._wait_one_response(tmp_obj, request))
                 rids.append(tmp_obj.rid)
+            if enable_colocated_batch_gen():
+                self._send_block_request(BlockReqType.UNBLOCK)
         else:
             # FIXME: When using batch and parallel_sample_num together, the perf is not optimal.
             if batch_size > 128:
@@ -628,9 +669,10 @@ class TokenizerManager:
                     except StopAsyncIteration:
                         pass
 
-    def flush_cache(self):
-        req = FlushCacheReq()
-        self.send_to_scheduler.send_pyobj(req)
+    async def flush_cache(self) -> FlushCacheReqOutput:
+        outputs = await self.flush_cache_communicator(FlushCacheReqInput())
+        success = all(output.success for output in outputs)
+        return FlushCacheReqOutput(success=success)
 
     def abort_request(self, rid: str):
         if rid not in self.rid_to_state:
@@ -650,15 +692,19 @@ class TokenizerManager:
             output_dir=output_dir,
             num_steps=num_steps,
             activities=activities,
+            profile_id=str(time.time()),
         )
-        result = (await self.start_profile_communicator(req))[0]
+        return await self._execute_profile(req)
+
+    async def stop_profile(self):
+        req = ProfileReq(type=ProfileReqType.STOP_PROFILE)
+        return await self._execute_profile(req)
+
+    async def _execute_profile(self, req: ProfileReq):
+        result = (await self.profile_communicator(req))[0]
         if not result.success:
             raise RuntimeError(result.message)
         return result
-
-    def stop_profile(self):
-        req = ProfileReq(type=ProfileReqType.STOP_PROFILE)
-        self.send_to_scheduler.send_pyobj(req)
 
     async def start_expert_distribution_record(self):
         await self.expert_distribution_communicator(ExpertDistributionReq.START_RECORD)
@@ -667,7 +713,61 @@ class TokenizerManager:
         await self.expert_distribution_communicator(ExpertDistributionReq.STOP_RECORD)
 
     async def dump_expert_distribution_record(self):
-        await self.expert_distribution_communicator(ExpertDistributionReq.DUMP_RECORD)
+        raw_outputs: List[ExpertDistributionReqOutput] = (
+            await self.expert_distribution_communicator(
+                ExpertDistributionReq.DUMP_RECORD
+            )
+        )
+        return expert_distribution.postprocess_dumps(
+            [output.dump_output for output in raw_outputs],
+            expert_location_metadata=self.expert_location_metadata,
+        )
+
+    async def eplb_rebalance(self, obj: EplbRebalanceReqInput):
+        self.auto_create_handle_loop()
+        await self.eplb_manager.rebalance(obj)
+
+    async def eplb_save_expert_distribution(self):
+        self.auto_create_handle_loop()
+        await self.eplb_manager.save_expert_distribution()
+
+    async def update_expert_location(self, obj: UpdateExpertLocationReqInput):
+        self.auto_create_handle_loop()
+        assert (
+            self.server_args.ep_dispatch_algorithm is not None
+        ), f"update_expert_location requires ep_dispatch_algorithm"
+
+        old_expert_location_metadata = copy.deepcopy(self.expert_location_metadata)
+        num_layers = old_expert_location_metadata.num_layers
+
+        # pretty arbitrary choice; can optimize if bottleneck
+        step = math.ceil(num_layers / 5)
+        layer_id_lens = list(range(step, num_layers, step)) + [num_layers]
+
+        for layer_id_end in layer_id_lens:
+            logger.info(f"update_expert_location handling up to {layer_id_end}th layer")
+            partial_expert_location_metadata = copy.deepcopy(
+                old_expert_location_metadata
+            )
+            partial_expert_location_metadata.update(
+                obj.expert_location_metadata,
+                layer_id_start=0,
+                layer_id_len=layer_id_end,
+            )
+            await self._update_expert_location_raw(
+                expert_location_metadata=partial_expert_location_metadata,
+            )
+
+    async def _update_expert_location_raw(
+        self, expert_location_metadata: ExpertLocationMetadata
+    ):
+        self.expert_location_metadata = None
+        await self.update_expert_location_communicator(
+            UpdateExpertLocationReqInput(
+                expert_location_metadata=expert_location_metadata,
+            )
+        )
+        self.expert_location_metadata = expert_location_metadata
 
     async def update_weights_from_disk(
         self,
@@ -897,6 +997,11 @@ class TokenizerManager:
         self.asyncio_tasks.add(
             loop.create_task(print_exception_wrapper(self.sigterm_watchdog))
         )
+
+        if self.eplb_manager is not None:
+            self.asyncio_tasks.add(
+                loop.create_task(print_exception_wrapper(self.eplb_manager.handle_loop))
+            )
 
     async def sigterm_watchdog(self):
         while not self.gracefully_exit:
@@ -1198,6 +1303,10 @@ class _Communicator(Generic[T]):
         self._ready_queue: Deque[asyncio.Future] = deque()
 
     async def __call__(self, obj):
+        await self.call_send(obj)
+        return await self.call_await()
+
+    async def call_send(self, obj):
         ready_event = asyncio.Event()
         if self._result_event is not None or len(self._ready_queue) > 0:
             self._ready_queue.append(ready_event)
@@ -1208,6 +1317,7 @@ class _Communicator(Generic[T]):
         if obj:
             self._sender.send_pyobj(obj)
 
+    async def call_await(self):
         self._result_event = asyncio.Event()
         self._result_values = []
         await self._result_event.wait()

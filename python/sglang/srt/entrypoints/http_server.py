@@ -51,6 +51,7 @@ from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     ConfigureLoggingReq,
     EmbeddingReqInput,
+    EplbRebalanceReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
@@ -315,11 +316,11 @@ async def classify_request(obj: EmbeddingReqInput, request: Request):
 @app.api_route("/flush_cache", methods=["GET", "POST"])
 async def flush_cache():
     """Flush the radix cache."""
-    _global_state.tokenizer_manager.flush_cache()
+    ret = await _global_state.tokenizer_manager.flush_cache()
     return Response(
         content="Cache flushed.\nPlease check backend logs for more details. "
         "(When there are running or waiting requests, the operation will not be performed.)\n",
-        status_code=200,
+        status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
     )
 
 
@@ -341,7 +342,7 @@ async def start_profile_async(obj: Optional[ProfileReqInput] = None):
 @app.api_route("/stop_profile", methods=["GET", "POST"])
 async def stop_profile_async():
     """Stop profiling."""
-    _global_state.tokenizer_manager.stop_profile()
+    await _global_state.tokenizer_manager.stop_profile()
     return Response(
         content="Stop profiling. This will take some time.\n",
         status_code=200,
@@ -371,11 +372,20 @@ async def stop_expert_distribution_record_async():
 @app.api_route("/dump_expert_distribution_record", methods=["GET", "POST"])
 async def dump_expert_distribution_record_async():
     """Dump expert distribution record."""
-    await _global_state.tokenizer_manager.dump_expert_distribution_record()
-    return Response(
-        content="Dump expert distribution record.\n",
-        status_code=200,
-    )
+    content = await _global_state.tokenizer_manager.dump_expert_distribution_record()
+    return ORJSONResponse(content, status_code=200)
+
+
+@app.post("/eplb_rebalance")
+async def eplb_rebalance(obj: Optional[EplbRebalanceReqInput] = None):
+    await _global_state.tokenizer_manager.eplb_rebalance(obj or EplbRebalanceReqInput())
+    return ORJSONResponse({}, status_code=200)
+
+
+@app.post("/eplb_save_expert_distribution")
+async def eplb_save_expert_distribution():
+    await _global_state.tokenizer_manager.eplb_save_expert_distribution()
+    return ORJSONResponse({}, status_code=200)
 
 
 @app.post("/update_weights_from_disk")

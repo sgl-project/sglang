@@ -129,6 +129,7 @@ def load_model(server_args, port_args, tp_rank):
     suppress_other_loggers()
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
 
+    # TODO re-apply from_server_args PR
     model_config = ModelConfig(
         server_args.model_path,
         trust_remote_code=server_args.trust_remote_code,
@@ -272,6 +273,7 @@ def _maybe_prepare_dp_attn_batch(batch: ScheduleBatch, model_runner):
             tp_cpu_group=model_runner.tp_group.cpu_group,
             get_idle_batch=None,
             disable_cuda_graph=model_runner.server_args.disable_cuda_graph,
+            enable_two_batch_overlap=model_runner.server_args.enable_two_batch_overlap,
             spec_algorithm=SpeculativeAlgorithm.NONE,
             speculative_num_draft_tokens=None,
         )

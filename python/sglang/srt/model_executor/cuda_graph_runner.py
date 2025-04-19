@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Callable
 import torch
 import tqdm
 
+from sglang.srt import two_batch_overlap
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.parallel_state import GroupCoordinator, graph_capture
@@ -138,6 +139,9 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
         capture_bs += [model_runner.req_to_token_pool.size - 1] + [
             model_runner.req_to_token_pool.size
         ]
+
+    if server_args.enable_two_batch_overlap:
+        capture_bs = [bs for bs in capture_bs if bs >= 2]
 
     capture_bs = list(sorted(set(capture_bs)))
     capture_bs = [
@@ -317,7 +321,14 @@ class CudaGraphRunner:
             if self.is_encoder_decoder
             else True
         )
-        return is_bs_supported and is_encoder_lens_supported
+
+        is_tbo_supported = (
+            forward_batch.can_run_tbo
+            if self.model_runner.server_args.enable_two_batch_overlap
+            else True
+        )
+
+        return is_bs_supported and is_encoder_lens_supported and is_tbo_supported
 
     def capture(self):
         with graph_capture() as graph_capture_context:
@@ -398,6 +409,19 @@ class CudaGraphRunner:
                 spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
             )
 
+        if self.model_runner.server_args.enable_two_batch_overlap:
+            tbo_split_seq_index = two_batch_overlap.compute_split_seq_index(
+                forward_mode=self.capture_forward_mode,
+                num_tokens=num_tokens,
+                extend_lens=None,
+            )
+            # For simplicity, when two_batch_overlap is enabled, we only capture CUDA Graph for tbo=true
+            assert (
+                tbo_split_seq_index is not None
+            ), f"{self.capture_forward_mode=} {num_tokens=}"
+        else:
+            tbo_split_seq_index = None
+
         forward_batch = ForwardBatch(
             forward_mode=self.capture_forward_mode,
             batch_size=bs,
@@ -418,7 +442,9 @@ class CudaGraphRunner:
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
             capture_hidden_mode=self.capture_hidden_mode,
+            tbo_split_seq_index=tbo_split_seq_index,
         )
+        forward_batch.prepare_tbo()
 
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata_capture_cuda_graph(

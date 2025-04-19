@@ -6,8 +6,6 @@ import asyncio
 import random
 import urllib
 from itertools import chain
-import os
-import time
 
 import aiohttp
 import orjson
@@ -20,49 +18,19 @@ class MiniLoadBalancer:
     def __init__(self, prefill_servers, decode_servers):
         self.prefill_servers = prefill_servers
         self.decode_servers = decode_servers
-        self.profiling = False
-
-        profile_dir = os.getenv("SGLANG_TORCH_PROFILER_DIR", "./tmp")
-        os.makedirs(profile_dir, exist_ok=True)
 
     def select_pair(self):
         return random.choice(self.prefill_servers), random.choice(self.decode_servers)
-
-    async def start_profile(self):
-        """Start profiling on all servers."""
-        if self.profiling:
-            return {"success": False, "message": "Profiling is already in progress"}
-
-        self.profiling = True
-        async with aiohttp.ClientSession() as session:
-            tasks = []
-            for server in chain(self.prefill_servers, self.decode_servers):
-                tasks.append(session.post(f"{server}/start_profile"))
-
-            responses = await asyncio.gather(*tasks)
-            success = all(response.status == 200 for response in responses)
-            return {"success": success, "message": "Profiling started" if success else "Failed to start profiling"}
-
-    async def stop_profile(self):
-        """Stop profiling on all servers."""
-        if not self.profiling:
-            return {"success": False, "message": "Profiling is not in progress"}
-
-        self.profiling = False
-        async with aiohttp.ClientSession() as session:
-            tasks = []
-            for server in chain(self.prefill_servers, self.decode_servers):
-                tasks.append(session.post(f"{server}/stop_profile"))
-
-            responses = await asyncio.gather(*tasks)
-            success = all(response.status == 200 for response in responses)
-            return {"success": success, "message": "Profiling stopped" if success else "Failed to stop profiling"}
 
     async def generate(
         self, modified_request, prefill_server, decode_server
     ) -> ORJSONResponse:
 
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(
+                total=3600
+            )  # Add timeout for request reliability
+        ) as session:
             tasks = [
                 session.post(f"{prefill_server}/generate", json=modified_request),
                 session.post(f"{decode_server}/generate", json=modified_request),
@@ -196,7 +164,7 @@ async def handle_generate_request(request_data: dict):
     modified_request.update(
         {
             "bootstrap_host": hostname,
-            "bootstrap_room": random.randint(0, 2**63 - 1),
+            "bootstrap_room": random.randint(0, 2 ** 63 - 1),
         }
     )
 
@@ -224,21 +192,6 @@ async def get_models():
             return ORJSONResponse(content=await response.json())
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/start_profile")
-async def start_profile():
-    """Start profiling on all servers."""
-    if load_balancer is None:
-        raise HTTPException(status_code=500, detail="Load balancer not initialized")
-    return await load_balancer.start_profile()
-
-@app.post("/stop_profile")
-async def stop_profile():
-    """Stop profiling on all servers."""
-    if load_balancer is None:
-        raise HTTPException(status_code=500, detail="Load balancer not initialized")
-    return await load_balancer.stop_profile()
 
 
 def run(prefill_addrs, decode_addrs, host, port):

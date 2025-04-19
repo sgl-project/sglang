@@ -28,6 +28,9 @@ if TYPE_CHECKING:
 else:
     Image = Any
 
+if TYPE_CHECKING:
+    from sglang.srt.managers.expert_location import ExpertLocationMetadata
+
 from sglang.srt.managers.schedule_batch import BaseFinishReason
 from sglang.srt.sampling.sampling_params import SamplingParams
 
@@ -96,8 +99,8 @@ class GenerateReqInput:
     return_hidden_states: bool = False
 
     # For disaggregated inference
-    bootstrap_host: Optional[str] = None
-    bootstrap_room: Optional[int] = None
+    bootstrap_host: Optional[Union[List[str], str]] = None
+    bootstrap_room: Optional[Union[List[int], int]] = None
 
     def normalize_batch_and_arguments(self):
         """
@@ -668,7 +671,27 @@ class BatchEmbeddingOut:
 
 
 @dataclass
-class FlushCacheReq:
+class FlushCacheReqInput:
+    pass
+
+
+@dataclass
+class FlushCacheReqOutput:
+    success: bool
+
+
+@dataclass
+class EplbRebalanceReqInput:
+    debug_use_random_stat: bool = False
+
+
+@dataclass
+class UpdateExpertLocationReqInput:
+    expert_location_metadata: "ExpertLocationMetadata"
+
+
+@dataclass
+class UpdateExpertLocationReqOutput:
     pass
 
 
@@ -678,6 +701,8 @@ class UpdateWeightFromDiskReqInput:
     model_path: str
     # The format to load the weights
     load_format: Optional[str] = None
+    # The parameter categories to filter
+    param_categories: Optional[List[str]] = None
 
 
 @dataclass
@@ -826,7 +851,7 @@ class ExpertDistributionReq(Enum):
 
 @dataclass
 class ExpertDistributionReqOutput:
-    pass
+    dump_output: Optional[Any] = None
 
 
 @dataclass
@@ -837,6 +862,7 @@ class ProfileReq:
     activities: Optional[List[str]] = None
     with_stack: Optional[bool] = None
     record_shapes: Optional[bool] = None
+    profile_id: Optional[str] = None
 
 
 @dataclass
@@ -921,3 +947,13 @@ class RpcReqInput:
 class RpcReqOutput:
     success: bool
     message: str
+
+
+class BlockReqType(Enum):
+    BLOCK = 1
+    UNBLOCK = 2
+
+
+@dataclass
+class BlockReqInput:
+    type: BlockReqType
