@@ -55,12 +55,15 @@ from sglang.srt.disaggregation.utils import (
     get_kv_class,
 )
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
+from sglang.srt.managers import expert_distribution
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOut,
     BatchMultimodalOut,
     BatchStrOut,
     BatchTokenIDOut,
+    BlockReqInput,
+    BlockReqType,
     CloseSessionReqInput,
     ConfigureLoggingReq,
     EmbeddingReqInput,
@@ -104,6 +107,8 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     dataclass_to_string_truncated,
+    enable_colocated_batch_gen,
+    get_bool_env_var,
     get_zmq_socket,
     kill_process_tree,
 )
@@ -235,6 +240,7 @@ class TokenizerManager:
 
         # Set after scheduler is initialized
         self.max_req_input_len = None
+        self.expert_location_metadata = None
 
         # Metrics
         if self.enable_metrics:
@@ -264,7 +270,7 @@ class TokenizerManager:
         self.resume_memory_occupation_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
-        self.start_profile_communicator = _Communicator(
+        self.profile_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
         self.get_internal_state_communicator = _Communicator(
@@ -316,7 +322,7 @@ class TokenizerManager:
                 ),
                 (
                     ProfileReqOutput,
-                    self.start_profile_communicator.handle_recv,
+                    self.profile_communicator.handle_recv,
                 ),
                 (
                     GetInternalStateReqOutput,
@@ -493,6 +499,9 @@ class TokenizerManager:
         self.rid_to_state[obj.rid] = state
         self.send_to_scheduler.send_pyobj(tokenized_obj)
 
+    def _send_block_request(self, type: BlockReqType):
+        self.send_to_scheduler.send_pyobj(BlockReqInput(type))
+
     async def _wait_one_response(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -562,12 +571,16 @@ class TokenizerManager:
         rids = []
         if getattr(obj, "parallel_sample_num", 1) == 1:
             # Send all requests
+            if enable_colocated_batch_gen():
+                self._send_block_request(BlockReqType.BLOCK)
             for i in range(batch_size):
                 tmp_obj = obj[i]
                 tokenized_obj = await self._tokenize_one_request(tmp_obj)
                 self._send_one_request(tmp_obj, tokenized_obj, created_time)
                 generators.append(self._wait_one_response(tmp_obj, request))
                 rids.append(tmp_obj.rid)
+            if enable_colocated_batch_gen():
+                self._send_block_request(BlockReqType.UNBLOCK)
         else:
             # FIXME: When using batch and parallel_sample_num together, the perf is not optimal.
             if batch_size > 128:
@@ -652,14 +665,17 @@ class TokenizerManager:
             activities=activities,
             profile_id=str(time.time()),
         )
-        result = (await self.start_profile_communicator(req))[0]
+        return await self._execute_profile(req)
+
+    async def stop_profile(self):
+        req = ProfileReq(type=ProfileReqType.STOP_PROFILE)
+        return await self._execute_profile(req)
+
+    async def _execute_profile(self, req: ProfileReq):
+        result = (await self.profile_communicator(req))[0]
         if not result.success:
             raise RuntimeError(result.message)
         return result
-
-    def stop_profile(self):
-        req = ProfileReq(type=ProfileReqType.STOP_PROFILE)
-        self.send_to_scheduler.send_pyobj(req)
 
     async def start_expert_distribution_record(self):
         await self.expert_distribution_communicator(ExpertDistributionReq.START_RECORD)
@@ -668,7 +684,15 @@ class TokenizerManager:
         await self.expert_distribution_communicator(ExpertDistributionReq.STOP_RECORD)
 
     async def dump_expert_distribution_record(self):
-        await self.expert_distribution_communicator(ExpertDistributionReq.DUMP_RECORD)
+        raw_outputs: List[ExpertDistributionReqOutput] = (
+            await self.expert_distribution_communicator(
+                ExpertDistributionReq.DUMP_RECORD
+            )
+        )
+        return expert_distribution.postprocess_dumps(
+            [output.dump_output for output in raw_outputs],
+            expert_location_metadata=self.expert_location_metadata,
+        )
 
     async def update_weights_from_disk(
         self,

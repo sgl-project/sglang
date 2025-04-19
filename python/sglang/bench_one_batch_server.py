@@ -16,12 +16,17 @@ import itertools
 import json
 import multiprocessing
 import os
+import random
 import time
+from pathlib import Path
 from typing import Tuple
 
 import numpy as np
 import requests
+import torch
+import torch.multiprocessing as mp
 
+from sglang.srt import fine_grained_benchmark
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
@@ -36,6 +41,14 @@ class BenchArgs:
     result_filename: str = "result.jsonl"
     base_url: str = ""
     skip_warmup: bool = False
+    profile: bool = False
+    profile_activities: Tuple[str] = ("CUDA_PROFILER",)
+    profile_with_stack: bool = False
+    profile_record_shapes: bool = False
+    profile_skip_cases: int = 0
+    enable_expert_distribution_recorder: bool = False
+    expert_distribution_recorder_dir: str = "/tmp"
+    seed: int = 1
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -54,6 +67,33 @@ class BenchArgs:
         )
         parser.add_argument("--base-url", type=str, default=BenchArgs.base_url)
         parser.add_argument("--skip-warmup", action="store_true")
+        parser.add_argument(
+            "--profile",
+            action="store_true",
+            help="Use Torch Profiler. The endpoint must be launched with "
+            "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
+        )
+        parser.add_argument(
+            "--profile-activities",
+            type=str,
+            nargs="+",
+            default=BenchArgs.profile_activities,
+        )
+        parser.add_argument("--profile-with-stack", action="store_true")
+        parser.add_argument("--profile-record-shapes", action="store_true")
+        parser.add_argument(
+            "--profile-skip-cases", type=int, default=BenchArgs.profile_skip_cases
+        )
+        parser.add_argument(
+            "--enable-expert-distribution-recorder",
+            action="store_true",
+        )
+        parser.add_argument(
+            "--expert-distribution-recorder-dir",
+            type=str,
+            default=BenchArgs.expert_distribution_recorder_dir,
+        )
+        parser.add_argument("--seed", type=int, default=1, help="The random seed.")
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
@@ -74,6 +114,9 @@ def launch_server_internal(server_args):
 
 
 def launch_server_process(server_args: ServerArgs):
+    if fine_grained_benchmark.is_enabled():
+        os.environ["SGLANG_ENABLE_COLOCATED_BATCH_GEN"] = "true"
+
     proc = multiprocessing.Process(target=launch_server_internal, args=(server_args,))
     proc.start()
     base_url = f"http://{server_args.host}:{server_args.port}"
@@ -107,6 +150,9 @@ def run_one_case(
         for _ in range(batch_size)
     ]
 
+    if fine_grained_benchmark.is_enabled():
+        fine_grained_benchmark.clear_output()
+
     tic = time.time()
     response = requests.post(
         url + "/generate",
@@ -122,6 +168,7 @@ def run_one_case(
     latency = time.time() - tic
 
     _ = response.json()
+
     output_throughput = batch_size * output_len / latency
     overall_throughput = batch_size * (input_len + output_len) / latency
 
@@ -129,6 +176,22 @@ def run_one_case(
     print(f"latency: {latency:.2f} s")
     print(f"output throughput: {output_throughput:.2f} token/s")
     print(f"(input + output) throughput: {overall_throughput:.2f} token/s")
+
+    if fine_grained_benchmark.is_enabled():
+        import pandas as pd
+
+        fine_grained_output = fine_grained_benchmark.read_output()
+        df = pd.DataFrame(fine_grained_output)
+        df["throughput"] = df["num_tokens"] / df["latency"]
+        with pd.option_context(
+            "display.max_rows",
+            10000,
+            "display.max_columns",
+            10000,
+            "display.width",
+            10000,
+        ):
+            print(df[df["tp_rank"] == 0].drop(["start_time", "tp_rank"], axis=1))
 
     if result_filename:
         with open(result_filename, "a") as fout:
@@ -141,10 +204,60 @@ def run_one_case(
                 "output_throughput": round(output_throughput, 2),
                 "overall_throughput": round(overall_throughput, 2),
             }
+            if fine_grained_benchmark.is_enabled():
+                res["fine_grained_output"] = fine_grained_output
             fout.write(json.dumps(res) + "\n")
 
 
+def _process_expert_distribution_record(bench_args, response):
+    response.raise_for_status()
+    data = response.json()
+    path = (
+        Path(bench_args.expert_distribution_recorder_dir) / "expert_distribution.json"
+    )
+    print(f"Write expert_distribution_recorder information to {path}", flush=True)
+    path.write_text(json.dumps(data))
+
+    import polars as pl
+
+    df = pl.read_json(path, infer_schema_length=1000000)
+    df = df.with_row_index("temp_index")
+    df = df.explode("physical_count")
+    df = df.with_columns(
+        layer_id=(pl.col("physical_count").cum_count() - 1).over("temp_index")
+    )
+    df = df.drop("temp_index")
+    df = df.with_columns(
+        total_num_tokens=pl.col("physical_count").list.sum(),
+        max_expert_num_tokens=pl.col("physical_count").list.max(),
+        min_expert_num_tokens=pl.col("physical_count").list.min(),
+    )
+    df = df.filter(pl.col("total_num_tokens") > 0)
+    df = df.sort("forward_pass_id", "layer_id", "gatherer_key", "rank")
+    df = df.select(
+        "forward_pass_id",
+        "layer_id",
+        "gatherer_key",
+        "rank",
+        "total_num_tokens",
+        "max_expert_num_tokens",
+        "min_expert_num_tokens",
+        "physical_count",
+    )
+    with pl.Config(
+        fmt_str_lengths=1000,
+        tbl_cols=-1,
+        tbl_rows=-1,
+        fmt_table_cell_list_len=1000,
+        tbl_width_chars=-1,
+    ):
+        print(df, flush=True)
+
+
 def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+
     if bench_args.base_url:
         proc, base_url = None, bench_args.base_url
     else:
@@ -163,9 +276,31 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
 
     # benchmark
     try:
-        for bs, il, ol in itertools.product(
-            bench_args.batch_size, bench_args.input_len, bench_args.output_len
+        for index, (bs, il, ol) in enumerate(
+            itertools.product(
+                bench_args.batch_size, bench_args.input_len, bench_args.output_len
+            )
         ):
+            if (
+                bench_args.enable_expert_distribution_recorder
+                and index == bench_args.profile_skip_cases
+            ):
+                requests.post(
+                    base_url + "/start_expert_distribution_record"
+                ).raise_for_status()
+            if bench_args.profile and index == bench_args.profile_skip_cases:
+                # TODO extract to PR
+                print("bench script call cudaProfilerStart")
+                torch.cuda.cudart().cudaProfilerStart()
+                # print("Execute start_profile")
+                # requests.post(
+                #     base_url + "/start_profile",
+                #     json={
+                #         "activities": bench_args.profile_activities,
+                #         "with_stack": bench_args.profile_with_stack,
+                #         "record_shapes": bench_args.profile_record_shapes,
+                #     },
+                # ).raise_for_status()
             run_one_case(
                 base_url,
                 bs,
@@ -174,6 +309,19 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
                 bench_args.run_name,
                 bench_args.result_filename,
             )
+        if bench_args.enable_expert_distribution_recorder:
+            requests.post(
+                base_url + "/stop_expert_distribution_record"
+            ).raise_for_status()
+            _process_expert_distribution_record(
+                bench_args, requests.post(base_url + "/dump_expert_distribution_record")
+            )
+        if bench_args.profile:
+            # TODO extract to PR
+            print("bench script call cudaProfilerStop")
+            torch.cuda.cudart().cudaProfilerStop()
+            # print("Execute stop_profile")
+            # requests.post(base_url + "/stop_profile").raise_for_status()
     finally:
         if proc:
             kill_process_tree(proc.pid)
@@ -182,6 +330,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
 
 
 if __name__ == "__main__":
+    mp.set_start_method("spawn", force=True)
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
     BenchArgs.add_cli_args(parser)

@@ -823,7 +823,7 @@ class ExpertDistributionReq(Enum):
 
 @dataclass
 class ExpertDistributionReqOutput:
-    pass
+    dump_output: Optional[Any] = None
 
 
 @dataclass
@@ -919,3 +919,13 @@ class RpcReqInput:
 class RpcReqOutput:
     success: bool
     message: str
+
+
+class BlockReqType(Enum):
+    BLOCK = 1
+    UNBLOCK = 2
+
+
+@dataclass
+class BlockReqInput:
+    type: BlockReqType
