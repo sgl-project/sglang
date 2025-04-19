@@ -19,6 +19,7 @@
 import logging
 import os
 import re
+from contextlib import nullcontext
 from dataclasses import dataclass
 from enum import Enum, IntEnum, auto
 from functools import partial
@@ -1654,9 +1655,18 @@ class DeepseekV2Model(nn.Module):
             ]
 
         # TODO do not hardcode
-        total_num_sm = torch.cuda.get_device_properties(device="cuda").multi_processor_count
-        chosen_num_sms = (total_num_sm - 20) if forward_batch.forward_mode.is_extend() else None
-        with configure_deep_gemm_num_sms(num_sms=chosen_num_sms):
+        total_num_sm = torch.cuda.get_device_properties(
+            device="cuda"
+        ).multi_processor_count
+        extend_mode_communication_num_sm = 20
+        num_sm_context = (
+            configure_deep_gemm_num_sms(
+                num_sms=total_num_sm - extend_mode_communication_num_sm
+            )
+            if forward_batch.forward_mode.is_extend()
+            else nullcontext()
+        )
+        with num_sm_context:
             return two_batch_overlap.model_forward_execute_two_batch(
                 inputs=dict(
                     positions=positions,
