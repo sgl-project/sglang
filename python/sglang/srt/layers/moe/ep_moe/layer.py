@@ -165,6 +165,7 @@ class EPMoE(torch.nn.Module):
         self.correction_bias = correction_bias
         self.custom_routing_function = custom_routing_function
         self.activation = activation
+        self.routed_scaling_factor = routed_scaling_factor
 
         if quant_config is None:
             self.quant_method: Optional[QuantizeMethodBase] = UnquantizedEPMoEMethod()
