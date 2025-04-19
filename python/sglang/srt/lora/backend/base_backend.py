@@ -75,7 +75,7 @@ class BaseLoRABackend:
         qkv_lora_a: torch.Tensor,
         qkv_lora_b: Union[torch.Tensor, Tuple[torch.Tensor]],
         *args,
-        **kwargs
+        **kwargs,
     ) -> torch.Tensor:
         """Run the lora pass for QKV Layer.
 
@@ -98,7 +98,7 @@ class BaseLoRABackend:
         gate_up_lora_a: torch.Tensor,
         gate_up_lora_b: Union[torch.Tensor, Tuple[torch.Tensor]],
         *args,
-        **kwargs
+        **kwargs,
     ) -> torch.Tensor:
         """Run the lora pass for gate_up_proj, usually attached to MergedColumnParallelLayer.
 
@@ -115,3 +115,19 @@ class BaseLoRABackend:
 
     def set_batch_info(self, batch_info: LoRABatchInfo):
         self.batch_info = batch_info
+
+
+def get_backend_from_name(name: str) -> BaseLoRABackend:
+    """
+    Get corresponding backend class from backend's name
+    """
+    if name == "triton":
+        from sglang.srt.lora.backend.triton_backend import TritonLoRABackend
+
+        return TritonLoRABackend
+    elif name == "flashinfer":
+        from sglang.srt.lora.backend.flashinfer_backend import FlashInferLoRABackend
+
+        return FlashInferLoRABackend
+    else:
+        raise ValueError(f"Invalid backend: {name}")
