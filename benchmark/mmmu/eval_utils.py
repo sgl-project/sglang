@@ -89,7 +89,7 @@ def set_seed(seed_value):
 
 
 def prepare_samples(eval_args: EvalArgs):
-    print("preparing samples...")
+    print("Preparing samples...")
     # Build prompts
     set_seed(eval_args.seed)
 
@@ -105,15 +105,40 @@ def prepare_samples(eval_args: EvalArgs):
             assert len(value) == 1, "key {} has more than one value".format(key)
             eval_args.config[key] = value[0]
 
-    # run for each subject
+    # run for each subject in parallel
     sub_dataset_list = []
+    subjects = list(CAT_SHORT2LONG.values())  # Get a fixed list of subjects
 
-    for subject in tqdm(CAT_SHORT2LONG.values()):
-        sub_dataset = load_dataset(
-            eval_args.dataset_path, subject, split=eval_args.split
-        )
-        sub_dataset_list.append(sub_dataset)
-        # break
+    print(f"Loading datasets for {len(subjects)} subjects...")
+    with ThreadPoolExecutor() as executor:
+        # Submit all load_dataset tasks
+        future_to_subject = {
+            executor.submit(
+                load_dataset, eval_args.dataset_path, subject, split=eval_args.split
+            ): subject
+            for subject in subjects
+        }
+
+        # Collect results as they complete
+        results = {}
+        for future in tqdm(
+            as_completed(future_to_subject),
+            total=len(subjects),
+            desc="Loading datasets",
+        ):
+            subject = future_to_subject[future]
+            try:
+                results[subject] = future.result()
+            except Exception as exc:
+                print(f"{subject} generated an exception: {exc}")
+
+    # Ensure datasets are added in the original order for consistency
+    for subject in subjects:
+        if subject in results:
+            sub_dataset_list.append(results[subject])
+        else:
+            # Handle cases where a dataset failed to load (optional, depends on desired behavior)
+            print(f"Warning: Dataset for subject '{subject}' could not be loaded.")
 
     # merge all dataset
     dataset = concatenate_datasets(sub_dataset_list)
@@ -133,18 +158,25 @@ def prepare_samples(eval_args: EvalArgs):
         width, height = image.size
         if width * height >= eval_args.image_pixels_limit:
             return None, True
-        image_path = f"{images_path}/image_{i}.png"
+        # Use a unique identifier for the image path to avoid potential collisions if indices reset
+        image_path = f"{images_path}/image_{sample['id']}.png"
         if not os.path.exists(image_path):
             image.save(image_path)
         sample["image_path"] = image_path
         return sample, False
 
+    print("Processing samples...")
     with ThreadPoolExecutor() as executor:
+        # Pass the sample itself to process_sample, index is less reliable now
         futures = [
-            executor.submit(process_sample, i, sample)
+            executor.submit(
+                process_sample, i, sample
+            )  # Keep index i for tqdm maybe? Or remove it. Let's keep it for now.
             for i, sample in enumerate(dataset)
         ]
-        for future in tqdm(as_completed(futures), total=len(futures)):
+        for future in tqdm(
+            as_completed(futures), total=len(dataset), desc="Processing samples"
+        ):
             sample, skipped = future.result()
             if skipped:
                 skip_count += 1
@@ -152,9 +184,9 @@ def prepare_samples(eval_args: EvalArgs):
                 samples.append(sample)
 
     print(
-        f"skipping {skip_count} samples with large images, {round((float(skip_count) / len(dataset)) * 100, 2)}% of dataset"
+        f"Skipping {skip_count} samples with large images, {round((float(skip_count) / len(dataset)) * 100, 2)}% of dataset"
     )
-    print("samples have been prepared")
+    print("Samples have been prepared")
     return samples
 
 

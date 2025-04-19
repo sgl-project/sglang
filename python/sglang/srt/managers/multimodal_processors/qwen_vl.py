@@ -5,6 +5,7 @@ from typing import List, Union
 import torch
 from PIL import Image
 
+from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.managers.multimodal_processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
@@ -27,6 +28,8 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
         self.IM_END_TOKEN_ID = hf_config.vision_end_token_id
         self.image_token_id = hf_config.image_token_id
         self.video_token_id = hf_config.video_token_id
+        self.vision_start_token_id = hf_config.vision_start_token_id
+        self.vision_end_token_id = hf_config.vision_end_token_id
         self.NUM_TOKEN_PER_FRAME = 770
         self.IMAGE_FACTOR = 28
         self.MIN_PIXELS = 4 * 28 * 28
@@ -36,20 +39,18 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
     async def process_mm_data_async(
         self,
         image_data: List[Union[str, bytes]],
-        prompt,
+        input_text,
         request_obj,
         max_req_input_len,
         *args,
         **kwargs,
     ):
-        if not image_data:
-            return None
         if isinstance(image_data, str):
             image_data = [image_data]
 
         image_token = self.IMAGE_TOKEN
         base_output = self.load_mm_data(
-            prompt=prompt,
+            prompt=input_text,
             image_data=image_data,
             multimodal_tokens=MultimodalSpecialTokens(image_token=image_token),
             max_req_input_len=max_req_input_len,
@@ -116,29 +117,53 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
         async def resize_image_async(image):
             return resize_image(image)
 
-        resize_tasks = [resize_image_async(image) for image in base_output.images]
-        resized_images = await asyncio.gather(*resize_tasks)
+        if base_output.images:
+            resize_tasks = [resize_image_async(image) for image in base_output.images]
+            base_output.images = await asyncio.gather(*resize_tasks)
 
         ret = self.process_mm_data(
             input_text=base_output.input_text,
-            images=resized_images,
+            images=base_output.images,
         )
 
-        image_grid_thws = torch.concat([ret["image_grid_thw"]])
-        return {
-            "input_ids": ret["input_ids"].flatten().tolist(),
-            "mm_items": [
+        items = []
+
+        input_ids = ret["input_ids"].flatten().tolist()
+        if "pixel_values" in ret:
+            items += [
                 MultimodalDataItem(
                     pixel_values=ret["pixel_values"],
-                    image_grid_thws=image_grid_thws,
+                    image_grid_thws=torch.concat([ret["image_grid_thw"]]),
                     # TODO
                     video_grid_thws=None,
                     second_per_grid_ts=ret.get("second_per_grid_ts", None),
                     modality=Modality.IMAGE,
                 )
-            ],
+            ]
+
+        mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
+            spatial_merge_size=self.hf_config.vision_config.spatial_merge_size,
+            image_token_id=self.image_token_id,
+            video_token_id=self.video_token_id,
+            vision_start_token_id=self.vision_start_token_id,
+            model_type=self.hf_config.model_type,
+            tokens_per_second=getattr(
+                self.hf_config.vision_config, "tokens_per_second", None
+            ),
+            input_ids=torch.tensor(input_ids).unsqueeze(0),
+            image_grid_thw=ret.get("image_grid_thw", None),
+            video_grid_thw=ret.get("video_grid_thw", None),
+            second_per_grid_ts=ret.get("second_per_grid_ts", None),
+        )
+        mrope_positions = mrope_positions.squeeze(1)
+
+        return {
+            "input_ids": input_ids,
+            "mm_items": items,
             "im_start_id": self.IM_START_TOKEN_ID,
             "im_end_id": self.IM_END_TOKEN_ID,
             "im_token_id": self.image_token_id,
             "video_token_id": self.video_token_id,
+            "mrope_positions": mrope_positions,
+            "mrope_position_delta": mrope_position_delta,
         }
