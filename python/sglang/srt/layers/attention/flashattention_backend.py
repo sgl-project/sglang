@@ -1520,11 +1520,18 @@ class FlashAttentionBackend(AttentionBackend):
                         )
                     )
 
-                    page_table = self.req_to_token[
-                        req_pool_indices, : metadata.max_seq_len_k
+                    max_seq_pages = (
+                        metadata.max_seq_len_k + self.page_size - 1
+                    ) // self.page_size
+                    page_indices = self.req_to_token[
+                        req_pool_indices[:, None],
+                        self.decode_cuda_graph_metadata["strided_indices"][
+                            :max_seq_pages
+                        ],
                     ]
 
-                    metadata.page_table[:, : metadata.max_seq_len_k].copy_(page_table)
+                    page_indices //= self.page_size
+                    metadata.page_table[:, :max_seq_pages].copy_(page_indices)
                 else:
                     # When top k > 1, we need two specific draft decode metadata, and then merge states
                     # 1. The first half of metadata for prefix tokens
@@ -1602,10 +1609,15 @@ class FlashAttentionBackend(AttentionBackend):
                         (1, 0),
                     )
                 )
-                page_table = self.req_to_token[
-                    req_pool_indices, : metadata.max_seq_len_k
+                max_seq_pages = (
+                    metadata.max_seq_len_k + self.page_size - 1
+                ) // self.page_size
+                page_indices = self.req_to_token[
+                    req_pool_indices[:, None],
+                    self.decode_cuda_graph_metadata["strided_indices"][:max_seq_pages],
                 ]
-                metadata.page_table[:, : metadata.max_seq_len_k].copy_(page_table)
+                page_indices //= self.page_size
+                metadata.page_table[:, :max_seq_pages].copy_(page_indices)
             else:
                 # When topk > 1, we need two specific target verify metadata, and then merge states
                 # 1. The first half of metadata for prefix tokens

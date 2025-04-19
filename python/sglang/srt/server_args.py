@@ -363,6 +363,15 @@ class ServerArgs:
                 self.speculative_eagle_topk = 1
                 logger.info("speculative_eagle_topk is changed to 1 when page_size > 1")
 
+            if (
+                self.speculative_eagle_topk == 1
+                and self.speculative_num_draft_tokens != self.speculative_num_steps
+            ):
+                logger.info(
+                    "speculative_num_draft_tokens is changed to speculative_num_steps when speculative_eagle_topk == 1 when using fa3"
+                )
+                self.speculative_num_draft_tokens = self.speculative_num_steps
+
             # The token generated from the verify step is counted.
             # If sepculative_num_steps >= speculative_num_draft_tokens, the additional tokens will definitely be discarded.
             # assert self.speculative_num_steps < self.speculative_num_draft_tokens
