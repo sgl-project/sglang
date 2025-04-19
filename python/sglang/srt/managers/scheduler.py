@@ -198,7 +198,6 @@ class Scheduler(
                 self.tp_rank,
                 self.tp_size,
                 self.dp_size,
-                server_args.moe_dense_tp_size,
             )
         )
 
