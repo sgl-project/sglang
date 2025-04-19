@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import math
 from typing import List, Union
@@ -12,21 +14,39 @@ from sglang.srt.managers.multimodal_processors.base_processor import (
     MultimodalSpecialTokens,
 )
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.models.qwen2_5_omni import Qwen2_5OmniModel
 from sglang.srt.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
 from sglang.srt.models.qwen2_vl import Qwen2VLForConditionalGeneration
 
+QWEN_DEFAULT_SYSTEM_PROMPT = """You are a helpful assistant."""
+QWEN_AUDIO_SYSTEM_PROMPT = """You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, capable of perceiving auditory and visual inputs, as well as generating text and speech."""
 
-# Compatible with Qwen2VL and Qwen2_5VL
+
+# Compatible with Qwen2VL, Qwen2_5VL and Qwen2_5_o
 class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
-    models = [Qwen2VLForConditionalGeneration, Qwen2_5_VLForConditionalGeneration]
+    models = [
+        Qwen2VLForConditionalGeneration,
+        Qwen2_5_VLForConditionalGeneration,
+        Qwen2_5OmniModel,
+    ]
 
     def __init__(self, hf_config, server_args, _processor):
         super().__init__(hf_config, server_args, _processor)
-        self.IMAGE_TOKEN = "<|vision_start|><|image_pad|><|vision_end|>"
-        self.IM_START_TOKEN_ID = hf_config.vision_start_token_id
-        self.IM_END_TOKEN_ID = hf_config.vision_end_token_id
-        self.image_token_id = hf_config.image_token_id
-        self.video_token_id = hf_config.video_token_id
+        if self.arch == Qwen2_5OmniModel.__name__:
+            self.image_token_id = hf_config.thinker_config.image_token_index
+            self.image_start_id = hf_config.thinker_config.vision_start_token_id
+            self.image_end_id = hf_config.thinker_config.vision_end_token_id
+
+            self.audio_token_id = hf_config.thinker_config.audio_token_index
+            self.audio_start_id = hf_config.thinker_config.audio_start_token_id
+            self.audio_end_id = hf_config.thinker_config.audio_end_token_id
+
+            self.video_token_id = hf_config.thinker_config.video_token_index
+        else:
+            self.image_token_id = hf_config.image_token_id
+            self.image_start_id = hf_config.vision_start_token_id
+            self.image_end_id = hf_config.vision_end_token_id
+            self.video_token_id = hf_config.video_token_id
         self.NUM_TOKEN_PER_FRAME = 770
         self.IMAGE_FACTOR = 28
         self.MIN_PIXELS = 4 * 28 * 28
@@ -42,16 +62,20 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
         *args,
         **kwargs,
     ):
-        if not image_data:
-            return None
+
         if isinstance(image_data, str):
             image_data = [image_data]
+        audio_data = request_obj.audio_data
 
-        image_token = self.IMAGE_TOKEN
         base_output = self.load_mm_data(
             prompt=prompt,
             image_data=image_data,
-            multimodal_tokens=MultimodalSpecialTokens(image_token=image_token),
+            audio_data=audio_data,
+            multimodal_tokens=MultimodalSpecialTokens(
+                image_token=self.image_token_id,
+                audio_token=getattr(self, "audio_token_id", None),
+                video_token=getattr(self, "video_token_id", None),
+            ),
             max_req_input_len=max_req_input_len,
         )
 
@@ -116,29 +140,42 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
         async def resize_image_async(image):
             return resize_image(image)
 
-        resize_tasks = [resize_image_async(image) for image in base_output.images]
-        resized_images = await asyncio.gather(*resize_tasks)
-
-        ret = self.process_mm_data(
+        resized_images = base_output.images
+        if base_output.images:
+            resize_tasks = [resize_image_async(image) for image in resized_images]
+            resized_images = await asyncio.gather(*resize_tasks)
+        res = self.process_mm_data(
             input_text=base_output.input_text,
             images=resized_images,
+            audios=base_output.audios,
         )
 
-        image_grid_thws = torch.concat([ret["image_grid_thw"]])
+        items = []
+
+        if "pixel_values" in res and res["pixel_values"] is not None:
+            image_grid_thws = torch.concat([res["image_grid_thw"]])
+            item = MultimodalDataItem(
+                pixel_values=res["pixel_values"],
+                image_grid_thws=image_grid_thws,
+                modality=Modality.IMAGE,
+            )
+            items += [item]
+
+        if "input_features" in res and res["input_features"] is not None:
+            item = MultimodalDataItem(
+                audio_feature=res["input_features"],
+                feature_attention_mask=res["feature_attention_mask"],
+                attention_mask=res["attention_mask"],
+                modality=Modality.AUDIO,
+            )
+            items += [item]
         return {
-            "input_ids": ret["input_ids"].flatten().tolist(),
-            "mm_items": [
-                MultimodalDataItem(
-                    pixel_values=ret["pixel_values"],
-                    image_grid_thws=image_grid_thws,
-                    # TODO
-                    video_grid_thws=None,
-                    second_per_grid_ts=ret.get("second_per_grid_ts", None),
-                    modality=Modality.IMAGE,
-                )
-            ],
-            "im_start_id": self.IM_START_TOKEN_ID,
-            "im_end_id": self.IM_END_TOKEN_ID,
+            "input_ids": res["input_ids"].flatten().tolist(),
+            "mm_items": items,
+            "im_start_id": self.image_start_id,
+            "im_end_id": self.image_end_id,
             "im_token_id": self.image_token_id,
+            "audio_start_id": getattr(self, "audio_start_id", None),
+            "audio_end_id": getattr(self, "audio_end_id", None),
             "video_token_id": self.video_token_id,
         }
