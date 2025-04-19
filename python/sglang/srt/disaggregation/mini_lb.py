@@ -71,7 +71,11 @@ class MiniLoadBalancer:
         self, modified_request, prefill_server, decode_server
     ) -> ORJSONResponse:
 
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(
+                total=3600
+            )  # Add timeout for request reliability
+        ) as session:
             tasks = [
                 session.post(f"{prefill_server}/generate", json=modified_request),
                 session.post(f"{decode_server}/generate", json=modified_request),
@@ -232,7 +236,7 @@ async def handle_generate_request(request_data: dict):
 
 
 def _generate_bootstrap_room():
-    return random.randint(0, 2 ** 63 - 1)
+    return random.randint(0, 2**63 - 1)
 
 
 # _next_bootstrap_room = 0
