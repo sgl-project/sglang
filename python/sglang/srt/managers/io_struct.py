@@ -665,8 +665,13 @@ class BatchEmbeddingOut:
 
 
 @dataclass
-class FlushCacheReq:
+class FlushCacheReqInput:
     pass
+
+
+@dataclass
+class FlushCacheReqOutput:
+    success: bool
 
 
 @dataclass
