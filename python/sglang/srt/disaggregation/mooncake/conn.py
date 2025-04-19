@@ -27,7 +27,7 @@ from sglang.srt.disaggregation.base.conn import (
 from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferEngine
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import get_free_port, get_ip, get_local_ip_by_remote
+from sglang.srt.utils import PortPool, get_ip, get_local_ip_by_remote
 
 logger = logging.getLogger(__name__)
 
@@ -116,9 +116,11 @@ class MooncakeKVManager(BaseKVManager):
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.transfer_queue = queue.Queue()
             self.transfer_infos: Dict[int, TransferInfo] = {}
+            self.rank_port_pool = PortPool(20000, 24999)
             self.start_prefill_thread()
             self._register_to_bootstrap()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            self.rank_port_pool = PortPool(25000, 29999)
             self.start_decode_thread()
             self.connection_pool: Dict[str, Dict[str, Union[str, int]]] = {}
         else:
@@ -205,7 +207,7 @@ class MooncakeKVManager(BaseKVManager):
         )
 
     def start_prefill_thread(self):
-        self.rank_port = get_free_port()
+        self.rank_port = self.rank_port_pool.allocate_port()
         self.server_socket.bind(f"tcp://{get_local_ip_by_remote()}:{self.rank_port}")
 
         def bootstrap_thread():
@@ -269,7 +271,7 @@ class MooncakeKVManager(BaseKVManager):
         threading.Thread(target=transfer_thread).start()
 
     def start_decode_thread(self):
-        self.rank_port = get_free_port()
+        self.rank_port = self.rank_port_pool.allocate_port()
         self.server_socket.bind(f"tcp://{get_local_ip_by_remote()}:{self.rank_port}")
 
         def decode_thread():
