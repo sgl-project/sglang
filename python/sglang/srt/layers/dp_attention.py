@@ -3,7 +3,7 @@ from __future__ import annotations
 import functools
 import logging
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 import triton
@@ -24,8 +24,8 @@ if TYPE_CHECKING:
 _ATTN_TP_GROUP = None
 _ATTN_TP_RANK = None
 _ATTN_TP_SIZE = None
-_DP_RANK = None
-_DP_SIZE = None
+_ATTN_DP_RANK = None
+_ATTN_DP_SIZE = None
 
 
 def compute_dp_attention_world_info(enable_dp_attention, tp_rank, tp_size, dp_size):
@@ -44,18 +44,20 @@ def initialize_dp_attention(
     tp_size: int,
     dp_size: int,
 ):
-    global _ATTN_TP_GROUP, _ATTN_TP_RANK, _ATTN_TP_SIZE, _DP_RANK, _DP_SIZE
+    global _ATTN_TP_GROUP, _ATTN_TP_RANK, _ATTN_TP_SIZE, _ATTN_DP_RANK, _ATTN_DP_SIZE
 
     from sglang.srt.layers.sampler import SYNC_TOKEN_IDS_ACROSS_TP
 
-    _ATTN_TP_RANK, _ATTN_TP_SIZE, _DP_RANK = compute_dp_attention_world_info(
+    _ATTN_TP_RANK, _ATTN_TP_SIZE, _ATTN_DP_RANK = compute_dp_attention_world_info(
         enable_dp_attention, tp_rank, tp_size, dp_size
     )
 
     if enable_dp_attention:
-        _DP_SIZE = dp_size
+        _ATTN_DP_SIZE = dp_size
     else:
-        _DP_SIZE = 1
+        _ATTN_DP_SIZE = 1
+
+    logger.info(f"{(_ATTN_TP_RANK, _ATTN_TP_SIZE, _ATTN_DP_RANK, _ATTN_DP_SIZE)=}")
 
     tp_group = get_tp_group()
     _ATTN_TP_GROUP = GroupCoordinator(
@@ -90,13 +92,13 @@ def get_attention_tp_size():
 
 
 def get_attention_dp_rank():
-    assert _DP_RANK is not None, "dp attention not initialized!"
-    return _DP_RANK
+    assert _ATTN_DP_RANK is not None, "dp attention not initialized!"
+    return _ATTN_DP_RANK
 
 
 def get_attention_dp_size():
-    assert _DP_SIZE is not None, "dp attention not initialized!"
-    return _DP_SIZE
+    assert _ATTN_DP_SIZE is not None, "dp attention not initialized!"
+    return _ATTN_DP_SIZE
 
 
 @contextmanager
@@ -109,15 +111,15 @@ def disable_dp_size():
     Args:
         tp_group (GroupCoordinator): the tp group coordinator
     """
-    global _DP_SIZE
-    assert _DP_SIZE is not None, "dp attention not initialized!"
+    global _ATTN_DP_SIZE
+    assert _ATTN_DP_SIZE is not None, "dp attention not initialized!"
 
-    old_dp_size = _DP_SIZE
-    _DP_SIZE = 1
+    old_dp_size = _ATTN_DP_SIZE
+    _ATTN_DP_SIZE = 1
     try:
         yield
     finally:
-        _DP_SIZE = old_dp_size
+        _ATTN_DP_SIZE = old_dp_size
 
 
 def get_dp_local_info(forward_batch: ForwardBatch):

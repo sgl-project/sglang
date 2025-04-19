@@ -362,12 +362,16 @@ class ModelRunner:
                 distributed_init_method=dist_init_method,
                 timeout=self.server_args.dist_timeout,
             )
-            initialize_model_parallel(tensor_model_parallel_size=self.tp_size)
+            moe_dense_tp_size = self.server_args.moe_dense_tp_size
+            local_tp_size = moe_dense_tp_size if moe_dense_tp_size else self.tp_size
+            local_tp_rank = self.tp_rank % moe_dense_tp_size if moe_dense_tp_size else self.tp_rank
+            local_dp_size = self.server_args.dp_size // (self.tp_size // local_tp_size)
+            initialize_model_parallel(tensor_model_parallel_size=local_tp_size)
             initialize_dp_attention(
                 enable_dp_attention=self.server_args.enable_dp_attention,
-                tp_rank=self.tp_rank,
-                tp_size=self.tp_size,
-                dp_size=self.server_args.dp_size,
+                tp_rank=local_tp_rank,
+                tp_size=local_tp_size,
+                dp_size=local_dp_size,
             )
 
         min_per_gpu_memory = get_available_gpu_memory(

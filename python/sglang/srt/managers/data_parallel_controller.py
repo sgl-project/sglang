@@ -24,7 +24,6 @@ import setproctitle
 import zmq
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import (
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -186,14 +185,12 @@ class DataParallelController:
         for tp_rank in tp_rank_range:
             rank_port_args = port_args
 
-            if server_args.enable_dp_attention:
+            if server_args.enable_dp_attention and server_args.moe_dense_tp_size != 1:
                 # dp attention has different sharding logic
-                _, _, dp_rank = compute_dp_attention_world_info(
-                    server_args.enable_dp_attention,
-                    tp_rank,
-                    server_args.tp_size,
-                    server_args.dp_size,
-                )
+                local_tp_size = server_args.moe_dense_tp_size if server_args.moe_dense_tp_size else server_args.tp_size
+                local_tp_rank = tp_rank % local_tp_size
+                attn_tp_size = server_args.tp_size // server_args.dp_size
+                dp_rank = local_tp_rank // attn_tp_size
                 # compute zmq ports for this dp rank
                 rank_port_args = PortArgs.init_new(server_args, dp_rank)
                 # Data parallelism resues the tensor parallelism group,
