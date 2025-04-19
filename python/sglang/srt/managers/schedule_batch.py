@@ -1196,7 +1196,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.token_to_kv_pool_allocator.available_size() >= tokens_required:
             return True
 
-        self.tree_cache.evict(tokens_required)
+        self.tree_cache.evict(
+            tokens_required - self.token_to_kv_pool_allocator.available_size()
+        )
 
         return self.token_to_kv_pool_allocator.available_size() >= tokens_required
 
