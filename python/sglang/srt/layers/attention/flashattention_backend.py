@@ -267,6 +267,7 @@ def cdiv(a: int, b: int) -> int:
     """Ceiling division."""
     return -(a // -b)
 
+
 # TODO(hebiao064): remove this once we have a better way to handle the merge_state_v2 torch.compile issue
 @torch._dynamo.disable()
 def merge_state_v2_wrapper(o, s_a, o_exp, s_b):
@@ -324,7 +325,6 @@ class FlashAttentionBackend(AttentionBackend):
             if model_runner.server_args.speculative_eagle_topk is not None
             else 0
         )
-        self.topk_greater_than_one = self.topk > 1
         self.speculative_num_steps = speculative_num_steps
         self.speculative_num_draft_tokens = (
             model_runner.server_args.speculative_num_draft_tokens
@@ -553,7 +553,9 @@ class FlashAttentionBackend(AttentionBackend):
                     ),
                     (1, 0),
                 )
-                metadata_expand.max_seq_len_k = metadata_expand.cache_seqlens_int32.max().item()
+                metadata_expand.max_seq_len_k = (
+                    metadata_expand.cache_seqlens_int32.max().item()
+                )
                 self.forward_metadata_spec_decode_expand = metadata_expand
         elif forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
             metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
@@ -674,6 +676,11 @@ class FlashAttentionBackend(AttentionBackend):
             and (hasattr(layer, "use_irope") and layer.use_irope)
         )
 
+        # We do cascade attention for Target Verify with topk > 1
+        use_cascade_attn = (
+            forward_batch.forward_mode.is_target_verify() and self.topk > 1
+        )
+
         # Get the appropriate page table based on whether we're using local attention
         if use_local_attn:
             local_metadata = metadata.local_attn_metadata
@@ -718,21 +725,17 @@ class FlashAttentionBackend(AttentionBackend):
                 cu_seqlens_k_new=cu_seqlens_k if not use_local_attn else None,
                 max_seqlen_q=max_seqlen_q,
                 softmax_scale=layer.scaling,
-                causal=(
-                    False
-                    if forward_batch.forward_mode.is_target_verify() and self.topk > 1
-                    else causal
-                ),
+                causal=False if use_cascade_attn else causal,
                 window_size=window_size,
                 softcap=layer.logit_cap,
                 k_descale=k_descale,
                 v_descale=v_descale,
-                return_softmax_lse=self.topk_greater_than_one,
+                return_softmax_lse=use_cascade_attn,
             )
 
-            if forward_batch.forward_mode.is_target_verify() and self.topk > 1:
-                o, softmax_lse, _ = result
-                o_expand, softmax_lse_expand, _ = flash_attn_with_kvcache(
+            if use_cascade_attn:
+                o, softmax_lse, *rest = result
+                o_expand, softmax_lse_expand, *rest_expand = flash_attn_with_kvcache(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     k_cache=key_cache,
                     v_cache=value_cache,
@@ -819,6 +822,7 @@ class FlashAttentionBackend(AttentionBackend):
                 q_all = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
                 q_nope = q_all[:, :, : layer.v_head_dim]
                 q_rope = q_all[:, :, layer.v_head_dim :]
+
                 result = flash_attn_with_kvcache(
                     q=q_rope,
                     k_cache=k_rope_cache,
@@ -830,19 +834,14 @@ class FlashAttentionBackend(AttentionBackend):
                     cu_seqlens_k_new=cu_seqlens_k if not use_local_attn else None,
                     max_seqlen_q=max_seqlen_q,
                     softmax_scale=layer.scaling,
-                    causal=(
-                        False
-                        if forward_batch.forward_mode.is_target_verify()
-                        and self.topk > 1
-                        else causal
-                    ),
+                    causal=False if use_cascade_attn else causal,
                     softcap=layer.logit_cap,
                     k_descale=k_descale,
                     v_descale=v_descale,
-                    return_softmax_lse=self.topk_greater_than_one,
+                    return_softmax_lse=use_cascade_attn,
                 )
-                if forward_batch.forward_mode.is_target_verify() and self.topk > 1:
-                    o, softmax_lse, _ = result
+                if use_cascade_attn:
+                    o, softmax_lse, *rest = result
                     o_expand, softmax_lse_expand, *rest_expand = (
                         flash_attn_with_kvcache(
                             q=q_rope,
@@ -909,6 +908,8 @@ class FlashAttentionBackend(AttentionBackend):
         use_local_attention = (
             self.attention_chunk_size is not None and local_attn_metadata is not None
         )
+        # We do cascade attention for Draft Decode with topk > 1
+        use_cascade_attn = self.topk > 1
 
         # Calculate window size (can be moved to metadata if layer properties don't change)
         # we don't do layer.sliding_window_size - 1 since in model.get_attention_sliding_window_size() we already - 1
@@ -987,6 +988,7 @@ class FlashAttentionBackend(AttentionBackend):
                 q_reshaped = q.contiguous().view(
                     -1, layer.tp_q_head_num, layer.head_dim
                 )
+
                 # Default: single-token self-attention
                 result = flash_attn_with_kvcache(
                     q=q_reshaped,
@@ -998,15 +1000,15 @@ class FlashAttentionBackend(AttentionBackend):
                     cu_seqlens_k_new=cu_seqlens_k,
                     max_seqlen_q=max_seqlen_q,
                     softmax_scale=layer.scaling,
-                    causal=False if self.topk > 1 else causal,
+                    causal=False if use_cascade_attn else causal,
                     window_size=window_size,
                     softcap=layer.logit_cap,
                     k_descale=k_descale,
                     v_descale=v_descale,
-                    return_softmax_lse=self.topk_greater_than_one,
+                    return_softmax_lse=use_cascade_attn,
                 )
-                if self.topk > 1:
-                    o, softmax_lse, _ = result
+                if use_cascade_attn:
+                    o, softmax_lse, *rest = result
                     o_expand, softmax_lse_expand, *rest_expand = (
                         flash_attn_with_kvcache(
                             q=q_reshaped,
@@ -1065,14 +1067,14 @@ class FlashAttentionBackend(AttentionBackend):
                 cu_seqlens_k_new=metadata.cu_seqlens_k,
                 max_seqlen_q=max_seqlen_q,
                 softmax_scale=layer.scaling,
-                causal=False if self.topk > 1 else causal,
+                causal=False if use_cascade_attn else causal,
                 softcap=layer.logit_cap,
                 k_descale=k_descale,
                 v_descale=v_descale,
-                return_softmax_lse=self.topk_greater_than_one,
+                return_softmax_lse=use_cascade_attn,  # softmax_lse is needed for merge states
             )
-            if self.topk > 1:
-                o, softmax_lse, _ = result
+            if use_cascade_attn:
+                o, softmax_lse, *rest = result
                 o_expand, softmax_lse_expand, *rest_expand = flash_attn_with_kvcache(
                     q=q_rope,
                     k_cache=k_rope_cache,
@@ -1097,7 +1099,9 @@ class FlashAttentionBackend(AttentionBackend):
                     o_expand,
                     softmax_lse_expand.T.contiguous(),
                 )
-            
+            else:
+                o = result
+
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def init_cuda_graph_state(self, max_bs: int):
@@ -1555,9 +1559,6 @@ class FlashAttentionBackend(AttentionBackend):
                     )
                 # TODO: we need to test this part for llama 4 eagle case
                 self._init_local_attn_metadata(metadata, device)
-                print("decode", self.speculative_step_id)
-                print("metadata", metadata)
-                print("metadata expand", metadata_expand)
             else:
                 metadata = self.decode_cuda_graph_metadata[bs]
                 # Normal Decode
@@ -1687,10 +1688,9 @@ class FlashAttentionBackend(AttentionBackend):
                         (1, 0),
                     )
                 )
-                metadata_expand.max_seq_len_k = metadata_expand.cache_seqlens_int32.max().item()
-                print("target")
-                print("metadata", metadata)
-                print("metadata expand", metadata_expand)
+                metadata_expand.max_seq_len_k = (
+                    metadata_expand.cache_seqlens_int32.max().item()
+                )
 
         if encoder_lens is not None:
             # Only support encoder size 1 for now
