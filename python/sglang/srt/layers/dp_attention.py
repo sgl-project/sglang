@@ -28,14 +28,19 @@ _ATTN_DP_RANK = None
 _ATTN_DP_SIZE = None
 
 
-def compute_dp_attention_world_info(enable_dp_attention, tp_rank, tp_size, dp_size):
+def compute_dp_attention_world_info(enable_dp_attention, tp_rank, tp_size, dp_size, moe_dense_tp_size):
     if not enable_dp_attention:
         return tp_rank, tp_size, 0
+    
+    local_tp_size = moe_dense_tp_size if moe_dense_tp_size else tp_size
+    local_tp_rank = tp_rank % local_tp_size
+    local_dp_size = dp_size // (tp_size // local_tp_size)
 
-    attn_tp_size = tp_size // dp_size
-    dp_rank = tp_rank // attn_tp_size
-    attn_tp_rank = tp_rank % attn_tp_size
-    return attn_tp_rank, attn_tp_size, dp_rank
+    attn_tp_size = local_tp_size // local_dp_size
+    attn_dp_rank = local_tp_rank // attn_tp_size
+    attn_tp_rank = local_tp_rank % attn_tp_size
+
+    return attn_tp_rank, attn_tp_size, attn_dp_rank
 
 
 def initialize_dp_attention(
@@ -43,13 +48,14 @@ def initialize_dp_attention(
     tp_rank: int,
     tp_size: int,
     dp_size: int,
+    moe_dense_tp_size: Optional[int],
 ):
     global _ATTN_TP_GROUP, _ATTN_TP_RANK, _ATTN_TP_SIZE, _ATTN_DP_RANK, _ATTN_DP_SIZE
 
     from sglang.srt.layers.sampler import SYNC_TOKEN_IDS_ACROSS_TP
 
     _ATTN_TP_RANK, _ATTN_TP_SIZE, _ATTN_DP_RANK = compute_dp_attention_world_info(
-        enable_dp_attention, tp_rank, tp_size, dp_size
+        enable_dp_attention, tp_rank, tp_size, dp_size, moe_dense_tp_size
     )
 
     if enable_dp_attention:

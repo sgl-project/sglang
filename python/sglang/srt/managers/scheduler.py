@@ -52,7 +52,7 @@ from sglang.srt.disaggregation.utils import (
     TransferBackend,
 )
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
-from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size, get_attention_dp_rank 
+from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.expert_distribution import ExpertDistributionRecorder
 from sglang.srt.managers.io_struct import (
@@ -192,6 +192,15 @@ class Scheduler(
 
         # Distributed rank info
         self.dp_size = server_args.dp_size
+        self.attn_tp_rank, self.attn_tp_size, self.attn_dp_rank = (
+            compute_dp_attention_world_info(
+                server_args.enable_dp_attention,
+                self.tp_rank,
+                self.tp_size,
+                self.dp_size,
+                server_args.moe_dense_tp_size,
+            )
+        )
 
         # Init inter-process communication
         context = zmq.Context(2)
@@ -256,9 +265,6 @@ class Scheduler(
             dp_rank=dp_rank,
             nccl_port=port_args.nccl_port,
         )
-        self.attn_tp_rank = get_attention_tp_rank()
-        self.attn_tp_size = get_attention_tp_size()
-        self.attn_dp_rank = get_attention_dp_rank()
 
         # Launch a draft worker for speculative decoding
         if self.spec_algorithm.is_eagle():
