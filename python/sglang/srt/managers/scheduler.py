@@ -1358,6 +1358,7 @@ class Scheduler(
                     model_worker_batch
                 )
                 bid = model_worker_batch.bid
+                logger.info(f"Scheduler::run_batch {model_worker_batch=} {logits_output=}")
             else:
                 (
                     logits_output,

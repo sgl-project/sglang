@@ -13,6 +13,8 @@ if TYPE_CHECKING:
         ScheduleBatch,
     )
 
+import logging
+logger = logging.getLogger(__name__)
 
 class SchedulerOutputProcessorMixin:
     """
@@ -438,6 +440,7 @@ class SchedulerOutputProcessorMixin:
     def stream_output(
         self, reqs: List[Req], return_logprob: bool, skip_req: Optional[Req] = None
     ):
+        logger.info(f"ScheduelrOutputProcessorMixin:stream_output {reqs=}, {return_logprob=}, {skip_req=}")
         """Stream the output to detokenizer."""
         if self.is_generation:
             self.stream_output_generation(reqs, return_logprob, skip_req)
