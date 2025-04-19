@@ -20,7 +20,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
+from typing import Iterable, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -492,7 +492,7 @@ class ModelRunner:
             ) from None
 
     def update_weights_from_disk(
-        self, model_path: str, load_format: str
+        self, model_path: str, load_format: str, param_categories: Optional[List[str]]
     ) -> tuple[bool, str]:
         """Update engine weights in-place from the disk."""
         logger.info(
@@ -522,18 +522,21 @@ class ModelRunner:
             )
             return iter
 
+        def filter_weight_iter(iter: Iterable[Tuple[str, torch.Tensor]]):
+            if param_categories is None:
+                yield from iter
+            else:
+                for name, weight in iter:
+                    if self.model.get_param_category(name) in param_categories:
+                        yield name, weight
+
         def model_load_weights(model, iter):
-            model.load_weights(iter)
-            for _, module in self.model.named_modules():
-                quant_method = getattr(module, "quant_method", None)
-                if quant_method is not None:
-                    with device_loading_context(module, target_device):
-                        quant_method.process_weights_after_loading(module)
+            DefaultModelLoader.load_weights_and_postprocess(model, iter, target_device)
             return model
 
         with set_default_torch_dtype(self.model_config.dtype):
             try:
-                iter = get_weight_iter(self.model_config)
+                iter = filter_weight_iter(get_weight_iter(self.model_config))
             except Exception as e:
                 message = f"Failed to get weights iterator: {e}."
                 return False, message

@@ -675,6 +675,8 @@ class UpdateWeightFromDiskReqInput:
     model_path: str
     # The format to load the weights
     load_format: Optional[str] = None
+    # The parameter categories to filter
+    param_categories: Optional[List[str]] = None
 
 
 @dataclass
