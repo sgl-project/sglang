@@ -194,7 +194,6 @@ class SchedulerDisaggregationPrefillMixin:
             self.cur_batch = batch
 
             if batch:
-                logger.info(f"SchedulerDisaggregationPrefillMixin::event_loop_normal_disagg_prefill {batch=}")
                 result = self.run_batch(batch)
                 self.process_batch_result_disagg_prefill(batch, result)
 

@@ -84,8 +84,6 @@ def initialize_dp_attention(
         _ATTN_DP_SIZE = 1
         _LOCAL_ATTN_DP_SIZE = 1
 
-    logger.info(f"{(_ATTN_TP_RANK, _ATTN_TP_SIZE, _ATTN_DP_RANK, _ATTN_DP_SIZE)=}")
-
     tp_group = get_tp_group()
     _ATTN_TP_GROUP = GroupCoordinator(
         [
