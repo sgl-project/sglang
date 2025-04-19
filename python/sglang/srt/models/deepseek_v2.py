@@ -1326,7 +1326,7 @@ class DeepseekV2Model(nn.Module):
     ) -> torch.Tensor:
         zero_allocator = BumpAllocator(
             # TODO for two-batch-overlap, we need a larger buffer size
-            buffer_size=TODO,
+            buffer_size=len(self.layers) * 2,
             dtype=TODO,
             device=TODO,
         )
