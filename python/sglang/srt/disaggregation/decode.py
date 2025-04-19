@@ -429,16 +429,31 @@ class SchedulerDisaggregationDecodeMixin:
             # polling and allocating kv cache
             self.process_decode_queue()
             batch = self.get_next_disagg_decode_batch_to_run()
-            self.cur_batch = batch
+
+            is_real_batch = True
+
+            if batch and batch.forward_mode.is_extend():
+                self.cur_batch = batch
+                # Generate fake extend output.
+                # Note: Logprobs should be handled on the prefill engine.
+                self.stream_output(batch.reqs, False)
+                self.last_batch = batch
+                batch = None
+                is_real_batch = False
+
+            # Handle DP attention
+            if (
+                self.server_args.enable_dp_attention
+                or self.server_args.enable_sp_layernorm
+            ):
+                batch, _ = self.prepare_dp_attn_batch(batch)
+
+            if is_real_batch:
+                self.cur_batch = batch
 
             if batch:
-                # Generate fake extend output.
-                if batch.forward_mode.is_extend():
-                    # Note: Logprobs should be handled on the prefill engine.
-                    self.stream_output(batch.reqs, False)
-                else:
-                    result = self.run_batch(batch)
-                    self.process_batch_result(batch, result)
+                result = self.run_batch(batch)
+                self.process_batch_result(batch, result)
 
             if batch is None and (
                 len(self.disagg_decode_transfer_queue.queue)
@@ -449,7 +464,8 @@ class SchedulerDisaggregationDecodeMixin:
                 self.check_memory()
                 self.new_token_ratio = self.init_new_token_ratio
 
-            self.last_batch = batch
+            if is_real_batch:
+                self.last_batch = batch
 
     def get_next_disagg_decode_batch_to_run(
         self: Scheduler,
