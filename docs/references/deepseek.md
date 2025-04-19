@@ -163,6 +163,35 @@ When using FlashInfer MLA wrapper (`--attention-backend flashinfer`) with specul
 
 See [Separate Reasoning](https://docs.sglang.ai/backend/separate_reasoning.html).
 
+
+### Function calling for DeepSeek Models
+
+Add arguments `--tool-call-parser deepseekv3` to enable this feature. For example (running on 1 * H20 node):
+
+```
+python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3-0324 --tp 8 --port 30000 --host 0.0.0.0 --mem-fraction-static 0.9 --disable-cuda-graph --tool-call-parser deepseekv3
+```
+
+Sample Request:
+
+```
+curl "http://127.0.0.1:30000/v1/chat/completions" \
+-H "Content-Type: application/json" \
+-d '{"temperature": 0, "max_tokens": 100, "model": "deepseek-ai/DeepSeek-V3-0324", "tools": [{"type": "function", "function": {"name": "query_weather", "description": "Get weather of an city, the user should supply a city first", "parameters": {"type": "object", "properties": {"city": {"type": "string", "description": "The city, e.g. Beijing"}}, "required": ["city"]}}}], "messages": [{"role": "user", "content": "Hows the weather like in Qingdao today"}]}'
+```
+
+Expected Response
+
+```
+{"id": "62af80528930423a82c806651ec66e7c", "object": "chat.completion", "created": 1744431333, "model": "deepseek-ai/DeepSeek-V3-0324", "choices": [{"index": 0, "message": {"role": "assistant", "content": null, "reasoning_content": null, "tool_calls": [{"id": "0", "type": "function", "function": {"name": "query_weather", "arguments": "{\\"city\\": \\"Guangzhou\\"}"}}]}, "logprobs": null, "finish_reason": "tool_calls", "matched_stop": null}], "usage": {"prompt_tokens": 118, "total_tokens": 140, "completion_tokens": 22, "prompt_tokens_details": null}}
+
+```
+
+Important Notes:
+1. Use a lower `"temperature"` value for better results.
+2. Currently, the function calling implementation for deepseek is incompatible with streaming requests.
+
+
 ## FAQ
 
 1. **Question**: What should I do if model loading takes too long and NCCL timeout occurs?
