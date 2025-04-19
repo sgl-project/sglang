@@ -1324,6 +1324,12 @@ class DeepseekV2Model(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
+        zero_allocator = BumpAllocator(
+            # TODO for two-batch-overlap, we need a larger buffer size
+            buffer_size=TODO,
+            dtype=TODO,
+            device=TODO,
+        )
 
         if input_embeds is None:
             hidden_states = self.embed_tokens(input_ids)
@@ -1335,7 +1341,7 @@ class DeepseekV2Model(nn.Module):
             expert_distribution_recorder.set_current_layer(i)
             layer = self.layers[i]
             hidden_states, residual = layer(
-                positions, hidden_states, forward_batch, residual
+                positions, hidden_states, forward_batch, residual, zero_allocator
             )
         if not forward_batch.forward_mode.is_idle():
             if residual is None:
