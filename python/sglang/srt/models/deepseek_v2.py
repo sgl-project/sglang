@@ -1134,6 +1134,12 @@ class DeepseekV2DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
+        
+        if hidden_states.shape[0] > 0:
+            logger.info(f"{self.layer_id=} entering forward_ffn_with_full_input")
+        
+        if hidden_states.shape[0] > 0:
+            logger.info(f"{self.layer_id=} step 0")
 
         if hidden_states.shape[0] == 0:
             residual = hidden_states
@@ -1154,6 +1160,9 @@ class DeepseekV2DecoderLayer(nn.Module):
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
+        
+        if hidden_states.shape[0] > 0:
+            logger.info(f"{self.layer_id=} step 1")
 
         # Gather
         if get_tensor_model_parallel_world_size() > 1:
@@ -1177,9 +1186,15 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual
             )
+        
+        if hidden_states.shape[0] > 0:
+            logger.info(f"{self.layer_id=} step 2")
 
         # Fully Connected
         hidden_states = self.mlp(hidden_states)
+        
+        if hidden_states.shape[0] > 0:
+            logger.info(f"{self.layer_id=} step 3")
 
         # TODO(ch-wan): ues reduce-scatter in MLP to avoid this scatter
         # Scatter
@@ -1191,6 +1206,9 @@ class DeepseekV2DecoderLayer(nn.Module):
                 hidden_states,
             )
             dp_scatter(hidden_states, global_hidden_states, forward_batch)
+        
+        if hidden_states.shape[0] > 0:
+            logger.info(f"{self.layer_id=} step 4")
 
         return hidden_states, residual
 
@@ -1201,6 +1219,9 @@ class DeepseekV2DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
+        
+        if hidden_states.shape[0] > 0:
+            logger.info(f"{self.layer_id=} entering forward_ffn_with_scattered_input")
 
         if hidden_states.shape[0] == 0:
             residual = hidden_states
@@ -1210,6 +1231,9 @@ class DeepseekV2DecoderLayer(nn.Module):
                 hidden_states = self.input_layernorm(hidden_states)
             else:
                 hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        
+        if hidden_states.shape[0] > 0:
+            logger.info(f"{self.layer_id=} step 0")
 
         if self.attn_tp_size != 1 and self.input_is_scattered:
             hidden_states, local_hidden_states = (
@@ -1219,6 +1243,9 @@ class DeepseekV2DecoderLayer(nn.Module):
             tp_all_gather(
                 list(hidden_states.tensor_split(self.attn_tp_size)), local_hidden_states
             )
+        
+        if hidden_states.shape[0] > 0:
+            logger.info(f"{self.layer_id=} step 1")
 
         # Self Attention
         hidden_states = self.self_attn(
@@ -1226,6 +1253,9 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
+        
+        if hidden_states.shape[0] > 0:
+            logger.info(f"{self.layer_id=} step 2")
 
         if self.attn_tp_size != 1:
             if self.input_is_scattered:
@@ -1250,6 +1280,9 @@ class DeepseekV2DecoderLayer(nn.Module):
                 hidden_states, residual = self.post_attention_layernorm(
                     hidden_states, residual
                 )
+        
+        if hidden_states.shape[0] > 0:
+            logger.info(f"{self.layer_id=} step 3")
 
         if not (
             self._enable_moe_dense_fully_dp()
@@ -1257,6 +1290,9 @@ class DeepseekV2DecoderLayer(nn.Module):
             and hidden_states.shape[0] == 0
         ):
             hidden_states = self.mlp(hidden_states, forward_batch.forward_mode)
+        
+        if hidden_states.shape[0] > 0:
+            logger.info(f"{self.layer_id=} step 4")
 
         if self.is_last_layer and self.attn_tp_size != 1:
             hidden_states += residual
@@ -1268,6 +1304,9 @@ class DeepseekV2DecoderLayer(nn.Module):
             tp_all_gather(
                 list(hidden_states.tensor_split(self.attn_tp_size)), local_hidden_states
             )
+        
+        if hidden_states.shape[0] > 0:
+            logger.info(f"{self.layer_id=} step 5")
 
         return hidden_states, residual
 
