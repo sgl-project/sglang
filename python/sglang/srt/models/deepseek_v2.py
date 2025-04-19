@@ -1654,9 +1654,8 @@ class DeepseekV2Model(nn.Module):
             ]
 
         # TODO do not hardcode
-        chosen_num_sms = (
-            torch.cuda.get_device_properties(device="cuda").multi_processor_count - 20
-        )
+        total_num_sm = torch.cuda.get_device_properties(device="cuda").multi_processor_count
+        chosen_num_sms = (total_num_sm - 20) if forward_batch.forward_mode.is_extend() else None
         with configure_deep_gemm_num_sms(num_sms=chosen_num_sms):
             return two_batch_overlap.model_forward_execute_two_batch(
                 inputs=dict(
