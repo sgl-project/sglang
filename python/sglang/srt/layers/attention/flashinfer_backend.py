@@ -460,7 +460,6 @@ class FlashInferAttnBackend(AttentionBackend):
             else forward_batch.encoder_out_cache_loc
         )
         logits_soft_cap = layer.logit_cap
-
         if not self.forward_metadata.use_ragged:
             if k is not None:
                 assert v is not None
