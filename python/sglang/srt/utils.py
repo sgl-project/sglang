@@ -1940,8 +1940,8 @@ class BumpAllocator:
         self._buffer = torch.zeros((buffer_size,), dtype=dtype, device=device)
         self._pointer = 0
 
-    def allocate(self):
-        assert self._pointer <= len(self._buffer)
-        output = self._buffer[self._pointer:self._pointer + 1]
-        self._pointer += 1
+    def allocate(self, size: int):
+        assert self._pointer + size <= len(self._buffer)
+        output = self._buffer[self._pointer:self._pointer + size]
+        self._pointer += size
         return output
