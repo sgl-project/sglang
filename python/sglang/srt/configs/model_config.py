@@ -533,6 +533,7 @@ multimodal_model_archs = [
     "LlavaVidForCausalLM",
     "MiniCPMO",
     "MiniCPMV",
+    "Mistral3ForConditionalGeneration",
     "MultiModalityCausalLM",
     "MllamaForConditionalGeneration",
     "Qwen2VLForConditionalGeneration",

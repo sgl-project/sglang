@@ -59,6 +59,12 @@ class EvalArgs:
             type=str,
             help="The path to the prompt format of mmmu. If not, a default format llava_config.yaml will be used",
         )
+        parser.add_argument(
+            "--query-format",
+            type=str,
+            help="The API to call the model for benchmark. `chat` (default) or `mistral`",
+            default=EvalArgs.query_format,
+        )
         parser.add_argument("--split", type=str, default=EvalArgs.split)
         parser.add_argument(
             "--extra-request-body",
@@ -509,6 +515,7 @@ def process_result(response, sample, answer_dict, out_samples):
     answer_dict[sample["id"]] = {
         "question_type": sample["question_type"],
         "ground_truth": sample["answer"],
+        "original_response": response,
     }
 
 
