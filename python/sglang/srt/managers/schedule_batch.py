@@ -609,6 +609,12 @@ class Req:
         if self.finished():
             return
 
+        if self.sampling_params.max_new_tokens == 0 and len(self.output_ids) <= 1:
+            self.finished_reason = FINISH_LENGTH(length=0)
+            if len(self.output_ids) == 1:
+                self.output_ids.pop()
+            return
+
         if self.to_abort:
             self.finished_reason = FINISH_ABORT(
                 message=self.to_abort_message,
@@ -619,6 +625,9 @@ class Req:
             self.finished_reason = FINISH_LENGTH(
                 length=self.sampling_params.max_new_tokens
             )
+            return
+
+        if not self.output_ids:
             return
 
         last_token_id = self.output_ids[-1]
