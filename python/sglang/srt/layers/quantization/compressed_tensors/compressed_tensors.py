@@ -41,6 +41,12 @@ from sglang.srt.layers.quantization.compressed_tensors.utils import (
 )
 from sglang.srt.layers.quantization.compressed_tensors import WNA16_SUPPORTED_BITS
 
+try:
+    import vllm
+
+    VLLM_AVAILABLE = True
+except ImportError:
+    VLLM_AVAILABLE = False
 logger = logging.getLogger(__name__)
 
 __all__ = ["CompressedTensorsLinearMethod"]
