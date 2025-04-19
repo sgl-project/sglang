@@ -251,9 +251,9 @@ def _apply_fallback_scaled_mm(
 ):
     global TORCH_DEVICE_IDENTITY
     if TORCH_DEVICE_IDENTITY is None:
-        TORCH_DEVICE_IDENTITY = torch.ones(1, dtype=torch.float32)
-    if TORCH_DEVICE_IDENTITY.device != weight.device:
-        TORCH_DEVICE_IDENTITY = TORCH_DEVICE_IDENTITY.to(weight.device)
+        TORCH_DEVICE_IDENTITY = torch.ones(
+            1, dtype=torch.float32, device=weight.device
+        )
 
     output = torch._scaled_mm(
         qinput,
@@ -290,10 +290,7 @@ def apply_fp8_linear(
     # We also don't pad when using torch.compile,
     # as it breaks with dynamic shapes.
     if pad_output is None:
-        enable_torch_compile = os.environ.get(
-            "SGLANG_ENABLE_TORCH_COMPILE", "0"
-        ).lower() in ("1", "true", "yes")
-        pad_output = not enable_torch_compile
+        pad_output = not get_bool_env_var("SGLANG_ENABLE_TORCH_COMPILE")
     output_padding = 17 if pad_output else None
 
     # View input as 2D matrix for fp8 methods
