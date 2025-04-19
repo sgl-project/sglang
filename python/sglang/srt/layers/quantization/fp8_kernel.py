@@ -22,7 +22,6 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import triton
 import triton.language as tl
-
 from sglang.srt.utils import (
     direct_register_custom_op,
     get_bool_env_var,
@@ -58,12 +57,9 @@ if _is_cuda:
     ):
         _enable_jit_deepgemm = True
 
-
 logger = logging.getLogger(__name__)
 
-
 if supports_custom_op():
-
     def deep_gemm_fp8_fp8_bf16_nt(
         A: torch.Tensor,
         As: torch.Tensor,
@@ -76,6 +72,7 @@ if supports_custom_op():
         with _log_jit_build(M, N, K):
             deep_gemm.gemm_fp8_fp8_bf16_nt((A, As), (B, Bs), C)
 
+
     def deep_gemm_fp8_fp8_bf16_nt_fake(
         A: torch.Tensor,
         As: torch.Tensor,
@@ -84,6 +81,7 @@ if supports_custom_op():
         C: torch.Tensor,
     ) -> None:
         return
+
 
     direct_register_custom_op(
         op_name="deep_gemm_fp8_fp8_bf16_nt",
@@ -916,7 +914,7 @@ def per_tensor_quant_mla_fp8(
 
     _per_tensor_quant_mla_fp8_stage1[grid](
         x,
-        x_s,
+        x_s_out,
         head_size,
         x.stride(0),
         x.stride(1),
@@ -926,7 +924,7 @@ def per_tensor_quant_mla_fp8(
     )
     _per_tensor_quant_mla_fp8_stage2[grid](
         x,
-        x_s,
+        x_s_out,
         x_q,
         num_seq,
         head_size,
