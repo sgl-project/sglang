@@ -630,6 +630,54 @@ class TestMinicpmoServer(TestOpenAIVisionServer):
         self._test_audio_ambient_completion()
 
 
+class TestPixtralServer(TestOpenAIVisionServer):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "mistral-community/pixtral-12b"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--trust-remote-code",
+                "--chat-template",
+                "mistral",
+                "--mem-fraction-static",
+                "0.73",
+            ],
+        )
+        cls.base_url += "/v1"
+
+    def test_video_chat_completion(self):
+        pass
+
+
+class TestMistral3_1Server(TestOpenAIVisionServer):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "mistralai/Mistral-Small-3.1-24B-Instruct-2503"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--trust-remote-code",
+                "--chat-template",
+                "mistral",
+                "--mem-fraction-static",
+                "0.73",
+            ],
+        )
+        cls.base_url += "/v1"
+
+    def test_video_chat_completion(self):
+        pass
+
+
 class TestDeepseekVL2Server(TestOpenAIVisionServer):
     @classmethod
     def setUpClass(cls):
@@ -679,6 +727,32 @@ class TestJanusProServer(TestOpenAIVisionServer):
 
     def test_single_image_chat_completion(self):
         # Skip this test because it is flaky
+        pass
+
+
+class TestMistral3_1Server(TestOpenAIVisionServer):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "mistralai/Mistral-Small-3.1-24B-Instruct-2503"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--trust-remote-code",
+                "--chat-template",
+                "llama-2",
+                "--mem-fraction-static",
+                "0.75",
+                "--context-length",
+                "8192",
+            ],
+        )
+        cls.base_url += "/v1"
+
+    def test_video_chat_completion(self):
         pass
 
 

@@ -33,6 +33,7 @@ class EvalArgs:
     prompt_format_file: str = "prompt_format.yaml"
     dataset_path: str = "MMMU/MMMU"
     extra_request_body: Optional[str] = None
+    query_format: str = "chat"
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -55,6 +56,12 @@ class EvalArgs:
             "--prompt-format-file",
             type=str,
             help="The path to the prompt format of mmmu. If not, a default format llava_config.yaml will be used",
+        )
+        parser.add_argument(
+            "--query-format",
+            type=str,
+            help="The API to call the model for benchmark. `chat` (default) or `mistral`",
+            default=EvalArgs.query_format,
         )
         parser.add_argument("--split", type=str, default=EvalArgs.split)
         parser.add_argument(
@@ -467,6 +474,7 @@ def process_result(response, sample, answer_dict, out_samples):
     answer_dict[sample["id"]] = {
         "question_type": sample["question_type"],
         "ground_truth": sample["answer"],
+        "original_response": response,
     }
 
 
