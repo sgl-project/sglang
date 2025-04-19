@@ -1805,6 +1805,7 @@ class Scheduler(
                 recv_req.activities,
                 recv_req.with_stack,
                 recv_req.record_shapes,
+                recv_req.profile_id,
             )
         else:
             return self.stop_profile()
