@@ -238,16 +238,17 @@ def biased_grouped_topk(
         <= 32  # moe_fused_gate kernel ensure that num_experts/num_expert_group does not exceed MAX_VPT=32 now. And when kernel can handle MAX_VPT > 32, we can remove this assertion.
         and n_share_experts_fusion == 0
         and is_power_of_two(correction_bias.shape[0])
-        # TODO fuse into the kernel
-        and expert_location_dispatch_info is None
     ):
-        return moe_fused_gate(
+        topk_weights, topk_ids = moe_fused_gate(
             gating_output,
             correction_bias,
             num_expert_group,
             topk_group,
             topk,
         )
+        if expert_location_dispatch_info is not None:
+            topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
+        return topk_weights, topk_ids
     else:
         biased_grouped_topk_fn = (
             torch.compile(
