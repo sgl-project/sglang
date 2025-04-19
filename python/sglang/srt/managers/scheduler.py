@@ -1817,6 +1817,7 @@ class Scheduler(
         activities: Optional[List[str]],
         with_stack: Optional[bool],
         record_shapes: Optional[bool],
+        profile_id: Optional[str],
     ) -> None:
         if self.profiler_activities:
             return ProfileReqOutput(
