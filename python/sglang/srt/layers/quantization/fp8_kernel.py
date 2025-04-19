@@ -935,7 +935,7 @@ def per_tensor_quant_mla_fp8(
         BLOCK_SIZE,
     )
 
-    return x_q, x_s
+    return x_q, x_s_out
 
 
 def scaled_fp8_quant(
