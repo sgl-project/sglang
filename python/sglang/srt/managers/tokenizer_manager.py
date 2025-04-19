@@ -436,15 +436,21 @@ class TokenizerManager:
             and obj.sampling_params.get("max_new_tokens") + input_token_num
             >= self.context_len
         ):
-            raise ValueError(
-                f"Requested token count exceeds the model's maximum context length "
-                f"of {self.context_len} tokens. You requested a total of "
-                f"{obj.sampling_params.get('max_new_tokens') + input_token_num} "
-                f"tokens: {input_token_num} tokens from the input messages and "
-                f"{obj.sampling_params.get('max_new_tokens')} tokens for the "
-                f"completion. Please reduce the number of tokens in the input "
-                f"messages or the completion to fit within the limit."
-            )
+            if self.server_args.allow_auto_truncate:
+                logger.warning(
+                    f"Requested token count exceeds the model's maximum context length "
+                    f"of {self.context_len} tokens. The completion will be truncated."
+                )
+            else:
+                raise ValueError(
+                    f"Requested token count exceeds the model's maximum context length "
+                    f"of {self.context_len} tokens. You requested a total of "
+                    f"{obj.sampling_params.get('max_new_tokens') + input_token_num} "
+                    f"tokens: {input_token_num} tokens from the input messages and "
+                    f"{obj.sampling_params.get('max_new_tokens')} tokens for the "
+                    f"completion. Please reduce the number of tokens in the input "
+                    f"messages or the completion to fit within the limit."
+                )
 
         # Parse sampling parameters
         sampling_params = SamplingParams(**obj.sampling_params)
