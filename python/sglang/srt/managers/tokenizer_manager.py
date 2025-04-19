@@ -650,6 +650,7 @@ class TokenizerManager:
             output_dir=output_dir,
             num_steps=num_steps,
             activities=activities,
+            profile_id=str(time.time()),
         )
         result = (await self.start_profile_communicator(req))[0]
         if not result.success:
