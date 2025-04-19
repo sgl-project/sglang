@@ -45,7 +45,6 @@ class SeparatorStyle(IntEnum):
     CHATGLM3 = auto()
     DEEPSEEK_CHAT = auto()
     METAMATH = auto()
-    DeepSeekVL2 = auto()
     QWEN2_VL_EMBED = auto()
     GEMMA3 = auto()
 
@@ -303,18 +302,6 @@ class Conversation:
                 else:
                     ret += role + ":"
             return ret
-        elif self.sep_style == SeparatorStyle.DeepSeekVL2:
-            seps = [self.sep, self.sep2]
-            if system_prompt == "" or system_prompt is None:
-                ret = ""
-            else:
-                ret = system_prompt + seps[0]
-            for i, (role, message) in enumerate(self.messages):
-                if message:
-                    ret += role + ": " + message + seps[i % 2]
-                else:
-                    ret += role + ":"
-            return ret
         elif self.sep_style == SeparatorStyle.GEMMA3:
             ret = system_prompt
             for i, (role, message) in enumerate(self.messages):
@@ -463,6 +450,30 @@ def generate_embedding_convs(
     return convs
 
 
+# Models in which system adds modality tokens at prompt start automatically
+# when media inputs exceed modality tokens in prompt (e.g. 3 images but 2 <image> tokens)
+_MODELS_REQUIRING_MODALITY_SUPPLEMENT = {"deepseek-vl2"}
+
+
+# adapted from https://github.com/vllm-project/vllm/blob/5124f5bf51b83e6f344c1bc6652e8c4d81313b34/vllm/entrypoints/chat_utils.py#L856
+def _get_full_multimodal_text_prompt(
+    modality_token: str, modality_count: int, text_prompt: str
+) -> str:
+    """Combine multimodal prompts for a multimodal language model."""
+
+    # For any existing placeholder in the text prompt, we leave it as is
+    left: int = modality_count - text_prompt.count(modality_token)
+    if left < 0:
+        raise ValueError(
+            f"Found more '{modality_token}' placeholders in input prompt than "
+            "actual multimodal data items."
+        )
+
+    # NOTE: For now we always add missing modality_token at the front of
+    # the prompt. This may change to be customizable in the future.
+    return "\n".join([modality_token] * left + [text_prompt])
+
+
 def generate_chat_conv(
     request: ChatCompletionRequest, template_name: str
 ) -> Conversation:
@@ -520,6 +531,12 @@ def generate_chat_conv(
                         if conv.name != "qwen2-vl"
                         else conv.image_token
                     )
+                add_token_as_needed: bool = (
+                    conv.name in _MODELS_REQUIRING_MODALITY_SUPPLEMENT
+                )
+                if add_token_as_needed:
+                    image_token = ""
+
                 audio_token = conv.audio_token
                 for content in message.content:
                     if content.type == "text":
@@ -533,7 +550,10 @@ def generate_chat_conv(
                     elif content.type == "audio_url":
                         real_content += audio_token
                         conv.append_audio(content.audio_url.url)
-
+                if add_token_as_needed:
+                    real_content = _get_full_multimodal_text_prompt(
+                        conv.image_token, num_image_url, real_content
+                    )
                 conv.append_message(conv.roles[0], real_content)
         elif msg_role == "assistant":
             parsed_content = ""
@@ -671,17 +691,18 @@ register_conv_template(
     )
 )
 
+# Reference: https://github.com/vllm-project/vllm/blob/main/examples/template_deepseek_vl2.jinja
 register_conv_template(
     Conversation(
         name="deepseek-vl2",
-        system_template="{system_message}",
+        system_template="<｜begin▁of▁sentence｜>{system_message}",
         # system_message="You are a helpful assistant. Please answer truthfully and write out your "
         # "thinking step by step to be sure you get the right answer.",
         system_message="",
         roles=("<|User|>", "<|Assistant|>"),
         messages=(),
         offset=0,
-        sep_style=SeparatorStyle.DeepSeekVL2,
+        sep_style=SeparatorStyle.DEEPSEEK_CHAT,
         sep="\n\n",
         sep2="<｜end▁of▁sentence｜>",
         stop_str=["User:", "<｜end▁of▁sentence｜>"],
