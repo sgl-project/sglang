@@ -1327,8 +1327,8 @@ class DeepseekV2Model(nn.Module):
         zero_allocator = BumpAllocator(
             # TODO for two-batch-overlap, we need a larger buffer size
             buffer_size=len(self.layers) * 2,
-            dtype=TODO,
-            device=TODO,
+            dtype=torch.float32,
+            device=input_ids.device,
         )
 
         if input_embeds is None:
