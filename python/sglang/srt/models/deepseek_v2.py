@@ -721,7 +721,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         elif self.w_vc.dtype == torch.float8_e4m3fn:
             attn_output_val, attn_output_scale = per_tensor_quant_mla_fp8(
                 attn_output.transpose(0, 1),
-                TODO,
+                zero_allocator.allocate(),
             )
             attn_bmm_output = bmm_fp8(
                 attn_output_val,
@@ -742,6 +742,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
         enable_rope_fusion = (
             os.getenv("SGLANG_FUSED_MLA_ENABLE_ROPE_FUSION", "1") == "1"
@@ -769,7 +770,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         elif self.w_kc.dtype == torch.float8_e4m3fn:
             q_nope_val, q_nope_scale = per_tensor_quant_mla_fp8(
                 q_nope.transpose(0, 1),
-                TODO,
+                zero_allocator.allocate(),
                 dtype=torch.float8_e4m3fn
             )
             q_nope_out = bmm_fp8(
@@ -867,7 +868,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         elif self.w_vc.dtype == torch.float8_e4m3fn:
             attn_output_val, attn_output_scale = per_tensor_quant_mla_fp8(
                 attn_output.transpose(0, 1),
-                TODO,
+                zero_allocator.allocate(),
                 dtype=torch.float8_e4m3fn
             )
             attn_bmm_output = bmm_fp8(
