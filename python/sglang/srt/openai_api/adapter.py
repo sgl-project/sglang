@@ -323,6 +323,8 @@ async def process_batch(tokenizer_manager, batch_id: str, batch_request: BatchRe
                     to_file=True,
                     cache_report=tokenizer_manager.server_args.enable_cache_report,
                     tool_call_parser=tokenizer_manager.server_args.tool_call_parser,
+                    reasoning_parser=tokenizer_manager.server_args.reasoning_parser,
+                    extra_body=all_extra_bodies,
                 )
             else:
                 responses = v1_generate_response(
@@ -1133,6 +1135,7 @@ def v1_chat_generate_response(
     cache_report=False,
     tool_call_parser=None,
     reasoning_parser=None,
+    extra_body=None,
 ):
     choices = []
 
@@ -1194,7 +1197,14 @@ def v1_chat_generate_response(
             tools = request.tools
             separate_reasoning = request.separate_reasoning
 
-        if reasoning_parser and separate_reasoning:
+        # Extract enable_thinking from chat_template_kwargs in extra_body
+        
+        enable_thinking = True
+        if extra_body:
+            chat_template_kwargs = extra_body.get("chat_template_kwargs", {})
+            enable_thinking = chat_template_kwargs.get("enable_thinking", True)
+
+        if reasoning_parser and separate_reasoning and enable_thinking:
             try:
                 parser = ReasoningParser(
                     model_type=reasoning_parser, stream_reasoning=False
@@ -1658,6 +1668,7 @@ async def v1_chat_completions(
         cache_report=tokenizer_manager.server_args.enable_cache_report,
         tool_call_parser=tokenizer_manager.server_args.tool_call_parser,
         reasoning_parser=tokenizer_manager.server_args.reasoning_parser,
+        extra_body=extra_body,
     )
 
     return response
