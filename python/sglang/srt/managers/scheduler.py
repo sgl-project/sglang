@@ -1431,6 +1431,7 @@ class Scheduler(
             local_batch,
             dp_size=self.server_args.dp_size,
             attn_tp_size=self.attn_tp_size,
+            moe_dense_tp_size = self.server_args.moe_dense_tp_size,
             tp_cpu_group=self.tp_cpu_group,
             get_idle_batch=self.get_idle_batch,
             disable_cuda_graph=self.server_args.disable_cuda_graph,
@@ -1443,6 +1444,7 @@ class Scheduler(
         local_batch: ScheduleBatch,
         dp_size,
         attn_tp_size: int,
+        moe_dense_tp_size: Optional[int],
         tp_cpu_group,
         get_idle_batch,
         disable_cuda_graph: bool,
@@ -1452,15 +1454,15 @@ class Scheduler(
         # Check if other DP workers have running batches
         if local_batch is None:
             num_tokens = 0
-            global_num_tokens_for_logprob = 0
+            num_tokens_for_logprob = 0
         elif local_batch.forward_mode.is_decode():
             num_tokens = local_batch.batch_size()
             if not spec_algorithm.is_none() and spec_algorithm.is_eagle():
                 num_tokens = num_tokens * speculative_num_draft_tokens
-            global_num_tokens_for_logprob = num_tokens
+            num_tokens_for_logprob = num_tokens
         else:
             num_tokens = local_batch.extend_num_tokens
-            global_num_tokens_for_logprob = sum(
+            num_tokens_for_logprob = sum(
                 [
                     # We should have at least 1 token for sample in every case.
                     max(extend_len - logprob_start_len, 1)
@@ -1487,7 +1489,7 @@ class Scheduler(
             [
                 num_tokens,
                 can_cuda_graph,
-                global_num_tokens_for_logprob,
+                num_tokens_for_logprob,
                 is_extend_in_batch,
             ],
             dtype=torch.int64,
@@ -1510,8 +1512,12 @@ class Scheduler(
             local_batch = get_idle_batch()
 
         if local_batch is not None:
-            local_batch.global_num_tokens = global_num_tokens
-            local_batch.global_num_tokens_for_logprob = global_num_tokens_for_logprob
+            if moe_dense_tp_size == 1:
+                local_batch.global_num_tokens = [num_tokens]
+                local_batch.global_num_tokens_for_logprob = [num_tokens_for_logprob]
+            else:
+                local_batch.global_num_tokens = global_num_tokens
+                local_batch.global_num_tokens_for_logprob = global_num_tokens_for_logprob
 
             # Check forward mode for cuda graph
             if not disable_cuda_graph:
