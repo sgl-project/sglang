@@ -26,16 +26,33 @@ _ATTN_TP_RANK = None
 _ATTN_TP_SIZE = None
 _DP_RANK = None
 _DP_SIZE = None
-
+_LOCAL_ATTN_DP_SIZE = None
+_LOCAL_ATTN_DP_RANK = None
 
 def compute_dp_attention_world_info(enable_dp_attention, tp_rank, tp_size, dp_size):
     if not enable_dp_attention:
         return tp_rank, tp_size, 0
 
     attn_tp_size = tp_size // dp_size
-    dp_rank = tp_rank // attn_tp_size
+    attn_dp_rank = tp_rank //tp_size
     attn_tp_rank = tp_rank % attn_tp_size
-    return attn_tp_rank, attn_tp_size, dp_rank
+
+    return attn_tp_rank, attn_tp_size, attn_dp_rank
+
+
+def compute_dp_attention_local_info(enable_dp_attention, tp_rank, tp_size, dp_size, moe_dense_tp_size):
+    if not enable_dp_attention:
+        return tp_rank, tp_size, 0
+    
+    local_tp_size = moe_dense_tp_size if moe_dense_tp_size else tp_size
+    local_tp_rank = tp_rank % local_tp_size
+    local_dp_size = dp_size // (tp_size // local_tp_size)
+
+    local_attn_tp_size = local_tp_size // local_dp_size
+    local_attn_dp_rank = local_tp_rank // local_attn_tp_size
+    local_attn_tp_rank = local_tp_rank % local_attn_tp_size
+
+    return local_attn_tp_rank, local_attn_tp_size, local_attn_dp_rank
 
 
 def initialize_dp_attention(
@@ -44,18 +61,29 @@ def initialize_dp_attention(
     tp_size: int,
     dp_size: int,
 ):
-    global _ATTN_TP_GROUP, _ATTN_TP_RANK, _ATTN_TP_SIZE, _DP_RANK, _DP_SIZE
+    global _ATTN_TP_GROUP, _ATTN_TP_RANK, _ATTN_TP_SIZE, _ATTN_DP_RANK, _ATTN_DP_SIZE
+    global _LOCAL_ATTN_DP_SIZE, _LOCAL_ATTN_DP_RANK
 
     from sglang.srt.layers.sampler import SYNC_TOKEN_IDS_ACROSS_TP
 
-    _ATTN_TP_RANK, _ATTN_TP_SIZE, _DP_RANK = compute_dp_attention_world_info(
+    _ATTN_TP_RANK, _ATTN_TP_SIZE, _ATTN_DP_RANK = compute_dp_attention_world_info(
         enable_dp_attention, tp_rank, tp_size, dp_size
+    )
+    _, _, _LOCAL_ATTN_DP_RANK = compute_dp_attention_local_info(
+        enable_dp_attention, tp_rank, tp_size, dp_size, moe_dense_tp_size
     )
 
     if enable_dp_attention:
-        _DP_SIZE = dp_size
+        _ATTN_DP_SIZE = dp_size
+        if moe_dense_tp_size is None:
+            _LOCAL_ATTN_DP_SIZE = _ATTN_DP_SIZE
+        else:
+            _LOCAL_ATTN_DP_SIZE = dp_size // (tp_size // moe_dense_tp_size)
     else:
-        _DP_SIZE = 1
+        _ATTN_DP_SIZE = 1
+        _LOCAL_ATTN_DP_SIZE = 1
+
+    logger.info(f"{(_ATTN_TP_RANK, _ATTN_TP_SIZE, _ATTN_DP_RANK, _ATTN_DP_SIZE)=}")
 
     tp_group = get_tp_group()
     _ATTN_TP_GROUP = GroupCoordinator(
@@ -95,8 +123,28 @@ def get_attention_dp_rank():
 
 
 def get_attention_dp_size():
-    assert _DP_SIZE is not None, "dp attention not initialized!"
-    return _DP_SIZE
+    assert _ATTN_DP_SIZE is not None, "dp attention not initialized!"
+    return _ATTN_DP_SIZE
+
+
+def get_local_attention_dp_rank():
+    assert _LOCAL_ATTN_DP_RANK is not None, "dp attention not initialized!"
+    return _LOCAL_ATTN_DP_RANK
+
+
+def get_local_attention_dp_size():
+    assert _LOCAL_ATTN_DP_SIZE is not None, "dp attention not initialized!"
+    return _LOCAL_ATTN_DP_SIZE
+
+
+def get_local_attention_dp_rank():
+    assert _LOCAL_ATTN_DP_RANK is not None, "dp attention not initialized!"
+    return _LOCAL_ATTN_DP_RANK
+
+
+def get_local_attention_dp_size():
+    assert _LOCAL_ATTN_DP_SIZE is not None, "dp attention not initialized!"
+    return _LOCAL_ATTN_DP_SIZE
 
 
 @contextmanager
@@ -121,7 +169,7 @@ def disable_dp_size():
 
 
 def get_dp_local_info(forward_batch: ForwardBatch):
-    dp_rank = get_attention_dp_rank()
+    dp_rank = get_local_attention_dp_rank()
 
     if forward_batch.dp_local_start_pos is None:
         cumtokens = torch.cumsum(forward_batch.global_num_tokens_gpu, dim=0)
