@@ -111,7 +111,7 @@ class Sampler(nn.Module):
                     except ValueError:
                         logger.warning("Detected errors during sampling!")
                         batch_next_token_ids = torch.zeros(
-                            (probs.size(0),), device=probs.device
+                            probs.size(0), device=probs.device
                         )
 
             elif global_server_args_dict["sampling_backend"] == "pytorch":
