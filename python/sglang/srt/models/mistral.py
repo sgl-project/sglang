@@ -18,6 +18,7 @@ from typing import List, Union
 import torch
 from transformers.models.mistral3.modeling_mistral3 import Mistral3MultiModalProjector
 
+from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.models.llama import LlamaForCausalLM
 
 
@@ -40,35 +41,44 @@ class Mistral3ForConditionalGeneration:
         self.inner.multi_modal_projector = self.MULTIMODAL_PROJECTOR_TYPE(
             kwargs["config"]
         )
-        self.inner.encode_images = self.encode_images
+        self.inner.get_image_feature = self.get_image_feature
 
-    def encode_images(
-        self, pixel_values: Union[torch.Tensor, List[torch.Tensor]]
-    ) -> torch.Tensor:
-        """
-        encode images by vision tower and multimodal projector
+    def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        """Extract features from image inputs.
+
         Args:
-            pixel_values: torch.Tensor or List[torch.Tensor]: each tensor for an input image
-        Returns:
-            torch.Tensor: encoded image features from the input image; if multiple, flattened by seq_len axis
-        """
-        image_outputs = self.vision_tower(pixel_values, output_hidden_states=True)
-        # NOTE: This is not memory efficient. (output_hidden_states=True) will save all the hidden stated.
+            items: List of MultimodalDataItem objects containing image data
+                Note that an item can be either "image" or "multi-images"
 
-        selected_image_feature = image_outputs.hidden_states[self.vision_feature_layer]
-        if self.vision_feature_select_strategy in ["default", "patch"]:
-            selected_image_feature = selected_image_feature[:, 1:]
-        elif self.vision_feature_select_strategy == "full":
-            selected_image_feature = selected_image_feature
-        else:
-            raise ValueError(
-                f"Unexpected select feature strategy: {self.config.vision_feature_select_strategy}"
+        Returns:
+            torch.Tensor: features from image inputs, concatenated
+        """
+        features = []
+        for item in items:
+            # in each item, we assume pixel_values is always batched
+            pixel_values, image_sizes = item.pixel_values, item.image_sizes
+            image_outputs = self.vision_tower(
+                pixel_values, image_sizes, output_hidden_states=True
             )
-        image_sizes = [p.shape[-2:] for p in pixel_values]
-        image_features = self.multi_modal_projector(
-            selected_image_feature.squeeze(0), image_sizes
-        )
-        return image_features
+            selected_image_feature = image_outputs.hidden_states[
+                self.vision_feature_layer
+            ]
+
+            if self.vision_feature_select_strategy in ["default", "patch"]:
+                selected_image_feature = selected_image_feature[:, 1:]
+            elif self.vision_feature_select_strategy == "full":
+                selected_image_feature = selected_image_feature
+            else:
+                raise ValueError(
+                    f"Unexpected select feature: {self.vision_feature_select_strategy}"
+                )
+            features.append(
+                self.multi_modal_projector(
+                    selected_image_feature.squeeze(0), image_sizes
+                )
+            )
+        ret = torch.cat(features, dim=0)
+        return ret
 
     def __getattr__(self, name):
         return getattr(self.inner, name)
