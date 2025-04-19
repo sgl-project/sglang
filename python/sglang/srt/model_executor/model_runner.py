@@ -231,7 +231,6 @@ class ModelRunner:
             if not self.use_mla_backend:
                 if (
                     is_hopper_with_cuda_12_3()
-                    and is_no_spec_infer_or_topk_one(server_args)
                     and is_fa3_default_architecture(self.model_config.hf_config)
                 ):
                     server_args.attention_backend = "fa3"
@@ -240,9 +239,7 @@ class ModelRunner:
                         "flashinfer" if is_flashinfer_available() else "triton"
                     )
             else:
-                if is_hopper_with_cuda_12_3() and is_no_spec_infer_or_topk_one(
-                    server_args
-                ):
+                if is_hopper_with_cuda_12_3():
                     server_args.attention_backend = "fa3"
                 else:
                     server_args.attention_backend = "triton"
