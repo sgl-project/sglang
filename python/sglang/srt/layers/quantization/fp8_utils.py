@@ -253,9 +253,7 @@ def _apply_fallback_scaled_mm(
 ):
     global TORCH_DEVICE_IDENTITY
     if TORCH_DEVICE_IDENTITY is None:
-        TORCH_DEVICE_IDENTITY = torch.ones(
-            1, dtype=torch.float32, device=weight.device
-        )
+        TORCH_DEVICE_IDENTITY = torch.ones(1, dtype=torch.float32, device=weight.device)
 
     output = torch._scaled_mm(
         qinput,
