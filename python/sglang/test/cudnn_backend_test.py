@@ -4,12 +4,16 @@ import logging
 import math
 import time
 from dataclasses import dataclass
+import os
 
 import cudnn
 
 # from sglang.srt.layers.attention import cudnn_backend
 import torch
+from datetime import datetime
+
 import tqdm
+from torch.profiler import profile, record_function, ProfilerActivity
 
 
 @dataclass
@@ -38,9 +42,9 @@ class InputParametersLarge:
 class _CuDNNInputParameters:
     num_heads = 4
     head_size = 128
-    max_total_num_tokens = 300
+    max_total_num_tokens = 30000
     max_num_reqs = 100
-    max_context_lenght = 300
+    max_context_lenght = 30000
 
 
 # If True, the tensors will be validated against the CuDNN graph for dims and strides
@@ -84,10 +88,9 @@ class CuDNNBackend:
 
         # create the cudnn graph cache
         # self._prefill_graphs[i][j] is the graph for seq_len=(i+1)*step_size, prefix_len=j*step_size
-        self._prefill_graphs = self._init_prefill_graphs(
-            self.input_size_params.max_total_num_tokens,
-            step_size=self._extend_seq_len_interval,
-        )
+
+        max_len = 750
+        self._prefill_graphs = self._init_prefill_graphs(max_len,step_size=self._extend_seq_len_interval)
 
         # create one decode graph per batch size
         self._decode_graphs = self._init_decode_graphs(self.input_size_params.num_seqs)
@@ -571,8 +574,8 @@ class CuDNNBackend:
         """
         assert query.shape[0] == seq_lens.shape[0], "batch size must be the same"
 
-        tensor_key_map, (cudnn_decode_graph, diagonal_band) = self.forward_metadata
-        print("diagonal band: ", diagonal_band)
+
+        tensor_key_map,(cudnn_decode_graph,diagonal_band) = self.forward_metadata
         # Convert into CuDNN Query format (B, H, S, D)
         # where B is number of queries and S is sequence per query (1 in decoding)
         # [num_tokens, num_heads, head_size] -> [num_token, num_heads, 1,  head_size]
@@ -883,6 +886,8 @@ class TorchNativeAttnBackend:
 
 def test_correctness(test_decode=True, test_extend=True):
 
+    test_seq_len = 512
+
     if test_decode:
         input_parem = InputParameters()
         cudnn_bknd = CuDNNBackend(None, input_shape_parems=input_parem)
@@ -918,40 +923,40 @@ def test_correctness(test_decode=True, test_extend=True):
 
         scaling = 1 / math.sqrt(input_parem.head_size)
 
-        query = (
-            torch.randn(
-                [input_parem.num_seqs, input_parem.num_heads, input_parem.head_size]
+
+        query = torch.randn([input_parem.num_seqs, input_parem.num_heads, input_parem.head_size]).half().cuda()
+        output = torch.randn([input_parem.num_seqs, input_parem.num_heads, input_parem.head_size]).half().cuda()
+        seq_lens = torch.randint(low=100,high=test_seq_len,size=[input_parem.num_seqs],dtype=torch.int32).cuda()    
+        req_to_token = torch.randint(low=0,high=input_parem.num_token,size=[input_parem.max_num_reqs, input_parem.max_context_lenght],dtype=torch.int32).cuda()
+        torch_output = torch.randn([input_parem.num_seqs, input_parem.num_heads, input_parem.head_size]).half().cuda()
+
+        # get current time for trace output file name
+        current_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        # create a directory for the trace files
+        os.makedirs("trace", exist_ok=True)
+        # set the trace file name
+        decode_trace_file_name = os.path.join("trace", f"decode_trace_{current_timestamp}.json")
+        prefill_trace_file_name = os.path.join("trace", f"prefill_trace_{current_timestamp}.json")
+        
+        cudnn_bknd.init_forward_metadata(None,mock=True, decode_batch_size=input_parem.num_seqs, prefix_lens=None, extend_seq_lens=None)
+        # warmup before benchmark
+        for i in range(3):
+            output = cudnn_bknd._run_sdpa_forward_decode(
+                query=query,
+                output=output,
+                k_cache=k_cache,
+                v_cache=v_cache,
+                req_to_token=req_to_token,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                scaling=scaling
             )
-            .half()
-            .cuda()
-        )
-        output = (
-            torch.randn(
-                [input_parem.num_seqs, input_parem.num_heads, input_parem.head_size]
-            )
-            .half()
-            .cuda()
-        )
-        seq_lens = torch.randint(
-            low=10,
-            high=input_parem.max_context_lenght,
-            size=[input_parem.num_seqs],
-            dtype=torch.int32,
-        ).cuda()
-        req_to_token = torch.randint(
-            low=0,
-            high=input_parem.num_token,
-            size=[input_parem.max_num_reqs, input_parem.max_context_lenght],
-            dtype=torch.int32,
-        ).cuda()
-        cudnn_bknd.init_forward_metadata(
-            None,
-            mock=True,
-            decode_batch_size=input_parem.num_seqs,
-            prefix_lens=None,
-            extend_seq_lens=None,
-        )
-        output = cudnn_bknd._run_sdpa_forward_decode(
+        torch.cuda.synchronize()
+
+
+        activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA, ProfilerActivity.XPU]
+        with profile(activities=activities) as prof:
+            output = cudnn_bknd._run_sdpa_forward_decode(
             query=query,
             output=output,
             k_cache=k_cache,
@@ -959,17 +964,16 @@ def test_correctness(test_decode=True, test_extend=True):
             req_to_token=req_to_token,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
-            scaling=scaling,
-        )
 
-        torch_output = (
-            torch.randn(
-                [input_parem.num_seqs, input_parem.num_heads, input_parem.head_size]
+            scaling=scaling
             )
-            .half()
-            .cuda()
-        )
-        start_time = time.perf_counter()
+            torch.cuda.synchronize()
+        prof.export_chrome_trace(decode_trace_file_name)
+        
+
+        
+        start_time =time.perf_counter()
+
         torch_output = torch_native_backend._run_sdpa_forward_decode(
             query=query,
             output=torch_output,
@@ -996,18 +1000,21 @@ def test_correctness(test_decode=True, test_extend=True):
         input_parem = InputParameters()
 
         torch_native_backend = TorchNativeAttnBackend()
-        input_parem.num_seqs = 3
-        vals = torch.randint(low=16, high=128, size=(input_parem.num_seqs,))
+        input_parem.num_seqs = 4
+        vals = torch.randint(low=16, high=test_seq_len, size=(input_parem.num_seqs,))
         input_parem.num_token = sum(vals)
         extend_seq_lens = torch.tensor(vals, dtype=torch.int32).cuda()
-        extend_prefix_lens = torch.randint(
-            low=0, high=60, size=[input_parem.num_seqs], dtype=torch.int32
-        ).cuda()
+
+        extend_prefix_lens = torch.randint(low=0,high=80,size=[input_parem.num_seqs],dtype=torch.int32).cuda()
+
         seq_lens = (extend_prefix_lens + extend_seq_lens).cuda()
         # add some random not used tokens
         input_parem.max_total_num_tokens = sum(seq_lens).item() + 20
 
-        cudnn_bknd = CuDNNBackend(None, input_shape_parems=input_parem)
+
+
+        cudnn_bknd = CuDNNBackend(None,input_shape_parems=input_parem)
+
 
         # TODO: dtype
         query = (
@@ -1080,13 +1087,26 @@ def test_correctness(test_decode=True, test_extend=True):
         ), "extend_seq_lens sum doesn't match input_parem.num_token."
 
         torch.cuda.reset_peak_memory_stats()
-        cudnn_bknd.init_forward_metadata(
-            None,
-            mock=True,
-            prefix_lens=extend_prefix_lens,
-            extend_seq_lens=extend_seq_lens,
-        )
-        output = cudnn_bknd._run_sdpa_forward_extend(
+
+        cudnn_bknd.init_forward_metadata(None,mock=True, prefix_lens=extend_prefix_lens, extend_seq_lens=extend_seq_lens)
+        # warmup before benchmark
+        for i in range(3):
+            output = cudnn_bknd._run_sdpa_forward_extend(
+                query=query,
+                output=output,
+                k_cache=k_cache,
+                v_cache=v_cache,
+                req_to_token=req_to_token,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                extend_prefix_lens=extend_prefix_lens,
+                extend_seq_lens=extend_seq_lens,
+                scaling=scaling
+            )
+        torch.cuda.synchronize()
+        with profile(activities=activities) as prof:
+            output = cudnn_bknd._run_sdpa_forward_extend(
+
             query=query,
             output=output,
             k_cache=k_cache,
@@ -1098,10 +1118,12 @@ def test_correctness(test_decode=True, test_extend=True):
             extend_seq_lens=extend_seq_lens,
             scaling=scaling,
         )
-        torch.cuda.synchronize()
-        print(
-            f"[cuDNN] Peak memory: {torch.cuda.max_memory_allocated() / 1024 / 1024:.2f} MB"
-        )
+
+            torch.cuda.synchronize()
+        prof.export_chrome_trace(prefill_trace_file_name)
+
+        print(f"[cuDNN] Peak memory: {torch.cuda.max_memory_allocated() / 1024 / 1024:.2f} MB")
+
 
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
