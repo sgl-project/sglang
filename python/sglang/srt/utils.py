@@ -1941,6 +1941,7 @@ class BumpAllocator:
         self._pointer = 0
 
     def allocate(self):
+        assert self._pointer <= len(self._buffer)
         output = self._buffer[self._pointer:self._pointer + 1]
         self._pointer += 1
         return output
