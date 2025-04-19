@@ -1932,3 +1932,4 @@ def is_fa3_default_architecture(hf_config):
         "MistralForCausalLM",
     }
     return architectures[0] in default_archs
+

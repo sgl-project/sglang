@@ -897,16 +897,18 @@ def _per_tensor_quant_mla_fp8_stage2(
 
 
 def per_tensor_quant_mla_fp8(
-    x: torch.Tensor, eps: float = 1e-12
+    x: torch.Tensor,
+    x_s_out: torch.Tensor,
+    eps: float = 1e-12
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     This function quantizes input values to float8 values with tensor-wise quantization
     and specialized for mla absorbed case.
     """
     assert x.dim() == 3, "`x` is not a 3d-tensor"
+    assert x_s_out.shape == (1,) and x_s_out.dtype == torch.float32 and x_s_out.device == x.device
 
     x_q = x.new_empty(x.size(), dtype=_fp8_type)
-    x_s = torch.zeros((1,), dtype=torch.float32, device=x.device)
 
     num_head, num_seq, head_size = x.shape
     BLOCK_SIZE = triton.next_power_of_2(head_size)
