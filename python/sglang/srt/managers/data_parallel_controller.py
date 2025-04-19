@@ -185,7 +185,7 @@ class DataParallelController:
         for tp_rank in tp_rank_range:
             rank_port_args = port_args
 
-            if server_args.enable_dp_attention and server_args.moe_dense_tp_size != 1:
+            if server_args.enable_dp_attentio:
                 # dp attention has different sharding logic
                 _, _, dp_rank = compute_dp_attention_world_info(
                     server_args.enable_dp_attention,
