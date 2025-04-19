@@ -188,6 +188,7 @@ class CudaGraphRunner:
         self.speculative_algorithm = model_runner.server_args.speculative_algorithm
         self.tp_size = model_runner.server_args.tp_size
         self.dp_size = model_runner.server_args.dp_size
+        self.enable_deepep_moe = model_runner.server_args.enable_deepep_moe
 
         # Batch sizes to capture
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
@@ -301,12 +302,16 @@ class CudaGraphRunner:
 
     def can_run(self, forward_batch: ForwardBatch):
         if self.enable_dp_attention or self.enable_sp_layernorm:
-            total_global_tokens = sum(forward_batch.global_num_tokens_cpu)
+            global_max_tokens = (
+                max(forward_batch.global_num_tokens_cpu)
+                if self.enable_deepep_moe
+                else sum(forward_batch.global_num_tokens_cpu)
+            )  # DeepEP MoE layers uses a fixed shape with masking instead of gather tokens from DP ranks.
 
             is_bs_supported = forward_batch.can_run_dp_cuda_graph and (
-                total_global_tokens in self.graphs
+                global_max_tokens in self.graphs
                 if self.disable_padding
-                else total_global_tokens <= self.max_bs
+                else global_max_tokens <= self.max_bs
             )
         else:
             is_bs_supported = (
@@ -484,9 +489,12 @@ class CudaGraphRunner:
 
         # Pad
         if self.enable_dp_attention or self.enable_sp_layernorm:
-            index = bisect.bisect_left(
-                self.capture_bs, sum(forward_batch.global_num_tokens_cpu)
-            )
+            global_max_tokens = (
+                max(forward_batch.global_num_tokens_cpu)
+                if self.enable_deepep_moe
+                else sum(forward_batch.global_num_tokens_cpu)
+            )  # DeepEP MoE layers uses a fixed shape with masking instead of gather tokens from DP ranks.
+            index = bisect.bisect_left(self.capture_bs, global_max_tokens)
         else:
             index = bisect.bisect_left(self.capture_bs, raw_bs)
         bs = self.capture_bs[index]
