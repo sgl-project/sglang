@@ -1,10 +1,10 @@
-# Adapted from https://github.com/vllm-project/vllm/tree/main/vllm/model_executor/layers/quantization/compressed_tensors
+# Adapted from https://github.com/vllm-project/vllm/tree/v0.8.2/vllm/model_executor/layers/quantization/compressed_tensors
 # SPDX-License-Identifier: Apache-2.0
 
 import enum
 import logging
 from enum import Enum
-from typing import TYPE_CHECKING, Callable, List, Optional
+from typing import Callable, List, Optional
 
 import torch
 from compressed_tensors import CompressionFormat
@@ -13,13 +13,7 @@ from compressed_tensors.quantization import (ActivationOrdering,
 
 from sglang.srt.layers.quantization.compressed_tensors import WNA16_SUPPORTED_BITS
 
-if TYPE_CHECKING:
-    from sglang.srt.layers.moe.fused_moe_triton import (
-        FusedMoE,
-        FusedMoEMethodBase,
-        FusedMoeWeightScaleSupported,
-    )
-
+from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
 from sglang.srt.layers.quantization.utils import (
     all_close_1d,
@@ -31,12 +25,10 @@ from sglang.srt.layers.quantization.utils import (
 from sglang.srt.utils import set_weight_attrs
 
 _is_cuda = is_cuda()
-from vllm import _custom_ops as vllm_ops
 
-if _is_cuda:
-    from sglang.srt.custom_op import scaled_fp8_quant as sgl_scaled_fp8_quant
-else:
+if not _is_cuda:
     from vllm import _custom_ops as vllm_ops
+    from vllm._custom_ops import scaled_fp8_quant
 
 try:
     import vllm
@@ -63,8 +55,6 @@ __all__ = [
 
 class CompressedTensorsMoEMethod:
     def __new__(cls, *args, **kwargs):
-        from sglang.srt.layers.moe.fused_moe_triton import FusedMoEMethodBase
-
         if cls is CompressedTensorsMoEMethod:
             return super().__new__(cls)
         return super().__new__(cls)
@@ -106,11 +96,6 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
     def __init__(
         self, quant_config: "CompressedTensorsConfig"  # type: ignore # noqa E501
     ):
-        from sglang.srt.layers.moe.fused_moe_triton import (
-            FusedMoEMethodBase,
-            FusedMoeWeightScaleSupported,
-        )
-
         self.quant_config = quant_config
         self.weight_quant = self.quant_config.target_scheme_map["Linear"].get("weights")
         self.input_quant = self.quant_config.target_scheme_map["Linear"].get(
@@ -281,19 +266,11 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
                         layer.w13_weight[expert_id][start : start + shard_size, :],
                         layer.w13_weight_scale[expert_id][shard_id],
                     )
+                    (
+                        layer.w13_weight[expert_id][start : start + shard_size, :],
+                        _,
+                    ) = scaled_fp8_quant(dq_weight, max_w13_scales[expert_id])
 
-                    if _is_cuda:
-                        (
-                            layer.w13_weight[expert_id][start : start + shard_size, :],
-                            _,
-                        ) = sgl_scaled_fp8_quant(dq_weight, max_w13_scales[expert_id])
-                    else:
-                        (
-                            layer.w13_weight[expert_id][start : start + shard_size, :],
-                            _,
-                        ) = vllm_ops.scaled_fp8_quant(
-                            dq_weight, max_w13_scales[expert_id]
-                        )
                     start += shard_size
 
             layer.w13_weight_scale = torch.nn.Parameter(
@@ -359,11 +336,6 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
     def __init__(
         self, quant_config: "CompressedTensorsConfig"  # type: ignore # noqa E501
     ):
-        from sglang.srt.layers.moe.fused_moe_triton import (
-            FusedMoEMethodBase,
-            FusedMoeWeightScaleSupported,
-        )
-
         self.quant_config = quant_config
         # TODO: @dsikka: refactor this to use schemes as other kernels
         # are supported + check if the layer is being ignored.
@@ -678,14 +650,9 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
         inplace: bool = True,
         no_combine: bool = False,
     ) -> torch.Tensor:
-        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
         from sglang.srt.layers.moe.topk import select_experts
 
         assert activation == "silu", "Only SiLU activation is supported."
-        if not VLLM_AVAILABLE:
-            raise ImportError(
-                "vllm is not installed, to use fused_marlin_moe, please install vllm"
-            )
         if expert_map is not None:
             raise NotImplementedError(
                 "Expert Parallelism is not supported for " "fused Marlin MoE method."
@@ -700,6 +667,7 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
             topk_group=topk_group,
             num_expert_group=num_expert_group,
             custom_routing_function=custom_routing_function,
+            scoring_func=scoring_func,
             correction_bias=correction_bias,
         )
 

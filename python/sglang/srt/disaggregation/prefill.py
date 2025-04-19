@@ -24,13 +24,7 @@ from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
-from sglang.srt.disaggregation.base import (
-    BaseKVManager,
-    BaseKVReceiver,
-    BaseKVSender,
-    KVArgs,
-    KVPoll,
-)
+from sglang.srt.disaggregation.base import BaseKVManager, KVArgs, KVPoll
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     KVClassType,
@@ -67,6 +61,7 @@ class PrefillBootstrapQueue:
         bootstrap_port: int,
         gloo_group: ProcessGroup,
         transfer_backend: TransferBackend,
+        scheduler: Scheduler,
     ):
         self.token_to_kv_pool = token_to_kv_pool
         self.aux_dtype = aux_dtype
@@ -76,6 +71,7 @@ class PrefillBootstrapQueue:
         self.tp_rank = tp_rank
         self.tp_size = tp_size
         self.transfer_backend = transfer_backend
+        self.scheduler = scheduler
         self.kv_manager = self._init_kv_manager()
         self.queue: List[Req] = []
         self.gloo_group = gloo_group
@@ -108,8 +104,11 @@ class PrefillBootstrapQueue:
             metadata_buffer[0].nbytes for metadata_buffer in self.metadata_buffers
         ]
         kv_args.ib_device = "mock-ib-device"
+        kv_args.gpu_id = self.scheduler.gpu_id
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
-        kv_manager = kv_manager_class(kv_args, DisaggregationMode.PREFILL)
+        kv_manager = kv_manager_class(
+            kv_args, DisaggregationMode.PREFILL, self.scheduler.server_args
+        )
         return kv_manager
 
     def add(self, req: Req) -> None:
@@ -172,6 +171,36 @@ class SchedulerDisaggregationPrefillMixin:
     Mixin for Scheduler to handle disaggregation prefill
     """
 
+    @torch.no_grad()
+    def event_loop_normal_disagg_prefill(self):
+        """A normal scheduler loop for prefill worker in disaggregation mode."""
+
+        while True:
+            recv_reqs = self.recv_requests()
+            self.process_input_requests(recv_reqs)
+            self.waiting_queue.extend(
+                self.disagg_prefill_pending_queue.pop_bootstrapped()
+            )
+            self.process_prefill_chunk()
+            batch = self.get_new_batch_prefill()
+            self.cur_batch = batch
+
+            if batch:
+                result = self.run_batch(batch)
+                self.process_batch_result_disagg_prefill(batch, result)
+
+            if len(self.disagg_prefill_inflight_queue) > 0:
+                self.process_disagg_prefill_inflight_queue()
+
+            if batch is None and len(self.disagg_prefill_inflight_queue) == 0:
+                self.check_memory()
+                self.new_token_ratio = self.init_new_token_ratio
+
+            self.last_batch = batch
+            # HACK (byronhsu): reset the batch_is_full flag because we never enter update_running_batch which resets it
+            # Otherwise, it hangs under high concurrency
+            self.running_batch.batch_is_full = False
+
     def process_batch_result_disagg_prefill(
         self: Scheduler, batch: ScheduleBatch, result: GenerationBatchResult
     ) -> None:
@@ -211,7 +240,7 @@ class SchedulerDisaggregationPrefillMixin:
 
         polls = poll_and_all_reduce(
             [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
-            self.tp_worker.get_tp_cpu_group(),
+            self.attn_tp_cpu_group,
         )
 
         undone_reqs: List[Req] = []
