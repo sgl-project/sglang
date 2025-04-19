@@ -99,8 +99,12 @@ class MooncakeKVManager(BaseKVManager):
         disaggregation_mode: DisaggregationMode,
         server_args: ServerArgs,
     ):
-        self.engine = MooncakeTransferEngine()
         self.kv_args = args
+        self.engine = MooncakeTransferEngine(
+            hostname=get_local_ip_by_remote(),
+            gpu_id=self.kv_args.gpu_id,
+            ib_device=self.kv_args.ib_device,
+        )
         self.disaggregation_mode = disaggregation_mode
         # for p/d multi node infer
         self.bootstrap_port = server_args.disaggregation_bootstrap_port
@@ -387,6 +391,10 @@ class MooncakeKVSender(BaseKVSender):
 
 
 class MooncakeKVReceiver(BaseKVReceiver):
+    _ctx = zmq.Context()
+    _socket_cache = {}
+    _socket_locks = {}
+    _global_lock = threading.Lock()
 
     def __init__(
         self,
@@ -436,11 +444,15 @@ class MooncakeKVReceiver(BaseKVReceiver):
             logger.error(f"Error fetching prefill info from bootstrap: {e}")
             return None
 
-    @cache
-    def _connect(self, endpoint: str):
-        socket = zmq.Context().socket(zmq.PUSH)
-        socket.connect(endpoint)
-        return socket
+    @classmethod
+    def _connect(cls, endpoint: str):
+        with cls._global_lock:
+            if endpoint not in cls._socket_cache:
+                sock = cls._ctx.socket(zmq.PUSH)
+                sock.connect(endpoint)
+                cls._socket_cache[endpoint] = sock
+                cls._socket_locks[endpoint] = threading.Lock()
+            return cls._socket_cache[endpoint], cls._socket_locks[endpoint]
 
     def init(self, kv_indices: npt.NDArray[np.int64], aux_index: Optional[int] = None):
         self.prefill_server_url = (
@@ -456,18 +468,20 @@ class MooncakeKVReceiver(BaseKVReceiver):
         packed_aux_data_ptrs = b"".join(
             struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.aux_data_ptrs
         )
-        self._connect("tcp://" + self.prefill_server_url).send_multipart(
-            [
-                str(self.bootstrap_room).encode("ascii"),
-                get_local_ip_by_remote().encode("ascii"),
-                str(self.kv_mgr.rank_port).encode("ascii"),
-                self.session_id.encode("ascii"),
-                packed_kv_data_ptrs,
-                kv_indices.tobytes(),
-                packed_aux_data_ptrs,
-                str(aux_index).encode("ascii"),
-            ]
-        )
+        sock, lock = self._connect("tcp://" + self.prefill_server_url)
+        with lock:
+            sock.send_multipart(
+                [
+                    str(self.bootstrap_room).encode("ascii"),
+                    get_local_ip_by_remote().encode("ascii"),
+                    str(self.kv_mgr.rank_port).encode("ascii"),
+                    self.session_id.encode("ascii"),
+                    packed_kv_data_ptrs,
+                    kv_indices.tobytes(),
+                    packed_aux_data_ptrs,
+                    str(aux_index).encode("ascii"),
+                ]
+            )
 
     def poll(self) -> KVPoll:
         return self.kv_mgr.check_status(self.bootstrap_room)
@@ -493,51 +507,7 @@ class MooncakeKVBootstrapServer(BaseKVBootstrapServer):
         self.thread.start()
 
     def _setup_routes(self):
-        self.app.router.add_route("*", "/metadata", self._handle_metadata)
         self.app.router.add_route("*", "/route", self._handle_route)
-
-    async def _handle_metadata(self, request: web.Request):
-        key = request.query.get("key", "")
-
-        if request.method == "GET":
-            return await self._handle_metadata_get(key)
-        elif request.method == "PUT":
-            return await self._handle_metadata_put(key, request)
-        elif request.method == "DELETE":
-            return await self._handle_metadata_delete(key)
-        return web.Response(
-            text="Method not allowed", status=405, content_type="application/json"
-        )
-
-    async def _handle_metadata_get(self, key):
-        async with self.lock:
-            value = self.store.get(key)
-        if value is None:
-            return web.Response(
-                text="metadata not found", status=404, content_type="application/json"
-            )
-        return web.Response(body=value, status=200, content_type="application/json")
-
-    async def _handle_metadata_put(self, key, request):
-        data = await request.read()
-        async with self.lock:
-            self.store[key] = data
-        return web.Response(
-            text="metadata updated", status=200, content_type="application/json"
-        )
-
-    async def _handle_metadata_delete(self, key):
-        async with self.lock:
-            if key not in self.store:
-                return web.Response(
-                    text="metadata not found",
-                    status=404,
-                    content_type="application/json",
-                )
-            del self.store[key]
-        return web.Response(
-            text="metadata deleted", status=200, content_type="application/json"
-        )
 
     async def _handle_route(self, request: web.Request):
         method = request.method
