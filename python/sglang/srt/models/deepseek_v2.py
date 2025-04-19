@@ -58,6 +58,7 @@ from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_kernel import (
+    _enable_jit_deepgemm_bmm,
     per_tensor_quant_mla_deep_gemm_masked_fp8,
     per_tensor_quant_mla_fp8,
 )
@@ -1471,7 +1472,7 @@ class DeepseekV2ForCausalLM(nn.Module):
 
                         if (
                             _is_cuda
-                            and torch.cuda.get_device_capability()[0] == 9  # is hopper
+                            and _enable_jit_deepgemm_bmm
                             and weight_block_size[0] == 128
                             and weight_block_size[1] == 128
                             and model_dtype == torch.bfloat16

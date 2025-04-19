@@ -44,6 +44,7 @@ else:
 fp8_min = -fp8_max
 
 _enable_jit_deepgemm = False
+_enable_jit_deepgemm_bmm = False
 if _is_cuda:
     import deep_gemm
     from sgl_kernel import (
@@ -53,10 +54,11 @@ if _is_cuda:
     )
 
     sm_version = get_device_sm()
-    if sm_version == 90 and get_bool_env_var(
-        "SGL_ENABLE_JIT_DEEPGEMM", default="false"
-    ):
-        _enable_jit_deepgemm = True
+    if sm_version == 90:
+        if get_bool_env_var("SGL_ENABLE_JIT_DEEPGEMM", default="false"):
+            _enable_jit_deepgemm = True
+        if get_bool_env_var("SGL_ENABLE_JIT_DEEPGEMM_BMM", default="false"):
+            _enable_jit_deepgemm_bmm = True
 
 
 logger = logging.getLogger(__name__)
