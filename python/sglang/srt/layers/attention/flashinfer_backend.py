@@ -100,11 +100,8 @@ class FlashInferAttnBackend(AttentionBackend):
             self.num_wrappers = 1
             self.dispatch_reason = None
 
-        # Qwen2/Qwen3 models require higher flashinfer workspace size
-        if (
-            "Qwen2ForCausalLM" in model_runner.model_config.hf_config.architectures
-            or "Qwen3ForCausalLM" in model_runner.model_config.hf_config.architectures
-        ):
+        # Qwen2 models require higher flashinfer workspace size
+        if "Qwen2ForCausalLM" in model_runner.model_config.hf_config.architectures:
             global_config.flashinfer_workspace_size = 512 * 1024 * 1024
 
         # Allocate buffers
@@ -409,6 +406,7 @@ class FlashInferAttnBackend(AttentionBackend):
 
         logits_soft_cap = layer.logit_cap
 
+        q = q.contiguous()
         if not self.forward_metadata.use_ragged:
             if k is not None:
                 assert v is not None
@@ -418,7 +416,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     )
 
             o = prefill_wrapper_paged.forward(
-                q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                q.view(-1, layer.tp_q_head_num, layer.head_dim),
                 forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
                 causal=not layer.is_cross_attention,
                 sm_scale=layer.scaling,
@@ -428,20 +426,27 @@ class FlashInferAttnBackend(AttentionBackend):
                 v_scale=v_scale,
             )
         else:
-            o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(
-                q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                k.view(-1, layer.tp_k_head_num, layer.head_dim),
-                v.view(-1, layer.tp_v_head_num, layer.head_dim),
-                causal=True,
-                sm_scale=layer.scaling,
-                logits_soft_cap=logits_soft_cap,
-            )
-
             if self.forward_metadata.extend_no_prefix:
-                o = o1
+                o = self.prefill_wrapper_ragged.forward(
+                    q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                    k.view(-1, layer.tp_k_head_num, layer.head_dim),
+                    v.view(-1, layer.tp_v_head_num, layer.head_dim),
+                    causal=True,
+                    sm_scale=layer.scaling,
+                    logits_soft_cap=logits_soft_cap,
+                )
+
             else:
+                o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(
+                    q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                    k.view(-1, layer.tp_k_head_num, layer.head_dim),
+                    v.view(-1, layer.tp_v_head_num, layer.head_dim),
+                    causal=True,
+                    sm_scale=layer.scaling,
+                    logits_soft_cap=logits_soft_cap,
+                )
                 o2, s2 = prefill_wrapper_paged.forward_return_lse(
-                    q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    q.view(-1, layer.tp_q_head_num, layer.head_dim),
                     forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
                     causal=False,
                     sm_scale=layer.scaling,
