@@ -192,7 +192,6 @@ class DataParallelController:
                     tp_rank,
                     server_args.tp_size,
                     server_args.dp_size,
-                    server_args.moe_dense_tp_size,
                 )
                 # compute zmq ports for this dp rank
                 rank_port_args = PortArgs.init_new(server_args, dp_rank)

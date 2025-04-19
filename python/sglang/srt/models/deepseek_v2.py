@@ -38,7 +38,7 @@ from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.dp_attention import (
     dp_gather_partial,
     dp_scatter,
-    get_attention_dp_size,
+    get_local_attention_dp_size,
     get_attention_tp_rank,
     get_attention_tp_size,
     tp_all_gather,
@@ -420,7 +420,6 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.v_head_dim = v_head_dim
         self.q_lora_rank = q_lora_rank
         self.kv_lora_rank = kv_lora_rank
-        self.dp_size = get_attention_dp_size()
         attn_tp_rank = get_attention_tp_rank()
         attn_tp_size = get_attention_tp_size()
 
@@ -1034,7 +1033,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         self.enable_dp_attention = global_server_args_dict["enable_dp_attention"]
         self.layer_id = layer_id
-        self.dp_size = get_attention_dp_size()
+        self.local_dp_size = get_local_attention_dp_size()
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
         self.self_attn = DeepseekV2AttentionMLA(
@@ -1166,7 +1165,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         # Gather
         if get_tensor_model_parallel_world_size() > 1:
             # all gather and all reduce
-            if self.dp_size != 1:
+            if self.local_dp_size != 1:
                 if self.attn_tp_rank == 0:
                     hidden_states += residual
                 hidden_states, local_hidden_states = (
@@ -1197,7 +1196,7 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         # TODO(ch-wan): ues reduce-scatter in MLP to avoid this scatter
         # Scatter
-        if self.dp_size != 1:
+        if self.local_dp_size != 1:
             # important: forward batch.gathered_buffer is used both after scatter and after gather.
             # be careful about this!
             hidden_states, global_hidden_states = (
@@ -1341,8 +1340,6 @@ class DeepseekV2Model(nn.Module):
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        self.dp_size = get_attention_dp_size()
-
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -1411,10 +1408,9 @@ class DeepseekV2ForCausalLM(nn.Module):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
-            enable_tp=not _enable_moe_dense_fully_dp(),
+            enable_tp=not _enable_moe_dense_fully_dp(), # TODO: replace it with DP attention
         )
         self.logits_processor = LogitsProcessor(config)
-        self.dp_size = get_attention_dp_size()
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
