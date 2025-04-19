@@ -345,7 +345,6 @@ def parse_open_response(response):
             return [response]
         return key_responses
 
-    # pdb.set_trace()
     key_responses = get_key_subresponses(response)
 
     pred_list = key_responses.copy()  # keep the original string response
@@ -528,7 +527,6 @@ def eval_result(model_answer_path, answer_dict):
         evaluation_result[category] = metric_dict
 
     printable_results = {}
-    # pdb.set_trace()
     # add domain Subject
     for domain, in_domain_cats in DOMAIN_CAT2SUB_CAT.items():
         in_domain_cat_results = {}

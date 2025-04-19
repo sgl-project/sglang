@@ -17,7 +17,10 @@ import torch
 
 from sglang.global_config import global_config
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
+from sglang.srt.layers.attention.utils import (
+    create_causal_mask_from_page_triton,
+    create_flashinfer_kv_indices_triton,
+)
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
@@ -32,6 +35,7 @@ if is_flashinfer_available():
         BatchDecodeWithPagedKVCacheWrapper,
         BatchPrefillWithPagedKVCacheWrapper,
         BatchPrefillWithRaggedKVCacheWrapper,
+        PODWithPagedKVCacheWrapper,
     )
     from flashinfer.cascade import merge_state
     from flashinfer.decode import _get_range_buf, get_seq_lens
@@ -53,6 +57,14 @@ class PrefillMetadata:
     use_ragged: bool
     extend_no_prefix: bool
 
+    # POD Attention
+    use_pod: Optional[bool] = False
+    pod_wrappers: Optional[List[PODWithPagedKVCacheWrapper]] = None
+    num_decode_reqs: Optional[torch.Tensor] = 0
+    prefill_qo_indptr: Optional[torch.Tensor] = None  # output seqlens
+    prefill_kv_indptr: Optional[torch.Tensor] = None
+    prefill_kv_indices: Optional[torch.Tensor] = None  # page to kv indices
+
 
 # Reuse this workspace buffer across all flashinfer wrappers
 global_workspace_buffer = None
@@ -67,6 +79,7 @@ class FlashInferAttnBackend(AttentionBackend):
         skip_prefill: bool = False,
         kv_indptr_buf: Optional[torch.Tensor] = None,
         kv_last_page_len_buf: Optional[torch.Tensor] = None,
+        enable_pd_colocation: Optional[bool] = False,
     ):
         super().__init__()
 
@@ -84,6 +97,22 @@ class FlashInferAttnBackend(AttentionBackend):
         self.is_multimodal = model_runner.model_config.is_multimodal
         self.kv_cache_dtype = model_runner.kv_cache_dtype
         self.kv_cache_dtype_str = model_runner.server_args.kv_cache_dtype
+
+        self.enable_pd_colocation = enable_pd_colocation
+
+        # track these for 2D mask fill kernel to avoid recompilation
+        # TODO(Wenxuan) shrink down to avoid outliers?
+        self.max_req_input_len = 0
+        self.max_cu_qo_len = 0
+        self.max_cu_kv_len = 0
+        self.mask_p = None
+        if enable_pd_colocation:
+            assert (
+                not self.is_multimodal
+            ), "PD colocation doesn't support multimodal models"
+            assert (
+                model_runner.sliding_window_size is None
+            ), "PD colocation only supports vanilla attention for now"
 
         assert not (
             model_runner.sliding_window_size is not None
@@ -152,9 +181,17 @@ class FlashInferAttnBackend(AttentionBackend):
         # Using two wrappers is unnecessary in the current PR, but are prepared for future PRs
         self.prefill_wrappers_paged = []
         self.prefill_wrappers_verify = []
+        self.prefill_wrappers_pod = []
         self.decode_wrappers = []
         for _ in range(self.num_wrappers):
             if not skip_prefill:
+                if self.enable_pd_colocation:
+                    self.prefill_wrappers_pod.append(
+                        PODWithPagedKVCacheWrapper(
+                            self.workspace_buffer,
+                            "NHD",
+                        )
+                    )
                 self.prefill_wrappers_paged.append(
                     BatchPrefillWithPagedKVCacheWrapper(
                         self.workspace_buffer,
@@ -229,27 +266,46 @@ class FlashInferAttnBackend(AttentionBackend):
                 self.prefill_wrappers_verify, False, False
             )
         else:
+            # Normal prefill
             prefix_lens = forward_batch.extend_prefix_lens
-
             if self.is_multimodal:
                 use_ragged = False
                 extend_no_prefix = False
+            elif self.enable_pd_colocation:
+                use_ragged = False
+                extend_no_prefix = False
             else:
-                use_ragged = True
+                # use_ragged = True
+                use_ragged = False  # debug
                 extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
 
+            seq_lens = forward_batch.seq_lens
+            req_pool_indices = forward_batch.req_pool_indices
+            seq_lens_sum = forward_batch.seq_lens_sum
+            self.forward_metadata = PrefillMetadata(
+                self.prefill_wrappers_paged, use_ragged, extend_no_prefix
+            )
+
+            # Split prefill and decode batches because prefill is non-paged for POD Attn
+            if self.enable_pd_colocation and forward_batch.num_decode_reqs > 0:
+                self.forward_metadata.use_pod = True
+                self.forward_metadata.num_decode_reqs = forward_batch.num_decode_reqs
+                self.forward_metadata.pod_wrappers = self.prefill_wrappers_pod
+
             self.indices_updater_prefill.update(
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                forward_batch.seq_lens_sum,
+                req_pool_indices,
+                seq_lens,
+                seq_lens_sum,
                 prefix_lens,
-                prefill_wrappers=self.prefill_wrappers_paged,
+                prefill_wrappers=(
+                    self.prefill_wrappers_paged
+                    if not self.forward_metadata.use_pod
+                    else self.prefill_wrappers_pod
+                ),
                 use_ragged=use_ragged,
                 encoder_lens=forward_batch.encoder_lens,
                 spec_info=None,
-            )
-            self.forward_metadata = PrefillMetadata(
-                self.prefill_wrappers_paged, use_ragged, extend_no_prefix
+                forward_metadata=self.forward_metadata,
             )
 
     def init_cuda_graph_state(
@@ -406,9 +462,7 @@ class FlashInferAttnBackend(AttentionBackend):
             if not layer.is_cross_attention
             else forward_batch.encoder_out_cache_loc
         )
-
         logits_soft_cap = layer.logit_cap
-
         if not self.forward_metadata.use_ragged:
             if k is not None:
                 assert v is not None
@@ -417,29 +471,110 @@ class FlashInferAttnBackend(AttentionBackend):
                         layer, cache_loc, k, v, k_scale, v_scale
                     )
 
-            o = prefill_wrapper_paged.forward(
-                q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
-                causal=not layer.is_cross_attention,
-                sm_scale=layer.scaling,
-                window_left=layer.sliding_window_size,
-                logits_soft_cap=logits_soft_cap,
-                k_scale=k_scale,
-                v_scale=v_scale,
-            )
-        else:
-            o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(
-                q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                k.view(-1, layer.tp_k_head_num, layer.head_dim),
-                v.view(-1, layer.tp_v_head_num, layer.head_dim),
-                causal=True,
-                sm_scale=layer.scaling,
-                logits_soft_cap=logits_soft_cap,
-            )
+            if self.enable_pd_colocation and self.forward_metadata.num_decode_reqs > 0:
+                pod_wrapper = self.forward_metadata.pod_wrappers[
+                    self._get_wrapper_idx(layer)
+                ]
+                q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+                bs = forward_batch.req_pool_indices.shape[0]
+                bs_p = bs - forward_batch.num_decode_reqs
+                # Fetch prefill kv cache from the pool
+                k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
+                    layer.layer_id
+                )
+                kv_indices_p = self.forward_metadata.prefill_kv_indices
+                kv_indptr_p = self.forward_metadata.prefill_kv_indptr
+                qo_indptr_p = self.forward_metadata.prefill_qo_indptr
+                max_cu_qo_len = qo_indptr_p[-1]
+                max_cu_kv_len = kv_indptr_p[-1]
+                kv_pool_indices_p = kv_indices_p[: kv_indptr_p[-1]]
+                # TODO(Wenxuan) Handle last_page_len for page size > 1 here
 
-            if self.forward_metadata.extend_no_prefix:
-                o = o1
+                k_cache_p = k_cache[
+                    kv_pool_indices_p
+                ]  # TODO(Wenxuan) de-duplicate the kv cache when reqs share prefix?
+                v_cache_p = v_cache[kv_pool_indices_p]
+                q_p = q[: qo_indptr_p[-1]]
+                q_d = q[qo_indptr_p[-1] :]
+                max_kv_len = forward_batch.seq_lens.max()
+
+                if self.max_req_input_len < max_kv_len * 2:
+                    max_kv_len = next_power_of_2(max_kv_len.item())
+                    if max_kv_len > self.max_req_input_len:
+                        self.max_req_input_len = max_kv_len
+
+                if (
+                    self.max_cu_qo_len < max_cu_qo_len
+                    or self.max_cu_kv_len < max_cu_kv_len
+                ):
+                    self.mask_p = torch.zeros(
+                        max_cu_qo_len, max_cu_kv_len, dtype=torch.bool, device=q.device
+                    )
+                    if self.max_cu_qo_len < max_cu_qo_len:
+                        self.max_cu_qo_len = max_cu_qo_len
+                    if self.max_cu_kv_len < max_cu_kv_len:
+                        self.max_cu_kv_len = max_cu_kv_len
+                # launch bs times more blocks, because we can't pass in bs
+                # as constexpr, or any change in bs triggers recompilation
+                create_causal_mask_from_page_triton[(max_cu_qo_len, bs_p)](
+                    self.mask_p,
+                    qo_indptr_p,
+                    kv_indptr_p,
+                    forward_batch.extend_prefix_lens,
+                    stride_mask_qo=self.mask_p.stride(0),
+                    # max_kv_len_per_req=next_power_of_2(forward_batch.max_req_input_len),
+                    max_kv_len_per_req=self.max_req_input_len,
+                )
+
+                o_p, o_d = pod_wrapper.run(
+                    q_p,
+                    k_cache_p,
+                    v_cache_p,
+                    q_d,
+                    paged_kv_cache_d=(k_cache, v_cache),
+                    custom_mask_p=self.mask_p,
+                    causal_d=True,
+                    causal_p=True,
+                    # TODO
+                    # logits_soft_cap_p=layer.logit_cap,
+                    # logits_soft_cap_d=layer.logit_cap,
+                    # window_left_p=layer.sliding_window_size,
+                    # window_left_d=layer.sliding_window_size,
+                    # sm_scale_p=layer.scaling,
+                    # sm_scale_d=layer.scaling,
+                )
+                o = torch.cat([o_p, o_d], dim=0)
             else:
+                o = prefill_wrapper_paged.forward(
+                    q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+                    causal=not layer.is_cross_attention,
+                    sm_scale=layer.scaling,
+                    window_left=layer.sliding_window_size,
+                    logits_soft_cap=logits_soft_cap,
+                    k_scale=layer.k_scale,
+                    v_scale=layer.v_scale,
+                )
+        else:
+            if self.forward_metadata.extend_no_prefix:
+                # no paged kv cache
+                o = self.prefill_wrapper_ragged.forward(
+                    q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                    k.view(-1, layer.tp_k_head_num, layer.head_dim),
+                    v.view(-1, layer.tp_v_head_num, layer.head_dim),
+                    causal=True,
+                    sm_scale=layer.scaling,
+                    logits_soft_cap=logits_soft_cap,
+                )
+            else:
+                o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(
+                    q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                    k.view(-1, layer.tp_k_head_num, layer.head_dim),
+                    v.view(-1, layer.tp_v_head_num, layer.head_dim),
+                    causal=True,
+                    sm_scale=layer.scaling,
+                    logits_soft_cap=logits_soft_cap,
+                )
                 o2, s2 = prefill_wrapper_paged.forward_return_lse(
                     q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
@@ -703,6 +838,8 @@ class FlashInferIndicesUpdaterPrefill:
         self.qo_indptr = attn_backend.qo_indptr
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.prefill_wrapper_ragged = attn_backend.prefill_wrapper_ragged
+        if attn_backend.enable_pd_colocation:
+            self.pod_wrapper = attn_backend.prefill_wrappers_pod
 
         # Dispatch the update function
         if self.attn_backend.dispatch_reason == WrapperDispatch.SLIDING_WINDOW:
@@ -723,6 +860,7 @@ class FlashInferIndicesUpdaterPrefill:
         use_ragged: bool,
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        forward_metadata: Optional[PrefillMetadata] = None,
     ):
         # Keep the signature for type checking. It will be assigned during runtime.
         raise NotImplementedError()
@@ -733,14 +871,19 @@ class FlashInferIndicesUpdaterPrefill:
         seq_lens: torch.Tensor,
         seq_lens_sum: int,
         prefix_lens: torch.Tensor,
-        prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper],
+        prefill_wrappers: List[
+            Union[BatchPrefillWithPagedKVCacheWrapper, PODWithPagedKVCacheWrapper]
+        ],
         use_ragged: bool,
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        forward_metadata: Optional[PrefillMetadata] = None,
     ):
         if use_ragged:
             paged_kernel_lens = prefix_lens
-            paged_kernel_lens_sum = paged_kernel_lens.sum().item()
+            paged_kernel_lens_sum = (
+                paged_kernel_lens.sum().to(device="cpu", non_blocking=True).item()
+            )
         else:
             paged_kernel_lens = seq_lens
             paged_kernel_lens_sum = seq_lens_sum
@@ -758,6 +901,7 @@ class FlashInferIndicesUpdaterPrefill:
             self.qo_indptr[0],
             use_ragged,
             spec_info,
+            forward_metadata,
         )
 
     def update_sliding_window(
@@ -770,6 +914,7 @@ class FlashInferIndicesUpdaterPrefill:
         use_ragged: bool,
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        forward_metadata: Optional[PrefillMetadata] = None,
     ):
         for wrapper_id in range(2):
             if wrapper_id == 0:
@@ -811,6 +956,7 @@ class FlashInferIndicesUpdaterPrefill:
         use_ragged: bool,
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        forward_metadata: Optional[PrefillMetadata] = None,
     ):
         for wrapper_id in range(2):
             if wrapper_id == 0:
@@ -842,7 +988,9 @@ class FlashInferIndicesUpdaterPrefill:
     def call_begin_forward(
         self,
         wrapper_ragged: BatchPrefillWithRaggedKVCacheWrapper,
-        wrapper_paged: BatchPrefillWithPagedKVCacheWrapper,
+        wrapper_paged: Union[
+            BatchPrefillWithPagedKVCacheWrapper, PODWithPagedKVCacheWrapper
+        ],
         req_pool_indices: torch.Tensor,
         paged_kernel_lens: torch.Tensor,
         paged_kernel_lens_sum: int,
@@ -853,14 +1001,15 @@ class FlashInferIndicesUpdaterPrefill:
         qo_indptr: torch.Tensor,
         use_ragged: bool,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        forward_metadata: Optional[PrefillMetadata] = None,
     ):
         bs = len(seq_lens)
         if spec_info is None:
             assert len(seq_lens) == len(req_pool_indices)
             # Normal extend
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
-            kv_indptr = kv_indptr[: bs + 1]
-            kv_indices = torch.empty(
+            kv_indptr = kv_indptr[: bs + 1]  # cumulative page ranges for each req
+            kv_indices = torch.empty(  # page to kv indices
                 paged_kernel_lens_sum + 256,
                 dtype=torch.int32,
                 device=req_pool_indices.device,
@@ -889,9 +1038,35 @@ class FlashInferIndicesUpdaterPrefill:
                     self.req_to_token,
                 )
             )
+        if forward_metadata.use_pod:
+            num_prefill_reqs = bs - forward_metadata.num_decode_reqs
+            # TODO(Wenxuan) avoid cat and allocate one more slot at the beginning?
+            decode_kv_indptr = torch.cat(
+                [
+                    torch.tensor([0], device=kv_indptr.device, dtype=kv_indptr.dtype),
+                    kv_indptr[num_prefill_reqs + 1 : bs + 1],
+                ]
+            )
+            forward_metadata.prefill_kv_indptr = kv_indptr[: num_prefill_reqs + 1]
+            forward_metadata.prefill_qo_indptr = qo_indptr[: num_prefill_reqs + 1]
+            forward_metadata.prefill_kv_indices = kv_indices
 
-        # extend part
-        if use_ragged:
+            # set page indices for decode
+            wrapper_paged.begin_forward(
+                decode_kv_indptr,
+                kv_indices,
+                self.kv_last_page_len[num_prefill_reqs:bs],
+                self.num_qo_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                1,
+                q_data_type=self.q_data_type,
+                kv_data_type=self.data_type,
+                non_blocking=True,
+            )
+
+        elif use_ragged:
+            # extend part
             wrapper_ragged.begin_forward(
                 qo_indptr,
                 qo_indptr,
@@ -900,22 +1075,23 @@ class FlashInferIndicesUpdaterPrefill:
                 self.head_dim,
                 q_data_type=self.q_data_type,
             )
-
-        # cached part
-        wrapper_paged.begin_forward(
-            qo_indptr,
-            kv_indptr,
-            kv_indices,
-            self.kv_last_page_len[:bs],
-            self.num_qo_heads,
-            self.num_kv_heads,
-            self.head_dim,
-            1,
-            q_data_type=self.q_data_type,
-            kv_data_type=self.data_type,
-            custom_mask=custom_mask,
-            non_blocking=True,
-        )
+        else:
+            # Normal prefill kernel
+            # cached part
+            wrapper_paged.begin_forward(
+                qo_indptr,
+                kv_indptr,
+                kv_indices,
+                self.kv_last_page_len[:bs],
+                self.num_qo_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                1,
+                q_data_type=self.q_data_type,
+                kv_data_type=self.data_type,
+                custom_mask=custom_mask,
+                non_blocking=True,
+            )
 
 
 # Use as a fast path to override the indptr in flashinfer's plan function

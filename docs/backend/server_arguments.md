@@ -102,7 +102,7 @@ Please consult the documentation below to learn more about the parameters you ma
 * `chunked_prefill_size`: Perform the prefill in chunks of these size. Larger chunk size speeds up the prefill phase but increases the VRAM consumption. If CUDA runs out of memory, it should be decreased.
 * `max_prefill_tokens`: Token budget of how many tokens to accept in one prefill batch. The actual number is the max of this parameter and the `context_length`.
 * `schedule_policy`: The scheduling policy to control the processing order of waiting prefill requests in a single engine.
-* `schedule_conservativeness`: Can be used to decrease/increase the conservativeness of the server when taking new requests. Highly conservative behavior leads to starvation, but low conservativeness leads to slowed-down performance.
+* `schedule_conservativeness`: Sets the conservativeness of the server when taking new requests. Highly conservative behavior (encourages decoding more tokens for running requests) leads to starvation, but low conservativeness leads to slowed-down performance.
 * `cpu_offload_gb`: Reserve this amount of RAM in GB for offloading of model parameters to the CPU.
 
 ## Other runtime options
