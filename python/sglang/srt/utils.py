@@ -635,6 +635,15 @@ def assert_pkg_version(pkg: str, min_version: str, message: str):
         )
 
 
+def resolve_obj_by_qualname(qualname: str) -> Any:
+    """
+    Resolve an object by its fully qualified name.
+    """
+    module_name, obj_name = qualname.rsplit(".", 1)
+    module = importlib.import_module(module_name)
+    return getattr(module, obj_name)
+
+
 def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = None):
     """Kill the process and all its child processes."""
     # Remove sigchld handler to avoid spammy logs.
@@ -1043,107 +1052,11 @@ def bind_port(port):
     return sock
 
 
-def get_amdgpu_memory_capacity():
-    try:
-        # Run rocm-smi and capture the output
-        result = subprocess.run(
-            [
-                "rocminfo | grep 'gfx' -A 100 | grep 'Pool 1' -A 5 | grep 'Size:' | awk '{print $2}'"
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            shell=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"rocm-smi error: {result.stderr.strip()}")
-
-        # Parse the output to extract memory values in MiB
-        memory_values = [
-            float(mem.split("(")[0].strip()) / 1024
-            for mem in result.stdout.strip().split("\n")
-        ]
-
-        if not memory_values:
-            raise ValueError("No GPU memory values found.")
-
-        # Return the minimum memory value
-        return min(memory_values)
-
-    except FileNotFoundError:
-        raise RuntimeError(
-            "rocm-smi not found. Ensure AMD ROCm drivers are installed and accessible."
-        )
-
-
 def get_device_sm():
     if torch.cuda.is_available():
         major, minor = torch.cuda.get_device_capability()
         return major * 10 + minor
     return 0
-
-
-def get_nvgpu_memory_capacity():
-    try:
-        # Run nvidia-smi and capture the output
-        result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-
-        if result.returncode != 0:
-            raise RuntimeError(f"nvidia-smi error: {result.stderr.strip()}")
-
-        # Parse the output to extract memory values
-        memory_values = [
-            float(mem)
-            for mem in result.stdout.strip().split("\n")
-            if re.match(r"^\d+(\.\d+)?$", mem.strip())
-        ]
-
-        if not memory_values:
-            raise ValueError("No GPU memory values found.")
-
-        # Return the minimum memory value
-        return min(memory_values)
-
-    except FileNotFoundError:
-        raise RuntimeError(
-            "nvidia-smi not found. Ensure NVIDIA drivers are installed and accessible."
-        )
-
-
-def get_hpu_memory_capacity():
-    try:
-        # Run hl-smi and capture the output
-        result = subprocess.run(
-            ["hl-smi --query | grep 'Total'"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            shell=True,
-            text=True,
-        )
-
-        if result.returncode != 0:
-            raise RuntimeError(f"hl-smi error: {result.stderr.strip()}")
-
-        # Parse the output to extract memory values in MiB
-        memory_values = [
-            float(mem.split(" ")[-2]) for mem in result.stdout.strip().split("\n")
-        ]
-
-        if not memory_values:
-            raise ValueError("No GPU memory values found.")
-
-        # Return the minimum memory value
-        return min(memory_values)
-
-    except FileNotFoundError:
-        raise RuntimeError(
-            "hl-smi not found. Ensure Habana drivers are installed and accessible."
-        )
 
 
 # Copy from pytorch and OpenRLHF to allow creating multiple main groups.
@@ -1242,34 +1155,6 @@ def get_device_name(device_id: int = 0) -> str:
 @lru_cache(maxsize=1)
 def is_habana_available() -> bool:
     return find_spec("habana_frameworks") is not None
-
-
-@lru_cache(maxsize=8)
-def get_device(device_id: Optional[int] = None) -> str:
-    if hasattr(torch, "cuda") and torch.cuda.is_available():
-        if device_id is None:
-            return "cuda"
-        return "cuda:{}".format(device_id)
-
-    if hasattr(torch, "xpu") and torch.xpu.is_available():
-        if device_id == None:
-            return "xpu"
-        return "xpu:{}".format(device_id)
-
-    if is_habana_available():
-        try:
-            import habana_frameworks.torch.hpu
-
-            if torch.hpu.is_available():
-                if device_id == None:
-                    return "hpu"
-                return "hpu:{}".format(device_id)
-        except ImportError as e:
-            raise ImportError(
-                "Habana frameworks detected, but failed to import 'habana_frameworks.torch.hpu'."
-            )
-
-    raise RuntimeError("No accelerator (CUDA, XPU, HPU) is available.")
 
 
 @lru_cache(maxsize=1)
