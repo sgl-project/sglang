@@ -55,9 +55,9 @@ import torch.distributed
 import torch.distributed as dist
 import triton
 import zmq
+from PIL import Image
 from fastapi.responses import ORJSONResponse
 from packaging import version as pkg_version
-from PIL import Image
 from starlette.routing import Mount
 from torch import nn
 from torch.func import functional_call
@@ -1934,9 +1934,13 @@ def is_fa3_default_architecture(hf_config):
     return architectures[0] in default_archs
 
 
+# Can be more general if it is used in multiple places (keep it simple and thus not general now)
 class BumpAllocator:
-    def __init__(self):
-        self._buffer = TODO
+    def __init__(self, buffer_size: int, dtype, device):
+        self._buffer = torch.zeros((buffer_size,), dtype=dtype, device=device)
+        self._pointer = 0
 
     def allocate(self):
-        return TODO
+        output = self._buffer[self._pointer:self._pointer + 1]
+        self._pointer += 1
+        return output
