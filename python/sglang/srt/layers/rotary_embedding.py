@@ -11,10 +11,11 @@ from sglang.srt.custom_op import CustomOp
 from sglang.srt.utils import is_cuda_available
 
 _is_cuda_available = is_cuda_available()
+
 if _is_cuda_available:
     from sgl_kernel import apply_rope_with_cos_sin_cache_inplace
 else:
-    from vllm import _custom_ops as ops
+    from vllm._custom_ops import rotary_embedding as vllm_rotary_embedding
 
 
 def _rotate_neox(x: torch.Tensor) -> torch.Tensor:
@@ -159,7 +160,7 @@ class RotaryEmbedding(CustomOp):
             )
         else:
             self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
-            ops.rotary_embedding(
+            vllm_rotary_embedding(
                 positions,
                 query,
                 key,

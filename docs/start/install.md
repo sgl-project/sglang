@@ -11,7 +11,7 @@ It is recommended to use uv to install the dependencies for faster installation:
 ```bash
 pip install --upgrade pip
 pip install uv
-uv pip install "sglang[all]>=0.4.5.post1" --find-links https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python
+uv pip install "sglang[all]>=0.4.5.post1"
 ```
 
 **Quick Fixes to Common Problems**
@@ -23,7 +23,7 @@ uv pip install "sglang[all]>=0.4.5.post1" --find-links https://flashinfer.ai/whl
   1. Use `export CUDA_HOME=/usr/local/cuda-<your-cuda-version>` to set the `CUDA_HOME` environment variable.
   2. Install FlashInfer first following [FlashInfer installation doc](https://docs.flashinfer.ai/installation.html), then install SGLang as described above.
 
-- If you encounter `ImportError; cannot import name 'is_valid_list_of_images' from 'transformers.models.llama.image_processing_llama'`, try to use the specified version of `transformers` in [pyproject.toml](https://github.com/sgl-project/sglang/blob/main/python/pyproject.toml). Currently, just running `pip install transformers==4.48.3`.
+- If you encounter `ImportError; cannot import name 'is_valid_list_of_images' from 'transformers.models.llama.image_processing_llama'`, try to use the specified version of `transformers` in [pyproject.toml](https://github.com/sgl-project/sglang/blob/main/python/pyproject.toml). Currently, just running `pip install transformers==4.51.1`.
 
 ## Method 2: From source
 
@@ -33,7 +33,7 @@ git clone -b v0.4.5.post1 https://github.com/sgl-project/sglang.git
 cd sglang
 
 pip install --upgrade pip
-pip install -e "python[all]" --find-links https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python
+pip install -e "python[all]"
 ```
 
 Note: SGLang currently uses torch 2.5, so you need to install flashinfer for torch 2.5. If you want to install flashinfer separately, please refer to [FlashInfer installation doc](https://docs.flashinfer.ai/installation.html).

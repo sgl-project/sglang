@@ -13,7 +13,6 @@
 # ==============================================================================
 
 import math
-import os
 from typing import Callable, Optional
 
 import torch
@@ -28,6 +27,10 @@ _is_hip = is_hip()
 
 if _is_cuda:
     from sgl_kernel import moe_fused_gate
+
+if _is_cuda or _is_hip:
+    from sgl_kernel import topk_softmax
+
 
 expert_distribution_recorder = ExpertDistributionRecorder()
 
@@ -59,11 +62,6 @@ def fused_topk(
     topk: int,
     renormalize: bool,
 ):
-    if _is_cuda or _is_hip:
-        from sgl_kernel import topk_softmax
-    else:
-        from vllm import _custom_ops as vllm_ops
-
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
     M, _ = hidden_states.shape
@@ -76,20 +74,12 @@ def fused_topk(
         M, topk, dtype=torch.int32, device=hidden_states.device
     )
 
-    if _is_cuda or _is_hip:
-        topk_softmax(
-            topk_weights,
-            topk_ids,
-            token_expert_indicies,
-            gating_output.float(),
-        )
-    else:
-        vllm_ops.topk_softmax(
-            topk_weights,
-            topk_ids,
-            token_expert_indicies,
-            gating_output.float(),
-        )
+    topk_softmax(
+        topk_weights,
+        topk_ids,
+        token_expert_indicies,
+        gating_output.float(),
+    )
     del token_expert_indicies
 
     if renormalize:
@@ -230,6 +220,8 @@ def biased_grouped_topk(
     # TODO: moe_fused_gate kernel is not supported for n_share_experts_fusion > 0 now.
     if (
         _is_cuda
+        and gating_output.shape[1] // num_expert_group
+        <= 32  # moe_fused_gate kernel ensure that num_experts/num_expert_group does not exceed MAX_VPT=32 now. And when kernel can handle MAX_VPT > 32, we can remove this assertion.
         and n_share_experts_fusion == 0
         and is_power_of_two(correction_bias.shape[0])
     ):

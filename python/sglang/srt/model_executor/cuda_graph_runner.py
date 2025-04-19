@@ -37,10 +37,10 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.patch_torch import monkey_patch_torch_compile
 from sglang.srt.utils import get_available_gpu_memory, is_hip
 
-_is_hip = is_hip()
-
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
+
+_is_hip = is_hip()
 
 
 def _to_torch(model: torch.nn.Module, reverse: bool, num_tokens: int):

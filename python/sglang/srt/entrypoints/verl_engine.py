@@ -12,18 +12,17 @@
 # limitations under the License.
 # ==============================================================================
 import os
-from typing import Dict, List, Literal, Optional, Tuple, Union
+from typing import Dict, Iterable, List, Literal, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
 from PIL.Image import Image
 from torch.distributed.tensor import DeviceMesh, DTensor
 
+from sglang.srt.entrypoints.engine import Engine
 from sglang.srt.entrypoints.http_server_engine import HttpServerEngineAdapter
 from sglang.srt.model_executor.model_runner import LocalSerializedTensor
 from sglang.srt.patch_torch import monkey_patch_torch_reductions
-from sglang.srt.server import Engine
-from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj
 
 
@@ -125,7 +124,7 @@ class VerlEngine:
 
     def update_weights_from_tensor(
         self,
-        named_tensors: List[Tuple[str, torch.Tensor]],
+        named_tensors: Iterable[Tuple[str, torch.Tensor]],
         load_format: Optional[str] = None,
     ):
         # Most naive implementation, can optimize a lot if it is bottleneck
@@ -154,8 +153,11 @@ class VerlEngine:
                         )
                     ],
                     load_format=load_format,
-                    flush_cache=tensor_index == len(named_tensors) - 1,
+                    flush_cache=False,
                 )
+
+        if self._tp_rank == 0:
+            self._engine.tokenizer_manager.flush_cache()
 
     def release_memory_occupation(self):
         if self._tp_rank == 0:
