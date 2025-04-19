@@ -58,8 +58,8 @@ FetchContent_Populate(repo-deepgemm)
 # flashinfer
 FetchContent_Declare(
     repo-flashinfer
-    GIT_REPOSITORY https://github.com/sgl-project/flashinfer
-    GIT_TAG        sgl-kernel
+    GIT_REPOSITORY https://github.com/flashinfer-ai/flashinfer.git
+    GIT_TAG        9220fb3443b5a5d274f00ca5552f798e225239b7
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-flashinfer)
