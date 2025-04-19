@@ -525,6 +525,7 @@ class ParallelLMHead(VocabParallelEmbedding):
         padding_size: int = DEFAULT_VOCAB_PADDING_SIZE,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        enable_tp: bool = True,
         use_presharded_weights: bool = False,
     ):
         super().__init__(
@@ -535,6 +536,7 @@ class ParallelLMHead(VocabParallelEmbedding):
             padding_size,
             quant_config,
             prefix,
+            enable_tp,
             use_presharded_weights=use_presharded_weights,
         )
         self.quant_config = quant_config

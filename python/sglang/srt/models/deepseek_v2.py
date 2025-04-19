@@ -96,6 +96,9 @@ expert_distribution_recorder = ExpertDistributionRecorder()
 logger = logging.getLogger(__name__)
 
 
+def _enable_moe_dense_fully_dp():
+    return global_server_args_dict["moe_dense_tp_size"] == 1
+
 class AttnForwardMethod(IntEnum):
 
     # Use multi-head attention
@@ -1066,7 +1069,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 prefix=add_prefix("mlp", prefix),
             )
         else:
-            if self._enable_moe_dense_fully_dp():
+            if _enable_moe_dense_fully_dp():
                 mlp_tp_rank, mlp_tp_size = 0, 1
             else:
                 mlp_tp_rank, mlp_tp_size = None, None
@@ -1091,10 +1094,6 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
 
     @staticmethod
-    def _enable_moe_dense_fully_dp():
-        return global_server_args_dict["moe_dense_tp_size"] == 1
-
-    @staticmethod
     def _compute_info(config: PretrainedConfig, layer_id: int, is_nextn: bool):
         is_sparse = is_nextn or (
             config.n_routed_experts is not None
@@ -1104,7 +1103,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         ffn_input_mode = (
             _FFNInputMode.SCATTERED
             if (global_server_args_dict["enable_deepep_moe"] and is_sparse)
-            or (DeepseekV2DecoderLayer._enable_moe_dense_fully_dp() and not is_sparse)
+            or (_enable_moe_dense_fully_dp() and not is_sparse)
             else _FFNInputMode.FULL
         )
         return _DecoderLayerInfo(is_sparse=is_sparse, ffn_input_mode=ffn_input_mode)
@@ -1285,7 +1284,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             logger.info(f"{self.layer_id=} step 3")
 
         if not (
-            self._enable_moe_dense_fully_dp()
+            _enable_moe_dense_fully_dp()
             and (not self.info.is_sparse)
             and hidden_states.shape[0] == 0
         ):
@@ -1412,6 +1411,7 @@ class DeepseekV2ForCausalLM(nn.Module):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
+            enable_tp=not _enable_moe_dense_fully_dp(),
         )
         self.logits_processor = LogitsProcessor(config)
         self.dp_size = get_attention_dp_size()
