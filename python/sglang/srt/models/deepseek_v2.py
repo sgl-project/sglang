@@ -690,6 +690,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         elif self.w_kc.dtype == torch.float8_e4m3fn:
             q_nope_val, q_nope_scale = per_tensor_quant_mla_fp8(
                 q_nope.transpose(0, 1),
+                TODO,
             )
             q_nope_out = bmm_fp8(
                 q_nope_val, self.w_kc, q_nope_scale, self.w_scale, torch.bfloat16
@@ -721,6 +722,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         elif self.w_vc.dtype == torch.float8_e4m3fn:
             attn_output_val, attn_output_scale = per_tensor_quant_mla_fp8(
                 attn_output.transpose(0, 1),
+                TODO,
             )
             attn_bmm_output = bmm_fp8(
                 attn_output_val,
@@ -767,7 +769,9 @@ class DeepseekV2AttentionMLA(nn.Module):
             )
         elif self.w_kc.dtype == torch.float8_e4m3fn:
             q_nope_val, q_nope_scale = per_tensor_quant_mla_fp8(
-                q_nope.transpose(0, 1), dtype=torch.float8_e4m3fn
+                q_nope.transpose(0, 1),
+                TODO,
+                dtype=torch.float8_e4m3fn
             )
             q_nope_out = bmm_fp8(
                 q_nope_val, self.w_kc, q_nope_scale, self.w_scale, torch.bfloat16
@@ -863,7 +867,9 @@ class DeepseekV2AttentionMLA(nn.Module):
             )
         elif self.w_vc.dtype == torch.float8_e4m3fn:
             attn_output_val, attn_output_scale = per_tensor_quant_mla_fp8(
-                attn_output.transpose(0, 1), dtype=torch.float8_e4m3fn
+                attn_output.transpose(0, 1),
+                TODO,
+                dtype=torch.float8_e4m3fn
             )
             attn_bmm_output = bmm_fp8(
                 attn_output_val,
