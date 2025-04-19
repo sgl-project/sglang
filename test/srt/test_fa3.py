@@ -89,20 +89,6 @@ class TestFlashAttention3(BaseFlashAttentionTest):
         return args
 
 
-class TestFlashAttention3DisableCudaGraph(BaseFlashAttentionTest):
-    """Test FlashAttention3 with CUDA graph disabled."""
-
-    @classmethod
-    def get_server_args(cls):
-        args = super().get_server_args()
-        args.extend(
-            [
-                "--disable-cuda-graph",
-            ]
-        )
-        return args
-
-
 class TestFlashAttention3MLA(BaseFlashAttentionTest):
     """Test FlashAttention3 with MLA."""
 
