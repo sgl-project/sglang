@@ -231,7 +231,7 @@ class ModelRunner:
             1. Models with MHA Architecture (e.g: Llama, QWen)
                 1.1 We will turn on FA3 on hopper unless user use spec decode with topk > 1 or page_size > 1.
                 1.2 In other cases, we will use flashinfer if available, otherwise use triton.
-            2. Models with MHA Architecture and using FA3
+            2. Models with MLA Architecture and using FA3
                 2.1 We will use FA3 backend on hopper.
                 2.2 Otherwise, we will use triton backend.
             """
