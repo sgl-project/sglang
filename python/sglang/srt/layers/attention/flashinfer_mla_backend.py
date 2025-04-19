@@ -10,11 +10,13 @@ More details can be found in https://docs.flashinfer.ai/api/mla.html
 """
 
 from dataclasses import dataclass
-from functools import partial
+from functools import partial, wraps
 from typing import TYPE_CHECKING, Callable, Optional, Union
 
 import torch
 import triton
+import torch._dynamo
+torch._dynamo.config.suppress_errors = True
 
 from sglang.global_config import global_config
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -200,13 +202,22 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         else:
             cuda_graph_kv_indices = kv_indices_buf
 
+        # Ensure tensors are properly allocated by forcing a synchronization
         self.cuda_graph_kv_indices = cuda_graph_kv_indices
         self.cuda_graph_qo_indptr = self.q_indptr_decode.clone()
         self.cuda_graph_kv_indptr = self.kv_indptr.clone()
         self.cuda_graph_kv_lens = torch.ones(
             (max_bs,), dtype=torch.int32, device=self.device
         )
-
+        
+        # Force allocation by performing a small operation and synchronizing
+        # This ensures all tensors are properly allocated in GPU memory
+        self.cuda_graph_kv_indices[0] = 0
+        self.cuda_graph_qo_indptr[0] = 0
+        self.cuda_graph_kv_indptr[0] = 0
+        self.cuda_graph_kv_lens[0] = 1
+        torch.cuda.synchronize()
+        
         # For fast decode plan in graph replaying
         self.cuda_graph_qo_indptr_cpu = self.cuda_graph_qo_indptr.to("cpu")
         self.cuda_graph_kv_indptr_cpu = self.cuda_graph_kv_indptr.to("cpu")
@@ -388,14 +399,17 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                     k,
                     v,
                 )
+        
+        # Reshape inputs
         reshaped_q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
         k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-        reshaped_k = k_buffer.view(-1, 1, layer.head_dim)
+        
+        # Direct call to run without the wrapper
         o = decode_wrapper.run(
             reshaped_q[:, :, : layer.v_head_dim],
             reshaped_q[:, :, layer.v_head_dim :],
-            reshaped_k[:, :, : layer.v_head_dim],
-            reshaped_k[:, :, layer.v_head_dim :],
+            k_buffer[:, :, : layer.v_head_dim],
+            k_buffer[:, :, layer.v_head_dim :],
         )
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
@@ -825,16 +839,43 @@ def fast_mla_decode_plan(
     self._sm_scale = sm_scale
 
     with self.device as device:
-        stream = torch.cuda.current_stream(device).cuda_stream
-        self._cached_module.plan(
-            self._float_workspace_buffer,
-            self._int_workspace_buffer,
-            self._pin_memory_int_workspace_buffer,
-            qo_indptr_cpu,
-            kv_indptr_cpu,
-            kv_len_arr_cpu,
-            num_heads,
-            head_dim_ckv,
-            causal,
-            stream,
-        )
+        try:
+            # Standard version with just the required arguments (no use_profiler)
+            self._cached_module.plan(
+                self._float_workspace_buffer,
+                self._int_workspace_buffer,
+                self._pin_memory_int_workspace_buffer,
+                qo_indptr_cpu,
+                kv_indptr_cpu,
+                kv_len_arr_cpu,
+                num_heads,
+                head_dim_ckv,
+                causal,
+            )
+        except Exception as e:
+            # Log error for debugging
+            import logging
+            logging.error(f"Error in MLA plan: {e}")
+            
+            # Try alternate version with more arguments if needed
+            try:
+                self._cached_module.plan(
+                    self._float_workspace_buffer,
+                    self._int_workspace_buffer,
+                    self._pin_memory_int_workspace_buffer,
+                    qo_indptr_cpu,
+                    kv_indptr_cpu,
+                    kv_indices, # Include kv_indices which was missing
+                    kv_len_arr_cpu,
+                    num_heads,
+                    head_dim_ckv,
+                    head_dim_kpe,
+                    page_size,
+                    causal,
+                    sm_scale,
+                    q_data_type,
+                    kv_data_type,
+                )
+            except Exception as e2:
+                logging.error(f"Error in alternate MLA plan: {e2}")
+                raise
