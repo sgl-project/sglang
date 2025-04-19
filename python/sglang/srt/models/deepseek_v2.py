@@ -1471,6 +1471,7 @@ class DeepseekV2ForCausalLM(nn.Module):
 
                         if (
                             _is_cuda
+                            and torch.cuda.get_device_capability()[0] == 9  # is hopper
                             and weight_block_size[0] == 128
                             and weight_block_size[1] == 128
                             and model_dtype == torch.bfloat16
@@ -1505,6 +1506,9 @@ class DeepseekV2ForCausalLM(nn.Module):
                         torch.bfloat16
                     )
 
+            w_kc, w_vc = w.unflatten(
+                0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
+            ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
             if not use_deep_gemm_bmm:
                 self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
                 self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
@@ -1516,11 +1520,11 @@ class DeepseekV2ForCausalLM(nn.Module):
                     if _is_hip:
                         self_attn.w_scale *= 2.0
             else:
-                num_tile_k = self_attn.qk_nope_head_dim // weight_block_size[1]
-                num_tile_n = self_attn.v_head_dim // weight_block_size[0]
+                num_tiles_k = self_attn.qk_nope_head_dim // weight_block_size[1]
+                num_tiles_n = self_attn.v_head_dim // weight_block_size[0]
                 ws_kc, ws_vc = block_scale.unflatten(
-                    0, (-1, (num_tile_k + num_tile_n))
-                ).split([num_tile_k, num_tile_n], dim=1)
+                    0, (-1, (num_tiles_k + num_tiles_n))
+                ).split([num_tiles_k, num_tiles_n], dim=1)
                 self_attn.w_scale_k = ws_kc.transpose(1, 2).contiguous()
                 self_attn.w_scale_v = ws_vc.contiguous()
                 self_attn.w_kc = w_kc.transpose(1, 2).contiguous()
