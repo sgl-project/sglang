@@ -231,15 +231,19 @@ async def handle_generate_request(request_data: dict):
         )
 
 
-_next_bootstrap_room = 0
-
-
 def _generate_bootstrap_room():
-    global _next_bootstrap_room
-    ans = _next_bootstrap_room
-    _next_bootstrap_room += 1
-    print(f"HACK _generate_bootstrap_room use sequential value {ans=}")
-    return ans
+    return random.randint(0, 2 ** 63 - 1)
+
+
+# _next_bootstrap_room = 0
+#
+#
+# def _generate_bootstrap_room():
+#     global _next_bootstrap_room
+#     ans = _next_bootstrap_room
+#     _next_bootstrap_room += 1
+#     print(f"HACK _generate_bootstrap_room use sequential value {ans=}")
+#     return ans
 
 
 # We may utilize `GenerateReqInput`'s logic later
