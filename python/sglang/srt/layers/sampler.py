@@ -100,16 +100,19 @@ class Sampler(nn.Module):
                         probs, sampling_info.min_ps
                     )
                 else:
-                    batch_next_token_ids = top_k_top_p_sampling_from_probs(
-                        probs,
-                        sampling_info.top_ks,
-                        sampling_info.top_ps,
-                        filter_apply_order="joint",
-                    )
-
-                    if self.use_nan_detection:
+                    try:
+                        batch_next_token_ids = top_k_top_p_sampling_from_probs(
+                            probs,
+                            sampling_info.top_ks,
+                            sampling_info.top_ps,
+                            filter_apply_order="joint",
+                            check_nan=self.use_nan_detection,
+                        )
+                    except ValueError:
                         logger.warning("Detected errors during sampling!")
-                        batch_next_token_ids.zero_()
+                        batch_next_token_ids = torch.zeros(
+                            (probs.size(0),), device=probs.device
+                        )
 
             elif global_server_args_dict["sampling_backend"] == "pytorch":
                 # A slower fallback implementation with torch native operations.
