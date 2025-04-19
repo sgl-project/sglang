@@ -105,8 +105,11 @@ class Sampler(nn.Module):
                         sampling_info.top_ks,
                         sampling_info.top_ps,
                         filter_apply_order="joint",
-                        check_nan=self.use_nan_detection,
                     )
+
+                    if self.use_nan_detection:
+                        logger.warning("Detected errors during sampling!")
+                        batch_next_token_ids.zero_()
 
             elif global_server_args_dict["sampling_backend"] == "pytorch":
                 # A slower fallback implementation with torch native operations.
