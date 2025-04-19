@@ -3,7 +3,6 @@ Minimal HTTP load balancer for prefill and decode servers for testing.
 """
 
 import asyncio
-import os
 import random
 import urllib
 from itertools import chain
@@ -19,53 +18,9 @@ class MiniLoadBalancer:
     def __init__(self, prefill_servers, decode_servers):
         self.prefill_servers = prefill_servers
         self.decode_servers = decode_servers
-        self.profiling = False
-
-        profile_dir = os.getenv("SGLANG_TORCH_PROFILER_DIR", "./tmp")
-        os.makedirs(profile_dir, exist_ok=True)
 
     def select_pair(self):
         return random.choice(self.prefill_servers), random.choice(self.decode_servers)
-
-    async def start_profile(self):
-        """Start profiling on all servers."""
-        if self.profiling:
-            return {"success": False, "message": "Profiling is already in progress"}
-
-        self.profiling = True
-        async with aiohttp.ClientSession() as session:
-            tasks = []
-            for server in chain(self.prefill_servers, self.decode_servers):
-                tasks.append(session.post(f"{server}/start_profile"))
-
-            responses = await asyncio.gather(*tasks)
-            success = all(response.status == 200 for response in responses)
-            return {
-                "success": success,
-                "message": (
-                    "Profiling started" if success else "Failed to start profiling"
-                ),
-            }
-
-    async def stop_profile(self):
-        """Stop profiling on all servers."""
-        if not self.profiling:
-            return {"success": False, "message": "Profiling is not in progress"}
-
-        self.profiling = False
-        async with aiohttp.ClientSession() as session:
-            tasks = []
-            for server in chain(self.prefill_servers, self.decode_servers):
-                tasks.append(session.post(f"{server}/stop_profile"))
-
-            responses = await asyncio.gather(*tasks)
-            success = all(response.status == 200 for response in responses)
-            return {
-                "success": success,
-                "message": (
-                    "Profiling stopped" if success else "Failed to stop profiling"
-                ),
-            }
 
     async def generate(
         self, modified_request, prefill_server, decode_server
@@ -206,24 +161,12 @@ async def handle_generate_request(request_data: dict):
     parsed_url = urllib.parse.urlparse(prefill_server)
     hostname = parsed_url.hostname
     modified_request = request_data.copy()
-
-    batch_size = _get_request_batch_size(modified_request)
-    if batch_size is not None:
-        modified_request.update(
-            {
-                "bootstrap_host": [hostname] * batch_size,
-                "bootstrap_room": [
-                    _generate_bootstrap_room() for _ in range(batch_size)
-                ],
-            }
-        )
-    else:
-        modified_request.update(
-            {
-                "bootstrap_host": hostname,
-                "bootstrap_room": _generate_bootstrap_room(),
-            }
-        )
+    modified_request.update(
+        {
+            "bootstrap_host": hostname,
+            "bootstrap_room": random.randint(0, 2 ** 63 - 1),
+        }
+    )
 
     if request_data.get("stream", False):
         return await load_balancer.generate_stream(
@@ -233,30 +176,6 @@ async def handle_generate_request(request_data: dict):
         return await load_balancer.generate(
             modified_request, prefill_server, decode_server
         )
-
-
-def _generate_bootstrap_room():
-    return random.randint(0, 2**63 - 1)
-
-
-# _next_bootstrap_room = 0
-#
-#
-# def _generate_bootstrap_room():
-#     global _next_bootstrap_room
-#     ans = _next_bootstrap_room
-#     _next_bootstrap_room += 1
-#     print(f"HACK _generate_bootstrap_room use sequential value {ans=}")
-#     return ans
-
-
-# We may utilize `GenerateReqInput`'s logic later
-def _get_request_batch_size(request):
-    if (text := request.get("text")) is not None:
-        return None if isinstance(text, str) else len(text)
-    if (input_ids := request.get("input_ids")) is not None:
-        return None if isinstance(input_ids[0], int) else len(input_ids)
-    return None
 
 
 @app.get("/v1/models")
@@ -273,22 +192,6 @@ async def get_models():
             return ORJSONResponse(content=await response.json())
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/start_profile")
-async def start_profile():
-    """Start profiling on all servers."""
-    if load_balancer is None:
-        raise HTTPException(status_code=500, detail="Load balancer not initialized")
-    return await load_balancer.start_profile()
-
-
-@app.post("/stop_profile")
-async def stop_profile():
-    """Stop profiling on all servers."""
-    if load_balancer is None:
-        raise HTTPException(status_code=500, detail="Load balancer not initialized")
-    return await load_balancer.stop_profile()
 
 
 def run(prefill_addrs, decode_addrs, host, port):
