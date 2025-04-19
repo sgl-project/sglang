@@ -972,9 +972,6 @@ class DeepEPMoE(EPMoE):
     ):
         assert self.quant_method is not None
         assert self.activation == "silu"
-        assert (
-            hidden_states_fp8[0].size(0) % 4 == 0
-        ), f"TMA alignment error: {hidden_states_fp8[0].size(0)}"
 
         # GroupGemm-0
         num_groups, m, k = hidden_states_fp8[0].size()
