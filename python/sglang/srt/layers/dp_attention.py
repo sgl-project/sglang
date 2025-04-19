@@ -59,7 +59,10 @@ def initialize_dp_attention(
     )
 
     if enable_dp_attention:
-        _ATTN_DP_SIZE = dp_size
+        if moe_dense_tp_size is None:
+            _ATTN_DP_SIZE = dp_size
+        else:
+            _ATTN_DP_SIZE = dp_size // (tp_size // moe_dense_tp_size)
     else:
         _ATTN_DP_SIZE = 1
 
