@@ -80,6 +80,7 @@ from sglang.srt.utils import (
     is_flashinfer_available,
     is_hip,
     is_hopper_with_cuda_12_3,
+    is_no_spec_infer_or_topk_one,
     monkey_patch_p2p_access_check,
     monkey_patch_vllm_gguf_config,
     set_cpu_offload_max_bytes,
@@ -226,10 +227,21 @@ class ModelRunner:
         server_args = self.server_args
 
         if server_args.attention_backend is None:
-            # By default, use flashinfer for non-mla attention and triton for mla attention
+            """
+            We auto select the fastest attention backend according to the current offering
+            1. Models with MHA Architecture (e.g: Llama, QWen)
+                1.1 We will turn on FA3 on hopper unless user use spec decode with topk > 1 or page_size > 1.
+                1.2 In other cases, we will use flashinfer if available, otherwise use triton.
+            2. Models with MHA Architecture and using FA3
+                2.1 We will use FA3 backend on hopper.
+                2.2 Otherwise, we will use triton backend.
+            """
+
             if not self.use_mla_backend:
-                if is_hopper_with_cuda_12_3() and is_fa3_default_architecture(
-                    self.model_config.hf_config
+                if (
+                    is_hopper_with_cuda_12_3()
+                    and is_no_spec_infer_or_topk_one(server_args)
+                    and is_fa3_default_architecture(self.model_config.hf_config)
                 ):
                     server_args.attention_backend = "fa3"
                 else:
