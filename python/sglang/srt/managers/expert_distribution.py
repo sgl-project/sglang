@@ -210,9 +210,9 @@ def set_global_expert_distribution_recorder(value):
 
 
 def postprocess_dumps(
-        dumps: List[Any], expert_location_metadata: "ExpertLocationMetadata"
+        dumps: List[Any], server_args: ServerArgs, expert_location_metadata: "ExpertLocationMetadata"
 ):
-    return _Accumulator.get_class().postprocess_dumps(dumps, expert_location_metadata)
+    return _Accumulator.get_class(server_args).postprocess_dumps(dumps, expert_location_metadata)
 
 
 # --------------------------------------- SinglePassGatherer -----------------------------------------

@@ -720,6 +720,7 @@ class TokenizerManager:
         )
         return expert_distribution.postprocess_dumps(
             [output.dump_output for output in raw_outputs],
+            server_args=self.server_args,
             expert_location_metadata=self.expert_location_metadata,
         )
 
