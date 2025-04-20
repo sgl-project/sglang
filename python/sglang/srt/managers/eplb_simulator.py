@@ -13,7 +13,10 @@ import torch
 from tqdm.auto import tqdm
 
 from sglang.srt.managers import deepseek_eplb
-from sglang.srt.managers.expert_distribution import compute_utilization_rate, compute_gpu_physical_count
+from sglang.srt.managers.expert_distribution import (
+    compute_gpu_physical_count,
+    compute_utilization_rate,
+)
 from sglang.srt.managers.expert_location import (
     ExpertLocationMetadata,
     ModelConfigForExpertLocation,
