@@ -424,13 +424,11 @@ class ForwardBatch:
                 )
         elif self.forward_mode.is_extend():
             for i, mm_input in enumerate(batch.multimodal_inputs):
+                extend_seq_len, extend_prefix_len = (
+                    batch.extend_seq_lens[i],
+                    batch.extend_prefix_lens[i],
+                )
                 if mm_input is None:
-                    extend_start_loc_cpu = self.extend_start_loc.cpu().numpy()
-                    extend_start_loc, extend_seq_len, extend_prefix_len = (
-                        extend_start_loc_cpu[i],
-                        batch.extend_seq_lens[i],
-                        batch.extend_prefix_lens[i],
-                    )
                     # text only
                     mrope_positions = torch.tensor(
                         [
@@ -450,11 +448,7 @@ class ForwardBatch:
                         self.seq_lens.tolist(), dim=1
                     )
                     mrope_positions_list = []
-                    for extend_seq_len, extend_prefix_len, pos in zip(
-                        batch.extend_seq_lens,
-                        batch.extend_prefix_lens,
-                        mrope_positions_split,
-                    ):
+                    for pos in mrope_positions_split:
                         mrope_positions_list.append(
                             pos[
                                 :,
