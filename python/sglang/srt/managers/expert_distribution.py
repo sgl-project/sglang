@@ -381,6 +381,7 @@ class _Accumulator(ABC):
     def get_class(server_args: ServerArgs) -> Type["_Accumulator"]:
         return {
             "stat": _StatAccumulator,
+            "stat_ut": _StatAndUtilizationRateAccumulator,
             "detail": _DetailAccumulator,
         }[server_args.expert_distribution_recorder_mode]
 
@@ -555,3 +556,7 @@ def _convert_global_physical_count_to_logical_count(
         src=global_physical_count,
     )
     return logical_count
+
+
+class _StatAndUtilizationRateAccumulator(_StatAccumulator):
+    pass

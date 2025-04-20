@@ -172,7 +172,7 @@ class ServerArgs:
     enable_eplb: bool = False
     eplb_storage_dir: str = "/tmp/eplb_storage"
     eplb_rebalance_period: Optional[int] = None
-    expert_distribution_recorder_mode: Optional[Literal["stat", "detail", "state_and_ut"]] = None
+    expert_distribution_recorder_mode: Optional[Literal["stat", "detail", "stat_ut"]] = None
     enable_torch_compile: bool = False
     torch_compile_max_bs: int = 32
     cuda_graph_max_bs: Optional[int] = None
