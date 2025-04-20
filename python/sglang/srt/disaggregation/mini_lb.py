@@ -164,7 +164,7 @@ async def handle_generate_request(request_data: dict):
     modified_request.update(
         {
             "bootstrap_host": hostname,
-            "bootstrap_room": random.randint(0, 2 ** 63 - 1),
+            "bootstrap_room": random.randint(0, 2**63 - 1),
         }
     )
 

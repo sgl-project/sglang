@@ -315,7 +315,8 @@ class LogitsProcessor(nn.Module):
 
         if self.debug_tensor_dump_output_folder:
             assert (
-                not self.do_tensor_parallel_all_gather or get_local_attention_dp_size() == 1
+                not self.do_tensor_parallel_all_gather
+                or get_local_attention_dp_size() == 1
             ), "dp attention + sharded lm_head doesn't support full logits"
             full_logits = self._get_logits(hidden_states, lm_head, logits_metadata)
             dump_to_file(self.debug_tensor_dump_output_folder, "logits", full_logits)

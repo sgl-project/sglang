@@ -406,6 +406,7 @@ class GenerateReqInput:
             ),
         )
 
+
 @dataclass
 class TokenizedGenerateReqInput:
     # The request id

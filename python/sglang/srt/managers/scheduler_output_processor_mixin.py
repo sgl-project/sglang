@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
 class SchedulerOutputProcessorMixin:
     """
     This class implements the output processing logic for Scheduler.

@@ -45,9 +45,9 @@ from sglang.srt.layers.attention.triton_ops.rocm_mla_decode_rope import (
 from sglang.srt.layers.dp_attention import (
     dp_gather_partial,
     dp_scatter,
-    get_local_attention_dp_size,
     get_attention_tp_rank,
     get_attention_tp_size,
+    get_local_attention_dp_size,
     tp_all_gather,
     tp_reduce_scatter,
 )
@@ -125,6 +125,7 @@ logger = logging.getLogger(__name__)
 
 def _enable_moe_dense_fully_dp():
     return global_server_args_dict["moe_dense_tp_size"] == 1
+
 
 class AttnForwardMethod(IntEnum):
     # Use multi-head attention
@@ -1719,7 +1720,7 @@ class DeepseekV2ForCausalLM(nn.Module):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
-            enable_tp=not _enable_moe_dense_fully_dp(), # TODO: replace it with DP attention
+            enable_tp=not _enable_moe_dense_fully_dp(),  # TODO: replace it with DP attention
         )
         self.logits_processor = LogitsProcessor(config)
 
