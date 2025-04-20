@@ -22,6 +22,7 @@ from typing import Tuple
 import numpy as np
 import requests
 
+from sglang.bench_serving import sample_random_requests
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
@@ -102,16 +103,21 @@ def run_one_case(
     run_name: str,
     result_filename: str,
 ):
-    input_ids = [
-        [int(x) for x in np.random.randint(0, high=16384, size=(input_len,))]
-        for _ in range(batch_size)
-    ]
+    input_requests = sample_random_requests(
+        input_len=input_len,
+        output_len=output_len,
+        num_prompts=batch_size,
+        range_ratio=args.random_range_ratio,
+        tokenizer=tokenizer,
+        dataset_path="",
+        random_sample=True,
+    )
 
     tic = time.time()
     response = requests.post(
         url + "/generate",
         json={
-            "input_ids": input_ids,
+            "prompt": [text for text, _, _ in input_requests],
             "sampling_params": {
                 "temperature": 0,
                 "max_new_tokens": output_len,
