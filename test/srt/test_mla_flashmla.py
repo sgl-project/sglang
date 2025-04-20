@@ -13,6 +13,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
+
 class TestFlashinferMLAMTP(CustomTestCase):
     @classmethod
     def setUpClass(cls):

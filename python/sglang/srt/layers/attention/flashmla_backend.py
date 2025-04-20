@@ -31,7 +31,7 @@ if TYPE_CHECKING:
 # FlashMLA only supports pagesize=64
 PAGE_SIZE = 64
 # TODO The current setup is hard-coded and will be changed after integrating with MTP.
-# Q_LEN = 1
+Q_LEN = 1
 
 
 @dataclass
@@ -282,6 +282,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         )
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
 
 class FlashMLAMultiStepDraftBackend:
     """

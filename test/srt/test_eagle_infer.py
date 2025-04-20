@@ -571,6 +571,7 @@ class TestEAGLEServerPageSize(TestEAGLEServer):
             ],
         )
 
+
 class TestEAGLEServerFlashMLA(TestEAGLEServer):
     @classmethod
     def setUpClass(cls):
@@ -597,7 +598,7 @@ class TestEAGLEServerFlashMLA(TestEAGLEServer):
                 "--max-running-requests",
                 8,
                 "--page-size",
-                64,
+                64,  # todo
             ],
         )
 
