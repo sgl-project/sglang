@@ -31,6 +31,8 @@ from sglang.srt.disaggregation.utils import (
     ReqToMetadataIdxAllocator,
     TransferBackend,
     get_kv_class,
+    kv_to_page_indices,
+    kv_to_page_num,
     poll_and_all_reduce,
 )
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req, ScheduleBatch
@@ -103,7 +105,7 @@ class PrefillBootstrapQueue:
         kv_args.aux_item_lens = [
             metadata_buffer[0].nbytes for metadata_buffer in self.metadata_buffers
         ]
-        kv_args.ib_device = "mock-ib-device"
+        kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.gpu_id
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
         kv_manager = kv_manager_class(
@@ -154,7 +156,8 @@ class PrefillBootstrapQueue:
                 self.req_to_metadata_buffer_idx_allocator.alloc()
             )
             assert req.metadata_buffer_index is not None
-            req.disagg_kv_sender.init(num_kv_indices, req.metadata_buffer_index)
+            num_pages = kv_to_page_num(num_kv_indices, self.token_to_kv_pool.page_size)
+            req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
 
             bootstrapped_reqs.append(req)
             indices_to_remove.add(i)
@@ -300,4 +303,7 @@ class SchedulerDisaggregationPrefillMixin:
                 req.metadata_buffer_index, token_id
             )
         is_last = token_id is not None
-        req.disagg_kv_sender.send(kv_indices, slice(start_idx, end_idx), is_last)
+        page_indices = kv_to_page_indices(
+            kv_indices, self.token_to_kv_pool_allocator.page_size
+        )
+        req.disagg_kv_sender.send(page_indices, slice(start_idx, end_idx), is_last)
