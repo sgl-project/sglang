@@ -78,8 +78,6 @@ class ModelConfig:
                 logger.warning("Multimodal is disabled for Llama4. To enable it, set --enable-llama4-multimodal.")
             else:
                 enable_multimodal = True
-        
-
 
         # Check model type
         self.is_generation = is_generation_model(
