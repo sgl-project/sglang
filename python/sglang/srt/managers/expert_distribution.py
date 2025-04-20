@@ -583,6 +583,8 @@ class _StatAndUtilizationRateAccumulator(_StatAccumulator):
         gpu_physical_count = gpu_physical_count.to("cuda")
         torch.distributed.reduce(gpu_physical_count, dst=0, op=torch.distributed.ReduceOp.SUM)
         if rank == 0:
+            utilization_rate_tensor = compute_utilization_rate(gpu_physical_count)
+            utilization_rate = torch.mean(utilization_rate_tensor).item()
             TODO
 
 
