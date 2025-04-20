@@ -23,8 +23,9 @@ class MiniLoadBalancer:
         return random.choice(self.prefill_servers), random.choice(self.decode_servers)
 
     async def generate(
-        self, modified_request, prefill_server, decode_server
+        self, modified_request, prefill_server, decode_server, endpoint
     ) -> ORJSONResponse:
+        assert endpoint[0] != "/", f"Endpoint should not start with '/': {endpoint}"
 
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(
@@ -32,8 +33,8 @@ class MiniLoadBalancer:
             )  # Add timeout for request reliability
         ) as session:
             tasks = [
-                session.post(f"{prefill_server}/generate", json=modified_request),
-                session.post(f"{decode_server}/generate", json=modified_request),
+                session.post(f"{prefill_server}/{endpoint}", json=modified_request),
+                session.post(f"{decode_server}/{endpoint}", json=modified_request),
             ]
             # Wait for both responses to complete. Prefill should end first.
             prefill_response, decode_response = await asyncio.gather(*tasks)
@@ -43,7 +44,9 @@ class MiniLoadBalancer:
                 status_code=decode_response.status,
             )
 
-    async def generate_stream(self, modified_request, prefill_server, decode_server):
+    async def generate_stream(self, modified_request, prefill_server, decode_server, endpoint = "generate"):
+        assert endpoint[0] != "/", f"Endpoint should not start with '/': {endpoint}"
+
         async def stream_results():
             async with aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(
@@ -54,10 +57,10 @@ class MiniLoadBalancer:
                     # Create the tasks for both prefill and decode requests
                     tasks = [
                         session.post(
-                            f"{prefill_server}/generate", json=modified_request
+                            f"{prefill_server}/{endpoint}", json=modified_request
                         ),
                         session.post(
-                            f"{decode_server}/generate", json=modified_request
+                            f"{decode_server}/{endpoint}", json=modified_request
                         ),
                     ]
                     # Wait for both responses to complete. Since this is streaming, they return immediately.
@@ -177,6 +180,29 @@ async def handle_generate_request(request_data: dict):
             modified_request, prefill_server, decode_server
         )
 
+@app.post("/v1/chat/completions")
+async def handle_completion_request(request_data: dict):
+    prefill_server, decode_server = load_balancer.select_pair()
+
+    # Parse and transform prefill_server for bootstrap data
+    parsed_url = urllib.parse.urlparse(prefill_server)
+    hostname = parsed_url.hostname
+    modified_request = request_data.copy()
+    modified_request.update(
+        {
+            "bootstrap_host": hostname,
+            "bootstrap_room": random.randint(0, 2**63 - 1),
+        }
+    )
+
+    if request_data.get("stream", False):
+        return await load_balancer.generate_stream(
+            modified_request, prefill_server, decode_server, endpoint="v1/chat/completions"
+        )
+    else:
+        return await load_balancer.generate(
+            modified_request, prefill_server, decode_server, endpoint="v1/chat/completions"
+        )
 
 @app.get("/v1/models")
 async def get_models():
