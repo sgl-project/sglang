@@ -597,7 +597,7 @@ class TestEAGLEServerFlashMLA(TestEAGLEServer):
                 "--max-running-requests",
                 8,
                 "--page-size",
-                1,
+                64,
             ],
         )
 
