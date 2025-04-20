@@ -187,7 +187,6 @@ class ModelRunner:
                 "debug_tensor_dump_output_folder": server_args.debug_tensor_dump_output_folder,
                 "debug_tensor_dump_inject": server_args.debug_tensor_dump_inject,
                 "n_share_experts_fusion": server_args.n_share_experts_fusion,
-                "disable_shared_experts_fusion": server_args.disable_shared_experts_fusion,
                 "ep_num_redundant_experts": server_args.ep_num_redundant_experts,
                 "disable_chunked_prefix_cache": server_args.disable_chunked_prefix_cache,
                 "use_mla_backend": self.use_mla_backend,

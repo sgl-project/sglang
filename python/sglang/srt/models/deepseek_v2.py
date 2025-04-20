@@ -99,6 +99,7 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
 )
 from sglang.srt.utils import (
+    BumpAllocator,
     DeepEPMode,
     add_prefix,
     configure_deep_gemm_num_sms,
@@ -106,8 +107,6 @@ from sglang.srt.utils import (
     is_cuda_available,
     is_hip,
 )
-from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import BumpAllocator, DeepEPMode, add_prefix, is_cuda, is_hip
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
