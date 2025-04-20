@@ -169,7 +169,7 @@ class ModelRunner:
         )
 
         # CPU offload
-        set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024**3))
+        set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024 ** 3))
 
         # Get memory before model loading
         min_per_gpu_memory = self.init_torch_distributed()
@@ -939,7 +939,7 @@ class ModelRunner:
             key = "model.layers." + str(i) + ".self_attn" + selected_channel
             self.sorted_channels.append(
                 torch.tensor(channel_config[key])[
-                    :, : self.server_args.ds_heavy_channel_num
+                :, : self.server_args.ds_heavy_channel_num
                 ]
                 .contiguous()
                 .cuda()
@@ -1022,6 +1022,10 @@ class ModelRunner:
     def forward(
         self, forward_batch: ForwardBatch, skip_attn_backend_init: bool = False
     ) -> LogitsProcessorOutput:
+        if self.forward_sleep_time is not None:
+            logger.info(f"ModelRunner.forward sleep {self.forward_sleep_time}")
+            time.sleep(self.forward_sleep_time)
+
         if (
             forward_batch.forward_mode.is_cuda_graph()
             and self.cuda_graph_runner
