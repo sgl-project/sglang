@@ -1374,7 +1374,9 @@ class DeepseekV2Model(nn.Module):
             # TODO for two-batch-overlap, we need a larger buffer size
             buffer_size=len(self.layers) * 2,
             dtype=torch.float32,
-            device=input_ids.device,
+            device=(
+                input_embeds.device if input_embeds is not None else input_ids.device
+            ),
         )
 
         if input_embeds is None:
