@@ -88,6 +88,7 @@ from sglang.srt.managers.io_struct import (
     SetInternalStateReq,
     SetInternalStateReqOutput,
     SlowDownReqInput,
+    SlowDownReqOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     UpdateExpertLocationReqInput,
@@ -412,6 +413,8 @@ class Scheduler(
         self.profiler_activities: Optional[List[str]] = None
         self.profiler_id: Optional[str] = None
         self.profiler_target_forward_ct: Optional[int] = None
+
+        self.forward_sleep_time = None
 
         # Init metrics stats
         self.init_metrics()
@@ -1382,6 +1385,10 @@ class Scheduler(
         ):
             self.send_to_tokenizer.send_pyobj(self.stop_profile())
 
+        if self.forward_sleep_time is not None:
+            logger.info(f"Scheduler.run_batch sleep {self.forward_sleep_time}s")
+            time.sleep(self.forward_sleep_time)
+
         # Run forward
         if self.is_generation:
             if self.spec_algorithm.is_none():
@@ -1879,11 +1886,11 @@ class Scheduler(
         return ResumeMemoryOccupationReqOutput()
 
     def slow_down(self, recv_req: SlowDownReqInput):
-        forward_sleep_time = recv_req.forward_sleep_time
-        if forward_sleep_time is not None and forward_sleep_time <= 0:
-            forward_sleep_time = None
-        self.tp_worker.worker.model_runner.forward_sleep_time = forward_sleep_time
-        return SlowDownReqInput()
+        t = recv_req.forward_sleep_time
+        if t is not None and t <= 0:
+            t = None
+        self.forward_sleep_time = t
+        return SlowDownReqOutput()
 
     def profile(self, recv_req: ProfileReq):
         if recv_req.type == ProfileReqType.START_PROFILE:

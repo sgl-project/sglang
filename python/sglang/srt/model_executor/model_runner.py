@@ -150,7 +150,6 @@ class ModelRunner:
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
         self.attention_chunk_size = model_config.attention_chunk_size
-        self.forward_sleep_time = None
 
         self.forward_pass_id = 0
 
@@ -1094,10 +1093,6 @@ class ModelRunner:
     def forward(
         self, forward_batch: ForwardBatch, skip_attn_backend_init: bool = False
     ) -> LogitsProcessorOutput:
-        if self.forward_sleep_time is not None:
-            logger.info(f"ModelRunner.forward sleep {self.forward_sleep_time}")
-            time.sleep(self.forward_sleep_time)
-
         self.forward_pass_id += 1
         with get_global_expert_distribution_recorder().with_forward_pass(
             self.forward_pass_id
