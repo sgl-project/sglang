@@ -157,7 +157,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
     else:
         proc, base_url = launch_server_process(server_args)
 
-    tokenizer_id = args.tokenizer if args.tokenizer is not None else args.model
+    tokenizer_id = server_args.tokenizer_path or server_args.model_path
     tokenizer = get_tokenizer(tokenizer_id)
 
     # warmup
