@@ -81,7 +81,6 @@ global_server_args_dict = {
     "moe_dense_tp_size": ServerArgs.moe_dense_tp_size,
     "chunked_prefill_size": ServerArgs.chunked_prefill_size,
     "n_share_experts_fusion": ServerArgs.n_share_experts_fusion,
-    "disable_shared_experts_fusion": ServerArgs.disable_shared_experts_fusion,
     "disable_chunked_prefix_cache": ServerArgs.disable_chunked_prefix_cache,
 }
 
