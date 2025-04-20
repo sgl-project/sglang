@@ -582,31 +582,31 @@ class _StatAndUtilizationRateAccumulator(_StatAccumulator):
 
 
 def compute_gpu_physical_count(
-        physical_count_of_whatever: torch.Tensor,  # (whatever, num_layer, num_physical_expert)
+        physical_count_of_whatever: torch.Tensor,  # (..., num_layer, num_physical_expert)
         num_gpu: int,
 ):
-    """output: gpu_physical_count_of_batch (whatever, num_layer, num_gpu)"""
+    """output: gpu_physical_count_of_batch (..., num_layer, num_gpu)"""
     return einops.reduce(
         physical_count_of_whatever,
-        "whatever num_layer (num_gpu num_expert_per_gpu) -> whatever num_layer num_gpu",
+        "... num_layer (num_gpu num_expert_per_gpu) -> ... num_layer num_gpu",
         "sum",
         num_gpu=num_gpu,
     )
 
 
 def compute_utilization_rate(
-        gpu_physical_count_of_batch: torch.Tensor,  # (num_batch, num_layer, num_gpu)
+        gpu_physical_count_of_batch: torch.Tensor,  # (..., num_layer, num_gpu)
 ):
-    """output: utilization_rate (num_batch, num_layer)"""
+    """output: utilization_rate (..., num_layer)"""
     gpu_physical_count_of_batch = gpu_physical_count_of_batch.float()
     max_gpu_physical_count = einops.reduce(
         gpu_physical_count_of_batch,
-        "num_batch num_layer num_gpu -> num_batch num_layer",
+        "... num_layer num_gpu -> ... num_layer",
         "max",
     )
     avg_gpu_physical_count = einops.reduce(
         gpu_physical_count_of_batch,
-        "num_batch num_layer num_gpu -> num_batch num_layer",
+        "... num_layer num_gpu -> ... num_layer",
         "mean",
     )
     return (avg_gpu_physical_count + 1e-5) / (max_gpu_physical_count + 1e-5)
