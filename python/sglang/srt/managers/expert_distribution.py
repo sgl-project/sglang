@@ -9,6 +9,7 @@ from typing import Any, List, Optional, Type
 
 import einops
 import torch
+import torch.distributed
 from sglang.srt.managers.expert_location import ExpertLocationMetadata
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import Withable, get_bool_env_var
@@ -580,7 +581,9 @@ class _StatAndUtilizationRateAccumulator(_StatAccumulator):
     def _log_utilization_rate(self, single_pass_global_physical_count: torch.Tensor):
         gpu_physical_count = compute_gpu_physical_count(single_pass_global_physical_count, num_gpu=TODO)
         gpu_physical_count = gpu_physical_count.to("cuda")
-        TODO
+        torch.distributed.reduce(gpu_physical_count, dst=0, op=torch.distributed.ReduceOp.SUM)
+        if rank == 0:
+            TODO
 
 
 def compute_gpu_physical_count(
