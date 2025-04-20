@@ -836,6 +836,7 @@ class ProfileReq:
     activities: Optional[List[str]] = None
     with_stack: Optional[bool] = None
     record_shapes: Optional[bool] = None
+    profile_id: Optional[str] = None
 
 
 @dataclass

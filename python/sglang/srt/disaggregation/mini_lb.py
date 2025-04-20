@@ -26,7 +26,11 @@ class MiniLoadBalancer:
         self, modified_request, prefill_server, decode_server
     ) -> ORJSONResponse:
 
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(
+                total=3600
+            )  # Add timeout for request reliability
+        ) as session:
             tasks = [
                 session.post(f"{prefill_server}/generate", json=modified_request),
                 session.post(f"{decode_server}/generate", json=modified_request),
