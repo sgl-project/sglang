@@ -343,7 +343,8 @@ class ServerArgs:
             )
 
         if self.enable_eplb:
-            self.expert_distribution_recorder_mode = "stat"
+            if self.expert_distribution_recorder_mode is None:
+                self.expert_distribution_recorder_mode = "stat"
             if self.expert_location_updater_mode is None:
                 self.expert_location_updater_mode = "pageable_memory"
             logger.info(
