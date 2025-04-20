@@ -85,6 +85,11 @@ class BenchArgs:
             "--profile-skip-cases", type=int, default=BenchArgs.profile_skip_cases
         )
         parser.add_argument(
+            "--enable-expert-distribution-recorder",
+            action="store_true",
+            help="Enable expert distribution recorder",
+        )
+        parser.add_argument(
             "--expert-distribution-recorder-dir",
             type=str,
             default=BenchArgs.expert_distribution_recorder_dir,
