@@ -87,6 +87,7 @@ from sglang.srt.managers.io_struct import (
     RpcReqOutput,
     SetInternalStateReq,
     SetInternalStateReqOutput,
+    SlowDownReqInput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     UpdateExpertLocationReqInput,
@@ -435,6 +436,7 @@ class Scheduler(
                 (GetWeightsByNameReqInput, self.get_weights_by_name),
                 (ReleaseMemoryOccupationReqInput, self.release_memory_occupation),
                 (ResumeMemoryOccupationReqInput, self.resume_memory_occupation),
+                (SlowDownReqInput, self.slow_down),
                 (ProfileReq, self.profile),
                 (GetInternalStateReq, self.get_internal_state),
                 (SetInternalStateReq, self.set_internal_state),
@@ -1875,6 +1877,13 @@ class Scheduler(
         )
         del self.stashed_model_static_state
         return ResumeMemoryOccupationReqOutput()
+
+    def slow_down(self, recv_req: SlowDownReqInput):
+        forward_sleep_time = recv_req.forward_sleep_time
+        if forward_sleep_time is not None and forward_sleep_time <= 0:
+            forward_sleep_time = None
+        self.tp_worker.worker.model_runner.forward_sleep_time = forward_sleep_time
+        return SlowDownReqInput()
 
     def profile(self, recv_req: ProfileReq):
         if recv_req.type == ProfileReqType.START_PROFILE:
