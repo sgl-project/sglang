@@ -58,9 +58,7 @@ if _is_cuda:
     ):
         _enable_jit_deepgemm = True
 
-
 logger = logging.getLogger(__name__)
-
 
 if supports_custom_op():
 
@@ -897,16 +895,20 @@ def _per_tensor_quant_mla_fp8_stage2(
 
 
 def per_tensor_quant_mla_fp8(
-    x: torch.Tensor, eps: float = 1e-12
+    x: torch.Tensor, x_s_out: torch.Tensor, eps: float = 1e-12
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     This function quantizes input values to float8 values with tensor-wise quantization
     and specialized for mla absorbed case.
     """
     assert x.dim() == 3, "`x` is not a 3d-tensor"
+    assert (
+        x_s_out.shape == (1,)
+        and x_s_out.dtype == torch.float32
+        and x_s_out.device == x.device
+    )
 
     x_q = x.new_empty(x.size(), dtype=_fp8_type)
-    x_s = torch.zeros((1,), dtype=torch.float32, device=x.device)
 
     num_head, num_seq, head_size = x.shape
     BLOCK_SIZE = triton.next_power_of_2(head_size)
@@ -914,7 +916,7 @@ def per_tensor_quant_mla_fp8(
 
     _per_tensor_quant_mla_fp8_stage1[grid](
         x,
-        x_s,
+        x_s_out,
         head_size,
         x.stride(0),
         x.stride(1),
@@ -924,7 +926,7 @@ def per_tensor_quant_mla_fp8(
     )
     _per_tensor_quant_mla_fp8_stage2[grid](
         x,
-        x_s,
+        x_s_out,
         x_q,
         num_seq,
         head_size,
@@ -935,7 +937,7 @@ def per_tensor_quant_mla_fp8(
         BLOCK_SIZE,
     )
 
-    return x_q, x_s
+    return x_q, x_s_out
 
 
 def scaled_fp8_quant(
