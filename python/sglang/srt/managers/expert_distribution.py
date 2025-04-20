@@ -379,9 +379,10 @@ class _Accumulator(ABC):
 
     @staticmethod
     def get_class(server_args: ServerArgs) -> Type["_Accumulator"]:
-        if get_bool_env_var("SGLANG_EXPERT_DISTRIBUTION_RECORDER_DETAIL"):
-            return _DetailAccumulator
-        return _StatAccumulator
+        return {
+            "stat": _StatAccumulator,
+            "detail": _DetailAccumulator,
+        }[server_args.expert_distribution_recorder_mode]
 
     def __init__(self, expert_location_metadata: "ExpertLocationMetadata", rank: int):
         self._expert_location_metadata = expert_location_metadata
