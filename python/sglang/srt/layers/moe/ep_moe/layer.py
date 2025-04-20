@@ -848,8 +848,8 @@ class DeepEPMoE(EPMoE):
         correction_bias: Optional[torch.Tensor] = None,
         custom_routing_function: Optional[Callable] = None,
         activation: str = "silu",
-        deepep_mode: DeepEPMode = DeepEPMode.auto,
         routed_scaling_factor: Optional[float] = None,
+        deepep_mode: DeepEPMode = DeepEPMode.auto,
     ):
         super().__init__(
             num_experts,
@@ -868,6 +868,7 @@ class DeepEPMoE(EPMoE):
             correction_bias,
             custom_routing_function,
             activation,
+            routed_scaling_factor,
         )
         self.deepep_mode = deepep_mode
         if self.deepep_mode.enable_low_latency():
