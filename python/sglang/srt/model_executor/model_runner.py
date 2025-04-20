@@ -130,7 +130,6 @@ class ModelRunner:
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
         self.attention_chunk_size = model_config.attention_chunk_size
-        self.forward_sleep_time = None
 
         # Model-specific adjustment
         self.model_specific_adjustment()
@@ -1023,10 +1022,6 @@ class ModelRunner:
     def forward(
         self, forward_batch: ForwardBatch, skip_attn_backend_init: bool = False
     ) -> LogitsProcessorOutput:
-        if self.forward_sleep_time is not None:
-            logger.info(f"ModelRunner.forward sleep {self.forward_sleep_time}")
-            time.sleep(self.forward_sleep_time)
-
         if (
             forward_batch.forward_mode.is_cuda_graph()
             and self.cuda_graph_runner
