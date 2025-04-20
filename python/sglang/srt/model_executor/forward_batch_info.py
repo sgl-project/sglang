@@ -443,19 +443,10 @@ class ForwardBatch:
                         * 3
                     )
                 else:
-                    # Split and recombine positions based on prefix lengths
-                    mrope_positions_split = mm_input.mrope_positions.split(
-                        self.seq_lens.tolist(), dim=1
-                    )
-                    mrope_positions_list = []
-                    for pos in mrope_positions_split:
-                        mrope_positions_list.append(
-                            pos[
-                                :,
-                                extend_prefix_len : extend_prefix_len + extend_seq_len,
-                            ]
-                        )
-                mrope_positions = torch.cat(mrope_positions_list, dim=1)
+                    mrope_positions = mm_input.mrope_positions[
+                        :,
+                        extend_prefix_len : extend_prefix_len + extend_seq_len,
+                    ]
                 mrope_positions_list[i] = mrope_positions
 
         self.mrope_positions = torch.cat(
