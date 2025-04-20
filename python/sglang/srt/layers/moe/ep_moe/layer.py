@@ -849,6 +849,7 @@ class DeepEPMoE(EPMoE):
         custom_routing_function: Optional[Callable] = None,
         activation: str = "silu",
         deepep_mode: DeepEPMode = DeepEPMode.auto,
+        routed_scaling_factor: Optional[float] = None,
     ):
         super().__init__(
             num_experts,
