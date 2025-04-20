@@ -558,6 +558,6 @@ def _convert_global_physical_count_to_logical_count(
     return logical_count
 
 
-# Can use composition instead of inheritance as well
+# TODO use composition instead of inheritance later
 class _StatAndUtilizationRateAccumulator(_StatAccumulator):
     pass
