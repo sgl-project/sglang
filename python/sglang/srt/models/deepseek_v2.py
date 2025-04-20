@@ -1558,7 +1558,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             and isinstance(self.mlp, DeepseekV2MoE)
         )
         state.hidden_states_after_attn = self.self_attn.forward_absorb_stage_core(
-            state.self_attn_state
+            state.self_attn_state,
         )
 
     def _forward_tbo_op_post_attn_layernorm(self, state):
@@ -1609,11 +1609,14 @@ class DeepseekV2Model(nn.Module):
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
         zero_allocator = BumpAllocator(
-            # TODO for two-batch-overlap, we need a larger buffer size
-            buffer_size=len(self.layers) * 2,
+            # TODO temp hack
+            buffer_size=len(self.layers) * 6,
             dtype=torch.float32,
             device=input_ids.device,
         )
+
+        # TODO temp hack
+        setattr(forward_batch, "hack_zero_allocator", zero_allocator)
 
         if input_embeds is None:
             hidden_states = self.embed_tokens(input_ids)
