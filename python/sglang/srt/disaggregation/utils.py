@@ -4,6 +4,7 @@ from collections import deque
 from enum import Enum
 from typing import List
 
+import numpy as np
 import torch
 import torch.distributed as dist
 
@@ -73,3 +74,17 @@ def get_kv_class(transfer_backend: TransferBackend, class_type: KVClassType):
         }
         return class_mapping.get(class_type)
     raise ValueError(f"Unsupported transfer backend: {transfer_backend}")
+
+
+def kv_to_page_indices(kv_indices: np.ndarray, page_size: int):
+    # 1. The page is guaruanteed to be full except the last page.
+    # 2. page index = kv_index // page_size
+    # The return vector is kv_indices[::page_size] // page_size
+    if page_size == 1:  # shortcut
+        return kv_indices
+    return kv_indices[::page_size] // page_size
+
+
+def kv_to_page_num(num_kv_indices: int, page_size: int):
+    # ceil(num_kv_indices / page_size)
+    return (num_kv_indices + page_size - 1) // page_size
