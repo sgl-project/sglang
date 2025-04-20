@@ -438,6 +438,8 @@ class MooncakeKVReceiver(BaseKVReceiver):
             return cls._socket_cache[endpoint], cls._socket_locks[endpoint]
 
     def init(self, kv_indices: npt.NDArray[np.int64], aux_index: Optional[int] = None):
+        assert self.bootstrap_info is not None
+
         self.prefill_server_url = (
             f"{self.bootstrap_info['rank_ip']}:{self.bootstrap_info['rank_port']}"
         )
@@ -568,11 +570,6 @@ class MooncakeKVBootstrapServer(BaseKVBootstrapServer):
     def poll(self) -> KVPoll: ...
 
 
-########################
-#     Async connector
-########################
-
-
 import aiohttp
 
 
@@ -587,22 +584,23 @@ class AsyncHttpConnector:
     def __init__(self, kv_mgr: MooncakeKVManager):
         self.buffer: asyncio.Queue = asyncio.Queue()
         self.loop = asyncio.new_event_loop()
-        self.thread = threading.Thread(target=self._start_loop, daemon=True).start()
+        self.thread = threading.Thread(
+            target=self._start_handshake_loop, daemon=True
+        ).start()
 
         self.kv_mgr = kv_mgr
 
-    def _start_loop(self):
+    def _start_handshake_loop(self):
         asyncio.set_event_loop(self.loop)
-        self.loop.run_until_complete(self._do_connect())
+        self.loop.run_until_complete(self._process_handshake_requests())
 
-    async def _do_connect(self):
+    async def _process_handshake_requests(self):
         async with aiohttp.ClientSession() as session:
             while True:
                 meta: HttpHandshakeMeta = await self.buffer.get()
-                asyncio.create_task(self._handle_single(session, meta))
+                asyncio.create_task(self._handle_single_handshake(session, meta))
 
-    async def _handle_single(self, session, meta: HttpHandshakeMeta):
-        # FIXME: how to handle error? in connector or in kv mgr?
+    async def _handle_single_handshake(self, session, meta: HttpHandshakeMeta):
         # FIXME: when to remove conn in kv_mgr.connection_pool?
         #    if we remove it as soon as finished, do we really need conn_pool?
         try:
@@ -611,17 +609,21 @@ class AsyncHttpConnector:
                     bootstrap_info = await resp.json()
                     self.kv_mgr.connection_pool[meta.bootstrap_key] = bootstrap_info
                     meta.kv_receiver.bootstrap_info = bootstrap_info
+                    # FIXME: do we need lock to protect request_status?
+                    self.kv_mgr.update_status(
+                        meta.kv_receiver.bootstrap_room, KVPoll.WaitingForInput
+                    )
                 else:
-                    # FIXME: how to handle error
                     result = await resp.text()
-                    logger.error(f"Failed with status: {result}")
+                    self.kv_mgr.request_status[meta.kv_receiver.bootstrap_room] = (
+                        KVPoll.Failed
+                    )
+                    logger.error(
+                        f"Failed to get prefill server info: {resp.status}, {result.text}"
+                    )
         except Exception as e:
-            logger.error(f"Error fetching prefill info: {e}")
-
-        # FIXME: do we need lock to protect request_status?
-        self.kv_mgr.update_status(
-            meta.kv_receiver.bootstrap_room, KVPoll.WaitingForInput
-        )
+            self.kv_mgr.request_status[meta.kv_receiver.bootstrap_room] = KVPoll.Failed
+            logger.error(f"Error fetching prefill info from bootstrap: {e}")
 
     def start_http_handshake(self, conn_meta: HttpHandshakeMeta):
         asyncio.run_coroutine_threadsafe(self.buffer.put(conn_meta), self.loop)
