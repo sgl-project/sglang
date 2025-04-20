@@ -64,7 +64,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
-    VertexGenerateReqInput,
+    VertexGenerateReqInput, SlowDownReqInput,
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.metrics.func_timer import enable_func_timer
@@ -484,6 +484,15 @@ async def resume_memory_occupation(
     """Resume GPU memory occupation."""
     try:
         await _global_state.tokenizer_manager.resume_memory_occupation(obj, request)
+    except Exception as e:
+        return _create_error_response(e)
+
+@app.api_route("/slow_down", methods=["GET", "POST"])
+async def slow_down(
+    obj: SlowDownReqInput, request: Request
+):
+    try:
+        await _global_state.tokenizer_manager.slow_down(obj, request)
     except Exception as e:
         return _create_error_response(e)
 
