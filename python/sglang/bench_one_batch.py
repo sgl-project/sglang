@@ -466,7 +466,7 @@ def latency_test(
         bench_args.input_len[0],
         min(32, bench_args.output_len[0]),  # shorter decoding to speed up the warmup
         server_args.device,
-        log_detail_latency = False,
+        log_detail_latency=False,
         profile=False,
         profile_filename_prefix="",  # not used
     )
