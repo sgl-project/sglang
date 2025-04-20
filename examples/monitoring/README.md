@@ -12,10 +12,10 @@ This directory contains a ready-to-use monitoring setup for SGLang using Prometh
 1. Start your SGLang server with metrics enabled:
 
 ```bash
-sglang server --enable-metrics
+python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --port 30000 --enable-metrics
 ```
 
-By default, the metrics server will run on `127.0.0.1:30001`.
+By default, the metrics server will run on `127.0.0.1:30000`.
 
 2. Start the monitoring stack:
 
