@@ -1542,7 +1542,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states=state.hidden_states_after_input_ln,
             forward_batch=state.forward_batch,
             # TODO hack
-            zero_allocator=state.forward_batch.hack_zero_allocator,
+            zero_allocator=BumpAllocator(buffer_size=2, dtype=torch.float32, device="cuda"),
         )
 
     def _forward_tbo_op_decode_attn_0(self, state):
@@ -1551,7 +1551,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states=state.hidden_states_after_input_ln,
             forward_batch=state.forward_batch,
             # TODO hack
-            zero_allocator=state.forward_batch.hack_zero_allocator,
+            zero_allocator=BumpAllocator(buffer_size=2, dtype=torch.float32, device="cuda"),
         )
 
     def _forward_tbo_op_decode_attn_1(self, state):
@@ -1564,7 +1564,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         state.hidden_states_after_attn = self.self_attn.forward_absorb_stage_core(
             state.self_attn_state,
             # TODO hack
-            zero_allocator=state.forward_batch.hack_zero_allocator,
+            zero_allocator=BumpAllocator(buffer_size=2, dtype=torch.float32, device="cuda"),
         )
 
     def _forward_tbo_op_post_attn_layernorm(self, state):
@@ -1615,14 +1615,10 @@ class DeepseekV2Model(nn.Module):
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
         zero_allocator = BumpAllocator(
-            # TODO temp hack
-            buffer_size=len(self.layers) * 6,
+            buffer_size=len(self.layers) * 2,
             dtype=torch.float32,
             device=input_ids.device,
         )
-
-        # TODO temp hack
-        setattr(forward_batch, "hack_zero_allocator", zero_allocator)
 
         if input_embeds is None:
             hidden_states = self.embed_tokens(input_ids)
