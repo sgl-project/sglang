@@ -560,4 +560,18 @@ def _convert_global_physical_count_to_logical_count(
 
 # TODO use composition instead of inheritance later
 class _StatAndUtilizationRateAccumulator(_StatAccumulator):
-    pass
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def append(
+            self,
+            forward_pass_id: int,
+            gatherer_key: str,
+            single_pass_global_physical_count: torch.Tensor,
+    ):
+        super().append(forward_pass_id, gatherer_key, single_pass_global_physical_count)
+        TODO
+
+    def reset(self):
+        super().reset()
+        TODO
