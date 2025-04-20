@@ -492,7 +492,7 @@ class FusedMoE(torch.nn.Module):
             loaded_weight.t().contiguous()
             if (
                 self.quant_method.__class__.__name__
-                == "CompressedTensorsWNA16MoEMethod"
+                in ["CompressedTensorsWNA16MarlinMoEMethod", 'CompressedTensorsWNA16MoEMethod']
             )
             else loaded_weight
         )
