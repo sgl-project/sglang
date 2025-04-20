@@ -596,8 +596,8 @@ class _StatAndUtilizationRateAccumulator(_StatAccumulator):
             logger.info(
                 f"[Expert Utilization Rate] "
                 f"forward_pass_id={forward_pass_id} "
-                f"current_pass={utilization_rate:.03f} "
-                f"{''.join(f'last_{size}={value:.03f} ' for size, value in self._history.mean())}"
+                f"current_pass_value={utilization_rate:.03f} "
+                f"{''.join(f'last_{size}_value={value:.03f} ' for size, value in self._history.mean())}"
             )
 
 
