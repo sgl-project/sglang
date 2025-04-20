@@ -143,7 +143,7 @@ def memcpy_triton_kernel(
     src_ptr,
     offset_ptr,
     sz_ptr,
-    offset_src,
+    offset_src: tl.constexpr,
     chunk_size,  # multiplied for offset and sz
     BLOCK_SIZE: tl.constexpr,
 ):
