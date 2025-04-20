@@ -22,7 +22,7 @@ from typing import Tuple
 import numpy as np
 import requests
 
-from sglang.bench_serving import sample_random_requests
+from sglang.bench_serving import sample_random_requests, get_tokenizer
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
@@ -102,6 +102,7 @@ def run_one_case(
     output_len: int,
     run_name: str,
     result_filename: str,
+    tokenizer,
 ):
     input_requests = sample_random_requests(
         input_len=input_len,
@@ -156,6 +157,9 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
     else:
         proc, base_url = launch_server_process(server_args)
 
+    tokenizer_id = args.tokenizer if args.tokenizer is not None else args.model
+    tokenizer = get_tokenizer(tokenizer_id)
+
     # warmup
     if not bench_args.skip_warmup:
         run_one_case(
@@ -165,6 +169,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
             output_len=16,
             run_name="",
             result_filename="",
+            tokenizer=tokenizer,
         )
 
     # benchmark
@@ -179,6 +184,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
                 ol,
                 bench_args.run_name,
                 bench_args.result_filename,
+                tokenizer,
             )
     finally:
         if proc:
