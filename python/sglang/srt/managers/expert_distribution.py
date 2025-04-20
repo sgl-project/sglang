@@ -565,6 +565,8 @@ def _convert_global_physical_count_to_logical_count(
 class _StatAndUtilizationRateAccumulator(_StatAccumulator):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self._window_sizes = [10, 100, 1000]
+        self._history = _DequeCollection(maxlens=self._window_sizes)
 
     def append(
             self,
