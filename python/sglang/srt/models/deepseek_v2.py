@@ -1541,6 +1541,8 @@ class DeepseekV2DecoderLayer(nn.Module):
             positions=state.positions,
             hidden_states=state.hidden_states_after_input_ln,
             forward_batch=state.forward_batch,
+            # TODO hack
+            zero_allocator=state.forward_batch.hack_zero_allocator,
         )
 
     def _forward_tbo_op_decode_attn_0(self, state):
@@ -1548,6 +1550,8 @@ class DeepseekV2DecoderLayer(nn.Module):
             positions=state.positions,
             hidden_states=state.hidden_states_after_input_ln,
             forward_batch=state.forward_batch,
+            # TODO hack
+            zero_allocator=state.forward_batch.hack_zero_allocator,
         )
 
     def _forward_tbo_op_decode_attn_1(self, state):
@@ -1559,6 +1563,8 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
         state.hidden_states_after_attn = self.self_attn.forward_absorb_stage_core(
             state.self_attn_state,
+            # TODO hack
+            zero_allocator=state.forward_batch.hack_zero_allocator,
         )
 
     def _forward_tbo_op_post_attn_layernorm(self, state):
