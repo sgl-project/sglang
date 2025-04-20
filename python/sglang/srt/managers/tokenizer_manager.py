@@ -55,6 +55,7 @@ from sglang.srt.disaggregation.utils import (
     TransferBackend,
     get_kv_class,
 )
+from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.managers import expert_distribution
 from sglang.srt.managers.eplb_manager import EPLBManager
@@ -900,8 +901,11 @@ class TokenizerManager:
         obj: SlowDownReqInput,
         request: Optional[fastapi.Request] = None,
     ):
+        print(f"hi [{self.__class__.__name__}] slow_down START", flush=True)
         self.auto_create_handle_loop()
+        print(f"hi [{self.__class__.__name__}] slow_down call comm", flush=True)
         await self.slow_down_communicator(obj)
+        print(f"hi [{self.__class__.__name__}] slow_down get output", flush=True)
 
     async def open_session(
         self, obj: OpenSessionReqInput, request: Optional[fastapi.Request] = None

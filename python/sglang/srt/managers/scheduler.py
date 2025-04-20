@@ -751,6 +751,13 @@ class Scheduler(
             recv_reqs = work_reqs + control_reqs
         elif self.tp_size != 1:
             recv_reqs = broadcast_pyobj(recv_reqs, self.tp_rank, self.tp_cpu_group)
+
+        if len(recv_reqs) > 0:
+            print(
+                f"hi [{get_tensor_model_parallel_rank()}, {self.__class__.__name__}] recv_requests {[type(x) for x in recv_reqs]=}",
+                flush=True,
+            )
+
         return recv_reqs
 
     def process_input_requests(self, recv_reqs: List):
@@ -1886,10 +1893,18 @@ class Scheduler(
         return ResumeMemoryOccupationReqOutput()
 
     def slow_down(self, recv_req: SlowDownReqInput):
+        print(
+            f"hi [{get_tensor_model_parallel_rank()}, {self.__class__.__name__}] slow_down START",
+            flush=True,
+        )
         t = recv_req.forward_sleep_time
         if t is not None and t <= 0:
             t = None
         self.forward_sleep_time = t
+        print(
+            f"hi [{get_tensor_model_parallel_rank()}, {self.__class__.__name__}] slow_down END",
+            flush=True,
+        )
         return SlowDownReqOutput()
 
     def profile(self, recv_req: ProfileReq):
