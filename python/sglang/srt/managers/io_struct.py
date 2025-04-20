@@ -397,8 +397,12 @@ class GenerateReqInput:
                 else None
             ),
             return_hidden_states=self.return_hidden_states,
-            bootstrap_host=self.bootstrap_host[i] if self.bootstrap_host is not None else None,
-            bootstrap_room=self.bootstrap_room[i] if self.bootstrap_room is not None else None,
+            bootstrap_host=(
+                self.bootstrap_host[i] if self.bootstrap_host is not None else None
+            ),
+            bootstrap_room=(
+                self.bootstrap_room[i] if self.bootstrap_room is not None else None
+            ),
         )
 
 
