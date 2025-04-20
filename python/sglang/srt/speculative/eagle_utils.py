@@ -19,9 +19,9 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.mem_cache.memory_pool import TokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.speculative.build_eagle_tree import build_tree_kernel_efficient
-from sglang.srt.utils import fast_topk, is_cuda_available, is_hip, next_power_of_2
+from sglang.srt.utils import fast_topk, is_cuda, is_hip, next_power_of_2
 
-if is_cuda_available():
+if is_cuda():
     from sgl_kernel import (
         top_k_renorm_prob,
         top_p_renorm_prob,
