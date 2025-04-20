@@ -210,6 +210,7 @@ class ServerArgs:
     disaggregation_mode: str = "null"
     disaggregation_bootstrap_port: int = 8998
     disaggregation_transfer_backend: str = "mooncake"
+    disaggregation_ib_device: Optional[str] = None
 
     def __post_init__(self):
         # Expert parallelism
@@ -1288,6 +1289,12 @@ class ServerArgs:
             type=str,
             default=ServerArgs.disaggregation_transfer_backend,
             help="The backend for disaggregation transfer. Default is mooncake.",
+        )
+        parser.add_argument(
+            "--disaggregation-ib-device",
+            type=str,
+            default=ServerArgs.disaggregation_ib_device,
+            help="The ib device for disaggregation transfer. Default is None, it will be detected automatically if using the mooncake backend.",
         )
 
     @classmethod
