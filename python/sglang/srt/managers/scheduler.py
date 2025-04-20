@@ -89,7 +89,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromTensorReqInput,
-    UpdateWeightsFromTensorReqOutput,
+    UpdateWeightsFromTensorReqOutput, SlowDownReqOutput,
 )
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
@@ -1805,7 +1805,7 @@ class Scheduler(
         if forward_sleep_time is not None and forward_sleep_time <= 0:
             forward_sleep_time = None
         self.tp_worker.worker.model_runner.forward_sleep_time = forward_sleep_time
-        return SlowDownReqInput()
+        return SlowDownReqOutput()
 
     def profile(self, recv_req: ProfileReq):
         if recv_req.type == ProfileReqType.START_PROFILE:
