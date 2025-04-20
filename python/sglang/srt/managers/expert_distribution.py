@@ -2,6 +2,7 @@ import logging
 import os
 import time
 from abc import ABC
+from collections import deque
 from contextlib import contextmanager
 from copy import deepcopy
 from pathlib import Path
@@ -586,6 +587,13 @@ class _StatAndUtilizationRateAccumulator(_StatAccumulator):
             utilization_rate_tensor = compute_utilization_rate(gpu_physical_count)
             utilization_rate = torch.mean(utilization_rate_tensor).item()
             TODO
+
+
+class _DequeCollection:
+    def __init__(self, maxlens: List[int]):
+        self._dequeues = [deque(maxlen=maxlen) for maxlen in maxlens]
+
+    TODO
 
 
 def compute_gpu_physical_count(
