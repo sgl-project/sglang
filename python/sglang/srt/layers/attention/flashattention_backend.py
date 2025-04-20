@@ -320,11 +320,7 @@ class FlashAttentionBackend(AttentionBackend):
         self.page_size = model_runner.page_size
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         self.skip_prefill = skip_prefill
-        self.topk = topk or (
-            model_runner.server_args.speculative_eagle_topk
-            if model_runner.server_args.speculative_eagle_topk is not None
-            else 0
-        )
+        self.topk = model_runner.server_args.speculative_eagle_topk or 0
         self.speculative_num_steps = speculative_num_steps
         self.speculative_num_draft_tokens = (
             model_runner.server_args.speculative_num_draft_tokens
