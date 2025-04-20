@@ -578,6 +578,8 @@ class _StatAndUtilizationRateAccumulator(_StatAccumulator):
         TODO
 
     def _log_utilization_rate(self, single_pass_global_physical_count: torch.Tensor):
+        gpu_physical_count = compute_gpu_physical_count(single_pass_global_physical_count, num_gpu=TODO)
+        gpu_physical_count = gpu_physical_count.to("cuda")
         TODO
 
 
