@@ -575,21 +575,23 @@ class _StatAndUtilizationRateAccumulator(_StatAccumulator):
             single_pass_global_physical_count: torch.Tensor,
     ):
         super().append(forward_pass_id, gatherer_key, single_pass_global_physical_count)
-        self._append_utilization_rate(single_pass_global_physical_count)
+        self._append_utilization_rate(forward_pass_id, single_pass_global_physical_count)
 
     def reset(self):
         super().reset()
         self._history.clear()
 
-    def _append_utilization_rate(self, single_pass_global_physical_count: torch.Tensor):
+    def _append_utilization_rate(self, forward_pass_id: int, single_pass_global_physical_count: torch.Tensor):
         gpu_physical_count = compute_gpu_physical_count(single_pass_global_physical_count, num_gpu=TODO)
         gpu_physical_count = gpu_physical_count.to("cuda")
         torch.distributed.reduce(gpu_physical_count, dst=0, op=torch.distributed.ReduceOp.SUM)
+
         if rank == 0:
             utilization_rate_tensor = compute_utilization_rate(gpu_physical_count)
             utilization_rate = torch.mean(utilization_rate_tensor).item()
             self._history.append(utilization_rate)
-            TODO
+
+            logger.info(f"[Expert Utilization Rate] {forward_pass_id=} ")
 
 
 class _DequeCollection:
