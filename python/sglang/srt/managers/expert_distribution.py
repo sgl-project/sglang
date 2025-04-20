@@ -591,7 +591,12 @@ class _StatAndUtilizationRateAccumulator(_StatAccumulator):
             utilization_rate = torch.mean(utilization_rate_tensor).item()
             self._history.append(utilization_rate)
 
-            logger.info(f"[Expert Utilization Rate] {forward_pass_id=} ")
+            logger.info(
+                f"[Expert Utilization Rate] "
+                f"forward_pass_id={forward_pass_id} "
+                f"current_pass={utilization_rate} "
+                f"{''.join(f'last_{size}={value} ' for size, value in self._history.mean())}"
+            )
 
 
 class _DequeCollection:
