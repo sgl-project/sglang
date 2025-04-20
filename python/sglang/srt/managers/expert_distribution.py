@@ -6,7 +6,7 @@ from collections import deque
 from contextlib import contextmanager
 from copy import deepcopy
 from pathlib import Path
-from typing import Any, List, Optional, Type
+from typing import Any, List, Optional, Type, Dict
 
 import einops
 import torch
@@ -565,8 +565,8 @@ def _convert_global_physical_count_to_logical_count(
 class _StatAndUtilizationRateAccumulator(_StatAccumulator):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._window_sizes = [10, 100, 1000]
-        self._history = _DequeCollection(maxlens=self._window_sizes)
+        window_sizes = [10, 100, 1000]
+        self._history = _DequeCollection(maxlens=window_sizes)
 
     def append(
             self,
@@ -599,7 +599,8 @@ class _DequeCollection:
         for d in self._dequeues:
             d.append(value)
 
-    TODO
+    def mean(self) -> Dict[int, float]:
+        TODO
 
 
 def compute_gpu_physical_count(
