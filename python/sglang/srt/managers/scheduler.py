@@ -82,6 +82,7 @@ from sglang.srt.managers.io_struct import (
     SetInternalStateReq,
     SetInternalStateReqOutput,
     SlowDownReqInput,
+    SlowDownReqOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     UpdateWeightFromDiskReqInput,
@@ -89,7 +90,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromTensorReqInput,
-    UpdateWeightsFromTensorReqOutput, SlowDownReqOutput,
+    UpdateWeightsFromTensorReqOutput,
 )
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
