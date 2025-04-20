@@ -567,6 +567,7 @@ class _StatAndUtilizationRateAccumulator(_StatAccumulator):
         super().__init__(*args, **kwargs)
         window_sizes = [10, 100, 1000]
         self._history = _DequeCollection(maxlens=window_sizes)
+        self._rank = torch.distributed.get_rank()
 
     def append(
             self,
@@ -582,11 +583,12 @@ class _StatAndUtilizationRateAccumulator(_StatAccumulator):
         self._history.clear()
 
     def _append_utilization_rate(self, forward_pass_id: int, single_pass_global_physical_count: torch.Tensor):
-        gpu_physical_count = compute_gpu_physical_count(single_pass_global_physical_count, num_gpu=TODO)
+        gpu_physical_count = compute_gpu_physical_count(single_pass_global_physical_count,
+                                                        num_gpu=self._expert_location_metadata.ep_size)
         gpu_physical_count = gpu_physical_count.to("cuda")
         torch.distributed.reduce(gpu_physical_count, dst=0, op=torch.distributed.ReduceOp.SUM)
 
-        if rank == 0:
+        if self._rank == 0:
             utilization_rate_tensor = compute_utilization_rate(gpu_physical_count)
             utilization_rate = torch.mean(utilization_rate_tensor).item()
             self._history.append(utilization_rate)
