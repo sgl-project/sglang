@@ -155,7 +155,7 @@ class ServerArgs:
     enable_nccl_nvls: bool = False
     disable_outlines_disk_cache: bool = False
     disable_custom_all_reduce: bool = False
-    disable_mla: bool = False
+    enable_llama4_multimodal: Optional[bool] = None
     disable_overlap_schedule: bool = False
     enable_mixed_chunk: bool = False
     enable_dp_attention: bool = False
@@ -179,12 +179,12 @@ class ServerArgs:
     tool_call_parser: Optional[str] = None
     enable_hierarchical_cache: bool = False
     hicache_ratio: float = 2.0
-    enable_flashinfer_mla: bool = False  # TODO: remove this argument
-    enable_flashmla: bool = False
     flashinfer_mla_disable_ragged: bool = False
     warmups: Optional[str] = None
+    moe_dense_tp_size: Optional[int] = None
     n_share_experts_fusion: int = 0
-    disable_shared_experts_fusion: bool = False
+    disable_chunked_prefix_cache: bool = False
+    disable_fast_image_processor: bool = False
 
     # Debug tensor dumps
     debug_tensor_dump_output_folder: Optional[str] = None
@@ -194,6 +194,8 @@ class ServerArgs:
     # For PD disaggregation: can be "null" (not disaggregated), "prefill" (prefill-only), or "decode" (decode-only)
     disaggregation_mode: str = "null"
     disaggregation_bootstrap_port: int = 8998
+    disaggregation_transfer_backend: str = "mooncake"
+    disaggregation_ib_device: Optional[str] = None
 
     def __post_init__(self):
         # Expert parallelism
@@ -226,9 +228,6 @@ class ServerArgs:
             # GPU memory is not known yet or no GPU is available.
             gpu_mem = None
 
-        if is_hip():
-            self.disable_shared_experts_fusion = True
-
         # Set mem fraction static, which depends on the tensor parallelism size
         if self.mem_fraction_static is None:
             if self.tp_size >= 16:
@@ -251,7 +250,12 @@ class ServerArgs:
 
         assert self.chunked_prefill_size % self.page_size == 0
 
-        if self.enable_flashmla is True:
+        assert self.moe_dense_tp_size in {
+            1,
+            None,
+        }, f"moe_dense_tp_size only support 1 and None currently"
+
+        if self.attention_backend == "flashmla":
             logger.warning(
                 "FlashMLA only supports a page_size of 64, change page_size to 64."
             )
@@ -293,6 +297,8 @@ class ServerArgs:
             logger.info(
                 f"EP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
+
+        self.enable_multimodal: Optional[bool] = self.enable_llama4_multimodal
 
         # Data parallelism attention
         if self.enable_dp_attention:
@@ -495,6 +501,7 @@ class ServerArgs:
                 "bitsandbytes",
                 "gguf",
                 "modelopt",
+                "modelopt_fp4",
                 "w8a8_int8",
                 "w8a8_fp8",
                 "moe_wna16",
@@ -817,7 +824,7 @@ class ServerArgs:
         parser.add_argument(
             "--attention-backend",
             type=str,
-            choices=["flashinfer", "triton", "torch_native", "fa3"],
+            choices=["flashinfer", "triton", "torch_native", "fa3", "flashmla"],
             default=ServerArgs.attention_backend,
             help="Choose the kernels for attention layers.",
         )
@@ -837,13 +844,13 @@ class ServerArgs:
         )
         parser.add_argument(
             "--enable-flashinfer-mla",
-            action="store_true",
-            help="Enable FlashInfer MLA optimization. This argument will be deprecated soon! Please use '--attention-backend flashinfer' instead for switching on flashfiner mla!",
+            action=DeprecatedAction,
+            help="--enable-flashinfer-mla is deprecated. Please use '--attention-backend flashinfer' instead.",
         )
         parser.add_argument(
             "--enable-flashmla",
-            action="store_true",
-            help="Enable FlashMLA decode optimization",
+            action=DeprecatedAction,
+            help="--enable-flashmla is deprecated. Please use '--attention-backend flashmla' instead.",
         )
         parser.add_argument(
             "--flashinfer-mla-disable-ragged",
@@ -969,9 +976,10 @@ class ServerArgs:
             help="Disable the custom all-reduce kernel and fall back to NCCL.",
         )
         parser.add_argument(
-            "--disable-mla",
+            "--enable-llama4-multimodal",
+            default=ServerArgs.enable_llama4_multimodal,
             action="store_true",
-            help="Disable Multi-head Latent Attention (MLA) for DeepSeek V2/V3/R1 series models.",
+            help="Enable the multimodal functionality for Llama-4.",
         )
         parser.add_argument(
             "--disable-overlap-schedule",
@@ -1097,9 +1105,16 @@ class ServerArgs:
             help="Enabling DeepEP MoE implementation for EP MoE.",
         )
         parser.add_argument(
+            "--moe-dense-tp-size",
+            type=int,
+            default=ServerArgs.moe_dense_tp_size,
+            help="TP size for MoE dense MLP layers. This flag is useful when, with large TP size, there are errors caused by weights in MLP layers having dimension smaller than the min dimension GEMM supports.",
+        )
+        parser.add_argument(
             "--deepep-mode",
             type=str,
             choices=["normal", "low_latency", "auto"],
+            default="auto",
             help="Select the mode when enable DeepEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch.",
         )
 
@@ -1107,13 +1122,18 @@ class ServerArgs:
             "--n-share-experts-fusion",
             type=int,
             default=0,
-            help="The number of shared_experts need to be replica to fuse with normal experts in deepseek v3/r1 "
-            "we use tp_size by default.",
+            help="The number of shared_experts need to be replicated to fuse with normal experts in deepseek v3/r1, "
+            "set it to tp_size can get best optimized performace.",
         )
         parser.add_argument(
-            "--disable-shared-experts-fusion",
+            "--disable-chunked-prefix-cache",
             action="store_true",
-            help="Disable shared experts fusion by setting n_share_experts_fusion to 0.",
+            help="Disable chunked prefix cache feature for deepseek, which should save overhead for short sequences.",
+        )
+        parser.add_argument(
+            "--disable-fast-image-processor",
+            action="store_true",
+            help="Adopt base image processor instead of fast image processor.",
         )
 
         # Server warmups
@@ -1158,6 +1178,18 @@ class ServerArgs:
             type=int,
             default=ServerArgs.disaggregation_bootstrap_port,
             help="Bootstrap server port on the prefill server. Default is 8998.",
+        )
+        parser.add_argument(
+            "--disaggregation-transfer-backend",
+            type=str,
+            default=ServerArgs.disaggregation_transfer_backend,
+            help="The backend for disaggregation transfer. Default is mooncake.",
+        )
+        parser.add_argument(
+            "--disaggregation-ib-device",
+            type=str,
+            default=ServerArgs.disaggregation_ib_device,
+            help="The ib device for disaggregation transfer. Default is None, it will be detected automatically if using the mooncake backend.",
         )
 
     @classmethod

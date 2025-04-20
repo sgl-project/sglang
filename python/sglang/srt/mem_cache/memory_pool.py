@@ -286,8 +286,12 @@ class MHATokenToKVPool(KVCache):
             self.get_key_buffer(i).nbytes for i in range(self.layer_num)
         ] + [self.get_value_buffer(i).nbytes for i in range(self.layer_num)]
         kv_item_lens = [
-            self.get_key_buffer(i)[0].nbytes for i in range(self.layer_num)
-        ] + [self.get_value_buffer(i)[0].nbytes for i in range(self.layer_num)]
+            self.get_key_buffer(i)[0].nbytes * self.page_size
+            for i in range(self.layer_num)
+        ] + [
+            self.get_value_buffer(i)[0].nbytes * self.page_size
+            for i in range(self.layer_num)
+        ]
         return kv_data_ptrs, kv_data_lens, kv_item_lens
 
     # Todo: different memory layout
@@ -441,6 +445,14 @@ class MLATokenToKVPool(KVCache):
             ]
 
         self.layer_transfer_counter = None
+
+    # for disagg
+    def get_contiguous_buf_infos(self):
+        # MLA has only one kv_buffer, so only the information of this buffer needs to be returned.
+        kv_data_ptrs = [self.kv_buffer[i].data_ptr() for i in range(self.layer_num)]
+        kv_data_lens = [self.kv_buffer[i].nbytes for i in range(self.layer_num)]
+        kv_item_lens = [self.kv_buffer[i][0].nbytes for i in range(self.layer_num)]
+        return kv_data_ptrs, kv_data_lens, kv_item_lens
 
     def get_key_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
@@ -866,7 +878,12 @@ class MLATokenToKVPoolHost(HostKVCache):
         self.qk_rope_head_dim = self.device_pool.qk_rope_head_dim
         self.layer_num = self.device_pool.layer_num
 
-        return (self.kv_lora_rank + self.qk_rope_head_dim) * 1 * self.dtype.itemsize
+        return (
+            (self.kv_lora_rank + self.qk_rope_head_dim)
+            * 1
+            * self.dtype.itemsize
+            * self.layer_num
+        )
 
     def init_kv_buffer(self):
         return torch.empty(
