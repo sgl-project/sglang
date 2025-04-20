@@ -73,10 +73,13 @@ class ModelConfig:
         )
 
         if enable_multimodal is None:
-            if "Llama4ForConditionalGeneration" in self.hf_config.architectures:
+            if self.hf_config.architectures[0] == "Llama4ForConditionalGeneration":
                 enable_multimodal = False
+                logger.warning("Multimodal is disabled for Llama4. To enable it, set --enable-llama4-multimodal.")
             else:
                 enable_multimodal = True
+        
+
 
         # Check model type
         self.is_generation = is_generation_model(
