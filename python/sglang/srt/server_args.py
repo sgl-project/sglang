@@ -23,6 +23,7 @@ import tempfile
 from typing import List, Literal, Optional
 
 from sglang.srt.hf_transformers_utils import check_gguf_file
+from sglang.srt.layers.quantization import QUANTIZATION_METHODS
 from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.utils import (
     configure_ipv6,
@@ -494,21 +495,7 @@ class ServerArgs:
             "--quantization",
             type=str,
             default=ServerArgs.quantization,
-            choices=[
-                "awq",
-                "fp8",
-                "gptq",
-                "marlin",
-                "gptq_marlin",
-                "awq_marlin",
-                "bitsandbytes",
-                "gguf",
-                "modelopt",
-                "modelopt_fp4",
-                "w8a8_int8",
-                "w8a8_fp8",
-                "moe_wna16",
-            ],
+            choices=QUANTIZATION_METHODS.keys(),
             help="The quantization method.",
         )
         parser.add_argument(
