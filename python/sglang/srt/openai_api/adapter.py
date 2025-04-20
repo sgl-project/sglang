@@ -962,6 +962,7 @@ def v1_chat_generate_request(
                         tokenize=True,
                         add_generation_prompt=True,
                         tools=tools,
+                        **request.chat_template_kwargs,
                     )
                 except:
                     #  This except branch will be triggered when the chosen model
@@ -973,6 +974,7 @@ def v1_chat_generate_request(
                         tokenize=True,
                         add_generation_prompt=True,
                         tools=tools,
+                        **request.chat_template_kwargs,
                     )
 
                 if assistant_prefix:
@@ -1183,7 +1185,11 @@ def v1_chat_generate_response(
             tools = request.tools
             separate_reasoning = request.separate_reasoning
 
-        if reasoning_parser and separate_reasoning:
+        enable_thinking = True
+        if request.chat_template_kwargs:
+            enable_thinking = request.chat_template_kwargs.get("enable_thinking", True)
+
+        if reasoning_parser and separate_reasoning and enable_thinking:
             try:
                 parser = ReasoningParser(
                     model_type=reasoning_parser, stream_reasoning=False
