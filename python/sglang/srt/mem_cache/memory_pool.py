@@ -418,6 +418,7 @@ class MLATokenToKVPool(KVCache):
         enable_memory_saver: bool,
     ):
         self.size = size
+        self.page_size = page_size
         self.dtype = dtype
         self.device = device
         if dtype in (torch.float8_e5m2, torch.float8_e4m3fn):
