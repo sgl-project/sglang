@@ -108,7 +108,7 @@ def run_one_case(
         input_len=input_len,
         output_len=output_len,
         num_prompts=batch_size,
-        range_ratio=args.random_range_ratio,
+        range_ratio=1.0,
         tokenizer=tokenizer,
         dataset_path="",
         random_sample=True,
@@ -118,7 +118,7 @@ def run_one_case(
     response = requests.post(
         url + "/generate",
         json={
-            "prompt": [text for text, _, _ in input_requests],
+            "text": [text for text, _, _ in input_requests],
             "sampling_params": {
                 "temperature": 0,
                 "max_new_tokens": output_len,
