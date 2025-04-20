@@ -8,7 +8,7 @@ Enable speculative sampling in FlashMLA
 """
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Callable, Optional, Tuple, Union
 
 import torch
 import triton
@@ -20,18 +20,18 @@ from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttn
 from sglang.srt.layers.attention.utils import create_flashmla_kv_indices_triton
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
-    from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
     from sglang.srt.speculative.spec_info import SpecInfo
 
 
 # FlashMLA only supports pagesize=64
 PAGE_SIZE = 64
 # TODO The current setup is hard-coded and will be changed after integrating with MTP.
-Q_LEN = 1
+# Q_LEN = 1
 
 
 @dataclass
@@ -282,3 +282,159 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         )
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+class FlashMLAMultiStepDraftBackend:
+    """
+    Wrap multiple flashmla attention backends as one for multiple consecutive
+    draft decoding steps.
+    """
+
+    def __init__(
+        self,
+        model_runner: ModelRunner,
+        topk: int,
+        speculative_num_steps: int,
+    ):
+        from sglang.srt.speculative.eagle_utils import generate_draft_decode_kv_indices
+
+        if topk > 1:
+            raise ValueError(
+                f"Currently FlashMLA only supports topk=1 for speculative decoding"
+            )
+        self.topk = topk
+        self.speculative_num_steps = speculative_num_steps
+        self.generate_draft_decode_kv_indices = generate_draft_decode_kv_indices
+
+        max_bs = model_runner.req_to_token_pool.size * self.topk
+        self.kv_indptr = torch.zeros(
+            (
+                self.speculative_num_steps,
+                max_bs + 1,
+            ),
+            dtype=torch.int32,
+            device=model_runner.device,
+        )
+        self.q_indptr_decode = torch.arange(
+            0, max_bs + 1, dtype=torch.int32, device=model_runner.device
+        )
+
+        self.attn_backends = []
+        for i in range(self.speculative_num_steps):
+            self.attn_backends.append(
+                FlashMLABackend(
+                    model_runner,
+                    skip_prefill=True,
+                    kv_indptr_buf=self.kv_indptr[i],
+                    kv_last_page_len_buf=None,
+                )
+            )
+
+        self.max_context_len = self.attn_backends[0].max_context_len
+
+        # Cached variables for generate_draft_decode_kv_indices
+        self.pool_len = model_runner.req_to_token_pool.req_to_token.shape[1]
+
+    def common_template(
+        self,
+        forward_batch: ForwardBatch,
+        kv_indices_buffer: torch.Tensor,
+        call_fn: Callable,
+    ):
+        num_seqs = forward_batch.batch_size
+        bs = self.topk * num_seqs
+        seq_lens_sum = forward_batch.seq_lens_sum
+
+        self.generate_draft_decode_kv_indices[
+            (self.speculative_num_steps, num_seqs, self.topk)
+        ](
+            forward_batch.req_pool_indices,
+            forward_batch.req_to_token_pool.req_to_token,
+            forward_batch.seq_lens,
+            kv_indices_buffer,
+            self.kv_indptr,
+            forward_batch.positions,
+            num_seqs,
+            self.topk,
+            self.pool_len,
+            kv_indices_buffer.shape[1],
+            self.kv_indptr.shape[1],
+            triton.next_power_of_2(num_seqs),
+            triton.next_power_of_2(self.speculative_num_steps),
+            triton.next_power_of_2(bs),
+        )
+
+        assert forward_batch.spec_info is not None
+        assert isinstance(forward_batch.spec_info, EagleDraftInput)
+
+        for i in range(self.speculative_num_steps - 1):
+            forward_batch.spec_info.kv_indptr = self.kv_indptr[i, : bs + 1]
+            forward_batch.spec_info.kv_indices = kv_indices_buffer[i][
+                : seq_lens_sum * self.topk + bs * (i + 1)
+            ]
+            call_fn(i, forward_batch)
+
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
+        kv_indices = torch.zeros(
+            (
+                self.speculative_num_steps,
+                forward_batch.batch_size * self.topk * self.max_context_len,
+            ),
+            dtype=torch.int32,
+            device="cuda",
+        )
+
+        def call_fn(i, forward_batch):
+            assert forward_batch.spec_info is not None
+            assert isinstance(forward_batch.spec_info, EagleDraftInput)
+            forward_batch.spec_info.kv_indptr = (
+                forward_batch.spec_info.kv_indptr.clone()
+            )
+            forward_batch.spec_info.kv_indices = (
+                forward_batch.spec_info.kv_indices.clone()
+            )
+            self.attn_backends[i].init_forward_metadata(forward_batch)
+
+        self.common_template(forward_batch, kv_indices, call_fn)
+
+    def init_cuda_graph_state(self, max_bs: int):
+        self.cuda_graph_kv_indices = torch.zeros(
+            (self.speculative_num_steps, max_bs * self.max_context_len),
+            dtype=torch.int32,
+            device="cuda",
+        )
+
+        for i in range(self.speculative_num_steps):
+            self.attn_backends[i].init_cuda_graph_state(
+                max_bs, block_kv_indices=self.cuda_graph_kv_indices[i]
+            )
+
+    def init_forward_metadata_capture_cuda_graph(self, forward_batch: ForwardBatch):
+        def call_fn(i, forward_batch):
+            self.attn_backends[i].init_forward_metadata_capture_cuda_graph(
+                forward_batch.batch_size,
+                forward_batch.batch_size * self.topk,
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                encoder_lens=None,
+                forward_mode=ForwardMode.DECODE,
+                spec_info=forward_batch.spec_info,
+            )
+
+        self.common_template(forward_batch, self.cuda_graph_kv_indices, call_fn)
+
+    def init_forward_metadata_replay_cuda_graph(
+        self, forward_batch: ForwardBatch, bs: int
+    ):
+        def call_fn(i, forward_batch):
+            self.attn_backends[i].init_forward_metadata_replay_cuda_graph(
+                bs,
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                seq_lens_sum=-1,
+                encoder_lens=None,
+                forward_mode=ForwardMode.DECODE,
+                spec_info=forward_batch.spec_info,
+                seq_lens_cpu=forward_batch.seq_lens_cpu,
+            )
+
+        self.common_template(forward_batch, self.cuda_graph_kv_indices, call_fn)
