@@ -26,7 +26,6 @@ import requests
 import torch
 import torch.multiprocessing as mp
 
-from sglang.bench_serving import sample_random_requests
 from sglang.srt import fine_grained_benchmark
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
@@ -147,15 +146,10 @@ def run_one_case(
     run_name: str,
     result_filename: str,
 ):
-    input_requests = sample_random_requests(
-        input_len=input_len,
-        output_len=output_len,
-        num_prompts=batch_size,
-        range_ratio=args.random_range_ratio,
-        tokenizer=tokenizer,
-        dataset_path="",
-        random_sample=True,
-    )
+    input_ids = [
+        [int(x) for x in np.random.randint(0, high=16384, size=(input_len,))]
+        for _ in range(batch_size)
+    ]
 
     if fine_grained_benchmark.is_enabled():
         fine_grained_benchmark.clear_output()
@@ -164,7 +158,7 @@ def run_one_case(
     response = requests.post(
         url + "/generate",
         json={
-            "prompt": [text for text, _, _ in input_requests],
+            "input_ids": input_ids,
             "sampling_params": {
                 "temperature": 0,
                 "max_new_tokens": output_len,
