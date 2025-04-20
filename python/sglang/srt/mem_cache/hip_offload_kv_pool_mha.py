@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, List, Tuple
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import torch
 from torch import Tensor
@@ -22,7 +22,9 @@ class MHATokenToHiPOffloadKVPool(KVCache):
         self,
         max_token_size: int,
         max_mask_cache_factor: float,
+        max_mask_cache_size: Optional[int],
         max_sa_cache_factor: float,
+        max_sa_cache_size: Optional[int],
         dtype: torch.dtype,
         head_num: int,
         head_dim: int,
@@ -43,7 +45,9 @@ class MHATokenToHiPOffloadKVPool(KVCache):
         self.offload_cache = HiPModelOffloadCache(
             max_token_size=max_token_size,
             max_mask_cache_factor=max_mask_cache_factor,
+            max_mask_cache_token_size=max_mask_cache_size,
             max_sa_cache_factor=max_sa_cache_factor,
+            max_sa_cache_token_size=max_sa_cache_size,
             dtype=dtype,
             head_num=head_num,
             head_dim=head_dim,
