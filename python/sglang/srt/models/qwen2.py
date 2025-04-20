@@ -154,6 +154,7 @@ class Qwen2Attention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
         )
 
@@ -238,6 +239,7 @@ class Qwen2Model(nn.Module):
         config: Qwen2Config,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        decoder_layer_type: type[nn.Module] = Qwen2DecoderLayer,
     ) -> None:
         super().__init__()
         self.config = config
@@ -249,9 +251,11 @@ class Qwen2Model(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("embed_tokens", prefix),
         )
+        # Use the provided decoder layer type or default to Qwen2DecoderLayer
+        decoder_layer_type = decoder_layer_type or Qwen2DecoderLayer
         self.layers = make_layers(
             config.num_hidden_layers,
-            lambda idx, prefix: Qwen2DecoderLayer(
+            lambda idx, prefix: decoder_layer_type(
                 layer_id=idx,
                 config=config,
                 quant_config=quant_config,
@@ -261,11 +265,14 @@ class Qwen2Model(nn.Module):
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def get_input_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
         if hasattr(self.config, "scale_emb"):
-            return self.embed_tokens(input_ids) * self.config.scale_emb
+            return self.get_input_embeddings()(input_ids) * self.config.scale_emb
         else:
-            return self.embed_tokens(input_ids)
+            return self.get_input_embeddings()(input_ids)
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.embed_tokens
 
     def forward(
         self,
@@ -358,10 +365,10 @@ class Qwen2ForCausalLM(nn.Module):
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
 
-    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.model.get_input_embeddings(input_ids)
+    def get_input_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.model.get_input_embedding(input_ids)
 
-    def get_input_embedding(self) -> nn.Embedding:
+    def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
 
     @torch.no_grad()

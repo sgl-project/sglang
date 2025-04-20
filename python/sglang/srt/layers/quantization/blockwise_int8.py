@@ -370,8 +370,10 @@ class BlockInt8MoEMethod:
         custom_routing_function: Optional[Callable] = None,
         correction_bias: Optional[torch.Tensor] = None,
         activation: str = "silu",
+        apply_router_weight_on_input: bool = False,
         inplace: bool = True,
         no_combine: bool = False,
+        routed_scaling_factor: Optional[float] = None,
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
         from sglang.srt.layers.moe.topk import select_experts
@@ -387,6 +389,7 @@ class BlockInt8MoEMethod:
             num_expert_group=num_expert_group,
             custom_routing_function=custom_routing_function,
             correction_bias=correction_bias,
+            routed_scaling_factor=routed_scaling_factor,
         )
 
         # Expert fusion with INT8 quantization
@@ -398,6 +401,7 @@ class BlockInt8MoEMethod:
             topk_ids=topk_ids,
             inplace=inplace,
             activation=activation,
+            apply_router_weight_on_input=apply_router_weight_on_input,
             use_int8_w8a8=True,
             w1_scale=(layer.w13_weight_scale_inv),
             w2_scale=(layer.w2_weight_scale_inv),

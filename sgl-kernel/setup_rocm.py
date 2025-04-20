@@ -21,9 +21,6 @@ from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 root = Path(__file__).parent.resolve()
 
-if "bdist_wheel" in sys.argv and "--plat-name" not in sys.argv:
-    sys.argv.extend(["--plat-name", "manylinux2014_x86_64"])
-
 
 def _get_version():
     with open(root / "pyproject.toml") as f:
@@ -74,7 +71,7 @@ ext_modules = [
         },
         libraries=libraries,
         extra_link_args=extra_link_args,
-        py_limited_api=True,
+        py_limited_api=False,
     ),
 ]
 

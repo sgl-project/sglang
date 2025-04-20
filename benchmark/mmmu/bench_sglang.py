@@ -2,7 +2,9 @@
 Bench the sglang-hosted vLM with benchmark MMMU
 
 Usage:
-    python benchmark/mmmu/bench_sglang.py --model-path Qwen/Qwen2-VL-7B-Instruct --chat-template qwen2-vl
+    Host the VLM: python -m sglang.launch_server --model-path Qwen/Qwen2-VL-7B-Instruct --chat-template qwen2-vl --port 30000
+
+    Benchmark: python benchmark/mmmu/bench_sglang.py --port 30000
 
 The eval output will be logged
 """
@@ -84,8 +86,7 @@ def eval_mmmu(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    args = add_common_sglang_args_and_parse(parser)
     EvalArgs.add_cli_args(parser)
+    args = add_common_sglang_args_and_parse(parser)
     args = parser.parse_args()
-
     eval_mmmu(args)

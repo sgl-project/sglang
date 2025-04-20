@@ -11,6 +11,7 @@ RUN apt-get update && apt-get install -y \
     wget \
     curl \
     locales \
+    lsof \
     git \
     git-lfs \
     zsh \
@@ -21,6 +22,7 @@ RUN apt-get update && apt-get install -y \
     pkg-config \
     libssl-dev \
     bear \
+    ccache \
     && apt install -y rdma-core infiniband-diags openssh-server perftest ibverbs-providers libibumad3 libibverbs1 libnl-3-200 libnl-route-3-200 librdmacm1 \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
@@ -44,6 +46,7 @@ RUN python3 -m pip install --no-cache-dir \
     black \
     isort \
     icdiff \
+    uv \
     pre-commit
 
 # Install diff-so-fancy
