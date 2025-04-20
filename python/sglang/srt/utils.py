@@ -55,7 +55,6 @@ import torch.distributed
 import torch.distributed as dist
 import triton
 import zmq
-from decord import VideoReader, cpu
 from fastapi.responses import ORJSONResponse
 from packaging import version as pkg_version
 from PIL import Image
@@ -545,6 +544,9 @@ def load_audio(audio_file: str, sr: int = 16000, mono: bool = True) -> np.ndarra
 
 
 def encode_video(video_path, frame_count_limit=None):
+    # Lazy import because decord is not available on some arm platforms.
+    from decord import VideoReader, cpu
+
     if not os.path.exists(video_path):
         logger.error(f"Video {video_path} does not exist")
         return []
@@ -569,7 +571,7 @@ def encode_video(video_path, frame_count_limit=None):
 
 
 def load_image(
-    image_file: Union[Image.Image, str, bytes]
+    image_file: Union[Image.Image, str, bytes],
 ) -> tuple[Image.Image, tuple[int, int]]:
     image = image_size = None
     if isinstance(image_file, Image.Image):
@@ -1905,3 +1907,41 @@ def get_local_ip_by_remote() -> str:
         return s.getsockname()[0]
     except Exception:
         raise ValueError(f"Can not get local ip")
+
+
+def is_page_size_one(server_args):
+    return server_args.page_size == 1
+
+
+def is_no_spec_infer_or_topk_one(server_args):
+    return server_args.speculative_eagle_topk is None or (
+        server_args.speculative_eagle_topk is not None
+        and server_args.speculative_eagle_topk == 1
+        and is_page_size_one(server_args)
+    )
+
+
+def is_fa3_default_architecture(hf_config):
+    architectures = getattr(hf_config, "architectures", None)
+    if not isinstance(architectures, list) or not architectures:
+        return False
+    default_archs = {
+        "Qwen2ForCausalLM",
+        "Llama4ForConditionalGeneration",
+        "LlamaForCausalLM",
+        "MistralForCausalLM",
+    }
+    return architectures[0] in default_archs
+
+
+# Can be more general if it is used in multiple places (keep it simple and thus not general now)
+class BumpAllocator:
+    def __init__(self, buffer_size: int, dtype, device):
+        self._buffer = torch.zeros((buffer_size,), dtype=dtype, device=device)
+        self._pointer = 0
+
+    def allocate(self, size: int):
+        assert self._pointer + size <= len(self._buffer)
+        output = self._buffer[self._pointer : self._pointer + size]
+        self._pointer += size
+        return output
