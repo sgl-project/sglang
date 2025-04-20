@@ -1356,7 +1356,7 @@ class Scheduler(
             self.stop_profile()
 
         if self.forward_sleep_time is not None:
-            logger.info(f"ModelRunner.forward sleep {self.forward_sleep_time}")
+            logger.info(f"Scheduler.run_batch sleep {self.forward_sleep_time}s")
             time.sleep(self.forward_sleep_time)
 
         # Run forward
