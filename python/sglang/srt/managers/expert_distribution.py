@@ -599,8 +599,15 @@ class _DequeCollection:
         for d in self._dequeues:
             d.append(value)
 
+    def clear(self):
+        for d in self._dequeues:
+            d.clear()
+
     def mean(self) -> Dict[int, float]:
-        TODO
+        return {
+            d.maxlen: sum(d) / len(d)
+            for d in self._dequeues
+        }
 
 
 def compute_gpu_physical_count(
