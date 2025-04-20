@@ -963,17 +963,62 @@ class ModelRunner:
             self.server_args.enable_hip_attention
             and self.server_args.enable_hip_kv_cache_offload
         ):
-            self.token_to_kv_pool = MHATokenToHiPOffloadKVPool(
-                max_token_size=self.max_total_num_tokens,
-                max_mask_cache_factor=self.server_args.hip_max_mask_cache_factor,
-                max_sa_cache_factor=self.server_args.hip_max_sa_cache_factor,
-                dtype=self.kv_cache_dtype,
-                head_num=self.model_config.get_num_kv_heads(self.tp_size),
-                head_dim=self.model_config.head_dim,
-                layer_num=self.model_config.num_hidden_layers,
-                device=torch.device(self.gpu_id),
-                hip_config=self.server_args.hip_attention_config,
-            )
+            if self.model_config.attention_chunk_size is not None:
+                # NOTE: this should handle only llama4, for now.
+                assert self.model_config.hf_config.architectures[0] in [
+                    "Llama4ForConditionalGeneration", 
+                ], self.model_config.hf_config.architectures
+                
+                num_layers = self.model_config.num_hidden_layers
+                attention_chunk_size = self.model_config.attention_chunk_size
+                
+                mask_factors = []
+                mask_sizes = []
+                sa_factors = []
+                sa_sizes = []
+                
+                for layer_id in range(num_layers):
+                    use_rope = (layer_id + 1) % 4 != 0
+                    if use_rope:
+                        # Chunked attention
+                        mask_factors.append(None)
+                        mask_sizes.append(1)
+                        sa_factors.append(None)
+                        sa_sizes.append(int(attention_chunk_size * 1.5))
+                    else:
+                        # NoPE attention
+                        mask_factors.append(self.server_args.hip_max_mask_cache_factor)
+                        mask_sizes.append(self.server_args.hip_max_mask_cache_size)
+                        sa_factors.append(self.server_args.hip_max_sa_cache_factor)
+                        sa_sizes.append(self.server_args.hip_max_sa_cache_size)
+                
+                self.token_to_kv_pool = MHATokenToHiPOffloadKVPool(
+                    max_token_size=self.max_total_num_tokens,
+                    max_mask_cache_factor=mask_factors,
+                    max_mask_cache_size=mask_sizes,
+                    max_sa_cache_factor=sa_factors,
+                    max_sa_cache_size=sa_sizes,
+                    dtype=self.kv_cache_dtype,
+                    head_num=self.model_config.get_num_kv_heads(self.tp_size),
+                    head_dim=self.model_config.head_dim,
+                    layer_num=self.model_config.num_hidden_layers,
+                    device=torch.device(self.gpu_id),
+                    hip_config=self.server_args.hip_attention_config,
+                )
+            else:
+                self.token_to_kv_pool = MHATokenToHiPOffloadKVPool(
+                    max_token_size=self.max_total_num_tokens,
+                    max_mask_cache_factor=self.server_args.hip_max_mask_cache_factor,
+                    max_mask_cache_size=self.server_args.hip_max_mask_cache_size,
+                    max_sa_cache_factor=self.server_args.hip_max_sa_cache_factor,
+                    max_sa_cache_size=self.server_args.hip_max_sa_cache_size,
+                    dtype=self.kv_cache_dtype,
+                    head_num=self.model_config.get_num_kv_heads(self.tp_size),
+                    head_dim=self.model_config.head_dim,
+                    layer_num=self.model_config.num_hidden_layers,
+                    device=torch.device(self.gpu_id),
+                    hip_config=self.server_args.hip_attention_config,
+                )
         else:
             self.token_to_kv_pool = MHATokenToKVPool(
                 self.max_total_num_tokens,
