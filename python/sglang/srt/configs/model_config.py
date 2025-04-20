@@ -73,7 +73,7 @@ class ModelConfig:
         )
 
         if enable_multimodal is None:
-            if self.hf_config.architectures == "Llama4ForConditionalGeneration":
+            if "Llama4ForConditionalGeneration" in self.hf_config.architectures:
                 enable_multimodal = False
             else:
                 enable_multimodal = True
