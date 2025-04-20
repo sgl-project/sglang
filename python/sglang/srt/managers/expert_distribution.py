@@ -593,6 +593,10 @@ class _DequeCollection:
     def __init__(self, maxlens: List[int]):
         self._dequeues = [deque(maxlen=maxlen) for maxlen in maxlens]
 
+    def append(self, value):
+        for d in self._dequeues:
+            d.append(value)
+
     TODO
 
 
