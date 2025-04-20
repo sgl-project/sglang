@@ -14,7 +14,7 @@ from sglang.test.test_utils import (
 )
 
 
-class TestFlashinferMLAMTP(CustomTestCase):
+class TestFlashMLAMTP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = "lmsys/sglang-ci-dsv3-test"
