@@ -26,7 +26,6 @@ import requests
 import torch
 import torch.multiprocessing as mp
 
-
 from sglang.bench_serving import get_tokenizer, sample_random_requests
 from sglang.srt import fine_grained_benchmark
 from sglang.srt.entrypoints.http_server import launch_server
