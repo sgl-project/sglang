@@ -514,20 +514,6 @@ class DeepseekV2MoE(nn.Module):
             state.forward_batch.forward_mode, state.hidden_states_after_post_attn_ln
         )
 
-    def _forward_tbo_op_compute_layer_output(self, state):
-        final_hidden_states = state.hidden_states_from_combine
-        if state.shared_output is not None:
-            final_hidden_states = final_hidden_states + state.shared_output
-        output = dict(
-            positions=state.positions,
-            hidden_states=final_hidden_states,
-            forward_batch=state.forward_batch,
-            residual=state.residual_after_post_attn_ln,
-            tbo_subbatch_index=state.tbo_subbatch_index,
-        )
-        state.clear()
-        return output
-
     def _forward_shared_experts(self, hidden_states):
         if self.n_share_experts_fusion == 0:
             return self.shared_experts(hidden_states)
@@ -1544,7 +1530,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 two_batch_overlap.YieldOperation(),
                 self.mlp._forward_tbo_op_shared,
                 self.mlp._forward_tbo_op_combine_b,
-                self.mlp._forward_tbo_op_compute_layer_output,
+                self._forward_tbo_op_compute_layer_output,
             ]
         elif forward_mode == ForwardMode.DECODE:
             operations = [
@@ -1565,7 +1551,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 self.mlp._forward_tbo_op_combine_a,
                 two_batch_overlap.YieldOperation(),
                 self.mlp._forward_tbo_op_combine_b,
-                self.mlp._forward_tbo_op_compute_layer_output,
+                self._forward_tbo_op_compute_layer_output,
                 two_batch_overlap.YieldOperation(),
             ]
         else:
@@ -1682,6 +1668,21 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states,
             residual,
         )
+
+    # TODO some logic should be in MLP, refactor this
+    def _forward_tbo_op_compute_layer_output(self, state):
+        final_hidden_states = state.hidden_states_from_combine
+        if state.shared_output is not None:
+            final_hidden_states = final_hidden_states + state.shared_output
+        output = dict(
+            positions=state.positions,
+            hidden_states=final_hidden_states,
+            forward_batch=state.forward_batch,
+            residual=state.residual_after_post_attn_ln,
+            tbo_subbatch_index=state.tbo_subbatch_index,
+        )
+        state.clear()
+        return output
 
 
 class DeepseekV2Model(nn.Module):
