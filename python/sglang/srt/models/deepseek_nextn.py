@@ -94,7 +94,9 @@ class DeepseekModelNextN(nn.Module):
         zero_allocator = BumpAllocator(
             buffer_size=2,
             dtype=torch.float32,
-            device=input_ids.device,
+            device=(
+                input_embeds.device if input_embeds is not None else input_ids.device
+            ),
         )
 
         if input_embeds is None:
