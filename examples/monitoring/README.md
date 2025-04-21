@@ -21,7 +21,7 @@ By default, the metrics server will run on `127.0.0.1:30000`.
 
 ```bash
 cd examples/monitoring
-docker compose up -d
+docker compose up
 ```
 
 3. Access the monitoring interfaces:
