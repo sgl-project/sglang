@@ -1887,7 +1887,8 @@ class DeepseekV2Model(nn.Module):
         )
         with num_sm_context:
             return two_batch_overlap.model_forward_execute_two_batch(
-                splitted_inputs=(inputs_a, inputs_b),
+                inputs_a=inputs_a,
+                inputs_b=inputs_b,
                 operations_a=compute_operations(0),
                 operations_b=compute_operations(1),
                 delta_stages={
