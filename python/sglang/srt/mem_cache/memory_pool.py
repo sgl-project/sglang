@@ -624,26 +624,27 @@ class HostKVCache(abc.ABC):
         self,
         device_pool: MHATokenToKVPool,
         host_to_device_ratio: float,
+        host_size: int,
         pin_memory: bool,
         device: str,
         page_size: int,
     ):
-        assert (
-            host_to_device_ratio >= 1
-        ), "The host memory should be larger than the device memory with the current protocol"
-        # todo, other ways of configuring the size
-
         self.device_pool = device_pool
-        self.host_to_device_ratio = host_to_device_ratio
+        self.dtype = device_pool.store_dtype
         self.pin_memory = pin_memory
         self.device = device
         self.page_size = page_size
-
-        self.size = int(device_pool.size * host_to_device_ratio)
+        self.size_per_token = self.get_size_per_token()
+        if host_size > 0:
+            self.size = int(host_size * 1e9 // self.size_per_token)
+        else:
+            self.size = int(device_pool.size * host_to_device_ratio)
         # Align the host memory pool size to the page size
         self.size = self.size - (self.size % self.page_size)
-        self.dtype = device_pool.store_dtype
-        self.size_per_token = self.get_size_per_token()
+
+        assert (
+            self.size > device_pool.size
+        ), "The host memory should be larger than the device memory with the current protocol"
 
         # Verify there is enough available host memory.
         host_mem = psutil.virtual_memory()
@@ -795,12 +796,13 @@ class MHATokenToKVPoolHost(HostKVCache):
         self,
         device_pool: MHATokenToKVPool,
         host_to_device_ratio: float,
+        host_size: int,
         page_size: int,
         pin_memory: bool = True,
         device: str = "cpu",
     ):
         super().__init__(
-            device_pool, host_to_device_ratio, pin_memory, device, page_size
+            device_pool, host_to_device_ratio, host_size, pin_memory, device, page_size
         )
 
     def get_size_per_token(self):
@@ -869,12 +871,13 @@ class MLATokenToKVPoolHost(HostKVCache):
         self,
         device_pool: MLATokenToKVPool,
         host_to_device_ratio: float,
+        host_size: int,
         page_size: int,
         pin_memory: bool = True,
         device: str = "cpu",
     ):
         super().__init__(
-            device_pool, host_to_device_ratio, pin_memory, device, page_size
+            device_pool, host_to_device_ratio, host_size, pin_memory, device, page_size
         )
 
     def get_size_per_token(self):
