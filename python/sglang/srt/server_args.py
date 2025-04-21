@@ -26,11 +26,8 @@ from sglang.srt.hf_transformers_utils import check_gguf_file
 from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.utils import (
     configure_ipv6,
-    get_amdgpu_memory_capacity,
     get_device,
-    get_hpu_memory_capacity,
-    get_nvgpu_memory_capacity,
-    is_cuda,
+    get_whatever_gpu_memory_capacity,
     is_flashinfer_available,
     is_hip,
     is_port_available,
@@ -219,15 +216,7 @@ class ServerArgs:
         if self.random_seed is None:
             self.random_seed = random.randint(0, 1 << 30)
 
-        if is_cuda():
-            gpu_mem = get_nvgpu_memory_capacity()
-        elif is_hip():
-            gpu_mem = get_amdgpu_memory_capacity()
-        elif self.device == "hpu":
-            gpu_mem = get_hpu_memory_capacity()
-        else:
-            # GPU memory is not known yet or no GPU is available.
-            gpu_mem = None
+        gpu_mem = get_whatever_gpu_memory_capacity(self.device)
 
         # Set mem fraction static, which depends on the tensor parallelism size
         if self.mem_fraction_static is None:
