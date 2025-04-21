@@ -291,6 +291,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
             self.forward_metadata.mla_metadata = self.cuda_graph_mla_metadata
             self.forward_metadata.num_splits = self.cuda_graph_num_splits[: bs + 1]
+            print("self.forward_metadata.block_kv_indices", self.forward_metadata.block_kv_indices.shape)
             self.forward_metadata.block_kv_indices = self.cuda_graph_kv_indices[
                 :bs, :max_seqlen_pad
             ]
@@ -316,10 +317,12 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
             self.forward_metadata.mla_metadata = self.cuda_graph_mla_metadata
             self.forward_metadata.num_splits = self.cuda_graph_num_splits[: bs + 1]
+            print("self.forward_metadata.block_kv_indices", self.forward_metadata.block_kv_indices.shape)
             self.forward_metadata.block_kv_indices = self.cuda_graph_kv_indices[
                 :bs, :max_seqlen_pad
             ]
         else:
+            print("super().init_forward_metadata_replay_cuda_graph")
             super().init_forward_metadata_replay_cuda_graph(
                 bs,
                 req_pool_indices,
