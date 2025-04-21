@@ -97,7 +97,7 @@ def _compile_warning_1():
             "Recommand to run `sglang.compile_deep_gemm` with same args as `sglang.launch_server`"
             " for pre-compilation to reduce the overhead if you have not run it before. "
             "For example: "
-            "`python -m sglang.compile_deep_gemm --model deepseek-ai/DeepSeek-V3 --tp 8 --trust-remote-code`"
+            "`python3 -m sglang.compile_deep_gemm --model deepseek-ai/DeepSeek-V3 --tp 8 --trust-remote-code`"
         )
 
 
@@ -108,7 +108,7 @@ def _compile_warning_2():
         "Please run `sglang.compile_deep_gemm` with same args as `sglang.launch_server`"
         " for pre-compilation to solve this issue. "
         "For example: "
-        "`python -m sglang.compile_deep_gemm --model deepseek-ai/DeepSeek-V3 --tp 8 --trust-remote-code`"
+        "`python3 -m sglang.compile_deep_gemm --model deepseek-ai/DeepSeek-V3 --tp 8 --trust-remote-code`"
     )
 
 
