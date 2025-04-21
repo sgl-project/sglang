@@ -270,23 +270,23 @@ class Scheduler(
         else:
             TpWorkerClass = TpModelWorker
 
-        ################################################################################
-        print("HACK!!!! temp start_profile")
-        # Init profiler
-        self.torch_profiler = None
-        self.torch_profiler_output_dir: Optional[str] = None
-        self.profiler_activities: Optional[List[str]] = None
-        self.profiler_id: Optional[str] = None
-        self.profiler_target_forward_ct: Optional[int] = None
-        self.start_profile(
-            output_dir=None,
-            num_steps=None,
-            activities=["MEM"],
-            with_stack=None,
-            record_shapes=None,
-            profile_id=str(time.time()),
-        )
-        ################################################################################
+        # ################################################################################
+        # print("HACK!!!! temp start_profile")
+        # # Init profiler
+        # self.torch_profiler = None
+        # self.torch_profiler_output_dir: Optional[str] = None
+        # self.profiler_activities: Optional[List[str]] = None
+        # self.profiler_id: Optional[str] = None
+        # self.profiler_target_forward_ct: Optional[int] = None
+        # self.start_profile(
+        #     output_dir=None,
+        #     num_steps=None,
+        #     activities=["MEM"],
+        #     with_stack=None,
+        #     record_shapes=None,
+        #     profile_id=str(time.time()),
+        # )
+        # ################################################################################
 
         try:
             self.tp_worker = TpWorkerClass(
@@ -301,10 +301,10 @@ class Scheduler(
             print(f"HACK!!!! see error but continue {e=}")
             traceback.print_exc()
 
-        ################################################################################
-        print("HACK!!!! temp stop_profile")
-        self.stop_profile()
-        ################################################################################
+        # ################################################################################
+        # print("HACK!!!! temp stop_profile")
+        # self.stop_profile()
+        # ################################################################################
 
         # Launch a draft worker for speculative decoding
         if self.spec_algorithm.is_eagle():
