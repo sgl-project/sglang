@@ -1076,6 +1076,7 @@ class DeepEPMoE(EPMoE):
             scale_block_size,
             masked_m,
         )
+        del gateup_output
 
         # GroupGemm-1
         n = self.w2_weight.size(1)
