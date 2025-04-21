@@ -665,6 +665,7 @@ class ForwardBatch:
             start_seq_index=0,
             end_seq_index=self.tbo_split_seq_index,
             output_attn_backend=attn_backend_child_a,
+            output_global_num_tokens=self.global_split_token_index,
         )
         child_b = self.filter_batch(
             start_token_index=tbo_split_token_index,
@@ -672,6 +673,14 @@ class ForwardBatch:
             start_seq_index=self.tbo_split_seq_index,
             end_seq_index=self.batch_size,
             output_attn_backend=attn_backend_child_b,
+            output_global_num_tokens=[
+                rank_num_tokens - rank_split_token_index
+                for rank_split_token_index, rank_num_tokens in zip(
+                    self.global_split_token_index,
+                    self.global_num_tokens_cpu,
+                    strict=True,
+                )
+            ],
         )
 
         assert self.tbo_children is None
@@ -685,6 +694,7 @@ class ForwardBatch:
         start_seq_index: int,
         end_seq_index: int,
         output_attn_backend: AttentionBackend,
+        output_global_num_tokens: List[int],
     ):
         num_tokens = self.input_ids.shape[0]
         num_seqs = self.batch_size
@@ -745,6 +755,18 @@ class ForwardBatch:
             output_dict["input_ids"], output_dict["forward_mode"]
         )
 
+        # TODO improve, e.g. unify w/ `init_raw`
+        if output_global_num_tokens is not None:
+            max_len = max(output_global_num_tokens)
+            tp_size = get_tensor_model_parallel_world_size()
+            gathered_buffer = torch.zeros(
+                (max_len * tp_size, self.gathered_buffer.shape[1]),
+                dtype=self.gathered_buffer.dtype,
+                device=self.gathered_buffer.device,
+            )
+        else:
+            gathered_buffer = None
+
         output_dict.update(
             dict(
                 batch_size=end_seq_index - start_seq_index,
@@ -756,7 +778,7 @@ class ForwardBatch:
                 tbo_children=None,
                 global_num_tokens_gpu=None,
                 global_num_tokens_cpu=None,
-                gathered_buffer=None,
+                gathered_buffer=gathered_buffer,
                 global_num_tokens_for_logprob_gpu=None,
                 global_num_tokens_for_logprob_cpu=None,
                 sampling_info=None,
