@@ -244,6 +244,7 @@ class ForwardBatch:
     dp_local_start_pos: Optional[torch.Tensor] = None  # cached info at runtime
     dp_local_num_tokens: Optional[torch.Tensor] = None  # cached info at runtime
     gathered_buffer: Optional[torch.Tensor] = None
+    tbo_global_split_token_index: Optional[List[int]] = None
     tbo_split_seq_index: Optional[int] = None
     can_run_dp_cuda_graph: bool = False
     global_forward_mode: Optional[ForwardMode] = None
@@ -665,7 +666,7 @@ class ForwardBatch:
             start_seq_index=0,
             end_seq_index=self.tbo_split_seq_index,
             output_attn_backend=attn_backend_child_a,
-            output_global_num_tokens=self.global_split_token_index,
+            output_global_num_tokens=self.tbo_global_split_token_index,
         )
         child_b = self.filter_batch(
             start_token_index=tbo_split_token_index,
@@ -676,7 +677,7 @@ class ForwardBatch:
             output_global_num_tokens=[
                 rank_num_tokens - rank_split_token_index
                 for rank_split_token_index, rank_num_tokens in zip(
-                    self.global_split_token_index,
+                    self.tbo_global_split_token_index,
                     self.global_num_tokens_cpu,
                     strict=True,
                 )
