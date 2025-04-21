@@ -1672,6 +1672,8 @@ class DeepseekV2DecoderLayer(nn.Module):
     # TODO some logic should be in MLP, refactor this
     def _forward_tbo_op_compute_layer_output(self, state):
         hidden_states = state.hidden_states_from_combine
+        residual = state.residual_after_post_attn_ln
+
         if state.shared_output is not None:
             hidden_states = hidden_states + state.shared_output
 
@@ -1690,8 +1692,8 @@ class DeepseekV2DecoderLayer(nn.Module):
         output = dict(
             positions=state.positions,
             hidden_states=hidden_states,
+            residual=residual,
             forward_batch=state.forward_batch,
-            residual=state.residual_after_post_attn_ln,
             tbo_subbatch_index=state.tbo_subbatch_index,
         )
         state.clear()
