@@ -1529,11 +1529,6 @@ class DeepseekV2DecoderLayer(nn.Module):
     def get_forward_tbo_operations(
         self, forward_mode: ForwardMode, tbo_child_index: int
     ):
-        # DeepSeek also uses DP=TP
-        assert (
-            self.attn_tp_size == 1
-        ), "For simplicity of two-batch-overlap, DP!=TP is not supported currently."
-
         if forward_mode == ForwardMode.EXTEND:
             operations = [
                 self._forward_tbo_op_input_layernorm,
