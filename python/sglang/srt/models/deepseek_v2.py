@@ -98,6 +98,7 @@ from sglang.srt.model_loader.weight_utils import (
     ModelParamNameInfoOthers,
     default_weight_loader,
 )
+from sglang.srt.two_batch_overlap import model_forward_split_inputs
 from sglang.srt.utils import (
     BumpAllocator,
     DeepEPMode,
@@ -1830,6 +1831,13 @@ class DeepseekV2Model(nn.Module):
                 )
             ]
 
+        inputs_a, inputs_b = model_forward_split_inputs(
+            positions=positions,
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+            residual=residual,
+        )
+
         # TODO do not hardcode
         total_num_sm = torch.cuda.get_device_properties(
             device="cuda"
@@ -1844,12 +1852,7 @@ class DeepseekV2Model(nn.Module):
         )
         with num_sm_context:
             return two_batch_overlap.model_forward_execute_two_batch(
-                inputs=dict(
-                    positions=positions,
-                    hidden_states=hidden_states,
-                    forward_batch=forward_batch,
-                    residual=residual,
-                ),
+                splitted_inputs=(inputs_a, inputs_b),
                 operations_a=compute_operations(0),
                 operations_b=compute_operations(1),
                 delta_stages={

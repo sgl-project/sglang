@@ -137,13 +137,11 @@ Stage = List[ExecutionOperation]
 
 
 def model_forward_execute_two_batch(
-    inputs,
+    splitted_inputs,
     operations_a: List[Operation],
     operations_b: List[Operation],
     delta_stages: int,
 ):
-    splitted_inputs = model_forward_split_inputs(**inputs)
-    inputs_a, inputs_b = splitted_inputs
     output_a, output_b = _execute_two_batch_raw(
         inputs_a, inputs_b, operations_a, operations_b, delta_stages=delta_stages
     )
