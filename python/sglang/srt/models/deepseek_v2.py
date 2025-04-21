@@ -1606,13 +1606,10 @@ class DeepseekV2DecoderLayer(nn.Module):
                 list(hidden_states.tensor_split(self.attn_tp_size)), local_hidden_states
             )
 
-        state.hidden_states_after_input_ln, state.residual_after_input_ln = (
-            hidden_states,
-            residual,
-        )
-
         state.update(
             dict(
+                hidden_states_after_input_ln=hidden_states,
+                residual_after_input_ln=residual,
                 forward_batch=forward_batch,
                 positions=positions,
                 tbo_subbatch_index=tbo_subbatch_index,
