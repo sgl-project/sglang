@@ -84,8 +84,8 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         self.kv_cache_dim = self.kv_lora_rank + self.qk_rope_head_dim
 
         # other data
-        self.decode_cuda_graph_metadata = {}
-        self.prefill_cuda_graph_metadata = {}  # For verify
+        # self.decode_cuda_graph_metadata = {}
+        # self.prefill_cuda_graph_metadata = {}  # For verify
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
 
