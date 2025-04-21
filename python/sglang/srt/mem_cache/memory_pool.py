@@ -448,10 +448,10 @@ class MLATokenToKVPool(KVCache):
         self.layer_transfer_counter = None
         self.page_size = page_size
 
-
         kv_size = self.get_kv_size_bytes()
         logger.info(
-            f"KV Cache is allocated. #tokens: {size}, KV size: {kv_size / GB:.2f} GB")
+            f"KV Cache is allocated. #tokens: {size}, KV size: {kv_size / GB:.2f} GB"
+        )
 
     def get_kv_size_bytes(self):
         assert hasattr(self, "kv_buffer")
