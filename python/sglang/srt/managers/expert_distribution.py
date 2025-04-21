@@ -610,11 +610,14 @@ class _StatAndUtilizationRateAccumulator(_StatAccumulator):
             utilization_rate = torch.mean(utilization_rate_tensor).item()
             self._history.append(utilization_rate)
 
+            gpu_physical_count_sum = gpu_physical_count.sum().item()
+
             logger.info(
                 f"[Expert Utilization Rate] "
                 f"forward_pass_id={forward_pass_id} "
                 f"current_pass_value={utilization_rate:.03f} "
-                f"{''.join(f'last_{size}_value={value:.03f} ' for size, value in self._history.mean().items())}"
+                f"{''.join(f'last_{size}_value={value:.03f} ' for size, value in self._history.mean().items())} "
+                f"gpu_physical_count_sum={gpu_physical_count_sum}"
             )
 
 
