@@ -22,7 +22,8 @@ class TboAttnBackend(AttentionBackend):
             for child, forward_batch_child in zip(
                 self.children, forward_batch.tbo_children, strict=True
             ):
-                child.init_forward_metadata(forward_batch=forward_batch_child)
+                if forward_batch_child.batch_size > 0:
+                    child.init_forward_metadata(forward_batch=forward_batch_child)
 
     def init_cuda_graph_state(self, max_bs: int):
         self.primary.init_cuda_graph_state(max_bs=max_bs)
