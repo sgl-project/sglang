@@ -396,7 +396,7 @@ def latency_test_run_once(
         decode_latencies.append(latency)
         if i < 5:
             rank_print(
-                f"Decode.  latency: {latency:6.5f} s, throughput: {throughput:9.2f} token/s"
+                f"Decode. Batch size: {batch_size}, latency: {latency:6.5f} s, throughput: {throughput:9.2f} token/s"
             )
 
     if profile:

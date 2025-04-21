@@ -1423,6 +1423,18 @@ class DeepseekV2ForCausalLM(nn.Module):
                 assert (
                     self.n_share_experts_fusion == self.tp_size
                 ), f"Shared experts fusion optimization is enabled in DeepSeek V3/R1, set it to {self.tp_size} can get best optimized performace."
+        elif self.n_share_experts_fusion == 0:
+            if (
+                torch.cuda.get_device_capability("cuda") >= (9, 0)
+                and self.config.architectures[0] == "DeepseekV3ForCausalLM"
+                and self.config.n_routed_experts == 256
+                and (not global_server_args_dict["enable_deepep_moe"])
+            ):
+                self.n_share_experts_fusion = self.tp_size
+                global_server_args_dict["n_share_experts_fusion"] = self.tp_size
+                logger.info(
+                    "Deepseek V3/R1 with fp8 can use shared experts fusion optimization when SM version >=90. Shared experts fusion optimization is enabled."
+                )
 
         self.model = DeepseekV2Model(
             config, quant_config, prefix=add_prefix("model", prefix)
@@ -1612,7 +1624,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                                 f"mlp.experts."
                                 f"{self.config.n_routed_experts + num_repeat}"
                                 f".{suffix}",
-                                weights_dict[shared_expert_weight_name].clone(),
+                                weights_dict[shared_expert_weight_name],
                             )
                         )
                         names_to_remove += [shared_expert_weight_name]
