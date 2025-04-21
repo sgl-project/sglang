@@ -40,7 +40,7 @@ from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer, DeepseekV3ForCausalLM
-from sglang.srt.utils import add_prefix, is_cuda, is_hip
+from sglang.srt.utils import BumpAllocator, add_prefix, is_cuda, is_hip
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -91,6 +91,14 @@ class DeepseekModelNextN(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
+        zero_allocator = BumpAllocator(
+            buffer_size=2,
+            dtype=torch.float32,
+            device=(
+                input_embeds.device if input_embeds is not None else input_ids.device
+            ),
+        )
+
         if input_embeds is None:
             hidden_states = self.embed_tokens(input_ids)
         else:
@@ -108,7 +116,7 @@ class DeepseekModelNextN(nn.Module):
 
         residual = None
         hidden_states, residual = self.decoder(
-            positions, hidden_states, forward_batch, residual
+            positions, hidden_states, forward_batch, residual, zero_allocator
         )
 
         if not forward_batch.forward_mode.is_idle():
