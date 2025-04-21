@@ -306,4 +306,10 @@ class SchedulerDisaggregationPrefillMixin:
         page_indices = kv_to_page_indices(
             kv_indices, self.token_to_kv_pool_allocator.page_size
         )
-        req.disagg_kv_sender.send(page_indices, slice(start_idx, end_idx), is_last)
+
+        page_start_idx = start_idx // self.token_to_kv_pool_allocator.page_size
+        page_end_idx = page_start_idx + len(page_indices)
+
+        req.disagg_kv_sender.send(
+            page_indices, slice(page_start_idx, page_end_idx), is_last
+        )

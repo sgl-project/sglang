@@ -130,10 +130,6 @@ def is_flashinfer_available():
     return importlib.util.find_spec("flashinfer") is not None and is_cuda()
 
 
-def is_cuda_available():
-    return is_cuda()
-
-
 _ENABLE_TORCH_INFERENCE_MODE = get_bool_env_var(
     "SGLANG_ENABLE_TORCH_INFERENCE_MODE", "false"
 )
@@ -1932,6 +1928,7 @@ def is_fa3_default_architecture(hf_config):
         "Llama4ForConditionalGeneration",
         "LlamaForCausalLM",
         "MistralForCausalLM",
+        "Gemma2ForCausalLM",
     }
     return architectures[0] in default_archs
 

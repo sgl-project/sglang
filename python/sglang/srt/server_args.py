@@ -49,6 +49,7 @@ class ServerArgs:
     tokenizer_path: Optional[str] = None
     tokenizer_mode: str = "auto"
     skip_tokenizer_init: bool = False
+    enable_tokenizer_batch_encode: bool = False
     load_format: str = "auto"
     trust_remote_code: bool = False
     dtype: str = "auto"
@@ -442,6 +443,11 @@ class ServerArgs:
             "--skip-tokenizer-init",
             action="store_true",
             help="If set, skip init tokenizer and pass input_ids in generate request",
+        )
+        parser.add_argument(
+            "--enable-tokenizer-batch-encode",
+            action="store_true",
+            help="Enable batch tokenization for improved performance when processing multiple text inputs. Do not use with image inputs, pre-tokenized input_ids, or input_embeds.",
         )
         parser.add_argument(
             "--load-format",
@@ -1098,7 +1104,7 @@ class ServerArgs:
         parser.add_argument(
             "--tool-call-parser",
             type=str,
-            choices=["qwen25", "mistral", "llama3"],
+            choices=["qwen25", "mistral", "llama3", "deepseekv3"],
             default=ServerArgs.tool_call_parser,
             help="Specify the parser for handling tool-call interactions. Options include: 'qwen25', 'mistral', and 'llama3'.",
         )
