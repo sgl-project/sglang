@@ -1561,7 +1561,7 @@ class Scheduler(
                 num_tokens_for_logprob,
                 is_extend_in_batch,
                 local_can_run_tbo,
-                local_batch.forward_mode.value if local_batch is not None else -1,
+                (local_batch.forward_mode if local_batch is not None else ForwardMode.IDLE).value,
             ],
             dtype=torch.int64,
         )
