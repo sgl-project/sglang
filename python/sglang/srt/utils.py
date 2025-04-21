@@ -78,10 +78,24 @@ time_infos = {}
 
 HIP_FP8_E4M3_FNUZ_MAX = 224.0
 
+_warned_bool_env_var_keys = set()
+
 
 def get_bool_env_var(name: str, default: str = "false") -> bool:
     value = os.getenv(name, default)
-    return value.lower() in ("true", "1")
+    value = value.lower()
+
+    truthy_values = ("true", "1")
+    falsy_values = ("false", "0")
+
+    if (value not in truthy_values) and (value not in falsy_values):
+        if value not in _warned_bool_env_var_keys:
+            logger.warning(
+                f"get_bool_env_var({name}) see non-understandable value={value} and treat as false"
+            )
+        _warned_bool_env_var_keys.add(value)
+
+    return value in truthy_values
 
 
 # https://pytorch.org/docs/stable/notes/hip.html#checking-for-hip
@@ -128,10 +142,6 @@ def is_flashinfer_available():
     if not get_bool_env_var("SGLANG_IS_FLASHINFER_AVAILABLE", default="true"):
         return False
     return importlib.util.find_spec("flashinfer") is not None and is_cuda()
-
-
-def is_cuda_available():
-    return is_cuda()
 
 
 _ENABLE_TORCH_INFERENCE_MODE = get_bool_env_var(
@@ -1913,6 +1923,8 @@ def is_page_size_one(server_args):
     return server_args.page_size == 1
 
 
+# TODO(hebiao064): Accelerate FA3 Spec Decode with topk > 1.
+# TODO(hebiao064): Improve the acc rate for FA3 Spec Decode with topk == 1 and page_size > 1.
 def is_no_spec_infer_or_topk_one(server_args):
     return server_args.speculative_eagle_topk is None or (
         server_args.speculative_eagle_topk is not None
@@ -1930,5 +1942,19 @@ def is_fa3_default_architecture(hf_config):
         "Llama4ForConditionalGeneration",
         "LlamaForCausalLM",
         "MistralForCausalLM",
+        "Gemma2ForCausalLM",
     }
     return architectures[0] in default_archs
+
+
+# Can be more general if it is used in multiple places (keep it simple and thus not general now)
+class BumpAllocator:
+    def __init__(self, buffer_size: int, dtype, device):
+        self._buffer = torch.zeros((buffer_size,), dtype=dtype, device=device)
+        self._pointer = 0
+
+    def allocate(self, size: int):
+        assert self._pointer + size <= len(self._buffer)
+        output = self._buffer[self._pointer : self._pointer + size]
+        self._pointer += size
+        return output

@@ -19,6 +19,7 @@ from sglang.test.test_utils import (
 # Use DeepSeek V3 model for testing
 DSV3_MODEL_FOR_TEST = "deepseek-ai/DeepSeek-V3"
 
+
 class TestFlashMLAAttnBackend(unittest.TestCase):
     def test_latency(self):
         output_throughput = run_bench_one_batch(
@@ -42,7 +43,7 @@ class TestFlashMLAAttnBackend(unittest.TestCase):
             model,
             base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--attention-backend", "flashinfer", "--trust-remote-code"],
+            other_args=["--attention-backend", "flashmla", "--trust-remote-code"],
         )
 
         try:
@@ -55,7 +56,9 @@ class TestFlashMLAAttnBackend(unittest.TestCase):
             )
 
             metrics = run_eval(args)
-            self.assertGreaterEqual(metrics["score"], 0.87)  # Higher threshold based on DSV3 MMLU score from PR
+            self.assertGreaterEqual(
+                metrics["score"], 0.87
+            )  # Higher threshold based on DSV3 MMLU score from PR
         finally:
             kill_process_tree(process.pid)
 
@@ -66,7 +69,7 @@ class TestFlashMLAAttnBackend(unittest.TestCase):
             model,
             base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--attention-backend", "flashinfer", "--trust-remote-code"],
+            other_args=["--attention-backend", "flashmla", "--trust-remote-code"],
         )
 
         try:
@@ -79,7 +82,9 @@ class TestFlashMLAAttnBackend(unittest.TestCase):
             )
 
             metrics = run_eval(args)
-            self.assertGreaterEqual(metrics["score"], 0.97)  # Higher threshold based on DSV3 GSM8K score from PR
+            self.assertGreaterEqual(
+                metrics["score"], 0.97
+            )  # Higher threshold based on DSV3 GSM8K score from PR
         finally:
             kill_process_tree(process.pid)
 

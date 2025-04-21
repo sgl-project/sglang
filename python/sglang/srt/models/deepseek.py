@@ -170,7 +170,7 @@ class DeepseekMoE(nn.Module):
             shared_output = self.shared_experts(hidden_states)
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
-        final_hidden_states = fused_moe(
+        final_hidden_states = fused_moe.fused_moe(
             hidden_states,
             self.w1,
             self.w2,
