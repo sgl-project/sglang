@@ -61,7 +61,7 @@ Integration test for python/sglang/srt/layers/attention/flashattention_backend.p
 
 @unittest.skipIf(get_device_sm() < 90, "Test requires CUDA SM 90 or higher")
 class BaseFlashAttentionTest(unittest.TestCase):
-    """Test FlashAttention3 with MHA model, also it will be base class for derived tests."""
+    """Base class for testing FlashAttention3."""
 
     model = DEFAULT_MODEL_NAME_FOR_TEST
     base_url = DEFAULT_URL_FOR_TEST
@@ -117,6 +117,10 @@ class TestFlashAttention3MLA(BaseFlashAttentionTest):
     accuracy_threshold = 0.60
     model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
 
+    @classmethod
+    def get_server_args(cls):
+        DEFAULT_SERVER_ARGS
+
 
 class TestFlashAttention3LocalAttn(BaseFlashAttentionTest):
     """Test FlashAttention3 with Model with local attention, e.g. Llama 4."""
@@ -126,9 +130,9 @@ class TestFlashAttention3LocalAttn(BaseFlashAttentionTest):
 
     @classmethod
     def get_server_args(cls):
-        args = super().get_server_args()
-        args.extend(["--tp", "4"])
-        return args
+        cloned_args = DEFAULT_SERVER_ARGS.deepcopy()
+        cloned_args.extend(["--tp", "4"])
+        return cloned_args
 
 
 class TestFlashAttention3SpeculativeDecode(BaseFlashAttentionTest):
@@ -141,7 +145,7 @@ class TestFlashAttention3SpeculativeDecode(BaseFlashAttentionTest):
 
     @classmethod
     def get_server_args(cls):
-        args = super().get_server_args()
+        args = DEFAULT_SERVER_ARGS
         args.extend(
             [
                 "--cuda-graph-max-bs",
@@ -175,7 +179,7 @@ class TestFlashAttention3SpeculativeDecodeTopk(BaseFlashAttentionTest):
 
     @classmethod
     def get_server_args(cls):
-        args = super().get_server_args()
+        args = DEFAULT_SERVER_ARGS
         args.extend(
             [
                 "--cuda-graph-max-bs",
@@ -207,7 +211,7 @@ class TestFlashAttention3MLASpeculativeDecode(BaseFlashAttentionTest):
 
     @classmethod
     def get_server_args(cls):
-        args = super().get_server_args()
+        args = DEFAULT_SERVER_ARGS
         args.extend(
             [
                 "--cuda-graph-max-bs",
@@ -239,7 +243,7 @@ class TestFlashAttention3MLASpeculativeDecodeTopk(BaseFlashAttentionTest):
 
     @classmethod
     def get_server_args(cls):
-        args = super().get_server_args()
+        args = DEFAULT_SERVER_ARGS
         args.extend(
             [
                 "--cuda-graph-max-bs",
