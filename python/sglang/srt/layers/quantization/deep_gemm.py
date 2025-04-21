@@ -38,7 +38,7 @@ if is_cuda():
 logger = logging.getLogger(__name__)
 
 _INITIALIZATION_DICT = {}
-_PRE_COMPILE_M_LIST = list(range(1, 1024 * 64 + 1))
+_PRE_COMPILE_M_LIST = list(range(1, 1024 * 16 + 1))
 
 # Force redirect deep_gemm cache_dir
 os.environ["DG_CACHE_DIR"] = os.getenv(
