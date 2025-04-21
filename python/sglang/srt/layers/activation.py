@@ -21,13 +21,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sglang.srt.utils import is_cuda_available
-
-_is_cuda = is_cuda_available()
-
-if _is_cuda:
-    from sgl_kernel import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
-
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import (
     divide,
@@ -35,7 +28,12 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.utils import set_weight_attrs
+from sglang.srt.utils import is_cuda, set_weight_attrs
+
+_is_cuda = is_cuda()
+
+if _is_cuda:
+    from sgl_kernel import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
 
 logger = logging.getLogger(__name__)
 
