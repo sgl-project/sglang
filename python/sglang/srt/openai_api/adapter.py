@@ -964,8 +964,6 @@ def v1_chat_generate_request(
                             ),
                         }
                     )
-                    # TODO fix the compatible issues with xgrammar
-                    strict_tag = None
 
                 for message in request.messages:
                     if isinstance(message.content, str):
