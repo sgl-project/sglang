@@ -28,6 +28,9 @@ class TestDPAttentionDP2TP2(CustomTestCase):
                 "--enable-dp-attention",
                 "--dp",
                 "2",
+                "--enable-torch-compile",
+                "--torch-compile-max-bs",
+                "2",
             ],
         )
 
@@ -60,3 +63,7 @@ class TestDPAttentionDP2TP2(CustomTestCase):
         metrics = run_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.8)
+
+
+if __name__ == "__main__":
+    unittest.main()

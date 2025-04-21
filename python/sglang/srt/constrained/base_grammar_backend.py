@@ -28,6 +28,18 @@ logger = logging.getLogger(__name__)
 
 
 class BaseGrammarObject(ABC):
+
+    def __init__(self):
+        self._finished = False
+
+    @property
+    def finished(self):
+        return self._finished
+
+    @finished.setter
+    def finished(self, finished):
+        self._finished = finished
+
     @abstractmethod
     def try_jump_forward(self, tokenizer) -> Optional[Tuple[List[int], str]]:
         """
@@ -56,6 +68,13 @@ class BaseGrammarObject(ABC):
     ) -> None:
         """
         Jump forward occurs, and update the grammar state if needed.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def accept_token(self, token: int) -> None:
+        """
+        Accept a token in the grammar.
         """
         raise NotImplementedError
 
@@ -90,7 +109,7 @@ class CacheEntry:
     event: Event
 
 
-class BaseGrammarBackend(ABC):
+class BaseGrammarBackend:
     def __init__(self):
         self.executor = ThreadPoolExecutor()
         self.cache: Dict[Tuple[str, str], CacheEntry] = {}
@@ -107,19 +126,15 @@ class BaseGrammarBackend(ABC):
         """
         raise ValueError(f"Invalid key_type: {key_type}={key_string}")
 
-    @abstractmethod
     def dispatch_json(self, key_string: str) -> Optional[BaseGrammarObject]:
         return self._not_supported("json", key_string)
 
-    @abstractmethod
     def dispatch_regex(self, key_string: str) -> Optional[BaseGrammarObject]:
         return self._not_supported("regex", key_string)
 
-    @abstractmethod
     def dispatch_ebnf(self, key_string: str) -> Optional[BaseGrammarObject]:
         return self._not_supported("ebnf", key_string)
 
-    @abstractmethod
     def dispatch_structural_tag(self, key_string: str) -> Optional[BaseGrammarObject]:
         return self._not_supported("structural_tag", key_string)
 
@@ -169,7 +184,9 @@ class BaseGrammarBackend(ABC):
             self.cache.clear()
 
 
-def create_grammar_backend(server_args: ServerArgs, tokenizer, vocab_size):
+def create_grammar_backend(
+    server_args: ServerArgs, tokenizer, vocab_size: int
+) -> Optional[BaseGrammarBackend]:
     if server_args.grammar_backend == "outlines":
         from sglang.srt.constrained.outlines_backend import OutlinesGrammarBackend
 
@@ -188,7 +205,15 @@ def create_grammar_backend(server_args: ServerArgs, tokenizer, vocab_size):
             tokenizer=tokenizer,
             whitespace_pattern=server_args.constrained_json_whitespace_pattern,
         )
+    elif server_args.grammar_backend == "none":
+        return None
     else:
         raise ValueError(f"Invalid grammar backend: {server_args.grammar_backend}")
 
+    if server_args.reasoning_parser and hasattr(tokenizer, "think_end_id"):
+        from .reasoner_grammar_backend import ReasonerGrammarBackend
+
+        grammar_backend = ReasonerGrammarBackend(
+            grammar_backend, tokenizer.think_end_id
+        )
     return grammar_backend

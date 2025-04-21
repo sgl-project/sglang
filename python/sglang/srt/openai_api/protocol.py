@@ -252,7 +252,7 @@ ChatCompletionMessageContentPart = Union[
 
 class ChatCompletionMessageGenericParam(BaseModel):
     role: Literal["system", "assistant", "tool"]
-    content: Union[str, List[ChatCompletionMessageContentTextPart]]
+    content: Union[str, List[ChatCompletionMessageContentTextPart], None]
 
 
 class ChatCompletionMessageUserParam(BaseModel):
@@ -323,7 +323,7 @@ class ChatCompletionRequest(BaseModel):
     max_tokens: Optional[int] = None
     n: int = 1
     presence_penalty: float = 0.0
-    response_format: Union[ResponseFormat, StructuralTagResponseFormat] = None
+    response_format: Optional[Union[ResponseFormat, StructuralTagResponseFormat]] = None
     seed: Optional[int] = None
     stop: Optional[Union[str, List[str]]] = None
     stream: bool = False
@@ -355,6 +355,7 @@ class ChatCompletionRequest(BaseModel):
     stop_token_ids: Optional[List[int]] = None
     no_stop_trim: bool = False
     ignore_eos: bool = False
+    continue_final_message: bool = False
     skip_special_tokens: bool = True
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
     session_params: Optional[Dict] = None

@@ -1,4 +1,4 @@
-# Adapted from https://github.com/vllm-project/vllm/tree/main/vllm/model_executor/layers/quantization/compressed_tensors
+# Adapted from https://github.com/vllm-project/vllm/tree/v0.8.2/vllm/model_executor/layers/quantization/compressed_tensors
 # SPDX-License-Identifier: Apache-2.0
 
 import logging
@@ -23,7 +23,6 @@ from sglang.srt.layers.linear import (
     LinearMethodBase,
     UnquantizedLinearMethod,
 )
-from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
@@ -40,7 +39,13 @@ from sglang.srt.layers.quantization.compressed_tensors.utils import (
     is_activation_quantization_format,
     should_ignore_layer,
 )
-from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
+
+try:
+    import vllm
+
+    VLLM_AVAILABLE = True
+except ImportError:
+    VLLM_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +83,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         sparsity_ignore_list: List[str],
         kv_cache_scheme: Optional[Dict[str, Any]] = None,
         config: Optional[Dict[str, Any]] = None,
+        packed_modules_mapping: Dict[str, List[str]] = {},
     ):
         super().__init__()
         self.ignore = ignore
@@ -88,6 +94,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         self.sparsity_scheme_map = sparsity_scheme_map
         self.sparsity_ignore_list = sparsity_ignore_list
         self.config = config
+        self.packed_modules_mapping = packed_modules_mapping
 
     def get_linear_method(self) -> "CompressedTensorsLinearMethod":
         return CompressedTensorsLinearMethod(self)
@@ -123,6 +130,8 @@ class CompressedTensorsConfig(QuantizationConfig):
                 return UnquantizedLinearMethod()
             layer.scheme = scheme
             return CompressedTensorsLinearMethod(self)
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+
         if isinstance(layer, FusedMoE):
             return CompressedTensorsMoEMethod.get_moe_method(self)
         return None
@@ -135,6 +144,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         sparsity_scheme_map, sparsity_ignore_list = cls._parse_sparsity_config(
             config=config
         )
+        packed_modules_mapping = config.get("packed_modules_mapping", {})
 
         return cls(
             target_scheme_map=target_scheme_map,
@@ -143,6 +153,7 @@ class CompressedTensorsConfig(QuantizationConfig):
             sparsity_scheme_map=sparsity_scheme_map,
             sparsity_ignore_list=sparsity_ignore_list,
             config=config,
+            packed_modules_mapping=packed_modules_mapping,
         )
 
     @classmethod
