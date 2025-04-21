@@ -453,6 +453,7 @@ class FlashMLAMultiStepDraftBackend:
                 )
             )
 
+        # todo: ???
         self.max_context_len = self.attn_backends[0].max_context_len
 
         # Cached variables for generate_draft_decode_kv_indices
@@ -498,10 +499,11 @@ class FlashMLAMultiStepDraftBackend:
             call_fn(i, forward_batch)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        max_blocks_per_seq = (self.max_context_len + PAGE_SIZE - 1) // PAGE_SIZE
         kv_indices = torch.zeros(
             (
                 self.speculative_num_steps,
-                forward_batch.batch_size * self.topk * self.max_context_len,
+                forward_batch.batch_size * self.topk * max_blocks_per_seq,
             ),
             dtype=torch.int32,
             device="cuda",
@@ -521,8 +523,9 @@ class FlashMLAMultiStepDraftBackend:
         self.common_template(forward_batch, kv_indices, call_fn)
 
     def init_cuda_graph_state(self, max_bs: int):
+        max_blocks_per_seq = (self.max_context_len + PAGE_SIZE - 1) // PAGE_SIZE
         self.cuda_graph_kv_indices = torch.zeros(
-            (self.speculative_num_steps, max_bs * self.max_context_len),
+            (self.speculative_num_steps, max_bs, max_blocks_per_seq),
             dtype=torch.int32,
             device="cuda",
         )
