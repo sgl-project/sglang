@@ -1834,6 +1834,7 @@ class DeepseekV2Model(nn.Module):
         if self.attn_tp_size != 1 and self.input_is_scattered:
             hidden_states += residual
             residual = None
+
             hidden_states, local_hidden_states = (
                 forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
                 hidden_states,
@@ -1848,6 +1849,7 @@ class DeepseekV2Model(nn.Module):
             forward_batch=forward_batch,
             residual=residual,
         )
+        del hidden_states, residual
 
         # TODO do not hardcode
         total_num_sm = torch.cuda.get_device_properties(
