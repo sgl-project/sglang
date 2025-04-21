@@ -746,8 +746,8 @@ class ForwardBatch:
         )
 
         # TODO improve, e.g. unify w/ `init_raw`
-        if (global_server_args_dict["moe_dense_tp_size"] == 1) and (output_global_num_tokens is not None):
-            sum_len = sum(output_global_num_tokens)
+        if global_server_args_dict["moe_dense_tp_size"] == 1:
+            sum_len = end_token_index - start_token_index
             gathered_buffer = torch.zeros(
                 (sum_len, self.gathered_buffer.shape[1]),
                 dtype=self.gathered_buffer.dtype,
