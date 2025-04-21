@@ -76,13 +76,22 @@ def get_kv_class(transfer_backend: TransferBackend, class_type: KVClassType):
     raise ValueError(f"Unsupported transfer backend: {transfer_backend}")
 
 
-def kv_to_page_indices(kv_indices: np.ndarray, page_size: int):
+def kv_to_page_indices(kv_indices: np.ndarray, page_size: int, is_last: bool = True):
     # 1. The page is guaruanteed to be full except the last page.
     # 2. page index = kv_index // page_size
-    # The return vector is kv_indices[::page_size] // page_size
+
     if page_size == 1:  # shortcut
         return kv_indices
-    return kv_indices[::page_size] // page_size
+
+    # if last chunk, send the last partial page
+    # if not last chunk, delay the last partial page to the next send
+    if is_last:
+        return kv_indices[::page_size] // page_size
+    else:
+        if len(kv_indices) % page_size == 0:  # no partial page
+            return kv_indices[::page_size] // page_size
+        else:  # partial page
+            return kv_indices[::page_size][:-1] // page_size
 
 
 def kv_to_page_num(num_kv_indices: int, page_size: int):

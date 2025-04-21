@@ -120,6 +120,7 @@ class TpModelWorker:
             ),
             self.model_runner.req_to_token_pool.size,
         )
+        assert self.max_running_requests > 0, "max_running_request is zero"
         self.max_req_len = min(
             self.model_config.context_len - 1,
             self.max_total_num_tokens - 1,

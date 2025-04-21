@@ -25,6 +25,8 @@ import multiprocessing as multiprocessing
 import os
 import threading
 import time
+from http import HTTPStatus
+from typing import AsyncIterator, Callable, Dict, Optional
 import traceback
 from http import HTTPStatus
 from typing import AsyncIterator, Callable, Dict, Optional
@@ -87,7 +89,6 @@ from sglang.srt.openai_api.protocol import ModelCard, ModelList
 from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
-    MultiprocessingSerializer,
     add_api_key_middleware,
     add_prometheus_middleware,
     delete_directory,
