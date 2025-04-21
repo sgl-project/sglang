@@ -234,6 +234,9 @@ class _StateDict:
     def __getattr__(self, item):
         return self._data[item]
 
+    def __delattr__(self, item):
+        del self._data[item]
+
     def update(self, values: Dict[str, Any]):
         for k, v in values.items():
             setattr(self, k, v)
