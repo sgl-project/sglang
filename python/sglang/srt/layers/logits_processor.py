@@ -23,12 +23,13 @@ import triton.language as tl
 from torch import nn
 
 from sglang.srt.distributed import (
-    get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
 from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
     get_attention_dp_size,
+    get_attention_tp_size,
+    attn_tp_all_gather,
 )
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.managers.schedule_batch import global_server_args_dict
@@ -195,9 +196,11 @@ class LogitsProcessor(nn.Module):
         super().__init__()
         self.config = config
         self.logit_scale = logit_scale
+        self.attn_tp_size = get_attention_tp_size()
         self.do_tensor_parallel_all_gather = (
-            not skip_all_gather and get_tensor_model_parallel_world_size() > 1
+            not skip_all_gather and self.attn_tp_size > 1
         )
+        self.use_attn_tp_group = get_attention_dp_size() > 1
         self.final_logit_softcapping = getattr(
             self.config, "final_logit_softcapping", None
         )
@@ -429,7 +432,17 @@ class LogitsProcessor(nn.Module):
             logits.mul_(self.logit_scale)
 
         if self.do_tensor_parallel_all_gather:
-            logits = tensor_model_parallel_all_gather(logits)
+            if self.use_attn_tp_group:
+                global_logits = torch.empty(
+                    (self.config.vocab_size, logits.shape[0]),
+                    device=logits.device,
+                    dtype=logits.dtype,
+                )
+                global_logits = global_logits.T
+                attn_tp_all_gather(list(global_logits.tensor_split(self.attn_tp_size, dim=-1)), logits)
+                logits = global_logits
+            else:
+                logits = tensor_model_parallel_all_gather(logits)
 
         logits = logits[:, : self.config.vocab_size].float()
 
