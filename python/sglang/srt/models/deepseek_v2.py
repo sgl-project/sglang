@@ -1834,7 +1834,7 @@ class DeepseekV2Model(nn.Module):
 
         print(
             f"hi [{get_tensor_model_parallel_rank()}] forward_tbo_layers start {forward_batch.tbo_split_seq_index=} {hidden_states.shape=}")
-        if self.attn_tp_size != 1 and self.input_is_scattered:
+        if self.attn_tp_size != 1:
             hidden_states += residual
             residual = None
 
