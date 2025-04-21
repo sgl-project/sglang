@@ -1573,9 +1573,15 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         tbo_subbatch_index: int,
     ):
-        state.hidden_states_after_input_ln, state.residual_after_input_ln = (
-            self._forward_input_layernorm(hidden_states, residual)
-        )
+        if hidden_states.shape[0] == 0:
+            state.hidden_states_after_input_ln = state.residual_after_input_ln = hidden_states
+        else:
+            hidden_states, residual = self._forward_input_layernorm(
+                hidden_states, residual
+            )
+            state.hidden_states_after_input_ln, state.residual_after_input_ln = (
+                self._forward_input_layernorm(hidden_states, residual)
+            )
         state.update(
             dict(
                 forward_batch=forward_batch,
