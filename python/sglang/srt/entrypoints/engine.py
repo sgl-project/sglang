@@ -38,6 +38,7 @@ import torch
 import uvloop
 
 from sglang.srt.code_completion_parser import load_completion_template_for_openai_api
+from sglang.srt.entrypoints.EngineBase import EngineBase
 from sglang.srt.managers.data_parallel_controller import (
     run_data_parallel_controller_process,
 )
@@ -78,7 +79,7 @@ logger = logging.getLogger(__name__)
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 
-class Engine:
+class Engine(EngineBase):
     """
     The entry point to the inference engine.
 
@@ -277,6 +278,10 @@ class Engine:
     def __exit__(self, exc_type, exc_value, traceback):
         self.shutdown()
         return False
+
+    def flush_cache(self):
+        loop = asyncio.get_event_loop()
+        return loop.run_until_complete(self.tokenizer_manager.flush_cache())
 
     def start_profile(self):
         loop = asyncio.get_event_loop()

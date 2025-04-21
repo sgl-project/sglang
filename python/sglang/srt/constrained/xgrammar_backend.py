@@ -25,13 +25,16 @@ from xgrammar import (
     StructuralTagItem,
     TokenizerInfo,
     allocate_token_bitmask,
-    apply_token_bitmask_inplace,
 )
 
 from sglang.srt.constrained.base_grammar_backend import (
     BaseGrammarBackend,
     BaseGrammarObject,
 )
+from sglang.srt.constrained.triton_ops.bitmask_ops import (
+    apply_token_bitmask_inplace_triton,
+)
+from sglang.srt.utils import get_bool_env_var
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +57,18 @@ class XGrammarGrammar(BaseGrammarObject):
         self.ctx = ctx
         self.override_stop_tokens = override_stop_tokens
         self.finished = False
+
+        # Fix (from vLLM team): postpone the import of apply_token_bitmask_inplace_kernels to the
+        # class init site to avoid re-initializing CUDA in forked subprocess.
+        from xgrammar.kernels import apply_token_bitmask_inplace_kernels
+
+        self.use_token_bitmask_triton = get_bool_env_var(
+            "SGLANG_TOKEN_BITMASK_TRITON", "false"
+        )
+        self.apply_vocab_mask_cuda = apply_token_bitmask_inplace_kernels.get(
+            "cuda", None
+        )
+        self.apply_vocab_mask_cpu = apply_token_bitmask_inplace_kernels.get("cpu", None)
 
     def accept_token(self, token: int):
         assert self.matcher.accept_token(token)
@@ -97,9 +112,16 @@ class XGrammarGrammar(BaseGrammarObject):
     def move_vocab_mask(vocab_mask: torch.Tensor, device) -> torch.Tensor:
         return vocab_mask.to(device, non_blocking=True)
 
-    @staticmethod
-    def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
-        apply_token_bitmask_inplace(logits, vocab_mask)
+    def apply_vocab_mask(self, logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
+        if (
+            not self.use_token_bitmask_triton
+            and logits.device.type == "cuda"
+            and self.apply_vocab_mask_cuda
+        ):
+            return self.apply_vocab_mask_cuda(logits, vocab_mask)
+        if logits.device.type == "cpu" and self.apply_vocab_mask_cpu:
+            return self.apply_vocab_mask_cpu(logits, vocab_mask)
+        apply_token_bitmask_inplace_triton(logits, vocab_mask)
 
     def copy(self):
         matcher = GrammarMatcher(
@@ -136,6 +158,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
     def dispatch_json(self, key_string: str) -> Optional[XGrammarGrammar]:
         try:
             if key_string == "$$ANY$$":
+                # Note: This builtin JSON grammar includes *all* valid JSON (including, for example, arrays at the root)
                 ctx = self.grammar_compiler.compile_builtin_json_grammar()
             else:
                 ctx = self.grammar_compiler.compile_json_schema(schema=key_string)
