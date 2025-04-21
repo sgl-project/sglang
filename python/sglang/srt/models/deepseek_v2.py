@@ -1629,6 +1629,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 buffer_size=2, dtype=torch.float32, device="cuda"
             ),
         )
+        del state.hidden_states_after_input_ln
 
     def _forward_tbo_op_decode_attn_0(self, state):
         state.self_attn_state = self.self_attn.forward_absorb_stage_prepare(
