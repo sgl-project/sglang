@@ -1859,14 +1859,13 @@ class DeepseekV2Model(nn.Module):
         print(
             f"hi [{get_tensor_model_parallel_rank()}] forward_tbo_layers TBO-split {inputs_a['hidden_states'].shape=} {inputs_b['hidden_states'].shape=}")
 
-        def _postprocess_splitted_inputs(hidden_states, residual, positions, forward_batch):
+        def _postprocess_splitted_inputs(hidden_states, residual, **kwargs):
             if self.attn_tp_size != 1:
                 assert residual is None
                 tensor_list = list(hidden_states.tensor_split(self.attn_tp_size))
                 hidden_states = tensor_list[self.attn_tp_rank]
 
-            return dict(
-                hidden_states=hidden_states, residual=residual, positions=positions, forward_batch=forward_batch)
+            return dict(hidden_states=hidden_states, residual=residual, **kwargs)
 
         inputs_a = _postprocess_splitted_inputs(**inputs_a)
         inputs_b = _postprocess_splitted_inputs(**inputs_b)
