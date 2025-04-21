@@ -780,6 +780,7 @@ class ForwardBatch:
                 global_num_tokens_gpu=None,
                 global_num_tokens_cpu=None,
                 gathered_buffer=gathered_buffer,
+                tbo_global_split_token_index=None,
                 global_num_tokens_for_logprob_gpu=None,
                 global_num_tokens_for_logprob_cpu=None,
                 sampling_info=None,
