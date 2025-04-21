@@ -41,8 +41,8 @@ from sglang.srt.layers.dp_attention import (
     get_attention_dp_size,
     get_attention_tp_rank,
     get_attention_tp_size,
-    tp_all_gather,
-    tp_reduce_scatter,
+    attn_tp_all_gather,
+    attn_tp_reduce_scatter,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -1273,7 +1273,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
                 hidden_states,
             )
-            tp_all_gather(
+            attn_tp_all_gather(
                 list(hidden_states.tensor_split(self.attn_tp_size)), local_hidden_states
             )
 
@@ -1289,7 +1289,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             if self.input_is_scattered:
                 tensor_list = list(hidden_states.tensor_split(self.attn_tp_size))
                 hidden_states = tensor_list[self.attn_tp_rank]
-                tp_reduce_scatter(hidden_states, tensor_list)
+                attn_tp_reduce_scatter(hidden_states, tensor_list)
                 if hidden_states.shape[0] != 0:
                     hidden_states, residual = self.post_attention_layernorm(
                         hidden_states, residual
@@ -1299,7 +1299,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                     hidden_states += residual
                 tensor_list = list(hidden_states.tensor_split(self.attn_tp_size))
                 hidden_states = tensor_list[self.attn_tp_rank]
-                tp_reduce_scatter(hidden_states, tensor_list)
+                attn_tp_reduce_scatter(hidden_states, tensor_list)
                 residual = hidden_states
                 if hidden_states.shape[0] != 0:
                     hidden_states = self.post_attention_layernorm(hidden_states)
@@ -1323,7 +1323,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
                 hidden_states,
             )
-            tp_all_gather(
+            attn_tp_all_gather(
                 list(hidden_states.tensor_split(self.attn_tp_size)), local_hidden_states
             )
 
@@ -1346,7 +1346,7 @@ class DeepseekV2Model(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
-            enable_tp=not global_server_args_dict["enable_dp_attention"],
+            use_attn_tp_group=global_server_args_dict["enable_dp_attention"],
         )
         self.layers = nn.ModuleList(
             [
