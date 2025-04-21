@@ -1984,6 +1984,11 @@ def run_scheduler_process(
     if dp_rank is None and "SGLANG_DP_RANK" in os.environ:
         dp_rank = int(os.environ["SGLANG_DP_RANK"])
 
+    # Record whether this rank is the first rank overall on the node.
+    os.environ["SGL_IS_FIRST_RANK_ON_NODE"] = (
+        "1" if server_args.base_gpu_id == gpu_id else "0"
+    )
+
     # Configure the logger
     configure_logger(server_args, prefix=prefix)
     suppress_other_loggers()

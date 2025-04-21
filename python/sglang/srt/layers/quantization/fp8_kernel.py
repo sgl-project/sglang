@@ -22,7 +22,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.quantization.deep_gemm import ENABLE_JIT_DEEPGEMM
+from sglang.srt.layers.quantization.deep_gemm import _ENABLE_JIT_DEEPGEMM
 from sglang.srt.utils import (
     direct_register_custom_op,
     get_device_core_count,
@@ -774,7 +774,7 @@ def w8a8_block_fp8_matmul(
     )
 
     # deepgemm only support bf16
-    if C.dtype == torch.bfloat16 and ENABLE_JIT_DEEPGEMM:
+    if C.dtype == torch.bfloat16 and _ENABLE_JIT_DEEPGEMM:
         if supports_custom_op():
             torch.ops.sglang.deep_gemm_fp8_fp8_bf16_nt(A, As, B, Bs, C)
         else:

@@ -9,13 +9,15 @@ from tqdm.contrib.concurrent import thread_map
 
 from sglang.srt.utils import get_bool_env_var, get_device_sm, get_int_env_var, is_cuda
 
-ENABLE_JIT_DEEPGEMM = False
-ENABLE_JIT_DEEPGEMM_BMM = False
-ENABLE_JIT_DEEPGEMM_PRECOMPILE = get_bool_env_var("SGL_JIT_DEEPGEMM_PRECOMPILE", "true")
-ENABLE_JIT_DEEPGEMM_LOG_BUILD = get_bool_env_var(
-    "SGL_JIT_DEEPGEMM_LOG_BUILD", "false" if ENABLE_JIT_DEEPGEMM_PRECOMPILE else "true"
+_ENABLE_JIT_DEEPGEMM = False
+_ENABLE_JIT_DEEPGEMM_PRECOMPILE = get_bool_env_var(
+    "SGL_JIT_DEEPGEMM_PRECOMPILE", "true"
 )
-COMPILE_WORKERS = get_int_env_var("SGL_JIT_DEEPGEMM_COMPILE_WORKERS", 4)
+_ENABLE_JIT_DEEPGEMM_LOG_BUILD = get_bool_env_var(
+    "SGL_JIT_DEEPGEMM_LOG_BUILD", "false" if _ENABLE_JIT_DEEPGEMM_PRECOMPILE else "true"
+)
+_DO_COMPILE = get_bool_env_var("SGL_IS_FIRST_RANK_ON_NODE", "true")
+_COMPILE_WORKERS = get_int_env_var("SGL_JIT_DEEPGEMM_COMPILE_WORKERS", 4)
 
 if is_cuda():
     import deep_gemm
@@ -31,14 +33,12 @@ if is_cuda():
     sm_version = get_device_sm()
     if sm_version == 90:
         if get_bool_env_var("SGL_ENABLE_JIT_DEEPGEMM", default="false"):
-            ENABLE_JIT_DEEPGEMM = True
-        if get_bool_env_var("SGL_ENABLE_JIT_DEEPGEMM_BMM", default="false"):
-            ENABLE_JIT_DEEPGEMM_BMM = True
+            _ENABLE_JIT_DEEPGEMM = True
 
 logger = logging.getLogger(__name__)
 
-INITIALIZATION_DICT = {}
-PRE_COMPILE_M_LIST = list(range(1, 1024 * 64 + 1))
+_INITIALIZATION_DICT = {}
+_PRE_COMPILE_M_LIST = list(range(1, 1024 * 64 + 1))
 
 # Force redirect deep_gemm cache_dir
 os.environ["DG_CACHE_DIR"] = os.getenv(
@@ -52,14 +52,14 @@ class DeepGemmKernelType(IntEnum):
     GEMM_NT_F8F8BF16 = auto()
 
 
-FUNCTION_NAME_DICT = {
+_FUNCTION_NAME_DICT = {
     DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED: "m_grouped_gemm_fp8_fp8_bf16_nt_masked",
     DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG: "m_grouped_gemm_fp8_fp8_bf16_nt_contiguous",
     DeepGemmKernelType.GEMM_NT_F8F8BF16: "gemm_fp8_fp8_bf16_nt",
 }
 
 
-def compile_grouped_gemm_nt_f8f8bf16_masked_one(n, k, num_groups, config) -> None:
+def _compile_grouped_gemm_nt_f8f8bf16_masked_one(n, k, num_groups, config) -> None:
     # Auto-tuning with compilation
     global deep_gemm_includes, deep_gemm_grouped_gemm_template
     _, block_m, block_n, num_stages, tma_multicast_config, smem_config = config
@@ -97,7 +97,7 @@ def compile_grouped_gemm_nt_f8f8bf16_masked_one(n, k, num_groups, config) -> Non
     )
 
 
-def compile_grouped_gemm_nt_f8f8bf16_contig_one(n, k, num_groups, config) -> None:
+def _compile_grouped_gemm_nt_f8f8bf16_contig_one(n, k, num_groups, config) -> None:
     global deep_gemm_includes, deep_gemm_grouped_gemm_template
     _, block_m, block_n, num_stages, tma_multicast_config, smem_config = config
     _ = jit_tuner.compile_and_tune(
@@ -135,7 +135,7 @@ def compile_grouped_gemm_nt_f8f8bf16_contig_one(n, k, num_groups, config) -> Non
     )
 
 
-def compile_gemm_nt_f8f8bf16_one(n, k, config) -> None:
+def _compile_gemm_nt_f8f8bf16_one(n, k, config) -> None:
     global deep_gemm_includes, deep_gemm_gemm_template
     _, block_m, block_n, num_stages, tma_multicast_config, smem_config = config
     _ = jit_tuner.compile_and_tune(
@@ -169,53 +169,56 @@ def compile_gemm_nt_f8f8bf16_one(n, k, config) -> None:
     )
 
 
-def compile_grouped_gemm_nt_f8f8bf16_masked_all(n, k, num_groups) -> None:
-    global PRE_COMPILE_M_LIST
+def _compile_grouped_gemm_nt_f8f8bf16_masked_all(n, k, num_groups) -> None:
+    global _PRE_COMPILE_M_LIST
     logger.info(
-        f"DeepGEMM JIT Compiling for <m_grouped_gemm_fp8_fp8_bf16_nt_masked> N={n}, K={k}, num_groups={num_groups} with all Ms. Please wait."
+        f"DeepGEMM JIT Compiling on {_COMPILE_WORKERS} workers for "
+        f"<m_grouped_gemm_fp8_fp8_bf16_nt_masked> N={n}, K={k}, num_groups={num_groups} with all Ms. Please wait."
     )
     num_sms = get_num_sms()
     collected_configs = set()
-    for expected_m in PRE_COMPILE_M_LIST:
+    for expected_m in _PRE_COMPILE_M_LIST:
         collected_configs.add(
             get_best_configs(
                 expected_m, n, k, num_groups, num_sms, is_grouped_masked=True
             )
         )
-    compile_func = lambda config: compile_grouped_gemm_nt_f8f8bf16_masked_one(
+    compile_func = lambda config: _compile_grouped_gemm_nt_f8f8bf16_masked_one(
         n, k, num_groups, config
     )
-    thread_map(compile_func, collected_configs, max_workers=COMPILE_WORKERS)
+    thread_map(compile_func, collected_configs, max_workers=_COMPILE_WORKERS)
 
 
-def compile_grouped_gemm_nt_f8f8bf16_contig_all(n, k, num_groups) -> None:
-    global PRE_COMPILE_M_LIST
+def _compile_grouped_gemm_nt_f8f8bf16_contig_all(n, k, num_groups) -> None:
+    global _PRE_COMPILE_M_LIST
     logger.info(
-        f"DeepGEMM JIT Compiling for <m_grouped_gemm_fp8_fp8_bf16_nt_contiguous> for N={n}, K={k}, num_groups={num_groups} with all Ms. Please wait."
+        f"DeepGEMM JIT Compiling on {_COMPILE_WORKERS} workers for "
+        f"<m_grouped_gemm_fp8_fp8_bf16_nt_contiguous> for N={n}, K={k}, num_groups={num_groups} with all Ms. Please wait."
     )
     num_sms = get_num_sms()
     collected_configs = set()
-    for m in PRE_COMPILE_M_LIST:
+    for m in _PRE_COMPILE_M_LIST:
         collected_configs.add(
             get_best_configs(m, n, k, 1, num_sms, is_grouped_contiguous=True)
         )
-    compile_func = lambda config: compile_grouped_gemm_nt_f8f8bf16_contig_one(
+    compile_func = lambda config: _compile_grouped_gemm_nt_f8f8bf16_contig_one(
         n, k, num_groups, config
     )
-    thread_map(compile_func, collected_configs, max_workers=COMPILE_WORKERS)
+    thread_map(compile_func, collected_configs, max_workers=_COMPILE_WORKERS)
 
 
-def compile_gemm_nt_f8f8bf16_all(n, k) -> None:
-    global PRE_COMPILE_M_LIST
+def _compile_gemm_nt_f8f8bf16_all(n, k) -> None:
+    global _PRE_COMPILE_M_LIST
     logger.info(
-        f"DeepGEMM JIT Compiling for <gemm_fp8_fp8_bf16_nt> N={n}, K={k} with all Ms. Please wait."
+        f"DeepGEMM JIT Compiling on {_COMPILE_WORKERS} workers for "
+        f"<gemm_fp8_fp8_bf16_nt> N={n}, K={k} with all Ms. Please wait."
     )
     num_sms = get_num_sms()
     collected_configs = set()
-    for m in PRE_COMPILE_M_LIST:
+    for m in _PRE_COMPILE_M_LIST:
         collected_configs.add(get_best_configs(m, n, k, 1, num_sms))
-    compile_func = lambda config: compile_gemm_nt_f8f8bf16_one(n, k, config)
-    thread_map(compile_func, collected_configs, max_workers=COMPILE_WORKERS)
+    compile_func = lambda config: _compile_gemm_nt_f8f8bf16_one(n, k, config)
+    thread_map(compile_func, collected_configs, max_workers=_COMPILE_WORKERS)
 
 
 def grouped_gemm_nt_f8f8bf16_masked(
@@ -226,14 +229,18 @@ def grouped_gemm_nt_f8f8bf16_masked(
     expected_m: int,
 ):
 
-    global INITIALIZATION_DICT
+    global _INITIALIZATION_DICT
     num_groups, _, k = lhs[0].shape
     _, n, _ = rhs[0].shape
 
     query_key = (DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED, n, k, num_groups)
-    if ENABLE_JIT_DEEPGEMM_PRECOMPILE and INITIALIZATION_DICT.get(query_key) is None:
-        compile_grouped_gemm_nt_f8f8bf16_masked_all(n, k, num_groups)
-        INITIALIZATION_DICT[query_key] = True
+    if (
+        _ENABLE_JIT_DEEPGEMM_PRECOMPILE
+        and _DO_COMPILE
+        and _INITIALIZATION_DICT.get(query_key) is None
+    ):
+        _compile_grouped_gemm_nt_f8f8bf16_masked_all(n, k, num_groups)
+        _INITIALIZATION_DICT[query_key] = True
 
     with _log_jit_build(expected_m, n, k, query_key[0]):
         deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_masked(
@@ -248,14 +255,18 @@ def grouped_gemm_nt_f8f8bf16_contig(
     m_indices: torch.Tensor,
 ):
 
-    global INITIALIZATION_DICT
+    global _INITIALIZATION_DICT
     m, k = lhs[0].shape
     num_groups, n, _ = rhs[0].shape
 
     query_key = (DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG, n, k, num_groups)
-    if ENABLE_JIT_DEEPGEMM_PRECOMPILE and INITIALIZATION_DICT.get(query_key) is None:
-        compile_grouped_gemm_nt_f8f8bf16_contig_all(n, k, num_groups)
-        INITIALIZATION_DICT[query_key] = True
+    if (
+        _ENABLE_JIT_DEEPGEMM_PRECOMPILE
+        and _DO_COMPILE
+        and _INITIALIZATION_DICT.get(query_key) is None
+    ):
+        _compile_grouped_gemm_nt_f8f8bf16_contig_all(n, k, num_groups)
+        _INITIALIZATION_DICT[query_key] = True
 
     with _log_jit_build(m, n, k, query_key[0]):
         deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(lhs, rhs, out, m_indices)
@@ -267,14 +278,18 @@ def gemm_nt_f8f8bf16(
     out: torch.Tensor,
 ):
 
-    global INITIALIZATION_DICT
+    global _INITIALIZATION_DICT
     m, k = lhs[0].shape
     n, _ = rhs[0].shape
 
     query_key = (DeepGemmKernelType.GEMM_NT_F8F8BF16, n, k, 1)
-    if ENABLE_JIT_DEEPGEMM_PRECOMPILE and INITIALIZATION_DICT.get(query_key) is None:
-        compile_gemm_nt_f8f8bf16_all(n, k)
-        INITIALIZATION_DICT[query_key] = True
+    if (
+        _ENABLE_JIT_DEEPGEMM_PRECOMPILE
+        and _DO_COMPILE
+        and _INITIALIZATION_DICT.get(query_key) is None
+    ):
+        _compile_gemm_nt_f8f8bf16_all(n, k)
+        _INITIALIZATION_DICT[query_key] = True
 
     with _log_jit_build(m, n, k, query_key[0]):
         deep_gemm.gemm_fp8_fp8_bf16_nt(lhs, rhs, out)
@@ -282,7 +297,7 @@ def gemm_nt_f8f8bf16(
 
 @contextmanager
 def _log_jit_build(M: int, N: int, K: int, func_type: DeepGemmKernelType):
-    if not ENABLE_JIT_DEEPGEMM_LOG_BUILD:
+    if not _ENABLE_JIT_DEEPGEMM_LOG_BUILD:
         yield
         return
 
@@ -293,7 +308,7 @@ def _log_jit_build(M: int, N: int, K: int, func_type: DeepGemmKernelType):
     def __patched_func(self, *args, **kwargs):
         ret = origin_func(self, *args, **kwargs)
         if ret is None:
-            func_name = FUNCTION_NAME_DICT[func_type]
+            func_name = _FUNCTION_NAME_DICT[func_type]
             logger.warning(
                 f"DeepGEMM JIT Compiling for <{func_name}> M={M}, N={N}, K={K}. Please wait."
             )

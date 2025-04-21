@@ -57,7 +57,7 @@ from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPDispatcher
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.deep_gemm import ENABLE_JIT_DEEPGEMM_BMM
+from sglang.srt.layers.quantization.deep_gemm import _ENABLE_JIT_DEEPGEMM
 from sglang.srt.layers.quantization.fp8_kernel import (
     per_tensor_quant_mla_deep_gemm_masked_fp8,
     per_tensor_quant_mla_fp8,
@@ -1511,7 +1511,7 @@ class DeepseekV2ForCausalLM(nn.Module):
 
                         if (
                             _is_cuda
-                            and ENABLE_JIT_DEEPGEMM_BMM
+                            and _ENABLE_JIT_DEEPGEMM
                             and weight_block_size[0] == 128
                             and weight_block_size[1] == 128
                             and model_dtype == torch.bfloat16
