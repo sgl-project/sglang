@@ -272,9 +272,13 @@ class _LayerBasedSinglePassGatherer(_SinglePassGatherer):
         self._objects_of_layer = {}
 
     def _on_layer_data(self, layer_idx: int, objects: List[int]):
-        assert layer_idx not in self._objects_of_layer
         assert 0 <= layer_idx < self._expert_location_metadata.num_layers
-        self._objects_of_layer[layer_idx] = objects
+        if layer_idx in self._objects_of_layer:
+            self._objects_of_layer[layer_idx] = _list_sum(
+                self._objects_of_layer[layer_idx], objects
+            )
+        else:
+            self._objects_of_layer[layer_idx] = objects
 
     def reset(self):
         self._objects_of_layer.clear()
@@ -285,6 +289,10 @@ class _LayerBasedSinglePassGatherer(_SinglePassGatherer):
             for layer_index in range(self._expert_location_metadata.num_layers)
         ]
         return torch.tensor(data)
+
+
+def _list_sum(a: List, b: List) -> List:
+    return [x + y for x, y in zip(a, b, strict=True)]
 
 
 class _SelectExpertsSinglePassGatherer(_LayerBasedSinglePassGatherer):
