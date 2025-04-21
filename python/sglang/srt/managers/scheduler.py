@@ -1567,12 +1567,11 @@ class Scheduler(
                     if local_batch is not None
                     else ForwardMode.IDLE
                 ).value,
-                local_tbo_split_seq_index,
             ],
             dtype=torch.int64,
         )
         global_info = torch.empty(
-            (dp_size, attn_tp_size, 7),
+            (dp_size, attn_tp_size, 6),
             dtype=torch.int64,
         )
         torch.distributed.all_gather_into_tensor(
@@ -1586,7 +1585,6 @@ class Scheduler(
         is_extend_in_batch = global_info[:, 0, 3].tolist()
         local_can_run_tbo_aggregated = min(global_info[:, 0, 4].tolist())
         forward_modes = global_info[:, 0, 5].tolist()
-        global_tbo_split_seq_index = global_info[:, 0, 6].tolist()
 
         non_idle_forward_modes = [
             x for x in forward_modes if x != ForwardMode.IDLE.value
@@ -1618,9 +1616,6 @@ class Scheduler(
                 local_batch.global_num_tokens_for_logprob = (
                     global_num_tokens_for_logprob
                 )
-            local_batch.tbo_global_split_token_index = (
-                global_tbo_split_seq_index if can_run_tbo else None
-            )
             local_batch.tbo_split_seq_index = (
                 local_tbo_split_seq_index if can_run_tbo else None
             )

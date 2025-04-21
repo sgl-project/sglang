@@ -731,7 +731,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # For DP attention
     global_num_tokens: Optional[List[int]] = None
     global_num_tokens_for_logprob: Optional[List[int]] = None
-    tbo_global_split_token_index: Optional[List[int]] = None
     tbo_split_seq_index: Optional[int] = None
     can_run_dp_cuda_graph: bool = False
     global_forward_mode: Optional[ForwardMode] = None
@@ -1529,7 +1528,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             token_ids_logprobs=self.token_ids_logprobs,
             global_num_tokens=self.global_num_tokens,
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
-            tbo_global_split_token_index=self.tbo_global_split_token_index,
             tbo_split_seq_index=self.tbo_split_seq_index,
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
             global_forward_mode=self.global_forward_mode,
@@ -1609,7 +1607,6 @@ class ModelWorkerBatch:
     # For DP attention
     global_num_tokens: Optional[List[int]]
     global_num_tokens_for_logprob: Optional[List[int]]
-    tbo_global_split_token_index: Optional[List[int]]
     tbo_split_seq_index: Optional[int]
     can_run_dp_cuda_graph: bool
     global_forward_mode: Optional[ForwardMode]
