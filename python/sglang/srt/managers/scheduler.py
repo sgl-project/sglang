@@ -32,8 +32,6 @@ import psutil
 import setproctitle
 import torch
 import zmq
-from torch.distributed import barrier
-
 from sglang.global_config import global_config
 from sglang.srt import two_batch_overlap
 from sglang.srt.configs.model_config import ModelConfig
@@ -145,6 +143,7 @@ from sglang.srt.utils import (
     suppress_other_loggers,
 )
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
+from torch.distributed import barrier
 
 logger = logging.getLogger(__name__)
 
@@ -385,8 +384,8 @@ class Scheduler(
             1.0,
         )
         self.new_token_ratio_decay = (
-            self.init_new_token_ratio - self.min_new_token_ratio
-        ) / global_config.default_new_token_ratio_decay_steps
+                                         self.init_new_token_ratio - self.min_new_token_ratio
+                                     ) / global_config.default_new_token_ratio_decay_steps
         self.new_token_ratio = self.init_new_token_ratio
 
         # Init watchdog thread
@@ -403,7 +402,7 @@ class Scheduler(
         self.input_blocker = (
             SchedulerInputBlocker(server_args, noop=self.attn_tp_rank != 0)
             if enable_colocated_batch_gen()
-            or server_args.enable_scheduler_input_blocker
+               or server_args.enable_scheduler_input_blocker
             else None
         )
 
@@ -1246,10 +1245,10 @@ class Scheduler(
             if (
                 self.lora_paths
                 and len(
-                    lora_set
-                    | set([req.lora_path for req in adder.can_run_list])
-                    | set([req.lora_path])
-                )
+                lora_set
+                | set([req.lora_path for req in adder.can_run_list])
+                | set([req.lora_path])
+            )
                 > self.max_loras_per_batch
             ):
                 self.running_batch.batch_is_full = True
@@ -1274,9 +1273,9 @@ class Scheduler(
                         self.running_batch.batch_is_full = len(
                             adder.can_run_list
                         ) > 0 or (
-                            self.running_batch is not None
-                            and not self.running_batch.is_empty()
-                        )
+                                                               self.running_batch is not None
+                                                               and not self.running_batch.is_empty()
+                                                           )
                     else:
                         self.running_batch.batch_is_full = True
                 break
@@ -1520,8 +1519,8 @@ class Scheduler(
                     # We should have at least 1 token for sample in every case.
                     max(extend_len - logprob_start_len, 1)
                     for logprob_start_len, extend_len in zip(
-                        local_batch.extend_logprob_start_lens, local_batch.extend_lens
-                    )
+                    local_batch.extend_logprob_start_lens, local_batch.extend_lens
+                )
                 ]
             )
 
@@ -1586,15 +1585,16 @@ class Scheduler(
         local_can_run_tbo_aggregated = min(global_info[:, 0, 4].tolist())
         forward_modes = global_info[:, 0, 5].tolist()
 
-        forward_mode_same = _is_all_same(forward_modes)
+        non_idle_forward_modes = [x for x in forward_modes if x != ForwardMode.IDLE.value]
+        forward_mode_same_or_idle = _is_all_same(non_idle_forward_modes)
         global_forward_mode = (
-            ForwardMode(forward_modes[0]) if forward_mode_same else None
+            ForwardMode(non_idle_forward_modes[0]) if forward_mode_same_or_idle else None
         )
 
         can_run_tbo = (
             enable_two_batch_overlap
             and local_can_run_tbo_aggregated
-            and forward_mode_same
+            and forward_mode_same_or_idle
         )
 
         if local_batch is None and max(global_num_tokens) > 0:
@@ -2081,7 +2081,7 @@ def _import_static_state(model, static_params):
 
 
 def _is_all_same(x):
-    return all(value == x[0] for value in x)
+    return len(x) == 0 or all(value == x[0] for value in x)
 
 
 def run_scheduler_process(
