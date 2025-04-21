@@ -121,6 +121,9 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 )
             else:
                 super().init_forward_metadata(forward_batch)
+        elif forward_batch.forward_mode.is_target_verify():
+            # Handle target_verify mode by using a PrefillMetadata structure
+            if hasattr(self, 'prefill_wrapper_verify'):
         else:
             super().init_forward_metadata(forward_batch)
 
@@ -138,20 +141,6 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             )
         else:
             cuda_graph_kv_indices = block_kv_indices
-
-        # # try to bypass the error for now
-        # self.cuda_graph_qo_indptr = torch.arange(
-        #     0, max_bs + 1, dtype=torch.int32, device="cuda"
-        # )
-        
-        # # try to bypass the error for now
-        # self.cuda_graph_kv_indptr = torch.zeros(
-        #     (max_bs + 1,), dtype=torch.int32, device="cuda"
-        # )
-        
-        # self.cuda_graph_kv_lens = torch.ones(
-        #     (max_bs,), dtype=torch.int32, device=self.device
-        # )
 
         self.cuda_graph_mla_metadata, self.cuda_graph_num_splits = get_mla_metadata(
             torch.ones(max_bs, dtype=torch.int32, device=cuda_graph_kv_indices.device),
@@ -195,7 +184,8 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                     self.cuda_graph_num_splits[: bs + 1],
                     self.cuda_graph_kv_indices[:bs, :max_seqlen_pad],
                 )
-
+        elif forward_mode.is_target_verify():
+            if spec_info is None:
         else:
             super().init_forward_metadata_capture_cuda_graph(
                 bs,
@@ -297,6 +287,15 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
+    def forward_extend(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool = True,
+    ):
 
 class FlashMLAMultiStepDraftBackend:
     """
