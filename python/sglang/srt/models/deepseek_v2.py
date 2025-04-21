@@ -1593,9 +1593,6 @@ class DeepseekV2DecoderLayer(nn.Module):
                 hidden_states
             )
         else:
-            hidden_states, residual = self._forward_input_layernorm(
-                hidden_states, residual
-            )
             state.hidden_states_after_input_ln, state.residual_after_input_ln = (
                 self._forward_input_layernorm(hidden_states, residual)
             )
