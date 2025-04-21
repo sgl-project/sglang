@@ -41,8 +41,8 @@ class TestVLMModels(CustomTestCase):
         cls.time_out = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
 
         # Set OpenAI API key and base URL environment variables. Needed for lmm-evals to work.
-        os.environ["OPENAI_COMPATIBLE_API_KEY"] = cls.api_key
-        os.environ["OPENAI_COMPATIBLE_API_URL"] = f"{cls.base_url}/v1"
+        os.environ["OPENAI_API_KEY"] = cls.api_key
+        os.environ["OPENAI_API_BASE"] = f"{cls.base_url}/v1"
 
     def run_mmmu_eval(
         self,
