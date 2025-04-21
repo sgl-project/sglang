@@ -60,7 +60,8 @@ from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
-    FlushCacheReq,
+    FlushCacheReqInput,
+    FlushCacheReqOutput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
     GetWeightsByNameReqInput,
@@ -402,7 +403,7 @@ class Scheduler(
             [
                 (TokenizedGenerateReqInput, self.handle_generate_request),
                 (TokenizedEmbeddingReqInput, self.handle_embedding_request),
-                (FlushCacheReq, self.flush_cache_wrapped),
+                (FlushCacheReqInput, self.flush_cache_wrapped),
                 (AbortReq, self.abort_request),
                 (OpenSessionReqInput, self.open_session),
                 (CloseSessionReqInput, self.close_session),
@@ -488,6 +489,8 @@ class Scheduler(
                     tp_cache_group=self.tp_cpu_group,
                     page_size=self.page_size,
                     hicache_ratio=server_args.hicache_ratio,
+                    hicache_size=server_args.hicache_size,
+                    hicache_write_policy=server_args.hicache_write_policy,
                 )
             else:
                 self.tree_cache = RadixCache(
@@ -1596,8 +1599,9 @@ class Scheduler(
         time.sleep(5)
         self.parent_process.send_signal(signal.SIGQUIT)
 
-    def flush_cache_wrapped(self, recv_req: FlushCacheReq):
-        self.flush_cache()
+    def flush_cache_wrapped(self, recv_req: FlushCacheReqInput):
+        success = self.flush_cache()
+        return FlushCacheReqOutput(success=success)
 
     def flush_cache(self):
         """Flush the memory pool and cache."""
@@ -2010,9 +2014,15 @@ def run_scheduler_process(
             else:
                 scheduler.event_loop_normal()
         elif disaggregation_mode == DisaggregationMode.PREFILL:
-            scheduler.event_loop_normal_disagg_prefill()
+            if scheduler.enable_overlap:
+                scheduler.event_loop_overlap_disagg_prefill()
+            else:
+                scheduler.event_loop_normal_disagg_prefill()
         elif disaggregation_mode == DisaggregationMode.DECODE:
-            scheduler.event_loop_normal_disagg_decode()
+            if scheduler.enable_overlap:
+                scheduler.event_loop_overlap_disagg_decode()
+            else:
+                scheduler.event_loop_normal_disagg_decode()
 
     except Exception:
         traceback = get_exception_traceback()
