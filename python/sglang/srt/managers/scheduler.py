@@ -1616,6 +1616,9 @@ class Scheduler(
                 local_batch.global_num_tokens_for_logprob = (
                     global_num_tokens_for_logprob
                 )
+            local_batch.tbo_global_split_token_index = (
+                TODO if can_run_tbo else None
+            )
             local_batch.tbo_split_seq_index = (
                 local_tbo_split_seq_index if can_run_tbo else None
             )
