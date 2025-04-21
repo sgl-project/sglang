@@ -534,6 +534,7 @@ The SmartHome Mini is a compact smart home assistant available in black or white
                 },
             ],
             temperature=0,
+            extra_body={"continue_final_message": True},
         )
 
         assert (
