@@ -43,6 +43,7 @@ suites = {
         TestFile("test_mla_int8_deepseek_v3.py", 522),
         TestFile("test_mla_flashinfer.py", 395),
         TestFile("test_mla_fp8.py", 93),
+        TestFile("test_mla_flashmla.py", 300),
         TestFile("test_no_chunked_prefill.py", 126),
         TestFile("test_no_overlap_scheduler.py", 262),
         TestFile("test_openai_server.py", 124),
