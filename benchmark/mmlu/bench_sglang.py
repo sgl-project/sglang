@@ -6,7 +6,6 @@ import time
 import numpy as np
 import pandas as pd
 import tiktoken
-from tqdm import tqdm
 
 from sglang.test.test_utils import (
     add_common_sglang_args_and_parse,

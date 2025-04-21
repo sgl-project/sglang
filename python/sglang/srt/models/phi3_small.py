@@ -202,6 +202,7 @@ class Phi3SmallSelfAttention(nn.Module):
             self.scale,
             num_kv_heads=self.num_kv_heads_per_partion,
             layer_id=layer_id,
+            quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
         )
 
@@ -301,7 +302,7 @@ class Phi3SmallModel(nn.Module):
         self.mup_embedding_multiplier = config.mup_embedding_multiplier
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
-            lambda prefix: Phi3SmallDecoderLayer(
+            lambda idx, prefix: Phi3SmallDecoderLayer(
                 config,
                 int(prefix.split(".")[-1]),
                 quant_config,

@@ -18,11 +18,12 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     popen_launch_server,
 )
 
 
-class TestVisionChunkedPrefill(unittest.TestCase):
+class TestVisionChunkedPrefill(CustomTestCase):
     def prepare_video_messages(self, video_path, max_frames_num=8):
         # We import decord here to avoid a strange Segmentation fault (core dumped) issue.
         # The following import order will cause Segmentation fault.

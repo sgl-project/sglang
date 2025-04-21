@@ -1,5 +1,6 @@
 """Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/model_executor/layers/linear.py"""
 
+import itertools
 import logging
 from abc import abstractmethod
 from typing import Dict, List, Optional, Tuple
@@ -23,6 +24,7 @@ from sglang.srt.layers.parameter import (
     PackedvLLMParameter,
     PerTensorScaleParameter,
     RowvLLMParameter,
+    _ColumnvLLMParameter,
 )
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
@@ -46,6 +48,7 @@ WEIGHT_LOADER_V2_SUPPORTED = [
     "GPTQLinearMethod",
     "FBGEMMFp8LinearMethod",
     "ModelOptFp8LinearMethod",
+    "ModelOptFp4LinearMethod",
     "IPEXAWQLinearMethod",
 ]
 
@@ -59,12 +62,12 @@ def adjust_marlin_shard(param, shard_size, shard_offset):
 
 
 def adjust_bitsandbytes_4bit_shard(
-    param: Parameter, qkv_offsets: Dict[str, Tuple[int, int]], loaded_shard_id: str
+    param: Parameter, shard_offsets: Dict[str, Tuple[int, int]], loaded_shard_id: str
 ) -> Tuple[int, int]:
     """Adjust the quantization offsets and sizes for BitsAndBytes sharding."""
 
-    total, _ = qkv_offsets["total"]
-    orig_offset, orig_size = qkv_offsets[loaded_shard_id]
+    total, _ = shard_offsets["total"]
+    orig_offset, orig_size = shard_offsets[loaded_shard_id]
 
     quantized_total = param.data.shape[0]
     quantized_offset = orig_offset * quantized_total // total
@@ -423,8 +426,6 @@ class ColumnParallelLinear(LinearBase):
             assert loaded_weight.numel() == 1
             loaded_weight = loaded_weight.reshape(1)
 
-        from sglang.srt.layers.parameter import _ColumnvLLMParameter
-
         if isinstance(param, _ColumnvLLMParameter):
             param.load_column_parallel_weight(
                 loaded_weight,
@@ -573,6 +574,8 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 shard_offsets.append((i, current_shard_offset, output_size))
                 current_shard_offset += output_size
             packed_dim = getattr(param, "packed_dim", None)
+
+            use_bitsandbytes_4bit = getattr(param, "use_bitsandbytes_4bit", False)
             for shard_id, shard_offset, shard_size in shard_offsets:
                 # Special case for Quantization.
                 # If quantized, we need to adjust the offset and size to account
@@ -583,6 +586,17 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                     # Special case for Marlin.
                     shard_size, shard_offset = adjust_marlin_shard(
                         param, shard_size, shard_offset
+                    )
+
+                if use_bitsandbytes_4bit:
+                    index = list(itertools.accumulate([0] + self.output_sizes))
+                    orig_offsets = {
+                        str(i): (index[i], size)
+                        for i, size in enumerate(self.output_sizes)
+                    }
+                    orig_offsets["total"] = (self.output_size, 0)
+                    shard_size, shard_offset = adjust_bitsandbytes_4bit_shard(
+                        param, orig_offsets, str(shard_id)
                     )
 
                 loaded_weight_shard = loaded_weight.narrow(
@@ -687,10 +701,19 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
     ):
         if loaded_shard_id is None:
             if isinstance(param, PerTensorScaleParameter):
-                param.load_merged_column_weight(loaded_weight=loaded_weight, shard_id=0)
+                param.load_merged_column_weight(
+                    loaded_weight=loaded_weight,
+                    shard_id=0,
+                    tp_rank=self.tp_rank,
+                    tp_size=self.tp_size,
+                )
                 return
             elif type(param) in (RowvLLMParameter, BasevLLMParameter):
-                param.load_merged_column_weight(loaded_weight=loaded_weight)
+                param.load_merged_column_weight(
+                    loaded_weight=loaded_weight,
+                    tp_rank=self.tp_rank,
+                    tp_size=self.tp_size,
+                )
                 return
             # TODO: @dsikka - move to parameter.py
             self._load_fused_module_from_checkpoint(param, loaded_weight)
@@ -719,6 +742,8 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             shard_offset=shard_offset,
             shard_size=shard_size,
             use_presharded_weights=self.use_presharded_weights,
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
         )
 
 
@@ -782,6 +807,8 @@ class QKVParallelLinear(ColumnParallelLinear):
         else:
             self.num_kv_heads = divide(self.total_num_kv_heads, tp_size)
             self.num_kv_head_replicas = 1
+        self.q_proj_shard_size = self.num_heads * self.head_size
+        self.kv_proj_shard_size = self.num_kv_heads * self.head_size
         input_size = self.hidden_size
         output_size = (
             (self.num_heads + 2 * self.num_kv_heads) * tp_size * self.head_size
@@ -1234,7 +1261,7 @@ class RowParallelLinear(LinearBase):
             assert loaded_weight.numel() == 1
             loaded_weight = loaded_weight.reshape(1)
 
-        if isinstance(param, BasevLLMParameter):
+        if isinstance(param, RowvLLMParameter):
             # This `BasevLLMParameter` is defined in sglang/srt/layers/parameter.py,
             # It supports additional parameters like tp_rank and use_presharded_weights.
             param.load_row_parallel_weight(

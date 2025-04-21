@@ -5,6 +5,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
 from sglang.srt.utils import is_cuda
 
@@ -14,6 +15,115 @@ if _is_cuda:
         sglang_per_token_group_quant_fp8,
     )
 logger = logging.getLogger(__name__)
+
+
+@triton.jit
+def deepep_permute_triton_kernel(
+    input_ptr,
+    gateup_input_ptr,
+    src2dst_ptr,
+    topk_ids_ptr,
+    a1_scales_ptr,
+    topk,
+    hidden_size,
+    BLOCK_SIZE: tl.constexpr,
+):
+    OutDtype = gateup_input_ptr.dtype.element_ty
+
+    src_idx = tl.program_id(0)
+    src2dst_ptr = src2dst_ptr + src_idx * topk
+    topk_ids_ptr = topk_ids_ptr + src_idx * topk
+
+    src_ptr = input_ptr + src_idx * hidden_size
+
+    for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
+        offset = start_offset + tl.arange(0, BLOCK_SIZE)
+        mask = offset < hidden_size
+        in_data = tl.load(src_ptr + offset, mask=mask).to(OutDtype)
+
+        for idx in range(topk):
+            dst_idx = tl.load(src2dst_ptr + idx)
+            if dst_idx >= 0:
+                dst_ptr = gateup_input_ptr + dst_idx * hidden_size
+                tl.store(dst_ptr + offset, in_data, mask=mask)
+
+
+@triton.jit
+def deepep_post_reorder_triton_kernel(
+    down_output_ptr,
+    output_ptr,
+    src2dst_ptr,
+    topk_ids_ptr,
+    topk_weights_ptr,
+    topk,
+    hidden_size,
+    BLOCK_SIZE: tl.constexpr,
+):
+    InDtype = down_output_ptr.dtype.element_ty
+
+    src_idx = tl.program_id(0)
+    src2dst_ptr = src2dst_ptr + src_idx * topk
+    topk_ids_ptr = topk_ids_ptr + src_idx * topk
+    topk_weights_ptr = topk_weights_ptr + src_idx * topk
+
+    store_ptr = output_ptr + src_idx * hidden_size
+    for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
+        offset = start_offset + tl.arange(0, BLOCK_SIZE)
+        mask = offset < hidden_size
+        sum_vec = tl.zeros([BLOCK_SIZE], dtype=InDtype)
+        for idx in range(topk):
+            dst_idx = tl.load(src2dst_ptr + idx)
+            if dst_idx >= 0:
+                weigh_scale = tl.load(topk_weights_ptr + idx).to(InDtype)
+                load_ptr = down_output_ptr + dst_idx * hidden_size
+                in_data = tl.load(load_ptr + offset, mask=mask)
+                sum_vec += in_data * weigh_scale
+        tl.store(store_ptr + offset, sum_vec, mask=mask)
+
+
+@triton.jit
+def compute_src2dst_triton_kernel(
+    reorder_ids, src2dst, num_toks, BLOCK_SIZE: tl.constexpr
+):
+    pid = tl.program_id(axis=0)
+    dst_id = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = dst_id < num_toks
+    src_id = tl.load(reorder_ids + dst_id, mask=mask)
+    tl.store(src2dst + src_id, dst_id, mask=mask)
+
+
+@triton.jit
+def deepep_compute_src2dst_triton_kernel(
+    reorder_ids, src2dst, num_toks, num_minus_one, BLOCK_SIZE: tl.constexpr
+):
+    pid = tl.program_id(axis=0)
+    dst_id = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = dst_id < num_toks
+    src_id = tl.load(reorder_ids + dst_id, mask=mask)
+    num_invalid = tl.load(num_minus_one)
+    tl.store(src2dst + src_id, dst_id - num_invalid, mask=mask)
+
+
+def deepep_run_moe_deep_preprocess(topk_ids: torch.Tensor, num_experts: int):
+    reorder_topk_ids, reorder_ids = torch.sort(topk_ids.view(-1), stable=True)
+    seg_indptr = torch.empty(num_experts + 1, device=topk_ids.device, dtype=torch.int64)
+    src2dst = torch.empty(topk_ids.numel(), device=topk_ids.device, dtype=torch.int64)
+
+    # Find offet
+    expert_ids = torch.arange(
+        num_experts + 1, device=topk_ids.device, dtype=reorder_topk_ids.dtype
+    )
+    torch.searchsorted(reorder_topk_ids, expert_ids, out=seg_indptr)
+    num_minus_one = seg_indptr[0]
+    seg_indptr = seg_indptr - num_minus_one
+
+    BLOCK_SIZE = 512
+    grid = (triton.cdiv(topk_ids.numel(), BLOCK_SIZE),)
+    deepep_compute_src2dst_triton_kernel[grid](
+        reorder_ids, src2dst, topk_ids.numel(), num_minus_one, BLOCK_SIZE
+    )
+    reorder_topk_ids = reorder_topk_ids[num_minus_one:]
+    return reorder_topk_ids, src2dst, seg_indptr
 
 
 @triton.jit
@@ -31,17 +141,6 @@ def compute_seg_indptr_triton_kernel(reorder_topk_ids, seg_indptr, num_toks):
             low = mid + 1
             target_location = mid
     tl.store(seg_indptr + expert + 1, target_location + 1)
-
-
-@triton.jit
-def compute_src2dst_triton_kernel(
-    reorder_ids, src2dst, num_toks, BLOCK_SIZE: tl.constexpr
-):
-    pid = tl.program_id(axis=0)
-    dst_id = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = dst_id < num_toks
-    src_id = tl.load(reorder_ids + dst_id, mask=mask)
-    tl.store(src2dst + src_id, dst_id, mask=mask)
 
 
 def run_moe_ep_preproess(topk_ids: torch.Tensor, num_experts: int):
@@ -143,6 +242,148 @@ def silu_and_mul_triton_kernel(
             silu_mul_output = gate_output * up_output * scale
             silu_mul_output = silu_mul_output.to(OutDtype)
             tl.store(down_input_ptr + offset, silu_mul_output, mask=mask)
+
+
+# copy from https://github.com/ModelTC/lightllm/blob/a000ab69098654df4731f5b12587dd4e7f0a4f41/lightllm/common/fused_moe/moe_silu_and_mul_mix_quant_ep.py
+@triton.jit
+def _silu_and_mul_post_quant_kernel(
+    input_ptr,
+    stride_input_0,
+    stride_input_1,
+    stride_input_2,
+    output_ptr,
+    stride_output_0,
+    stride_output_1,
+    stride_output_2,
+    output_scale_ptr,
+    stride_output_scale_0,
+    stride_output_scale_1,
+    stride_output_scale_2,
+    masked_m_ptr,
+    size_n,
+    fp8_max,
+    fp8_min,
+    BLOCK_N: tl.constexpr,
+    NUM_STAGE: tl.constexpr,
+):
+    expert_id = tl.program_id(2)
+    token_id = tl.program_id(1)
+    hidden_dim_block_index = tl.program_id(0)
+
+    block_num_per_expert = tl.num_programs(1)
+
+    token_num_cur_expert = tl.load(masked_m_ptr + expert_id)
+
+    stride_input_0 = tl.cast(stride_input_0, dtype=tl.int64)
+    stride_output_0 = tl.cast(stride_output_0, dtype=tl.int64)
+    stride_input_1 = tl.cast(stride_input_1, dtype=tl.int64)
+    stride_output_1 = tl.cast(stride_output_1, dtype=tl.int64)
+
+    offs_in_d = hidden_dim_block_index * BLOCK_N + tl.arange(0, BLOCK_N)
+    input_ptr_offs = input_ptr + expert_id * stride_input_0 + offs_in_d
+    output_ptr_offs = output_ptr + expert_id * stride_output_0 + offs_in_d
+    output_scale_offs = (
+        output_scale_ptr
+        + expert_id * stride_output_scale_0
+        + hidden_dim_block_index * stride_output_scale_2
+    )
+
+    for token_index in tl.range(
+        token_id, token_num_cur_expert, block_num_per_expert, num_stages=NUM_STAGE
+    ):
+        gate = tl.load(
+            input_ptr_offs + token_index * stride_input_1,
+            mask=offs_in_d < size_n,
+            other=0.0,
+        ).to(tl.float32)
+        up = tl.load(
+            input_ptr_offs + token_index * stride_input_1 + size_n,
+            mask=offs_in_d < size_n,
+            other=0.0,
+        )
+        gate = gate / (1 + tl.exp(-gate))
+        gate = gate.to(input_ptr.dtype.element_ty)
+        gate_up = up * gate
+        _absmax = tl.maximum(tl.max(tl.abs(gate_up)), 1e-10)
+        output_s = _absmax / fp8_max
+        output_q = tl.clamp(gate_up / output_s, fp8_min, fp8_max).to(
+            output_ptr.dtype.element_ty
+        )
+        tl.store(
+            output_ptr_offs + token_index * stride_output_1,
+            output_q,
+            mask=offs_in_d < size_n,
+        )
+        tl.store(
+            output_scale_offs + token_index * stride_output_scale_1,
+            output_s,
+        )
+
+
+def silu_and_mul_masked_post_quant_fwd(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    output_scale: torch.Tensor,
+    quant_group_size: int,
+    masked_m: torch.Tensor,
+):
+    """
+    input shape [expert_num, token_num_padded, hidden_dim]
+    output shape [expert_num, token_num_padded, hidden_dim // 2], dtype fp8
+    output_scale [expert_num token_num_paddded, hidden_dim // 2 // 128] dtype float32
+    quant_group_size  int,
+    masked_m shape [expert_num],
+    """
+
+    assert input.is_contiguous()
+    assert output.dtype == torch.float8_e4m3fn
+    assert output.is_contiguous()
+    assert len(input.shape) == 3
+    assert input.shape[0] == masked_m.shape[0]
+    assert input.shape[-1] % 2 == 0
+
+    size_n = input.shape[-1] // 2
+    assert size_n % quant_group_size == 0
+
+    expert_num = len(masked_m)
+
+    if expert_num < 4:
+        BLOCK_NUM_PER_EXPERT = 64
+    else:
+        BLOCK_NUM_PER_EXPERT = 32
+
+    BLOCK_N = quant_group_size
+    num_warps = 1
+    NUM_STAGES = 6
+    hidden_dim_split_block_num = triton.cdiv(size_n, BLOCK_N)
+    assert BLOCK_N % quant_group_size == 0
+
+    grid = (
+        hidden_dim_split_block_num,
+        BLOCK_NUM_PER_EXPERT,
+        expert_num,
+    )
+
+    finfo = torch.finfo(torch.float8_e4m3fn)
+    fp8_max = finfo.max
+    fp8_min = -fp8_max
+
+    _silu_and_mul_post_quant_kernel[grid](
+        input,
+        *input.stride(),
+        output,
+        *output.stride(),
+        output_scale,
+        *output_scale.stride(),
+        masked_m,
+        size_n,
+        fp8_max,
+        fp8_min,
+        BLOCK_N=BLOCK_N,
+        NUM_STAGE=NUM_STAGES,
+        num_warps=num_warps,
+    )
+    return
 
 
 @triton.jit

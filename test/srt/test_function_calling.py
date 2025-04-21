@@ -10,11 +10,12 @@ from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     popen_launch_server,
 )
 
 
-class TestOpenAIServerFunctionCalling(unittest.TestCase):
+class TestOpenAIServerFunctionCalling(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         # Replace with the model name needed for testing; if not required, reuse DEFAULT_SMALL_MODEL_NAME_FOR_TEST
@@ -237,12 +238,61 @@ class TestOpenAIServerFunctionCalling(unittest.TestCase):
 
         self.assertIn("a", args_obj, "Missing parameter 'a'")
         self.assertIn("b", args_obj, "Missing parameter 'b'")
-        self.assertEqual(
-            args_obj["a"],
-            5,
-            "Parameter a should be 5",
+        self.assertEqual(str(args_obj["a"]), "5", "Parameter a should be 5")
+        self.assertEqual(str(args_obj["b"]), "7", "Parameter b should be 7")
+
+    def test_function_call_strict(self):
+        """
+        Test: Whether the strict mode of function calling works as expected.
+        - When strict mode is enabled, the AI should not return a function call if the function name is not recognized.
+        """
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "sub",
+                    "description": "Compute the difference of two integers",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "int_a": {
+                                "type": "int",
+                                "description": "First integer",
+                            },
+                            "int_b": {
+                                "type": "int",
+                                "description": "Second integer",
+                            },
+                        },
+                        "required": ["int_a", "int_b"],
+                    },
+                    "strict": True,
+                },
+            }
+        ]
+
+        messages = [
+            {"role": "user", "content": "Please compute 5 - 7, using your tool."}
+        ]
+        response = client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            temperature=0.8,
+            top_p=0.8,
+            stream=False,
+            tools=tools,
         )
-        self.assertEqual(args_obj["b"], 7, "Parameter b should be 7")
+
+        tool_calls = response.choices[0].message.tool_calls
+        function_name = tool_calls[0].function.name
+        arguments = tool_calls[0].function.arguments
+        args_obj = json.loads(arguments)
+
+        self.assertEqual(function_name, "sub", "Function name should be 'sub'")
+        self.assertEqual(str(args_obj["int_a"]), "5", "Parameter int_a should be 5")
+        self.assertEqual(str(args_obj["int_b"]), "7", "Parameter int_b should be 7")
 
 
 if __name__ == "__main__":

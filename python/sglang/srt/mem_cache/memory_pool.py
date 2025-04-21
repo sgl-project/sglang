@@ -185,12 +185,18 @@ class TokenToKVPoolAllocator:
         if self.free_group:
             self.free(torch.cat(self.free_group))
 
+    def backup_state(self):
+        return self.free_slots
+
+    def restore_state(self, free_slots):
+        self.free_slots = free_slots
+
     def clear(self):
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
         self.free_slots = torch.arange(
             1, self.size + 1, dtype=torch.int64, device=self.device
         )
-        self.is_in_free_group = False
+        self.is_not_in_free_group = True
         self.free_group = []
 
 
@@ -270,6 +276,23 @@ class MHATokenToKVPool(KVCache):
         for v_cache in self.v_buffer:
             v_size_bytes += np.prod(v_cache.shape) * v_cache.dtype.itemsize
         return k_size_bytes, v_size_bytes
+
+    # for disagg
+    def get_contiguous_buf_infos(self):
+        kv_data_ptrs = [
+            self.get_key_buffer(i).data_ptr() for i in range(self.layer_num)
+        ] + [self.get_value_buffer(i).data_ptr() for i in range(self.layer_num)]
+        kv_data_lens = [
+            self.get_key_buffer(i).nbytes for i in range(self.layer_num)
+        ] + [self.get_value_buffer(i).nbytes for i in range(self.layer_num)]
+        kv_item_lens = [
+            self.get_key_buffer(i)[0].nbytes * self.page_size
+            for i in range(self.layer_num)
+        ] + [
+            self.get_value_buffer(i)[0].nbytes * self.page_size
+            for i in range(self.layer_num)
+        ]
+        return kv_data_ptrs, kv_data_lens, kv_item_lens
 
     # Todo: different memory layout
     def get_flat_data(self, indices):
@@ -395,6 +418,7 @@ class MLATokenToKVPool(KVCache):
         enable_memory_saver: bool,
     ):
         self.size = size
+        self.page_size = page_size
         self.dtype = dtype
         self.device = device
         if dtype in (torch.float8_e5m2, torch.float8_e4m3fn):
@@ -422,6 +446,17 @@ class MLATokenToKVPool(KVCache):
             ]
 
         self.layer_transfer_counter = None
+        self.page_size = page_size
+
+    # for disagg
+    def get_contiguous_buf_infos(self):
+        # MLA has only one kv_buffer, so only the information of this buffer needs to be returned.
+        kv_data_ptrs = [self.kv_buffer[i].data_ptr() for i in range(self.layer_num)]
+        kv_data_lens = [self.kv_buffer[i].nbytes for i in range(self.layer_num)]
+        kv_item_lens = [
+            self.kv_buffer[i][0].nbytes * self.page_size for i in range(self.layer_num)
+        ]
+        return kv_data_ptrs, kv_data_lens, kv_item_lens
 
     def get_key_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
@@ -567,13 +602,20 @@ class MemoryStateInt(IntEnum):
     BACKUP = 4
 
 
-def synchronized(func):
-    @wraps(func)
-    def wrapper(self, *args, **kwargs):
-        with self.lock:
-            return func(self, *args, **kwargs)
+def synchronized(debug_only=False):
+    def _decorator(func):
+        @wraps(func)
+        def wrapper(self, *args, **kwargs):
+            if (not debug_only) or self.debug:
+                return func(self, *args, **kwargs)
+                with self.lock:
+                    return func(self, *args, **kwargs)
+            else:
+                return True
 
-    return wrapper
+        return wrapper
+
+    return _decorator
 
 
 class HostKVCache(abc.ABC):
@@ -582,22 +624,27 @@ class HostKVCache(abc.ABC):
         self,
         device_pool: MHATokenToKVPool,
         host_to_device_ratio: float,
-        pin_memory: bool = False,  # no need to use pin memory with the double buffering
-        device: str = "cpu",
+        host_size: int,
+        pin_memory: bool,
+        device: str,
+        page_size: int,
     ):
-        assert (
-            host_to_device_ratio >= 1
-        ), "The host memory should be larger than the device memory with the current protocol"
-        # todo, other ways of configuring the size
-
         self.device_pool = device_pool
-        self.host_to_device_ratio = host_to_device_ratio
+        self.dtype = device_pool.store_dtype
         self.pin_memory = pin_memory
         self.device = device
-
-        self.size = int(device_pool.size * host_to_device_ratio)
-        self.dtype = device_pool.store_dtype
+        self.page_size = page_size
         self.size_per_token = self.get_size_per_token()
+        if host_size > 0:
+            self.size = int(host_size * 1e9 // self.size_per_token)
+        else:
+            self.size = int(device_pool.size * host_to_device_ratio)
+        # Align the host memory pool size to the page size
+        self.size = self.size - (self.size % self.page_size)
+
+        assert (
+            self.size > device_pool.size
+        ), "The host memory should be larger than the device memory with the current protocol"
 
         # Verify there is enough available host memory.
         host_mem = psutil.virtual_memory()
@@ -618,13 +665,9 @@ class HostKVCache(abc.ABC):
 
         self.kv_buffer = self.init_kv_buffer()
 
-        # Initialize memory states and tracking structures.
-        self.mem_state = torch.zeros(
-            (self.size,), dtype=torch.uint8, device=self.device
-        )
-
         # A lock for synchronized operations on memory allocation and state transitions.
         self.lock = threading.RLock()
+        self.debug = logger.isEnabledFor(logging.DEBUG)
         self.clear()
 
     @abc.abstractmethod
@@ -651,13 +694,38 @@ class HostKVCache(abc.ABC):
     def assign_flat_data(self, indices, flat_data):
         raise NotImplementedError()
 
-    @synchronized
+    @synchronized()
     def clear(self):
-        self.mem_state.fill_(0)
-        self.can_use_mem_size = self.size
+        # Initialize memory states and tracking structures.
+        self.mem_state = torch.zeros(
+            (self.size,), dtype=torch.uint8, device=self.device
+        )
         self.free_slots = torch.arange(self.size, dtype=torch.int64)
 
-    @synchronized
+    def available_size(self):
+        return len(self.free_slots)
+
+    @synchronized()
+    def alloc(self, need_size: int) -> torch.Tensor:
+        if need_size > self.available_size():
+            return None
+
+        select_index = self.free_slots[:need_size]
+        self.free_slots = self.free_slots[need_size:]
+
+        if self.debug:
+            self.mem_state[select_index] = MemoryStateInt.RESERVED
+
+        return select_index
+
+    @synchronized()
+    def free(self, indices: torch.Tensor) -> int:
+        self.free_slots = torch.cat([self.free_slots, indices])
+        if self.debug:
+            self.mem_state[indices] = MemoryStateInt.IDLE
+        return len(indices)
+
+    @synchronized(debug_only=True)
     def get_state(self, indices: torch.Tensor) -> MemoryStateInt:
         assert len(indices) > 0, "The indices should not be empty"
         states = self.mem_state[indices]
@@ -666,81 +734,61 @@ class HostKVCache(abc.ABC):
         ).all(), "The memory slots should have the same state {}".format(states)
         return MemoryStateInt(states[0].item())
 
-    @synchronized
-    def alloc(self, need_size: int) -> torch.Tensor:
-        if need_size > self.can_use_mem_size:
-            return None
-
-        # todo: de-fragementation
-        select_index = self.free_slots[:need_size]
-        self.free_slots = self.free_slots[need_size:]
-
-        self.mem_state[select_index] = MemoryStateInt.RESERVED
-        self.can_use_mem_size -= need_size
-
-        return select_index
-
-    @synchronized
+    @synchronized(debug_only=True)
     def is_reserved(self, indices: torch.Tensor) -> bool:
         return self.get_state(indices) == MemoryStateInt.RESERVED
 
-    @synchronized
+    @synchronized(debug_only=True)
     def is_protected(self, indices: torch.Tensor) -> bool:
         return self.get_state(indices) == MemoryStateInt.PROTECTED
 
-    @synchronized
+    @synchronized(debug_only=True)
     def is_synced(self, indices: torch.Tensor) -> bool:
         return self.get_state(indices) == MemoryStateInt.SYNCED
 
-    @synchronized
+    @synchronized(debug_only=True)
     def is_backup(self, indices: torch.Tensor) -> bool:
         return self.get_state(indices) == MemoryStateInt.BACKUP
 
-    @synchronized
+    @synchronized(debug_only=True)
     def update_backup(self, indices: torch.Tensor):
-        assert self.is_synced(indices), (
-            f"The host memory slots should be in SYNCED state before turning into BACKUP. "
-            f"Current state: {self.get_state(indices)}"
-        )
+        if not self.is_synced(indices):
+            raise ValueError(
+                f"The host memory slots should be in SYNCED state before turning into BACKUP. "
+                f"Current state: {self.get_state(indices)}"
+            )
         self.mem_state[indices] = MemoryStateInt.BACKUP
 
-    @synchronized
+    @synchronized(debug_only=True)
     def update_synced(self, indices: torch.Tensor):
         self.mem_state[indices] = MemoryStateInt.SYNCED
 
-    @synchronized
+    @synchronized(debug_only=True)
     def protect_write(self, indices: torch.Tensor):
-        assert self.is_reserved(indices), (
-            f"The host memory slots should be RESERVED before write operations. "
-            f"Current state: {self.get_state(indices)}"
-        )
+        if not self.is_reserved(indices):
+            raise ValueError(
+                f"The host memory slots should be RESERVED before write operations. "
+                f"Current state: {self.get_state(indices)}"
+            )
         self.mem_state[indices] = MemoryStateInt.PROTECTED
 
-    @synchronized
+    @synchronized(debug_only=True)
     def protect_load(self, indices: torch.Tensor):
-        assert self.is_backup(indices), (
-            f"The host memory slots should be in BACKUP state before load operations. "
-            f"Current state: {self.get_state(indices)}"
-        )
+        if not self.is_backup(indices):
+            raise ValueError(
+                f"The host memory slots should be in BACKUP state before load operations. "
+                f"Current state: {self.get_state(indices)}"
+            )
         self.mem_state[indices] = MemoryStateInt.PROTECTED
 
-    @synchronized
+    @synchronized(debug_only=True)
     def complete_io(self, indices: torch.Tensor):
-        assert self.is_protected(indices), (
-            f"The host memory slots should be PROTECTED during I/O operations. "
-            f"Current state: {self.get_state(indices)}"
-        )
+        if not self.is_protected(indices):
+            raise ValueError(
+                f"The host memory slots should be PROTECTED during I/O operations. "
+                f"Current state: {self.get_state(indices)}"
+            )
         self.mem_state[indices] = MemoryStateInt.SYNCED
-
-    def available_size(self):
-        return len(self.free_slots)
-
-    @synchronized
-    def free(self, indices: torch.Tensor) -> int:
-        self.mem_state[indices] = MemoryStateInt.IDLE
-        self.free_slots = torch.cat([self.free_slots, indices])
-        self.can_use_mem_size += len(indices)
-        return len(indices)
 
 
 class MHATokenToKVPoolHost(HostKVCache):
@@ -748,10 +796,14 @@ class MHATokenToKVPoolHost(HostKVCache):
         self,
         device_pool: MHATokenToKVPool,
         host_to_device_ratio: float,
-        pin_memory: bool = False,  # no need to use pin memory with the double buffering
+        host_size: int,
+        page_size: int,
+        pin_memory: bool = True,
         device: str = "cpu",
     ):
-        super().__init__(device_pool, host_to_device_ratio, pin_memory, device)
+        super().__init__(
+            device_pool, host_to_device_ratio, host_size, pin_memory, device, page_size
+        )
 
     def get_size_per_token(self):
         self.head_num = self.device_pool.head_num
@@ -784,23 +836,61 @@ class MHATokenToKVPoolHost(HostKVCache):
     def assign_flat_data(self, indices, flat_data):
         self.kv_buffer[:, :, indices] = flat_data
 
+    def write_page_all_layers(self, host_indices, device_indices, device_pool):
+        device_indices_cpu = device_indices[:: self.page_size].cpu()
+        for i in range(len(device_indices_cpu)):
+            h_index = host_indices[i * self.page_size]
+            d_index = device_indices_cpu[i]
+            for j in range(self.layer_num):
+                self.kv_buffer[0, j, h_index : h_index + self.page_size].copy_(
+                    device_pool.k_buffer[j][d_index : d_index + self.page_size],
+                    non_blocking=True,
+                )
+                self.kv_buffer[1, j, h_index : h_index + self.page_size].copy_(
+                    device_pool.v_buffer[j][d_index : d_index + self.page_size],
+                    non_blocking=True,
+                )
+
+    def load_page_per_layer(self, host_indices, device_indices, device_pool, layer_id):
+        device_indices_cpu = device_indices[:: self.page_size].cpu()
+        for i in range(len(device_indices_cpu)):
+            h_index = host_indices[i * self.page_size]
+            d_index = device_indices_cpu[i]
+            device_pool.k_buffer[layer_id][d_index : d_index + self.page_size].copy_(
+                self.kv_buffer[0, layer_id, h_index : h_index + self.page_size],
+                non_blocking=True,
+            )
+            device_pool.v_buffer[layer_id][d_index : d_index + self.page_size].copy_(
+                self.kv_buffer[1, layer_id, h_index : h_index + self.page_size],
+                non_blocking=True,
+            )
+
 
 class MLATokenToKVPoolHost(HostKVCache):
     def __init__(
         self,
         device_pool: MLATokenToKVPool,
         host_to_device_ratio: float,
-        pin_memory: bool = False,  # no need to use pin memory with the double buffering
+        host_size: int,
+        page_size: int,
+        pin_memory: bool = True,
         device: str = "cpu",
     ):
-        super().__init__(device_pool, host_to_device_ratio, pin_memory, device)
+        super().__init__(
+            device_pool, host_to_device_ratio, host_size, pin_memory, device, page_size
+        )
 
     def get_size_per_token(self):
         self.kv_lora_rank = self.device_pool.kv_lora_rank
         self.qk_rope_head_dim = self.device_pool.qk_rope_head_dim
         self.layer_num = self.device_pool.layer_num
 
-        return (self.kv_lora_rank + self.qk_rope_head_dim) * 1 * self.dtype.itemsize
+        return (
+            (self.kv_lora_rank + self.qk_rope_head_dim)
+            * 1
+            * self.dtype.itemsize
+            * self.layer_num
+        )
 
     def init_kv_buffer(self):
         return torch.empty(
@@ -830,3 +920,24 @@ class MLATokenToKVPoolHost(HostKVCache):
 
     def assign_flat_data(self, indices, flat_data):
         self.kv_buffer[:, indices] = flat_data
+
+    def write_page_all_layers(self, host_indices, device_indices, device_pool):
+        device_indices_cpu = device_indices[:: self.page_size].cpu()
+        for i in range(len(device_indices_cpu)):
+            h_index = host_indices[i * self.page_size]
+            d_index = device_indices_cpu[i]
+            for j in range(self.layer_num):
+                self.kv_buffer[j, h_index : h_index + self.page_size].copy_(
+                    device_pool.kv_buffer[j][d_index : d_index + self.page_size],
+                    non_blocking=True,
+                )
+
+    def load_page_per_layer(self, host_indices, device_indices, device_pool, layer_id):
+        device_indices_cpu = device_indices[:: self.page_size].cpu()
+        for i in range(len(device_indices_cpu)):
+            h_index = host_indices[i * self.page_size]
+            d_index = device_indices_cpu[i]
+            device_pool.kv_buffer[layer_id][d_index : d_index + self.page_size].copy_(
+                self.kv_buffer[layer_id, h_index : h_index + self.page_size],
+                non_blocking=True,
+            )

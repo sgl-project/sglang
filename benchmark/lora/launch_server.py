@@ -22,7 +22,10 @@ def launch_server(args):
     cmd += f"--disable-radix --disable-cuda-graph "
     cmd += f"--max-loras-per-batch {args.max_loras_per_batch} "
     cmd += f"--max-running-requests {args.max_running_requests} "
-    cmd += f"--lora-backend {args.lora_backend}"
+    cmd += f"--lora-backend {args.lora_backend} "
+    cmd += f"--tp-size {args.tp_size} "
+    if args.disable_custom_all_reduce:
+        cmd += "--disable-custom-all-reduce"
     print(cmd)
     os.system(cmd)
 
@@ -47,6 +50,18 @@ if __name__ == "__main__":
         "--lora-backend",
         type=str,
         default="triton",
+    )
+    parser.add_argument(
+        "--tp-size",
+        type=int,
+        default=1,
+        help="Tensor parallel size for distributed inference",
+    )
+    # disable_custom_all_reduce
+    parser.add_argument(
+        "--disable-custom-all-reduce",
+        action="store_true",
+        help="Disable custom all reduce when device does not support p2p communication",
     )
     args = parser.parse_args()
 

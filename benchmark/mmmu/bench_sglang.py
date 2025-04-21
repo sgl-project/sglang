@@ -1,13 +1,16 @@
 """
-    Bench the sglang-hosted vLM with benchmark MMMU
+Bench the sglang-hosted vLM with benchmark MMMU
 
-    Usage:
-        python benchmark/mmmu/bench_sglang.py --model-path Qwen/Qwen2-VL-7B-Instruct --chat-template qwen2-vl
+Usage:
+    Host the VLM: python -m sglang.launch_server --model-path Qwen/Qwen2-VL-7B-Instruct --chat-template qwen2-vl --port 30000
 
-    The eval output will be logged
+    Benchmark: python benchmark/mmmu/bench_sglang.py --port 30000
+
+The eval output will be logged
 """
 
 import argparse
+import time
 
 import openai
 from data_utils import save_json
@@ -37,6 +40,7 @@ def eval_mmmu(args):
     # had to use an openai server, since SglImage doesn't support image data
     client = openai.Client(api_key="sk", base_url=f"http://127.0.0.1:{args.port}/v1")
 
+    start = time.time()
     for i, sample in enumerate(tqdm(samples)):
         prompt = sample["final_input_prompt"]
         prefix = prompt.split("<")[0]
@@ -73,6 +77,8 @@ def eval_mmmu(args):
         response = response.choices[0].message.content
         process_result(response, sample, answer_dict, out_samples)
 
+    print(f"Benchmark time: {time.time() - start}")
+
     args.output_path = f"./val_sglang.json"
     save_json(args.output_path, out_samples)
     eval_result(model_answer_path=args.output_path, answer_dict=answer_dict)
@@ -80,8 +86,7 @@ def eval_mmmu(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    args = add_common_sglang_args_and_parse(parser)
     EvalArgs.add_cli_args(parser)
+    args = add_common_sglang_args_and_parse(parser)
     args = parser.parse_args()
-
     eval_mmmu(args)

@@ -49,7 +49,6 @@ def create_flashmla_kv_indices_triton(
     kv_indices_ptr,
     req_to_token_ptr_stride: tl.constexpr,
     kv_indices_ptr_stride: tl.constexpr,
-    max_pagesize: tl.constexpr,
 ):
     PAGED_SIZE: tl.constexpr = 64
     BLOCK_SIZE: tl.constexpr = 4096

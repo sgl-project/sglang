@@ -163,6 +163,7 @@ class Gemma2Attention(nn.Module):
                 if use_sliding_window
                 else None
             ),
+            quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
         )
 

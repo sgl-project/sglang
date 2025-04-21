@@ -33,6 +33,7 @@ from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     is_in_ci,
     popen_launch_server,
 )
@@ -523,7 +524,7 @@ def test_update_weights_from_distributed(
     torch.cuda.empty_cache()
 
 
-class TestUpdateWeightsFromDistributed(unittest.TestCase):
+class TestUpdateWeightsFromDistributed(CustomTestCase):
 
     def test_update_weights_from_distributed(self):
 

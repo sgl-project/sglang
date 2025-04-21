@@ -1,5 +1,6 @@
 import argparse
 
+import PIL
 import torch
 from data_utils import save_json
 from eval_utils import (
@@ -10,22 +11,38 @@ from eval_utils import (
     process_result,
 )
 from tqdm import tqdm
-from transformers import AutoModelForImageTextToText, AutoProcessor, GenerationConfig
+from transformers import AutoModel, AutoProcessor, GenerationConfig
 
 
 @torch.no_grad()
 def eval_mmmu(args):
     eval_args = EvalArgs.from_cli_args(args)
+    try:
+        from transformers import AutoModelForImageTextToText
 
-    model = AutoModelForImageTextToText.from_pretrained(
-        args.model_path,
-        torch_dtype="auto",
-        trust_remote_code=True,
-    )
+        model = AutoModelForImageTextToText.from_pretrained(
+            args.model_path,
+            torch_dtype="auto",
+            trust_remote_code=True,
+        )
+    except Exception as first_exception:
+        try:
+            model = AutoModel.from_pretrained(
+                args.model_path,
+                torch_dtype="auto",
+                trust_remote_code=True,
+                init_tts=False,
+            )
+        except Exception as second_exception:
+            raise RuntimeError(
+                f"Failed to load model: First attempt failed with {first_exception}, "
+                f"second attempt failed with {second_exception}"
+            ) from second_exception
+
     model = model.eval().cuda()
 
     processor = AutoProcessor.from_pretrained(
-        args.model_path, torch_dtype="auto", device_map="auto"
+        args.model_path, torch_dtype="auto", device_map="auto", trust_remote_code=True
     )
 
     samples = prepare_samples(eval_args)
@@ -56,17 +73,38 @@ def eval_mmmu(args):
         if suffix:
             contents += [{"type": "text", "text": suffix}]
         messages = [{"role": "user", "content": contents}]
-        model_inputs = processor.apply_chat_template(
-            messages,
-            tokenize=True,
-            return_dict=True,
-            add_generation_prompt=True,
-            return_tensors="pt",
-        ).to(model.device)
-        input_len = model_inputs["input_ids"].shape[-1]
-        generation = model.generate(**model_inputs, generation_config=generation_config)
-        generation = generation[0][input_len:]
-        response = processor.decode(generation, skip_special_tokens=True)
+        try:
+            model_inputs = processor.tokenizer.apply_chat_template(
+                messages,
+                tokenize=True,
+                return_dict=True,
+                add_generation_prompt=True,
+                return_tensors="pt",
+            ).to(model.device)
+            input_len = model_inputs["input_ids"].shape[-1]
+            generation = model.generate(
+                **model_inputs, generation_config=generation_config
+            )
+            generation = generation[0][input_len:]
+            response = processor.decode(generation, skip_special_tokens=True)
+        except:
+            contents = []
+            if prefix:
+                contents += [prefix]
+            image = PIL.Image.open(sample["image_path"])
+            contents += [image]
+            if suffix:
+                contents += [suffix]
+            messages = [{"role": "user", "content": contents}]
+            response = model.chat(
+                msgs=messages,
+                tokenizer=processor.tokenizer,
+                sampling=False,
+                max_new_tokens=sampling_params["max_new_tokens"],
+                use_tts_template=False,
+                generate_audio=False,
+                temperature=0.0,
+            )
         print(f"response: {response}")
         process_result(response, sample, answer_dict, out_samples)
 

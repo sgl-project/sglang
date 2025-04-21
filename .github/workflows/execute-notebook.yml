@@ -33,7 +33,7 @@ jobs:
           pip install -r docs/requirements.txt
           apt-get update
           apt-get install -y pandoc
-          apt-get update && apt-get install -y parallel
+          apt-get update && apt-get install -y parallel retry
 
       - name: Setup Jupyter Kernel
         run: |

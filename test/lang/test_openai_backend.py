@@ -17,9 +17,10 @@ from sglang.test.test_programs import (
     test_stream,
     test_tool_use,
 )
+from sglang.test.test_utils import CustomTestCase
 
 
-class TestOpenAIBackend(unittest.TestCase):
+class TestOpenAIBackend(CustomTestCase):
     instruct_backend = None
     chat_backend = None
     chat_vision_backend = None

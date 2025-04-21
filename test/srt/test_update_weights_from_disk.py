@@ -10,6 +10,7 @@ from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     is_in_ci,
     popen_launch_server,
 )
@@ -18,7 +19,7 @@ from sglang.test.test_utils import (
 ###############################################################################
 # Engine Mode Tests (Single-configuration)
 ###############################################################################
-class TestEngineUpdateWeightsFromDisk(unittest.TestCase):
+class TestEngineUpdateWeightsFromDisk(CustomTestCase):
     def setUp(self):
         self.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         # Initialize the engine in offline (direct) mode.
@@ -70,7 +71,7 @@ class TestEngineUpdateWeightsFromDisk(unittest.TestCase):
 ###############################################################################
 # HTTP Server Mode Tests (Single-configuration)
 ###############################################################################
-class TestServerUpdateWeightsFromDisk(unittest.TestCase):
+class TestServerUpdateWeightsFromDisk(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
@@ -159,7 +160,7 @@ class TestServerUpdateWeightsFromDisk(unittest.TestCase):
 # - In a non-CI environment: test both Engine and Server modes, and enumerate all combinations
 #   with tp and dp ranging from 1 to 2.
 ###############################################################################
-class TestUpdateWeightsFromDiskParameterized(unittest.TestCase):
+class TestUpdateWeightsFromDiskParameterized(CustomTestCase):
     def run_common_test(self, mode, tp, dp):
         """
         Common test procedure for update_weights_from_disk.
