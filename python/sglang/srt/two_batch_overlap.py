@@ -37,9 +37,6 @@ def compute_split_seq_index(
     else:
         raise NotImplementedError
 
-    if split_seq_index == 0 or split_seq_index == num_seqs:
-        return None
-
     return split_seq_index
 
 
