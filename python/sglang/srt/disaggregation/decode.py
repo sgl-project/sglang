@@ -451,8 +451,7 @@ class SchedulerDisaggregationDecodeMixin:
         ):
             batch, _ = self.prepare_dp_attn_batch(batch)
             if batch:
-                result = self.run_batch(batch)
-                # self.process_batch_result(batch, result)
+                _ = self.run_batch(batch)
 
     @torch.no_grad()
     def event_loop_normal_disagg_decode(self):
