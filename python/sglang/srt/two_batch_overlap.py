@@ -22,9 +22,9 @@ if TYPE_CHECKING:
 
 
 def compute_split_seq_index(
-    forward_mode: "ForwardMode",
-    num_tokens: int,
-    extend_lens: Optional[Sequence[int]],
+        forward_mode: "ForwardMode",
+        num_tokens: int,
+        extend_lens: Optional[Sequence[int]],
 ) -> Optional[int]:
     if forward_mode.is_extend():
         assert extend_lens is not None
@@ -50,9 +50,9 @@ def _split_array_by_half_sum(arr: Sequence[int]) -> int:
 
 
 def compute_split_token_index(
-    split_seq_index: int,
-    forward_mode: "ForwardMode",
-    extend_seq_lens: Optional[Sequence[int]],
+        split_seq_index: int,
+        forward_mode: "ForwardMode",
+        extend_seq_lens: Optional[Sequence[int]],
 ) -> int:
     if forward_mode.is_extend():
         assert extend_seq_lens is not None
@@ -67,10 +67,10 @@ def compute_split_token_index(
 
 
 def model_forward_split_inputs(
-    hidden_states: torch.Tensor,
-    residual: torch.Tensor,
-    positions: torch.Tensor,
-    forward_batch: "ForwardBatch",
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: "ForwardBatch",
 ) -> Tuple[Dict, Dict]:
     return tuple(
         [
@@ -89,11 +89,11 @@ def model_forward_split_inputs(
 
 
 def _model_forward_filter_inputs(
-    hidden_states: torch.Tensor,
-    residual: torch.Tensor,
-    positions: torch.Tensor,
-    output_forward_batch: "ForwardBatch",
-    tbo_subbatch_index: int,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        positions: torch.Tensor,
+        output_forward_batch: "ForwardBatch",
+        tbo_subbatch_index: int,
 ) -> Dict:
     token_slice = slice(*output_forward_batch.tbo_parent_token_range)
     return dict(
@@ -138,11 +138,11 @@ Stage = List[ExecutionOperation]
 
 
 def model_forward_execute_two_batch(
-    inputs_a,
-    inputs_b,
-    operations_a: List[Operation],
-    operations_b: List[Operation],
-    delta_stages: int,
+        inputs_a,
+        inputs_b,
+        operations_a: List[Operation],
+        operations_b: List[Operation],
+        delta_stages: int,
 ):
     output_a, output_b = _execute_two_batch_raw(
         inputs_a, inputs_b, operations_a, operations_b, delta_stages=delta_stages
@@ -151,7 +151,7 @@ def model_forward_execute_two_batch(
 
 
 def _execute_two_batch_raw(
-    inputs_a, inputs_b, operations_a, operations_b, delta_stages: int
+        inputs_a, inputs_b, operations_a, operations_b, delta_stages: int
 ):
     stages_a = _convert_operations_to_stages(operations_a)
     stages_b = _convert_operations_to_stages(operations_b)
@@ -227,7 +227,7 @@ class _StateDict:
             super().__setattr__(key, value)
             return
         assert (
-            key not in self._data
+                key not in self._data
         ), f"`{key}` already exist, are you sure you want to override it?"
         self._data[key] = value
 
@@ -236,6 +236,9 @@ class _StateDict:
 
     def __delattr__(self, item):
         del self._data[item]
+
+    def pop(self, item):
+        return self._data.pop(item)
 
     def update(self, values: Dict[str, Any]):
         for k, v in values.items():
@@ -258,7 +261,7 @@ def _convert_operations_to_stages(operations: List[Operation]) -> List[Stage]:
 
 
 def _chunk_by_separator(
-    items: List[Any], is_separator: Callable[[Any], bool]
+        items: List[Any], is_separator: Callable[[Any], bool]
 ) -> Generator[List[Any], None, None]:
     pending_items = []
     for item in items:
