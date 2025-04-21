@@ -292,7 +292,7 @@ class SchedulerDisaggregationPrefillMixin:
         end_idx = min(len(req.fill_ids), len(req.origin_input_ids))
         last_chunk = token_id is not None
 
-        if not last_chunk and end_idx % page_size != 0:
+        if (not last_chunk) and (end_idx % page_size != 0):
             # if not the last chunk and the last page is partial, delay the last partial page to the next send
             end_idx = end_idx - end_idx % page_size
 
