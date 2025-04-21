@@ -307,7 +307,6 @@ class TestOpenAIVisionServer(CustomTestCase):
         self.assertGreater(len(video_response), 0)
 
     def test_regex(self):
-        return
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
 
         regex = (
@@ -681,6 +680,32 @@ class TestJanusProServer(TestOpenAIVisionServer):
     def test_single_image_chat_completion(self):
         # Skip this test because it is flaky
         pass
+
+
+## Skip for ci test
+# class TestLlama4Server(TestOpenAIVisionServer):
+#     @classmethod
+#     def setUpClass(cls):
+#         cls.model = "meta-llama/Llama-4-Scout-17B-16E-Instruct"
+#         cls.base_url = DEFAULT_URL_FOR_TEST
+#         cls.api_key = "sk-123456"
+#         cls.process = popen_launch_server(
+#             cls.model,
+#             cls.base_url,
+#             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+#             other_args=[
+#                 "--chat-template",
+#                 "llama-4",
+#                 "--mem-fraction-static",
+#                 "0.8",
+#                 "--tp-size=8",
+#                 "--context-length=8192",
+#             ],
+#         )
+#         cls.base_url += "/v1"
+
+#     def test_video_chat_completion(self):
+#         pass
 
 
 class TestGemma3itServer(TestOpenAIVisionServer):

@@ -490,7 +490,7 @@ def get_dataset(args, tokenizer):
             prompt_suffix=args.prompt_suffix,
             apply_chat_template=args.apply_chat_template,
         )
-    elif args.dataset_name == "random":
+    elif args.dataset_name.startswith("random"):
         input_requests = sample_random_requests(
             input_len=args.random_input_len,
             output_len=args.random_output_len,
@@ -498,6 +498,7 @@ def get_dataset(args, tokenizer):
             range_ratio=args.random_range_ratio,
             tokenizer=tokenizer,
             dataset_path=args.dataset_path,
+            random_sample=args.dataset_name == "random",
         )
     elif args.dataset_name == "generated-shared-prefix":
         input_requests = sample_generated_shared_prefix_requests(
@@ -687,8 +688,8 @@ def sample_random_requests(
     range_ratio: float,
     tokenizer: PreTrainedTokenizerBase,
     dataset_path: str,
+    random_sample: bool = True,
 ) -> List[Tuple[str, int, int]]:
-
     input_lens = np.random.randint(
         max(int(input_len * range_ratio), 1),
         input_len + 1,
@@ -700,7 +701,7 @@ def sample_random_requests(
         size=num_prompts,
     )
 
-    if True:
+    if random_sample:
         # Sample token ids from ShareGPT and repeat/truncate them to satisfy the input_lens
 
         # Download sharegpt if necessary
@@ -993,13 +994,16 @@ async def benchmark(
             return await request_func(request_func_input=request_func_input, pbar=pbar)
 
     # Warmup
-    print("Starting initial single prompt test run...")
+    print(f"Starting warmup with {args.warmup_requests} sequences...")
+
+    # Use the first request for all warmup iterations
     test_prompt, test_prompt_len, test_output_len = input_requests[0]
     if lora_names != None and len(lora_names) != 0:
         lora_name = lora_names[0]
     else:
         lora_name = None
 
+    # Create the test input once
     test_input = RequestFuncInput(
         model=model_id,
         prompt=test_prompt,
@@ -1009,14 +1013,28 @@ async def benchmark(
         lora_name=lora_name,
         extra_request_body=extra_request_body,
     )
-    test_output = await request_func(request_func_input=test_input)
-    if not test_output.success:
+
+    # Run warmup requests
+    warmup_tasks = []
+    for _ in range(args.warmup_requests):
+        warmup_tasks.append(
+            asyncio.create_task(request_func(request_func_input=test_input))
+        )
+
+    warmup_outputs = await asyncio.gather(*warmup_tasks)
+
+    # Check if at least one warmup request succeeded
+    if args.warmup_requests > 0 and not any(
+        output.success for output in warmup_outputs
+    ):
         raise ValueError(
-            "Initial test run failed - Please make sure benchmark arguments "
-            f"are correctly specified. Error: {test_output.error}"
+            "Warmup failed - Please make sure benchmark arguments "
+            f"are correctly specified. Error: {warmup_outputs[0].error}"
         )
     else:
-        print("Initial test run completed. Starting main benchmark run...")
+        print(
+            f"Warmup completed with {args.warmup_requests} sequences. Starting main benchmark run..."
+        )
 
     # Flush cache
     if ("sglang" in backend and _get_bool_env_var("SGLANG_IS_IN_CI")) or flush_cache:
@@ -1208,7 +1226,7 @@ async def benchmark(
         output_file_name = args.output_file
     else:
         now = datetime.now().strftime("%m%d")
-        if args.dataset_name == "random":
+        if args.dataset_name.startswith("random"):
             output_file_name = f"{args.backend}_{now}_{args.num_prompts}_{args.random_input_len}_{args.random_output_len}.jsonl"
         else:
             output_file_name = f"{args.backend}_{now}_{args.num_prompts}_sharegpt.jsonl"
@@ -1252,6 +1270,10 @@ def run_benchmark(args_: argparse.Namespace):
     # Set default value for max_concurrency if not present
     if not hasattr(args, "max_concurrency"):
         args.max_concurrency = None
+
+    # Set default value for warmup_requests if not present
+    if not hasattr(args, "warmup_requests"):
+        args.warmup_requests = 1
 
     print(f"benchmark_args={args}")
 
@@ -1423,7 +1445,7 @@ if __name__ == "__main__":
         "--dataset-name",
         type=str,
         default="sharegpt",
-        choices=["sharegpt", "random", "generated-shared-prefix"],
+        choices=["sharegpt", "random", "random-ids", "generated-shared-prefix"],
         help="Name of the dataset to benchmark on.",
     )
     parser.add_argument(
@@ -1559,6 +1581,12 @@ if __name__ == "__main__":
         "--flush-cache",
         action="store_true",
         help="Flush the cache before running the benchmark",
+    )
+    parser.add_argument(
+        "--warmup-requests",
+        type=int,
+        default=1,
+        help="Number of warmup requests to run before the benchmark",
     )
 
     group = parser.add_argument_group("generated-shared-prefix dataset arguments")

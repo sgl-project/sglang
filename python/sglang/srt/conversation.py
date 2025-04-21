@@ -33,6 +33,7 @@ class SeparatorStyle(IntEnum):
     ADD_NEW_LINE_SINGLE = auto()
     LLAMA2 = auto()
     LLAMA3 = auto()
+    LLAMA4 = auto()
     CHATGLM = auto()
     CHATML = auto()
     CHATINTERN = auto()
@@ -156,19 +157,30 @@ class Conversation:
                 else:
                     ret += role + ":"
             return ret
-        elif self.sep_style == SeparatorStyle.LLAMA3:
-            ret = "<|begin_of_text|>"
+        elif self.sep_style == SeparatorStyle.LLAMA4:
+            # begin_of_text is added by default
             if self.system_message:
-                ret += system_prompt
+                ret = system_prompt
             else:
-                ret += ""
+                ret = ""
+            for i, (role, message) in enumerate(self.messages):
+                if message:
+                    ret += f"<|header_start|>{role}<|header_end|>\n\n"
+                    ret += f"{message.strip()}<|eot|>"
+                else:
+                    ret += f"<|header_start|>{role}<|header_end|>\n\n"
+            return ret
+        elif self.sep_style == SeparatorStyle.LLAMA3:
+            if self.system_message:
+                ret = system_prompt
+            else:
+                ret = ""
             for i, (role, message) in enumerate(self.messages):
                 if message:
                     ret += f"<|start_header_id|>{role}<|end_header_id|>\n\n"
                     ret += f"{message.strip()}<|eot_id|>"
                 else:
                     ret += f"<|start_header_id|>{role}<|end_header_id|>\n\n"
-            # print(ret)
             return ret
         elif self.sep_style == SeparatorStyle.LLAMA2:
             seps = [self.sep, self.sep2]
@@ -558,6 +570,19 @@ register_conv_template(
         sep=" ",
         sep2=" </s><s>",
         stop_str=["[INST]", "[/INST]", "<<SYS>>", "<</SYS>>"],
+    )
+)
+
+# reference: https://huggingface.co/meta-llama/Llama-4-Scout-17B-16E-Instruct/blob/main/chat_template.json
+register_conv_template(
+    Conversation(
+        name="llama-4",
+        system_template="<|header_start|>system<|header_end|>\n\n{system_message}<|eot|>",
+        roles=("user", "assistant"),
+        sep_style=SeparatorStyle.LLAMA4,
+        sep="",
+        stop_str=["<|end_of_text|>", "<|eot|>", "<|eom|>"],
+        image_token="<|image|>",
     )
 )
 

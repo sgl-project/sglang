@@ -14,7 +14,7 @@ Here we take the deployment of DeepSeek-R1 as an example.
 
 1. At least two Kubernetes nodes, each with two H20 systems and eight GPUs, are required.
 
-2. Make sure your K8S cluster has LWS correctly installed. If it hasn't been set up yet, please follow the [installation instructions](https://github.com/kubernetes-sigs/lws/blob/main/site/content/en/docs/installation/_index.md).
+2. Make sure your K8S cluster has LWS correctly installed. If it hasn't been set up yet, please follow the [installation instructions](https://github.com/kubernetes-sigs/lws/blob/main/site/content/en/docs/installation/_index.md). **Note:** For LWS versions ≤0.5.x, you must use the Downward API to obtain `LWS_WORKER_INDEX`, as native support for this feature was introduced in v0.6.0.
 
 ## Basic example
 
@@ -95,10 +95,6 @@ spec:
             env:
               - name: NCCL_IB_GID_INDEX
                 value: "3"
-              - name: LWS_WORKER_INDEX
-                valueFrom:
-                  fieldRef:
-                    fieldPath: metadata.labels['leaderworkerset.sigs.k8s.io/worker-index']
             command:
               - python3
               - -m
@@ -164,10 +160,6 @@ spec:
             env:
             - name: NCCL_IB_GID_INDEX
               value: "3"
-            - name: LWS_WORKER_INDEX
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.labels['leaderworkerset.sigs.k8s.io/worker-index']
             command:
               - python3
               - -m

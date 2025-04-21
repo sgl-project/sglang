@@ -128,8 +128,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         custom_routing_function: Optional[Callable] = None,
         correction_bias: Optional[torch.Tensor] = None,
         activation: str = "silu",
+        apply_router_weight_on_input: bool = False,
         inplace: bool = True,
         no_combine: bool = False,
+        routed_scaling_factor: Optional[float] = None,
     ) -> torch.Tensor:
         return self.forward(
             x=x,
@@ -143,8 +145,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             custom_routing_function=custom_routing_function,
             correction_bias=correction_bias,
             activation=activation,
+            apply_router_weight_on_input=apply_router_weight_on_input,
             inplace=inplace,
             no_combine=no_combine,
+            routed_scaling_factor=routed_scaling_factor,
         )
 
     def forward_cuda(
@@ -160,8 +164,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         custom_routing_function: Optional[Callable] = None,
         correction_bias: Optional[torch.Tensor] = None,
         activation: str = "silu",
+        apply_router_weight_on_input: bool = False,
         inplace: bool = True,
         no_combine: bool = False,
+        routed_scaling_factor: Optional[float] = None,
     ) -> torch.Tensor:
         topk_weights, topk_ids = select_experts(
             hidden_states=x,
@@ -173,6 +179,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             num_expert_group=num_expert_group,
             custom_routing_function=custom_routing_function,
             correction_bias=correction_bias,
+            routed_scaling_factor=routed_scaling_factor,
         )
 
         if _is_hip and get_bool_env_var("CK_MOE"):
@@ -200,6 +207,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 topk_ids=topk_ids,
                 inplace=inplace and not no_combine,
                 activation=activation,
+                apply_router_weight_on_input=apply_router_weight_on_input,
                 no_combine=no_combine,
             )
 
@@ -276,9 +284,11 @@ class FusedMoE(torch.nn.Module):
         custom_routing_function: Optional[Callable] = None,
         correction_bias: Optional[torch.Tensor] = None,
         activation: str = "silu",
+        apply_router_weight_on_input: bool = False,
         use_presharded_weights: bool = False,
         inplace: bool = True,
         no_combine: bool = False,
+        routed_scaling_factor: Optional[float] = None,
     ):
         super().__init__()
 
@@ -288,6 +298,7 @@ class FusedMoE(torch.nn.Module):
         self.tp_size = (
             tp_size if tp_size is not None else get_tensor_model_parallel_world_size()
         )
+        self.routed_scaling_factor = routed_scaling_factor
         self.top_k = top_k
         self.num_experts = num_experts
         assert intermediate_size % self.tp_size == 0
@@ -302,6 +313,7 @@ class FusedMoE(torch.nn.Module):
         self.custom_routing_function = custom_routing_function
         self.correction_bias = correction_bias
         self.activation = activation
+        self.apply_router_weight_on_input = apply_router_weight_on_input
         self.use_presharded_weights = use_presharded_weights
         self.inplace = inplace
         self.no_combine = no_combine
@@ -630,6 +642,8 @@ class FusedMoE(torch.nn.Module):
             custom_routing_function=self.custom_routing_function,
             correction_bias=self.correction_bias,
             activation=self.activation,
+            apply_router_weight_on_input=self.apply_router_weight_on_input,
+            routed_scaling_factor=self.routed_scaling_factor,
         )
 
         if self.reduce_results and self.tp_size > 1:

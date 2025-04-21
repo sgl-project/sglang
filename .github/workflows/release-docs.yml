@@ -49,6 +49,7 @@ jobs:
           make compile
 
           make html
+          python3 wrap_run_llm.py
           cd _build/html
 
           git clone https://$GITHUB_TOKEN@github.com/sgl-project/sgl-project.github.io.git ../sgl-project.github.io --depth 1
