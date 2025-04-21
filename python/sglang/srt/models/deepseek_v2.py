@@ -27,10 +27,6 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
-from torch import nn
-from tqdm import tqdm
-from transformers import PretrainedConfig
-
 from sglang.srt import two_batch_overlap
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
@@ -112,6 +108,9 @@ from sglang.srt.utils import (
     is_cuda_available,
     is_hip,
 )
+from torch import nn
+from tqdm import tqdm
+from transformers import PretrainedConfig
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -253,8 +252,8 @@ class DeepseekV2MoE(nn.Module):
 
         self.experts = MoEImpl(
             num_experts=config.n_routed_experts
-            + self.n_share_experts_fusion
-            + global_server_args_dict["ep_num_redundant_experts"],
+                        + self.n_share_experts_fusion
+                        + global_server_args_dict["ep_num_redundant_experts"],
             top_k=config.num_experts_per_tok + min(self.n_share_experts_fusion, 1),
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
@@ -329,7 +328,7 @@ class DeepseekV2MoE(nn.Module):
             router_topk=self.top_k,
             permute_fusion=True,
             num_experts=config.n_routed_experts
-            + global_server_args_dict["ep_num_redundant_experts"],
+                        + global_server_args_dict["ep_num_redundant_experts"],
             num_local_experts=config.n_routed_experts // self.tp_size,
             hidden_size=config.hidden_size,
             params_dtype=config.torch_dtype,
@@ -509,8 +508,9 @@ class DeepseekV2MoE(nn.Module):
     def _forward_tbo_op_combine_b(self, state):
         dispatcher = self.tbo_deepep_dispatchers[state.tbo_subbatch_index]
         hidden_states = dispatcher.combine_b()
-        hidden_states *= self.routed_scaling_factor
-        state.hidden_states_from_combine = hidden_states
+        # hidden_states *= self.routed_scaling_factor
+        # state.hidden_states_from_combine = hidden_states
+        state.hidden_states_from_combine_without_scaling = hidden_states
 
     def _forward_tbo_op_shared(self, state):
         state.shared_output = self._forward_deepep_shared_output(
@@ -568,7 +568,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.num_heads = num_heads
         assert num_heads % attn_tp_size == 0
         self.num_local_heads = num_heads // attn_tp_size
-        self.scaling = self.qk_head_dim**-0.5
+        self.scaling = self.qk_head_dim ** -0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
 
@@ -794,16 +794,16 @@ class DeepseekV2AttentionMLA(nn.Module):
         kv = self.kv_b_proj(kv_a)[0]
         kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
         k_nope = kv[..., : self.qk_nope_head_dim]
-        v = kv[..., self.qk_nope_head_dim :]
-        k_pe = latent_cache[:, :, self.kv_lora_rank :]
+        v = kv[..., self.qk_nope_head_dim:]
+        k_pe = latent_cache[:, :, self.kv_lora_rank:]
         q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
-        q[..., self.qk_nope_head_dim :] = q_pe
+        q[..., self.qk_nope_head_dim:] = q_pe
         k = torch.empty_like(q)
         k[..., : self.qk_nope_head_dim] = k_nope
-        k[..., self.qk_nope_head_dim :] = k_pe
+        k[..., self.qk_nope_head_dim:] = k_pe
 
         latent_cache[:, :, : self.kv_lora_rank] = kv_a.unsqueeze(1)
-        latent_cache[:, :, self.kv_lora_rank :] = k_pe
+        latent_cache[:, :, self.kv_lora_rank:] = k_pe
 
         # Save latent cache
         forward_batch.token_to_kv_pool.set_kv_buffer(
@@ -897,11 +897,11 @@ class DeepseekV2AttentionMLA(nn.Module):
         v_input = self.kv_a_layernorm(v_input.contiguous()).unsqueeze(1)
         k_input = latent_cache.unsqueeze(1)
         k_input[..., : self.kv_lora_rank] = v_input
-        k_pe = k_input[..., self.kv_lora_rank :]
+        k_pe = k_input[..., self.kv_lora_rank:]
 
         q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
-        q_input[..., self.kv_lora_rank :] = q_pe
-        k_input[..., self.kv_lora_rank :] = k_pe
+        q_input[..., self.kv_lora_rank:] = q_pe
+        k_input[..., self.kv_lora_rank:] = k_pe
 
         return q_input, k_input, v_input, forward_batch
 
@@ -1012,15 +1012,15 @@ class DeepseekV2AttentionMLA(nn.Module):
         k_input[..., : self.kv_lora_rank] = v_input
 
         if not enable_rope_fusion:
-            k_pe = k_input[..., self.kv_lora_rank :]
+            k_pe = k_input[..., self.kv_lora_rank:]
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
-            q_input[..., self.kv_lora_rank :] = q_pe
-            k_input[..., self.kv_lora_rank :] = k_pe
+            q_input[..., self.kv_lora_rank:] = q_pe
+            k_input[..., self.kv_lora_rank:] = k_pe
             k_pe_output = None
         else:
-            k_pe_output = torch.empty_like(k_input[..., self.kv_lora_rank :])
+            k_pe_output = torch.empty_like(k_input[..., self.kv_lora_rank:])
 
-        q_input[..., self.kv_lora_rank :] = q_pe
+        q_input[..., self.kv_lora_rank:] = q_pe
 
         # attn_output = self.attn_mqa(q_input, k_input, v_input, forward_batch)
         # Use Fused ROPE with use_rope=OFF.
@@ -1077,7 +1077,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         )
 
         if enable_rope_fusion:
-            k_input[..., self.kv_lora_rank :] = k_pe_output
+            k_input[..., self.kv_lora_rank:] = k_pe_output
             forward_batch.token_to_kv_pool.set_kv_buffer(
                 self.attn_mqa, forward_batch.out_cache_loc, k_input, None
             )
@@ -1138,7 +1138,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             kv = kv.view(
                 -1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim
             )
-            v = kv[..., self.qk_nope_head_dim :]
+            v = kv[..., self.qk_nope_head_dim:]
             k_nope = kv[..., : self.qk_nope_head_dim]
 
             k = torch.empty(
@@ -1151,7 +1151,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 device=v.device,
             )
             k[..., : self.qk_nope_head_dim] = k_nope
-            k[..., self.qk_nope_head_dim :] = k_pe
+            k[..., self.qk_nope_head_dim:] = k_pe
 
             output, lse = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
             lse = torch.transpose(lse, 0, 1).contiguous()
@@ -1191,17 +1191,17 @@ class DeepseekV2AttentionMLA(nn.Module):
         kv = self.kv_b_proj(kv_a)[0]
         kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
         k_nope = kv[..., : self.qk_nope_head_dim]
-        v = kv[..., self.qk_nope_head_dim :]
-        k_pe = latent_cache[:, :, self.kv_lora_rank :]
+        v = kv[..., self.qk_nope_head_dim:]
+        k_pe = latent_cache[:, :, self.kv_lora_rank:]
 
         q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
-        q[..., self.qk_nope_head_dim :] = q_pe
+        q[..., self.qk_nope_head_dim:] = q_pe
         k = torch.empty_like(q)
         k[..., : self.qk_nope_head_dim] = k_nope
-        k[..., self.qk_nope_head_dim :] = k_pe
+        k[..., self.qk_nope_head_dim:] = k_pe
 
         latent_cache[:, :, : self.kv_lora_rank] = kv_a.unsqueeze(1)
-        latent_cache[:, :, self.kv_lora_rank :] = k_pe
+        latent_cache[:, :, self.kv_lora_rank:] = k_pe
 
         # Save latent cache
         forward_batch.token_to_kv_pool.set_kv_buffer(
@@ -1333,7 +1333,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         ffn_input_mode = (
             _FFNInputMode.SCATTERED
             if (global_server_args_dict["enable_deepep_moe"] and is_sparse)
-            or (_enable_moe_dense_fully_dp() and not is_sparse)
+               or (_enable_moe_dense_fully_dp() and not is_sparse)
             else _FFNInputMode.FULL
         )
         return _DecoderLayerInfo(is_sparse=is_sparse, ffn_input_mode=ffn_input_mode)
@@ -1693,11 +1693,14 @@ class DeepseekV2DecoderLayer(nn.Module):
 
     # TODO some logic should be in MLP, refactor this
     def _forward_tbo_op_compute_layer_output(self, state):
-        hidden_states = state.pop("hidden_states_from_combine")
+        hidden_states = state.pop("hidden_states_from_combine_without_scaling")
         residual = state.pop("residual_after_post_attn_ln")
 
         if (shared_output := state.pop("shared_output")) is not None:
-            hidden_states = hidden_states + shared_output
+            # TODO fuse into one
+            hidden_states = hidden_states * self.mlp.routed_scaling_factor + shared_output
+        else:
+            hidden_states *= self.mlp.routed_scaling_factor
 
         # TODO do not copy paste
         if self.is_last_layer and self.attn_tp_size != 1:
@@ -1705,7 +1708,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             residual = None
             hidden_states, local_hidden_states = (
                 state.forward_batch.gathered_buffer[
-                    : state.forward_batch.input_ids.shape[0]
+                : state.forward_batch.input_ids.shape[0]
                 ],
                 hidden_states,
             )
@@ -2122,7 +2125,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                     self.config.moe_layer_freq,
                 ),
                 desc=f"Cloning {self.n_share_experts_fusion} "
-                "replicas of the shared expert into MoE",
+                     "replicas of the shared expert into MoE",
             ):
                 for num_repeat in range(self.n_share_experts_fusion):
                     for suffix in suffix_list:
