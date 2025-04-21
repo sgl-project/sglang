@@ -1105,6 +1105,8 @@ def v1_chat_generate_request(
             sampling_params["json_schema"] = convert_json_schema_to_str(
                 request.response_format.json_schema.schema_
             )
+        elif request.response_format and request.response_format.type == "json_object":
+            sampling_params["json_schema"] = '{"type": "object"}'
         elif (
             request.response_format and request.response_format.type == "structural_tag"
         ):
