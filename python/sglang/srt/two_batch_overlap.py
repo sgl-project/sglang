@@ -95,9 +95,12 @@ def _model_forward_filter_inputs(
     tbo_subbatch_index: int,
 ) -> Dict:
     token_slice = slice(*output_forward_batch.tbo_parent_token_range)
+    assert residual is None
     return dict(
         hidden_states=hidden_states[token_slice],
-        residual=residual[token_slice],
+        # TODO beautify
+        residual=None,
+        # residual=residual[token_slice],
         positions=positions[token_slice],
         forward_batch=output_forward_batch,
         tbo_subbatch_index=tbo_subbatch_index,
