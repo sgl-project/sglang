@@ -475,15 +475,13 @@ class SchedulerDisaggregationDecodeMixin:
                     self.stream_output(batch.reqs, False)
                     if prepare_dp_attn_flag:
                         self._prepare_idle_batch_and_run(None)
-                        
                 else:
                     if prepare_dp_attn_flag:
                         batch, _ = self.prepare_dp_attn_batch(batch)
                     result = self.run_batch(batch)
                     self.process_batch_result(batch, result)
-            else:
-                if prepare_dp_attn_flag:
-                    self._prepare_idle_batch_and_run(None)
+            elif prepare_dp_attn_flag:
+                self._prepare_idle_batch_and_run(None)
 
             if batch is None and (
                 len(self.disagg_decode_transfer_queue.queue)
@@ -510,6 +508,11 @@ class SchedulerDisaggregationDecodeMixin:
             batch = self.get_next_disagg_decode_batch_to_run()
             self.cur_batch = batch
             last_batch_is_extend = False
+            
+            prepare_dp_attn_flag = (
+                self.server_args.enable_dp_attention
+                or self.server_args.enable_sp_layernorm
+            )
 
             if batch:
                 # Generate fake extend output.
@@ -517,12 +520,15 @@ class SchedulerDisaggregationDecodeMixin:
                     # Note: Logprobs should be handled on the prefill engine.
                     self.stream_output(batch.reqs, False)
                     last_batch_is_extend = True
-                    self._process_idle_batch_and_run()
+                    if prepare_dp_attn_flag:
+                        self._prepare_idle_batch_and_run(None)
                 else:
+                    if prepare_dp_attn_flag:
+                        batch, _ = self.prepare_dp_attn_batch(batch)
                     result = self.run_batch(batch)
                     result_queue.append((batch.copy(), result))
-            else:
-                self._process_idle_batch_and_run()
+            elif prepare_dp_attn_flag:
+                self._prepare_idle_batch_and_run(None)
 
             # Process the results of the previous batch but skip if the last batch is extend
             if self.last_batch and not self.last_batch_is_extend:
