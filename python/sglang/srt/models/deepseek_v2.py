@@ -1695,7 +1695,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual = state.pop("residual_after_post_attn_ln")
 
         if state.shared_output is not None:
-            hidden_states = hidden_states + state.shared_output
+            hidden_states = hidden_states + state.pop("shared_output")
 
         # TODO do not copy paste
         if self.is_last_layer and self.attn_tp_size != 1:
