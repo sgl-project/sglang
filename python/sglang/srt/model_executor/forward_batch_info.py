@@ -244,7 +244,6 @@ class ForwardBatch:
     dp_local_start_pos: Optional[torch.Tensor] = None  # cached info at runtime
     dp_local_num_tokens: Optional[torch.Tensor] = None  # cached info at runtime
     gathered_buffer: Optional[torch.Tensor] = None
-    tbo_global_split_token_index: Optional[List[int]] = None
     tbo_split_seq_index: Optional[int] = None
     can_run_dp_cuda_graph: bool = False
     global_forward_mode: Optional[ForwardMode] = None
@@ -291,7 +290,6 @@ class ForwardBatch:
             return_logprob=batch.return_logprob,
             top_logprobs_nums=batch.top_logprobs_nums,
             token_ids_logprobs=batch.token_ids_logprobs,
-            tbo_global_split_token_index=batch.tbo_global_split_token_index,
             tbo_split_seq_index=batch.tbo_split_seq_index,
             can_run_dp_cuda_graph=batch.can_run_dp_cuda_graph,
             global_forward_mode=batch.global_forward_mode,
@@ -667,7 +665,6 @@ class ForwardBatch:
             start_seq_index=0,
             end_seq_index=self.tbo_split_seq_index,
             output_attn_backend=attn_backend_child_a,
-            output_global_num_tokens=self.tbo_global_split_token_index,
         )
         child_b = self.filter_batch(
             start_token_index=tbo_split_token_index,
@@ -675,14 +672,6 @@ class ForwardBatch:
             start_seq_index=self.tbo_split_seq_index,
             end_seq_index=self.batch_size,
             output_attn_backend=attn_backend_child_b,
-            output_global_num_tokens=[
-                rank_num_tokens - rank_split_token_index
-                for rank_split_token_index, rank_num_tokens in zip(
-                    self.tbo_global_split_token_index,
-                    self.global_num_tokens_cpu,
-                    strict=True,
-                )
-            ],
         )
 
         assert self.tbo_children is None
@@ -696,7 +685,6 @@ class ForwardBatch:
         start_seq_index: int,
         end_seq_index: int,
         output_attn_backend: AttentionBackend,
-        output_global_num_tokens: List[int],
     ):
         num_tokens = self.input_ids.shape[0]
         num_seqs = self.batch_size
