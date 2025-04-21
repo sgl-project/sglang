@@ -1619,26 +1619,24 @@ class DeepseekV2DecoderLayer(nn.Module):
     def _forward_tbo_op_prefill_attn(self, state):
         state.hidden_states_after_attn = self.self_attn(
             positions=state.positions,
-            hidden_states=state.hidden_states_after_input_ln,
+            hidden_states=state.pop("hidden_states_after_input_ln"),
             forward_batch=state.forward_batch,
             # TODO hack
             zero_allocator=BumpAllocator(
                 buffer_size=2, dtype=torch.float32, device="cuda"
             ),
         )
-        del state.hidden_states_after_input_ln
 
     def _forward_tbo_op_decode_attn_0(self, state):
         state.self_attn_state = self.self_attn.forward_absorb_stage_prepare(
             positions=state.positions,
-            hidden_states=state.hidden_states_after_input_ln,
+            hidden_states=state.pop("hidden_states_after_input_ln"),
             forward_batch=state.forward_batch,
             # TODO hack
             zero_allocator=BumpAllocator(
                 buffer_size=2, dtype=torch.float32, device="cuda"
             ),
         )
-        del state.hidden_states_after_input_ln
 
     def _forward_tbo_op_decode_attn_1(self, state):
         assert (
@@ -1648,20 +1646,18 @@ class DeepseekV2DecoderLayer(nn.Module):
             and isinstance(self.mlp, DeepseekV2MoE)
         )
         state.hidden_states_after_attn = self.self_attn.forward_absorb_stage_core(
-            state.self_attn_state,
+            state.pop("self_attn_state"),
             # TODO hack
             zero_allocator=BumpAllocator(
                 buffer_size=2, dtype=torch.float32, device="cuda"
             ),
         )
-        del state.self_attn_state
 
     def _forward_tbo_op_post_attn_layernorm(self, state):
         hidden_states, residual = (
-            state.hidden_states_after_attn,
-            state.residual_after_input_ln,
+            state.pop("hidden_states_after_attn"),
+            state.pop("residual_after_input_ln"),
         )
-        del state.hidden_states_after_attn, state.residual_after_input_ln
 
         # TODO adhoc code, do not copy-paste
         if self.attn_tp_size != 1:
@@ -1695,9 +1691,8 @@ class DeepseekV2DecoderLayer(nn.Module):
 
     # TODO some logic should be in MLP, refactor this
     def _forward_tbo_op_compute_layer_output(self, state):
-        hidden_states = state.hidden_states_from_combine
-        residual = state.residual_after_post_attn_ln
-        del state.hidden_states_from_combine, state.residual_after_post_attn_ln
+        hidden_states = state.pop("hidden_states_from_combine")
+        residual = state.pop("residual_after_post_attn_ln")
 
         if state.shared_output is not None:
             hidden_states = hidden_states + state.shared_output
