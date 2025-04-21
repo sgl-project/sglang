@@ -15,7 +15,6 @@ from typing import (
 )
 
 import torch
-
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 
 if TYPE_CHECKING:
@@ -83,8 +82,8 @@ def model_forward_split_inputs(
                 tbo_subbatch_index=tbo_subbatch_index,
             )
             for tbo_subbatch_index, output_forward_batch in enumerate(
-                forward_batch.tbo_children
-            )
+            forward_batch.tbo_children
+        )
         ]
     )
 
@@ -239,7 +238,11 @@ class _StateDict:
         for k, v in values.items():
             setattr(self, k, v)
 
-    def clear(self):
+    def clear(self, expect_keys: Sequence[str]):
+        if set(self._data.keys()) != set(expect_keys):
+            raise Exception(
+                f"Unexpected keys when clearning. This may indicate you do not release memory early enough but leave it to here. {list(self._data.keys())=} {expect_keys=}")
+
         self._data.clear()
 
 
@@ -274,6 +277,6 @@ def _decorate_operation(operation: Operation, debug_name_prefix: str):
         return operation
     return ExecutionOperation(
         debug_name=debug_name_prefix
-        + getattr(operation, "__name__", "unknown").replace("_forward_tbo_op_", ""),
+                   + getattr(operation, "__name__", "unknown").replace("_forward_tbo_op_", ""),
         fn=operation,
     )
