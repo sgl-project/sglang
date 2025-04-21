@@ -52,8 +52,6 @@ class FlashMLADecodeMetadata:
 
 
 class FlashMLABackend(FlashInferMLAAttnBackend):
-    """Flashinfer attention kernels."""
-
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -149,7 +147,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 Q_LEN * self.num_q_heads // self.num_kv_heads,
                 self.num_kv_heads,
             )
-            
+
             # Use FlashMLADecodeMetadata which has the attributes forward_extend expects
             self.forward_metadata = FlashMLADecodeMetadata(
                 mla_metadata,
@@ -180,7 +178,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             self.num_kv_heads,
         )
         self.cuda_graph_kv_indices = cuda_graph_kv_indices
-        
+
         self.forward_metadata = FlashMLADecodeMetadata(
             self.cuda_graph_mla_metadata,
             self.cuda_graph_num_splits,
@@ -390,9 +388,9 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
 
         bs = forward_batch.batch_size
         k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-        
+
         reshape_q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
-        
+
         o, _ = flash_mla_with_kvcache(
             q=reshape_q,
             k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
