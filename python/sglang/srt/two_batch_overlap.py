@@ -15,6 +15,7 @@ from typing import (
 )
 
 import torch
+
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 
 if TYPE_CHECKING:
@@ -80,8 +81,8 @@ def model_forward_split_inputs(
                 tbo_subbatch_index=tbo_subbatch_index,
             )
             for tbo_subbatch_index, output_forward_batch in enumerate(
-            forward_batch.tbo_children
-        )
+                forward_batch.tbo_children
+            )
         ]
     )
 
@@ -272,6 +273,6 @@ def _decorate_operation(operation: Operation, debug_name_prefix: str):
         return operation
     return ExecutionOperation(
         debug_name=debug_name_prefix
-                   + getattr(operation, "__name__", "unknown").replace("_forward_tbo_op_", ""),
+        + getattr(operation, "__name__", "unknown").replace("_forward_tbo_op_", ""),
         fn=operation,
     )
