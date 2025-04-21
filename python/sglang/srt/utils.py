@@ -784,6 +784,8 @@ def add_api_key_middleware(app, api_key: str):
             return await call_next(request)
         if request.url.path.startswith("/health"):
             return await call_next(request)
+        if request.url.path.startswith("/metrics"):
+            return await call_next(request)
         if request.headers.get("Authorization") != "Bearer " + api_key:
             return ORJSONResponse(content={"error": "Unauthorized"}, status_code=401)
         return await call_next(request)
