@@ -1,4 +1,4 @@
-name: Release SGLang Kernel Wheel (cu128)
+name: Release SGLang Kernel Wheel (cu118)
 
 on:
   workflow_dispatch:
@@ -14,11 +14,11 @@ on:
 jobs:
   build-wheels:
     if: github.repository == 'sgl-project/sglang'
-    runs-on: ubuntu-latest
+    runs-on: sgl-kernel-release-node
     strategy:
       matrix:
         python-version: ['3.9']
-        cuda-version: ['12.8']
+        cuda-version: ['11.8']
 
     steps:
       - uses: actions/checkout@v4
@@ -80,7 +80,7 @@ jobs:
           WHL_TOKEN: ${{ secrets.WHL_TOKEN }}
 
       - name: Update wheel index
-        run: python3 scripts/update_kernel_whl_index.py --cuda 128
+        run: python3 scripts/update_kernel_whl_index.py
 
       - name: Push wheel index
         run: |

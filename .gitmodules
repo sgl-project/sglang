@@ -1,4 +1,0 @@
-[submodule "sgl-kernel/3rdparty/flashinfer"]
-	path = sgl-kernel/3rdparty/flashinfer
-	url = https://github.com/sgl-project/flashinfer.git
-	branch = sgl-kernel
