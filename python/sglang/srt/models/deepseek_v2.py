@@ -1628,7 +1628,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                                 f"mlp.experts."
                                 f"{self.config.n_routed_experts + num_repeat}"
                                 f".{suffix}",
-                                weights_dict[shared_expert_weight_name].clone(),
+                                weights_dict[shared_expert_weight_name],
                             )
                         )
                         names_to_remove += [shared_expert_weight_name]
