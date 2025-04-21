@@ -30,10 +30,8 @@ def compute_split_seq_index(
     if forward_mode.is_extend():
         assert extend_lens is not None
         split_seq_index = _split_array_by_half_sum(extend_lens)
-        num_seqs = len(extend_lens)
     elif forward_mode.is_decode():
         split_seq_index = num_tokens // 2
-        num_seqs = num_tokens
     elif forward_mode.is_idle():
         return 0
     else:
