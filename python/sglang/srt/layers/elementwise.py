@@ -4,6 +4,10 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.utils import is_hip
+
+_is_hip = is_hip()
+
 fused_softcap_autotune = triton.autotune(
     configs=[
         triton.Config(kwargs={"BLOCK_SIZE": 128}, num_warps=4),
@@ -185,6 +189,9 @@ def fused_dual_residual_rmsnorm(x, residual, weight1, weight2, eps, autotune=Fal
     assert x.shape == residual.shape and x.dtype == residual.dtype
     output, mid = torch.empty_like(x), torch.empty_like(x)
     bs, hidden_dim = x.shape
+
+    min_num_warps = 16 if _is_hip else 32
+
     if autotune:
         fused_dual_residual_rmsnorm_kernel_autotune[(bs,)](
             output, mid, x, residual, weight1, weight2, eps=eps, hidden_dim=hidden_dim
@@ -193,7 +200,10 @@ def fused_dual_residual_rmsnorm(x, residual, weight1, weight2, eps, autotune=Fal
         config = {
             "BLOCK_SIZE": triton.next_power_of_2(hidden_dim),
             "num_warps": max(
-                min(triton.next_power_of_2(triton.cdiv(hidden_dim, 256)), 32), 4
+                min(
+                    triton.next_power_of_2(triton.cdiv(hidden_dim, 256)), min_num_warps
+                ),
+                4,
             ),
         }
 
@@ -250,10 +260,13 @@ def fused_rmsnorm(x, weight, eps, autotune=False, inplace=False):
     else:
         output = torch.empty_like(x)
     bs, hidden_dim = x.shape
+
+    min_num_warps = 16 if _is_hip else 32
+
     config = {
         "BLOCK_SIZE": triton.next_power_of_2(hidden_dim),
         "num_warps": max(
-            min(triton.next_power_of_2(triton.cdiv(hidden_dim, 256)), 32), 4
+            min(triton.next_power_of_2(triton.cdiv(hidden_dim, 256)), min_num_warps), 4
         ),
     }
 
