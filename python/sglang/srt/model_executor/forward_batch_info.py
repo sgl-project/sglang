@@ -645,7 +645,6 @@ class ForwardBatch:
         self.prepare_chunked_kv_indices(device)
 
     def prepare_tbo(self):
-        print(f"hi [{get_tensor_model_parallel_rank()}] prepare_tbo start {self.tbo_split_seq_index=}")
         if self.tbo_split_seq_index is None:
             return
 
@@ -677,7 +676,6 @@ class ForwardBatch:
 
         assert self.tbo_children is None
         self.tbo_children = [child_a, child_b]
-        print(f"hi [{get_tensor_model_parallel_rank()}] prepare_tbo set self.tbo_children")
 
     def filter_batch(
         self,
