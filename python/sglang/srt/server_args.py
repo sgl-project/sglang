@@ -388,8 +388,6 @@ class ServerArgs:
         if self.disaggregation_mode == "prefill":
             self.disable_cuda_graph = True
             logger.warning("Cuda graph is disabled for prefill server")
-            self.disable_overlap_schedule = True
-            logger.warning("Overlap scheduler is disabled for prefill server")
         elif self.disaggregation_mode == "decode":
             self.disable_radix_cache = True
             logger.warning("KV cache is forced as chunk cache for decode server")
