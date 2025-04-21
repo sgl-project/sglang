@@ -1831,6 +1831,9 @@ class DeepseekV2Model(nn.Module):
                 )
             ]
 
+        hidden_states += residual
+        residual = None
+
         inputs_a, inputs_b = model_forward_split_inputs(
             positions=positions,
             hidden_states=hidden_states,
