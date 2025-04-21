@@ -180,6 +180,8 @@ class ServerArgs:
     tool_call_parser: Optional[str] = None
     enable_hierarchical_cache: bool = False
     hicache_ratio: float = 2.0
+    hicache_size: int = 0
+    hicache_write_policy: str = "write_through_selective"
     flashinfer_mla_disable_ragged: bool = False
     warmups: Optional[str] = None
     moe_dense_tp_size: Optional[int] = None
@@ -1116,9 +1118,21 @@ class ServerArgs:
         parser.add_argument(
             "--hicache-ratio",
             type=float,
-            required=False,
             default=ServerArgs.hicache_ratio,
             help="The ratio of the size of host KV cache memory pool to the size of device pool.",
+        )
+        parser.add_argument(
+            "--hicache-size",
+            type=int,
+            default=ServerArgs.hicache_size,
+            help="The size of host KV cache memory pool in gigabytes, which will override the hicache_ratio if set.",
+        )
+        parser.add_argument(
+            "--hicache-write-policy",
+            type=str,
+            choices=["write_back", "write_through", "write_through_selective"],
+            default=ServerArgs.hicache_write_policy,
+            help="The write policy of hierarchical cache.",
         )
         parser.add_argument(
             "--enable-deepep-moe",
