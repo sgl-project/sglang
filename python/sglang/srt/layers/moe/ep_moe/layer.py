@@ -995,7 +995,8 @@ class DeepEPMoE(EPMoE):
     ):
         assert self.quant_method is not None
         assert self.activation == "silu"
-
+        if num_recv_tokens_per_expert is None:
+            return hidden_states_fp8
         all_tokens = sum(num_recv_tokens_per_expert)
         if all_tokens <= 0:
             return hidden_states_fp8
