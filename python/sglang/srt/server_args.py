@@ -294,13 +294,6 @@ class ServerArgs:
         if self.grammar_backend is None:
             self.grammar_backend = "xgrammar"
 
-        # Expert parallelism
-        if self.enable_ep_moe:
-            self.ep_size = self.tp_size
-            logger.info(
-                f"EP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
-            )
-
         self.enable_multimodal: Optional[bool] = self.enable_llama4_multimodal
 
         # Data parallelism attention
@@ -394,14 +387,10 @@ class ServerArgs:
         # PD disaggregation
         if self.disaggregation_mode == "prefill":
             self.disable_cuda_graph = True
-            logger.warning("KV cache is forced as chunk cache for decode server")
-            self.disable_overlap_schedule = True
-            logger.warning("Overlap scheduler is disabled for prefill server")
+            logger.warning("Cuda graph is disabled for prefill server")
         elif self.disaggregation_mode == "decode":
             self.disable_radix_cache = True
-            logger.warning("Cuda graph is disabled for prefill server")
-            self.disable_overlap_schedule = True
-            logger.warning("Overlap scheduler is disabled for decode server")
+            logger.warning("KV cache is forced as chunk cache for decode server")
 
         os.environ["SGLANG_ENABLE_TORCH_COMPILE"] = (
             "1" if self.enable_torch_compile else "0"
@@ -1218,6 +1207,7 @@ class ServerArgs:
             "--disaggregation-transfer-backend",
             type=str,
             default=ServerArgs.disaggregation_transfer_backend,
+            choices=["mooncake", "nixl"],
             help="The backend for disaggregation transfer. Default is mooncake.",
         )
         parser.add_argument(
