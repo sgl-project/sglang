@@ -118,7 +118,9 @@ class TboAttnBackend(AttentionBackend):
             assert capture_num_tokens == bs, "Only support num_tokens==bs currently"
         num_tokens = bs
 
-        forward_mode_for_tbo_split = forward_mode if forward_mode != ForwardMode.IDLE else ForwardMode.DECODE
+        forward_mode_for_tbo_split = (
+            forward_mode if forward_mode != ForwardMode.IDLE else ForwardMode.DECODE
+        )
         tbo_split_seq_index = two_batch_overlap.compute_split_seq_index(
             forward_mode=forward_mode_for_tbo_split,
             num_tokens=num_tokens,
