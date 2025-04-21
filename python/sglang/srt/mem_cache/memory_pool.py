@@ -448,6 +448,18 @@ class MLATokenToKVPool(KVCache):
         self.layer_transfer_counter = None
         self.page_size = page_size
 
+        kv_size = self.get_kv_size_bytes()
+        logger.info(
+            f"KV Cache is allocated. #tokens: {size}, KV size: {kv_size / GB:.2f} GB"
+        )
+
+    def get_kv_size_bytes(self):
+        assert hasattr(self, "kv_buffer")
+        kv_size_bytes = 0
+        for kv_cache in self.kv_buffer:
+            kv_size_bytes += np.prod(kv_cache.shape) * kv_cache.dtype.itemsize
+        return kv_size_bytes
+
     # for disagg
     def get_contiguous_buf_infos(self):
         # MLA has only one kv_buffer, so only the information of this buffer needs to be returned.

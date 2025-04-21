@@ -26,11 +26,8 @@ from sglang.srt.hf_transformers_utils import check_gguf_file
 from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.utils import (
     configure_ipv6,
-    get_amdgpu_memory_capacity,
     get_device,
-    get_hpu_memory_capacity,
-    get_nvgpu_memory_capacity,
-    is_cuda,
+    get_whatever_gpu_memory_capacity,
     is_flashinfer_available,
     is_hip,
     is_port_available,
@@ -221,28 +218,24 @@ class ServerArgs:
         if self.random_seed is None:
             self.random_seed = random.randint(0, 1 << 30)
 
-        if is_cuda():
-            gpu_mem = get_nvgpu_memory_capacity()
-        elif is_hip():
-            gpu_mem = get_amdgpu_memory_capacity()
-        elif self.device == "hpu":
-            gpu_mem = get_hpu_memory_capacity()
-        else:
-            # GPU memory is not known yet or no GPU is available.
-            gpu_mem = None
+        gpu_mem = get_whatever_gpu_memory_capacity(self.device)
 
         # Set mem fraction static, which depends on the tensor parallelism size
         if self.mem_fraction_static is None:
-            if self.tp_size >= 16:
-                self.mem_fraction_static = 0.79
-            elif self.tp_size >= 8:
-                self.mem_fraction_static = 0.81
-            elif self.tp_size >= 4:
-                self.mem_fraction_static = 0.85
-            elif self.tp_size >= 2:
-                self.mem_fraction_static = 0.87
+            if gpu_mem <= 81920:
+                if self.tp_size >= 16:
+                    self.mem_fraction_static = 0.79
+                elif self.tp_size >= 8:
+                    self.mem_fraction_static = 0.81
+                elif self.tp_size >= 4:
+                    self.mem_fraction_static = 0.85
+                elif self.tp_size >= 2:
+                    self.mem_fraction_static = 0.87
+                else:
+                    self.mem_fraction_static = 0.88
             else:
-                self.mem_fraction_static = 0.88
+                # FIXME: more fine grained auto-selection polices
+                self.mem_fraction_static = (gpu_mem - 1024 * 13) / gpu_mem
 
         # Set chunked prefill size, which depends on the gpu memory capacity
         if self.chunked_prefill_size is None:
@@ -271,8 +264,6 @@ class ServerArgs:
                     self.cuda_graph_max_bs = 8
                 else:
                     self.cuda_graph_max_bs = 80
-            else:
-                self.cuda_graph_max_bs = 160
 
         # Set kernel backends for hpu device
         if self.device == "hpu":
