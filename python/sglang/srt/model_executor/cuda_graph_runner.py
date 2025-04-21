@@ -138,7 +138,7 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
 
         gpu_mem = get_whatever_gpu_memory_capacity() / 1024
 
-        if gpu_mem > 120:
+        if gpu_mem is not None and gpu_mem > 120:
             capture_bs += list(range(160, 256, 8))
 
     if max(capture_bs) > model_runner.req_to_token_pool.size:
@@ -196,8 +196,6 @@ class CudaGraphRunner:
 
         # Batch sizes to capture
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
-
-        print(f"\x1b[32mx)bs={self.capture_bs}\x1b[0m")
 
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.NULL
