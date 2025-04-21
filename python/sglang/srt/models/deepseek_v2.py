@@ -1734,7 +1734,7 @@ class DeepseekV2Model(nn.Module):
                 op
                 for i in range(start_layer, end_layer)
                 for op in self.layers[i].get_forward_tbo_operations(
-                    forward_batch.forward_mode, tbo_child_index
+                    forward_batch.global_forward_mode, tbo_child_index
                 )
             ]
 
