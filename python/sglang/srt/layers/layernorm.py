@@ -20,10 +20,10 @@ import torch
 import torch.nn as nn
 
 from sglang.srt.custom_op import CustomOp
-from sglang.srt.utils import is_cuda, is_gpu_available
+from sglang.srt.utils import is_cuda, is_xpu
 
 _is_cuda = is_cuda()
-
+_is_xpu = is_xpu()
 if _is_cuda:
     from sgl_kernel import (
         fused_add_rmsnorm,
@@ -51,6 +51,7 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+
         if residual is not None:
             fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
             return x, residual
@@ -138,7 +139,7 @@ class Gemma3RMSNorm(nn.Module):
         return f"{tuple(self.weight.shape)}, eps={self.eps}"
 
 
-if not is_gpu_available():
+if not _is_cuda and not _is_xpu:
     logger.info(
         "sgl-kernel is not available on Non-NV platforms. Fallback to other kernel libraries."
     )

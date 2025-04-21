@@ -134,17 +134,6 @@ def is_xpu() -> bool:
     return hasattr(torch, "xpu") and torch.xpu.is_available()
 
 
-def is_gpu_available():
-    """
-    Check if any GPU device is available for computation.
-
-    Returns:
-        bool: True if either CUDA (NVIDIA) or XPU (Intel) GPU is available,
-              False otherwise.
-    """
-    return is_cuda() or is_xpu()
-
-
 def is_flashinfer_available():
     """
     Check whether flashinfer is available.
