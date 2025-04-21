@@ -852,7 +852,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             assert (
                 not self.o_proj.reduce_results
             ), "short-circuiting allreduce will lead to hangs"
-            return hidden_states
+            return (hidden_states,)
 
         q_len = hidden_states.shape[0]
         q_input = hidden_states.new_empty(
