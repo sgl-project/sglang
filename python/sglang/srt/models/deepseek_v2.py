@@ -25,7 +25,6 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 import torch
 import torch.nn.functional as F
 from torch import nn
-from tqdm import tqdm
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
@@ -79,7 +78,10 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.managers.expert_distribution import ExpertDistributionRecorder
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    compute_shared_experts_fusion_weights,
+    default_weight_loader,
+)
 from sglang.srt.utils import BumpAllocator, DeepEPMode, add_prefix, is_cuda, is_hip
 
 _is_hip = is_hip()
@@ -1411,34 +1413,10 @@ class DeepseekV2ForCausalLM(nn.Module):
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
-        self.n_share_experts_fusion = global_server_args_dict["n_share_experts_fusion"]
-        if self.n_share_experts_fusion > 0:
-            # Only Deepseek V3/R1 can use shared experts fusion optimization now.
-            if (
-                self.config.architectures[0] != "DeepseekV3ForCausalLM"
-                or self.config.n_routed_experts != 256
-            ):
-                self.n_share_experts_fusion = 0
-                global_server_args_dict["n_share_experts_fusion"] = 0
-                logger.info(
-                    "Only Deepseek V3/R1 can use shared experts fusion optimization. Shared experts fusion optimization is disabled."
-                )
-            else:
-                assert (
-                    self.n_share_experts_fusion == self.tp_size
-                ), f"Shared experts fusion optimization is enabled in DeepSeek V3/R1, set it to {self.tp_size} can get best optimized performace."
-        elif self.n_share_experts_fusion == 0:
-            if (
-                torch.cuda.get_device_capability("cuda") >= (9, 0)
-                and self.config.architectures[0] == "DeepseekV3ForCausalLM"
-                and self.config.n_routed_experts == 256
-                and (not global_server_args_dict["enable_deepep_moe"])
-            ):
-                self.n_share_experts_fusion = self.tp_size
-                global_server_args_dict["n_share_experts_fusion"] = self.tp_size
-                logger.info(
-                    "Deepseek V3/R1 with fp8 can use shared experts fusion optimization when SM version >=90. Shared experts fusion optimization is enabled."
-                )
+
+        self.n_share_experts_fusion = self._initialize_shared_experts_fusion(
+            config, self.tp_size
+        )
 
         self.model = DeepseekV2Model(
             config, quant_config, prefix=add_prefix("model", prefix)
@@ -1451,6 +1429,40 @@ class DeepseekV2ForCausalLM(nn.Module):
         )
         self.logits_processor = LogitsProcessor(config)
         self.dp_size = get_attention_dp_size()
+
+    @staticmethod
+    def _initialize_shared_experts_fusion(config, tp_size) -> int:
+        n_share_experts_fusion = global_server_args_dict["n_share_experts_fusion"]
+
+        if n_share_experts_fusion > 0:
+            # Only Deepseek V3/R1 can use shared experts fusion optimization now.
+            if (
+                (config.architectures[0] != "DeepseekV3ForCausalLM" and config.architectures[0] != "DeepseekV3ForCausalLMNextN")
+                or config.n_routed_experts != 256
+            ):
+                n_share_experts_fusion = 0
+                global_server_args_dict["n_share_experts_fusion"] = 0
+                logger.info(
+                    "Only Deepseek V3/R1 can use shared experts fusion optimization. Shared experts fusion optimization is disabled."
+                )
+            else:
+                assert (
+                    n_share_experts_fusion == tp_size
+                ), f"Shared experts fusion optimization is enabled in DeepSeek V3/R1, set it to {tp_size} can get best optimized performace."
+        elif n_share_experts_fusion == 0:
+            if (
+                torch.cuda.get_device_capability("cuda") >= (9, 0)
+                and (config.architectures[0] == "DeepseekV3ForCausalLM" or config.architectures[0] == "DeepseekV3ForCausalLMNextN")
+                and config.n_routed_experts == 256
+                and (not global_server_args_dict["enable_deepep_moe"])
+            ):
+                n_share_experts_fusion = tp_size
+                global_server_args_dict["n_share_experts_fusion"] = tp_size
+                logger.info(
+                    "Deepseek V3/R1 with fp8 can use shared experts fusion optimization when SM version >=90. Shared experts fusion optimization is enabled."
+                )
+
+        return n_share_experts_fusion
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
@@ -1586,53 +1598,34 @@ class DeepseekV2ForCausalLM(nn.Module):
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
         ]
-        if self.n_share_experts_fusion > 0:
-            weights_list = list(weights)
-            weights_dict = dict(weights_list)
-            if self.quant_config.get_name() == "w8a8_int8":
-                suffix_list = [
-                    "down_proj.weight",
-                    "down_proj.weight_scale",
-                    "gate_proj.weight",
-                    "gate_proj.weight_scale",
-                    "up_proj.weight",
-                    "up_proj.weight_scale",
-                ]
-            else:
-                suffix_list = [
-                    "down_proj.weight",
-                    "down_proj.weight_scale_inv",
-                    "gate_proj.weight",
-                    "gate_proj.weight_scale_inv",
-                    "up_proj.weight",
-                    "up_proj.weight_scale_inv",
-                ]
-            names_to_remove = []
-            for moe_layer in tqdm(
-                range(
-                    self.config.first_k_dense_replace,
-                    self.config.num_hidden_layers,
-                    self.config.moe_layer_freq,
-                ),
-                desc=f"Cloning {self.n_share_experts_fusion} "
-                "replicas of the shared expert into MoE",
-            ):
-                for num_repeat in range(self.n_share_experts_fusion):
-                    for suffix in suffix_list:
-                        shared_expert_weight_name = (
-                            f"model.layers.{moe_layer}.mlp.shared_experts.{suffix}"
-                        )
-                        weights_list.append(
-                            (
-                                f"model.layers.{moe_layer}."
-                                f"mlp.experts."
-                                f"{self.config.n_routed_experts + num_repeat}"
-                                f".{suffix}",
-                                weights_dict[shared_expert_weight_name],
-                            )
-                        )
-                        names_to_remove += [shared_expert_weight_name]
-            weights = [w for w in weights_list if w[0] not in names_to_remove]
+
+        weights = compute_shared_experts_fusion_weights(
+            weights,
+            n_share_experts_fusion=self.n_share_experts_fusion,
+            n_routed_experts=self.config.n_routed_experts,
+            moe_layer_ids=range(
+                self.config.first_k_dense_replace,
+                self.config.num_hidden_layers,
+                self.config.moe_layer_freq,
+            ),
+            suffix_list=[
+                "down_proj.weight",
+                "down_proj.weight_scale",
+                "gate_proj.weight",
+                "gate_proj.weight_scale",
+                "up_proj.weight",
+                "up_proj.weight_scale",
+            ] if self.quant_config.get_name() == "w8a8_int8" else [
+                "down_proj.weight",
+                "down_proj.weight_scale_inv",
+                "gate_proj.weight",
+                "gate_proj.weight_scale_inv",
+                "up_proj.weight",
+                "up_proj.weight_scale_inv",
+            ],
+            shared_expert_name_template="model.layers.{moe_layer_id}.mlp.shared_experts.{suffix}",
+            routed_expert_name_template="model.layers.{moe_layer_id}.mlp.experts.{expert_index}.{suffix}",
+        )
 
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
