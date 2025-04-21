@@ -690,7 +690,6 @@ def sample_random_requests(
     dataset_path: str,
     random_sample: bool = True,
 ) -> List[Tuple[str, int, int]]:
-
     input_lens = np.random.randint(
         max(int(input_len * range_ratio), 1),
         input_len + 1,
@@ -707,10 +706,6 @@ def sample_random_requests(
 
         # Download sharegpt if necessary
         if not os.path.isfile(dataset_path):
-            print(
-                "If you do not want to randomly sample from a dataset,"
-                " please use --dataset-name random-ids."
-            )
             dataset_path = download_and_cache_file(SHAREGPT_URL)
 
         # Load the dataset.
@@ -1029,7 +1024,9 @@ async def benchmark(
     warmup_outputs = await asyncio.gather(*warmup_tasks)
 
     # Check if at least one warmup request succeeded
-    if not any(output.success for output in warmup_outputs):
+    if args.warmup_requests > 0 and not any(
+        output.success for output in warmup_outputs
+    ):
         raise ValueError(
             "Warmup failed - Please make sure benchmark arguments "
             f"are correctly specified. Error: {warmup_outputs[0].error}"

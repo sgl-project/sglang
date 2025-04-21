@@ -7,7 +7,6 @@ import torch
 from sglang.srt.utils import get_device_sm, kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
-    DEFAULT_MLA_MODEL_NAME_FOR_TEST,
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -19,7 +18,7 @@ Integration test for python/sglang/srt/layers/attention/flashattention_backend.p
 """
 # Change to your own model if testing model is not public.
 MODEL_USED_FOR_TEST = DEFAULT_MODEL_NAME_FOR_TEST
-MODEL_USED_FOR_TEST_MLA = DEFAULT_MLA_MODEL_NAME_FOR_TEST
+MODEL_USED_FOR_TEST_MLA = "lmsys/sglang-ci-dsv3-test"
 # Setting data path to None uses default data path in few_shot_gsm8k eval test.
 DATA_PATH = None
 
@@ -144,6 +143,112 @@ class TestFlashAttention3SpeculativeDecode(BaseFlashAttentionTest):
                 "3",
                 "--dtype",
                 "float16",
+            ]
+        )
+        return args
+
+    def test_gsm8k(self):
+        """
+        Override the test_gsm8k to further test for average speculative accept length.
+        """
+        requests.get(self.base_url + "/flush_cache")
+
+        args = SimpleNamespace(
+            num_shots=5,
+            data_path=DATA_PATH,
+            num_questions=200,
+            max_new_tokens=512,
+            parallel=128,
+            host="http://127.0.0.1",
+            port=int(self.base_url.split(":")[-1]),
+        )
+        metrics = run_eval_few_shot_gsm8k(args)
+        print(metrics)
+
+        self.assertGreater(metrics["accuracy"], 0.60)
+
+        server_info = requests.get(self.base_url + "/get_server_info")
+        avg_spec_accept_length = server_info.json()["avg_spec_accept_length"]
+        print(f"{avg_spec_accept_length=}")
+        self.assertGreater(avg_spec_accept_length, 1.5)
+
+
+class TestFlashAttention3SpeculativeDecodeTopk(BaseFlashAttentionTest):
+    """Test FlashAttention3 with speculative decode enabled, topk > 1"""
+
+    model = "meta-llama/Llama-3.1-8B-Instruct"
+
+    @classmethod
+    def get_server_args(cls):
+        args = super().get_server_args()
+        args.extend(
+            [
+                "--cuda-graph-max-bs",
+                "2",
+                "--speculative-algorithm",
+                "EAGLE3",
+                "--speculative-draft",
+                "jamesliu1/sglang-EAGLE3-Llama-3.1-Instruct-8B",
+                "--speculative-num-steps",
+                "5",
+                "--speculative-eagle-topk",
+                "4",
+                "--speculative-num-draft-tokens",
+                "8",
+                "--dtype",
+                "float16",
+            ]
+        )
+        return args
+
+    def test_gsm8k(self):
+        """
+        Override the test_gsm8k to further test for average speculative accept length.
+        """
+        requests.get(self.base_url + "/flush_cache")
+
+        args = SimpleNamespace(
+            num_shots=5,
+            data_path=DATA_PATH,
+            num_questions=200,
+            max_new_tokens=512,
+            parallel=128,
+            host="http://127.0.0.1",
+            port=int(self.base_url.split(":")[-1]),
+        )
+        metrics = run_eval_few_shot_gsm8k(args)
+        print(metrics)
+
+        self.assertGreater(metrics["accuracy"], 0.60)
+
+        server_info = requests.get(self.base_url + "/get_server_info")
+        avg_spec_accept_length = server_info.json()["avg_spec_accept_length"]
+        print(f"{avg_spec_accept_length=}")
+        self.assertGreater(avg_spec_accept_length, 1.8)
+
+
+class TestFlashAttention3MLASpeculativeDecode(BaseFlashAttentionTest):
+    """Test FlashAttention3 with speculative decode enabled."""
+
+    model = MODEL_USED_FOR_TEST_MLA
+
+    @classmethod
+    def get_server_args(cls):
+        args = super().get_server_args()
+        args.extend(
+            [
+                "--cuda-graph-max-bs",
+                "2",
+                "--speculative-algorithm",
+                "EAGLE",
+                "--speculative-draft",
+                "lmsys/sglang-ci-dsv3-test-NextN",
+                "--speculative-num-steps",
+                "3",
+                "--speculative-eagle-topk",
+                "1",
+                "--speculative-num-draft-tokens",
+                "3",
             ]
         )
         return args

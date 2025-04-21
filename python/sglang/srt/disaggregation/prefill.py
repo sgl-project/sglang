@@ -31,6 +31,8 @@ from sglang.srt.disaggregation.utils import (
     ReqToMetadataIdxAllocator,
     TransferBackend,
     get_kv_class,
+    kv_to_page_indices,
+    kv_to_page_num,
     poll_and_all_reduce,
 )
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req, ScheduleBatch
@@ -103,7 +105,7 @@ class PrefillBootstrapQueue:
         kv_args.aux_item_lens = [
             metadata_buffer[0].nbytes for metadata_buffer in self.metadata_buffers
         ]
-        kv_args.ib_device = "mock-ib-device"
+        kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.gpu_id
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
         kv_manager = kv_manager_class(
@@ -154,7 +156,8 @@ class PrefillBootstrapQueue:
                 self.req_to_metadata_buffer_idx_allocator.alloc()
             )
             assert req.metadata_buffer_index is not None
-            req.disagg_kv_sender.init(num_kv_indices, req.metadata_buffer_index)
+            num_pages = kv_to_page_num(num_kv_indices, self.token_to_kv_pool.page_size)
+            req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
 
             bootstrapped_reqs.append(req)
             indices_to_remove.add(i)
@@ -170,6 +173,36 @@ class SchedulerDisaggregationPrefillMixin:
     """
     Mixin for Scheduler to handle disaggregation prefill
     """
+
+    @torch.no_grad()
+    def event_loop_normal_disagg_prefill(self):
+        """A normal scheduler loop for prefill worker in disaggregation mode."""
+
+        while True:
+            recv_reqs = self.recv_requests()
+            self.process_input_requests(recv_reqs)
+            self.waiting_queue.extend(
+                self.disagg_prefill_pending_queue.pop_bootstrapped()
+            )
+            self.process_prefill_chunk()
+            batch = self.get_new_batch_prefill()
+            self.cur_batch = batch
+
+            if batch:
+                result = self.run_batch(batch)
+                self.process_batch_result_disagg_prefill(batch, result)
+
+            if len(self.disagg_prefill_inflight_queue) > 0:
+                self.process_disagg_prefill_inflight_queue()
+
+            if batch is None and len(self.disagg_prefill_inflight_queue) == 0:
+                self.check_memory()
+                self.new_token_ratio = self.init_new_token_ratio
+
+            self.last_batch = batch
+            # HACK (byronhsu): reset the batch_is_full flag because we never enter update_running_batch which resets it
+            # Otherwise, it hangs under high concurrency
+            self.running_batch.batch_is_full = False
 
     def process_batch_result_disagg_prefill(
         self: Scheduler, batch: ScheduleBatch, result: GenerationBatchResult
@@ -210,7 +243,7 @@ class SchedulerDisaggregationPrefillMixin:
 
         polls = poll_and_all_reduce(
             [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
-            self.tp_worker.get_tp_cpu_group(),
+            self.attn_tp_cpu_group,
         )
 
         undone_reqs: List[Req] = []
@@ -270,4 +303,13 @@ class SchedulerDisaggregationPrefillMixin:
                 req.metadata_buffer_index, token_id
             )
         is_last = token_id is not None
-        req.disagg_kv_sender.send(kv_indices, slice(start_idx, end_idx), is_last)
+        page_indices = kv_to_page_indices(
+            kv_indices, self.token_to_kv_pool_allocator.page_size
+        )
+
+        page_start_idx = start_idx // self.token_to_kv_pool_allocator.page_size
+        page_end_idx = page_start_idx + len(page_indices)
+
+        req.disagg_kv_sender.send(
+            page_indices, slice(page_start_idx, page_end_idx), is_last
+        )
