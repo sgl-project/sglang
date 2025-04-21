@@ -355,6 +355,7 @@ class ChatCompletionRequest(BaseModel):
     stop_token_ids: Optional[List[int]] = None
     no_stop_trim: bool = False
     ignore_eos: bool = False
+    continue_final_message: bool = False
     skip_special_tokens: bool = True
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
     session_params: Optional[Dict] = None
