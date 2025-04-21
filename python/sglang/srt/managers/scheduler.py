@@ -1586,22 +1586,19 @@ class Scheduler(
         local_can_run_tbo_aggregated = min(global_info[:, 0, 4].tolist())
         forward_modes = global_info[:, 0, 5].tolist()
 
-        non_idle_forward_modes = [
-            x for x in forward_modes if x != ForwardMode.IDLE.value
+        converted_forward_modes = [
+            ForwardMode.DECODE.value if x == ForwardMode.IDLE.value else x
+            for x in forward_modes
         ]
-        forward_mode_same_or_idle = len(non_idle_forward_modes) > 0 and _is_all_same(
-            non_idle_forward_modes
-        )
+        forward_mode_agree = _is_all_same(converted_forward_modes)
         global_forward_mode = (
-            ForwardMode(non_idle_forward_modes[0])
-            if forward_mode_same_or_idle
-            else None
+            ForwardMode(converted_forward_modes[0]) if forward_mode_agree else None
         )
 
         can_run_tbo = (
             enable_two_batch_overlap
             and local_can_run_tbo_aggregated
-            and forward_mode_same_or_idle
+            and forward_mode_agree
         )
 
         if local_batch is None and max(global_num_tokens) > 0:
