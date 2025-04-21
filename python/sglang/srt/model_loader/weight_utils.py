@@ -853,14 +853,14 @@ def kv_cache_scales_loader(
 
 def compute_shared_experts_fusion_weights(
     weights: Iterable[Tuple[str, torch.Tensor]],
-    n_share_experts_fusion: Optional[int],
+    n_share_experts_fusion: int,
     n_routed_experts: int,
     moe_layer_ids: Iterable[int],
     suffix_list: List[str],
     shared_expert_name_template: str,
     routed_expert_name_template: str,
 ):
-    if n_share_experts_fusion is None or n_share_experts_fusion == 0:
+    if n_share_experts_fusion == 0:
         return weights
 
     weights_list = list(weights)
