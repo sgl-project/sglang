@@ -292,7 +292,7 @@ class SchedulerDisaggregationPrefillMixin:
         end_idx = min(len(req.fill_ids), len(req.origin_input_ids))
         last_chunk = token_id is not None
 
-        if (not last_chunk) and (end_idx % page_size != 0):
+        if (not last_chunk) and (end_idx % page_size != 0): # todo: remove the second condition
             # if not the last chunk and the last page is partial, delay the last partial page to the next send
             end_idx = end_idx - end_idx % page_size
 
@@ -309,11 +309,9 @@ class SchedulerDisaggregationPrefillMixin:
                 req.metadata_buffer_index, token_id
             )
 
-        page_indices = kv_to_page_indices(
-            kv_indices, self.token_to_kv_pool_allocator.page_size
-        )
+        page_indices = kv_to_page_indices(kv_indices, page_size)
 
-        page_start_idx = start_idx // self.token_to_kv_pool_allocator.page_size
+        page_start_idx = start_idx // page_size
         page_end_idx = page_start_idx + len(page_indices)
 
         req.disagg_kv_sender.send(

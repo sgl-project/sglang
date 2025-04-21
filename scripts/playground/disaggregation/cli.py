@@ -1,4 +1,4 @@
-prompt = "Hello " * 16000
+prompt = "Yolo " * 16000
 
 import json
 
