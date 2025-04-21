@@ -35,7 +35,11 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.patch_torch import monkey_patch_torch_compile
-from sglang.srt.utils import get_available_gpu_memory, is_hip
+from sglang.srt.utils import (
+    get_available_gpu_memory,
+    get_whatever_gpu_memory_capacity,
+    is_hip,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -131,6 +135,11 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
 
         if _is_hip:
             capture_bs += list(range(160, 257, 8))
+
+        gpu_mem = get_whatever_gpu_memory_capacity() / 1024
+
+        if gpu_mem > 120:
+            capture_bs += list(range(160, 320, 8))
 
     if max(capture_bs) > model_runner.req_to_token_pool.size:
         # In some case (e.g., with a small GPU or --max-running-requests), the #max-running-requests
