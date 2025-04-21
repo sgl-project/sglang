@@ -48,7 +48,7 @@ from sglang.srt.utils import get_compiler_backend
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-    from sglang.srt.managers.schedule_batch import ModelWorkerBatch, MultimodalInputs
+    from sglang.srt.managers.schedule_batch import ModelWorkerBatch, MultimodalInputs, global_server_args_dict
     from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -746,7 +746,7 @@ class ForwardBatch:
         )
 
         # TODO improve, e.g. unify w/ `init_raw`
-        if output_global_num_tokens is not None:
+        if (global_server_args_dict["moe_dense_tp_size"] == 1) and (output_global_num_tokens is not None):
             sum_len = sum(output_global_num_tokens)
             gathered_buffer = torch.zeros(
                 (sum_len, self.gathered_buffer.shape[1]),
