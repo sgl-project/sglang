@@ -136,6 +136,7 @@ class EPMoE(torch.nn.Module):
         correction_bias: Optional[torch.Tensor] = None,
         custom_routing_function: Optional[Callable] = None,
         activation: str = "silu",
+        routed_scaling_factor: Optional[float] = None,
     ):
         super().__init__()
 
@@ -164,6 +165,7 @@ class EPMoE(torch.nn.Module):
         self.correction_bias = correction_bias
         self.custom_routing_function = custom_routing_function
         self.activation = activation
+        self.routed_scaling_factor = routed_scaling_factor
 
         if quant_config is None:
             self.quant_method: Optional[QuantizeMethodBase] = UnquantizedEPMoEMethod()
@@ -215,6 +217,7 @@ class EPMoE(torch.nn.Module):
             num_expert_group=self.num_expert_group,
             correction_bias=self.correction_bias,
             custom_routing_function=self.custom_routing_function,
+            routed_scaling_factor=self.routed_scaling_factor,
         )
 
         reorder_topk_ids, src2dst, seg_indptr = run_moe_ep_preproess(
@@ -799,6 +802,7 @@ class DeepEPMoE(EPMoE):
         correction_bias: Optional[torch.Tensor] = None,
         custom_routing_function: Optional[Callable] = None,
         activation: str = "silu",
+        routed_scaling_factor: Optional[float] = None,
         deepep_mode: DeepEPMode = DeepEPMode.auto,
     ):
         super().__init__(
@@ -817,6 +821,7 @@ class DeepEPMoE(EPMoE):
             correction_bias,
             custom_routing_function,
             activation,
+            routed_scaling_factor,
         )
         self.deepep_mode = deepep_mode
         if self.deepep_mode.enable_low_latency():
