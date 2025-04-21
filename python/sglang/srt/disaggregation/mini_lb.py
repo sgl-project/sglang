@@ -161,12 +161,24 @@ async def handle_generate_request(request_data: dict):
     parsed_url = urllib.parse.urlparse(prefill_server)
     hostname = parsed_url.hostname
     modified_request = request_data.copy()
-    modified_request.update(
-        {
-            "bootstrap_host": hostname,
-            "bootstrap_room": random.randint(0, 2**63 - 1),
-        }
-    )
+
+    batch_size = _get_request_batch_size(modified_request)
+    if batch_size is not None:
+        modified_request.update(
+            {
+                "bootstrap_host": [hostname] * batch_size,
+                "bootstrap_room": [
+                    _generate_bootstrap_room() for _ in range(batch_size)
+                ],
+            }
+        )
+    else:
+        modified_request.update(
+            {
+                "bootstrap_host": hostname,
+                "bootstrap_room": _generate_bootstrap_room(),
+            }
+        )
 
     if request_data.get("stream", False):
         return await load_balancer.generate_stream(
@@ -176,6 +188,19 @@ async def handle_generate_request(request_data: dict):
         return await load_balancer.generate(
             modified_request, prefill_server, decode_server
         )
+
+
+def _generate_bootstrap_room():
+    return random.randint(0, 2**63 - 1)
+
+
+# We may utilize `GenerateReqInput`'s logic later
+def _get_request_batch_size(request):
+    if (text := request.get("text")) is not None:
+        return None if isinstance(text, str) else len(text)
+    if (input_ids := request.get("input_ids")) is not None:
+        return None if isinstance(input_ids[0], int) else len(input_ids)
+    return None
 
 
 @app.get("/v1/models")
