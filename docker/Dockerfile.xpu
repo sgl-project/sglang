@@ -1,4 +1,5 @@
-# Usage: docker build --build-arg GITHUB_TOKEN=github_token -t sglang:xpu_u2410 -f  Dockerfile.xpu --no-cache .
+# Usage: save your github_token in github_token.txt
+# docker build --secret id=github_token,src=github_token.txt  -t sglang:xpu_u2410 -f  Dockerfile.xpu --no-cache .
 
 
 # default base image
@@ -15,38 +16,35 @@ ENV PYTHON_VERSION=3.10
 # Set maintainer label
 LABEL maintainer="zhaoqiong.zheng@intel.com"
 
-# Define build arguments
-ARG GITHUB_TOKEN
-ENV GITHUB_TOKEN=${GITHUB_TOKEN}
-
 # Install Miniforge & PyTorch/Triton & build vllm/SGlang from source
-RUN cd /root && \
+RUN --mount=type=secret,id=github_token \
+    cd /root && \
     echo ${PYTHON_VERSION} | sed 's/\.//g' > /tmp/version.txt && \
     export PYTHON_VERSION_STRING=$(cat /tmp/version.txt) && \
     . /miniforge3/bin/activate && \
     conda activate py${PYTHON_VERSION_STRING} && \
     TEMP_DIR=$(mktemp -d) && \
     echo "Downloading Triton wheels..." && \
-    WORKFLOW_ID=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+    WORKFLOW_ID=$(curl -s -H "Authorization: token $(cat /run/secrets/github_token)"  \
       "https://api.github.com/repos/intel/intel-xpu-backend-for-triton/actions/workflows" \
       | jq -r '.workflows[] | select(.name == "Triton wheels") | .id') && \
     echo "WORKFLOW_ID=${WORKFLOW_ID}" && \
-    RUN_ID=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+    RUN_ID=$(curl -s -H "Authorization: token $(cat /run/secrets/github_token)" \
         "https://api.github.com/repos/intel/intel-xpu-backend-for-triton/actions/workflows/${WORKFLOW_ID}/runs?status=completed&conclusion=success&per_page=1" \
         | jq -r '.workflow_runs[0].id') && \
     echo "RUN_ID=${RUN_ID}" && \
     ARTIFACT_TEMPLATE="wheels-pytorch-py${PYTHON_VERSION}*" && \
     REGEX_PATTERN=$(echo "$ARTIFACT_TEMPLATE" | sed 's/\*/.*/g') && \
-    ARTIFACT_NAME=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+    ARTIFACT_NAME=$(curl -s -H "Authorization: token $(cat /run/secrets/github_token)"  \
         "https://api.github.com/repos/intel/intel-xpu-backend-for-triton/actions/runs/$RUN_ID/artifacts" | \
         jq -r --arg regex "^${REGEX_PATTERN}$" \
     '(.artifacts // [])[] | select(.name | test($regex)) | .name') && \
     echo "ARTIFACT_NAME=${ARTIFACT_NAME}" && \
-    LATEST_ARTIFACT_URL=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+    LATEST_ARTIFACT_URL=$(curl -s -H "Authorization: token $(cat /run/secrets/github_token)"  \
         "https://api.github.com/repos/intel/intel-xpu-backend-for-triton/actions/runs/$RUN_ID/artifacts" | \
         jq -r ".artifacts[] | select(.name == \"$ARTIFACT_NAME\") | .archive_download_url") && \
     echo "LATEST_ARTIFACT_URL=${LATEST_ARTIFACT_URL}" && \
-    curl -L -H "Authorization: token $GITHUB_TOKEN" -C - \
+    curl -L -H "Authorization: token $(cat /run/secrets/github_token)" -C - \
         --retry 5 \
         -o $ARTIFACT_NAME.zip $LATEST_ARTIFACT_URL && \
     unzip -t $ARTIFACT_NAME.zip && \ 
