@@ -1579,7 +1579,10 @@ class Scheduler(
         global_num_tokens_for_logprob = global_info[:, 0, 2].tolist()
         is_extend_in_batch = global_info[:, 0, 3].tolist()
         local_can_run_tbo_aggregated = min(global_info[:, 0, 4].tolist())
-        forward_mode_same = _is_all_same(global_info[:, 0, 5].tolist())
+        forward_modes = global_info[:, 0, 5].tolist()
+        
+        forward_mode_same = _is_all_same(forward_modes)
+        global_forward_mode = ForwardMode[forward_modes[0]] if forward_mode_same else None
 
         can_run_tbo = (
             enable_two_batch_overlap
