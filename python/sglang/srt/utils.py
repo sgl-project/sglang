@@ -12,11 +12,11 @@
 # limitations under the License.
 # ==============================================================================
 """Common utilities."""
-
 import base64
 import builtins
 import ctypes
 import dataclasses
+import importlib
 import io
 import ipaddress
 import itertools
@@ -38,6 +38,7 @@ import time
 import traceback
 import warnings
 from contextlib import contextmanager
+from enum import Enum
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
 from importlib.util import find_spec
@@ -77,10 +78,24 @@ time_infos = {}
 
 HIP_FP8_E4M3_FNUZ_MAX = 224.0
 
+_warned_bool_env_var_keys = set()
+
 
 def get_bool_env_var(name: str, default: str = "false") -> bool:
     value = os.getenv(name, default)
-    return value.lower() in ("true", "1")
+    value = value.lower()
+
+    truthy_values = ("true", "1")
+    falsy_values = ("false", "0")
+
+    if (value not in truthy_values) and (value not in falsy_values):
+        if value not in _warned_bool_env_var_keys:
+            logger.warning(
+                f"get_bool_env_var({name}) see non-understandable value={value} and treat as false"
+            )
+        _warned_bool_env_var_keys.add(value)
+
+    return value in truthy_values
 
 
 # https://pytorch.org/docs/stable/notes/hip.html#checking-for-hip
@@ -126,11 +141,7 @@ def is_flashinfer_available():
     """
     if not get_bool_env_var("SGLANG_IS_FLASHINFER_AVAILABLE", default="true"):
         return False
-    return is_cuda()
-
-
-def is_cuda_available():
-    return is_cuda()
+    return importlib.util.find_spec("flashinfer") is not None and is_cuda()
 
 
 _ENABLE_TORCH_INFERENCE_MODE = get_bool_env_var(
@@ -262,7 +273,7 @@ def get_available_gpu_memory(device, gpu_id, distributed=False, empty_cache=True
     When distributed is True, the available memory is the minimum available memory of all GPUs.
     """
     if device == "cuda":
-        num_gpus = cuda_device_count_stateless()
+        num_gpus = torch.cuda.device_count()
         assert gpu_id < num_gpus
 
         if torch.cuda.current_device() != gpu_id:
@@ -513,13 +524,18 @@ def load_audio(audio_file: str, sr: int = 16000, mono: bool = True) -> np.ndarra
     import soundfile as sf
     from scipy.signal import resample
 
-    # print(f"loading {audio_file}")
     # Load audio data
     if isinstance(audio_file, bytes):
         audio, original_sr = sf.read(BytesIO(audio_file))
     elif audio_file.startswith("data:"):
         audio_file = audio_file.split(",")[1]
         audio, original_sr = sf.read(BytesIO(base64.b64decode(audio_file)))
+    elif audio_file.startswith("http://") or audio_file.startswith("https://"):
+        timeout = int(os.getenv("REQUEST_TIMEOUT", "5"))
+        response = requests.get(audio_file, stream=True, timeout=timeout)
+        audio_file = BytesIO(response.content)
+        response.close()
+        audio, original_sr = sf.read(audio_file)
     elif isinstance(audio_file, str):
         audio, original_sr = sf.read(audio_file)
     else:
@@ -537,10 +553,41 @@ def load_audio(audio_file: str, sr: int = 16000, mono: bool = True) -> np.ndarra
     return audio
 
 
-def load_image(image_file: Union[str, bytes]) -> tuple[Image, tuple[int, int]]:
-    image = image_size = None
+def encode_video(video_path, frame_count_limit=None):
+    # Lazy import because decord is not available on some arm platforms.
+    from decord import VideoReader, cpu
 
-    if isinstance(image_file, bytes):
+    if not os.path.exists(video_path):
+        logger.error(f"Video {video_path} does not exist")
+        return []
+
+    if frame_count_limit == 0:
+        return []
+
+    def uniform_sample(l, n):
+        gap = len(l) / n
+        idxs = [int(i * gap + gap / 2) for i in range(n)]
+        return [l[i] for i in idxs]
+
+    vr = VideoReader(video_path, ctx=cpu(0))
+    sample_fps = round(vr.get_avg_fps() / 1)  # FPS
+    frame_indices = [i for i in range(0, len(vr), sample_fps)]
+    if frame_count_limit is not None and len(frame_indices) > frame_count_limit:
+        frame_indices = uniform_sample(frame_indices, frame_count_limit)
+
+    frames = vr.get_batch(frame_indices).asnumpy()
+    frames = [Image.fromarray(v.astype("uint8")) for v in frames]
+    return frames
+
+
+def load_image(
+    image_file: Union[Image.Image, str, bytes],
+) -> tuple[Image.Image, tuple[int, int]]:
+    image = image_size = None
+    if isinstance(image_file, Image.Image):
+        image = image_file
+        image_size = (image.width, image.height)
+    elif isinstance(image_file, bytes):
         image = Image.open(BytesIO(image_file))
     elif image_file.startswith("http://") or image_file.startswith("https://"):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
@@ -737,6 +784,8 @@ def add_api_key_middleware(app, api_key: str):
             return await call_next(request)
         if request.url.path.startswith("/health"):
             return await call_next(request)
+        if request.url.path.startswith("/metrics"):
+            return await call_next(request)
         if request.headers.get("Authorization") != "Bearer " + api_key:
             return ORJSONResponse(content={"error": "Unauthorized"}, status_code=401)
         return await call_next(request)
@@ -811,33 +860,38 @@ def broadcast_pyobj(
     rank: int,
     dist_group: Optional[torch.distributed.ProcessGroup] = None,
     src: int = 0,
+    force_cpu_device: bool = True,
 ):
     """Broadcast inputs from rank=0 to all other ranks with torch.dist backend."""
+    device = torch.device(
+        "cuda" if torch.cuda.is_available() and not force_cpu_device else "cpu"
+    )
 
     if rank == 0:
         if len(data) == 0:
-            tensor_size = torch.tensor([0], dtype=torch.long)
+            tensor_size = torch.tensor([0], dtype=torch.long, device=device)
             dist.broadcast(tensor_size, src=src, group=dist_group)
         else:
             serialized_data = pickle.dumps(data)
             size = len(serialized_data)
+
             tensor_data = torch.ByteTensor(
                 np.frombuffer(serialized_data, dtype=np.uint8)
-            )
-            tensor_size = torch.tensor([size], dtype=torch.long)
+            ).to(device)
+            tensor_size = torch.tensor([size], dtype=torch.long, device=device)
 
             dist.broadcast(tensor_size, src=src, group=dist_group)
             dist.broadcast(tensor_data, src=src, group=dist_group)
         return data
     else:
-        tensor_size = torch.tensor([0], dtype=torch.long)
+        tensor_size = torch.tensor([0], dtype=torch.long, device=device)
         dist.broadcast(tensor_size, src=src, group=dist_group)
         size = tensor_size.item()
 
         if size == 0:
             return []
 
-        tensor_data = torch.empty(size, dtype=torch.uint8)
+        tensor_data = torch.empty(size, dtype=torch.uint8, device=device)
         dist.broadcast(tensor_data, src=src, group=dist_group)
 
         serialized_data = bytes(tensor_data.cpu().numpy())
@@ -1382,47 +1436,6 @@ def disable_request_logging() -> bool:
     return get_bool_env_var("SGLANG_DISABLE_REQUEST_LOGGING")
 
 
-@lru_cache(maxsize=8)
-def _cuda_device_count_stateless(cuda_visible_devices: Optional[str] = None) -> int:
-    # Note: cuda_visible_devices is not used, but we keep it as an argument for
-    # LRU Cache purposes.
-
-    # Code below is based on
-    # https://github.com/pytorch/pytorch/blob/
-    # c1cd946818442aca8c7f812b16d187ce1586c3bc/
-    # torch/cuda/__init__.py#L831C1-L831C17
-    import torch.version
-
-    if not torch.cuda._is_compiled():
-        return 0
-    if is_hip():
-        # ROCm uses amdsmi instead of nvml for stateless device count
-        # This requires a sufficiently modern version of Torch 2.4.0
-        raw_count = (
-            torch.cuda._device_count_amdsmi()
-            if (hasattr(torch.cuda, "_device_count_amdsmi"))
-            else -1
-        )
-    else:
-        raw_count = torch.cuda._device_count_nvml()
-    r = torch._C._cuda_getDeviceCount() if raw_count < 0 else raw_count
-    return r
-
-
-# Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/utils.py
-def cuda_device_count_stateless() -> int:
-    """Get number of CUDA devices, caching based on the value of
-    CUDA_VISIBLE_DEVICES at the time of call.
-
-    This should be used instead of torch.cuda.device_count()
-    unless CUDA_VISIBLE_DEVICES has already been set to the desired
-    value."""
-
-    # This can be removed and simply replaced with torch.cuda.get_device_count
-    # after https://github.com/pytorch/pytorch/pull/122815 is released.
-    return _cuda_device_count_stateless(os.environ.get("CUDA_VISIBLE_DEVICES", None))
-
-
 def dataclass_to_string_truncated(
     data, max_length=2048, skip_names: Optional[Set[str]] = None
 ):
@@ -1487,14 +1500,43 @@ def permute_weight(x: torch.Tensor) -> torch.Tensor:
 
 class MultiprocessingSerializer:
     @staticmethod
-    def serialize(obj):
+    def serialize(obj, output_str: bool = False):
+        """
+        Serialize a Python object using ForkingPickler.
+
+        Args:
+            obj: The object to serialize.
+            output_str (bool): If True, return a base64-encoded string instead of raw bytes.
+
+        Returns:
+            bytes or str: The serialized object.
+        """
         buf = io.BytesIO()
         ForkingPickler(buf).dump(obj)
         buf.seek(0)
-        return buf.read()
+        output = buf.read()
+
+        if output_str:
+            # Convert bytes to base64-encoded string
+            output = base64.b64encode(output).decode("utf-8")
+
+        return output
 
     @staticmethod
     def deserialize(data):
+        """
+        Deserialize a previously serialized object.
+
+        Args:
+            data (bytes or str): The serialized data, optionally base64-encoded.
+
+        Returns:
+            The deserialized Python object.
+        """
+        if isinstance(data, str):
+            # Decode base64 string to bytes
+            data = base64.b64decode(data)
+
         return ForkingPickler.loads(data)
 
 
@@ -1796,3 +1838,125 @@ def retry(
             traceback.print_exc()
 
             time.sleep(delay)
+
+
+def flatten_nested_list(nested_list):
+    if isinstance(nested_list, list):
+        return [
+            item for sublist in nested_list for item in flatten_nested_list(sublist)
+        ]
+    else:
+        return [nested_list]
+
+
+class DeepEPMode(Enum):
+    normal = "normal"
+    low_latency = "low_latency"
+    auto = "auto"
+
+    def enable_normal(self):
+        return self in [DeepEPMode.normal, DeepEPMode.auto]
+
+    def enable_low_latency(self):
+        return self in [DeepEPMode.low_latency, DeepEPMode.auto]
+
+    def resolve(self, forward_mode):
+        if self != DeepEPMode.auto:
+            return self
+
+        if forward_mode.is_decode():
+            return DeepEPMode.low_latency
+        else:
+            return DeepEPMode.normal
+
+
+def fast_topk(values, topk, dim):
+    if topk == 1:
+        # Use max along the specified dimension to get both value and index
+        return torch.max(values, dim=dim, keepdim=True)
+    else:
+        # Use topk for efficiency with larger k values
+        return torch.topk(values, topk, dim=dim)
+
+
+def is_hopper_with_cuda_12_3():
+    if not is_cuda():
+        return False
+    is_hopper = torch.cuda.get_device_capability()[0] == 9
+    cuda_version = torch.version.cuda.split(".")
+    is_cuda_compatible = int(cuda_version[0]) == 12 and int(cuda_version[1]) >= 3
+    return is_hopper and is_cuda_compatible
+
+
+def get_free_port():
+    # try ipv4
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("", 0))
+            return s.getsockname()[1]
+    except OSError:
+        # try ipv6
+        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as s:
+            s.bind(("", 0))
+            return s.getsockname()[1]
+
+
+def get_local_ip_by_remote() -> str:
+    # try ipv4
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))  # Doesn't need to be reachable
+        return s.getsockname()[0]
+    except Exception:
+        pass
+
+    # try ipv6
+    try:
+        s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+        # Google's public DNS server, see
+        # https://developers.google.com/speed/public-dns/docs/using#addresses
+        s.connect(("2001:4860:4860::8888", 80))  # Doesn't need to be reachable
+        return s.getsockname()[0]
+    except Exception:
+        raise ValueError(f"Can not get local ip")
+
+
+def is_page_size_one(server_args):
+    return server_args.page_size == 1
+
+
+# TODO(hebiao064): Accelerate FA3 Spec Decode with topk > 1.
+# TODO(hebiao064): Improve the acc rate for FA3 Spec Decode with topk == 1 and page_size > 1.
+def is_no_spec_infer_or_topk_one(server_args):
+    return server_args.speculative_eagle_topk is None or (
+        server_args.speculative_eagle_topk is not None
+        and server_args.speculative_eagle_topk == 1
+        and is_page_size_one(server_args)
+    )
+
+
+def is_fa3_default_architecture(hf_config):
+    architectures = getattr(hf_config, "architectures", None)
+    if not isinstance(architectures, list) or not architectures:
+        return False
+    default_archs = {
+        "Qwen2ForCausalLM",
+        "Llama4ForConditionalGeneration",
+        "LlamaForCausalLM",
+        "MistralForCausalLM",
+        "Gemma2ForCausalLM",
+    }
+    return architectures[0] in default_archs
+
+
+# Can be more general if it is used in multiple places (keep it simple and thus not general now)
+class BumpAllocator:
+    def __init__(self, buffer_size: int, dtype, device):
+        self._buffer = torch.zeros((buffer_size,), dtype=dtype, device=device)
+        self._pointer = 0
+
+    def allocate(self, size: int):
+        assert self._pointer + size <= len(self._buffer)
+        output = self._buffer[self._pointer : self._pointer + size]
+        self._pointer += size
+        return output

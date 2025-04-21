@@ -1,13 +1,13 @@
-import asyncio
 from typing import List, Union
 
 import torch
+from transformers import BaseImageProcessorFast
 
 from sglang.srt.managers.multimodal_processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
-    get_global_processor,
 )
+from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.models.minicpmo import MiniCPMO
 from sglang.srt.models.minicpmv import MiniCPMV
 
@@ -21,19 +21,23 @@ class MiniCPMMultimodalProcessor(BaseMultimodalProcessor):
         self.image_token = "(<image>./</image>)"
         self.audio_token = "(<audio>./</audio>)"
 
-    @staticmethod
-    def _process_data_task(input_text, images=None, audios=None):
+    def process_data_task(self, input_text, images=None, audios=None):
 
         if isinstance(images, list) and len(images) == 0:
             images = None
         if isinstance(audios, list) and len(audios) == 0:
             audios = None
-        result = get_global_processor().__call__(
+        processor = self._processor
+        args = {}
+        if isinstance(processor, BaseImageProcessorFast):
+            args["device"] = "cuda"
+        result = self._processor.__call__(
             text=input_text,
             images=images,
             audios=audios,
             return_tensors="pt",
             chunk_input=True,
+            **args,
         )
         return {
             "input_ids": result.input_ids,
@@ -43,23 +47,6 @@ class MiniCPMMultimodalProcessor(BaseMultimodalProcessor):
             "audio_feature_lens": getattr(result, "audio_feature_lens", None),
             "audio_bounds": getattr(result, "audio_bounds", None),
         }
-
-    async def _process_data(self, images, input_text, audios=None):
-        if self.executor is not None:
-            loop = asyncio.get_event_loop()
-            multimodal_data_inputs = await loop.run_in_executor(
-                self.executor,
-                MiniCPMMultimodalProcessor._process_data_task,
-                input_text,
-                images,
-                audios,
-            )
-        else:
-            multimodal_data_inputs = self._processor(
-                images=images, text=input_text, audios=audios, return_tensors="pt"
-            )
-
-        return multimodal_data_inputs
 
     async def process_mm_data_async(
         self,
@@ -77,7 +64,7 @@ class MiniCPMMultimodalProcessor(BaseMultimodalProcessor):
             audio_data = [audio_data]
 
         base_output = self.load_mm_data(
-            input_ids=input_ids,
+            prompt=input_ids,
             max_req_input_len=max_req_input_len,
             audio_data=audio_data,
             image_data=image_data,
@@ -88,9 +75,9 @@ class MiniCPMMultimodalProcessor(BaseMultimodalProcessor):
         if base_output is None:
             return None
 
-        res = await self._process_data(
-            images=base_output.images,
+        res = self.process_mm_data(
             input_text=base_output.input_text,
+            images=base_output.images,
             audios=base_output.audios,
         )
 
@@ -142,23 +129,33 @@ class MiniCPMMultimodalProcessor(BaseMultimodalProcessor):
                 tgt_sizes_flat += [tgt_n]
 
         pixel_values = pixel_values_flat
-        if len(tgt_sizes_flat) == 0:
-            tgt_sizes = None
-        else:
-            tgt_sizes = torch.stack(tgt_sizes_flat)
-        if not isinstance(res["audio_features"], list):
-            res["audio_features"] = [res["audio_features"]]
+
+        items = []
+        if len(pixel_values) != 0:
+            item = MultimodalDataItem(
+                pixel_values=pixel_values,
+                tgt_size=tgt_sizes_flat,
+                modality=Modality.IMAGE,
+            )
+            items += [item]
+
+        if (
+            "audio_features" in res
+            and res["audio_features"] is not None
+            and len(res["audio_features"]) != 0
+        ):
+            item = MultimodalDataItem(
+                audio_features=[res["audio_features"]],
+                audio_feature_lens=res["audio_feature_lens"],
+                modality=Modality.AUDIO,
+            )
+            items += [item]
+
         return {
+            "mm_items": items,
             "input_ids": res["input_ids"].flatten().tolist(),
-            "pixel_values": pixel_values,
-            "tgt_sizes": tgt_sizes,
-            "data_hashes": base_output.mm_data_hashes,
-            "modalities": request_obj.modalities or ["image"],
             "audio_start_id": audio_start_id,
             "audio_end_id": audio_end_id,
-            "audio_features": res["audio_features"],
-            "audio_bounds": res["audio_bounds"],
-            "audio_feature_lens": res["audio_feature_lens"],
             "im_token_id": im_token_id,
             "im_start_id": tokenizer.im_start_id,
             "im_end_id": tokenizer.im_end_id,

@@ -11,7 +11,11 @@ from sglang.srt.distributed import GroupCoordinator, patch_tensor_parallel_group
 from sglang.srt.layers.dp_attention import disable_dp_size
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import get_token_ids_logprobs, get_top_logprobs
-from sglang.srt.managers.schedule_batch import ScheduleBatch, get_last_loc
+from sglang.srt.managers.schedule_batch import (
+    ScheduleBatch,
+    get_last_loc,
+    global_server_args_dict,
+)
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -27,13 +31,12 @@ from sglang.srt.speculative.eagle_utils import (
     EagleVerifyInput,
     EagleVerifyOutput,
     assign_draft_cache_locs,
-    fast_topk,
     select_top_k_tokens,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.utils import empty_context, get_available_gpu_memory, is_cuda_available
+from sglang.srt.utils import empty_context, fast_topk, get_available_gpu_memory, is_cuda
 
-if is_cuda_available():
+if is_cuda():
     from sgl_kernel import segment_packbits
 
 logger = logging.getLogger(__name__)
@@ -146,15 +149,26 @@ class EAGLEWorker(TpModelWorker):
     def init_attention_backend(self):
         # Create multi-step attn backends and cuda graph runners
         if self.server_args.attention_backend == "flashinfer":
-            from sglang.srt.layers.attention.flashinfer_backend import (
-                FlashInferMultiStepDraftBackend,
-            )
+            if not global_server_args_dict["use_mla_backend"]:
+                from sglang.srt.layers.attention.flashinfer_backend import (
+                    FlashInferMultiStepDraftBackend,
+                )
 
-            self.draft_attn_backend = FlashInferMultiStepDraftBackend(
-                self.draft_model_runner,
-                self.topk,
-                self.speculative_num_steps,
-            )
+                self.draft_attn_backend = FlashInferMultiStepDraftBackend(
+                    self.draft_model_runner,
+                    self.topk,
+                    self.speculative_num_steps,
+                )
+            else:
+                from sglang.srt.layers.attention.flashinfer_mla_backend import (
+                    FlashInferMLAMultiStepDraftBackend,
+                )
+
+                self.draft_attn_backend = FlashInferMLAMultiStepDraftBackend(
+                    self.draft_model_runner,
+                    self.topk,
+                    self.speculative_num_steps,
+                )
             self.draft_extend_attn_backend = None
             self.padded_static_len = self.speculative_num_steps + 1
             self.has_prefill_wrapper_verify = True
@@ -171,19 +185,19 @@ class EAGLEWorker(TpModelWorker):
             self.draft_extend_attn_backend = None
             self.padded_static_len = self.speculative_num_steps + 1
             self.has_prefill_wrapper_verify = False
-        elif self.server_args.attention_backend == "flashinfer_mla":
-            from sglang.srt.layers.attention.flashinfer_mla_backend import (
-                FlashInferMLAMultiStepDraftBackend,
+        elif self.server_args.attention_backend == "fa3":
+            from sglang.srt.layers.attention.flashattention_backend import (
+                FlashAttentionMultiStepBackend,
             )
 
-            self.draft_attn_backend = FlashInferMLAMultiStepDraftBackend(
+            self.draft_attn_backend = FlashAttentionMultiStepBackend(
                 self.draft_model_runner,
                 self.topk,
                 self.speculative_num_steps,
             )
             self.draft_extend_attn_backend = None
             self.padded_static_len = self.speculative_num_steps + 1
-            self.has_prefill_wrapper_verify = True
+            self.has_prefill_wrapper_verify = False
         else:
             raise ValueError(
                 f"EAGLE is not supportted in attention backend {self.server_args.attention_backend}"
@@ -252,14 +266,11 @@ class EAGLEWorker(TpModelWorker):
             )
         elif batch.forward_mode.is_idle():
             model_worker_batch = batch.get_model_worker_batch()
-            logits_output, next_token_ids, _ = (
-                self.target_worker.forward_batch_generation(
-                    ForwardBatch.init_new(
-                        model_worker_batch, self.target_worker.model_runner
-                    )
-                )
+            logits_output, next_token_ids = self.target_worker.forward_batch_generation(
+                model_worker_batch
             )
-            return logits_output, next_token_ids, model_worker_batch.bid, 0, False
+
+            return logits_output, next_token_ids, model_worker_batch.bid, 0
         else:
             logits_output, next_token_ids, bid = self.forward_target_extend(batch)
             with self.draft_tp_context(self.draft_model_runner.tp_group):

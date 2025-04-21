@@ -897,6 +897,7 @@ def v1_chat_generate_request(
     request_ids: List[str] = None,
 ):
     input_ids = []
+    prompts = []
     sampling_params_list = []
     image_data_list = []
     audio_data_list = []
@@ -916,6 +917,7 @@ def v1_chat_generate_request(
         #  - audio_data: None or a list of audio strings (URLs).
         #    None skips any image processing in GenerateReqInput.
         strict_tag = None
+        prompt = ""
         if not isinstance(request.messages, str):
             # Apply chat template and its stop strings.
             tools = None
@@ -936,6 +938,35 @@ def v1_chat_generate_request(
 
             if chat_template_name is None:
                 openai_compatible_messages = []
+                if (
+                    tools
+                    and tokenizer_manager.server_args.tool_call_parser == "deepseekv3"
+                ):
+                    # add function call prompt to deepseekv3
+                    openai_compatible_messages.append(
+                        {
+                            "role": "system",
+                            "content": """You are a helpful Assistant.
+                    ## Tools
+                    ### Function
+                    You have the following functions available:
+                    """
+                            + "".join(
+                                [
+                                    f"""
+                        - `{tool['name']}`:
+                        ```json
+                        {json.dumps(tool)}
+                        ```
+                        """
+                                    for tool in tools
+                                ]
+                            ),
+                        }
+                    )
+                    # TODO fix the compatible issues with xgrammar
+                    strict_tag = None
+
                 for message in request.messages:
                     if isinstance(message.content, str):
                         openai_compatible_messages.append(
@@ -948,9 +979,16 @@ def v1_chat_generate_request(
                                 openai_compatible_messages.append(
                                     {"role": message.role, "content": content["text"]}
                                 )
-                if openai_compatible_messages[-1]["role"] == "assistant":
-                    assistant_prefix = openai_compatible_messages[-1]["content"]
-                    openai_compatible_messages = openai_compatible_messages[:-1]
+                if (
+                    openai_compatible_messages
+                    and openai_compatible_messages[-1]["role"] == "assistant"
+                ):
+                    if request.continue_final_message:
+                        # Remove the final assistant message so its content can be continued.
+                        assistant_prefix = openai_compatible_messages[-1]["content"]
+                        openai_compatible_messages = openai_compatible_messages[:-1]
+                    else:
+                        assistant_prefix = None
                 else:
                     assistant_prefix = None
 
@@ -981,23 +1019,53 @@ def v1_chat_generate_request(
                     ):
                         encoded = encoded[1:]
                     prompt_ids += encoded
+                if tokenizer_manager.model_config.is_multimodal:
+                    prompt = tokenizer_manager.tokenizer.decode(prompt_ids)
                 stop = request.stop
                 image_data = None
                 audio_data = None
                 modalities = []
             else:
                 conv = generate_chat_conv(request, chat_template_name)
-                prompt = conv.get_prompt()
+                # If we should continue the final assistant message, adjust the conversation.
+                if (
+                    request.continue_final_message
+                    and request.messages
+                    and request.messages[-1].role == "assistant"
+                ):
+                    # Remove the auto-added blank assistant turn, if present.
+                    if conv.messages and conv.messages[-1][1] is None:
+                        conv.messages.pop()
+                    # Rebuild the prompt from the conversation.
+                    prompt = conv.get_prompt()
+                    # Strip any trailing stop tokens or separators that indicate end-of-assistant.
+                    if isinstance(conv.stop_str, list):
+                        for stop_token in conv.stop_str:
+                            if prompt.endswith(stop_token):
+                                prompt = prompt[: -len(stop_token)]
+                    elif isinstance(conv.stop_str, str) and prompt.endswith(
+                        conv.stop_str
+                    ):
+                        prompt = prompt[: -len(conv.stop_str)]
+                    if conv.sep and prompt.endswith(conv.sep):
+                        prompt = prompt[: -len(conv.sep)]
+                    if getattr(conv, "sep2", None) and prompt.endswith(conv.sep2):
+                        prompt = prompt[: -len(conv.sep2)]
+                else:
+                    prompt = conv.get_prompt()
+
                 image_data = conv.image_data
                 audio_data = conv.audio_data
                 modalities = conv.modalities
-                stop = conv.stop_str or []
+                stop = conv.stop_str or [] if not request.ignore_eos else []
+
                 if request.stop:
                     if isinstance(request.stop, str):
                         stop.append(request.stop)
                     else:
                         stop.extend(request.stop)
                 prompt_ids = tokenizer_manager.tokenizer.encode(prompt)
+
         else:
             # Use the raw prompt and stop strings if the messages is already a string.
             prompt_ids = request.messages
@@ -1005,11 +1073,13 @@ def v1_chat_generate_request(
             image_data = None
             audio_data = None
             modalities = []
+            prompt = request.messages
         input_ids.append(prompt_ids)
         return_logprobs.append(request.logprobs)
         logprob_start_lens.append(-1)
         top_logprobs_nums.append(request.top_logprobs or 0)
         lora_paths.append(request.lora_path)
+        prompts.append(prompt)
 
         sampling_params = {
             "temperature": request.temperature,
@@ -1035,6 +1105,8 @@ def v1_chat_generate_request(
             sampling_params["json_schema"] = convert_json_schema_to_str(
                 request.response_format.json_schema.schema_
             )
+        elif request.response_format and request.response_format.type == "json_object":
+            sampling_params["json_schema"] = '{"type": "object"}'
         elif (
             request.response_format and request.response_format.type == "structural_tag"
         ):
@@ -1063,10 +1135,14 @@ def v1_chat_generate_request(
         audio_data_list.append(audio_data)
         modalities_list.append(modalities)
     if len(all_requests) == 1:
-        if isinstance(input_ids[0], str):
-            prompt_kwargs = {"text": input_ids[0]}
+        if tokenizer_manager.model_config.is_multimodal:
+            # processor will need text input
+            prompt_kwargs = {"text": prompts[0]}
         else:
-            prompt_kwargs = {"input_ids": input_ids[0]}
+            if isinstance(input_ids[0], str):
+                prompt_kwargs = {"text": input_ids[0]}
+            else:
+                prompt_kwargs = {"input_ids": input_ids[0]}
         sampling_params_list = sampling_params_list[0]
         image_data_list = image_data_list[0]
         audio_data_list = audio_data_list[0]
@@ -1076,10 +1152,14 @@ def v1_chat_generate_request(
         modalities_list = modalities_list[0]
         lora_paths = lora_paths[0]
     else:
-        if isinstance(input_ids[0], str):
-            prompt_kwargs = {"text": input_ids}
+        if tokenizer_manager.model_config.is_multimodal:
+            # processor will need text input
+            prompt_kwargs = {"text": prompts}
         else:
-            prompt_kwargs = {"input_ids": input_ids}
+            if isinstance(input_ids[0], str):
+                prompt_kwargs = {"text": input_ids}
+            else:
+                prompt_kwargs = {"input_ids": input_ids}
 
     adapted_request = GenerateReqInput(
         **prompt_kwargs,

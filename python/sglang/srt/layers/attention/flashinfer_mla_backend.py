@@ -71,8 +71,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         self.device = model_runner.device
         self.skip_prefill = skip_prefill
 
-        global_config.enable_flashinfer_mla = True
-
         # Allocate buffers
         global global_workspace_buffer
         if global_workspace_buffer is None:
