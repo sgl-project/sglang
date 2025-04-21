@@ -1831,10 +1831,9 @@ class DeepseekV2Model(nn.Module):
                 )
             ]
 
-        hidden_states += residual
-        residual = None
-
         if self.attn_tp_size != 1 and self.input_is_scattered:
+            hidden_states += residual
+            residual = None
             hidden_states, local_hidden_states = (
                 forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
                 hidden_states,
