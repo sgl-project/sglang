@@ -34,6 +34,8 @@ def compute_split_seq_index(
     elif forward_mode.is_decode():
         split_seq_index = num_tokens // 2
         num_seqs = num_tokens
+    elif forward_mode.is_idle():
+        return 0
     else:
         raise NotImplementedError
 
@@ -61,6 +63,8 @@ def compute_split_token_index(
         return sum(extend_seq_lens[:split_seq_index])
     elif forward_mode.is_decode():
         return split_seq_index
+    elif forward_mode.is_idle():
+        return 0
     else:
         raise NotImplementedError
 
