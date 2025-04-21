@@ -13,7 +13,6 @@
 # ==============================================================================
 
 import math
-import os
 from typing import Callable, Optional
 
 import torch
@@ -28,6 +27,10 @@ _is_hip = is_hip()
 
 if _is_cuda:
     from sgl_kernel import moe_fused_gate
+
+if _is_cuda or _is_hip:
+    from sgl_kernel import topk_softmax
+
 
 expert_distribution_recorder = ExpertDistributionRecorder()
 
@@ -59,11 +62,6 @@ def fused_topk(
     topk: int,
     renormalize: bool,
 ):
-    if _is_cuda or _is_hip:
-        from sgl_kernel import topk_softmax
-    else:
-        from vllm import _custom_ops as vllm_ops
-
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
     M, _ = hidden_states.shape
@@ -76,20 +74,12 @@ def fused_topk(
         M, topk, dtype=torch.int32, device=hidden_states.device
     )
 
-    if _is_cuda or _is_hip:
-        topk_softmax(
-            topk_weights,
-            topk_ids,
-            token_expert_indicies,
-            gating_output.float(),
-        )
-    else:
-        vllm_ops.topk_softmax(
-            topk_weights,
-            topk_ids,
-            token_expert_indicies,
-            gating_output.float(),
-        )
+    topk_softmax(
+        topk_weights,
+        topk_ids,
+        token_expert_indicies,
+        gating_output.float(),
+    )
     del token_expert_indicies
 
     if renormalize:
@@ -108,6 +98,7 @@ def grouped_topk(
     num_expert_group: int = 0,
     topk_group: int = 0,
     n_share_experts_fusion: int = 0,
+    routed_scaling_factor: Optional[float] = None,
 ):
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
@@ -137,9 +128,7 @@ def grouped_topk(
             dtype=topk_ids.dtype,
             device=topk_ids.device,
         )
-        topk_weights[:, -1] = (
-            topk_weights[:, :-1].sum(dim=-1) / 2.5
-        )  # 2.5 is the routed_scaling_factor.
+        topk_weights[:, -1] = topk_weights[:, :-1].sum(dim=-1) / routed_scaling_factor
 
     if renormalize:
         topk_weights_sum = (
@@ -161,6 +150,7 @@ def biased_grouped_topk_impl(
     num_expert_group: int = 0,
     topk_group: int = 0,
     n_share_experts_fusion: int = 0,
+    routed_scaling_factor: Optional[float] = None,
 ):
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
@@ -197,9 +187,7 @@ def biased_grouped_topk_impl(
             dtype=topk_ids.dtype,
             device=topk_ids.device,
         )
-        topk_weights[:, -1] = (
-            topk_weights[:, :-1].sum(dim=-1) / 2.5
-        )  # 2.5 is the routed_scaling_factor.
+        topk_weights[:, -1] = topk_weights[:, :-1].sum(dim=-1) / routed_scaling_factor
 
     if renormalize:
         topk_weights_sum = (
@@ -226,11 +214,16 @@ def biased_grouped_topk(
     topk_group: int = 0,
     compiled: bool = True,
     n_share_experts_fusion: int = 0,
+    routed_scaling_factor: Optional[float] = None,
 ):
+    assert (
+        routed_scaling_factor is not None
+    ), "routed_scaling_factor is required for biased_grouped_topk"
     # TODO: moe_fused_gate kernel is not supported for n_share_experts_fusion > 0 now.
     if (
         _is_cuda
-        and n_share_experts_fusion == 0
+        and gating_output.shape[1] // num_expert_group
+        <= 32  # moe_fused_gate kernel ensure that num_experts/num_expert_group does not exceed MAX_VPT=32 now. And when kernel can handle MAX_VPT > 32, we can remove this assertion.
         and is_power_of_two(correction_bias.shape[0])
     ):
         return moe_fused_gate(
@@ -239,6 +232,8 @@ def biased_grouped_topk(
             num_expert_group,
             topk_group,
             topk,
+            n_share_experts_fusion,
+            routed_scaling_factor,
         )
     else:
         biased_grouped_topk_fn = (
@@ -257,6 +252,7 @@ def biased_grouped_topk(
             num_expert_group,
             topk_group,
             n_share_experts_fusion=n_share_experts_fusion,
+            routed_scaling_factor=routed_scaling_factor,
         )
 
 
@@ -271,10 +267,9 @@ def select_experts(
     custom_routing_function: Optional[Callable] = None,
     correction_bias: Optional[torch.Tensor] = None,
     torch_native: bool = False,
+    routed_scaling_factor: Optional[float] = None,
 ):
-    n_share_experts_fusion = 0
-    if global_server_args_dict["n_share_experts_fusion"] is not None:
-        n_share_experts_fusion = global_server_args_dict["n_share_experts_fusion"]
+    n_share_experts_fusion = global_server_args_dict["n_share_experts_fusion"]
     # DeekSeek V2/V3/R1 serices models uses grouped_top_k
     if use_grouped_topk:
         assert topk_group is not None
@@ -288,6 +283,7 @@ def select_experts(
                 num_expert_group=num_expert_group,
                 topk_group=topk_group,
                 n_share_experts_fusion=n_share_experts_fusion,
+                routed_scaling_factor=routed_scaling_factor,
             )
         else:
             topk_weights, topk_ids = biased_grouped_topk(
@@ -299,6 +295,7 @@ def select_experts(
                 num_expert_group=num_expert_group,
                 topk_group=topk_group,
                 n_share_experts_fusion=n_share_experts_fusion,
+                routed_scaling_factor=routed_scaling_factor,
             )
     elif torch_native and custom_routing_function is None:
         topk_weights, topk_ids = fused_topk_native(

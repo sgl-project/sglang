@@ -23,6 +23,10 @@ class TestHiCache(CustomTestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--enable-hierarchical-cache",
+                "--mem-fraction-static",
+                0.7,
+                "--hicache-size",
+                100,
             ],
         )
 

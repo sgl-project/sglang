@@ -18,7 +18,7 @@
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 0,
-  "id": 1,
+  "id": 8,
   "links": [],
   "panels": [
     {
@@ -69,8 +69,7 @@
             "mode": "absolute",
             "steps": [
               {
-                "color": "green",
-                "value": null
+                "color": "green"
               },
               {
                 "color": "red",
@@ -96,10 +95,12 @@
           "showLegend": true
         },
         "tooltip": {
+          "hideZeros": false,
           "mode": "single",
           "sort": "none"
         }
       },
+      "pluginVersion": "11.6.0",
       "targets": [
         {
           "datasource": {
@@ -199,9 +200,18 @@
         "y": 0
       },
       "id": 17,
+      "maxDataPoints": 30,
       "options": {
-        "calculate": true,
+        "calculate": false,
+        "calculation": {
+          "yBuckets": {
+            "scale": {
+              "type": "linear"
+            }
+          }
+        },
         "cellGap": 1,
+        "cellValues": {},
         "color": {
           "exponent": 0.5,
           "fill": "dark-orange",
@@ -215,7 +225,7 @@
           "color": "rgba(255,0,255,0.7)"
         },
         "filterValues": {
-          "le": 1e-09
+          "le": 1e-9
         },
         "legend": {
           "show": true
@@ -230,10 +240,11 @@
         },
         "yAxis": {
           "axisPlacement": "left",
-          "reverse": false
+          "reverse": false,
+          "unit": "secs"
         }
       },
-      "pluginVersion": "11.2.0",
+      "pluginVersion": "11.6.0",
       "targets": [
         {
           "datasource": {
@@ -241,8 +252,9 @@
             "uid": "ddyfngn31dg5cf"
           },
           "disableTextWrap": false,
-          "editorMode": "code",
-          "expr": "rate(sglang:e2e_request_latency_seconds_bucket{model_name=~\"$model_name\"}[$__rate_interval])\r\n",
+          "editorMode": "builder",
+          "expr": "sum(increase(sglang:e2e_request_latency_seconds_bucket{model_name=~\"$model_name\"}[$__rate_interval])) by (le)\r\n",
+          "format": "heatmap",
           "fullMetaSearch": false,
           "includeNullMetadata": true,
           "instant": false,
@@ -252,7 +264,7 @@
           "useBackend": false
         }
       ],
-      "title": "End-to-End Request Latency Heatmap",
+      "title": "End-to-End Request Latency(s) Heatmap",
       "type": "heatmap"
     },
     {
@@ -303,8 +315,7 @@
             "mode": "absolute",
             "steps": [
               {
-                "color": "green",
-                "value": null
+                "color": "green"
               },
               {
                 "color": "red",
@@ -330,10 +341,12 @@
           "showLegend": true
         },
         "tooltip": {
+          "hideZeros": false,
           "mode": "single",
           "sort": "none"
         }
       },
+      "pluginVersion": "11.6.0",
       "targets": [
         {
           "datasource": {
@@ -375,7 +388,7 @@
           },
           "disableTextWrap": false,
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(sglang:time_to_first_token_seconds_bucket[$__rate_interval])))\r\n",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(sglang:time_to_first_token_seconds_bucket[$__rate_interval])))\r\n",
           "fullMetaSearch": false,
           "hide": false,
           "includeNullMetadata": true,
@@ -403,7 +416,7 @@
           "useBackend": false
         }
       ],
-      "title": "End-to-End Request Latency",
+      "title": "Time-To-First-Token Latency",
       "type": "timeseries"
     },
     {
@@ -433,8 +446,21 @@
         "y": 8
       },
       "id": 19,
+      "maxDataPoints": 30,
       "options": {
-        "calculate": true,
+        "calculate": false,
+        "calculation": {
+          "xBuckets": {
+            "value": ""
+          },
+          "yBuckets": {
+            "mode": "size",
+            "scale": {
+              "type": "linear"
+            },
+            "value": ""
+          }
+        },
         "cellGap": 1,
         "color": {
           "exponent": 0.5,
@@ -449,7 +475,7 @@
           "color": "rgba(255,0,255,0.7)"
         },
         "filterValues": {
-          "le": 1e-09
+          "le": 1e-9
         },
         "legend": {
           "show": true
@@ -464,11 +490,10 @@
         },
         "yAxis": {
           "axisPlacement": "left",
-          "reverse": false,
-          "unit": "s"
+          "reverse": false
         }
       },
-      "pluginVersion": "11.2.0",
+      "pluginVersion": "11.6.0",
       "targets": [
         {
           "datasource": {
@@ -476,11 +501,14 @@
             "uid": "ddyfngn31dg5cf"
           },
           "disableTextWrap": false,
-          "editorMode": "code",
-          "expr": "rate(sglang:time_to_first_token_seconds_bucket{model_name=~\"$model_name\"}[$__rate_interval])\r\n",
+          "editorMode": "builder",
+          "exemplar": false,
+          "expr": "sum by(le) (increase(sglang:time_to_first_token_seconds_bucket{model_name=~\"$model_name\"}[$__rate_interval]))",
+          "format": "heatmap",
           "fullMetaSearch": false,
           "includeNullMetadata": true,
           "instant": false,
+          "interval": "",
           "legendFormat": "{{le}}",
           "range": true,
           "refId": "A",
@@ -538,8 +566,7 @@
             "mode": "absolute",
             "steps": [
               {
-                "color": "green",
-                "value": null
+                "color": "green"
               },
               {
                 "color": "red",
@@ -565,10 +592,12 @@
           "showLegend": true
         },
         "tooltip": {
+          "hideZeros": false,
           "mode": "single",
           "sort": "none"
         }
       },
+      "pluginVersion": "11.6.0",
       "targets": [
         {
           "datasource": {
@@ -639,8 +668,7 @@
             "mode": "absolute",
             "steps": [
               {
-                "color": "green",
-                "value": null
+                "color": "green"
               },
               {
                 "color": "red",
@@ -666,10 +694,12 @@
           "showLegend": true
         },
         "tooltip": {
+          "hideZeros": false,
           "mode": "single",
           "sort": "none"
         }
       },
+      "pluginVersion": "11.6.0",
       "targets": [
         {
           "datasource": {
@@ -735,8 +765,7 @@
             "mode": "absolute",
             "steps": [
               {
-                "color": "green",
-                "value": null
+                "color": "green"
               },
               {
                 "color": "red",
@@ -762,10 +791,12 @@
           "showLegend": true
         },
         "tooltip": {
+          "hideZeros": false,
           "mode": "single",
           "sort": "none"
         }
       },
+      "pluginVersion": "11.6.0",
       "targets": [
         {
           "datasource": {
@@ -835,8 +866,7 @@
             "mode": "absolute",
             "steps": [
               {
-                "color": "green",
-                "value": null
+                "color": "green"
               },
               {
                 "color": "red",
@@ -862,10 +892,12 @@
           "showLegend": true
         },
         "tooltip": {
+          "hideZeros": false,
           "mode": "single",
           "sort": "none"
         }
       },
+      "pluginVersion": "11.6.0",
       "targets": [
         {
           "datasource": {
@@ -888,14 +920,14 @@
       "type": "timeseries"
     }
   ],
+  "preload": false,
   "refresh": "5s",
-  "schemaVersion": 39,
+  "schemaVersion": 41,
   "tags": [],
   "templating": {
     "list": [
       {
         "current": {
-          "selected": false,
           "text": "127.0.0.1:30000",
           "value": "127.0.0.1:30000"
         },
@@ -903,10 +935,8 @@
           "type": "prometheus"
         },
         "definition": "label_values(instance)",
-        "hide": 0,
         "includeAll": false,
         "label": "instance",
-        "multi": false,
         "name": "instance",
         "options": [],
         "query": {
@@ -916,13 +946,10 @@
         },
         "refresh": 1,
         "regex": "",
-        "skipUrlSync": false,
-        "sort": 0,
         "type": "query"
       },
       {
         "current": {
-          "selected": false,
           "text": "meta-llama/Llama-3.1-8B-Instruct",
           "value": "meta-llama/Llama-3.1-8B-Instruct"
         },
@@ -930,10 +957,8 @@
           "type": "prometheus"
         },
         "definition": "label_values(model_name)",
-        "hide": 0,
         "includeAll": false,
         "label": "model name",
-        "multi": false,
         "name": "model_name",
         "options": [],
         "query": {
@@ -943,8 +968,6 @@
         },
         "refresh": 1,
         "regex": "",
-        "skipUrlSync": false,
-        "sort": 0,
         "type": "query"
       }
     ]
@@ -957,6 +980,5 @@
   "timezone": "browser",
   "title": "SGLang Dashboard",
   "uid": "sglang-dashboard",
-  "version": 5,
-  "weekStart": ""
+  "version": 11
 }

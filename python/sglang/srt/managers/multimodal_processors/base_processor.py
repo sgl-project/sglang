@@ -8,8 +8,6 @@ from typing import List, Optional
 
 import numpy as np
 import PIL
-from decord import VideoReader, cpu
-from PIL import Image
 from transformers import BaseImageProcessorFast
 
 from sglang.srt.managers.schedule_batch import Modality
@@ -102,6 +100,9 @@ class BaseMultimodalProcessor(ABC):
         """
         estimate the total frame count from all visual input
         """
+        # Lazy import because decord is not available on some arm platforms.
+        from decord import VideoReader, cpu
+
         # Before processing inputs
         estimated_frames_list = []
         for image in image_data:
