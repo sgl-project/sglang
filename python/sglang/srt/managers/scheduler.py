@@ -269,6 +269,24 @@ class Scheduler(
         else:
             TpWorkerClass = TpModelWorker
 
+        ################################################################################
+        print("HACK!!!! temp start_profile")
+        # Init profiler
+        self.torch_profiler = None
+        self.torch_profiler_output_dir: Optional[str] = None
+        self.profiler_activities: Optional[List[str]] = None
+        self.profiler_id: Optional[str] = None
+        self.profiler_target_forward_ct: Optional[int] = None
+        self.start_profile(
+            output_dir=None,
+            num_steps=None,
+            activities=["MEM"],
+            with_stack=None,
+            record_shapes=None,
+            profile_id=None,
+        )
+        ################################################################################
+
         self.tp_worker = TpWorkerClass(
             server_args=server_args,
             expert_location_metadata=expert_location_metadata,
@@ -277,6 +295,11 @@ class Scheduler(
             dp_rank=dp_rank,
             nccl_port=port_args.nccl_port,
         )
+
+        ################################################################################
+        print("HACK!!!! temp stop_profile")
+        self.stop_profile()
+        ################################################################################
 
         # Launch a draft worker for speculative decoding
         if self.spec_algorithm.is_eagle():
