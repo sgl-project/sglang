@@ -4,6 +4,7 @@ from typing import Callable, List, Optional, Tuple
 import torch
 from torch.nn import Module
 
+_enable_jit_deepgemm = False
 try:
     from deep_gemm import (
         get_col_major_tma_aligned_tensor,
@@ -15,7 +16,10 @@ try:
     from sglang.srt.layers.quantization.fp8_kernel import (
         sglang_per_token_group_quant_fp8,
     )
+    from sglang.srt.utils import DeepEPMode, get_bool_env_var, get_device_sm
 
+    if get_bool_env_var("SGL_ENABLE_JIT_DEEPGEMM", default="false"):
+        _enable_jit_deepgemm = True
     use_deep_gemm = True
 except ImportError:
     use_deep_gemm = False
@@ -862,7 +866,7 @@ class DeepEPMoE(EPMoE):
     ):
         resolved_deepep_mode = self.deepep_mode.resolve(forward_mode)
         if resolved_deepep_mode == DeepEPMode.normal:
-            if use_deep_gemm:
+            if _enable_jit_deepgemm:
                 return self.forward_deepgemm_contiguous(
                     hidden_states, topk_idx, topk_weights, num_recv_tokens_per_expert
                 )
