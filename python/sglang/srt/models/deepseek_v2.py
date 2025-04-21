@@ -1691,10 +1691,9 @@ class DeepseekV2DecoderLayer(nn.Module):
     # TODO some logic should be in MLP, refactor this
     def _forward_tbo_op_compute_layer_output(self, state):
         hidden_states = state.pop("hidden_states_from_combine")
-        residual = state.pop("residual_after_post_attn_ln")
 
-        if state.shared_output is not None:
-            hidden_states = hidden_states + state.pop("shared_output")
+        if (shared_output := state.pop("shared_output")) is not None:
+            hidden_states = hidden_states + shared_output
 
         # TODO do not copy paste
         if self.is_last_layer and self.attn_tp_size != 1:
