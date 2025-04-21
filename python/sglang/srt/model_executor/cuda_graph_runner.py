@@ -35,7 +35,11 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.patch_torch import monkey_patch_torch_compile
-from sglang.srt.utils import get_available_gpu_memory, is_hip
+from sglang.srt.utils import (
+    get_available_gpu_memory,
+    get_whatever_gpu_memory_capacity,
+    is_hip,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -132,6 +136,11 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
         if _is_hip:
             capture_bs += list(range(160, 257, 8))
 
+        gpu_mem = get_whatever_gpu_memory_capacity() / 1024
+
+        if gpu_mem is not None and gpu_mem > 120:
+            capture_bs += list(range(160, 256, 8))
+
     if max(capture_bs) > model_runner.req_to_token_pool.size:
         # In some case (e.g., with a small GPU or --max-running-requests), the #max-running-requests
         # is very small. We add more values here to make sure we capture the maximum bs.
@@ -140,12 +149,13 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
         ]
 
     capture_bs = list(sorted(set(capture_bs)))
-    capture_bs = [
-        bs
-        for bs in capture_bs
-        if bs <= model_runner.req_to_token_pool.size
-        and bs <= server_args.cuda_graph_max_bs
-    ]
+
+    assert len(capture_bs) > 0 and capture_bs[0] > 0
+    capture_bs = [bs for bs in capture_bs if bs <= model_runner.req_to_token_pool.size]
+
+    if server_args.cuda_graph_max_bs:
+        capture_bs = [bs for bs in capture_bs if bs <= server_args.cuda_graph_max_bs]
+
     compile_bs = (
         [bs for bs in capture_bs if bs <= server_args.torch_compile_max_bs]
         if server_args.enable_torch_compile
@@ -186,6 +196,7 @@ class CudaGraphRunner:
 
         # Batch sizes to capture
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
+
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.NULL
         self.num_tokens_per_bs = 1

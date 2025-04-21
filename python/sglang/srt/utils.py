@@ -1160,6 +1160,20 @@ def get_hpu_memory_capacity():
         )
 
 
+def get_whatever_gpu_memory_capacity(device: str = None):
+    if is_cuda():
+        gpu_mem = get_nvgpu_memory_capacity()
+    elif is_hip():
+        gpu_mem = get_amdgpu_memory_capacity()
+    elif device == "hpu":
+        gpu_mem = get_hpu_memory_capacity()
+    else:
+        # GPU memory is not known yet or no GPU is available.
+        gpu_mem = None
+
+    return gpu_mem
+
+
 # Copy from pytorch and OpenRLHF to allow creating multiple main groups.
 # https://github.com/pytorch/pytorch/blob/main/torch/distributed/distributed_c10d.py
 # https://github.com/OpenRLHF/OpenRLHF/blob/main/openrlhf/utils/distributed_util.py
