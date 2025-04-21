@@ -516,9 +516,12 @@ class DeepseekV2MoE(nn.Module):
         )
 
     def _forward_tbo_op_compute_layer_output(self, state):
+        final_hidden_states = state.hidden_states_from_combine
+        if state.shared_output is not None:
+            final_hidden_states = final_hidden_states + state.shared_output
         output = dict(
             positions=state.positions,
-            hidden_states=state.hidden_states_from_combine + state.shared_output,
+            hidden_states=final_hidden_states,
             forward_batch=state.forward_batch,
             residual=state.residual_after_post_attn_ln,
             tbo_subbatch_index=state.tbo_subbatch_index,
@@ -844,6 +847,13 @@ class DeepseekV2AttentionMLA(nn.Module):
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ):
+        # TODO optimize this part
+        if hidden_states.shape[0] == 0:
+            assert (
+                not self.o_proj.reduce_results
+            ), "short-circuiting allreduce will lead to hangs"
+            return (hidden_states,)
+
         q_len = hidden_states.shape[0]
         q_input = hidden_states.new_empty(
             q_len, self.num_local_heads, self.kv_lora_rank + self.qk_rope_head_dim
@@ -911,6 +921,11 @@ class DeepseekV2AttentionMLA(nn.Module):
         state,
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
+        # TODO optimize this part
+        if len(state) == 1:
+            (hidden_states,) = state
+            return hidden_states
+
         q_input, k_input, v_input, forward_batch = state
 
         attn_output = self.attn_mqa(q_input, k_input, v_input, forward_batch)
@@ -1573,9 +1588,14 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         tbo_subbatch_index: int,
     ):
-        state.hidden_states_after_input_ln, state.residual_after_input_ln = (
-            self._forward_input_layernorm(hidden_states, residual)
-        )
+        if hidden_states.shape[0] == 0:
+            state.hidden_states_after_input_ln = state.residual_after_input_ln = (
+                hidden_states
+            )
+        else:
+            state.hidden_states_after_input_ln, state.residual_after_input_ln = (
+                self._forward_input_layernorm(hidden_states, residual)
+            )
         state.update(
             dict(
                 forward_batch=forward_batch,
@@ -1622,10 +1642,17 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
 
     def _forward_tbo_op_post_attn_layernorm(self, state):
-        state.hidden_states_after_post_attn_ln, state.residual_after_post_attn_ln = (
-            self.post_attention_layernorm(
-                state.hidden_states_after_attn, state.residual_after_input_ln
+        hidden_states, residual = (
+            state.hidden_states_after_attn,
+            state.residual_after_input_ln,
+        )
+        if hidden_states.shape[0] != 0:
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual
             )
+        state.hidden_states_after_post_attn_ln, state.residual_after_post_attn_ln = (
+            hidden_states,
+            residual,
         )
 
 
@@ -1734,7 +1761,7 @@ class DeepseekV2Model(nn.Module):
                 op
                 for i in range(start_layer, end_layer)
                 for op in self.layers[i].get_forward_tbo_operations(
-                    forward_batch.forward_mode, tbo_child_index
+                    forward_batch.global_forward_mode, tbo_child_index
                 )
             ]
 
@@ -1763,7 +1790,7 @@ class DeepseekV2Model(nn.Module):
                 delta_stages={
                     ForwardMode.EXTEND: 0,
                     ForwardMode.DECODE: 2,
-                }[forward_batch.forward_mode],
+                }[forward_batch.global_forward_mode],
             )
 
 

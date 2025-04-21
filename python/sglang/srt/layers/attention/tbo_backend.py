@@ -22,7 +22,8 @@ class TboAttnBackend(AttentionBackend):
             for child, forward_batch_child in zip(
                 self.children, forward_batch.tbo_children, strict=True
             ):
-                child.init_forward_metadata(forward_batch=forward_batch_child)
+                if forward_batch_child.batch_size > 0:
+                    child.init_forward_metadata(forward_batch=forward_batch_child)
 
     def init_cuda_graph_state(self, max_bs: int):
         self.primary.init_cuda_graph_state(max_bs=max_bs)
@@ -130,6 +131,10 @@ class TboAttnBackend(AttentionBackend):
         num_tokens_child_right = num_tokens - tbo_split_token_index
         bs_child_left = num_tokens_child_left
         bs_child_right = num_tokens_child_right
+
+        assert (
+            num_tokens_child_left > 0 and num_tokens_child_right > 0
+        ), f"{num_tokens_child_left=} {num_tokens_child_right=}"
 
         common_pre_split_args = dict(
             fn_name=fn_name,

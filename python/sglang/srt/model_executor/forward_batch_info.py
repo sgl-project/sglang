@@ -246,6 +246,7 @@ class ForwardBatch:
     gathered_buffer: Optional[torch.Tensor] = None
     tbo_split_seq_index: Optional[int] = None
     can_run_dp_cuda_graph: bool = False
+    global_forward_mode: Optional[ForwardMode] = None
 
     # Speculative decoding
     spec_info: Optional[Union[EagleVerifyInput, EagleDraftInput]] = None
@@ -291,6 +292,7 @@ class ForwardBatch:
             token_ids_logprobs=batch.token_ids_logprobs,
             tbo_split_seq_index=batch.tbo_split_seq_index,
             can_run_dp_cuda_graph=batch.can_run_dp_cuda_graph,
+            global_forward_mode=batch.global_forward_mode,
             lora_paths=batch.lora_paths,
             sampling_info=batch.sampling_info,
             req_to_token_pool=model_runner.req_to_token_pool,
@@ -323,6 +325,7 @@ class ForwardBatch:
             )
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), device=device)
+            ret.prepare_tbo()
             return ret
 
         # Override the positions with spec_info
@@ -725,6 +728,7 @@ class ForwardBatch:
             "req_to_token_pool",
             "token_to_kv_pool",
             "can_run_dp_cuda_graph",
+            "global_forward_mode",
             "spec_info",
             "spec_algorithm",
             "capture_hidden_mode",
@@ -784,7 +788,7 @@ class ForwardBatch:
 def _compute_extend_num_tokens(input_ids, forward_mode: ForwardMode):
     if forward_mode.is_extend():
         return input_ids.shape[0]
-    elif forward_mode.is_decode():
+    elif forward_mode.is_decode() or forward_mode.is_idle():
         return None
     raise NotImplementedError
 

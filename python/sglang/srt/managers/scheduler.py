@@ -1552,8 +1552,8 @@ class Scheduler(
                 and (resolved_deepep_mode == DeepEPMode.low_latency)
             )
         else:
-            local_tbo_split_seq_index = None
-            local_can_run_tbo = False
+            local_tbo_split_seq_index = 0
+            local_can_run_tbo = True
 
         local_info = torch.tensor(
             [
@@ -1562,7 +1562,11 @@ class Scheduler(
                 num_tokens_for_logprob,
                 is_extend_in_batch,
                 local_can_run_tbo,
-                local_batch.forward_mode.value if local_batch is not None else -1,
+                (
+                    local_batch.forward_mode
+                    if local_batch is not None
+                    else ForwardMode.IDLE
+                ).value,
             ],
             dtype=torch.int64,
         )
@@ -1580,12 +1584,24 @@ class Scheduler(
         global_num_tokens_for_logprob = global_info[:, 0, 2].tolist()
         is_extend_in_batch = global_info[:, 0, 3].tolist()
         local_can_run_tbo_aggregated = min(global_info[:, 0, 4].tolist())
-        forward_mode_same = _is_all_same(global_info[:, 0, 5].tolist())
+        forward_modes = global_info[:, 0, 5].tolist()
+
+        non_idle_forward_modes = [
+            x for x in forward_modes if x != ForwardMode.IDLE.value
+        ]
+        forward_mode_same_or_idle = len(non_idle_forward_modes) > 0 and _is_all_same(
+            non_idle_forward_modes
+        )
+        global_forward_mode = (
+            ForwardMode(non_idle_forward_modes[0])
+            if forward_mode_same_or_idle
+            else None
+        )
 
         can_run_tbo = (
             enable_two_batch_overlap
             and local_can_run_tbo_aggregated
-            and forward_mode_same
+            and forward_mode_same_or_idle
         )
 
         if local_batch is None and max(global_num_tokens) > 0:
@@ -1603,6 +1619,7 @@ class Scheduler(
             local_batch.tbo_split_seq_index = (
                 local_tbo_split_seq_index if can_run_tbo else None
             )
+            local_batch.global_forward_mode = global_forward_mode
 
             # Check forward mode for cuda graph
             if not disable_cuda_graph:
