@@ -13,10 +13,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
-from sglang.srt.layers.dp_attention import (
-    get_attention_tp_rank,
-    get_attention_tp_size,
-)
+from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.layers.parameter import BasevLLMParameter
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,

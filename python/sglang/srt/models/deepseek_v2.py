@@ -36,13 +36,13 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.dp_attention import (
+    attn_tp_all_gather,
+    attn_tp_reduce_scatter,
     dp_gather_partial,
     dp_scatter,
     get_attention_dp_size,
     get_attention_tp_rank,
     get_attention_tp_size,
-    attn_tp_all_gather,
-    attn_tp_reduce_scatter,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (

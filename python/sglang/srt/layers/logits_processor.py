@@ -22,14 +22,12 @@ import triton
 import triton.language as tl
 from torch import nn
 
-from sglang.srt.distributed import (
-    tensor_model_parallel_all_gather,
-)
+from sglang.srt.distributed import tensor_model_parallel_all_gather
 from sglang.srt.layers.dp_attention import (
+    attn_tp_all_gather,
     get_attention_dp_rank,
     get_attention_dp_size,
     get_attention_tp_size,
-    attn_tp_all_gather,
 )
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.managers.schedule_batch import global_server_args_dict
@@ -439,7 +437,9 @@ class LogitsProcessor(nn.Module):
                     dtype=logits.dtype,
                 )
                 global_logits = global_logits.T
-                attn_tp_all_gather(list(global_logits.tensor_split(self.attn_tp_size, dim=-1)), logits)
+                attn_tp_all_gather(
+                    list(global_logits.tensor_split(self.attn_tp_size, dim=-1)), logits
+                )
                 logits = global_logits
             else:
                 logits = tensor_model_parallel_all_gather(logits)
