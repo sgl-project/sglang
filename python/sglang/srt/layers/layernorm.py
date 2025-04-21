@@ -37,9 +37,9 @@ if _is_cuda:
 
 if _is_hip:
 
-    import aiter
+    from aiter.ops.rmsnorm import rms_norm, rmsnorm2d_fwd_with_add
 
-    rmsnorm = aiter.rms_norm
+    rmsnorm = rms_norm
 
     def fused_add_rmsnorm(
         x: torch.Tensor,
@@ -47,7 +47,7 @@ if _is_hip:
         w: torch.Tensor,
         eps: float,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        aiter.rmsnorm2d_fwd_with_add(x, x, residual, residual, w, eps)
+        rmsnorm2d_fwd_with_add(x, x, residual, residual, w, eps)
         return x, residual
 
 
