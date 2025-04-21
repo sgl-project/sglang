@@ -54,6 +54,7 @@ class DeepEPBuffer:
         num_experts: int = None,
     ):
         if cls._buffer is not None:
+            print("buffer already exists")
             return cls._buffer
 
         cls._hidden_size = hidden_size
@@ -87,7 +88,13 @@ class DeepEPBuffer:
                 ),
                 num_rdma_bytes,
             )
-
+        print("num_nvl_bytes", num_nvl_bytes)
+        print("num_rdma_bytes", num_rdma_bytes)
+        print("deepep_mode.enable_low_latency()", deepep_mode.enable_low_latency())
+        print(
+            "num_qps_per_rank",
+            num_experts // group.size() if deepep_mode.enable_low_latency() else 1,
+        )
         cls._buffer = Buffer(
             group,
             num_nvl_bytes,
@@ -406,7 +413,20 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         return combined_x, event
 
     def _get_buffer(self):
+        print("dispatch mode", DeepEPBuffer._dispatch_mode)
         DeepEPBuffer.set_dispatch_mode_as_normal()
+        print("set dispatch mode as normal")
+        print("dispatch mode", DeepEPBuffer._dispatch_mode)
+
+        print("get deepep buffer")
+        # print all parameters of get_deepep_buffer
+        print("group", self.group)
+        print("hidden_size", self.hidden_size)
+        print("params_bytes", self.params_bytes)
+        print("deepep_mode", self.deepep_mode)
+        print("num_max_dispatch_tokens_per_rank", self.num_max_dispatch_tokens_per_rank)
+        print("num_experts", self.num_experts)
+
         return DeepEPBuffer.get_deepep_buffer(
             self.group,
             self.hidden_size,
