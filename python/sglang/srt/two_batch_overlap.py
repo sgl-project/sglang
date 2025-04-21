@@ -29,15 +29,13 @@ def compute_split_seq_index(
 ) -> Optional[int]:
     if forward_mode.is_extend():
         assert extend_lens is not None
-        split_seq_index = _split_array_by_half_sum(extend_lens)
+        return _split_array_by_half_sum(extend_lens)
     elif forward_mode.is_decode():
-        split_seq_index = num_tokens // 2
+        return num_tokens // 2
     elif forward_mode.is_idle():
         return 0
     else:
         raise NotImplementedError
-
-    return split_seq_index
 
 
 def _split_array_by_half_sum(arr: Sequence[int]) -> int:
