@@ -35,6 +35,7 @@ from sglang.srt.disaggregation.utils import (
     ReqToMetadataIdxAllocator,
     TransferBackend,
     get_kv_class,
+    kv_to_page_indices,
     poll_and_all_reduce,
 )
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
@@ -121,7 +122,7 @@ class DecodePreallocQueue:
         kv_args.aux_item_lens = [
             metadata_buffer[0].nbytes for metadata_buffer in self.metadata_buffers
         ]
-        kv_args.ib_device = "mock-ib-device"
+        kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.gpu_id
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
         kv_manager = kv_manager_class(
@@ -205,7 +206,10 @@ class DecodePreallocQueue:
                 self.req_to_metadata_buffer_idx_allocator.alloc()
             )
             assert decode_req.metadata_buffer_index is not None
-            decode_req.kv_receiver.init(kv_indices, decode_req.metadata_buffer_index)
+            page_indices = kv_to_page_indices(
+                kv_indices, self.token_to_kv_pool_allocator.page_size
+            )
+            decode_req.kv_receiver.init(page_indices, decode_req.metadata_buffer_index)
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
 
@@ -245,10 +249,30 @@ class DecodePreallocQueue:
         assert req_pool_indices is not None
 
         req.req_pool_idx = req_pool_indices[0]
-        kv_loc = self.token_to_kv_pool_allocator.alloc(
-            len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
-        )
-
+        if self.token_to_kv_pool_allocator.page_size == 1:
+            kv_loc = self.token_to_kv_pool_allocator.alloc(
+                len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+            )
+        else:
+            num_tokens = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+            kv_loc = self.token_to_kv_pool_allocator.alloc_extend(
+                prefix_lens=torch.tensor(
+                    [0],
+                    dtype=torch.int64,
+                    device=self.token_to_kv_pool_allocator.device,
+                ),
+                seq_lens=torch.tensor(
+                    [num_tokens],
+                    dtype=torch.int64,
+                    device=self.token_to_kv_pool_allocator.device,
+                ),
+                last_loc=torch.tensor(
+                    [-1],
+                    dtype=torch.int64,
+                    device=self.token_to_kv_pool_allocator.device,
+                ),
+                extend_num_tokens=num_tokens,
+            )
         assert kv_loc is not None
 
         self.req_to_token_pool.write((req.req_pool_idx, slice(0, len(kv_loc))), kv_loc)

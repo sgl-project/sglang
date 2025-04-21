@@ -286,8 +286,12 @@ class MHATokenToKVPool(KVCache):
             self.get_key_buffer(i).nbytes for i in range(self.layer_num)
         ] + [self.get_value_buffer(i).nbytes for i in range(self.layer_num)]
         kv_item_lens = [
-            self.get_key_buffer(i)[0].nbytes for i in range(self.layer_num)
-        ] + [self.get_value_buffer(i)[0].nbytes for i in range(self.layer_num)]
+            self.get_key_buffer(i)[0].nbytes * self.page_size
+            for i in range(self.layer_num)
+        ] + [
+            self.get_value_buffer(i)[0].nbytes * self.page_size
+            for i in range(self.layer_num)
+        ]
         return kv_data_ptrs, kv_data_lens, kv_item_lens
 
     # Todo: different memory layout
@@ -414,6 +418,7 @@ class MLATokenToKVPool(KVCache):
         enable_memory_saver: bool,
     ):
         self.size = size
+        self.page_size = page_size
         self.dtype = dtype
         self.device = device
         if dtype in (torch.float8_e5m2, torch.float8_e4m3fn):

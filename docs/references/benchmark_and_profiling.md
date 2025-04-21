@@ -41,9 +41,14 @@
   Please make sure that the `SGLANG_TORCH_PROFILER_DIR` should be set at both server and client side, otherwise the trace file cannot be generated correctly . A secure way will be setting `SGLANG_TORCH_PROFILER_DIR` in the `.*rc` file of shell (e.g. `~/.bashrc` for bash shells).
 
 - To profile offline
-
   ```bash
   export SGLANG_TORCH_PROFILER_DIR=/root/sglang/profile_log
+
+  # profile one batch with bench_one_batch.py
+  # batch size can be controlled with --batch argument
+  python3 -m sglang.bench_one_batch --model-path meta-llama/Llama-3.1-8B-Instruct --batch 32 --input-len 1024 --output-len 10 --profile
+
+  # profile multiple batches with bench_offline_throughput.py
   python -m sglang.bench_offline_throughput --model-path meta-llama/Llama-3.1-8B-Instruct --dataset-name random --num-prompts 10 --profile --mem-frac=0.8
   ```
 
