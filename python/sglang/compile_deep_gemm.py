@@ -18,8 +18,11 @@ import time
 import requests
 
 from sglang.srt.entrypoints.http_server import launch_server
+from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
+from sglang.srt.warmup import warmup
 
 multiprocessing.set_start_method("spawn", force=True)
 
@@ -29,11 +32,11 @@ os.environ["SGL_IN_DEEP_GEMM_PRE_COMPILE_STAGE"] = "1"
 
 @dataclasses.dataclass
 class CompileArgs:
-    time_out: int = 600
+    timeout: int = 3600
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
-        parser.add_argument("--time-out", type=int, default=CompileArgs.time_out)
+        parser.add_argument("--timeout", type=int, default=CompileArgs.timeout)
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
@@ -42,6 +45,20 @@ class CompileArgs:
         return cls(
             **{attr: attr_type(getattr(args, attr)) for attr, attr_type in attrs}
         )
+
+
+@warmup("compile-deep-gemm")
+async def warm_up_compile(tokenizer_manager: TokenizerManager):
+    print("\nGenerate warm up request for compiling DeepGEMM...\n")
+    generate_req_input = GenerateReqInput(
+        input_ids=[0, 1, 2, 3],
+        sampling_params={
+            "temperature": 0.0,
+            "max_new_tokens": 2,
+            "ignore_eos": True,
+        },
+    )
+    await tokenizer_manager.generate_request(generate_req_input, None).__anext__()
 
 
 def launch_server_internal(server_args):
@@ -59,7 +76,7 @@ def launch_server_process_and_send_one_request(
     proc = multiprocessing.Process(target=launch_server_internal, args=(server_args,))
     proc.start()
     base_url = f"http://{server_args.host}:{server_args.port}"
-    timeout = compile_args.time_out
+    timeout = compile_args.timeout
 
     start_time = time.time()
     while time.time() - start_time < timeout:
@@ -69,33 +86,25 @@ def launch_server_process_and_send_one_request(
             }
             response = requests.get(f"{base_url}/v1/models", headers=headers)
             if response.status_code == 200:
-                # Resend a request to comfirm warmup is finished
-                response = requests.post(
-                    f"{base_url}/generate",
-                    json={
-                        "input_ids": [0, 1, 2, 3],
-                        "sampling_params": {
-                            "temperature": 0,
-                            "max_new_tokens": 2,
-                            "ignore_eos": True,
-                        },
-                    },
-                )
                 return proc
         except requests.RequestException:
             pass
         time.sleep(10)
-    raise TimeoutError("Server failed to start within the timeout period.")
+    raise TimeoutError(
+        "DeepGEMM Kernels compilation timeout."
+        "\n\nFeel free and please restart the command."
+    )
 
 
-def refine_server_args(server_args: ServerArgs):
+def refine_server_args(server_args: ServerArgs, compile_args: CompileArgs):
     # Disbale cuda graph and torch compile to save time
     server_args.disable_cuda_graph = True
     server_args.enable_torch_compile = False
     print(f"Disable CUDA Graph and Torch Compile to save time...")
 
-    # Set watchdog timeout to 1 hours because compilation will take a long time
-    server_args.watchdog_timeout = 3600 * 1
+    # Set watchdog timeout to compile_args.timeout because compilation will take a long time
+    server_args.watchdog_timeout = compile_args.timeout
+    server_args.warmups = "compile-deep-gemm"
 
 
 def run_compile(server_args: ServerArgs, compile_args: CompileArgs):
@@ -122,6 +131,6 @@ if __name__ == "__main__":
     server_args = ServerArgs.from_cli_args(args)
     compile_args = CompileArgs.from_cli_args(args)
 
-    refine_server_args(server_args)
+    refine_server_args(server_args, compile_args)
 
     run_compile(server_args, compile_args)

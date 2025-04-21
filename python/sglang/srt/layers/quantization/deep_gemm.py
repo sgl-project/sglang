@@ -355,6 +355,10 @@ def gemm_nt_f8f8bf16(
 
 @contextmanager
 def _log_jit_build(M: int, N: int, K: int, kernel_type: DeepGemmKernelType):
+    if _IN_PRE_COMPILE_STAGE:
+        yield
+        return
+
     from deep_gemm.jit.runtime import RuntimeCache
 
     origin_func = RuntimeCache.__getitem__
