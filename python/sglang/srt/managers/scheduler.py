@@ -304,7 +304,6 @@ class Scheduler(
         ################################################################################
         print("HACK!!!! temp stop_profile")
         self.stop_profile()
-        raise Exception("hello exception")
         ################################################################################
 
         # Launch a draft worker for speculative decoding
