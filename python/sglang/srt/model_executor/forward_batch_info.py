@@ -747,6 +747,7 @@ class ForwardBatch:
 
         # TODO improve, e.g. unify w/ `init_raw`
         from sglang.srt.managers.schedule_batch import global_server_args_dict
+
         if global_server_args_dict["moe_dense_tp_size"] == 1:
             sum_len = end_token_index - start_token_index
             gathered_buffer = torch.zeros(
