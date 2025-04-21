@@ -923,7 +923,7 @@ class DeepseekV2AttentionMLA(nn.Module):
     ) -> torch.Tensor:
         # TODO optimize this part
         if len(state) == 1:
-            hidden_states, = state
+            (hidden_states,) = state
             return hidden_states
 
         q_input, k_input, v_input, forward_batch = state
