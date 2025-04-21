@@ -26,9 +26,9 @@ from sglang.srt.utils import set_weight_attrs
 
 _is_cuda = is_cuda()
 
-if not _is_cuda:
-    from vllm import _custom_ops as vllm_ops
-    from vllm._custom_ops import scaled_fp8_quant
+# if not _is_cuda:
+from vllm import _custom_ops as vllm_ops
+from vllm._custom_ops import scaled_fp8_quant
 
 try:
     import vllm
@@ -75,9 +75,7 @@ class CompressedTensorsMoEMethod:
             # 2. Non-FP16 dtype (MarlinMoE only supports FP16)
             # 3. Actorder is not group/dynamic (g_idx is unsupported)
             # 4. Scaled are grouped (channelwise is unsupported)
-            if ((layer.local_num_experts >= 16
-                 or layer.params_dtype != torch.float16) and
-                    weight_quant.actorder not in (ActivationOrdering.GROUP,
+            if (weight_quant.actorder not in (ActivationOrdering.GROUP,
                                                   ActivationOrdering.DYNAMIC)
                     and weight_quant.strategy in QuantizationStrategy.GROUP):
                 return CompressedTensorsWNA16MoEMethod(quant_config)
@@ -368,9 +366,9 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
         **extra_weight_attrs,
     ):
 
-        assert (
-            params_dtype == torch.float16
-        ), "float16 is required for MoE compressed models. Set dtype=torch.float16"  # noqa: E501
+        # assert (
+        #     params_dtype == torch.float16
+        # ), "float16 is required for MoE compressed models. Set dtype=torch.float16"  # noqa: E501
 
         intermediate_size_full = extra_weight_attrs.pop("intermediate_size_full")
 
