@@ -1582,7 +1582,7 @@ class Scheduler(
         forward_modes = global_info[:, 0, 5].tolist()
 
         forward_mode_same = _is_all_same(forward_modes)
-        global_forward_mode = ForwardMode[forward_modes[0]] if forward_mode_same else None
+        global_forward_mode = ForwardMode(forward_modes[0]) if forward_mode_same else None
 
         can_run_tbo = (
             enable_two_batch_overlap
