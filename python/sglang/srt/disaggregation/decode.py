@@ -449,7 +449,7 @@ class SchedulerDisaggregationDecodeMixin:
             self.server_args.enable_dp_attention
             or self.server_args.enable_sp_layernorm
         ):
-            batch, _ = self.prepare_dp_attn_batch(batch)
+            batch, _ = self.prepare_dp_attn_batch(None)
             if batch:
                 _ = self.run_batch(batch)
 
