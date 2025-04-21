@@ -1661,6 +1661,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             state.hidden_states_after_attn,
             state.residual_after_input_ln,
         )
+        del state.hidden_states_after_attn, state.residual_after_input_ln
 
         # TODO adhoc code, do not copy-paste
         if self.attn_tp_size != 1:
@@ -1691,7 +1692,6 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states,
             residual,
         )
-        del state.hidden_states_after_attn, state.residual_after_input_ln
 
     # TODO some logic should be in MLP, refactor this
     def _forward_tbo_op_compute_layer_output(self, state):
