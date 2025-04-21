@@ -1628,11 +1628,12 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
 
     def _forward_tbo_op_post_attn_layernorm(self, state):
-        state.hidden_states_after_post_attn_ln, state.residual_after_post_attn_ln = (
-            self.post_attention_layernorm(
-                state.hidden_states_after_attn, state.residual_after_input_ln
+        hidden_states, residual = state.hidden_states_after_attn, state.residual_after_input_ln
+        if hidden_states.shape[0] != 0:
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual
             )
-        )
+        state.hidden_states_after_post_attn_ln, state.residual_after_post_attn_ln = hidden_states, residual
 
 
 class DeepseekV2Model(nn.Module):
