@@ -444,15 +444,12 @@ class ScheduleBatchDisaggregationDecodeMixin:
 
 class SchedulerDisaggregationDecodeMixin:
     
-    def _process_idle_batch_and_run(self):
-        if (
-            self.server_args.enable_dp_attention
-            or self.server_args.enable_sp_layernorm
-        ):
-            batch, _ = self.prepare_dp_attn_batch(None)
-            if batch:
-                result = self.run_batch(batch)
-                self.process_batch_result(batch, result)
+    
+    def _prepare_idle_batch_and_run(self, batch):
+        batch, _ = self.prepare_dp_attn_batch(batch)
+        if batch:
+            result = self.run_batch(batch)
+            self.process_batch_result(batch, result)
 
     @torch.no_grad()
     def event_loop_normal_disagg_decode(self):
@@ -471,12 +468,26 @@ class SchedulerDisaggregationDecodeMixin:
                 if batch.forward_mode.is_extend():
                     # Note: Logprobs should be handled on the prefill engine.
                     self.stream_output(batch.reqs, False)
-                    self._process_idle_batch_and_run()
+                    if (
+                        self.server_args.enable_dp_attention
+                        or self.server_args.enable_sp_layernorm
+                    ):
+                        self._prepare_idle_batch_and_run(None)
+                        
                 else:
+                    if (
+                        self.server_args.enable_dp_attention
+                        or self.server_args.enable_sp_layernorm
+                    ):
+                        batch, _ = self.prepare_dp_attn_batch(batch)
                     result = self.run_batch(batch)
                     self.process_batch_result(batch, result)
             else:
-                self._process_idle_batch_and_run()
+                if (
+                    self.server_args.enable_dp_attention
+                    or self.server_args.enable_sp_layernorm
+                ):
+                    self._prepare_idle_batch_and_run(None)
 
             if batch is None and (
                 len(self.disagg_decode_transfer_queue.queue)
