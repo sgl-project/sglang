@@ -1583,11 +1583,12 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         tbo_subbatch_index: int,
     ):
+        # TODO adhoc code, avoid copy-pasting these
         if hidden_states.shape[0] == 0:
             residual = hidden_states
         else:
-            hidden_states, residual = (
-                self._forward_input_layernorm(hidden_states, residual)
+            hidden_states, residual = self._forward_input_layernorm(
+                hidden_states, residual
             )
 
         if self.attn_tp_size != 1 and self.input_is_scattered:
