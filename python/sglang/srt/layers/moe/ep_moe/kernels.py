@@ -18,10 +18,10 @@ logger = logging.getLogger(__name__)
 
 
 import random
-import torch.nn.functional as F
-import triton.language as tl
 from typing import Dict
 
+import torch.nn.functional as F
+import triton.language as tl
 
 
 @triton.jit
@@ -716,7 +716,6 @@ def grouped_gemm_triton(
     return c
 
 
-
 @triton.jit
 def _fwd_kernel_ep_scatter_1(
     num_recv_tokens_per_expert,
@@ -729,7 +728,11 @@ def _fwd_kernel_ep_scatter_1(
     cur_expert = tl.program_id(0)
 
     offset_cumsum = tl.arange(0, BLOCK_EXPERT_NUM)
-    tokens_per_expert = tl.load(num_recv_tokens_per_expert + offset_cumsum, mask=offset_cumsum < num_experts, other=0)
+    tokens_per_expert = tl.load(
+        num_recv_tokens_per_expert + offset_cumsum,
+        mask=offset_cumsum < num_experts,
+        other=0,
+    )
     cumsum = tl.cumsum(tokens_per_expert) - tokens_per_expert
     tl.store(expert_start_loc + offset_cumsum, cumsum, mask=offset_cumsum < num_experts)
 
@@ -785,15 +788,24 @@ def _fwd_kernel_ep_scatter_2(
 
     for token_id in range(start_token_id, total_token_num, grid_num):
         to_copy = tl.load(recv_x + token_id * recv_x_stride0 + offset_in, mask=mask)
-        to_copy_s = tl.load(recv_x_scale + token_id * recv_x_scale_stride0 + offset_in_s, mask=mask_s)
+        to_copy_s = tl.load(
+            recv_x_scale + token_id * recv_x_scale_stride0 + offset_in_s, mask=mask_s
+        )
 
         for topk_index in tl.range(0, topk_num, 1, num_stages=4):
             expert_id = tl.load(recv_topk + token_id * recv_topk_stride0 + topk_index)
             if expert_id >= 0:
                 dest_token_index = tl.atomic_add(expert_start_loc + expert_id, 1)
-                tl.store(output_index + token_id * output_index_stride0 + topk_index, dest_token_index)
-                output_tensor_ptr = output_tensor + dest_token_index * output_tensor_stride0
-                output_tensor_scale_ptr = output_tensor_scale + dest_token_index * output_tensor_scale_stride0
+                tl.store(
+                    output_index + token_id * output_index_stride0 + topk_index,
+                    dest_token_index,
+                )
+                output_tensor_ptr = (
+                    output_tensor + dest_token_index * output_tensor_stride0
+                )
+                output_tensor_scale_ptr = (
+                    output_tensor_scale + dest_token_index * output_tensor_scale_stride0
+                )
                 tl.store(output_tensor_ptr + offset_in, to_copy, mask=mask)
                 tl.store(output_tensor_scale_ptr + offset_in_s, to_copy_s, mask=mask_s)
 
@@ -813,7 +825,9 @@ def ep_scatter(
     BLOCK_E = 128  # token num of per expert is aligned to 128
     BLOCK_D = 128  # block size of quantization
     num_warps = 8
-    num_experts = num_recv_tokens_per_expert.shape[0]  # 获取num_recv_tokens_per_expert的元素个数
+    num_experts = num_recv_tokens_per_expert.shape[
+        0
+    ]  # 获取num_recv_tokens_per_expert的元素个数
     hidden_size = recv_x.shape[1]
     # grid = (triton.cdiv(hidden_size, BLOCK_D), num_experts)
     grid = num_experts
@@ -892,15 +906,29 @@ def _fwd_kernel_ep_gather(
         off_d = tl.arange(0, BLOCK_D)
         accumulator = tl.zeros([BLOCK_D], dtype=tl.float32)
         for topk_index in range(0, topk_num):
-            expert_id = tl.load(recv_topk_ids + cur_token * recv_topk_ids_stride0 + topk_index)
+            expert_id = tl.load(
+                recv_topk_ids + cur_token * recv_topk_ids_stride0 + topk_index
+            )
             if expert_id >= 0:
-                source_token_index = tl.load(input_index + cur_token * input_index_stride0 + topk_index)
-                acc_weight = tl.load(recv_topk_weight + cur_token * recv_topk_weight_stride0 + topk_index)
-                tmp = tl.load(input_tensor + source_token_index * input_tensor_stride0 + cur_block * BLOCK_D + off_d)
+                source_token_index = tl.load(
+                    input_index + cur_token * input_index_stride0 + topk_index
+                )
+                acc_weight = tl.load(
+                    recv_topk_weight + cur_token * recv_topk_weight_stride0 + topk_index
+                )
+                tmp = tl.load(
+                    input_tensor
+                    + source_token_index * input_tensor_stride0
+                    + cur_block * BLOCK_D
+                    + off_d
+                )
                 accumulator += tmp.to(tl.float32) * acc_weight
 
         tl.store(
-            output_tensor + cur_token * output_tensor_stride0 + cur_block * BLOCK_D + off_d,
+            output_tensor
+            + cur_token * output_tensor_stride0
+            + cur_block * BLOCK_D
+            + off_d,
             accumulator.to(output_tensor.dtype.element_ty),
         )
 
@@ -964,7 +992,6 @@ def get_tma_aligned_size(x: int, element_size: int) -> int:
     return ceil_div(x, alignment) * alignment
 
 
-
 @triton.jit
 def _tma_align_input_scale_kernel(
     input_scale_ptr,
@@ -982,17 +1009,26 @@ def _tma_align_input_scale_kernel(
     k_offsets = tl.arange(0, BLOCK_SIZE_K)
 
     for m_base in range(pid_m, m, grid_m):
-        input_offset = input_scale_ptr + m_base * input_scale_stride_m + k_offsets * input_scale_stride_k
+        input_offset = (
+            input_scale_ptr
+            + m_base * input_scale_stride_m
+            + k_offsets * input_scale_stride_k
+        )
         input_data = tl.load(input_offset, mask=k_offsets < k_div_block_size)
 
-        output_offset = output_ptr + k_offsets * output_stride_k + m_base * output_stride_m
+        output_offset = (
+            output_ptr + k_offsets * output_stride_k + m_base * output_stride_m
+        )
         tl.store(output_offset, input_data, mask=k_offsets < k_div_block_size)
+
 
 def tma_align_input_scale(input_scale: torch.Tensor):
     assert input_scale.dim() == 2
     m, k_div_block_size = input_scale.shape
     padd_m = get_tma_aligned_size(m, input_scale.element_size())
-    output = torch.empty((k_div_block_size, padd_m), dtype=input_scale.dtype, device=input_scale.device)
+    output = torch.empty(
+        (k_div_block_size, padd_m), dtype=input_scale.dtype, device=input_scale.device
+    )
 
     grid_m = min(m, 8192)
     BLOCK_SIZE_K = triton.next_power_of_2(k_div_block_size)

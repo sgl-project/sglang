@@ -1,15 +1,13 @@
-from sglang.srt.utils import DeepEPMode
+from sglang.srt.utils import DeepEPMode, get_bool_env_var, get_device_sm
 
-from sglang.srt.utils import (
-    get_bool_env_var,
-    get_device_sm,
-)
-
+_enable_jit_deepgemm = False
 try:
     from deep_ep import Buffer
+
     from sglang.srt.layers.quantization.fp8_kernel import (
         sglang_per_token_group_quant_fp8,
     )
+
     sm_version = get_device_sm()
     if sm_version == 90:
         if get_bool_env_var("SGL_ENABLE_JIT_DEEPGEMM", default="false"):
@@ -198,26 +196,28 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         return hidden_states, topk_idx, topk_weights, previous_event
 
     def dispatch_b(self, hidden_states, topk_idx, topk_weights, previous_event):
-        event.current_stream_wait() if self.async_finish else ()
         if _enable_jit_deepgemm:
-            #TODO hard code 128 block quant
-            hidden_states=sglang_per_token_group_quant_fp8(hidden_states,128)
+            # TODO hard code 128 block quant
+            hidden_states = sglang_per_token_group_quant_fp8(hidden_states, 128)
             (
                 hidden_states,
                 topk_idx,
                 topk_weights,
                 num_recv_tokens_per_expert_list,
                 event,
-            ) = self._dispatch_core(hidden_states, topk_idx, topk_weights, previous_event)
+            ) = self._dispatch_core(
+                hidden_states, topk_idx, topk_weights, previous_event
+            )
+            event.current_stream_wait() if self.async_finish else ()
             return (
                 hidden_states,
                 topk_idx,
                 topk_weights,
                 num_recv_tokens_per_expert_list,
-                _,
-                _,
-                _,
-                _,
+                None,
+                None,
+                None,
+                None,
             )
         else:
             (
@@ -226,7 +226,10 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
                 topk_weights,
                 num_recv_tokens_per_expert_list,
                 event,
-            ) = self._dispatch_core(hidden_states, topk_idx, topk_weights, previous_event)
+            ) = self._dispatch_core(
+                hidden_states, topk_idx, topk_weights, previous_event
+            )
+            event.current_stream_wait() if self.async_finish else ()
             if hidden_states.shape[0] > 0:
                 reorder_topk_ids, seg_indptr, hidden_states = self._deepep_permute(
                     hidden_states, topk_idx, fp8_dtype=hidden_states.dtype
@@ -236,7 +239,9 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
                     (0,), device=hidden_states.device, dtype=torch.int64
                 )
                 seg_indptr = torch.zeros(
-                    (self.num_experts + 1,), device=hidden_states.device, dtype=torch.int64
+                    (self.num_experts + 1,),
+                    device=hidden_states.device,
+                    dtype=torch.int64,
                 )
 
             masked_m = expected_m = None
@@ -245,7 +250,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
                 hidden_states,
                 topk_idx,
                 topk_weights,
-                _,
+                None,
                 reorder_topk_ids,
                 seg_indptr,
                 masked_m,
@@ -351,10 +356,10 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
     ):
-        #TODO support deepgemm
+        # TODO support deepgemm
         previous_event = Buffer.capture() if self.async_finish else None
         if _enable_jit_deepgemm:
-            return hidden_states,previous_event
+            return hidden_states, previous_event
         else:
             if hidden_states.shape[0] > 0:
                 num_tokens = self.src2dst.shape[0] // self.router_topk
@@ -379,7 +384,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
                     device=hidden_states.device,
                     dtype=hidden_states.dtype,
                 )
-        
+
         return output, previous_event
 
     def combine_b(self, output, previous_event):

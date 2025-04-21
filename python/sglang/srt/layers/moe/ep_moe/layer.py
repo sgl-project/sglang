@@ -7,14 +7,15 @@ from torch.nn import Module
 try:
     from deep_gemm import (
         get_col_major_tma_aligned_tensor,
-        m_grouped_gemm_fp8_fp8_bf16_nt_masked,
         m_grouped_gemm_fp8_fp8_bf16_nt_contiguous,
-        tma_align_input_scale,
+        m_grouped_gemm_fp8_fp8_bf16_nt_masked,
     )
-    from sgl_kernel import  silu_and_mul
+    from sgl_kernel import silu_and_mul
+
     from sglang.srt.layers.quantization.fp8_kernel import (
         sglang_per_token_group_quant_fp8,
     )
+
     use_deep_gemm = True
 except ImportError:
     use_deep_gemm = False
@@ -25,6 +26,8 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.layers.moe.ep_moe.kernels import (
+    ep_gather,
+    ep_scatter,
     gelu_and_mul_triton_kernel,
     grouped_gemm_triton,
     post_reorder_triton_kernel,
@@ -32,8 +35,7 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     run_moe_ep_preproess,
     silu_and_mul_masked_post_quant_fwd,
     silu_and_mul_triton_kernel,
-    ep_scatter,
-    ep_gather,
+    tma_align_input_scale,
 )
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoEMethodBase
@@ -849,8 +851,8 @@ class DeepEPMoE(EPMoE):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        topk_idx:torch.Tensor,
-        topk_weights:torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
         reorder_topk_ids: torch.Tensor,
         seg_indptr: torch.Tensor,
         masked_m: torch.Tensor,
@@ -860,8 +862,11 @@ class DeepEPMoE(EPMoE):
     ):
         resolved_deepep_mode = self.deepep_mode.resolve(forward_mode)
         if resolved_deepep_mode == DeepEPMode.normal:
+            print("ffffffffffff ", use_deep_gemm)
             if use_deep_gemm:
-                return self.forward_deepgemm_contiguous(hidden_states,topk_idx,topk_weights,num_recv_tokens_per_expert)
+                return self.forward_deepgemm_contiguous(
+                    hidden_states, topk_idx, topk_weights, num_recv_tokens_per_expert
+                )
             else:
                 return self.forward_normal(hidden_states, reorder_topk_ids, seg_indptr)
         elif resolved_deepep_mode == DeepEPMode.low_latency:
@@ -982,7 +987,6 @@ class DeepEPMoE(EPMoE):
             )
         return down_output
 
-
     def forward_deepgemm_contiguous(
         self,
         topk_idx,
@@ -998,18 +1002,35 @@ class DeepEPMoE(EPMoE):
 
         all_tokens = sum(num_recv_tokens_per_expert)
 
-        gather_out = torch.empty_like(hidden_states_fp8[0], device=hidden_states_fp8[0].device, dtype=hidden_states_fp8[0].dtype)
+        gather_out = torch.empty_like(
+            hidden_states_fp8[0],
+            device=hidden_states_fp8[0].device,
+            dtype=hidden_states_fp8[0].dtype,
+        )
         if all_tokens > 0:
             input_tensor = [
-                torch.empty((all_tokens, K), device=hidden_states_fp8[0].device, dtype=hidden_states_fp8[0].dtype),
-                torch.empty((all_tokens, K // 128), device=hidden_states_fp8[0].device, dtype=torch.float32),
+                torch.empty(
+                    (all_tokens, K),
+                    device=hidden_states_fp8[0].device,
+                    dtype=hidden_states_fp8[0].dtype,
+                ),
+                torch.empty(
+                    (all_tokens, K // 128),
+                    device=hidden_states_fp8[0].device,
+                    dtype=torch.float32,
+                ),
             ]
-            m_indices = torch.empty(all_tokens, device=hidden_states_fp8[0].device, dtype=torch.int32)
+            m_indices = torch.empty(
+                all_tokens, device=hidden_states_fp8[0].device, dtype=torch.int32
+            )
             output_index = torch.empty_like(topk_idx)
 
             num_recv_tokens_per_expert_gpu = torch.tensor(
-                    num_recv_tokens_per_expert, dtype=torch.int32, pin_memory=True, device="cpu"
-                ).cuda(non_blocking=True)
+                num_recv_tokens_per_expert,
+                dtype=torch.int32,
+                pin_memory=True,
+                device="cpu",
+            ).cuda(non_blocking=True)
             expert_start_loc = torch.empty_like(num_recv_tokens_per_expert_gpu)
 
             ep_scatter(
@@ -1024,9 +1045,15 @@ class DeepEPMoE(EPMoE):
                 output_index,
             )
 
-            gateup_output = torch.empty((all_tokens, N), device=hidden_states_fp8[0].device, dtype=torch.bfloat16)
+            gateup_output = torch.empty(
+                (all_tokens, N),
+                device=hidden_states_fp8[0].device,
+                dtype=torch.bfloat16,
+            )
             input_tensor[1] = tma_align_input_scale(input_tensor[1])
-            m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(input_tensor, self.w13_weight_fp8, gateup_output, m_indices)
+            m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(
+                input_tensor, self.w13_weight_fp8, gateup_output, m_indices
+            )
             down_input = torch.empty(
                 (
                     all_tokens,
@@ -1043,23 +1070,26 @@ class DeepEPMoE(EPMoE):
                 device=gateup_output.device,
                 dtype=torch.float32,
             )
-            silu_and_mul(gateup_output.view(-1, N),down_input)
-            down_output = torch.empty((all_tokens, K), device=hidden_states_fp8[0].device, dtype=torch.bfloat16)
-            down_input_fp8=sglang_per_token_group_quant_fp8(down_input,scale_block_size)
-
+            silu_and_mul(gateup_output.view(-1, N), down_input)
+            down_output = torch.empty(
+                (all_tokens, K),
+                device=hidden_states_fp8[0].device,
+                dtype=torch.bfloat16,
+            )
+            down_input_fp8, down_input_scale = sglang_per_token_group_quant_fp8(
+                down_input, scale_block_size
+            )
+            down_input_scale = tma_align_input_scale(down_input_scale)
             m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(
-               down_input_fp8, self, self.w2_weight_fp8,down_output ,m_indices)
-            
-            
+                (down_input_fp8, down_input_scale),
+                self.w2_weight_fp8,
+                down_output,
+                m_indices,
+            )
+
             ep_gather(down_output, topk_idx, topk_weights, output_index, gather_out)
 
-
-    
-
         return gather_out
-
-
-
 
     def forward_deepgemm_masked(
         self,
