@@ -1032,7 +1032,7 @@ class DeepEPMoE(EPMoE):
         assert self.activation == "silu"
 
         # GroupGemm-0
-        num_groups, m, k = hidden_states_fp8[0].size()
+        num_groups, m, k = hidden_states_fp8[0].shape
         n = self.w13_weight.size(1)
         expected_m = min(expected_m, m)
         gateup_output = torch.empty(
@@ -1040,12 +1040,14 @@ class DeepEPMoE(EPMoE):
         )
         with _ensure_get_col_major_tma_aligned_tensor_noop():
             m_grouped_gemm_fp8_fp8_bf16_nt_masked(
-                hidden_states_fp8,
+                DisposibleTensor.maybe_unwrap(hidden_states_fp8),
                 self.w13_weight_fp8,
                 gateup_output,
                 masked_m,
                 expected_m,
             )
+        DisposibleTensor.maybe_dispose(hidden_states_fp8[0])
+        DisposibleTensor.maybe_dispose(hidden_states_fp8[1])
 
         # Act
         down_input = torch.empty(
