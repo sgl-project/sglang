@@ -456,7 +456,6 @@ class MLATokenToKVPool(KVCache):
         kv_item_lens = [
             self.kv_buffer[i][0].nbytes * self.page_size for i in range(self.layer_num)
         ]
-        # kv_item_lens = [self.kv_buffer[i].nbytes for i in range(self.layer_num)]
         return kv_data_ptrs, kv_data_lens, kv_item_lens
 
     def get_key_buffer(self, layer_id: int):
