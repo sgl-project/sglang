@@ -443,6 +443,16 @@ class ScheduleBatchDisaggregationDecodeMixin:
 
 
 class SchedulerDisaggregationDecodeMixin:
+    
+    def _process_idle_batch_and_run(self):
+        if (
+            self.server_args.enable_dp_attention
+            or self.server_args.enable_sp_layernorm
+        ):
+            batch, _ = self.prepare_dp_attn_batch(batch)
+            if batch:
+                result = self.run_batch(batch)
+                # self.process_batch_result(batch, result)
 
     @torch.no_grad()
     def event_loop_normal_disagg_decode(self):
@@ -454,31 +464,19 @@ class SchedulerDisaggregationDecodeMixin:
             # polling and allocating kv cache
             self.process_decode_queue()
             batch = self.get_next_disagg_decode_batch_to_run()
-
-            is_real_batch = True
-
-            if batch and batch.forward_mode.is_extend():
-                self.cur_batch = batch
-                # Generate fake extend output.
-                # Note: Logprobs should be handled on the prefill engine.
-                self.stream_output(batch.reqs, False)
-                self.last_batch = batch
-                batch = None
-                is_real_batch = False
-
-            # Handle DP attention
-            if (
-                self.server_args.enable_dp_attention
-                or self.server_args.enable_sp_layernorm
-            ):
-                batch, _ = self.prepare_dp_attn_batch(batch)
-
-            if is_real_batch:
-                self.cur_batch = batch
+            self.cur_batch = batch
 
             if batch:
-                result = self.run_batch(batch)
-                self.process_batch_result(batch, result)
+                # Generate fake extend output.
+                if batch.forward_mode.is_extend():
+                    # Note: Logprobs should be handled on the prefill engine.
+                    self.stream_output(batch.reqs, False)
+                    self._process_idle_batch_and_run()
+                else:
+                    result = self.run_batch(batch)
+                    self.process_batch_result(batch, result)
+            else:
+                self._process_idle_batch_and_run()
 
             if batch is None and (
                 len(self.disagg_decode_transfer_queue.queue)
@@ -489,8 +487,7 @@ class SchedulerDisaggregationDecodeMixin:
                 self.check_memory()
                 self.new_token_ratio = self.init_new_token_ratio
 
-            if is_real_batch:
-                self.last_batch = batch
+            self.last_batch = batch
 
     @torch.no_grad()
     def event_loop_overlap_disagg_decode(self):
@@ -513,9 +510,12 @@ class SchedulerDisaggregationDecodeMixin:
                     # Note: Logprobs should be handled on the prefill engine.
                     self.stream_output(batch.reqs, False)
                     last_batch_is_extend = True
+                    self._process_idle_batch_and_run()
                 else:
                     result = self.run_batch(batch)
                     result_queue.append((batch.copy(), result))
+            else:
+                self._process_idle_batch_and_run()
 
             # Process the results of the previous batch but skip if the last batch is extend
             if self.last_batch and not self.last_batch_is_extend:
