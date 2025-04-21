@@ -1851,15 +1851,22 @@ class DeepseekV2Model(nn.Module):
         )
         del hidden_states, residual
 
-        if self.attn_tp_size != 1:
-            assert residual is None
-            hidden_states, local_hidden_states = (
-                forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
-                hidden_states,
-            )
-            tp_all_gather(
-                list(hidden_states.tensor_split(self.attn_tp_size)), local_hidden_states
-            )
+        def _postprocess_splitted_inputs(hidden_states, residual, positions, forward_batch):
+            if self.attn_tp_size != 1:
+                assert residual is None
+                hidden_states, local_hidden_states = (
+                    forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
+                    hidden_states,
+                )
+                tp_all_gather(
+                    list(hidden_states.tensor_split(self.attn_tp_size)), local_hidden_states
+                )
+
+            return dict(
+                hidden_states=hidden_states, residual=residual, positions=positions, forward_batch=forward_batch)
+
+        inputs_a = _postprocess_splitted_inputs(**inputs_a)
+        inputs_b = _postprocess_splitted_inputs(**inputs_b)
 
         # TODO do not hardcode
         total_num_sm = torch.cuda.get_device_properties(
