@@ -1697,7 +1697,10 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual = state.pop("residual_after_post_attn_ln")
 
         if (shared_output := state.pop("shared_output")) is not None:
-            hidden_states = torch.add(shared_output, hidden_states, alpha=self.mlp.routed_scaling_factor)
+            # TODO beautify
+            x = shared_output
+            x.add_(hidden_states, alpha=self.mlp.routed_scaling_factor)
+            hidden_states = x
         else:
             hidden_states *= self.mlp.routed_scaling_factor
 
