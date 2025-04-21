@@ -128,7 +128,7 @@ def is_cuda_available():
     return is_cuda()
 
 
-def is_hardware_backend_available():
+def is_gpu_available():
     return is_cuda_available() or is_xpu()
 
 
