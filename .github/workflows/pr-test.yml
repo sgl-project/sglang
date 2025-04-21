@@ -187,8 +187,6 @@ jobs:
         timeout-minutes: 10
         run: |
           cd test/srt
-          USE_VLLM_CUSTOM_ALLREDUCE=1 python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_moe_tp2_bs1
-
           python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_moe_tp2_bs1
 
       - name: Benchmark single latency + torch.compile (TP=2)

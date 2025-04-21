@@ -49,6 +49,7 @@ from sglang.srt.disaggregation.prefill import (
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     ReqToMetadataIdxAllocator,
+    TransferBackend,
 )
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
@@ -113,6 +114,7 @@ from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -231,6 +233,15 @@ class Scheduler(
 
         # Init tokenizer
         self.init_tokenizer()
+
+        # Set reasoning_parser and think_end_id if --reasoning_parser is enabled
+        if self.server_args.reasoning_parser and self.tokenizer:
+            reasoning_parser = ReasoningParser(
+                model_type=self.server_args.reasoning_parser, stream_reasoning=False
+            )
+            self.tokenizer.think_end_id = self.tokenizer.encode(
+                reasoning_parser.detector.think_end_token, add_special_tokens=False
+            )[0]
 
         # Check whether overlap can be enabled
         if not self.is_generation:
@@ -427,6 +438,7 @@ class Scheduler(
             context_length=server_args.context_length,
             model_override_args=server_args.json_model_override_args,
             is_embedding=server_args.is_embedding,
+            enable_multimodal=server_args.enable_multimodal,
             dtype=server_args.dtype,
             quantization=server_args.quantization,
         )
@@ -441,6 +453,7 @@ class Scheduler(
                     tokenizer_mode=server_args.tokenizer_mode,
                     trust_remote_code=server_args.trust_remote_code,
                     revision=server_args.revision,
+                    use_fast=not server_args.disable_fast_image_processor,
                 )
                 self.tokenizer = self.processor.tokenizer
             else:
@@ -518,6 +531,10 @@ class Scheduler(
             )
 
     def init_disaggregation(self):
+        self.transfer_backend = TransferBackend(
+            self.server_args.disaggregation_transfer_backend
+        )
+
         if (
             self.disaggregation_mode == DisaggregationMode.DECODE
         ):  # *2 for the headroom.
@@ -555,6 +572,7 @@ class Scheduler(
                 tp_rank=self.tp_rank,
                 tp_size=self.tp_size,
                 bootstrap_port=self.server_args.disaggregation_bootstrap_port,
+                transfer_backend=self.transfer_backend,
             )
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             # *2 for the headroom.
@@ -580,9 +598,11 @@ class Scheduler(
                 tp_size=self.tp_size,
                 bootstrap_port=self.server_args.disaggregation_bootstrap_port,
                 gloo_group=self.tp_worker.get_attention_tp_cpu_group(),
+                transfer_backend=self.transfer_backend,
+                scheduler=self,
             )
             # The prefill requests that are in the middle of kv sending
-            self.disagg_prefill_infight_queue: List[Req] = []
+            self.disagg_prefill_inflight_queue: List[Req] = []
 
     @DynamicGradMode()
     def event_loop_normal(self):
@@ -662,10 +682,10 @@ class Scheduler(
                 result = self.run_batch(batch)
                 self.process_batch_result_disagg_prefill(batch, result)
 
-            if len(self.disagg_prefill_infight_queue) > 0:
-                self.process_disagg_prefill_infight_queue()
+            if len(self.disagg_prefill_inflight_queue) > 0:
+                self.process_disagg_prefill_inflight_queue()
 
-            if batch is None and len(self.disagg_prefill_infight_queue) == 0:
+            if batch is None and len(self.disagg_prefill_inflight_queue) == 0:
                 self.check_memory()
                 self.new_token_ratio = self.init_new_token_ratio
 
@@ -826,6 +846,8 @@ class Scheduler(
                 custom_logit_processor=custom_logit_processor,
                 return_hidden_states=recv_req.return_hidden_states,
                 eos_token_ids=self.model_config.hf_eos_token_id,
+                bootstrap_host=recv_req.bootstrap_host,
+                bootstrap_room=recv_req.bootstrap_room,
             )
             req.tokenizer = self.tokenizer
 
@@ -937,12 +959,11 @@ class Scheduler(
             self._add_request_to_queue(req)
 
     def _add_request_to_queue(self, req: Req):
+        req.queue_time_start = time.time()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.disagg_prefill_pending_queue.add(req)
-
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.disagg_decode_prealloc_queue.add(req)
-
         else:
             self.waiting_queue.append(req)
 
@@ -985,6 +1006,7 @@ class Scheduler(
                 req.finished_reason = FINISH_ABORT(
                     error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
                 )
+                req.queue_time_start = time.time()
                 self.waiting_queue.append(req)
                 return
 
@@ -1021,9 +1043,10 @@ class Scheduler(
             self._largest_prefill_len, adder.log_input_tokens
         )
 
+        num_new_seq = len(can_run_list)
         f = (
             f"Prefill batch. "
-            f"#new-seq: {len(can_run_list)}, "
+            f"#new-seq: {num_new_seq}, "
             f"#new-token: {adder.log_input_tokens}, "
             f"#cached-token: {adder.log_hit_tokens}, "
             f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
@@ -1041,6 +1064,12 @@ class Scheduler(
             self.stats.token_usage = round(num_used / self.max_total_num_tokens, 2)
             self.stats.num_queue_reqs = len(self.waiting_queue)
             self.stats.cache_hit_rate = cache_hit_rate
+
+            total_queue_latency = 0
+            for req in can_run_list:
+                total_queue_latency += req.queue_time_end - req.queue_time_start
+            self.stats.avg_request_queue_latency = total_queue_latency / num_new_seq
+
             self.metrics_collector.log_stats(self.stats)
 
     def log_decode_stats(self):
@@ -1277,6 +1306,12 @@ class Scheduler(
         can_run_list: List[Req] = adder.can_run_list
         if len(can_run_list) == 0:
             return None
+
+        if self.enable_metrics:
+            # only record queue time when enable_metrics is True to avoid overhead
+            for req in can_run_list:
+                req.queue_time_end = time.time()
+
         self.waiting_queue = [
             x for x in self.waiting_queue if x not in set(can_run_list)
         ]
@@ -1456,14 +1491,36 @@ class Scheduler(
             self.send_to_tokenizer.send_pyobj(HealthCheckOutput())
 
     def prepare_dp_attn_batch(self, local_batch: ScheduleBatch):
+        return self.prepare_dp_attn_batch_raw(
+            local_batch,
+            dp_size=self.server_args.dp_size,
+            attn_tp_size=self.attn_tp_size,
+            tp_cpu_group=self.tp_cpu_group,
+            get_idle_batch=self.get_idle_batch,
+            disable_cuda_graph=self.server_args.disable_cuda_graph,
+            spec_algorithm=self.spec_algorithm,
+            speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
+        )
+
+    @staticmethod
+    def prepare_dp_attn_batch_raw(
+        local_batch: ScheduleBatch,
+        dp_size,
+        attn_tp_size: int,
+        tp_cpu_group,
+        get_idle_batch,
+        disable_cuda_graph: bool,
+        spec_algorithm,
+        speculative_num_draft_tokens,
+    ):
         # Check if other DP workers have running batches
         if local_batch is None:
             num_tokens = 0
             global_num_tokens_for_logprob = 0
         elif local_batch.forward_mode.is_decode():
             num_tokens = local_batch.batch_size()
-            if not self.spec_algorithm.is_none() and self.spec_algorithm.is_eagle():
-                num_tokens = num_tokens * self.server_args.speculative_num_draft_tokens
+            if not spec_algorithm.is_none() and spec_algorithm.is_eagle():
+                num_tokens = num_tokens * speculative_num_draft_tokens
             global_num_tokens_for_logprob = num_tokens
         else:
             num_tokens = local_batch.extend_num_tokens
@@ -1482,7 +1539,7 @@ class Scheduler(
         else:
             can_cuda_graph = 0
 
-        if not self.spec_algorithm.is_none():
+        if not spec_algorithm.is_none():
             # TODO(sang): Support cuda graph when idle batch is there.
             if local_batch is None or local_batch.forward_mode.is_idle():
                 can_cuda_graph = 0
@@ -1500,13 +1557,13 @@ class Scheduler(
             dtype=torch.int64,
         )
         global_info = torch.empty(
-            (self.server_args.dp_size, self.attn_tp_size, 4),
+            (dp_size, attn_tp_size, 4),
             dtype=torch.int64,
         )
         torch.distributed.all_gather_into_tensor(
             global_info.flatten(),
             local_info,
-            group=self.tp_cpu_group,
+            group=tp_cpu_group,
         )
         global_num_tokens = global_info[:, 0, 0].tolist()
         can_cuda_graph = min(global_info[:, 0, 1].tolist())
@@ -1514,14 +1571,14 @@ class Scheduler(
         is_extend_in_batch = global_info[:, 0, 3].tolist()
 
         if local_batch is None and max(global_num_tokens) > 0:
-            local_batch = self.get_idle_batch()
+            local_batch = get_idle_batch()
 
         if local_batch is not None:
             local_batch.global_num_tokens = global_num_tokens
             local_batch.global_num_tokens_for_logprob = global_num_tokens_for_logprob
 
             # Check forward mode for cuda graph
-            if not self.server_args.disable_cuda_graph:
+            if not disable_cuda_graph:
                 local_batch.can_run_dp_cuda_graph = can_cuda_graph
 
         return local_batch, any(is_extend_in_batch)

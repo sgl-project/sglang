@@ -35,9 +35,14 @@ jobs:
     runs-on: sgl-kernel-build-node
     strategy:
       matrix:
-        python-version: ['3.9']
-        cuda-version: ['12.4']
-
+        include:
+          - python-version: '3.9'
+            cuda-version: '11.8'
+          - python-version: '3.9'
+            cuda-version: '12.4'
+          - python-version: '3.9'
+            cuda-version: '12.8'
+    name: Build Wheel (CUDA ${{ matrix.cuda-version }})
     steps:
       - name: Cleanup
         run: |
@@ -52,13 +57,15 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Build wheels for Python ${{ matrix.python-version }} and CUDA ${{ matrix.cuda-version }}
+      - name: Build wheel for Python ${{ matrix.python-version }} and CUDA ${{ matrix.cuda-version }}
+        if: github.event_name != 'push' || (matrix.cuda-version != '11.8' && matrix.cuda-version != '12.8')
         run: |
           cd sgl-kernel
           chmod +x ./build.sh
           ./build.sh "${{ matrix.python-version }}" "${{ matrix.cuda-version }}"
 
-      - name: Upload artifacts
+      - name: Upload artifacts (only for CUDA 12.4)
+        if: ${{ matrix.cuda-version == '12.4' }}
         uses: actions/upload-artifact@v4
         with:
           name: wheel-python${{ matrix.python-version }}-cuda${{ matrix.cuda-version }}
@@ -81,7 +88,7 @@ jobs:
       - name: Install
         run: |
           bash scripts/ci_install_dependency.sh
-          pip3 install torch==2.5.1 && pip3 install pytest && pip3 install vllm==0.7.2
+          pip3 install torch==2.5.1 && pip3 install pytest
           pip3 uninstall sgl-kernel -y || true
           pip3 install sgl-kernel/dist/*whl --force-reinstall --no-deps
           pip3 list | grep sgl-kernel
@@ -128,7 +135,7 @@ jobs:
           pip3 uninstall sgl-kernel -y
 
   finish:
-    needs: [unit-test, mla-test, lint]
+    needs: [unit-test, mla-test, lint, build-wheels]
     runs-on: ubuntu-latest
     steps:
       - name: Check all dependent job statuses

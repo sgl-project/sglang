@@ -156,6 +156,7 @@ class ServerArgs:
     disable_outlines_disk_cache: bool = False
     disable_custom_all_reduce: bool = False
     disable_mla: bool = False
+    enable_llama4_multimodal: Optional[bool] = None
     disable_overlap_schedule: bool = False
     enable_mixed_chunk: bool = False
     enable_dp_attention: bool = False
@@ -179,11 +180,11 @@ class ServerArgs:
     tool_call_parser: Optional[str] = None
     enable_hierarchical_cache: bool = False
     hicache_ratio: float = 2.0
-    enable_flashinfer_mla: bool = False
+    enable_flashinfer_mla: bool = False  # TODO: remove this argument
     enable_flashmla: bool = False
     flashinfer_mla_disable_ragged: bool = False
     warmups: Optional[str] = None
-    n_share_experts_fusion: Optional[int] = None
+    n_share_experts_fusion: int = 0
     disable_shared_experts_fusion: bool = False
 
     # Debug tensor dumps
@@ -194,6 +195,10 @@ class ServerArgs:
     # For PD disaggregation: can be "null" (not disaggregated), "prefill" (prefill-only), or "decode" (decode-only)
     disaggregation_mode: str = "null"
     disaggregation_bootstrap_port: int = 8998
+    disaggregation_transfer_backend: str = "mooncake"
+
+    # multimodal
+    disable_fast_image_processor: bool = False
 
     def __post_init__(self):
         # Expert parallelism
@@ -267,15 +272,11 @@ class ServerArgs:
             else:
                 self.cuda_graph_max_bs = 160
 
-        # Choose kernel backends
+        # Set kernel backends for hpu device
         if self.device == "hpu":
             self.attention_backend = "torch_native"
             self.sampling_backend = "pytorch"
 
-        if self.attention_backend is None:
-            self.attention_backend = (
-                "flashinfer" if is_flashinfer_available() else "triton"
-            )
         if self.sampling_backend is None:
             self.sampling_backend = (
                 "flashinfer" if is_flashinfer_available() else "pytorch"
@@ -297,6 +298,8 @@ class ServerArgs:
             logger.info(
                 f"EP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
+
+        self.enable_multimodal: Optional[bool] = self.enable_llama4_multimodal
 
         # Data parallelism attention
         if self.enable_dp_attention:
@@ -499,6 +502,7 @@ class ServerArgs:
                 "bitsandbytes",
                 "gguf",
                 "modelopt",
+                "modelopt_fp4",
                 "w8a8_int8",
                 "w8a8_fp8",
                 "moe_wna16",
@@ -842,7 +846,7 @@ class ServerArgs:
         parser.add_argument(
             "--enable-flashinfer-mla",
             action="store_true",
-            help="Enable FlashInfer MLA optimization",
+            help="Enable FlashInfer MLA optimization. This argument will be deprecated soon! Please use '--attention-backend flashinfer' instead for switching on flashfiner mla!",
         )
         parser.add_argument(
             "--enable-flashmla",
@@ -978,6 +982,12 @@ class ServerArgs:
             help="Disable Multi-head Latent Attention (MLA) for DeepSeek V2/V3/R1 series models.",
         )
         parser.add_argument(
+            "--enable-llama4-multimodal",
+            default=ServerArgs.enable_llama4_multimodal,
+            action="store_true",
+            help="Enable the multimodal functionality for Llama-4.",
+        )
+        parser.add_argument(
             "--disable-overlap-schedule",
             action="store_true",
             help="Disable the overlap scheduler, which overlaps the CPU scheduler with GPU model worker.",
@@ -1104,13 +1114,14 @@ class ServerArgs:
             "--deepep-mode",
             type=str,
             choices=["normal", "low_latency", "auto"],
+            default="auto",
             help="Select the mode when enable DeepEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch.",
         )
 
         parser.add_argument(
             "--n-share-experts-fusion",
             type=int,
-            default=None,
+            default=0,
             help="The number of shared_experts need to be replica to fuse with normal experts in deepseek v3/r1 "
             "we use tp_size by default.",
         )
@@ -1162,6 +1173,19 @@ class ServerArgs:
             type=int,
             default=ServerArgs.disaggregation_bootstrap_port,
             help="Bootstrap server port on the prefill server. Default is 8998.",
+        )
+        parser.add_argument(
+            "--disaggregation-transfer-backend",
+            type=str,
+            default=ServerArgs.disaggregation_transfer_backend,
+            help="The backend for disaggregation transfer. Default is mooncake.",
+        )
+
+        # Multimodal
+        parser.add_argument(
+            "--disable-fast-image-processor",
+            action="store_true",
+            help="Adopt base image processor instead of fast image processor.",
         )
 
     @classmethod

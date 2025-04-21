@@ -24,12 +24,17 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
+import numpy as np
 import torch
 from torch.distributed import ProcessGroup
 
-from sglang.srt.disaggregation.conn import KVArgs, KVManager, KVPoll, KVReceiver
+from sglang.srt.disaggregation.base import BaseKVManager, BaseKVReceiver, KVArgs, KVPoll
 from sglang.srt.disaggregation.utils import (
+    DisaggregationMode,
+    KVClassType,
     ReqToMetadataIdxAllocator,
+    TransferBackend,
+    get_kv_class,
     poll_and_all_reduce,
 )
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
@@ -49,7 +54,7 @@ if TYPE_CHECKING:
 @dataclass
 class DecodeRequest:
     req: Req
-    kv_receiver: KVReceiver
+    kv_receiver: BaseKVReceiver
     waiting_for_input: bool = False
     metadata_buffer_index: int = -1
 
@@ -73,6 +78,7 @@ class DecodePreallocQueue:
         tp_rank: int,
         tp_size: int,
         bootstrap_port: int,
+        transfer_backend: TransferBackend,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -92,9 +98,10 @@ class DecodePreallocQueue:
 
         # Queue for requests pending pre-allocation
         self.queue: List[DecodeRequest] = []
+        self.transfer_backend = transfer_backend
         self.kv_manager = self._init_kv_manager()
 
-    def _init_kv_manager(self) -> KVManager:
+    def _init_kv_manager(self) -> BaseKVManager:
         kv_args = KVArgs()
         kv_args.engine_rank = self.tp_rank
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
@@ -115,13 +122,18 @@ class DecodePreallocQueue:
             metadata_buffer[0].nbytes for metadata_buffer in self.metadata_buffers
         ]
         kv_args.ib_device = "mock-ib-device"
-        kv_manager = KVManager(kv_args)
+        kv_args.gpu_id = self.scheduler.gpu_id
+        kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
+        kv_manager = kv_manager_class(
+            kv_args, DisaggregationMode.DECODE, self.scheduler.server_args
+        )
         return kv_manager
 
     def add(self, req: Req) -> None:
         """Add a request to the pending queue."""
 
-        kv_receiver = KVReceiver(
+        kv_receiver_class = get_kv_class(self.transfer_backend, KVClassType.RECEIVER)
+        kv_receiver = kv_receiver_class(
             mgr=self.kv_manager,
             bootstrap_addr=f"{req.bootstrap_host}:{self.bootstrap_port}",
             bootstrap_room=req.bootstrap_room,
@@ -186,6 +198,7 @@ class DecodePreallocQueue:
                 ]
                 .cpu()
                 .numpy()
+                .astype(np.int64)
             )
 
             decode_req.metadata_buffer_index = (

@@ -71,7 +71,7 @@ ext_modules = [
         },
         libraries=libraries,
         extra_link_args=extra_link_args,
-        py_limited_api=True,
+        py_limited_api=False,
     ),
 ]
 

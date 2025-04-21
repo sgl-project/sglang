@@ -4,14 +4,16 @@ import dataclasses
 import multiprocessing as mp
 import os
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import List, Optional
 
 import numpy as np
 import PIL
 from decord import VideoReader, cpu
 from PIL import Image
+from transformers import BaseImageProcessorFast
 
-from sglang.srt.utils import encode_video, load_audio, load_image, logger
+from sglang.srt.managers.schedule_batch import Modality
+from sglang.srt.utils import encode_video, load_audio, load_image
 
 
 @dataclasses.dataclass
@@ -78,6 +80,10 @@ class BaseMultimodalProcessor(ABC):
             kwargs["audios"] = audios
 
         processor = self._processor
+        if hasattr(processor, "image_processor") and isinstance(
+            processor.image_processor, BaseImageProcessorFast
+        ):
+            kwargs["device"] = "cuda"
         result = processor.__call__(
             text=[input_text],
             padding=True,
@@ -110,6 +116,84 @@ class BaseMultimodalProcessor(ABC):
             estimated_frames_list.append(num_frames)
 
         return estimated_frames_list
+
+    @staticmethod
+    def _load_single_item(
+        data, is_video, is_audio, frame_count_limit=None, discard_alpha_channel=True
+    ):
+        """Static method that can be pickled for multiprocessing"""
+        try:
+            if is_audio:
+                return load_audio(data)
+            elif is_video:
+                path = data[len("video:") :]
+                return encode_video(path, frame_count_limit)
+            else:
+                img, _ = load_image(data)
+                return img.convert("RGB") if discard_alpha_channel else img
+        except Exception as e:
+            raise RuntimeError(f"Error while loading data {data}: {e}")
+
+    def submit_data_loading_tasks(
+        self,
+        text_parts: List[str],
+        multimodal_tokens: MultimodalSpecialTokens,
+        image_data: Optional[list] = None,
+        audio_data: Optional[list] = None,
+        discard_alpha_channel: bool = True,
+    ):
+        """
+        load multimodal data parallelly
+        """
+
+        # TODO(mick): load from server_args, env, or sampling_params
+        MAX_NUM_FRAMES = 30
+        estimated_frames_list = self.get_estimated_frames_list(image_data=image_data)
+        total_frame_count = sum(estimated_frames_list)
+        # a heuristic value, suggesting the maximum fraction of frames to embed from all visual inputs.
+        # e.g., 0.1 suggests that 1 frame out of 10 input frames should be used
+        scaling_factor = min(1.0, MAX_NUM_FRAMES / max(1, total_frame_count))
+
+        assert len(image_data) == len(estimated_frames_list)
+        # Submit all tasks
+        futures = []
+        task_info = []
+        image_index, audio_index = 0, 0
+
+        for text_part in text_parts:
+            if text_part == multimodal_tokens.image_token:
+                data = image_data[image_index]
+                is_video = isinstance(data, str) and data.startswith("video:")
+                estimated_frames = estimated_frames_list[image_index]
+                frame_count_limit = max(1, int(estimated_frames * scaling_factor))
+                futures.append(
+                    self.io_executor.submit(
+                        BaseMultimodalProcessor._load_single_item,
+                        data,
+                        is_video,
+                        False,
+                        frame_count_limit,
+                        discard_alpha_channel,
+                    )
+                )
+                task_info.append((Modality.IMAGE, data, frame_count_limit))
+                image_index += 1
+            elif text_part == multimodal_tokens.audio_token:
+                data = audio_data[audio_index]
+                futures.append(
+                    self.io_executor.submit(
+                        BaseMultimodalProcessor._load_single_item,
+                        data,
+                        False,
+                        True,
+                        None,
+                        discard_alpha_channel,
+                    )
+                )
+                task_info.append((Modality.AUDIO, data, None))
+                audio_index += 1
+
+        return futures, task_info
 
     def load_mm_data(
         self,
@@ -155,84 +239,37 @@ class BaseMultimodalProcessor(ABC):
             # split text into list of normal text and special tokens
             text_parts = re.split(pattern, prompt)
 
-        # TODO(mick): load from server_args, env, or sampling_params
-        MAX_NUM_FRAMES = 30
-        estimated_frames_list = self.get_estimated_frames_list(image_data=image_data)
-        total_frame_count = sum(estimated_frames_list)
-        # a heuristic value, suggesting the maximum fraction of frames to embed from all visual inputs.
-        # e.g., 0.1 suggests that 1 frame out of 10 input frames should be used
-        scaling_factor = min(1.0, MAX_NUM_FRAMES / max(1, total_frame_count))
-
-        assert len(image_data) == len(estimated_frames_list)
-
-        image_index, audio_index = 0, 0
-        hashes, image_sizes, images, audios = [], [], [], []
+        futures, task_info = self.submit_data_loading_tasks(
+            text_parts=text_parts,
+            multimodal_tokens=multimodal_tokens,
+            image_data=image_data,
+            audio_data=audio_data,
+            discard_alpha_channel=discard_alpha_channel,
+        )
+        # Process results
+        image_sizes, images, audios = [], [], []
         new_text = ""
-        for index, text_part in enumerate(text_parts):
-            try:
-                if text_part == multimodal_tokens.image_token:
-                    # load as image
-                    if len(images) >= MAX_NUM_FRAMES:
-                        frames_to_process = 0
-                    else:
-                        estimated_frames = estimated_frames_list[image_index]
-                        frames_to_process = max(
-                            1, int(estimated_frames * scaling_factor)
-                        )
+        task_ptr = 0
 
-                    if frames_to_process == 0:
-                        frames = []
-                    else:
-                        image_file = image_data[image_index]
-                        if isinstance(image_file, str) and image_file.startswith(
-                            "video:"
-                        ):
-                            # video
-                            path = image_file[len("video:") :]
-                            frames = encode_video(
-                                path, frame_count_limit=frames_to_process
-                            )
-                        else:
-                            # image
-                            raw_image, _size = load_image(image_file)
-                            if discard_alpha_channel:
-                                raw_image = raw_image.convert("RGB")
-                            frames = [raw_image]
-                        if len(frames) == 0:
-                            continue
+        for text_part in text_parts:
+            if text_part in multimodal_tokens.collect():
+                task_type, data, frame_limit = task_info[task_ptr]
+                result = futures[task_ptr].result()
+                task_ptr += 1
 
-                    image_sizes += frames[0].size * len(frames)
-
-                    # Generate a hashable value for the image file
-                    if isinstance(image_file, Image.Image):
-                        # For PIL.Image objects, use the ID as a hashable value
-                        hash_value = hash(id(image_file))
-                    else:
-                        # For other types (strings, etc.), use the regular hash
-                        hash_value = hash(image_file)
-
-                    hashes += [hash_value] * len(frames)
-                    images += frames
-                    image_index += 1
-                    if frames_to_process != 0:
+                if task_type == Modality.IMAGE:
+                    frames = [result] if not isinstance(result, list) else result
+                    if frames:
+                        image_sizes += frames[0].size * len(frames)
+                        images += frames
                         new_text += multimodal_tokens.image_token * len(frames)
-                    assert frames_to_process == len(frames)
-                elif text_part == multimodal_tokens.audio_token:
-                    # load as audio
-                    audio_file = audio_data[audio_index]
-                    audio = load_audio(audio_file)
-                    hashes += [hash(audio_file)]
-                    audios += [audio]
-                    audio_index += 1
+                elif task_type == Modality.AUDIO:
+                    # audio
+                    audios.append(result)
                     new_text += multimodal_tokens.audio_token
-                else:
-                    # TODO(mick): handle video
-                    # normal text
-                    new_text += text_part
-
-            except Exception as e:
-                logger.error(f"An exception occurred while loading images: {e}")
-                raise RuntimeError(f"An exception occurred while loading images: {e}")
+                # TODO: handle video
+            else:
+                new_text += text_part
 
         out = BaseMultiModalProcessorOutput(
             images=images,

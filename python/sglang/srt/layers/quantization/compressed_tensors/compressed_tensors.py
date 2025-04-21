@@ -77,6 +77,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         sparsity_ignore_list: List[str],
         kv_cache_scheme: Optional[Dict[str, Any]] = None,
         config: Optional[Dict[str, Any]] = None,
+        packed_modules_mapping: Dict[str, List[str]] = {},
     ):
         super().__init__()
         self.ignore = ignore
@@ -87,6 +88,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         self.sparsity_scheme_map = sparsity_scheme_map
         self.sparsity_ignore_list = sparsity_ignore_list
         self.config = config
+        self.packed_modules_mapping = packed_modules_mapping
 
     def get_linear_method(self) -> "CompressedTensorsLinearMethod":
         return CompressedTensorsLinearMethod(self)
@@ -136,6 +138,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         sparsity_scheme_map, sparsity_ignore_list = cls._parse_sparsity_config(
             config=config
         )
+        packed_modules_mapping = config.get("packed_modules_mapping", {})
 
         return cls(
             target_scheme_map=target_scheme_map,
@@ -144,6 +147,7 @@ class CompressedTensorsConfig(QuantizationConfig):
             sparsity_scheme_map=sparsity_scheme_map,
             sparsity_ignore_list=sparsity_ignore_list,
             config=config,
+            packed_modules_mapping=packed_modules_mapping,
         )
 
     @classmethod

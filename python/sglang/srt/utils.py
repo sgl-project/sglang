@@ -16,6 +16,7 @@ import base64
 import builtins
 import ctypes
 import dataclasses
+import importlib
 import io
 import ipaddress
 import itertools
@@ -127,7 +128,7 @@ def is_flashinfer_available():
     """
     if not get_bool_env_var("SGLANG_IS_FLASHINFER_AVAILABLE", default="true"):
         return False
-    return is_cuda()
+    return importlib.util.find_spec("flashinfer") is not None and is_cuda()
 
 
 def is_cuda_available():
@@ -568,7 +569,7 @@ def encode_video(video_path, frame_count_limit=None):
 
 
 def load_image(
-    image_file: Union[Image.Image, str, bytes]
+    image_file: Union[Image.Image, str, bytes],
 ) -> tuple[Image.Image, tuple[int, int]]:
     image = image_size = None
     if isinstance(image_file, Image.Image):
@@ -845,33 +846,38 @@ def broadcast_pyobj(
     rank: int,
     dist_group: Optional[torch.distributed.ProcessGroup] = None,
     src: int = 0,
+    force_cpu_device: bool = True,
 ):
     """Broadcast inputs from rank=0 to all other ranks with torch.dist backend."""
+    device = torch.device(
+        "cuda" if torch.cuda.is_available() and not force_cpu_device else "cpu"
+    )
 
     if rank == 0:
         if len(data) == 0:
-            tensor_size = torch.tensor([0], dtype=torch.long)
+            tensor_size = torch.tensor([0], dtype=torch.long, device=device)
             dist.broadcast(tensor_size, src=src, group=dist_group)
         else:
             serialized_data = pickle.dumps(data)
             size = len(serialized_data)
+
             tensor_data = torch.ByteTensor(
                 np.frombuffer(serialized_data, dtype=np.uint8)
-            )
-            tensor_size = torch.tensor([size], dtype=torch.long)
+            ).to(device)
+            tensor_size = torch.tensor([size], dtype=torch.long, device=device)
 
             dist.broadcast(tensor_size, src=src, group=dist_group)
             dist.broadcast(tensor_data, src=src, group=dist_group)
         return data
     else:
-        tensor_size = torch.tensor([0], dtype=torch.long)
+        tensor_size = torch.tensor([0], dtype=torch.long, device=device)
         dist.broadcast(tensor_size, src=src, group=dist_group)
         size = tensor_size.item()
 
         if size == 0:
             return []
 
-        tensor_data = torch.empty(size, dtype=torch.uint8)
+        tensor_data = torch.empty(size, dtype=torch.uint8, device=device)
         dist.broadcast(tensor_data, src=src, group=dist_group)
 
         serialized_data = bytes(tensor_data.cpu().numpy())
@@ -1480,14 +1486,43 @@ def permute_weight(x: torch.Tensor) -> torch.Tensor:
 
 class MultiprocessingSerializer:
     @staticmethod
-    def serialize(obj):
+    def serialize(obj, output_str: bool = False):
+        """
+        Serialize a Python object using ForkingPickler.
+
+        Args:
+            obj: The object to serialize.
+            output_str (bool): If True, return a base64-encoded string instead of raw bytes.
+
+        Returns:
+            bytes or str: The serialized object.
+        """
         buf = io.BytesIO()
         ForkingPickler(buf).dump(obj)
         buf.seek(0)
-        return buf.read()
+        output = buf.read()
+
+        if output_str:
+            # Convert bytes to base64-encoded string
+            output = base64.b64encode(output).decode("utf-8")
+
+        return output
 
     @staticmethod
     def deserialize(data):
+        """
+        Deserialize a previously serialized object.
+
+        Args:
+            data (bytes or str): The serialized data, optionally base64-encoded.
+
+        Returns:
+            The deserialized Python object.
+        """
+        if isinstance(data, str):
+            # Decode base64 string to bytes
+            data = base64.b64decode(data)
+
         return ForkingPickler.loads(data)
 
 
@@ -1819,3 +1854,79 @@ class DeepEPMode(Enum):
             return DeepEPMode.low_latency
         else:
             return DeepEPMode.normal
+
+
+def fast_topk(values, topk, dim):
+    if topk == 1:
+        # Use max along the specified dimension to get both value and index
+        return torch.max(values, dim=dim, keepdim=True)
+    else:
+        # Use topk for efficiency with larger k values
+        return torch.topk(values, topk, dim=dim)
+
+
+def is_hopper_with_cuda_12_3():
+    if not is_cuda():
+        return False
+    is_hopper = torch.cuda.get_device_capability()[0] == 9
+    cuda_version = torch.version.cuda.split(".")
+    is_cuda_compatible = int(cuda_version[0]) == 12 and int(cuda_version[1]) >= 3
+    return is_hopper and is_cuda_compatible
+
+
+def get_free_port():
+    # try ipv4
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("", 0))
+            return s.getsockname()[1]
+    except OSError:
+        # try ipv6
+        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as s:
+            s.bind(("", 0))
+            return s.getsockname()[1]
+
+
+def get_local_ip_by_remote() -> str:
+    # try ipv4
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))  # Doesn't need to be reachable
+        return s.getsockname()[0]
+    except Exception:
+        pass
+
+    # try ipv6
+    try:
+        s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+        # Google's public DNS server, see
+        # https://developers.google.com/speed/public-dns/docs/using#addresses
+        s.connect(("2001:4860:4860::8888", 80))  # Doesn't need to be reachable
+        return s.getsockname()[0]
+    except Exception:
+        raise ValueError(f"Can not get local ip")
+
+
+def is_page_size_one(server_args):
+    return server_args.page_size == 1
+
+
+def is_no_spec_infer_or_topk_one(server_args):
+    return server_args.speculative_eagle_topk is None or (
+        server_args.speculative_eagle_topk is not None
+        and server_args.speculative_eagle_topk == 1
+        and is_page_size_one(server_args)
+    )
+
+
+def is_fa3_default_architecture(hf_config):
+    architectures = getattr(hf_config, "architectures", None)
+    if not isinstance(architectures, list) or not architectures:
+        return False
+    default_archs = {
+        "Qwen2ForCausalLM",
+        "Llama4ForConditionalGeneration",
+        "LlamaForCausalLM",
+        "MistralForCausalLM",
+    }
+    return architectures[0] in default_archs
