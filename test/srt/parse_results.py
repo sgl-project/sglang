@@ -1,7 +1,8 @@
-import json
-import pandas as pd
 import argparse
+import json
 import os
+
+import pandas as pd
 from tabulate import tabulate
 
 # Parse command-line arguments
@@ -15,6 +16,7 @@ output_file = f"{base_name}_summary.csv"
 
 fields = [
     "max_concurrency",
+    "input_throughput",
     "output_throughput",
     "mean_ttft_ms",
     "median_ttft_ms",

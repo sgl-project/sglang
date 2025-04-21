@@ -89,6 +89,8 @@ void lightning_attention_decode(
     torch::Tensor new_kv);
 void merge_state(
     at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b, at::Tensor v_merged, at::Tensor s_merged);
+void merge_state_v2(
+    at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b, at::Tensor v_merged, at::Tensor s_merged);
 void cutlass_mla_decode(
     torch::Tensor const& out,
     torch::Tensor const& q_nope_and_q_pe,
@@ -100,11 +102,11 @@ int64_t cutlass_mla_get_workspace_size(int64_t max_seq_len, int64_t num_batches,
 /*
  * From csrc/elementwise
  */
-void rmsnorm(at::Tensor& output, at::Tensor& input, at::Tensor& weight, double eps, int64_t cuda_stream);
-void sgl_fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double eps);
-void gemma_rmsnorm(at::Tensor& output, at::Tensor& input, at::Tensor& weight, double eps, int64_t cuda_stream);
-void gemma_fused_add_rmsnorm(
-    at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps, int64_t cuda_stream);
+void rmsnorm(at::Tensor& output, at::Tensor& input, at::Tensor& weight, double eps, bool enable_pdl);
+void sgl_fused_add_rmsnorm(
+    torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double eps, bool enable_pdl);
+void gemma_rmsnorm(at::Tensor& output, at::Tensor& input, at::Tensor& weight, double eps, bool enable_pdl);
+void gemma_fused_add_rmsnorm(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps, bool enable_pdl);
 void silu_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream);
 void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream);
 void gelu_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream);
@@ -198,8 +200,14 @@ void topk_softmax(
     torch::Tensor& token_expert_indices,
     torch::Tensor& gating_output);
 
-std::vector<at::Tensor>
-moe_fused_gate(at::Tensor& input, at::Tensor& bias, int64_t num_expert_group, int64_t topk_group, int64_t topk);
+std::vector<at::Tensor> moe_fused_gate(
+    at::Tensor& input,
+    at::Tensor& bias,
+    int64_t num_expert_group,
+    int64_t topk_group,
+    int64_t topk,
+    int64_t n_share_experts_fusion,
+    double routed_scaling_factor);
 
 /*
  * From csrc/speculative
@@ -252,48 +260,38 @@ void segment_packbits(
  */
 void min_p_sampling_from_probs(
     at::Tensor probs,
-    at::Tensor uniform_samples,
-    at::Tensor samples,
+    at::Tensor output,
+    std::optional<at::Tensor> maybe_indices,
     std::optional<at::Tensor> maybe_min_p_arr,
     double min_p_val,
     bool deterministic,
-    int64_t cuda_stream);
+    std::optional<at::Generator> gen);
 
 void top_k_renorm_probs(
-    at::Tensor probs,
-    at::Tensor renorm_probs,
-    std::optional<at::Tensor> maybe_top_k_arr,
-    int64_t top_k_val,
-    int64_t cuda_stream);
+    at::Tensor probs, at::Tensor renorm_probs, std::optional<at::Tensor> maybe_top_k_arr, int64_t top_k_val);
 
 void top_p_renorm_probs(
-    at::Tensor probs,
-    at::Tensor renorm_probs,
-    std::optional<at::Tensor> maybe_top_p_arr,
-    double top_p_val,
-    int64_t cuda_stream);
+    at::Tensor probs, at::Tensor renorm_probs, std::optional<at::Tensor> maybe_top_p_arr, double top_p_val);
 
 void top_k_top_p_sampling_from_probs(
     at::Tensor probs,
-    at::Tensor uniform_samples,
-    at::Tensor samples,
-    at::Tensor success,
+    at::Tensor output,
+    std::optional<at::Tensor> maybe_indices,
     std::optional<at::Tensor> maybe_top_k_arr,
     double top_k_val,
     std::optional<at::Tensor> maybe_top_p_arr,
     double top_p_val,
     bool deterministic,
-    int64_t cuda_stream);
+    std::optional<at::Generator> gen);
 
 void top_p_sampling_from_probs(
     at::Tensor probs,
-    at::Tensor uniform_samples,
-    at::Tensor samples,
-    at::Tensor success,
+    at::Tensor output,
+    std::optional<at::Tensor> maybe_indices,
     std::optional<at::Tensor> maybe_top_p_arr,
     double top_p_val,
     bool deterministic,
-    int64_t cuda_stream);
+    std::optional<at::Generator> gen);
 
 namespace flash {
 /*

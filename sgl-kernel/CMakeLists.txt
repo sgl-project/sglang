@@ -1,14 +1,25 @@
 cmake_minimum_required(VERSION 3.26 FATAL_ERROR)
 project(sgl-kernel LANGUAGES CXX CUDA)
 
+# CMake
 cmake_policy(SET CMP0169 OLD)
-
 include(${CMAKE_CURRENT_LIST_DIR}/cmake/utils.cmake)
+set(CMAKE_COLOR_DIAGNOSTICS ON)
+set(CMAKE_VERBOSE_MAKEFILE ON CACHE BOOL "ON")
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+set(CMAKE_SHARED_LIBRARY_PREFIX "")
 
+# Python
 find_package(Python COMPONENTS Interpreter Development.Module ${SKBUILD_SABI_COMPONENT} REQUIRED)
 
+# CXX
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3")
+
+# CUDA
 enable_language(CUDA)
 find_package(CUDAToolkit REQUIRED)
+set_property(GLOBAL PROPERTY CUDA_SEPARABLE_COMPILATION ON)
 
 message(STATUS "Detected CUDA_VERSION=${CUDA_VERSION}")
 if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8")
@@ -21,11 +32,10 @@ elseif ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "11.8")
     message("CUDA_VERSION ${CUDA_VERSION} >= 11.8")
 endif()
 
+# Torch
 find_package(Torch REQUIRED)
 # clean Torch Flag
 clear_cuda_arches(CMAKE_FLAG)
-
-set_property(GLOBAL PROPERTY CUDA_SEPARABLE_COMPILATION ON)
 
 include(FetchContent)
 
@@ -33,7 +43,7 @@ include(FetchContent)
 FetchContent_Declare(
     repo-cutlass
     GIT_REPOSITORY https://github.com/NVIDIA/cutlass
-    GIT_TAG        df8a550d3917b0e97f416b2ed8c2d786f7f686a3
+    GIT_TAG        5e497243f7ad13a2aa842143f9b10bbb23d98292
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-cutlass)
@@ -41,15 +51,15 @@ FetchContent_Populate(repo-cutlass)
 FetchContent_Declare(
     repo-deepgemm
     GIT_REPOSITORY https://github.com/deepseek-ai/DeepGEMM
-    GIT_TAG        c187c23ba8dcdbad91720737e8be9c43700cb9e9
+    GIT_TAG        4499c4ccbb5d3958b1a069f29ef666156a121278
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-deepgemm)
 # flashinfer
 FetchContent_Declare(
     repo-flashinfer
-    GIT_REPOSITORY https://github.com/sgl-project/flashinfer
-    GIT_TAG        sgl-kernel
+    GIT_REPOSITORY https://github.com/flashinfer-ai/flashinfer.git
+    GIT_TAG        9220fb3443b5a5d274f00ca5552f798e225239b7
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-flashinfer)
@@ -76,14 +86,9 @@ include_directories(
     ${PROJECT_SOURCE_DIR}/csrc
     ${repo-cutlass_SOURCE_DIR}/include
     ${repo-cutlass_SOURCE_DIR}/tools/util/include
-    ${repo-cutlass_SOURCE_DIR}/examples/77_blackwell_fmha
-    ${repo-cutlass_SOURCE_DIR}/examples/common
     ${repo-flashinfer_SOURCE_DIR}/include
     ${repo-flashinfer_SOURCE_DIR}/csrc
 )
-
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3")
 
 set(SGL_KERNEL_CUDA_FLAGS
     "-DNDEBUG"
@@ -104,9 +109,16 @@ set(SGL_KERNEL_CUDA_FLAGS
     "-DCUTLASS_TEST_ENABLE_CACHED_RESULTS=1"
     "-DCUTLASS_DEBUG_TRACE_LEVEL=0"
     "--expt-relaxed-constexpr"
+    "--expt-extended-lambda"
+    "--threads=32"
+
+    # Supress warnings
     "-Xcompiler=-Wconversion"
     "-Xcompiler=-fno-strict-aliasing"
-    "--threads=16"
+
+    # uncomment to debug
+    # "--ptxas-options=-v"
+    # "--ptxas-options=--verbose,--register-usage-level=10,--warn-on-local-memory-usage"
 )
 
 option(SGL_KERNEL_ENABLE_SM100A "Enable SM100A" OFF)
@@ -114,9 +126,7 @@ option(SGL_KERNEL_ENABLE_SM90A  "Enable SM90A"  OFF)
 option(SGL_KERNEL_ENABLE_BF16   "Enable BF16"   ON)
 option(SGL_KERNEL_ENABLE_FP8    "Enable FP8"    ON)
 option(SGL_KERNEL_ENABLE_FP4    "Enable FP4"    OFF)
-
 option(SGL_KERNEL_ENABLE_FA3    "Enable FA3"    OFF)
-
 
 if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
@@ -164,6 +174,7 @@ string(REPLACE "-D__CUDA_NO_HALF2_OPERATORS__"      "" CMAKE_CUDA_FLAGS "${CMAKE
 set(SOURCES
     "csrc/allreduce/custom_all_reduce.cu"
     "csrc/attention/cascade.cu"
+    "csrc/attention/merge_attn_states.cu"
     "csrc/attention/cutlass_mla_kernel.cu"
     "csrc/attention/lightning_attention_decode_kernel.cu"
     "csrc/elementwise/activation.cu"
@@ -202,17 +213,19 @@ Python_add_library(common_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI
 
 target_compile_options(common_ops PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS}>)
 target_include_directories(common_ops PRIVATE
-        ${TORCH_INCLUDE_DIRS}
-        ${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src)
+    ${repo-cutlass_SOURCE_DIR}/examples/77_blackwell_fmha
+    ${repo-cutlass_SOURCE_DIR}/examples/common
+    ${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src
+)
 target_link_libraries(common_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt)
 
 target_compile_definitions(common_ops PRIVATE
-         FLASHATTENTION_DISABLE_BACKWARD
-         FLASHATTENTION_DISABLE_DROPOUT
-         FLASHATTENTION_DISABLE_UNEVEN_K
-    )
+    FLASHATTENTION_DISABLE_BACKWARD
+    FLASHATTENTION_DISABLE_DROPOUT
+    FLASHATTENTION_DISABLE_UNEVEN_K
+)
 
-install(TARGETS common_ops LIBRARY DESTINATION "sgl_kernel")
+install(TARGETS common_ops LIBRARY DESTINATION sgl_kernel)
 
 # ============================ Optional Install ============================= #
 # set flash-attention sources file
@@ -273,8 +286,8 @@ if (SGL_KERNEL_ENABLE_FA3)
 
     target_compile_options(flash_ops PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${SGL_FLASH_KERNEL_CUDA_FLAGS}>)
     target_include_directories(flash_ops PRIVATE
-        ${TORCH_INCLUDE_DIRS}
-        ${repo-flash-attention_SOURCE_DIR}/hopper)
+        ${repo-flash-attention_SOURCE_DIR}/hopper
+    )
     target_link_libraries(flash_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda)
 
     install(TARGETS flash_ops LIBRARY DESTINATION "sgl_kernel")

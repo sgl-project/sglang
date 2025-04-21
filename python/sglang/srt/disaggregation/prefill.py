@@ -24,19 +24,15 @@ from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
-from sglang.srt.disaggregation.base import (
-    BaseKVManager,
-    BaseKVReceiver,
-    BaseKVSender,
-    KVArgs,
-    KVPoll,
-)
+from sglang.srt.disaggregation.base import BaseKVManager, KVArgs, KVPoll
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     KVClassType,
     ReqToMetadataIdxAllocator,
     TransferBackend,
     get_kv_class,
+    kv_to_page_indices,
+    kv_to_page_num,
     poll_and_all_reduce,
 )
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req, ScheduleBatch
@@ -67,6 +63,7 @@ class PrefillBootstrapQueue:
         bootstrap_port: int,
         gloo_group: ProcessGroup,
         transfer_backend: TransferBackend,
+        scheduler: Scheduler,
     ):
         self.token_to_kv_pool = token_to_kv_pool
         self.aux_dtype = aux_dtype
@@ -76,12 +73,13 @@ class PrefillBootstrapQueue:
         self.tp_rank = tp_rank
         self.tp_size = tp_size
         self.transfer_backend = transfer_backend
+        self.scheduler = scheduler
         self.kv_manager = self._init_kv_manager()
         self.queue: List[Req] = []
         self.gloo_group = gloo_group
         self.bootstrap_port = bootstrap_port
 
-    def allocate_token_id(self, idx: int, token_id: int):
+    def store_prefill_results(self, idx: int, token_id: int):
         assert token_id >= 0, f"token_id: {token_id} is negative"
         output_id_buffer = self.metadata_buffers[0]
         output_id_buffer[idx] = token_id
@@ -107,9 +105,12 @@ class PrefillBootstrapQueue:
         kv_args.aux_item_lens = [
             metadata_buffer[0].nbytes for metadata_buffer in self.metadata_buffers
         ]
-        kv_args.ib_device = "mock-ib-device"
+        kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
+        kv_args.gpu_id = self.scheduler.gpu_id
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
-        kv_manager = kv_manager_class(kv_args, DisaggregationMode.PREFILL)
+        kv_manager = kv_manager_class(
+            kv_args, DisaggregationMode.PREFILL, self.scheduler.server_args
+        )
         return kv_manager
 
     def add(self, req: Req) -> None:
@@ -146,7 +147,7 @@ class PrefillBootstrapQueue:
             elif poll == KVPoll.Failed:
                 raise Exception("Bootstrap failed")
 
-            # KV.WaitingForInput - init here
+            # KV.WaitingForInput
             num_kv_indices = len(req.origin_input_ids)
             if self.req_to_metadata_buffer_idx_allocator.available_size() == 0:
                 break
@@ -155,7 +156,8 @@ class PrefillBootstrapQueue:
                 self.req_to_metadata_buffer_idx_allocator.alloc()
             )
             assert req.metadata_buffer_index is not None
-            req.disagg_kv_sender.init(num_kv_indices, req.metadata_buffer_index)
+            num_pages = kv_to_page_num(num_kv_indices, self.token_to_kv_pool.page_size)
+            req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
 
             bootstrapped_reqs.append(req)
             indices_to_remove.add(i)
@@ -171,6 +173,36 @@ class SchedulerDisaggregationPrefillMixin:
     """
     Mixin for Scheduler to handle disaggregation prefill
     """
+
+    @torch.no_grad()
+    def event_loop_normal_disagg_prefill(self):
+        """A normal scheduler loop for prefill worker in disaggregation mode."""
+
+        while True:
+            recv_reqs = self.recv_requests()
+            self.process_input_requests(recv_reqs)
+            self.waiting_queue.extend(
+                self.disagg_prefill_pending_queue.pop_bootstrapped()
+            )
+            self.process_prefill_chunk()
+            batch = self.get_new_batch_prefill()
+            self.cur_batch = batch
+
+            if batch:
+                result = self.run_batch(batch)
+                self.process_batch_result_disagg_prefill(batch, result)
+
+            if len(self.disagg_prefill_inflight_queue) > 0:
+                self.process_disagg_prefill_inflight_queue()
+
+            if batch is None and len(self.disagg_prefill_inflight_queue) == 0:
+                self.check_memory()
+                self.new_token_ratio = self.init_new_token_ratio
+
+            self.last_batch = batch
+            # HACK (byronhsu): reset the batch_is_full flag because we never enter update_running_batch which resets it
+            # Otherwise, it hangs under high concurrency
+            self.running_batch.batch_is_full = False
 
     def process_batch_result_disagg_prefill(
         self: Scheduler, batch: ScheduleBatch, result: GenerationBatchResult
@@ -211,7 +243,7 @@ class SchedulerDisaggregationPrefillMixin:
 
         polls = poll_and_all_reduce(
             [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
-            self.tp_worker.get_tp_cpu_group(),
+            self.attn_tp_cpu_group,
         )
 
         undone_reqs: List[Req] = []
@@ -222,9 +254,15 @@ class SchedulerDisaggregationPrefillMixin:
             elif poll == KVPoll.Success:  # transfer done
                 self.tree_cache.cache_finished_req(req)  # unlock the tree
                 req.finished_reason = FINISH_LENGTH(length=0)
+                # FIXME: clean up req's data in transfer engine
                 done_reqs.append(req)
             elif poll == KVPoll.Failed:
                 raise Exception("Transferring failed")
+
+        for req in done_reqs:
+            self.disagg_prefill_pending_queue.req_to_metadata_buffer_idx_allocator.free(
+                req.metadata_buffer_index
+            )
 
         # Stream requests which have finished transfer
         self.stream_output(done_reqs, False, None)
@@ -251,14 +289,27 @@ class SchedulerDisaggregationPrefillMixin:
         """
         start_idx = req.start_send_idx
         end_idx = min(len(req.fill_ids), len(req.origin_input_ids))
+
+        # Update next start_send_idx
+        req.start_send_idx = end_idx
+
         kv_indices = (
             self.req_to_token_pool.req_to_token[req.req_pool_idx][start_idx:end_idx]
             .cpu()
             .numpy()
         )
-        req.start_send_idx = end_idx
         if token_id is not None:
-            self.disagg_prefill_pending_queue.allocate_token_id(
+            self.disagg_prefill_pending_queue.store_prefill_results(
                 req.metadata_buffer_index, token_id
             )
-        req.disagg_kv_sender.send(kv_indices)
+        is_last = token_id is not None
+        page_indices = kv_to_page_indices(
+            kv_indices, self.token_to_kv_pool_allocator.page_size
+        )
+
+        page_start_idx = start_idx // self.token_to_kv_pool_allocator.page_size
+        page_end_idx = page_start_idx + len(page_indices)
+
+        req.disagg_kv_sender.send(
+            page_indices, slice(page_start_idx, page_end_idx), is_last
+        )
