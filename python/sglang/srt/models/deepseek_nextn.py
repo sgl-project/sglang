@@ -40,7 +40,7 @@ from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer, DeepseekV3ForCausalLM
-from sglang.srt.utils import add_prefix, is_cuda, is_hip
+from sglang.srt.utils import BumpAllocator, add_prefix, is_cuda, is_hip
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -48,7 +48,7 @@ _is_cuda = is_cuda()
 if _is_cuda:
     from sgl_kernel import awq_dequantize
 else:
-    from vllm import _custom_ops as ops
+    from vllm._custom_ops import awq_dequantize
 
 
 class DeepseekModelNextN(nn.Module):
@@ -91,6 +91,14 @@ class DeepseekModelNextN(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
+        zero_allocator = BumpAllocator(
+            buffer_size=2,
+            dtype=torch.float32,
+            device=(
+                input_embeds.device if input_embeds is not None else input_ids.device
+            ),
+        )
+
         if input_embeds is None:
             hidden_states = self.embed_tokens(input_ids)
         else:
@@ -108,7 +116,7 @@ class DeepseekModelNextN(nn.Module):
 
         residual = None
         hidden_states, residual = self.decoder(
-            positions, hidden_states, forward_batch, residual
+            positions, hidden_states, forward_batch, residual, zero_allocator
         )
 
         if not forward_batch.forward_mode.is_idle():
@@ -262,79 +270,75 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                     )
                     weight_loader(param, loaded_weight)
 
-        if not global_server_args_dict["disable_mla"]:
-            self_attn = self.model.decoder.self_attn
-            if hasattr(self_attn.kv_b_proj, "qweight"):
-                # AWQ compatible
-                if _is_cuda:
-                    w = awq_dequantize(
-                        self_attn.kv_b_proj.qweight,
-                        self_attn.kv_b_proj.scales,
-                        self_attn.kv_b_proj.qzeros,
-                    ).T
-                else:
-                    w = ops.awq_dequantize(
-                        self_attn.kv_b_proj.qweight,
-                        self_attn.kv_b_proj.scales,
-                        self_attn.kv_b_proj.qzeros,
-                        0,
-                        0,
-                        0,
-                    ).T
+        self_attn = self.model.decoder.self_attn
+        if hasattr(self_attn.kv_b_proj, "qweight"):
+            # AWQ compatible
+            if _is_cuda:
+                w = awq_dequantize(
+                    self_attn.kv_b_proj.qweight,
+                    self_attn.kv_b_proj.scales,
+                    self_attn.kv_b_proj.qzeros,
+                ).T
             else:
-                w = self_attn.kv_b_proj.weight
-            # NOTE(HandH1998): Since `bmm_fp8` only supports per-tensor scale, we have to requantize `self_attn.kv_b_proj`.
-            # This may affect the accuracy of fp8 model.
-            if hasattr(self.quant_config, "weight_block_size") and w.dtype in (
-                torch.float8_e4m3fn,
-                torch.float8_e4m3fnuz,
-            ):
+                w = awq_dequantize(
+                    self_attn.kv_b_proj.qweight,
+                    self_attn.kv_b_proj.scales,
+                    self_attn.kv_b_proj.qzeros,
+                    0,
+                    0,
+                    0,
+                ).T
+        else:
+            w = self_attn.kv_b_proj.weight
+        # NOTE(HandH1998): Since `bmm_fp8` only supports per-tensor scale, we have to requantize `self_attn.kv_b_proj`.
+        # This may affect the accuracy of fp8 model.
+        if hasattr(self.quant_config, "weight_block_size") and w.dtype in (
+            torch.float8_e4m3fn,
+            torch.float8_e4m3fnuz,
+        ):
+            weight_block_size = self.quant_config.weight_block_size
+            if weight_block_size is not None:
+                assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
+                if _is_hip:
+                    weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                        weight=w,
+                        weight_scale=self_attn.kv_b_proj.weight_scale_inv,
+                        input_scale=None,
+                    )
+                else:
+                    weight = w
+                    weight_scale = self_attn.kv_b_proj.weight_scale_inv
+
+                w, scale = block_quant_to_tensor_quant(
+                    weight, weight_scale, weight_block_size
+                )
+                self_attn.w_scale = scale
+        if w.dtype == torch.int8:
+            if hasattr(self.quant_config, "weight_block_size"):
+                # block-wise int8 need it
                 weight_block_size = self.quant_config.weight_block_size
                 if weight_block_size is not None:
                     assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
-                    if _is_hip:
-                        weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
-                            weight=w,
-                            weight_scale=self_attn.kv_b_proj.weight_scale_inv,
-                            input_scale=None,
-                        )
-                    else:
-                        weight = w
-                        weight_scale = self_attn.kv_b_proj.weight_scale_inv
-
-                    w, scale = block_quant_to_tensor_quant(
-                        weight, weight_scale, weight_block_size
-                    )
-                    self_attn.w_scale = scale
-            if w.dtype == torch.int8:
-                if hasattr(self.quant_config, "weight_block_size"):
-                    # block-wise int8 need it
-                    weight_block_size = self.quant_config.weight_block_size
-                    if weight_block_size is not None:
-                        assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
-                        weight = w
-                        weight_scale = self_attn.kv_b_proj.weight_scale_inv
-                        w = int8_block_dequant(
-                            weight, weight_scale, weight_block_size
-                        ).to(torch.bfloat16)
-                else:
-                    # channel-wise int8 need it
-                    assert hasattr(self_attn.kv_b_proj, "weight_scale")
-                    w = w.to(torch.bfloat16) * self_attn.kv_b_proj.weight_scale.to(
+                    weight = w
+                    weight_scale = self_attn.kv_b_proj.weight_scale_inv
+                    w = int8_block_dequant(weight, weight_scale, weight_block_size).to(
                         torch.bfloat16
                     )
-            w_kc, w_vc = w.unflatten(
-                0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
-            ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
-            self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
-            self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
-            if (
-                hasattr(self_attn.kv_b_proj, "weight_scale")
-                and self_attn.w_scale is None
-            ):
-                self_attn.w_scale = self_attn.kv_b_proj.weight_scale
-                if _is_hip:
-                    self_attn.w_scale *= 2.0
+            else:
+                # channel-wise int8 need it
+                assert hasattr(self_attn.kv_b_proj, "weight_scale")
+                w = w.to(torch.bfloat16) * self_attn.kv_b_proj.weight_scale.to(
+                    torch.bfloat16
+                )
+        w_kc, w_vc = w.unflatten(
+            0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
+        ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
+        self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
+        self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
+        if hasattr(self_attn.kv_b_proj, "weight_scale") and self_attn.w_scale is None:
+            self_attn.w_scale = self_attn.kv_b_proj.weight_scale
+            if _is_hip:
+                self_attn.w_scale *= 2.0
 
 
 EntryClass = [DeepseekV3ForCausalLMNextN]
