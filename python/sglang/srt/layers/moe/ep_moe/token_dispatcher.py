@@ -1,10 +1,19 @@
 from sglang.srt.utils import DeepEPMode
 
+from sglang.srt.utils import (
+    get_bool_env_var,
+    get_device_sm,
+)
+
 try:
     from deep_ep import Buffer
     from sglang.srt.layers.quantization.fp8_kernel import (
         sglang_per_token_group_quant_fp8,
     )
+    sm_version = get_device_sm()
+    if sm_version == 90:
+        if get_bool_env_var("SGL_ENABLE_JIT_DEEPGEMM", default="false"):
+            _enable_jit_deepgemm = True
     use_deepep = True
 except ImportError:
     use_deepep = False
@@ -190,7 +199,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
 
     def dispatch_b(self, hidden_states, topk_idx, topk_weights, previous_event):
         event.current_stream_wait() if self.async_finish else ()
-        if use_deepep:
+        if _enable_jit_deepgemm:
             #TODO hard code 128 block quant
             hidden_states=sglang_per_token_group_quant_fp8(hidden_states,128)
             (
@@ -343,30 +352,34 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_weights: torch.Tensor,
     ):
         #TODO support deepgemm
-        if hidden_states.shape[0] > 0:
-            num_tokens = self.src2dst.shape[0] // self.router_topk
-            output = torch.empty(
-                (num_tokens, hidden_states.shape[1]),
-                device=hidden_states.device,
-                dtype=hidden_states.dtype,
-            )
-            deepep_post_reorder_triton_kernel[(num_tokens,)](
-                hidden_states,
-                output,
-                self.src2dst,
-                topk_idx,
-                topk_weights,
-                self.router_topk,
-                hidden_states.shape[1],
-                BLOCK_SIZE=512,
-            )
-        else:
-            output = torch.zeros(
-                (0, hidden_states.shape[1]),
-                device=hidden_states.device,
-                dtype=hidden_states.dtype,
-            )
         previous_event = Buffer.capture() if self.async_finish else None
+        if _enable_jit_deepgemm:
+            return hidden_states,previous_event
+        else:
+            if hidden_states.shape[0] > 0:
+                num_tokens = self.src2dst.shape[0] // self.router_topk
+                output = torch.empty(
+                    (num_tokens, hidden_states.shape[1]),
+                    device=hidden_states.device,
+                    dtype=hidden_states.dtype,
+                )
+                deepep_post_reorder_triton_kernel[(num_tokens,)](
+                    hidden_states,
+                    output,
+                    self.src2dst,
+                    topk_idx,
+                    topk_weights,
+                    self.router_topk,
+                    hidden_states.shape[1],
+                    BLOCK_SIZE=512,
+                )
+            else:
+                output = torch.zeros(
+                    (0, hidden_states.shape[1]),
+                    device=hidden_states.device,
+                    dtype=hidden_states.dtype,
+                )
+        
         return output, previous_event
 
     def combine_b(self, output, previous_event):

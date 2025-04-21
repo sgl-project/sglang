@@ -998,6 +998,7 @@ class DeepEPMoE(EPMoE):
 
         all_tokens = sum(num_recv_tokens_per_expert)
 
+        gather_out = torch.empty_like(hidden_states_fp8[0], device=hidden_states_fp8[0].device, dtype=hidden_states_fp8[0].dtype)
         if all_tokens > 0:
             input_tensor = [
                 torch.empty((all_tokens, K), device=hidden_states_fp8[0].device, dtype=hidden_states_fp8[0].dtype),
@@ -1055,7 +1056,7 @@ class DeepEPMoE(EPMoE):
 
     
 
-        return down_output
+        return gather_out
 
 
 
