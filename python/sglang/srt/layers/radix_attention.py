@@ -13,9 +13,26 @@
 # ==============================================================================
 """Radix attention."""
 
+from enum import Enum
+from typing import Optional
+
 from torch import nn
 
+from sglang.srt.layers.linear import UnquantizedLinearMethod
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+
+class AttentionType(Enum):
+    """
+    Attention type.
+    Use string to be compatible with `torch.compile`.
+    """
+
+    # Decoder attention between previous layer Q/K/V
+    DECODER = "decoder"
+    # Encoder attention between previous layer Q/K/V
+    ENCODER_ONLY = "encoder_only"
 
 
 class RadixAttention(nn.Module):
@@ -34,6 +51,8 @@ class RadixAttention(nn.Module):
         v_head_dim: int = -1,
         sliding_window_size: int = -1,
         is_cross_attention: bool = False,
+        quant_config: Optional[QuantizationConfig] = None,
+        attn_type=AttentionType.DECODER,
         prefix: str = "",
         use_irope: bool = False,
     ):
@@ -49,9 +68,17 @@ class RadixAttention(nn.Module):
         self.logit_cap = logit_cap
         self.sliding_window_size = sliding_window_size or -1
         self.is_cross_attention = is_cross_attention
+        self.use_irope = use_irope
         self.k_scale = None
         self.v_scale = None
-        self.use_irope = use_irope
+        self.k_scale_float = None
+        self.v_scale_float = None
+        self.quant_method = None
+        if quant_config is not None:
+            self.quant_method = quant_config.get_quant_method(self, prefix=prefix)
+        if self.quant_method is not None:
+            self.quant_method.create_weights(self)
+        self.attn_type = attn_type
 
     def forward(
         self,
