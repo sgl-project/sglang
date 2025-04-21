@@ -291,6 +291,7 @@ class ForwardBatch:
             return_logprob=batch.return_logprob,
             top_logprobs_nums=batch.top_logprobs_nums,
             token_ids_logprobs=batch.token_ids_logprobs,
+            tbo_global_split_token_index=batch.tbo_global_split_token_index,
             tbo_split_seq_index=batch.tbo_split_seq_index,
             can_run_dp_cuda_graph=batch.can_run_dp_cuda_graph,
             global_forward_mode=batch.global_forward_mode,
