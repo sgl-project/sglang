@@ -54,7 +54,7 @@ async def warm_up_compile(tokenizer_manager: TokenizerManager):
         input_ids=[0, 1, 2, 3],
         sampling_params={
             "temperature": 0.0,
-            "max_new_tokens": 2,
+            "max_new_tokens": 8,
             "ignore_eos": True,
         },
     )
