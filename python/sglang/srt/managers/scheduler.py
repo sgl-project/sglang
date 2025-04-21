@@ -20,6 +20,7 @@ import signal
 import sys
 import threading
 import time
+import traceback
 import warnings
 from collections import defaultdict, deque
 from concurrent import futures
@@ -287,18 +288,23 @@ class Scheduler(
         )
         ################################################################################
 
-        self.tp_worker = TpWorkerClass(
-            server_args=server_args,
-            expert_location_metadata=expert_location_metadata,
-            gpu_id=gpu_id,
-            tp_rank=tp_rank,
-            dp_rank=dp_rank,
-            nccl_port=port_args.nccl_port,
-        )
+        try:
+            self.tp_worker = TpWorkerClass(
+                server_args=server_args,
+                expert_location_metadata=expert_location_metadata,
+                gpu_id=gpu_id,
+                tp_rank=tp_rank,
+                dp_rank=dp_rank,
+                nccl_port=port_args.nccl_port,
+            )
+        except Exception as e:
+            print(f"HACK!!!! see error but continue {e=}")
+            traceback.print_exc()
 
         ################################################################################
         print("HACK!!!! temp stop_profile")
         self.stop_profile()
+        raise Exception("hello exception")
         ################################################################################
 
         # Launch a draft worker for speculative decoding
