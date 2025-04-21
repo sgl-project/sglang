@@ -99,8 +99,12 @@ class MooncakeKVManager(BaseKVManager):
         disaggregation_mode: DisaggregationMode,
         server_args: ServerArgs,
     ):
-        self.engine = MooncakeTransferEngine()
         self.kv_args = args
+        self.engine = MooncakeTransferEngine(
+            hostname=get_local_ip_by_remote(),
+            gpu_id=self.kv_args.gpu_id,
+            ib_device=self.kv_args.ib_device,
+        )
         self.disaggregation_mode = disaggregation_mode
         # for p/d multi node infer
         self.bootstrap_port = server_args.disaggregation_bootstrap_port
@@ -227,7 +231,7 @@ class MooncakeKVManager(BaseKVManager):
                     chunked_dst_kv_indice = req.dst_kv_indices[kv_chunk.index_slice]
                     assert len(chunked_dst_kv_indice) == len(
                         kv_chunk.prefill_kv_indices
-                    )
+                    ), f"len(chunked_dst_kv_indice) = {len(chunked_dst_kv_indice)}, len(kv_chunk.prefill_kv_indices) = {len(kv_chunk.prefill_kv_indices)}"
 
                     ret = self.send_kvcache(
                         req.mooncake_session_id,
@@ -503,51 +507,7 @@ class MooncakeKVBootstrapServer(BaseKVBootstrapServer):
         self.thread.start()
 
     def _setup_routes(self):
-        self.app.router.add_route("*", "/metadata", self._handle_metadata)
         self.app.router.add_route("*", "/route", self._handle_route)
-
-    async def _handle_metadata(self, request: web.Request):
-        key = request.query.get("key", "")
-
-        if request.method == "GET":
-            return await self._handle_metadata_get(key)
-        elif request.method == "PUT":
-            return await self._handle_metadata_put(key, request)
-        elif request.method == "DELETE":
-            return await self._handle_metadata_delete(key)
-        return web.Response(
-            text="Method not allowed", status=405, content_type="application/json"
-        )
-
-    async def _handle_metadata_get(self, key):
-        async with self.lock:
-            value = self.store.get(key)
-        if value is None:
-            return web.Response(
-                text="metadata not found", status=404, content_type="application/json"
-            )
-        return web.Response(body=value, status=200, content_type="application/json")
-
-    async def _handle_metadata_put(self, key, request):
-        data = await request.read()
-        async with self.lock:
-            self.store[key] = data
-        return web.Response(
-            text="metadata updated", status=200, content_type="application/json"
-        )
-
-    async def _handle_metadata_delete(self, key):
-        async with self.lock:
-            if key not in self.store:
-                return web.Response(
-                    text="metadata not found",
-                    status=404,
-                    content_type="application/json",
-                )
-            del self.store[key]
-        return web.Response(
-            text="metadata deleted", status=200, content_type="application/json"
-        )
 
     async def _handle_route(self, request: web.Request):
         method = request.method

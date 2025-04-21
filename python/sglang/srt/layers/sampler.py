@@ -10,9 +10,9 @@ from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.utils import crash_on_warnings, get_bool_env_var, is_cuda_available
+from sglang.srt.utils import crash_on_warnings, get_bool_env_var, is_cuda
 
-if is_cuda_available():
+if is_cuda():
     from sgl_kernel import (
         min_p_sampling_from_probs,
         top_k_renorm_prob,
@@ -100,16 +100,15 @@ class Sampler(nn.Module):
                         probs, sampling_info.min_ps
                     )
                 else:
+                    # Check Nan will throw exception, only check when crash_on_warnings is True
+                    check_nan = self.use_nan_detection and crash_on_warnings()
                     batch_next_token_ids = top_k_top_p_sampling_from_probs(
                         probs,
                         sampling_info.top_ks,
                         sampling_info.top_ps,
                         filter_apply_order="joint",
+                        check_nan=check_nan,
                     )
-
-                    if self.use_nan_detection:
-                        logger.warning("Detected errors during sampling!")
-                        batch_next_token_ids = torch.zeros_like(batch_next_token_ids)
 
             elif global_server_args_dict["sampling_backend"] == "pytorch":
                 # A slower fallback implementation with torch native operations.
