@@ -233,7 +233,7 @@ class ServerArgs:
                     self.mem_fraction_static = 0.88
             else:
                 # FIXME: more fine grained auto-selection polices
-                self.mem_fraction_static = (gpu_mem - 1024 * 12) / gpu_mem
+                self.mem_fraction_static = (gpu_mem - 1024 * 13) / gpu_mem
 
         # Set chunked prefill size, which depends on the gpu memory capacity
         if self.chunked_prefill_size is None:
