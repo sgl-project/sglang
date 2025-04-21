@@ -512,7 +512,7 @@ class DeepseekV2MoE(nn.Module):
 
     def _forward_tbo_op_shared(self, state):
         state.shared_output = self._forward_deepep_shared_output(
-            state.forward_batch.forward_mode, state.hidden_states_after_post_attn_ln
+            state.forward_batch.forward_mode, state.pop("hidden_states_after_post_attn_ln")
         )
 
     def _forward_shared_experts(self, hidden_states):
