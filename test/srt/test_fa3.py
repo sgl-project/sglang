@@ -2,6 +2,7 @@ import unittest
 from types import SimpleNamespace
 
 import requests
+import torch
 
 from sglang.srt.utils import get_device_sm, kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
