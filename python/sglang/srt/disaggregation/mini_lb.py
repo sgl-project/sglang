@@ -3,11 +3,11 @@ Minimal HTTP load balancer for prefill and decode servers for testing.
 """
 
 import asyncio
+import os
 import random
+import time
 import urllib
 from itertools import chain
-import os
-import time
 
 import aiohttp
 import orjson
@@ -41,7 +41,12 @@ class MiniLoadBalancer:
 
             responses = await asyncio.gather(*tasks)
             success = all(response.status == 200 for response in responses)
-            return {"success": success, "message": "Profiling started" if success else "Failed to start profiling"}
+            return {
+                "success": success,
+                "message": (
+                    "Profiling started" if success else "Failed to start profiling"
+                ),
+            }
 
     async def stop_profile(self):
         """Stop profiling on all servers."""
@@ -56,7 +61,12 @@ class MiniLoadBalancer:
 
             responses = await asyncio.gather(*tasks)
             success = all(response.status == 200 for response in responses)
-            return {"success": success, "message": "Profiling stopped" if success else "Failed to stop profiling"}
+            return {
+                "success": success,
+                "message": (
+                    "Profiling stopped" if success else "Failed to stop profiling"
+                ),
+            }
 
     async def generate(
         self, modified_request, prefill_server, decode_server
@@ -236,6 +246,7 @@ async def start_profile():
     if load_balancer is None:
         raise HTTPException(status_code=500, detail="Load balancer not initialized")
     return await load_balancer.start_profile()
+
 
 @app.post("/stop_profile")
 async def stop_profile():
