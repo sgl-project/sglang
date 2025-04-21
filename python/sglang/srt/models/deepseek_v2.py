@@ -516,9 +516,12 @@ class DeepseekV2MoE(nn.Module):
         )
 
     def _forward_tbo_op_compute_layer_output(self, state):
+        final_hidden_states = state.hidden_states_from_combine
+        if state.shared_output is not None:
+            final_hidden_states = final_hidden_states + state.shared_output
         output = dict(
             positions=state.positions,
-            hidden_states=state.hidden_states_from_combine + state.shared_output,
+            hidden_states=final_hidden_states,
             forward_batch=state.forward_batch,
             residual=state.residual_after_post_attn_ln,
             tbo_subbatch_index=state.tbo_subbatch_index,
