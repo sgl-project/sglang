@@ -49,6 +49,7 @@ from sglang.srt.disaggregation.prefill import (
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     ReqToMetadataIdxAllocator,
+    TransferBackend,
 )
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
@@ -59,7 +60,8 @@ from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
-    FlushCacheReq,
+    FlushCacheReqInput,
+    FlushCacheReqOutput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
     GetWeightsByNameReqInput,
@@ -390,6 +392,7 @@ class Scheduler(
         self.torch_profiler = None
         self.torch_profiler_output_dir: Optional[str] = None
         self.profiler_activities: Optional[List[str]] = None
+        self.profiler_id: Optional[str] = None
         self.profiler_target_forward_ct: Optional[int] = None
 
         # Init metrics stats
@@ -400,7 +403,7 @@ class Scheduler(
             [
                 (TokenizedGenerateReqInput, self.handle_generate_request),
                 (TokenizedEmbeddingReqInput, self.handle_embedding_request),
-                (FlushCacheReq, self.flush_cache_wrapped),
+                (FlushCacheReqInput, self.flush_cache_wrapped),
                 (AbortReq, self.abort_request),
                 (OpenSessionReqInput, self.open_session),
                 (CloseSessionReqInput, self.close_session),
@@ -437,6 +440,7 @@ class Scheduler(
             context_length=server_args.context_length,
             model_override_args=server_args.json_model_override_args,
             is_embedding=server_args.is_embedding,
+            enable_multimodal=server_args.enable_multimodal,
             dtype=server_args.dtype,
             quantization=server_args.quantization,
         )
@@ -451,6 +455,7 @@ class Scheduler(
                     tokenizer_mode=server_args.tokenizer_mode,
                     trust_remote_code=server_args.trust_remote_code,
                     revision=server_args.revision,
+                    use_fast=not server_args.disable_fast_image_processor,
                 )
                 self.tokenizer = self.processor.tokenizer
             else:
@@ -481,9 +486,11 @@ class Scheduler(
                 self.tree_cache = HiRadixCache(
                     req_to_token_pool=self.req_to_token_pool,
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                    tp_cache_group=self.tp_worker.get_tp_cpu_group(),
+                    tp_cache_group=self.tp_cpu_group,
                     page_size=self.page_size,
                     hicache_ratio=server_args.hicache_ratio,
+                    hicache_size=server_args.hicache_size,
+                    hicache_write_policy=server_args.hicache_write_policy,
                 )
             else:
                 self.tree_cache = RadixCache(
@@ -528,6 +535,10 @@ class Scheduler(
             )
 
     def init_disaggregation(self):
+        self.transfer_backend = TransferBackend(
+            self.server_args.disaggregation_transfer_backend
+        )
+
         if (
             self.disaggregation_mode == DisaggregationMode.DECODE
         ):  # *2 for the headroom.
@@ -546,7 +557,7 @@ class Scheduler(
 
             # The decode requests polling kv cache
             self.disagg_decode_transfer_queue = DecodeTransferQueue(
-                gloo_group=self.tp_worker.get_attention_tp_cpu_group(),
+                gloo_group=self.attn_tp_cpu_group,
                 req_to_metadata_buffer_idx_allocator=req_to_metadata_buffer_idx_allocator,
                 metadata_buffers=metadata_buffers,
             )
@@ -561,10 +572,11 @@ class Scheduler(
                 scheduler=self,
                 transfer_queue=self.disagg_decode_transfer_queue,
                 tree_cache=self.tree_cache,
-                gloo_group=self.tp_worker.get_attention_tp_cpu_group(),
+                gloo_group=self.attn_tp_cpu_group,
                 tp_rank=self.tp_rank,
                 tp_size=self.tp_size,
                 bootstrap_port=self.server_args.disaggregation_bootstrap_port,
+                transfer_backend=self.transfer_backend,
             )
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             # *2 for the headroom.
@@ -589,10 +601,12 @@ class Scheduler(
                 tp_rank=self.tp_rank,
                 tp_size=self.tp_size,
                 bootstrap_port=self.server_args.disaggregation_bootstrap_port,
-                gloo_group=self.tp_worker.get_attention_tp_cpu_group(),
+                gloo_group=self.attn_tp_cpu_group,
+                transfer_backend=self.transfer_backend,
+                scheduler=self,
             )
             # The prefill requests that are in the middle of kv sending
-            self.disagg_prefill_infight_queue: List[Req] = []
+            self.disagg_prefill_inflight_queue: List[Req] = []
 
     @DynamicGradMode()
     def event_loop_normal(self):
@@ -648,70 +662,6 @@ class Scheduler(
                 )
                 self.process_batch_result(tmp_batch, tmp_result)
             elif batch is None:
-                # When the server is idle, do self-check and re-init some states
-                self.check_memory()
-                self.new_token_ratio = self.init_new_token_ratio
-
-            self.last_batch = batch
-
-    @torch.no_grad()
-    def event_loop_normal_disagg_prefill(self):
-        """A normal scheduler loop for prefill worker in disaggregation mode."""
-
-        while True:
-            recv_reqs = self.recv_requests()
-            self.process_input_requests(recv_reqs)
-            self.waiting_queue.extend(
-                self.disagg_prefill_pending_queue.pop_bootstrapped()
-            )
-            self.process_prefill_chunk()
-            batch = self.get_new_batch_prefill()
-            self.cur_batch = batch
-
-            if batch:
-                result = self.run_batch(batch)
-                self.process_batch_result_disagg_prefill(batch, result)
-
-            if len(self.disagg_prefill_infight_queue) > 0:
-                self.process_disagg_prefill_infight_queue()
-
-            if batch is None and len(self.disagg_prefill_infight_queue) == 0:
-                self.check_memory()
-                self.new_token_ratio = self.init_new_token_ratio
-
-            self.last_batch = batch
-            # HACK (byronhsu): reset the batch_is_full flag because we never enter update_running_batch which resets it
-            # Otherwise, it hangs under high concurrency
-            self.running_batch.batch_is_full = False
-
-    @torch.no_grad()
-    def event_loop_normal_disagg_decode(self):
-        """A normal scheduler loop for decode worker in disaggregation mode."""
-
-        while True:
-            recv_reqs = self.recv_requests()
-            self.process_input_requests(recv_reqs)
-            # polling and allocating kv cache
-            self.process_decode_queue()
-            batch = self.get_next_disagg_decode_batch_to_run()
-            self.cur_batch = batch
-
-            if batch:
-                # Generate fake extend output.
-                if batch.forward_mode.is_extend():
-                    # Note: Logprobs should be handled on the prefill engine.
-                    self.stream_output(
-                        batch.reqs, [False for _ in range(len(batch.reqs))]
-                    )
-                else:
-                    result = self.run_batch(batch)
-                    self.process_batch_result(batch, result)
-
-            if batch is None and (
-                len(self.disagg_decode_transfer_queue.queue)
-                + len(self.disagg_decode_prealloc_queue.queue)
-                == 0
-            ):
                 # When the server is idle, do self-check and re-init some states
                 self.check_memory()
                 self.new_token_ratio = self.init_new_token_ratio
@@ -836,6 +786,8 @@ class Scheduler(
                 custom_logit_processor=custom_logit_processor,
                 return_hidden_states=recv_req.return_hidden_states,
                 eos_token_ids=self.model_config.hf_eos_token_id,
+                bootstrap_host=recv_req.bootstrap_host,
+                bootstrap_room=recv_req.bootstrap_room,
             )
             req.tokenizer = self.tokenizer
 
@@ -947,12 +899,11 @@ class Scheduler(
             self._add_request_to_queue(req)
 
     def _add_request_to_queue(self, req: Req):
+        req.queue_time_start = time.time()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.disagg_prefill_pending_queue.add(req)
-
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.disagg_decode_prealloc_queue.add(req)
-
         else:
             self.waiting_queue.append(req)
 
@@ -995,6 +946,7 @@ class Scheduler(
                 req.finished_reason = FINISH_ABORT(
                     error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
                 )
+                req.queue_time_start = time.time()
                 self.waiting_queue.append(req)
                 return
 
@@ -1031,9 +983,10 @@ class Scheduler(
             self._largest_prefill_len, adder.log_input_tokens
         )
 
+        num_new_seq = len(can_run_list)
         f = (
             f"Prefill batch. "
-            f"#new-seq: {len(can_run_list)}, "
+            f"#new-seq: {num_new_seq}, "
             f"#new-token: {adder.log_input_tokens}, "
             f"#cached-token: {adder.log_hit_tokens}, "
             f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
@@ -1051,6 +1004,12 @@ class Scheduler(
             self.stats.token_usage = round(num_used / self.max_total_num_tokens, 2)
             self.stats.num_queue_reqs = len(self.waiting_queue)
             self.stats.cache_hit_rate = cache_hit_rate
+
+            total_queue_latency = 0
+            for req in can_run_list:
+                total_queue_latency += req.queue_time_end - req.queue_time_start
+            self.stats.avg_request_queue_latency = total_queue_latency / num_new_seq
+
             self.metrics_collector.log_stats(self.stats)
 
     def log_decode_stats(self):
@@ -1287,6 +1246,12 @@ class Scheduler(
         can_run_list: List[Req] = adder.can_run_list
         if len(can_run_list) == 0:
             return None
+
+        if self.enable_metrics:
+            # only record queue time when enable_metrics is True to avoid overhead
+            for req in can_run_list:
+                req.queue_time_end = time.time()
+
         self.waiting_queue = [
             x for x in self.waiting_queue if x not in set(can_run_list)
         ]
@@ -1634,8 +1599,9 @@ class Scheduler(
         time.sleep(5)
         self.parent_process.send_signal(signal.SIGQUIT)
 
-    def flush_cache_wrapped(self, recv_req: FlushCacheReq):
-        self.flush_cache()
+    def flush_cache_wrapped(self, recv_req: FlushCacheReqInput):
+        success = self.flush_cache()
+        return FlushCacheReqOutput(success=success)
 
     def flush_cache(self):
         """Flush the memory pool and cache."""
@@ -1844,6 +1810,7 @@ class Scheduler(
                 recv_req.activities,
                 recv_req.with_stack,
                 recv_req.record_shapes,
+                recv_req.profile_id,
             )
         else:
             return self.stop_profile()
@@ -1855,6 +1822,7 @@ class Scheduler(
         activities: Optional[List[str]],
         with_stack: Optional[bool],
         record_shapes: Optional[bool],
+        profile_id: Optional[str],
     ) -> None:
         if self.profiler_activities:
             return ProfileReqOutput(
@@ -1869,9 +1837,11 @@ class Scheduler(
 
         self.torch_profiler_output_dir = output_dir
         self.profiler_activities = activities
+        self.profiler_id = profile_id
         logger.info(
-            "Profiling starts. Traces will be saved to: %s",
+            "Profiling starts. Traces will be saved to: %s (with id %s)",
             self.torch_profiler_output_dir,
+            self.profiler_id,
         )
 
         activity_map = {
@@ -1916,14 +1886,14 @@ class Scheduler(
             self.torch_profiler.export_chrome_trace(
                 os.path.join(
                     self.torch_profiler_output_dir,
-                    str(time.time()) + f"-TP-{self.tp_rank}" + ".trace.json.gz",
+                    self.profiler_id + f"-TP-{self.tp_rank}" + ".trace.json.gz",
                 )
             )
 
         if "MEM" in self.profiler_activities:
             memory_profile_path = os.path.join(
                 self.torch_profiler_output_dir,
-                str(time.time()) + f"-TP-{self.tp_rank}-memory" + ".pickle",
+                self.profiler_id + f"-TP-{self.tp_rank}-memory" + ".pickle",
             )
             torch.cuda.memory._dump_snapshot(memory_profile_path)
             torch.cuda.memory._record_memory_history(enabled=None)

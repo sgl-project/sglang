@@ -73,10 +73,14 @@ from sglang.srt.utils import (
     MultiprocessingSerializer,
     enable_show_time_cost,
     get_available_gpu_memory,
+    get_bool_env_var,
     init_custom_process_group,
     is_cuda,
+    is_fa3_default_architecture,
     is_flashinfer_available,
     is_hip,
+    is_hopper_with_cuda_12_3,
+    is_no_spec_infer_or_topk_one,
     monkey_patch_p2p_access_check,
     monkey_patch_vllm_gguf_config,
     set_cpu_offload_max_bytes,
@@ -124,10 +128,7 @@ class ModelRunner:
         self.page_size = server_args.page_size
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
-        self.use_mla_backend = (
-            self.model_config.attention_arch == AttentionArch.MLA
-            and not server_args.disable_mla
-        )
+        self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
         self.attention_chunk_size = model_config.attention_chunk_size
 
         # Model-specific adjustment
@@ -136,18 +137,12 @@ class ModelRunner:
         if server_args.show_time_cost:
             enable_show_time_cost()
 
-        if server_args.disable_outlines_disk_cache:
-            from outlines.caching import disable_cache
-
-            disable_cache()
-
         # Global vars
         global_server_args_dict.update(
             {
                 "attention_backend": server_args.attention_backend,
                 "sampling_backend": server_args.sampling_backend,
                 "triton_attention_reduce_in_fp32": server_args.triton_attention_reduce_in_fp32,
-                "disable_mla": server_args.disable_mla,
                 "torchao_config": server_args.torchao_config,
                 "enable_nan_detection": server_args.enable_nan_detection,
                 "enable_dp_attention": server_args.enable_dp_attention,
@@ -157,13 +152,13 @@ class ModelRunner:
                 "device": server_args.device,
                 "speculative_accept_threshold_single": server_args.speculative_accept_threshold_single,
                 "speculative_accept_threshold_acc": server_args.speculative_accept_threshold_acc,
-                "enable_flashmla": server_args.enable_flashmla,
                 "disable_radix_cache": server_args.disable_radix_cache,
                 "flashinfer_mla_disable_ragged": server_args.flashinfer_mla_disable_ragged,
+                "moe_dense_tp_size": server_args.moe_dense_tp_size,
                 "debug_tensor_dump_output_folder": server_args.debug_tensor_dump_output_folder,
                 "debug_tensor_dump_inject": server_args.debug_tensor_dump_inject,
                 "n_share_experts_fusion": server_args.n_share_experts_fusion,
-                "disable_shared_experts_fusion": server_args.disable_shared_experts_fusion,
+                "disable_chunked_prefix_cache": server_args.disable_chunked_prefix_cache,
                 "use_mla_backend": self.use_mla_backend,
             }
         )
@@ -225,29 +220,45 @@ class ModelRunner:
     def model_specific_adjustment(self):
         server_args = self.server_args
 
-        if server_args.enable_flashinfer_mla:
-            # TODO: remove this branch after enable_flashinfer_mla is deprecated
-            logger.info("MLA optimization is turned on. Use flashinfer backend.")
-            server_args.attention_backend = "flashinfer"
-        elif server_args.enable_flashmla:
-            # TODO: remove this branch after enable_flashmla is deprecated
-            logger.info("MLA optimization is turned on. Use flashmla decode.")
-            server_args.attention_backend = "flashmla"
-        elif server_args.attention_backend is None:
-            # By default, use flashinfer for non-mla attention and triton for mla attention
+        if server_args.attention_backend is None:
+            """
+            We auto select the fastest attention backend according to the current offering
+            1. Models with MHA Architecture (e.g: Llama, QWen)
+                1.1 We will turn on FA3 on hopper unless user use spec decode with topk > 1 or page_size > 1.
+                1.2 In other cases, we will use flashinfer if available, otherwise use triton.
+            2. Models with MLA Architecture and using FA3
+                2.1 We will use FA3 backend on hopper.
+                2.2 Otherwise, we will use triton backend.
+            """
+
             if not self.use_mla_backend:
-                server_args.attention_backend = (
-                    "flashinfer" if is_flashinfer_available() else "triton"
-                )
+                if (
+                    is_hopper_with_cuda_12_3()
+                    and is_no_spec_infer_or_topk_one(server_args)
+                    and is_fa3_default_architecture(self.model_config.hf_config)
+                ):
+                    server_args.attention_backend = "fa3"
+                else:
+                    server_args.attention_backend = (
+                        "flashinfer" if is_flashinfer_available() else "triton"
+                    )
             else:
-                server_args.attention_backend = "triton"
+                if is_hopper_with_cuda_12_3():
+                    server_args.attention_backend = "fa3"
+                else:
+                    server_args.attention_backend = "triton"
             logger.info(
                 f"Attention backend not set. Use {server_args.attention_backend} backend by default."
             )
         elif self.use_mla_backend:
             # TODO: add MLA optimization on CPU
             if server_args.device != "cpu":
-                if server_args.attention_backend in ["flashinfer", "fa3", "triton"]:
+                if server_args.attention_backend in [
+                    "flashinfer",
+                    "fa3",
+                    "triton",
+                    "flashmla",
+                ]:
                     logger.info(
                         f"MLA optimization is turned on. Use {server_args.attention_backend} backend."
                     )
@@ -257,6 +268,16 @@ class ModelRunner:
                     )
             else:
                 raise ValueError(f"MLA optimization not supported on CPU.")
+
+        if (
+            server_args.attention_backend == "fa3"
+            and server_args.kv_cache_dtype == "fp8_e5m2"
+        ):
+            logger.warning(
+                "FlashAttention3 only supports fp8_e4m3 if using FP8; "
+                "Setting attention backend to triton."
+            )
+            server_args.attention_backend = "triton"
 
         if server_args.enable_double_sparsity:
             logger.info(
@@ -276,7 +297,6 @@ class ModelRunner:
                 f"Automatically reduce --mem-fraction-static to {self.mem_fraction_static:.3f} "
                 f"because this is a multimodal model."
             )
-
             logger.info(
                 "Automatically turn off --chunked-prefill-size for multimodal model."
             )
@@ -293,6 +313,15 @@ class ModelRunner:
 
         if server_args.enable_deepep_moe:
             logger.info(f"DeepEP is turned on. DeepEP mode: {server_args.deepep_mode}")
+
+        if not self.use_mla_backend:
+            server_args.disable_chunked_prefix_cache = True
+        elif self.page_size > 1:
+            logger.info("Disable chunked prefix cache when page size > 1.")
+            server_args.disable_chunked_prefix_cache = True
+
+        if not server_args.disable_chunked_prefix_cache:
+            logger.info("Chunked prefix cache is turned on.")
 
     def init_torch_distributed(self):
         logger.info("Init torch distributed begin.")
@@ -352,10 +381,16 @@ class ModelRunner:
         local_gpu_memory = get_available_gpu_memory(self.device, self.gpu_id)
         if self.tp_size > 1:
             if min_per_gpu_memory < local_gpu_memory * 0.9:
-                raise ValueError(
-                    "The memory capacity is unbalanced. Some GPUs may be occupied by other processes. "
-                    f"{min_per_gpu_memory=}, {local_gpu_memory=}, {local_gpu_memory * 0.9=}"
-                )
+                if get_bool_env_var("SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK"):
+                    logger.warning(
+                        "The memory capacity is unbalanced. Some GPUs may be occupied by other processes. "
+                        f"{min_per_gpu_memory=}, {local_gpu_memory=}, {local_gpu_memory * 0.9=}"
+                    )
+                else:
+                    raise ValueError(
+                        "The memory capacity is unbalanced. Some GPUs may be occupied by other processes. "
+                        f"{min_per_gpu_memory=}, {local_gpu_memory=}, {local_gpu_memory * 0.9=}"
+                    )
 
         logger.info(
             f"Init torch distributed ends. mem usage={(before_avail_memory - local_gpu_memory):.2f} GB"
@@ -885,9 +920,6 @@ class ModelRunner:
                 "FlashAttention v3 Backend requires SM>=90. "
                 "Please use `--attention-backend flashinfer`."
             )
-            logger.warning(
-                "FlashAttention v3 Backend is in Beta. FP8 is not supported."
-            )
             from sglang.srt.layers.attention.flashattention_backend import (
                 FlashAttentionBackend,
             )
@@ -924,6 +956,12 @@ class ModelRunner:
             return
 
         if self.server_args.disable_cuda_graph:
+            logger.warning(
+                "\n\nCUDA Graph is DISABLED.\n"
+                "This will cause significant performance degradation.\n"
+                "CUDA Graph should almost never be disabled in most usage scenarios.\n"
+                "If you encounter OOM issues, please try setting --mem-fraction-static to a lower value (such as 0.8 or 0.7) instead of disabling CUDA Graph.\n"
+            )
             return
 
         tic = time.time()
@@ -1060,7 +1098,8 @@ class ModelRunner:
         rope_scaling = getattr(self.model_config.hf_config, "rope_scaling", {})
         if rope_scaling is None:
             return False
-        return rope_scaling.get("type", None) == "mrope"
+        is_mrope_enabled = "mrope_section" in rope_scaling
+        return is_mrope_enabled
 
     def save_remote_model(self, url: str):
         from sglang.srt.model_loader.loader import RemoteModelLoader
