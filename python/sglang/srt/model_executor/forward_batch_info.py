@@ -757,10 +757,9 @@ class ForwardBatch:
 
         # TODO improve, e.g. unify w/ `init_raw`
         if output_global_num_tokens is not None:
-            max_len = max(output_global_num_tokens)
-            tp_size = get_tensor_model_parallel_world_size()
+            sum_len = sum(output_global_num_tokens)
             gathered_buffer = torch.zeros(
-                (max_len * tp_size, self.gathered_buffer.shape[1]),
+                (sum_len, self.gathered_buffer.shape[1]),
                 dtype=self.gathered_buffer.dtype,
                 device=self.gathered_buffer.device,
             )
