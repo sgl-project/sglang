@@ -2,7 +2,9 @@ from sglang.srt.utils import DeepEPMode
 
 try:
     from deep_ep import Buffer
-
+    from sglang.srt.layers.quantization.fp8_kernel import (
+        sglang_per_token_group_quant_fp8,
+    )
     use_deepep = True
 except ImportError:
     use_deepep = False
@@ -187,36 +189,59 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         return hidden_states, topk_idx, topk_weights, previous_event
 
     def dispatch_b(self, hidden_states, topk_idx, topk_weights, previous_event):
-        (
-            hidden_states,
-            topk_idx,
-            topk_weights,
-            event,
-        ) = self._dispatch_core(hidden_states, topk_idx, topk_weights, previous_event)
         event.current_stream_wait() if self.async_finish else ()
-        if hidden_states.shape[0] > 0:
-            reorder_topk_ids, seg_indptr, hidden_states = self._deepep_permute(
-                hidden_states, topk_idx, fp8_dtype=hidden_states.dtype
+        if use_deepep:
+            #TODO hard code 128 block quant
+            hidden_states=sglang_per_token_group_quant_fp8(hidden_states,128)
+            (
+                hidden_states,
+                topk_idx,
+                topk_weights,
+                num_recv_tokens_per_expert_list,
+                event,
+            ) = self._dispatch_core(hidden_states, topk_idx, topk_weights, previous_event)
+            return (
+                hidden_states,
+                topk_idx,
+                topk_weights,
+                num_recv_tokens_per_expert_list,
+                _,
+                _,
+                _,
+                _,
             )
         else:
-            reorder_topk_ids = torch.empty(
-                (0,), device=hidden_states.device, dtype=torch.int64
-            )
-            seg_indptr = torch.zeros(
-                (self.num_experts + 1,), device=hidden_states.device, dtype=torch.int64
-            )
+            (
+                hidden_states,
+                topk_idx,
+                topk_weights,
+                num_recv_tokens_per_expert_list,
+                event,
+            ) = self._dispatch_core(hidden_states, topk_idx, topk_weights, previous_event)
+            if hidden_states.shape[0] > 0:
+                reorder_topk_ids, seg_indptr, hidden_states = self._deepep_permute(
+                    hidden_states, topk_idx, fp8_dtype=hidden_states.dtype
+                )
+            else:
+                reorder_topk_ids = torch.empty(
+                    (0,), device=hidden_states.device, dtype=torch.int64
+                )
+                seg_indptr = torch.zeros(
+                    (self.num_experts + 1,), device=hidden_states.device, dtype=torch.int64
+                )
 
-        masked_m = expected_m = None
+            masked_m = expected_m = None
 
-        return (
-            hidden_states,
-            topk_idx,
-            topk_weights,
-            reorder_topk_ids,
-            seg_indptr,
-            masked_m,
-            expected_m,
-        )
+            return (
+                hidden_states,
+                topk_idx,
+                topk_weights,
+                _,
+                reorder_topk_ids,
+                seg_indptr,
+                masked_m,
+                expected_m,
+            )
 
     def _dispatch_core(
         self,
@@ -248,7 +273,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             recv_x,
             recv_topk_idx,
             recv_topk_weights,
-            _,  # num_recv_tokens_per_expert_list
+            num_recv_tokens_per_expert_list,  # num_recv_tokens_per_expert_list
             self.handle,
             event,
         ) = buffer.dispatch(
@@ -268,6 +293,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             recv_x,
             recv_topk_idx,
             recv_topk_weights,
+            num_recv_tokens_per_expert_list,
             event,
         )
 
@@ -316,6 +342,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
     ):
+        #TODO support deepgemm
         if hidden_states.shape[0] > 0:
             num_tokens = self.src2dst.shape[0] // self.router_topk
             output = torch.empty(
