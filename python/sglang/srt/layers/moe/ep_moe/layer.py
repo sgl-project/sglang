@@ -1040,7 +1040,7 @@ class DeepEPMoE(EPMoE):
         )
         with _ensure_get_col_major_tma_aligned_tensor_noop():
             m_grouped_gemm_fp8_fp8_bf16_nt_masked(
-                DisposibleTensor.maybe_unwrap(hidden_states_fp8),
+                [DisposibleTensor.maybe_unwrap(x) for x in hidden_states_fp8],
                 self.w13_weight_fp8,
                 gateup_output,
                 masked_m,
