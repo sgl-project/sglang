@@ -1638,6 +1638,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 buffer_size=2, dtype=torch.float32, device="cuda"
             ),
         )
+        del state.hidden_states_after_input_ln
 
     def _forward_tbo_op_decode_attn_1(self, state):
         assert (
@@ -1653,6 +1654,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 buffer_size=2, dtype=torch.float32, device="cuda"
             ),
         )
+        del state.self_attn_state
 
     def _forward_tbo_op_post_attn_layernorm(self, state):
         hidden_states, residual = (
@@ -1689,6 +1691,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states,
             residual,
         )
+        del state.hidden_states_after_attn, state.residual_after_input_ln
 
     # TODO some logic should be in MLP, refactor this
     def _forward_tbo_op_compute_layer_output(self, state):
@@ -1719,7 +1722,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             forward_batch=state.forward_batch,
             tbo_subbatch_index=state.tbo_subbatch_index,
         )
-        state.clear()
+        state.clear(expect_keys={"positions", "forward_batch", "tbo_subbatch_index"})
         return output
 
 
