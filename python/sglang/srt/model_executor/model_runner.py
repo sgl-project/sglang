@@ -137,11 +137,6 @@ class ModelRunner:
         if server_args.show_time_cost:
             enable_show_time_cost()
 
-        if server_args.disable_outlines_disk_cache:
-            from outlines.caching import disable_cache
-
-            disable_cache()
-
         # Global vars
         global_server_args_dict.update(
             {
