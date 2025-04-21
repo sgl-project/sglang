@@ -462,31 +462,27 @@ class SchedulerDisaggregationDecodeMixin:
             self.process_decode_queue()
             batch = self.get_next_disagg_decode_batch_to_run()
             self.cur_batch = batch
+            
+            prepare_dp_attn_flag = (
+                self.server_args.enable_dp_attention
+                or self.server_args.enable_sp_layernorm
+            )
 
             if batch:
                 # Generate fake extend output.
                 if batch.forward_mode.is_extend():
                     # Note: Logprobs should be handled on the prefill engine.
                     self.stream_output(batch.reqs, False)
-                    if (
-                        self.server_args.enable_dp_attention
-                        or self.server_args.enable_sp_layernorm
-                    ):
+                    if prepare_dp_attn_flag:
                         self._prepare_idle_batch_and_run(None)
                         
                 else:
-                    if (
-                        self.server_args.enable_dp_attention
-                        or self.server_args.enable_sp_layernorm
-                    ):
+                    if prepare_dp_attn_flag:
                         batch, _ = self.prepare_dp_attn_batch(batch)
                     result = self.run_batch(batch)
                     self.process_batch_result(batch, result)
             else:
-                if (
-                    self.server_args.enable_dp_attention
-                    or self.server_args.enable_sp_layernorm
-                ):
+                if prepare_dp_attn_flag:
                     self._prepare_idle_batch_and_run(None)
 
             if batch is None and (
