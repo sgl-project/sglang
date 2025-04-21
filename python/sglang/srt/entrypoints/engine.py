@@ -279,6 +279,10 @@ class Engine(EngineBase):
         self.shutdown()
         return False
 
+    def flush_cache(self):
+        loop = asyncio.get_event_loop()
+        return loop.run_until_complete(self.tokenizer_manager.flush_cache())
+
     def start_profile(self):
         loop = asyncio.get_event_loop()
         loop.run_until_complete(self.tokenizer_manager.start_profile())
