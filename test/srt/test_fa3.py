@@ -119,7 +119,7 @@ class TestFlashAttention3MLA(BaseFlashAttentionTest):
 
     @classmethod
     def get_server_args(cls):
-        DEFAULT_SERVER_ARGS
+        return DEFAULT_SERVER_ARGS
 
 
 class TestFlashAttention3LocalAttn(BaseFlashAttentionTest):
@@ -130,7 +130,7 @@ class TestFlashAttention3LocalAttn(BaseFlashAttentionTest):
 
     @classmethod
     def get_server_args(cls):
-        cloned_args = DEFAULT_SERVER_ARGS.deepcopy()
+        cloned_args = DEFAULT_SERVER_ARGS.copy()
         cloned_args.extend(["--tp", "4"])
         return cloned_args
 
