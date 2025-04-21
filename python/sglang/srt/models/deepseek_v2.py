@@ -1854,13 +1854,8 @@ class DeepseekV2Model(nn.Module):
         def _postprocess_splitted_inputs(hidden_states, residual, positions, forward_batch):
             if self.attn_tp_size != 1:
                 assert residual is None
-                hidden_states, local_hidden_states = (
-                    forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
-                    hidden_states,
-                )
-                tp_all_gather(
-                    list(hidden_states.tensor_split(self.attn_tp_size)), local_hidden_states
-                )
+                tensor_list = list(hidden_states.tensor_split(self.attn_tp_size))
+                hidden_states = tensor_list[self.attn_tp_rank]
 
             return dict(
                 hidden_states=hidden_states, residual=residual, positions=positions, forward_batch=forward_batch)
