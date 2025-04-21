@@ -33,6 +33,7 @@ def compute_split_seq_index(
     elif forward_mode.is_decode():
         return num_tokens // 2
     elif forward_mode.is_idle():
+        assert num_tokens == 0
         return 0
     else:
         raise NotImplementedError
@@ -60,6 +61,7 @@ def compute_split_token_index(
     elif forward_mode.is_decode():
         return split_seq_index
     elif forward_mode.is_idle():
+        assert split_seq_index == 0
         return 0
     else:
         raise NotImplementedError
@@ -97,7 +99,7 @@ def _model_forward_filter_inputs(
     token_slice = slice(*output_forward_batch.tbo_parent_token_range)
     return dict(
         hidden_states=hidden_states[token_slice],
-        residual=residual[token_slice],
+        residual=None if residual is None else residual[token_slice],
         positions=positions[token_slice],
         forward_batch=output_forward_batch,
         tbo_subbatch_index=tbo_subbatch_index,
@@ -106,7 +108,12 @@ def _model_forward_filter_inputs(
 
 def model_forward_merge_outputs(output_a, output_b):
     def _handle_key(name):
-        return torch.concat([output_a[name], output_b[name]], dim=0)
+        value_a = output_a[name]
+        value_b = output_b[name]
+        assert (value_a is None) == (value_b is None)
+        if value_a is None:
+            return None
+        return torch.concat([value_a, value_b], dim=0)
 
     return _handle_key("hidden_states"), _handle_key("residual")
 
@@ -132,13 +139,12 @@ Stage = List[ExecutionOperation]
 
 
 def model_forward_execute_two_batch(
-    inputs,
+    inputs_a,
+    inputs_b,
     operations_a: List[Operation],
     operations_b: List[Operation],
     delta_stages: int,
 ):
-    splitted_inputs = model_forward_split_inputs(**inputs)
-    inputs_a, inputs_b = splitted_inputs
     output_a, output_b = _execute_two_batch_raw(
         inputs_a, inputs_b, operations_a, operations_b, delta_stages=delta_stages
     )

@@ -745,6 +745,19 @@ class ForwardBatch:
             output_dict["input_ids"], output_dict["forward_mode"]
         )
 
+        # TODO improve, e.g. unify w/ `init_raw`
+        from sglang.srt.managers.schedule_batch import global_server_args_dict
+
+        if global_server_args_dict["moe_dense_tp_size"] == 1:
+            sum_len = end_token_index - start_token_index
+            gathered_buffer = torch.zeros(
+                (sum_len, self.gathered_buffer.shape[1]),
+                dtype=self.gathered_buffer.dtype,
+                device=self.gathered_buffer.device,
+            )
+        else:
+            gathered_buffer = None
+
         output_dict.update(
             dict(
                 batch_size=end_seq_index - start_seq_index,
@@ -756,7 +769,7 @@ class ForwardBatch:
                 tbo_children=None,
                 global_num_tokens_gpu=None,
                 global_num_tokens_cpu=None,
-                gathered_buffer=None,
+                gathered_buffer=gathered_buffer,
                 global_num_tokens_for_logprob_gpu=None,
                 global_num_tokens_for_logprob_cpu=None,
                 sampling_info=None,

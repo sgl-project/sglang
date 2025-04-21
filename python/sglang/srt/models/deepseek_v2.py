@@ -102,6 +102,7 @@ from sglang.srt.model_loader.weight_utils import (
     ModelParamNameInfoOthers,
     default_weight_loader,
 )
+from sglang.srt.two_batch_overlap import model_forward_split_inputs
 from sglang.srt.utils import (
     BumpAllocator,
     DeepEPMode,
@@ -514,20 +515,6 @@ class DeepseekV2MoE(nn.Module):
         state.shared_output = self._forward_deepep_shared_output(
             state.forward_batch.forward_mode, state.hidden_states_after_post_attn_ln
         )
-
-    def _forward_tbo_op_compute_layer_output(self, state):
-        final_hidden_states = state.hidden_states_from_combine
-        if state.shared_output is not None:
-            final_hidden_states = final_hidden_states + state.shared_output
-        output = dict(
-            positions=state.positions,
-            hidden_states=final_hidden_states,
-            forward_batch=state.forward_batch,
-            residual=state.residual_after_post_attn_ln,
-            tbo_subbatch_index=state.tbo_subbatch_index,
-        )
-        state.clear()
-        return output
 
     def _forward_shared_experts(self, hidden_states):
         if self.n_share_experts_fusion == 0:
@@ -1376,6 +1363,8 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
+        # print(
+        #     f"hi [{get_tensor_model_parallel_rank()}, {self.layer_id}, {self.__class__.__name__}] forward_ffn_with_full_input start {hidden_states.shape=}")
 
         if hidden_states.shape[0] == 0:
             residual = hidden_states
@@ -1421,6 +1410,8 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states = self.mlp(hidden_states)
+        # print(
+        #     f"hi [{get_tensor_model_parallel_rank()}, {self.layer_id}, {self.__class__.__name__}] forward_ffn_with_full_input after-mlp {hidden_states.shape=}")
 
         # TODO(ch-wan): ues reduce-scatter in MLP to avoid this scatter
         # Scatter
@@ -1433,6 +1424,8 @@ class DeepseekV2DecoderLayer(nn.Module):
             )
             dp_scatter(hidden_states, global_hidden_states, forward_batch)
 
+        # print(
+        #     f"hi [{get_tensor_model_parallel_rank()}, {self.layer_id}, {self.__class__.__name__}] forward_ffn_with_full_input end {self.local_dp_size=} {hidden_states.shape=}")
         return hidden_states, residual
 
     def forward_ffn_with_scattered_input(
@@ -1443,6 +1436,8 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
+        # print(
+        #     f"hi [{get_tensor_model_parallel_rank()}, {self.layer_id}, {self.__class__.__name__}] forward_ffn_with_scattered_input start {hidden_states.shape=}")
         # print(f"hi [{get_tensor_model_parallel_rank()}, {self.__class__.__name__}] forward_deepep start {self.layer_id=} {self.mlp.__class__.__name__=} "
         #       f"{hidden_states.shape=} {hidden_states[:1, :5]=} {residual[:1, :5] if residual is not None else None=}")
 
@@ -1512,6 +1507,8 @@ class DeepseekV2DecoderLayer(nn.Module):
                 list(hidden_states.tensor_split(self.attn_tp_size)), local_hidden_states
             )
 
+        # print(
+        #     f"hi [{get_tensor_model_parallel_rank()}, {self.layer_id}, {self.__class__.__name__}] forward_ffn_with_scattered_input end {hidden_states.shape=}")
         # print(f"hi [{get_tensor_model_parallel_rank()}, {self.__class__.__name__}] forward_deepep end {self.layer_id=} {self.mlp.__class__.__name__=} "
         #       f"{hidden_states.shape=} {hidden_states[:1, :5]=} {residual[:1, :5] if residual is not None else None=}")
         return hidden_states, residual
@@ -1529,11 +1526,6 @@ class DeepseekV2DecoderLayer(nn.Module):
     def get_forward_tbo_operations(
         self, forward_mode: ForwardMode, tbo_child_index: int
     ):
-        # DeepSeek also uses DP=TP
-        assert (
-            self.attn_tp_size == 1
-        ), "For simplicity of two-batch-overlap, DP!=TP is not supported currently."
-
         if forward_mode == ForwardMode.EXTEND:
             operations = [
                 self._forward_tbo_op_input_layernorm,
@@ -1550,7 +1542,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 two_batch_overlap.YieldOperation(),
                 self.mlp._forward_tbo_op_shared,
                 self.mlp._forward_tbo_op_combine_b,
-                self.mlp._forward_tbo_op_compute_layer_output,
+                self._forward_tbo_op_compute_layer_output,
             ]
         elif forward_mode == ForwardMode.DECODE:
             operations = [
@@ -1571,7 +1563,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 self.mlp._forward_tbo_op_combine_a,
                 two_batch_overlap.YieldOperation(),
                 self.mlp._forward_tbo_op_combine_b,
-                self.mlp._forward_tbo_op_compute_layer_output,
+                self._forward_tbo_op_compute_layer_output,
                 two_batch_overlap.YieldOperation(),
             ]
         else:
@@ -1589,14 +1581,36 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         tbo_subbatch_index: int,
     ):
+        # print(
+        #     f"hi [{get_tensor_model_parallel_rank()}, {self.layer_id}] _forward_tbo_op_input_layernorm start {forward_batch.input_ids.shape=} {hidden_states.shape=}")
+
+        # TODO adhoc code, avoid copy-pasting these
         if hidden_states.shape[0] == 0:
-            state.hidden_states_after_input_ln = state.residual_after_input_ln = (
-                hidden_states
-            )
+            residual = hidden_states
         else:
-            state.hidden_states_after_input_ln, state.residual_after_input_ln = (
-                self._forward_input_layernorm(hidden_states, residual)
+            hidden_states, residual = self._forward_input_layernorm(
+                hidden_states, residual
             )
+
+        if self.attn_tp_size != 1 and self.input_is_scattered:
+            assert (
+                forward_batch.gathered_buffer is not None
+            ), "please use moe_dense_tp_size=1"
+            # print(
+            #     f"hi [{get_tensor_model_parallel_rank()}, {self.layer_id}] _forward_tbo_op_input_layernorm {forward_batch.input_ids.shape=} {hidden_states.shape=} {forward_batch.gathered_buffer.shape=}")
+            hidden_states, local_hidden_states = (
+                forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
+                hidden_states,
+            )
+            tp_all_gather(
+                list(hidden_states.tensor_split(self.attn_tp_size)), local_hidden_states
+            )
+
+        state.hidden_states_after_input_ln, state.residual_after_input_ln = (
+            hidden_states,
+            residual,
+        )
+
         state.update(
             dict(
                 forward_batch=forward_batch,
@@ -1647,14 +1661,68 @@ class DeepseekV2DecoderLayer(nn.Module):
             state.hidden_states_after_attn,
             state.residual_after_input_ln,
         )
-        if hidden_states.shape[0] != 0:
-            hidden_states, residual = self.post_attention_layernorm(
-                hidden_states, residual
-            )
+
+        # TODO adhoc code, do not copy-paste
+        if self.attn_tp_size != 1:
+            if self.input_is_scattered:
+                tensor_list = list(hidden_states.tensor_split(self.attn_tp_size))
+                hidden_states = tensor_list[self.attn_tp_rank]
+                tp_reduce_scatter(hidden_states, tensor_list)
+                if hidden_states.shape[0] != 0:
+                    hidden_states, residual = self.post_attention_layernorm(
+                        hidden_states, residual
+                    )
+            else:
+                if self.attn_tp_rank == 0:
+                    hidden_states += residual
+                tensor_list = list(hidden_states.tensor_split(self.attn_tp_size))
+                hidden_states = tensor_list[self.attn_tp_rank]
+                tp_reduce_scatter(hidden_states, tensor_list)
+                residual = hidden_states
+                if hidden_states.shape[0] != 0:
+                    hidden_states = self.post_attention_layernorm(hidden_states)
+        else:
+            if hidden_states.shape[0] != 0:
+                hidden_states, residual = self.post_attention_layernorm(
+                    hidden_states, residual
+                )
+
         state.hidden_states_after_post_attn_ln, state.residual_after_post_attn_ln = (
             hidden_states,
             residual,
         )
+
+    # TODO some logic should be in MLP, refactor this
+    def _forward_tbo_op_compute_layer_output(self, state):
+        hidden_states = state.hidden_states_from_combine
+        residual = state.residual_after_post_attn_ln
+
+        if state.shared_output is not None:
+            hidden_states = hidden_states + state.shared_output
+
+        # TODO do not copy paste
+        if self.is_last_layer and self.attn_tp_size != 1:
+            hidden_states += residual
+            residual = None
+            hidden_states, local_hidden_states = (
+                state.forward_batch.gathered_buffer[
+                    : state.forward_batch.input_ids.shape[0]
+                ],
+                hidden_states,
+            )
+            tp_all_gather(
+                list(hidden_states.tensor_split(self.attn_tp_size)), local_hidden_states
+            )
+
+        output = dict(
+            positions=state.positions,
+            hidden_states=hidden_states,
+            residual=residual,
+            forward_batch=state.forward_batch,
+            tbo_subbatch_index=state.tbo_subbatch_index,
+        )
+        state.clear()
+        return output
 
 
 class DeepseekV2Model(nn.Module):
@@ -1670,6 +1738,8 @@ class DeepseekV2Model(nn.Module):
         self.padding_id = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.first_k_dense_replace = config.first_k_dense_replace
+        self.attn_tp_size = get_attention_tp_size()
+        self.attn_tp_rank = get_attention_tp_rank()
 
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
@@ -1766,6 +1836,46 @@ class DeepseekV2Model(nn.Module):
                 )
             ]
 
+        # print(
+        #     f"hi [{get_tensor_model_parallel_rank()}] forward_tbo_layers start {forward_batch.tbo_split_seq_index=} {hidden_states.shape=}")
+        if self.attn_tp_size != 1:
+            hidden_states += residual
+            residual = None
+
+            hidden_states, local_hidden_states = (
+                forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
+                hidden_states,
+            )
+            tp_all_gather(
+                list(hidden_states.tensor_split(self.attn_tp_size)), local_hidden_states
+            )
+
+        # print(
+        #     f"hi [{get_tensor_model_parallel_rank()}] forward_tbo_layers gathered {hidden_states.shape=}")
+        inputs_a, inputs_b = model_forward_split_inputs(
+            positions=positions,
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+            residual=residual,
+        )
+        del hidden_states, residual
+
+        # print(
+        #     f"hi [{get_tensor_model_parallel_rank()}] forward_tbo_layers TBO-split {inputs_a['hidden_states'].shape=} {inputs_b['hidden_states'].shape=}")
+
+        def _postprocess_splitted_inputs(hidden_states, residual, **kwargs):
+            if self.attn_tp_size != 1:
+                assert residual is None
+                tensor_list = list(hidden_states.tensor_split(self.attn_tp_size))
+                hidden_states = tensor_list[self.attn_tp_rank]
+
+            return dict(hidden_states=hidden_states, residual=residual, **kwargs)
+
+        inputs_a = _postprocess_splitted_inputs(**inputs_a)
+        inputs_b = _postprocess_splitted_inputs(**inputs_b)
+        # print(
+        #     f"hi [{get_tensor_model_parallel_rank()}] forward_tbo_layers postprocessed {inputs_a['hidden_states'].shape=} {inputs_b['hidden_states'].shape=}")
+
         # TODO do not hardcode
         total_num_sm = torch.cuda.get_device_properties(
             device="cuda"
@@ -1780,12 +1890,8 @@ class DeepseekV2Model(nn.Module):
         )
         with num_sm_context:
             return two_batch_overlap.model_forward_execute_two_batch(
-                inputs=dict(
-                    positions=positions,
-                    hidden_states=hidden_states,
-                    forward_batch=forward_batch,
-                    residual=residual,
-                ),
+                inputs_a=inputs_a,
+                inputs_b=inputs_b,
                 operations_a=compute_operations(0),
                 operations_b=compute_operations(1),
                 delta_stages={
@@ -1848,7 +1954,7 @@ class DeepseekV2ForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
         # print(
-        #     f"hi [{get_tensor_model_parallel_rank()}, {self.__class__.__name__}] forward start {forward_batch.tbo_split_seq_index=} {input_ids=} {positions=}")
+        #     f"hi [{get_tensor_model_parallel_rank()}, {self.__class__.__name__}] forward start {forward_batch.tbo_split_seq_index=} {input_ids.shape=} {input_ids=} {positions=}")
 
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
 
