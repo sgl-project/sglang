@@ -391,6 +391,7 @@ class Scheduler(
         self.torch_profiler = None
         self.torch_profiler_output_dir: Optional[str] = None
         self.profiler_activities: Optional[List[str]] = None
+        self.profiler_id: Optional[str] = None
         self.profiler_target_forward_ct: Optional[int] = None
 
         # Init metrics stats
@@ -1805,6 +1806,7 @@ class Scheduler(
                 recv_req.activities,
                 recv_req.with_stack,
                 recv_req.record_shapes,
+                recv_req.profile_id,
             )
         else:
             return self.stop_profile()
@@ -1816,6 +1818,7 @@ class Scheduler(
         activities: Optional[List[str]],
         with_stack: Optional[bool],
         record_shapes: Optional[bool],
+        profile_id: Optional[str],
     ) -> None:
         if self.profiler_activities:
             return ProfileReqOutput(
@@ -1830,9 +1833,11 @@ class Scheduler(
 
         self.torch_profiler_output_dir = output_dir
         self.profiler_activities = activities
+        self.profiler_id = profile_id
         logger.info(
-            "Profiling starts. Traces will be saved to: %s",
+            "Profiling starts. Traces will be saved to: %s (with id %s)",
             self.torch_profiler_output_dir,
+            self.profiler_id,
         )
 
         activity_map = {
@@ -1874,14 +1879,14 @@ class Scheduler(
             self.torch_profiler.export_chrome_trace(
                 os.path.join(
                     self.torch_profiler_output_dir,
-                    str(time.time()) + f"-TP-{self.tp_rank}" + ".trace.json.gz",
+                    self.profiler_id + f"-TP-{self.tp_rank}" + ".trace.json.gz",
                 )
             )
 
         if "MEM" in self.profiler_activities:
             memory_profile_path = os.path.join(
                 self.torch_profiler_output_dir,
-                str(time.time()) + f"-TP-{self.tp_rank}-memory" + ".pickle",
+                self.profiler_id + f"-TP-{self.tp_rank}-memory" + ".pickle",
             )
             torch.cuda.memory._dump_snapshot(memory_profile_path)
             torch.cuda.memory._record_memory_history(enabled=None)

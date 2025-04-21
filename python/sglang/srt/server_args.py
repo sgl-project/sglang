@@ -183,7 +183,6 @@ class ServerArgs:
     warmups: Optional[str] = None
     moe_dense_tp_size: Optional[int] = None
     n_share_experts_fusion: int = 0
-    disable_shared_experts_fusion: bool = False
     disable_chunked_prefix_cache: bool = False
     disable_fast_image_processor: bool = False
 
@@ -196,6 +195,7 @@ class ServerArgs:
     disaggregation_mode: str = "null"
     disaggregation_bootstrap_port: int = 8998
     disaggregation_transfer_backend: str = "mooncake"
+    disaggregation_ib_device: Optional[str] = None
 
     def __post_init__(self):
         # Expert parallelism
@@ -227,9 +227,6 @@ class ServerArgs:
         else:
             # GPU memory is not known yet or no GPU is available.
             gpu_mem = None
-
-        if is_hip():
-            self.disable_shared_experts_fusion = True
 
         # Set mem fraction static, which depends on the tensor parallelism size
         if self.mem_fraction_static is None:
@@ -394,6 +391,10 @@ class ServerArgs:
 
         os.environ["SGLANG_ENABLE_TORCH_COMPILE"] = (
             "1" if self.enable_torch_compile else "0"
+        )
+        # Set env var before grammar backends init
+        os.environ["SGLANG_DISABLE_OUTLINES_DISK_CACHE"] = (
+            "1" if self.disable_outlines_disk_cache else "0"
         )
 
     @staticmethod
@@ -1125,13 +1126,8 @@ class ServerArgs:
             "--n-share-experts-fusion",
             type=int,
             default=0,
-            help="The number of shared_experts need to be replica to fuse with normal experts in deepseek v3/r1 "
-            "we use tp_size by default.",
-        )
-        parser.add_argument(
-            "--disable-shared-experts-fusion",
-            action="store_true",
-            help="Disable shared experts fusion by setting n_share_experts_fusion to 0.",
+            help="The number of shared_experts need to be replicated to fuse with normal experts in deepseek v3/r1, "
+            "set it to tp_size can get best optimized performace.",
         )
         parser.add_argument(
             "--disable-chunked-prefix-cache",
@@ -1192,6 +1188,12 @@ class ServerArgs:
             type=str,
             default=ServerArgs.disaggregation_transfer_backend,
             help="The backend for disaggregation transfer. Default is mooncake.",
+        )
+        parser.add_argument(
+            "--disaggregation-ib-device",
+            type=str,
+            default=ServerArgs.disaggregation_ib_device,
+            help="The ib device for disaggregation transfer. Default is None, it will be detected automatically if using the mooncake backend.",
         )
 
     @classmethod
