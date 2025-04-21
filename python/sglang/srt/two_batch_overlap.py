@@ -33,6 +33,7 @@ def compute_split_seq_index(
     elif forward_mode.is_decode():
         return num_tokens // 2
     elif forward_mode.is_idle():
+        assert num_tokens == 0
         return 0
     else:
         raise NotImplementedError
@@ -60,6 +61,7 @@ def compute_split_token_index(
     elif forward_mode.is_decode():
         return split_seq_index
     elif forward_mode.is_idle():
+        assert split_seq_index == 0
         return 0
     else:
         raise NotImplementedError

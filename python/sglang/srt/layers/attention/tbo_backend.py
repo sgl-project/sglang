@@ -134,7 +134,7 @@ class TboAttnBackend(AttentionBackend):
 
         assert (
             num_tokens_child_left > 0 and num_tokens_child_right > 0
-        ), f"{num_tokens_child_left=} {num_tokens_child_right=}"
+        ), f"{num_tokens_child_left=} {num_tokens_child_right=} {forward_mode=} {num_tokens=}"
 
         common_pre_split_args = dict(
             fn_name=fn_name,
