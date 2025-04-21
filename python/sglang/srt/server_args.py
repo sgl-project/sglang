@@ -273,8 +273,6 @@ class ServerArgs:
                     self.cuda_graph_max_bs = 8
                 else:
                     self.cuda_graph_max_bs = 80
-            else:
-                self.cuda_graph_max_bs = 160
 
         # Set kernel backends for hpu device
         if self.device == "hpu":
