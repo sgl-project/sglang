@@ -2,22 +2,15 @@ import unittest
 from types import SimpleNamespace
 
 import requests
-import torch
 
 from sglang.srt.utils import get_device_sm, kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
-from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST  # llama 3.1 8B
 from sglang.test.test_utils import (
-    DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3,  # eagle3 llama 3.1 8B
-)
-from sglang.test.test_utils import (
-    DEFAULT_MODEL_NAME_FOR_TEST_LOCAL_ATTENTION,  # llama 4 scout 17B 16E
-)
-from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST_MLA  # deepseek v3 test
-from sglang.test.test_utils import (
-    DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN,  # deepseek v3 test nextN
-)
-from sglang.test.test_utils import (
+    DEFAULT_MODEL_NAME_FOR_TEST,
+    DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3,
+    DEFAULT_MODEL_NAME_FOR_TEST_LOCAL_ATTENTION,
+    DEFAULT_MODEL_NAME_FOR_TEST_MLA,
+    DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     popen_launch_server,
@@ -127,8 +120,8 @@ class TestFlashAttention3MLA(BaseFlashAttentionTest):
 class TestFlashAttention3LocalAttn(BaseFlashAttentionTest):
     """Test FlashAttention3 with Model with local attention, e.g. Llama 4."""
 
-    self.accuracy_threshold = 0.70
-    self.model = DEFAULT_LOCAL_ATTENTION_MODEL_NAME_FOR_TEST
+    accuracy_threshold = 0.70
+    model = DEFAULT_MODEL_NAME_FOR_TEST_LOCAL_ATTENTION
 
     @classmethod
     def get_server_args(cls):
@@ -161,7 +154,41 @@ class TestFlashAttention3SpeculativeDecode(BaseFlashAttentionTest):
                 "--speculative-eagle-topk",
                 "1",
                 "--speculative-num-draft-tokens",
-                "3",
+                "4",
+                "--dtype",
+                "float16",
+            ]
+        )
+        return args
+
+
+class TestFlashAttention3SpeculativeDecodeTopk(BaseFlashAttentionTest):
+    """Tests FlashAttention3 with enhanced speculative decoding using Llama 3.1 8B and EAGLE3.
+    This test will be using top-k value > 1 which would verify the other branches of the FA3 code
+    """
+
+    model = DEFAULT_MODEL_NAME_FOR_TEST
+    accuracy_threshold = 0.65
+    speculative_decode = True
+    spec_decode_threshold = 1.5
+
+    @classmethod
+    def get_server_args(cls):
+        args = super().get_server_args()
+        args.extend(
+            [
+                "--cuda-graph-max-bs",
+                "2",
+                "--speculative-algorithm",
+                "EAGLE3",
+                "--speculative-draft",
+                DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3,
+                "--speculative-num-steps",
+                "5",
+                "--speculative-eagle-topk",
+                "4",
+                "--speculative-num-draft-tokens",
+                "8",
                 "--dtype",
                 "float16",
             ]
@@ -193,7 +220,39 @@ class TestFlashAttention3MLASpeculativeDecode(BaseFlashAttentionTest):
                 "--speculative-eagle-topk",
                 "1",
                 "--speculative-num-draft-tokens",
-                "3",
+                "4",
+            ]
+        )
+        return args
+
+
+class TestFlashAttention3MLASpeculativeDecodeTopk(BaseFlashAttentionTest):
+    """Test FlashAttention3 with speculative decode enabled with deepseek v3 test model and its nextN model
+    This test will be using top-k value > 1 which would verify the other branches of the FA3 code
+    """
+
+    model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
+    accuracy_threshold = 0.60
+    speculative_decode = True
+    spec_decode_threshold = 1.5
+
+    @classmethod
+    def get_server_args(cls):
+        args = super().get_server_args()
+        args.extend(
+            [
+                "--cuda-graph-max-bs",
+                "2",
+                "--speculative-algorithm",
+                "EAGLE",
+                "--speculative-draft",
+                DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN,
+                "--speculative-num-steps",
+                "5",
+                "--speculative-eagle-topk",
+                "4",
+                "--speculative-num-draft-tokens",
+                "8",
             ]
         )
         return args
