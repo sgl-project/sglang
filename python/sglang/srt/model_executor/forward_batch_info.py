@@ -788,7 +788,7 @@ class ForwardBatch:
 def _compute_extend_num_tokens(input_ids, forward_mode: ForwardMode):
     if forward_mode.is_extend():
         return input_ids.shape[0]
-    elif forward_mode.is_decode():
+    elif forward_mode.is_decode() or forward_mode.is_idle():
         return None
     raise NotImplementedError
 
