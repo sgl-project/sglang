@@ -40,7 +40,9 @@ class MiniLoadBalancer:
                 status_code=decode_response.status,
             )
 
-    async def generate_stream(self, modified_request, prefill_server, decode_server, endpoint = "generate"):
+    async def generate_stream(
+        self, modified_request, prefill_server, decode_server, endpoint="generate"
+    ):
         assert endpoint[0] != "/", f"Endpoint should not start with '/': {endpoint}"
 
         async def stream_results():
@@ -176,6 +178,7 @@ async def handle_generate_request(request_data: dict):
             modified_request, prefill_server, decode_server
         )
 
+
 @app.post("/v1/chat/completions")
 async def handle_completion_request(request_data: dict):
     prefill_server, decode_server = load_balancer.select_pair()
@@ -193,12 +196,19 @@ async def handle_completion_request(request_data: dict):
 
     if request_data.get("stream", False):
         return await load_balancer.generate_stream(
-            modified_request, prefill_server, decode_server, endpoint="v1/chat/completions"
+            modified_request,
+            prefill_server,
+            decode_server,
+            endpoint="v1/chat/completions",
         )
     else:
         return await load_balancer.generate(
-            modified_request, prefill_server, decode_server, endpoint="v1/chat/completions"
+            modified_request,
+            prefill_server,
+            decode_server,
+            endpoint="v1/chat/completions",
         )
+
 
 @app.get("/v1/models")
 async def get_models():
