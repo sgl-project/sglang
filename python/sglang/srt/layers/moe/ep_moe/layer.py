@@ -862,7 +862,6 @@ class DeepEPMoE(EPMoE):
     ):
         resolved_deepep_mode = self.deepep_mode.resolve(forward_mode)
         if resolved_deepep_mode == DeepEPMode.normal:
-            print("ffffffffffff ", use_deep_gemm)
             if use_deep_gemm:
                 return self.forward_deepgemm_contiguous(
                     hidden_states, topk_idx, topk_weights, num_recv_tokens_per_expert
@@ -989,105 +988,107 @@ class DeepEPMoE(EPMoE):
 
     def forward_deepgemm_contiguous(
         self,
+        hidden_states_fp8: Tuple[torch.Tensor, torch.Tensor],
         topk_idx,
         topk_weights,
-        hidden_states_fp8: Tuple[torch.Tensor, torch.Tensor],
         num_recv_tokens_per_expert: List[int],
     ):
         assert self.quant_method is not None
         assert self.activation == "silu"
+
+        all_tokens = sum(num_recv_tokens_per_expert)
+        if all_tokens <= 0:
+            return hidden_states_fp8
         num_groups, M, K = hidden_states_fp8[0].size()
         N = self.w13_weight.size(1)
         scale_block_size = 128
-
-        all_tokens = sum(num_recv_tokens_per_expert)
 
         gather_out = torch.empty_like(
             hidden_states_fp8[0],
             device=hidden_states_fp8[0].device,
             dtype=hidden_states_fp8[0].dtype,
         )
-        if all_tokens > 0:
-            input_tensor = [
-                torch.empty(
-                    (all_tokens, K),
-                    device=hidden_states_fp8[0].device,
-                    dtype=hidden_states_fp8[0].dtype,
-                ),
-                torch.empty(
-                    (all_tokens, K // 128),
-                    device=hidden_states_fp8[0].device,
-                    dtype=torch.float32,
-                ),
-            ]
-            m_indices = torch.empty(
-                all_tokens, device=hidden_states_fp8[0].device, dtype=torch.int32
-            )
-            output_index = torch.empty_like(topk_idx)
 
-            num_recv_tokens_per_expert_gpu = torch.tensor(
-                num_recv_tokens_per_expert,
-                dtype=torch.int32,
-                pin_memory=True,
-                device="cpu",
-            ).cuda(non_blocking=True)
-            expert_start_loc = torch.empty_like(num_recv_tokens_per_expert_gpu)
-
-            ep_scatter(
-                hidden_states_fp8[0],
-                hidden_states_fp8[1],
-                topk_idx,
-                num_recv_tokens_per_expert_gpu,
-                expert_start_loc,
-                input_tensor[0],
-                input_tensor[1],
-                m_indices,
-                output_index,
-            )
-
-            gateup_output = torch.empty(
-                (all_tokens, N),
-                device=hidden_states_fp8[0].device,
-                dtype=torch.bfloat16,
-            )
-            input_tensor[1] = tma_align_input_scale(input_tensor[1])
-            m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(
-                input_tensor, self.w13_weight_fp8, gateup_output, m_indices
-            )
-            down_input = torch.empty(
-                (
-                    all_tokens,
-                    N // 2,
-                ),
-                device=gateup_output.device,
-                dtype=self.fp8_dtype,
-            )
-            down_input_scale = torch.empty(
-                (
-                    all_tokens,
-                    N // 2,
-                ),
-                device=gateup_output.device,
-                dtype=torch.float32,
-            )
-            silu_and_mul(gateup_output.view(-1, N), down_input)
-            down_output = torch.empty(
+        input_tensor = [
+            torch.empty(
                 (all_tokens, K),
                 device=hidden_states_fp8[0].device,
-                dtype=torch.bfloat16,
-            )
-            down_input_fp8, down_input_scale = sglang_per_token_group_quant_fp8(
-                down_input, scale_block_size
-            )
-            down_input_scale = tma_align_input_scale(down_input_scale)
-            m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(
-                (down_input_fp8, down_input_scale),
-                self.w2_weight_fp8,
-                down_output,
-                m_indices,
-            )
+                dtype=hidden_states_fp8[0].dtype,
+            ),
+            torch.empty(
+                (all_tokens, K // 128),
+                device=hidden_states_fp8[0].device,
+                dtype=torch.float32,
+            ),
+        ]
+        m_indices = torch.empty(
+            all_tokens, device=hidden_states_fp8[0].device, dtype=torch.int32
+        )
+        output_index = torch.empty_like(topk_idx)
 
-            ep_gather(down_output, topk_idx, topk_weights, output_index, gather_out)
+        num_recv_tokens_per_expert_gpu = torch.tensor(
+            num_recv_tokens_per_expert,
+            dtype=torch.int32,
+            pin_memory=True,
+            device="cpu",
+        ).cuda(non_blocking=True)
+        expert_start_loc = torch.empty_like(num_recv_tokens_per_expert_gpu)
+
+        ep_scatter(
+            hidden_states_fp8[0],
+            hidden_states_fp8[1],
+            topk_idx,
+            num_recv_tokens_per_expert_gpu,
+            expert_start_loc,
+            input_tensor[0],
+            input_tensor[1],
+            m_indices,
+            output_index,
+        )
+
+        gateup_output = torch.empty(
+            (all_tokens, N),
+            device=hidden_states_fp8[0].device,
+            dtype=torch.bfloat16,
+        )
+        input_tensor[1] = tma_align_input_scale(input_tensor[1])
+        m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(
+            input_tensor, self.w13_weight_fp8, gateup_output, m_indices
+        )
+        down_input = torch.empty(
+            (
+                all_tokens,
+                N // 2,
+            ),
+            device=gateup_output.device,
+            dtype=self.fp8_dtype,
+        )
+        down_input_scale = torch.empty(
+            (
+                all_tokens,
+                N // 2,
+            ),
+            device=gateup_output.device,
+            dtype=torch.float32,
+        )
+        silu_and_mul(gateup_output.view(-1, N), down_input)
+        down_output = torch.empty(
+            (all_tokens, K),
+            device=hidden_states_fp8[0].device,
+            dtype=torch.bfloat16,
+        )
+        down_input_fp8, down_input_scale = sglang_per_token_group_quant_fp8(
+            down_input, scale_block_size
+        )
+        down_input_scale = tma_align_input_scale(down_input_scale)
+        m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(
+            (down_input_fp8, down_input_scale),
+            self.w2_weight_fp8,
+            down_output,
+            m_indices,
+        )
+
+        ep_gather(down_output, topk_idx, topk_weights, output_index, gather_out)
 
         return gather_out
 
