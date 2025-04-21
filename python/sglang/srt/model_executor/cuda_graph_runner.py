@@ -443,6 +443,7 @@ class CudaGraphRunner:
             spec_info=spec_info,
             capture_hidden_mode=self.capture_hidden_mode,
             tbo_split_seq_index=tbo_split_seq_index,
+            global_forward_mode=self.capture_forward_mode,
         )
         forward_batch.prepare_tbo()
 
