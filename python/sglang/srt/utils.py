@@ -98,6 +98,16 @@ def get_bool_env_var(name: str, default: str = "false") -> bool:
     return value in truthy_values
 
 
+def get_int_env_var(name: str, default: int = 0) -> int:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
 # https://pytorch.org/docs/stable/notes/hip.html#checking-for-hip
 def is_hip() -> bool:
     return torch.version.hip is not None
