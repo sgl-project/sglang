@@ -1671,15 +1671,16 @@ class DeepseekV2DecoderLayer(nn.Module):
 
     # TODO some logic should be in MLP, refactor this
     def _forward_tbo_op_compute_layer_output(self, state):
-        final_hidden_states = state.hidden_states_from_combine
+        hidden_states = state.hidden_states_from_combine
         if state.shared_output is not None:
-            final_hidden_states = final_hidden_states + state.shared_output
+            hidden_states = hidden_states + state.shared_output
 
+        # TODO do not copy paste
         if self.is_last_layer and self.attn_tp_size != 1:
             hidden_states += residual
             residual = None
             hidden_states, local_hidden_states = (
-                forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
+                state.forward_batch.gathered_buffer[: state.forward_batch.input_ids.shape[0]],
                 hidden_states,
             )
             tp_all_gather(
@@ -1688,7 +1689,7 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         output = dict(
             positions=state.positions,
-            hidden_states=final_hidden_states,
+            hidden_states=hidden_states,
             forward_batch=state.forward_batch,
             residual=state.residual_after_post_attn_ln,
             tbo_subbatch_index=state.tbo_subbatch_index,
