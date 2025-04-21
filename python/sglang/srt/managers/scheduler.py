@@ -1616,7 +1616,9 @@ class Scheduler(
             local_batch.tbo_split_seq_index = (
                 local_tbo_split_seq_index if can_run_tbo else None
             )
-            local_batch.global_forward_mode = global_forward_mode
+            local_batch.global_forward_mode = (
+                global_forward_mode if can_run_tbo else None
+            )
 
             # Check forward mode for cuda graph
             if not disable_cuda_graph:
