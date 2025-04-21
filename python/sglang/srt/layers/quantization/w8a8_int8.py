@@ -11,10 +11,10 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
-from sglang.srt.utils import is_cuda_available, set_weight_attrs
+from sglang.srt.utils import is_cuda, set_weight_attrs
 
-is_cuda = is_cuda_available()
-if is_cuda:
+_is_cuda = is_cuda()
+if _is_cuda:
     from sgl_kernel import int8_scaled_mm
 
 
