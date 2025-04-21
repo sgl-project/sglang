@@ -27,7 +27,7 @@ jobs:
 
       - name: Build Docker image
         run: |
-          docker build -f ${{ github.workspace }}/docker/Dockerfile.xpu -t sglang_xpu:u2410 .
+          docker build --secret id=github_token,src=/home/sdp/github_token.txt -f ${{ github.workspace }}/docker/Dockerfile.xpu -t sglang_xpu:u2410 .
 
       - name: Run container
         run: |
