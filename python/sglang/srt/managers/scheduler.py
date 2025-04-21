@@ -1586,7 +1586,7 @@ class Scheduler(
         forward_modes = global_info[:, 0, 5].tolist()
 
         non_idle_forward_modes = [x for x in forward_modes if x != ForwardMode.IDLE.value]
-        forward_mode_same_or_idle = _is_all_same(non_idle_forward_modes)
+        forward_mode_same_or_idle = len(non_idle_forward_modes) > 0 and _is_all_same(non_idle_forward_modes)
         global_forward_mode = (
             ForwardMode(non_idle_forward_modes[0]) if forward_mode_same_or_idle else None
         )
@@ -2081,7 +2081,7 @@ def _import_static_state(model, static_params):
 
 
 def _is_all_same(x):
-    return len(x) == 0 or all(value == x[0] for value in x)
+    return all(value == x[0] for value in x)
 
 
 def run_scheduler_process(
