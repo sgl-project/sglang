@@ -1674,6 +1674,18 @@ class DeepseekV2DecoderLayer(nn.Module):
         final_hidden_states = state.hidden_states_from_combine
         if state.shared_output is not None:
             final_hidden_states = final_hidden_states + state.shared_output
+
+        if self.is_last_layer and self.attn_tp_size != 1:
+            hidden_states += residual
+            residual = None
+            hidden_states, local_hidden_states = (
+                forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
+                hidden_states,
+            )
+            tp_all_gather(
+                list(hidden_states.tensor_split(self.attn_tp_size)), local_hidden_states
+            )
+
         output = dict(
             positions=state.positions,
             hidden_states=final_hidden_states,
