@@ -51,14 +51,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers.activations import ACT2FN, PytorchGELUTanh
 from transformers.modeling_utils import PreTrainedModel
-from transformers.utils import is_flash_attn_2_available
 
 from sglang.srt.configs import MoonViTConfig
-
-if is_flash_attn_2_available():
-    from flash_attn import flash_attn_varlen_func
-else:
-    flash_attn_varlen_func = None
 
 
 def multihead_attention(
@@ -406,7 +400,7 @@ class MoonVitEncoderLayer(nn.Module):
         hidden_dim: int,
         mlp_dim: int,
         *,
-        attn_implementation: str = "sdpa",
+        attn_implementation: str = "flash_attention_2",  # use fa2 in sglang by default
         activation=F.gelu,
         attn_bias: bool = False,
     ):
@@ -415,9 +409,6 @@ class MoonVitEncoderLayer(nn.Module):
         self.hidden_dim = hidden_dim
         self.hidden_size_per_attention_head = self.hidden_dim // self.num_heads
         self.attn_implementation = attn_implementation
-        # use fa2 in vllm by default
-        if is_flash_attn_2_available():
-            self.attn_implementation = "flash_attention_2"
 
         self.norm0 = nn.LayerNorm(hidden_dim)
         self.norm1 = nn.LayerNorm(hidden_dim)

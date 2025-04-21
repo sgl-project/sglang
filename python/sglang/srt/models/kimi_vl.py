@@ -60,11 +60,9 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.activation import QuickGELU
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternImageTokens,
     general_mm_embed_routine,
@@ -103,6 +101,7 @@ class KimiVLMultiModalProjector(nn.Module):
         self.pre_norm = torch.nn.LayerNorm(config.vision_config.hidden_size, eps=1e-5)
         self.linear_1 = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
         self.act = GELUActivation()
+        self.act = QuickGELU()
         self.linear_2 = nn.Linear(
             self.hidden_size, config.text_config.hidden_size, bias=True
         )
@@ -246,9 +245,6 @@ class KimiVLForConditionalGeneration(nn.Module):
                     if name.endswith(".bias") and name not in params_dict:
                         continue
 
-                    # if is_pp_missing_parameter(name, self):
-                    #     continue
-
                     param = params_dict[name]
                     weight_loader = param.weight_loader
                     weight_loader(param, loaded_weight, shard_id, **kwargs)
@@ -263,9 +259,6 @@ class KimiVLForConditionalGeneration(nn.Module):
                         if weight_name not in name:
                             continue
                         name = name.replace(weight_name, param_name)
-
-                        # if is_pp_missing_parameter(name, self):
-                        #     continue
 
                         param = params_dict[name]
                         weight_loader = param.weight_loader
