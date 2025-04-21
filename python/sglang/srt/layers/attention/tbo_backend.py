@@ -112,6 +112,8 @@ class TboAttnBackend(AttentionBackend):
         replay_seq_lens_sum: int = None,
         replay_seq_lens_cpu: Optional[torch.Tensor] = None,
     ):
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
         if fn_name == "init_forward_metadata_capture_cuda_graph":
             assert capture_num_tokens == bs, "Only support num_tokens==bs currently"
         num_tokens = bs
