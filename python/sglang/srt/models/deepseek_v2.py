@@ -1437,9 +1437,9 @@ class DeepseekV2ForCausalLM(nn.Module):
         if n_share_experts_fusion > 0:
             # Only Deepseek V3/R1 can use shared experts fusion optimization now.
             if (
-                (config.architectures[0] != "DeepseekV3ForCausalLM" and config.architectures[0] != "DeepseekV3ForCausalLMNextN")
-                or config.n_routed_experts != 256
-            ):
+                config.architectures[0] != "DeepseekV3ForCausalLM"
+                and config.architectures[0] != "DeepseekV3ForCausalLMNextN"
+            ) or config.n_routed_experts != 256:
                 n_share_experts_fusion = 0
                 global_server_args_dict["n_share_experts_fusion"] = 0
                 logger.info(
@@ -1452,7 +1452,10 @@ class DeepseekV2ForCausalLM(nn.Module):
         elif n_share_experts_fusion == 0:
             if (
                 torch.cuda.get_device_capability("cuda") >= (9, 0)
-                and (config.architectures[0] == "DeepseekV3ForCausalLM" or config.architectures[0] == "DeepseekV3ForCausalLMNextN")
+                and (
+                    config.architectures[0] == "DeepseekV3ForCausalLM"
+                    or config.architectures[0] == "DeepseekV3ForCausalLMNextN"
+                )
                 and config.n_routed_experts == 256
                 and (not global_server_args_dict["enable_deepep_moe"])
             ):
@@ -1608,21 +1611,25 @@ class DeepseekV2ForCausalLM(nn.Module):
                 self.config.num_hidden_layers,
                 self.config.moe_layer_freq,
             ),
-            suffix_list=[
-                "down_proj.weight",
-                "down_proj.weight_scale",
-                "gate_proj.weight",
-                "gate_proj.weight_scale",
-                "up_proj.weight",
-                "up_proj.weight_scale",
-            ] if self.quant_config.get_name() == "w8a8_int8" else [
-                "down_proj.weight",
-                "down_proj.weight_scale_inv",
-                "gate_proj.weight",
-                "gate_proj.weight_scale_inv",
-                "up_proj.weight",
-                "up_proj.weight_scale_inv",
-            ],
+            suffix_list=(
+                [
+                    "down_proj.weight",
+                    "down_proj.weight_scale",
+                    "gate_proj.weight",
+                    "gate_proj.weight_scale",
+                    "up_proj.weight",
+                    "up_proj.weight_scale",
+                ]
+                if self.quant_config.get_name() == "w8a8_int8"
+                else [
+                    "down_proj.weight",
+                    "down_proj.weight_scale_inv",
+                    "gate_proj.weight",
+                    "gate_proj.weight_scale_inv",
+                    "up_proj.weight",
+                    "up_proj.weight_scale_inv",
+                ]
+            ),
             shared_expert_name_template="model.layers.{moe_layer_id}.mlp.shared_experts.{suffix}",
             routed_expert_name_template="model.layers.{moe_layer_id}.mlp.experts.{expert_index}.{suffix}",
         )

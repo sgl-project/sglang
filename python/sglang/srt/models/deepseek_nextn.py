@@ -20,7 +20,6 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
-
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -142,8 +141,10 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
 
-        self.n_share_experts_fusion = DeepseekV3ForCausalLM._initialize_shared_experts_fusion(
-            config, self.tp_size
+        self.n_share_experts_fusion = (
+            DeepseekV3ForCausalLM._initialize_shared_experts_fusion(
+                config, self.tp_size
+            )
         )
 
         self.model = DeepseekModelNextN(
@@ -269,21 +270,25 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
             n_share_experts_fusion=self.n_share_experts_fusion,
             n_routed_experts=self.config.n_routed_experts,
             moe_layer_ids=range(1),
-            suffix_list=[
-                "down_proj.weight",
-                "down_proj.weight_scale",
-                "gate_proj.weight",
-                "gate_proj.weight_scale",
-                "up_proj.weight",
-                "up_proj.weight_scale",
-            ] if self.quant_config.get_name() == "w8a8_int8" else [
-                "down_proj.weight",
-                "down_proj.weight_scale_inv",
-                "gate_proj.weight",
-                "gate_proj.weight_scale_inv",
-                "up_proj.weight",
-                "up_proj.weight_scale_inv",
-            ],
+            suffix_list=(
+                [
+                    "down_proj.weight",
+                    "down_proj.weight_scale",
+                    "gate_proj.weight",
+                    "gate_proj.weight_scale",
+                    "up_proj.weight",
+                    "up_proj.weight_scale",
+                ]
+                if self.quant_config.get_name() == "w8a8_int8"
+                else [
+                    "down_proj.weight",
+                    "down_proj.weight_scale_inv",
+                    "gate_proj.weight",
+                    "gate_proj.weight_scale_inv",
+                    "up_proj.weight",
+                    "up_proj.weight_scale_inv",
+                ]
+            ),
             shared_expert_name_template="model.layers.{moe_layer_id}.mlp.shared_experts.{suffix}",
             routed_expert_name_template="model.layers.{moe_layer_id}.mlp.experts.{expert_index}.{suffix}",
         )
