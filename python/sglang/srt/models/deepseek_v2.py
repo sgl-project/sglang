@@ -1735,6 +1735,7 @@ class DeepseekV2Model(nn.Module):
         self.padding_id = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.first_k_dense_replace = config.first_k_dense_replace
+        self.attn_tp_size = get_attention_tp_size()
 
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
