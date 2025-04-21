@@ -424,12 +424,6 @@ class DeepseekV2MoE(nn.Module):
     def _forward_deepep_dispatch_a(
         self, chosen_deepep_dispatcher, forward_mode, hidden_states, router_logits
     ):
-        topk_idx = torch.full(
-            (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device
-        )
-        topk_weights = torch.empty(
-            (0, self.top_k), dtype=torch.float32, device=hidden_states.device
-        )
         if (
             forward_mode is not None
             and not forward_mode.is_idle()
@@ -449,6 +443,13 @@ class DeepseekV2MoE(nn.Module):
                     ep_rank=self.tp_rank,
                     layer_id=self.layer_id,
                 ),
+            )
+        else:
+            topk_idx = torch.full(
+                (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device
+            )
+            topk_weights = torch.empty(
+                (0, self.top_k), dtype=torch.float32, device=hidden_states.device
             )
         chosen_deepep_dispatcher.dispatch_a(
             hidden_states,
