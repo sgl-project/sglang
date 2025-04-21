@@ -1346,7 +1346,7 @@ class DeepseekV2Model(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
-            use_attn_tp_group=global_server_args_dict["enable_dp_attention"],
+            enable_tp=not global_server_args_dict["enable_dp_attention"],
         )
         self.layers = nn.ModuleList(
             [
@@ -1448,7 +1448,7 @@ class DeepseekV2ForCausalLM(nn.Module):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
-            enable_tp=not global_server_args_dict["enable_dp_attention"],
+            use_attn_tp_group=global_server_args_dict["enable_dp_attention"],
         )
         self.logits_processor = LogitsProcessor(config)
         self.dp_size = get_attention_dp_size()
