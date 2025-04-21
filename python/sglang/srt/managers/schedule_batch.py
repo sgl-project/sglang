@@ -45,7 +45,7 @@ import triton.language as tl
 from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
-from sglang.srt.disaggregation.conn import KVSender
+from sglang.srt.disaggregation.base import BaseKVSender
 from sglang.srt.disaggregation.decode import ScheduleBatchDisaggregationDecodeMixin
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
@@ -67,7 +67,6 @@ global_server_args_dict = {
     "attention_backend": ServerArgs.attention_backend,
     "sampling_backend": ServerArgs.sampling_backend,
     "triton_attention_reduce_in_fp32": ServerArgs.triton_attention_reduce_in_fp32,
-    "disable_mla": ServerArgs.disable_mla,
     "torchao_config": ServerArgs.torchao_config,
     "enable_nan_detection": ServerArgs.enable_nan_detection,
     "enable_dp_attention": ServerArgs.enable_dp_attention,
@@ -77,12 +76,12 @@ global_server_args_dict = {
     "device": ServerArgs.device,
     "speculative_accept_threshold_single": ServerArgs.speculative_accept_threshold_single,
     "speculative_accept_threshold_acc": ServerArgs.speculative_accept_threshold_acc,
-    "enable_flashmla": ServerArgs.enable_flashmla,
     "disable_radix_cache": ServerArgs.disable_radix_cache,
     "flashinfer_mla_disable_ragged": ServerArgs.flashinfer_mla_disable_ragged,
+    "moe_dense_tp_size": ServerArgs.moe_dense_tp_size,
     "chunked_prefill_size": ServerArgs.chunked_prefill_size,
     "n_share_experts_fusion": ServerArgs.n_share_experts_fusion,
-    "disable_shared_experts_fusion": ServerArgs.disable_shared_experts_fusion,
+    "disable_chunked_prefix_cache": ServerArgs.disable_chunked_prefix_cache,
 }
 
 logger = logging.getLogger(__name__)
@@ -222,10 +221,10 @@ class MultimodalDataItem:
                 # memoryview() doesn't support PyTorch's BFloat16 dtype
                 tensor = tensor.float()
 
+            assert isinstance(tensor, torch.Tensor)
             if tensor.is_cuda:
-                tensor_cpu = torch.frombuffer(
-                    tensor.storage().untyped(), dtype=tensor.dtype, count=tensor.numel()
-                ).clone()
+                # TODO: improve this
+                tensor_cpu = tensor.cpu()
             else:
                 tensor_cpu = tensor
 
@@ -268,6 +267,9 @@ class MultimodalDataItem:
             self.modality == Modality.VIDEO
         ) and not MultimodalDataItem.is_empty_list(self.pixel_values)
 
+    def is_valid(self) -> bool:
+        return self.is_image() or self.is_video() or self.is_audio()
+
     def validate(self):
         ...
         # TODO
@@ -306,11 +308,7 @@ class MultimodalInputs:
         )
 
         assert isinstance(ret.mm_items, list)
-        ret.mm_items = [
-            item
-            for item in ret.mm_items
-            if item.is_audio() or item.is_image() or item.is_video()
-        ]
+        ret.mm_items = [item for item in ret.mm_items if item.is_valid()]
 
         assert len(ret.mm_items) != 0
 
@@ -322,7 +320,6 @@ class MultimodalInputs:
             item.set_pad_value()
 
         optional_args = [
-            "modalities",
             "im_token_id",
             "im_start_id",
             "im_end_id",
@@ -345,8 +342,8 @@ class MultimodalInputs:
         """ """
         return any(item.is_audio() for item in self.mm_items)
 
-    def collect_image_inputs(self) -> List[torch.Tensor]:
-        return [item.pixel_values for item in self.mm_items if item.is_image()]
+    def contains_mm_input(self) -> bool:
+        return any(True for item in self.mm_items if item.is_valid())
 
     def merge(self, other: MultimodalInputs):
         """
@@ -390,6 +387,8 @@ class Req:
         custom_logit_processor: Optional[str] = None,
         return_hidden_states: bool = False,
         eos_token_ids: Optional[Set[int]] = None,
+        bootstrap_host: Optional[str] = None,
+        bootstrap_room: Optional[int] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -523,9 +522,9 @@ class Req:
         self.lora_path = lora_path
 
         # For disaggregation
-        self.bootstrap_host: str = "0.0.0.0"
-        self.bootstrap_room: Optional[int] = None
-        self.disagg_kv_sender: Optional[KVSender] = None
+        self.bootstrap_host: str = bootstrap_host
+        self.bootstrap_room: Optional[int] = bootstrap_room
+        self.disagg_kv_sender: Optional[BaseKVSender] = None
 
         # used for warmup because we don't have a pair yet when init
         self.skip_kv_transfer: bool = False
@@ -1480,7 +1479,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 global_server_args_dict["use_mla_backend"]
                 and global_server_args_dict["attention_backend"] == "flashinfer"
             )
-            or global_server_args_dict["enable_flashmla"]
+            or global_server_args_dict["attention_backend"] == "flashmla"
             or global_server_args_dict["attention_backend"] == "fa3"
         ):
             seq_lens_cpu = self.seq_lens.cpu()
