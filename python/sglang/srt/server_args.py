@@ -201,6 +201,13 @@ class ServerArgs:
     disaggregation_ib_device: Optional[str] = None
 
     def __post_init__(self):
+        # Expert parallelism
+        if self.enable_ep_moe:
+            self.ep_size = self.tp_size
+            logger.info(
+                f"EP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
+            )
+
         # Set missing default values
         if self.tokenizer_path is None:
             self.tokenizer_path = self.model_path
@@ -286,13 +293,6 @@ class ServerArgs:
         # Choose grammar backend
         if self.grammar_backend is None:
             self.grammar_backend = "xgrammar"
-
-        # Expert parallelism
-        if self.enable_ep_moe:
-            self.ep_size = self.tp_size
-            logger.info(
-                f"EP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
-            )
 
         self.enable_multimodal: Optional[bool] = self.enable_llama4_multimodal
 
