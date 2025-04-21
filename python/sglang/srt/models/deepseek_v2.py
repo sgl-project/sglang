@@ -922,7 +922,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
         # TODO optimize this part
-        if hidden_states.shape[0] == 0:
+        if len(state) == 1:
             hidden_states, = state
             return hidden_states
 
