@@ -1551,8 +1551,8 @@ class Scheduler(
                 and (resolved_deepep_mode == DeepEPMode.low_latency)
             )
         else:
-            local_tbo_split_seq_index = None
-            local_can_run_tbo = False
+            local_tbo_split_seq_index = 0
+            local_can_run_tbo = True
 
         local_info = torch.tensor(
             [
