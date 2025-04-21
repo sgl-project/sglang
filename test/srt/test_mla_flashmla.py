@@ -41,6 +41,7 @@ class TestFlashMLAMTP(CustomTestCase):
                     "4",
                     "--attention-backend",
                     "flashmla",
+                    "--disable-cuda-graph",
                 ]
             )
         cls.process = popen_launch_server(
