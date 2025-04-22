@@ -539,6 +539,11 @@ class Req:
         # The first output_id transferred from prefill instance.
         self.transferred_output_id: Optional[int] = None
 
+        # For overlap schedule, we delay the kv transfer until `process_batch_result_disagg_prefill` rather than `process_prefill_chunk` in non-overlap
+        # This is because kv is not ready in `process_prefill_chunk`.
+        # We use `tmp_end_idx` to store the end index of the kv cache to send.
+        self.tmp_end_idx: int = -1
+
     @property
     def seqlen(self):
         return len(self.origin_input_ids) + len(self.output_ids)
@@ -571,6 +576,14 @@ class Req:
                 self.prefix_indices, self.last_node = tree_cache.match_prefix(
                     rid=self.rid, key=self.adjust_max_prefix_ids()
                 )
+        elif enable_hierarchical_cache:
+            # in case last_node is evicted during scheduling, we need to update the prefix_indices
+            while self.last_node.evicted:
+                self.prefix_indices = self.prefix_indices[
+                    : -len(self.last_node.host_value)
+                ]
+                self.last_node = self.last_node.parent
+
         self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
 
     def adjust_max_prefix_ids(self):

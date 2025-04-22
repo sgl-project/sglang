@@ -20,16 +20,17 @@ from sglang.test.test_utils import (
 GSM_DATASET_PATH = None
 
 # In case of some machine lack internet connection, we can set OFFLINE_MODE to True.
-OFFLINE_MODE = False
+OFFLINE_MODE = True
 
 # Change the path below when OFFLINE_MODE is True.
 OFFLINE_PATH_DICT = {
-    DEFAULT_MODEL_NAME_FOR_TEST: "meta-llama/Meta-Llama-3.1-8B-Instruct",
-    DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3: "jamesliu1/sglang-EAGLE3-Llama-3.1-Instruct-8B",
-    DEFAULT_MODEL_NAME_FOR_TEST_MLA: "deepseek/dsv3-test/snapshots/",
-    DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN: "deepseek/dsv3-test-NextN/snapshots/",
-    GSM_DATASET_PATH: "/shared/public/data/gsm8k/test.jsonl",
+    DEFAULT_MODEL_NAME_FOR_TEST: "/shared/public/elr-models/meta-llama/Meta-Llama-3.1-8B-Instruct/07eb05b21d191a58c577b4a45982fe0c049d0693",
+    DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3: "/shared/public/elr-models/jamesliu1/sglang-EAGLE3-Llama-3.1-Instruct-8B/e5ed08d66f528a95ce89f5d4fd136a28f6def714",
+    DEFAULT_MODEL_NAME_FOR_TEST_MLA: "/shared/public/sharing/bhe/deepseek/dsv3-test/snapshots/fed995305b0e4f9acacb74bc0c17787a966bf42a/",
+    DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN: "/shared/public/sharing/bhe/deepseek/dsv3-test-NextN/snapshots/981e68c48968bacb228b645b2b8ddf69f98ee5a6/",
+    GSM_DATASET_PATH: "/shared/public/data/gsm8k/test.jsonl"
 }
+
 
 
 if OFFLINE_MODE:
@@ -199,6 +200,60 @@ class TestFlashAttention3SpeculativeDecodeTopk(BaseFlashAttentionTest):
             ]
         )
         return args
+
+
+class TestFlashAttention3SpeculativeDecodeTopk(BaseFlashAttentionTest):
+    """Test FlashAttention3 with speculative decode enabled, topk > 1"""
+
+    model = "meta-llama/Llama-3.1-8B-Instruct"
+
+    @classmethod
+    def get_server_args(cls):
+        args = super().get_server_args()
+        args.extend(
+            [
+                "--cuda-graph-max-bs",
+                "2",
+                "--speculative-algorithm",
+                "EAGLE3",
+                "--speculative-draft",
+                "jamesliu1/sglang-EAGLE3-Llama-3.1-Instruct-8B",
+                "--speculative-num-steps",
+                "5",
+                "--speculative-eagle-topk",
+                "4",
+                "--speculative-num-draft-tokens",
+                "8",
+                "--dtype",
+                "float16",
+            ]
+        )
+        return args
+
+    def test_gsm8k(self):
+        """
+        Override the test_gsm8k to further test for average speculative accept length.
+        """
+        requests.get(self.base_url + "/flush_cache")
+
+        args = SimpleNamespace(
+            num_shots=5,
+            data_path=DATA_PATH,
+            num_questions=200,
+            max_new_tokens=512,
+            parallel=128,
+            host="http://127.0.0.1",
+            port=int(self.base_url.split(":")[-1]),
+        )
+        metrics = run_eval_few_shot_gsm8k(args)
+        print(metrics)
+
+        self.assertGreater(metrics["accuracy"], 0.60)
+
+        server_info = requests.get(self.base_url + "/get_server_info")
+        avg_spec_accept_length = server_info.json()["avg_spec_accept_length"]
+        print(f"{avg_spec_accept_length=}")
+        self.assertGreater(avg_spec_accept_length, 1.8)
 
 
 class TestFlashAttention3MLASpeculativeDecode(BaseFlashAttentionTest):

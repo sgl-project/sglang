@@ -2,7 +2,7 @@
 
 SGLang exposes the following metrics via Prometheus. The metrics are namespaced by `$name` (the model name).
 
-An example of the monitoring dashboard is available in [examples/monitoring/grafana.json](../examples/monitoring/grafana.json).
+An example of the monitoring dashboard is available in [examples/monitoring/grafana.json](../examples/monitoring/grafana/dashboards/json/sglang-dashboard.json).
 
 Here is an example of the metrics:
 
@@ -150,7 +150,7 @@ In a new Grafana setup, ensure that you have the `Prometheus` data source enable
 
 If not, click `Add data source` -> `Prometheus`, set Prometheus URL to `http://localhost:9090`, and click `Save & Test`.
 
-To import the Grafana dashboard, click `+` -> `Import` -> `Upload JSON file` -> `Upload` and select [grafana.json](../examples/monitoring/grafana.json).
+To import the Grafana dashboard, click `+` -> `Import` -> `Upload JSON file` -> `Upload` and select [grafana.json](../examples/monitoring/grafana/dashboards/json/sglang-dashboard.json).
 
 ### Troubleshooting
 
