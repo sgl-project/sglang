@@ -1004,31 +1004,33 @@ class DeepEPMoE(EPMoE):
         all_tokens = sum(num_recv_tokens_per_expert)
         if all_tokens <= 0:
             return hidden_states_fp8
-        hidden_states_fp8 = sglang_per_token_group_quant_fp8(hidden_states_fp8, 128)
-        M, K = hidden_states_fp8[0].size()
+        hidden_states_fp8, hidden_states_scale = sglang_per_token_group_quant_fp8(
+            hidden_states_fp8, 128
+        )
+        M, K = hidden_states_fp8.size()
         N = self.w13_weight.size(1)
         scale_block_size = 128
 
         gather_out = torch.empty_like(
-            hidden_states_fp8[0],
-            device=hidden_states_fp8[0].device,
+            hidden_states_fp8,
+            device=hidden_states_fp8.device,
             dtype=torch.bfloat16,
         )
 
         input_tensor = [
             torch.empty(
                 (all_tokens, K),
-                device=hidden_states_fp8[0].device,
-                dtype=hidden_states_fp8[0].dtype,
+                device=hidden_states_fp8.device,
+                dtype=hidden_states_fp8.dtype,
             ),
             torch.empty(
                 (all_tokens, K // 128),
-                device=hidden_states_fp8[0].device,
+                device=hidden_states_fp8.device,
                 dtype=torch.float32,
             ),
         ]
         m_indices = torch.empty(
-            all_tokens, device=hidden_states_fp8[0].device, dtype=torch.int32
+            all_tokens, device=hidden_states_fp8.device, dtype=torch.int32
         )
         output_index = torch.empty_like(topk_idx)
 
@@ -1041,8 +1043,8 @@ class DeepEPMoE(EPMoE):
         expert_start_loc = torch.empty_like(num_recv_tokens_per_expert_gpu)
 
         ep_scatter(
-            hidden_states_fp8[0],
-            hidden_states_fp8[1],
+            hidden_states_fp8,
+            hidden_states_scale,
             topk_idx,
             num_recv_tokens_per_expert_gpu,
             expert_start_loc,
@@ -1054,7 +1056,7 @@ class DeepEPMoE(EPMoE):
 
         gateup_output = torch.empty(
             (all_tokens, N),
-            device=hidden_states_fp8[0].device,
+            device=hidden_states_fp8.device,
             dtype=torch.bfloat16,
         )
         input_tensor[1] = tma_align_input_scale(input_tensor[1])
@@ -1080,7 +1082,7 @@ class DeepEPMoE(EPMoE):
         silu_and_mul(gateup_output.view(-1, N), down_input)
         down_output = torch.empty(
             (all_tokens, K),
-            device=hidden_states_fp8[0].device,
+            device=hidden_states_fp8.device,
             dtype=torch.bfloat16,
         )
         down_input_fp8, down_input_scale = sglang_per_token_group_quant_fp8(
