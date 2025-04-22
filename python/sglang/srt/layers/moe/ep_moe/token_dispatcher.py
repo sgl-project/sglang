@@ -54,7 +54,6 @@ class DeepEPBuffer:
         num_experts: int = None,
     ):
         if cls._buffer is not None:
-            print("buffer already exists")
             return cls._buffer
 
         cls._hidden_size = hidden_size
@@ -197,9 +196,8 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
 
     def dispatch_b(self, hidden_states, topk_idx, topk_weights, previous_event):
         if _enable_jit_deepgemm:
-            # TODO hard code 128 block quant
+            # TODO hard code 128 block quant,use fp8 communication
             # hidden_states = sglang_per_token_group_quant_fp8(hidden_states, 128)
-            # print("fffff type ",type(hidden_states),hidden_states[0].shape,hidden_states[1].shape)
             (
                 hidden_states,
                 topk_idx,
