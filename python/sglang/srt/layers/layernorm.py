@@ -20,9 +20,10 @@ import torch
 import torch.nn as nn
 
 from sglang.srt.custom_op import CustomOp
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, is_xpu
 
 _is_cuda = is_cuda()
+_is_xpu = is_xpu()
 
 if _is_cuda:
     from sgl_kernel import (
@@ -139,7 +140,7 @@ class Gemma3RMSNorm(nn.Module):
         return f"{tuple(self.weight.shape)}, eps={self.eps}"
 
 
-if not _is_cuda:
+if not _is_cuda and not _is_xpu:
     logger.info(
         "sgl-kernel is not available on Non-NV platforms. Fallback to other kernel libraries."
     )
