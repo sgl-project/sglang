@@ -28,8 +28,6 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import numpy as np
 import torch
-from torch.distributed import ProcessGroup
-
 from sglang.srt.disaggregation.base import BaseKVManager, BaseKVReceiver, KVArgs, KVPoll
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
@@ -44,6 +42,7 @@ from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from torch.distributed import ProcessGroup
 
 logger = logging.getLogger(__name__)
 
@@ -201,7 +200,7 @@ class DecodePreallocQueue:
 
             kv_indices = (
                 self.req_to_token_pool.req_to_token[decode_req.req.req_pool_idx][
-                    : len(decode_req.req.origin_input_ids)
+                : len(decode_req.req.origin_input_ids)
                 ]
                 .cpu()
                 .numpy()
@@ -252,7 +251,7 @@ class DecodePreallocQueue:
               f"{len(self.scheduler.running_batch.reqs)=} "
               f"{len(self.transfer_queue.queue)=} "
               f"{len(self.scheduler.waiting_queue)=} "
-              f"{len(self.scheduler.last_batch.reqs)=} "
+              f"{len(self.scheduler.last_batch.reqs) if self.scheduler.last_batch is not None else None=} "
               )
         return allocatable_tokens
 
@@ -376,7 +375,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
 
         self.forward_mode = ForwardMode.EXTEND
         reqs = self.reqs
-        input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
+        input_ids = [r.fill_ids[len(r.prefix_indices):] for r in reqs]
         extend_num_tokens = sum(len(ids) for ids in input_ids)
         seq_lens = []
         pre_lens = []
@@ -392,12 +391,12 @@ class ScheduleBatchDisaggregationDecodeMixin:
             req_pool_indices.append(req.req_pool_idx)
 
             chunk = self.req_to_token_pool.req_to_token[req.req_pool_idx][
-                : req.extend_input_len
-            ]
+                    : req.extend_input_len
+                    ]
             assert (
                 offset + req.extend_input_len <= total_size
             ), f"Exceeds total size: offset={offset}, req.extend_input_len={req.extend_input_len}, total_size={total_size}"
-            out_cache_loc[offset : offset + req.extend_input_len] = chunk
+            out_cache_loc[offset: offset + req.extend_input_len] = chunk
             offset += req.extend_input_len
 
             pre_len = len(req.prefix_indices)
