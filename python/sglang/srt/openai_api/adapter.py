@@ -1722,21 +1722,27 @@ def v1_embedding_request(all_requests, tokenizer_manager):
     first_prompt_type = type(all_requests[0].input)
 
     for request in all_requests:
-        # Add validation for empty input string
-        if isinstance(request.input, str) and request.input == "":
-            raise HTTPException(
-                status_code=400, detail="Input cannot be an empty string."
+        prompt = request.input
+        is_invalid = False
+
+        # Check for empty/whitespace string
+        if isinstance(prompt, str):
+            is_invalid = not prompt.strip()
+        # Check for various invalid list cases: [], [""], [" "], [[]]
+        elif isinstance(prompt, list):
+            is_invalid = not prompt or (
+                len(prompt) == 1
+                and (
+                    (isinstance(prompt[0], str) and not prompt[0].strip())
+                    or (isinstance(prompt[0], list) and not prompt[0])
+                )
             )
-        if (
-            isinstance(request.input, list)
-            and len(request.input) == 1
-            and request.input[0] == ""
-        ):
+        if is_invalid:
             raise HTTPException(
-                status_code=400, detail="Input cannot be an empty string."
+                status_code=400,
+                detail="Input cannot be empty or contain only whitespace.",
             )
         # End of validation
-        prompt = request.input
         assert (
             type(prompt) is first_prompt_type
         ), "All prompts must be of the same type in file input settings"
