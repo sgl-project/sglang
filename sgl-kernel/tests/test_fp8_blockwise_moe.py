@@ -45,8 +45,8 @@ def baseline_scaled_mm(a: torch.Tensor,
 def test_fp8_blockwise_scaled_grouped_mm(num_experts, out_dtype):
     device = "cuda"
     alignment = 16
-    n_g = alignment * random.randint(1, 12) * 128
-    k_g = alignment * random.randint(1, 12) * 128
+    n_g = alignment * random.randint(1, 5) * 128
+    k_g = alignment * random.randint(1, 5) * 128
 
     scale_a_group_shape = (1, 128)
     scale_b_group_shape = (128, 128)

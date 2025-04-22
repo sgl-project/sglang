@@ -27,19 +27,14 @@
 
 using namespace cute;
 
-template <
-    typename OutType,
-    typename ScheduleConfig,
-    int ScaleGranularityM = 1,
-    int ScaleGranularityN = 128,
-    int ScaleGranularityK = 128,
-    typename LayoutD = cutlass::layout::RowMajor>
+using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int, int, int>>;
+template <typename OutType, typename ScheduleConfig, typename LayoutD>
 void launch_sm100_fp8_blockwise_scaled_group_mm(
-    torch::Tensor& output,
-    const torch::Tensor& a,
-    const torch::Tensor& b,
-    const torch::Tensor& scales_a,
-    const torch::Tensor& scales_b,
+    torch::Tensor& out_ptrs,
+    const torch::Tensor& a_ptrs,
+    const torch::Tensor& b_ptrs,
+    const torch::Tensor& a_scales_ptrs,
+    const torch::Tensor& b_scales_ptrs,
     const torch::Tensor& stride_a,
     const torch::Tensor& stride_b,
     const torch::Tensor& stride_c,
@@ -47,7 +42,7 @@ void launch_sm100_fp8_blockwise_scaled_group_mm(
     const torch::Tensor& layout_sfb,
     const torch::Tensor& problem_sizes,
     const torch::Tensor& expert_offsets,
-    bool transpose = false) {
+    const torch::Tensor& workspace) {
   using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int, int, int>>;
   using ElementA = cutlass::float_e4m3_t;
   using ElementB = cutlass::float_e4m3_t;
@@ -68,14 +63,9 @@ void launch_sm100_fp8_blockwise_scaled_group_mm(
   using ArchTag = cutlass::arch::Sm100;
   using OperatorClass = cutlass::arch::OpClassTensorOp;
   // For fp8 block scale.
-  using ScaleConfig = cutlass::detail::Sm100BlockwiseScaleConfig<
-      ScaleGranularityM,
-      ScaleGranularityN,
-      ScaleGranularityK,
-      cute::UMMA::Major::K,
-      cute::UMMA::Major::K>;
-  using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
-  using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
+  // using ScaleConfig = cutlass::detail::Sm100BlockwiseScaleConfig<ScaleGranularityM, ScaleGranularityN,
+  // ScaleGranularityK, cute::UMMA::Major::K, cute::UMMA::Major::K>; using LayoutSFA =
+  // decltype(ScaleConfig::deduce_layoutSFA()); using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
   using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
       ArchTag,
       OperatorClass,
@@ -84,7 +74,7 @@ void launch_sm100_fp8_blockwise_scaled_group_mm(
       cutlass::epilogue::collective::EpilogueTileAuto,
       ElementAccumulator,
       ElementAccumulator,
-      ElementC,
+      void,
       LayoutC*,
       AlignmentC,
       ElementD,
@@ -96,10 +86,10 @@ void launch_sm100_fp8_blockwise_scaled_group_mm(
       ArchTag,
       OperatorClass,
       ElementA,
-      cute::tuple<LayoutA*, LayoutSFA*>,
+      cute::tuple<LayoutA*, typename ScheduleConfig::LayoutSFA*>,
       AlignmentA,
       ElementB,
-      cute::tuple<LayoutB*, LayoutSFB*>,
+      cute::tuple<LayoutB*, typename ScheduleConfig::LayoutSFB*>,
       AlignmentB,
       ElementAccumulator,
       typename ScheduleConfig::MmaTileShape,
@@ -108,7 +98,7 @@ void launch_sm100_fp8_blockwise_scaled_group_mm(
           sizeof(typename CollectiveEpilogue::SharedStorage))>,
       typename ScheduleConfig::KernelSchedule>::CollectiveOp;
 
-  using GemmKernel = cutlass::gemm::kernel::GemmUniversal<ProblemShape, CollectiveMainloop, CollectiveEpilogue>;
+  using GemmKernel = cutlass::gemm::kernel::GemmUniversal<ProblemShape, CollectiveMainloop, CollectiveEpilogue, void>;
 
   using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
   using UnderlyingProblemShape = ProblemShape::UnderlyingProblemShape;
@@ -118,64 +108,8 @@ void launch_sm100_fp8_blockwise_scaled_group_mm(
   using StrideD = typename Gemm::GemmKernel::InternalStrideD;
 
   int num_experts = (int)expert_offsets.size(0);
-
-  auto options_int = torch::TensorOptions().dtype(torch::kInt64).device(a.device());
-
-  torch::Tensor a_ptrs = torch::empty(num_experts, options_int);
-  torch::Tensor b_ptrs = torch::empty(num_experts, options_int);
-  torch::Tensor out_ptrs = torch::empty(num_experts, options_int);
-  torch::Tensor a_scales_ptrs = torch::empty(num_experts, options_int);
-  torch::Tensor b_scales_ptrs = torch::empty(num_experts, options_int);
-  torch::Tensor problem_sizes_transpose = torch::empty(num_experts * 3, options_int);
-  if (!transpose) {
-    run_get_group_gemm_starts<LayoutSFA, LayoutSFB, ScaleConfig>(
-        expert_offsets,
-        a_ptrs,
-        b_ptrs,
-        out_ptrs,
-        a_scales_ptrs,
-        b_scales_ptrs,
-        a,
-        b,
-        output,
-        scales_a,
-        scales_b,
-        layout_sfa,
-        layout_sfb,
-        problem_sizes,
-        problem_sizes_transpose);
-  } else {
-    run_get_group_gemm_starts<LayoutSFA, LayoutSFB, ScaleConfig>(
-        expert_offsets,
-        a_ptrs,
-        b_ptrs,
-        out_ptrs,
-        a_scales_ptrs,
-        b_scales_ptrs,
-        b,
-        a,
-        output,
-        scales_b,
-        scales_a,
-        layout_sfa,
-        layout_sfb,
-        problem_sizes,
-        problem_sizes_transpose,
-        true);
-  }
-
-  auto problem_sizes_ptr = static_cast<const int32_t*>(problem_sizes.data_ptr());
-
-  // Use the expert offsets tensor directly
-  auto expert_offsets_ptr = static_cast<const int32_t*>(expert_offsets.data_ptr());
-
   // Create an instance of the GEMM
   Gemm gemm_op;
-
-  // Initialize problem_sizes_as_shapes correctly
-  UnderlyingProblemShape* problem_sizes_as_shapes =
-      transpose ? static_cast<UnderlyingProblemShape*>(problem_sizes_transpose.data_ptr())
-                : static_cast<UnderlyingProblemShape*>(problem_sizes.data_ptr());
 
   typename GemmKernel::MainloopArguments mainloop_args{
       static_cast<const ElementA**>(a_ptrs.data_ptr()),
@@ -183,14 +117,14 @@ void launch_sm100_fp8_blockwise_scaled_group_mm(
       static_cast<const ElementB**>(b_ptrs.data_ptr()),
       static_cast<StrideB*>(stride_b.data_ptr()),
       static_cast<const ElementAccumulator**>(a_scales_ptrs.data_ptr()),
-      reinterpret_cast<LayoutSFA*>(layout_sfa.data_ptr()),
+      reinterpret_cast<typename ScheduleConfig::LayoutSFA*>(layout_sfa.data_ptr()),
       static_cast<const ElementAccumulator**>(b_scales_ptrs.data_ptr()),
-      reinterpret_cast<LayoutSFB*>(layout_sfb.data_ptr())};
+      reinterpret_cast<typename ScheduleConfig::LayoutSFB*>(layout_sfb.data_ptr())};
 
   cutlass::KernelHardwareInfo hw_info;
 
-  hw_info.device_id = a.get_device();
-  hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
+  hw_info.device_id = 0;
+  hw_info.sm_count = 1;
   // Currently, we are only able to do broadcast on either all or none a_scales
   // and on either all or none b_scales
   typename GemmKernel::EpilogueArguments epilogue_args{
@@ -200,6 +134,8 @@ void launch_sm100_fp8_blockwise_scaled_group_mm(
       static_cast<ElementD**>(out_ptrs.data_ptr()),
       static_cast<StrideC*>(stride_c.data_ptr())};
 
+  // Initialize problem_sizes_as_shapes correctly
+  UnderlyingProblemShape* problem_sizes_as_shapes = static_cast<UnderlyingProblemShape*>(problem_sizes.data_ptr());
   // Use prob_shape in the GEMM arguments
   typename GemmKernel::Arguments args{
       cutlass::gemm::GemmUniversalMode::kGrouped,
@@ -208,14 +144,12 @@ void launch_sm100_fp8_blockwise_scaled_group_mm(
       epilogue_args,
       hw_info};
 
-  size_t workspace_size = Gemm::get_workspace_size(args);
-  cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
-
   auto can_implement_status = gemm_op.can_implement(args);
   TORCH_CHECK(can_implement_status == cutlass::Status::kSuccess, "Failed to implement GEMM");
 
   // Run the GEMM
-  auto status = gemm_op.initialize(args, workspace.get());
+  auto status = gemm_op.initialize(args, workspace.data_ptr());
+
   TORCH_CHECK(status == cutlass::Status::kSuccess, "Failed to initialize GEMM");
 
   status = gemm_op.run();
@@ -236,34 +170,104 @@ void sm100_fp8_blockwise_group_mm_dispatch_shape(
     const torch::Tensor& layout_sfb,
     const torch::Tensor& problem_sizes,
     const torch::Tensor& expert_offsets) {
-  struct MMASmallConfig {
-    using ElementA = cutlass::float_e4m3_t;
-    using MmaTileShape = Shape<_128, _16, _128>;
-    using ClusterShape = Shape<_1, _1, _1>;  // Layout type for SFB matrix operand
-    using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedBlockwise1SmSm100;
-    using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecialized1Sm;
-  };
-
+  // Check the first matrix size to decide on the configuration
+  // Assuming all matrices in the group have similar size characteristics
+  // bool use_small_config = a[0].size(0) <= 128;
   struct MMALargeConfig {
     using ElementA = cutlass::float_e4m3_t;
     using MmaTileShape = Shape<_128, _128, _128>;
     using ClusterShape = Shape<_1, _1, _1>;  // Layout type for SFB matrix operand
     using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedBlockwise1SmSm100;
     using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecialized1Sm;
+    using ScaleConfig =
+        cutlass::detail::Sm100BlockwiseScaleConfig<1, 128, 128, cute::UMMA::Major::K, cute::UMMA::Major::K>;
+    using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
+    using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
   };
+
+  struct MMASmallConfig {
+    using ElementA = cutlass::float_e4m3_t;
+    using MmaTileShape = Shape<_128, _16, _128>;
+    using ClusterShape = Shape<_1, _1, _1>;  // Layout type for SFB matrix operand
+    using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedBlockwise1SmSm100;
+    using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecialized1Sm;
+    using ScaleConfig =
+        cutlass::detail::Sm100BlockwiseScaleConfig<128, 1, 128, cute::UMMA::Major::K, cute::UMMA::Major::K>;
+    using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
+    using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
+  };
+  int num_experts = (int)expert_offsets.size(0);
+  torch::TensorOptions options_int = torch::TensorOptions().dtype(torch::kInt64).device(a.device());
+  torch::Tensor a_ptrs = torch::empty(num_experts, options_int);
+  torch::Tensor b_ptrs = torch::empty(num_experts, options_int);
+  torch::Tensor out_ptrs = torch::empty(num_experts, options_int);
+  torch::Tensor a_scales_ptrs = torch::empty(num_experts, options_int);
+  torch::Tensor b_scales_ptrs = torch::empty(num_experts, options_int);
+  torch::Tensor problem_sizes_transpose = torch::empty(num_experts * 3, options_int);
+  // TODO: move this to the caller
+  torch::Tensor workspace = torch::empty(100, options_int);
+  torch::Tensor output_t = output.t();
+  torch::Tensor a_t = a.t();
+  torch::Tensor b_t = b.transpose(1, 2);
+  torch::Tensor scales_a_t = scales_a.t();
+  torch::Tensor scales_b_t = scales_b.transpose(1, 2);
+
   if (a.size(0) <= 512) {
-    // Swaps the input tensors for performance.
-    output = output.t();
-    torch::Tensor a_t = a.t();
-    torch::Tensor b_t = b.transpose(1, 2);
-    torch::Tensor scales_a_t = scales_a.t();
-    torch::Tensor scales_b_t = scales_b.transpose(1, 2);
-    launch_sm100_fp8_blockwise_scaled_group_mm<OutType, MMASmallConfig, 128, 1, 128, cutlass::layout::ColumnMajor>(
-        output,
-        a_t,
+    run_get_group_gemm_starts<MMASmallConfig::LayoutSFA, MMASmallConfig::LayoutSFB, MMASmallConfig::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
         b_t,
-        scales_a_t,
+        a_t,
+        output_t,
         scales_b_t,
+        scales_a_t,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose,
+        true);
+    launch_sm100_fp8_blockwise_scaled_group_mm<OutType, MMASmallConfig, cutlass::layout::ColumnMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes_transpose,
+        expert_offsets,
+        workspace);
+    output = output_t.t();
+  } else {
+    run_get_group_gemm_starts<MMALargeConfig::LayoutSFA, MMALargeConfig::LayoutSFB, MMALargeConfig::ScaleConfig>(
+        expert_offsets,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        output,
+        scales_a,
+        scales_b,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        problem_sizes_transpose);
+    launch_sm100_fp8_blockwise_scaled_group_mm<OutType, MMALargeConfig, cutlass::layout::RowMajor>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
         stride_a,
         stride_b,
         stride_c,
@@ -271,22 +275,7 @@ void sm100_fp8_blockwise_group_mm_dispatch_shape(
         layout_sfb,
         problem_sizes,
         expert_offsets,
-        true);
-    output = output.t();
-  } else {
-    launch_sm100_fp8_blockwise_scaled_group_mm<OutType, MMALargeConfig, 1, 128, 128>(
-        output,
-        a,
-        b,
-        scales_a,
-        scales_b,
-        stride_a,
-        stride_b,
-        stride_c,
-        layout_sfa,
-        layout_sfb,
-        problem_sizes,
-        expert_offsets);
+        workspace);
   }
 }
 
@@ -309,6 +298,16 @@ void fp8_blockwise_scaled_grouped_mm(
   TORCH_CHECK(
       problem_sizes.size(0) == expert_offsets.size(0), "Number of experts in problem_sizes must match expert_offsets");
   TORCH_CHECK(problem_sizes.dtype() == torch::kInt32, "problem_sizes must be int32");
+  TORCH_CHECK(a.scalar_type() == torch::kFloat8_e4m3fn, "a must be float8_e4m3fn");
+  TORCH_CHECK(b.scalar_type() == torch::kFloat8_e4m3fn, "b must be float8_e4m3fn");
+  TORCH_CHECK(scales_a.scalar_type() == torch::kFloat32, "scales_a must be float32");
+  TORCH_CHECK(scales_b.scalar_type() == torch::kFloat32, "scales_b must be float32");
+  TORCH_CHECK(stride_a.scalar_type() == torch::kInt32, "stride_a must be int32");
+  TORCH_CHECK(stride_b.scalar_type() == torch::kInt32, "stride_b must be int32");
+  TORCH_CHECK(stride_c.scalar_type() == torch::kInt32, "stride_c must be int32");
+  TORCH_CHECK(layout_sfa.scalar_type() == torch::kInt32, "layout_sfa must be int32");
+  TORCH_CHECK(layout_sfb.scalar_type() == torch::kInt32, "layout_sfb must be int32");
+  TORCH_CHECK(expert_offsets.scalar_type() == torch::kInt32, "expert_offsets must be int32");
 
   // Get output shapes and create output tensors
   bool can_implement = false;
