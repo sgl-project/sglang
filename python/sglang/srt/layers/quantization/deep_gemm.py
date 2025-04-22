@@ -279,6 +279,9 @@ def _maybe_compile_deep_gemm_one_type_all(
         and _DO_COMPILE
         and _INITIALIZATION_DICT.get(query_key) is None
     ):
+        print("HACK: skip warmup deepgemm!!!")
+        return
+        
         _INITIALIZATION_DICT[query_key] = True
 
         kernel_helper = _KERNEL_HELPER_DICT[kernel_type]
