@@ -27,7 +27,7 @@ from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.utils import (
     configure_ipv6,
     get_device,
-    get_whatever_gpu_memory_capacity,
+    get_device_memory_capacity,
     is_flashinfer_available,
     is_hip,
     is_port_available,
@@ -218,7 +218,7 @@ class ServerArgs:
         if self.random_seed is None:
             self.random_seed = random.randint(0, 1 << 30)
 
-        gpu_mem = get_whatever_gpu_memory_capacity(self.device)
+        gpu_mem = get_device_memory_capacity(self.device)
 
         # Set mem fraction static, which depends on the tensor parallelism size
         if self.mem_fraction_static is None:
