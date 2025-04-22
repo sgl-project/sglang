@@ -71,14 +71,10 @@ class CompressedTensorsMoEMethod:
         input_quant = quant_config.target_scheme_map["Linear"].get("input_activations")
 
         if quant_config._is_wNa16_group_channel(weight_quant, input_quant):
-            # Prefer to use the non-marlin kernel when:
-            # 1. Many experts (MarlinMoE gives poor performance when >= 16)
-            # 2. Non-FP16 dtype (MarlinMoE only supports FP16)
-            # 3. Actorder is not group/dynamic (g_idx is unsupported)
-            # 4. Scaled are grouped (channelwise is unsupported)
-            # if (weight_quant.actorder not in (ActivationOrdering.GROUP,
-            #                                       ActivationOrdering.DYNAMIC)
-            #         and weight_quant.strategy in QuantizationStrategy.GROUP):
+            if not VLLM_AVAILABLE:
+                raise ImportError(
+                    "vllm is not installed, to use CompressedTensorsWNA16MoEMethod, please install vllm."
+                )
             # TODO: check is there a situation that non-marlin kernel is better
             return CompressedTensorsWNA16MarlinMoEMethod(quant_config)
         elif quant_config._is_fp8_w8a8(weight_quant, input_quant):
@@ -367,11 +363,6 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-
-        # assert (
-        #     params_dtype == torch.float16
-        # ), "float16 is required for MoE compressed models. Set dtype=torch.float16"  # noqa: E501
-
         intermediate_size_full = extra_weight_attrs.pop("intermediate_size_full")
 
         # Will transpose the loaded weight along the
