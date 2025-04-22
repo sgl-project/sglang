@@ -358,9 +358,8 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_weights: torch.Tensor,
     ):
         # TODO support deepgemm
-        previous_event = Buffer.capture() if self.async_finish else None
         if _enable_jit_deepgemm:
-            return hidden_states, previous_event
+            output = hidden_states
         else:
             if hidden_states.shape[0] > 0:
                 num_tokens = self.src2dst.shape[0] // self.router_topk
@@ -385,7 +384,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
                     device=hidden_states.device,
                     dtype=hidden_states.dtype,
                 )
-
+        previous_event = Buffer.capture() if self.async_finish else None
         return output, previous_event
 
     def combine_b(self, output, previous_event):
