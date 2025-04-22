@@ -245,14 +245,12 @@ class EPMoE(torch.nn.Module):
         )
 
         # PreReorder
-        input_dtype = (
-                self.fp8_dtype
-                if (self.use_fp8_w8a8 and not self.use_block_quant)
-                else hidden_states.dtype
+        m_max, masked_m, expected_m, src2dst, gateup_input, gateup_input_scale = moe_ep_deepgemm_preproess(
+            topk_ids, self.num_experts, hidden_states, self.top_k, self.start_expert_id, self.end_expert_id, self.block_shape
         )
-        m_max, masked_m, expected_m, src2dst, gateup_input_fp8 = moe_ep_deepgemm_preproess(
-            topk_ids, self.num_experts, hidden_states, self.top_k, input_dtype, self.start_expert_id, self.end_expert_id,
-        )
+        gateup_input_fp8 = (
+            gateup_input,
+            get_col_major_tma_aligned_tensor(gateup_input_scale),)
 
         # GroupGemm-0
         num_groups, m, k = gateup_input_fp8[0].size()
@@ -260,6 +258,12 @@ class EPMoE(torch.nn.Module):
         gateup_output = torch.empty(
             (num_groups, m, n), device=hidden_states.device, dtype=torch.bfloat16
         )
+        print("group1: ", num_groups)
+        print("group2: ", self.w13_weight_fp8[0].size(0))
+        print("m: ", m)
+        print("n: ", n)
+        print("k: ", k)
+        
         m_grouped_gemm_fp8_fp8_bf16_nt_masked(
             gateup_input_fp8, self.w13_weight_fp8, gateup_output, masked_m, expected_m
         )
