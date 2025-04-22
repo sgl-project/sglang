@@ -491,6 +491,11 @@ async def resume_memory_occupation(
 
 @app.api_route("/slow_down", methods=["GET", "POST"])
 async def slow_down(obj: SlowDownReqInput, request: Request):
+    """Slow down the system deliberately. Only for testing. Example scenario:
+    when we want to test performance of D in large-scale PD disaggregation and have no enough nodes for P,
+    we can use this to slow down D to let it have enough running sequences, and then disable slowdown
+    to let it run in full batch size.
+    """
     try:
         await _global_state.tokenizer_manager.slow_down(obj, request)
     except Exception as e:
