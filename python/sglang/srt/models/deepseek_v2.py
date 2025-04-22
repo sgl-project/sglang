@@ -899,7 +899,7 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
-        return q_input, k_input, v_input, forward_batch
+        return q_nope_out, q_pe, k_nope, k_pe, forward_batch
 
     def forward_absorb_stage_core(
         self,
@@ -911,7 +911,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             (hidden_states,) = state
             return hidden_states
 
-        q_input, k_input, v_input, forward_batch = state
+        q_nope_out, q_pe, k_nope, k_pe, forward_batch = state
 
         q = torch.cat([q_nope_out, q_pe], dim=-1)
         k = torch.cat([k_nope, k_pe], dim=-1)
