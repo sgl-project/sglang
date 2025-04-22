@@ -288,18 +288,18 @@ class Scheduler(
         # )
         # ################################################################################
 
-        try:
-            self.tp_worker = TpWorkerClass(
-                server_args=server_args,
-                expert_location_metadata=expert_location_metadata,
-                gpu_id=gpu_id,
-                tp_rank=tp_rank,
-                dp_rank=dp_rank,
-                nccl_port=port_args.nccl_port,
-            )
-        except Exception as e:
-            print(f"HACK!!!! see error but continue {e=}")
-            traceback.print_exc()
+        # try:
+        self.tp_worker = TpWorkerClass(
+            server_args=server_args,
+            expert_location_metadata=expert_location_metadata,
+            gpu_id=gpu_id,
+            tp_rank=tp_rank,
+            dp_rank=dp_rank,
+            nccl_port=port_args.nccl_port,
+        )
+        # except Exception as e:
+        #     print(f"HACK!!!! see error but continue {e=}")
+        #     traceback.print_exc()
 
         # ################################################################################
         # print("HACK!!!! temp stop_profile")
