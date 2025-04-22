@@ -34,12 +34,17 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.utils import get_available_gpu_memory, is_hip
-
-_is_hip = is_hip()
+from sglang.srt.patch_torch import monkey_patch_torch_compile
+from sglang.srt.utils import (
+    get_available_gpu_memory,
+    get_device_memory_capacity,
+    is_hip,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
+
+_is_hip = is_hip()
 
 
 def _to_torch(model: torch.nn.Module, reverse: bool, num_tokens: int):
@@ -108,6 +113,8 @@ def set_torch_compile_config():
     if hasattr(torch._dynamo.config, "cache_size_limit"):
         torch._dynamo.config.cache_size_limit = 1024
 
+    monkey_patch_torch_compile()
+
 
 def get_batch_sizes_to_capture(model_runner: ModelRunner):
     server_args = model_runner.server_args
@@ -116,7 +123,7 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
     if capture_bs is None:
         if server_args.speculative_algorithm is None:
             if server_args.disable_cuda_graph_padding:
-                capture_bs = list(range(1, 33)) + range(40, 161, 16)
+                capture_bs = list(range(1, 33)) + list(range(40, 161, 16))
             else:
                 capture_bs = [1, 2, 4, 8] + list(range(16, 161, 8))
         else:
@@ -126,7 +133,8 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
                 list(range(1, 9)) + list(range(10, 33, 2)) + list(range(40, 161, 16))
             )
 
-        if _is_hip:
+        gpu_mem = get_device_memory_capacity()
+        if gpu_mem is not None and gpu_mem > 81920:
             capture_bs += list(range(160, 257, 8))
 
     if max(capture_bs) > model_runner.req_to_token_pool.size:
@@ -137,12 +145,11 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
         ]
 
     capture_bs = list(sorted(set(capture_bs)))
-    capture_bs = [
-        bs
-        for bs in capture_bs
-        if bs <= model_runner.req_to_token_pool.size
-        and bs <= server_args.cuda_graph_max_bs
-    ]
+
+    assert len(capture_bs) > 0 and capture_bs[0] > 0
+    capture_bs = [bs for bs in capture_bs if bs <= model_runner.req_to_token_pool.size]
+    if server_args.cuda_graph_max_bs:
+        capture_bs = [bs for bs in capture_bs if bs <= server_args.cuda_graph_max_bs]
     compile_bs = (
         [bs for bs in capture_bs if bs <= server_args.torch_compile_max_bs]
         if server_args.enable_torch_compile
@@ -183,6 +190,7 @@ class CudaGraphRunner:
 
         # Batch sizes to capture
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
+
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.NULL
         self.num_tokens_per_bs = 1

@@ -45,7 +45,7 @@ import triton.language as tl
 from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
-from sglang.srt.disaggregation.conn import KVSender
+from sglang.srt.disaggregation.base import BaseKVSender
 from sglang.srt.disaggregation.decode import ScheduleBatchDisaggregationDecodeMixin
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
@@ -67,7 +67,6 @@ global_server_args_dict = {
     "attention_backend": ServerArgs.attention_backend,
     "sampling_backend": ServerArgs.sampling_backend,
     "triton_attention_reduce_in_fp32": ServerArgs.triton_attention_reduce_in_fp32,
-    "disable_mla": ServerArgs.disable_mla,
     "torchao_config": ServerArgs.torchao_config,
     "enable_nan_detection": ServerArgs.enable_nan_detection,
     "enable_dp_attention": ServerArgs.enable_dp_attention,
@@ -77,12 +76,12 @@ global_server_args_dict = {
     "device": ServerArgs.device,
     "speculative_accept_threshold_single": ServerArgs.speculative_accept_threshold_single,
     "speculative_accept_threshold_acc": ServerArgs.speculative_accept_threshold_acc,
-    "enable_flashmla": ServerArgs.enable_flashmla,
     "disable_radix_cache": ServerArgs.disable_radix_cache,
     "flashinfer_mla_disable_ragged": ServerArgs.flashinfer_mla_disable_ragged,
+    "moe_dense_tp_size": ServerArgs.moe_dense_tp_size,
     "chunked_prefill_size": ServerArgs.chunked_prefill_size,
     "n_share_experts_fusion": ServerArgs.n_share_experts_fusion,
-    "disable_shared_experts_fusion": ServerArgs.disable_shared_experts_fusion,
+    "disable_chunked_prefix_cache": ServerArgs.disable_chunked_prefix_cache,
 }
 
 logger = logging.getLogger(__name__)
@@ -222,10 +221,10 @@ class MultimodalDataItem:
                 # memoryview() doesn't support PyTorch's BFloat16 dtype
                 tensor = tensor.float()
 
+            assert isinstance(tensor, torch.Tensor)
             if tensor.is_cuda:
-                tensor_cpu = torch.frombuffer(
-                    tensor.storage().untyped(), dtype=tensor.dtype, count=tensor.numel()
-                ).clone()
+                # TODO: improve this
+                tensor_cpu = tensor.cpu()
             else:
                 tensor_cpu = tensor
 
@@ -321,7 +320,6 @@ class MultimodalInputs:
             item.set_pad_value()
 
         optional_args = [
-            "modalities",
             "im_token_id",
             "im_start_id",
             "im_end_id",
@@ -526,7 +524,7 @@ class Req:
         # For disaggregation
         self.bootstrap_host: str = bootstrap_host
         self.bootstrap_room: Optional[int] = bootstrap_room
-        self.disagg_kv_sender: Optional[KVSender] = None
+        self.disagg_kv_sender: Optional[BaseKVSender] = None
 
         # used for warmup because we don't have a pair yet when init
         self.skip_kv_transfer: bool = False
@@ -540,6 +538,11 @@ class Req:
         self.metadata_buffer_index: int = -1
         # The first output_id transferred from prefill instance.
         self.transferred_output_id: Optional[int] = None
+
+        # For overlap schedule, we delay the kv transfer until `process_batch_result_disagg_prefill` rather than `process_prefill_chunk` in non-overlap
+        # This is because kv is not ready in `process_prefill_chunk`.
+        # We use `tmp_end_idx` to store the end index of the kv cache to send.
+        self.tmp_end_idx: int = -1
 
     @property
     def seqlen(self):
@@ -573,6 +576,14 @@ class Req:
                 self.prefix_indices, self.last_node = tree_cache.match_prefix(
                     rid=self.rid, key=self.adjust_max_prefix_ids()
                 )
+        elif enable_hierarchical_cache:
+            # in case last_node is evicted during scheduling, we need to update the prefix_indices
+            while self.last_node.evicted:
+                self.prefix_indices = self.prefix_indices[
+                    : -len(self.last_node.host_value)
+                ]
+                self.last_node = self.last_node.parent
+
         self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
 
     def adjust_max_prefix_ids(self):
@@ -1481,7 +1492,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 global_server_args_dict["use_mla_backend"]
                 and global_server_args_dict["attention_backend"] == "flashinfer"
             )
-            or global_server_args_dict["enable_flashmla"]
+            or global_server_args_dict["attention_backend"] == "flashmla"
             or global_server_args_dict["attention_backend"] == "fa3"
         ):
             seq_lens_cpu = self.seq_lens.cpu()

@@ -96,8 +96,8 @@ class GenerateReqInput:
     return_hidden_states: bool = False
 
     # For disaggregated inference
-    bootstrap_host: Optional[str] = None
-    bootstrap_room: Optional[int] = None
+    bootstrap_host: Optional[Union[List[str], str]] = None
+    bootstrap_room: Optional[Union[List[int], int]] = None
 
     def normalize_batch_and_arguments(self):
         """
@@ -397,6 +397,12 @@ class GenerateReqInput:
                 else None
             ),
             return_hidden_states=self.return_hidden_states,
+            bootstrap_host=(
+                self.bootstrap_host[i] if self.bootstrap_host is not None else None
+            ),
+            bootstrap_room=(
+                self.bootstrap_room[i] if self.bootstrap_room is not None else None
+            ),
         )
 
 
@@ -665,8 +671,13 @@ class BatchEmbeddingOut:
 
 
 @dataclass
-class FlushCacheReq:
+class FlushCacheReqInput:
     pass
+
+
+@dataclass
+class FlushCacheReqOutput:
+    success: bool
 
 
 @dataclass
@@ -700,10 +711,17 @@ class UpdateWeightsFromDistributedReqOutput:
 
 @dataclass
 class UpdateWeightsFromTensorReqInput:
-    # List containing one serialized Dict[str, torch.Tensor] per TP worker
-    serialized_named_tensors: List[bytes]
-    load_format: Optional[str]
-    flush_cache: bool
+    """Update model weights from tensor input.
+
+    - Tensors are serialized for transmission
+    - Data is structured in JSON for easy transmission over HTTP
+    """
+
+    serialized_named_tensors: List[Union[str, bytes]]
+    # Optional format specification for loading
+    load_format: Optional[str] = None
+    # Whether to flush the cache after updating weights
+    flush_cache: bool = True
 
 
 @dataclass
@@ -827,6 +845,7 @@ class ProfileReq:
     activities: Optional[List[str]] = None
     with_stack: Optional[bool] = None
     record_shapes: Optional[bool] = None
+    profile_id: Optional[str] = None
 
 
 @dataclass

@@ -20,6 +20,7 @@ suites = {
         TestFile("models/test_generation_models.py", 103),
         TestFile("models/test_grok_models.py", 60),
         TestFile("models/test_qwen_models.py", 82),
+        TestFile("models/test_compressed_tensors_models.py", 100),
         TestFile("models/test_reward_models.py", 83),
         TestFile("models/test_gme_qwen_models.py", 45),
         TestFile("models/test_clip_models.py", 100),
@@ -28,7 +29,7 @@ suites = {
         TestFile("test_chunked_prefill.py", 336),
         TestFile("test_eagle_infer.py", 500),
         TestFile("test_ebnf_constrained.py"),
-        TestFile("test_fa3.py", 5),
+        TestFile("test_fa3.py", 200),
         TestFile("test_fp8_kernel.py", 8),
         TestFile("test_embedding_openai_server.py", 36),
         TestFile("test_hidden_states.py", 55),
@@ -97,6 +98,7 @@ suites = {
         TestFile("test_awq.py"),
         TestFile("test_gguf.py", 78),
         TestFile("test_gptqmodel_dynamic.py", 72),
+        TestFile("test_bnb.py"),
     ],
 }
 

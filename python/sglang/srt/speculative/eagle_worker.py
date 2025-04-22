@@ -34,14 +34,9 @@ from sglang.srt.speculative.eagle_utils import (
     select_top_k_tokens,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.utils import (
-    empty_context,
-    fast_topk,
-    get_available_gpu_memory,
-    is_cuda_available,
-)
+from sglang.srt.utils import empty_context, fast_topk, get_available_gpu_memory, is_cuda
 
-if is_cuda_available():
+if is_cuda():
     from sgl_kernel import segment_packbits
 
 logger = logging.getLogger(__name__)
@@ -271,14 +266,11 @@ class EAGLEWorker(TpModelWorker):
             )
         elif batch.forward_mode.is_idle():
             model_worker_batch = batch.get_model_worker_batch()
-            logits_output, next_token_ids, _ = (
-                self.target_worker.forward_batch_generation(
-                    ForwardBatch.init_new(
-                        model_worker_batch, self.target_worker.model_runner
-                    )
-                )
+            logits_output, next_token_ids = self.target_worker.forward_batch_generation(
+                model_worker_batch
             )
-            return logits_output, next_token_ids, model_worker_batch.bid, 0, False
+
+            return logits_output, next_token_ids, model_worker_batch.bid, 0
         else:
             logits_output, next_token_ids, bid = self.forward_target_extend(batch)
             with self.draft_tp_context(self.draft_model_runner.tp_group):
