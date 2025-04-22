@@ -651,7 +651,7 @@ class ForwardBatch:
         tbo_split_token_index = two_batch_overlap.compute_split_token_index(
             split_seq_index=self.tbo_split_seq_index,
             forward_mode=self.forward_mode,
-            extend_seq_lens=self.extend_seq_lens,
+            extend_seq_lens=self.extend_seq_lens_cpu,
         )
 
         from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
@@ -761,7 +761,11 @@ class ForwardBatch:
         output_dict.update(
             dict(
                 batch_size=end_seq_index - start_seq_index,
-                seq_lens_sum=output_dict["seq_lens"].sum().item(),
+                seq_lens_sum=(
+                    output_dict["seq_lens_cpu"].sum()
+                    if "seq_lens_cpu" in output_dict
+                    else None
+                ),
                 extend_num_tokens=extend_num_tokens,
                 attn_backend=output_attn_backend,
                 tbo_split_seq_index=None,

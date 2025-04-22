@@ -20,7 +20,6 @@ import signal
 import sys
 import threading
 import time
-import traceback
 import warnings
 from collections import defaultdict, deque
 from concurrent import futures
@@ -1961,7 +1960,8 @@ class Scheduler(
                 recv_req.output_dir,
                 recv_req.num_steps,
                 recv_req.activities,
-                False,
+                # NOTE fix
+                recv_req.with_stack,
                 recv_req.record_shapes,
                 recv_req.profile_id,
             )
@@ -2004,6 +2004,7 @@ class Scheduler(
         torchprof_activities = [
             activity_map[a] for a in activities if a in activity_map
         ]
+        print(f"hi {torchprof_activities=}")
 
         if torchprof_activities:
             self.torch_profiler = torch.profiler.profile(
