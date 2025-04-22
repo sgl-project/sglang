@@ -37,7 +37,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.patch_torch import monkey_patch_torch_compile
 from sglang.srt.utils import (
     get_available_gpu_memory,
-    get_whatever_gpu_memory_capacity,
+    get_device_memory_capacity,
     is_hip,
 )
 
@@ -133,13 +133,9 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
                 list(range(1, 9)) + list(range(10, 33, 2)) + list(range(40, 161, 16))
             )
 
-        if _is_hip:
+        gpu_mem = get_device_memory_capacity()
+        if gpu_mem is not None and gpu_mem > 81920:
             capture_bs += list(range(160, 257, 8))
-
-        gpu_mem = get_whatever_gpu_memory_capacity() / 1024
-
-        if gpu_mem is not None and gpu_mem > 120:
-            capture_bs += list(range(160, 256, 8))
 
     if max(capture_bs) > model_runner.req_to_token_pool.size:
         # In some case (e.g., with a small GPU or --max-running-requests), the #max-running-requests
@@ -152,10 +148,8 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
 
     assert len(capture_bs) > 0 and capture_bs[0] > 0
     capture_bs = [bs for bs in capture_bs if bs <= model_runner.req_to_token_pool.size]
-
     if server_args.cuda_graph_max_bs:
         capture_bs = [bs for bs in capture_bs if bs <= server_args.cuda_graph_max_bs]
-
     compile_bs = (
         [bs for bs in capture_bs if bs <= server_args.torch_compile_max_bs]
         if server_args.enable_torch_compile
