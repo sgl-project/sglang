@@ -1133,7 +1133,8 @@ class DeepseekV2DecoderLayer(nn.Module):
             )
 
         self.input_is_scattered = (
-            previous_layer_info.ffn_input_mode == _FFNInputMode.SCATTERED
+            layer_id > 0
+            and previous_layer_info.ffn_input_mode == _FFNInputMode.SCATTERED
         )
         self.is_last_layer = self.layer_id == config.num_hidden_layers - 1
 

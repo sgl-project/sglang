@@ -25,6 +25,7 @@ from torch import nn
 from sglang.srt.distributed import tensor_model_parallel_all_gather
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather,
+    get_attention_tp_size,
     get_local_attention_dp_rank,
     get_local_attention_dp_size,
 )
@@ -193,6 +194,7 @@ class LogitsProcessor(nn.Module):
         super().__init__()
         self.config = config
         self.logit_scale = logit_scale
+        self.attn_tp_size = get_attention_tp_size()
         self.do_tensor_parallel_all_gather = (
             not skip_all_gather and self.attn_tp_size > 1
         )
