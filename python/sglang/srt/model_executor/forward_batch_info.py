@@ -37,7 +37,6 @@ from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 import torch
 import triton
 import triton.language as tl
-
 from sglang.srt import two_batch_overlap
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
@@ -449,13 +448,13 @@ class ForwardBatch:
                 if mm_input is None:
                     # text only
                     mrope_positions = [
-                        [
-                            pos
-                            for pos in range(
-                                extend_prefix_len, extend_prefix_len + extend_seq_len
-                            )
-                        ]
-                    ] * 3
+                                          [
+                                              pos
+                                              for pos in range(
+                                              extend_prefix_len, extend_prefix_len + extend_seq_len
+                                          )
+                                          ]
+                                      ] * 3
                 else:
                     image_grid_thws_list = [
                         item.image_grid_thws
@@ -494,8 +493,8 @@ class ForwardBatch:
                     mrope_positions, mrope_position_delta = (
                         MRotaryEmbedding.get_input_positions(
                             input_tokens=self.input_ids[
-                                extend_start_loc : extend_start_loc + extend_seq_len
-                            ].tolist(),
+                                         extend_start_loc: extend_start_loc + extend_seq_len
+                                         ].tolist(),
                             image_grid_thw=image_grid_thw,
                             video_grid_thw=video_grid_thw,
                             image_token_id=hf_config.image_token_id,
@@ -605,8 +604,8 @@ class ForwardBatch:
         self.prefix_chunk_len = chunk_capacity // self.batch_size
 
         self.num_prefix_chunks = (
-            max(self.extend_prefix_lens_cpu) + self.prefix_chunk_len - 1
-        ) // self.prefix_chunk_len
+                                     max(self.extend_prefix_lens_cpu) + self.prefix_chunk_len - 1
+                                 ) // self.prefix_chunk_len
 
         # Here we compute chunk lens twice to avoid stream sync, once on gpu and once on cpu.
         prefix_chunk_starts_cuda, prefix_chunk_seq_lens_cuda = (
@@ -761,7 +760,7 @@ class ForwardBatch:
         output_dict.update(
             dict(
                 batch_size=end_seq_index - start_seq_index,
-                seq_lens_sum=output_dict["seq_lens"].sum().item(),
+                seq_lens_sum=output_dict["seq_lens_cpu"].sum(),
                 extend_num_tokens=extend_num_tokens,
                 attn_backend=output_attn_backend,
                 tbo_split_seq_index=None,
