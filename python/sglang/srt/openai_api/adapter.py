@@ -1722,6 +1722,20 @@ def v1_embedding_request(all_requests, tokenizer_manager):
     first_prompt_type = type(all_requests[0].input)
 
     for request in all_requests:
+        # Add validation for empty input string
+        if isinstance(request.input, str) and request.input == "":
+            raise HTTPException(
+                status_code=400, detail="Input cannot be an empty string."
+            )
+        if (
+            isinstance(request.input, list)
+            and len(request.input) == 1
+            and request.input[0] == ""
+        ):
+            raise HTTPException(
+                status_code=400, detail="Input cannot be an empty string."
+            )
+        # End of validation
         prompt = request.input
         assert (
             type(prompt) is first_prompt_type
