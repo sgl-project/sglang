@@ -30,6 +30,8 @@ multiprocessing.set_start_method("spawn", force=True)
 os.environ["SGL_IN_DEEP_GEMM_PRE_COMPILE_STAGE"] = "1"
 # Force enable deep gemm
 os.environ["SGL_ENABLE_JIT_DEEPGEMM"] = "1"
+# Force enable mha chunked kv for DeepSeek V3 to avoid missing kv_b_proj DeepGEMM case
+os.environ["SGL_CHUNKED_PREFIX_CACHE_THRESHOLD"] = "0"
 
 
 @dataclasses.dataclass
