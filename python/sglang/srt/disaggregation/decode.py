@@ -509,6 +509,13 @@ class SchedulerDisaggregationDecodeMixin:
         self.last_batch_in_queue = False  # last batch is modifed in-place, so we need another variable to track if it's extend
 
         while True:
+            print(f"hi event_loop "
+                  f"{len(self.disagg_decode_prealloc_queue.queue)=} "
+                  f"{len(self.disagg_decode_transfer_queue.queue)=} "
+                  f"{len(self.waiting_queue)=} "
+                  f"{len(self.running_batch.reqs)=} "
+                  f"")
+
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
             # polling and allocating kv cache
