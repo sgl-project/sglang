@@ -51,6 +51,7 @@ Please refer to our dedicated guide on [constrained decoding](./structured_outpu
 * `n: int = 1`: Specifies the number of output sequences to generate per request. (Generating multiple outputs in one request (n > 1) is discouraged; repeating the same prompts several times offers better control and efficiency.)
 * `spaces_between_special_tokens: bool = True`: Whether or not to add spaces between special tokens during detokenization.
 * `no_stop_trim: bool = False`: Don't trim stop words or EOS token from the generated text.
+* `continue_final_message: bool = False` : When enabled, the final assistant message is removed and its content is used as a prefill so that the model continues that message instead of starting a new turn. See [openai_chat_with_response_prefill.py](https://github.com/sgl-project/sglang/blob/main/examples/runtime/openai_chat_with_response_prefill.py) for examples.
 * `ignore_eos: bool = False`: Don't stop generation when EOS token is sampled.
 * `skip_special_tokens: bool = True`: Remove special tokens during decoding.
 * `custom_params: Optional[List[Optional[Dict[str, Any]]]] = None`: Used when employing `CustomLogitProcessor`. For usage, see below.

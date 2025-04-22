@@ -8,11 +8,11 @@ import torch
 import torch.nn as nn
 
 from sglang.srt.custom_op import CustomOp
-from sglang.srt.utils import is_cuda_available
+from sglang.srt.utils import is_cuda
 
-_is_cuda_available = is_cuda_available()
+_is_cuda = is_cuda()
 
-if _is_cuda_available:
+if _is_cuda:
     from sgl_kernel import apply_rope_with_cos_sin_cache_inplace
 else:
     from vllm._custom_ops import rotary_embedding as vllm_rotary_embedding
@@ -82,7 +82,7 @@ class RotaryEmbedding(CustomOp):
 
         cache = self._compute_cos_sin_cache()
         # NOTE(ByronHsu): cache needs to be in FP32 for numerical stability
-        if not _is_cuda_available:
+        if not _is_cuda:
             cache = cache.to(dtype)
         self.cos_sin_cache: torch.Tensor
         self.register_buffer("cos_sin_cache", cache, persistent=False)
@@ -149,7 +149,7 @@ class RotaryEmbedding(CustomOp):
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if _is_cuda_available and (self.head_size in [64, 128, 256, 512]):
+        if _is_cuda and (self.head_size in [64, 128, 256, 512]):
             apply_rope_with_cos_sin_cache_inplace(
                 positions=positions,
                 query=query,
@@ -652,7 +652,7 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
     def forward(self, *args, **kwargs):
         if torch.compiler.is_compiling():
             return self.forward_native(*args, **kwargs)
-        if _is_cuda_available:
+        if _is_cuda:
             return self.forward_cuda(*args, **kwargs)
         else:
             return self.forward_native(*args, **kwargs)
@@ -665,6 +665,7 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """PyTorch-native implementation equivalent to forward()."""
+        dtype = query.dtype
         query_rot = query[..., : self.rotary_dim]
         key_rot = key[..., : self.rotary_dim]
         if self.rotary_dim < self.head_size:
@@ -695,7 +696,7 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         else:
             query = query_rot
             key = key_rot
-        return query, key
+        return query.to(dtype), key.to(dtype)
 
 
 class Llama3RotaryEmbedding(RotaryEmbedding):
