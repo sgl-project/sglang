@@ -760,7 +760,7 @@ class ForwardBatch:
         output_dict.update(
             dict(
                 batch_size=end_seq_index - start_seq_index,
-                seq_lens_sum=output_dict["seq_lens_cpu"].sum(),
+                seq_lens_sum=output_dict["seq_lens_cpu"].sum() if "seq_lens_cpu" in output_dict else None,
                 extend_num_tokens=extend_num_tokens,
                 attn_backend=output_attn_backend,
                 tbo_split_seq_index=None,
