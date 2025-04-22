@@ -563,7 +563,7 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         # TODO: Design a finer way to determine the threshold
         self.chunked_prefix_cache_threshold = get_int_env_var(
-            "SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD", 8192
+            "SGL_CHUNKED_PREFIX_CACHE_THRESHOLD", 8192
         )
 
     def dispatch_attn_forward_method(
