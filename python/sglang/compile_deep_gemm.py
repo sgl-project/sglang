@@ -28,6 +28,8 @@ multiprocessing.set_start_method("spawn", force=True)
 
 # Reduce warning
 os.environ["SGL_IN_DEEP_GEMM_PRE_COMPILE_STAGE"] = "1"
+# Force enable deep gemm
+os.environ["SGL_ENABLE_JIT_DEEPGEMM"] = "1"
 
 
 @dataclasses.dataclass
