@@ -28,8 +28,6 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install dependencies
-        env:
-          FLASHINFER_REPO: 'https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python'
         run: |
           bash scripts/ci_install_dependency.sh
           pip install "vllm>=0.6.4.post1,<=0.7.2"

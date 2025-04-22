@@ -11,10 +11,10 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
-from sglang.srt.utils import is_cuda_available, set_weight_attrs
+from sglang.srt.utils import is_cuda, set_weight_attrs
 
-is_cuda = is_cuda_available()
-if is_cuda:
+_is_cuda = is_cuda()
+if _is_cuda:
     from sgl_kernel import int8_scaled_mm
 
 
@@ -231,6 +231,7 @@ class W8A8Int8MoEMethod:
         apply_router_weight_on_input: bool = False,
         inplace: bool = True,
         no_combine: bool = False,
+        routed_scaling_factor: Optional[float] = None,
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
         from sglang.srt.layers.moe.topk import select_experts
@@ -246,6 +247,7 @@ class W8A8Int8MoEMethod:
             num_expert_group=num_expert_group,
             custom_routing_function=custom_routing_function,
             correction_bias=correction_bias,
+            routed_scaling_factor=routed_scaling_factor,
         )
 
         return fused_experts(

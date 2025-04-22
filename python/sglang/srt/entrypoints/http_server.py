@@ -25,11 +25,9 @@ import multiprocessing as multiprocessing
 import os
 import threading
 import time
-from ast import Mult
 from http import HTTPStatus
 from typing import AsyncIterator, Callable, Dict, Optional, Union
 
-from sglang.srt.model_executor.model_runner import LocalSerializedTensor
 from sglang.srt.parser.parser_manager import ParserManager
 
 # Fix a bug of Python threading
@@ -85,7 +83,6 @@ from sglang.srt.parser.function_call_parser import FunctionCallParser
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
-    MultiprocessingSerializer,
     add_api_key_middleware,
     add_prometheus_middleware,
     delete_directory,
@@ -316,11 +313,11 @@ async def classify_request(obj: EmbeddingReqInput, request: Request):
 @app.api_route("/flush_cache", methods=["GET", "POST"])
 async def flush_cache():
     """Flush the radix cache."""
-    _global_state.tokenizer_manager.flush_cache()
+    ret = await _global_state.tokenizer_manager.flush_cache()
     return Response(
         content="Cache flushed.\nPlease check backend logs for more details. "
         "(When there are running or waiting requests, the operation will not be performed.)\n",
-        status_code=200,
+        status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
     )
 
 

@@ -450,7 +450,9 @@ def popen_launch_server(
 
             return_code = process.poll()
             if return_code is not None:
-                raise Exception(f"Server unexpectedly exits ({return_code=}).")
+                raise Exception(
+                    f"Server unexpectedly exits ({return_code=}). Usually there will be error logs describing the cause far above this line."
+                )
 
             time.sleep(10)
 
