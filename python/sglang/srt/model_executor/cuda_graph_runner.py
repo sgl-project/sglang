@@ -450,10 +450,6 @@ class CudaGraphRunner:
             tbo_split_seq_index=tbo_split_seq_index,
             global_forward_mode=self.capture_forward_mode,
         )
-        
-        # TODO hack!!!
-        forward_batch.seq_lens_cpu = seq_lens.cpu()
-
         forward_batch.prepare_tbo()
 
         # Attention backend
