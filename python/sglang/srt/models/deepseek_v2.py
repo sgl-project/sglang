@@ -551,9 +551,6 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.attention_backend = global_server_args_dict["attention_backend"]
         self.rocm_fused_decode_mla = os.getenv("SGLANG_ROCM_FUSED_DECODE_MLA") == "1"
 
-        # TODO: Design a finer way to determine the threshold
-        self.chunked_prefix_cache_threshold = 8192
-
     def dispatch_attn_forward_method(
         self, forward_batch: ForwardBatch
     ) -> AttnForwardMethod:
@@ -575,17 +572,14 @@ class DeepseekV2AttentionMLA(nn.Module):
                 forward_batch.forward_mode.is_extend()
                 and not forward_batch.forward_mode.is_target_verify()
                 and not forward_batch.forward_mode.is_draft_extend()
+                and (
+                    sum(forward_batch.extend_prefix_lens_cpu) == 0
+                    or not self.disable_chunked_prefix_cache
+                )
             ):
-                prefix_len_sum = sum(forward_batch.extend_prefix_lens_cpu)
-                if prefix_len_sum == 0:
-                    return AttnForwardMethod.MHA
-
-                if (
-                    not self.disable_chunked_prefix_cache
-                    and prefix_len_sum >= self.chunked_prefix_cache_threshold
-                ):
-                    return AttnForwardMethod.MHA_CHUNKED_KV
-            return AttnForwardMethod.MLA
+                return AttnForwardMethod.MHA_CHUNKED_KV
+            else:
+                return AttnForwardMethod.MLA
         else:
             # Triton: Use normal computation for prefill and use weight absorption for extend/decode
             if (
@@ -1036,7 +1030,6 @@ class DeepseekV2AttentionMLA(nn.Module):
         # Do mha for extended part without prefix
         forward_batch.set_attn_attend_prefix_cache(False)
         attn_output, lse = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
-        lse = torch.transpose(lse, 0, 1).contiguous()
 
         # Do mha attention with chunked prefix cache if there are any sequence with prefix
         if any(forward_batch.extend_prefix_lens_cpu):
@@ -1045,6 +1038,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 forward_batch.prepare_chunked_prefix_cache_info(q.device)
 
             forward_batch.set_attn_attend_prefix_cache(True)
+            lse = torch.transpose(lse, 0, 1).contiguous()
             attn_output = self._chunked_prefix_attn_mha(
                 q=q,
                 accum_output=attn_output,
