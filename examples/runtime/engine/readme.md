@@ -47,3 +47,27 @@ This will send both non-streaming and streaming requests to the server.
 ### [Token-In-Token-Out for RLHF](../token_in_token_out)
 
 In this example, we launch an SGLang engine, feed tokens as input and generate tokens as output.
+
+### [Inference Using FastAPI](fastapi_engine_inference.py)
+
+This example demonstrates how to create a FastAPI server that uses the SGLang engine for text generation.
+
+#### Steps:
+
+1. Start the server:
+
+    ```python
+    python fastapi_engine_inference.py
+    ```
+
+2. Send requests:
+
+    ```bash
+        curl -X POST http://localhost:8000/generate \
+            -H "Content-Type: application/json" \
+            -d '{
+                "prompt": "What is the capital of France?",
+                "max_new_tokens": 50,
+                "temperature": 0.1
+                }'
+    ```
