@@ -80,7 +80,15 @@ from sglang.srt.managers.expert_distribution import ExpertDistributionRecorder
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import BumpAllocator, DeepEPMode, add_prefix, is_cuda, is_hip
+from sglang.srt.utils import (
+    BumpAllocator,
+    DeepEPMode,
+    add_prefix,
+    get_bool_env_var,
+    get_int_env_var,
+    is_cuda,
+    is_hip,
+)
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -549,7 +557,9 @@ class DeepseekV2AttentionMLA(nn.Module):
             "disable_chunked_prefix_cache"
         ]
         self.attention_backend = global_server_args_dict["attention_backend"]
-        self.rocm_fused_decode_mla = os.getenv("SGLANG_ROCM_FUSED_DECODE_MLA") == "1"
+        self.rocm_fused_decode_mla = get_bool_env_var(
+            "SGLANG_ROCM_FUSED_DECODE_MLA", "false"
+        )
 
     def dispatch_attn_forward_method(
         self, forward_batch: ForwardBatch
