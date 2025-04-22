@@ -573,15 +573,19 @@ class DeepseekV2AttentionMLA(nn.Module):
             # Flash Attention: Use MHA with chunked KV cache when prefilling on long sequences.
             if (
                 forward_batch.forward_mode.is_extend()
-                and not self.disable_chunked_prefix_cache
                 and not forward_batch.forward_mode.is_target_verify()
                 and not forward_batch.forward_mode.is_draft_extend()
-                and sum(forward_batch.extend_prefix_lens_cpu)
-                >= self.chunked_prefix_cache_threshold
             ):
-                return AttnForwardMethod.MHA_CHUNKED_KV
-            else:
-                return AttnForwardMethod.MLA
+                prefix_len_sum = sum(forward_batch.extend_prefix_lens_cpu)
+                if prefix_len_sum == 0:
+                    return AttnForwardMethod.MHA
+
+                if (
+                    not self.disable_chunked_prefix_cache
+                    and prefix_len_sum >= self.chunked_prefix_cache_threshold
+                ):
+                    return AttnForwardMethod.MHA_CHUNKED_KV
+            return AttnForwardMethod.MLA
         else:
             # Triton: Use normal computation for prefill and use weight absorption for extend/decode
             if (
