@@ -1101,7 +1101,7 @@ def get_amdgpu_memory_capacity():
 
 
 def get_device_sm():
-    print(torch.cuda.is_available())
+    print(f"torch.cuda.is_available(): {torch.cuda.is_available()}")
     if torch.cuda.is_available():
         major, minor = torch.cuda.get_device_capability()
         print(f"the version is {major} {minor}")
