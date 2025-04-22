@@ -813,6 +813,7 @@ def _fwd_kernel_ep_scatter_2(
                 tl.store(output_tensor_scale_ptr + offset_in_s, to_copy_s, mask=mask_s)
 
 
+# copy from https://github.com/ModelTC/lightllm/blob/main/lightllm/common/fused_moe/deepep_scatter_gather.py
 @torch.no_grad()
 def ep_scatter(
     recv_x: torch.Tensor,
@@ -1025,6 +1026,7 @@ def _tma_align_input_scale_kernel(
         tl.store(output_offset, input_data, mask=k_offsets < k_div_block_size)
 
 
+# copy from https://github.com/ModelTC/lightllm/blob/main/lightllm/common/quantization/triton_quant/fp8/fp8act_quant_kernel.py
 def tma_align_input_scale(input_scale: torch.Tensor):
     assert input_scale.dim() == 2
     m, k_div_block_size = input_scale.shape

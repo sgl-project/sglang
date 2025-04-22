@@ -17,7 +17,7 @@ except ImportError:
     use_deepep = False
 
 from enum import IntEnum, auto
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -257,7 +257,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
 
     def _dispatch_core(
         self,
-        x: torch.Tensor,
+        x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
         previous_event,
