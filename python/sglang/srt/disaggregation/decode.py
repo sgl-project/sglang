@@ -483,7 +483,7 @@ class SchedulerDisaggregationDecodeMixin:
                     result = self.run_batch(batch)
                     self.process_batch_result(batch, result)
             elif prepare_dp_attn_flag:
-                self._prepare_idle_batch_and_run(None)
+                batch, _ = self._prepare_idle_batch_and_run(None)
 
             if batch is None and (
                 len(self.disagg_decode_transfer_queue.queue)
@@ -522,9 +522,9 @@ class SchedulerDisaggregationDecodeMixin:
                     # Note: Logprobs should be handled on the prefill engine.
                     self.stream_output(batch.reqs, False)
                     if prepare_dp_attn_flag:
-                        dp_attn_batch, dp_attn_result = self._prepare_idle_batch_and_run(None, delay_process=True)
-                        if dp_attn_batch:
-                            result_queue.append((dp_attn_batch.copy(), dp_attn_result))
+                        batch_, result = self._prepare_idle_batch_and_run(None, delay_process=True)
+                        if batch_:
+                            result_queue.append((batch_.copy(), result))
                             last_batch_in_queue = True
                 else:
                     if prepare_dp_attn_flag:
@@ -533,9 +533,9 @@ class SchedulerDisaggregationDecodeMixin:
                     result_queue.append((batch.copy(), result))
                     last_batch_in_queue = True
             elif prepare_dp_attn_flag:
-                dp_attn_batch, dp_attn_result = self._prepare_idle_batch_and_run(None, delay_process=True)
-                if dp_attn_batch:
-                    result_queue.append((dp_attn_batch.copy(), dp_attn_result))
+                batch, result = self._prepare_idle_batch_and_run(None, delay_process=True)
+                if batch:
+                    result_queue.append((batch.copy(), result))
                     last_batch_in_queue = True
 
             # Process the results of the previous batch but skip if the last batch is extend
