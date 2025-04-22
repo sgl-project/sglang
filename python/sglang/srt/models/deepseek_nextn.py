@@ -279,7 +279,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                     "up_proj.weight",
                     "up_proj.weight_scale",
                 ]
-                if self.quant_config.get_name() == "w8a8_int8"
+                if self.quant_config is None or self.quant_config.get_name() == "w8a8_int8"
                 else [
                     "down_proj.weight",
                     "down_proj.weight_scale_inv",
