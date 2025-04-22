@@ -246,6 +246,14 @@ class DecodePreallocQueue:
                 self.scheduler.last_batch.reqs
             )
 
+        print(f"hi compute {allocatable_tokens=} "
+              f"{self.token_to_kv_pool_allocator.available_size()=} "
+              f"{self.num_reserved_decode_tokens=} "
+              f"{len(self.scheduler.running_batch.reqs)=} "
+              f"{len(self.transfer_queue.queue)=} "
+              f"{len(self.scheduler.waiting_queue)=} "
+              f"{len(self.scheduler.last_batch.reqs)=} "
+              )
         return allocatable_tokens
 
     def _pre_alloc(self, req: Req) -> torch.Tensor:
