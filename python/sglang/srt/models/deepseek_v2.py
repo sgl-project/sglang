@@ -561,6 +561,11 @@ class DeepseekV2AttentionMLA(nn.Module):
             "SGLANG_ROCM_FUSED_DECODE_MLA", "false"
         )
 
+        # TODO: Design a finer way to determine the threshold
+        self.chunked_prefix_cache_threshold = get_int_env_var(
+            "SGL_CHUNKED_PREFIX_CACHE_THRESHOLD", 8192
+        )
+
     def dispatch_attn_forward_method(
         self, forward_batch: ForwardBatch
     ) -> AttnForwardMethod:
@@ -582,14 +587,14 @@ class DeepseekV2AttentionMLA(nn.Module):
                 forward_batch.forward_mode.is_extend()
                 and not forward_batch.forward_mode.is_target_verify()
                 and not forward_batch.forward_mode.is_draft_extend()
-                and (
-                    sum(forward_batch.extend_prefix_lens_cpu) == 0
-                    or not self.disable_chunked_prefix_cache
-                )
             ):
-                return AttnForwardMethod.MHA_CHUNKED_KV
-            else:
-                return AttnForwardMethod.MLA
+                prefix_len_sum = sum(forward_batch.extend_prefix_lens_cpu)
+                if prefix_len_sum == 0 or (
+                    prefix_len_sum >= self.chunked_prefix_cache_threshold
+                    and not self.disable_chunked_prefix_cache
+                ):
+                    return AttnForwardMethod.MHA_CHUNKED_KV
+            return AttnForwardMethod.MLA
         else:
             # Triton: Use normal computation for prefill and use weight absorption for extend/decode
             if (
