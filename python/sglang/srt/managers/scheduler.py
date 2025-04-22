@@ -782,11 +782,11 @@ class Scheduler(
         elif self.tp_size != 1:
             recv_reqs = broadcast_pyobj(recv_reqs, self.tp_rank, self.tp_cpu_group)
 
-        # if len(recv_reqs) > 0:
-        #     print(
-        #         f"hi [{get_tensor_model_parallel_rank()}, {self.__class__.__name__}] recv_requests {[type(x) for x in recv_reqs]=}",
-        #         flush=True,
-        #     )
+        if len(recv_reqs) > 0:
+            print(
+                f"hi [{get_tensor_model_parallel_rank()}, {self.__class__.__name__}] recv_requests {[type(x) for x in recv_reqs]=}",
+                flush=True,
+            )
 
         return recv_reqs
 
