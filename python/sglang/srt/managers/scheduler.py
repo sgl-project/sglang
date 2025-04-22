@@ -785,7 +785,6 @@ class Scheduler(
         if len(recv_reqs) > 0:
             print(
                 f"hi [{get_tensor_model_parallel_rank()}, {self.__class__.__name__}] recv_requests {[type(x).__name__ for x in recv_reqs]=}",
-                flush=True,
             )
 
         return recv_reqs
