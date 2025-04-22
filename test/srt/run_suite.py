@@ -29,7 +29,7 @@ suites = {
         TestFile("test_chunked_prefill.py", 336),
         TestFile("test_eagle_infer.py", 500),
         TestFile("test_ebnf_constrained.py"),
-        TestFile("test_fa3.py", 5),
+        TestFile("test_fa3.py", 200),
         TestFile("test_fp8_kernel.py", 8),
         TestFile("test_embedding_openai_server.py", 36),
         TestFile("test_hidden_states.py", 55),
