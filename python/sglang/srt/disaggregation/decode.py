@@ -21,6 +21,7 @@ Life cycle of a request in the decode server
 from __future__ import annotations
 
 import logging
+import os
 from collections import deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional, Tuple
@@ -96,7 +97,8 @@ class DecodePreallocQueue:
         self.tp_size = tp_size
         self.bootstrap_port = bootstrap_port
 
-        self.num_reserved_decode_tokens = 512
+        self.num_reserved_decode_tokens = int(os.environ.get("SGLANG_HACK_PD_DECODE_NUM_RESERVED_DECODE_TOKENS", "512"))
+        print(f"HACK: {self.num_reserved_decode_tokens=}")
 
         # Queue for requests pending pre-allocation
         self.queue: List[DecodeRequest] = []
@@ -179,9 +181,11 @@ class DecodePreallocQueue:
                 continue
 
             if self.req_to_token_pool.available_size() <= 0:
+                print("hi pop_preallocated break because self.req_to_token_pool.available_size")
                 break
 
             if self.req_to_metadata_buffer_idx_allocator.available_size() <= 0:
+                print("hi pop_preallocated break because self.req_to_metadata_buffer_idx_allocator")
                 break
 
             required_tokens_for_request = (
@@ -189,6 +193,7 @@ class DecodePreallocQueue:
             )
 
             if required_tokens_for_request > allocatable_tokens:
+                print(f"hi pop_preallocated break because {required_tokens_for_request=} {allocatable_tokens=}")
                 break
 
             allocatable_tokens -= required_tokens_for_request
