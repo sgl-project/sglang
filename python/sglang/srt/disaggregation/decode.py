@@ -443,7 +443,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
 
 
 class SchedulerDisaggregationDecodeMixin:
-    
+
     def _prepare_idle_batch_and_run(self, batch, delay_process=False):
         batch, _ = self.prepare_dp_attn_batch(batch)
         result = None
@@ -465,7 +465,7 @@ class SchedulerDisaggregationDecodeMixin:
             self.process_decode_queue()
             batch = self.get_next_disagg_decode_batch_to_run()
             self.cur_batch = batch
-            
+
             prepare_dp_attn_flag = (
                 self.server_args.enable_dp_attention
                 or self.server_args.enable_sp_layernorm
@@ -502,7 +502,7 @@ class SchedulerDisaggregationDecodeMixin:
         result_queue = deque()
         self.last_batch: Optional[ScheduleBatch] = None
         self.last_batch_in_queue = False  # last batch is modifed in-place, so we need another variable to track if it's extend
-        
+
         while True:
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
@@ -511,7 +511,7 @@ class SchedulerDisaggregationDecodeMixin:
             batch = self.get_next_disagg_decode_batch_to_run()
             self.cur_batch = batch
             last_batch_in_queue = False
-            
+
             prepare_dp_attn_flag = (
                 self.server_args.enable_dp_attention
                 or self.server_args.enable_sp_layernorm
@@ -523,7 +523,9 @@ class SchedulerDisaggregationDecodeMixin:
                     # Note: Logprobs should be handled on the prefill engine.
                     self.stream_output(batch.reqs, False)
                     if prepare_dp_attn_flag:
-                        batch_, result = self._prepare_idle_batch_and_run(None, delay_process=True)
+                        batch_, result = self._prepare_idle_batch_and_run(
+                            None, delay_process=True
+                        )
                         if batch_:
                             result_queue.append((batch_.copy(), result))
                             last_batch_in_queue = True
@@ -534,7 +536,9 @@ class SchedulerDisaggregationDecodeMixin:
                     result_queue.append((batch.copy(), result))
                     last_batch_in_queue = True
             elif prepare_dp_attn_flag:
-                batch, result = self._prepare_idle_batch_and_run(None, delay_process=True)
+                batch, result = self._prepare_idle_batch_and_run(
+                    None, delay_process=True
+                )
                 if batch:
                     result_queue.append((batch.copy(), result))
                     last_batch_in_queue = True
