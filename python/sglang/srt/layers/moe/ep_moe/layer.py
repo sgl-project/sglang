@@ -16,7 +16,7 @@ try:
     from sglang.srt.layers.quantization.fp8_kernel import (
         sglang_per_token_group_quant_fp8,
     )
-    from sglang.srt.utils import DeepEPMode, get_bool_env_var, get_device_sm
+    from sglang.srt.utils import DeepEPMode, get_bool_env_var
 
     if get_bool_env_var("SGL_ENABLE_JIT_DEEPGEMM", default="false"):
         _enable_jit_deepgemm = True
@@ -867,19 +867,11 @@ class DeepEPMoE(EPMoE):
         resolved_deepep_mode = self.deepep_mode.resolve(forward_mode)
         if resolved_deepep_mode == DeepEPMode.normal:
             if _enable_jit_deepgemm:
-                ret = self.forward_deepgemm_contiguous(
+                return self.forward_deepgemm_contiguous(
                     hidden_states, topk_idx, topk_weights, num_recv_tokens_per_expert
                 )
-                print("ret shape", ret.shape)
-                return ret
-                # return self.forward_deepgemm_contiguous(
-                #     hidden_states, topk_idx, topk_weights, num_recv_tokens_per_expert
-                # )
             else:
-                ret = self.forward_normal(hidden_states, reorder_topk_ids, seg_indptr)
-                print("ret shape", ret.shape)
-                return ret
-                # return self.forward_normal(hidden_states, reorder_topk_ids, seg_indptr)
+                return self.forward_normal(hidden_states, reorder_topk_ids, seg_indptr)
         elif resolved_deepep_mode == DeepEPMode.low_latency:
             return self.forward_deepgemm_masked(hidden_states, masked_m, expected_m)
         else:
@@ -1012,14 +1004,15 @@ class DeepEPMoE(EPMoE):
         all_tokens = sum(num_recv_tokens_per_expert)
         if all_tokens <= 0:
             return hidden_states_fp8
-        num_groups, M, K = hidden_states_fp8[0].size()
+        hidden_states_fp8 = sglang_per_token_group_quant_fp8(hidden_states_fp8, 128)
+        M, K = hidden_states_fp8[0].size()
         N = self.w13_weight.size(1)
         scale_block_size = 128
 
         gather_out = torch.empty_like(
             hidden_states_fp8[0],
             device=hidden_states_fp8[0].device,
-            dtype=hidden_states_fp8[0].dtype,
+            dtype=torch.bfloat16,
         )
 
         input_tensor = [
@@ -1074,7 +1067,7 @@ class DeepEPMoE(EPMoE):
                 N // 2,
             ),
             device=gateup_output.device,
-            dtype=self.fp8_dtype,
+            dtype=torch.bfloat16,
         )
         down_input_scale = torch.empty(
             (

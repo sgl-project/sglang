@@ -7,13 +7,16 @@ import triton.language as tl
 
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import get_bool_env_var, is_cuda
 
 _is_cuda = is_cuda()
 if _is_cuda:
     from sglang.srt.layers.quantization.fp8_kernel import (
         sglang_per_token_group_quant_fp8,
     )
+
+    if get_bool_env_var("SGL_ENABLE_JIT_DEEPGEMM", default="false"):
+        from deep_gemm import ceil_div
 logger = logging.getLogger(__name__)
 
 
