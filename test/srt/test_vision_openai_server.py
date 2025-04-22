@@ -724,7 +724,7 @@ class TestGemma3itServer(TestOpenAIVisionServer):
                 "gemma-it",
                 "--mem-fraction-static",
                 "0.75",
-                "--enable-gemma3-multimodal",
+                "--enable-multimodal",
             ],
         )
         cls.base_url += "/v1"

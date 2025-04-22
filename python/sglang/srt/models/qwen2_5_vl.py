@@ -533,7 +533,19 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
                 (Use input_metadata.mrope_positions to replace it)
         """
         if self.is_mrope_enabled:
-            positions = forward_batch.mrope_positions
+            # deal with prefixed prefill
+            mrope_positions_list = []
+            if forward_batch.forward_mode.is_extend():
+                mrope_positions = forward_batch.mrope_positions.split(
+                    forward_batch.seq_lens.tolist(), dim=1
+                )
+                for extend_seq_len, mrope_position in zip(
+                    forward_batch.extend_seq_lens, mrope_positions
+                ):
+                    mrope_positions_list += [mrope_position[:, -extend_seq_len:]]
+                positions = torch.cat(mrope_positions_list, dim=1)
+            else:
+                positions = forward_batch.mrope_positions
 
         if not (
             forward_batch.forward_mode.is_decode()
