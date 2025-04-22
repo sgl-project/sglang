@@ -41,15 +41,6 @@ from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils import DeepEPMode, is_cuda, is_hip, set_weight_attrs, get_bool_env_var
 
-_is_cuda = is_cuda()
-
-if _is_cuda:
-    from sglang.srt.custom_op import scaled_fp8_quant as sgl_scaled_fp8_quant
-else:
-    from vllm import _custom_ops as vllm_ops
-
-logger = logging.getLogger(__name__)
-
 _is_hip = is_hip()
 
 if _is_hip:
