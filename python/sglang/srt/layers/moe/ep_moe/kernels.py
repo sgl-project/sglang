@@ -829,9 +829,7 @@ def ep_scatter(
     BLOCK_E = 128  # token num of per expert is aligned to 128
     BLOCK_D = 128  # block size of quantization
     num_warps = 8
-    num_experts = num_recv_tokens_per_expert.shape[
-        0
-    ]  # 获取num_recv_tokens_per_expert的元素个数
+    num_experts = num_recv_tokens_per_expert.shape[0]
     hidden_size = recv_x.shape[1]
     # grid = (triton.cdiv(hidden_size, BLOCK_D), num_experts)
     grid = num_experts
