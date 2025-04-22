@@ -32,6 +32,8 @@ import psutil
 import setproctitle
 import torch
 import zmq
+from torch.distributed import barrier
+
 from sglang.global_config import global_config
 from sglang.srt import two_batch_overlap
 from sglang.srt.configs.model_config import ModelConfig
@@ -143,7 +145,6 @@ from sglang.srt.utils import (
     suppress_other_loggers,
 )
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
-from torch.distributed import barrier
 
 logger = logging.getLogger(__name__)
 
@@ -411,8 +412,8 @@ class Scheduler(
             1.0,
         )
         self.new_token_ratio_decay = (
-                                         self.init_new_token_ratio - self.min_new_token_ratio
-                                     ) / global_config.default_new_token_ratio_decay_steps
+            self.init_new_token_ratio - self.min_new_token_ratio
+        ) / global_config.default_new_token_ratio_decay_steps
         self.new_token_ratio = self.init_new_token_ratio
 
         # Init watchdog thread
@@ -429,7 +430,7 @@ class Scheduler(
         self.input_blocker = (
             SchedulerInputBlocker(server_args, noop=self.attn_tp_rank != 0)
             if enable_colocated_batch_gen()
-               or server_args.enable_scheduler_input_blocker
+            or server_args.enable_scheduler_input_blocker
             else None
         )
 
@@ -1276,10 +1277,10 @@ class Scheduler(
             if (
                 self.lora_paths
                 and len(
-                lora_set
-                | set([req.lora_path for req in adder.can_run_list])
-                | set([req.lora_path])
-            )
+                    lora_set
+                    | set([req.lora_path for req in adder.can_run_list])
+                    | set([req.lora_path])
+                )
                 > self.max_loras_per_batch
             ):
                 self.running_batch.batch_is_full = True
@@ -1304,9 +1305,9 @@ class Scheduler(
                         self.running_batch.batch_is_full = len(
                             adder.can_run_list
                         ) > 0 or (
-                                                               self.running_batch is not None
-                                                               and not self.running_batch.is_empty()
-                                                           )
+                            self.running_batch is not None
+                            and not self.running_batch.is_empty()
+                        )
                     else:
                         self.running_batch.batch_is_full = True
                 break
@@ -1550,8 +1551,8 @@ class Scheduler(
                     # We should have at least 1 token for sample in every case.
                     max(extend_len - logprob_start_len, 1)
                     for logprob_start_len, extend_len in zip(
-                    local_batch.extend_logprob_start_lens, local_batch.extend_lens
-                )
+                        local_batch.extend_logprob_start_lens, local_batch.extend_lens
+                    )
                 ]
             )
 
