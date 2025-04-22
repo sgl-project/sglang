@@ -400,6 +400,9 @@ class ServerArgs:
                 self.max_prefill_tokens = (
                     4096  # Currently, HPU prefer smaller prefill batches
                 )
+            # overlap schedule is not supported on HPU
+            # running scheduler on CPU needs to be supported
+            self.disable_overlap_schedule = True
         else:
             self.max_prefill_tokens = 16384
 

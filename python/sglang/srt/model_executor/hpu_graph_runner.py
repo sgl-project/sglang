@@ -37,7 +37,8 @@ from sglang.srt.utils import is_hpu
 _is_hpu = is_hpu()
 if _is_hpu:
 
-    os.environ["PT_HPU_ENABLE_LAZY_COLLECTIVES"] = "true"
+    if torch.hpu.is_lazy():
+        os.environ["PT_HPU_ENABLE_LAZY_COLLECTIVES"] = "true"
 
     from sglang.srt.hpu_utils import (
         SKIP_WARMUP,

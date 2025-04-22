@@ -125,7 +125,6 @@ from sglang.srt.utils import (
     configure_logger,
     crash_on_warnings,
     get_bool_env_var,
-    get_scheduler_device,
     get_zmq_socket,
     is_hpu,
     kill_itself_when_parent_died,
@@ -293,13 +292,12 @@ class Scheduler(
             self.max_req_len,
             self.max_req_input_len,
             self.random_seed,
-            worker_device,
+            self.device,
             worker_global_server_args_dict,
             _,
             _,
             _,
         ) = self.tp_worker.get_worker_info()
-        self.device = get_scheduler_device(worker_device)
         self.tp_cpu_group = self.tp_worker.get_tp_cpu_group()
         self.attn_tp_cpu_group = self.tp_worker.get_attention_tp_cpu_group()
         self.pad_input_ids_func = self.tp_worker.get_pad_input_ids_func()

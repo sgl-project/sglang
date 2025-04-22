@@ -1707,7 +1707,7 @@ def write_req_to_token_pool_triton(
         )
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend())
+@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_hpu)
 def get_last_loc(req_to_token, req_pool_indices_tensor, prefix_lens_tensor):
     return torch.where(
         prefix_lens_tensor > 0,

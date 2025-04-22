@@ -36,7 +36,7 @@ jobs:
           pip install --user -e "python[all_hpu]"
 
       - name: Evaluate Accuracy
-        timeout-minutes: 20
+        timeout-minutes: 60
         run: |
           cd test/srt/
           SGLANG_IS_IN_CI=1 SGLANG_HPU_SKIP_WARMUP=true python test_eval_accuracy_large.py

@@ -1993,9 +1993,3 @@ class BumpAllocator:
         output = self._buffer[self._pointer : self._pointer + size]
         self._pointer += size
         return output
-
-
-def get_scheduler_device(worker_device: str):
-    # HPU has higher overhead when running many small ops
-    # so we run all scheduler ops on CPU when using HPU
-    return "cpu" if is_hpu() else worker_device
