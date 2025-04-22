@@ -1170,7 +1170,7 @@ def get_hpu_memory_capacity():
         )
 
 
-def get_whatever_gpu_memory_capacity(device: str = None):
+def get_device_memory_capacity(device: str = None):
     if is_cuda():
         gpu_mem = get_nvgpu_memory_capacity()
     elif is_hip():
