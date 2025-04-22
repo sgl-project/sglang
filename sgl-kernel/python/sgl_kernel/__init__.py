@@ -11,7 +11,13 @@ if os.path.exists("/usr/local/cuda/targets/x86_64-linux/lib/libcudart.so.12"):
 
 from sgl_kernel import common_ops
 from sgl_kernel.allreduce import *
-from sgl_kernel.attention import lightning_attention_decode
+from sgl_kernel.attention import (
+    cutlass_mla_decode,
+    cutlass_mla_get_workspace_size,
+    lightning_attention_decode,
+    merge_state,
+    merge_state_v2,
+)
 from sgl_kernel.elementwise import (
     apply_rope_with_cos_sin_cache_inplace,
     fused_add_rmsnorm,
@@ -25,7 +31,6 @@ from sgl_kernel.elementwise import (
 from sgl_kernel.gemm import (
     awq_dequantize,
     bmm_fp8,
-    cublas_grouped_gemm,
     cutlass_scaled_fp4_mm,
     fp8_blockwise_scaled_mm,
     fp8_scaled_mm,
