@@ -218,7 +218,14 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             print("normal dispatcher dispatch_b enable jit deepgemm")
             # TODO hard code 128 block quant
             # disable for now to bypass buffer init error
-            # hidden_states = sglang_per_token_group_quant_fp8(hidden_states, 128)
+            # hidden_states, scales = sglang_per_token_group_quant_fp8(hidden_states, 128)
+            print("hidden_states shape", hidden_states.shape)
+            print(
+                "hidden_states byte size",
+                hidden_states.element_size() * hidden_states.numel(),
+            )
+            # make hidden_states contiguous
+            # hidden_states = hidden_states.contiguous()
             (
                 hidden_states,
                 topk_idx,
@@ -266,6 +273,11 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
                 )
 
             masked_m = expected_m = None
+            print("hidden_states shape", hidden_states.shape)
+            print(
+                "hidden_states byte size",
+                hidden_states.element_size() * hidden_states.numel(),
+            )
 
             return (
                 hidden_states,
