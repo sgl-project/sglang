@@ -16,19 +16,17 @@ import functools
 import json
 import logging
 import os
-from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.layers.quantization.deep_gemm import _ENABLE_JIT_DEEPGEMM
 from sglang.srt.utils import (
     direct_register_custom_op,
-    get_bool_env_var,
     get_device_core_count,
     get_device_name,
-    get_device_sm,
     is_cuda,
     is_hip,
     supports_custom_op,
@@ -43,24 +41,18 @@ else:
     fp8_max = torch.finfo(_fp8_type).max
 fp8_min = -fp8_max
 
-_enable_jit_deepgemm = False
 if _is_cuda:
-    import deep_gemm
     from sgl_kernel import (
         sgl_per_tensor_quant_fp8,
         sgl_per_token_group_quant_fp8,
         sgl_per_token_quant_fp8,
     )
 
-    sm_version = get_device_sm()
-    if sm_version == 90 and get_bool_env_var(
-        "SGL_ENABLE_JIT_DEEPGEMM", default="false"
-    ):
-        _enable_jit_deepgemm = True
-
+    from sglang.srt.layers.quantization.deep_gemm import (
+        gemm_nt_f8f8bf16 as deep_gemm_gemm_nt_f8f8bf16,
+    )
 
 logger = logging.getLogger(__name__)
-
 
 if supports_custom_op():
 
@@ -71,10 +63,7 @@ if supports_custom_op():
         Bs: torch.Tensor,
         C: torch.Tensor,
     ) -> None:
-        M, K = A.shape
-        N, _ = B.shape
-        with _log_jit_build(M, N, K):
-            deep_gemm.gemm_fp8_fp8_bf16_nt((A, As), (B, Bs), C)
+        deep_gemm_gemm_nt_f8f8bf16((A, As), (B, Bs), C)
 
     def deep_gemm_fp8_fp8_bf16_nt_fake(
         A: torch.Tensor,
@@ -715,25 +704,6 @@ def get_w8a8_block_fp8_configs(
     return None
 
 
-@contextmanager
-def _log_jit_build(M: int, N: int, K: int):
-    from deep_gemm.jit.runtime import RuntimeCache
-
-    origin_func = RuntimeCache.__getitem__
-
-    def __patched_func(self, *args, **kwargs):
-        ret = origin_func(self, *args, **kwargs)
-        if ret is None:
-            logger.warning(
-                f"DeepGEMM JIT code generation <gemm_fp8_fp8_bf16_nt>: M={M}, N={N}, K={K}. Please wait."
-            )
-        return ret
-
-    RuntimeCache.__getitem__ = __patched_func
-    yield
-    RuntimeCache.__getitem__ = origin_func
-
-
 def w8a8_block_fp8_matmul(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -804,12 +774,11 @@ def w8a8_block_fp8_matmul(
     )
 
     # deepgemm only support bf16
-    if C.dtype == torch.bfloat16 and _enable_jit_deepgemm:
+    if C.dtype == torch.bfloat16 and _ENABLE_JIT_DEEPGEMM:
         if supports_custom_op():
             torch.ops.sglang.deep_gemm_fp8_fp8_bf16_nt(A, As, B, Bs, C)
         else:
-            with _log_jit_build(M, N, K):
-                deep_gemm.gemm_fp8_fp8_bf16_nt((A, As), (B, Bs), C)
+            deep_gemm_gemm_nt_f8f8bf16((A, As), (B, Bs), C)
     else:
         kernel = (
             _w8a8_block_fp8_matmul_unrolledx4
@@ -897,16 +866,20 @@ def _per_tensor_quant_mla_fp8_stage2(
 
 
 def per_tensor_quant_mla_fp8(
-    x: torch.Tensor, eps: float = 1e-12
+    x: torch.Tensor, x_s_out: torch.Tensor, eps: float = 1e-12
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     This function quantizes input values to float8 values with tensor-wise quantization
     and specialized for mla absorbed case.
     """
     assert x.dim() == 3, "`x` is not a 3d-tensor"
+    assert (
+        x_s_out.shape == (1,)
+        and x_s_out.dtype == torch.float32
+        and x_s_out.device == x.device
+    )
 
     x_q = x.new_empty(x.size(), dtype=_fp8_type)
-    x_s = torch.zeros((1,), dtype=torch.float32, device=x.device)
 
     num_head, num_seq, head_size = x.shape
     BLOCK_SIZE = triton.next_power_of_2(head_size)
@@ -914,7 +887,7 @@ def per_tensor_quant_mla_fp8(
 
     _per_tensor_quant_mla_fp8_stage1[grid](
         x,
-        x_s,
+        x_s_out,
         head_size,
         x.stride(0),
         x.stride(1),
@@ -924,7 +897,7 @@ def per_tensor_quant_mla_fp8(
     )
     _per_tensor_quant_mla_fp8_stage2[grid](
         x,
-        x_s,
+        x_s_out,
         x_q,
         num_seq,
         head_size,
@@ -935,7 +908,109 @@ def per_tensor_quant_mla_fp8(
         BLOCK_SIZE,
     )
 
-    return x_q, x_s
+    return x_q, x_s_out
+
+
+@triton.jit
+def _per_token_group_quant_mla_deep_gemm_masked_fp8(
+    y_ptr,
+    y_q_ptr,
+    y_s_ptr,
+    masked_m_ptr,
+    group_size,
+    y_stride_b,
+    y_stride_t,
+    y_q_stride_b,
+    y_q_stride_t,
+    y_s_stride_b,
+    y_s_stride_g,
+    eps,
+    fp8_min,
+    fp8_max,
+    NUM_GROUP: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """A Triton-accelerated function to perform per-token-group
+    quantization on a tensor for deep_gemm grouped_gemm_masked.
+    This function converts the tensor values into float8 values.
+    y and y_q: (b, t, k)
+    y_s: (b, k//group_size, t)
+    """
+    t_id = tl.program_id(0)
+    b_id = tl.program_id(1)
+
+    y_ptr += b_id * y_stride_b + t_id * y_stride_t
+    y_q_ptr += b_id * y_q_stride_b + t_id * y_q_stride_t
+    y_s_ptr += b_id * y_s_stride_b + t_id
+
+    if t_id == 0:
+        tl.store(masked_m_ptr + b_id, tl.num_programs(0))
+
+    cols = tl.arange(0, BLOCK)  # group_size <= BLOCK
+    mask = cols < group_size
+
+    for gid in range(NUM_GROUP):
+        y = tl.load(y_ptr + gid * group_size + cols, mask=mask, other=0.0).to(
+            tl.float32
+        )
+        _absmax = tl.maximum(tl.max(tl.abs(y)), eps)
+        y_s = _absmax / fp8_max
+        y_q = tl.clamp(y / y_s, fp8_min, fp8_max).to(y_q_ptr.dtype.element_ty)
+
+        tl.store(y_q_ptr + gid * group_size + cols, y_q, mask=mask)
+        tl.store(y_s_ptr + gid * y_s_stride_g, y_s)
+
+
+def per_tensor_quant_mla_deep_gemm_masked_fp8(
+    x: torch.Tensor,
+    group_size: int = 128,
+    eps: float = 1e-12,
+    dtype: torch.dtype = torch.float8_e4m3fn,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    This function quantizes input values to float8 values with per-token-group-quantization
+    for deep_gemm grouped_gemm_masked and specialized for mla absorbed case.
+    """
+    assert x.dim() == 3, "`x` is not a 3d-tensor"
+
+    finfo = torch.finfo(dtype)
+    fp8_max = finfo.max
+    if _is_hip:
+        dtype = torch.float8_e4m3fnuz
+        fp8_max = 224.0
+
+    b, m, k = x.shape
+    aligned_m = (m + 255) // 256 * 256  # 256 is the max block_m of the gemm kernel
+    num_tiles_k = k // group_size
+    assert num_tiles_k * group_size == k, f"k % {group_size} must be zero"
+
+    x_q = x.new_empty((b, aligned_m, k), dtype=dtype)
+    x_s = x.new_empty((b, num_tiles_k, aligned_m), dtype=torch.float32)
+    masked_m = x.new_empty((b,), dtype=torch.int32)
+
+    BLOCK_SIZE = triton.next_power_of_2(group_size)
+    grid = (m, b)
+
+    _per_token_group_quant_mla_deep_gemm_masked_fp8[grid](
+        x,
+        x_q,
+        x_s,
+        masked_m,
+        group_size,
+        x.stride(0),
+        x.stride(1),
+        x_q.stride(0),
+        x_q.stride(1),
+        x_s.stride(0),
+        x_s.stride(1),
+        eps,
+        -fp8_max,
+        fp8_max,
+        num_tiles_k,
+        BLOCK_SIZE,
+    )
+
+    return x_q, x_s.transpose(1, 2), masked_m, m, aligned_m
 
 
 def scaled_fp8_quant(

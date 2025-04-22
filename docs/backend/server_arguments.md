@@ -127,7 +127,7 @@ Please consult the documentation below to learn more about the parameters you ma
 ## Multi-node distributed serving
 
 * `dist_init_addr`: The TCP address used for initializing PyTorch's distributed backend (e.g. `192.168.0.2:25000`).
-* `nnodes`: Total number of nodes in the cluster. Refer to how to run the [Llama 405B model](https://docs.sglang.ai/references/llama_405B.html#run-405b-fp16-on-two-nodes).
+* `nnodes`: Total number of nodes in the cluster. Refer to how to run the [Llama 405B model](https://docs.sglang.ai/references/multi_node.html#llama-3-1-405b).
 * `node_rank`: Rank (ID) of this node among the `nnodes` in the distributed setup.
 
 
