@@ -364,6 +364,10 @@ class CompressedTensorsConfig(QuantizationConfig):
                 raise ImportError(
                     "vllm is not installed, to use CompressedTensorsW4A16Sparse24 and CompressedTensorsWNA16, please install vllm"
                 )
+            from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
+                CompressedTensorsWNA16,
+                CompressedTensorsW4A16Sparse24,
+            )
             if (
                 self.quant_format == CompressionFormat.marlin_24.value
                 and weight_quant.num_bits in W4A16SPARSE24_SUPPORTED_BITS

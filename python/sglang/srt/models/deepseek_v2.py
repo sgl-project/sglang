@@ -1417,6 +1417,9 @@ class DeepseekV2ForCausalLM(nn.Module):
                         0,
                         0,
                     ).T
+            # FIXME: adapt to CompressedTensorsWNA16
+            # elif hasattr(self_attn.kv_b_proj, "weight_packed"):
+            #     w = self_attn.kv_b_proj.weight_packed
             else:
                 w = self_attn.kv_b_proj.weight
             # NOTE(HandH1998): Since `bmm_fp8` only supports per-tensor scale, we have to requantize `self_attn.kv_b_proj`.

@@ -668,8 +668,8 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
             correction_bias=correction_bias,
         )
 
-        return fused_marlin_moe(
-        # return torch.ops.vllm.fused_marlin_moe(
+        #FIXME: checkout why sgl fused_marlin_moe is much slower than vllm
+        return torch.ops.vllm.fused_marlin_moe(
             x,
             layer.w13_weight_packed,
             layer.w2_weight_packed,
