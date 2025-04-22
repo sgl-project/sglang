@@ -217,6 +217,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         if _enable_jit_deepgemm:
             print("normal dispatcher dispatch_b enable jit deepgemm")
             # TODO hard code 128 block quant
+            # disable for now to bypass buffer init error
             # hidden_states = sglang_per_token_group_quant_fp8(hidden_states, 128)
             (
                 hidden_states,
