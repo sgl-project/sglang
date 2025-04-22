@@ -204,7 +204,6 @@ void sm100_fp8_blockwise_group_mm_dispatch_shape(
   torch::Tensor a_scales_ptrs = torch::empty(num_experts, options_int);
   torch::Tensor b_scales_ptrs = torch::empty(num_experts, options_int);
   torch::Tensor problem_sizes_transpose = torch::empty(num_experts * 3, options_int);
-  // TODO: move this to the caller
   torch::Tensor workspace = torch::empty(100, options_int);
   torch::Tensor output_t = output.t();
   torch::Tensor a_t = a.t();
@@ -279,6 +278,38 @@ void sm100_fp8_blockwise_group_mm_dispatch_shape(
   }
 }
 
+/**
+ * @brief Performs blockwise grouped matrix multiplication on FP8 quantized inputs,
+ *        with per-block scaling.
+ *
+ * This function dispatches to hardware-specific implementations (e.g., SM100 FP8)
+ * to compute:
+ *     C_i = scale_a[i] * A_i * scale_b[i] * B_i
+ * for each expert group `i`, using input `problem_sizes` and `expert_offsets`
+ * to describe the individual matrix dimensions and their offsets.
+ *
+ * Input tensors A and B must be quantized to 8-bit formats and dequantized before multiplication.
+ * The output tensor is written with bfloat16 or half precision.
+ *
+ * @param output         Output tensor (must be of type bfloat16 or half).
+ * @param a              Input tensor A (must be kFloat8_e4m3fn).
+ * @param b              Input tensor B (must be kFloat8_e4m3fn).
+ * @param scales_a       Scaling factors for tensor A, float32 per expert group.
+ * @param scales_b       Scaling factors for tensor B, float32 per expert group.
+ * @param stride_a       Stride information for tensor A (int32).
+ * @param stride_b       Stride information for tensor B (int32).
+ * @param stride_c       Stride information for output tensor C (int32).
+ * @param layout_sfa     Layout descriptor for A (int32), e.g., row-major/column-major.
+ * @param layout_sfb     Layout descriptor for B (int32).
+ * @param problem_sizes  2D int32 tensor of shape (num_experts, 3), specifying (M, N, K)
+ *                       for each grouped matrix multiplication problem.
+ * @param expert_offsets 1D int32 tensor of size (num_experts), used to index into
+ *                       the grouped input tensors for dispatch.
+ *  @note Performance Optimization:
+ *       If the batch size (a.size(0)) is smaller than 512, the implementation
+ *       will internally transpose input matrices to align with the optimal memory access
+ *       pattern for better GPU efficiency. This transformation is done within the kernel.
+ */
 void fp8_blockwise_scaled_grouped_mm(
     torch::Tensor& output,
     const torch::Tensor& a,
@@ -292,24 +323,25 @@ void fp8_blockwise_scaled_grouped_mm(
     const torch::Tensor& layout_sfb,
     const torch::Tensor& problem_sizes,
     const torch::Tensor& expert_offsets) {
-  // Input validation
   TORCH_CHECK(problem_sizes.dim() == 2, "problem_sizes must be 2D tensor");
   TORCH_CHECK(problem_sizes.size(1) == 3, "problem_sizes must have shape (num_experts, 3)");
   TORCH_CHECK(
       problem_sizes.size(0) == expert_offsets.size(0), "Number of experts in problem_sizes must match expert_offsets");
   TORCH_CHECK(problem_sizes.dtype() == torch::kInt32, "problem_sizes must be int32");
-  TORCH_CHECK(a.scalar_type() == torch::kFloat8_e4m3fn, "a must be float8_e4m3fn");
-  TORCH_CHECK(b.scalar_type() == torch::kFloat8_e4m3fn, "b must be float8_e4m3fn");
+  TORCH_CHECK(a.scalar_type() == torch::kFloat8_e4m3fn, "a must be kFloat8_e4m3fn");
+  TORCH_CHECK(b.scalar_type() == torch::kFloat8_e4m3fn, "b must be kFloat8_e4m3fn");
+  TORCH_CHECK(
+      output.scalar_type() == torch::kBFloat16 || output.scalar_type() == torch::kHalf,
+      "output must be bfloat16 or half");
   TORCH_CHECK(scales_a.scalar_type() == torch::kFloat32, "scales_a must be float32");
   TORCH_CHECK(scales_b.scalar_type() == torch::kFloat32, "scales_b must be float32");
-  TORCH_CHECK(stride_a.scalar_type() == torch::kInt32, "stride_a must be int32");
-  TORCH_CHECK(stride_b.scalar_type() == torch::kInt32, "stride_b must be int32");
-  TORCH_CHECK(stride_c.scalar_type() == torch::kInt32, "stride_c must be int32");
+  TORCH_CHECK(stride_a.scalar_type() == torch::kInt64, "stride_a must be int64");
+  TORCH_CHECK(stride_b.scalar_type() == torch::kInt64, "stride_b must be int64");
+  TORCH_CHECK(stride_c.scalar_type() == torch::kInt64, "stride_c must be int64");
   TORCH_CHECK(layout_sfa.scalar_type() == torch::kInt32, "layout_sfa must be int32");
   TORCH_CHECK(layout_sfb.scalar_type() == torch::kInt32, "layout_sfb must be int32");
   TORCH_CHECK(expert_offsets.scalar_type() == torch::kInt32, "expert_offsets must be int32");
 
-  // Get output shapes and create output tensors
   bool can_implement = false;
   auto sm_version = getSMVersion();
 

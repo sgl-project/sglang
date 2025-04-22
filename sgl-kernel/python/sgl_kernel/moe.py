@@ -61,6 +61,7 @@ def moe_fused_gate(
         routed_scaling_factor,
     )
 
+
 def fp8_blockwise_scaled_grouped_mm(
     output,
     a,
