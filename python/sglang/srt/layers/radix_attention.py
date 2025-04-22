@@ -74,9 +74,11 @@ class RadixAttention(nn.Module):
         self.k_scale_float = None
         self.v_scale_float = None
         self.quant_method = None
+        #FIXME: temp patch for moe only quantization
+        print("quant_config: ", quant_config.__dict__)
         if quant_config is not None:
             self.quant_method = quant_config.get_quant_method(self, prefix=prefix)
-        if self.quant_method is not None:
+        if self.quant_method is not None and (quant_config.get_name() not in ["compressed_tensors", "compressed-tensors"]):
             self.quant_method.create_weights(self)
         self.attn_type = attn_type
 

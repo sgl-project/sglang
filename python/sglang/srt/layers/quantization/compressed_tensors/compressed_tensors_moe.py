@@ -23,6 +23,7 @@ from sglang.srt.layers.quantization.utils import (
     replace_parameter,
 )
 from sglang.srt.utils import set_weight_attrs
+from sgl_kernel import fused_marlin_moe
 
 _is_cuda = is_cuda()
 
@@ -75,12 +76,11 @@ class CompressedTensorsMoEMethod:
             # 2. Non-FP16 dtype (MarlinMoE only supports FP16)
             # 3. Actorder is not group/dynamic (g_idx is unsupported)
             # 4. Scaled are grouped (channelwise is unsupported)
-            if (weight_quant.actorder not in (ActivationOrdering.GROUP,
-                                                  ActivationOrdering.DYNAMIC)
-                    and weight_quant.strategy in QuantizationStrategy.GROUP):
-                return CompressedTensorsWNA16MoEMethod(quant_config)
-            else:
-                return CompressedTensorsWNA16MarlinMoEMethod(quant_config)
+            # if (weight_quant.actorder not in (ActivationOrdering.GROUP,
+            #                                       ActivationOrdering.DYNAMIC)
+            #         and weight_quant.strategy in QuantizationStrategy.GROUP):
+            # TODO: check is there a situation that non-marlin kernel is better
+            return CompressedTensorsWNA16MarlinMoEMethod(quant_config)
         elif quant_config._is_fp8_w8a8(weight_quant, input_quant):
             return CompressedTensorsW8A8Fp8MoEMethod(quant_config)
         else:
@@ -665,11 +665,11 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
             topk_group=topk_group,
             num_expert_group=num_expert_group,
             custom_routing_function=custom_routing_function,
-            scoring_func=scoring_func,
             correction_bias=correction_bias,
         )
 
-        return torch.ops.vllm.fused_marlin_moe(
+        return fused_marlin_moe(
+        # return torch.ops.vllm.fused_marlin_moe(
             x,
             layer.w13_weight_packed,
             layer.w2_weight_packed,
@@ -716,9 +716,15 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
                              "is supported for the following bits: ",
                              f"{WNA16_SUPPORTED_BITS}")
 
-    def create_weights(self, layer: torch.nn.Module, num_experts: int,
-                       hidden_size: int, intermediate_size_per_partition: int,
-                       params_dtype: torch.dtype, **extra_weight_attrs):
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
 
         # Will transpose the loaded weight along the
         # intermediate and hidden dim sizes. Will
@@ -898,7 +904,3 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             no_combine=no_combine,
             block_shape=[0, self.group_size]
         )
-
-
-
-
