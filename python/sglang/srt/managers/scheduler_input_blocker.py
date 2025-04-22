@@ -27,9 +27,10 @@ class SchedulerInputBlocker:
         self._pending_reqs = []
         self._noop = noop
         self._global_unblock_barrier = PollBasedBarrier(noop=noop)
-        assert (
-            server_args.disable_overlap_schedule
-        ), "SchedulerInputBlocker requires overlap scheduler to be disabled"
+        # TODO do we (still) need this?
+        # assert (
+        #     server_args.disable_overlap_schedule
+        # ), "SchedulerInputBlocker requires overlap scheduler to be disabled"
 
     def handle(self, recv_reqs: Optional[List[Any]]):
         assert (recv_reqs is None) == self._noop
