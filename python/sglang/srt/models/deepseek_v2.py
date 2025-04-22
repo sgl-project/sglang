@@ -1656,7 +1656,9 @@ class DeepseekV2ForCausalLM(nn.Module):
         )
 
         # Fuse q_a_proj and kv_a_proj_with_mqa along output dimension when q_lora_rank is not None
-        fuse_qkv_a_proj = self.config.hasattr("q_lora_rank")
+        fuse_qkv_a_proj = hasattr(self.config, "q_lora_rank") and (
+            self.config.q_lora_rank is not None
+        )
         cached_a_proj = {} if fuse_qkv_a_proj else None
 
         params_dict = dict(self.named_parameters())
