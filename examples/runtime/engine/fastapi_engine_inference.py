@@ -25,12 +25,15 @@ Usage:
     ```
 """
 
-from examples.runtime.engine.fastapi_engine_inference import FastAPI, Request
-import sglang as sgl
-import uvicorn
 from contextlib import asynccontextmanager
 
+import uvicorn
+
+import sglang as sgl
+from examples.runtime.engine.fastapi_engine_inference import FastAPI, Request
+
 engine = None
+
 
 # Use FastAPI's lifespan manager to initialize/shutdown the engine
 @asynccontextmanager
@@ -39,7 +42,7 @@ async def lifespan(app: FastAPI):
     # Initialize the SGLang engine when the server starts
     # Adjust model_path and other engine arguments as needed
     print("Loading SGLang engine...")
-    engine = sgl.Engine(model_path="Qwen/Qwen2.5-0.5B-Instruct", tp_size=1) 
+    engine = sgl.Engine(model_path="Qwen/Qwen2.5-0.5B-Instruct", tp_size=1)
     print("SGLang engine loaded.")
     yield
     # Clean up engine resources when the server stops (optional, depends on engine needs)
@@ -49,6 +52,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
 
 @app.post("/generate")
 async def generate_text(request: Request):
@@ -71,7 +75,7 @@ async def generate_text(request: Request):
             sampling_params={
                 "max_new_tokens": max_new_tokens,
                 "temperature": temperature,
-            }
+            },
             # Add other parameters like stop, top_p etc. as needed
         )
 
@@ -79,9 +83,10 @@ async def generate_text(request: Request):
     except Exception as e:
         return {"error": str(e)}, 500
 
+
 if __name__ == "__main__":
-     # Required for async_generate if running in a nested loop environment like Jupyter
-     # import nest_asyncio
-     # nest_asyncio.apply()
+    # Required for async_generate if running in a nested loop environment like Jupyter
+    # import nest_asyncio
+    # nest_asyncio.apply()
 
     uvicorn.run(app, host="0.0.0.0", port=8000)
