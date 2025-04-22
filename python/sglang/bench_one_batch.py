@@ -207,7 +207,7 @@ def prepare_extend_inputs_for_correctness_test(
 
 
 def prepare_synthetic_inputs_for_latency_test(batch_size, input_len):
-    input_ids = np.ones((batch_size, input_len), dtype=np.int32)
+    input_ids = np.random.randint(0, 10000, (batch_size, input_len), dtype=np.int32)
     sampling_params = SamplingParams(
         temperature=0,
         max_new_tokens=BenchArgs.output_len,
@@ -396,7 +396,7 @@ def latency_test_run_once(
         decode_latencies.append(latency)
         if i < 5:
             rank_print(
-                f"Decode.  latency: {latency:6.5f} s, throughput: {throughput:9.2f} token/s"
+                f"Decode. Batch size: {batch_size}, latency: {latency:6.5f} s, throughput: {throughput:9.2f} token/s"
             )
 
     if profile:

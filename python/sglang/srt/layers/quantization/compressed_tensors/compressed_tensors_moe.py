@@ -294,6 +294,7 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
         inplace: bool = True,
         no_combine: bool = False,
         apply_router_weight_on_input: bool = False,
+        routed_scaling_factor: Optional[float] = None,
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.fused_moe_triton import fused_experts
         from sglang.srt.layers.moe.topk import select_experts
@@ -308,6 +309,7 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
             num_expert_group=num_expert_group,
             custom_routing_function=custom_routing_function,
             correction_bias=correction_bias,
+            routed_scaling_factor=routed_scaling_factor,
         )
 
         return fused_experts(
@@ -644,9 +646,7 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
         scoring_func: str = "softmax",
         correction_bias: Optional[torch.Tensor] = None,
         activation: str = "silu",
-        apply_router_weight_on_input: bool = False,
-        inplace: bool = True,
-        no_combine: bool = False,
+        routed_scaling_factor: Optional[float] = None,
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.topk import select_experts
 
@@ -666,6 +666,7 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
             num_expert_group=num_expert_group,
             custom_routing_function=custom_routing_function,
             correction_bias=correction_bias,
+            routed_scaling_factor=routed_scaling_factor,
         )
 
         #FIXME: checkout why sgl fused_marlin_moe is much slower than vllm
