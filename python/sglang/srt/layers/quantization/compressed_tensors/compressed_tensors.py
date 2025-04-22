@@ -27,6 +27,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.quantization.compressed_tensors import WNA16_SUPPORTED_BITS
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe import (  # noqa: E501
     CompressedTensorsMoEMethod,
 )
@@ -40,7 +41,6 @@ from sglang.srt.layers.quantization.compressed_tensors.utils import (
     is_activation_quantization_format,
     should_ignore_layer,
 )
-from sglang.srt.layers.quantization.compressed_tensors import WNA16_SUPPORTED_BITS
 
 try:
     import vllm
@@ -366,9 +366,10 @@ class CompressedTensorsConfig(QuantizationConfig):
                     "vllm is not installed, to use CompressedTensorsW4A16Sparse24 and CompressedTensorsWNA16, please install vllm"
                 )
             from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
-                CompressedTensorsWNA16,
                 CompressedTensorsW4A16Sparse24,
+                CompressedTensorsWNA16,
             )
+
             if (
                 self.quant_format == CompressionFormat.marlin_24.value
                 and weight_quant.num_bits in W4A16SPARSE24_SUPPORTED_BITS

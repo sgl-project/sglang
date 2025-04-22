@@ -336,7 +336,7 @@ class FusedMoE(torch.nn.Module):
             intermediate_size_per_partition=self.intermediate_size_per_partition,
             params_dtype=params_dtype,
             weight_loader=self.weight_loader,
-            intermediate_size_full=intermediate_size
+            intermediate_size_full=intermediate_size,
         )
 
     def _load_per_tensor_weight_scale(
@@ -498,7 +498,10 @@ class FusedMoE(torch.nn.Module):
             loaded_weight.t().contiguous()
             if (
                 self.quant_method.__class__.__name__
-                in ["CompressedTensorsWNA16MarlinMoEMethod", 'CompressedTensorsWNA16MoEMethod']
+                in [
+                    "CompressedTensorsWNA16MarlinMoEMethod",
+                    "CompressedTensorsWNA16MoEMethod",
+                ]
             )
             else loaded_weight
         )
