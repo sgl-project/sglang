@@ -105,7 +105,6 @@ from sglang.srt.utils import (
     add_prefix,
     configure_deep_gemm_num_sms,
     is_cuda,
-    is_cuda_available,
     is_hip,
 )
 from torch import nn
