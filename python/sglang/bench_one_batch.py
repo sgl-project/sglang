@@ -85,7 +85,7 @@ class BenchArgs:
     correctness_test: bool = False
     # This is only used for correctness test
     cut_len: int = 4
-    log_detail_latency: bool = False
+    log_decode_step: int = 0
     profile: bool = False
     profile_filename_prefix: str = "profile"
 
@@ -107,9 +107,10 @@ class BenchArgs:
         parser.add_argument("--correctness-test", action="store_true")
         parser.add_argument("--cut-len", type=int, default=BenchArgs.cut_len)
         parser.add_argument(
-            "--log-detail-latency",
-            action="store_true",
-            help="Log decode latency for tails step",
+            "--log-decode-step",
+            type=int,
+            default=BenchArgs.log_decode_step,
+            help="Log decode latency by step, default is set to zero to disable.",
         )
         parser.add_argument(
             "--profile", action="store_true", help="Use Torch Profiler."
@@ -341,7 +342,7 @@ def latency_test_run_once(
     input_len,
     output_len,
     device,
-    log_detail_latency,
+    log_decode_step,
     profile,
     profile_filename_prefix,
 ):
@@ -401,7 +402,7 @@ def latency_test_run_once(
         tot_latency += latency
         throughput = batch_size / latency
         decode_latencies.append(latency)
-        if i < 5 or (i % 10 == 0 and log_detail_latency):
+        if i < 5 or (log_decode_step > 0 and i % log_decode_step == 0):
             rank_print(
                 f"Decode {i}. Batch size: {batch_size}, latency: {latency:6.5f} s, throughput: {throughput:9.2f} token/s"
             )
@@ -466,7 +467,7 @@ def latency_test(
         bench_args.input_len[0],
         min(32, bench_args.output_len[0]),  # shorter decoding to speed up the warmup
         server_args.device,
-        log_detail_latency=False,
+        log_decode_step=0,
         profile=False,
         profile_filename_prefix="",  # not used
     )
@@ -488,7 +489,7 @@ def latency_test(
             il,
             ol,
             server_args.device,
-            bench_args.log_detail_latency,
+            bench_args.log_decode_step,
             bench_args.profile if tp_rank == 0 else None,
             bench_args.profile_filename_prefix,
         )
