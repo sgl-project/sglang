@@ -95,6 +95,9 @@ class DeepEPBuffer:
             "num_qps_per_rank",
             num_experts // group.size() if deepep_mode.enable_low_latency() else 1,
         )
+        # check the group status
+        print("group size", group.size())
+        print("group rank", group.rank())
         cls._buffer = Buffer(
             group,
             num_nvl_bytes,
@@ -104,6 +107,7 @@ class DeepEPBuffer:
                 num_experts // group.size() if deepep_mode.enable_low_latency() else 1
             ),
         )
+        print("rank return buffer", group.rank(), cls._buffer)
         return cls._buffer
 
     @classmethod
@@ -200,12 +204,20 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
     ):
         topk_idx = topk_idx.to(torch.int64)
         previous_event = Buffer.capture() if self.async_finish else None
+        print(
+            "normal dispatcher dispatch_a return",
+            hidden_states,
+            topk_idx,
+            topk_weights,
+            previous_event,
+        )
         return hidden_states, topk_idx, topk_weights, previous_event
 
     def dispatch_b(self, hidden_states, topk_idx, topk_weights, previous_event):
         if _enable_jit_deepgemm:
+            print("normal dispatcher dispatch_b enable jit deepgemm")
             # TODO hard code 128 block quant
-            hidden_states = sglang_per_token_group_quant_fp8(hidden_states, 128)
+            # hidden_states = sglang_per_token_group_quant_fp8(hidden_states, 128)
             (
                 hidden_states,
                 topk_idx,
@@ -227,6 +239,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
                 None,
             )
         else:
+            print("normal dispatcher dispatch_b disable jit deepgemm")
             (
                 hidden_states,
                 topk_idx,
@@ -257,8 +270,8 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
                 hidden_states,
                 topk_idx,
                 topk_weights,
-                None,
                 reorder_topk_ids,
+                None,
                 seg_indptr,
                 masked_m,
                 expected_m,
@@ -366,8 +379,10 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         # TODO support deepgemm
         previous_event = Buffer.capture() if self.async_finish else None
         if _enable_jit_deepgemm:
+            print("normal dispatcher combine_a enable jit deepgemm")
             return hidden_states, previous_event
         else:
+            print("normal dispatcher combine_a disable jit deepgemm")
             if hidden_states.shape[0] > 0:
                 num_tokens = self.src2dst.shape[0] // self.router_topk
                 output = torch.empty(
@@ -637,7 +652,9 @@ class DeepEPDispatcher:
 
     def dispatch(self, *args, **kwargs) -> Tuple:
         self.dispatch_a(*args, **kwargs)
-        return self.dispatch_b()
+        ret = self.dispatch_b()
+        print("dispatch_b return ret", ret)
+        return ret
 
     def dispatch_a(
         self,
@@ -651,6 +668,8 @@ class DeepEPDispatcher:
             topk_idx=topk_idx,
             topk_weights=topk_weights,
         )
+        print("dispatch_a args", hidden_states, topk_idx, topk_weights)
+        print("dispatch_a return inner_state", inner_state)
         self._dispatch_intermediate_state = forward_mode, inner_state
 
     def dispatch_b(self):
@@ -660,7 +679,9 @@ class DeepEPDispatcher:
 
     def combine(self, *args, **kwargs) -> Tuple:
         self.combine_a(*args, **kwargs)
-        return self.combine_b()
+        ret = self.combine_b()
+        print("combine_b return ret", ret)
+        return ret
 
     def combine_a(
         self,
@@ -674,6 +695,9 @@ class DeepEPDispatcher:
             topk_idx=topk_idx,
             topk_weights=topk_weights,
         )
+        # print the combina_a args and return value
+        print("combine_a args", hidden_states, topk_idx, topk_weights)
+        print("combine_a return inner_state", inner_state)
         self._combine_intermediate_state = forward_mode, inner_state
 
     def combine_b(self):

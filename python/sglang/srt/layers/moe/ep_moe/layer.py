@@ -867,11 +867,19 @@ class DeepEPMoE(EPMoE):
         resolved_deepep_mode = self.deepep_mode.resolve(forward_mode)
         if resolved_deepep_mode == DeepEPMode.normal:
             if _enable_jit_deepgemm:
-                return self.forward_deepgemm_contiguous(
+                ret = self.forward_deepgemm_contiguous(
                     hidden_states, topk_idx, topk_weights, num_recv_tokens_per_expert
                 )
+                print("ret shape", ret.shape)
+                return ret
+                # return self.forward_deepgemm_contiguous(
+                #     hidden_states, topk_idx, topk_weights, num_recv_tokens_per_expert
+                # )
             else:
-                return self.forward_normal(hidden_states, reorder_topk_ids, seg_indptr)
+                ret = self.forward_normal(hidden_states, reorder_topk_ids, seg_indptr)
+                print("ret shape", ret.shape)
+                return ret
+                # return self.forward_normal(hidden_states, reorder_topk_ids, seg_indptr)
         elif resolved_deepep_mode == DeepEPMode.low_latency:
             return self.forward_deepgemm_masked(hidden_states, masked_m, expected_m)
         else:
