@@ -707,3 +707,128 @@ def grouped_gemm_triton(
         **config,
     )
     return c
+
+
+@triton.jit
+def fill_masked_m_triton_kernel(topk_ids, masked_m, num_experts, N, BLOCK_SIZE: tl.constexpr):
+    id = tl.program_id(0)
+    
+    topk_ids_off = tl.arange(0, BLOCK_SIZE) + id * BLOCK_SIZE
+    topk_ids_mask = topk_ids_off < N
+    topk_ids_tensor = tl.load(topk_ids + topk_ids_off, topk_ids_mask, -1)
+    masked_m_tensor = tl.zeros(num_experts, tl.int32)
+    
+    for i in tl.range(BLOCK_SIZE):
+        masked_m_tensor[topk_ids_tensor[i]] += 1
+    
+    for i in tl.range(num_experts):
+        tl.atomic_add(masked_m, masked_m_tensor[i])
+
+
+@triton.jit
+def compute_src2dst_triton_kernel(topk_ids, src2dst, max_m, num_experts, BLOCK_SIZE, N):
+    expert_id = tl.program_id(0)
+    expert_len = 0
+    start_dst = max_m * expert_id
+    
+    for i in tl.range(0, N, BLOCK_SIZE):
+        off = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
+        mask = off < N
+        topk_ids_tensor = tl.load(topk_ids + off, mask, other=num_experts)
+        src2dst_tensor  = tl.zeros(BLOCK_SIZE, dtype=tl.int32)
+        src2dst_mask    = tl.zeros(BLOCK_SIZE, dtype=tl.int16)
+        for j in tl.range(0, BLOCK_SIZE):
+            if topk_ids_tensor[j] == expert_id:
+                src2dst_mask[j] = 1
+                src2dst_tensor[j] = start_dst + expert_len
+                expert_len += 1
+        tl.store(src2dst + off, src2dst_tensor, src2dst_mask)
+            
+
+@triton.jit
+def fill_gateup_input_triton_kernel(
+    input_ptr,
+    scale_ptr,
+    gateup_input_ptr,
+    gateup_input_scale_ptr,
+    src2dst_ptr,
+    topk_ids_ptr,
+    start_expert_id,
+    end_expert_id,
+    topk,
+    hidden_size,
+    scale_size,
+    BLOCK_SIZE: tl.constexpr,
+):
+
+    src_idx = tl.program_id(0)
+    src2dst_ptr = src2dst_ptr + src_idx * topk
+    topk_ids_ptr = topk_ids_ptr + src_idx * topk
+
+    src_ptr = input_ptr + src_idx * hidden_size
+    scale_src_ptr = scale_ptr + src_idx * scale_size
+    
+    for idx in range(topk):
+        expert_id = tl.load(topk_ids_ptr + idx)
+        if expert_id >= start_expert_id and expert_id <= end_expert_id:
+            dst_idx = tl.load(src2dst_ptr + idx)
+            dst_ptr = gateup_input_ptr + dst_idx * hidden_size
+            for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
+                offset = start_offset + tl.arange(0, BLOCK_SIZE)
+                mask = offset < hidden_size
+                in_data = tl.load(src_ptr + offset, mask=mask)
+                tl.store(dst_ptr + offset, in_data, mask=mask)
+            off = tl.arange(0, scale_size)
+            in_scale = tl.load(scale_src_ptr + off)
+            scale_dst_ptr = gateup_input_scale_ptr + dst_idx * scale_size
+            tl.store(scale_dst_ptr + off, in_scale)
+            
+
+def moe_ep_deepgemm_preproess(topk_ids: torch.Tensor, 
+                              num_experts: int, 
+                              hidden_states: torch.Tensor, 
+                              top_k: int,  
+                              start_expert_id, 
+                              end_expert_id, 
+                              block_shape,
+                              output_dtype: torch.dtype = torch.float8_e4m3fn,):
+    src2dst = torch.empty(topk_ids.numel(), device=topk_ids.device, dtype=torch.int32)
+    masked_m = torch.zeros(num_experts, device=topk_ids.device, dtype=torch.int32)
+    
+    grid = lambda meta: (triton.cdiv(topk_ids.numel(), meta["BLOCK_SIZE"]),)
+    fill_masked_m_triton_kernel[grid](
+        topk_ids, masked_m, num_experts, topk_ids.numel(), BLOCK_SIZE=512)
+    
+    m_max = torch.max(masked_m).item()
+    expected_m = int(topk_ids.shape[0] / num_experts)
+    gateup_input = torch.empty(
+        (int(end_expert_id - start_expert_id + 1), m_max, hidden_states.size(1)),
+        device=hidden_states.device,
+        dtype=output_dtype,
+    )
+
+    compute_src2dst_triton_kernel[(num_experts, )](
+        topk_ids, src2dst, m_max, num_experts, 1024, topk_ids.numel())
+
+    if block_shape is not None:
+        assert len(block_shape) == 2
+        block_n, block_k = block_shape[0], block_shape[1]
+        if _is_cuda:
+            hidden_states, scale = sglang_per_token_group_quant_fp8(hidden_states, block_k)
+        else:
+            hidden_states, scale = per_token_group_quant_fp8(hidden_states, block_k)
+    
+        gateup_input_scale = torch.empty(gateup_input.size(0), gateup_input.size(1), scale.size(1))
+
+    fill_gateup_input_triton_kernel[(hidden_states.shape[0],)](hidden_states, scale,
+                                    gateup_input,
+                                    gateup_input_scale,
+                                    src2dst,
+                                    topk_ids, 
+                                    start_expert_id, 
+                                    end_expert_id, 
+                                    top_k,
+                                    hidden_states.size(1),
+                                    scale.size(1),
+                                    BLOCK_SIZE=1024)
+    return m_max, masked_m, expected_m, src2dst, (gateup_input, gateup_input_scale)
