@@ -361,7 +361,7 @@ class ChatCompletionRequest(BaseModel):
     session_params: Optional[Dict] = None
     separate_reasoning: bool = True
     stream_reasoning: bool = True
-    chat_template_kwargs: Optional[Dict] = None
+    chat_template_kwargs: Optional[Dict] = Field(default_factory=dict)
 
     # For PD disaggregation
     bootstrap_host: Optional[str] = None
