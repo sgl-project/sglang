@@ -27,10 +27,6 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
-from torch import nn
-from tqdm import tqdm
-from transformers import PretrainedConfig
-
 from sglang.srt import two_batch_overlap
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
@@ -114,6 +110,9 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
 )
+from torch import nn
+from tqdm import tqdm
+from transformers import PretrainedConfig
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -549,9 +548,6 @@ class DeepseekV2MoE(nn.Module):
         )
 
     def _forward_tbo_op_dispatch_b(self, state, tbo_child_index: int):
-        if get_bool_env_var("SGLANG_HACK_SLOW_BETWEEN_COMMUNICATION", "false"):
-            _deliberate_slow_gpu_operation()
-
         dispatcher = self.tbo_deepep_dispatchers[state.tbo_subbatch_index]
         with get_global_expert_distribution_recorder().with_current_layer(
             self.layer_id
@@ -577,9 +573,6 @@ class DeepseekV2MoE(nn.Module):
         )
 
     def _forward_tbo_op_combine_b(self, state):
-        if get_bool_env_var("SGLANG_HACK_SLOW_BETWEEN_COMMUNICATION", "false"):
-            _deliberate_slow_gpu_operation()
-
         dispatcher = self.tbo_deepep_dispatchers[state.tbo_subbatch_index]
         hidden_states = dispatcher.combine_b()
         # hidden_states *= self.routed_scaling_factor
@@ -587,6 +580,10 @@ class DeepseekV2MoE(nn.Module):
         state.hidden_states_from_combine_without_scaling = hidden_states
 
     def _forward_tbo_op_shared(self, state):
+        if get_bool_env_var("SGLANG_HACK_SLOW_BETWEEN_COMMUNICATION", "false"):
+            for i in range(3):
+                self.shared_experts(state.hidden_states_after_post_attn_ln)
+
         state.shared_output = self._forward_deepep_shared_output(
             state.forward_batch.forward_mode,
             state.pop("hidden_states_after_post_attn_ln"),
@@ -1048,6 +1045,10 @@ class DeepseekV2AttentionMLA(nn.Module):
             attn_bmm_output = torch.bmm(attn_output.transpose(0, 1), self.w_vc)
         attn_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
         output, _ = self.o_proj(attn_output)
+
+        if get_bool_env_var("SGLANG_HACK_SLOW_BETWEEN_COMMUNICATION", "false"):
+            for i in range(3):
+                self.o_proj(attn_output)
 
         return output
 
@@ -2406,10 +2407,3 @@ class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):
 
 
 EntryClass = [DeepseekV2ForCausalLM, DeepseekV3ForCausalLM]
-
-
-# ref: DeepEP :: large_gemm_with_hook, but we put it on gpu instead
-def _deliberate_slow_gpu_operation():
-    mat_0 = torch.randn((8192, 8192), dtype=torch.float, device="cuda")
-    mat_1 = torch.randn((8192, 8192), dtype=torch.float, device="cuda")
-    mat_0 @ mat_1
