@@ -1253,7 +1253,7 @@ def v1_chat_generate_response(
             separate_reasoning = request.separate_reasoning
 
         enable_thinking = True
-        if request.chat_template_kwargs:
+        if request.chat_template_kwargs.get("enable_thinking"):
             enable_thinking = request.chat_template_kwargs.get("enable_thinking", True)
 
         if reasoning_parser and separate_reasoning and enable_thinking:
