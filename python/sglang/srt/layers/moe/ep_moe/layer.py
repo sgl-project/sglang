@@ -11,7 +11,7 @@ from sglang.srt.managers.schedule_batch import get_global_expert_location_metada
 from sglang.srt.layers.moe.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.managers.schedule_batch import get_global_expert_location_metadata
 
-_enable_jit_deepgemm = True  # chwan: it was False
+_enable_jit_deepgemm = False
 try:
     from deep_gemm import (
         get_col_major_tma_aligned_tensor,
