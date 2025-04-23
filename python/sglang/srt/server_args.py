@@ -154,6 +154,7 @@ class ServerArgs:
     disable_outlines_disk_cache: bool = False
     disable_custom_all_reduce: bool = False
     enable_llama4_multimodal: Optional[bool] = None
+    enable_gemma3_multimodal: Optional[bool] = None
     disable_overlap_schedule: bool = False
     enable_mixed_chunk: bool = False
     enable_dp_attention: bool = False
@@ -285,7 +286,9 @@ class ServerArgs:
         if self.grammar_backend is None:
             self.grammar_backend = "xgrammar"
 
-        self.enable_multimodal: Optional[bool] = self.enable_llama4_multimodal
+        self.enable_multimodal: Optional[bool] = (
+            self.enable_llama4_multimodal or self.enable_gemma3_multimodal
+        )
 
         # Data parallelism attention
         if self.enable_dp_attention:
@@ -983,6 +986,12 @@ class ServerArgs:
             default=ServerArgs.enable_llama4_multimodal,
             action="store_true",
             help="Enable the multimodal functionality for Llama-4.",
+        )
+        parser.add_argument(
+            "--enable-gemma3-multimodal",
+            default=ServerArgs.enable_gemma3_multimodal,
+            action="store_true",
+            help="Enable the multimodal functionality for Gemma-3.",
         )
         parser.add_argument(
             "--disable-overlap-schedule",

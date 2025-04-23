@@ -80,7 +80,15 @@ from sglang.srt.managers.expert_distribution import ExpertDistributionRecorder
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import BumpAllocator, DeepEPMode, add_prefix, is_cuda, is_hip
+from sglang.srt.utils import (
+    BumpAllocator,
+    DeepEPMode,
+    add_prefix,
+    get_bool_env_var,
+    get_int_env_var,
+    is_cuda,
+    is_hip,
+)
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -549,10 +557,14 @@ class DeepseekV2AttentionMLA(nn.Module):
             "disable_chunked_prefix_cache"
         ]
         self.attention_backend = global_server_args_dict["attention_backend"]
-        self.rocm_fused_decode_mla = os.getenv("SGLANG_ROCM_FUSED_DECODE_MLA") == "1"
+        self.rocm_fused_decode_mla = get_bool_env_var(
+            "SGLANG_ROCM_FUSED_DECODE_MLA", "false"
+        )
 
         # TODO: Design a finer way to determine the threshold
-        self.chunked_prefix_cache_threshold = 8192
+        self.chunked_prefix_cache_threshold = get_int_env_var(
+            "SGL_CHUNKED_PREFIX_CACHE_THRESHOLD", 8192
+        )
 
     def dispatch_attn_forward_method(
         self, forward_batch: ForwardBatch
@@ -571,13 +583,17 @@ class DeepseekV2AttentionMLA(nn.Module):
                 return AttnForwardMethod.MLA
         elif self.attention_backend == "fa3":
             # Flash Attention: Use MHA with chunked KV cache when prefilling on long sequences.
+            if forward_batch.extend_prefix_lens_cpu is not None:
+                sum_extend_prefix_lens = sum(forward_batch.extend_prefix_lens_cpu)
             if (
                 forward_batch.forward_mode.is_extend()
                 and not self.disable_chunked_prefix_cache
                 and not forward_batch.forward_mode.is_target_verify()
                 and not forward_batch.forward_mode.is_draft_extend()
-                and sum(forward_batch.extend_prefix_lens_cpu)
-                >= self.chunked_prefix_cache_threshold
+                and (
+                    sum_extend_prefix_lens >= self.chunked_prefix_cache_threshold
+                    or sum_extend_prefix_lens == 0
+                )
             ):
                 return AttnForwardMethod.MHA_CHUNKED_KV
             else:
@@ -682,10 +698,6 @@ class DeepseekV2AttentionMLA(nn.Module):
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
-        q_len = hidden_states.shape[0]
-        q_input = hidden_states.new_empty(
-            q_len, self.num_local_heads, self.kv_lora_rank + self.qk_rope_head_dim
-        )
         if self.q_lora_rank is not None:
             q = self.q_a_proj(hidden_states)[0]
             q = self.q_a_layernorm(q)
@@ -729,20 +741,25 @@ class DeepseekV2AttentionMLA(nn.Module):
             )
         else:
             q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
-        q_input[..., : self.kv_lora_rank] = q_nope_out.transpose(0, 1)
+
+        q_nope_out = q_nope_out.transpose(0, 1)
 
         latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
-        v_input = latent_cache[..., : self.kv_lora_rank]
-        v_input = self.kv_a_layernorm(v_input.contiguous()).unsqueeze(1)
-        k_input = latent_cache.unsqueeze(1)
-        k_input[..., : self.kv_lora_rank] = v_input
-        k_pe = k_input[..., self.kv_lora_rank :]
+        k_nope = latent_cache[..., : self.kv_lora_rank]
+        k_nope = self.kv_a_layernorm(k_nope).unsqueeze(1)
+        k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
 
         q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
-        q_input[..., self.kv_lora_rank :] = q_pe
-        k_input[..., self.kv_lora_rank :] = k_pe
 
-        attn_output = self.attn_mqa(q_input, k_input, v_input, forward_batch)
+        k = torch.cat([k_nope, k_pe], dim=-1)
+
+        if self.attention_backend == "fa3":
+            attn_output = self.attn_mqa(
+                q_nope_out, k, k_nope, forward_batch, q_rope=q_pe
+            )
+        else:
+            q = torch.cat([q_nope_out, q_pe], dim=-1)
+            attn_output = self.attn_mqa(q, k, k_nope, forward_batch)
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
         if self.use_deep_gemm_bmm:
@@ -1592,7 +1609,7 @@ class DeepseekV2ForCausalLM(nn.Module):
         if self.n_share_experts_fusion > 0:
             weights_list = list(weights)
             weights_dict = dict(weights_list)
-            if self.quant_config.get_name() == "w8a8_int8":
+            if self.quant_config is None or self.quant_config.get_name() == "w8a8_int8":
                 suffix_list = [
                     "down_proj.weight",
                     "down_proj.weight_scale",
