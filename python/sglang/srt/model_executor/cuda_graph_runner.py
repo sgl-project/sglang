@@ -189,6 +189,10 @@ class CudaGraphRunner:
         self.tp_size = model_runner.server_args.tp_size
         self.dp_size = model_runner.server_args.dp_size
         self.enable_deepep_moe = model_runner.server_args.enable_deepep_moe
+        self.moe_dense_fullly_dp = (
+            model_runner.server_args.enable_deepep_moe
+            and model_runner.server_args.moe_dense_tp_size == 1
+        )
 
         # Batch sizes to capture
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
@@ -302,16 +306,14 @@ class CudaGraphRunner:
 
     def can_run(self, forward_batch: ForwardBatch):
         if self.enable_dp_attention or self.enable_sp_layernorm:
-            global_max_tokens = (
-                max(forward_batch.global_num_tokens_cpu)
-                if self.enable_deepep_moe
-                else sum(forward_batch.global_num_tokens_cpu)
-            )  # DeepEP MoE layers uses a fixed shape with masking instead of gather tokens from DP ranks.
+            reducer = max if self.moe_dense_fullly_dp else sum
+            # DeepEP MoE layers uses a fixed shape with masking instead of gather tokens from DP ranks.
+            total_global_tokens = reducer(forward_batch.global_num_tokens_cpu)
 
             is_bs_supported = forward_batch.can_run_dp_cuda_graph and (
-                global_max_tokens in self.graphs
+                total_global_tokens in self.graphs
                 if self.disable_padding
-                else global_max_tokens <= self.max_bs
+                else total_global_tokens <= self.max_bs
             )
         else:
             is_bs_supported = (
@@ -489,12 +491,11 @@ class CudaGraphRunner:
 
         # Pad
         if self.enable_dp_attention or self.enable_sp_layernorm:
-            global_max_tokens = (
-                max(forward_batch.global_num_tokens_cpu)
-                if self.enable_deepep_moe
-                else sum(forward_batch.global_num_tokens_cpu)
-            )  # DeepEP MoE layers uses a fixed shape with masking instead of gather tokens from DP ranks.
-            index = bisect.bisect_left(self.capture_bs, global_max_tokens)
+            reducer = max if self.moe_dense_fullly_dp else sum
+            # DeepEP MoE layers uses a fixed shape with masking instead of gather tokens from DP ranks.
+            index = bisect.bisect_left(
+                self.capture_bs, reducer(forward_batch.global_num_tokens_cpu)
+            )
         else:
             index = bisect.bisect_left(self.capture_bs, raw_bs)
         bs = self.capture_bs[index]
