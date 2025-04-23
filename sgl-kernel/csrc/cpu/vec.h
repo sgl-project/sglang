@@ -30,6 +30,22 @@ convert_from_float_ext<at::BFloat16>(const Vectorized<float>& a, const Vectorize
 
 #define CVT_FP16_TO_FP32(a) _mm512_cvtps_ph(a, (_MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC))
 
+// this doesn't handle NaN.
+inline __m512bh cvt_e4m3_bf16_intrinsic_no_nan(__m256i fp8_vec) {
+  const __m512i x = _mm512_cvtepu8_epi16(fp8_vec);
+
+  const __m512i mant = _mm512_slli_epi16(_mm512_and_si512(x, _mm512_set1_epi16(0x07)), 4);
+  const __m512i raw_exp = _mm512_srli_epi16(_mm512_and_si512(x, _mm512_set1_epi16(0x78)), 3);
+  const __m512i exp = _mm512_slli_epi16(_mm512_add_epi16(raw_exp, _mm512_set1_epi16(120)), 7);
+  const __m512i nonsign = _mm512_or_si512(exp, mant);
+
+  const __m512i sign = _mm512_slli_epi16(_mm512_and_si512(x, _mm512_set1_epi16(0x80)), 8);
+  const __m512i combined = _mm512_or_si512(nonsign, sign);
+
+  const __mmask32 is_nonzero = _mm512_cmpneq_epi16_mask(x, _mm512_setzero_si512());
+  return (__m512bh)_mm512_maskz_mov_epi16(is_nonzero, combined);
+}
+
 inline __m512bh cvt_e4m3_bf16_intrinsic_without_denorm(__m256i fp8_vec) {
   // The following conversion is without denorm behavior, that is to say,
   //   Max subnorm   : S.0000.111 = 0.875 ∗ 2**(−6)
@@ -84,7 +100,7 @@ inline __m512bh cvt_e4m3_bf16_intrinsic_with_denorm(__m256i fp8_vec) {
 
 inline __m512bh CVT_FP8_TO_BF16(__m256i a) {
 #ifdef SGLANG_CPU_FP8_CVT_FTZ
-  return cvt_e4m3_bf16_intrinsic_without_denorm(a);
+  return cvt_e4m3_bf16_intrinsic_no_nan(a);
 #else
   return cvt_e4m3_bf16_intrinsic_with_denorm(a);
 #endif
