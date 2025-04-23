@@ -297,10 +297,7 @@ class ServerArgs:
                 self.dp_size > 1
             ), "Please set a dp-size > 1. You can use 1 < dp-size <= tp-size "
             assert self.tp_size % self.dp_size == 0
-            self.chunked_prefill_size = self.chunked_prefill_size // self.dp_size
-            logger.warning(
-                f"DP attention is enabled. The chunked prefill size is adjusted to {self.chunked_prefill_size} to avoid MoE kernel issues. "
-            )
+            logger.info(f"DP attention is enabled.")
 
         self.enable_sp_layernorm = False
         # DeepEP MoE
