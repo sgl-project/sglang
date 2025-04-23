@@ -1,0 +1,107 @@
+import unittest
+from types import SimpleNamespace
+
+import requests
+import torch
+
+from sglang.srt.utils import kill_process_tree
+from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
+from sglang.test.test_utils import (
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
+    popen_launch_server,
+)
+
+
+class TestDeepseekV3(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "deepseek-ai/DeepSeek-V3-0324"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        other_args = ["--trust-remote-code", "--tp", "8"]
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=other_args,
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_gsm8k(self):
+        args = SimpleNamespace(
+            num_shots=8,
+            data_path=None,
+            num_questions=1400,
+            parallel=1400,
+            max_new_tokens=512,
+            host="http://127.0.0.1",
+            port=int(self.base_url.split(":")[-1]),
+        )
+        metrics = run_eval_few_shot_gsm8k(args)
+        print(metrics)
+
+        self.assertGreater(metrics["accuracy"], 0.945)
+
+
+class TestDeepseekV3MTP(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "deepseek-ai/DeepSeek-V3-0324"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        other_args = [
+            "--tp",
+            "8",
+            "--trust-remote-code",
+            "--speculative-algorithm",
+            "EAGLE",
+            "--speculative-draft",
+            "lmsys/DeepSeek-V3-0324-NextN",
+            "--speculative-num-steps",
+            "5",
+            "--speculative-eagle-topk",
+            "4",
+            "--speculative-num-draft-tokens",
+            "8",
+            "--mem-fraction-static",
+            "0.6",
+        ]
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=other_args,
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_gsm8k(self):
+        requests.get(self.base_url + "/flush_cache")
+
+        args = SimpleNamespace(
+            num_shots=5,
+            data_path=None,
+            num_questions=200,
+            max_new_tokens=512,
+            parallel=128,
+            host="http://127.0.0.1",
+            port=int(self.base_url.split(":")[-1]),
+        )
+        metrics = run_eval_few_shot_gsm8k(args)
+        print(metrics)
+
+        self.assertGreater(metrics["accuracy"], 0.94)
+
+        server_info = requests.get(self.base_url + "/get_server_info")
+        avg_spec_accept_length = server_info.json()["avg_spec_accept_length"]
+        print(f"{avg_spec_accept_length=}")
+        self.assertGreater(avg_spec_accept_length, 3.0)
+
+
+if __name__ == "__main__":
+    unittest.main()
