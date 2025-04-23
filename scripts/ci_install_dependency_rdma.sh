@@ -14,6 +14,10 @@ else
     apt-get install -y libibverbs-dev
 fi
 
+show_gids
+ibv_devinfo
+ibv_devices
+
 # Clean up existing installations
 pip uninstall -y flashinfer flashinfer_python sgl-kernel sglang vllm || true
 pip cache purge
