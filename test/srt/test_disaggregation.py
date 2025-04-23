@@ -10,6 +10,7 @@ import torch
 from sglang.srt.utils import kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
+    DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -21,7 +22,7 @@ from sglang.test.test_utils import (
 class TestDisaggregationMooncake(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = "lmsys/sglang-ci-dsv3-test"
+        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         cls.base_host = "127.0.0.1"
         cls.base_port = int(DEFAULT_URL_FOR_TEST.split(":")[-1])
         cls.lb_url = DEFAULT_URL_FOR_TEST
@@ -88,6 +89,8 @@ class TestDisaggregationMooncake(CustomTestCase):
             str(cls.base_port + 200),
             "--tp",
             "2",
+            "--mem-fraction-static",
+            "0.45",
         ]
         cls.process_decode = popen_launch_pd_server(
             cls.model,
