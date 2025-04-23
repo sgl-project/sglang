@@ -1000,10 +1000,10 @@ class DeepEPMoE(EPMoE):
         assert self.quant_method is not None
         assert self.activation == "silu"
         if num_recv_tokens_per_expert is None:
-            return hidden_states_fp8[0]
+            return hidden_states_fp8[0].to(torch.bfloat16)
         all_tokens = sum(num_recv_tokens_per_expert)
         if all_tokens <= 0:
-            return hidden_states_fp8[0]
+            return hidden_states_fp8[0].to(torch.bfloat16)
         hidden_states_fp8, hidden_states_scale = hidden_states_fp8
         M, K = hidden_states_fp8.size()
         N = self.w13_weight.size(1)
