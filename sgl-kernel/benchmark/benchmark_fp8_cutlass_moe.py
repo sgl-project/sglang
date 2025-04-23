@@ -21,7 +21,7 @@ from sglang.srt.layers.moe.topk import fused_topk
 # num_experts, topk, hidden_size, 2* intermediate_size
 # num_experts, topk, intermediate_size, hidden_size
 WEIGHT_SHAPES_MOE = {
-    "nm-testing/Mixtral-8x7B-Instruct-v0.1": [
+    "mistralai/Mixtral-8x7B-Instruct-v0.1": [
         [8, 2, 4096, 28672],
         [8, 2, 14336, 4096],
     ],
@@ -40,7 +40,7 @@ WEIGHT_SHAPES_MOE = {
 }
 
 DEFAULT_MODELS = [
-    "nm-testing/Mixtral-8x7B-Instruct-v0.1",
+    "mistralai/Mixtral-8x7B-Instruct-v0.1",
     "meta-llama/Llama-4-Scout-17B-16E-Instruct",
     "Qwen/Qwen2-57B-A14B-Instruct",
     "Qwen/Qwen3-MoE",
