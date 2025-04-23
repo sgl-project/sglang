@@ -309,6 +309,7 @@ void top_p_sampling_from_probs(
     bool deterministic,
     std::optional<at::Generator> gen);
 
+<<<<<<< HEAD
 torch::Tensor marlin_gemm_moe(
     const torch::Tensor& a, const torch::Tensor& b_q_weights,
     const torch::Tensor& sorted_ids, const torch::Tensor& topk_weights,
@@ -319,6 +320,8 @@ torch::Tensor marlin_gemm_moe(
     int64_t size_k, bool is_k_full, int64_t num_experts, int64_t topk,
     int64_t moe_block_size, bool replicate_input, bool apply_weights);
 
+=======
+>>>>>>> ee76713a7 (support moe_marlin)
 torch::Tensor moe_wna16_marlin_gemm(
     torch::Tensor& a, std::optional<torch::Tensor> const& c_or_none,
     torch::Tensor& b_q_weight, torch::Tensor& b_scales,
