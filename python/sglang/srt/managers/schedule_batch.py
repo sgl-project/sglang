@@ -1158,7 +1158,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
 
         # Write to req_to_token_pool
-        if global_server_args_dict["attention_backend"] not in ["torch_native", "hpu_attn_backend"]:
+        if global_server_args_dict["attention_backend"] not in [
+            "torch_native",
+            "hpu_attn_backend",
+        ]:
             # TODO: some tensors can be reused for ForwardBatchInfo (e.g., extend_lens, cumsum_start)
 
             write_req_to_token_pool_triton[(bs,)](
