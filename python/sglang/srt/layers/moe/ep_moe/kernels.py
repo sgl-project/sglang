@@ -14,6 +14,7 @@ from sglang.srt.utils import (
     TensorCreator,
     is_cuda,
     get_bool_env_var,
+    get_compiler_backend,
 )
 
 _is_cuda = is_cuda()
@@ -1066,3 +1067,13 @@ def tma_align_input_scale(input_scale: torch.Tensor):
         BLOCK_SIZE_K=BLOCK_SIZE_K,
     )
     return output.t()[:m]
+
+
+# adapt from https://github.com/deepseek-ai/DeepEP/blob/007fcfcf97914e1f3d661f28dd125e7d1b9f8320/tests/utils.py#L37
+@torch.compile(dynamic=True, backend=get_compiler_backend())
+def per_token_cast_to_fp8(x: torch.Tensor):
+    assert x.dim() == 2 and x.size(1) % 128 == 0
+    m, n = x.shape
+    x_view = x.view(m, n // 128, 128)
+    x_amax = x_view.abs().float().amax(dim=2).view(m, n // 128).clamp(1e-4)
+    return (x_view * (448.0 / x_amax.unsqueeze(2))).to(torch.float8_e4m3fn).view(m, n), (x_amax / 448.0).view(m, n // 128)

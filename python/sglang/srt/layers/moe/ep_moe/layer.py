@@ -1,6 +1,6 @@
 import logging
 from contextlib import contextmanager
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple, Union
 
 import torch
 from torch.nn import Module
@@ -904,7 +904,7 @@ class DeepEPMoE(EPMoE):
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
         reorder_topk_ids: torch.Tensor,
@@ -1051,18 +1051,16 @@ class DeepEPMoE(EPMoE):
         hidden_states_fp8: Tuple[torch.Tensor, torch.Tensor],
         topk_idx,
         topk_weights,
-        num_recv_tokens_per_expert: List[int],
+        num_recv_tokens_per_expert: Optional[List[int]],
     ):
         assert self.quant_method is not None
         assert self.activation == "silu"
         if num_recv_tokens_per_expert is None:
-            return hidden_states_fp8
+            return hidden_states_fp8[0].to(torch.bfloat16)
         all_tokens = sum(num_recv_tokens_per_expert)
         if all_tokens <= 0:
-            return hidden_states_fp8
-        hidden_states_fp8, hidden_states_scale = sglang_per_token_group_quant_fp8(
-            hidden_states_fp8, 128
-        )
+            return hidden_states_fp8[0].to(torch.bfloat16)
+        hidden_states_fp8, hidden_states_scale = hidden_states_fp8
         M, K = hidden_states_fp8.size()
         N = self.w13_weight.size(1)
         scale_block_size = 128
@@ -1109,10 +1107,12 @@ class DeepEPMoE(EPMoE):
             m_indices,
             output_index,
         )
+        
+        del hidden_states_fp8
 
         gateup_output = torch.empty(
             (all_tokens, N),
-            device=hidden_states_fp8.device,
+            device=gather_out.device,
             dtype=torch.bfloat16,
         )
         input_tensor[1] = tma_align_input_scale(input_tensor[1])
@@ -1138,7 +1138,7 @@ class DeepEPMoE(EPMoE):
         silu_and_mul(gateup_output.view(-1, N), down_input)
         down_output = torch.empty(
             (all_tokens, K),
-            device=hidden_states_fp8.device,
+            device=gather_out.device,
             dtype=torch.bfloat16,
         )
         down_input_fp8, down_input_scale = sglang_per_token_group_quant_fp8(
