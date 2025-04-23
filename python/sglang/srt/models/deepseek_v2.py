@@ -27,6 +27,10 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+from torch import nn
+from tqdm import tqdm
+from transformers import PretrainedConfig
+
 from sglang.srt import two_batch_overlap
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
@@ -110,9 +114,6 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
 )
-from torch import nn
-from tqdm import tqdm
-from transformers import PretrainedConfig
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -257,8 +258,8 @@ class DeepseekV2MoE(nn.Module):
 
         self.experts = MoEImpl(
             num_experts=config.n_routed_experts
-                        + self.n_share_experts_fusion
-                        + global_server_args_dict["ep_num_redundant_experts"],
+            + self.n_share_experts_fusion
+            + global_server_args_dict["ep_num_redundant_experts"],
             top_k=config.num_experts_per_tok + min(self.n_share_experts_fusion, 1),
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
@@ -333,7 +334,7 @@ class DeepseekV2MoE(nn.Module):
             router_topk=self.top_k,
             permute_fusion=True,
             num_experts=config.n_routed_experts
-                        + global_server_args_dict["ep_num_redundant_experts"],
+            + global_server_args_dict["ep_num_redundant_experts"],
             num_local_experts=config.n_routed_experts // self.tp_size,
             hidden_size=config.hidden_size,
             params_dtype=config.torch_dtype,
@@ -500,7 +501,12 @@ class DeepseekV2MoE(nn.Module):
         return topk_weights, topk_idx
 
     def _forward_deepep_dispatch_a_part_two(
-        self, chosen_deepep_dispatcher, forward_mode, hidden_states, topk_idx, topk_weights,
+        self,
+        chosen_deepep_dispatcher,
+        forward_mode,
+        hidden_states,
+        topk_idx,
+        topk_weights,
     ):
         chosen_deepep_dispatcher.dispatch_a(
             hidden_states,
@@ -533,7 +539,9 @@ class DeepseekV2MoE(nn.Module):
 
     def _forward_tbo_op_dispatch_a_part_two(self, state):
         self._forward_deepep_dispatch_a_part_two(
-            chosen_deepep_dispatcher=self.tbo_deepep_dispatchers[state.tbo_subbatch_index],
+            chosen_deepep_dispatcher=self.tbo_deepep_dispatchers[
+                state.tbo_subbatch_index
+            ],
             forward_mode=state.forward_batch.forward_mode,
             hidden_states=state.hidden_states_after_post_attn_ln,
             topk_idx=state.pop("topk_idx"),
@@ -628,7 +636,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.num_heads = num_heads
         assert num_heads % attn_tp_size == 0
         self.num_local_heads = num_heads // attn_tp_size
-        self.scaling = self.qk_head_dim ** -0.5
+        self.scaling = self.qk_head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
 
@@ -782,9 +790,9 @@ class DeepseekV2AttentionMLA(nn.Module):
                 and not forward_batch.forward_mode.is_target_verify()
                 and not forward_batch.forward_mode.is_draft_extend()
                 and (
-                sum_extend_prefix_lens >= self.chunked_prefix_cache_threshold
-                or sum_extend_prefix_lens == 0
-            )
+                    sum_extend_prefix_lens >= self.chunked_prefix_cache_threshold
+                    or sum_extend_prefix_lens == 0
+                )
             ):
                 return AttnForwardMethod.MHA_CHUNKED_KV
             else:
@@ -865,16 +873,16 @@ class DeepseekV2AttentionMLA(nn.Module):
         kv = self.kv_b_proj(kv_a)[0]
         kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
         k_nope = kv[..., : self.qk_nope_head_dim]
-        v = kv[..., self.qk_nope_head_dim:]
-        k_pe = latent_cache[:, :, self.kv_lora_rank:]
+        v = kv[..., self.qk_nope_head_dim :]
+        k_pe = latent_cache[:, :, self.kv_lora_rank :]
         q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
-        q[..., self.qk_nope_head_dim:] = q_pe
+        q[..., self.qk_nope_head_dim :] = q_pe
         k = torch.empty_like(q)
         k[..., : self.qk_nope_head_dim] = k_nope
-        k[..., self.qk_nope_head_dim:] = k_pe
+        k[..., self.qk_nope_head_dim :] = k_pe
 
         latent_cache[:, :, : self.kv_lora_rank] = kv_a.unsqueeze(1)
-        latent_cache[:, :, self.kv_lora_rank:] = k_pe
+        latent_cache[:, :, self.kv_lora_rank :] = k_pe
 
         # Save latent cache
         forward_batch.token_to_kv_pool.set_kv_buffer(
@@ -965,7 +973,7 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         k_nope = latent_cache[..., : self.kv_lora_rank]
         k_nope = self.kv_a_layernorm(k_nope).unsqueeze(1)
-        k_pe = latent_cache[..., self.kv_lora_rank:].unsqueeze(1)
+        k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
 
         q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
@@ -1088,15 +1096,15 @@ class DeepseekV2AttentionMLA(nn.Module):
         k_input[..., : self.kv_lora_rank] = v_input
 
         if not enable_rope_fusion:
-            k_pe = k_input[..., self.kv_lora_rank:]
+            k_pe = k_input[..., self.kv_lora_rank :]
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
-            q_input[..., self.kv_lora_rank:] = q_pe
-            k_input[..., self.kv_lora_rank:] = k_pe
+            q_input[..., self.kv_lora_rank :] = q_pe
+            k_input[..., self.kv_lora_rank :] = k_pe
             k_pe_output = None
         else:
-            k_pe_output = torch.empty_like(k_input[..., self.kv_lora_rank:])
+            k_pe_output = torch.empty_like(k_input[..., self.kv_lora_rank :])
 
-        q_input[..., self.kv_lora_rank:] = q_pe
+        q_input[..., self.kv_lora_rank :] = q_pe
 
         # attn_output = self.attn_mqa(q_input, k_input, v_input, forward_batch)
         # Use Fused ROPE with use_rope=OFF.
@@ -1153,7 +1161,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         )
 
         if enable_rope_fusion:
-            k_input[..., self.kv_lora_rank:] = k_pe_output
+            k_input[..., self.kv_lora_rank :] = k_pe_output
             forward_batch.token_to_kv_pool.set_kv_buffer(
                 self.attn_mqa, forward_batch.out_cache_loc, k_input, None
             )
@@ -1214,7 +1222,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             kv = kv.view(
                 -1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim
             )
-            v = kv[..., self.qk_nope_head_dim:]
+            v = kv[..., self.qk_nope_head_dim :]
             k_nope = kv[..., : self.qk_nope_head_dim]
 
             k = torch.empty(
@@ -1227,7 +1235,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 device=v.device,
             )
             k[..., : self.qk_nope_head_dim] = k_nope
-            k[..., self.qk_nope_head_dim:] = k_pe
+            k[..., self.qk_nope_head_dim :] = k_pe
 
             output, lse = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
             lse = torch.transpose(lse, 0, 1).contiguous()
@@ -1269,17 +1277,17 @@ class DeepseekV2AttentionMLA(nn.Module):
         kv = self.kv_b_proj(kv_a)[0]
         kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
         k_nope = kv[..., : self.qk_nope_head_dim]
-        v = kv[..., self.qk_nope_head_dim:]
-        k_pe = latent_cache[:, :, self.kv_lora_rank:]
+        v = kv[..., self.qk_nope_head_dim :]
+        k_pe = latent_cache[:, :, self.kv_lora_rank :]
 
         q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
-        q[..., self.qk_nope_head_dim:] = q_pe
+        q[..., self.qk_nope_head_dim :] = q_pe
         k = torch.empty_like(q)
         k[..., : self.qk_nope_head_dim] = k_nope
-        k[..., self.qk_nope_head_dim:] = k_pe
+        k[..., self.qk_nope_head_dim :] = k_pe
 
         latent_cache[:, :, : self.kv_lora_rank] = kv_a.unsqueeze(1)
-        latent_cache[:, :, self.kv_lora_rank:] = k_pe
+        latent_cache[:, :, self.kv_lora_rank :] = k_pe
 
         # Save latent cache
         forward_batch.token_to_kv_pool.set_kv_buffer(
@@ -1411,7 +1419,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         ffn_input_mode = (
             _FFNInputMode.SCATTERED
             if (global_server_args_dict["enable_deepep_moe"] and is_sparse)
-               or (_enable_moe_dense_fully_dp() and not is_sparse)
+            or (_enable_moe_dense_fully_dp() and not is_sparse)
             else _FFNInputMode.FULL
         )
         return _DecoderLayerInfo(is_sparse=is_sparse, ffn_input_mode=ffn_input_mode)
@@ -1790,7 +1798,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             residual = None
             hidden_states, local_hidden_states = (
                 state.forward_batch.gathered_buffer[
-                : state.forward_batch.input_ids.shape[0]
+                    : state.forward_batch.input_ids.shape[0]
                 ],
                 hidden_states,
             )
@@ -2065,121 +2073,121 @@ class DeepseekV2ForCausalLM(nn.Module):
 
         # Perform post-processing after loading weights
         if enable_mla_postprocess:
-	        for layer_id in range(self.config.num_hidden_layers):
-	            self_attn = self.model.layers[layer_id].self_attn
-	            if hasattr(self_attn.kv_b_proj, "qweight"):
-	                # AWQ compatible
-	                if _is_cuda:
-	                    w = awq_dequantize(
-	                        self_attn.kv_b_proj.qweight,
-	                        self_attn.kv_b_proj.scales,
-	                        self_attn.kv_b_proj.qzeros,
-	                    ).T
-	                else:
-	                    w = awq_dequantize(
-	                        self_attn.kv_b_proj.qweight,
-	                        self_attn.kv_b_proj.scales,
-	                        self_attn.kv_b_proj.qzeros,
-	                        0,
-	                        0,
-	                        0,
-	                    ).T
-	            else:
-	                w = self_attn.kv_b_proj.weight
-	            # NOTE(HandH1998): Since `bmm_fp8` only supports per-tensor scale, we have to requantize `self_attn.kv_b_proj`.
-	            # This may affect the accuracy of fp8 model.
-	            # Fix deepseek v3 blockwise bmm by using deep_gemm
-	            use_deep_gemm_bmm = False
-	            model_dtype = torch.get_default_dtype()
+            for layer_id in range(self.config.num_hidden_layers):
+                self_attn = self.model.layers[layer_id].self_attn
+                if hasattr(self_attn.kv_b_proj, "qweight"):
+                    # AWQ compatible
+                    if _is_cuda:
+                        w = awq_dequantize(
+                            self_attn.kv_b_proj.qweight,
+                            self_attn.kv_b_proj.scales,
+                            self_attn.kv_b_proj.qzeros,
+                        ).T
+                    else:
+                        w = awq_dequantize(
+                            self_attn.kv_b_proj.qweight,
+                            self_attn.kv_b_proj.scales,
+                            self_attn.kv_b_proj.qzeros,
+                            0,
+                            0,
+                            0,
+                        ).T
+                else:
+                    w = self_attn.kv_b_proj.weight
+                # NOTE(HandH1998): Since `bmm_fp8` only supports per-tensor scale, we have to requantize `self_attn.kv_b_proj`.
+                # This may affect the accuracy of fp8 model.
+                # Fix deepseek v3 blockwise bmm by using deep_gemm
+                use_deep_gemm_bmm = False
+                model_dtype = torch.get_default_dtype()
 
-	            if w.dtype in (
-	                torch.float8_e4m3fn,
-	                torch.float8_e4m3fnuz,
-	            ):
-	                if hasattr(self.quant_config, "weight_block_size"):
-	                    weight_block_size = self.quant_config.weight_block_size
-	                    if weight_block_size is not None:
-	                        assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
-	                        if _is_hip:
-	                            weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
-	                                weight=w,
-	                                weight_scale=self_attn.kv_b_proj.weight_scale_inv,
-	                                input_scale=None,
-	                            )
-	                        else:
-	                            weight = w
-	                            weight_scale = self_attn.kv_b_proj.weight_scale_inv
+                if w.dtype in (
+                    torch.float8_e4m3fn,
+                    torch.float8_e4m3fnuz,
+                ):
+                    if hasattr(self.quant_config, "weight_block_size"):
+                        weight_block_size = self.quant_config.weight_block_size
+                        if weight_block_size is not None:
+                            assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
+                            if _is_hip:
+                                weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                                    weight=w,
+                                    weight_scale=self_attn.kv_b_proj.weight_scale_inv,
+                                    input_scale=None,
+                                )
+                            else:
+                                weight = w
+                                weight_scale = self_attn.kv_b_proj.weight_scale_inv
 
-	                        if (
-	                            _is_cuda
-	                            and weight_block_size[0] == 128
-	                            and weight_block_size[1] == 128
-	                            and model_dtype == torch.bfloat16
-	                        ):
-	                            if _ENABLE_JIT_DEEPGEMM and get_bool_env_var(
-	                                "SGL_USE_DEEPGEMM_BMM", "false"
-	                            ):
-	                                block_scale = weight_scale
-	                                use_deep_gemm_bmm = True
-	                            else:
-	                                w = block_quant_dequant(
-	                                    weight,
-	                                    weight_scale,
-	                                    weight_block_size,
-	                                    model_dtype,
-	                                )
-	                        else:
-	                            w, scale = block_quant_to_tensor_quant(
-	                                weight, weight_scale, weight_block_size
-	                            )
-	                            self_attn.w_scale = scale
-	                else:
-	                    weight = w
-	                    weight_scale = self_attn.kv_b_proj.weight_scale
-	                    w, scale = channel_quant_to_tensor_quant(weight, weight_scale)
-	                    self_attn.w_scale = scale
+                            if (
+                                _is_cuda
+                                and weight_block_size[0] == 128
+                                and weight_block_size[1] == 128
+                                and model_dtype == torch.bfloat16
+                            ):
+                                if _ENABLE_JIT_DEEPGEMM and get_bool_env_var(
+                                    "SGL_USE_DEEPGEMM_BMM", "false"
+                                ):
+                                    block_scale = weight_scale
+                                    use_deep_gemm_bmm = True
+                                else:
+                                    w = block_quant_dequant(
+                                        weight,
+                                        weight_scale,
+                                        weight_block_size,
+                                        model_dtype,
+                                    )
+                            else:
+                                w, scale = block_quant_to_tensor_quant(
+                                    weight, weight_scale, weight_block_size
+                                )
+                                self_attn.w_scale = scale
+                    else:
+                        weight = w
+                        weight_scale = self_attn.kv_b_proj.weight_scale
+                        w, scale = channel_quant_to_tensor_quant(weight, weight_scale)
+                        self_attn.w_scale = scale
 
-	            if w.dtype == torch.int8:
-	                if hasattr(self.quant_config, "weight_block_size"):
-	                    # block-wise int8 need it
-	                    weight_block_size = self.quant_config.weight_block_size
-	                    if weight_block_size is not None:
-	                        assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
-	                        weight = w
-	                        weight_scale = self_attn.kv_b_proj.weight_scale_inv
-	                        w = int8_block_dequant(
-	                            weight, weight_scale, weight_block_size
-	                        ).to(torch.bfloat16)
-	                else:
-	                    # channel-wise int8 need it
-	                    w = w.to(torch.bfloat16) * self_attn.kv_b_proj.weight_scale.to(
-	                        torch.bfloat16
-	                    )
+                if w.dtype == torch.int8:
+                    if hasattr(self.quant_config, "weight_block_size"):
+                        # block-wise int8 need it
+                        weight_block_size = self.quant_config.weight_block_size
+                        if weight_block_size is not None:
+                            assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
+                            weight = w
+                            weight_scale = self_attn.kv_b_proj.weight_scale_inv
+                            w = int8_block_dequant(
+                                weight, weight_scale, weight_block_size
+                            ).to(torch.bfloat16)
+                    else:
+                        # channel-wise int8 need it
+                        w = w.to(torch.bfloat16) * self_attn.kv_b_proj.weight_scale.to(
+                            torch.bfloat16
+                        )
 
-	            w_kc, w_vc = w.unflatten(
-	                0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
-	            ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
-	            if not use_deep_gemm_bmm:
-	                self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
-	                self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
-	                if (
-	                    hasattr(self_attn.kv_b_proj, "weight_scale")
-	                    and self_attn.w_scale is None
-	                ):
-	                    self_attn.w_scale = self_attn.kv_b_proj.weight_scale
-	                    if _is_hip:
-	                        self_attn.w_scale *= 2.0
-	            else:
-	                num_tiles_k = self_attn.qk_nope_head_dim // weight_block_size[1]
-	                num_tiles_n = self_attn.v_head_dim // weight_block_size[0]
-	                ws_kc, ws_vc = block_scale.unflatten(
-	                    0, (-1, (num_tiles_k + num_tiles_n))
-	                ).split([num_tiles_k, num_tiles_n], dim=1)
-	                self_attn.w_scale_k = ws_kc.transpose(1, 2).contiguous()
-	                self_attn.w_scale_v = ws_vc.contiguous()
-	                self_attn.w_kc = w_kc.transpose(1, 2).contiguous()
-	                self_attn.w_vc = w_vc.contiguous()
-	                self_attn.use_deep_gemm_bmm = True
+                w_kc, w_vc = w.unflatten(
+                    0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
+                ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
+                if not use_deep_gemm_bmm:
+                    self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
+                    self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
+                    if (
+                        hasattr(self_attn.kv_b_proj, "weight_scale")
+                        and self_attn.w_scale is None
+                    ):
+                        self_attn.w_scale = self_attn.kv_b_proj.weight_scale
+                        if _is_hip:
+                            self_attn.w_scale *= 2.0
+                else:
+                    num_tiles_k = self_attn.qk_nope_head_dim // weight_block_size[1]
+                    num_tiles_n = self_attn.v_head_dim // weight_block_size[0]
+                    ws_kc, ws_vc = block_scale.unflatten(
+                        0, (-1, (num_tiles_k + num_tiles_n))
+                    ).split([num_tiles_k, num_tiles_n], dim=1)
+                    self_attn.w_scale_k = ws_kc.transpose(1, 2).contiguous()
+                    self_attn.w_scale_v = ws_vc.contiguous()
+                    self_attn.w_kc = w_kc.transpose(1, 2).contiguous()
+                    self_attn.w_vc = w_vc.contiguous()
+                    self_attn.use_deep_gemm_bmm = True
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
@@ -2216,7 +2224,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                     self.config.moe_layer_freq,
                 ),
                 desc=f"Cloning {self.n_share_experts_fusion} "
-                     "replicas of the shared expert into MoE",
+                "replicas of the shared expert into MoE",
             ):
                 for num_repeat in range(self.n_share_experts_fusion):
                     for suffix in suffix_list:
