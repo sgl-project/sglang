@@ -75,7 +75,7 @@ class ModelConfig:
         if enable_multimodal is None:
             mm_disabled_models = [
                 "Gemma3ForConditionalGeneration",
-                "Gemma3ForConditionalGeneration",
+                "Llama4ForConditionalGeneration",
             ]
             if self.hf_config.architectures[0] in mm_disabled_models:
                 enable_multimodal = False

@@ -148,11 +148,6 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
         # Check if the number of regions matches the number of pad values
         if len(starts) != len(pad_values):
             # Maybe log a warning here?
-            logger.warning(
-                f"Number of contiguous regions ({len(starts)}) does not match "
-                f"the number of pad values ({len(pad_values)}). "
-                f"Input IDs: {input_ids}, Token IDs: {self.token_ids}, Pad Values: {pad_values}"
-            )
             num_regions = len(starts)
             num_pad_values = len(pad_values)
             if num_regions > 0 and num_pad_values > 0:
