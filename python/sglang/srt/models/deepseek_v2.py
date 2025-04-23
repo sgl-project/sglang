@@ -96,7 +96,6 @@ from sglang.srt.managers.schedule_batch import (
     global_server_args_dict,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.model_loader.weight_utils import (
     ModelParamNameInfo,
     ModelParamNameInfoMoe,
@@ -108,9 +107,9 @@ from sglang.srt.utils import (
     BumpAllocator,
     DeepEPMode,
     add_prefix,
+    configure_deep_gemm_num_sms,
     get_bool_env_var,
     get_int_env_var,
-    configure_deep_gemm_num_sms,
     is_cuda,
     is_hip,
 )
