@@ -5,12 +5,13 @@ import time
 
 # noinspection PyUnresolvedReferences
 import deep_ep
+
+# Test compatibility with low latency functions
+import test_deepep_low_latency
 import torch
 import torch.distributed as dist
 
-# Test compatibility with low latency functions
-import sglang.test.srt.test_deepep_low_latency as test_deepep_low_latency
-from sglang.test.srt.test_deepep_utils import (
+from sglang.test.test_deepep_utils import (
     bench,
     calc_diff,
     init_dist,
