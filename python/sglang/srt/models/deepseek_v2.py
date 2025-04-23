@@ -67,6 +67,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     per_tensor_quant_mla_fp8,
 )
 from sglang.srt.layers.quantization.fp8_utils import (
+    block_quant_dequant,
     block_quant_to_tensor_quant,
     channel_quant_to_tensor_quant,
     normalize_e4m3fn_to_e4m3fnuz,
@@ -2064,112 +2065,121 @@ class DeepseekV2ForCausalLM(nn.Module):
 
         # Perform post-processing after loading weights
         if enable_mla_postprocess:
-            for layer_id in range(self.config.num_hidden_layers):
-                self_attn = self.model.layers[layer_id].self_attn
-                if hasattr(self_attn.kv_b_proj, "qweight"):
-                    # AWQ compatible
-                    if _is_cuda:
-                        w = awq_dequantize(
-                            self_attn.kv_b_proj.qweight,
-                            self_attn.kv_b_proj.scales,
-                            self_attn.kv_b_proj.qzeros,
-                        ).T
-                    else:
-                        w = awq_dequantize(
-                            self_attn.kv_b_proj.qweight,
-                            self_attn.kv_b_proj.scales,
-                            self_attn.kv_b_proj.qzeros,
-                            0,
-                            0,
-                            0,
-                        ).T
-                else:
-                    w = self_attn.kv_b_proj.weight
-                # NOTE(HandH1998): Since `bmm_fp8` only supports per-tensor scale, we have to requantize `self_attn.kv_b_proj`.
-                # This may affect the accuracy of fp8 model.
-                # Fix deepseek v3 blockwise bmm by using deep_gemm
-                use_deep_gemm_bmm = False
-                model_dtype = torch.get_default_dtype()
+	        for layer_id in range(self.config.num_hidden_layers):
+	            self_attn = self.model.layers[layer_id].self_attn
+	            if hasattr(self_attn.kv_b_proj, "qweight"):
+	                # AWQ compatible
+	                if _is_cuda:
+	                    w = awq_dequantize(
+	                        self_attn.kv_b_proj.qweight,
+	                        self_attn.kv_b_proj.scales,
+	                        self_attn.kv_b_proj.qzeros,
+	                    ).T
+	                else:
+	                    w = awq_dequantize(
+	                        self_attn.kv_b_proj.qweight,
+	                        self_attn.kv_b_proj.scales,
+	                        self_attn.kv_b_proj.qzeros,
+	                        0,
+	                        0,
+	                        0,
+	                    ).T
+	            else:
+	                w = self_attn.kv_b_proj.weight
+	            # NOTE(HandH1998): Since `bmm_fp8` only supports per-tensor scale, we have to requantize `self_attn.kv_b_proj`.
+	            # This may affect the accuracy of fp8 model.
+	            # Fix deepseek v3 blockwise bmm by using deep_gemm
+	            use_deep_gemm_bmm = False
+	            model_dtype = torch.get_default_dtype()
 
-                if w.dtype in (
-                    torch.float8_e4m3fn,
-                    torch.float8_e4m3fnuz,
-                ):
-                    if hasattr(self.quant_config, "weight_block_size"):
-                        weight_block_size = self.quant_config.weight_block_size
-                        if weight_block_size is not None:
-                            assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
-                            if _is_hip:
-                                weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
-                                    weight=w,
-                                    weight_scale=self_attn.kv_b_proj.weight_scale_inv,
-                                    input_scale=None,
-                                )
-                            else:
-                                weight = w
-                                weight_scale = self_attn.kv_b_proj.weight_scale_inv
+	            if w.dtype in (
+	                torch.float8_e4m3fn,
+	                torch.float8_e4m3fnuz,
+	            ):
+	                if hasattr(self.quant_config, "weight_block_size"):
+	                    weight_block_size = self.quant_config.weight_block_size
+	                    if weight_block_size is not None:
+	                        assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
+	                        if _is_hip:
+	                            weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+	                                weight=w,
+	                                weight_scale=self_attn.kv_b_proj.weight_scale_inv,
+	                                input_scale=None,
+	                            )
+	                        else:
+	                            weight = w
+	                            weight_scale = self_attn.kv_b_proj.weight_scale_inv
 
-                            if (
-                                _is_cuda
-                                and _ENABLE_JIT_DEEPGEMM
-                                and weight_block_size[0] == 128
-                                and weight_block_size[1] == 128
-                                and model_dtype == torch.bfloat16
-                            ):
-                                block_scale = weight_scale
-                                use_deep_gemm_bmm = True
-                            else:
-                                w, scale = block_quant_to_tensor_quant(
-                                    weight, weight_scale, weight_block_size
-                                )
-                                self_attn.w_scale = scale
-                    else:
-                        weight = w
-                        weight_scale = self_attn.kv_b_proj.weight_scale
-                        w, scale = channel_quant_to_tensor_quant(weight, weight_scale)
-                        self_attn.w_scale = scale
+	                        if (
+	                            _is_cuda
+	                            and weight_block_size[0] == 128
+	                            and weight_block_size[1] == 128
+	                            and model_dtype == torch.bfloat16
+	                        ):
+	                            if _ENABLE_JIT_DEEPGEMM and get_bool_env_var(
+	                                "SGL_USE_DEEPGEMM_BMM", "false"
+	                            ):
+	                                block_scale = weight_scale
+	                                use_deep_gemm_bmm = True
+	                            else:
+	                                w = block_quant_dequant(
+	                                    weight,
+	                                    weight_scale,
+	                                    weight_block_size,
+	                                    model_dtype,
+	                                )
+	                        else:
+	                            w, scale = block_quant_to_tensor_quant(
+	                                weight, weight_scale, weight_block_size
+	                            )
+	                            self_attn.w_scale = scale
+	                else:
+	                    weight = w
+	                    weight_scale = self_attn.kv_b_proj.weight_scale
+	                    w, scale = channel_quant_to_tensor_quant(weight, weight_scale)
+	                    self_attn.w_scale = scale
 
-                if w.dtype == torch.int8:
-                    if hasattr(self.quant_config, "weight_block_size"):
-                        # block-wise int8 need it
-                        weight_block_size = self.quant_config.weight_block_size
-                        if weight_block_size is not None:
-                            assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
-                            weight = w
-                            weight_scale = self_attn.kv_b_proj.weight_scale_inv
-                            w = int8_block_dequant(
-                                weight, weight_scale, weight_block_size
-                            ).to(torch.bfloat16)
-                    else:
-                        # channel-wise int8 need it
-                        w = w.to(torch.bfloat16) * self_attn.kv_b_proj.weight_scale.to(
-                            torch.bfloat16
-                        )
+	            if w.dtype == torch.int8:
+	                if hasattr(self.quant_config, "weight_block_size"):
+	                    # block-wise int8 need it
+	                    weight_block_size = self.quant_config.weight_block_size
+	                    if weight_block_size is not None:
+	                        assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
+	                        weight = w
+	                        weight_scale = self_attn.kv_b_proj.weight_scale_inv
+	                        w = int8_block_dequant(
+	                            weight, weight_scale, weight_block_size
+	                        ).to(torch.bfloat16)
+	                else:
+	                    # channel-wise int8 need it
+	                    w = w.to(torch.bfloat16) * self_attn.kv_b_proj.weight_scale.to(
+	                        torch.bfloat16
+	                    )
 
-                w_kc, w_vc = w.unflatten(
-                    0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
-                ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
-                if not use_deep_gemm_bmm:
-                    self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
-                    self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
-                    if (
-                        hasattr(self_attn.kv_b_proj, "weight_scale")
-                        and self_attn.w_scale is None
-                    ):
-                        self_attn.w_scale = self_attn.kv_b_proj.weight_scale
-                        if _is_hip:
-                            self_attn.w_scale *= 2.0
-                else:
-                    num_tiles_k = self_attn.qk_nope_head_dim // weight_block_size[1]
-                    num_tiles_n = self_attn.v_head_dim // weight_block_size[0]
-                    ws_kc, ws_vc = block_scale.unflatten(
-                        0, (-1, (num_tiles_k + num_tiles_n))
-                    ).split([num_tiles_k, num_tiles_n], dim=1)
-                    self_attn.w_scale_k = ws_kc.transpose(1, 2).contiguous()
-                    self_attn.w_scale_v = ws_vc.contiguous()
-                    self_attn.w_kc = w_kc.transpose(1, 2).contiguous()
-                    self_attn.w_vc = w_vc.contiguous()
-                    self_attn.use_deep_gemm_bmm = True
+	            w_kc, w_vc = w.unflatten(
+	                0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
+	            ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
+	            if not use_deep_gemm_bmm:
+	                self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
+	                self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
+	                if (
+	                    hasattr(self_attn.kv_b_proj, "weight_scale")
+	                    and self_attn.w_scale is None
+	                ):
+	                    self_attn.w_scale = self_attn.kv_b_proj.weight_scale
+	                    if _is_hip:
+	                        self_attn.w_scale *= 2.0
+	            else:
+	                num_tiles_k = self_attn.qk_nope_head_dim // weight_block_size[1]
+	                num_tiles_n = self_attn.v_head_dim // weight_block_size[0]
+	                ws_kc, ws_vc = block_scale.unflatten(
+	                    0, (-1, (num_tiles_k + num_tiles_n))
+	                ).split([num_tiles_k, num_tiles_n], dim=1)
+	                self_attn.w_scale_k = ws_kc.transpose(1, 2).contiguous()
+	                self_attn.w_scale_v = ws_vc.contiguous()
+	                self_attn.w_kc = w_kc.transpose(1, 2).contiguous()
+	                self_attn.w_vc = w_vc.contiguous()
+	                self_attn.use_deep_gemm_bmm = True
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
