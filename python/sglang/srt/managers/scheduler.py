@@ -1433,7 +1433,7 @@ class Scheduler(
             local_batch,
             dp_size=self.server_args.dp_size,
             attn_tp_size=self.attn_tp_size,
-            moe_dense_tp_size = self.server_args.moe_dense_tp_size,
+            moe_dense_tp_size=self.server_args.moe_dense_tp_size,
             tp_cpu_group=self.tp_cpu_group,
             get_idle_batch=self.get_idle_batch,
             disable_cuda_graph=self.server_args.disable_cuda_graph,
@@ -1519,7 +1519,9 @@ class Scheduler(
                 local_batch.global_num_tokens_for_logprob = [num_tokens_for_logprob]
             else:
                 local_batch.global_num_tokens = global_num_tokens
-                local_batch.global_num_tokens_for_logprob = global_num_tokens_for_logprob
+                local_batch.global_num_tokens_for_logprob = (
+                    global_num_tokens_for_logprob
+                )
 
             # Check forward mode for cuda graph
             if not disable_cuda_graph:
