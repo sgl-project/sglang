@@ -169,6 +169,23 @@ This section describes how to set up the monitoring stack (Prometheus + Grafana)
 ### Troubleshooting
 
 *   **Port Conflicts:** If you encounter errors like "port is already allocated," check if other services (including previous instances of Prometheus/Grafana) are using ports `9090` or `3000`. Use `docker ps` to find running containers and `docker stop <container_id>` to stop them, or use `lsof -i :<port>` to find other processes using the ports. You might need to adjust the ports in the `docker-compose.yaml` file if they permanently conflict with other essential services on your system.
+   
+To modify Grafana's port to the other one(like 3090) in your Docker Compose file, you need to explicitly specify the port mapping under the grafana service.
+
+    Option 1: Add GF_SERVER_HTTP_PORT to the environment section:
+    ```
+      environment:
+    - GF_AUTH_ANONYMOUS_ENABLED=true
+    - GF_SERVER_HTTP_PORT=3090  # <-- Add this line
+    ```
+    Option 2: Use port mapping:
+    ```
+    grafana:
+      image: grafana/grafana:latest
+      container_name: grafana
+      ports:
+      - "3090:3000"  # <-- Host:Container port mapping
+    ```
 *   **Connection Issues:**
     *   Ensure both Prometheus and Grafana containers are running (`docker ps`).
     *   Verify the Prometheus data source configuration in Grafana (usually auto-configured via `grafana/datasources/datasource.yaml`). Go to `Connections` -> `Data sources` -> `Prometheus`. The URL should point to the Prometheus service (e.g., `http://prometheus:9090`).
