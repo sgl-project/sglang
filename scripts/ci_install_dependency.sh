@@ -104,26 +104,6 @@ cmake -S . -B build/ -DCMAKE_INSTALL_PREFIX=/opt/nvshmem/install -DCMAKE_CUDA_AR
 cd build
 make install -j
 
-# Set NVSHMEM environment variables
-export NVSHMEM_HOME=/opt/nvshmem/install
-export LD_LIBRARY_PATH=$NVSHMEM_HOME/lib:$LD_LIBRARY_PATH
-export PATH=$NVSHMEM_HOME/bin:$PATH
-
-# Verify NVSHMEM installation
-if [ ! -f "$NVSHMEM_HOME/lib/libnvshmem.so" ]; then
-    echo "Error: NVSHMEM library not found at $NVSHMEM_HOME/lib/libnvshmem.so"
-    exit 1
-fi
-
-# Install DeepEP to system Python packages
+# Install DeepEP
 cd /root/.cache/deepep
-# Set CUDA paths for DeepEP
-export CUDA_HOME=/usr/local/cuda
-export PATH=$CUDA_HOME/bin:$PATH
-export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
-
-# Install with verbose output to catch any issues
-NVSHMEM_DIR=/opt/nvshmem/install python3 setup.py install --verbose
-
-# Verify DeepEP installation
-python3 -c "import deepep; print('DeepEP version:', deepep.__version__)"
+NVSHMEM_DIR=/opt/nvshmem/install python3 setup.py install
