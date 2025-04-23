@@ -1103,6 +1103,7 @@ def get_amdgpu_memory_capacity():
 def get_device_sm():
     # print python interpreter path
     print(f"python interpreter path: {sys.executable}")
+
     print(f"torch.cuda.is_available(): {torch.cuda.is_available()}")
     if torch.cuda.is_available():
         major, minor = torch.cuda.get_device_capability()
