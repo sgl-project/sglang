@@ -352,3 +352,8 @@ std::vector<at::Tensor> mha_varlen_fwd_sparse(
     const bool return_softmax,
     c10::optional<at::Generator> gen_);
 }  // namespace flash
+
+/*
+ * From XGrammar
+ */
+void ApplyTokenBitmaskInplace(at::Tensor logits, at::Tensor bitmask, at::optional<at::Tensor> indices = at::nullopt);
