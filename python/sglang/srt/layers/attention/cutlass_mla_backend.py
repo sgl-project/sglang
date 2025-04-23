@@ -27,7 +27,7 @@ if TYPE_CHECKING:
 
 _is_cuda = is_cuda()
 if _is_cuda:
-    from sgl_kernel import cutlass_mla_get_workspace_size, cutlass_mla_decode
+    from sgl_kernel import cutlass_mla_decode, cutlass_mla_get_workspace_size
 
 
 # Cutlass MLA only supports pagesize=128
@@ -107,8 +107,12 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
                     max_seqlen_pad,
                     PAGE_SIZE,
                 )
-                workspace_size = cutlass_mla_get_workspace_size(max_seqlen_pad * PAGE_SIZE, bs)
-                workspace = torch.empty(workspace_size, device="cuda", dtype=torch.uint8)
+                workspace_size = cutlass_mla_get_workspace_size(
+                    max_seqlen_pad * PAGE_SIZE, bs
+                )
+                workspace = torch.empty(
+                    workspace_size, device="cuda", dtype=torch.uint8
+                )
                 self.forward_metadata = CutlassMLADecodeMetadata(
                     workspace,
                     block_kv_indices,
@@ -133,8 +137,12 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
         else:
             cuda_graph_kv_indices = block_kv_indices
 
-        workspace_size = cutlass_mla_get_workspace_size(cuda_graph_kv_indices.shape[1] * PAGE_SIZE, max_bs)
-        self.cuda_graph_mla_workspace = torch.empty(workspace_size, device="cuda", dtype=torch.uint8)
+        workspace_size = cutlass_mla_get_workspace_size(
+            cuda_graph_kv_indices.shape[1] * PAGE_SIZE, max_bs
+        )
+        self.cuda_graph_mla_workspace = torch.empty(
+            workspace_size, device="cuda", dtype=torch.uint8
+        )
         self.cuda_graph_kv_indices = cuda_graph_kv_indices
 
     def init_forward_metadata_capture_cuda_graph(
@@ -161,8 +169,12 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
                     self.cuda_graph_kv_indices.stride(0),
                     PAGE_SIZE,
                 )
-                workspace_size = cutlass_mla_get_workspace_size(max_seqlen_pad * PAGE_SIZE, bs)
-                self.cuda_graph_mla_workspace = torch.empty(workspace_size, device="cuda", dtype=torch.uint8)
+                workspace_size = cutlass_mla_get_workspace_size(
+                    max_seqlen_pad * PAGE_SIZE, bs
+                )
+                self.cuda_graph_mla_workspace = torch.empty(
+                    workspace_size, device="cuda", dtype=torch.uint8
+                )
                 self.forward_metadata = CutlassMLADecodeMetadata(
                     self.cuda_graph_mla_workspace,
                     self.cuda_graph_kv_indices[:bs, :max_seqlen_pad],
@@ -205,8 +217,12 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
                 self.cuda_graph_kv_indices.stride(0),
                 PAGE_SIZE,
             )
-            workspace_size = cutlass_mla_get_workspace_size(max_seqlen_pad * PAGE_SIZE, bs)
-            self.cuda_graph_mla_workspace = torch.empty(workspace_size, device="cuda", dtype=torch.uint8)
+            workspace_size = cutlass_mla_get_workspace_size(
+                max_seqlen_pad * PAGE_SIZE, bs
+            )
+            self.cuda_graph_mla_workspace = torch.empty(
+                workspace_size, device="cuda", dtype=torch.uint8
+            )
             self.forward_metadata.workspace = self.cuda_graph_mla_workspace
             self.forward_metadata.block_kv_indices = self.cuda_graph_kv_indices[
                 :bs, :max_seqlen_pad

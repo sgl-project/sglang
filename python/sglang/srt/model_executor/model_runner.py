@@ -935,7 +935,9 @@ class ModelRunner:
 
             self.attn_backend = FlashAttentionBackend(self)
         elif self.server_args.attention_backend == "cutlass_mla":
-            from sglang.srt.layers.attention.cutlass_mla_backend import CutlassMLABackend
+            from sglang.srt.layers.attention.cutlass_mla_backend import (
+                CutlassMLABackend,
+            )
 
             self.attn_backend = CutlassMLABackend(self)
         else:

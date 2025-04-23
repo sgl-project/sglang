@@ -835,7 +835,14 @@ class ServerArgs:
         parser.add_argument(
             "--attention-backend",
             type=str,
-            choices=["flashinfer", "triton", "torch_native", "fa3", "flashmla", "cutlass_mla"],
+            choices=[
+                "flashinfer",
+                "triton",
+                "torch_native",
+                "fa3",
+                "flashmla",
+                "cutlass_mla",
+            ],
             default=ServerArgs.attention_backend,
             help="Choose the kernels for attention layers.",
         )
