@@ -11,7 +11,6 @@ from typing import Any, Dict, List, Optional, Type
 import einops
 import torch
 import torch.distributed
-
 from sglang.srt.managers.expert_location import ExpertLocationMetadata
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import Withable, get_bool_env_var
@@ -302,8 +301,8 @@ class _SelectExpertsSinglePassGatherer(_LayerBasedSinglePassGatherer):
         torch.cuda.synchronize()
 
         global_physical_count = [
-            0
-        ] * self._expert_location_metadata.num_physical_experts
+                                    0
+                                ] * self._expert_location_metadata.num_physical_experts
         for token_record in topk_ids_list:
             for global_physical_expert_idx in token_record:
                 global_physical_count[global_physical_expert_idx] += 1
@@ -378,7 +377,7 @@ def _convert_local_to_global_physical_count(
 
     ans = torch.zeros((num_layers, num_physical_experts), dtype=dtype, device=device)
     ans[
-        :, num_local_physical_experts * rank : num_local_physical_experts * (rank + 1)
+    :, num_local_physical_experts * rank: num_local_physical_experts * (rank + 1)
     ] = local_physical_count
     return ans
 
@@ -626,6 +625,7 @@ class _StatAndUtilizationRateAccumulator(_StatAccumulator):
                 f"current_pass_value={utilization_rate:.03f} "
                 f"{''.join(f'last_{size}_value={value:.03f} ' for size, value in self._history.mean().items())} "
                 f"gpu_physical_count_sum={gpu_physical_count_sum}"
+                f"current_pass_per_layer={utilization_rate_tensor.cpu().tolist()}"
             )
 
 
