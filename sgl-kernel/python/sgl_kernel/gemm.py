@@ -451,19 +451,6 @@ def sgl_per_token_quant_fp8(
     output_q: torch.Tensor,
     output_s: torch.Tensor,
 ) -> None:
-    python
-
-
-运行
-
-复制
-
-
-def sgl_per_token_quant_fp8(
-    input: torch.Tensor,
-    output_q: torch.Tensor,
-    output_s: torch.Tensor,
-) -> None:
     r"""
     Perform single-pass per-token quantization of a tensor into FP8 format.
 
@@ -498,22 +485,6 @@ def sgl_per_token_quant_fp8(
       or transformer inference, helping preserve accuracy with aggressive quantization.
     """
     torch.ops.sgl_kernel.sgl_per_token_quant_fp8.default(input, output_q, output_s)
-
-
-def cutlass_scaled_fp4_mm(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    block_scale_a: torch.Tensor,
-    block_scale_b: torch.Tensor,
-    alpha: torch.Tensor,
-    out_dtype: torch.dtype,
-) -> torch.Tensor:
-    python
-
-
-运行
-
-复制
 
 
 def cutlass_scaled_fp4_mm(
