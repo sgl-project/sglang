@@ -58,7 +58,9 @@ class ServerArgs:
     served_model_name: Optional[str] = None
     chat_template: Optional[str] = None
     chat_template_kwargs_json: Optional[str] = None
-    chat_template_kwargs: Optional[Dict[str, Any]] = None  # Any due to parsing user provided json, vLLM uses the same typing for the equivalent server argument.
+    chat_template_kwargs: Optional[Dict[str, Any]] = (
+        None  # Any due to parsing user provided json, vLLM uses the same typing for the equivalent server argument.
+    )
     completion_template: Optional[str] = None
     is_embedding: bool = False
     revision: Optional[str] = None
@@ -251,7 +253,6 @@ class ServerArgs:
             else:
                 # FIXME: more fine grained auto-selection polices
                 self.mem_fraction_static = (gpu_mem - 1024 * 13) / gpu_mem
-
 
         # Set chunked prefill size, which depends on the gpu memory capacity
         if self.chunked_prefill_size is None:
