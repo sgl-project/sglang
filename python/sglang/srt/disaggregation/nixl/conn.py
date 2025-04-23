@@ -10,7 +10,7 @@ import threading
 import uuid
 from collections import defaultdict
 from functools import cache
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
@@ -32,6 +32,8 @@ from sglang.srt.utils import get_free_port, get_ip, get_local_ip_by_remote
 
 logger = logging.getLogger(__name__)
 
+NixlEngineInfo = Dict[str, Union[str, int]]
+
 
 @dataclasses.dataclass
 class TransferInfo:
@@ -45,19 +47,36 @@ class TransferInfo:
     dst_aux_index: int
     dst_gpu_id: int
 
+    def is_dummy(self):
+        return self.endpoint == ""
+
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
-        return cls(
-            room=int(msg[0].decode("ascii")),
-            endpoint=msg[1].decode("ascii"),
-            dst_port=int(msg[2].decode("ascii")),
-            agent_metadata=msg[3],
-            dst_kv_ptrs=list(struct.unpack(f"{len(msg[4])//8}Q", msg[4])),
-            dst_kv_indices=np.frombuffer(msg[5], dtype=np.int64),
-            dst_aux_ptrs=list(struct.unpack(f"{len(msg[6])//8}Q", msg[6])),
-            dst_aux_index=int(msg[7].decode("ascii")),
-            dst_gpu_id=int(msg[8].decode("ascii")),
-        )
+        if len(msg) == 1:
+            # dummy msg
+            return cls(
+                room=int(msg[0].decode("ascii")),
+                endpoint="",
+                dst_port=0,
+                agent_metadata=b"",
+                dst_kv_ptrs=[],
+                dst_kv_indices=np.array([], dtype=np.int64),
+                dst_aux_ptrs=[],
+                dst_aux_index=0,
+                dst_gpu_id=0,
+            )
+        else:
+            return cls(
+                room=int(msg[0].decode("ascii")),
+                endpoint=msg[1].decode("ascii"),
+                dst_port=int(msg[2].decode("ascii")),
+                agent_metadata=msg[3],
+                dst_kv_ptrs=list(struct.unpack(f"{len(msg[4])//8}Q", msg[4])),
+                dst_kv_indices=np.frombuffer(msg[5], dtype=np.int64),
+                dst_aux_ptrs=list(struct.unpack(f"{len(msg[6])//8}Q", msg[6])),
+                dst_aux_index=int(msg[7].decode("ascii")),
+                dst_gpu_id=int(msg[8].decode("ascii")),
+            )
 
 
 @dataclasses.dataclass
@@ -70,6 +89,9 @@ class TransferStatus:
     num_kvs_expected: Optional[int] = None
     # Whether aux data has been received.
     received_aux: bool = False
+
+    # For dummy transfer
+    always_done: bool = False
 
     def is_done(self):
         if self.num_kvs_expected is None:
@@ -98,6 +120,19 @@ class NixlKVManager(BaseKVManager):
         # for p/d multi node infer
         self.bootstrap_port = server_args.disaggregation_bootstrap_port
         self.dist_init_addr = server_args.dist_init_addr
+        self.tp_size = server_args.tp_size
+
+        self.tp_rank = args.engine_rank
+        self.enable_dp_attention = server_args.enable_dp_attention
+        if self.enable_dp_attention:
+            assert (
+                server_args.dp_size > 1
+            ), "If dp_attention is enabled, dp size must be greater than 1 in disaggregation mode."
+            self.dp_size = server_args.dp_size
+            self.tp_size_of_dp = server_args.tp_size // server_args.dp_size
+            self.attn_tp_rank = args.engine_rank % self.tp_size_of_dp
+            self.dp_rank = args.engine_rank // self.tp_size_of_dp
+
         self.rank_port = None
         self.server_socket = zmq.Context().socket(zmq.PULL)
         self.register_buffer_to_engine()
@@ -110,7 +145,10 @@ class NixlKVManager(BaseKVManager):
             self._start_bootstrap_thread()
             self._register_to_bootstrap()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            self.connection_pool: Dict[str, Dict[str, Union[str, int]]] = {}
+            # bootstrap key -> (engine_rank - >real source remote, engine_rank -> dummy remote)
+            self.prefill_peer_infos: Dict[
+                str, Tuple[Dict[int, NixlEngineInfo], Dict[int, NixlEngineInfo]]
+            ] = {}
             self.transfer_statuses: Dict[int, TransferStatus] = defaultdict(
                 TransferStatus
             )
@@ -180,7 +218,7 @@ class NixlKVManager(BaseKVManager):
             src_descs,
             dst_descs,
             peer_name,
-            notif.encode("ascii"),
+            notif.encode("ascii"),  # type: ignore
         )
         if not xfer_handle:
             raise Exception("KVSender failed to create transfer")
@@ -213,7 +251,7 @@ class NixlKVManager(BaseKVManager):
             src_descs,
             dst_descs,
             peer_name,
-            notif.encode("ascii"),
+            notif.encode("ascii"),  # type: ignore
         )
         if not xfer_handle:
             raise Exception("KVSender failed to create transfer")
@@ -240,6 +278,9 @@ class NixlKVManager(BaseKVManager):
             req = self.transfer_infos[bootstrap_room]
         assert bootstrap_room == req.room
 
+        if req.is_dummy():
+            return []
+
         peer_name = self._add_remote(bootstrap_room, req.agent_metadata)
         chunked_dst_kv_indice = req.dst_kv_indices[index_slice]
         assert len(chunked_dst_kv_indice) == len(kv_indices)
@@ -256,6 +297,7 @@ class NixlKVManager(BaseKVManager):
         handles = [kv_xfer_handle]
         # Only the last chunk we need to send the aux data.
         if is_last:
+            assert aux_index is not None
             aux_xfer_handle = self.send_aux(
                 peer_name,
                 aux_index,
@@ -372,14 +414,13 @@ class NixlKVSender(BaseKVSender):
 
     def poll(self) -> KVPoll:
         if not self.has_sent:
-            return KVPoll.WaitingForInput
-
+            return KVPoll.WaitingForInput  # type: ignore
         states = [self.kv_mgr.agent.check_xfer_state(x) for x in self.xfer_handles]
         if all([x == "DONE" for x in states]):
-            return KVPoll.Success
+            return KVPoll.Success  # type: ignore
         if any([x == "ERR" for x in states]):
             raise Exception("KVSender transfer encountered an error.")
-        return KVPoll.WaitingForInput
+        return KVPoll.WaitingForInput  # type: ignore
 
     def failure_exception(self):
         raise Exception("Fake KVSender Exception")
@@ -401,7 +442,7 @@ class NixlKVReceiver(BaseKVReceiver):
         # NOTE: key distinguished by bootstrap_addr and engine_rank
         bootstrap_key = f"{self.bootstrap_addr}_{self.kv_mgr.kv_args.engine_rank}"
 
-        if bootstrap_key not in self.kv_mgr.connection_pool:
+        if bootstrap_key not in self.kv_mgr.prefill_peer_infos:
             self.bootstrap_info = self._get_bootstrap_info_from_server(
                 self.kv_mgr.kv_args.engine_rank
             )
@@ -410,25 +451,76 @@ class NixlKVReceiver(BaseKVReceiver):
                     f"Could not fetch bootstrap info for engine rank: {self.kv_mgr.kv_args.engine_rank}"
                 )
             else:
-                self.kv_mgr.connection_pool[bootstrap_key] = self.bootstrap_info
+                self.kv_mgr.prefill_peer_infos[bootstrap_key] = self.bootstrap_info
         else:
-            self.bootstrap_info = self.kv_mgr.connection_pool[bootstrap_key]
-
+            self.bootstrap_info = self.kv_mgr.prefill_peer_infos[bootstrap_key]
         assert self.bootstrap_info is not None
 
-    def _get_bootstrap_info_from_server(self, engine_rank):
+    # return: (real source remotes, others dummy remotes)
+    def _get_bootstrap_info_from_server(
+        self, engine_rank
+    ) -> Optional[Tuple[Dict[int, NixlEngineInfo], Dict[int, NixlEngineInfo]]]:
         """Fetch the bootstrap info from the bootstrap server."""
         try:
-            url = f"http://{self.bootstrap_addr}/route?engine_rank={engine_rank}"
-            response = requests.get(url)
-            if response.status_code == 200:
+            if self.kv_mgr.enable_dp_attention:
+                url = f"http://{self.bootstrap_addr}/route"
+                response = requests.get(url)
+                if response.status_code != 200:
+                    logger.error(
+                        f"Failed to get prefill server info: {response.status_code}, {response.text}"
+                    )
+                    return None
+
                 bootstrap_info = response.json()
-                return bootstrap_info
-            else:
-                logger.error(
-                    f"Failed to get prefill server info: {response.status_code}, {response.text}"
+                assert isinstance(bootstrap_info, dict)
+                bootstrap_info = {int(k): v for k, v in bootstrap_info.items()}
+
+                # split out who need to send to this rank.
+                # currently for dpsk mla model, those ranks share the same latent cache.
+                # pick one as the real source
+
+                prefill_tp_size = len(bootstrap_info.keys())
+
+                assert (
+                    prefill_tp_size >= self.kv_mgr.tp_size_of_dp
+                ), f"Only support Prefill TP size >= Decode TP size of DP, now we have {prefill_tp_size} vs {self.kv_mgr.tp_size_of_dp}"
+
+                num_remote_tp_rank_we_managed = (
+                    prefill_tp_size // self.kv_mgr.tp_size_of_dp
                 )
-                return None
+
+                # We handle [num * self.attn_tp_rank, num * self.attn_tp_rank + num)
+                remote_tp_ranks = list(range(0, prefill_tp_size))
+                # split it into tp_size_of_dp parts and get our part
+                remote_tp_ranks_grouped = [
+                    remote_tp_ranks[i : i + self.kv_mgr.tp_size_of_dp]
+                    for i in range(0, prefill_tp_size, self.kv_mgr.tp_size_of_dp)
+                ]
+                managed_ranks = remote_tp_ranks_grouped[self.kv_mgr.attn_tp_rank]
+                picked_rank = managed_ranks[0]
+
+                assert len(managed_ranks) == num_remote_tp_rank_we_managed
+
+                logger.debug(
+                    f"Rank {self.kv_mgr.kv_args.engine_rank} managed {managed_ranks}, picked {picked_rank} as real source"
+                )
+
+                return {picked_rank: bootstrap_info[picked_rank]}, {
+                    rk: bootstrap_info[rk]
+                    for rk in bootstrap_info.keys()
+                    if rk in managed_ranks and rk != picked_rank
+                }
+            else:
+                url = f"http://{self.bootstrap_addr}/route?engine_rank={engine_rank}"
+                response = requests.get(url)
+                if response.status_code == 200:
+                    bootstrap_info = response.json()
+                    return {engine_rank: bootstrap_info}, {}
+                else:
+                    logger.error(
+                        f"Failed to get prefill server info: {response.status_code}, {response.text}"
+                    )
+                    return None
         except Exception as e:
             logger.error(f"Error fetching prefill info from bootstrap: {e}")
             return None
@@ -440,11 +532,20 @@ class NixlKVReceiver(BaseKVReceiver):
         return socket
 
     def init(self, kv_indices: npt.NDArray[np.int64], aux_index: Optional[int] = None):
-        self.prefill_server_url = (
-            f"{self.bootstrap_info['rank_ip']}:{self.bootstrap_info['rank_port']}"
-        )
+
+        assert self.bootstrap_info is not None
+
+        sources = self.bootstrap_info[0]
+        dummy = self.bootstrap_info[1]
+
+        assert len(sources) == 1, "Only support one source now"
+
+        remote_rank = list(self.bootstrap_info[0].keys())[0]
+
+        self.prefill_server_url = f"{self.bootstrap_info[0][remote_rank]['rank_ip']}:{self.bootstrap_info[0][remote_rank]['rank_port']}"
+
         logger.debug(
-            f"Fetched bootstrap info: {self.bootstrap_info} for engine rank: {self.kv_mgr.kv_args.engine_rank}"
+            f"Fetched bootstrap info for engine rank: {self.kv_mgr.kv_args.engine_rank}, source: {self.bootstrap_info[0].keys()}, dummy: {self.bootstrap_info[1].keys()} "
         )
 
         packed_kv_data_ptrs = b"".join(
@@ -466,17 +567,26 @@ class NixlKVReceiver(BaseKVReceiver):
                 str(self.kv_mgr.kv_args.gpu_id).encode("ascii"),
             ]
         )
+
+        for dummy_rank, dummy_info in dummy.items():
+            dummy_url = f"{dummy_info['rank_ip']}:{dummy_info['rank_port']}"
+            self._connect("tcp://" + dummy_url).send_multipart(
+                [
+                    str(self.bootstrap_room).encode("ascii"),
+                ]
+            )
+
         self.started_transfer = True
 
     def poll(self) -> KVPoll:
         if not self.started_transfer:
-            return KVPoll.WaitingForInput
+            return KVPoll.WaitingForInput  # type: ignore
 
         self.kv_mgr.update_transfer_status()
 
-        if self.kv_mgr.check_transfer_done(self.bootstrap_room):
-            return KVPoll.Success
-        return KVPoll.WaitingForInput
+        if self.kv_mgr.check_transfer_done(self.bootstrap_room):  # type: ignore
+            return KVPoll.Success  # type: ignore
+        return KVPoll.WaitingForInput  # type: ignore
 
     def failure_exception(self):
         raise Exception("Fake KVReceiver Exception")
@@ -564,13 +674,13 @@ class NixlKVBootstrapServer(BaseKVBootstrapServer):
         engine_rank = int(data["engine_rank"])
         agent_name = data["agent_name"]
 
-        # Add lock to make sure thread-safe
         if role == "Prefill":
-            self.prefill_port_table[engine_rank] = {
-                "rank_ip": rank_ip,
-                "rank_port": rank_port,
-                "agent_name": agent_name,
-            }
+            async with self.lock:
+                self.prefill_port_table[engine_rank] = {
+                    "rank_ip": rank_ip,
+                    "rank_port": rank_port,
+                    "agent_name": agent_name,
+                }
             logger.info(
                 f"Registered Prefill boostrap: {engine_rank} with rank_ip: {rank_ip} and rank_port: {rank_port} and name: {agent_name}"
             )
@@ -580,7 +690,13 @@ class NixlKVBootstrapServer(BaseKVBootstrapServer):
     async def _handle_route_get(self, request: web.Request):
         engine_rank = request.query.get("engine_rank")
         if not engine_rank:
-            return web.Response(text="Missing rank", status=400)
+            logger.debug(
+                f"No engine_rank specified, return all {len(self.prefill_port_table)} engine infos as a dict"
+            )
+            # Return a dict of all engine_rank
+            async with self.lock:
+                bootstrap_info = self.prefill_port_table
+            return web.json_response(bootstrap_info, status=200)
 
         # Find corresponding prefill info
         async with self.lock:
