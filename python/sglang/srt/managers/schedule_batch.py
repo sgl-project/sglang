@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from enum import Enum, auto
 
 # Copyright 2023-2024 SGLang Team
@@ -44,7 +45,7 @@ import triton.language as tl
 from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
-from sglang.srt.disaggregation.conn import KVSender
+from sglang.srt.disaggregation.base import BaseKVSender
 from sglang.srt.disaggregation.decode import ScheduleBatchDisaggregationDecodeMixin
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
@@ -66,7 +67,6 @@ global_server_args_dict = {
     "attention_backend": ServerArgs.attention_backend,
     "sampling_backend": ServerArgs.sampling_backend,
     "triton_attention_reduce_in_fp32": ServerArgs.triton_attention_reduce_in_fp32,
-    "disable_mla": ServerArgs.disable_mla,
     "torchao_config": ServerArgs.torchao_config,
     "enable_nan_detection": ServerArgs.enable_nan_detection,
     "enable_dp_attention": ServerArgs.enable_dp_attention,
@@ -76,13 +76,12 @@ global_server_args_dict = {
     "device": ServerArgs.device,
     "speculative_accept_threshold_single": ServerArgs.speculative_accept_threshold_single,
     "speculative_accept_threshold_acc": ServerArgs.speculative_accept_threshold_acc,
-    "enable_flashinfer_mla": ServerArgs.enable_flashinfer_mla,
-    "enable_flashmla": ServerArgs.enable_flashmla,
     "disable_radix_cache": ServerArgs.disable_radix_cache,
     "flashinfer_mla_disable_ragged": ServerArgs.flashinfer_mla_disable_ragged,
+    "moe_dense_tp_size": ServerArgs.moe_dense_tp_size,
     "chunked_prefill_size": ServerArgs.chunked_prefill_size,
     "n_share_experts_fusion": ServerArgs.n_share_experts_fusion,
-    "disable_shared_experts_fusion": ServerArgs.disable_shared_experts_fusion,
+    "disable_chunked_prefix_cache": ServerArgs.disable_chunked_prefix_cache,
 }
 
 logger = logging.getLogger(__name__)
@@ -158,7 +157,7 @@ class Modality(Enum):
 @dataclasses.dataclass
 class MultimodalDataItem:
     """
-    A single multimodal data, from a single image/video/audio or other
+    A single multimodal data, from a single image/video/audio or others
     """
 
     modality: Modality
@@ -196,17 +195,54 @@ class MultimodalDataItem:
 
     def set_pad_value(self):
         """
-        Set the pad value after first hashign the data
+        Set the pad value after first hashing the data
         """
+
+        def data_hash(data) -> int:
+            hash_bytes = hashlib.sha256(data).digest()[:8]
+            return int.from_bytes(hash_bytes, byteorder="big", signed=False)
+
+        def tensor_hash(tensor_list) -> int:
+            """
+            hash a tensor or a tensor list
+            """
+            tensor = tensor_list
+            if isinstance(tensor_list, list):
+                tensor_list = flatten_nested_list(tensor_list)
+                tensor_list = [
+                    x.flatten() if isinstance(x, torch.Tensor) else x
+                    for x in tensor_list
+                ]
+                tensor = torch.concat(tensor_list)
+
+            tensor = tensor.detach().contiguous()
+
+            if tensor.dtype == torch.bfloat16:
+                # memoryview() doesn't support PyTorch's BFloat16 dtype
+                tensor = tensor.float()
+
+            assert isinstance(tensor, torch.Tensor)
+            if tensor.is_cuda:
+                # TODO: improve this
+                tensor_cpu = tensor.cpu()
+            else:
+                tensor_cpu = tensor
+
+            mv = memoryview(tensor_cpu.numpy())
+            return data_hash(mv.tobytes())
 
         def hash_feature(f):
             if isinstance(f, list):
-                return hash(tuple(flatten_nested_list(f)))
+                if isinstance(f[0], torch.Tensor):
+                    return tensor_hash(f)
+                return data_hash(tuple(flatten_nested_list(f)))
             elif isinstance(f, np.ndarray):
                 arr = np.ascontiguousarray(f)
                 arr_bytes = arr.tobytes()
-                return hash(arr_bytes)
-            return hash(f)
+                return data_hash(arr_bytes)
+            elif isinstance(f, torch.Tensor):
+                return tensor_hash([f])
+            return data_hash(f)
 
         if self.is_audio():
             self.hash = hash_feature(self.audio_features)
@@ -231,6 +267,9 @@ class MultimodalDataItem:
             self.modality == Modality.VIDEO
         ) and not MultimodalDataItem.is_empty_list(self.pixel_values)
 
+    def is_valid(self) -> bool:
+        return self.is_image() or self.is_video() or self.is_audio()
+
     def validate(self):
         ...
         # TODO
@@ -249,7 +288,7 @@ class MultimodalInputs:
     mrope_position_delta: Optional[torch.Tensor] = None
 
     # image
-    im_token_id: Optional[torch.Tensor] = None
+    im_token_id: Optional[int] = None
     im_start_id: Optional[int] = None
     im_end_id: Optional[int] = None
     slice_start_id: Optional[int] = None
@@ -269,11 +308,7 @@ class MultimodalInputs:
         )
 
         assert isinstance(ret.mm_items, list)
-        ret.mm_items = [
-            item
-            for item in ret.mm_items
-            if item.is_audio() or item.is_image() or item.is_video()
-        ]
+        ret.mm_items = [item for item in ret.mm_items if item.is_valid()]
 
         assert len(ret.mm_items) != 0
 
@@ -285,7 +320,6 @@ class MultimodalInputs:
             item.set_pad_value()
 
         optional_args = [
-            "modalities",
             "im_token_id",
             "im_start_id",
             "im_end_id",
@@ -308,8 +342,8 @@ class MultimodalInputs:
         """ """
         return any(item.is_audio() for item in self.mm_items)
 
-    def collect_image_inputs(self) -> List[torch.Tensor]:
-        return [item.pixel_values for item in self.mm_items if item.is_image()]
+    def contains_mm_input(self) -> bool:
+        return any(True for item in self.mm_items if item.is_valid())
 
     def merge(self, other: MultimodalInputs):
         """
@@ -323,10 +357,8 @@ class MultimodalInputs:
 
         # args needed to be merged
         optional_args = [
-            "items",
-            "image_offsets",
+            "mm_items",
             "image_pad_len",
-            # "modalities", # modalities should be ["multi-images"] (one entry) even for multiple images
         ]
         for arg in optional_args:
             self_arg = getattr(self, arg, None)
@@ -355,6 +387,8 @@ class Req:
         custom_logit_processor: Optional[str] = None,
         return_hidden_states: bool = False,
         eos_token_ids: Optional[Set[int]] = None,
+        bootstrap_host: Optional[str] = None,
+        bootstrap_room: Optional[int] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -439,6 +473,10 @@ class Req:
         self.temp_scaled_logprobs = False
         self.top_p_normalized_logprobs = False
 
+        # Latency Breakdown
+        self.queue_time_start = None
+        self.queue_time_end = None
+
         # Logprobs (return values)
         self.input_token_logprobs_val: Optional[List[float]] = None
         self.input_token_logprobs_idx: Optional[List[int]] = None
@@ -484,9 +522,9 @@ class Req:
         self.lora_path = lora_path
 
         # For disaggregation
-        self.bootstrap_host: str = "0.0.0.0"
-        self.bootstrap_room: Optional[int] = None
-        self.disagg_kv_sender: Optional[KVSender] = None
+        self.bootstrap_host: str = bootstrap_host
+        self.bootstrap_room: Optional[int] = bootstrap_room
+        self.disagg_kv_sender: Optional[BaseKVSender] = None
 
         # used for warmup because we don't have a pair yet when init
         self.skip_kv_transfer: bool = False
@@ -500,6 +538,11 @@ class Req:
         self.metadata_buffer_index: int = -1
         # The first output_id transferred from prefill instance.
         self.transferred_output_id: Optional[int] = None
+
+        # For overlap schedule, we delay the kv transfer until `process_batch_result_disagg_prefill` rather than `process_prefill_chunk` in non-overlap
+        # This is because kv is not ready in `process_prefill_chunk`.
+        # We use `tmp_end_idx` to store the end index of the kv cache to send.
+        self.tmp_end_idx: int = -1
 
     @property
     def seqlen(self):
@@ -533,6 +576,14 @@ class Req:
                 self.prefix_indices, self.last_node = tree_cache.match_prefix(
                     rid=self.rid, key=self.adjust_max_prefix_ids()
                 )
+        elif enable_hierarchical_cache:
+            # in case last_node is evicted during scheduling, we need to update the prefix_indices
+            while self.last_node.evicted:
+                self.prefix_indices = self.prefix_indices[
+                    : -len(self.last_node.host_value)
+                ]
+                self.last_node = self.last_node.parent
+
         self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
 
     def adjust_max_prefix_ids(self):
@@ -1437,8 +1488,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Create seq_lens_cpu when needed
         if (
-            global_server_args_dict["enable_flashinfer_mla"]
-            or global_server_args_dict["enable_flashmla"]
+            (
+                global_server_args_dict["use_mla_backend"]
+                and global_server_args_dict["attention_backend"] == "flashinfer"
+            )
+            or global_server_args_dict["attention_backend"] == "flashmla"
             or global_server_args_dict["attention_backend"] == "fa3"
         ):
             seq_lens_cpu = self.seq_lens.cpu()
