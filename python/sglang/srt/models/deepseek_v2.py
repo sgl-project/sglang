@@ -492,6 +492,10 @@ class DeepseekV2MoE(nn.Module):
             topk_weights = torch.empty(
                 (0, self.top_k), dtype=torch.float32, device=hidden_states.device
             )
+
+        # NOTE HACK this is originally in DeepEPDispatcherImplLowLatency.dispatch_a, but we copy it here to reduce a kernel there
+        topk_idx = topk_idx.to(torch.int64)
+
         return topk_weights, topk_idx
 
     def _forward_deepep_dispatch_a_part_two(
