@@ -149,7 +149,7 @@ class Llama4Attention(nn.Module):
         super().__init__()
         self.layer_id = layer_id
         self.hidden_size = hidden_size
-        self.use_rope = int((layer_id + 1) % 4 != 0)
+        self.use_rope = bool((layer_id + 1) % 4 != 0)
         self.use_qk_norm = config.use_qk_norm and self.use_rope
 
         self.dp_size = get_attention_dp_size()
