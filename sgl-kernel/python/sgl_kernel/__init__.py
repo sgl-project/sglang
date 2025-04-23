@@ -46,6 +46,9 @@ from sgl_kernel.moe import (
     moe_align_block_size,
     moe_fused_gate,
     topk_softmax,
+    fp8_cutlass_moe_mm,
+    get_moe_prepare_input_caller,
+    cutlass_moe_fp8
 )
 from sgl_kernel.sampling import (
     min_p_sampling_from_probs,

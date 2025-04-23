@@ -196,6 +196,8 @@ set(SOURCES
     "csrc/moe/moe_fused_gate.cu"
     "csrc/moe/moe_topk_softmax_kernels.cu"
     "csrc/moe/fp8_blockwise_moe_kernel.cu"
+    "csrc/moe/fp8_cutlass_moe_kernel.cu"
+    "csrc/moe/cutlass_moe_perpare_input.cu"
     "csrc/speculative/eagle_utils.cu"
     "csrc/speculative/speculative_sampling.cu"
     "csrc/speculative/packbit.cu"

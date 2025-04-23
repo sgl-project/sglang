@@ -88,38 +88,36 @@ class TestFP8Base(CustomTestCase):
 
 class TestPerTokenGroupQuantFP8(TestFP8Base):
     def test_per_token_group_quant_fp8(self):
-        if torch.cuda.get_device_capability()[0] < 9:
-            return
-        A, A_quant_gt, scale_gt = self._make_A(
-            M=self.M, K=self.K, group_size=self.group_size, out_dtype=self.quant_type
-        )
-        A_quant, scale = per_token_group_quant_fp8(x=A, group_size=self.group_size)
-        torch.testing.assert_close(scale, scale_gt)
-        diff = (A_quant.to(torch.float16) - A_quant_gt.to(torch.float16)).abs()
-        diff_count = (diff > 1e-5).count_nonzero()
-        assert diff_count / diff.numel() < 1e-4
+        if torch.cuda.get_device_capability()[0] >= 9:
+            A, A_quant_gt, scale_gt = self._make_A(
+                M=self.M, K=self.K, group_size=self.group_size, out_dtype=self.quant_type
+            )
+            A_quant, scale = per_token_group_quant_fp8(x=A, group_size=self.group_size)
+            torch.testing.assert_close(scale, scale_gt)
+            diff = (A_quant.to(torch.float16) - A_quant_gt.to(torch.float16)).abs()
+            diff_count = (diff > 1e-5).count_nonzero()
+            assert diff_count / diff.numel() < 1e-4
 
 
 class TestW8A8BlockFP8Matmul(TestFP8Base):
     def test_w8a8_block_fp8_matmul(self):
-        if torch.cuda.get_device_capability()[0] < 9:
-            return
-        A, A_quant_gt, A_scale_gt = self._make_A(
-            M=self.M, K=self.K, group_size=self.group_size, out_dtype=self.quant_type
-        )
-        B, B_quant_gt, B_scale_gt = self._make_B(
-            K=self.K, N=self.N, group_size=self.group_size, out_dtype=self.quant_type
-        )
-        C_gt = A.to(self.output_type) @ B.to(self.output_type)
-        C = w8a8_block_fp8_matmul(
-            A=A_quant_gt,
-            B=B_quant_gt.T.contiguous(),
-            As=A_scale_gt,
-            Bs=B_scale_gt.T.contiguous(),
-            block_size=[128, 128],
-            output_dtype=self.output_type,
-        )
-        torch.testing.assert_close(C, C_gt, atol=0.5, rtol=1e-4)
+        if torch.cuda.get_device_capability()[0] >= 9:
+            A, A_quant_gt, A_scale_gt = self._make_A(
+                M=self.M, K=self.K, group_size=self.group_size, out_dtype=self.quant_type
+            )
+            B, B_quant_gt, B_scale_gt = self._make_B(
+                K=self.K, N=self.N, group_size=self.group_size, out_dtype=self.quant_type
+            )
+            C_gt = A.to(self.output_type) @ B.to(self.output_type)
+            C = w8a8_block_fp8_matmul(
+                A=A_quant_gt,
+                B=B_quant_gt.T.contiguous(),
+                As=A_scale_gt,
+                Bs=B_scale_gt.T.contiguous(),
+                block_size=[128, 128],
+                output_dtype=self.output_type,
+            )
+            torch.testing.assert_close(C, C_gt, atol=0.5, rtol=1e-4)
 
 
 if __name__ == "__main__":

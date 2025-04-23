@@ -18,6 +18,7 @@ limitations under the License.
 #include <ATen/Tensor.h>
 #include <cuda_runtime.h>
 #include <torch/all.h>
+#include "cutlass/cutlass.h"
 
 #include <sstream>
 
@@ -346,3 +347,15 @@ inline torch::Tensor pad_tensor(const torch::Tensor& tensor, int64_t alignment =
   }
   return tensor_padded;
 }
+
+template <typename Kernel>
+struct enable_sm90_only : Kernel {
+  template <typename... Args>
+  CUTLASS_DEVICE void operator()(Args&&... args) {
+#if defined __CUDA_ARCH__ && __CUDA_ARCH__ == 900
+    Kernel::operator()(std::forward<Args>(args)...);
+#endif
+  }
+};
+
+

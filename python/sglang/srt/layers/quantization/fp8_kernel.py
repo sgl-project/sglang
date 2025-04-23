@@ -1060,7 +1060,7 @@ def scaled_fp8_quant(
             )  # False for dynamic
     else:
         # Static scaling
-        assert scale.numel() == 1, f"Expected scalar scale, got numel={scale.numel()}"
+        assert (scale.numel() == 1 or num_token_padding is None)
         sgl_per_tensor_quant_fp8(
             input, output, scale, is_static=True
         )  # True for static
