@@ -1,0 +1,48 @@
+name: Build DeepEP Docker Image
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * *'
+
+jobs:
+  build-dev:
+    if: ${{ github.repository == 'sgl-project/sglang' }}
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          docker-images: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: false
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build DeepEP Image
+        run: |
+          docker build . -f docker/Dockerfile.deepep -t lmsysorg/sglang:deepep --no-cache
+
+      - name: Test and Push DeepEP Image
+        run: |
+          docker run --workdir /sgl-workspace lmsysorg/sglang:deepep \
+              sh -c "python3 DeepEP/tests/test_intranode.py && python3 DeepEP/tests/test_low_latency.py"
+          if [ $? -eq 0 ]; then
+            docker push lmsysorg/sglang:deepep
+          else
+            echo "DeepEP tests failed"
+            exit 1
+          fi
+          echo "DeepEP image build successfully"
+          exit 0
