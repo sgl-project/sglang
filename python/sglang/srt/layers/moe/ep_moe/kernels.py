@@ -745,9 +745,10 @@ def grouped_gemm_triton(
 @triton.jit
 def compute_masked_m_triton_kernel(seg_indptr, masked_m, num_experts, N):
     expert_id = tl.program_id(0)  
-    start = tl.load(seg_indptr + expert_id + 1)
-    end = tl.load(seg_indptr + expert_id + 2, mask = expert_id < (num_experts - 1), other=N)
+    start = tl.load(seg_indptr + expert_id)
+    end = tl.load(seg_indptr + expert_id + 1)
     tl.store(masked_m + expert_id, (end - start))
+
 
 @triton.jit
 def deepgemm_compute_src2dst_triton_kernel(
@@ -758,7 +759,7 @@ def deepgemm_compute_src2dst_triton_kernel(
     mask = dst_id < num_toks
     src_id = tl.load(reorder_ids + dst_id, mask=mask)
     expert_id = tl.load(topk_ids + src_id, mask=(src_id < num_toks))
-    expert_dst_start = tl.load(seg_indptr + expert_id + 1)
+    expert_dst_start = tl.load(seg_indptr + expert_id)
     expert_dst_offset = dst_id - expert_dst_start
     dst_id = expert_id * max_m + expert_dst_offset
     tl.store(src2dst + src_id, dst_id, mask=mask)   
@@ -804,6 +805,14 @@ def fill_gateup_input_triton_kernel(
                 tl.store(scale_dst_ptr + offset, in_scale, mask=mask)
             
 
+def exp2_upper(num: int) -> int:
+    for i in range(31):
+        value = pow(2, i)
+        if num <= value:
+            return value
+    return num
+
+
 def moe_ep_deepgemm_preproess(topk_ids: torch.Tensor, 
                               num_experts: int, 
                               hidden_states: torch.Tensor, 
@@ -825,14 +834,17 @@ def moe_ep_deepgemm_preproess(topk_ids: torch.Tensor,
     compute_masked_m_triton_kernel[(num_experts, )](
         seg_indptr, masked_m, num_experts, reorder_topk_ids.numel())
     
-    m_max = torch.max(masked_m).item()
-    expected_m = (topk_ids.shape[0] + num_experts - 1) // num_experts
+    m_max = 256
+    expected_m = (topk_ids.numel() + num_experts - 1) // num_experts
     gateup_input = torch.empty(
         (int(end_expert_id - start_expert_id + 1), m_max, hidden_states.size(1)),
         device=hidden_states.device,
         dtype=output_dtype,
     )
 
+    # compute_src2dst_triton_kernel[grid](
+    #     reorder_ids, src2dst, topk_ids.numel(), BLOCK_SIZE=512
+    # )
     deepgemm_compute_src2dst_triton_kernel[grid](
         topk_ids, reorder_ids, seg_indptr, src2dst, m_max, topk_ids.numel(), BLOCK_SIZE=256)
 
@@ -859,4 +871,15 @@ def moe_ep_deepgemm_preproess(topk_ids: torch.Tensor,
                                     hidden_states.size(1),
                                     scale.size(1),
                                     BLOCK_SIZE=1024)
+    
+    if hidden_states.get_device() == 0:
+            print("begin")
+            print("src2dst: ", src2dst)
+            print("seg_indptr: ", seg_indptr)
+            print("masked_m:", masked_m)
+            print("m_max:", m_max)
+            print("topk_ids: ", topk_ids)
+            print("hidden_state: ", hidden_states)
+            print("gateup_input: ", gateup_input)
+
     return m_max, masked_m[start_expert_id : (end_expert_id+1)], expected_m, src2dst, gateup_input, gateup_input_scale

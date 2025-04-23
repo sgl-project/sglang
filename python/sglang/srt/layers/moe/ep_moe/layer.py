@@ -152,6 +152,7 @@ class EPMoE(torch.nn.Module):
         self.tp_rank = get_tensor_model_parallel_rank()
 
         self.num_experts = num_experts
+        print("num_experts: ", num_experts)
         assert self.num_experts % self.tp_size == 0
         self.num_experts_per_partition = self.num_experts // self.tp_size
         self.start_expert_id = self.tp_rank * self.num_experts_per_partition
@@ -233,6 +234,7 @@ class EPMoE(torch.nn.Module):
             num_expert_group=self.num_expert_group,
             correction_bias=self.correction_bias,
             custom_routing_function=self.custom_routing_function,
+            routed_scaling_factor=self.routed_scaling_factor,
         )
 
         # PreReorder
@@ -249,15 +251,21 @@ class EPMoE(torch.nn.Module):
         gateup_output = torch.empty(
             (num_groups, m, n), device=hidden_states.device, dtype=torch.bfloat16
         )
-        print("group1: ", num_groups)
-        print("group2: ", self.w13_weight_fp8[0].size(0))
-        print("m: ", m)
-        print("n: ", n)
-        print("k: ", k)
+        # print("group1: ", num_groups)
+        # print("group2: ", self.w13_weight_fp8[0].size(0))
+        # print("m: ", m)
+        # print("n: ", n)
+        # print("k: ", k)
         
         m_grouped_gemm_fp8_fp8_bf16_nt_masked(
             gateup_input_fp8, self.w13_weight_fp8, gateup_output, masked_m, expected_m
         )
+        # if hidden_states.get_device() == 0 or hidden_states.get_device() == 0:
+        #     print(topk_ids.shape)
+        #     print("topk_ids: ", topk_ids)
+        #     print("masked_m: ", masked_m)
+        # if hidden_states.get_device() == 0:
+        #     print("finish gemm")
         
         # Act
         down_input = torch.empty(
@@ -381,11 +389,16 @@ class EPMoE(torch.nn.Module):
             dtype=torch.int64,
         )
         # GroupGemm-0
-        
+        gateup_output = torch.empty(
+            gateup_input.shape[0],
+            self.w13_weight.shape[1],
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
         gateup_output = self.grouped_gemm_runner(
             a=gateup_input,
             b=self.w13_weight,
-            c=None,
+            c=gateup_output,
             batch_size=self.num_experts_per_partition,
             weight_column_major=True,
             seg_indptr=seg_indptr_cur_rank,
