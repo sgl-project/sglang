@@ -187,6 +187,14 @@ class SchedulerDisaggregationPrefillMixin:
             )
             self.process_prefill_chunk()
             batch = self.get_new_batch_prefill()
+
+            # Handle DP attention
+            if (
+                self.server_args.enable_dp_attention
+                or self.server_args.enable_sp_layernorm
+            ):
+                batch, _ = self.prepare_dp_attn_batch(batch)
+
             self.cur_batch = batch
 
             if batch:
@@ -217,6 +225,14 @@ class SchedulerDisaggregationPrefillMixin:
             )
             self.process_prefill_chunk()
             batch = self.get_new_batch_prefill()
+
+            # Handle DP attention
+            if (
+                self.server_args.enable_dp_attention
+                or self.server_args.enable_sp_layernorm
+            ):
+                batch, _ = self.prepare_dp_attn_batch(batch)
+
             self.cur_batch = batch
 
             if batch:
