@@ -17,6 +17,7 @@
 # https://github.com/lm-sys/FastChat/blob/main/fastchat/conversation.py
 import dataclasses
 from enum import IntEnum, auto
+from optparse import Option
 from typing import Dict, List, Optional, Tuple, Union
 
 from sglang.srt.openai_api.protocol import ChatCompletionRequest
@@ -61,17 +62,17 @@ class Conversation:
     # The system message
     system_message: str = ""
     # The names of two roles
-    roles: Tuple[str] = ("USER", "ASSISTANT")
+    roles: Tuple[str, str] = ("USER", "ASSISTANT")
     # All messages. Each item is (role, message).
-    messages: List[List[str]] = ()
+    messages: List[List[str]] = dataclasses.field(default_factory=list)
     # The number of few shot examples
     offset: int = 0
     # The separator style and configurations
     sep_style: SeparatorStyle = SeparatorStyle.ADD_COLON_SINGLE
     sep: str = "\n"
-    sep2: str = None
+    sep2: Optional[str] = None
     # Stop criteria (the default one is EOS token)
-    stop_str: Union[str, List[str]] = None
+    stop_str: Optional[Union[str, List[str]]] = None
     # The string that represents an image token in the prompt
     image_token: str = "<image>"
     audio_token: str = "<audio>"
@@ -679,7 +680,7 @@ register_conv_template(
         # "thinking step by step to be sure you get the right answer.",
         system_message="",
         roles=("<|User|>", "<|Assistant|>"),
-        messages=(),
+        messages=[],
         offset=0,
         sep_style=SeparatorStyle.DeepSeekVL2,
         sep="\n\n",
