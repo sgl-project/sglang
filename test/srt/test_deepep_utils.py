@@ -1,3 +1,5 @@
+# Copy from deepseek-ai/DeepEP/tests/test_utils.py
+
 import os
 import sys
 from typing import Optional
