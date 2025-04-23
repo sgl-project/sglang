@@ -189,7 +189,7 @@ class CudaGraphRunner:
         self.tp_size = model_runner.server_args.tp_size
         self.dp_size = model_runner.server_args.dp_size
         self.enable_deepep_moe = model_runner.server_args.enable_deepep_moe
-        self.moe_dense_fullly_dp = (
+        self.moe_dense_fully_dp = (
             model_runner.server_args.enable_deepep_moe
             and model_runner.server_args.moe_dense_tp_size == 1
         )
@@ -306,7 +306,7 @@ class CudaGraphRunner:
 
     def can_run(self, forward_batch: ForwardBatch):
         if self.enable_dp_attention or self.enable_sp_layernorm:
-            reducer = max if self.moe_dense_fullly_dp else sum
+            reducer = max if self.moe_dense_fully_dp else sum
             # DeepEP MoE layers uses a fixed shape with masking instead of gather tokens from DP ranks.
             total_global_tokens = reducer(forward_batch.global_num_tokens_cpu)
 
@@ -491,7 +491,7 @@ class CudaGraphRunner:
 
         # Pad
         if self.enable_dp_attention or self.enable_sp_layernorm:
-            reducer = max if self.moe_dense_fullly_dp else sum
+            reducer = max if self.moe_dense_fully_dp else sum
             # DeepEP MoE layers uses a fixed shape with masking instead of gather tokens from DP ranks.
             index = bisect.bisect_left(
                 self.capture_bs, reducer(forward_batch.global_num_tokens_cpu)
