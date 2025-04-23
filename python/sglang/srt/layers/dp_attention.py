@@ -24,8 +24,8 @@ if TYPE_CHECKING:
 _ATTN_TP_GROUP = None
 _ATTN_TP_RANK = None
 _ATTN_TP_SIZE = None
-_DP_RANK = None
-_DP_SIZE = None
+_ATTN_DP_RANK = None
+_ATTN_DP_SIZE = None
 _LOCAL_ATTN_DP_SIZE = None
 _LOCAL_ATTN_DP_RANK = None
 
@@ -117,8 +117,8 @@ def get_attention_tp_size():
 
 
 def get_attention_dp_rank():
-    assert _DP_RANK is not None, "dp attention not initialized!"
-    return _DP_RANK
+    assert _ATTN_DP_RANK is not None, "dp attention not initialized!"
+    return _ATTN_DP_RANK
 
 
 def get_attention_dp_size():
@@ -156,15 +156,15 @@ def disable_dp_size():
     Args:
         tp_group (GroupCoordinator): the tp group coordinator
     """
-    global _DP_SIZE
-    assert _DP_SIZE is not None, "dp attention not initialized!"
+    global _ATTN_DP_SIZE
+    assert _ATTN_DP_SIZE is not None, "dp attention not initialized!"
 
-    old_dp_size = _DP_SIZE
-    _DP_SIZE = 1
+    old_dp_size = _ATTN_DP_SIZE
+    _ATTN_DP_SIZE = 1
     try:
         yield
     finally:
-        _DP_SIZE = old_dp_size
+        _ATTN_DP_SIZE = old_dp_size
 
 
 def get_dp_local_info(forward_batch: ForwardBatch):
