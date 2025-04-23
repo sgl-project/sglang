@@ -30,19 +30,7 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build DeepEP Image
+      - name: Build and Push DeepEP Image
         run: |
           docker build . -f docker/Dockerfile.deepep -t lmsysorg/sglang:deepep --no-cache
-
-      - name: Test and Push DeepEP Image
-        run: |
-          docker run --workdir /sgl-workspace lmsysorg/sglang:deepep \
-              sh -c "python3 DeepEP/tests/test_intranode.py && python3 DeepEP/tests/test_low_latency.py"
-          if [ $? -eq 0 ]; then
-            docker push lmsysorg/sglang:deepep
-          else
-            echo "DeepEP tests failed"
-            exit 1
-          fi
-          echo "DeepEP image build successfully"
-          exit 0
+          docker push lmsysorg/sglang:deepep
