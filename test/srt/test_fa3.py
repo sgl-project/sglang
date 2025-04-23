@@ -1,3 +1,4 @@
+import os
 import unittest
 from types import SimpleNamespace
 
@@ -20,17 +21,16 @@ from sglang.test.test_utils import (
 GSM_DATASET_PATH = None
 
 # In case of some machine lack internet connection, we can set OFFLINE_MODE to True.
-OFFLINE_MODE = True
+OFFLINE_MODE = False
 
 # Change the path below when OFFLINE_MODE is True.
 OFFLINE_PATH_DICT = {
-    DEFAULT_MODEL_NAME_FOR_TEST: "/shared/public/elr-models/meta-llama/Meta-Llama-3.1-8B-Instruct/07eb05b21d191a58c577b4a45982fe0c049d0693",
-    DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3: "/shared/public/elr-models/jamesliu1/sglang-EAGLE3-Llama-3.1-Instruct-8B/e5ed08d66f528a95ce89f5d4fd136a28f6def714",
-    DEFAULT_MODEL_NAME_FOR_TEST_MLA: "/shared/public/sharing/bhe/deepseek/dsv3-test/snapshots/fed995305b0e4f9acacb74bc0c17787a966bf42a/",
-    DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN: "/shared/public/sharing/bhe/deepseek/dsv3-test-NextN/snapshots/981e68c48968bacb228b645b2b8ddf69f98ee5a6/",
-    GSM_DATASET_PATH: "/shared/public/data/gsm8k/test.jsonl"
+    DEFAULT_MODEL_NAME_FOR_TEST: "/shared/public/elr-models/meta-llama/Meta-Llama-3.1-8B-Instruct",
+    DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3: "/shared/public/elr-models/jamesliu1/sglang-EAGLE3-Llama-3.1-Instruct-8B",
+    DEFAULT_MODEL_NAME_FOR_TEST_MLA: "/shared/public/sharing/deepseek/dsv3-test/snapshots/",
+    DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN: "/shared/public/sharing/deepseek/dsv3-test-NextN/snapshots/",
+    GSM_DATASET_PATH: "/shared/public/data/gsm8k/test.jsonl",
 }
-
 
 
 if OFFLINE_MODE:
@@ -77,11 +77,15 @@ class BaseFlashAttentionTest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
+        # disable deep gemm precompile to make launch server faster
+        # please don't do this if you want to make your inference workload faster
+        os.environ["SGL_JIT_DEEPGEMM_PRECOMPILE"] = "False"
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=cls.get_server_args(),
+            env=os.environ,
         )
 
     @classmethod
@@ -205,7 +209,7 @@ class TestFlashAttention3SpeculativeDecodeTopk(BaseFlashAttentionTest):
 class TestFlashAttention3SpeculativeDecodeTopk(BaseFlashAttentionTest):
     """Test FlashAttention3 with speculative decode enabled, topk > 1"""
 
-    model = "meta-llama/Llama-3.1-8B-Instruct"
+    model = DEFAULT_MODEL_NAME_FOR_TEST
 
     @classmethod
     def get_server_args(cls):
@@ -217,7 +221,7 @@ class TestFlashAttention3SpeculativeDecodeTopk(BaseFlashAttentionTest):
                 "--speculative-algorithm",
                 "EAGLE3",
                 "--speculative-draft",
-                "jamesliu1/sglang-EAGLE3-Llama-3.1-Instruct-8B",
+                DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3,
                 "--speculative-num-steps",
                 "5",
                 "--speculative-eagle-topk",
@@ -238,7 +242,7 @@ class TestFlashAttention3SpeculativeDecodeTopk(BaseFlashAttentionTest):
 
         args = SimpleNamespace(
             num_shots=5,
-            data_path=DATA_PATH,
+            data_path=GSM_DATASET_PATH,
             num_questions=200,
             max_new_tokens=512,
             parallel=128,
