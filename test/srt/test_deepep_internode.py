@@ -10,7 +10,7 @@ import torch.distributed as dist
 
 # Test compatibility with low latency functions
 import sglang.test.srt.test_deepep_low_latency as test_deepep_low_latency
-from sglang.test.srt.test_deepep_utils import (
+from sglang.python.sglang.test.test_deepep_utils import (
     bench,
     calc_diff,
     create_grouped_scores,
