@@ -526,7 +526,7 @@ class SglSelect(SglExpr):
 
     def __init__(
         self,
-        name: str,
+        name: Optional[str],
         choices: List[str],
         temperature: float,
         choices_method: ChoicesSamplingMethod,
