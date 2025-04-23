@@ -993,6 +993,8 @@ async def benchmark(
         async with semaphore:
             return await request_func(request_func_input=request_func_input, pbar=pbar)
 
+    if not hasattr(args, "warmup_requests"):
+        args.warmup_requests = 1
     # Warmup
     print(f"Starting warmup with {args.warmup_requests} sequences...")
 
