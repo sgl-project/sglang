@@ -240,22 +240,19 @@ def block_quant_dequant(
     assert n_tiles == x_s.shape[0]
     assert k_tiles == x_s.shape[1]
 
-    x_dq_block = x_q_block.to(dtype)
+    x_dq_block = torch.empty_like(x_q_block, dtype=dtype)
 
-    x_dq_block_tiles = [
-        [
-            x_dq_block[
+    for j in range(n_tiles):
+        for i in range(k_tiles):
+            x_q_block_tile = x_q_block[
                 j * block_n : min((j + 1) * block_n, n),
                 i * block_k : min((i + 1) * block_k, k),
             ]
-            for i in range(k_tiles)
-        ]
-        for j in range(n_tiles)
-    ]
-
-    for i in range(k_tiles):
-        for j in range(n_tiles):
-            x_dq_block_tiles[j][i][:, :] = x_dq_block_tiles[j][i] * x_s[j][i]
+            x_dq_block_tile = x_dq_block[
+                j * block_n : min((j + 1) * block_n, n),
+                i * block_k : min((i + 1) * block_k, k),
+            ]
+            x_dq_block_tile[:, :] = x_q_block_tile.to(torch.float32) * x_s[j][i]
 
     return x_dq_block
 
