@@ -7,7 +7,7 @@ import triton.language as tl
 
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
-from sglang.srt.utils import get_bool_env_var, is_cuda
+from sglang.srt.utils import get_bool_env_var, is_cuda, get_compiler_backend
 
 _is_cuda = is_cuda()
 if _is_cuda:
@@ -664,10 +664,10 @@ def grouped_gemm_triton(
     if block_shape is not None:
         assert len(block_shape) == 2
         block_n, block_k = block_shape[0], block_shape[1]
-        if _is_cuda:
-            a, scale_a = sglang_per_token_group_quant_fp8(a, block_k)
-        else:
-            a, scale_a = per_token_group_quant_fp8(a, block_k)
+        # if _is_cuda:
+        #     a, scale_a = sglang_per_token_group_quant_fp8(a, block_k)
+        # else:
+        #     a, scale_a = per_token_group_quant_fp8(a, block_k)
 
         assert triton.cdiv(a.shape[-1], block_k) == scale_a.shape[-1]
         assert triton.cdiv(b.shape[-2], block_n) == scale_b.shape[-2]
@@ -1048,3 +1048,12 @@ def tma_align_input_scale(input_scale: torch.Tensor):
         BLOCK_SIZE_K=BLOCK_SIZE_K,
     )
     return output.t()[:m]
+
+
+@torch.compile(dynamic=True, backend=get_compiler_backend())
+def per_token_cast_to_fp8(x: torch.Tensor):
+    assert x.dim() == 2 and x.size(1) % 128 == 0
+    m, n = x.shape
+    x_view = x.view(m, -1, 128)
+    x_amax = x_view.abs().float().amax(dim=2).view(m, -1).clamp(1e-4)
+    return (x_view * (448.0 / x_amax.unsqueeze(2))).to(torch.float8_e4m3fn).view(m, n), (x_amax / 448.0).view(m, -1)

@@ -26,6 +26,7 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     deepep_permute_triton_kernel,
     deepep_post_reorder_triton_kernel,
     deepep_run_moe_deep_preprocess,
+    per_token_cast_to_fp8,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
@@ -197,7 +198,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
     def dispatch_b(self, hidden_states, topk_idx, topk_weights, previous_event):
         if _enable_jit_deepgemm:
             # TODO hard code 128 block quant,use fp8 communication
-            # hidden_states = sglang_per_token_group_quant_fp8(hidden_states, 128)
+            hidden_states = per_token_cast_to_fp8(hidden_states, 128)
             (
                 hidden_states,
                 topk_idx,
