@@ -549,6 +549,9 @@ class DeepseekV2MoE(nn.Module):
         )
 
     def _forward_tbo_op_dispatch_b(self, state, tbo_child_index: int):
+        if get_bool_env_var("SGLANG_HACK_SLOW_BETWEEN_COMMUNICATION", "false"):
+            TODO
+
         dispatcher = self.tbo_deepep_dispatchers[state.tbo_subbatch_index]
         with get_global_expert_distribution_recorder().with_current_layer(
             self.layer_id
@@ -574,6 +577,9 @@ class DeepseekV2MoE(nn.Module):
         )
 
     def _forward_tbo_op_combine_b(self, state):
+        if get_bool_env_var("SGLANG_HACK_SLOW_BETWEEN_COMMUNICATION", "false"):
+            TODO
+
         dispatcher = self.tbo_deepep_dispatchers[state.tbo_subbatch_index]
         hidden_states = dispatcher.combine_b()
         # hidden_states *= self.routed_scaling_factor
