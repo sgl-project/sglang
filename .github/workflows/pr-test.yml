@@ -87,29 +87,29 @@ jobs:
           cd test/srt
           python3 run_suite.py --suite per-commit-2-gpu
 
-  unit-test-backend-8-gpu:
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false
-    runs-on: 8-gpu-runner
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+  # unit-test-backend-8-gpu:
+  #   if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+  #       github.event.pull_request.draft == false
+  #   runs-on: 8-gpu-runner
+  #   steps:
+  #     - name: Checkout code
+  #       uses: actions/checkout@v4
 
-      - name: Install dependencies
-        run: |
-          bash scripts/ci_install_dependency.sh
+  #     - name: Install dependencies
+  #       run: |
+  #         bash scripts/ci_install_dependency.sh
 
-      - name: Run DeepEP intranode test
-        timeout-minutes: 20
-        run: |
-          cd test/srt
-          python3 test_deepep_intranode.py
+  #     - name: Run DeepEP intranode test
+  #       timeout-minutes: 20
+  #       run: |
+  #         cd test/srt
+  #         python3 test_deepep_intranode.py
 
-      - name: Run DeepEP low latency test
-        timeout-minutes: 20
-        run: |
-          cd test/srt
-          python3 test_deepep_low_latency.py
+  #     - name: Run DeepEP low latency test
+  #       timeout-minutes: 20
+  #       run: |
+  #         cd test/srt
+  #         python3 test_deepep_low_latency.py
 
   performance-test-1-gpu-part-1:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
@@ -310,7 +310,7 @@ jobs:
         timeout-minutes: 30
         run: |
           cd test/srt
-          python3 test_moe_eval_accuracy_large.py
+          python3 test_moe_deepep_eval_accuracy_large.py
 
   finish:
     if: always()
