@@ -67,7 +67,7 @@ class TestDisaggregationMooncake(CustomTestCase):
             "--tp",
             "2",
             "--mem-fraction-static",
-            "0.45"
+            "0.45",
         ]
         cls.process_prefill = popen_launch_pd_server(
             cls.model,
