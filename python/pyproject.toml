@@ -38,10 +38,10 @@ runtime_common = [
     "pyzmq>=25.1.2",
     "soundfile==0.13.1",
     "torchao>=0.7.0",
-    "transformers==4.51.1",
+    "transformers==4.51.3",
     "uvicorn",
     "uvloop",
-    "xgrammar==0.1.17",
+    "xgrammar==0.1.18",
 ]
 
 srt = [
