@@ -291,12 +291,15 @@ void top_p_sampling_from_probs(
     bool deterministic,
     int64_t cuda_stream);
 
-torch::Tensor marlin_gemm_moe(
-    const torch::Tensor& a, const torch::Tensor& b_q_weights,
-    const torch::Tensor& sorted_ids, const torch::Tensor& topk_weights,
-    const torch::Tensor& topk_ids, const torch::Tensor& b_scales,
-    torch::Tensor& b_zeros, const torch::Tensor& g_idx,
-    const torch::Tensor& perm, torch::Tensor& workspace,
-    sglang::ScalarTypeId const b_q_type_id, int64_t size_m, int64_t size_n,
-    int64_t size_k, bool is_k_full, int64_t num_experts, int64_t topk,
-    int64_t moe_block_size, bool replicate_input, bool apply_weights);
+torch::Tensor moe_wna16_marlin_gemm(
+    torch::Tensor& a, std::optional<torch::Tensor> const& c_or_none,
+    torch::Tensor& b_q_weight, torch::Tensor& b_scales,
+    std::optional<torch::Tensor> const& b_zeros_or_none,
+    std::optional<torch::Tensor> const& g_idx_or_none,
+    std::optional<torch::Tensor> const& perm_or_none, torch::Tensor& workspace,
+    torch::Tensor& sorted_token_ids, torch::Tensor& expert_ids,
+    torch::Tensor& num_tokens_past_padded, torch::Tensor& topk_weights,
+    int64_t moe_block_size, int64_t top_k, bool mul_topk_weights, bool is_ep,
+    sglang::ScalarTypeId const& b_q_type_id, int64_t size_m, int64_t size_n,
+    int64_t size_k, bool is_k_full, bool use_atomic_add, bool use_fp32_reduce,
+    bool is_zp_float);
