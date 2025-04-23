@@ -751,10 +751,15 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
-        q = torch.cat([q_nope_out, q_pe], dim=-1)
         k = torch.cat([k_nope, k_pe], dim=-1)
 
-        attn_output = self.attn_mqa(q, k, k_nope, forward_batch)
+        if self.attention_backend == "fa3":
+            attn_output = self.attn_mqa(
+                q_nope_out, k, k_nope, forward_batch, q_rope=q_pe
+            )
+        else:
+            q = torch.cat([q_nope_out, q_pe], dim=-1)
+            attn_output = self.attn_mqa(q, k, k_nope, forward_batch)
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
         if self.use_deep_gemm_bmm:
@@ -1607,7 +1612,7 @@ class DeepseekV2ForCausalLM(nn.Module):
         if self.n_share_experts_fusion > 0:
             weights_list = list(weights)
             weights_dict = dict(weights_list)
-            if self.quant_config.get_name() == "w8a8_int8":
+            if self.quant_config is None or self.quant_config.get_name() == "w8a8_int8":
                 suffix_list = [
                     "down_proj.weight",
                     "down_proj.weight_scale",
