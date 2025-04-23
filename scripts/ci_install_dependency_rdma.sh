@@ -5,6 +5,15 @@ set -euxo pipefail
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 bash "${SCRIPT_DIR}/killall_sglang.sh"
 
+# Check if sudo is available, and install disaggregation requirement
+if command -v sudo >/dev/null 2>&1; then
+    sudo apt-get update
+    sudo apt-get install -y libibverbs-dev
+else
+    apt-get update
+    apt-get install -y libibverbs-dev
+fi
+
 # Clean up existing installations
 pip uninstall -y flashinfer flashinfer_python sgl-kernel sglang vllm || true
 pip cache purge
@@ -23,7 +32,7 @@ pip install -e "python[all]"
 
 # Install additional dependencies
 pip install torch_memory_saver
-pip install transformers==4.51.0 sentence_transformers accelerate peft pandas datasets timm torchaudio
+pip install transformers==4.51.0 sentence_transformers accelerate peft pandas datasets timm torchaudio mooncake-transfer-engine
 
 # For compling xgrammar kernels
 pip install cuda-python nvidia-cuda-nvrtc-cu12

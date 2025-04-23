@@ -79,7 +79,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci_install_dependency.sh
+          bash scripts/ci_install_dependency_rdma.sh
 
       - name: Run test
         timeout-minutes: 25
