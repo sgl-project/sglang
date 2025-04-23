@@ -12,6 +12,7 @@ if command -v sudo >/dev/null 2>&1; then
 else
     apt-get update
     apt-get install -y libibverbs-dev
+fi
 
 # Clean up existing installations
 pip uninstall -y flashinfer flashinfer_python sgl-kernel sglang vllm || true
