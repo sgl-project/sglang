@@ -1106,6 +1106,7 @@ class Scheduler(
                 f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
                 f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
                 f"#queue-req: {len(self.waiting_queue)}, "
+                f"{time.time()=}, "
                 f"{self.forward_ct_decode=}"
             )
             spec_accept_length = 0
