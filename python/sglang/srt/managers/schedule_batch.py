@@ -539,6 +539,11 @@ class Req:
         # The first output_id transferred from prefill instance.
         self.transferred_output_id: Optional[int] = None
 
+        # For overlap schedule, we delay the kv transfer until `process_batch_result_disagg_prefill` rather than `process_prefill_chunk` in non-overlap
+        # This is because kv is not ready in `process_prefill_chunk`.
+        # We use `tmp_end_idx` to store the end index of the kv cache to send.
+        self.tmp_end_idx: int = -1
+
     @property
     def seqlen(self):
         return len(self.origin_input_ids) + len(self.output_ids)
