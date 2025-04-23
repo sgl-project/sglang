@@ -8,9 +8,6 @@ from torch.nn import Module
 from sglang.srt.layers.moe.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.managers.schedule_batch import get_global_expert_location_metadata
 
-from sglang.srt.layers.moe.expert_location_dispatch import ExpertLocationDispatchInfo
-from sglang.srt.managers.schedule_batch import get_global_expert_location_metadata
-
 _enable_jit_deepgemm = False
 try:
     from deep_gemm import (
