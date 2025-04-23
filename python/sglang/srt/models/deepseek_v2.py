@@ -583,13 +583,17 @@ class DeepseekV2AttentionMLA(nn.Module):
                 return AttnForwardMethod.MLA
         elif self.attention_backend == "fa3":
             # Flash Attention: Use MHA with chunked KV cache when prefilling on long sequences.
+            if forward_batch.extend_prefix_lens_cpu is not None:
+                sum_extend_prefix_lens = sum(forward_batch.extend_prefix_lens_cpu)
             if (
                 forward_batch.forward_mode.is_extend()
                 and not self.disable_chunked_prefix_cache
                 and not forward_batch.forward_mode.is_target_verify()
                 and not forward_batch.forward_mode.is_draft_extend()
-                and sum(forward_batch.extend_prefix_lens_cpu)
-                >= self.chunked_prefix_cache_threshold
+                and (
+                    sum_extend_prefix_lens >= self.chunked_prefix_cache_threshold
+                    or sum_extend_prefix_lens == 0
+                )
             ):
                 return AttnForwardMethod.MHA_CHUNKED_KV
             else:
@@ -747,10 +751,15 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
-        q = torch.cat([q_nope_out, q_pe], dim=-1)
         k = torch.cat([k_nope, k_pe], dim=-1)
 
-        attn_output = self.attn_mqa(q, k, k_nope, forward_batch)
+        if self.attention_backend == "fa3":
+            attn_output = self.attn_mqa(
+                q_nope_out, k, k_nope, forward_batch, q_rope=q_pe
+            )
+        else:
+            q = torch.cat([q_nope_out, q_pe], dim=-1)
+            attn_output = self.attn_mqa(q, k, k_nope, forward_batch)
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
         if self.use_deep_gemm_bmm:
@@ -1600,7 +1609,7 @@ class DeepseekV2ForCausalLM(nn.Module):
         if self.n_share_experts_fusion > 0:
             weights_list = list(weights)
             weights_dict = dict(weights_list)
-            if self.quant_config.get_name() == "w8a8_int8":
+            if self.quant_config is None or self.quant_config.get_name() == "w8a8_int8":
                 suffix_list = [
                     "down_proj.weight",
                     "down_proj.weight_scale",

@@ -994,6 +994,7 @@ async def benchmark(
         async with semaphore:
             return await request_func(request_func_input=request_func_input, pbar=pbar)
 
+
     print(f"Starting warmup with {warmup_requests} sequences...")
 
     # Use the first request for all warmup iterations
