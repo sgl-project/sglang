@@ -12,6 +12,23 @@ rm -rf /root/.cache/flashinfer
 rm -rf /usr/local/lib/python3.10/dist-packages/flashinfer*
 rm -rf /usr/local/lib/python3.10/dist-packages/sgl_kernel*
 
+# Clean up gdrcopy, nvshmem and DeepEP
+# Remove gdrcopy packages
+dpkg -r gdrcopy gdrcopy-tests libgdrapi gdrdrv-dkms || true
+rm -rf /opt/gdrcopy
+rm -rf /usr/local/lib/libgdrapi*
+rm -rf /usr/local/include/gdrapi.h
+
+# Remove nvshmem
+rm -rf /opt/nvshmem
+rm -rf /usr/local/lib/libnvshmem*
+rm -rf /usr/local/include/nvshmem*
+
+# Remove DeepEP
+pip uninstall -y deepep || true
+rm -rf /root/.cache/deepep
+rm -rf /usr/local/lib/python3.10/dist-packages/deepep*
+
 # Update pip
 pip install --upgrade pip
 
@@ -35,9 +52,14 @@ chmod +x cmake-3.27.4-linux-x86_64.sh
 ./cmake-3.27.4-linux-x86_64.sh --skip-license --prefix=/usr/local
 rm cmake-3.27.4-linux-x86_64.sh
 
+# Create installation directories
+mkdir -p /opt/gdrcopy
+mkdir -p /opt/nvshmem
+mkdir -p /opt/deepep
+
 # Install GDRCopy
-git clone https://github.com/NVIDIA/gdrcopy.git
-cd gdrcopy
+cd /opt/gdrcopy
+git clone https://github.com/NVIDIA/gdrcopy.git .
 git checkout v2.4.4
 apt update
 apt install -y nvidia-dkms-535
@@ -50,18 +72,26 @@ dpkg -i gdrdrv-dkms_*.deb
 dpkg -i libgdrapi_*.deb
 dpkg -i gdrcopy-tests_*.deb
 dpkg -i gdrcopy_*.deb
-cd ../..
 
 # Install IBGDA dependencies
+# Check and remove existing libmlx5.so symlink if it exists
+if [ -L "/usr/lib/x86_64-linux-gnu/libmlx5.so" ]; then
+    rm -f /usr/lib/x86_64-linux-gnu/libmlx5.so
+fi
 ln -s /usr/lib/x86_64-linux-gnu/libmlx5.so.1 /usr/lib/x86_64-linux-gnu/libmlx5.so
 apt-get install -y libfabric-dev
 
+# Clone DeepEP first (only for source code)
+cd /root/.cache
+git clone https://github.com/deepseek-ai/DeepEP.git deepep
+
 # Install NVSHMEM
+cd /opt/nvshmem
 wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.2.5/source/nvshmem_src_3.2.5-1.txz
 tar -xf nvshmem_src_3.2.5-1.txz
 mv nvshmem_src nvshmem
 cd nvshmem
-git apply ../DeepEP/third-party/nvshmem.patch
+git apply /root/.cache/deepep/third-party/nvshmem.patch
 NVSHMEM_SHMEM_SUPPORT=0 \
 NVSHMEM_UCX_SUPPORT=0 \
 NVSHMEM_USE_NCCL=0 \
@@ -70,13 +100,30 @@ NVSHMEM_IBGDA_SUPPORT=1 \
 NVSHMEM_PMIX_SUPPORT=0 \
 NVSHMEM_TIMEOUT_DEVICE_POLLING=0 \
 NVSHMEM_USE_GDRCOPY=1 \
-cmake -S . -B build/ -DCMAKE_INSTALL_PREFIX=/sgl-workspace/nvshmem/install -DCMAKE_CUDA_ARCHITECTURES=90
+cmake -S . -B build/ -DCMAKE_INSTALL_PREFIX=/opt/nvshmem/install -DCMAKE_CUDA_ARCHITECTURES=90
 cd build
 make install -j
-cd ../..
 
-# Install DeepEP
-git clone https://github.com/deepseek-ai/DeepEP.git
-cd DeepEP
-NVSHMEM_DIR=/sgl-workspace/nvshmem/install python setup.py install
-cd ..
+# Set NVSHMEM environment variables
+export NVSHMEM_HOME=/opt/nvshmem/install
+export LD_LIBRARY_PATH=$NVSHMEM_HOME/lib:$LD_LIBRARY_PATH
+export PATH=$NVSHMEM_HOME/bin:$PATH
+
+# Verify NVSHMEM installation
+if [ ! -f "$NVSHMEM_HOME/lib/libnvshmem.so" ]; then
+    echo "Error: NVSHMEM library not found at $NVSHMEM_HOME/lib/libnvshmem.so"
+    exit 1
+fi
+
+# Install DeepEP to system Python packages
+cd /root/.cache/deepep
+# Set CUDA paths for DeepEP
+export CUDA_HOME=/usr/local/cuda
+export PATH=$CUDA_HOME/bin:$PATH
+export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
+
+# Install with verbose output to catch any issues
+NVSHMEM_DIR=/opt/nvshmem/install python3 setup.py install --verbose
+
+# Verify DeepEP installation
+python3 -c "import deepep; print('DeepEP version:', deepep.__version__)"
