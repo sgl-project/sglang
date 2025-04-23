@@ -626,7 +626,7 @@ class _StatAndUtilizationRateAccumulator(_StatAccumulator):
                 f"current_pass_value={utilization_rate:.03f} "
                 f"{''.join(f'last_{size}_value={value:.03f} ' for size, value in self._history.mean().items())} "
                 f"gpu_physical_count_sum={gpu_physical_count_sum} "
-                f"current_pass_per_layer={utilization_rate_tensor.cpu().tolist()}"
+                f"current_pass_per_layer={[round(x, 2) for x in utilization_rate_tensor.cpu().tolist()]}"
             )
 
 
