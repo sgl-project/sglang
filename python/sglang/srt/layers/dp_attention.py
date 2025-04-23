@@ -29,6 +29,7 @@ _ATTN_DP_SIZE = None
 _LOCAL_ATTN_DP_SIZE = None
 _LOCAL_ATTN_DP_RANK = None
 
+
 def compute_dp_attention_world_info(enable_dp_attention, tp_rank, tp_size, dp_size):
     if not enable_dp_attention:
         return tp_rank, tp_size, 0
@@ -40,10 +41,12 @@ def compute_dp_attention_world_info(enable_dp_attention, tp_rank, tp_size, dp_si
     return attn_tp_rank, attn_tp_size, attn_dp_rank
 
 
-def compute_dp_attention_local_info(enable_dp_attention, tp_rank, tp_size, dp_size, moe_dense_tp_size):
+def compute_dp_attention_local_info(
+    enable_dp_attention, tp_rank, tp_size, dp_size, moe_dense_tp_size
+):
     if not enable_dp_attention:
         return tp_rank, tp_size, 0
-    
+
     local_tp_size = moe_dense_tp_size if moe_dense_tp_size else tp_size
     local_tp_rank = tp_rank % local_tp_size
     local_dp_size = max(1, dp_size // (tp_size // local_tp_size))
