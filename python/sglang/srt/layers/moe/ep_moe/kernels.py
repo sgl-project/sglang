@@ -1050,6 +1050,7 @@ def tma_align_input_scale(input_scale: torch.Tensor):
     return output.t()[:m]
 
 
+# adapt from https://github.com/deepseek-ai/DeepEP/blob/007fcfcf97914e1f3d661f28dd125e7d1b9f8320/tests/utils.py#L37
 @torch.compile(dynamic=True, backend=get_compiler_backend())
 def per_token_cast_to_fp8(x: torch.Tensor):
     assert x.dim() == 2 and x.size(1) % 128 == 0

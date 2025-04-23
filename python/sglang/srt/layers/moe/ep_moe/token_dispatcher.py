@@ -198,7 +198,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
     def dispatch_b(self, hidden_states, topk_idx, topk_weights, previous_event):
         if _enable_jit_deepgemm:
             # TODO hard code 128 block quant,use fp8 communication
-            hidden_states = per_token_cast_to_fp8(hidden_states, 128)
+            hidden_states = per_token_cast_to_fp8(hidden_states)
             (
                 hidden_states,
                 topk_idx,
