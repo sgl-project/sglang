@@ -18,7 +18,7 @@ from sglang.test.test_utils import (
 )
 
 
-class TestDisaggregation(CustomTestCase):
+class TestDisaggregationMooncake(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = "lmsys/sglang-ci-dsv3-test"

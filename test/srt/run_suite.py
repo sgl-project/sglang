@@ -83,6 +83,7 @@ suites = {
     "per-commit-2-gpu": [
         TestFile("models/lora/test_lora_tp.py", 300),
         TestFile("test_data_parallelism.py", 90),
+        TestFile("test_disaggregation.py", 90),
         TestFile("test_dp_attention.py", 90),
         TestFile("test_mla_tp.py", 420),
         TestFile("test_moe_ep.py", 220),
