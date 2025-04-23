@@ -9,7 +9,6 @@ USER root
 
 WORKDIR /sgl-workspace
 ARG BUILD_TYPE=all
-ARG SGL_REPO="https://github.com/sgl-project/sglang"
 ENV SGL_DEFAULT="main"
 ARG SGL_BRANCH=${SGL_DEFAULT}
 
@@ -20,8 +19,8 @@ ARG TRITON_COMMIT="improve_fa_decode_3.0.0"
 ARG AITER_REPO="https://github.com/ROCm/aiter.git"
 ARG AITER_COMMIT="v0.1.1"
 
-RUN git clone ${SGL_REPO} \
-    && cd sglang \
+COPY . /sgl-workspace/sglang
+RUN cd sglang \
     && if [ "${SGL_BRANCH}" = ${SGL_DEFAULT} ]; then \
          echo "Using ${SGL_DEFAULT}, default branch."; \
        else \
