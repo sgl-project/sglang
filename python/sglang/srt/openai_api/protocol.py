@@ -14,7 +14,7 @@
 """Pydantic models for OpenAI API protocol"""
 
 import time
-from typing import Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 from pydantic import BaseModel, Field, root_validator
 from typing_extensions import Literal
@@ -335,6 +335,7 @@ class ChatCompletionRequest(BaseModel):
     tool_choice: Union[ToolChoice, Literal["auto", "required", "none"]] = Field(
         default="auto", examples=["none"]
     )  # noqa
+    chat_template_kwargs: Optional[Dict[str, Any]] = None
 
     @root_validator(pre=True)
     def set_tool_choice_default(cls, values):
