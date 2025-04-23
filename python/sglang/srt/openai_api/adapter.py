@@ -20,7 +20,7 @@ import os
 import time
 import uuid
 from http import HTTPStatus
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from fastapi import HTTPException, Request, UploadFile
 from fastapi.responses import ORJSONResponse, StreamingResponse
@@ -894,7 +894,7 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
 def v1_chat_generate_request(
     all_requests: List[ChatCompletionRequest],
     tokenizer_manager,
-    request_ids: List[str] = None,
+    request_ids: Optional[List[str]],
 ):
     input_ids = []
     prompts = []
