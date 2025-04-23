@@ -932,7 +932,7 @@ class ModelRunner:
             )
 
             self.attn_backend = TorchNativeAttnBackend(self)
-        elif self.server_args.attention_backend == "hpu":
+        elif self.server_args.attention_backend == "hpu_attn_backend":
             from sglang.srt.layers.attention.hpu_attn_backend import HPUAttnBackend
 
             self.attn_backend = HPUAttnBackend(self)
