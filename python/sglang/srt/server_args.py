@@ -268,7 +268,7 @@ class ServerArgs:
 
         # Set kernel backends for hpu device
         if self.device == "hpu":
-            self.attention_backend = "hpu"
+            self.attention_backend = "hpu_attn_backend"
             self.sampling_backend = "pytorch"
 
         # Set kernel backends

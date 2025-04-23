@@ -347,7 +347,7 @@ class ForwardBatch:
             ).to(device, non_blocking=True)
             if model_runner.server_args.attention_backend not in [
                 "torch_native",
-                "hpu",
+                "hpu_attn_backend",
             ]:
                 ret.extend_num_tokens = batch.extend_num_tokens
                 positions, ret.extend_start_loc = compute_position_triton(
@@ -372,7 +372,7 @@ class ForwardBatch:
         if model_runner.server_args.lora_paths is not None:
             model_runner.lora_manager.prepare_lora_batch(ret)
 
-        if model_runner.server_args.attention_backend == "hpu":
+        if model_runner.server_args.attention_backend == "hpu_attn_backend":
             ret.hpu_metadata = batch.hpu_metadata
         return ret
 
