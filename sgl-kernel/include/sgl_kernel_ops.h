@@ -209,6 +209,20 @@ std::vector<at::Tensor> moe_fused_gate(
     int64_t n_share_experts_fusion,
     double routed_scaling_factor);
 
+void fp8_blockwise_scaled_grouped_mm(
+    torch::Tensor& output,
+    const torch::Tensor& a,
+    const torch::Tensor& b,
+    const torch::Tensor& scales_a,
+    const torch::Tensor& scales_b,
+    const torch::Tensor& stride_a,
+    const torch::Tensor& stride_b,
+    const torch::Tensor& stride_c,
+    const torch::Tensor& layout_sfa,
+    const torch::Tensor& layout_sfb,
+    const torch::Tensor& problem_sizes,
+    const torch::Tensor& expert_offsets);
+
 /*
  * From csrc/speculative
  */
@@ -338,3 +352,8 @@ std::vector<at::Tensor> mha_varlen_fwd_sparse(
     const bool return_softmax,
     c10::optional<at::Generator> gen_);
 }  // namespace flash
+
+/*
+ * From XGrammar
+ */
+void ApplyTokenBitmaskInplace(at::Tensor logits, at::Tensor bitmask, at::optional<at::Tensor> indices = at::nullopt);
