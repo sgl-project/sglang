@@ -1991,6 +1991,7 @@ def is_fa3_default_architecture(hf_config):
         "LlamaForCausalLM",
         "MistralForCausalLM",
         "Gemma2ForCausalLM",
+        "Gemma3ForConditionalGeneration",
     }
     return architectures[0] in default_archs
 
