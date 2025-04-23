@@ -46,7 +46,7 @@ DEFAULT_MODELS = [
     "Qwen/Qwen3-MoE",
 ]
 DEFAULT_BATCH_SIZES = [1, 4, 8, 16, 32, 64, 128, 256, 512]
-DEFAULT_TP_SIZES = [1, 2, 4, 8]
+DEFAULT_TP_SIZES = [1]
 
 PER_ACT_TOKEN_OPTS = [False]
 PER_OUT_CH_OPTS = [False]
@@ -61,7 +61,7 @@ def to_fp8(tensor: torch.Tensor):
 def bench_run(results: list[benchmark.Measurement], model: str,
               num_experts: int, topk: int, per_act_token: bool,
               per_out_ch: bool, mkn: tuple[int, int, int]):
-    label = "Quant Matmul"
+    label = "Cutlass vs Triton MoE"
 
     sub_label = (
         "{}, num_experts={}, topk={}, per_act_token={} per_out_ch={}, "
@@ -285,7 +285,7 @@ def bench_run(results: list[benchmark.Measurement], model: str,
             globals=globals,
             label=label,
             sub_label=sub_label,
-            description="grouped_gemm_moe",
+            description="cutlass_moe",
         ).blocked_autorange(min_run_time=min_run_time))
 
     # Warmup
@@ -297,7 +297,7 @@ def bench_run(results: list[benchmark.Measurement], model: str,
             globals=globals,
             label=label,
             sub_label=sub_label,
-            description="grouped_gemm_moe_cuda_graphs",
+            description="cutlass_moe_cuda_graphs",
         ).blocked_autorange(min_run_time=min_run_time))
 
 
