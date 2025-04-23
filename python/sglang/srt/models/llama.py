@@ -491,6 +491,14 @@ class LlamaForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
 
         for name, loaded_weight in weights:
+
+            #QuaRot - temporary
+            if "zero_point" in name:
+                continue
+
+            if ".module" in name:
+                name=name.replace(".module","")
+
             if "rotary_emb.inv_freq" in name or "projector" in name:
                 continue
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
