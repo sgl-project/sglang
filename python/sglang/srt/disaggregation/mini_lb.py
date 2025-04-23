@@ -187,11 +187,11 @@ async def handle_generate_request(request_data: dict):
 
     if request_data.get("stream", False):
         return await load_balancer.generate_stream(
-            modified_request, prefill_server, decode_server
+            modified_request, prefill_server, decode_server, "generate"
         )
     else:
         return await load_balancer.generate(
-            modified_request, prefill_server, decode_server
+            modified_request, prefill_server, decode_server, "generate"
         )
 
 
