@@ -1607,7 +1607,8 @@ class DeepseekV2DecoderLayer(nn.Module):
                 self._forward_tbo_op_prefill_attn,
                 self._forward_tbo_op_post_attn_layernorm,
                 self.mlp._forward_tbo_op_gate,
-                self.mlp._forward_tbo_op_dispatch_a,
+                self.mlp._forward_tbo_op_dispatch_a_part_one,
+                self.mlp._forward_tbo_op_dispatch_a_part_two,
                 two_batch_overlap.YieldOperation(),
                 partial(
                     self.mlp._forward_tbo_op_dispatch_b, tbo_child_index=tbo_child_index
@@ -1628,7 +1629,8 @@ class DeepseekV2DecoderLayer(nn.Module):
                 self._forward_tbo_op_post_attn_layernorm,
                 self.mlp._forward_tbo_op_gate,
                 two_batch_overlap.YieldOperation(),
-                self.mlp._forward_tbo_op_dispatch_a,
+                self.mlp._forward_tbo_op_dispatch_a_part_one,
+                self.mlp._forward_tbo_op_dispatch_a_part_two,
                 self.mlp._forward_tbo_op_shared,
                 two_batch_overlap.YieldOperation(),
                 partial(
