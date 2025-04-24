@@ -66,23 +66,24 @@ INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 # Put some global args for easy access
 global_server_args_dict = {
     "attention_backend": ServerArgs.attention_backend,
-    "sampling_backend": ServerArgs.sampling_backend,
-    "triton_attention_reduce_in_fp32": ServerArgs.triton_attention_reduce_in_fp32,
-    "torchao_config": ServerArgs.torchao_config,
-    "enable_nan_detection": ServerArgs.enable_nan_detection,
-    "enable_dp_attention": ServerArgs.enable_dp_attention,
-    "enable_ep_moe": ServerArgs.enable_ep_moe,
-    "enable_deepep_moe": ServerArgs.enable_deepep_moe,
+    "chunked_prefill_size": ServerArgs.chunked_prefill_size,
     "deepep_mode": ServerArgs.deepep_mode,
     "device": ServerArgs.device,
-    "speculative_accept_threshold_single": ServerArgs.speculative_accept_threshold_single,
-    "speculative_accept_threshold_acc": ServerArgs.speculative_accept_threshold_acc,
-    "disable_radix_cache": ServerArgs.disable_radix_cache,
-    "flashinfer_mla_disable_ragged": ServerArgs.flashinfer_mla_disable_ragged,
-    "moe_dense_tp_size": ServerArgs.moe_dense_tp_size,
-    "chunked_prefill_size": ServerArgs.chunked_prefill_size,
-    "n_share_experts_fusion": ServerArgs.n_share_experts_fusion,
     "disable_chunked_prefix_cache": ServerArgs.disable_chunked_prefix_cache,
+    "disable_radix_cache": ServerArgs.disable_radix_cache,
+    "enable_deepep_moe": ServerArgs.enable_deepep_moe,
+    "enable_dp_attention": ServerArgs.enable_dp_attention,
+    "enable_ep_moe": ServerArgs.enable_ep_moe,
+    "enable_nan_detection": ServerArgs.enable_nan_detection,
+    "flashinfer_mla_disable_ragged": ServerArgs.flashinfer_mla_disable_ragged,
+    "max_micro_batch_size": ServerArgs.max_micro_batch_size,
+    "moe_dense_tp_size": ServerArgs.moe_dense_tp_size,
+    "n_share_experts_fusion": ServerArgs.n_share_experts_fusion,
+    "sampling_backend": ServerArgs.sampling_backend,
+    "speculative_accept_threshold_acc": ServerArgs.speculative_accept_threshold_acc,
+    "speculative_accept_threshold_single": ServerArgs.speculative_accept_threshold_single,
+    "torchao_config": ServerArgs.torchao_config,
+    "triton_attention_reduce_in_fp32": ServerArgs.triton_attention_reduce_in_fp32,
 }
 
 logger = logging.getLogger(__name__)
@@ -728,6 +729,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Events
     launch_done: Optional[threading.Event] = None
 
+    # For chunked prefill in PP
+    chunked_req: Optional[Req] = None
+
     # Sampling info
     sampling_info: SamplingBatchInfo = None
     next_batch_sampling_info: SamplingBatchInfo = None
@@ -761,7 +765,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # For extend and mixed chunekd prefill
     prefix_lens: List[int] = None
     extend_lens: List[int] = None
-    extend_num_tokens: int = None
+    extend_num_tokens: Optional[int] = None
     decoding_reqs: List[Req] = None
     extend_logprob_start_lens: List[int] = None
     # It comes empty list if logprob is not required.
@@ -803,6 +807,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         enable_overlap: bool,
         spec_algorithm: SpeculativeAlgorithm,
         enable_custom_logit_processor: bool,
+        chunked_req: Optional[Req] = None,
     ):
         return_logprob = any(req.return_logprob for req in reqs)
 
@@ -820,6 +825,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             spec_algorithm=spec_algorithm,
             enable_custom_logit_processor=enable_custom_logit_processor,
             return_hidden_states=any(req.return_hidden_states for req in reqs),
+            chunked_req=chunked_req,
         )
 
     def batch_size(self):
@@ -1236,7 +1242,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def retract_decode(self, server_args: ServerArgs):
         """Retract the decoding requests when there is not enough memory."""
-        sorted_indices = [i for i in range(len(self.reqs))]
+        sorted_indices = list(range(len(self.reqs)))
 
         # TODO(lsyin): improve retraction policy for radix cache
         # For spec decoding, filter_batch API can only filter
@@ -1413,15 +1419,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def filter_batch(
         self,
-        chunked_req_to_exclude: Optional[Req] = None,
+        chunked_req_to_exclude: Optional[Union[Req, List[Req]]] = None,
         keep_indices: Optional[List[int]] = None,
     ):
         if keep_indices is None:
+            if isinstance(chunked_req_to_exclude, Req):
+                chunked_req_to_exclude = [chunked_req_to_exclude]
+            elif chunked_req_to_exclude is None:
+                chunked_req_to_exclude = []
             keep_indices = [
                 i
                 for i in range(len(self.reqs))
                 if not self.reqs[i].finished()
-                and self.reqs[i] is not chunked_req_to_exclude
+                and not self.reqs[i] in chunked_req_to_exclude
             ]
 
         if keep_indices is None or len(keep_indices) == 0:
