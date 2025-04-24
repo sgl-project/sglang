@@ -141,11 +141,10 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
         if base_output.images:
             resize_tasks = [resize_image_async(image) for image in base_output.images]
             base_output.images = await asyncio.gather(*resize_tasks)
-        print(f"{base_output=}")
         ret = self.process_mm_data(
             input_text=base_output.input_text,
             images=base_output.images,
-            audios=base_output.audios,
+            audio=base_output.audios,
         )
 
         items = []
@@ -173,7 +172,6 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
             items += [item]
 
         if self.hf_config.model_type == "qwen2_5_omni":
-            print(f"qwen2_5_omni")
             feature_attention_mask = ret.get("feature_attention_mask", None)
             if feature_attention_mask is not None:
                 audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)

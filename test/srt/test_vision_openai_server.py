@@ -803,7 +803,7 @@ class TestOpenAIOmniServer(TestOpenAIVisionServer):
         audio_response = self.get_audio_response(
             AUDIO_TRUMP_SPEECH_URL,
             # "I have an audio sample. Please repeat the person's words",
-            "Repeat what does the person say in the audio",
+            "Repeat exactly what does the person say in the audio. Be exact",
             category="speech",
         )
         self.verify_speech_recognition_response(audio_response)

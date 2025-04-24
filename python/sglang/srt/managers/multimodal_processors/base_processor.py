@@ -35,9 +35,9 @@ class BaseMultiModalProcessorOutput:
 
 @dataclasses.dataclass
 class MultimodalSpecialTokens:
-    image_token: Optional[Union[int, str]] = None
-    video_token: Optional[Union[int, str]] = None
-    audio_token: Optional[Union[int, str]] = None
+    image_token: Optional[Union[int, str, List[str]]] = None
+    video_token: Optional[Union[int, str, List[str]]] = None
+    audio_token: Optional[Union[int, str, List[str]]] = None
 
     def convert_to_str(self, token: Union[str, int], processor) -> str:
         if token is None:
@@ -89,7 +89,7 @@ class BaseMultimodalProcessor(ABC):
         if videos is not None:
             kwargs["videos"] = videos
         if audios is not None:
-            kwargs["audio"] = audios
+            kwargs["audios"] = audios
 
         processor = self._processor
         if hasattr(processor, "image_processor") and isinstance(

@@ -1827,8 +1827,10 @@ class MiniCPMO(MiniCPMBaseModel):
     ) -> torch.Tensor:
 
         mm_input = forward_batch.merge_mm_inputs()
-        placeholder_token_id = (
-            mm_input.im_token_id if forward_batch.contains_mm_inputs() else None
+        placeholder_token_ids = (
+            ([mm_input.im_token_id] + [item.pad_value for item in mm_input.mm_items])
+            if forward_batch.contains_mm_inputs()
+            else []
         )
         hidden_states = general_mm_embed_routine(
             input_ids=input_ids,
