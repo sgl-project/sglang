@@ -746,7 +746,7 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
         k_nope = latent_cache[..., : self.kv_lora_rank]
-        k_nope = self.kv_a_layernorm(k_nope).unsqueeze(1)
+        k_nope = self.kv_a_layernorm(k_nope.contiguous()).unsqueeze(1)
         k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
 
         q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
