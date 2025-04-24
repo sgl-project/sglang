@@ -2,33 +2,14 @@
 # Install the dependency in CI.
 set -euxo pipefail
 
-# Install InfiniBand packages in container
-echo "Installing InfiniBand packages in container..."
-apt-get update
-apt-get install -y libibverbs-dev libmlx5-1 rdma-core
-
-# Check InfiniBand status
-echo "Checking InfiniBand status..."
-ibv_devinfo || true
-
-# Set up GPU Direct RDMA
-echo "Setting up GPU Direct RDMA..."
-mkdir -p /etc/modprobe.d
-echo "options nvidia NVreg_EnableGpuDirectRdma=1" > /etc/modprobe.d/nvidia-gdrdma.conf
-echo "options nvidia NVreg_EnableGpuDirectRdma=1" > /etc/modprobe.d/nvidia.conf
-
-# Set environment variables for NVSHMEM
 export GDRCOPY_HOME=/usr/src/gdrdrv-2.4.4/
 export CUDA_HOME=/usr/local/cuda
 export NVSHMEM_DIR=/opt/nvshmem/install
-export NVSHMEM_CFLAGS="-I/usr/include/infiniband"
-export NVSHMEM_CXXFLAGS="-I/usr/include/infiniband"
-export NVSHMEM_LDFLAGS="-L/usr/lib/x86_64-linux-gnu -libverbs -lmlx5 -lrdmacm"
-export NVSHMEM_IBGDA_SUPPORT=1
-export NVSHMEM_USE_GDRCOPY=1
 
-# Set up InfiniBand device permissions
-chmod 666 /dev/infiniband/* 2>/dev/null || true
+# Install InfiniBand packages in container
+echo "Installing InfiniBand packages in container..."
+apt-get update
+apt-get install -y libibverbs-dev libmlx5-1 rdma-core ibverbs-utils infiniband-diags
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 bash "${SCRIPT_DIR}/killall_sglang.sh"
@@ -120,6 +101,8 @@ tar -xf nvshmem_src_3.2.5-1.txz
 mv nvshmem_src nvshmem
 cd nvshmem
 git apply /root/.cache/deepep/third-party/nvshmem.patch
+
+# Configure and build NVSHMEM with IBGDA support
 NVSHMEM_SHMEM_SUPPORT=0 \
 NVSHMEM_UCX_SUPPORT=0 \
 NVSHMEM_USE_NCCL=0 \
@@ -128,9 +111,22 @@ NVSHMEM_IBGDA_SUPPORT=1 \
 NVSHMEM_PMIX_SUPPORT=0 \
 NVSHMEM_TIMEOUT_DEVICE_POLLING=0 \
 NVSHMEM_USE_GDRCOPY=1 \
-cmake -S . -B build/ -DCMAKE_INSTALL_PREFIX=/opt/nvshmem/install -DCMAKE_CUDA_ARCHITECTURES=90
+cmake -S . -B build/ \
+    -DCMAKE_INSTALL_PREFIX=/opt/nvshmem/install \
+    -DCMAKE_CUDA_ARCHITECTURES=90 \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_CXX_FLAGS="-O3" \
+    -DCMAKE_C_FLAGS="-O3"
+
 cd build
 make -j$(nproc) install
+
+# Verify IBGDA installation
+if [ -f "/usr/lib/x86_64-linux-gnu/libibverbs.so" ]; then
+    echo "IBGDA libraries are properly installed"
+else
+    echo "Warning: IBGDA libraries may not be properly installed"
+fi
 
 # Install DeepEP
 cd /root/.cache/deepep
