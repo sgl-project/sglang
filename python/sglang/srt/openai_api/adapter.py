@@ -1497,7 +1497,7 @@ async def v1_chat_completions(
                                 model=request.model,
                             )
                             yield f"data: {chunk.model_dump_json()}\n\n"
-                        if (delta and len(delta) == 0) or not delta:
+                        if not delta:
                             stream_buffers[index] = new_stream_buffer
                             is_firsts[index] = is_first
                             continue

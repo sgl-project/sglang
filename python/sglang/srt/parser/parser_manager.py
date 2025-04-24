@@ -13,7 +13,7 @@
 # ==============================================================================
 
 import logging
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple, Union
 
 from sglang.srt.openai_api.protocol import FunctionResponse, ToolCall
 from sglang.srt.parser.code_completion_parser import (
@@ -52,7 +52,11 @@ class ParserManager:
         stream: bool = False,
         index: Optional[int] = None,
         finish_reason_type: Optional[str] = None,
-    ) -> Tuple[Optional[str], Optional[List[ToolCall]], Optional[str]]:
+    ) -> Tuple[
+        Optional[str],
+        Optional[Union[List[ToolCall], List[ToolCallItem]]],
+        Optional[str],
+    ]:
         """Handle tool calls in the response"""
         if not use_tool_call or not tools:
             return text, None, finish_reason_type

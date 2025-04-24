@@ -898,20 +898,16 @@ class Tool:
 
 
 @dataclass
-class ParseFunctionCallReq:
-    text: str  # The text to parse.
+class GenerateWithParserReqInput(GenerateReqInput):
     tools: List[Tool] = field(
-        default_factory=list
-    )  # A list of available function tools (name, parameters, etc.).
+        default_factory=list  # A list of available function tools (name, parameters, etc.).
+    )
     tool_call_parser: Optional[str] = (
         None  # Specify the parser type, e.g. 'llama3', 'qwen25', or 'mistral'. If not specified, tries all.
     )
-
-
-@dataclass
-class SeparateReasoningReqInput:
-    text: str  # The text to parse.
-    reasoning_parser: str  # Specify the parser type, e.g., "deepseek-r1".
+    reasoning_parser: Optional[str] = (
+        None  # Specify the parser type, e.g., "deepseek-r1".
+    )
 
 
 @dataclass
