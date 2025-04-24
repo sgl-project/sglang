@@ -342,9 +342,8 @@ class SchedulerDisaggregationPrefillMixin:
                 # only finished requests to running_batch.
                 self.last_batch.filter_batch(chunked_req_to_exclude=self.chunked_req)
                 self.tree_cache.cache_unfinished_req(self.chunked_req)
-                if (
-                    self.enable_overlap
-                ):  # Delay KV transfer to process_batch_result_disagg_prefill when overlap is enabled to ensure results are resolved
+                if self.enable_overlap:
+                    # Delay KV transfer to process_batch_result_disagg_prefill when overlap is enabled to ensure results are resolved
                     self.chunked_req.tmp_end_idx = min(
                         len(self.chunked_req.fill_ids),
                         len(self.chunked_req.origin_input_ids),
