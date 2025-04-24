@@ -108,6 +108,7 @@ jobs:
       - name: Run DeepEP low latency test
         timeout-minutes: 20
         run: |
+          /opt/nvshmem/bin/perftest/device/pt-to-pt/shmem_put_bw
           cd test/srt
           python3 test_deepep_low_latency.py
 
