@@ -202,6 +202,145 @@ class TestMultiTenantRadixTree(unittest.TestCase):
         for tenant, size in sizes_after.items():
             self.assertLessEqual(size, max_size[tenant])
 
+    def test_remove_tenant_simple_pruning(self):
+        """Test 6: Remove tenant leading to simple node pruning."""
+        self.tree.insert("abc", "tenant1")
+        self.tree.insert("abd", "tenant1")
+        # Tree: root -> a -> b -> c [t1]
+        #                     -> d [t1]
+        # Sizes: t1 = a(1)+b(1)+c(1) + d(1) = 4 (Note: size calc is based on node text length)
+
+        self.assertEqual(self.tree.get_used_size_per_tenant()["tenant1"], 4)
+
+        self.tree.remove_tenant("tenant1")
+
+        # Verify tenant is removed and nodes are pruned
+        sizes_after = self.tree.get_used_size_per_tenant()
+        self.assertNotIn("tenant1", sizes_after)
+        # Check if root has any children left (it shouldn't if 'a' was pruned)
+        self.assertEqual(len(self.tree.root.children), 0)
+        # Verify prefix match fails
+        matched, tenant = self.tree.prefix_match("abc")
+        self.assertEqual(matched, "") # Should match nothing
+        self.assertIsNone(tenant)
+
+    def test_remove_tenant_shared_leaf(self):
+        """Test 7: Remove tenant from a shared leaf node, node should remain."""
+        self.tree.insert("shared", "tenant1")
+        self.tree.insert("shared", "tenant2")
+        # Tree: root -> shared [t1, t2]
+        # Sizes: t1=6, t2=6
+
+        self.assertEqual(self.tree.get_used_size_per_tenant()["tenant1"], 6)
+        self.assertEqual(self.tree.get_used_size_per_tenant()["tenant2"], 6)
+
+        self.tree.remove_tenant("tenant1")
+
+        # Verify tenant1 removed, tenant2 remains, node not pruned
+        sizes_after = self.tree.get_used_size_per_tenant()
+        self.assertNotIn("tenant1", sizes_after)
+        self.assertEqual(sizes_after["tenant2"], 6)
+
+        # Verify prefix match still works for tenant2
+        matched, tenant = self.tree.prefix_match("shared")
+        self.assertEqual(matched, "shared")
+        self.assertEqual(tenant, "tenant2")
+
+    def test_remove_tenant_shared_internal_nodes(self):
+        """Test 8: Remove tenant from shared internal nodes."""
+        self.tree.insert("common/path/t1_leaf", "tenant1")
+        self.tree.insert("common/path/t2_leaf", "tenant2")
+        # Tree: root -> common -> / -> path -> / -> t1_leaf [t1]
+        #                                      -> t2_leaf [t2]
+        # Sizes: t1 = common(6)+/(1)+path(4)+/(1)+t1_leaf(7) = 19
+        #        t2 = common(6)+/(1)+path(4)+/(1)+t2_leaf(7) = 19
+
+        self.assertEqual(self.tree.get_used_size_per_tenant()["tenant1"], 19)
+        self.assertEqual(self.tree.get_used_size_per_tenant()["tenant2"], 19)
+
+        self.tree.remove_tenant("tenant1")
+
+        # Verify tenant1 removed, its leaf pruned, shared nodes remain for tenant2
+        sizes_after = self.tree.get_used_size_per_tenant()
+        self.assertNotIn("tenant1", sizes_after)
+        # Size t2 = common(6)+/(1)+path(4)+/(1)+t2_leaf(7) = 19 (should be unchanged)
+        self.assertEqual(sizes_after["tenant2"], 19)
+
+        # Verify prefix match fails for t1 data but works for t2
+        matched_t1, tenant_t1 = self.tree.prefix_match("common/path/t1_leaf")
+        # Match might stop at "common/path/" if t1_leaf node was pruned
+        self.assertTrue(len(matched_t1) < len("common/path/t1_leaf"))
+        if matched_t1 == "common/path/": # Check tenant at the stopping point
+             self.assertEqual(tenant_t1, "tenant2")
+
+        matched_t2, tenant_t2 = self.tree.prefix_match("common/path/t2_leaf")
+        self.assertEqual(matched_t2, "common/path/t2_leaf")
+        self.assertEqual(tenant_t2, "tenant2")
+
+    def test_remove_tenant_partial_branch_pruning(self):
+        """Test 9: Remove tenant causing partial branch pruning."""
+        self.tree.insert("a/b/c", "tenant1")
+        self.tree.insert("a/b/d", "tenant2")
+        # Tree: root -> a -> / -> b -> / -> c [t1]
+        #                           -> d [t2]
+        # Sizes: t1 = a(1)+/(1)+b(1)+/(1)+c(1) = 5
+        #        t2 = a(1)+/(1)+b(1)+/(1)+d(1) = 5
+
+        self.assertEqual(self.tree.get_used_size_per_tenant()["tenant1"], 5)
+        self.assertEqual(self.tree.get_used_size_per_tenant()["tenant2"], 5)
+
+        self.tree.remove_tenant("tenant1")
+
+        # Verify tenant1 removed, node 'c' pruned, nodes 'a', '/', 'b', '/' remain for t2
+        sizes_after = self.tree.get_used_size_per_tenant()
+        self.assertNotIn("tenant1", sizes_after)
+        self.assertEqual(sizes_after["tenant2"], 5) # t2 size unchanged
+
+        # Verify prefix match fails for t1, works for t2
+        matched_t1, tenant_t1 = self.tree.prefix_match("a/b/c")
+        self.assertEqual(matched_t1, "a/b/") # Should stop at 'b/' node
+        self.assertEqual(tenant_t1, "tenant2") # 'b/' node owned by t2
+
+        matched_t2, tenant_t2 = self.tree.prefix_match("a/b/d")
+        self.assertEqual(matched_t2, "a/b/d")
+        self.assertEqual(tenant_t2, "tenant2")
+
+    def test_remove_tenant_complete_removal_single_tenant(self):
+        """Test 10: Remove the only tenant, clearing the tree."""
+        self.tree.insert("data1", "tenant1")
+        self.tree.insert("data2", "tenant1")
+        # Sizes: t1 = d(1)+a(1)+t(1)+a(1)+1(1) + 2(1) = 6 (due to node splitting)
+
+        self.assertEqual(self.tree.get_used_size_per_tenant()["tenant1"], 6)
+
+        self.tree.remove_tenant("tenant1")
+
+        # Verify tree is empty
+        sizes_after = self.tree.get_used_size_per_tenant()
+        self.assertNotIn("tenant1", sizes_after)
+        self.assertEqual(len(self.tree.root.children), 0)
+
+    def test_remove_nonexistent_tenant(self):
+        """Test 11: Attempt to remove a tenant not in the tree."""
+        self.tree.insert("exists", "tenant1")
+        size_before = self.tree.get_used_size_per_tenant()["tenant1"]
+
+        self.tree.remove_tenant("nonexistent") # Should do nothing
+
+        # Verify tree state is unchanged
+        size_after = self.tree.get_used_size_per_tenant()["tenant1"]
+        self.assertEqual(size_before, size_after)
+        matched, tenant = self.tree.prefix_match("exists")
+        self.assertEqual(matched, "exists")
+        self.assertEqual(tenant, "tenant1")
+
+    def test_remove_tenant_from_empty_tree(self):
+        """Test 12: Attempt to remove a tenant from an empty tree."""
+        self.assertEqual(len(self.tree.root.children), 0)
+        self.tree.remove_tenant("tenant1") # Should do nothing, no error
+        self.assertEqual(len(self.tree.root.children), 0)
+        self.assertEqual(len(self.tree.get_used_size_per_tenant()), 0)
+
 
 if __name__ == "__main__":
     unittest.main()
