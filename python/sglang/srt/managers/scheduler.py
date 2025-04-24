@@ -1059,7 +1059,7 @@ class Scheduler(
             f"#cached-token: {adder.log_hit_tokens}, "
             f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
             # NOTE MODIFIED
-            f"input throughput (token/s): {self.last_input_throughput:.2f}, "
+            f"gap_latency: {gap_latency:.2f}, "
             f"#running-req: {running_bs}, "
             f"#queue-req: {len(self.waiting_queue)}, "
         )
