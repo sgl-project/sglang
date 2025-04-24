@@ -176,14 +176,14 @@ class SchedulerDisaggregationPrefillMixin:
     """
 
     @torch.no_grad()
-    def event_loop_normal_disagg_prefill(self):
+    def event_loop_normal_disagg_prefill(self: Scheduler):
         """A normal scheduler loop for prefill worker in disaggregation mode."""
 
         while True:
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
             self.waiting_queue.extend(
-                self.disagg_prefill_pending_queue.pop_bootstrapped()
+                self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
             self.process_prefill_chunk()
             batch = self.get_new_batch_prefill()
@@ -214,14 +214,14 @@ class SchedulerDisaggregationPrefillMixin:
             self.running_batch.batch_is_full = False
 
     @torch.no_grad()
-    def event_loop_overlap_disagg_prefill(self):
+    def event_loop_overlap_disagg_prefill(self: Scheduler):
         self.result_queue = deque()
 
         while True:
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
             self.waiting_queue.extend(
-                self.disagg_prefill_pending_queue.pop_bootstrapped()
+                self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
             self.process_prefill_chunk()
             batch = self.get_new_batch_prefill()
@@ -326,7 +326,7 @@ class SchedulerDisaggregationPrefillMixin:
                 raise Exception("Transferring failed")
 
         for req in done_reqs:
-            self.disagg_prefill_pending_queue.req_to_metadata_buffer_idx_allocator.free(
+            self.disagg_prefill_bootstrap_queue.req_to_metadata_buffer_idx_allocator.free(
                 req.metadata_buffer_index
             )
 
@@ -390,7 +390,7 @@ class SchedulerDisaggregationPrefillMixin:
             .numpy()
         )
         if last_chunk is True:
-            self.disagg_prefill_pending_queue.store_prefill_results(
+            self.disagg_prefill_bootstrap_queue.store_prefill_results(
                 req.metadata_buffer_index, token_id
             )
         page_indices = kv_to_page_indices(kv_indices, page_size)
