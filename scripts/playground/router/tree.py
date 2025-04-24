@@ -237,8 +237,38 @@ class MultiTenantRadixTree:
         Args:
             tenant_id: The identifier of the tenant whose data should be removed
         """
-        # TODO: Implementation needed
-        pass
+        if not self.root:
+            return
+
+        stack = [self.root]
+        visited_nodes = []
+
+        while stack:
+            node = stack.pop()
+            visited_nodes.append(node)
+
+            if tenant_id in node.tenant_last_access_time:
+                del node.tenant_last_access_time[tenant_id]
+
+            for child in node.children.values():
+                stack.append(child)
+
+        for node in reversed(visited_nodes):
+            # Check pruning conditions: Not root, no tenants, no children
+            if (
+                node != self.root
+                and not node.tenant_last_access_time
+                and not node.children
+            ):
+                parent = node.parent
+                if parent:  # Should always be true if node != self.root
+                    key_to_remove = None
+                    for key, child_node in parent.children.items():
+                        if child_node is node:
+                            key_to_remove = key
+                            break
+                    if key_to_remove is not None:
+                        del parent.children[key_to_remove]
 
     def pretty_print(self) -> str:
         """
