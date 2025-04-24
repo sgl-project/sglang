@@ -104,3 +104,5 @@ dpkg -l | grep -E "libibverbs|rdma-core|libmlx5"
 lsmod | grep -E "ib|mlx|rdma"
 
 ibv_devices
+
+lspci | grep -i mellanox
