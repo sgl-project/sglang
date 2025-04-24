@@ -776,6 +776,7 @@ def fill_gateup_input_triton_kernel(
     start_expert_id,
     end_expert_id,
     topk,
+    m_max,
     hidden_size,
     scale_size,
     BLOCK_SIZE: tl.constexpr,
@@ -791,6 +792,7 @@ def fill_gateup_input_triton_kernel(
         expert_id = tl.load(topk_ids_ptr + idx)
         if expert_id >= start_expert_id and expert_id <= end_expert_id:
             dst_idx = tl.load(src2dst_ptr + idx)
+            dst_idx = dst_idx - start_expert_id * m_max
             dst_ptr = gateup_input_ptr + dst_idx * hidden_size
             for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
                 offset = start_offset + tl.arange(0, BLOCK_SIZE)
@@ -834,7 +836,8 @@ def moe_ep_deepgemm_preproess(topk_ids: torch.Tensor,
     compute_masked_m_triton_kernel[(num_experts, )](
         seg_indptr, masked_m, num_experts, reorder_topk_ids.numel())
     
-    m_max = 256
+    # m_max = exp2_upper(torch.max(masked_m).item())
+    m_max = exp2_upper(hidden_states.size(0))
     expected_m = (topk_ids.numel() + num_experts - 1) // num_experts
     gateup_input = torch.empty(
         (int(end_expert_id - start_expert_id + 1), m_max, hidden_states.size(1)),
@@ -842,12 +845,9 @@ def moe_ep_deepgemm_preproess(topk_ids: torch.Tensor,
         dtype=output_dtype,
     )
 
-    # compute_src2dst_triton_kernel[grid](
-    #     reorder_ids, src2dst, topk_ids.numel(), BLOCK_SIZE=512
-    # )
     deepgemm_compute_src2dst_triton_kernel[grid](
         topk_ids, reorder_ids, seg_indptr, src2dst, m_max, topk_ids.numel(), BLOCK_SIZE=256)
-
+    
     if block_shape is not None:
         assert len(block_shape) == 2
         block_n, block_k = block_shape[0], block_shape[1]
@@ -868,18 +868,71 @@ def moe_ep_deepgemm_preproess(topk_ids: torch.Tensor,
                                     start_expert_id, 
                                     end_expert_id, 
                                     top_k,
+                                    m_max,
                                     hidden_states.size(1),
                                     scale.size(1),
                                     BLOCK_SIZE=1024)
     
-    if hidden_states.get_device() == 0:
-            print("begin")
-            print("src2dst: ", src2dst)
-            print("seg_indptr: ", seg_indptr)
-            print("masked_m:", masked_m)
-            print("m_max:", m_max)
-            print("topk_ids: ", topk_ids)
-            print("hidden_state: ", hidden_states)
-            print("gateup_input: ", gateup_input)
+    # if hidden_states.get_device() == 0:
+    #         print("begin")
+    #         print("src2dst: ", src2dst)
+    #         print("seg_indptr: ", seg_indptr)
+    #         print("m_max:", m_max)
+    #         print("topk_ids: ", topk_ids)
+    #         print("hidden_state: ", hidden_states)
+    # if hidden_states.get_device() == 7:
+    #         print("masked_m:", masked_m[start_expert_id : (end_expert_id+1)])
+    #         print("gateup_input: ", gateup_input[31])
+    #         print("gateup_input_scale: ", gateup_input_scale[31])
+    #         print("topk: ", top_k)
 
     return m_max, masked_m[start_expert_id : (end_expert_id+1)], expected_m, src2dst, gateup_input, gateup_input_scale
+
+
+@triton.jit
+def deepgemm_post_reorder_triton_kernel(
+    down_output_ptr,
+    output_ptr,
+    src2dst_ptr,
+    topk_ids_ptr,
+    topk_weights_ptr,
+    start_expert_id,
+    end_expert_id,
+    topk,
+    hidden_size,
+    max_m,
+    BLOCK_SIZE: tl.constexpr,
+):
+    InDtype = down_output_ptr.dtype.element_ty
+
+    src_idx = tl.program_id(0)
+    src2dst_ptr = src2dst_ptr + src_idx * topk
+    topk_ids_ptr = topk_ids_ptr + src_idx * topk
+    topk_weights_ptr = topk_weights_ptr + src_idx * topk
+
+    computed = False
+    store_ptr = output_ptr + src_idx * hidden_size
+    for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
+        offset = start_offset + tl.arange(0, BLOCK_SIZE)
+        mask = offset < hidden_size
+
+        sum_vec = tl.zeros([BLOCK_SIZE], dtype=InDtype)
+        for idx in range(topk):
+            expert_id = tl.load(topk_ids_ptr + idx)
+            if expert_id >= start_expert_id and expert_id <= end_expert_id:
+                computed = True
+                dst_idx = tl.load(src2dst_ptr + idx)
+                dst_idx = dst_idx - start_expert_id * max_m
+                weigh_scale = tl.load(topk_weights_ptr + idx).to(InDtype)
+                load_ptr = down_output_ptr + dst_idx * hidden_size
+                in_data = tl.load(load_ptr + offset, mask=mask)
+                sum_vec += in_data * weigh_scale
+        tl.store(store_ptr + offset, sum_vec, mask=mask)
+
+    if computed == False:
+        for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
+            offset = start_offset + tl.arange(0, BLOCK_SIZE)
+            mask = offset < hidden_size
+            tl.store(
+                store_ptr + offset, tl.zeros([BLOCK_SIZE], dtype=InDtype), mask=mask
+            )

@@ -28,6 +28,7 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     silu_and_mul_masked_post_quant_fwd,
     silu_and_mul_triton_kernel,
     moe_ep_deepgemm_preproess,
+    deepgemm_post_reorder_triton_kernel,
 )
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoEMethodBase
@@ -152,7 +153,6 @@ class EPMoE(torch.nn.Module):
         self.tp_rank = get_tensor_model_parallel_rank()
 
         self.num_experts = num_experts
-        print("num_experts: ", num_experts)
         assert self.num_experts % self.tp_size == 0
         self.num_experts_per_partition = self.num_experts // self.tp_size
         self.start_expert_id = self.tp_rank * self.num_experts_per_partition
@@ -251,21 +251,10 @@ class EPMoE(torch.nn.Module):
         gateup_output = torch.empty(
             (num_groups, m, n), device=hidden_states.device, dtype=torch.bfloat16
         )
-        # print("group1: ", num_groups)
-        # print("group2: ", self.w13_weight_fp8[0].size(0))
-        # print("m: ", m)
-        # print("n: ", n)
-        # print("k: ", k)
         
         m_grouped_gemm_fp8_fp8_bf16_nt_masked(
             gateup_input_fp8, self.w13_weight_fp8, gateup_output, masked_m, expected_m
         )
-        # if hidden_states.get_device() == 0 or hidden_states.get_device() == 0:
-        #     print(topk_ids.shape)
-        #     print("topk_ids: ", topk_ids)
-        #     print("masked_m: ", masked_m)
-        # if hidden_states.get_device() == 0:
-        #     print("finish gemm")
         
         # Act
         down_input = torch.empty(
@@ -310,7 +299,7 @@ class EPMoE(torch.nn.Module):
 
         # PostReorder
         output = torch.empty_like(hidden_states)
-        post_reorder_triton_kernel[(hidden_states.size(0),)](
+        deepgemm_post_reorder_triton_kernel[(hidden_states.size(0),)](
             down_output,
             output,
             src2dst,
@@ -320,6 +309,7 @@ class EPMoE(torch.nn.Module):
             self.end_expert_id,
             self.top_k,
             hidden_states.size(1),
+            m_max,
             BLOCK_SIZE=512,
         )
         return output
