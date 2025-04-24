@@ -23,13 +23,16 @@ import psutil
 import setproctitle
 import zmq
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import (
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
 )
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import bind_port, configure_logger, get_zmq_socket
 from sglang.utils import get_exception_traceback
 
@@ -174,6 +177,10 @@ class DataParallelController:
         if not server_args.enable_dp_attention:
             logger.info(f"Launch DP{dp_rank} starting at GPU #{base_gpu_id}.")
 
+        memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=server_args.enable_memory_saver
+        )
+
         # Launch tensor parallel scheduler processes
         scheduler_pipe_readers = []
         tp_size_per_node = server_args.tp_size // server_args.nnodes
@@ -208,7 +215,8 @@ class DataParallelController:
                 target=run_scheduler_process,
                 args=(server_args, rank_port_args, gpu_id, tp_rank, dp_rank, writer),
             )
-            proc.start()
+            with memory_saver_adapter.configure_subprocess():
+                proc.start()
             self.scheduler_procs.append(proc)
             scheduler_pipe_readers.append(reader)
 
@@ -220,9 +228,14 @@ class DataParallelController:
         self.max_total_num_tokens = scheduler_info[0]["max_total_num_tokens"]
         self.max_req_input_len = scheduler_info[0]["max_req_input_len"]
 
-    def round_robin_scheduler(self, req):
-        self.workers[self.round_robin_counter].send_pyobj(req)
-        self.round_robin_counter = (self.round_robin_counter + 1) % len(self.workers)
+    def round_robin_scheduler(self, req: Req):
+        if self.server_args.disaggregation_mode == "null":
+            self.workers[self.round_robin_counter].send_pyobj(req)
+            self.round_robin_counter = (self.round_robin_counter + 1) % len(
+                self.workers
+            )
+        else:
+            self.workers[req.bootstrap_room % len(self.workers)].send_pyobj(req)
 
     def shortest_queue_scheduler(self, input_requests):
         raise NotImplementedError()

@@ -6,7 +6,7 @@ WORKDIR /sgl-workspace
 
 RUN pip3 install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu128
 
-RUN pip3 install https://github.com/sgl-project/whl/releases/download/v0.0.9.post1/sgl_kernel-0.0.9.post1+cu128-cp39-abi3-manylinux2014_x86_64.whl \
+RUN pip3 install https://github.com/sgl-project/whl/releases/download/v0.1.0/sgl_kernel-0.1.0+cu128-cp39-abi3-manylinux2014_x86_64.whl \
     && pip3 install setuptools==75.0.0 wheel==0.41.0 scikit-build-core
 
 RUN git clone --depth=1 https://github.com/sgl-project/sglang.git \

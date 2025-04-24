@@ -1547,6 +1547,7 @@ def fused_moe(
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
     no_combine: bool = False,
+    routed_scaling_factor: Optional[float] = None,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -1601,6 +1602,7 @@ def fused_moe(
         topk_group=topk_group,
         num_expert_group=num_expert_group,
         custom_routing_function=custom_routing_function,
+        routed_scaling_factor=routed_scaling_factor,
     )
 
     return fused_experts(

@@ -58,8 +58,8 @@ FetchContent_Populate(repo-deepgemm)
 # flashinfer
 FetchContent_Declare(
     repo-flashinfer
-    GIT_REPOSITORY https://github.com/sgl-project/flashinfer
-    GIT_TAG        sgl-kernel
+    GIT_REPOSITORY https://github.com/flashinfer-ai/flashinfer.git
+    GIT_TAG        9220fb3443b5a5d274f00ca5552f798e225239b7
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-flashinfer)
@@ -195,9 +195,11 @@ set(SOURCES
     "csrc/moe/moe_align_kernel.cu"
     "csrc/moe/moe_fused_gate.cu"
     "csrc/moe/moe_topk_softmax_kernels.cu"
+    "csrc/moe/fp8_blockwise_moe_kernel.cu"
     "csrc/speculative/eagle_utils.cu"
     "csrc/speculative/speculative_sampling.cu"
     "csrc/speculative/packbit.cu"
+    "csrc/grammar/apply_token_bitmask_inplace_cuda.cu"
     "csrc/common_extension.cc"
     "${repo-flashinfer_SOURCE_DIR}/csrc/norm.cu"
     "${repo-flashinfer_SOURCE_DIR}/csrc/renorm.cu"

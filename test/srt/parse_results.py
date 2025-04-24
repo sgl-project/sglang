@@ -16,6 +16,7 @@ output_file = f"{base_name}_summary.csv"
 
 fields = [
     "max_concurrency",
+    "input_throughput",
     "output_throughput",
     "mean_ttft_ms",
     "median_ttft_ms",

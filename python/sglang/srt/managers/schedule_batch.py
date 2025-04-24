@@ -67,7 +67,6 @@ global_server_args_dict = {
     "attention_backend": ServerArgs.attention_backend,
     "sampling_backend": ServerArgs.sampling_backend,
     "triton_attention_reduce_in_fp32": ServerArgs.triton_attention_reduce_in_fp32,
-    "disable_mla": ServerArgs.disable_mla,
     "torchao_config": ServerArgs.torchao_config,
     "enable_nan_detection": ServerArgs.enable_nan_detection,
     "enable_dp_attention": ServerArgs.enable_dp_attention,
@@ -77,12 +76,11 @@ global_server_args_dict = {
     "device": ServerArgs.device,
     "speculative_accept_threshold_single": ServerArgs.speculative_accept_threshold_single,
     "speculative_accept_threshold_acc": ServerArgs.speculative_accept_threshold_acc,
-    "enable_flashmla": ServerArgs.enable_flashmla,
     "disable_radix_cache": ServerArgs.disable_radix_cache,
     "flashinfer_mla_disable_ragged": ServerArgs.flashinfer_mla_disable_ragged,
+    "moe_dense_tp_size": ServerArgs.moe_dense_tp_size,
     "chunked_prefill_size": ServerArgs.chunked_prefill_size,
     "n_share_experts_fusion": ServerArgs.n_share_experts_fusion,
-    "disable_shared_experts_fusion": ServerArgs.disable_shared_experts_fusion,
     "disable_chunked_prefix_cache": ServerArgs.disable_chunked_prefix_cache,
 }
 
@@ -287,6 +285,7 @@ class MultimodalInputs:
     num_image_tokens: Optional[int] = None
 
     # QWen2-VL related
+    mrope_positions: Optional[torch.Tensor] = None
     mrope_position_delta: Optional[torch.Tensor] = None
 
     # image
@@ -312,16 +311,12 @@ class MultimodalInputs:
         assert isinstance(ret.mm_items, list)
         ret.mm_items = [item for item in ret.mm_items if item.is_valid()]
 
-        assert len(ret.mm_items) != 0
-
-        # Use image hash as fake token_ids. We use this as the key for prefix matching in the radix cache.
-        # Please note that if the `input_ids` is later used in the model forward,
-        # you also need to clamp the values within the range of [0, vocab_size) to avoid out-of-bound
-        # errors in cuda kernels. See also llava.py for example.
         for item in ret.mm_items:
             item.set_pad_value()
 
         optional_args = [
+            "mrope_positions",
+            "mrope_position_delta",
             "im_token_id",
             "im_start_id",
             "im_end_id",
@@ -352,20 +347,26 @@ class MultimodalInputs:
         merge image inputs when requests are being merged
         """
 
-        # Use image hash as fake token_ids. We use this as the key for prefix matching in the radix cache.
-        # Please note that if the `input_ids` is later used in the model forward,
-        # you also need to clamp the values within the range of [0, vocab_size) to avoid out-of-bound
-        # errors in cuda kernels. See also llava.py for example.
-
         # args needed to be merged
         optional_args = [
             "mm_items",
             "image_pad_len",
+            "mrope_position_delta",
         ]
         for arg in optional_args:
             self_arg = getattr(self, arg, None)
             if self_arg is not None:
                 setattr(self, arg, self_arg + getattr(other, arg))
+
+        mrope_positions = self.mrope_positions
+        if mrope_positions is not None:
+            if other.mrope_positions is None:
+                self.mrope_positions = mrope_positions
+            else:
+                self.mrope_positions = torch.cat(
+                    [self.mrope_positions, other.mrope_positions], dim=1
+                )
+
         # other args would be kept intact
 
 
@@ -541,6 +542,11 @@ class Req:
         # The first output_id transferred from prefill instance.
         self.transferred_output_id: Optional[int] = None
 
+        # For overlap schedule, we delay the kv transfer until `process_batch_result_disagg_prefill` rather than `process_prefill_chunk` in non-overlap
+        # This is because kv is not ready in `process_prefill_chunk`.
+        # We use `tmp_end_idx` to store the end index of the kv cache to send.
+        self.tmp_end_idx: int = -1
+
     @property
     def seqlen(self):
         return len(self.origin_input_ids) + len(self.output_ids)
@@ -573,6 +579,14 @@ class Req:
                 self.prefix_indices, self.last_node = tree_cache.match_prefix(
                     rid=self.rid, key=self.adjust_max_prefix_ids()
                 )
+        elif enable_hierarchical_cache:
+            # in case last_node is evicted during scheduling, we need to update the prefix_indices
+            while self.last_node.evicted:
+                self.prefix_indices = self.prefix_indices[
+                    : -len(self.last_node.host_value)
+                ]
+                self.last_node = self.last_node.parent
+
         self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
 
     def adjust_max_prefix_ids(self):
@@ -1481,7 +1495,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 global_server_args_dict["use_mla_backend"]
                 and global_server_args_dict["attention_backend"] == "flashinfer"
             )
-            or global_server_args_dict["enable_flashmla"]
+            or global_server_args_dict["attention_backend"] == "flashmla"
             or global_server_args_dict["attention_backend"] == "fa3"
         ):
             seq_lens_cpu = self.seq_lens.cpu()
