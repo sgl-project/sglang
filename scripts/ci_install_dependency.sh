@@ -2,6 +2,12 @@
 # Install the dependency in CI.
 set -euxo pipefail
 
+export GDRCOPY_HOME=/usr/src/gdrdrv-2.4.4/
+export NVSHMEM_DIR=/opt/nvshmem/install
+export LD_LIBRARY_PATH="${NVSHMEM_DIR}/lib:$LD_LIBRARY_PATH"
+export PATH="${NVSHMEM_DIR}/bin:$PATH"
+export CUDA_HOME=/usr/local/cuda
+
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 bash "${SCRIPT_DIR}/killall_sglang.sh"
 
@@ -37,11 +43,6 @@ pip install transformers==4.51.0 sentence_transformers accelerate peft pandas da
 # For compling xgrammar kernels
 pip install cuda-python nvidia-cuda-nvrtc-cu12
 
-# Install DeepEP dependencies
-export GDRCOPY_HOME=/usr/src/gdrdrv-2.4.4/
-export CUDA_HOME=/usr/local/cuda
-export NVSHMEM_DIR=/opt/nvshmem/install
-
 apt-get update
 apt-get install -y wget
 wget https://github.com/Kitware/CMake/releases/download/v3.27.4/cmake-3.27.4-linux-x86_64.sh
@@ -66,10 +67,19 @@ dpkg -i gdrdrv-dkms_*.deb
 dpkg -i libgdrapi_*.deb
 dpkg -i gdrcopy-tests_*.deb
 dpkg -i gdrcopy_*.deb
+
+# Verify GDRCopy
+gdrcopy_copybw
+
 if [ ! -e "/usr/lib/x86_64-linux-gnu/libmlx5.so" ]; then
     ln -s /usr/lib/x86_64-linux-gnu/libmlx5.so.1 /usr/lib/x86_64-linux-gnu/libmlx5.so
 fi
 apt-get install -y libfabric-dev
+
+# Install nvidia-peermem
+apt-get install -y nvidia-peermem
+modprobe nvidia-peermem
+lsmod | grep nvidia_peermem
 
 # Clone DeepEP
 git clone https://github.com/deepseek-ai/DeepEP.git /root/.cache/deepep
@@ -93,18 +103,14 @@ cmake -S . -B build/ -DCMAKE_INSTALL_PREFIX=/opt/nvshmem/install -DCMAKE_CUDA_AR
 cd build
 make -j$(nproc) install
 
+# Verify NVSHMEM
+nvshmem-info -a
+
 # Install DeepEP
-cd /root/.cache/deepep
-NVSHMEM_DIR=/opt/nvshmem/install python3 setup.py install
+cd /root/.cache/deepep && python3 setup.py install
 
+# Debug
 dpkg -l | grep gdrcopy
-
 dpkg -l | grep -E "libibverbs|rdma-core|libmlx5"
-
 lsmod | grep -E "ib|mlx|rdma"
-
 ibv_devices
-
-apt-get update && apt-get install -y pciutils
-
-lspci | grep -i mellanox
