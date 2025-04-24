@@ -2,41 +2,24 @@
 # Install the dependency in CI.
 set -euxo pipefail
 
-export GDRCOPY_HOME=/usr/src/gdrdrv-2.4.4/
-export CUDA_HOME=/usr/local/cuda
-export NVSHMEM_DIR=/opt/nvshmem/install
-
-# Install InfiniBand packages in container
-echo "Installing InfiniBand packages in container..."
-apt-get update
-apt-get install -y libibverbs-dev libmlx5-1 rdma-core
-
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 bash "${SCRIPT_DIR}/killall_sglang.sh"
 
 # Clean up existing installations
-pip uninstall -y flashinfer flashinfer_python sgl-kernel sglang vllm || true
+pip uninstall -y flashinfer flashinfer_python sgl-kernel sglang vllm deepep || true
 pip cache purge
 rm -rf /root/.cache/flashinfer
+rm -rf /root/.cache/deepep
 rm -rf /usr/local/lib/python3.10/dist-packages/flashinfer*
 rm -rf /usr/local/lib/python3.10/dist-packages/sgl_kernel*
-
-# Clean up gdrcopy, nvshmem and DeepEP
-# Remove gdrcopy packages
+rm -rf /usr/local/lib/python3.10/dist-packages/deepep*
 dpkg -r gdrcopy gdrcopy-tests libgdrapi gdrdrv-dkms || true
 rm -rf /opt/gdrcopy
 rm -rf /usr/local/lib/libgdrapi*
 rm -rf /usr/local/include/gdrapi.h
-
-# Remove nvshmem
 rm -rf /opt/nvshmem
 rm -rf /usr/local/lib/libnvshmem*
 rm -rf /usr/local/include/nvshmem*
-
-# Remove DeepEP
-pip uninstall -y deepep || true
-rm -rf /root/.cache/deepep
-rm -rf /usr/local/lib/python3.10/dist-packages/deepep*
 
 # Update pip
 pip install --upgrade pip
@@ -55,7 +38,10 @@ pip install transformers==4.51.0 sentence_transformers accelerate peft pandas da
 pip install cuda-python nvidia-cuda-nvrtc-cu12
 
 # Install DeepEP dependencies
-# Install CMake
+export GDRCOPY_HOME=/usr/src/gdrdrv-2.4.4/
+export CUDA_HOME=/usr/local/cuda
+export NVSHMEM_DIR=/opt/nvshmem/install
+
 apt-get update
 apt-get install -y wget
 wget https://github.com/Kitware/CMake/releases/download/v3.27.4/cmake-3.27.4-linux-x86_64.sh
@@ -63,12 +49,10 @@ chmod +x cmake-3.27.4-linux-x86_64.sh
 ./cmake-3.27.4-linux-x86_64.sh --skip-license --prefix=/usr/local
 rm cmake-3.27.4-linux-x86_64.sh
 
-# Create installation directories
+# Install GDRCopy
+apt-get install -y libibverbs-dev libmlx5-1 rdma-core
 mkdir -p /opt/gdrcopy
 mkdir -p /opt/nvshmem
-mkdir -p /opt/deepep
-
-# Install GDRCopy
 cd /opt/gdrcopy
 git clone https://github.com/NVIDIA/gdrcopy.git .
 git checkout v2.4.4
@@ -76,7 +60,6 @@ apt update
 apt install -y nvidia-dkms-535
 apt install -y build-essential devscripts debhelper fakeroot pkg-config dkms
 apt install -y check libsubunit0 libsubunit-dev
-
 cd packages
 CUDA=/usr/local/cuda ./build-deb-packages.sh
 dpkg -i gdrdrv-dkms_*.deb
@@ -90,7 +73,7 @@ if [ ! -e "/usr/lib/x86_64-linux-gnu/libmlx5.so" ]; then
 fi
 apt-get install -y libfabric-dev
 
-# Clone DeepEP first (only for source code)
+# Clone DeepEP
 cd /root/.cache
 git clone https://github.com/deepseek-ai/DeepEP.git deepep
 
