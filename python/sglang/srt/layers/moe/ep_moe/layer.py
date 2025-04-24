@@ -997,16 +997,14 @@ class DeepEPMoE(EPMoE):
         topk_weights,
         num_recv_tokens_per_expert: List[int],
     ):
+        hidden_states_fp8, hidden_states_scale = hidden_states_fp8
         assert self.quant_method is not None
         assert self.activation == "silu"
         if num_recv_tokens_per_expert is None:
-            return hidden_states_fp8
+            return hidden_states_fp8.bfloat16()
         all_tokens = sum(num_recv_tokens_per_expert)
         if all_tokens <= 0:
-            return hidden_states_fp8
-        hidden_states_fp8, hidden_states_scale = sglang_per_token_group_quant_fp8(
-            hidden_states_fp8, 128
-        )
+            return hidden_states_fp8.bfloat16()
         M, K = hidden_states_fp8.size()
         N = self.w13_weight.size(1)
         scale_block_size = 128
