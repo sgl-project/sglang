@@ -142,6 +142,8 @@ class Qwen2_5_VisionBlock(nn.Module):
             num_heads=num_heads,
             projection_size=dim,
             use_qkv_parallel=True,
+            rotary_embed="normal",
+            proj_bias=True,
             qkv_backend="sdpa",
             softmax_in_single_precision=softmax_in_single_precision,
             flatten_batch=flatten_batch,
@@ -188,7 +190,7 @@ class Qwen2_5_VisionPatchMerger(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.hidden_size = context_dim * (spatial_merge_size**2)
+        self.hidden_size = context_dim * (spatial_merge_size ** 2)
         self.ln_q = Qwen2RMSNorm(context_dim, eps=1e-6)
         self.mlp = nn.ModuleList(
             [

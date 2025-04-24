@@ -77,7 +77,7 @@ class Qwen2_5OmniAudioAttention(nn.Module):
                 f"embed_dim must be divisible by num_heads (got `embed_dim`: {self.embed_dim}"
                 f" and `num_heads`: {num_heads})."
             )
-        self.scaling = self.head_dim**-0.5
+        self.scaling = self.head_dim ** -0.5
         self.is_decoder = is_decoder
         self.is_causal = is_causal
 
@@ -133,9 +133,9 @@ class Qwen2_5OmniAudioAttention(nn.Module):
         )
         for i in range(1, len(cu_seqlens)):
             attention_mask[
-                ...,
-                cu_seqlens[i - 1] : cu_seqlens[i],
-                cu_seqlens[i - 1] : cu_seqlens[i],
+            ...,
+            cu_seqlens[i - 1]: cu_seqlens[i],
+            cu_seqlens[i - 1]: cu_seqlens[i],
             ] = 0
 
         attn_weights = attn_weights + attention_mask
@@ -479,6 +479,8 @@ class Qwen2_5OmniVisionBlock(nn.Module):
             projection_size=config.hidden_size,
             use_qkv_parallel=True,
             qkv_backend="sdpa",
+            rotary_embed="normal",
+            proj_bias=True,
             softmax_in_single_precision=True,
             flatten_batch=True,
             quant_config=quant_config,
@@ -501,7 +503,7 @@ class Qwen2_5OmniVisionBlock(nn.Module):
 class Qwen2_5OmniPatchMerger(nn.Module):
     def __init__(self, dim: int, context_dim: int, spatial_merge_size: int = 2) -> None:
         super().__init__()
-        self.hidden_size = context_dim * (spatial_merge_size**2)
+        self.hidden_size = context_dim * (spatial_merge_size ** 2)
         self.ln_q = RMSNorm(context_dim, eps=1e-6)
         self.mlp = nn.Sequential(
             nn.Linear(self.hidden_size, self.hidden_size),
@@ -922,8 +924,6 @@ class Qwen2_5OmniThinkerForConditionalGeneration(nn.Module):
         return self.model.get_input_embeddings()
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        print(f"image {items=}")
-
         # in qwen-vl, last dim is the same
         pixel_values = (
             torch.concat([item.pixel_values for item in items], dim=0)
@@ -939,7 +939,6 @@ class Qwen2_5OmniThinkerForConditionalGeneration(nn.Module):
         return image_embeds
 
     def get_audio_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        print(f"audio {items=}")
         input_features = (
             torch.cat([item.audio_feature for item in items])
             .type(self.audio_tower.dtype)
@@ -950,9 +949,9 @@ class Qwen2_5OmniThinkerForConditionalGeneration(nn.Module):
         )
         if feature_attention_mask is not None:
             audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
-            # input_features = input_features.permute(0, 2, 1)[
-            #     feature_attention_mask.bool()
-            # ].permute(1, 0)
+            input_features = input_features.permute(0, 2, 1)[
+                feature_attention_mask.bool()
+            ].permute(1, 0)
         else:
             audio_feature_lengths = None
 
@@ -988,7 +987,6 @@ class Qwen2_5OmniThinkerForConditionalGeneration(nn.Module):
 
         if self.is_mrope_enabled:
             positions = forward_batch.mrope_positions
-
         hs = general_mm_embed_routine(
             input_ids=input_ids,
             forward_batch=forward_batch,
@@ -1038,7 +1036,6 @@ class Qwen2_5OmniModel(nn.Module):
         media_token_ids = [mm_inputs.im_token_id, mm_inputs.audio_token_id]
         pattern = MultiModalityDataPaddingPatternMultimodalTokens(media_token_ids)
         return pattern.pad_input_tokens(input_ids, mm_inputs)
-        return input_ids
 
     def load_speakers(self, path):
         for key, value in torch.load(path).items():

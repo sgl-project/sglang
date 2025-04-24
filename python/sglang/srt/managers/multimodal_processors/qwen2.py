@@ -19,9 +19,6 @@ from sglang.srt.models.qwen2_5_omni import Qwen2_5OmniModel
 from sglang.srt.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
 from sglang.srt.models.qwen2_vl import Qwen2VLForConditionalGeneration
 
-QWEN_DEFAULT_SYSTEM_PROMPT = """You are a helpful assistant."""
-QWEN_AUDIO_SYSTEM_PROMPT = """You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, capable of perceiving auditory and visual inputs, as well as generating text and speech."""
-
 
 # Compatible with Qwen2VL, Qwen2_5VL and Qwen2_5_o
 class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
@@ -41,15 +38,14 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
             self.audio_token_id = hf_config.thinker_config.audio_token_index
             self.audio_start_id = hf_config.thinker_config.audio_start_token_id
             self.audio_end_id = hf_config.thinker_config.audio_end_token_id
-
             self.video_token_id = hf_config.thinker_config.video_token_index
         else:
-            self.image_token_id = hf_config.token_ids
+            self.image_token_id = hf_config.image_token_id
             self.image_start_id = hf_config.vision_start_token_id
             self.image_end_id = hf_config.vision_end_token_id
             self.video_token_id = hf_config.video_token_id
-        self.vision_start_token_id = hf_config.vision_start_token_id
-        self.vision_end_token_id = hf_config.vision_end_token_id
+            self.vision_start_token_id = hf_config.vision_start_token_id
+            self.vision_end_token_id = hf_config.vision_end_token_id
         self.NUM_TOKEN_PER_FRAME = 770
         self.IMAGE_FACTOR = 28
         self.MIN_PIXELS = 4 * 28 * 28
@@ -65,7 +61,6 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
         *args,
         **kwargs,
     ):
-
         if isinstance(image_data, str):
             image_data = [image_data]
         audio_data = request_obj.audio_data
@@ -177,20 +172,38 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
             )
             items += [item]
 
-        mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
-            spatial_merge_size=self.hf_config.vision_config.spatial_merge_size,
-            image_token_id=self.image_token_id,
-            video_token_id=self.video_token_id,
-            vision_start_token_id=self.vision_start_token_id,
-            model_type=self.hf_config.model_type,
-            tokens_per_second=getattr(
-                self.hf_config.vision_config, "tokens_per_second", None
-            ),
-            input_ids=torch.tensor(input_ids).unsqueeze(0),
-            image_grid_thw=ret.get("image_grid_thw", None),
-            video_grid_thw=ret.get("video_grid_thw", None),
-            second_per_grid_ts=ret.get("second_per_grid_ts", None),
-        )
+        if self.hf_config.model_type == "qwen2_5_omni":
+            print(f"qwen2_5_omni")
+            feature_attention_mask = ret.get("feature_attention_mask", None)
+            if feature_attention_mask is not None:
+                audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
+            else:
+                audio_feature_lengths = None
+            mrope_positions, mrope_position_delta = (
+                MRotaryEmbedding.get_rope_index_omni(
+                    input_ids=torch.tensor(input_ids).unsqueeze(0),
+                    config=self.hf_config.thinker_config,
+                    image_grid_thw=ret.get("image_grid_thw", None),
+                    video_grid_thw=ret.get("video_grid_thw", None),
+                    audio_seqlens=audio_feature_lengths,
+                    second_per_grids=ret.get("second_per_grids", None),
+                )
+            )
+        else:
+            mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
+                spatial_merge_size=self.hf_config.vision_config.spatial_merge_size,
+                image_token_id=self.image_token_id,
+                video_token_id=self.video_token_id,
+                vision_start_token_id=self.vision_start_token_id,
+                model_type=self.hf_config.model_type,
+                tokens_per_second=getattr(
+                    self.hf_config.vision_config, "tokens_per_second", None
+                ),
+                input_ids=torch.tensor(input_ids).unsqueeze(0),
+                image_grid_thw=ret.get("image_grid_thw", None),
+                video_grid_thw=ret.get("video_grid_thw", None),
+                second_per_grid_ts=ret.get("second_per_grid_ts", None),
+            )
         mrope_positions = mrope_positions.squeeze(1)
 
         return {

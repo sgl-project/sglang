@@ -436,7 +436,7 @@ class ForwardBatch:
                     batch.extend_seq_lens[batch_idx],
                     batch.extend_prefix_lens[batch_idx],
                 )
-                if mm_input is None or not mm_input.contains_mm_input():
+                if mm_input is None:
                     # text only
                     mrope_positions = torch.tensor(
                         [
@@ -460,7 +460,9 @@ class ForwardBatch:
         self.mrope_positions = torch.cat(
             [pos.to(device=model_runner.device) for pos in mrope_positions_list],
             dim=1,
-        ).to(dtype=torch.int64, device=model_runner.device)
+        ).to(dtype=torch.int64,device=model_runner.device)
+
+
 
     def get_max_chunk_capacity(self):
         # Maximum number of tokens in each chunk

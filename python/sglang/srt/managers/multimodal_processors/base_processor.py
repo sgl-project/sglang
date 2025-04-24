@@ -265,7 +265,7 @@ class BaseMultimodalProcessor(ABC):
             discard_alpha_channel=discard_alpha_channel,
         )
         # Process results
-        image_index, audio_index = 0, 0
+        audio_index = 0
         image_sizes, images, audios = [], [], []
         new_text = ""
         task_ptr = 0

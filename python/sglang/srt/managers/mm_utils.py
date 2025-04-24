@@ -182,11 +182,11 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
             start_idx = starts[i]
             end_idx = ends[i]
             pad_value = pad_values[i]
-if pad_value is not None:  # Ensure pad_value is not None before assignment
+            if pad_value is not None:  # Ensure pad_value is not None before assignment
                 output_ids_tensor[start_idx:end_idx] = pad_value
             else:
                 logger.warning(f"Skipping region {i} due to None pad_value.")
-
+        print(f"{output_ids_tensor.tolist()=}")
         return output_ids_tensor.tolist()
 
 
@@ -276,6 +276,7 @@ def embed_mm_inputs(
 
     if mm_inputs is None:
         return None
+
     # 1. Calculate the multimodal data which exists in input_ids, with the help of pad_values
     # we assume that multimodal data are represented with its pad_values in input_ids
     # See `pad_input_ids` for more detail

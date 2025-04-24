@@ -150,6 +150,7 @@ def prepare_samples(eval_args: EvalArgs):
             # Handle cases where a dataset failed to load (optional, depends on desired behavior)
             print(f"Warning: Dataset for subject '{subject}' could not be loaded.")
 
+    # merge all dataset
     dataset = concatenate_datasets(sub_dataset_list)
 
     # Prepare images in parallel
