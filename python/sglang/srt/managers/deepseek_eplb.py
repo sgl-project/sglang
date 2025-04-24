@@ -243,6 +243,10 @@ def _hack_shuffle(phy2log_old, log2phy_old, logcnt_old):
         for logical_expert_id in range(num_log_experts):
             for last_dim_index in range(log2phy_last_dim):
                 old_value = log2phy_old[layer_id, logical_expert_id, last_dim_index]
+                if old_value == -1:
+                    new_value = -1
+                else:
+                    new_value = TODO
                 log2phy_new[layer_id, logical_expert_id, last_dim_index] = new_value
 
     return phy2log_new, log2phy_new, None
