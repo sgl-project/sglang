@@ -1,36 +1,18 @@
 """
-# FastAPI example for SGLang engine
-# This example demonstrates how to create a FastAPI server that uses the SGLang engine for text generation.
+FastAPI server example for text generation using SGLang Engine and demonstrating client usage.
 
-Requirements:
-- fastapi
-- uvicorn
-
-Usage:
-
-1. Start the server:
-    ```python
-    python fastapi_engine_inference.py
-    ```
-
-2. Then, you can send a curl request to test the endpoint:
-    ```bash
-        curl -X POST http://localhost:8000/generate \
-            -H "Content-Type: application/json" \
-            -d '{
-                "prompt": "What is the capital of France?",
-                "max_new_tokens": 50,
-                "temperature": 0.5
-                }'
-    ```
+Starts the server, sends requests to it, and prints responses.
 """
 
+import subprocess
+import time
 from contextlib import asynccontextmanager
 
-import uvicorn
+import requests
+from fastapi import FastAPI, Request
 
 import sglang as sgl
-from examples.runtime.engine.fastapi_engine_inference import FastAPI, Request
+from sglang.utils import terminate_process
 
 engine = None
 
@@ -38,6 +20,7 @@ engine = None
 # Use FastAPI's lifespan manager to initialize/shutdown the engine
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """Manages SGLang engine initialization during server startup."""
     global engine
     # Initialize the SGLang engine when the server starts
     # Adjust model_path and other engine arguments as needed
@@ -56,6 +39,7 @@ app = FastAPI(lifespan=lifespan)
 
 @app.post("/generate")
 async def generate_text(request: Request):
+    """FastAPI endpoint to handle text generation requests."""
     global engine
     if not engine:
         return {"error": "Engine not initialized"}, 503
@@ -84,9 +68,104 @@ async def generate_text(request: Request):
         return {"error": str(e)}, 500
 
 
-if __name__ == "__main__":
-    # Required for async_generate if running in a nested loop environment like Jupyter
-    # import nest_asyncio
-    # nest_asyncio.apply()
+# Helper function to start the server
+def start_server(host, port, timeout=60):
+    """Starts the Uvicorn server as a subprocess and waits for it to be ready."""
+    base_url = f"http://{host}:{port}"
+    command = [
+        "python",
+        "-m",
+        "uvicorn",
+        "fastapi_engine_inference:app",
+        f"--host={host}",
+        f"--port={port}",
+    ]
 
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    process = subprocess.Popen(command, stdout=None, stderr=None)
+
+    start_time = time.time()
+    with requests.Session() as session:
+        while time.time() - start_time < timeout:
+            try:
+                # Check the /docs endpoint which FastAPI provides by default
+                response = session.get(
+                    f"{base_url}/docs", timeout=5
+                )  # Add a request timeout
+                if response.status_code == 200:
+                    print(f"Server {base_url} is ready (responded on /docs)")
+                    return process
+            except requests.ConnectionError:
+                # Specific exception for connection refused/DNS error etc.
+                pass
+            except requests.Timeout:
+                # Specific exception for request timeout
+                print(f"Health check to {base_url}/docs timed out, retrying...")
+                pass
+            except requests.RequestException as e:
+                # Catch other request exceptions
+                print(f"Health check request error: {e}, retrying...")
+                pass
+            # Use a shorter sleep interval for faster startup detection
+            time.sleep(1)
+
+    # If loop finishes, raise the timeout error
+    # Attempt to terminate the failed process before raising
+    if process:
+        print(
+            "Server failed to start within timeout, attempting to terminate process..."
+        )
+        terminate_process(process)  # Use the imported terminate_process
+    raise TimeoutError(
+        f"Server failed to start at {base_url} within the timeout period."
+    )
+
+
+def send_requests(server_url, prompts, max_new_tokens, temperature):
+    """Sends generation requests to the running server for a list of prompts."""
+    # Iterate through prompts and send requests
+    for i, prompt in enumerate(prompts):
+        print(f"\n[{i+1}/{len(prompts)}] Sending prompt: '{prompt}'")
+        payload = {
+            "prompt": prompt,
+            "max_new_tokens": max_new_tokens,
+            "temperature": temperature,
+        }
+
+        try:
+            response = requests.post(f"{server_url}/generate", json=payload, timeout=60)
+
+            result = response.json()
+
+            print(f"Prompt: {prompt}\nResponse: {result['generated_text']}")
+
+        except requests.exceptions.Timeout:
+            print(f"  Error: Request timed out for prompt '{prompt}'")
+        except requests.exceptions.RequestException as e:
+            print(f"  Error sending request for prompt '{prompt}': {e}")
+
+
+if __name__ == "__main__":
+    """Main entry point for the script."""
+    # Define the server parameters
+    port = 8000
+    host = "127.0.0.1"
+    server_url = f"http://{host}:{port}"
+
+    # Start the server
+    process = start_server(host, port)
+
+    # Define the prompts and sampling parameters
+    prompts = [
+        "Hello, my name is",
+        "The president of the United States is",
+        "The capital of France is",
+        "The future of AI is",
+    ]
+    max_new_tokens = 64
+    temperature = 0.1
+
+    # Send requests to the server
+    send_requests(server_url, prompts, max_new_tokens, temperature)
+
+    # Terminate the server process
+    terminate_process(process)
