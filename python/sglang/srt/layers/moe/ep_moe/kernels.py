@@ -808,7 +808,7 @@ def fill_gateup_input_triton_kernel(
             
 
 def exp2_upper(num: int) -> int:
-    for i in range(31):
+    for i in range(2, 31):
         value = pow(2, i)
         if num <= value:
             return value
