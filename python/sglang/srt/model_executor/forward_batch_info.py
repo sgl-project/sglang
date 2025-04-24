@@ -29,7 +29,7 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import IntEnum, auto
 from typing import TYPE_CHECKING, List, Optional, Union
 
@@ -38,7 +38,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
-from sglang.srt.utils import get_compiler_backend
+from sglang.srt.utils import flatten_nested_list, get_compiler_backend
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -364,20 +364,20 @@ class ForwardBatch:
 
     def merge_mm_inputs(self) -> Optional[MultimodalInputs]:
         """
-        Merge all image inputs in the batch into a single MultiModalInputs object.
+        Merge all multimodal inputs in the batch into a single MultiModalInputs object.
 
         Returns:
-            if none, current batch contains no image input
+            if none, current batch contains no multimodal input
 
         """
         if not self.mm_inputs or all(x is None for x in self.mm_inputs):
             return None
-
         # Filter out None values
         valid_inputs = [x for x in self.mm_inputs if x is not None]
 
         # Start with the first valid image input
-        merged = valid_inputs[0]
+        # TODO: is it expensive?
+        merged = replace(valid_inputs[0])
 
         # Merge remaining inputs
         for mm_input in valid_inputs[1:]:
@@ -407,26 +407,33 @@ class ForwardBatch:
     def _compute_mrope_positions(
         self, model_runner: ModelRunner, batch: ModelWorkerBatch
     ):
-        mrope_positions_list = [None] * self.seq_lens.shape[0]
-        if self.forward_mode.is_decode():
-            for i, _ in enumerate(mrope_positions_list):
-                mrope_position_delta = (
-                    0
-                    if batch.multimodal_inputs[i] is None
-                    else batch.multimodal_inputs[i].mrope_position_delta
+        # batch_size * [3 * seq_len]
+        batch_size = self.seq_lens.shape[0]
+        mrope_positions_list = [[]] * batch_size
+        for batch_idx in range(batch_size):
+            mm_input = batch.multimodal_inputs[batch_idx]
+            if self.forward_mode.is_decode():
+                mrope_position_deltas = (
+                    [0]
+                    if mm_input is None
+                    else flatten_nested_list(mm_input.mrope_position_delta.tolist())
                 )
-                mrope_positions_list[i] = torch.tensor(
-                    MRotaryEmbedding.get_next_input_positions(
-                        mrope_position_delta,
-                        int(self.seq_lens[i]) - 1,
-                        int(self.seq_lens[i]),
-                    )
-                )
-        elif self.forward_mode.is_extend():
-            for i, mm_input in enumerate(batch.multimodal_inputs):
+                next_input_positions = []
+                for i, mrope_position_delta in enumerate(mrope_position_deltas):
+                    # batched deltas needs to be processed separately
+                    next_input_positions += [
+                        MRotaryEmbedding.get_next_input_positions(
+                            mrope_position_delta,
+                            int(self.seq_lens[batch_idx]) - 1,
+                            int(self.seq_lens[batch_idx]),
+                        )
+                    ]
+                # 3 * N
+                mrope_positions_list[batch_idx] = torch.cat(next_input_positions, dim=1)
+            elif self.forward_mode.is_extend():
                 extend_seq_len, extend_prefix_len = (
-                    batch.extend_seq_lens[i],
-                    batch.extend_prefix_lens[i],
+                    batch.extend_seq_lens[batch_idx],
+                    batch.extend_prefix_lens[batch_idx],
                 )
                 if mm_input is None:
                     # text only
@@ -447,7 +454,7 @@ class ForwardBatch:
                         :,
                         extend_prefix_len : extend_prefix_len + extend_seq_len,
                     ]
-                mrope_positions_list[i] = mrope_positions
+                mrope_positions_list[batch_idx] = mrope_positions
 
         self.mrope_positions = torch.cat(
             [pos.to(device=model_runner.device) for pos in mrope_positions_list],
