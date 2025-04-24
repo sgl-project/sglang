@@ -740,7 +740,6 @@ class TestOpenAIOmniServer(TestOpenAIVisionServer):
                 "--mem-fraction-static",
                 "0.6",
                 "--tp=2",
-                "--disable-cuda-graph",
             ],
         )
         cls.base_url += "/v1"
