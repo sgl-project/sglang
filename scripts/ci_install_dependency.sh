@@ -7,10 +7,14 @@ export GDRCOPY_HOME=/usr/src/gdrdrv-2.4.4/
 export CUDA_HOME=/usr/local/cuda
 export NVSHMEM_DIR=/opt/nvshmem/install
 
-# Set include paths, handling unset variables
-export C_INCLUDE_PATH=/usr/include/infiniband${C_INCLUDE_PATH:+:$C_INCLUDE_PATH}
-export CPLUS_INCLUDE_PATH=/usr/include/infiniband${CPLUS_INCLUDE_PATH:+:$CPLUS_INCLUDE_PATH}
-export CPATH=/usr/include/infiniband${CPATH:+:$CPATH}
+# Set NVSHMEM compilation flags
+export NVSHMEM_CFLAGS="-I/usr/include/infiniband"
+export NVSHMEM_CXXFLAGS="-I/usr/include/infiniband"
+
+# Debug information
+echo "Current include paths:"
+echo "NVSHMEM_CFLAGS: $NVSHMEM_CFLAGS"
+echo "NVSHMEM_CXXFLAGS: $NVSHMEM_CXXFLAGS"
 
 # Check InfiniBand headers
 echo "Checking InfiniBand headers..."
