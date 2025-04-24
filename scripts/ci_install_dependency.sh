@@ -3,34 +3,50 @@
 set -euxo pipefail
 
 # Set environment variables
-export GDRCOPY_HOME=/usr/src/gdrdrv-2.4.4/
-export CUDA_HOME=/usr/local/cuda
-export NVSHMEM_DIR=/opt/nvshmem/install
+# export GDRCOPY_HOME=/usr/src/gdrdrv-2.4.4/
+# export CUDA_HOME=/usr/local/cuda
+# export NVSHMEM_DIR=/opt/nvshmem/install
 
-# Set NVSHMEM compilation flags
-export NVSHMEM_CFLAGS="-I/usr/include/infiniband"
-export NVSHMEM_CXXFLAGS="-I/usr/include/infiniband"
+apt-get update
+apt-get install -y libibverbs-dev libmlx5-dev
 
-# Debug information
-echo "Current include paths:"
-echo "NVSHMEM_CFLAGS: $NVSHMEM_CFLAGS"
-echo "NVSHMEM_CXXFLAGS: $NVSHMEM_CXXFLAGS"
+# # Debug system information
+# echo "System information:"
+# echo "Current directory: $(pwd)"
+# echo "System paths:"
+# echo "/usr/include/infiniband exists: $(test -d /usr/include/infiniband && echo "yes" || echo "no")"
+# echo "/usr/include/infiniband/mlx5dv.h exists: $(test -f /usr/include/infiniband/mlx5dv.h && echo "yes" || echo "no")"
+# echo "Directory contents of /usr/include:"
+# ls -la /usr/include/
+# echo "Directory contents of /usr/include/infiniband (if exists):"
+# ls -la /usr/include/infiniband/ 2>/dev/null || echo "Directory does not exist"
 
-# Check InfiniBand headers
-echo "Checking InfiniBand headers..."
-if [ ! -d "/usr/include/infiniband" ]; then
-    echo "Error: /usr/include/infiniband directory not found"
-    exit 1
-fi
+# # Set NVSHMEM compilation flags
+# export NVSHMEM_CFLAGS="-I/usr/include/infiniband"
+# export NVSHMEM_CXXFLAGS="-I/usr/include/infiniband"
 
-if [ ! -f "/usr/include/infiniband/mlx5dv.h" ]; then
-    echo "Error: /usr/include/infiniband/mlx5dv.h not found"
-    echo "Available headers in /usr/include/infiniband:"
-    ls -la /usr/include/infiniband/
-    exit 1
-fi
+# # Debug information
+# echo "Current include paths:"
+# echo "NVSHMEM_CFLAGS: $NVSHMEM_CFLAGS"
+# echo "NVSHMEM_CXXFLAGS: $NVSHMEM_CXXFLAGS"
 
-echo "InfiniBand headers check passed"
+# # Check InfiniBand headers
+# echo "Checking InfiniBand headers..."
+# if [ ! -d "/usr/include/infiniband" ]; then
+#     echo "Error: /usr/include/infiniband directory not found"
+#     echo "Trying to find InfiniBand headers..."
+#     find /usr -name "mlx5dv.h" | grep -i infiniband
+#     exit 1
+# fi
+
+# if [ ! -f "/usr/include/infiniband/mlx5dv.h" ]; then
+#     echo "Error: /usr/include/infiniband/mlx5dv.h not found"
+#     echo "Available headers in /usr/include/infiniband:"
+#     ls -la /usr/include/infiniband/
+#     exit 1
+# fi
+
+# echo "InfiniBand headers check passed"
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 bash "${SCRIPT_DIR}/killall_sglang.sh"
