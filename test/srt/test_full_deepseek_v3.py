@@ -57,7 +57,7 @@ class TestBenchOneBatch(CustomTestCase):
             ["--trust-remote-code", "--tp", "8", "--cuda-graph-max-bs", "2"],
         )
         print(f"output_throughput : {output_throughput:.2f} token/s")
-        self.assertGreater(output_throughput, 60)
+        self.assertGreater(output_throughput, 65)
 
 
 class TestDeepseekV3MTP(CustomTestCase):
@@ -107,14 +107,12 @@ class TestDeepseekV3MTP(CustomTestCase):
         )
         metrics = run_eval_few_shot_gsm8k(args)
         print(metrics)
-
-        # TODO: Remove this comment after the accuracy bug is fixed
-        # self.assertGreater(metrics["accuracy"], 0.94)
+        self.assertGreater(metrics["accuracy"], 0.945)
 
         server_info = requests.get(self.base_url + "/get_server_info")
         avg_spec_accept_length = server_info.json()["avg_spec_accept_length"]
         print(f"{avg_spec_accept_length=}")
-        self.assertGreater(avg_spec_accept_length, 3.0)
+        self.assertGreater(avg_spec_accept_length, 3.2)
 
 
 if __name__ == "__main__":
