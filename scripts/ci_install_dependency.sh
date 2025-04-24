@@ -82,7 +82,14 @@ dpkg -i gdrcopy_*.deb
 if [ -L "/usr/lib/x86_64-linux-gnu/libmlx5.so" ]; then
     rm -f /usr/lib/x86_64-linux-gnu/libmlx5.so
 fi
-ln -s /usr/lib/x86_64-linux-gnu/libmlx5.so.1 /usr/lib/x86_64-linux-gnu/libmlx5.so
+
+# Check if libmlx5.so.1 exists before creating symlink
+if [ -f "/usr/lib/x86_64-linux-gnu/libmlx5.so.1" ]; then
+    ln -s /usr/lib/x86_64-linux-gnu/libmlx5.so.1 /usr/lib/x86_64-linux-gnu/libmlx5.so
+else
+    echo "Warning: /usr/lib/x86_64-linux-gnu/libmlx5.so.1 not found"
+fi
+
 apt-get install -y libfabric-dev libibverbs-dev libmlx5-dev
 
 # Clone DeepEP first (only for source code)
