@@ -6,6 +6,25 @@ set -euxo pipefail
 export GDRCOPY_HOME=/usr/src/gdrdrv-2.4.4/
 export CUDA_HOME=/usr/local/cuda
 export NVSHMEM_DIR=/opt/nvshmem/install
+export C_INCLUDE_PATH=/usr/include/infiniband:$C_INCLUDE_PATH
+export CPLUS_INCLUDE_PATH=/usr/include/infiniband:$CPLUS_INCLUDE_PATH
+export CPATH=/usr/include/infiniband:$CPATH
+
+# Check InfiniBand headers
+echo "Checking InfiniBand headers..."
+if [ ! -d "/usr/include/infiniband" ]; then
+    echo "Error: /usr/include/infiniband directory not found"
+    exit 1
+fi
+
+if [ ! -f "/usr/include/infiniband/mlx5dv.h" ]; then
+    echo "Error: /usr/include/infiniband/mlx5dv.h not found"
+    echo "Available headers in /usr/include/infiniband:"
+    ls -la /usr/include/infiniband/
+    exit 1
+fi
+
+echo "InfiniBand headers check passed"
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 bash "${SCRIPT_DIR}/killall_sglang.sh"
