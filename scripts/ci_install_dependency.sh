@@ -131,3 +131,6 @@ fi
 # Install DeepEP
 cd /root/.cache/deepep
 NVSHMEM_DIR=/opt/nvshmem/install python3 setup.py install
+
+
+/opt/nvshmem/bin/perftest/device/pt-to-pt/shmem_put_bw
