@@ -237,9 +237,9 @@ class DeepseekVLV2Processor(ProcessorMixin):
 
     def process_one(
         self,
-        prompt: str = None,
-        conversations: List[Dict[str, str]] = None,
-        images: List[Image.Image] = None,
+        prompt: Optional[str] = None,
+        conversations: Optional[List[Dict[str, str]]] = None,
+        images: Optional[List[Image.Image]] = None,
         apply_sft_format: bool = False,
         inference_mode: bool = True,
         system_prompt: str = "",
@@ -322,9 +322,9 @@ class DeepseekVLV2Processor(ProcessorMixin):
     def __call__(
         self,
         *,
-        prompt: str = None,
-        conversations: List[Dict[str, str]] = None,
-        images: List[Image.Image] = None,
+        prompt: Optional[str] = None,
+        conversations: Optional[List[Dict[str, str]]] = None,
+        images: Optional[List[Image.Image]] = None,
         apply_sft_format: bool = False,
         inference_mode: bool = True,
         system_prompt: str = "",
