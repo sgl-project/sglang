@@ -43,15 +43,14 @@ pip install transformers==4.51.0 sentence_transformers accelerate peft pandas da
 # For compling xgrammar kernels
 pip install cuda-python nvidia-cuda-nvrtc-cu12
 
-apt-get update
-apt-get install -y wget
+apt-get update && apt-get install -y wget
 wget https://github.com/Kitware/CMake/releases/download/v3.27.4/cmake-3.27.4-linux-x86_64.sh
 chmod +x cmake-3.27.4-linux-x86_64.sh
 ./cmake-3.27.4-linux-x86_64.sh --skip-license --prefix=/usr/local
 rm cmake-3.27.4-linux-x86_64.sh
 
 # Install GDRCopy
-apt-get install -y libibverbs-dev libmlx5-1 rdma-core
+apt-get update && apt-get install -y libibverbs-dev libmlx5-1 rdma-core
 mkdir -p /opt/gdrcopy
 mkdir -p /opt/nvshmem
 cd /opt/gdrcopy
@@ -74,12 +73,12 @@ gdrcopy_copybw
 if [ ! -e "/usr/lib/x86_64-linux-gnu/libmlx5.so" ]; then
     ln -s /usr/lib/x86_64-linux-gnu/libmlx5.so.1 /usr/lib/x86_64-linux-gnu/libmlx5.so
 fi
-apt-get install -y libfabric-dev
+apt-get update && apt-get install -y libfabric-dev
 
-# Install nvidia-peermem
-apt-get install -y nvidia-peermem
-modprobe nvidia-peermem
-lsmod | grep nvidia_peermem
+# # Install nvidia-peermem
+# apt-get update && apt-get install -y nvidia-peermem
+# modprobe nvidia-peermem
+# lsmod | grep nvidia_peermem
 
 # Clone DeepEP
 git clone https://github.com/deepseek-ai/DeepEP.git /root/.cache/deepep
@@ -105,6 +104,7 @@ make -j$(nproc) install
 
 # Verify NVSHMEM
 nvshmem-info -a
+# /opt/nvshmem/bin/perftest/device/pt-to-pt/shmem_put_bw
 
 # Install DeepEP
 cd /root/.cache/deepep && python3 setup.py install
@@ -113,4 +113,4 @@ cd /root/.cache/deepep && python3 setup.py install
 dpkg -l | grep gdrcopy
 dpkg -l | grep -E "libibverbs|rdma-core|libmlx5"
 lsmod | grep -E "ib|mlx|rdma"
-ibv_devices
+# ibv_devices
