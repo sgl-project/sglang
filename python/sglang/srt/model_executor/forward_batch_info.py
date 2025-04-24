@@ -29,7 +29,7 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import IntEnum, auto
 from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
@@ -376,7 +376,7 @@ class ForwardBatch:
         valid_inputs = [x for x in self.mm_inputs if x is not None]
 
         # TODO: is it expensive?
-        # a workaround to avoid importing `MultimodalInputs`
+        # a hack to avoid importing `MultimodalInputs`
         merged = valid_inputs[0].__class__(mm_items=[])
 
         # Merge remaining inputs
@@ -460,9 +460,7 @@ class ForwardBatch:
         self.mrope_positions = torch.cat(
             [pos.to(device=model_runner.device) for pos in mrope_positions_list],
             dim=1,
-        ).to(dtype=torch.int64,device=model_runner.device)
-
-
+        ).to(dtype=torch.int64, device=model_runner.device)
 
     def get_max_chunk_capacity(self):
         # Maximum number of tokens in each chunk
