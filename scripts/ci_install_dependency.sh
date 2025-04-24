@@ -2,6 +2,10 @@
 # Install the dependency in CI.
 set -euxo pipefail
 
+export GDRCOPY_HOME=/usr/src/gdrdrv-2.4.4/
+export CUDA_HOME=/usr/local/cuda
+export NVSHMEM_DIR=/opt/nvshmem/install
+
 # Install InfiniBand packages in container
 echo "Installing InfiniBand packages in container..."
 apt-get update
