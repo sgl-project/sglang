@@ -66,16 +66,13 @@ dpkg -i gdrdrv-dkms_*.deb
 dpkg -i libgdrapi_*.deb
 dpkg -i gdrcopy-tests_*.deb
 dpkg -i gdrcopy_*.deb
-
-# Install IBGDA dependencies
 if [ ! -e "/usr/lib/x86_64-linux-gnu/libmlx5.so" ]; then
     ln -s /usr/lib/x86_64-linux-gnu/libmlx5.so.1 /usr/lib/x86_64-linux-gnu/libmlx5.so
 fi
 apt-get install -y libfabric-dev
 
 # Clone DeepEP
-cd /root/.cache
-git clone https://github.com/deepseek-ai/DeepEP.git deepep
+git clone https://github.com/deepseek-ai/DeepEP.git /root/.cache/deepep
 
 # Install NVSHMEM
 cd /opt/nvshmem
