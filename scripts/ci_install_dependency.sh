@@ -78,7 +78,8 @@ dpkg -i gdrcopy_*.deb
 # Install IBGDA dependencies
 # First install required packages
 apt-get update
-apt-get install -y libfabric-dev libibverbs-dev libmlx5-dev
+# apt-get install -y libfabric-dev libibverbs-dev libmlx5-dev
+apt-get install -y libfabric-dev
 
 # Then handle the libmlx5.so symlink
 if [ -L "/usr/lib/x86_64-linux-gnu/libmlx5.so" ]; then
