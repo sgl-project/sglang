@@ -246,7 +246,7 @@ def _hack_shuffle(phy2log_old, log2phy_old, logcnt_old):
                 if old_value == -1:
                     new_value = -1
                 else:
-                    new_value = TODO
+                    new_value = phy_old2new[old_value].item()
                 log2phy_new[layer_id, logical_expert_id, last_dim_index] = new_value
 
     return phy2log_new, log2phy_new, None
