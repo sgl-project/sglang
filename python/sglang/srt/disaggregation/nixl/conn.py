@@ -125,7 +125,7 @@ class NixlKVManager(BaseKVManager):
             self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens
         ):
             kv_addrs.append((kv_data_ptr, kv_data_len, self.kv_args.gpu_id, ""))
-        self.kv_descs = self.agent.register_memory(kv_addrs, "VRAM", is_sorted=True)
+        self.kv_descs = self.agent.register_memory(kv_addrs, "VRAM", is_sorted=False)
         if not self.kv_descs:
             raise Exception("NIXL memory registration failed for kv tensors")
         aux_addrs = []
@@ -133,7 +133,7 @@ class NixlKVManager(BaseKVManager):
             self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens
         ):
             aux_addrs.append((aux_data_ptr, aux_data_len, 0, ""))
-        self.aux_descs = self.agent.register_memory(aux_addrs, "DRAM", is_sorted=True)
+        self.aux_descs = self.agent.register_memory(aux_addrs, "DRAM", is_sorted=False)
         if not self.aux_descs:
             raise Exception("NIXL memory registration failed for aux tensors")
 
