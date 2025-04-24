@@ -2,10 +2,6 @@
 # Install the dependency in CI.
 set -euxo pipefail
 
-export GDRCOPY_HOME=/usr/src/gdrdrv-2.4.4/
-export CUDA_HOME=/usr/local/cuda
-export NVSHMEM_DIR=/opt/nvshmem/install
-
 # Install InfiniBand packages in container
 echo "Installing InfiniBand packages in container..."
 apt-get update
@@ -13,8 +9,26 @@ apt-get install -y libibverbs-dev libmlx5-1 rdma-core
 
 # Check InfiniBand status
 echo "Checking InfiniBand status..."
-ibstat || true
 ibv_devinfo || true
+
+# Set up GPU Direct RDMA
+echo "Setting up GPU Direct RDMA..."
+mkdir -p /etc/modprobe.d
+echo "options nvidia NVreg_EnableGpuDirectRdma=1" > /etc/modprobe.d/nvidia-gdrdma.conf
+echo "options nvidia NVreg_EnableGpuDirectRdma=1" > /etc/modprobe.d/nvidia.conf
+
+# Set environment variables for NVSHMEM
+export GDRCOPY_HOME=/usr/src/gdrdrv-2.4.4/
+export CUDA_HOME=/usr/local/cuda
+export NVSHMEM_DIR=/opt/nvshmem/install
+export NVSHMEM_CFLAGS="-I/usr/include/infiniband"
+export NVSHMEM_CXXFLAGS="-I/usr/include/infiniband"
+export NVSHMEM_LDFLAGS="-L/usr/lib/x86_64-linux-gnu -libverbs -lmlx5 -lrdmacm"
+export NVSHMEM_IBGDA_SUPPORT=1
+export NVSHMEM_USE_GDRCOPY=1
+
+# Set up InfiniBand device permissions
+chmod 666 /dev/infiniband/* 2>/dev/null || true
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 bash "${SCRIPT_DIR}/killall_sglang.sh"
