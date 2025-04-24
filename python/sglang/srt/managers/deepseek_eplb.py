@@ -229,6 +229,7 @@ def _hack_shuffle(phy2log_old, log2phy_old, logcnt_old):
     r = random.Random(42)
 
     num_layers, num_phy_experts = phy2log_old.shape
+    _, num_log_experts, log2phy_last_dim = log2phy_old.shape
     phy2log_new = torch.zeros_like(phy2log_old)
     log2phy_new = torch.zeros_like(log2phy_old)
 
@@ -238,7 +239,11 @@ def _hack_shuffle(phy2log_old, log2phy_old, logcnt_old):
         phy_old2new = torch.tensor(phy_old2new)
 
         phy2log_new[layer_id, :] = phy2log_old[layer_id, :][phy_old2new]
-        log2phy_new[layer_id, :] = TODO
+
+        for logical_expert_id in range(num_log_experts):
+            for last_dim_index in range(log2phy_last_dim):
+                old_value = log2phy_old[layer_id, logical_expert_id, last_dim_index]
+                log2phy_new[layer_id, logical_expert_id, last_dim_index] = new_value
 
     return phy2log_new, log2phy_new, None
 
