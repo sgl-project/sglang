@@ -1,6 +1,6 @@
 import time
 from collections import defaultdict
-from typing import Dict, List
+from typing import Dict
 
 
 class Node:
@@ -231,7 +231,7 @@ class MultiTenantRadixTree:
     def _remove_tenant_recursive(self, node: Node, tenant_id: str) -> bool:
         """
         Recursively remove tenant_id from the subtree rooted at node using post-order traversal.
-        
+
         Args:
             node: The current node in the traversal.
             tenant_id: The identifier of the tenant to remove.
@@ -246,11 +246,7 @@ class MultiTenantRadixTree:
             del node.children[key]
         if tenant_id in node.tenant_last_access_time:
             del node.tenant_last_access_time[tenant_id]
-        if (
-            node != self.root
-            and not node.tenant_last_access_time
-            and not node.children
-        ):
+        if node != self.root and not node.tenant_last_access_time and not node.children:
             return True  # Signal to parent that this node should be pruned
 
         return False
