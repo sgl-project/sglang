@@ -1204,8 +1204,9 @@ class GGUFModelLoader(BaseModelLoader):
         # only load the gguf module when needed
         try:
             import gguf
+            from sglang.srt.model_loader.utils import check_gguf_version
 
-            # FIXME: add version check for gguf
+            check_gguf_version(version=getattr(gguf, "__version__", None))
         except ImportError as err:
             raise ImportError(
                 "Please install gguf via `pip install gguf` to use gguf quantizer."
