@@ -2,23 +2,10 @@
 # Install the dependency in CI.
 set -euxo pipefail
 
-# Set environment variables
-export GDRCOPY_HOME=/usr/src/gdrdrv-2.4.4/
-export CUDA_HOME=/usr/local/cuda
-export NVSHMEM_DIR=/opt/nvshmem/install
-
 # Install InfiniBand packages in container
 echo "Installing InfiniBand packages in container..."
 apt-get update
-apt-get install -y libibverbs-dev libmlx5-dev rdma-core
-
-# Verify installation
-echo "Verifying InfiniBand installation..."
-dpkg -L libibverbs-dev libmlx5-dev rdma-core
-
-# Set NVSHMEM compilation flags
-export NVSHMEM_CFLAGS="-I/usr/include/infiniband"
-export NVSHMEM_CXXFLAGS="-I/usr/include/infiniband"
+apt-get install -y libibverbs-dev libmlx5-1 rdma-core
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 bash "${SCRIPT_DIR}/killall_sglang.sh"
