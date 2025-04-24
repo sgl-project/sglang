@@ -235,8 +235,9 @@ def _hack_shuffle(phy2log_old, log2phy_old, logcnt_old):
     for layer_id in range(num_layers):
         phy_old2new = list(range(num_phy_experts))
         r.shuffle(phy_old2new)
+        phy_old2new = torch.tensor(phy_old2new)
 
-        phy2log_new[layer_id, :] = TODO
+        phy2log_new[layer_id, :] = phy2log_old[layer_id, :][phy_old2new]
         log2phy_new[layer_id, :] = TODO
 
     return phy2log_new, log2phy_new, None
