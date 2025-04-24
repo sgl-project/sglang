@@ -11,6 +11,11 @@ echo "Installing InfiniBand packages in container..."
 apt-get update
 apt-get install -y libibverbs-dev libmlx5-1 rdma-core
 
+# Check InfiniBand status
+echo "Checking InfiniBand status..."
+ibstat || true
+ibv_devinfo || true
+
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 bash "${SCRIPT_DIR}/killall_sglang.sh"
 
