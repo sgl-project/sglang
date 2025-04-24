@@ -578,6 +578,10 @@ class Scheduler(
                 bootstrap_port=self.server_args.disaggregation_bootstrap_port,
                 transfer_backend=self.transfer_backend,
             )
+
+            # Metric for pre-allocation
+            self.num_tokens_pre_allocated = 0
+
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             # *2 for the headroom.
             buffer_size = self.max_running_requests * 2
@@ -1035,15 +1039,14 @@ class Scheduler(
                 gap_latency / self.server_args.decode_log_interval
             )
 
+        msg = (
+            f"Decode batch. "
+            f"#running-req: {num_running_reqs}, "
+            f"#token: {num_used}, "
+            f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
+        )
+
         if self.spec_algorithm.is_none():
-            msg = (
-                f"Decode batch. "
-                f"#running-req: {num_running_reqs}, "
-                f"#token: {num_used}, "
-                f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
-                f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
-                f"#queue-req: {len(self.waiting_queue)}, "
-            )
             spec_accept_length = 0
         else:
             spec_accept_length = (
@@ -1052,15 +1055,15 @@ class Scheduler(
             self.cum_spec_accept_length += self.spec_num_total_accepted_tokens
             self.cum_spec_accept_count += self.spec_num_total_forward_ct
             self.spec_num_total_accepted_tokens = self.spec_num_total_forward_ct = 0
-            msg = (
-                f"Decode batch. "
-                f"#running-req: {num_running_reqs}, "
-                f"#token: {num_used}, "
-                f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
-                f"accept len: {spec_accept_length:.2f}, "
-                f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
-                f"#queue-req: {len(self.waiting_queue)}, "
-            )
+            msg += f"accept len: {spec_accept_length:.2f}, "
+
+        if self.disaggregation_mode == DisaggregationMode.DECODE:
+            msg += f"pre-allocated usage: {self.num_tokens_pre_allocated / self.max_total_num_tokens:.2f}, "
+
+        msg += (
+            f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
+            f"#queue-req: {len(self.waiting_queue)}"
+        )
 
         logger.info(msg)
         if self.enable_metrics:
