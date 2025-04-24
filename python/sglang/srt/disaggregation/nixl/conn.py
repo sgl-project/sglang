@@ -189,6 +189,7 @@ class NixlKVManager(BaseKVManager):
         ):
             kv_addrs.append((kv_data_ptr, kv_data_len, self.kv_args.gpu_id, ""))
         self.kv_descs = self.agent.register_memory(kv_addrs, "VRAM", is_sorted=True)
+        logger.debug(f"Register kv tensors, len(kv_addr)= {len(kv_addrs)}")
         if not self.kv_descs:
             raise Exception("NIXL memory registration failed for kv tensors")
         aux_addrs = []
@@ -197,6 +198,7 @@ class NixlKVManager(BaseKVManager):
         ):
             aux_addrs.append((aux_data_ptr, aux_data_len, 0, ""))
         self.aux_descs = self.agent.register_memory(aux_addrs, "DRAM", is_sorted=True)
+        logger.debug(f"Register aux tensors, len(aux_addrs)= {len(aux_addrs)}")
         if not self.aux_descs:
             raise Exception("NIXL memory registration failed for aux tensors")
 
@@ -220,6 +222,12 @@ class NixlKVManager(BaseKVManager):
         dst_gpu_id: int,
         notif: str,
     ):
+        # group by indices
+        prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
+            prefill_kv_indices, dst_kv_indices
+        )
+
+        logger.debug(f"sending kvcache to {peer_name} with notif {notif}")
         # Make descs
         num_layers = len(self.kv_args.kv_data_ptrs)
         src_addrs = []
@@ -229,12 +237,16 @@ class NixlKVManager(BaseKVManager):
             dst_ptr = dst_kv_ptrs[layer_id]
             item_len = self.kv_args.kv_item_lens[layer_id]
 
-            for prefill_index, decode_index in zip(prefill_kv_indices, dst_kv_indices):
-                src_addr = src_ptr + int(prefill_index) * item_len
-                dst_addr = dst_ptr + int(decode_index) * item_len
-                length = item_len
+            for prefill_index, decode_index in zip(prefill_kv_blocks, dst_kv_blocks):
+                src_addr = src_ptr + int(prefill_index[0]) * item_len
+                dst_addr = dst_ptr + int(decode_index[0]) * item_len
+                length = item_len * len(prefill_index)
                 src_addrs.append((src_addr, length, self.kv_args.gpu_id))
                 dst_addrs.append((dst_addr, length, dst_gpu_id))
+
+        logger.debug(
+            f"len(src_addrs): before group: {len(prefill_kv_indices)}, after group: {len(src_addrs)}"
+        )
         src_descs = self.agent.get_xfer_descs(src_addrs, "VRAM", is_sorted=True)
         dst_descs = self.agent.get_xfer_descs(dst_addrs, "VRAM", is_sorted=True)
         # Transfer data
