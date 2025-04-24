@@ -1,3 +1,4 @@
+import argparse
 import glob
 import json
 import os
@@ -22,7 +23,7 @@ MODELS = [
         model="google/gemma-3-27b-it", chat_template="gemma-it", mmmu_accuracy=0.45
     ),
     SimpleNamespace(
-        model="Qwen/Qwen2.5-VL-7B-Instruct",
+        model="Qwen/Qwen2.5-VL-3B-Instruct",
         chat_template="qwen2-vl",
         mmmu_accuracy=0.4,
     ),
@@ -33,9 +34,11 @@ MODELS = [
 
 
 class TestVLMModels(CustomTestCase):
+    parsed_args = None  # Class variable to store args
 
     @classmethod
-    def setUpClass(cls):  # Fixed method name (was setUPClass)
+    def setUpClass(cls):
+        # Removed argument parsing from here
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
         cls.time_out = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
@@ -122,6 +125,8 @@ class TestVLMModels(CustomTestCase):
                         "--chat-template",
                         model.chat_template,
                         "--trust-remote-code",
+                        "--mem-fraction-static",
+                        str(self.parsed_args.mem_fraction_static),  # Use class variable
                     ],
                 )
 
@@ -160,4 +165,20 @@ class TestVLMModels(CustomTestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    # Define and parse arguments here, before unittest.main
+    parser = argparse.ArgumentParser(description="Test VLM models")
+    parser.add_argument(
+        "--mem-fraction-static",
+        type=float,
+        help="Static memory fraction for the model",
+        default=0.6,
+    )
+
+    # Parse args intended for unittest
+    args = parser.parse_args()
+
+    # Store the parsed args object on the class
+    TestVLMModels.parsed_args = args
+
+    # Pass args to unittest
+    unittest.main(argv=[sys.argv[0]])
