@@ -19,7 +19,7 @@ if _is_cuda:
         try:
             from deep_gemm import ceil_div
         except ImportError:
-            print("Failed to import ceil_div from deep_gemm. Using fallback implementation.")
+            print("Failed to import ceil_div from deep_gemm.")
             pass 
 logger = logging.getLogger(__name__)
 
