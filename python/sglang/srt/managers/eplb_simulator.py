@@ -93,7 +93,7 @@ def read_physical_count_of_forward_pass_id_and_rank(dir_data: Path):
 
 
 def read_physical_count_of_forward_pass(dir_data: Path):
-    physical_count_of_forward_pass_id_and_rank, _ = (
+    physical_count_of_forward_pass_id_and_rank, last_physical_to_logical_map = (
         read_physical_count_of_forward_pass_id_and_rank(dir_data)
     )
 
@@ -112,7 +112,7 @@ def read_physical_count_of_forward_pass(dir_data: Path):
     physical_count_of_forward_pass = torch.stack(items)
     print(f"{physical_count_of_forward_pass.shape=}")
 
-    return physical_count_of_forward_pass
+    return physical_count_of_forward_pass, last_physical_to_logical_map
 
 
 def scan_combinations(
