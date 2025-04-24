@@ -228,6 +228,33 @@ class MultiTenantRadixTree:
 
         return used_size_per_tenant
 
+    def _remove_tenant_recursive(self, node: Node, tenant_id: str) -> bool:
+        """
+        Recursively remove tenant_id from the subtree rooted at node using post-order traversal.
+        
+        Args:
+            node: The current node in the traversal.
+            tenant_id: The identifier of the tenant to remove.
+        """
+        keys_to_remove = []
+        for key, child in node.children.items():
+            should_prune_child = self._remove_tenant_recursive(child, tenant_id)
+            if should_prune_child:
+                keys_to_remove.append(key)
+
+        for key in keys_to_remove:
+            del node.children[key]
+        if tenant_id in node.tenant_last_access_time:
+            del node.tenant_last_access_time[tenant_id]
+        if (
+            node != self.root
+            and not node.tenant_last_access_time
+            and not node.children
+        ):
+            return True  # Signal to parent that this node should be pruned
+
+        return False
+
     def remove_tenant(self, tenant_id: str) -> None:
         """
         Remove all data associated with a specific tenant from the tree.
@@ -235,40 +262,11 @@ class MultiTenantRadixTree:
         removing only the specified tenant's access information.
 
         Args:
-            tenant_id: The identifier of the tenant whose data should be removed
+            tenant_id: The identifier of the tenant whose data should be removed.
         """
         if not self.root:
             return
-
-        stack = [self.root]
-        visited_nodes = []
-
-        while stack:
-            node = stack.pop()
-            visited_nodes.append(node)
-
-            if tenant_id in node.tenant_last_access_time:
-                del node.tenant_last_access_time[tenant_id]
-
-            for child in node.children.values():
-                stack.append(child)
-
-        for node in reversed(visited_nodes):
-            # Check pruning conditions: Not root, no tenants, no children
-            if (
-                node != self.root
-                and not node.tenant_last_access_time
-                and not node.children
-            ):
-                parent = node.parent
-                if parent:  # Should always be true if node != self.root
-                    key_to_remove = None
-                    for key, child_node in parent.children.items():
-                        if child_node is node:
-                            key_to_remove = key
-                            break
-                    if key_to_remove is not None:
-                        del parent.children[key_to_remove]
+        self._remove_tenant_recursive(self.root, tenant_id)
 
     def pretty_print(self) -> str:
         """
