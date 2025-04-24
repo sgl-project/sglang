@@ -475,7 +475,7 @@ class GroupCoordinator:
         self,
         input_: torch.Tensor,
         dim: int = -1,
-        tensor_list: List[torch.Tensor] = None,
+        tensor_list: Optional[List[torch.Tensor]] = None,
     ) -> torch.Tensor:
         world_size = self.world_size
         # Bypass the function if we are using only 1 GPU.
