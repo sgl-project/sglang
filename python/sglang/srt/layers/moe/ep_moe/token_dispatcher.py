@@ -472,6 +472,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             topk_idx,
             topk_weights,
             reorder_topk_ids,
+            None,
             seg_indptr,
             masked_m,
             expected_m,
