@@ -1005,9 +1005,6 @@ class DeepEPMoE(EPMoE):
         all_tokens = sum(num_recv_tokens_per_expert)
         if all_tokens <= 0:
             return hidden_states_fp8.bfloat16()
-        # hidden_states_fp8, hidden_states_scale = sglang_per_token_group_quant_fp8(
-        #     hidden_states_fp8, 128
-        # )
         M, K = hidden_states_fp8.size()
         N = self.w13_weight.size(1)
         scale_block_size = 128
