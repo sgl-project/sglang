@@ -83,7 +83,7 @@ if [ -L "/usr/lib/x86_64-linux-gnu/libmlx5.so" ]; then
     rm -f /usr/lib/x86_64-linux-gnu/libmlx5.so
 fi
 ln -s /usr/lib/x86_64-linux-gnu/libmlx5.so.1 /usr/lib/x86_64-linux-gnu/libmlx5.so
-apt-get install -y libfabric-dev
+apt-get install -y libfabric-dev libibverbs-dev libmlx5-dev
 
 # Clone DeepEP first (only for source code)
 cd /root/.cache
