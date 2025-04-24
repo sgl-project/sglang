@@ -10,6 +10,8 @@ from typing import Optional
 import einops
 import polars as pl
 import torch
+from tqdm.auto import tqdm
+
 from sglang.srt.managers import deepseek_eplb
 from sglang.srt.managers.expert_distribution import (
     compute_gpu_physical_count,
@@ -19,7 +21,6 @@ from sglang.srt.managers.expert_location import (
     ExpertLocationMetadata,
     ModelConfigForExpertLocation,
 )
-from tqdm.auto import tqdm
 
 _ = compute_utilization_rate, compute_gpu_physical_count
 
@@ -126,8 +127,8 @@ def scan_combinations(
         *[
             MyServerArgs(
                 num_tokens_in_batch_overall=num_tokens_in_batch_per_gpu
-                                            * num_gpu_per_node
-                                            * nnodes,
+                * num_gpu_per_node
+                * nnodes,
                 ep_num_redundant_experts=ep_num_redundant_experts,
                 nnodes=nnodes,
                 tp_size=num_gpu_per_node * nnodes,
@@ -297,7 +298,7 @@ def simulate_logical_to_physical(
             )
             for physical_expert_id in all_physical_expert_ids:
                 physical_count_of_whatever[
-                :, layer_id, physical_expert_id
+                    :, layer_id, physical_expert_id
                 ] += logical_count_of_whatever[:, layer_id, logical_expert_id] / len(
                     all_physical_expert_ids
                 )

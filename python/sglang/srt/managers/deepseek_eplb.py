@@ -154,11 +154,11 @@ def rebalance_experts_hierarchical(
     pphy2mlog = (
         pphy2mlog.view(num_layers, num_nodes, -1)
         + torch.arange(
-        0,
-        num_logical_experts,
-        num_logical_experts // num_nodes,
-        device=group_pack_index.device,
-    ).view(1, -1, 1)
+            0,
+            num_logical_experts,
+            num_logical_experts // num_nodes,
+            device=group_pack_index.device,
+        ).view(1, -1, 1)
     ).flatten(-2)
     pphy2log = mlog2log.gather(-1, pphy2mlog)
     pphyrank = phyrank.gather(-1, pphy2phy).view(num_layers, -1)
@@ -226,6 +226,7 @@ def rebalance_experts(
 # TODO super hacky and hardcode and slow
 def _hack_shuffle(phy2log_old, log2phy_old, logcnt_old):
     import random
+
     r = random.Random(42)
 
     num_layers, num_phy_experts = phy2log_old.shape
