@@ -16,11 +16,19 @@ import multiprocessing as mp
 import random
 import unittest
 
+import openai
 import torch
 from transformers import AutoConfig, AutoTokenizer
 
 from sglang.test.runners import DEFAULT_PROMPTS, HFRunner, SRTRunner
 from sglang.test.test_utils import CustomTestCase, get_similarities, is_in_ci
+
+if is_in_ci():
+    from patch import launch_server_cmd
+else:
+    from sglang.utils import launch_server_cmd
+
+from sglang.utils import terminate_process, wait_for_server
 
 MODELS = [
     ("Alibaba-NLP/gte-Qwen2-1.5B-instruct", 1, 1e-5),
@@ -104,6 +112,35 @@ class TestEmbeddingModels(CustomTestCase):
                 self.assert_close_prefill_logits(
                     DEFAULT_PROMPTS, model, tp_size, torch_dtype, prefill_tolerance
                 )
+
+    def test_empty_string_embedding(self):
+        """Test embedding an empty string."""
+        model_path = MODELS[0][0]
+        embedding_process, port = launch_server_cmd(
+            f"""python3 -m sglang.launch_server --model-path {model_path} """
+            """--host 127.0.0.1 --is-embedding"""
+        )
+        try:
+            wait_for_server(f"http://127.0.0.1:{port}")
+
+            client = openai.Client(
+                base_url=f"http://127.0.0.1:{port}/v1", api_key="None"
+            )
+
+            # Text embedding example with empty string
+            text = ""
+            # Expect a BadRequestError for empty input
+            with self.assertRaises(openai.BadRequestError) as cm:
+                client.embeddings.create(
+                    model=model_path,
+                    input=text,
+                )
+
+            # Optionally, check the error message or status code if needed
+            self.assertEqual(cm.exception.status_code, 400)
+
+        finally:
+            terminate_process(embedding_process)
 
 
 if __name__ == "__main__":
