@@ -120,6 +120,7 @@ class KimiVLForConditionalGeneration(nn.Module):
         config: KimiVLConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        **kwargs, # fix init_tts argument error 
     ) -> None:
         super().__init__()
         self.config = config
