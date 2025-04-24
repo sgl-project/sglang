@@ -57,6 +57,8 @@ from sglang.srt.openai_api.protocol import (
     CompletionResponseStreamChoice,
     CompletionStreamResponse,
     DeltaMessage,
+    DetokenizeRequest,
+    DetokenizeResponse,
     EmbeddingObject,
     EmbeddingRequest,
     EmbeddingResponse,
@@ -67,6 +69,8 @@ from sglang.srt.openai_api.protocol import (
     FunctionResponse,
     LogProbs,
     MultimodalEmbeddingInput,
+    TokenizeRequest,
+    TokenizeResponse,
     ToolCall,
     TopLogprob,
     UsageInfo,
@@ -1717,6 +1721,114 @@ async def v1_chat_completions(
     )
 
     return response
+
+
+async def v1_tokenize(tokenizer_manager, request: TokenizeRequest):
+    """Handles OpenAI-compatible tokenization requests."""
+    try:
+        tokenizer = tokenizer_manager.tokenizer
+        max_model_len = getattr(tokenizer, "model_max_length", -1)
+
+        if isinstance(request.prompt, str):
+            token_ids = tokenizer.encode(
+                request.prompt,
+                add_special_tokens=request.add_special_tokens,
+            )
+            count = len(token_ids)
+            tokens_to_return = token_ids
+
+        elif isinstance(request.prompt, list):
+            token_ids_list = [
+                tokenizer.encode(
+                    text,
+                    add_special_tokens=request.add_special_tokens,
+                )
+                for text in request.prompt
+            ]
+            count = [len(ids) for ids in token_ids_list]
+            tokens_to_return = token_ids_list
+        else:
+            return create_error_response(
+                f"Invalid prompt type: {type(request.prompt)}. Expected str or List[str]."
+            )
+
+        return ORJSONResponse(
+            TokenizeResponse(
+                tokens=tokens_to_return, count=count, max_model_len=max_model_len
+            ).model_dump()
+        )
+
+    except Exception as e:
+        logger.error(f"Error during tokenization: {get_exception_traceback()}")
+        return create_error_response(
+            f"Internal server error during tokenization: {e}",
+            err_type="InternalServerError",
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+        )
+
+
+async def v1_detokenize(tokenizer_manager, request: DetokenizeRequest):
+    """Handles OpenAI-compatible detokenization requests."""
+    try:
+        tokenizer = tokenizer_manager.tokenizer
+
+        if (
+            isinstance(request.tokens, list)
+            and request.tokens
+            and isinstance(request.tokens[0], int)
+        ):
+            if not all(isinstance(t, int) for t in request.tokens):
+                return create_error_response(
+                    "Invalid input: 'tokens' must be a list of integers."
+                )
+            tokens_to_decode = [int(t) for t in request.tokens]
+            text = tokenizer.decode(
+                tokens_to_decode, skip_special_tokens=request.skip_special_tokens
+            )
+            text_to_return = text
+
+        elif (
+            isinstance(request.tokens, list)
+            and request.tokens
+            and isinstance(request.tokens[0], list)
+        ):
+            texts = []
+            for token_list in request.tokens:
+                if not all(isinstance(t, int) for t in token_list):
+                    return create_error_response(
+                        f"Invalid input: Sublist in 'tokens' must contain only integers. Found: {token_list}"
+                    )
+                tokens_to_decode = [int(t) for t in token_list]
+                decoded_text = tokenizer.decode(
+                    tokens_to_decode, skip_special_tokens=request.skip_special_tokens
+                )
+                texts.append(decoded_text)
+            text_to_return = texts
+        elif isinstance(request.tokens, list) and not request.tokens:
+            text_to_return = ""
+        else:
+            return create_error_response(
+                f"Invalid tokens type: {type(request.tokens)}. Expected List[int] or List[List[int]]."
+            )
+
+        return ORJSONResponse(DetokenizeResponse(text=text_to_return).model_dump())
+
+    except Exception as e:
+        logger.error(f"Error during detokenization: {get_exception_traceback()}")
+        if "decode" in str(e).lower():
+            logger.warning(
+                f"Detokenization decode warning/error: {e}. Input tokens shape/type: {type(request.tokens)}"
+            )
+            return create_error_response(
+                f"Error decoding tokens: {e}. Input tokens might be invalid for the model.",
+                err_type="DecodeError",
+                status_code=HTTPStatus.BAD_REQUEST,
+            )
+        return create_error_response(
+            f"Internal server error during detokenization: {e}",
+            err_type="InternalServerError",
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+        )
 
 
 def v1_embedding_request(all_requests, tokenizer_manager):

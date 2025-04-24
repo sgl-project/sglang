@@ -71,13 +71,20 @@ from sglang.srt.openai_api.adapter import (
     v1_chat_completions,
     v1_completions,
     v1_delete_file,
+    v1_detokenize,
     v1_embeddings,
     v1_files_create,
     v1_retrieve_batch,
     v1_retrieve_file,
     v1_retrieve_file_content,
+    v1_tokenize,
 )
-from sglang.srt.openai_api.protocol import ModelCard, ModelList
+from sglang.srt.openai_api.protocol import (
+    DetokenizeRequest,
+    ModelCard,
+    ModelList,
+    TokenizeRequest,
+)
 from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
@@ -397,6 +404,16 @@ async def update_weights_from_disk(obj: UpdateWeightFromDiskReqInput, request: R
         )
 
 
+@app.post("/tokenize", response_class=ORJSONResponse)
+async def openai_tokenize(request: TokenizeRequest):
+    return await v1_tokenize(_global_state.tokenizer_manager, request)
+
+
+@app.post("/detokenize", response_class=ORJSONResponse)
+async def openai_detokenize(request: DetokenizeRequest):
+    return await v1_detokenize(_global_state.tokenizer_manager, request)
+
+
 @app.post("/init_weights_update_group")
 async def init_weights_update_group(
     obj: InitWeightsUpdateGroupReqInput, request: Request
@@ -614,6 +631,20 @@ async def openai_v1_batches(raw_request: Request):
 async def cancel_batches(batch_id: str):
     # https://platform.openai.com/docs/api-reference/batch/cancel
     return await v1_cancel_batch(_global_state.tokenizer_manager, batch_id)
+
+
+@app.post(
+    "/v1/tokenize", response_class=ORJSONResponse, include_in_schema=False
+)  # v1 alias
+async def openai_v1_tokenize_alias(request: TokenizeRequest):
+    return await openai_tokenize(request)
+
+
+@app.post(
+    "/v1/detokenize", response_class=ORJSONResponse, include_in_schema=False
+)  # v1 alias
+async def openai_v1_detokenize_alias(request: DetokenizeRequest):
+    return await openai_detokenize(request)
 
 
 @app.get("/v1/batches/{batch_id}")
