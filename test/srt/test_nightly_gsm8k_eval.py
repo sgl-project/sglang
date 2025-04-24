@@ -24,7 +24,7 @@ MODEL_SCORE_THRESHOLDS = {
     "meta-llama/Llama-3.1-8B-Instruct": 0.82,
     "mistralai/Mistral-7B-Instruct-v0.3": 0.58,
     "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct": 0.85,
-    "google/gemma-2-27b-it": 0.92,
+    "google/gemma-2-27b-it": 0.91,
     "meta-llama/Llama-3.1-70B-Instruct": 0.95,
     "mistralai/Mixtral-8x7B-Instruct-v0.1": 0.64,
     "Qwen/Qwen2-57B-A14B-Instruct": 0.86,
