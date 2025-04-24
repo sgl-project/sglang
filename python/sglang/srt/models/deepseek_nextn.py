@@ -13,6 +13,7 @@
 # ==============================================================================
 
 """Inference-only DeepSeek NextN Speculative Decoding."""
+import logging
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -49,6 +50,9 @@ if _is_cuda:
     from sgl_kernel import awq_dequantize
 else:
     from vllm._custom_ops import awq_dequantize
+
+
+logger = logging.getLogger(__name__)
 
 
 class DeepseekModelNextN(nn.Module):
@@ -135,6 +139,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         nn.Module.__init__(self)
         self.config = config
         self.quant_config = quant_config
+        self.n_share_experts_fusion = global_server_args_dict["n_share_experts_fusion"]
 
         self.model = DeepseekModelNextN(
             config, quant_config, prefix=add_prefix("model", prefix)
@@ -182,6 +187,48 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
         ]
+        if self.n_share_experts_fusion > 0:
+            logger.info(
+                f"Cloning {self.n_share_experts_fusion} "
+                "replicas of the shared expert into MoE for DeepseekV3ForCausalLMNextN"
+            )
+            weights_list = list(weights)
+            weights_dict = dict(weights_list)
+            if self.quant_config is None or self.quant_config.get_name() == "w8a8_int8":
+                suffix_list = [
+                    "down_proj.weight",
+                    "down_proj.weight_scale",
+                    "gate_proj.weight",
+                    "gate_proj.weight_scale",
+                    "up_proj.weight",
+                    "up_proj.weight_scale",
+                ]
+            else:
+                suffix_list = [
+                    "down_proj.weight",
+                    "down_proj.weight_scale_inv",
+                    "gate_proj.weight",
+                    "gate_proj.weight_scale_inv",
+                    "up_proj.weight",
+                    "up_proj.weight_scale_inv",
+                ]
+            names_to_remove = []
+            for num_repeat in range(self.n_share_experts_fusion):
+                for suffix in suffix_list:
+                    shared_expert_weight_name = (
+                        f"model.layers.0.mlp.shared_experts.{suffix}"
+                    )
+                    weights_list.append(
+                        (
+                            f"model.layers.0."
+                            f"mlp.experts."
+                            f"{self.config.n_routed_experts + num_repeat}"
+                            f".{suffix}",
+                            weights_dict[shared_expert_weight_name],
+                        )
+                    )
+                    names_to_remove += [shared_expert_weight_name]
+            weights = [w for w in weights_list if w[0] not in names_to_remove]
 
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
@@ -190,7 +237,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=self.config.n_routed_experts,
+            num_experts=self.config.n_routed_experts + self.n_share_experts_fusion,
         )
 
         nextn_layer_prefix = "model.layers.0"
