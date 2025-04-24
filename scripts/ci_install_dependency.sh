@@ -96,3 +96,7 @@ make -j$(nproc) install
 # Install DeepEP
 cd /root/.cache/deepep
 NVSHMEM_DIR=/opt/nvshmem/install python3 setup.py install
+
+dpkg -l | grep gdrcopy
+
+ibv_devices
