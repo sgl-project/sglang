@@ -88,8 +88,16 @@ def launch_server_process_and_send_one_request(
             headers = {
                 "Content-Type": "application/json; charset=utf-8",
             }
-            response = requests.get(f"{base_url}/v1/models", headers=headers)
+            if server_args.node_rank == 0:
+                response = requests.get(f"{base_url}/v1/models", headers=headers)
+            else:
+                # This http api is created by launch_dummy_health_check_server for none-rank0 node.
+                response = requests.get(f"{base_url}/health", headers=headers)
             if response.status_code == 200:
+                # Rank-0 node returns directly.
+                # Other nodes should wait for the exit signal from Rank-0 node.
+                while proc.is_alive() and server_args.node_rank > 0:
+                    time.sleep(1)
                 return proc
         except requests.RequestException:
             pass
@@ -122,9 +130,15 @@ def run_compile(server_args: ServerArgs, compile_args: CompileArgs):
 
     proc = launch_server_process_and_send_one_request(server_args, compile_args)
 
-    kill_process_tree(proc.pid)
-
     print("\nDeepGEMM Kernels compilation finished successfully.")
+    if proc.is_alive():
+        # This is the rank0 node.
+        kill_process_tree(proc.pid)
+    else:
+        try:
+            kill_process_tree(proc.pid)
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
