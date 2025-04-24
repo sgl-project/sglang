@@ -1044,6 +1044,10 @@ class DeepseekV2AttentionMLA(nn.Module):
                 torch.bfloat16,
             )
         else:
+            if (num_repeat := get_int_env_var("SGLANG_HACK_SLOW_ATTN_NUM_REPEAT")) > 0:
+                for i in range(num_repeat):
+                    torch.bmm(attn_output.transpose(0, 1), self.w_vc)
+
             attn_bmm_output = torch.bmm(attn_output.transpose(0, 1), self.w_vc)
         attn_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
         output, _ = self.o_proj(attn_output)
