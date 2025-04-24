@@ -1,17 +1,26 @@
 from sglang.srt.managers.expert_distribution import (
     get_global_expert_distribution_recorder,
 )
-from sglang.srt.utils import DeepEPMode, DisposibleTensor
+from sglang.srt.utils import DeepEPMode, DisposibleTensor, get_bool_env_var, get_device_sm
 
+_enable_jit_deepgemm = False
 try:
     from deep_ep import Buffer
 
+    from sglang.srt.layers.quantization.fp8_kernel import (
+        sglang_per_token_group_quant_fp8,
+    )
+
+    sm_version = get_device_sm()
+    if sm_version == 90:
+        if get_bool_env_var("SGL_ENABLE_JIT_DEEPGEMM", default="false"):
+            _enable_jit_deepgemm = True
     use_deepep = True
 except ImportError:
     use_deepep = False
 
 from enum import IntEnum, auto
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -20,6 +29,7 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     deepep_permute_triton_kernel,
     deepep_post_reorder_triton_kernel,
     deepep_run_moe_deep_preprocess,
+    per_token_cast_to_fp8,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
@@ -80,7 +90,6 @@ class DeepEPBuffer:
                 ),
                 num_rdma_bytes,
             )
-
         cls._buffer = Buffer(
             group,
             num_nvl_bytes,
@@ -189,41 +198,69 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         return hidden_states, topk_idx, topk_weights, previous_event
 
     def dispatch_b(self, hidden_states, topk_idx, topk_weights, previous_event):
-        (
-            hidden_states,
-            topk_idx,
-            topk_weights,
-            event,
-        ) = self._dispatch_core(hidden_states, topk_idx, topk_weights, previous_event)
-        event.current_stream_wait() if self.async_finish else ()
-        if hidden_states.shape[0] > 0:
-            reorder_topk_ids, seg_indptr, hidden_states = self._deepep_permute(
-                hidden_states, topk_idx, fp8_dtype=hidden_states.dtype
+        if _enable_jit_deepgemm:
+            hidden_states = per_token_cast_to_fp8(hidden_states)
+            (
+                hidden_states,
+                topk_idx,
+                topk_weights,
+                num_recv_tokens_per_expert_list,
+                event,
+            ) = self._dispatch_core(
+                hidden_states, topk_idx, topk_weights, previous_event
+            )
+            event.current_stream_wait() if self.async_finish else ()
+            return (
+                hidden_states,
+                topk_idx,
+                topk_weights,
+                None,
+                num_recv_tokens_per_expert_list,
+                None,
+                None,
+                None,
             )
         else:
-            reorder_topk_ids = torch.empty(
-                (0,), device=hidden_states.device, dtype=torch.int64
+            (
+                hidden_states,
+                topk_idx,
+                topk_weights,
+                num_recv_tokens_per_expert_list,
+                event,
+            ) = self._dispatch_core(
+                hidden_states, topk_idx, topk_weights, previous_event
             )
-            seg_indptr = torch.zeros(
-                (self.num_experts + 1,), device=hidden_states.device, dtype=torch.int64
-            )
+            event.current_stream_wait() if self.async_finish else ()
+            if hidden_states.shape[0] > 0:
+                reorder_topk_ids, seg_indptr, hidden_states = self._deepep_permute(
+                    hidden_states, topk_idx, fp8_dtype=hidden_states.dtype
+                )
+            else:
+                reorder_topk_ids = torch.empty(
+                    (0,), device=hidden_states.device, dtype=torch.int64
+                )
+                seg_indptr = torch.zeros(
+                    (self.num_experts + 1,),
+                    device=hidden_states.device,
+                    dtype=torch.int64,
+                )
             hidden_states = DisposibleTensor(hidden_states)
 
-        masked_m = expected_m = None
-
-        return (
-            hidden_states,
-            topk_idx,
-            topk_weights,
-            reorder_topk_ids,
-            seg_indptr,
-            masked_m,
-            expected_m,
-        )
+            masked_m = expected_m = None
+            return (
+                hidden_states,
+                topk_idx,
+                topk_weights,
+                reorder_topk_ids,
+                None,
+                seg_indptr,
+                masked_m,
+                expected_m,
+            )
 
     def _dispatch_core(
         self,
-        x: torch.Tensor,
+        x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
         previous_event,
@@ -265,6 +302,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             previous_event=previous_event,
             async_finish=self.async_finish,
             allocate_on_comm_stream=(previous_event is not None) and self.async_finish,
+            expert_alignment=128 if _enable_jit_deepgemm else 1,
         )
 
         get_global_expert_distribution_recorder().on_deepep_dispatch_normal(
@@ -275,6 +313,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             recv_x,
             recv_topk_idx,
             recv_topk_weights,
+            num_recv_tokens_per_expert_list,
             event,
         )
 
@@ -323,29 +362,33 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
     ):
-        if hidden_states.shape[0] > 0:
-            num_tokens = self.src2dst.shape[0] // self.router_topk
-            output = torch.empty(
-                (num_tokens, hidden_states.shape[1]),
-                device=hidden_states.device,
-                dtype=hidden_states.dtype,
-            )
-            deepep_post_reorder_triton_kernel[(num_tokens,)](
-                hidden_states,
-                output,
-                self.src2dst,
-                topk_idx,
-                topk_weights,
-                self.router_topk,
-                hidden_states.shape[1],
-                BLOCK_SIZE=512,
-            )
+        # TODO support deepgemm
+        if _enable_jit_deepgemm:
+            output = hidden_states
         else:
-            output = torch.zeros(
-                (0, hidden_states.shape[1]),
-                device=hidden_states.device,
-                dtype=hidden_states.dtype,
-            )
+            if hidden_states.shape[0] > 0:
+                num_tokens = self.src2dst.shape[0] // self.router_topk
+                output = torch.empty(
+                    (num_tokens, hidden_states.shape[1]),
+                    device=hidden_states.device,
+                    dtype=hidden_states.dtype,
+                )
+                deepep_post_reorder_triton_kernel[(num_tokens,)](
+                    hidden_states,
+                    output,
+                    self.src2dst,
+                    topk_idx,
+                    topk_weights,
+                    self.router_topk,
+                    hidden_states.shape[1],
+                    BLOCK_SIZE=512,
+                )
+            else:
+                output = torch.zeros(
+                    (0, hidden_states.shape[1]),
+                    device=hidden_states.device,
+                    dtype=hidden_states.dtype,
+                )
         previous_event = Buffer.capture() if self.async_finish else None
         return output, previous_event
 
@@ -369,6 +412,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
 
     def _get_buffer(self):
         DeepEPBuffer.set_dispatch_mode_as_normal()
+
         return DeepEPBuffer.get_deepep_buffer(
             self.group,
             self.hidden_size,
@@ -439,6 +483,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             topk_idx,
             topk_weights,
             reorder_topk_ids,
+            None,
             seg_indptr,
             masked_m,
             expected_m,
@@ -584,7 +629,8 @@ class DeepEPDispatcher:
 
     def dispatch(self, *args, **kwargs) -> Tuple:
         self.dispatch_a(*args, **kwargs)
-        return self.dispatch_b()
+        ret = self.dispatch_b()
+        return ret
 
     def dispatch_a(
         self,
@@ -607,7 +653,8 @@ class DeepEPDispatcher:
 
     def combine(self, *args, **kwargs) -> Tuple:
         self.combine_a(*args, **kwargs)
-        return self.combine_b()
+        ret = self.combine_b()
+        return ret
 
     def combine_a(
         self,
