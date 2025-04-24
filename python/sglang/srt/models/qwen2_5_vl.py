@@ -190,7 +190,7 @@ class Qwen2_5_VisionPatchMerger(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.hidden_size = context_dim * (spatial_merge_size ** 2)
+        self.hidden_size = context_dim * (spatial_merge_size**2)
         self.ln_q = Qwen2RMSNorm(context_dim, eps=1e-6)
         self.mlp = nn.ModuleList(
             [

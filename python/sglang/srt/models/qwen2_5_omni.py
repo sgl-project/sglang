@@ -77,7 +77,7 @@ class Qwen2_5OmniAudioAttention(nn.Module):
                 f"embed_dim must be divisible by num_heads (got `embed_dim`: {self.embed_dim}"
                 f" and `num_heads`: {num_heads})."
             )
-        self.scaling = self.head_dim ** -0.5
+        self.scaling = self.head_dim**-0.5
         self.is_decoder = is_decoder
         self.is_causal = is_causal
 
@@ -133,9 +133,9 @@ class Qwen2_5OmniAudioAttention(nn.Module):
         )
         for i in range(1, len(cu_seqlens)):
             attention_mask[
-            ...,
-            cu_seqlens[i - 1]: cu_seqlens[i],
-            cu_seqlens[i - 1]: cu_seqlens[i],
+                ...,
+                cu_seqlens[i - 1] : cu_seqlens[i],
+                cu_seqlens[i - 1] : cu_seqlens[i],
             ] = 0
 
         attn_weights = attn_weights + attention_mask
@@ -503,7 +503,7 @@ class Qwen2_5OmniVisionBlock(nn.Module):
 class Qwen2_5OmniPatchMerger(nn.Module):
     def __init__(self, dim: int, context_dim: int, spatial_merge_size: int = 2) -> None:
         super().__init__()
-        self.hidden_size = context_dim * (spatial_merge_size ** 2)
+        self.hidden_size = context_dim * (spatial_merge_size**2)
         self.ln_q = RMSNorm(context_dim, eps=1e-6)
         self.mlp = nn.Sequential(
             nn.Linear(self.hidden_size, self.hidden_size),
