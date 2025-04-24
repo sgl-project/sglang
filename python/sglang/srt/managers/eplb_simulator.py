@@ -33,6 +33,7 @@ class MyServerArgs:
     tp_size: int
     enable_expert_location_by_eplb: bool
     init_expert_location: Optional[str]
+    deepseek_eplb_hack_shuffle: bool = False
 
 
 @dataclass
@@ -55,6 +56,7 @@ class MyExpertLocationMetadata:
                 num_groups=model_config_for_expert_location.num_groups,
                 num_nodes=server_args.nnodes,
                 num_gpus=server_args.tp_size,
+                hack_shuffle=server_args.deepseek_eplb_hack_shuffle,
             )
         )
 
