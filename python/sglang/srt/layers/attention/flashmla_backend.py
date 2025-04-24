@@ -22,6 +22,8 @@ from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
 
+from sglang.srt.distributed import get_tensor_model_parallel_rank
+
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -89,7 +91,11 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         bs = forward_batch.batch_size
         spec_info = forward_batch.spec_info
         if forward_batch.forward_mode.is_decode_or_idle():
-            if spec_info is None:
+            # if get_tensor_model_parallel_rank() == 0:
+            #     print(f">> [FlashMLABackend: {forward_batch.forward_mode=}, {spec_info=}")
+
+            # if spec_info is None:
+            if True:
                 max_seqlen_pad = triton.cdiv(
                     forward_batch.seq_lens_cpu.max().item(), PAGE_SIZE
                 )
@@ -120,7 +126,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 )
             else:
                 super().init_forward_metadata(forward_batch)
-        elif forward_batch.forward_mode.is_target_verify():
+        elif False: # forward_batch.forward_mode.is_target_verify():
             max_seqlen_pad = triton.cdiv(
                 forward_batch.seq_lens_cpu.max().item(), PAGE_SIZE
             )
@@ -141,8 +147,8 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             )
             mla_metadata, num_splits = get_mla_metadata(
                 forward_batch.seq_lens.to(torch.int32),
-                Q_LEN * self.num_q_heads // self.num_kv_heads,
-                self.num_kv_heads,
+                Q_LEN * self.num_q_heads,
+                1,
             )
 
             # Use FlashMLADecodeMetadata which has the attributes forward_extend expects
@@ -338,6 +344,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
     ):
+        # return super().forward_decode(q, k, v, layer, forward_batch, save_kv_cache)
         cache_loc = forward_batch.out_cache_loc
 
         if k is not None:
@@ -380,6 +387,8 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         if forward_batch.forward_mode == ForwardMode.EXTEND or forward_batch.forward_mode == ForwardMode.DRAFT_EXTEND:
             return super().forward_extend(q,k,v,layer, forward_batch, save_kv_cache)
         else:
+            return super().forward_extend(q,k,v,layer, forward_batch, save_kv_cache)
+
             cache_loc = forward_batch.out_cache_loc
 
             if k is not None:

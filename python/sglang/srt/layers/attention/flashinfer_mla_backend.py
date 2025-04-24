@@ -27,6 +27,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
 from sglang.srt.utils import is_flashinfer_available
 
+from sglang.srt.distributed import get_tensor_model_parallel_rank
+
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -137,6 +139,10 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         self.prefill_cuda_graph_metadata = {}  # For verify
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        # if get_tensor_model_parallel_rank() == 0:
+        #     spec_info = forward_batch.spec_info
+        #     print(f">> [FlashInferMLAAttnBackend: {forward_batch.forward_mode=}, {spec_info=}")
+
         if forward_batch.forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
                 forward_batch.req_pool_indices,
