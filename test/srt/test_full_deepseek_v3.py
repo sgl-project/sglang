@@ -16,11 +16,13 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
+FULL_DEEPSEEK_V3_MODEL_PATH = "deepseek-ai/DeepSeek-V3-0324"
+
 
 class TestDeepseekV3(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = "deepseek-ai/DeepSeek-V3-0324"
+        cls.model = FULL_DEEPSEEK_V3_MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = ["--trust-remote-code", "--tp", "8"]
         cls.process = popen_launch_server(
@@ -53,17 +55,22 @@ class TestDeepseekV3(CustomTestCase):
 class TestBenchOneBatch(CustomTestCase):
     def test_bs1(self):
         output_throughput = run_bench_one_batch(
-            "deepseek-ai/DeepSeek-V3-0324",
+            FULL_DEEPSEEK_V3_MODEL_PATH,
             ["--trust-remote-code", "--tp", "8", "--cuda-graph-max-bs", "2"],
         )
         print(f"output_throughput : {output_throughput:.2f} token/s")
-        self.assertGreater(output_throughput, 65)
+        if is_in_ci():
+            write_github_step_summary(
+                f"### test_bs1\n"
+                f"output_throughput : {output_throughput:.2f} token/s\n"
+            )
+            self.assertGreater(output_throughput, 70)
 
 
 class TestDeepseekV3MTP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = "deepseek-ai/DeepSeek-V3-0324"
+        cls.model = FULL_DEEPSEEK_V3_MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = [
             "--tp",
