@@ -419,15 +419,18 @@ class ForwardBatch:
                     else flatten_nested_list(mm_input.mrope_position_delta.tolist())
                 )
                 next_input_positions = []
-                for i, mrope_position_delta in enumerate(mrope_position_deltas):
+                for mrope_position_delta in mrope_position_deltas:
                     # batched deltas needs to be processed separately
-                    next_input_positions += [
-                        MRotaryEmbedding.get_next_input_positions(
-                            mrope_position_delta,
-                            int(self.seq_lens[batch_idx]) - 1,
-                            int(self.seq_lens[batch_idx]),
-                        )
-                    ]
+                    positions = MRotaryEmbedding.get_next_input_positions(
+                        mrope_position_delta,
+                        int(self.seq_lens[batch_idx]) - 1,
+                        int(self.seq_lens[batch_idx]),
+                    )
+                    # Convert list of lists to tensor with shape [3, seq_len]
+                    positions_tensor = torch.tensor(
+                        positions, device=model_runner.device, dtype=torch.long
+                    )
+                    next_input_positions.append(positions_tensor)
                 # 3 * N
                 mrope_positions_list[batch_idx] = torch.cat(next_input_positions, dim=1)
             elif self.forward_mode.is_extend():
