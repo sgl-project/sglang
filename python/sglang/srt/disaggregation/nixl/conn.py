@@ -90,9 +90,6 @@ class TransferStatus:
     # Whether aux data has been received.
     received_aux: bool = False
 
-    # For dummy transfer
-    always_done: bool = False
-
     def is_done(self):
         if self.num_kvs_expected is None:
             return False
