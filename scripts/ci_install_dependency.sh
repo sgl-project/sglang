@@ -32,10 +32,6 @@ rm -rf /usr/local/lib/python3.10/dist-packages/deepep*
 # Update pip
 pip install --upgrade pip
 
-# Install wget
-apt-get update
-apt-get install -y wget
-
 # Install sgl-kernel
 pip install sgl-kernel==0.0.9.post2 --no-cache-dir
 
@@ -51,6 +47,8 @@ pip install cuda-python nvidia-cuda-nvrtc-cu12
 
 # Install DeepEP dependencies
 # Install CMake
+apt-get update
+apt-get install -y wget
 wget https://github.com/Kitware/CMake/releases/download/v3.27.4/cmake-3.27.4-linux-x86_64.sh
 chmod +x cmake-3.27.4-linux-x86_64.sh
 ./cmake-3.27.4-linux-x86_64.sh --skip-license --prefix=/usr/local
@@ -78,19 +76,21 @@ dpkg -i gdrcopy-tests_*.deb
 dpkg -i gdrcopy_*.deb
 
 # Install IBGDA dependencies
-# Check and remove existing libmlx5.so symlink if it exists
+# First install required packages
+apt-get update
+apt-get install -y libfabric-dev libibverbs-dev libmlx5-dev
+
+# Then handle the libmlx5.so symlink
 if [ -L "/usr/lib/x86_64-linux-gnu/libmlx5.so" ]; then
     rm -f /usr/lib/x86_64-linux-gnu/libmlx5.so
 fi
 
-# Check if libmlx5.so.1 exists before creating symlink
 if [ -f "/usr/lib/x86_64-linux-gnu/libmlx5.so.1" ]; then
     ln -s /usr/lib/x86_64-linux-gnu/libmlx5.so.1 /usr/lib/x86_64-linux-gnu/libmlx5.so
 else
-    echo "Warning: /usr/lib/x86_64-linux-gnu/libmlx5.so.1 not found"
+    echo "Error: /usr/lib/x86_64-linux-gnu/libmlx5.so.1 not found"
+    exit 1
 fi
-
-apt-get install -y libfabric-dev libibverbs-dev libmlx5-dev
 
 # Clone DeepEP first (only for source code)
 cd /root/.cache
