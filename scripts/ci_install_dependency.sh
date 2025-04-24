@@ -2,6 +2,11 @@
 # Install the dependency in CI.
 set -euxo pipefail
 
+# Set environment variables
+export GDRCOPY_HOME=/usr/src/gdrdrv-2.4.4/
+export CUDA_HOME=/usr/local/cuda
+export NVSHMEM_DIR=/opt/nvshmem/install
+
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 bash "${SCRIPT_DIR}/killall_sglang.sh"
 
@@ -76,22 +81,10 @@ dpkg -i gdrcopy-tests_*.deb
 dpkg -i gdrcopy_*.deb
 
 # Install IBGDA dependencies
-# First install required packages
-apt-get update
-# apt-get install -y libfabric-dev libibverbs-dev libmlx5-dev
-apt-get install -y libfabric-dev
-
-# Then handle the libmlx5.so symlink
-if [ -L "/usr/lib/x86_64-linux-gnu/libmlx5.so" ]; then
-    rm -f /usr/lib/x86_64-linux-gnu/libmlx5.so
-fi
-
-if [ -f "/usr/lib/x86_64-linux-gnu/libmlx5.so.1" ]; then
+if [ ! -e "/usr/lib/x86_64-linux-gnu/libmlx5.so" ]; then
     ln -s /usr/lib/x86_64-linux-gnu/libmlx5.so.1 /usr/lib/x86_64-linux-gnu/libmlx5.so
-else
-    echo "Error: /usr/lib/x86_64-linux-gnu/libmlx5.so.1 not found"
-    exit 1
 fi
+apt-get install -y libfabric-dev
 
 # Clone DeepEP first (only for source code)
 cd /root/.cache
