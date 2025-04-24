@@ -32,6 +32,10 @@ rm -rf /usr/local/lib/python3.10/dist-packages/deepep*
 # Update pip
 pip install --upgrade pip
 
+# Install wget
+apt-get update
+apt-get install -y wget
+
 # Install sgl-kernel
 pip install sgl-kernel==0.0.9.post2 --no-cache-dir
 
