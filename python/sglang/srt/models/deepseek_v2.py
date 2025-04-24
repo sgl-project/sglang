@@ -536,7 +536,7 @@ class DeepseekV2MoE(nn.Module):
             num_recv_tokens_per_expert=state.pop(
                 "num_recv_tokens_per_expert_from_dispatch"
             ),
-            forward_mode=state.pop("state.forward_batch.forward_mode_from_dispatch"),
+            forward_mode=state.forward_batch.forward_mode,
         )
 
     def _forward_tbo_op_dispatch_a_part_one(self, state):
