@@ -16,7 +16,11 @@ if _is_cuda:
     )
 
     if get_bool_env_var("SGL_ENABLE_JIT_DEEPGEMM", default="false"):
-        from deep_gemm import ceil_div
+        try:
+            from deep_gemm import ceil_div
+        except ImportError:
+            print("Failed to import ceil_div from deep_gemm. Using fallback implementation.")
+            pass 
 logger = logging.getLogger(__name__)
 
 

@@ -299,7 +299,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             recv_x,
             recv_topk_idx,
             recv_topk_weights,
-            num_recv_tokens_per_expert_list,  # num_recv_tokens_per_expert_list
+            num_recv_tokens_per_expert_list, 
             self.handle,
             event,
         ) = buffer.dispatch(
