@@ -295,7 +295,7 @@ async def async_request_truss(
                             # NOTE: Some completion API might have a last
                             # usage summary response without a token so we
                             # want to check a token was generated
-                            if data["choices"][0]["delta"]["content"]:
+                            if data["choices"][0]["text"]:
                                 timestamp = time.perf_counter()
                                 # First token
                                 if ttft == 0.0:
@@ -307,7 +307,7 @@ async def async_request_truss(
                                     output.itl.append(timestamp - most_recent_timestamp)
 
                                 most_recent_timestamp = timestamp
-                                generated_text += data["choices"][0]["delta"]["content"]
+                                generated_text += data["choices"][0]["text"]
 
                     output.generated_text = generated_text
                     output.success = True
@@ -993,6 +993,8 @@ async def benchmark(
         async with semaphore:
             return await request_func(request_func_input=request_func_input, pbar=pbar)
 
+    if not hasattr(args, "warmup_requests"):
+        args.warmup_requests = 1
     # Warmup
     print(f"Starting warmup with {args.warmup_requests} sequences...")
 

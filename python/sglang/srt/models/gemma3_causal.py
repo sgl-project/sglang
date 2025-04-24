@@ -189,7 +189,7 @@ class Gemma3Attention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
-            logit_cap=getattr(self.config, "attn_logit_softcapping", None),
+            logit_cap=0.0,
             # Module must also define `get_attention_sliding_window_size` to correctly initialize
             # attention backend in `ForwardBatch`.
             sliding_window_size=self.sliding_window,
