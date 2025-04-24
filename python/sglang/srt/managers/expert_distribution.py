@@ -351,7 +351,7 @@ class _DeepepLowLatencySinglePassGatherer(_SinglePassGatherer):
         self, layer_idx: int, local_physical_count_of_layer: torch.Tensor
     ):
         # Most naive implementation, can optimize later
-        self._data[layer_idx, :] = local_physical_count_of_layer
+        self._data[layer_idx, :] += local_physical_count_of_layer
 
     def reset(self):
         self._data[...] = 0
