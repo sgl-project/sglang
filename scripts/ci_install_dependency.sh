@@ -107,7 +107,7 @@ NVSHMEM_TIMEOUT_DEVICE_POLLING=0 \
 NVSHMEM_USE_GDRCOPY=1 \
 cmake -S . -B build/ -DCMAKE_INSTALL_PREFIX=/opt/nvshmem/install -DCMAKE_CUDA_ARCHITECTURES=90
 cd build
-make install -j
+make -j$(nproc) install
 
 echo "Verifying NVSHMEM installation..."
 ldconfig
