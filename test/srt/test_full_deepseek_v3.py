@@ -56,13 +56,8 @@ class TestBenchOneBatch(CustomTestCase):
             "deepseek-ai/DeepSeek-V3-0324",
             ["--trust-remote-code", "--tp", "8", "--cuda-graph-max-bs", "2"],
         )
-
-        if is_in_ci():
-            write_github_step_summary(
-                f"### test_bs1\n"
-                f"output_throughput : {output_throughput:.2f} token/s\n"
-            )
-            self.assertGreater(output_throughput, 60)
+        print(f"output_throughput : {output_throughput:.2f} token/s")
+        self.assertGreater(output_throughput, 60)
 
 
 class TestDeepseekV3MTP(CustomTestCase):
