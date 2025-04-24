@@ -105,4 +105,6 @@ lsmod | grep -E "ib|mlx|rdma"
 
 ibv_devices
 
+apt-get update && apt-get install -y pciutils
+
 lspci | grep -i mellanox
