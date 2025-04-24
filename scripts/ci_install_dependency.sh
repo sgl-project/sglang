@@ -99,4 +99,8 @@ NVSHMEM_DIR=/opt/nvshmem/install python3 setup.py install
 
 dpkg -l | grep gdrcopy
 
+dpkg -l | grep -E "libibverbs|rdma-core|libmlx5"
+
+lsmod | grep -E "ib|mlx|rdma"
+
 ibv_devices
