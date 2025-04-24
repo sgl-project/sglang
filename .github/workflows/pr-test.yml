@@ -219,36 +219,6 @@ jobs:
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_moe_offline_throughput_without_radix_cache
 
-  # performance-test-8-gpu:
-  #   if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-  #       github.event.pull_request.draft == false
-  #   runs-on: 8-gpu-runner
-  #   steps:
-  #     - name: Checkout code
-  #       uses: actions/checkout@v4
-
-  #     - name: Install dependencies
-  #       run: |
-  #         bash scripts/ci_install_dependency.sh
-
-  #     - name: Benchmark single latency (TP=8)
-  #       timeout-minutes: 30
-  #       run: |
-  #         cd test/srt
-  #         python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_moe_tp8_bs1
-
-  #     - name: Benchmark offline throughput (TP=8)
-  #       timeout-minutes: 30
-  #       run: |
-  #         cd test/srt
-  #         python3 -m unittest test_bench_serving.TestBenchServing.test_moe_offline_throughput_default
-
-  #     - name: Benchmark offline throughput (w/o RadixAttention) (TP=8)
-  #       timeout-minutes: 30
-  #       run: |
-  #         cd test/srt
-  #         python3 -m unittest test_bench_serving.TestBenchServing.test_moe_offline_throughput_without_radix_cache
-
   accuracy-test-1-gpu:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false
@@ -316,7 +286,7 @@ jobs:
     if: always()
     needs: [
       unit-test-frontend, unit-test-backend-1-gpu, unit-test-backend-2-gpu, unit-test-backend-8-gpu,
-      performance-test-1-gpu-part-1, performance-test-1-gpu-part-2, performance-test-2-gpu, performance-test-8-gpu,
+      performance-test-1-gpu-part-1, performance-test-1-gpu-part-2, performance-test-2-gpu,
       accuracy-test-1-gpu, accuracy-test-2-gpu, accuracy-test-8-gpu,
     ]
     runs-on: ubuntu-latest
