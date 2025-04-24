@@ -223,9 +223,17 @@ def rebalance_experts(
     return phy2log, log2phy, logcnt
 
 
+# TODO super hacky and hardcode and slow
 def _hack_shuffle(phy2log_old, log2phy_old, logcnt_old):
-    phy2log_new = TODO
-    log2phy_new = TODO
+    import random
+    r = random.Random(42)
+
+    phy2log_new = torch.zeros_like(phy2log_old)
+    log2phy_new = torch.zeros_like(log2phy_old)
+
+    for layer_id in range(phy2log_old.shape[0]):
+        TODO
+
     return phy2log_new, log2phy_new, None
 
 
