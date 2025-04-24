@@ -4,7 +4,7 @@ FastAPI server example for text generation using SGLang Engine and demonstrating
 Starts the server, sends requests to it, and prints responses.
 
 Usage:
-python fastapi_engine_inference.py --model_name Qwen/Qwen2.5-0.5B-Instruct --tp_size 1 --host 127.0.0.1 --port 8000
+python fastapi_engine_inference.py --model-path Qwen/Qwen2.5-0.5B-Instruct --tp_size 1 --host 127.0.0.1 --port 8000
 """
 
 import os
@@ -30,7 +30,7 @@ async def lifespan(app: FastAPI):
     # Adjust model_path and other engine arguments as needed
     print("Loading SGLang engine...")
     engine = sgl.Engine(
-        model_path=os.getenv("MODEL_NAME"), tp_size=int(os.getenv("TP_SIZE"))
+        model_path=os.getenv("MODEL_PATH"), tp_size=int(os.getenv("TP_SIZE"))
     )
     print("SGLang engine loaded.")
     yield
@@ -156,14 +156,14 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--host", type=str, default="http://127.0.0.1")
+    parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-0.5B-Instruct")
+    parser.add_argument("--model-path", type=str, default="Qwen/Qwen2.5-0.5B-Instruct")
     parser.add_argument("--tp_size", type=int, default=1)
     args = parser.parse_args()
 
     # Pass the model to the child uvicorn process via an env var
-    os.environ["MODEL_NAME"] = args.model_name
+    os.environ["MODEL_PATH"] = args.model_path
     os.environ["TP_SIZE"] = str(args.tp_size)
 
     # Start the server
