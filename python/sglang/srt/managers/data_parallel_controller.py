@@ -24,6 +24,7 @@ import psutil
 import setproctitle
 import zmq
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.expert_location import ExpertLocationMetadata
 from sglang.srt.managers.io_struct import (
