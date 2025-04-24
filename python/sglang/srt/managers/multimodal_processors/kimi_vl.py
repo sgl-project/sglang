@@ -36,7 +36,7 @@ class KimiVLImageProcessor(SGLangBaseProcessor):
     async def process_mm_data_async(
         self,
         image_data: List[Union[str, bytes]],
-        prompt,
+        input_text,
         request_obj,
         max_req_input_len,
         *args,
@@ -48,7 +48,7 @@ class KimiVLImageProcessor(SGLangBaseProcessor):
             image_data = [image_data]
 
         base_output = self.load_mm_data(
-            prompt=prompt,
+            prompt=input_text,
             image_data=image_data,
             multimodal_tokens=MultimodalSpecialTokens(image_token=self.IMAGE_TOKEN),
             max_req_input_len=max_req_input_len,

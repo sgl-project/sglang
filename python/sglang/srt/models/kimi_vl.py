@@ -64,7 +64,7 @@ from sglang.srt.layers.activation import QuickGELU
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternImageTokens,
+    MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
@@ -155,7 +155,7 @@ class KimiVLForConditionalGeneration(nn.Module):
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         # Get all special token IDs
-        pattern = MultiModalityDataPaddingPatternImageTokens(mm_inputs.im_token_id)
+        pattern = MultiModalityDataPaddingPatternMultimodalTokens(mm_inputs.im_token_id)
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
     def forward(
