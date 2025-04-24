@@ -310,15 +310,6 @@ class ModelRunner:
             )
             server_args.chunked_prefill_size = -1
 
-            if self.model_config.hf_config.architectures == [
-                "Qwen2VLForConditionalGeneration"
-            ] or self.model_config.hf_config.architectures == [
-                "Qwen2_5_VLForConditionalGeneration"
-            ]:
-                # TODO: qwen2-vl series does not support radix cache now, set disable_radix_cache=True automatically
-                logger.info("Automatically disable radix cache for qwen-vl series.")
-                server_args.disable_radix_cache = True
-
         if server_args.enable_deepep_moe:
             logger.info(f"DeepEP is turned on. DeepEP mode: {server_args.deepep_mode}")
 
