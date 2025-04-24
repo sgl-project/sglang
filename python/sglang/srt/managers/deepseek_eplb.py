@@ -232,7 +232,8 @@ def _hack_shuffle(phy2log_old, log2phy_old, logcnt_old):
     log2phy_new = torch.zeros_like(log2phy_old)
 
     for layer_id in range(phy2log_old.shape[0]):
-        TODO
+        phy2log_new[layer_id, :] = TODO
+        log2phy_new[layer_id, :] = TODO
 
     return phy2log_new, log2phy_new, None
 
