@@ -527,11 +527,16 @@ class DeepseekV2MoE(nn.Module):
     def _forward_tbo_op_mlp(self, state):
         state.expert_output_hidden_states = self.experts(
             hidden_states=state.pop("hidden_states_from_dispatch"),
+            topk_idx=state.pop("topk_idx"),
+            topk_weights=state.pop("topk_weights"),
             reorder_topk_ids=state.pop("reorder_topk_ids_from_dispatch"),
             seg_indptr=state.pop("seg_indptr_from_dispatch"),
             masked_m=state.pop("masked_m_from_dispatch"),
             expected_m=state.pop("expected_m_from_dispatch"),
-            forward_mode=state.forward_batch.forward_mode,
+            num_recv_tokens_per_expert=state.pop(
+                "num_recv_tokens_per_expert_from_dispatch"
+            ),
+            forward_mode=state.pop("state.forward_batch.forward_mode_from_dispatch"),
         )
 
     def _forward_tbo_op_dispatch_a_part_one(self, state):
@@ -548,8 +553,8 @@ class DeepseekV2MoE(nn.Module):
             ],
             forward_mode=state.forward_batch.forward_mode,
             hidden_states=state.hidden_states_after_post_attn_ln,
-            topk_idx=state.pop("topk_idx"),
-            topk_weights=state.pop("topk_weights"),
+            topk_idx=state.topk_idx,
+            topk_weights=state.topk_weights,
         )
 
     def _forward_tbo_op_dispatch_b(self, state, tbo_child_index: int):
@@ -564,6 +569,7 @@ class DeepseekV2MoE(nn.Module):
                 state.topk_idx_from_dispatch,
                 state.topk_weights_from_dispatch,
                 state.reorder_topk_ids_from_dispatch,
+                state.num_recv_tokens_per_expert_from_dispatch,
                 state.seg_indptr_from_dispatch,
                 state.masked_m_from_dispatch,
                 state.expected_m_from_dispatch,
