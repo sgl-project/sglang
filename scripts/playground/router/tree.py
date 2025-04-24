@@ -98,7 +98,7 @@ class MultiTenantRadixTree:
                     curr = matched_node
                     curr.tenant_last_access_time[tenant_id] = time.time()
 
-    def prefix_match(self, s: str) -> tuple[str, int]:
+    def prefix_match(self, s: str) -> tuple[str, str | None]:
         """
         Match string 's' with multiple tenants' trees in one operation.
 
@@ -131,7 +131,8 @@ class MultiTenantRadixTree:
                 curr = matched_node
                 break
 
-        selected_tenant = list(curr.tenant_last_access_time.keys())[0]
+        tenant_keys = list(curr.tenant_last_access_time.keys())
+        selected_tenant = tenant_keys[0] if tenant_keys else None
 
         # traverse back to the root to update last access time for the selected tenant
         while curr != self.root:
@@ -164,6 +165,7 @@ class MultiTenantRadixTree:
 
         # maintain a heap with (time, tenant, node) as the value
         import heapq
+        from itertools import count
 
         # 1. traverse the tree to
         #   a. add all the leaves into a heap (a node with N tenants will be added N times into the heap)
@@ -171,6 +173,7 @@ class MultiTenantRadixTree:
         # do a dfs with stack
         stack = [self.root]
         pq = []
+        tie_breaker = count()
         used_size_per_tenant = defaultdict(int)
 
         while stack:
@@ -184,13 +187,15 @@ class MultiTenantRadixTree:
             # if the node is a leaf for a tenant, add the tenant to the heap
             tenants = leaf_of(curr)
             for t in tenants:
-                heapq.heappush(pq, (curr.tenant_last_access_time[t], t, curr))
+                heapq.heappush(
+                    pq, (curr.tenant_last_access_time[t], next(tie_breaker), t, curr)
+                )
 
         # 2. pop the heap
         #   a. if the tenant's used size is less than the limit, continue
         #   b. if the tenant's used size is greater than the limit, remove the leaf and update the used size, and add its parent to the heap
         while len(pq) > 0:
-            time, tenant, node = heapq.heappop(pq)
+            time, _, tenant, node = heapq.heappop(pq)
             if used_size_per_tenant[tenant] <= max_size_per_tenant[tenant]:
                 continue
 
@@ -205,7 +210,12 @@ class MultiTenantRadixTree:
             if tenant in leaf_of(node.parent):
                 heapq.heappush(
                     pq,
-                    (node.parent.tenant_last_access_time[tenant], tenant, node.parent),
+                    (
+                        node.parent.tenant_last_access_time[tenant],
+                        next(tie_breaker),
+                        tenant,
+                        node.parent,
+                    ),
                 )
 
     def get_used_size_per_tenant(self) -> Dict[str, int]:
