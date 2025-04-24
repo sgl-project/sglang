@@ -1104,7 +1104,7 @@ class DeepEPMoE(EPMoE):
             m_indices,
             output_index,
         )
-        
+
         del hidden_states_fp8
 
         gateup_output = torch.empty(
