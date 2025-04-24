@@ -109,6 +109,10 @@ cmake -S . -B build/ -DCMAKE_INSTALL_PREFIX=/opt/nvshmem/install -DCMAKE_CUDA_AR
 cd build
 make install -j
 
+echo "Verifying NVSHMEM installation..."
+ldconfig
+nvshmem_info
+
 # Install DeepEP
 cd /root/.cache/deepep
 NVSHMEM_DIR=/opt/nvshmem/install python3 setup.py install
