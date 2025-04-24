@@ -62,6 +62,7 @@ class AttentionBackend(ABC):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
+        **kwargs,
     ):
         """Run forward on an attention layer."""
         if forward_batch.forward_mode.is_decode():
@@ -72,6 +73,7 @@ class AttentionBackend(ABC):
                 layer,
                 forward_batch,
                 save_kv_cache=save_kv_cache,
+                **kwargs,
             )
         else:
             return self.forward_extend(
@@ -81,6 +83,7 @@ class AttentionBackend(ABC):
                 layer,
                 forward_batch,
                 save_kv_cache=save_kv_cache,
+                **kwargs,
             )
 
     def forward_decode(

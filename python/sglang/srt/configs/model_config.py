@@ -73,15 +73,14 @@ class ModelConfig:
         )
 
         if enable_multimodal is None:
-            if self.hf_config.architectures[0] == "Llama4ForConditionalGeneration":
+            mm_disabled_models = [
+                "Gemma3ForConditionalGeneration",
+                "Llama4ForConditionalGeneration",
+            ]
+            if self.hf_config.architectures[0] in mm_disabled_models:
                 enable_multimodal = False
                 logger.info(
-                    "Multimodal is disabled for Llama4. To enable it, set --enable-llama4-multimodal."
-                )
-            elif self.hf_config.architectures[0] == "Gemma3ForConditionalGeneration":
-                enable_multimodal = False
-                logger.info(
-                    "Multimodal is disabled for Gemma3. To enable it, set --enable-gemma3-multimodal."
+                    f"Multimodal is disabled for {self.hf_config.model_type}. To enable it, set --enable-multimodal."
                 )
             else:
                 enable_multimodal = True
