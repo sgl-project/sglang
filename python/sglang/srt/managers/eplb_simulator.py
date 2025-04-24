@@ -74,7 +74,7 @@ _MY_MODEL_CONFIG_FOR_EXPERT_LOCATION = ModelConfigForExpertLocation(
 _MY_MODEL_CONFIG_NUM_EXPERTS_PER_TOK = 8
 
 
-def read_physical_count_of_forward_pass(dir_data: Path):
+def read_physical_count_of_forward_pass_id_and_rank(dir_data: Path):
     physical_count_of_forward_pass_id_and_rank = defaultdict(lambda: defaultdict())
     for path in tqdm(list(dir_data.glob("*.pt"))):
         for record in torch.load(path, weights_only=True):
@@ -88,6 +88,13 @@ def read_physical_count_of_forward_pass(dir_data: Path):
                 record["rank"]
             ] = record["physical_count"]
     # print(len(physical_count_of_forward_pass_id_and_rank))
+    return physical_count_of_forward_pass_id_and_rank
+
+
+def read_physical_count_of_forward_pass(dir_data: Path):
+    physical_count_of_forward_pass_id_and_rank = (
+        read_physical_count_of_forward_pass_id_and_rank(dir_data)
+    )
 
     items = []
     for forward_pass_id, physical_count_of_rank in sorted(
