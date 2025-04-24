@@ -154,11 +154,11 @@ def rebalance_experts_hierarchical(
     pphy2mlog = (
         pphy2mlog.view(num_layers, num_nodes, -1)
         + torch.arange(
-            0,
-            num_logical_experts,
-            num_logical_experts // num_nodes,
-            device=group_pack_index.device,
-        ).view(1, -1, 1)
+        0,
+        num_logical_experts,
+        num_logical_experts // num_nodes,
+        device=group_pack_index.device,
+    ).view(1, -1, 1)
     ).flatten(-2)
     pphy2log = mlog2log.gather(-1, pphy2mlog)
     pphyrank = phyrank.gather(-1, pphy2phy).view(num_layers, -1)
@@ -172,6 +172,7 @@ def rebalance_experts(
     num_groups: int,
     num_nodes: int,
     num_gpus: int,
+    hack_shuffle: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Entry point for expert-parallelism load balancer.
@@ -214,7 +215,18 @@ def rebalance_experts(
             num_layers, -1
         ),
     )
+
+    if hack_shuffle:
+        print("EPLB hack shuffle!!!")
+        phy2log, log2phy, logcnt = _hack_shuffle(phy2log, log2phy, logcnt)
+
     return phy2log, log2phy, logcnt
+
+
+def _hack_shuffle(phy2log_old, log2phy_old, logcnt_old):
+    phy2log_new = TODO
+    log2phy_new = TODO
+    return phy2log_new, log2phy_new, None
 
 
 __all__ = ["rebalance_experts"]
