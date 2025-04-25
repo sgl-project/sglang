@@ -852,6 +852,7 @@ def ep_scatter(
 
     grid = min(recv_topk.shape[0], 1024 * 8)
 
+
     _fwd_kernel_ep_scatter_2[(grid,)](
         recv_topk.shape[0],
         expert_start_loc,

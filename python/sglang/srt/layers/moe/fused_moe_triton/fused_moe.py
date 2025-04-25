@@ -21,6 +21,9 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
 )
+from sglang.srt.layers.moe.ep_moe.kernels import (
+    tma_align_input_scale,
+)
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -30,6 +33,18 @@ if _is_cuda:
 else:
     from vllm import _custom_ops as vllm_ops
     from vllm._custom_ops import scaled_fp8_quant
+
+from sglang.srt.layers.quantization.deep_gemm import _ENABLE_JIT_DEEPGEMM
+
+if _ENABLE_JIT_DEEPGEMM:
+    from deep_gemm import (
+        get_col_major_tma_aligned_tensor,
+        m_grouped_gemm_fp8_fp8_bf16_nt_contiguous,
+    )
+    from sgl_kernel import silu_and_mul
+    from sglang.srt.layers.quantization.fp8_kernel import (
+        sglang_per_token_group_quant_fp8,
+    )
 
 if _is_cuda or _is_hip:
     from sgl_kernel import moe_align_block_size as sgl_moe_align_block_size
@@ -1341,6 +1356,152 @@ def fused_experts_impl(
     assert w2.is_contiguous(), "Expert weights2 must be contiguous"
     assert hidden_states.dtype in [torch.float32, torch.float16, torch.bfloat16]
 
+    if _ENABLE_JIT_DEEPGEMM:
+        return fused_experts_impl_deepgemm(
+            hidden_states,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            inplace,
+            activation,
+            apply_router_weight_on_input,
+            use_fp8_w8a8,
+            use_int8_w8a8,
+            use_int8_w8a16,
+            use_int4_w4a16,
+            per_channel_quant,
+            w1_scale,
+            w2_scale,
+            w1_zp,
+            w2_zp,
+            a1_scale,
+            a2_scale,
+            block_shape,
+            no_combine,
+        )
+    else:
+        return fused_experts_impl_normal(
+            hidden_states,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            inplace,
+            activation,
+            apply_router_weight_on_input,
+            use_fp8_w8a8,
+            use_int8_w8a8,
+            use_int8_w8a16,
+            use_int4_w4a16,
+            per_channel_quant,
+            w1_scale,
+            w2_scale,
+            w1_zp,
+            w2_zp,
+            a1_scale,
+            a2_scale,
+            block_shape,
+            no_combine,
+        )
+
+
+def fused_experts_impl_deepgemm(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    inplace: bool = False,
+    activation: str = "silu",
+    apply_router_weight_on_input: bool = False,
+    use_fp8_w8a8: bool = False,
+    use_int8_w8a8: bool = False,
+    use_int8_w8a16: bool = False,
+    use_int4_w4a16: bool = False,
+    per_channel_quant: bool = False,
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    w1_zp: Optional[torch.Tensor] = None,
+    w2_zp: Optional[torch.Tensor] = None,
+    a1_scale: Optional[torch.Tensor] = None,
+    a2_scale: Optional[torch.Tensor] = None,
+    block_shape: Optional[List[int]] = None,
+    no_combine: bool = False,
+):
+    if padding_size > 0:
+        raise NotImplementedError
+    assert w1.dtype == torch.float8_e4m3fn
+    assert w2.dtype == torch.float8_e4m3fn
+    assert w1_scale is not None
+    assert w2_scale is not None
+    # assert block_shape
+
+    hidden_states_fp8, hidden_states_fp8_scale = sglang_per_token_group_quant_fp8(hidden_states, 128)
+    hidden_states_fp8 = hidden_states_fp8.unsqueeze(1).expand((-1, topk_ids.shape[1], -1))
+    hidden_states_fp8_scale = hidden_states_fp8_scale.unsqueeze(1).expand((-1, topk_ids.shape[1], -1))
+
+    hidden_states_fp8 = hidden_states_fp8.reshape(-1, hidden_states_fp8.shape[-1])
+    hidden_states_fp8_scale = hidden_states_fp8.reshape(-1, hidden_states_fp8_scale.shape[-1])
+
+    m_indices = topk_ids.view(-1)
+
+    w13_weight_fp8 = (w1, w1_scale)
+    w2_weight_fp8 = (w2, w2_scale)
+    M, K = hidden_states_fp8.shape
+    N = w1.shape[2]
+    logger.info(f"token {M}, hidden {(K, w1.shape[1])}, expert {w1.shape[0]}, inter {w1.shape[2]}")
+    scale_block_size = 128
+
+    input_tensor = [
+        hidden_states_fp8, hidden_states_fp8_scale
+    ]
+
+    gateup_output = torch.empty(
+        (M, N),
+        device=hidden_states.device,
+        dtype=torch.bfloat16,
+    )
+    down_input = torch.empty(
+        (
+            M,
+            N // 2,
+        ),
+        device=hidden_states.device,
+        dtype=torch.float8_e4m3fn,
+    )
+    down_output = torch.empty(
+        (M, K),
+        device=hidden_states.device,
+        dtype=torch.bfloat16,
+    )
+    deep_gemm_moe(input_tensor, w13_weight_fp8, w2_weight_fp8, gateup_output, m_indices, down_input, down_output, scale_block_size)
+    return down_output.reshape(-1, topk_ids.shape[1], K) * topk_weights.sum(1)
+    
+def fused_experts_impl_normal(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    inplace: bool = False,
+    activation: str = "silu",
+    apply_router_weight_on_input: bool = False,
+    use_fp8_w8a8: bool = False,
+    use_int8_w8a8: bool = False,
+    use_int8_w8a16: bool = False,
+    use_int4_w4a16: bool = False,
+    per_channel_quant: bool = False,
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    w1_zp: Optional[torch.Tensor] = None,
+    w2_zp: Optional[torch.Tensor] = None,
+    a1_scale: Optional[torch.Tensor] = None,
+    a2_scale: Optional[torch.Tensor] = None,
+    block_shape: Optional[List[int]] = None,
+    no_combine: bool = False,
+):
+    padded_size = padding_size
     num_tokens, _ = hidden_states.shape
     E, N, _ = w1.shape
     # We execute the fused_moe kernel in chunks to circumvent this issue:
@@ -1626,4 +1787,31 @@ def fused_moe(
         a2_scale=a2_scale,
         block_shape=block_shape,
         no_combine=no_combine,
+    )
+
+
+def deep_gemm_moe(
+    input_tensor: Tuple[torch.Tensor, torch.Tensor],
+    w13_weight_fp8: Tuple[torch.Tensor, torch.Tensor],
+    w2_weight_fp8: Tuple[torch.Tensor, torch.Tensor],
+    gateup_output: torch.Tensor,
+    m_indices: torch.Tensor,
+    down_input,
+    down_output,
+    scale_block_size: int,
+):
+    N = w13_weight_fp8[0].size(1)
+    m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(
+        input_tensor, w13_weight_fp8, gateup_output, m_indices
+    )
+    silu_and_mul(gateup_output.view(-1, N), down_input)
+    down_input_fp8, down_input_scale = sglang_per_token_group_quant_fp8(
+        down_input, scale_block_size
+    )
+    down_input_scale = tma_align_input_scale(down_input_scale)
+    m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(
+        (down_input_fp8, down_input_scale),
+        w2_weight_fp8,
+        down_output,
+        m_indices,
     )

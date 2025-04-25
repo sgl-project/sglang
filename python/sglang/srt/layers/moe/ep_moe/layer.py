@@ -1,5 +1,5 @@
 import logging
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple, Union
 
 import torch
 from torch.nn import Module
@@ -10,11 +10,6 @@ try:
         get_col_major_tma_aligned_tensor,
         m_grouped_gemm_fp8_fp8_bf16_nt_contiguous,
         m_grouped_gemm_fp8_fp8_bf16_nt_masked,
-    )
-    from sgl_kernel import silu_and_mul
-
-    from sglang.srt.layers.quantization.fp8_kernel import (
-        sglang_per_token_group_quant_fp8,
     )
     from sglang.srt.utils import DeepEPMode, get_bool_env_var
 
@@ -43,6 +38,7 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
 )
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoEMethodBase
+from sglang.srt.layers.moe.fused_moe_triton.fused_moe import deep_gemm_moe
 from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
@@ -213,6 +209,9 @@ class EPMoE(torch.nn.Module):
 
     def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
         assert self.quant_method is not None
+
+        if _enable_jit_deepgemm:
+            raise NotImplementedError
 
         if self.grouped_gemm_runner is None:
             self.grouped_gemm_runner = GroupedGemmRunner(
@@ -854,7 +853,7 @@ class DeepEPMoE(EPMoE):
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
         reorder_topk_ids: torch.Tensor,
@@ -1009,12 +1008,6 @@ class DeepEPMoE(EPMoE):
         N = self.w13_weight.size(1)
         scale_block_size = 128
 
-        gather_out = torch.empty_like(
-            hidden_states_fp8,
-            device=hidden_states_fp8.device,
-            dtype=torch.bfloat16,
-        )
-
         input_tensor = [
             torch.empty(
                 (all_tokens, K),
@@ -1058,9 +1051,6 @@ class DeepEPMoE(EPMoE):
             dtype=torch.bfloat16,
         )
         input_tensor[1] = tma_align_input_scale(input_tensor[1])
-        m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(
-            input_tensor, self.w13_weight_fp8, gateup_output, m_indices
-        )
         down_input = torch.empty(
             (
                 all_tokens,
@@ -1069,29 +1059,18 @@ class DeepEPMoE(EPMoE):
             device=gateup_output.device,
             dtype=torch.bfloat16,
         )
-        down_input_scale = torch.empty(
-            (
-                all_tokens,
-                N // 2,
-            ),
-            device=gateup_output.device,
-            dtype=torch.float32,
-        )
-        silu_and_mul(gateup_output.view(-1, N), down_input)
         down_output = torch.empty(
             (all_tokens, K),
             device=hidden_states_fp8.device,
             dtype=torch.bfloat16,
         )
-        down_input_fp8, down_input_scale = sglang_per_token_group_quant_fp8(
-            down_input, scale_block_size
-        )
-        down_input_scale = tma_align_input_scale(down_input_scale)
-        m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(
-            (down_input_fp8, down_input_scale),
-            self.w2_weight_fp8,
-            down_output,
-            m_indices,
+
+        deep_gemm_moe(input_tensor, self.w13_weight_fp8, self.w2_weight_fp8, gateup_output, m_indices, down_input, down_output, scale_block_size)
+
+        gather_out = torch.empty_like(
+            hidden_states_fp8,
+            device=hidden_states_fp8.device,
+            dtype=torch.bfloat16,
         )
 
         ep_gather(down_output, topk_idx, topk_weights, output_index, gather_out)
