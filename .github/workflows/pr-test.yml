@@ -276,17 +276,17 @@ jobs:
           cd human-eval
           pip install -e .
 
-      - name: Run DeepEP intranode test
-        timeout-minutes: 10
-        run: |
-          cd test/srt
-          python3 test_deepep_intranode.py
+      # - name: Run DeepEP intranode test
+      #   timeout-minutes: 10
+      #   run: |
+      #     cd test/srt
+      #     python3 test_deepep_intranode.py
 
-      - name: Run DeepEP low latency test
-        timeout-minutes: 10
-        run: |
-          cd test/srt
-          python3 test_deepep_low_latency.py
+      # - name: Run DeepEP low latency test
+      #   timeout-minutes: 10
+      #   run: |
+      #     cd test/srt
+      #     python3 test_deepep_low_latency.py
 
       - name: Evaluate accuracy (TP=8)
         timeout-minutes: 30

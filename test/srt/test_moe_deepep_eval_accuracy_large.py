@@ -41,18 +41,6 @@ class TestMoEDeepEPEvalAccuracyLarge(CustomTestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    # def test_mmlu(self):
-    #     args = SimpleNamespace(
-    #         base_url=self.base_url,
-    #         model=self.model,
-    #         eval_name="mmlu",
-    #         num_examples=5000,
-    #         num_threads=1024,
-    #     )
-
-    #     metrics = run_eval(args)
-    #     self.assertGreater(metrics["score"], 0.89)
-
     def test_gsm8k(self):
         args = SimpleNamespace(
             num_shots=8,
@@ -67,6 +55,18 @@ class TestMoEDeepEPEvalAccuracyLarge(CustomTestCase):
         print(metrics)
 
         self.assertGreater(metrics["accuracy"], 0.945)
+
+    def test_mmlu(self):
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="mmlu",
+            num_examples=5000,
+            num_threads=1024,
+        )
+
+        metrics = run_eval(args)
+        self.assertGreater(metrics["score"], 0.89)
 
 
 if __name__ == "__main__":
