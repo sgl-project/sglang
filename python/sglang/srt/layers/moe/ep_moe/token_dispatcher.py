@@ -1,7 +1,7 @@
 from sglang.srt.managers.expert_distribution import (
     get_global_expert_distribution_recorder,
 )
-from sglang.srt.utils import DeepEPMode, DisposibleTensor
+from sglang.srt.utils import DeepEPMode, DisposibleTensor, get_int_env_var
 
 try:
     from deep_ep import Buffer
@@ -141,7 +141,9 @@ class _DeepEPDispatcherImplBase:
         self.deepep_mode = deepep_mode
 
         self.params_bytes = 2
-        self.num_max_dispatch_tokens_per_rank = 128
+        self.num_max_dispatch_tokens_per_rank = get_int_env_var(
+            "SGLANG_HACK_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 128
+        )
 
         self.handle = None
 
