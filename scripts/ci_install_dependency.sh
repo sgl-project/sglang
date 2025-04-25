@@ -46,21 +46,24 @@ pip install cuda-python nvidia-cuda-nvrtc-cu12
 # Install system dependencies
 apt-get update && apt-get install -y wget libibverbs-dev infiniband-diags libmlx5-1 rdma-core openssh-server perftest ibverbs-providers libibumad3 libibverbs1 libnl-3-200 libnl-route-3-200 librdmacm1
 
-# Install NCCL and HPCX
-wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/libnccl2_2.20.3-1+cuda12.4_amd64.deb
-wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/libnccl-dev_2.20.3-1+cuda12.4_amd64.deb
-dpkg -i libnccl2_2.20.3-1+cuda12.4_amd64.deb
-dpkg -i libnccl-dev_2.20.3-1+cuda12.4_amd64.deb
+# # Add NVIDIA's apt repository for NCCL
+# curl -fsSL https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/3bf863cc.pub | apt-key add -
+# echo "deb https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64 /" | tee /etc/apt/sources.list.d/cuda.list
 
-# Install HPCX
-wget https://content.mellanox.com/hpc/hpc-x/v2.15/hpcx-v2.15-gcc-MLNX_OFED_LINUX-5-ubuntu22.04-cuda12-gdrcopy2-nccl2.20-x86_64.tbz
-tar -xvf hpcx-v2.15-gcc-MLNX_OFED_LINUX-5-ubuntu22.04-cuda12-gdrcopy2-nccl2.20-x86_64.tbz -C /opt/
-rm hpcx-v2.15-gcc-MLNX_OFED_LINUX-5-ubuntu22.04-cuda12-gdrcopy2-nccl2.20-x86_64.tbz
+# # Install NCCL
+# apt-get update && apt-get install -y --no-install-recommends \
+#     libnccl2=2.20.3-1+cuda12.4 \
+#     libnccl-dev=2.20.3-1+cuda12.4
 
-# Set HPCX environment variables
-export HPCX_HOME=/opt/hpcx-v2.15-gcc-MLNX_OFED_LINUX-5-ubuntu22.04-cuda12-gdrcopy2-nccl2.20-x86_64
-export PATH=$HPCX_HOME/bin:$PATH
-export LD_LIBRARY_PATH=$HPCX_HOME/lib:$LD_LIBRARY_PATH
+# # Install HPCX
+# wget https://content.mellanox.com/hpc/hpc-x/v2.15/hpcx-v2.15-gcc-MLNX_OFED_LINUX-5-ubuntu22.04-cuda12-gdrcopy2-nccl2.20-x86_64.tbz
+# tar -xvf hpcx-v2.15-gcc-MLNX_OFED_LINUX-5-ubuntu22.04-cuda12-gdrcopy2-nccl2.20-x86_64.tbz -C /opt/
+# rm hpcx-v2.15-gcc-MLNX_OFED_LINUX-5-ubuntu22.04-cuda12-gdrcopy2-nccl2.20-x86_64.tbz
+
+# # Set HPCX environment variables
+# export HPCX_HOME=/opt/hpcx-v2.15-gcc-MLNX_OFED_LINUX-5-ubuntu22.04-cuda12-gdrcopy2-nccl2.20-x86_64
+# export PATH=$HPCX_HOME/bin:$PATH
+# export LD_LIBRARY_PATH=$HPCX_HOME/lib:$LD_LIBRARY_PATH
 
 wget https://github.com/Kitware/CMake/releases/download/v3.27.4/cmake-3.27.4-linux-x86_64.sh
 chmod +x cmake-3.27.4-linux-x86_64.sh
@@ -120,9 +123,9 @@ make -j$(nproc) install
 cd /root/.cache/deepep && python3 setup.py install
 
 # Verify configuration
-echo "=== Network Configuration ==="
-ifconfig
-ethtool -i eth0
+# echo "=== Network Configuration ==="
+# ifconfig
+# ethtool -i eth0
 echo "=== NCCL Configuration ==="
 nvidia-smi topo -m
 nvidia-smi nvlink -s
