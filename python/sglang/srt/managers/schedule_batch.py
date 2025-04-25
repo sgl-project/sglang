@@ -391,6 +391,7 @@ class Req:
         return_hidden_states: bool = False,
         eos_token_ids: Optional[Set[int]] = None,
         bootstrap_host: Optional[str] = None,
+        bootstrap_port: Optional[int] = None,
         bootstrap_room: Optional[int] = None,
     ):
         # Input and output info
@@ -526,6 +527,7 @@ class Req:
 
         # For disaggregation
         self.bootstrap_host: str = bootstrap_host
+        self.bootstrap_port: Optional[int] = bootstrap_port
         self.bootstrap_room: Optional[int] = bootstrap_room
         self.disagg_kv_sender: Optional[BaseKVSender] = None
 

@@ -137,7 +137,7 @@ class DecodePreallocQueue:
         kv_receiver_class = get_kv_class(self.transfer_backend, KVClassType.RECEIVER)
         kv_receiver = kv_receiver_class(
             mgr=self.kv_manager,
-            bootstrap_addr=f"{req.bootstrap_host}:{self.bootstrap_port}",
+            bootstrap_addr=f"{req.bootstrap_host}:{req.bootstrap_port}",
             bootstrap_room=req.bootstrap_room,
         )
         self.queue.append(DecodeRequest(req=req, kv_receiver=kv_receiver))
