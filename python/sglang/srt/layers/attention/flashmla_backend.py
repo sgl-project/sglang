@@ -35,6 +35,7 @@ PAGE_SIZE = 64
 # TODO The current setup is hard-coded and will be changed after integrating with MTP.
 Q_LEN = 1
 
+USE_FLASHINFER = 0
 
 @dataclass
 class FlashMLADecodeMetadata:
@@ -82,6 +83,10 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         self.q_data_type = model_runner.dtype
         self.kv_cache_dim = self.kv_lora_rank + self.qk_rope_head_dim
 
+        self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
+        # if get_tensor_model_parallel_rank() == 0:
+        #     print(f"{self.num_draft_tokens=}")
+
         # other data
         # self.decode_cuda_graph_metadata = {}
         # self.prefill_cuda_graph_metadata = {}  # For verify
@@ -126,7 +131,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 )
             else:
                 super().init_forward_metadata(forward_batch)
-        elif False: # forward_batch.forward_mode.is_target_verify():
+        elif (not USE_FLASHINFER) and forward_batch.forward_mode.is_target_verify():
             max_seqlen_pad = triton.cdiv(
                 forward_batch.seq_lens_cpu.max().item(), PAGE_SIZE
             )
@@ -147,7 +152,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             )
             mla_metadata, num_splits = get_mla_metadata(
                 forward_batch.seq_lens.to(torch.int32),
-                Q_LEN * self.num_q_heads,
+                self.num_draft_tokens * self.num_q_heads,
                 1,
             )
 
@@ -387,7 +392,19 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         if forward_batch.forward_mode == ForwardMode.EXTEND or forward_batch.forward_mode == ForwardMode.DRAFT_EXTEND:
             return super().forward_extend(q,k,v,layer, forward_batch, save_kv_cache)
         else:
-            return super().forward_extend(q,k,v,layer, forward_batch, save_kv_cache)
+            # output_path = "./output_flashinfer/" if USE_FLASHINFER else "./output_flashmla/"
+            # if get_tensor_model_parallel_rank() == 0 and layer.layer_id == 0:
+            #     print(f"{q.shape=}, {k.shape=}, {v.shape=}, {save_kv_cache=}")
+            #     torch.save(q, f"{output_path}/0_q")
+            #     torch.save(k, f"{output_path}/1_k")
+            #     torch.save(v, f"{output_path}/2_v")
+
+            if USE_FLASHINFER:
+                o = super().forward_extend(q,k,v,layer, forward_batch, save_kv_cache)
+                # if get_tensor_model_parallel_rank() == 0 and layer.layer_id == 0:
+                #     print(f"{o.shape=}")
+                #     torch.save(o, f"{output_path}/3_o")
+                return o
 
             cache_loc = forward_batch.out_cache_loc
 
@@ -401,6 +418,17 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
 
             reshape_q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
 
+            # if get_tensor_model_parallel_rank() == 0 and layer.layer_id == 0:
+            #     torch.save(self.forward_metadata.flashmla_metadata, f"{output_path}/4_meta")
+            #     torch.save(k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim)[0:4], f"{output_path}/4_cache")
+            #     print(f"[0] {reshape_q.shape=}")
+            #     print(f"[1] {k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim).shape=}")
+            #     print(f"[2] {self.forward_metadata.block_kv_indices=}")
+            #     print(f"[3] {forward_batch.seq_lens.to(torch.int32)=}")
+            #     print(f"[4] {self.kv_lora_rank=}")
+            #     print(f"[5] {self.forward_metadata.flashmla_metadata.shape=}")
+            #     print(f"[6] {self.forward_metadata.num_splits=}")
+            #     print(f"[7] {layer.scaling=}")
             o, _ = flash_mla_with_kvcache(
                 q=reshape_q,
                 k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
@@ -412,6 +440,10 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 softmax_scale=layer.scaling,
                 causal=True,
             )
+            # o = o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+            # if get_tensor_model_parallel_rank() == 0 and layer.layer_id == 0:
+            #     print(f"{o.shape=}")
+            #     torch.save(o, f"{output_path}/3_o")
 
             return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 

@@ -364,6 +364,9 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         else:
             # mla paged prefill
             k_buf = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(torch.bfloat16)
+            # if get_tensor_model_parallel_rank() == 0 and layer.layer_id == 0 and forward_batch.forward_mode == ForwardMode.TARGET_VERIFY:
+            #     output_path = "./output_flashinfer/"
+            #     torch.save(k_buf.view(-1, 64, 1, self.kv_cache_dim)[0:4], f"{output_path}/4_cache")
             o = prefill_wrapper_paged.run(
                 qall[:, :, : layer.v_head_dim],
                 qall[:, :, layer.v_head_dim :],
