@@ -136,10 +136,10 @@ cd /root/.cache/deepep && python3 setup.py install
 echo "=== NCCL Configuration ==="
 nvidia-smi topo -m
 nvidia-smi nvlink -s
-echo "=== RDMA Configuration ==="
-ibv_devinfo
-ibv_devices
-ibv_rc_pingpong -d mlx5_0 -g 0 -i 1
+# echo "=== RDMA Configuration ==="
+# ibv_devinfo
+# ibv_devices
+# ibv_rc_pingpong -d mlx5_0 -g 0 -i 1
 echo "=== GDRCOPY ==="
 gdrcopy_copybw
 echo "=== NVSHMEM ==="
