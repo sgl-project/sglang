@@ -49,6 +49,14 @@ class RMSNorm(CustomOp):
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
 
+    def forward(self, *args, **kwargs):
+        if _is_cuda:
+            return self.forward_cuda(*args, **kwargs)
+        elif _is_hip:
+            return self.forward_hip(*args, **kwargs)
+        else:
+            return self.forward_native(*args, **kwargs)
+
     def forward_cuda(
         self,
         x: torch.Tensor,
