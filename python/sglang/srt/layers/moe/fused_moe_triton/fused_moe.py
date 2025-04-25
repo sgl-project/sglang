@@ -1442,15 +1442,14 @@ def fused_experts_impl_deepgemm(
     hidden_states_fp8_scale = hidden_states_fp8_scale.unsqueeze(1).expand((-1, topk_ids.shape[1], -1))
 
     hidden_states_fp8 = hidden_states_fp8.reshape(-1, hidden_states_fp8.shape[-1])
-    hidden_states_fp8_scale = hidden_states_fp8.reshape(-1, hidden_states_fp8_scale.shape[-1])
+    hidden_states_fp8_scale = hidden_states_fp8_scale.reshape(-1, hidden_states_fp8_scale.shape[-1])
 
     m_indices = topk_ids.view(-1)
 
-    w13_weight_fp8 = (w1, w1_scale)
-    w2_weight_fp8 = (w2, w2_scale)
+    w13_weight_fp8 = (w1, w1_scale)  # (w1.transpose(1, 2), w1_scale.transpose(1, 2))
+    w2_weight_fp8 = (w2, w2_scale)  # (w2.transpose(1, 2), w2_scale.transpose(1, 2))
     M, K = hidden_states_fp8.shape
-    N = w1.shape[2]
-    logger.info(f"token {M}, hidden {(K, w1.shape[1])}, expert {w1.shape[0]}, inter {w1.shape[2]}")
+    N = w1.shape[1]
     scale_block_size = 128
 
     input_tensor = [
@@ -1468,7 +1467,7 @@ def fused_experts_impl_deepgemm(
             N // 2,
         ),
         device=hidden_states.device,
-        dtype=torch.float8_e4m3fn,
+        dtype=torch.bfloat16,
     )
     down_output = torch.empty(
         (M, K),
@@ -1476,7 +1475,8 @@ def fused_experts_impl_deepgemm(
         dtype=torch.bfloat16,
     )
     deep_gemm_moe(input_tensor, w13_weight_fp8, w2_weight_fp8, gateup_output, m_indices, down_input, down_output, scale_block_size)
-    return down_output.reshape(-1, topk_ids.shape[1], K) * topk_weights.sum(1)
+    down_output = down_output.reshape(-1, topk_ids.shape[1], K) * topk_weights.unsqueeze(-1)
+    return down_output.sum(1)
     
 def fused_experts_impl_normal(
     hidden_states: torch.Tensor,
@@ -1801,6 +1801,10 @@ def deep_gemm_moe(
     scale_block_size: int,
 ):
     N = w13_weight_fp8[0].size(1)
+    # logger.info(f"M: {input_tensor[0].shape[0]}, {input_tensor[1].shape[0]}, {gateup_output.shape[0]}, {m_indices.shape[0]}")
+    # logger.info(f"K: {input_tensor[0].shape[1]}, {input_tensor[1].shape[1] * 128}, {w13_weight_fp8[0].shape[2]}, {w13_weight_fp8[1].shape[2] * 128}")
+    # logger.info(f"N: {w13_weight_fp8[0].shape[1]}, {w13_weight_fp8[1].shape[1] * 128}, {gateup_output.shape[1]}")
+    # logger.info(f"E: {w13_weight_fp8[0].shape[0]}, {w13_weight_fp8[1].shape[0]}")
     m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(
         input_tensor, w13_weight_fp8, gateup_output, m_indices
     )
