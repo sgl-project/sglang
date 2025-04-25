@@ -1441,10 +1441,10 @@ def fused_experts_impl_deepgemm(
     hidden_states_fp8 = hidden_states_fp8.unsqueeze(1).expand((-1, topk_ids.shape[1], -1))
     hidden_states_fp8_scale = hidden_states_fp8_scale.unsqueeze(1).expand((-1, topk_ids.shape[1], -1))
 
-    hidden_states_fp8 = hidden_states_fp8.reshape(-1, hidden_states_fp8.shape[-1])
-    hidden_states_fp8_scale = hidden_states_fp8_scale.reshape(-1, hidden_states_fp8_scale.shape[-1])
+    hidden_states_fp8 = hidden_states_fp8.reshape(-1, hidden_states_fp8.shape[-1]).contiguous()
+    hidden_states_fp8_scale = hidden_states_fp8_scale.reshape(-1, hidden_states_fp8_scale.shape[-1]).contiguous()
 
-    m_indices = topk_ids.view(-1)
+    m_indices = topk_ids.view(-1).contiguous()
 
     w13_weight_fp8 = (w1, w1_scale)  # (w1.transpose(1, 2), w1_scale.transpose(1, 2))
     w2_weight_fp8 = (w2, w2_scale)  # (w2.transpose(1, 2), w2_scale.transpose(1, 2))
