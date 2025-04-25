@@ -168,7 +168,7 @@ class Gemma3RMSNorm(nn.Module):
 
 if not _is_cuda:
     logger.info(
-        "sgl-kernel is not available on Non-NV platforms. Fallback to other kernel libraries."
+        "sgl-kernel layernorm implementation is not available on current platform. Fallback to other kernel libraries."
     )
     if _is_hip:
         from vllm.model_executor.layers.layernorm import GemmaRMSNorm
