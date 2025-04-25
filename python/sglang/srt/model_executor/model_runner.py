@@ -884,6 +884,7 @@ class ModelRunner:
                 layer_num=self.model_config.num_hidden_layers,
                 device=self.device,
                 enable_memory_saver=self.server_args.enable_memory_saver,
+                local_size = self.local_max_num_tokens,
             )
 
         if self.token_to_kv_pool_allocator is None:

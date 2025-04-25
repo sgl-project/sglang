@@ -212,8 +212,10 @@ class MHATokenToKVPool(KVCache):
         layer_num: int,
         device: str,
         enable_memory_saver: bool,
+        local_size: int = None,
     ):
         self.size = size
+        self.local_size = local_size
         self.page_size = page_size
         self.dtype = dtype
         self.device = device
@@ -245,22 +247,51 @@ class MHATokenToKVPool(KVCache):
         with self.memory_saver_adapter.region():
             # [size, head_num, head_dim] for each layer
             # The padded slot 0 is used for writing dummy outputs from padded tokens.
-            self.k_buffer = [
-                torch.zeros(
-                    (self.size + self.page_size, self.head_num, self.head_dim),
-                    dtype=self.store_dtype,
-                    device=self.device,
+            if self.local_size is None:
+                self.k_buffer = [
+                    torch.zeros(
+                        (self.size + self.page_size, self.head_num, self.head_dim),
+                        dtype=self.store_dtype,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+                self.v_buffer = [
+                    torch.zeros(
+                        (self.size + self.page_size, self.head_num, self.head_dim),
+                        dtype=self.store_dtype,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+            else:
+                self.k_buffer = []
+                self.v_buffer = []
+                for i in range(self.layer_num):
+                    temp_size = self.local_size if int((i+1)%4!=0) else self.size
+                    self.k_buffer.append(
+                        torch.zeros(
+                            (temp_size + self.page_size, self.head_num, self.head_dim),
+                            dtype=self.store_dtype,
+                            device=self.device,
+                        )
+                    )
+                    self.v_buffer.append(
+                        torch.zeros(
+                            (temp_size + self.page_size, self.head_num, self.head_dim),
+                            dtype=self.store_dtype,
+                            device=self.device,
+                        )
+                    )
+        
+        for i in range(self.layer_num):
+            with open("log.txt", "a") as f:
+                f.write(
+                    f"layer_id: {i}\n"
+                    f"kbuffer shape: {self.k_buffer[i].shape}\n"
                 )
-                for _ in range(self.layer_num)
-            ]
-            self.v_buffer = [
-                torch.zeros(
-                    (self.size + self.page_size, self.head_num, self.head_dim),
-                    dtype=self.store_dtype,
-                    device=self.device,
-                )
-                for _ in range(self.layer_num)
-            ]
+                    
+                
 
     def _clear_buffers(self):
         del self.k_buffer
