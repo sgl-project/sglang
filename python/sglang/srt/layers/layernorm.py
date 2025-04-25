@@ -50,6 +50,8 @@ class RMSNorm(CustomOp):
         self.variance_epsilon = eps
 
     def forward(self, *args, **kwargs):
+        if torch.compiler.is_compiling():
+            return self.forward_native(*args, **kwargs)
         if _is_cuda:
             return self.forward_cuda(*args, **kwargs)
         elif _is_hip:
@@ -115,6 +117,14 @@ class GemmaRMSNorm(CustomOp):
         self.weight = nn.Parameter(torch.zeros(hidden_size))
         self.variance_epsilon = eps
 
+    def forward(self, *args, **kwargs):
+        if torch.compiler.is_compiling():
+            return self.forward_native(*args, **kwargs)
+        if _is_cuda:
+            return self.forward_cuda(*args, **kwargs)
+        else:
+            return self.forward_native(*args, **kwargs)
+
     def forward_native(
         self,
         x: torch.Tensor,
@@ -166,11 +176,8 @@ class Gemma3RMSNorm(nn.Module):
         return f"{tuple(self.weight.shape)}, eps={self.eps}"
 
 
-if not _is_cuda:
+if not (_is_cuda or _is_hip):
     logger.info(
         "sgl-kernel layernorm implementation is not available on current platform. Fallback to other kernel libraries."
     )
-    if _is_hip:
-        from vllm.model_executor.layers.layernorm import GemmaRMSNorm
-    else:
-        from vllm.model_executor.layers.layernorm import GemmaRMSNorm, RMSNorm
+    from vllm.model_executor.layers.layernorm import GemmaRMSNorm, RMSNorm
