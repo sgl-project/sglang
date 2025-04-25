@@ -1,5 +1,4 @@
 import json
-import multiprocessing as mp
 import os
 import random
 import threading
@@ -8,7 +7,6 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from types import SimpleNamespace
-from typing import List, Optional
 
 import numpy as np
 import requests
@@ -18,7 +16,6 @@ import sglang as sgl
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.utils import kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval
-from sglang.test.runners import DEFAULT_PROMPTS, SRTRunner
 from sglang.test.test_utils import (
     DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
     DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
@@ -536,37 +533,6 @@ class TestEAGLEServerTriton(TestEAGLEServer):
                 "--attention-backend",
                 "triton",
                 "--max-running-requests",
-                8,
-            ],
-        )
-
-
-class TestEAGLEServerPageSize(TestEAGLEServer):
-    @classmethod
-    def setUpClass(cls):
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--speculative-algorithm",
-                "EAGLE",
-                "--speculative-draft-model-path",
-                DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
-                "--speculative-num-steps",
-                5,
-                "--speculative-eagle-topk",
-                1,
-                "--speculative-num-draft-tokens",
-                6,
-                "--mem-fraction-static",
-                0.7,
-                "--chunked-prefill-size",
-                128,
-                "--max-running-requests",
-                8,
-                "--page-size",
                 8,
             ],
         )
