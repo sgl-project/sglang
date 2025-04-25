@@ -143,12 +143,6 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         self.quant_config = quant_config
         self.determine_n_share_experts_fusion("DeepseekV3ForCausalLMNextN")
 
-        self.n_share_experts_fusion = (
-            DeepseekV3ForCausalLM._initialize_shared_experts_fusion(
-                config, self.tp_size
-            )
-        )
-
         self.model = DeepseekModelNextN(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
