@@ -493,7 +493,22 @@ class ServerArgs:
             "--quantization",
             type=str,
             default=ServerArgs.quantization,
-            choices=QUANTIZATION_METHODS.keys(),
+            choices=[
+                "awq",
+                "fp8",
+                "gptq",
+                "marlin",
+                "gptq_marlin",
+                "awq_marlin",
+                "bitsandbytes",
+                "gguf",
+                "modelopt",
+                "modelopt_fp4",
+                "w8a8_int8",
+                "w8a8_fp8",
+                "moe_wna16",
+                "compressed-tensors",
+            ],
             help="The quantization method.",
         )
         parser.add_argument(

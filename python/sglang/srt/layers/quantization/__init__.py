@@ -9,10 +9,6 @@ import torch
 
 try:
     from vllm.model_executor.layers.quantization.aqlm import AQLMConfig
-    # from vllm.model_executor.layers.quantization.awq_marlin import (
-    #     AWQMarlinConfig,
-    #     AWQMoEMethod,
-    # )
     from vllm.model_executor.layers.quantization.bitsandbytes import BitsAndBytesConfig
     from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (
         CompressedTensorsW8A8Fp8MoEMethod,
