@@ -21,6 +21,7 @@ Life cycle of a request in the decode server
 from __future__ import annotations
 
 import logging
+from collections import deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
@@ -35,6 +36,7 @@ from sglang.srt.disaggregation.utils import (
     ReqToMetadataIdxAllocator,
     TransferBackend,
     get_kv_class,
+    kv_to_page_indices,
     poll_and_all_reduce,
 )
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
@@ -205,7 +207,10 @@ class DecodePreallocQueue:
                 self.req_to_metadata_buffer_idx_allocator.alloc()
             )
             assert decode_req.metadata_buffer_index is not None
-            decode_req.kv_receiver.init(kv_indices, decode_req.metadata_buffer_index)
+            page_indices = kv_to_page_indices(
+                kv_indices, self.token_to_kv_pool_allocator.page_size
+            )
+            decode_req.kv_receiver.init(page_indices, decode_req.metadata_buffer_index)
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
 
@@ -245,10 +250,30 @@ class DecodePreallocQueue:
         assert req_pool_indices is not None
 
         req.req_pool_idx = req_pool_indices[0]
-        kv_loc = self.token_to_kv_pool_allocator.alloc(
-            len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
-        )
-
+        if self.token_to_kv_pool_allocator.page_size == 1:
+            kv_loc = self.token_to_kv_pool_allocator.alloc(
+                len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+            )
+        else:
+            num_tokens = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+            kv_loc = self.token_to_kv_pool_allocator.alloc_extend(
+                prefix_lens=torch.tensor(
+                    [0],
+                    dtype=torch.int64,
+                    device=self.token_to_kv_pool_allocator.device,
+                ),
+                seq_lens=torch.tensor(
+                    [num_tokens],
+                    dtype=torch.int64,
+                    device=self.token_to_kv_pool_allocator.device,
+                ),
+                last_loc=torch.tensor(
+                    [-1],
+                    dtype=torch.int64,
+                    device=self.token_to_kv_pool_allocator.device,
+                ),
+                extend_num_tokens=num_tokens,
+            )
         assert kv_loc is not None
 
         self.req_to_token_pool.write((req.req_pool_idx, slice(0, len(kv_loc))), kv_loc)
@@ -419,6 +444,15 @@ class ScheduleBatchDisaggregationDecodeMixin:
 
 class SchedulerDisaggregationDecodeMixin:
 
+    def _prepare_idle_batch_and_run(self, batch, delay_process=False):
+        batch, _ = self.prepare_dp_attn_batch(batch)
+        result = None
+        if batch:
+            result = self.run_batch(batch)
+            if not delay_process:
+                self.process_batch_result(batch, result)
+        return batch, result
+
     @torch.no_grad()
     def event_loop_normal_disagg_decode(self):
         """A normal scheduler loop for decode worker in disaggregation mode."""
@@ -431,14 +465,25 @@ class SchedulerDisaggregationDecodeMixin:
             batch = self.get_next_disagg_decode_batch_to_run()
             self.cur_batch = batch
 
+            prepare_dp_attn_flag = (
+                self.server_args.enable_dp_attention
+                or self.server_args.enable_sp_layernorm
+            )
+
             if batch:
                 # Generate fake extend output.
                 if batch.forward_mode.is_extend():
                     # Note: Logprobs should be handled on the prefill engine.
                     self.stream_output(batch.reqs, False)
+                    if prepare_dp_attn_flag:
+                        self._prepare_idle_batch_and_run(None)
                 else:
+                    if prepare_dp_attn_flag:
+                        self.prepare_dp_attn_batch(batch)
                     result = self.run_batch(batch)
                     self.process_batch_result(batch, result)
+            elif prepare_dp_attn_flag:
+                batch, _ = self._prepare_idle_batch_and_run(None)
 
             if batch is None and (
                 len(self.disagg_decode_transfer_queue.queue)
@@ -450,6 +495,69 @@ class SchedulerDisaggregationDecodeMixin:
                 self.new_token_ratio = self.init_new_token_ratio
 
             self.last_batch = batch
+
+    @torch.no_grad()
+    def event_loop_overlap_disagg_decode(self):
+        result_queue = deque()
+        self.last_batch: Optional[ScheduleBatch] = None
+        self.last_batch_in_queue = False  # last batch is modifed in-place, so we need another variable to track if it's extend
+
+        while True:
+            recv_reqs = self.recv_requests()
+            self.process_input_requests(recv_reqs)
+            # polling and allocating kv cache
+            self.process_decode_queue()
+            batch = self.get_next_disagg_decode_batch_to_run()
+            self.cur_batch = batch
+            last_batch_in_queue = False
+
+            prepare_dp_attn_flag = (
+                self.server_args.enable_dp_attention
+                or self.server_args.enable_sp_layernorm
+            )
+
+            if batch:
+                # Generate fake extend output.
+                if batch.forward_mode.is_extend():
+                    # Note: Logprobs should be handled on the prefill engine.
+                    self.stream_output(batch.reqs, False)
+                    if prepare_dp_attn_flag:
+                        batch_, result = self._prepare_idle_batch_and_run(
+                            None, delay_process=True
+                        )
+                        if batch_:
+                            result_queue.append((batch_.copy(), result))
+                            last_batch_in_queue = True
+                else:
+                    if prepare_dp_attn_flag:
+                        self.prepare_dp_attn_batch(batch)
+                    result = self.run_batch(batch)
+                    result_queue.append((batch.copy(), result))
+                    last_batch_in_queue = True
+            elif prepare_dp_attn_flag:
+                batch, result = self._prepare_idle_batch_and_run(
+                    None, delay_process=True
+                )
+                if batch:
+                    result_queue.append((batch.copy(), result))
+                    last_batch_in_queue = True
+
+            # Process the results of the previous batch but skip if the last batch is extend
+            if self.last_batch and self.last_batch_in_queue:
+                tmp_batch, tmp_result = result_queue.popleft()
+                self.process_batch_result(tmp_batch, tmp_result)
+
+            if batch is None and (
+                len(self.disagg_decode_transfer_queue.queue)
+                + len(self.disagg_decode_prealloc_queue.queue)
+                == 0
+            ):
+                # When the server is idle, do self-check and re-init some states
+                self.check_memory()
+                self.new_token_ratio = self.init_new_token_ratio
+
+            self.last_batch = batch
+            self.last_batch_in_queue = last_batch_in_queue
 
     def get_next_disagg_decode_batch_to_run(
         self: Scheduler,
