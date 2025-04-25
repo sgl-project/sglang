@@ -87,29 +87,29 @@ jobs:
           cd test/srt
           python3 run_suite.py --suite per-commit-2-gpu
 
-  unit-test-backend-8-gpu:
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false
-    runs-on: 8-gpu-runner
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+  # unit-test-backend-8-gpu:
+  #   if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+  #       github.event.pull_request.draft == false
+  #   runs-on: 8-gpu-runner
+  #   steps:
+  #     - name: Checkout code
+  #       uses: actions/checkout@v4
 
-      - name: Install dependencies
-        run: |
-          bash scripts/ci_install_dependency.sh
+  #     - name: Install dependencies
+  #       run: |
+  #         bash scripts/ci_install_dependency.sh
 
-      - name: Run DeepEP intranode test
-        timeout-minutes: 20
-        run: |
-          cd test/srt
-          python3 test_deepep_intranode.py
+  #     - name: Run DeepEP intranode test
+  #       timeout-minutes: 10
+  #       run: |
+  #         cd test/srt
+  #         python3 test_deepep_intranode.py
 
-      - name: Run DeepEP low latency test
-        timeout-minutes: 20
-        run: |
-          cd test/srt
-          python3 test_deepep_low_latency.py
+  #     - name: Run DeepEP low latency test
+  #       timeout-minutes: 10
+  #       run: |
+  #         cd test/srt
+  #         python3 test_deepep_low_latency.py
 
   performance-test-1-gpu-part-1:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
@@ -276,6 +276,18 @@ jobs:
           cd human-eval
           pip install -e .
 
+      - name: Run DeepEP intranode test
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 test_deepep_intranode.py
+
+      - name: Run DeepEP low latency test
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 test_deepep_low_latency.py
+
       - name: Evaluate accuracy (TP=8)
         timeout-minutes: 30
         run: |
@@ -285,7 +297,7 @@ jobs:
   finish:
     if: always()
     needs: [
-      unit-test-frontend, unit-test-backend-1-gpu, unit-test-backend-2-gpu, unit-test-backend-8-gpu,
+      unit-test-frontend, unit-test-backend-1-gpu, unit-test-backend-2-gpu, # unit-test-backend-8-gpu,
       performance-test-1-gpu-part-1, performance-test-1-gpu-part-2, performance-test-2-gpu,
       accuracy-test-1-gpu, accuracy-test-2-gpu, accuracy-test-8-gpu,
     ]
