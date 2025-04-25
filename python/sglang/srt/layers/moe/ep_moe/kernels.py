@@ -3,6 +3,7 @@ from typing import List, Optional
 
 import torch
 import triton
+
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
 from sglang.srt.utils import (
@@ -449,12 +450,12 @@ def gelu_and_mul_triton_kernel(
                 * (
                     1
                     + tanh(
-                    kAlpha
-                    * (
-                        gate_output
-                        + 0.044715 * gate_output * gate_output * gate_output
+                        kAlpha
+                        * (
+                            gate_output
+                            + 0.044715 * gate_output * gate_output * gate_output
+                        )
                     )
-                )
                 )
             )
             gate_output = gate_output.to(InDtype)
