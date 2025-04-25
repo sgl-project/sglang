@@ -431,7 +431,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
             )
             # Currently, we don't allow prefill instance and decode instance to
             # have different TP sizes per DP rank.
-            assert tp_size_per_dp_rank == int(self.kv_mgr.tp_size / self.kv_mgr.dp_size)
+            assert tp_size_per_dp_rank == self.kv_mgr.tp_size // self.kv_mgr.dp_size
             if self.prefill_dp_size is None:
                 logger.error(
                     f"Could not fetch prefill dp_size for bootstrap_addr: {self.bootstrap_addr}"
@@ -592,13 +592,13 @@ class MooncakeKVBootstrapServer(BaseKVBootstrapServer):
         if self.dp_size is None:
             self.dp_size = dp_size
 
-        tp_size_per_dp_rank = int(tp_size / dp_size)
+        tp_size_per_dp_rank = tp_size // dp_size
         if self.tp_size_per_dp_rank == None:
             self.tp_size_per_dp_rank = tp_size_per_dp_rank
 
         # Add lock to make sure thread-safe
         if role == "Prefill":
-            dp_group = int(engine_rank / tp_size_per_dp_rank)
+            dp_group = engine_rank // tp_size_per_dp_rank
             tp_rank_in_dp_group = engine_rank % tp_size_per_dp_rank
 
             async with self.lock:

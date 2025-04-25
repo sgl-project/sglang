@@ -1579,10 +1579,17 @@ class Scheduler(
                 extend_lens=local_batch.extend_lens,
             )
             resolved_deepep_mode = deepep_mode.resolve(local_batch.forward_mode)
-            local_can_run_tbo = (local_tbo_split_seq_index is not None) and not (
-                local_batch.forward_mode.is_extend()
-                and enable_deepep_moe
-                and (resolved_deepep_mode == DeepEPMode.low_latency)
+            local_can_run_tbo = (
+                (local_tbo_split_seq_index is not None)
+                and not (
+                    local_batch.forward_mode.is_extend()
+                    and enable_deepep_moe
+                    and (resolved_deepep_mode == DeepEPMode.low_latency)
+                )
+                and not (
+                    get_bool_env_var("SGLANG_HACK_DISABLE_TBO_WHEN_DECODE")
+                    and local_batch.forward_mode.is_decode()
+                )
             )
         else:
             local_tbo_split_seq_index = 0
