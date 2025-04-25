@@ -320,7 +320,6 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             previous_event=previous_event,
             async_finish=self.async_finish,
             allocate_on_comm_stream=previous_event is not None,
-            config=_HACK_NORMAL_DISPATCH_CONFIG,
         )
 
         # FIXME: `handle` should be transmitted with tokens from dispatch to combine.
@@ -346,6 +345,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             async_finish=self.async_finish,
             allocate_on_comm_stream=(previous_event is not None) and self.async_finish,
             expert_alignment=128 if _enable_jit_deepgemm else 1,
+            config=_HACK_NORMAL_DISPATCH_CONFIG,
         )
 
         get_global_expert_distribution_recorder().on_deepep_dispatch_normal(
