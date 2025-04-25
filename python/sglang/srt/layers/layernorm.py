@@ -33,6 +33,8 @@ if _is_cuda:
         rmsnorm,
     )
 
+if _is_hip:
+    from vllm.model_executor.layers.layernorm import fused_add_rms_norm, rms_norm
 
 logger = logging.getLogger(__name__)
 
@@ -145,7 +147,7 @@ class Gemma3RMSNorm(nn.Module):
         return f"{tuple(self.weight.shape)}, eps={self.eps}"
 
 
-if not _is_cuda:
+if not (_is_cuda or _is_hip):
     logger.info(
         "sgl-kernel is not available on Non-NV platforms. Fallback to other kernel libraries."
     )
