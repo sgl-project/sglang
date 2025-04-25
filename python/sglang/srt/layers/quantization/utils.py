@@ -10,11 +10,8 @@ from sglang.srt.utils import is_cuda
 
 _is_cuda = is_cuda()
 
-# vllm scaled_fp8_quant also need cuda.
-# because it used dynamic_per_token_scaled_fp8_quant
-# and dynamic_scaled_fp8_quant custom op
-# if not _is_cuda:
-# from vllm._custom_ops import scaled_fp8_quant
+if not _is_cuda:
+    from vllm._custom_ops import scaled_fp8_quant
 
 
 def is_fp8_fnuz() -> bool:
