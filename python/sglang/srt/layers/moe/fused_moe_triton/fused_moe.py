@@ -1454,7 +1454,7 @@ def fused_experts_impl_deepgemm(
     scale_block_size = 128
 
     input_tensor = [
-        hidden_states_fp8, hidden_states_fp8_scale
+        hidden_states_fp8, tma_align_input_scale(hidden_states_fp8_scale)
     ]
 
     gateup_output = torch.empty(
