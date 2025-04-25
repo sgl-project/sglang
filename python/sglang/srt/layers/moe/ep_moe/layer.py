@@ -16,10 +16,9 @@ try:
     from sglang.srt.layers.quantization.fp8_kernel import (
         sglang_per_token_group_quant_fp8,
     )
-    from sglang.srt.utils import DeepEPMode, get_bool_env_var
 
-    if get_bool_env_var("SGL_ENABLE_JIT_DEEPGEMM", default="false"):
-        _enable_jit_deepgemm = True
+    from sglang.srt.layers.quantization.deep_gemm import get_enable_jit_deepgemm
+    _enable_jit_deepgemm = get_enable_jit_deepgemm()
     use_deep_gemm = True
 except ImportError:
     use_deep_gemm = False

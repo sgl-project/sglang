@@ -1,4 +1,4 @@
-from sglang.srt.utils import DeepEPMode, get_bool_env_var, get_device_sm
+from sglang.srt.utils import DeepEPMode
 
 _enable_jit_deepgemm = False
 try:
@@ -8,10 +8,8 @@ try:
         sglang_per_token_group_quant_fp8,
     )
 
-    sm_version = get_device_sm()
-    if sm_version == 90:
-        if get_bool_env_var("SGL_ENABLE_JIT_DEEPGEMM", default="false"):
-            _enable_jit_deepgemm = True
+    from sglang.srt.layers.quantization.deep_gemm import get_enable_jit_deepgemm
+    _enable_jit_deepgemm = get_enable_jit_deepgemm()
     use_deepep = True
 except ImportError:
     use_deepep = False
