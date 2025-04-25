@@ -60,7 +60,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, EPMoE
-from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPDispatcher
+from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPDispatcher, DEEPEP_NUM_SMS
 from sglang.srt.layers.moe.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import select_experts
@@ -1995,7 +1995,7 @@ class DeepseekV2Model(nn.Module):
         total_num_sm = torch.cuda.get_device_properties(
             device="cuda"
         ).multi_processor_count
-        extend_mode_communication_num_sm = 20
+        extend_mode_communication_num_sm = DEEPEP_NUM_SMS
         num_sm_context = (
             configure_deep_gemm_num_sms(
                 num_sms=total_num_sm - extend_mode_communication_num_sm

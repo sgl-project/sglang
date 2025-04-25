@@ -39,6 +39,8 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
+# TODO do not hardcode
+DEEPEP_NUM_SMS = 24
 
 class DeepEPDispatchMode(IntEnum):
     NORMAL = auto()
@@ -68,6 +70,8 @@ class DeepEPBuffer:
         cls._hidden_size = hidden_size
         cls._num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
         cls._num_experts = num_experts
+
+        Buffer.set_num_sms(DEEPEP_NUM_SMS)
 
         num_nvl_bytes, num_rdma_bytes = 0, 0
         if deepep_mode.enable_normal():
