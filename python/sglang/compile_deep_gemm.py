@@ -111,8 +111,13 @@ def launch_server_process_and_send_one_request(
                         error = response.json()
                         raise RuntimeError(f"Sync request failed: {error}")
                 # Other nodes should wait for the exit signal from Rank-0 node.
-                while proc.is_alive() and server_args.node_rank > 0:
-                    time.sleep(1)
+                else:
+                    start_time_waiting = time.time()
+                    while proc.is_alive():
+                        if time.time() - start_time_waiting < timeout:
+                            time.sleep(10)
+                        else:
+                            raise TimeoutError("Waiting for main node timeout!")
                 return proc
         except requests.RequestException:
             pass
