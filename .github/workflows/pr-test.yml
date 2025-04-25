@@ -38,8 +38,6 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install dependencies
-        env:
-          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.5/flashinfer-python' || 'https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python' }}
         run: |
           bash scripts/ci_install_dependency.sh
 
@@ -62,8 +60,6 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install dependencies
-        env:
-          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.5/flashinfer-python' || 'https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python' }}
         run: |
           bash scripts/ci_install_dependency.sh
 
@@ -82,8 +78,6 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install dependencies
-        env:
-          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.5/flashinfer-python' || 'https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python' }}
         run: |
           bash scripts/ci_install_dependency.sh
 
@@ -102,8 +96,6 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install dependencies
-        env:
-          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.5/flashinfer-python' || 'https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python' }}
         run: |
           bash scripts/ci_install_dependency.sh
 
@@ -146,8 +138,6 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install dependencies
-        env:
-          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.5/flashinfer-python' || 'https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python' }}
         run: |
           bash scripts/ci_install_dependency.sh
 
@@ -178,8 +168,6 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install dependencies
-        env:
-          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.5/flashinfer-python' || 'https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python' }}
         run: |
           bash scripts/ci_install_dependency.sh
 
@@ -187,8 +175,6 @@ jobs:
         timeout-minutes: 10
         run: |
           cd test/srt
-          USE_VLLM_CUSTOM_ALLREDUCE=1 python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_moe_tp2_bs1
-
           python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_moe_tp2_bs1
 
       - name: Benchmark single latency + torch.compile (TP=2)
@@ -218,8 +204,6 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install dependencies
-        env:
-          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.5/flashinfer-python' || 'https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python' }}
         run: |
           bash scripts/ci_install_dependency.sh
           git clone https://github.com/merrymercy/human-eval.git
@@ -241,8 +225,6 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install dependencies
-        env:
-          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.5/flashinfer-python' || 'https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python' }}
         run: |
           bash scripts/ci_install_dependency.sh
           git clone https://github.com/merrymercy/human-eval.git

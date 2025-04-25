@@ -909,6 +909,7 @@ def v1_chat_generate_request(
 
     # NOTE: with openai API, the prompt's logprobs are always not computed
 
+    is_multimodal = tokenizer_manager.model_config.is_multimodal
     for request in all_requests:
         # Prep the data needed for the underlying GenerateReqInput:
         #  - prompt: The full prompt string.
@@ -918,6 +919,7 @@ def v1_chat_generate_request(
         #    None skips any image processing in GenerateReqInput.
         strict_tag = None
         prompt = ""
+        prompt_ids = []
         if not isinstance(request.messages, str):
             # Apply chat template and its stop strings.
             tools = None
@@ -938,6 +940,35 @@ def v1_chat_generate_request(
 
             if chat_template_name is None:
                 openai_compatible_messages = []
+                if (
+                    tools
+                    and tokenizer_manager.server_args.tool_call_parser == "deepseekv3"
+                ):
+                    # add function call prompt to deepseekv3
+                    openai_compatible_messages.append(
+                        {
+                            "role": "system",
+                            "content": """You are a helpful Assistant.
+                    ## Tools
+                    ### Function
+                    You have the following functions available:
+                    """
+                            + "".join(
+                                [
+                                    f"""
+                        - `{tool['name']}`:
+                        ```json
+                        {json.dumps(tool)}
+                        ```
+                        """
+                                    for tool in tools
+                                ]
+                            ),
+                        }
+                    )
+                    # TODO fix the compatible issues with xgrammar
+                    strict_tag = None
+
                 for message in request.messages:
                     if isinstance(message.content, str):
                         openai_compatible_messages.append(
@@ -950,9 +981,16 @@ def v1_chat_generate_request(
                                 openai_compatible_messages.append(
                                     {"role": message.role, "content": content["text"]}
                                 )
-                if openai_compatible_messages[-1]["role"] == "assistant":
-                    assistant_prefix = openai_compatible_messages[-1]["content"]
-                    openai_compatible_messages = openai_compatible_messages[:-1]
+                if (
+                    openai_compatible_messages
+                    and openai_compatible_messages[-1]["role"] == "assistant"
+                ):
+                    if request.continue_final_message:
+                        # Remove the final assistant message so its content can be continued.
+                        assistant_prefix = openai_compatible_messages[-1]["content"]
+                        openai_compatible_messages = openai_compatible_messages[:-1]
+                    else:
+                        assistant_prefix = None
                 else:
                     assistant_prefix = None
 
@@ -983,23 +1021,54 @@ def v1_chat_generate_request(
                     ):
                         encoded = encoded[1:]
                     prompt_ids += encoded
+                if is_multimodal:
+                    prompt = tokenizer_manager.tokenizer.decode(prompt_ids)
                 stop = request.stop
                 image_data = None
                 audio_data = None
                 modalities = []
             else:
                 conv = generate_chat_conv(request, chat_template_name)
-                prompt = conv.get_prompt()
+                # If we should continue the final assistant message, adjust the conversation.
+                if (
+                    request.continue_final_message
+                    and request.messages
+                    and request.messages[-1].role == "assistant"
+                ):
+                    # Remove the auto-added blank assistant turn, if present.
+                    if conv.messages and conv.messages[-1][1] is None:
+                        conv.messages.pop()
+                    # Rebuild the prompt from the conversation.
+                    prompt = conv.get_prompt()
+                    # Strip any trailing stop tokens or separators that indicate end-of-assistant.
+                    if isinstance(conv.stop_str, list):
+                        for stop_token in conv.stop_str:
+                            if prompt.endswith(stop_token):
+                                prompt = prompt[: -len(stop_token)]
+                    elif isinstance(conv.stop_str, str) and prompt.endswith(
+                        conv.stop_str
+                    ):
+                        prompt = prompt[: -len(conv.stop_str)]
+                    if conv.sep and prompt.endswith(conv.sep):
+                        prompt = prompt[: -len(conv.sep)]
+                    if getattr(conv, "sep2", None) and prompt.endswith(conv.sep2):
+                        prompt = prompt[: -len(conv.sep2)]
+                else:
+                    prompt = conv.get_prompt()
+
                 image_data = conv.image_data
                 audio_data = conv.audio_data
                 modalities = conv.modalities
-                stop = conv.stop_str or []
+                stop = conv.stop_str or [] if not request.ignore_eos else []
+
                 if request.stop:
                     if isinstance(request.stop, str):
                         stop.append(request.stop)
                     else:
                         stop.extend(request.stop)
-                prompt_ids = tokenizer_manager.tokenizer.encode(prompt)
+
+                if not is_multimodal:
+                    prompt_ids = tokenizer_manager.tokenizer.encode(prompt)
         else:
             # Use the raw prompt and stop strings if the messages is already a string.
             prompt_ids = request.messages
@@ -1039,6 +1108,8 @@ def v1_chat_generate_request(
             sampling_params["json_schema"] = convert_json_schema_to_str(
                 request.response_format.json_schema.schema_
             )
+        elif request.response_format and request.response_format.type == "json_object":
+            sampling_params["json_schema"] = '{"type": "object"}'
         elif (
             request.response_format and request.response_format.type == "structural_tag"
         ):
@@ -1067,7 +1138,7 @@ def v1_chat_generate_request(
         audio_data_list.append(audio_data)
         modalities_list.append(modalities)
     if len(all_requests) == 1:
-        if tokenizer_manager.model_config.is_multimodal:
+        if is_multimodal:
             # processor will need text input
             prompt_kwargs = {"text": prompts[0]}
         else:
@@ -1106,6 +1177,8 @@ def v1_chat_generate_request(
         rid=request_ids,
         modalities=modalities_list,
         lora_path=lora_paths,
+        bootstrap_host=all_requests[0].bootstrap_host,
+        bootstrap_room=all_requests[0].bootstrap_room,
     )
 
     return adapted_request, all_requests if len(all_requests) > 1 else all_requests[0]

@@ -344,8 +344,10 @@ class MoeWNA16Method:
         custom_routing_function: Optional[Callable] = None,
         correction_bias: Optional[torch.Tensor] = None,
         activation: str = "silu",
+        apply_router_weight_on_input: bool = False,
         inplace: bool = True,
         no_combine: bool = False,
+        routed_scaling_factor: Optional[float] = None,
     ) -> torch.Tensor:
         # avoid circular import
         from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
@@ -362,6 +364,7 @@ class MoeWNA16Method:
             num_expert_group=num_expert_group,
             custom_routing_function=custom_routing_function,
             correction_bias=correction_bias,
+            routed_scaling_factor=routed_scaling_factor,
         )
 
         weight_bits = self.quant_config.weight_bits
@@ -374,6 +377,7 @@ class MoeWNA16Method:
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             inplace=inplace,
+            apply_router_weight_on_input=apply_router_weight_on_input,
             use_int4_w4a16=weight_bits == 4,
             use_int8_w8a16=weight_bits == 8,
             w1_scale=layer.w13_scales,

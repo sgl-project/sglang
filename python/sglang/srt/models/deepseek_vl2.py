@@ -12,7 +12,7 @@ from sglang.srt.configs.deepseekvl2 import (
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternImageTokens,
+    MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
@@ -249,8 +249,8 @@ class DeepseekVL2ForCausalLM(nn.Module):
                 weights_loader(param, loaded_weight)
 
     def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
-        helper = MultiModalityDataPaddingPatternImageTokens(
-            image_token_id=image_inputs.im_token_id
+        helper = MultiModalityDataPaddingPatternMultimodalTokens(
+            [image_inputs.im_token_id]
         )
         return helper.pad_input_tokens(input_ids, image_inputs)
 

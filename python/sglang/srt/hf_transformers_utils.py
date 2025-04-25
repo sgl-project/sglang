@@ -31,6 +31,7 @@ from transformers import (
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
 from sglang.srt.configs import (
+    ArcticConfig,
     ChatGLMConfig,
     DbrxConfig,
     DeepseekVL2Config,
@@ -41,6 +42,7 @@ from sglang.srt.connector import create_remote_connector
 from sglang.srt.utils import is_remote_url
 
 _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
+    ArcticConfig.model_type: ArcticConfig,
     ChatGLMConfig.model_type: ChatGLMConfig,
     DbrxConfig.model_type: DbrxConfig,
     ExaoneConfig.model_type: ExaoneConfig,
@@ -215,6 +217,7 @@ def get_processor(
     tokenizer_mode: str = "auto",
     trust_remote_code: bool = False,
     tokenizer_revision: Optional[str] = None,
+    use_fast: Optional[bool] = True,
     **kwargs,
 ):
     # pop 'revision' from kwargs if present.
@@ -231,6 +234,9 @@ def get_processor(
     if config.model_type in {"qwen2_vl"}:
         if "size" not in kwargs:
             kwargs["size"] = {"shortest_edge": 3136, "longest_edge": 1003520}
+
+    if config.model_type not in {"llava", "clip"}:
+        kwargs["use_fast"] = use_fast
 
     processor = AutoProcessor.from_pretrained(
         tokenizer_name,
