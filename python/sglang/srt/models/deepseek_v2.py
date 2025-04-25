@@ -552,8 +552,8 @@ class DeepseekV2MoE(nn.Module):
             ],
             forward_mode=state.forward_batch.forward_mode,
             hidden_states=state.hidden_states_after_post_attn_ln,
-            topk_idx=state.topk_idx,
-            topk_weights=state.topk_weights,
+            topk_idx=state.pop("topk_idx"),
+            topk_weights=state.pop("topk_weights"),
         )
 
     def _forward_tbo_op_dispatch_b(self, state, tbo_child_index: int):
