@@ -13,7 +13,6 @@ try:
     )
     from sgl_kernel import silu_and_mul
 
-    from sglang.srt.layers.quantization.deep_gemm import get_enable_jit_deepgemm
     from sglang.srt.layers.quantization.fp8_kernel import (
         sglang_per_token_group_quant_fp8,
     )
