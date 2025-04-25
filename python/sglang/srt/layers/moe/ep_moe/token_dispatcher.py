@@ -203,11 +203,13 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
     ):
         topk_idx = topk_idx.to(torch.int64)
         previous_event = Buffer.capture() if self.async_finish else None
+        # NOTE fix
+        if _enable_jit_deepgemm:
+            hidden_states = per_token_cast_to_fp8(hidden_states)
         return hidden_states, topk_idx, topk_weights, previous_event
 
     def dispatch_b(self, hidden_states, topk_idx, topk_weights, previous_event):
         if _enable_jit_deepgemm:
-            hidden_states = per_token_cast_to_fp8(hidden_states)
             (
                 hidden_states,
                 topk_idx,
