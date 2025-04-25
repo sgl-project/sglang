@@ -6,6 +6,7 @@ SGLang provides a direct inference engine without the need for an HTTP server. T
 1. **Offline Batch Inference**
 2. **Embedding Generation**
 3. **Custom Server on Top of the Engine**
+4. **Inference Using FastAPI**
 
 ## Examples
 
@@ -47,3 +48,7 @@ This will send both non-streaming and streaming requests to the server.
 ### [Token-In-Token-Out for RLHF](../token_in_token_out)
 
 In this example, we launch an SGLang engine, feed tokens as input and generate tokens as output.
+
+### [Inference Using FastAPI](fastapi_engine_inference.py)
+
+This example demonstrates how to create a FastAPI server that uses the SGLang engine for text generation.
