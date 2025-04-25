@@ -94,7 +94,22 @@ def launch_server_process_and_send_one_request(
                 # This http api is created by launch_dummy_health_check_server for none-rank0 node.
                 response = requests.get(f"{base_url}/health", headers=headers)
             if response.status_code == 200:
-                # Rank-0 node returns directly.
+                # Rank-0 node send a request to sync with other node and then return.
+                if server_args.node_rank == 0:
+                    response = requests.post(
+                        f"{base_url}/generate",
+                        json={
+                            "input_ids": [0, 1, 2, 3],
+                            "sampling_params": {
+                                "max_new_tokens": 8,
+                                "temperature": 0,
+                            },
+                        },
+                        timeout=600,
+                    )
+                    if response.status_code != 200:
+                        error = response.json()
+                        raise RuntimeError(f"Sync request failed: {error}")
                 # Other nodes should wait for the exit signal from Rank-0 node.
                 while proc.is_alive() and server_args.node_rank > 0:
                     time.sleep(1)
