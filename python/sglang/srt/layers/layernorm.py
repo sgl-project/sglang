@@ -34,7 +34,10 @@ if _is_cuda:
     )
 
 if _is_hip:
-    from vllm.model_executor.layers.layernorm import fused_add_rms_norm, rms_norm
+    from vllm.model_executor.layers.layernorm import (
+        fused_add_rms_norm as fused_add_rmsnorm,
+    )
+    from vllm.model_executor.layers.layernorm import rms_norm as rmsnorm
 
 logger = logging.getLogger(__name__)
 
