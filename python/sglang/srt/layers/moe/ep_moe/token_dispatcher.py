@@ -30,17 +30,17 @@ try:
     # TODO do not hardcode
     _HACK_NORMAL_DISPATCH_CONFIG = deep_ep.Config(
         num_sms=DEEPEP_NUM_SMS,
-        num_max_nvl_chunked_send_tokens=TODO,
-        num_max_nvl_chunked_recv_tokens=TODO,
-        num_max_rdma_chunked_send_tokens=TODO,
-        num_max_rdma_chunked_recv_tokens=TODO,
+        num_max_nvl_chunked_send_tokens=16,
+        num_max_nvl_chunked_recv_tokens=512,
+        num_max_rdma_chunked_send_tokens=8,
+        num_max_rdma_chunked_recv_tokens=128,
     )
     _HACK_NORMAL_COMBINE_CONFIG = deep_ep.Config(
         num_sms=DEEPEP_NUM_SMS,
-        num_max_nvl_chunked_send_tokens=TODO,
-        num_max_nvl_chunked_recv_tokens=TODO,
-        num_max_rdma_chunked_send_tokens=TODO,
-        num_max_rdma_chunked_recv_tokens=TODO,
+        num_max_nvl_chunked_send_tokens=32,
+        num_max_nvl_chunked_recv_tokens=512,
+        num_max_rdma_chunked_send_tokens=20,
+        num_max_rdma_chunked_recv_tokens=128,
     )
 except ImportError:
     use_deepep = False
