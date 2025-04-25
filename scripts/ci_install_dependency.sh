@@ -43,14 +43,13 @@ pip install transformers==4.51.0 sentence_transformers accelerate peft pandas da
 # For compling xgrammar kernels
 pip install cuda-python nvidia-cuda-nvrtc-cu12
 
-apt-get update && apt-get install -y wget
+apt-get update && apt-get install -y wget libibverbs-dev infiniband-diags libmlx5-1 rdma-core openssh-server perftest ibverbs-providers libibumad3 libibverbs1 libnl-3-200 libnl-route-3-200 librdmacm1
 wget https://github.com/Kitware/CMake/releases/download/v3.27.4/cmake-3.27.4-linux-x86_64.sh
 chmod +x cmake-3.27.4-linux-x86_64.sh
 ./cmake-3.27.4-linux-x86_64.sh --skip-license --prefix=/usr/local
 rm cmake-3.27.4-linux-x86_64.sh
 
 # Install GDRCopy
-apt-get update && apt-get install -y libibverbs-dev libmlx5-1 rdma-core
 mkdir -p /opt/gdrcopy
 mkdir -p /opt/nvshmem
 cd /opt/gdrcopy
