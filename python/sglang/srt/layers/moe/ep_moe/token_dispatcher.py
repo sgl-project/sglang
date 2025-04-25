@@ -95,8 +95,10 @@ class DeepEPBuffer:
         if deepep_mode.enable_normal():
             hidden_bytes = hidden_size * param_bytes
             for config in (
-                Buffer.get_dispatch_config(group.size()),
-                Buffer.get_combine_config(group.size()),
+                _HACK_NORMAL_DISPATCH_CONFIG,
+                _HACK_NORMAL_COMBINE_CONFIG,
+                # Buffer.get_dispatch_config(group.size()),
+                # Buffer.get_combine_config(group.size()),
             ):
                 num_nvl_bytes = max(
                     config.get_nvl_buffer_size_hint(hidden_bytes, group.size()),
