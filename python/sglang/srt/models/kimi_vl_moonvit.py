@@ -51,6 +51,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers.activations import ACT2FN, PytorchGELUTanh
 from transformers.modeling_utils import PreTrainedModel
+
 try:
     from flash_attn.flash_attn_interface import flash_attn_varlen_func
 except ImportError:
@@ -66,10 +67,10 @@ def multihead_attention(
     q_cu_seqlens: Optional[torch.Tensor] = None,
     k_cu_seqlens: Optional[torch.Tensor] = None,
 ):
-    """Multi-head attention using flash attention 2. 
+    """Multi-head attention using flash attention 2.
     This function is used to handle the case where the query, key, and value are packed.
     Args:
-        q, k, v: tensor of shape (tot_seqlens, num_heads, head_dim). 
+        q, k, v: tensor of shape (tot_seqlens, num_heads, head_dim).
         q_cu_seqlens (torch.Tensor): cumulative sequence lengths of q.
             The first element should be 0 and the last element should be q.shape[0].
         k_cu_seqlens (torch.Tensor): cumulative sequence lengths of k.
@@ -80,7 +81,9 @@ def multihead_attention(
             where dim = num_heads * head_dim
     """
     if flash_attn_varlen_func is None:
-        raise ImportError("flash_attn is not installed, this function needs flash_attn_varlen_func from flash_attn")
+        raise ImportError(
+            "flash_attn is not installed, this function needs flash_attn_varlen_func from flash_attn"
+        )
     # Unified format legal check
     assert q.dim() == k.dim() == v.dim() == 3, "q, k, v must have 3 dims"
     assert q_cu_seqlens[-1] == q.shape[0], "q_cu_seqlens must sum to q.shape[0]"
@@ -116,10 +119,10 @@ def sdpa_attention(
     q_cu_seqlens: Optional[torch.Tensor] = None,
     k_cu_seqlens: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Multi-head attention using torch scaled dot product attention. 
+    """Multi-head attention using torch scaled dot product attention.
     This function is used to handle the case where the query, key, and value are packed.
     Args:
-        q, k, v: tensor of shape (tot_seqlens, num_heads, head_dim). 
+        q, k, v: tensor of shape (tot_seqlens, num_heads, head_dim).
         q_cu_seqlens (torch.Tensor): cumulative sequence lengths of q.
             The first element should be 0 and the last element should be q.shape[0].
         k_cu_seqlens (torch.Tensor): cumulative sequence lengths of k.
