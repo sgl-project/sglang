@@ -161,6 +161,7 @@ class ServerArgs:
     enable_deepep_moe: bool = False
     deepep_mode: Optional[Literal["auto", "normal", "low_latency"]] = "auto"
     enable_torch_compile: bool = False
+    hybrid_ratio: Optional[float] = None
     torch_compile_max_bs: int = 32
     cuda_graph_max_bs: Optional[int] = None
     cuda_graph_bs: Optional[List[int]] = None
@@ -619,6 +620,16 @@ class ServerArgs:
             type=int,
             default=ServerArgs.page_size,
             help="The number of tokens in a page.",
+        )
+        parser.add_argument(
+            "--hybrid-ratio",
+            type=float,
+            default=ServerArgs.hybrid_ratio,
+            help=(
+                "Mix ratio in [0,1] between uniform and hybrid kv buffers "
+                "(0.0 = pure uniform: local_size / global_size = 1)"
+                "(1.0 = pure hybrid: local_size / global_size = local_attention_size / context_length)"
+            ),
         )
 
         # Other runtime options

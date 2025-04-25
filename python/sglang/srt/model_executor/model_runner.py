@@ -125,6 +125,7 @@ class ModelRunner:
         self.is_draft_worker = is_draft_worker
         self.is_generation = model_config.is_generation
         self.is_multimodal = model_config.is_multimodal
+        self.hybrid_ratio = model_config.is_hybrid
         self.should_log = tp_rank == 0
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
@@ -739,6 +740,7 @@ class ModelRunner:
             )
 
         self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
+        self.local_max_num_tokens = None
 
         if max_num_reqs is None:
             max_num_reqs = min(
@@ -796,7 +798,48 @@ class ModelRunner:
             raise RuntimeError(
                 "Not enough memory. Please try to increase --mem-fraction-static."
             )
-
+        
+        if self.hybrid_ratio is not None:
+            if self.hybrid_ratio < 0 or self.hybrid_ratio > 1:
+                raise RuntimeError(
+                    "Invalid hybrid ratio. Please set --hybrid-ratio between 0 and 1."
+                )
+            if not self.server_args.disable_cuda_graph:
+                raise RuntimeError(
+                    "Hybrid cache does not support CUDA graph. Please set --disable-cuda-graph"
+                )
+            if not self.server_args.disable_radix_cache:
+                raise RuntimeError(
+                    "Hybrid cache does not support radix cache. Please set --disable-radix-cache"
+                )
+            
+            
+            temp_ratio = (
+                (1 - self.hybrid_ratio) 
+                + self.hybrid_ratio 
+                * self.attention_chunk_size / self.model_config.context_len
+            )
+            self.local_max_num_tokens = (
+                4 * self.max_total_num_tokens 
+                * temp_ratio // (3 * temp_ratio + 1)
+            )
+            self.max_total_num_tokens = (
+                4 * self.max_total_num_tokens 
+                - 12 * self.max_total_num_tokens 
+                * temp_ratio // (3 * temp_ratio + 1)
+            )
+            self.local_max_num_tokens = int(
+                self.local_max_num_tokens 
+                // self.server_args.page_size
+                * self.server_args.page_size
+            )
+            self.max_total_num_tokens = int(
+                self.max_total_num_tokens
+                // self.server_args.page_size
+                * self.server_args.page_size
+            )            
+            
+            
         if self.req_to_token_pool is None:
             self.req_to_token_pool = ReqToTokenPool(
                 size=max_num_reqs + 1,
