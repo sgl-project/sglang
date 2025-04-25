@@ -60,7 +60,10 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, EPMoE
-from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPDispatcher, DEEPEP_NUM_SMS
+from sglang.srt.layers.moe.ep_moe.token_dispatcher import (
+    DEEPEP_NUM_SMS,
+    DeepEPDispatcher,
+)
 from sglang.srt.layers.moe.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import select_experts
