@@ -13,11 +13,11 @@ try:
     )
     from sgl_kernel import silu_and_mul
 
+    from sglang.srt.layers.quantization.deep_gemm import get_enable_jit_deepgemm
     from sglang.srt.layers.quantization.fp8_kernel import (
         sglang_per_token_group_quant_fp8,
     )
 
-    from sglang.srt.layers.quantization.deep_gemm import get_enable_jit_deepgemm
     _enable_jit_deepgemm = get_enable_jit_deepgemm()
     use_deep_gemm = True
 except ImportError:
@@ -1067,14 +1067,6 @@ class DeepEPMoE(EPMoE):
             ),
             device=gateup_output.device,
             dtype=torch.bfloat16,
-        )
-        down_input_scale = torch.empty(
-            (
-                all_tokens,
-                N // 2,
-            ),
-            device=gateup_output.device,
-            dtype=torch.float32,
         )
         silu_and_mul(gateup_output.view(-1, N), down_input)
         down_output = torch.empty(
