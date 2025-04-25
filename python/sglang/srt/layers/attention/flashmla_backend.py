@@ -37,6 +37,7 @@ PAGE_SIZE = 64
 Q_LEN = 1
 
 USE_FLASHINFER = 0
+g_count = 0
 
 @dataclass
 class FlashMLADecodeMetadata:
@@ -133,26 +134,29 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             else:
                 super().init_forward_metadata(forward_batch)
         elif (not USE_FLASHINFER) and forward_batch.forward_mode.is_target_verify():
+            seq_lens_cpu = forward_batch.seq_lens_cpu + self.num_draft_tokens - 1
+            seq_lens = forward_batch.seq_lens + self.num_draft_tokens - 1
+
             max_seqlen_pad = triton.cdiv(
-                forward_batch.seq_lens_cpu.max().item(), PAGE_SIZE
+                seq_lens_cpu.max().item(), PAGE_SIZE
             )
             block_kv_indices = torch.full(
                 (bs, max_seqlen_pad),
                 -1,
                 dtype=torch.int32,
-                device=forward_batch.seq_lens.device,
+                device=seq_lens.device,
             )
             create_flashmla_kv_indices_triton[(bs,)](
                 self.req_to_token,
                 forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
+                seq_lens,
                 None,
                 block_kv_indices,
                 self.req_to_token.stride(0),
                 max_seqlen_pad,
             )
             mla_metadata, num_splits = get_mla_metadata(
-                forward_batch.seq_lens.to(torch.int32),
+                seq_lens.to(torch.int32),
                 self.num_draft_tokens * self.num_q_heads,
                 1,
             )
@@ -423,9 +427,6 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
 
             if USE_FLASHINFER:
                 o = super().forward_extend(q,k,v,layer, forward_batch, save_kv_cache)
-                # if get_tensor_model_parallel_rank() == 0 and layer.layer_id == 0:
-                #     print(f"{o.shape=}")
-                #     torch.save(o, f"{output_path}/3_o")
                 return o
 
             cache_loc = forward_batch.out_cache_loc
@@ -440,9 +441,12 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
 
             reshape_q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
 
-            # if get_tensor_model_parallel_rank() == 0 and layer.layer_id == 0:
-            #     torch.save(self.forward_metadata.flashmla_metadata, f"{output_path}/4_meta")
-            #     torch.save(k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim)[0:4], f"{output_path}/4_cache")
+            # if get_tensor_model_parallel_rank() == 0 and (layer.layer_id in [0,1,59,60]):
+            #     global g_count
+            #     g_count += 1
+            #     output_path = "./output_flashmla/"
+            #     torch.save(reshape_q, f"{output_path}/{g_count:03d}_0_q")
+            #     torch.save(k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim)[0:2], f"{output_path}/{g_count:03d}_1_cache")
             #     print(f"[0] {reshape_q.shape=}")
             #     print(f"[1] {k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim).shape=}")
             #     print(f"[2] {self.forward_metadata.block_kv_indices=}")
@@ -479,7 +483,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 q=reshape_q,
                 k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
                 block_table=self.forward_metadata.block_kv_indices[:bs],
-                cache_seqlens=forward_batch.seq_lens.to(torch.int32),
+                cache_seqlens=forward_batch.seq_lens.to(torch.int32) + self.num_draft_tokens - 1,
                 head_dim_v=self.kv_lora_rank,
                 tile_scheduler_metadata=self.forward_metadata.flashmla_metadata,
                 num_splits=self.forward_metadata.num_splits,
@@ -487,9 +491,9 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 causal=True,
             )
             # o = o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
-            # if get_tensor_model_parallel_rank() == 0 and layer.layer_id == 0:
+            # if get_tensor_model_parallel_rank() == 0 and (layer.layer_id in [0,1,59,60]):
             #     print(f"{o.shape=}")
-            #     torch.save(o, f"{output_path}/3_o")
+            #     torch.save(o, f"{output_path}/{g_count:03d}_3_o")
 
             return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 

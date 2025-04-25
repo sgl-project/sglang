@@ -28,6 +28,7 @@ from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
 from sglang.srt.utils import is_flashinfer_available
 
 from sglang.srt.distributed import get_tensor_model_parallel_rank
+g_count = 0
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -364,15 +365,21 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         else:
             # mla paged prefill
             k_buf = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(torch.bfloat16)
-            # if get_tensor_model_parallel_rank() == 0 and layer.layer_id == 0 and forward_batch.forward_mode == ForwardMode.TARGET_VERIFY:
+            # if get_tensor_model_parallel_rank() == 0 and (layer.layer_id in [0,1,59,60]) and forward_batch.forward_mode == ForwardMode.TARGET_VERIFY:
+            #     global g_count
+            #     g_count += 1
             #     output_path = "./output_flashinfer/"
-            #     torch.save(k_buf.view(-1, 64, 1, self.kv_cache_dim)[0:4], f"{output_path}/4_cache")
+            #     torch.save(qall, f"{output_path}/{g_count:03d}_0_q")
+            #     torch.save(k_buf.view(-1, 64, 1, self.kv_cache_dim)[0:2], f"{output_path}/{g_count:03d}_1_cache")
             o = prefill_wrapper_paged.run(
                 qall[:, :, : layer.v_head_dim],
                 qall[:, :, layer.v_head_dim :],
                 k_buf[:, :, : layer.v_head_dim],
                 k_buf[:, :, layer.v_head_dim :],
             )
+            # if get_tensor_model_parallel_rank() == 0 and (layer.layer_id in [0,1,59,60]) and forward_batch.forward_mode == ForwardMode.TARGET_VERIFY:
+            #     print(f"{o.shape=}")
+            #     torch.save(o, f"{output_path}/{g_count:03d}_3_o")
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
