@@ -43,7 +43,7 @@ pip install transformers==4.51.0 sentence_transformers accelerate peft pandas da
 # For compling xgrammar kernels
 pip install cuda-python nvidia-cuda-nvrtc-cu12
 
-apt-get update && apt-get install -y wget libibverbs-dev infiniband-diags rdma-core openssh-server perftest ibverbs-providers libibumad3 libibverbs1 libnl-3-200 libnl-route-3-200 librdmacm1
+apt-get update && apt-get install -y wget libibverbs-dev infiniband-diags libmlx5-1 rdma-core openssh-server perftest ibverbs-providers libibumad3 libibverbs1 libnl-3-200 libnl-route-3-200 librdmacm1
 wget https://github.com/Kitware/CMake/releases/download/v3.27.4/cmake-3.27.4-linux-x86_64.sh
 chmod +x cmake-3.27.4-linux-x86_64.sh
 ./cmake-3.27.4-linux-x86_64.sh --skip-license --prefix=/usr/local
@@ -65,9 +65,6 @@ dpkg -i gdrdrv-dkms_*.deb
 dpkg -i libgdrapi_*.deb
 dpkg -i gdrcopy-tests_*.deb
 dpkg -i gdrcopy_*.deb
-
-# Verify GDRCopy
-gdrcopy_copybw
 
 if [ ! -e "/usr/lib/x86_64-linux-gnu/libmlx5.so" ]; then
     ln -s /usr/lib/x86_64-linux-gnu/libmlx5.so.1 /usr/lib/x86_64-linux-gnu/libmlx5.so
@@ -101,15 +98,22 @@ cmake -S . -B build/ -DCMAKE_INSTALL_PREFIX=/opt/nvshmem/install -DCMAKE_CUDA_AR
 cd build
 make -j$(nproc) install
 
-# Verify NVSHMEM
-nvshmem-info -a
-# /opt/nvshmem/bin/perftest/device/pt-to-pt/shmem_put_bw
-
 # Install DeepEP
 cd /root/.cache/deepep && python3 setup.py install
 
-# Debug
-dpkg -l | grep gdrcopy
-dpkg -l | grep -E "libibverbs|rdma-core|libmlx5"
-lsmod | grep -E "ib|mlx|rdma"
-# ibv_devices
+# Verify configuration
+echo "=== Network Configuration ==="
+ifconfig
+ethtool -i eth0
+echo "=== NCCL Configuration ==="
+nvidia-smi topo -m
+nvidia-smi nvlink -s
+echo "=== RDMA Configuration ==="
+ibv_devinfo
+ibv_devices
+ibv_rc_pingpong -d mlx5_0 -g 0 -i 1
+echo "=== GDRCOPY ==="
+gdrcopy_copybw
+echo "=== NVSHMEM ==="
+nvshmem-info -a
+# /opt/nvshmem/bin/perftest/device/pt-to-pt/shmem_put_bw
