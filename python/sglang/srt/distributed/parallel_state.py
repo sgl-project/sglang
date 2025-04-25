@@ -1055,6 +1055,7 @@ def init_distributed_environment(
             world_size=world_size,
             rank=rank,
             timeout=timeout,
+            device_id=f"cuda:{torch.cuda.current_device()}",  # Allow NCCL to eagerly init communicator
         )
 
     # set the local rank
