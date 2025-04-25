@@ -17,7 +17,6 @@ from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple, cast
 import huggingface_hub
 import numpy as np
 import torch
-import re
 from huggingface_hub import HfApi, hf_hub_download
 from torch import nn
 from transformers import AutoModelForCausalLM
@@ -62,7 +61,6 @@ from sglang.srt.utils import (
     set_weight_attrs,
 )
 
-_pattern = re.compile(r"language_model\.model\.layers\.(\d+)\.")
 
 def contains_layer_gt8(s: str) -> bool:
     """
@@ -345,14 +343,10 @@ class DefaultModelLoader(BaseModelLoader):
             weights_iterator = pt_weights_iterator(hf_weights_files)
 
         # Apply the prefix.
-        for name, tensor in weights_iterator:
-            with open("log.txt", "a") as f:
-                print("name", name, contains_layer_gt8(name), file=f)
             
         return (
             (source.prefix + name, tensor) 
-            for (name, tensor) in weights_iterator
-            if not contains_layer_gt8(name)
+            for (name, tensor) in weights_iterator          
         )
 
     def _get_all_weights(
