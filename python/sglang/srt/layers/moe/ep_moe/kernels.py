@@ -881,6 +881,9 @@ def ep_scatter(
     print_tensor("output_tensor")
     print_tensor("output_tensor_scale")
     print_tensor("output_index")
+    print(f"{recv_topk.tolist()=}")
+    print(f"{num_recv_tokens_per_expert.tolist()=}")
+    print(f"{expert_start_loc.tolist()=}")
 
     _fwd_kernel_ep_scatter_2[(grid,)](
         recv_topk.shape[0],
