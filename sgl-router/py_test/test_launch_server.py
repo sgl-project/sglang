@@ -23,6 +23,7 @@ def popen_launch_router(
     policy: str = "cache_aware",
     max_payload_size: int = None,
     api_key: str = None,
+    log_dir: str = None,
 ):
     """
     Launch the router server process.
@@ -35,6 +36,7 @@ def popen_launch_router(
         policy: Router policy, one of "cache_aware", "round_robin", "random"
         max_payload_size: Maximum payload size in bytes
         api_key: API key for the router
+        log_dir: Directory to store log files. If None, logs are only output to console.
     """
     _, host, port = base_url.split(":")
     host = host[2:]
@@ -62,6 +64,9 @@ def popen_launch_router(
 
     if max_payload_size is not None:
         command.extend(["--router-max-payload-size", str(max_payload_size)])
+
+    if log_dir is not None:
+        command.extend(["--log-dir", log_dir])
 
     process = subprocess.Popen(command, stdout=None, stderr=None)
 

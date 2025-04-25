@@ -1,4 +1,4 @@
-# SGLang Router
+c# SGLang Router
 
 SGLang router is a standalone module implemented in Rust to achieve data parallelism across SGLang instances.
 
@@ -66,6 +66,20 @@ $ pip install -e .
 ```
 
 **Note:** When modifying Rust code, you must rebuild the wheel for changes to take effect.
+
+### Logging
+
+The SGL Router includes structured logging with console output by default. To enable log files:
+
+```python
+# Enable file logging when creating a router
+router = Router(
+    worker_urls=["http://worker1:8000", "http://worker2:8000"],
+    log_dir="./logs"  # Daily log files will be created here
+)
+```
+
+Use the `--verbose` flag with the CLI for more detailed logs.
 
 ### Troubleshooting
 
