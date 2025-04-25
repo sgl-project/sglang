@@ -29,7 +29,7 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from enum import IntEnum, auto
 from typing import TYPE_CHECKING, List, Optional, Union
 
@@ -375,12 +375,12 @@ class ForwardBatch:
         # Filter out None values
         valid_inputs = [x for x in self.mm_inputs if x is not None]
 
-        # Start with the first valid image input
         # TODO: is it expensive?
-        merged = replace(valid_inputs[0])
+        # a workaround to avoid importing `MultimodalInputs`
+        merged = valid_inputs[0].__class__(mm_items=[])
 
         # Merge remaining inputs
-        for mm_input in valid_inputs[1:]:
+        for mm_input in valid_inputs:
             merged.merge(mm_input)
 
         return merged
