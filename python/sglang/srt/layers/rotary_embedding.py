@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+from vllm._custom_ops import rotary_embedding as vllm_rotary_embedding
 
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.utils import is_cuda
@@ -14,8 +15,6 @@ _is_cuda = is_cuda()
 
 if _is_cuda:
     from sgl_kernel import apply_rope_with_cos_sin_cache_inplace
-else:
-    from vllm._custom_ops import rotary_embedding as vllm_rotary_embedding
 
 
 def _rotate_neox(x: torch.Tensor) -> torch.Tensor:
