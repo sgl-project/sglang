@@ -151,6 +151,9 @@ def run_compile(server_args: ServerArgs, compile_args: CompileArgs):
     proc = launch_server_process_and_send_one_request(server_args, compile_args)
 
     print("\nDeepGEMM Kernels compilation finished successfully.")
+
+    # Sleep for safety
+    time.sleep(10)
     if proc.is_alive():
         # This is the rank0 node.
         kill_process_tree(proc.pid)
