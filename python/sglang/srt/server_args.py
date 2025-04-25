@@ -23,7 +23,6 @@ import tempfile
 from typing import List, Literal, Optional
 
 from sglang.srt.hf_transformers_utils import check_gguf_file
-from sglang.srt.layers.quantization import QUANTIZATION_METHODS
 from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.utils import (
     configure_ipv6,
