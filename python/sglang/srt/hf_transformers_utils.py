@@ -31,6 +31,7 @@ from transformers import (
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
 from sglang.srt.configs import (
+    ArcticConfig,
     ChatGLMConfig,
     DbrxConfig,
     DeepseekVL2Config,
@@ -41,6 +42,7 @@ from sglang.srt.connector import create_remote_connector
 from sglang.srt.utils import is_remote_url
 
 _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
+    ArcticConfig.model_type: ArcticConfig,
     ChatGLMConfig.model_type: ChatGLMConfig,
     DbrxConfig.model_type: DbrxConfig,
     ExaoneConfig.model_type: ExaoneConfig,
