@@ -191,31 +191,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         ]
         weights = self.compute_shared_experts_fusion_weights(
             weights,
-            n_share_experts_fusion=self.n_share_experts_fusion,
-            n_routed_experts=self.config.n_routed_experts,
             moe_layer_ids=range(1),
-            suffix_list=(
-                [
-                    "down_proj.weight",
-                    "down_proj.weight_scale",
-                    "gate_proj.weight",
-                    "gate_proj.weight_scale",
-                    "up_proj.weight",
-                    "up_proj.weight_scale",
-                ]
-                if self.quant_config is None
-                or self.quant_config.get_name() == "w8a8_int8"
-                else [
-                    "down_proj.weight",
-                    "down_proj.weight_scale_inv",
-                    "gate_proj.weight",
-                    "gate_proj.weight_scale_inv",
-                    "up_proj.weight",
-                    "up_proj.weight_scale_inv",
-                ]
-            ),
-            shared_expert_name_template="model.layers.{moe_layer_id}.mlp.shared_experts.{suffix}",
-            routed_expert_name_template="model.layers.{moe_layer_id}.mlp.experts.{expert_index}.{suffix}",
         )
 
         # Params for weights, fp8 weight scales, fp8 activation scales

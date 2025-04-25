@@ -1616,36 +1616,48 @@ class DeepseekV2ForCausalLM(nn.Module):
     def compute_shared_experts_fusion_weights(
         self,
         weights: Iterable[Tuple[str, torch.Tensor]],
-        n_share_experts_fusion: int,
-        n_routed_experts: int,
         moe_layer_ids: Iterable[int],
-        suffix_list: List[str],
-        shared_expert_name_template: str,
-        routed_expert_name_template: str,
     ):
-        if n_share_experts_fusion == 0:
+        if self.n_share_experts_fusion == 0:
             return weights
 
         weights_list = list(weights)
         weights_dict = dict(weights_list)
+        if self.quant_config is None or self.quant_config.get_name() == "w8a8_int8":
+            suffix_list = [
+                "down_proj.weight",
+                "down_proj.weight_scale",
+                "gate_proj.weight",
+                "gate_proj.weight_scale",
+                "up_proj.weight",
+                "up_proj.weight_scale",
+            ]
+        else:
+            suffix_list = [
+                "down_proj.weight",
+                "down_proj.weight_scale_inv",
+                "gate_proj.weight",
+                "gate_proj.weight_scale_inv",
+                "up_proj.weight",
+                "up_proj.weight_scale_inv",
+            ]
         names_to_remove = []
-        for moe_layer_id in tqdm(
+        for moe_layer in tqdm(
             moe_layer_ids,
-            desc=f"Cloning {n_share_experts_fusion} "
+            desc=f"Cloning {self.n_share_experts_fusion} "
             f"replicas of the shared expert into MoE for {self.config.architectures[0]}",
         ):
-            for repeat_index in range(n_share_experts_fusion):
+            for num_repeat in range(self.n_share_experts_fusion):
                 for suffix in suffix_list:
-                    shared_expert_weight_name = shared_expert_name_template.format(
-                        moe_layer_id=moe_layer_id, suffix=suffix
+                    shared_expert_weight_name = (
+                        f"model.layers.{moe_layer}.mlp.shared_experts.{suffix}"
                     )
                     weights_list.append(
                         (
-                            routed_expert_name_template.format(
-                                moe_layer_id=moe_layer_id,
-                                expert_index=n_routed_experts + repeat_index,
-                                suffix=suffix,
-                            ),
+                            f"model.layers.{moe_layer}."
+                            f"mlp.experts."
+                            f"{self.config.n_routed_experts + num_repeat}"
+                            f".{suffix}",
                             weights_dict[shared_expert_weight_name],
                         )
                     )
@@ -1661,35 +1673,11 @@ class DeepseekV2ForCausalLM(nn.Module):
 
         weights = self.compute_shared_experts_fusion_weights(
             weights,
-            n_share_experts_fusion=self.n_share_experts_fusion,
-            n_routed_experts=self.config.n_routed_experts,
             moe_layer_ids=range(
                 self.config.first_k_dense_replace,
                 self.config.num_hidden_layers,
                 self.config.moe_layer_freq,
             ),
-            suffix_list=(
-                [
-                    "down_proj.weight",
-                    "down_proj.weight_scale",
-                    "gate_proj.weight",
-                    "gate_proj.weight_scale",
-                    "up_proj.weight",
-                    "up_proj.weight_scale",
-                ]
-                if self.quant_config is None
-                or self.quant_config.get_name() == "w8a8_int8"
-                else [
-                    "down_proj.weight",
-                    "down_proj.weight_scale_inv",
-                    "gate_proj.weight",
-                    "gate_proj.weight_scale_inv",
-                    "up_proj.weight",
-                    "up_proj.weight_scale_inv",
-                ]
-            ),
-            shared_expert_name_template="model.layers.{moe_layer_id}.mlp.shared_experts.{suffix}",
-            routed_expert_name_template="model.layers.{moe_layer_id}.mlp.experts.{expert_index}.{suffix}",
         )
 
         # Params for weights, fp8 weight scales, fp8 activation scales
