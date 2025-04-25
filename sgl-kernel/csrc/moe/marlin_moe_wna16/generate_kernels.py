@@ -16,20 +16,22 @@ FILE_HEAD = """
 namespace MARLIN_NAMESPACE_NAME {
 """.strip()
 
-TEMPLATE = ("template __global__ void Marlin<"
-            "{{scalar_t}}, "
-            "{{w_type_id}}, "
-            "{{threads}}, "
-            "{{thread_m_blocks}}, "
-            "{{thread_n_blocks}}, "
-            "{{thread_k_blocks}}, "
-            "{{'true' if m_block_size_8 else 'false'}}, "
-            "{{stages}}, "
-            "{{'true' if has_act_order else 'false'}}, "
-            "{{'true' if has_zp else 'false'}}, "
-            "{{group_blocks}}, "
-            "{{'true' if is_zp_float else 'false'}}>"
-            "( MARLIN_KERNEL_PARAMS );")
+TEMPLATE = (
+    "template __global__ void Marlin<"
+    "{{scalar_t}}, "
+    "{{w_type_id}}, "
+    "{{threads}}, "
+    "{{thread_m_blocks}}, "
+    "{{thread_n_blocks}}, "
+    "{{thread_k_blocks}}, "
+    "{{'true' if m_block_size_8 else 'false'}}, "
+    "{{stages}}, "
+    "{{'true' if has_act_order else 'false'}}, "
+    "{{'true' if has_zp else 'false'}}, "
+    "{{group_blocks}}, "
+    "{{'true' if is_zp_float else 'false'}}>"
+    "( MARLIN_KERNEL_PARAMS );"
+)
 
 # int8 with zero point case (sglang::kU8) is also supported,
 # we don't add it to reduce wheel size.
@@ -56,7 +58,8 @@ def generate_new_kernels():
         all_template_str_list = []
 
         for group_blocks, m_blocks, thread_configs in itertools.product(
-                GROUP_BLOCKS, THREAD_M_BLOCKS, THREAD_CONFIGS):
+            GROUP_BLOCKS, THREAD_M_BLOCKS, THREAD_CONFIGS
+        ):
 
             has_act_order = group_blocks == 0
             if has_zp and has_act_order:

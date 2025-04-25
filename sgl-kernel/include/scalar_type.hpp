@@ -24,9 +24,13 @@ class ScalarType {
     NAN_REPR_ID_MAX
   };
 
-  constexpr ScalarType(uint8_t exponent, uint8_t mantissa, bool signed_,
-                       int32_t bias, bool finite_values_only = false,
-                       NanRepr nan_repr = NAN_IEEE_754)
+  constexpr ScalarType(
+      uint8_t exponent,
+      uint8_t mantissa,
+      bool signed_,
+      int32_t bias,
+      bool finite_values_only = false,
+      NanRepr nan_repr = NAN_IEEE_754)
       : exponent(exponent),
         mantissa(mantissa),
         signed_(signed_),
@@ -43,32 +47,29 @@ class ScalarType {
   }
 
   // IEEE 754 compliant floating point type
-  static constexpr ScalarType float_IEEE754(uint8_t exponent,
-                                            uint8_t mantissa) {
+  static constexpr ScalarType float_IEEE754(uint8_t exponent, uint8_t mantissa) {
     TORCH_CHECK(mantissa > 0 && exponent > 0);
     return ScalarType(exponent, mantissa, true, 0, false, NAN_IEEE_754);
   }
 
   // IEEE 754 non-compliant floating point type
-  static constexpr ScalarType float_(uint8_t exponent, uint8_t mantissa,
-                                     bool finite_values_only,
-                                     NanRepr nan_repr) {
+  static constexpr ScalarType float_(uint8_t exponent, uint8_t mantissa, bool finite_values_only, NanRepr nan_repr) {
     TORCH_CHECK(nan_repr < NAN_REPR_ID_MAX, "Invalid NanRepr");
     TORCH_CHECK(mantissa > 0 && exponent > 0);
-    TORCH_CHECK(nan_repr != NAN_IEEE_754,
-                "use `float_IEEE754` constructor for floating point types that "
-                "follow IEEE 754 conventions");
-    return ScalarType(exponent, mantissa, true, 0, finite_values_only,
-                      nan_repr);
+    TORCH_CHECK(
+        nan_repr != NAN_IEEE_754,
+        "use `float_IEEE754` constructor for floating point types that "
+        "follow IEEE 754 conventions");
+    return ScalarType(exponent, mantissa, true, 0, finite_values_only, nan_repr);
   }
 
   uint8_t const exponent;  // size of the exponent field (0 for integer types)
   uint8_t const mantissa;  // size of the mantissa field (size of the integer
                            // excluding the sign bit for integer types)
-  bool const signed_;  // flag if the type supports negative numbers (i.e. has a
-                       // sign bit)
-  int32_t const bias;  // stored values equal value + bias,
-                       // used for quantized type
+  bool const signed_;      // flag if the type supports negative numbers (i.e. has a
+                           // sign bit)
+  int32_t const bias;      // stored values equal value + bias,
+                           // used for quantized type
 
   // Extra Floating point info
   bool const finite_values_only;  // i.e. no +/-inf if true
@@ -86,8 +87,7 @@ class ScalarType {
   }
 
   template <typename Fn, typename Init, typename Member, typename... Rest>
-  static constexpr auto reduce_members_helper(Fn f, Init val, Member member,
-                                              Rest... rest) {
+  static constexpr auto reduce_members_helper(Fn f, Init val, Member member, Rest... rest) {
     auto new_val = f(val, member);
     if constexpr (sizeof...(rest) > 0) {
       return reduce_members_helper(f, new_val, rest...);
@@ -99,8 +99,7 @@ class ScalarType {
   template <typename Fn, typename Init>
   constexpr auto reduce_members(Fn f, Init init) const {
     // Should be in constructor order for `from_id`
-    return reduce_members_helper(f, init, exponent, mantissa, signed_, bias,
-                                 finite_values_only, nan_repr);
+    return reduce_members_helper(f, init, exponent, mantissa, signed_, bias, finite_values_only, nan_repr);
   };
 
   template <typename Fn, typename Init>
@@ -111,10 +110,7 @@ class ScalarType {
 
   static constexpr auto id_size_bits() {
     return reduce_member_types(
-        [](int acc, auto member) -> int {
-          return acc + member_id_field_width<decltype(member)>();
-        },
-        0);
+        [](int acc, auto member) -> int { return acc + member_id_field_width<decltype(member)>(); }, 0);
   }
 
  public:
@@ -122,16 +118,12 @@ class ScalarType {
   //  c++17 template specialization this is not needed once we migrate to
   //  c++20 and can pass literal classes as template parameters
   constexpr Id id() const {
-    static_assert(id_size_bits() <= sizeof(Id) * 8,
-                  "ScalarType id is too large to be stored");
+    static_assert(id_size_bits() <= sizeof(Id) * 8, "ScalarType id is too large to be stored");
 
-    auto or_and_advance = [](std::pair<Id, uint32_t> result,
-                             auto member) -> std::pair<Id, uint32_t> {
+    auto or_and_advance = [](std::pair<Id, uint32_t> result, auto member) -> std::pair<Id, uint32_t> {
       auto [id, bit_offset] = result;
       auto constexpr bits = member_id_field_width<decltype(member)>();
-      return {id | (int64_t(member) & ((uint64_t(1) << bits) - 1))
-                       << bit_offset,
-              bit_offset + bits};
+      return {id | (int64_t(member) & ((uint64_t(1) << bits) - 1)) << bit_offset, bit_offset + bits};
     };
     return reduce_members(or_and_advance, std::pair<Id, uint32_t>{}).first;
   }
@@ -144,27 +136,29 @@ class ScalarType {
       using T = decltype(member);
       auto [tuple, bit_offset] = result;
       auto constexpr bits = member_id_field_width<T>();
-      auto extracted_val = static_cast<T>((int64_t(id) >> bit_offset) &
-                                          ((uint64_t(1) << bits) - 1));
+      auto extracted_val = static_cast<T>((int64_t(id) >> bit_offset) & ((uint64_t(1) << bits) - 1));
       auto new_tuple = std::tuple_cat(tuple, std::make_tuple(extracted_val));
       return std::pair<decltype(new_tuple), int>{new_tuple, bit_offset + bits};
     };
 
-    auto [tuple_args, _] = reduce_member_types(extract_and_advance,
-                                               std::pair<std::tuple<>, int>{});
-    return std::apply([](auto... args) { return ScalarType(args...); },
-                      tuple_args);
+    auto [tuple_args, _] = reduce_member_types(extract_and_advance, std::pair<std::tuple<>, int>{});
+    return std::apply([](auto... args) { return ScalarType(args...); }, tuple_args);
   }
 
   constexpr int64_t size_bits() const {
     return mantissa + exponent + is_signed();
   }
-  constexpr bool is_signed() const { return signed_; }
-  constexpr bool is_integer() const { return exponent == 0; }
-  constexpr bool is_floating_point() const { return exponent > 0; }
+  constexpr bool is_signed() const {
+    return signed_;
+  }
+  constexpr bool is_integer() const {
+    return exponent == 0;
+  }
+  constexpr bool is_floating_point() const {
+    return exponent > 0;
+  }
   constexpr bool is_ieee_754() const {
-    return is_floating_point() && finite_values_only == false &&
-           nan_repr == NAN_IEEE_754;
+    return is_floating_point() && finite_values_only == false && nan_repr == NAN_IEEE_754;
   }
   constexpr bool has_nans() const {
     return is_floating_point() && nan_repr != NAN_NONE;
@@ -172,12 +166,13 @@ class ScalarType {
   constexpr bool has_infs() const {
     return is_floating_point() && finite_values_only == false;
   }
-  constexpr bool has_bias() const { return bias != 0; }
+  constexpr bool has_bias() const {
+    return bias != 0;
+  }
 
  private:
   double _floating_point_max() const {
-    TORCH_CHECK(mantissa <= 52 && exponent <= 11,
-                "Cannot represent max/min as a double for type ", str());
+    TORCH_CHECK(mantissa <= 52 && exponent <= 11, "Cannot represent max/min as a double for type ", str());
 
     uint64_t max_mantissa = (uint64_t(1) << mantissa) - 1;
     if (nan_repr == NAN_EXTD_RANGE_MAX_MIN) {
@@ -186,8 +181,7 @@ class ScalarType {
 
     uint64_t max_exponent = (uint64_t(1) << exponent) - 2;
     if (nan_repr == NAN_EXTD_RANGE_MAX_MIN || nan_repr == NAN_NONE) {
-      TORCH_CHECK(exponent < 11,
-                  "Cannot represent max/min as a double for type ", str());
+      TORCH_CHECK(exponent < 11, "Cannot represent max/min as a double for type ", str());
       max_exponent += 1;
     }
 
@@ -201,13 +195,11 @@ class ScalarType {
     uint64_t exponent_bias = (uint64_t(1) << (exponent - 1)) - 1;
     uint64_t exponent_bias_double = (uint64_t(1) << 10) - 1;  // double e = 11
 
-    uint64_t max_exponent_double =
-        max_exponent - exponent_bias + exponent_bias_double;
+    uint64_t max_exponent_double = max_exponent - exponent_bias + exponent_bias_double;
 
     // shift the mantissa into the position for a double and
     // the exponent
-    uint64_t double_raw =
-        (max_mantissa << (52 - mantissa)) | (max_exponent_double << 52);
+    uint64_t double_raw = (max_mantissa << (52 - mantissa)) | (max_exponent_double << 52);
 
     return *reinterpret_cast<double*>(&double_raw);
   }
@@ -216,16 +208,14 @@ class ScalarType {
     if (is_floating_point()) {
       return {_floating_point_max()};
     } else {
-      TORCH_CHECK(size_bits() < 64 || size_bits() == 64 && is_signed(),
-                  "Cannot represent max as a int64_t");
+      TORCH_CHECK(size_bits() < 64 || size_bits() == 64 && is_signed(), "Cannot represent max as a int64_t");
       return {(int64_t(1) << mantissa) - 1};
     }
   }
 
   constexpr std::variant<int64_t, double> _raw_min() const {
     if (is_floating_point()) {
-      TORCH_CHECK(is_signed(),
-                  "We currently assume all floating point types are signed");
+      TORCH_CHECK(is_signed(), "We currently assume all floating point types are signed");
       constexpr uint64_t sign_bit_double = (uint64_t(1) << 63);
 
       double max = _floating_point_max();
@@ -233,8 +223,7 @@ class ScalarType {
       uint64_t min_raw = max_raw | sign_bit_double;
       return {*reinterpret_cast<double*>(&min_raw)};
     } else {
-      TORCH_CHECK(!is_signed() || size_bits() <= 64,
-                  "Cannot represent min as a int64_t");
+      TORCH_CHECK(!is_signed() || size_bits() <= 64, "Cannot represent min as a int64_t");
       if (is_signed()) {
         // set the top bit to 1 (i.e. INT64_MIN) and the rest to 0
         // then perform an arithmetic shift right to set all the bits above
@@ -250,17 +239,13 @@ class ScalarType {
   // Max representable value for this scalar type.
   // (accounting for bias if there is one)
   constexpr std::variant<int64_t, double> max() const {
-    return std::visit(
-        [this](auto x) -> std::variant<int64_t, double> { return {x - bias}; },
-        _raw_max());
+    return std::visit([this](auto x) -> std::variant<int64_t, double> { return {x - bias}; }, _raw_max());
   }
 
   // Min representable value for this scalar type.
   // (accounting for bias if there is one)
   constexpr std::variant<int64_t, double> min() const {
-    return std::visit(
-        [this](auto x) -> std::variant<int64_t, double> { return {x - bias}; },
-        _raw_min());
+    return std::visit([this](auto x) -> std::variant<int64_t, double> { return {x - bias}; }, _raw_min());
   }
 
   std::string str() const {
@@ -276,8 +261,8 @@ class ScalarType {
      *  - if bias is not present it means its zero
      */
     if (is_floating_point()) {
-      auto ret = "float" + std::to_string(size_bits()) + "_e" +
-                 std::to_string(exponent) + "m" + std::to_string(mantissa);
+      auto ret =
+          "float" + std::to_string(size_bits()) + "_e" + std::to_string(exponent) + "m" + std::to_string(mantissa);
       if (!is_ieee_754()) {
         if (finite_values_only) {
           ret += "f";
@@ -297,10 +282,8 @@ class ScalarType {
   }
 
   constexpr bool operator==(ScalarType const& other) const {
-    return mantissa == other.mantissa && exponent == other.exponent &&
-           bias == other.bias && signed_ == other.signed_ &&
-           finite_values_only == other.finite_values_only &&
-           nan_repr == other.nan_repr;
+    return mantissa == other.mantissa && exponent == other.exponent && bias == other.bias && signed_ == other.signed_ &&
+           finite_values_only == other.finite_values_only && nan_repr == other.nan_repr;
   }
 };
 
@@ -315,10 +298,8 @@ static inline constexpr auto kS8 = ScalarType::int_(8);
 static inline constexpr auto kU8 = ScalarType::uint(8);
 static inline constexpr auto kU8B128 = ScalarType::uint(8, 128);
 
-static inline constexpr auto kFE3M2f =
-    ScalarType::float_(3, 2, true, ScalarType::NAN_NONE);
-static inline constexpr auto kFE4M3fn =
-    ScalarType::float_(4, 3, true, ScalarType::NAN_EXTD_RANGE_MAX_MIN);
+static inline constexpr auto kFE3M2f = ScalarType::float_(3, 2, true, ScalarType::NAN_NONE);
+static inline constexpr auto kFE4M3fn = ScalarType::float_(4, 3, true, ScalarType::NAN_EXTD_RANGE_MAX_MIN);
 static inline constexpr auto kFE5M2 = ScalarType::float_IEEE754(5, 2);
 static inline constexpr auto kFE8M7 = ScalarType::float_IEEE754(8, 7);
 static inline constexpr auto kFE5M10 = ScalarType::float_IEEE754(5, 10);
@@ -344,4 +325,4 @@ static inline constexpr auto kFloat16 = kHalf;
 static inline constexpr auto kBFloat16 = kFE8M7;
 
 static inline constexpr auto kFloat16Id = kFloat16.id();
-};  // namespace vllm
+};  // namespace sglang

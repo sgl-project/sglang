@@ -1,12 +1,13 @@
 
 #ifndef _data_types_cuh
 #define _data_types_cuh
-#include "marlin.cuh"
-#include <cuda_fp16.h>
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
+
+#include "marlin.cuh"
 
 #ifndef MARLIN_NAMESPACE_NAME
-  #define MARLIN_NAMESPACE_NAME marlin
+#define MARLIN_NAMESPACE_NAME marlin
 #endif
 
 namespace MARLIN_NAMESPACE_NAME {
@@ -67,8 +68,7 @@ class ScalarType<nv_bfloat16> {
     return __bfloat162bfloat162(x);
   }
 
-  static __device__ nv_bfloat162 inline nums2num2(const nv_bfloat16 x1,
-                                                  const nv_bfloat16 x2) {
+  static __device__ nv_bfloat162 inline nums2num2(const nv_bfloat16 x1, const nv_bfloat16 x2) {
     return __halves2bfloat162(x1, x2);
   }
 

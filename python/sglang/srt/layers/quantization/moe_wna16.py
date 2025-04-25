@@ -4,6 +4,12 @@ import logging
 from typing import Any, Callable, Dict, List, Optional
 
 import torch
+from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+    marlin_permute_scales,
+)
+from vllm.model_executor.layers.quantization.utils.marlin_utils_test import (
+    marlin_weights,
+)
 
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.parallel_state import get_tp_group
@@ -15,8 +21,7 @@ from sglang.srt.layers.quantization.base_config import (
 )
 from sglang.srt.layers.quantization.gptq import GPTQConfig, GPTQMarlinConfig
 from sglang.srt.utils import get_device_capability, set_weight_attrs
-from vllm.model_executor.layers.quantization.utils.marlin_utils_test import marlin_weights
-from vllm.model_executor.layers.quantization.utils.marlin_utils import marlin_permute_scales
+
 logger = logging.getLogger(__name__)
 
 
@@ -27,10 +32,10 @@ def get_weight_perm(num_bits: int):
         col = i // 4
         for block in [0, 1]:
             for row in [
-                    2 * (i % 4),
-                    2 * (i % 4) + 1,
-                    2 * (i % 4 + 4),
-                    2 * (i % 4 + 4) + 1,
+                2 * (i % 4),
+                2 * (i % 4) + 1,
+                2 * (i % 4 + 4),
+                2 * (i % 4 + 4) + 1,
             ]:
                 perm1.append(16 * row + col + 8 * block)
         for j in range(4):
@@ -49,12 +54,14 @@ def get_weight_perm(num_bits: int):
     perm = torch.from_numpy(perm)
     return perm
 
+
 def marlin_weights_transform(w, s, num_bits, group_size):
     size_k, size_n = w.shape
     weight_perm = get_weight_perm(num_bits)
     marlin_q_w = marlin_weights(w, size_k, size_n, num_bits, weight_perm)
     marlin_s = marlin_permute_scales(s, size_k, size_n, group_size)
     return [marlin_q_w, marlin_s]
+
 
 class MoeWNA16Config(QuantizationConfig):
     """Config class for MOE WNA16 (W8A16/W4A16) quantization."""
@@ -424,7 +431,7 @@ class MoeWNA16Method:
             block_shape=[0, layer.group_size],
             no_combine=no_combine,
         )
-        
+
     @staticmethod
     def get_weight_loader(layer, weight_loader):
 

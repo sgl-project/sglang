@@ -14,14 +14,12 @@
 
 // A version of the TORCH_LIBRARY_IMPL macro that expands the NAME, i.e. so NAME
 // could be a macro instead of a literal token.
-#define TORCH_LIBRARY_IMPL_EXPAND(NAME, DEVICE, MODULE) \
-  TORCH_LIBRARY_IMPL(NAME, DEVICE, MODULE)
+#define TORCH_LIBRARY_IMPL_EXPAND(NAME, DEVICE, MODULE) TORCH_LIBRARY_IMPL(NAME, DEVICE, MODULE)
 
 // REGISTER_EXTENSION allows the shared library to be loaded and initialized
 // via python's import statement.
-#define REGISTER_EXTENSION(NAME)                                               \
-  PyMODINIT_FUNC CONCAT(PyInit_, NAME)() {                                     \
-    static struct PyModuleDef module = {PyModuleDef_HEAD_INIT,                 \
-                                        STRINGIFY(NAME), nullptr, 0, nullptr}; \
-    return PyModule_Create(&module);                                           \
+#define REGISTER_EXTENSION(NAME)                                                                      \
+  PyMODINIT_FUNC CONCAT(PyInit_, NAME)() {                                                            \
+    static struct PyModuleDef module = {PyModuleDef_HEAD_INIT, STRINGIFY(NAME), nullptr, 0, nullptr}; \
+    return PyModule_Create(&module);                                                                  \
   }
