@@ -136,7 +136,8 @@ class TestFlashAttention3LocalAttn(BaseFlashAttentionTest):
     @classmethod
     def get_server_args(cls):
         cloned_args = DEFAULT_SERVER_ARGS.copy()
-        cloned_args.extend(["--tp", "4"])
+        # we cannot use scout's 10m context due to this bug: https://github.com/sgl-project/sglang/issues/5755
+        cloned_args.extend(["--tp", "4", "--context-length", "1000000"])
         return cloned_args
 
 
