@@ -1,6 +1,6 @@
 ARG CUDA_VERSION=12.5.1
 
-FROM nvcr.io/nvidia/tritonserver:24.04-py3-min
+FROM nvcr.io/nvidia/tritonserver:25.03-py3-min
 
 ARG BUILD_TYPE=all
 ENV DEBIAN_FRONTEND=noninteractive
