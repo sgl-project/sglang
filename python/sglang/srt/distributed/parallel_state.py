@@ -1057,6 +1057,8 @@ def init_distributed_environment(
             timeout=timeout,
             device_id=torch.device(
                 f"cuda:{torch.cuda.current_device()}"
+                if hasattr(torch, "cuda") and torch.cuda.is_available()
+                else None
             ),  # Allow NCCL to eagerly init communicator
         )
 
