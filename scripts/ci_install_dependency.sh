@@ -15,6 +15,9 @@ bash "${SCRIPT_DIR}/killall_sglang.sh"
 pip uninstall -y flashinfer flashinfer_python sgl-kernel sglang vllm deepep || true
 pip cache purge
 rm -rf /root/.cache/flashinfer
+if [ -d "lmms-eval" ]; then
+    rm -rf lmms-eval
+fi
 rm -rf /root/.cache/deepep
 rm -rf /usr/local/lib/python3.10/dist-packages/flashinfer*
 rm -rf /usr/local/lib/python3.10/dist-packages/sgl_kernel*
