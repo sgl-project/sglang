@@ -873,51 +873,47 @@ def ep_scatter(
         x = that_locals[name]
         print(f"{name=} {x.shape=} {x.stride()=} {x.dtype=} {x.device=}")
 
-    try:
-        _fwd_kernel_ep_scatter_2[(grid,)](
-            recv_topk.shape[0],
-            expert_start_loc,
-            recv_x,
-            recv_x.stride(0),
-            recv_x.stride(1),
-            recv_x_scale,
-            recv_x_scale.stride(0),
-            recv_x_scale.stride(1),
-            recv_topk,
-            recv_topk.stride(0),
-            recv_topk.stride(1),
-            output_tensor,
-            output_tensor.stride(0),
-            output_tensor.stride(1),
-            output_tensor_scale,
-            output_tensor_scale.stride(0),
-            output_tensor_scale.stride(1),
-            output_index,
-            output_index.stride(0),
-            output_index.stride(1),
-            topk_num=recv_topk.shape[1],
-            num_warps=num_warps,
-            HIDDEN_SIZE=hidden_size,
-            HIDDEN_SIZE_PAD=triton.next_power_of_2(hidden_size),
-            SCALE_HIDDEN_SIZE=hidden_size // BLOCK_D,
-            SCALE_HIDDEN_SIZE_PAD=triton.next_power_of_2(hidden_size // BLOCK_D),
-        )
-    except Exception as e:
-        print(f"error!!! {e=}")
+    print_tensor("recv_topk")
+    print_tensor("num_recv_tokens_per_expert")
+    print_tensor("expert_start_loc")
+    print_tensor("recv_x")
+    print_tensor("recv_x_scale")
+    print_tensor("output_tensor")
+    print_tensor("output_tensor_scale")
+    print_tensor("output_index")
+    print(f"{recv_topk.tolist()=}")
+    print(f"{num_recv_tokens_per_expert.tolist()=}")
+    print(f"{expert_start_loc.tolist()=}")
 
-        print_tensor("recv_topk")
-        print_tensor("num_recv_tokens_per_expert")
-        print_tensor("expert_start_loc")
-        print_tensor("recv_x")
-        print_tensor("recv_x_scale")
-        print_tensor("output_tensor")
-        print_tensor("output_tensor_scale")
-        print_tensor("output_index")
-        print(f"{recv_topk.tolist()=}")
-        print(f"{num_recv_tokens_per_expert.tolist()=}")
-        print(f"{expert_start_loc.tolist()=}")
-
-        raise
+    _fwd_kernel_ep_scatter_2[(grid,)](
+        recv_topk.shape[0],
+        expert_start_loc,
+        recv_x,
+        recv_x.stride(0),
+        recv_x.stride(1),
+        recv_x_scale,
+        recv_x_scale.stride(0),
+        recv_x_scale.stride(1),
+        recv_topk,
+        recv_topk.stride(0),
+        recv_topk.stride(1),
+        output_tensor,
+        output_tensor.stride(0),
+        output_tensor.stride(1),
+        output_tensor_scale,
+        output_tensor_scale.stride(0),
+        output_tensor_scale.stride(1),
+        output_index,
+        output_index.stride(0),
+        output_index.stride(1),
+        topk_num=recv_topk.shape[1],
+        num_warps=num_warps,
+        HIDDEN_SIZE=hidden_size,
+        HIDDEN_SIZE_PAD=triton.next_power_of_2(hidden_size),
+        SCALE_HIDDEN_SIZE=hidden_size // BLOCK_D,
+        SCALE_HIDDEN_SIZE_PAD=triton.next_power_of_2(hidden_size // BLOCK_D),
+    )
+    return
 
 
 @triton.jit
