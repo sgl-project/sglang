@@ -63,6 +63,8 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if not x.is_contiguous():
+            x = x.contiguous()
         orig_dtype = x.dtype
         x = x.to(torch.float32)
         if residual is not None:
