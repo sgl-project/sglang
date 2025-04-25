@@ -50,7 +50,7 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.fused_moe import fused_experts, fused_topk
+from vllm.model_executor.layers.fused_moe import fused_experts, fused_topk
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -67,18 +67,12 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_executor.utils import set_weight_attrs
+from vllm.model_executor.utils import set_weight_attrs
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.platforms import current_platform
 
-from .interfaces import SupportsPP, SupportsQuant
-from .utils import (
-    extract_layer_index,
-    is_pp_missing_parameter,
-    make_empty_intermediate_tensors_factory,
-    make_layers,
-    maybe_prefix,
-)
+
+from sglang.srt.utils import make_layers, add_prefix
+from sglang.srt.models.gemma3_causal import extract_layer_index
 
 logger = logging.getLogger(__name__)
 
@@ -102,7 +96,7 @@ class ArcticMLP(nn.Module):
         )
 
         self.w13 = MergedColumnParallelLinear(
-            self.hidden_size, [self.ffn_dim] * 2, bias=False, quant_config=quant_config
+            input_size=self.hidden_size, output_sizes=[self.ffn_dim] * 2, bias=False, quant_config=quant_config
         )
         self.w2 = RowParallelLinear(
             self.ffn_dim,
@@ -181,7 +175,7 @@ class ArcticMoE(nn.Module):
                         self.num_experts,
                         2 * self.intermediate_size,
                         self.hidden_size,
-                        device=current_platform.device_type,
+                        device="cuda",
                         dtype=self.params_dtype,
                     )
                 )
@@ -190,7 +184,7 @@ class ArcticMoE(nn.Module):
                         self.num_experts,
                         self.hidden_size,
                         self.intermediate_size,
-                        device=current_platform.device_type,
+                        device="cuda",
                         dtype=self.params_dtype,
                     )
                 )
@@ -441,9 +435,6 @@ class ArcticModel(nn.Module):
         )
         self._attn_implementation = config._attn_implementation
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
-            ["hidden_states"], config.hidden_size
-        )
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -483,7 +474,7 @@ class ArcticForCausalLM(nn.Module):
         self.model = ArcticModel(
             config=config,
             quant_config=quant_config,
-            prefix=maybe_prefix(prefix, "model"),
+            prefix=add_prefix("model", prefix), # Use add_prefix from sglang.srt.utils
         )
         self.vocab_size = config.vocab_size
         self.lm_head = ParallelLMHead(
@@ -589,8 +580,6 @@ class ArcticForCausalLM(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
-                if is_pp_missing_parameter(name, self):
-                    continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -600,8 +589,6 @@ class ArcticForCausalLM(nn.Module):
                     if weight_name not in name:
                         continue
                     name = name.replace(weight_name, param_name)
-                    if is_pp_missing_parameter(name, self):
-                        continue
                     param = params_dict[name]
                     weight_loader = param.weight_loader
                     weight_loader(param, loaded_weight, shard_id)
@@ -611,8 +598,6 @@ class ArcticForCausalLM(nn.Module):
                         if weight_name not in name:
                             continue
                         name = name.replace(weight_name, param_name)
-                        if is_pp_missing_parameter(name, self):
-                            continue
                         param = params_dict[name]
                         weight_loader = param.weight_loader
                         weight_loader(
@@ -621,8 +606,6 @@ class ArcticForCausalLM(nn.Module):
                         break
                     else:
                         if name.endswith(".bias") and name not in params_dict:
-                            continue
-                        if is_pp_missing_parameter(name, self):
                             continue
                         param = params_dict[name]
 
