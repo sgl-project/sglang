@@ -9,9 +9,13 @@ from sglang.srt.utils import (
     get_int_env_var,
 )
 
+# TODO do not hardcode
+DEEPEP_NUM_SMS = 24
+
 _enable_jit_deepgemm = False
 try:
     from deep_ep import Buffer
+    import deep_ep
 
     from sglang.srt.layers.quantization.fp8_kernel import (
         sglang_per_token_group_quant_fp8,
@@ -22,6 +26,22 @@ try:
         if get_bool_env_var("SGL_ENABLE_JIT_DEEPGEMM", default="false"):
             _enable_jit_deepgemm = True
     use_deepep = True
+
+    # TODO do not hardcode
+    _HACK_NORMAL_DISPATCH_CONFIG = deep_ep.Config(
+        num_sms=DEEPEP_NUM_SMS,
+        num_max_nvl_chunked_send_tokens=TODO,
+        num_max_nvl_chunked_recv_tokens=TODO,
+        num_max_rdma_chunked_send_tokens=TODO,
+        num_max_rdma_chunked_recv_tokens=TODO,
+    )
+    _HACK_NORMAL_COMBINE_CONFIG = deep_ep.Config(
+        num_sms=DEEPEP_NUM_SMS,
+        num_max_nvl_chunked_send_tokens=TODO,
+        num_max_nvl_chunked_recv_tokens=TODO,
+        num_max_rdma_chunked_send_tokens=TODO,
+        num_max_rdma_chunked_recv_tokens=TODO,
+    )
 except ImportError:
     use_deepep = False
 
@@ -38,9 +58,6 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     per_token_cast_to_fp8,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-
-# TODO do not hardcode
-DEEPEP_NUM_SMS = 24
 
 
 class DeepEPDispatchMode(IntEnum):
