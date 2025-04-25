@@ -688,7 +688,7 @@ class MooncakeKVBootstrapServer(BaseKVBootstrapServer):
                 "rank_port": rank_port,
             }
             logger.debug(
-                f"Registere Prefill bootstrap: {engine_rank} with rank_ip: {rank_ip} and rank_port: {rank_port}"
+                f"Register Prefill bootstrap: {engine_rank} with rank_ip: {rank_ip} and rank_port: {rank_port}"
             )
 
         return web.Response(text="OK", status=200)
