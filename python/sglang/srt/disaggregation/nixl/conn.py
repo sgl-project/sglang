@@ -490,7 +490,7 @@ class NixlKVReceiver(BaseKVReceiver):
                 remote_tp_ranks = list(range(0, prefill_tp_size))
                 # split it into tp_size_of_dp parts and get our part
                 remote_tp_ranks_grouped = [
-                    remote_tp_ranks[i : i + self.kv_mgr.tp_size_of_dp]
+                    remote_tp_ranks[i : i + num_remote_tp_rank_we_managed]
                     for i in range(0, prefill_tp_size, self.kv_mgr.tp_size_of_dp)
                 ]
                 managed_ranks = remote_tp_ranks_grouped[self.kv_mgr.attn_tp_rank]
