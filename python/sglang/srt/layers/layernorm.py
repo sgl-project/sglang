@@ -20,9 +20,10 @@ import torch
 import torch.nn as nn
 
 from sglang.srt.custom_op import CustomOp
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, is_hip
 
 _is_cuda = is_cuda()
+_is_hip = is_hip()
 
 if _is_cuda:
     from sgl_kernel import (
@@ -51,6 +52,9 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if _is_hip and not x.is_contiguous():
+            # NOTE: Romove this if aiter kernel supports discontinuous input
+            x = x.contiguous()
 
         if residual is not None:
             fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
