@@ -320,6 +320,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             previous_event=previous_event,
             async_finish=self.async_finish,
             allocate_on_comm_stream=previous_event is not None,
+            config=_HACK_NORMAL_DISPATCH_CONFIG,
         )
 
         # FIXME: `handle` should be transmitted with tokens from dispatch to combine.
@@ -449,6 +450,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             async_finish=self.async_finish,
             previous_event=previous_event,
             allocate_on_comm_stream=previous_event is not None,
+            config=_HACK_NORMAL_COMBINE_CONFIG,
         )
         return combined_x, event
 
