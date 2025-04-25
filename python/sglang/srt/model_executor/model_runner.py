@@ -954,15 +954,6 @@ class ModelRunner:
             # TODO: Currently, cuda graph only captures decode steps, which only exists for generation models
             return
 
-        if self.server_args.disable_cuda_graph:
-            logger.warning(
-                "\n\nCUDA Graph is DISABLED.\n"
-                "This will cause significant performance degradation.\n"
-                "CUDA Graph should almost never be disabled in most usage scenarios.\n"
-                "If you encounter OOM issues, please try setting --mem-fraction-static to a lower value (such as 0.8 or 0.7) instead of disabling CUDA Graph.\n"
-            )
-            return
-
         tic = time.time()
         before_mem = get_available_gpu_memory(self.device, self.gpu_id)
         logger.info(
