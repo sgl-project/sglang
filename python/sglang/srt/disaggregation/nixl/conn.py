@@ -10,7 +10,7 @@ import threading
 import uuid
 from collections import defaultdict
 from functools import cache
-from typing import Dict, List, Optional, Set, Tuple, Union
+from typing import Dict, List, Optional, Set, Tuple, TypeAlias, Union
 
 import numpy as np
 import numpy.typing as npt
@@ -32,7 +32,7 @@ from sglang.srt.utils import get_free_port, get_ip, get_local_ip_by_remote
 
 logger = logging.getLogger(__name__)
 
-NixlEngineInfo = Dict[str, Union[str, int]]
+NixlEngineInfo: TypeAlias = Dict[str, Union[str, int]]
 
 
 @dataclasses.dataclass
