@@ -25,6 +25,7 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 import torch
 import torch.nn.functional as F
 from torch import nn
+from tqdm import tqdm
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
@@ -78,10 +79,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.managers.expert_distribution import ExpertDistributionRecorder
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.model_loader.weight_utils import (
-    compute_shared_experts_fusion_weights,
-    default_weight_loader,
-)
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import (
     BumpAllocator,
     DeepEPMode,
@@ -1615,6 +1613,45 @@ class DeepseekV2ForCausalLM(nn.Module):
                 self_attn.w_vc = w_vc.contiguous()
                 self_attn.use_deep_gemm_bmm = True
 
+    def compute_shared_experts_fusion_weights(
+        self,
+        weights: Iterable[Tuple[str, torch.Tensor]],
+        n_share_experts_fusion: int,
+        n_routed_experts: int,
+        moe_layer_ids: Iterable[int],
+        suffix_list: List[str],
+        shared_expert_name_template: str,
+        routed_expert_name_template: str,
+    ):
+        if n_share_experts_fusion == 0:
+            return weights
+
+        weights_list = list(weights)
+        weights_dict = dict(weights_list)
+        names_to_remove = []
+        for moe_layer_id in tqdm(
+            moe_layer_ids,
+            desc=f"Cloning {n_share_experts_fusion} "
+            f"replicas of the shared expert into MoE for {self.config.architectures[0]}",
+        ):
+            for repeat_index in range(n_share_experts_fusion):
+                for suffix in suffix_list:
+                    shared_expert_weight_name = shared_expert_name_template.format(
+                        moe_layer_id=moe_layer_id, suffix=suffix
+                    )
+                    weights_list.append(
+                        (
+                            routed_expert_name_template.format(
+                                moe_layer_id=moe_layer_id,
+                                expert_index=n_routed_experts + repeat_index,
+                                suffix=suffix,
+                            ),
+                            weights_dict[shared_expert_weight_name],
+                        )
+                    )
+                    names_to_remove += [shared_expert_weight_name]
+        return [w for w in weights_list if w[0] not in names_to_remove]
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -1622,7 +1659,7 @@ class DeepseekV2ForCausalLM(nn.Module):
             ("gate_up_proj", "up_proj", 1),
         ]
 
-        weights = compute_shared_experts_fusion_weights(
+        weights = self.compute_shared_experts_fusion_weights(
             weights,
             n_share_experts_fusion=self.n_share_experts_fusion,
             n_routed_experts=self.config.n_routed_experts,
@@ -1640,7 +1677,8 @@ class DeepseekV2ForCausalLM(nn.Module):
                     "up_proj.weight",
                     "up_proj.weight_scale",
                 ]
-                if self.quant_config is None or self.quant_config.get_name() == "w8a8_int8"
+                if self.quant_config is None
+                or self.quant_config.get_name() == "w8a8_int8"
                 else [
                     "down_proj.weight",
                     "down_proj.weight_scale_inv",

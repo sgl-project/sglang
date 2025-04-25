@@ -40,10 +40,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import (
-    compute_shared_experts_fusion_weights,
-    default_weight_loader,
-)
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer, DeepseekV3ForCausalLM
 from sglang.srt.utils import BumpAllocator, add_prefix, is_cuda, is_hip
 
@@ -185,77 +182,6 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
             input_ids, hidden_states, self.lm_head, forward_batch
         )
 
-    def post_load_weights(self):
-        self_attn = self.model.decoder.self_attn
-        if hasattr(self_attn.kv_b_proj, "qweight"):
-            # AWQ compatible
-            if _is_cuda:
-                w = awq_dequantize(
-                    self_attn.kv_b_proj.qweight,
-                    self_attn.kv_b_proj.scales,
-                    self_attn.kv_b_proj.qzeros,
-                ).T
-            else:
-                w = awq_dequantize(
-                    self_attn.kv_b_proj.qweight,
-                    self_attn.kv_b_proj.scales,
-                    self_attn.kv_b_proj.qzeros,
-                    0,
-                    0,
-                    0,
-                ).T
-        else:
-            w = self_attn.kv_b_proj.weight
-        # NOTE(HandH1998): Since `bmm_fp8` only supports per-tensor scale, we have to requantize `self_attn.kv_b_proj`.
-        # This may affect the accuracy of fp8 model.
-        if hasattr(self.quant_config, "weight_block_size") and w.dtype in (
-            torch.float8_e4m3fn,
-            torch.float8_e4m3fnuz,
-        ):
-            weight_block_size = self.quant_config.weight_block_size
-            if weight_block_size is not None:
-                assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
-                if _is_hip:
-                    weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
-                        weight=w,
-                        weight_scale=self_attn.kv_b_proj.weight_scale_inv,
-                        input_scale=None,
-                    )
-                else:
-                    weight = w
-                    weight_scale = self_attn.kv_b_proj.weight_scale_inv
-
-                w, scale = block_quant_to_tensor_quant(
-                    weight, weight_scale, weight_block_size
-                )
-                self_attn.w_scale = scale
-        if w.dtype == torch.int8:
-            if hasattr(self.quant_config, "weight_block_size"):
-                # block-wise int8 need it
-                weight_block_size = self.quant_config.weight_block_size
-                if weight_block_size is not None:
-                    assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
-                    weight = w
-                    weight_scale = self_attn.kv_b_proj.weight_scale_inv
-                    w = int8_block_dequant(weight, weight_scale, weight_block_size).to(
-                        torch.bfloat16
-                    )
-            else:
-                # channel-wise int8 need it
-                assert hasattr(self_attn.kv_b_proj, "weight_scale")
-                w = w.to(torch.bfloat16) * self_attn.kv_b_proj.weight_scale.to(
-                    torch.bfloat16
-                )
-        w_kc, w_vc = w.unflatten(
-            0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
-        ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
-        self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
-        self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
-        if hasattr(self_attn.kv_b_proj, "weight_scale") and self_attn.w_scale is None:
-            self_attn.w_scale = self_attn.kv_b_proj.weight_scale
-            if _is_hip:
-                self_attn.w_scale *= 2.0
-
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         if hasattr(self.config, "num_nextn_predict_layers"):
             num_nextn_layers = self.config.num_nextn_predict_layers
@@ -269,50 +195,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
         ]
-        if self.n_share_experts_fusion > 0:
-            logger.info(
-                f"Cloning {self.n_share_experts_fusion} "
-                "replicas of the shared expert into MoE for DeepseekV3ForCausalLMNextN"
-            )
-            weights_list = list(weights)
-            weights_dict = dict(weights_list)
-            if self.quant_config is None or self.quant_config.get_name() == "w8a8_int8":
-                suffix_list = [
-                    "down_proj.weight",
-                    "down_proj.weight_scale",
-                    "gate_proj.weight",
-                    "gate_proj.weight_scale",
-                    "up_proj.weight",
-                    "up_proj.weight_scale",
-                ]
-            else:
-                suffix_list = [
-                    "down_proj.weight",
-                    "down_proj.weight_scale_inv",
-                    "gate_proj.weight",
-                    "gate_proj.weight_scale_inv",
-                    "up_proj.weight",
-                    "up_proj.weight_scale_inv",
-                ]
-            names_to_remove = []
-            for num_repeat in range(self.n_share_experts_fusion):
-                for suffix in suffix_list:
-                    shared_expert_weight_name = (
-                        f"model.layers.0.mlp.shared_experts.{suffix}"
-                    )
-                    weights_list.append(
-                        (
-                            f"model.layers.0."
-                            f"mlp.experts."
-                            f"{self.config.n_routed_experts + num_repeat}"
-                            f".{suffix}",
-                            weights_dict[shared_expert_weight_name],
-                        )
-                    )
-                    names_to_remove += [shared_expert_weight_name]
-            weights = [w for w in weights_list if w[0] not in names_to_remove]
-
-        weights = compute_shared_experts_fusion_weights(
+        weights = self.compute_shared_experts_fusion_weights(
             weights,
             n_share_experts_fusion=self.n_share_experts_fusion,
             n_routed_experts=self.config.n_routed_experts,
@@ -326,7 +209,8 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                     "up_proj.weight",
                     "up_proj.weight_scale",
                 ]
-                if self.quant_config is None or self.quant_config.get_name() == "w8a8_int8"
+                if self.quant_config is None
+                or self.quant_config.get_name() == "w8a8_int8"
                 else [
                     "down_proj.weight",
                     "down_proj.weight_scale_inv",
