@@ -413,6 +413,9 @@ def set_mla_kv_buffer_kernel(
     cache_k_nope_ptr,
     cache_k_rope_ptr,
     loc_ptr,
+    buffer_stride: tl.constexpr,
+    nope_stride: tl.constexpr,
+    rope_stride: tl.constexpr,
     nope_dim: tl.constexpr,
     rope_dim: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -426,17 +429,17 @@ def set_mla_kv_buffer_kernel(
     mask = offs < total_dim
 
     loc = tl.load(loc_ptr + pid_loc)
-    dst_ptr = kv_buffer_ptr + loc * total_dim + offs
+    dst_ptr = kv_buffer_ptr + loc * buffer_stride + offs
 
     if base + BLOCK <= nope_dim:
         src = tl.load(
-            cache_k_nope_ptr + pid_loc * nope_dim + offs,
+            cache_k_nope_ptr + pid_loc * nope_stride + offs,
             mask=mask,
         )
     else:
         offs_rope = offs - nope_dim
         src = tl.load(
-            cache_k_rope_ptr + pid_loc * rope_dim + offs_rope,
+            cache_k_rope_ptr + pid_loc * rope_stride + offs_rope,
             mask=mask,
         )
 
@@ -449,9 +452,6 @@ def set_mla_kv_buffer_triton(
     cache_k_nope: torch.Tensor,
     cache_k_rope: torch.Tensor,
 ):
-    assert cache_k_nope.is_contiguous()
-    assert cache_k_rope.is_contiguous()
-
     nope_dim = cache_k_nope.shape[-1]
     rope_dim = cache_k_rope.shape[-1]
     total_dim = nope_dim + rope_dim
@@ -464,6 +464,9 @@ def set_mla_kv_buffer_triton(
         cache_k_nope,
         cache_k_rope,
         loc,
+        kv_buffer.stride(0),
+        cache_k_nope.stride(0),
+        cache_k_rope.stride(0),
         nope_dim,
         rope_dim,
         BLOCK=BLOCK,
