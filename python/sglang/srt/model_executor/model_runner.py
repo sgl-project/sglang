@@ -954,6 +954,9 @@ class ModelRunner:
             # TODO: Currently, cuda graph only captures decode steps, which only exists for generation models
             return
 
+        if self.server_args.disable_cuda_graph:
+            return
+
         tic = time.time()
         before_mem = get_available_gpu_memory(self.device, self.gpu_id)
         logger.info(
