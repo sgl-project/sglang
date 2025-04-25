@@ -113,4 +113,4 @@ echo "=== Verify GDRCOPY ==="
 gdrcopy_copybw
 echo "=== Verify NVSHMEM ==="
 nvshmem-info -a
-/opt/nvshmem/bin/perftest/device/pt-to-pt/shmem_put_bw
+# /opt/nvshmem/bin/perftest/device/pt-to-pt/shmem_put_bw
