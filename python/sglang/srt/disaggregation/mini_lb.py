@@ -3,10 +3,11 @@ Minimal HTTP load balancer for prefill and decode servers for testing.
 """
 
 import asyncio
+import dataclasses
 import random
 import urllib
 from itertools import chain
-from typing import List
+from typing import List, Optional
 
 import aiohttp
 import orjson
@@ -15,10 +16,10 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 
 
+@dataclasses.dataclass
 class PrefillConfig:
-    def __init__(self, url: str, bootstrap_port: int):
-        self.url = url
-        self.bootstrap_port = bootstrap_port
+    url: str
+    bootstrap_port: Optional[int] = None
 
 
 class MiniLoadBalancer:
@@ -47,7 +48,7 @@ class MiniLoadBalancer:
                 session.post(f"{decode_server}/{endpoint}", json=modified_request),
             ]
             # Wait for both responses to complete. Prefill should end first.
-            prefill_response, decode_response = await asyncio.gather(*tasks)
+            _, decode_response = await asyncio.gather(*tasks)
 
             return ORJSONResponse(
                 content=await decode_response.json(),
@@ -279,15 +280,16 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Mini Load Balancer Server")
     parser.add_argument(
-        "--prefill", required=True, help="Comma-separated URLs for prefill servers"
+        "--prefill", required=True, type=str, nargs="+", help="URLs for prefill servers"
+    )
+    parser.add_argument(
+        "--decode", required=True, type=str, nargs="+", help="URLs for decode servers"
     )
     parser.add_argument(
         "--prefill-bootstrap-ports",
-        help="Comma-separated bootstrap ports for prefill servers",
-        default="8998",
-    )
-    parser.add_argument(
-        "--decode", required=True, help="Comma-separated URLs for decode servers"
+        type=int,
+        nargs="+",
+        help="Bootstrap ports for prefill servers",
     )
     parser.add_argument(
         "--host", default="0.0.0.0", help="Host to bind the server (default: 0.0.0.0)"
@@ -297,22 +299,19 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    prefill_urls = args.prefill.split(",")
-    bootstrap_ports = [int(p) for p in args.prefill_bootstrap_ports.split(",")]
-
-    if len(bootstrap_ports) == 1:
-        bootstrap_ports = bootstrap_ports * len(prefill_urls)
+    bootstrap_ports = args.prefill_bootstrap_ports
+    if bootstrap_ports is None:
+        bootstrap_ports = [None] * len(args.prefill)
+    elif len(bootstrap_ports) == 1:
+        bootstrap_ports = bootstrap_ports * len(args.prefill)
     else:
-        if len(bootstrap_ports) != len(prefill_urls):
+        if len(bootstrap_ports) != len(args.prefill):
             raise ValueError(
                 "Number of prefill URLs must match number of bootstrap ports"
             )
-            exit(1)
 
-    prefill_configs = []
-    for url, port in zip(prefill_urls, bootstrap_ports):
-        prefill_configs.append(PrefillConfig(url, port))
+    prefill_configs = [
+        PrefillConfig(url, port) for url, port in zip(args.prefill, bootstrap_ports)
+    ]
 
-    decode_addrs = args.decode.split(",")
-
-    run(prefill_configs, decode_addrs, args.host, args.port)
+    run(prefill_configs, args.decode, args.host, args.port)
