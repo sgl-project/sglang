@@ -526,8 +526,8 @@ class DeepseekV2MoE(nn.Module):
     def _forward_tbo_op_mlp(self, state):
         state.expert_output_hidden_states = self.experts(
             hidden_states=state.pop("hidden_states_from_dispatch"),
-            topk_idx=state.pop("topk_idx_from_dispatch"),
-            topk_weights=state.pop("topk_weights_from_dispatch"),
+            topk_idx=state.topk_idx_from_dispatch,
+            topk_weights=state.topk_weights_from_dispatch,
             reorder_topk_ids=state.pop("reorder_topk_ids_from_dispatch"),
             seg_indptr=state.pop("seg_indptr_from_dispatch"),
             masked_m=state.pop("masked_m_from_dispatch"),
