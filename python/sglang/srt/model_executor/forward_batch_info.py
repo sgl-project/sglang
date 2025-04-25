@@ -421,16 +421,14 @@ class ForwardBatch:
                 next_input_positions = []
                 for mrope_position_delta in mrope_position_deltas:
                     # batched deltas needs to be processed separately
-                    positions = MRotaryEmbedding.get_next_input_positions(
-                        mrope_position_delta,
-                        int(self.seq_lens[batch_idx]) - 1,
-                        int(self.seq_lens[batch_idx]),
-                    )
                     # Convert list of lists to tensor with shape [3, seq_len]
-                    positions_tensor = torch.tensor(
-                        positions, device=model_runner.device, dtype=torch.long
-                    )
-                    next_input_positions.append(positions_tensor)
+                    next_input_positions += [
+                        MRotaryEmbedding.get_next_input_positions(
+                            mrope_position_delta,
+                            int(self.seq_lens[batch_idx]) - 1,
+                            int(self.seq_lens[batch_idx]),
+                        )
+                    ]
                 # 3 * N
                 mrope_positions_list[batch_idx] = torch.cat(next_input_positions, dim=1)
             elif self.forward_mode.is_extend():
@@ -462,8 +460,7 @@ class ForwardBatch:
         self.mrope_positions = torch.cat(
             [pos.to(device=model_runner.device) for pos in mrope_positions_list],
             dim=1,
-        ).to(device=model_runner.device)
-        self.mrope_positions = self.mrope_positions.to(torch.int64)
+        ).to(dtype=torch.int64, device=model_runner.device)
 
     def get_max_chunk_capacity(self):
         # Maximum number of tokens in each chunk
