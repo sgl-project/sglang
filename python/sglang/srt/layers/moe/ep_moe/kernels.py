@@ -874,10 +874,10 @@ def ep_scatter(
         print(f"{name=} {x.shape=} {x.stride()=} {x.dtype=} {x.device=}")
 
     print_tensor("recv_topk")
+    print_tensor("num_recv_tokens_per_expert")
     print_tensor("expert_start_loc")
     print_tensor("recv_x")
     print_tensor("recv_x_scale")
-    print_tensor("recv_topk")
     print_tensor("output_tensor")
     print_tensor("output_tensor_scale")
     print_tensor("output_index")
