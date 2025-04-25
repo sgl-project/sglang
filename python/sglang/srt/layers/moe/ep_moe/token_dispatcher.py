@@ -42,7 +42,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 # TODO do not hardcode
 DEEPEP_NUM_SMS = 24
 
-
 class DeepEPDispatchMode(IntEnum):
     NORMAL = auto()
     LOW_LATENCY = auto()
@@ -101,26 +100,15 @@ class DeepEPBuffer:
                 ),
                 num_rdma_bytes,
             )
-
-        # NOTE HACK!!
-        if deepep_mode == DeepEPMode.normal:
-            cls._buffer = Buffer(
-                TODO,
-                TODO,
-                TODO,
-                low_latency_mode=TODO,
-                num_qps_per_rank=TODO,
-            )
-        else:
-            cls._buffer = Buffer(
-                group,
-                num_nvl_bytes,
-                num_rdma_bytes,
-                low_latency_mode=deepep_mode.enable_low_latency(),
-                num_qps_per_rank=(
-                    num_experts // group.size() if deepep_mode.enable_low_latency() else 1
-                ),
-            )
+        cls._buffer = Buffer(
+            group,
+            num_nvl_bytes,
+            num_rdma_bytes,
+            low_latency_mode=deepep_mode.enable_low_latency(),
+            num_qps_per_rank=(
+                num_experts // group.size() if deepep_mode.enable_low_latency() else 1
+            ),
+        )
         return cls._buffer
 
     @classmethod
@@ -468,9 +456,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         buffer = self._get_buffer()
         topk_idx = topk_idx.to(torch.int64)
         expected_m = (
-                         hidden_states.shape[0] * buffer.group_size * topk_idx.shape[1]
-                         + self.num_experts
-                     ) // self.num_experts
+            hidden_states.shape[0] * buffer.group_size * topk_idx.shape[1]
+            + self.num_experts
+        ) // self.num_experts
         hidden_states, masked_m, event, hook = self._dispatch_core(
             hidden_states,
             topk_idx,
