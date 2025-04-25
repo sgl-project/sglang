@@ -33,6 +33,8 @@ pip install --upgrade pip
 # Install sgl-kernel
 pip install sgl-kernel==0.0.9.post2 --no-cache-dir
 
+python3 -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cu124
+
 # Install the main package
 pip install -e "python[all]"
 
