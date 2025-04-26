@@ -126,10 +126,18 @@ void pack_vnni(
 #endif
 }
 
-inline void fill_stub(float* __restrict__ out, float val, int64_t size) {
-  using Vec = at::vec::Vectorized<float>;
-  const Vec data_vec(val);
-  at::vec::map<float>([data_vec](Vec out) { return out = data_vec; }, out, out, size);
+template <typename scalar_t>
+inline void fill_stub(scalar_t* __restrict__ out, float val, int64_t size) {
+  using Vec = at::vec::Vectorized<scalar_t>;
+  const Vec data_vec = Vec(static_cast<scalar_t>(val));
+  int64_t d = 0;
+#pragma GCC unroll 4
+  for (; d <= size - Vec::size(); d += Vec::size()) {
+    data_vec.store(out + d);
+  }
+  if (size - d > 0) {
+    data_vec.store(out + d, size - d);
+  }
 }
 
 template <typename scalar_t>
@@ -138,6 +146,7 @@ inline void copy_stub(scalar_t* __restrict__ out, const float* __restrict__ acc,
   using fVec = at::vec::Vectorized<float>;
   const fVec s_fvec = fVec(s);
   int64_t d = 0;
+#pragma GCC unroll 4
   for (; d <= size - bVec::size(); d += bVec::size()) {
     fVec a_fvec0 = fVec::loadu(acc + d) * s_fvec;
     fVec a_fvec1 = fVec::loadu(acc + d + fVec::size()) * s_fvec;
@@ -153,6 +162,7 @@ template <typename scalar_t>
 inline void copy_stub(scalar_t* __restrict__ out, const scalar_t* __restrict__ src, int64_t size) {
   using bVec = at::vec::Vectorized<scalar_t>;
   int64_t d = 0;
+#pragma GCC unroll 4
   for (; d <= size - bVec::size(); d += bVec::size()) {
     bVec out_bvec = bVec::loadu(src + d);
     out_bvec.store(out + d);
@@ -1039,6 +1049,10 @@ void decode_attention_mla_kernel_impl(
     int tid = at::get_thread_num();
     scalar_t* __restrict__ Btmp0 = buffer + tid * buffer_size_per_thread;
     scalar_t* __restrict__ Btmp1 = Btmp0 + BLOCK_N * head_size;
+
+    // init Btmp1 just once for each thread to prevent NaN
+    // Btmp0 is not needed as it computes full K every single time
+    fill_stub(Btmp1, 0.f, BLOCK_N * head_size_v);
 
     alignas(64) float s_i[BLOCK_H * BLOCK_N];
     float* __restrict__ s_delta = s_i;
