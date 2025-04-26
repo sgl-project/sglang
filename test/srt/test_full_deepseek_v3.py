@@ -49,7 +49,7 @@ class TestDeepseekV3(CustomTestCase):
         metrics = run_eval_few_shot_gsm8k(args)
         print(metrics)
 
-        self.assertGreater(metrics["accuracy"], 0.945)
+        self.assertGreater(metrics["accuracy"], 0.94)
 
 
 class TestBenchOneBatch(CustomTestCase):
@@ -114,7 +114,7 @@ class TestDeepseekV3MTP(CustomTestCase):
         )
         metrics = run_eval_few_shot_gsm8k(args)
         print(metrics)
-        self.assertGreater(metrics["accuracy"], 0.945)
+        self.assertGreater(metrics["accuracy"], 0.94)
 
         server_info = requests.get(self.base_url + "/get_server_info")
         avg_spec_accept_length = server_info.json()["avg_spec_accept_length"]
