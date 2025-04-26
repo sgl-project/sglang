@@ -15,6 +15,7 @@ class ExpertLocationDispatchInfo:
     partial_logical_to_rank_dispatch_physical_map: torch.Tensor
     partial_logical_to_all_physical_map: torch.Tensor
     partial_logical_to_all_physical_map_num_valid: torch.Tensor
+    num_physical_experts: int
 
     @classmethod
     def init_new(cls, ep_rank: int, layer_id: int):
@@ -35,6 +36,7 @@ class ExpertLocationDispatchInfo:
             partial_logical_to_all_physical_map_num_valid=expert_location_metadata.logical_to_all_physical_map_num_valid[
                 layer_id, :
             ],
+            num_physical_experts=expert_location_metadata.num_physical_experts,
         )
 
 
@@ -48,6 +50,8 @@ def topk_ids_logical_to_physical(
         return _topk_ids_logical_to_physical_static(topk_ids, info)
     if info.ep_dispatch_algorithm == "random":
         return _topk_ids_logical_to_physical_random(topk_ids, info)
+    if info.ep_dispatch_algorithm == "fake_uniform":
+        return _topk_ids_logical_to_physical_fake_uniform(topk_ids, info)
     raise NotImplementedError
 
 
@@ -72,3 +76,15 @@ def _topk_ids_logical_to_physical_random(
 
     topk_ids = topk_ids.view(topk_ids_original_shape)
     return topk_ids
+
+
+def _topk_ids_logical_to_physical_fake_uniform(
+    topk_ids: torch.Tensor, info: Optional[ExpertLocationDispatchInfo]
+) -> torch.Tensor:
+    return torch.randint(
+        0,
+        info.num_physical_experts,
+        topk_ids.shape,
+        dtype=topk_ids.dtype,
+        device=topk_ids.device,
+    )
