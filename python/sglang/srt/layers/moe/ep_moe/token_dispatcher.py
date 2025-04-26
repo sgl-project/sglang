@@ -28,7 +28,9 @@ try:
     use_deepep = True
 
     # TODO do not hardcode
-    sglang_hack_deepep_new_mode = get_bool_env_var("SGLANG_HACK_DEEPEP_NEW_MODE", "true")
+    sglang_hack_deepep_new_mode = get_bool_env_var(
+        "SGLANG_HACK_DEEPEP_NEW_MODE", "true"
+    )
     if sglang_hack_deepep_new_mode:
         _HACK_NORMAL_DISPATCH_CONFIG = deep_ep.Config(
             num_sms=DEEPEP_NUM_SMS,

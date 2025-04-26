@@ -11,6 +11,7 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.managers import deepseek_eplb
 from sglang.srt.model_loader import get_model_architecture
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils import get_bool_env_var
 
 
 @dataclass
@@ -92,6 +93,14 @@ class ExpertLocationMetadata:
             physical_to_logical_map,
             num_logical_experts=model_config_for_expert_location.num_logical_experts,
         )
+
+        if get_bool_env_var(
+            "SGLANG_HACK_LOGICAL_TO_ALL_PHYSICAL_MAP_PICK_FIRST_ONLY", "false"
+        ):
+            logical_to_all_physical_map = logical_to_all_physical_map[:, :, :1]
+            print(
+                f"hack since SGLANG_HACK_LOGICAL_TO_ALL_PHYSICAL_MAP_PICK_FIRST_ONLY! {logical_to_all_physical_map.tolist()=}"
+            )
 
         return ExpertLocationMetadata._init_raw(
             ep_size=common["ep_size"],
