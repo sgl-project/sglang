@@ -24,7 +24,6 @@ from transformers import (
     AutoModelForCausalLM,
     AutoModelForVision2Seq,
     AutoProcessor,
-    CompileConfig,
     GenerationConfig,
 )
 
@@ -377,7 +376,7 @@ class HFRunner:
                 model = base_model
 
             outputs = model.generate(
-                input_ids,
+                input_ids=input_ids,
                 generation_config=GenerationConfig(
                     do_sample=False,
                     temperature=None,
@@ -385,7 +384,8 @@ class HFRunner:
                     max_new_tokens=max_new_tokens,
                     return_dict_in_generate=True,
                     output_scores=(not output_str_only),
-                    compile_config=CompileConfig(dynamic=True),
+                    # make sure to disable compile
+                    disable_compile=True,
                 ),
             )
 
