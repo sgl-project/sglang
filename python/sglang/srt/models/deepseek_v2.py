@@ -1653,11 +1653,11 @@ class DeepseekV2ForCausalLM(nn.Module):
                 desc=f"Cloning {self.n_share_experts_fusion} "
                 "replicas of the shared expert into MoE",
             ):
-                for num_repeat in range(self.n_share_experts_fusion):
-                    for suffix in suffix_list:
-                        shared_expert_weight_name = (
-                            f"model.layers.{moe_layer}.mlp.shared_experts.{suffix}"
-                        )
+                for suffix in suffix_list:
+                    shared_expert_weight_name = (
+                        f"model.layers.{moe_layer}.mlp.shared_experts.{suffix}"
+                    )
+                    for num_repeat in range(self.n_share_experts_fusion):
                         weights_list.append(
                             (
                                 f"model.layers.{moe_layer}."
@@ -1667,7 +1667,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                                 weights_dict[shared_expert_weight_name],
                             )
                         )
-                        names_to_remove += [shared_expert_weight_name]
+                    names_to_remove += [shared_expert_weight_name]
             weights = [w for w in weights_list if w[0] not in names_to_remove]
 
         # Params for weights, fp8 weight scales, fp8 activation scales
