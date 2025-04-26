@@ -214,7 +214,8 @@ class MooncakeKVManager(BaseKVManager):
                 length = item_len * len(prefill_index)
 
                 # FIXME: remove the GIL in transfer_sync
-                self.disagg_launch_done.wait()
+                if self.disagg_launch_done is not None:
+                    self.disagg_launch_done.wait()
                 status = self.engine.transfer_sync(
                     mooncake_session_id, src_addr, dst_addr, length
                 )
