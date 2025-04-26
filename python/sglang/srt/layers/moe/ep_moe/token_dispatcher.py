@@ -116,7 +116,7 @@ class DeepEPBuffer:
                     Buffer.get_dispatch_config(group.size()),
                     Buffer.get_combine_config(group.size()),
                 )
-           
+
             for config in configs:
                 num_nvl_bytes = max(
                     config.get_nvl_buffer_size_hint(hidden_bytes, group.size()),
@@ -504,9 +504,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         buffer = self._get_buffer()
         topk_idx = topk_idx.to(torch.int64)
         expected_m = (
-                         hidden_states.shape[0] * buffer.group_size * topk_idx.shape[1]
-                         + self.num_experts
-                     ) // self.num_experts
+            hidden_states.shape[0] * buffer.group_size * topk_idx.shape[1]
+            + self.num_experts
+        ) // self.num_experts
         hidden_states, masked_m, event, hook = self._dispatch_core(
             hidden_states,
             topk_idx,
