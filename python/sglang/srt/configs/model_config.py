@@ -47,6 +47,7 @@ class ModelConfig:
         dtype: str = "auto",
         quantization: Optional[str] = None,
         override_config_file: Optional[str] = None,
+        is_draft_model: bool = False,
     ) -> None:
 
         self.model_path = model_path
@@ -84,6 +85,12 @@ class ModelConfig:
                 )
             else:
                 enable_multimodal = True
+
+        if (
+            is_draft_model
+            and self.hf_config.architectures[0] == "DeepseekV3ForCausalLM"
+        ):
+            self.hf_config.architectures[0] = "DeepseekV3ForCausalLMNextN"
 
         # Check model type
         self.is_generation = is_generation_model(
