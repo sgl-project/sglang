@@ -1040,15 +1040,18 @@ class MRotaryEmbedding(RotaryEmbedding):
         mrope_position_delta: int,
         context_len: int,
         seq_len: int,
-    ) -> List[List[int]]:
-        return [
-            list(
-                range(
-                    context_len + mrope_position_delta, seq_len + mrope_position_delta
+    ) -> torch.Tensor:
+        return torch.tensor(
+            [
+                list(
+                    range(
+                        context_len + mrope_position_delta,
+                        seq_len + mrope_position_delta,
+                    )
                 )
-            )
-            for _ in range(3)
-        ]
+                for _ in range(3)
+            ]
+        )
 
 
 _ROPE_DICT: Dict[Tuple, RotaryEmbedding] = {}
