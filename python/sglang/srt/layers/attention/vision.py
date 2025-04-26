@@ -22,6 +22,7 @@ from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import apply_rotary_pos_emb, rotate_half
 from sglang.srt.utils import add_prefix
 
+from sgl_kernel import flash_attn_varlen_func
 
 class VisionAttention(nn.Module):
     r"""
@@ -64,15 +65,21 @@ class VisionAttention(nn.Module):
             num_heads, world_size
         )
 
-        if self.use_context_forward:
-            self.qkv_backend = VisionTritonAttention()
-        else:
-            self.qkv_backend = VisionSdpaAttention(
-                head_size=self.head_size,
-                dropout=dropout,
-                flatten_batch=flatten_batch,
-                softmax_in_single_precision=softmax_in_single_precision,
-            )
+        # if self.use_context_forward:
+        #     self.qkv_backend = VisionTritonAttention()
+        # else:
+        #     self.qkv_backend = VisionSdpaAttention(
+        #         head_size=self.head_size,
+        #         dropout=dropout,
+        #         flatten_batch=flatten_batch,
+        #         softmax_in_single_precision=softmax_in_single_precision,
+        #     )
+        self.qkv_backend = VisionSdpaAttention(
+            head_size=self.head_size,
+            dropout=dropout,
+            flatten_batch=flatten_batch,
+            softmax_in_single_precision=softmax_in_single_precision,
+        )
 
         self.use_qkv_parallel = use_qkv_parallel
         if use_qkv_parallel:
@@ -332,6 +339,7 @@ class VisionTritonAttention(nn.Module):
 
     def __init__(
         self,
+        **kwargs,
     ):
         super().__init__()
 
@@ -340,8 +348,8 @@ class VisionTritonAttention(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        _bsz: int,
         cu_seqlens: Optional[torch.Tensor],
+        **kwargs,
     ) -> torch.Tensor:
         r"""
         Args:
@@ -363,6 +371,42 @@ class VisionTritonAttention(nn.Module):
             seq_lens.cuda(),
             max_seqlen,
             is_causal=False,
+        )
+
+        return output
+
+class VisionFlashAttention(nn.Module):
+    def __init__(
+        self,
+        **kwargs,
+    ):
+        self.__init__()
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_seqlens: Optional[torch.Tensor],
+        **kwargs,
+    ) -> torch.Tensor:
+        r"""
+        Args:
+            cu_seqlens: [b]
+        Returns:
+             [b * s, h, head_size]
+        """
+
+        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+        max_seqlen = seq_lens.max().item()
+        output = flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q=cu_seqlens.cuda(),
+            cu_seqlens_k=cu_seqlens.cuda(),
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
         )
 
         return output
