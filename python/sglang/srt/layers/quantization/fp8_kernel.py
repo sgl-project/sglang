@@ -56,7 +56,6 @@ if _is_cuda:
 logger = logging.getLogger(__name__)
 
 if supports_custom_op():
-
     def deep_gemm_fp8_fp8_bf16_nt(
         A: torch.Tensor,
         As: torch.Tensor,
@@ -66,6 +65,7 @@ if supports_custom_op():
     ) -> None:
         deep_gemm_gemm_nt_f8f8bf16((A, As), (B, Bs), C)
 
+
     def deep_gemm_fp8_fp8_bf16_nt_fake(
         A: torch.Tensor,
         As: torch.Tensor,
@@ -74,6 +74,7 @@ if supports_custom_op():
         C: torch.Tensor,
     ) -> None:
         return
+
 
     direct_register_custom_op(
         op_name="deep_gemm_fp8_fp8_bf16_nt",
@@ -268,10 +269,11 @@ def sglang_per_token_group_quant_fp8(
     column_major_scales: bool = False,
     scale_tma_aligned: bool = False,
 ):
+    x = DisposibleTensor.maybe_unwrap(x)
     assert (
         x.shape[-1] % group_size == 0
     ), "the last dimension of `x` cannot be divisible by `group_size`"
-    assert DisposibleTensor.maybe_unwrap(x).is_contiguous(), "`x` is not contiguous"
+    assert x.is_contiguous(), "`x` is not contiguous"
 
     x_q = torch.empty_like(x, device=x.device, dtype=_fp8_type)
     if column_major_scales:
