@@ -738,8 +738,7 @@ class TestOpenAIOmniServer(TestOpenAIVisionServer):
                 "--chat-template",
                 "qwen2-5-o",
                 "--mem-fraction-static",
-                "0.6",
-                "--tp=2",
+                "0.4",
             ],
         )
         cls.base_url += "/v1"
