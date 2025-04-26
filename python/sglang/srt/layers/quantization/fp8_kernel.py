@@ -24,6 +24,7 @@ import triton.language as tl
 
 from sglang.srt.layers.quantization.deep_gemm import _ENABLE_JIT_DEEPGEMM
 from sglang.srt.utils import (
+    DisposibleTensor,
     direct_register_custom_op,
     get_device_core_count,
     get_device_name,
@@ -270,7 +271,7 @@ def sglang_per_token_group_quant_fp8(
     assert (
         x.shape[-1] % group_size == 0
     ), "the last dimension of `x` cannot be divisible by `group_size`"
-    assert x.is_contiguous(), "`x` is not contiguous"
+    assert DisposibleTensor.maybe_unwrap(x).is_contiguous(), "`x` is not contiguous"
 
     x_q = torch.empty_like(x, device=x.device, dtype=_fp8_type)
     if column_major_scales:
