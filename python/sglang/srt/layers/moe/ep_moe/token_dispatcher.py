@@ -28,7 +28,8 @@ try:
     use_deepep = True
 
     # TODO do not hardcode
-    if get_bool_env_var("SGLANG_HACK_DEEPEP_MANUAL_CONFIG", "true"):
+    sglang_hack_deepep_new_mode = get_bool_env_var("SGLANG_HACK_DEEPEP_NEW_MODE", "true")
+    if sglang_hack_deepep_new_mode:
         _HACK_NORMAL_DISPATCH_CONFIG = deep_ep.Config(
             num_sms=DEEPEP_NUM_SMS,
             num_max_nvl_chunked_send_tokens=16,
@@ -140,7 +141,7 @@ class DeepEPBuffer:
             )
 
         # TODO temp hack
-        if deepep_mode == DeepEPMode.normal:
+        if sglang_hack_deepep_new_mode and deepep_mode == DeepEPMode.normal:
             # TODO indeed: num_qps_per_rank = max(num_sms // 2, ll_num_experts // num_ranks if test_ll_compatibility else 0)
             num_qps_per_rank = DEEPEP_NUM_SMS // 2
         else:
