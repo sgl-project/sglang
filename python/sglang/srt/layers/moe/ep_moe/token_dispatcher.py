@@ -28,28 +28,31 @@ try:
     use_deepep = True
 
     # TODO do not hardcode
-    _HACK_NORMAL_DISPATCH_CONFIG = deep_ep.Config(
-        num_sms=DEEPEP_NUM_SMS,
-        num_max_nvl_chunked_send_tokens=16,
-        num_max_nvl_chunked_recv_tokens=get_int_env_var(
-            "SGLANG_HACK_DEEPEP_NORMAL_NUM_MAX_NVL_CHUNKED_RECV_TOKENS", 512
-        ),
-        num_max_rdma_chunked_send_tokens=8,
-        num_max_rdma_chunked_recv_tokens=get_int_env_var(
-            "SGLANG_HACK_DEEPEP_NORMAL_NUM_MAX_RDMA_CHUNKED_RECV_TOKENS", 128
-        ),
-    )
-    _HACK_NORMAL_COMBINE_CONFIG = deep_ep.Config(
-        num_sms=DEEPEP_NUM_SMS,
-        num_max_nvl_chunked_send_tokens=32,
-        num_max_nvl_chunked_recv_tokens=get_int_env_var(
-            "SGLANG_HACK_DEEPEP_NORMAL_NUM_MAX_NVL_CHUNKED_RECV_TOKENS", 512
-        ),
-        num_max_rdma_chunked_send_tokens=20,
-        num_max_rdma_chunked_recv_tokens=get_int_env_var(
-            "SGLANG_HACK_DEEPEP_NORMAL_NUM_MAX_RDMA_CHUNKED_RECV_TOKENS", 128
-        ),
-    )
+    if get_bool_env_var("SGLANG_HACK_DEEPEP_MANUAL_CONFIG", "true"):
+        _HACK_NORMAL_DISPATCH_CONFIG = deep_ep.Config(
+            num_sms=DEEPEP_NUM_SMS,
+            num_max_nvl_chunked_send_tokens=16,
+            num_max_nvl_chunked_recv_tokens=get_int_env_var(
+                "SGLANG_HACK_DEEPEP_NORMAL_NUM_MAX_NVL_CHUNKED_RECV_TOKENS", 512
+            ),
+            num_max_rdma_chunked_send_tokens=8,
+            num_max_rdma_chunked_recv_tokens=get_int_env_var(
+                "SGLANG_HACK_DEEPEP_NORMAL_NUM_MAX_RDMA_CHUNKED_RECV_TOKENS", 128
+            ),
+        )
+        _HACK_NORMAL_COMBINE_CONFIG = deep_ep.Config(
+            num_sms=DEEPEP_NUM_SMS,
+            num_max_nvl_chunked_send_tokens=32,
+            num_max_nvl_chunked_recv_tokens=get_int_env_var(
+                "SGLANG_HACK_DEEPEP_NORMAL_NUM_MAX_NVL_CHUNKED_RECV_TOKENS", 512
+            ),
+            num_max_rdma_chunked_send_tokens=20,
+            num_max_rdma_chunked_recv_tokens=get_int_env_var(
+                "SGLANG_HACK_DEEPEP_NORMAL_NUM_MAX_RDMA_CHUNKED_RECV_TOKENS", 128
+            ),
+        )
+    else:
+        _HACK_NORMAL_DISPATCH_CONFIG = _HACK_NORMAL_COMBINE_CONFIG = None
 except ImportError:
     use_deepep = False
 
@@ -102,12 +105,19 @@ class DeepEPBuffer:
         num_nvl_bytes, num_rdma_bytes = 0, 0
         if deepep_mode.enable_normal():
             hidden_bytes = hidden_size * param_bytes
-            for config in (
-                _HACK_NORMAL_DISPATCH_CONFIG,
-                _HACK_NORMAL_COMBINE_CONFIG,
-                # Buffer.get_dispatch_config(group.size()),
-                # Buffer.get_combine_config(group.size()),
-            ):
+
+            if _HACK_NORMAL_DISPATCH_CONFIG is not None:
+                configs = (
+                    _HACK_NORMAL_DISPATCH_CONFIG,
+                    _HACK_NORMAL_COMBINE_CONFIG,
+                )
+            else:
+                configs = (
+                    Buffer.get_dispatch_config(group.size()),
+                    Buffer.get_combine_config(group.size()),
+                )
+           
+            for config in configs:
                 num_nvl_bytes = max(
                     config.get_nvl_buffer_size_hint(hidden_bytes, group.size()),
                     num_nvl_bytes,
@@ -494,9 +504,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         buffer = self._get_buffer()
         topk_idx = topk_idx.to(torch.int64)
         expected_m = (
-            hidden_states.shape[0] * buffer.group_size * topk_idx.shape[1]
-            + self.num_experts
-        ) // self.num_experts
+                         hidden_states.shape[0] * buffer.group_size * topk_idx.shape[1]
+                         + self.num_experts
+                     ) // self.num_experts
         hidden_states, masked_m, event, hook = self._dispatch_core(
             hidden_states,
             topk_idx,
