@@ -56,6 +56,7 @@ if _is_cuda:
 logger = logging.getLogger(__name__)
 
 if supports_custom_op():
+
     def deep_gemm_fp8_fp8_bf16_nt(
         A: torch.Tensor,
         As: torch.Tensor,
@@ -65,7 +66,6 @@ if supports_custom_op():
     ) -> None:
         deep_gemm_gemm_nt_f8f8bf16((A, As), (B, Bs), C)
 
-
     def deep_gemm_fp8_fp8_bf16_nt_fake(
         A: torch.Tensor,
         As: torch.Tensor,
@@ -74,7 +74,6 @@ if supports_custom_op():
         C: torch.Tensor,
     ) -> None:
         return
-
 
     direct_register_custom_op(
         op_name="deep_gemm_fp8_fp8_bf16_nt",
