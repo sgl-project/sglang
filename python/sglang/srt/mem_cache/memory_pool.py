@@ -283,13 +283,6 @@ class MHATokenToKVPool(KVCache):
                             device=self.device,
                         )
                     )
-        
-        for i in range(self.layer_num):
-            with open("log.txt", "a") as f:
-                f.write(
-                    f"layer_id: {i}\n"
-                    f"kbuffer shape: {self.k_buffer[i].shape}\n"
-                )
                     
                 
 

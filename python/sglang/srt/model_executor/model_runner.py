@@ -133,6 +133,7 @@ class ModelRunner:
         self.page_size = server_args.page_size
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+        self.token_to_kv_pool_allocator_local = None
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
         self.attention_chunk_size = model_config.attention_chunk_size
 
@@ -895,6 +896,13 @@ class ModelRunner:
                     device=self.device,
                     kvcache=self.token_to_kv_pool,
                 )
+                if self.hybrid_ratio > 0:
+                    self.token_to_kv_pool_allocator_local = TokenToKVPoolAllocator(
+                    self.local_max_num_tokens,
+                    dtype=self.kv_cache_dtype,
+                    device=self.device,
+                    kvcache=self.token_to_kv_pool,
+                )
             else:
                 self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
                     self.max_total_num_tokens,
@@ -903,6 +911,7 @@ class ModelRunner:
                     device=self.device,
                     kvcache=self.token_to_kv_pool,
                 )
+                # TODO: hybrid cache for page size > 1
         else:
             assert self.is_draft_worker
 

@@ -624,14 +624,26 @@ class FlashAttentionBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
+        # Use precomputed metadata across all layers
+        metadata = self.forward_metadata
+        # Check if we should use local attention
+        use_local_attn = (
+            self.attention_chunk_size is not None
+            and metadata.local_attn_metadata is not None
+            and (hasattr(layer, "use_irope") and layer.use_irope)
+        )
         if k is not None:
             assert v is not None
             if save_kv_cache:
-                cache_loc = (
-                    forward_batch.out_cache_loc
-                    if not layer.is_cross_attention
-                    else forward_batch.encoder_out_cache_loc
-                )
+                if not use_local_attn: 
+                    cache_loc = (
+                        forward_batch.out_cache_loc
+                        if not layer.is_cross_attention
+                        else forward_batch.encoder_out_cache_loc
+                    )
+                else:
+                    cache_loc = forward_batch.out_cache_loc_local
+                    # TODO enable cross attention
                 if not self.use_mla:
                     forward_batch.token_to_kv_pool.set_kv_buffer(
                         layer, cache_loc, k, v, layer.k_scale, layer.v_scale
@@ -644,8 +656,6 @@ class FlashAttentionBackend(AttentionBackend):
                         v,
                     )
 
-        # Use precomputed metadata across all layers
-        metadata = self.forward_metadata
 
         # Calculate window size (can be moved to metadata if layer properties don't change)
         # we don't do layer.sliding_window_size - 1 since in model.get_attention_sliding_window_size() we already - 1
@@ -664,13 +674,6 @@ class FlashAttentionBackend(AttentionBackend):
             v_descale = layer.v_scale.expand(descale_shape)
             q = q.to(self.kv_cache_dtype)
         causal = not layer.is_cross_attention
-
-        # Check if we should use local attention
-        use_local_attn = (
-            self.attention_chunk_size is not None
-            and metadata.local_attn_metadata is not None
-            and (hasattr(layer, "use_irope") and layer.use_irope)
-        )
 
         # We do cascade attention for Target Verify with topk > 1
         use_cascade_attn = (
@@ -878,14 +881,26 @@ class FlashAttentionBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ) -> torch.Tensor:
+        
+        metadata = self.forward_metadata
+        
+        local_attn_metadata = getattr(metadata, "local_attn_metadata", None)
+        use_local_attention = (
+            self.attention_chunk_size is not None and local_attn_metadata is not None
+        )
+        
         if k is not None:
             assert v is not None
             if save_kv_cache:
-                cache_loc = (
-                    forward_batch.out_cache_loc
-                    if not layer.is_cross_attention
-                    else forward_batch.encoder_out_cache_loc
-                )
+                if not use_local_attention:
+                    cache_loc = (
+                        forward_batch.out_cache_loc
+                        if not layer.is_cross_attention
+                        else forward_batch.encoder_out_cache_loc
+                    )
+                else:
+                    cache_loc = forward_batch.out_cache_loc_local
+                    # TODO enable cross attention
                 if not self.use_mla:
                     forward_batch.token_to_kv_pool.set_kv_buffer(
                         layer, cache_loc, k, v, layer.k_scale, layer.v_scale

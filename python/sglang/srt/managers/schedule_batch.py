@@ -695,6 +695,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     reqs: List[Req]
     req_to_token_pool: ReqToTokenPool = None
     token_to_kv_pool_allocator: TokenToKVPoolAllocator = None
+    token_to_kv_pool_allocator_local: TokenToKVPoolAllocator = None
     tree_cache: BasePrefixCache = None
 
     # Batch configs
@@ -776,6 +777,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         reqs: List[Req],
         req_to_token_pool: ReqToTokenPool,
         token_to_kv_pool_allocator: TokenToKVPoolAllocator,
+        token_to_kv_pool_allocator_local: TokenToKVPoolAllocator,
         tree_cache: BasePrefixCache,
         model_config: ModelConfig,
         enable_overlap: bool,
@@ -788,6 +790,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             reqs=reqs,
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+            token_to_kv_pool_allocator_local=token_to_kv_pool_allocator_local,
             tree_cache=tree_cache,
             model_config=model_config,
             enable_overlap=enable_overlap,
@@ -816,6 +819,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 f"{num_reqs=}, "
             )
         return req_pool_indices
+    
+    def alloc_token_slots_local(self, num_tokens: int, backup_state: bool = False):
+        # TODO backup_state
+        out_cache_loc_local = self.token_to_kv_pool_allocator_local.alloc(num_tokens)
+        # if out_cache_loc is None:
+        return out_cache_loc_local
 
     def alloc_token_slots(self, num_tokens: int, backup_state: bool = False):
         if self.token_to_kv_pool_allocator.available_size() < num_tokens:
@@ -1099,7 +1108,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Allocate memory
         if self.token_to_kv_pool_allocator.page_size == 1:
             out_cache_loc = self.alloc_token_slots(extend_num_tokens)
+            if self.token_to_kv_pool_allocator_local is not None:
+                out_cache_loc_local = self.alloc_token_slots_local(extend_num_tokens)
         else:
+            # TODO: page_size != 1
             last_loc = get_last_loc(
                 self.req_to_token_pool.req_to_token,
                 req_pool_indices_tensor,
@@ -1114,6 +1126,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.req_pool_indices = req_pool_indices_tensor
         self.seq_lens = seq_lens_tensor
         self.out_cache_loc = out_cache_loc
+        self.out_cache_loc_local = out_cache_loc_local
         self.input_embeds = (
             torch.tensor(input_embeds).to(self.device, non_blocking=True)
             if input_embeds
@@ -1144,6 +1157,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 out_cache_loc,
                 self.req_to_token_pool.req_to_token.shape[1],
             )
+            # TODO: write out_cache_loc to req_to_token_pool
         else:
             pt = 0
             for i in range(bs):
@@ -1377,7 +1391,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Allocate memory
         if self.token_to_kv_pool_allocator.page_size == 1:
             self.out_cache_loc = self.alloc_token_slots(bs)
+            if self.token_to_kv_pool_allocator_local is not None:
+                self.out_cache_loc_local = self.alloc_token_slots_local(bs)
         else:
+            # TODO: page_size != 1
             last_loc = self.req_to_token_pool.req_to_token[
                 self.req_pool_indices, self.seq_lens - 2
             ]
@@ -1385,6 +1402,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.seq_lens, last_loc
             )
 
+        # TODO: write out_cache_loc_local to req_to_token_pool
         self.req_to_token_pool.write(
             (self.req_pool_indices, locs), self.out_cache_loc.to(torch.int32)
         )
@@ -1514,6 +1532,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req_pool_indices=self.req_pool_indices,
             seq_lens=self.seq_lens,
             out_cache_loc=self.out_cache_loc,
+            out_cache_loc_local=self.out_cache_loc_local,
             seq_lens_sum=self.seq_lens_sum,
             return_logprob=self.return_logprob,
             top_logprobs_nums=self.top_logprobs_nums,
@@ -1585,6 +1604,8 @@ class ModelWorkerBatch:
     seq_lens_cpu: Optional[torch.Tensor]
     # The indices of output tokens in the token_to_kv_pool_allocator
     out_cache_loc: torch.Tensor
+    # The indices of output tokens in the token_to_kv_pool_allocator_local
+    out_cache_loc_local: torch.Tensor
 
     # The sum of all sequence lengths
     seq_lens_sum: int

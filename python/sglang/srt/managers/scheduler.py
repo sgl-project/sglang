@@ -257,7 +257,7 @@ class Scheduler(
             TpWorkerClass = TpModelWorkerClient
         else:
             TpWorkerClass = TpModelWorker
-
+                
         self.tp_worker = TpWorkerClass(
             server_args=server_args,
             gpu_id=gpu_id,
@@ -470,7 +470,7 @@ class Scheduler(
     def init_memory_pool_and_cache(self):
         server_args = self.server_args
 
-        self.req_to_token_pool, self.token_to_kv_pool_allocator = (
+        self.req_to_token_pool, self.token_to_kv_pool_allocator, self.token_to_kv_pool_allocator_local = (
             self.tp_worker.get_memory_pool()
         )
 
@@ -1153,7 +1153,7 @@ class Scheduler(
                 self.running_batch = self.update_running_batch(self.running_batch)
                 ret = self.running_batch if not self.running_batch.is_empty() else None
             else:
-                ret = None
+                ret = None               
 
         # Handle DP attention
         if self.server_args.enable_dp_attention or self.server_args.enable_sp_layernorm:
@@ -1276,6 +1276,7 @@ class Scheduler(
             can_run_list,
             self.req_to_token_pool,
             self.token_to_kv_pool_allocator,
+            self.token_to_kv_pool_allocator_local,
             self.tree_cache,
             self.model_config,
             self.enable_overlap,
