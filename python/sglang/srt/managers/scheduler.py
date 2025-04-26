@@ -648,6 +648,8 @@ class Scheduler(
             )
             metadata_buffers = [output_id_buffer]
 
+            self.disagg_launch_done = threading.Event()
+
             self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(
                 token_to_kv_pool=self.token_to_kv_pool_allocator.get_kvcache(),
                 req_to_metadata_buffer_idx_allocator=req_to_metadata_buffer_idx_allocator,
