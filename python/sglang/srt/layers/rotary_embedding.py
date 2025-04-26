@@ -6,7 +6,6 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
-from vllm._custom_ops import rotary_embedding as vllm_rotary_embedding
 
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.utils import is_cuda
@@ -83,6 +82,12 @@ class RotaryEmbedding(CustomOp):
         # NOTE(ByronHsu): cache needs to be in FP32 for numerical stability
         if not _is_cuda:
             cache = cache.to(dtype)
+
+        if not _is_cuda or self.head_size not in [64, 128, 256, 512]:
+            from vllm._custom_ops import rotary_embedding
+
+            self.vllm_rotary_embedding = rotary_embedding
+
         self.cos_sin_cache: torch.Tensor
         self.register_buffer("cos_sin_cache", cache, persistent=False)
 
@@ -159,7 +164,7 @@ class RotaryEmbedding(CustomOp):
             )
         else:
             self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
-            vllm_rotary_embedding(
+            self.vllm_rotary_embedding(
                 positions,
                 query,
                 key,
