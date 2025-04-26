@@ -2031,11 +2031,28 @@ class DeepseekV2ForCausalLM(nn.Module):
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
+        self.determine_n_share_experts_fusion()
+        self.model = DeepseekV2Model(
+            config, quant_config, prefix=add_prefix("model", prefix)
+        )
+        self.lm_head = ParallelLMHead(
+            config.vocab_size,
+            config.hidden_size,
+            quant_config=quant_config,
+            prefix=add_prefix("lm_head", prefix),
+            enable_tp=not _enable_moe_dense_fully_dp(),  # TODO: replace it with DP attention
+        )
+        self.logits_processor = LogitsProcessor(config)
+        self.dp_size = get_attention_dp_size()
+
+    def determine_n_share_experts_fusion(
+        self, architecture: str = "DeepseekV3ForCausalLM"
+    ):
         self.n_share_experts_fusion = global_server_args_dict["n_share_experts_fusion"]
         if self.n_share_experts_fusion > 0:
             # Only Deepseek V3/R1 can use shared experts fusion optimization now.
             if (
-                self.config.architectures[0] != "DeepseekV3ForCausalLM"
+                self.config.architectures[0] != architecture
                 or self.config.n_routed_experts != 256
             ):
                 self.n_share_experts_fusion = 0
@@ -2050,7 +2067,7 @@ class DeepseekV2ForCausalLM(nn.Module):
         elif self.n_share_experts_fusion == 0:
             if (
                 torch.cuda.get_device_capability("cuda") >= (9, 0)
-                and self.config.architectures[0] == "DeepseekV3ForCausalLM"
+                and self.config.architectures[0] == architecture
                 and self.config.n_routed_experts == 256
                 and (not global_server_args_dict["enable_deepep_moe"])
             ):
@@ -2059,18 +2076,6 @@ class DeepseekV2ForCausalLM(nn.Module):
                 logger.info(
                     "Deepseek V3/R1 with fp8 can use shared experts fusion optimization when SM version >=90. Shared experts fusion optimization is enabled."
                 )
-
-        self.model = DeepseekV2Model(
-            config, quant_config, prefix=add_prefix("model", prefix)
-        )
-        self.lm_head = ParallelLMHead(
-            config.vocab_size,
-            config.hidden_size,
-            quant_config=quant_config,
-            prefix=add_prefix("lm_head", prefix),
-            enable_tp=not _enable_moe_dense_fully_dp(),  # TODO: replace it with DP attention
-        )
-        self.logits_processor = LogitsProcessor(config)
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
@@ -2252,11 +2257,11 @@ class DeepseekV2ForCausalLM(nn.Module):
                 desc=f"Cloning {self.n_share_experts_fusion} "
                 "replicas of the shared expert into MoE",
             ):
-                for num_repeat in range(self.n_share_experts_fusion):
-                    for suffix in suffix_list:
-                        shared_expert_weight_name = (
-                            f"model.layers.{moe_layer}.mlp.shared_experts.{suffix}"
-                        )
+                for suffix in suffix_list:
+                    shared_expert_weight_name = (
+                        f"model.layers.{moe_layer}.mlp.shared_experts.{suffix}"
+                    )
+                    for num_repeat in range(self.n_share_experts_fusion):
                         weights_list.append(
                             (
                                 f"model.layers.{moe_layer}."
@@ -2266,7 +2271,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                                 weights_dict[shared_expert_weight_name],
                             )
                         )
-                        names_to_remove += [shared_expert_weight_name]
+                    names_to_remove += [shared_expert_weight_name]
             weights = [w for w in weights_list if w[0] not in names_to_remove]
 
         # Params for weights, fp8 weight scales, fp8 activation scales

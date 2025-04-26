@@ -100,6 +100,7 @@ class GenerateReqInput:
 
     # For disaggregated inference
     bootstrap_host: Optional[Union[List[str], str]] = None
+    bootstrap_port: Optional[Union[List[int], int]] = None
     bootstrap_room: Optional[Union[List[int], int]] = None
 
     def normalize_batch_and_arguments(self):
@@ -403,6 +404,9 @@ class GenerateReqInput:
             bootstrap_host=(
                 self.bootstrap_host[i] if self.bootstrap_host is not None else None
             ),
+            bootstrap_port=(
+                self.bootstrap_port[i] if self.bootstrap_port is not None else None
+            ),
             bootstrap_room=(
                 self.bootstrap_room[i] if self.bootstrap_room is not None else None
             ),
@@ -450,6 +454,7 @@ class TokenizedGenerateReqInput:
 
     # For disaggregated inference
     bootstrap_host: Optional[str] = None
+    bootstrap_port: Optional[int] = None
     bootstrap_room: Optional[int] = None
 
 
