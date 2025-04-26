@@ -201,7 +201,7 @@ class SchedulerDisaggregationPrefillMixin:
             self.cur_batch = batch
 
             if batch:
-                # NOTE: nerver influence the kernel launch
+                # NOTE: never influence the kernel launch
                 if self.disagg_launch_done is not None:
                     self.disagg_launch_done.clear()
 
