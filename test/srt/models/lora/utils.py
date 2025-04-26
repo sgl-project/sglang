@@ -100,7 +100,7 @@ def run_batch_lora_test(
     torch_dtype: torch.dtype,
     max_new_tokens: int,
     backend: str,
-    disable_cuda_graph: bool = True,
+    disable_cuda_graph: bool = False,
     disable_radix_cache: bool = True,
     mem_fraction_static: float = 0.88,
     test_tag: str = "",
@@ -119,7 +119,7 @@ def run_batch_lora_test(
         torch_dtype (torch.dtype): The torch dtype to use.
         max_new_tokens (int): The maximum number of new tokens to generate.
         backend (str): The lora backend to use.
-        disable_cuda_graph (bool, optional): Whether to disable CUDA graph. Defaults to True.
+        disable_cuda_graph (bool, optional): Whether to disable CUDA graph. Defaults to False.
         disable_radix_cache (bool, optional): Whether to disable radix cache. Defaults to True.
         mem_fraction_static (float, optional): The fraction of memory to use. Defaults to 0.88.
         test_tag (str, optional): The tag to use for the test. Defaults to "".

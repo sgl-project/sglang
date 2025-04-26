@@ -53,11 +53,13 @@ class LoRAManager:
         lora_backend: str = "triton",
         tp_size: int = 1,
         tp_rank: int = 0,
+        max_bs_in_cuda_graph: int = 0,
     ):
         self.base_model: torch.nn.Module = base_model
         self.lora_paths: Dict[str, str] = lora_paths
         self.base_hf_config: AutoConfig = base_hf_config
         self.max_loras_per_batch: int = max_loras_per_batch
+        self.max_bs_in_cuda_graph: int = max_bs_in_cuda_graph
         self.load_config: LoadConfig = load_config
         self.dtype: torch.dtype = dtype
         self.device: torch.device = next(self.base_model.parameters()).device
@@ -71,6 +73,23 @@ class LoRAManager:
 
         self.init_loras()
         self.init_lora_memory_pool()
+
+    def init_cuda_graph_batch_info(self, max_bs_in_cuda_graph: int):
+        self.max_bs_in_cuda_graph = max_bs_in_cuda_graph
+        with torch.device("cuda"):
+            self.cuda_graph_batch_info = LoRABatchInfo(
+                bs=self.max_bs_in_cuda_graph,
+                seg_lens=torch.zeros(self.max_bs_in_cuda_graph, dtype=torch.int32),
+                seg_indptr=torch.zeros(
+                    self.max_bs_in_cuda_graph + 1, dtype=torch.int32
+                ),
+                max_len=0,
+                weight_indices=torch.zeros(
+                    self.max_bs_in_cuda_graph, dtype=torch.int32
+                ),
+                lora_ranks=torch.zeros(self.max_loras_per_batch, dtype=torch.int32),
+                scalings=torch.zeros(self.max_loras_per_batch, dtype=torch.float),
+            )
 
     def init_loras(self):
         # Config of each LoRA adapter
@@ -140,39 +159,71 @@ class LoRAManager:
         if cur_uids == set([None]):
             return
 
-        # set up batch info shared by all lora moruldes
+        # set up batch info shared by all lora modules
         bs = forward_batch.batch_size
-        seg_lens = (
-            forward_batch.extend_seq_lens
-            if forward_batch.forward_mode.is_extend()
-            else torch.ones(bs, device=self.device)
-        )
-        seg_indptr = torch.zeros((bs + 1,), dtype=torch.int32, device=self.device)
-        seg_indptr[1:] = torch.cumsum(seg_lens, dim=0)
-        max_len = int(torch.max(seg_lens))
-        weight_indices = torch.empty((bs,), dtype=torch.int64, device=self.device)
 
-        lora_ranks = torch.empty(
-            (self.max_loras_per_batch,), dtype=torch.int64, device="cuda"
-        )
-        scalings = torch.empty(
-            (self.max_loras_per_batch,), dtype=torch.float, device="cuda"
-        )
-        for i, lora_path in enumerate(forward_batch.lora_paths):
-            weight_indices[i] = self.memory_pool.get_buffer_id(lora_path)
-            lora = self.loras[lora_path]
-            lora_ranks[weight_indices[i]] = lora.config.hf_config["r"]
-            scalings[weight_indices[i]] = lora.scaling
+        if bs <= self.max_bs_in_cuda_graph:
+            # Do in-place update for cuda graph
+            self.cuda_graph_batch_info.bs = bs
+            if forward_batch.forward_mode.is_extend():
+                self.cuda_graph_batch_info.seg_lens[:bs].copy_(
+                    forward_batch.extend_seq_lens
+                )
+            else:
+                self.cuda_graph_batch_info.seg_lens[:bs].fill_(1)
+            self.cuda_graph_batch_info.seg_indptr[0] = 0
+            torch.cumsum(
+                self.cuda_graph_batch_info.seg_lens[:bs],
+                dim=0,
+                out=self.cuda_graph_batch_info.seg_indptr[1 : bs + 1],
+            )
+            self.cuda_graph_batch_info.max_len = int(
+                torch.max(self.cuda_graph_batch_info.seg_lens[:bs])
+            )
 
-        batch_info = LoRABatchInfo(
-            bs=bs,
-            seg_lens=seg_lens,
-            seg_indptr=seg_indptr,
-            max_len=max_len,
-            weight_indices=weight_indices,
-            lora_ranks=lora_ranks,
-            scalings=scalings,
-        )
+            for i, lora_path in enumerate(forward_batch.lora_paths):
+                self.cuda_graph_batch_info.weight_indices[i] = (
+                    self.memory_pool.get_buffer_id(lora_path)
+                )
+                lora = self.loras[lora_path]
+                self.cuda_graph_batch_info.lora_ranks[
+                    self.cuda_graph_batch_info.weight_indices[i]
+                ] = lora.config.hf_config["r"]
+                self.cuda_graph_batch_info.scalings[
+                    self.cuda_graph_batch_info.weight_indices[i]
+                ] = lora.scaling
+            batch_info = self.cuda_graph_batch_info
+        else:
+            seg_lens = (
+                forward_batch.extend_seq_lens
+                if forward_batch.forward_mode.is_extend()
+                else torch.ones(bs, device=self.device)
+            )
+            seg_indptr = torch.zeros((bs + 1,), dtype=torch.int32, device=self.device)
+            seg_indptr[1:] = torch.cumsum(seg_lens, dim=0)
+            max_len = int(torch.max(seg_lens))
+            weight_indices = torch.empty((bs,), dtype=torch.int64, device=self.device)
+
+            lora_ranks = torch.empty(
+                (self.max_loras_per_batch,), dtype=torch.int64, device="cuda"
+            )
+            scalings = torch.empty(
+                (self.max_loras_per_batch,), dtype=torch.float, device="cuda"
+            )
+            for i, lora_path in enumerate(forward_batch.lora_paths):
+                weight_indices[i] = self.memory_pool.get_buffer_id(lora_path)
+                lora = self.loras[lora_path]
+                lora_ranks[weight_indices[i]] = lora.config.hf_config["r"]
+                scalings[weight_indices[i]] = lora.scaling
+            batch_info = LoRABatchInfo(
+                bs=bs,
+                seg_lens=seg_lens,
+                seg_indptr=seg_indptr,
+                max_len=max_len,
+                weight_indices=weight_indices,
+                lora_ranks=lora_ranks,
+                scalings=scalings,
+            )
         self.lora_backend.set_batch_info(batch_info)
 
         # call set_lora_info for each lora modules

@@ -133,7 +133,7 @@ Please consult the documentation below to learn more about the parameters you ma
 
 ## LoRA
 
-* `lora_paths`: You may provide a list of adapters to your model as a list. Each batch element will get model response with the corresponding lora adapter applied. Currently `cuda_graph` and `radix_attention` are not supported with this option so you need to disable them manually. We are still working on through these [issues](https://github.com/sgl-project/sglang/issues/2929).
+* `lora_paths`: You may provide a list of adapters to your model as a list. Each batch element will get model response with the corresponding lora adapter applied. Currently `radix_attention` is not supported with this option so you need to disable it manually. We are still working on through these [issues](https://github.com/sgl-project/sglang/issues/2929).
 * `max_loras_per_batch`: Maximum number of LoRAs in a running batch including base model.
 * `lora_backend`: The backend of running GEMM kernels for Lora modules, can be one of `triton` or `flashinfer`. Defaults to be `triton`.
 
