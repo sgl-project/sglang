@@ -382,7 +382,6 @@ class TestOpenAIVisionServer(CustomTestCase):
             temperature=0,
         )
 
-        print(f"{response=}")
         assert response.choices[0].message.role == "assistant"
         text = response.choices[0].message.content
         assert isinstance(text, str)
