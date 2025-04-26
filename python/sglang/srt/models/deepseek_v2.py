@@ -2043,7 +2043,6 @@ class DeepseekV2ForCausalLM(nn.Module):
             enable_tp=not _enable_moe_dense_fully_dp(),  # TODO: replace it with DP attention
         )
         self.logits_processor = LogitsProcessor(config)
-        self.dp_size = get_attention_dp_size()
 
     def determine_n_share_experts_fusion(
         self, architecture: str = "DeepseekV3ForCausalLM"
