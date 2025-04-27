@@ -42,6 +42,10 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.quantization import monkey_patch_isinstance_for_vllm_base_layer
+from sglang.srt.layers.quantization.deep_gemm import (
+    _ENABLE_JIT_DEEPGEMM,
+    update_deep_gemm_config,
+)
 from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
@@ -137,11 +141,6 @@ class ModelRunner:
         if server_args.show_time_cost:
             enable_show_time_cost()
 
-        if server_args.disable_outlines_disk_cache:
-            from outlines.caching import disable_cache
-
-            disable_cache()
-
         # Global vars
         global_server_args_dict.update(
             {
@@ -173,6 +172,10 @@ class ModelRunner:
 
         # Get memory before model loading
         min_per_gpu_memory = self.init_torch_distributed()
+
+        # Update deep gemm configure
+        if _ENABLE_JIT_DEEPGEMM:
+            update_deep_gemm_config(gpu_id, server_args)
 
         # If it is a draft model tp_group can be different.
         self.initialize(min_per_gpu_memory)
@@ -226,7 +229,16 @@ class ModelRunner:
         server_args = self.server_args
 
         if server_args.attention_backend is None:
-            # By default, use flashinfer for non-mla attention and triton for mla attention
+            """
+            We auto select the fastest attention backend according to the current offering
+            1. Models with MHA Architecture (e.g: Llama, QWen)
+                1.1 We will turn on FA3 on hopper unless user use spec decode with topk > 1 or page_size > 1.
+                1.2 In other cases, we will use flashinfer if available, otherwise use triton.
+            2. Models with MLA Architecture and using FA3
+                2.1 We will use FA3 backend on hopper.
+                2.2 Otherwise, we will use triton backend.
+            """
+
             if not self.use_mla_backend:
                 if (
                     is_hopper_with_cuda_12_3()
@@ -239,9 +251,7 @@ class ModelRunner:
                         "flashinfer" if is_flashinfer_available() else "triton"
                     )
             else:
-                if is_hopper_with_cuda_12_3() and is_no_spec_infer_or_topk_one(
-                    server_args
-                ):
+                if is_hopper_with_cuda_12_3():
                     server_args.attention_backend = "fa3"
                 else:
                     server_args.attention_backend = "triton"
@@ -299,15 +309,6 @@ class ModelRunner:
                 "Automatically turn off --chunked-prefill-size for multimodal model."
             )
             server_args.chunked_prefill_size = -1
-
-            if self.model_config.hf_config.architectures == [
-                "Qwen2VLForConditionalGeneration"
-            ] or self.model_config.hf_config.architectures == [
-                "Qwen2_5_VLForConditionalGeneration"
-            ]:
-                # TODO: qwen2-vl series does not support radix cache now, set disable_radix_cache=True automatically
-                logger.info("Automatically disable radix cache for qwen-vl series.")
-                server_args.disable_radix_cache = True
 
         if server_args.enable_deepep_moe:
             logger.info(f"DeepEP is turned on. DeepEP mode: {server_args.deepep_mode}")
@@ -954,12 +955,6 @@ class ModelRunner:
             return
 
         if self.server_args.disable_cuda_graph:
-            logger.warning(
-                "\n\nCUDA Graph is DISABLED.\n"
-                "This will cause significant performance degradation.\n"
-                "CUDA Graph should almost never be disabled in most usage scenarios.\n"
-                "If you encounter OOM issues, please try setting --mem-fraction-static to a lower value (such as 0.8 or 0.7) instead of disabling CUDA Graph.\n"
-            )
             return
 
         tic = time.time()

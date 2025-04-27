@@ -78,10 +78,34 @@ time_infos = {}
 
 HIP_FP8_E4M3_FNUZ_MAX = 224.0
 
+_warned_bool_env_var_keys = set()
+
 
 def get_bool_env_var(name: str, default: str = "false") -> bool:
     value = os.getenv(name, default)
-    return value.lower() in ("true", "1")
+    value = value.lower()
+
+    truthy_values = ("true", "1")
+    falsy_values = ("false", "0")
+
+    if (value not in truthy_values) and (value not in falsy_values):
+        if value not in _warned_bool_env_var_keys:
+            logger.warning(
+                f"get_bool_env_var({name}) see non-understandable value={value} and treat as false"
+            )
+        _warned_bool_env_var_keys.add(value)
+
+    return value in truthy_values
+
+
+def get_int_env_var(name: str, default: int = 0) -> int:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
 
 
 # https://pytorch.org/docs/stable/notes/hip.html#checking-for-hip
@@ -128,10 +152,6 @@ def is_flashinfer_available():
     if not get_bool_env_var("SGLANG_IS_FLASHINFER_AVAILABLE", default="true"):
         return False
     return importlib.util.find_spec("flashinfer") is not None and is_cuda()
-
-
-def is_cuda_available():
-    return is_cuda()
 
 
 _ENABLE_TORCH_INFERENCE_MODE = get_bool_env_var(
@@ -774,6 +794,8 @@ def add_api_key_middleware(app, api_key: str):
             return await call_next(request)
         if request.url.path.startswith("/health"):
             return await call_next(request)
+        if request.url.path.startswith("/metrics"):
+            return await call_next(request)
         if request.headers.get("Authorization") != "Bearer " + api_key:
             return ORJSONResponse(content={"error": "Unauthorized"}, status_code=401)
         return await call_next(request)
@@ -930,6 +952,8 @@ def get_zmq_socket(
         buf_size = -1
 
     socket = context.socket(socket_type)
+    if endpoint.find("[") != -1:
+        socket.setsockopt(zmq.IPV6, 1)
 
     def set_send_opt():
         socket.setsockopt(zmq.SNDHWM, 0)
@@ -1144,6 +1168,20 @@ def get_hpu_memory_capacity():
         raise RuntimeError(
             "hl-smi not found. Ensure Habana drivers are installed and accessible."
         )
+
+
+def get_device_memory_capacity(device: str = None):
+    if is_cuda():
+        gpu_mem = get_nvgpu_memory_capacity()
+    elif is_hip():
+        gpu_mem = get_amdgpu_memory_capacity()
+    elif device == "hpu":
+        gpu_mem = get_hpu_memory_capacity()
+    else:
+        # GPU memory is not known yet or no GPU is available.
+        gpu_mem = None
+
+    return gpu_mem
 
 
 # Copy from pytorch and OpenRLHF to allow creating multiple main groups.
@@ -1913,6 +1951,8 @@ def is_page_size_one(server_args):
     return server_args.page_size == 1
 
 
+# TODO(hebiao064): Accelerate FA3 Spec Decode with topk > 1.
+# TODO(hebiao064): Improve the acc rate for FA3 Spec Decode with topk == 1 and page_size > 1.
 def is_no_spec_infer_or_topk_one(server_args):
     return server_args.speculative_eagle_topk is None or (
         server_args.speculative_eagle_topk is not None
@@ -1930,6 +1970,8 @@ def is_fa3_default_architecture(hf_config):
         "Llama4ForConditionalGeneration",
         "LlamaForCausalLM",
         "MistralForCausalLM",
+        "Gemma2ForCausalLM",
+        "Gemma3ForConditionalGeneration",
     }
     return architectures[0] in default_archs
 
