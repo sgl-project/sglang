@@ -82,8 +82,62 @@ class ExpertLocationMetadata:
             physical_to_logical_map=physical_to_logical_map,
         )
 
+    # TODO hack
     @staticmethod
-    def init_by_mapping(server_args: ServerArgs, physical_to_logical_map):
+    def init_padding(server_args: ServerArgs):
+        common = ExpertLocationMetadata._init_common(server_args)
+        num_physical_experts = common["num_physical_experts"]
+        model_config_for_expert_location = common["model_config_for_expert_location"]
+        ep_size = common["ep_size"]
+        num_layers = model_config_for_expert_location.num_layers
+        num_logical_experts = model_config_for_expert_location.num_logical_experts
+
+        num_redundant_experts = num_physical_experts - num_logical_experts
+        num_physical_experts_per_gpu = num_physical_experts // ep_size
+
+        num_padded_gpus = num_redundant_experts
+        num_non_padded_gpus = ep_size - num_redundant_experts
+
+        phy2log_non_padded = torch.arange(
+            num_physical_experts_per_gpu * num_non_padded_gpus
+        )
+
+        phy2log_padded_start = num_physical_experts_per_gpu * num_non_padded_gpus
+        phy2log_padded = torch.cat(
+            [
+                phy2log_padded_start
+                + torch.arange(
+                    (num_physical_experts_per_gpu - 1) * num_padded_gpus
+                ).reshape(-1, (num_physical_experts_per_gpu - 1)),
+                torch.arange(num_padded_gpus)[:, None],
+            ],
+            dim=-1,
+        )
+
+        physical_to_logical_map_one_layer = torch.cat(
+            [phy2log_non_padded, phy2log_padded.flatten()]
+        )
+        print(f"{phy2log_non_padded=}")
+        print(f"{phy2log_padded=}")
+        print(f"{physical_to_logical_map_one_layer=}")
+
+        physical_to_logical_map = torch.tensor(
+            physical_to_logical_map_one_layer, dtype=torch.int
+        ).repeat(num_layers, 1)
+        print(f"hi init_padding {physical_to_logical_map=}")
+
+        return ExpertLocationMetadata.init_by_mapping(
+            server_args,
+            physical_to_logical_map=physical_to_logical_map,
+            hack_logical_to_all_physical_map_pick_first_only=True,
+        )
+
+    @staticmethod
+    def init_by_mapping(
+        server_args: ServerArgs,
+        physical_to_logical_map,
+        hack_logical_to_all_physical_map_pick_first_only=False,
+    ):
         if not isinstance(physical_to_logical_map, torch.Tensor):
             physical_to_logical_map = torch.tensor(physical_to_logical_map)
 
@@ -93,6 +147,12 @@ class ExpertLocationMetadata:
             physical_to_logical_map,
             num_logical_experts=model_config_for_expert_location.num_logical_experts,
         )
+
+        if hack_logical_to_all_physical_map_pick_first_only:
+            logical_to_all_physical_map = logical_to_all_physical_map[:, :, :1]
+            print(
+                f"hack since hack_logical_to_all_physical_map_pick_first_only! {logical_to_all_physical_map.tolist()=}"
+            )
 
         return ExpertLocationMetadata._init_raw(
             ep_size=common["ep_size"],
