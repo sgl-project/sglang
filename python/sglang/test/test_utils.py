@@ -509,7 +509,7 @@ def run_unittest_files(files: List[TestFile], timeout_per_file: float):
     tic = time.time()
     success = True
 
-    for file in files:
+    for i, file in enumerate(files):
         filename, estimated_time = file.name, file.estimated_time
         process = None
 
@@ -517,7 +517,10 @@ def run_unittest_files(files: List[TestFile], timeout_per_file: float):
             nonlocal process
 
             filename = os.path.join(os.getcwd(), filename)
-            print(f".\n.\nBegin:\npython3 {filename}\n.\n.\n", flush=True)
+            print(
+                f".\n.\nBegin ({i}/{len(files)}):\npython3 {filename}\n.\n.\n",
+                flush=True,
+            )
             tic = time.time()
 
             process = subprocess.Popen(
@@ -527,7 +530,7 @@ def run_unittest_files(files: List[TestFile], timeout_per_file: float):
             elapsed = time.time() - tic
 
             print(
-                f".\n.\nEnd:\n{filename=}, {elapsed=:.0f}, {estimated_time=}\n.\n.\n",
+                f".\n.\nEnd ({i}/{len(files)}):\n{filename=}, {elapsed=:.0f}, {estimated_time=}\n.\n.\n",
                 flush=True,
             )
             return process.returncode

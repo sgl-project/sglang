@@ -508,6 +508,8 @@ def latency_test(
 
 
 def main(server_args, bench_args):
+    server_args.cuda_graph_max_bs = max(bench_args.batch_size)
+
     _set_envs_and_config(server_args)
 
     if server_args.model_path:
