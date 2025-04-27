@@ -1151,19 +1151,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if input_embeds
             else None
         )
-        if multimodal_inputs:
-            for mm_input in multimodal_inputs:
-                for mm_item in mm_input.mm_items:
-                    if (
-                        hasattr(mm_item, "pixel_values")
-                        and mm_item.pixel_values is not None
-                    ):
-                        mm_item.pixel_values = mm_item.pixel_values.to(
-                            self.device, non_blocking=True
-                        )
-            self.multimodal_inputs = multimodal_inputs
-        else:
-            self.multimodal_inputs = None
+        for mm_input in multimodal_inputs:
+            for mm_item in mm_input.mm_items:
+                if hasattr(mm_item, "pixel_values") and isinstance(
+                    mm_item.pixel_values, torch.Tensor
+                ):
+                    mm_item.pixel_values = mm_item.pixel_values.to(
+                        self.device, non_blocking=True
+                    )
+        self.multimodal_inputs = multimodal_inputs
         self.seq_lens_sum = sum(seq_lens)
 
         if self.return_logprob:
