@@ -38,7 +38,7 @@ runtime_common = [
     "pyzmq>=25.1.2",
     "soundfile==0.13.1",
     "torchao>=0.9.0",
-    "transformers @ git+https://github.com/huggingface/transformers.git@v4.51.3-Qwen2.5-Omni-preview",
+    "transformers==4.51.1",
     "uvicorn",
     "uvloop",
     "xgrammar==0.1.17",

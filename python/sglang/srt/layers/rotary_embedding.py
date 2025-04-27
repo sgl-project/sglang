@@ -1,12 +1,15 @@
 # Adapted from https://raw.githubusercontent.com/vllm-project/vllm/refs/tags/v0.6.6.post1/vllm/model_executor/layers/rotary_embedding.py
 
 """Rotary Positional Embeddings."""
+import logging
 import math
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
-from transformers.models.qwen2_5_omni import Qwen2_5OmniThinkerConfig
+from transformers import PretrainedConfig
+
+logger = logging.getLogger(__name__)
 
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.utils import is_cuda
@@ -886,7 +889,7 @@ class MRotaryEmbedding(RotaryEmbedding):
     @staticmethod
     def get_rope_index_omni(
         input_ids: Optional[torch.Tensor],
-        config: Qwen2_5OmniThinkerConfig,
+        config: PretrainedConfig,
         image_grid_thw: Optional[torch.LongTensor] = None,
         video_grid_thw: Optional[torch.LongTensor] = None,
         use_audio_in_video: bool = False,

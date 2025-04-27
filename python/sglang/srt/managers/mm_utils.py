@@ -244,12 +244,6 @@ def get_embedding_and_mask(
     return embedding, special_multimodal_mask
 
 
-@dataclasses.dataclass
-class Modality2Token:
-    modality: Modality
-    token_id: int
-
-
 def embed_mm_inputs(
     mm_inputs: MultimodalInputs,
     input_ids: torch.Tensor,

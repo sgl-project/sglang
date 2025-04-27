@@ -181,8 +181,8 @@ class MultimodalDataItem:
     video_grid_thws: Union[torch.Tensor, np.array] = None
 
     # modality: audio
-    audio_feature: Union[torch.Tensor, np.array] = None
-    audio_feature_len: Optional[List[torch.Tensor]] = None
+    audio_features: Union[torch.Tensor, np.array] = None
+    audio_feature_lens: Optional[List[torch.Tensor]] = None
 
     # general
     attention_mask: Optional[torch.Tensor] = None
@@ -248,7 +248,7 @@ class MultimodalDataItem:
             return data_hash(f)
 
         if self.is_audio():
-            self.hash = hash_feature(self.audio_feature)
+            self.hash = hash_feature(self.audio_features)
         else:
             self.hash = hash_feature(self.pixel_values)
 
@@ -258,7 +258,7 @@ class MultimodalDataItem:
     def is_audio(self):
         return (
             self.modality == Modality.AUDIO
-        ) and not MultimodalDataItem.is_empty_list(self.audio_feature)
+        ) and not MultimodalDataItem.is_empty_list(self.audio_features)
 
     def is_image(self):
         return (

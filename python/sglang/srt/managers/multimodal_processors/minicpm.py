@@ -118,8 +118,8 @@ class MiniCPMMultimodalProcessor(BaseMultimodalProcessor):
             and len(res["audio_features"]) != 0
         ):
             item = MultimodalDataItem(
-                audio_feature=[res["audio_features"]],
-                audio_feature_len=res["audio_feature_lens"],
+                audio_features=[res["audio_features"]],
+                audio_feature_lens=res["audio_feature_lens"],
                 modality=Modality.AUDIO,
             )
             items += [item]

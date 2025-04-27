@@ -75,7 +75,6 @@ class Conversation:
     stop_str: Union[str, List[str]] = None
     # The string that represents an image token in the prompt
     image_token: str = "<image>"
-    video_token: str = "<video>"
     audio_token: str = "<audio>"
 
     image_data: Optional[List[str]] = None
@@ -531,7 +530,6 @@ def generate_chat_conv(
         audio_data=[],
         modalities=[],
         image_token=conv.image_token,
-        video_token=conv.video_token,
         audio_token=conv.audio_token,
     )
 
@@ -757,7 +755,7 @@ register_conv_template(
         sep_style=SeparatorStyle.ADD_NEW_LINE_SINGLE,
         stop_str=["<|im_end|>"],
         image_token="<|vision_bos|><|IMAGE|><|vision_eos|>",
-        video_token="<|vision_bos|><|VIDEO|><|vision_eos|>",
+        # video_token="<|vision_bos|><|VIDEO|><|vision_eos|>",
         audio_token="<|audio_bos|><|AUDIO|><|audio_eos|>",
     )
 )

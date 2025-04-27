@@ -164,7 +164,7 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
 
         if "input_features" in ret and ret["input_features"] is not None:
             item = MultimodalDataItem(
-                audio_feature=ret["input_features"],
+                audio_features=ret["input_features"],
                 feature_attention_mask=ret["feature_attention_mask"],
                 attention_mask=ret["attention_mask"],
                 modality=Modality.AUDIO,

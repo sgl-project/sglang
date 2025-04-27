@@ -153,12 +153,10 @@ class Qwen2VisionBlock(nn.Module):
             num_heads=num_heads,
             projection_size=dim,
             use_qkv_parallel=True,
-            qkv_backend="sdpa",
+            use_context_forward=use_context_forward,
             softmax_in_single_precision=softmax_in_single_precision,
-            rotary_embed="normal",
             flatten_batch=True,
             quant_config=quant_config,
-            proj_bias=True,
             prefix=add_prefix("attn", prefix),
         )
         self.mlp = Qwen2VisionMLP(
