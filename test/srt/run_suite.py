@@ -92,6 +92,7 @@ suites = {
     ],
     "per-commit-8-gpu": [
         TestFile("test_fa3.py", 30),
+        TestFile("test_full_deepseek_v3.py", 30),
     ],
     "nightly": [
         TestFile("test_nightly_gsm8k_eval.py"),

@@ -102,7 +102,7 @@ jobs:
           bash scripts/ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 30
+        timeout-minutes: 40
         run: |
           cd test/srt
           python3 run_suite.py --suite per-commit-8-gpu
@@ -256,24 +256,6 @@ jobs:
         run: |
           cd test/srt
           python3 test_moe_eval_accuracy_large.py
-
-  unit-test-backend-8-gpu:
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false
-    runs-on: 8-gpu-runner
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install dependencies
-        run: |
-          bash scripts/ci_install_dependency.sh
-
-      - name: Run DeepSeek-V3 test
-        timeout-minutes: 40
-        run: |
-          cd test/srt
-          python3 test_full_deepseek_v3.py
 
   finish:
     if: always()
