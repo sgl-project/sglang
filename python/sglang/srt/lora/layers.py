@@ -127,7 +127,6 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         lora_backend: BaseLoRABackend,
     ) -> None:
         super().__init__(base_layer, lora_backend)
-        self.B_buffer_gate_up = None
 
     def set_lora_info(
         self,
@@ -139,7 +138,7 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         if self.lora_backend.fuse_stacked_lora_b:
             # TODO: avoid using contiguous() in GPU.
             # B_buffer_gate_up: (num_lora, 2 * output_dim, r)
-            if self.B_buffer_gate_up is None:
+            if not hasattr(self, "B_buffer_gate_up") or self.B_buffer_gate_up is None:
                 self.B_buffer_gate_up = torch.empty(
                     (
                         B_buffer[0].shape[0],
@@ -149,8 +148,6 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
                     dtype=B_buffer[0].dtype,
                     device=B_buffer[0].device,
                 ).contiguous()
-                # TODO: avoid using contiguous() in GPU.
-                # B_buffer_gate_up: (num_lora, 2 * output_dim, r)
             self.B_buffer_gate_up[:, : B_buffer[0].shape[1], :].copy_(B_buffer[0])
             self.B_buffer_gate_up[:, B_buffer[0].shape[1] :, :].copy_(B_buffer[1])
         else:
@@ -189,9 +186,6 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         lora_backend: BaseLoRABackend,
     ) -> None:
         super().__init__(base_layer, lora_backend)
-        self.output_offset = None
-        self.B_buffer_qkv = None
-        self.max_qkv_out_dim = 0
 
     def set_lora_info(
         self,
@@ -213,7 +207,7 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
             #     (B_buffer_q[0], B_buffer_kv[0], B_buffer_kv[1]), dim=-2
             # ).contiguous()
 
-            if self.B_buffer_qkv is None:
+            if not hasattr(self, "B_buffer_qkv") or self.B_buffer_qkv is None:
                 self.B_buffer_qkv = torch.empty(
                     (
                         B_buffer_q[0].shape[0],

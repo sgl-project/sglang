@@ -53,13 +53,11 @@ class LoRAManager:
         lora_backend: str = "triton",
         tp_size: int = 1,
         tp_rank: int = 0,
-        max_bs_in_cuda_graph: int = 0,
     ):
         self.base_model: torch.nn.Module = base_model
         self.lora_paths: Dict[str, str] = lora_paths
         self.base_hf_config: AutoConfig = base_hf_config
         self.max_loras_per_batch: int = max_loras_per_batch
-        self.max_bs_in_cuda_graph: int = max_bs_in_cuda_graph
         self.load_config: LoadConfig = load_config
         self.dtype: torch.dtype = dtype
         self.device: torch.device = next(self.base_model.parameters()).device
@@ -162,8 +160,8 @@ class LoRAManager:
         # set up batch info shared by all lora modules
         bs = forward_batch.batch_size
 
-        if bs <= self.max_bs_in_cuda_graph:
-            # Do in-place update for cuda graph
+        if hasattr(self, "max_bs_in_cuda_graph") and bs <= self.max_bs_in_cuda_graph:
+            # Do in-place updates when CUDA graph is enabled
             self.cuda_graph_batch_info.bs = bs
             if forward_batch.forward_mode.is_extend():
                 self.cuda_graph_batch_info.seg_lens[:bs].copy_(
