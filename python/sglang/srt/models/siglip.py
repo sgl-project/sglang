@@ -15,7 +15,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.utils import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 
-
+# Adapted from transformers.models.siglip.modeling_siglip.SiglipVisionTransformer
 class SiglipVisionEmbeddings(nn.Module):
 
     def __init__(self, config: SiglipVisionConfig):
@@ -44,12 +44,12 @@ class SiglipVisionEmbeddings(nn.Module):
         )
 
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        batch_size = pixel_values.shape[0]
         target_dtype = self.patch_embedding.weight.dtype
         patch_embeds = self.patch_embedding(
             pixel_values.to(dtype=target_dtype)
         )  # shape = [*, width, grid, grid]
-        patch_embeds = patch_embeds.flatten(2).transpose(1, 2)
+        embeddings = patch_embeds.flatten(2).transpose(1, 2)
+        # interpolate_pos_encoding is never used in sglang
         embeddings = embeddings + self.position_embedding(
                 self.position_ids)
 
@@ -215,7 +215,7 @@ class SiglipEncoder(nn.Module):
             return hidden_states_pool
         return hidden_states
 
-# Copied from sglang.srt.models.clip.CLIPVisionTransformer
+# Adapted from transformers.models.siglip.modeling_siglip.SiglipVisionTransformer
 class SiglipVisionTransformer(nn.Module):
 
     def __init__(
@@ -244,9 +244,8 @@ class SiglipVisionTransformer(nn.Module):
                 f"layers, but you requested {len(self.encoder.layers)} layers."
             )
 
+        # VisionAttention in SiglipEncoderLayer is multihead attention
         self.post_layernorm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
-        
-        # self.use_head is yet to be implemented
 
     @property
     def device(self) -> torch.device:
@@ -257,7 +256,6 @@ class SiglipVisionTransformer(nn.Module):
         pixel_values: torch.Tensor,
     ) -> torch.Tensor:
         hidden_states = self.embeddings(pixel_values.to(self.device))
-        hidden_states = self.pre_layrnorm(hidden_states)
 
         return_all_hidden_states = False
 
@@ -270,7 +268,7 @@ class SiglipVisionTransformer(nn.Module):
 
         return last_hidden_state
 
-# Adapted from 
+# Copied from sglang.srt.models.clip.CLIPVisionModel
 class SiglipVisionModel(nn.Module):
     def __init__(
         self,
