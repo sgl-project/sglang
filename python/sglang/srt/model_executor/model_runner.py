@@ -42,6 +42,10 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.quantization import monkey_patch_isinstance_for_vllm_base_layer
+from sglang.srt.layers.quantization.deep_gemm import (
+    _ENABLE_JIT_DEEPGEMM,
+    update_deep_gemm_config,
+)
 from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
@@ -168,6 +172,10 @@ class ModelRunner:
 
         # Get memory before model loading
         min_per_gpu_memory = self.init_torch_distributed()
+
+        # Update deep gemm configure
+        if _ENABLE_JIT_DEEPGEMM:
+            update_deep_gemm_config(gpu_id, server_args)
 
         # If it is a draft model tp_group can be different.
         self.initialize(min_per_gpu_memory)
@@ -301,15 +309,6 @@ class ModelRunner:
                 "Automatically turn off --chunked-prefill-size for multimodal model."
             )
             server_args.chunked_prefill_size = -1
-
-            if self.model_config.hf_config.architectures == [
-                "Qwen2VLForConditionalGeneration"
-            ] or self.model_config.hf_config.architectures == [
-                "Qwen2_5_VLForConditionalGeneration"
-            ]:
-                # TODO: qwen2-vl series does not support radix cache now, set disable_radix_cache=True automatically
-                logger.info("Automatically disable radix cache for qwen-vl series.")
-                server_args.disable_radix_cache = True
 
         if server_args.enable_deepep_moe:
             logger.info(f"DeepEP is turned on. DeepEP mode: {server_args.deepep_mode}")
@@ -956,12 +955,6 @@ class ModelRunner:
             return
 
         if self.server_args.disable_cuda_graph:
-            logger.warning(
-                "\n\nCUDA Graph is DISABLED.\n"
-                "This will cause significant performance degradation.\n"
-                "CUDA Graph should almost never be disabled in most usage scenarios.\n"
-                "If you encounter OOM issues, please try setting --mem-fraction-static to a lower value (such as 0.8 or 0.7) instead of disabling CUDA Graph.\n"
-            )
             return
 
         tic = time.time()

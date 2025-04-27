@@ -43,6 +43,7 @@ from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
 )
 from sglang.srt.managers.schedule_batch import (
+    Modality,
     MultimodalDataItem,
     MultimodalInputs,
     flatten_nested_list,
@@ -1834,7 +1835,10 @@ class MiniCPMO(MiniCPMBaseModel):
             language_model=self.llm,
             image_data_embedding_func=self.get_image_feature,
             audio_data_embedding_func=self.get_audio_feature,
-            placeholder_token_ids=placeholder_token_ids,
+            placeholder_tokens={
+                Modality.IMAGE: placeholder_token_ids,
+                Modality.AUDIO: placeholder_token_ids,
+            },
             positions=positions,
         )
         return hidden_states
