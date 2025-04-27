@@ -19,7 +19,7 @@ class TestBenchOneBatch(CustomTestCase):
         if is_in_ci():
             write_github_step_summary(
                 f"### test_bs1_default (llama-3.1-8b)\n"
-                f"output_throughput : {output_throughput:.2f} token/s\n"
+                f"output_throughput: {output_throughput:.2f} token/s\n"
             )
             self.assertGreater(output_throughput, 135)
 
@@ -31,7 +31,7 @@ class TestBenchOneBatch(CustomTestCase):
         if is_in_ci():
             write_github_step_summary(
                 f"### test_moe_tp2_bs1\n"
-                f"output_throughput : {output_throughput:.2f} token/s\n"
+                f"output_throughput: {output_throughput:.2f} token/s\n"
             )
             self.assertGreater(output_throughput, 125)
 
@@ -44,7 +44,7 @@ class TestBenchOneBatch(CustomTestCase):
         if is_in_ci():
             write_github_step_summary(
                 f"### test_torch_compile_tp2_bs1\n"
-                f"output_throughput : {output_throughput:.2f} token/s\n"
+                f"output_throughput: {output_throughput:.2f} token/s\n"
             )
             self.assertGreater(output_throughput, 225)
 
