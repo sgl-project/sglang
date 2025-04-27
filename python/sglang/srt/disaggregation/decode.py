@@ -137,7 +137,7 @@ class DecodePreallocQueue:
         kv_receiver_class = get_kv_class(self.transfer_backend, KVClassType.RECEIVER)
         kv_receiver = kv_receiver_class(
             mgr=self.kv_manager,
-            bootstrap_addr=f"{req.bootstrap_host}:{self.bootstrap_port}",
+            bootstrap_addr=f"{req.bootstrap_host}:{req.bootstrap_port}",
             bootstrap_room=req.bootstrap_room,
         )
         self.queue.append(DecodeRequest(req=req, kv_receiver=kv_receiver))
@@ -307,7 +307,7 @@ class DecodeTransferQueue:
     def extend(self, req_conns) -> None:
         self.queue.extend(req_conns)
 
-    def pop_transferred(self) -> List[Req]:
+    def pop_transferred(self) -> List[DecodeRequest]:
         if not self.queue:
             return []
 
@@ -330,7 +330,7 @@ class DecodeTransferQueue:
                 assert len(decode_req.req.output_ids) == 0
                 assert decode_req.req.transferred_output_id is None
                 decode_req.req.transferred_output_id = output_id
-                transferred_reqs.append(decode_req.req)
+                transferred_reqs.append(decode_req)
                 indices_to_remove.add(i)
             elif poll in [
                 KVPoll.Bootstrapping,
@@ -444,8 +444,17 @@ class ScheduleBatchDisaggregationDecodeMixin:
 
 class SchedulerDisaggregationDecodeMixin:
 
+    def _prepare_idle_batch_and_run(self, batch, delay_process=False):
+        batch, _ = self.prepare_dp_attn_batch(batch)
+        result = None
+        if batch:
+            result = self.run_batch(batch)
+            if not delay_process:
+                self.process_batch_result(batch, result)
+        return batch, result
+
     @torch.no_grad()
-    def event_loop_normal_disagg_decode(self):
+    def event_loop_normal_disagg_decode(self: Scheduler):
         """A normal scheduler loop for decode worker in disaggregation mode."""
 
         while True:
@@ -456,14 +465,25 @@ class SchedulerDisaggregationDecodeMixin:
             batch = self.get_next_disagg_decode_batch_to_run()
             self.cur_batch = batch
 
+            prepare_dp_attn_flag = (
+                self.server_args.enable_dp_attention
+                or self.server_args.enable_sp_layernorm
+            )
+
             if batch:
                 # Generate fake extend output.
                 if batch.forward_mode.is_extend():
                     # Note: Logprobs should be handled on the prefill engine.
                     self.stream_output(batch.reqs, False)
+                    if prepare_dp_attn_flag:
+                        self._prepare_idle_batch_and_run(None)
                 else:
+                    if prepare_dp_attn_flag:
+                        self.prepare_dp_attn_batch(batch)
                     result = self.run_batch(batch)
                     self.process_batch_result(batch, result)
+            elif prepare_dp_attn_flag:
+                batch, _ = self._prepare_idle_batch_and_run(None)
 
             if batch is None and (
                 len(self.disagg_decode_transfer_queue.queue)
@@ -477,10 +497,10 @@ class SchedulerDisaggregationDecodeMixin:
             self.last_batch = batch
 
     @torch.no_grad()
-    def event_loop_overlap_disagg_decode(self):
+    def event_loop_overlap_disagg_decode(self: Scheduler):
         result_queue = deque()
         self.last_batch: Optional[ScheduleBatch] = None
-        self.last_batch_is_extend = False  # last batch is modifed in-place, so we need another variable to track if it's extend
+        self.last_batch_in_queue = False  # last batch is modifed in-place, so we need another variable to track if it's extend
 
         while True:
             recv_reqs = self.recv_requests()
@@ -489,20 +509,41 @@ class SchedulerDisaggregationDecodeMixin:
             self.process_decode_queue()
             batch = self.get_next_disagg_decode_batch_to_run()
             self.cur_batch = batch
-            last_batch_is_extend = False
+            last_batch_in_queue = False
+
+            prepare_dp_attn_flag = (
+                self.server_args.enable_dp_attention
+                or self.server_args.enable_sp_layernorm
+            )
 
             if batch:
                 # Generate fake extend output.
                 if batch.forward_mode.is_extend():
                     # Note: Logprobs should be handled on the prefill engine.
                     self.stream_output(batch.reqs, False)
-                    last_batch_is_extend = True
+                    if prepare_dp_attn_flag:
+                        batch_, result = self._prepare_idle_batch_and_run(
+                            None, delay_process=True
+                        )
+                        if batch_:
+                            result_queue.append((batch_.copy(), result))
+                            last_batch_in_queue = True
                 else:
+                    if prepare_dp_attn_flag:
+                        self.prepare_dp_attn_batch(batch)
                     result = self.run_batch(batch)
                     result_queue.append((batch.copy(), result))
+                    last_batch_in_queue = True
+            elif prepare_dp_attn_flag:
+                batch, result = self._prepare_idle_batch_and_run(
+                    None, delay_process=True
+                )
+                if batch:
+                    result_queue.append((batch.copy(), result))
+                    last_batch_in_queue = True
 
             # Process the results of the previous batch but skip if the last batch is extend
-            if self.last_batch and not self.last_batch_is_extend:
+            if self.last_batch and self.last_batch_in_queue:
                 tmp_batch, tmp_result = result_queue.popleft()
                 self.process_batch_result(tmp_batch, tmp_result)
 
@@ -516,7 +557,7 @@ class SchedulerDisaggregationDecodeMixin:
                 self.new_token_ratio = self.init_new_token_ratio
 
             self.last_batch = batch
-            self.last_batch_is_extend = last_batch_is_extend
+            self.last_batch_in_queue = last_batch_in_queue
 
     def get_next_disagg_decode_batch_to_run(
         self: Scheduler,
@@ -600,8 +641,15 @@ class SchedulerDisaggregationDecodeMixin:
 
     def process_decode_queue(self: Scheduler):
         req_conns = self.disagg_decode_prealloc_queue.pop_preallocated()
+
+        def _num_pre_alloc(req):
+            return len(req.req.origin_input_ids) + max(len(req.req.output_ids) - 1, 0)
+
+        self.num_tokens_pre_allocated += sum(_num_pre_alloc(req) for req in req_conns)
         self.disagg_decode_transfer_queue.extend(req_conns)
         alloc_reqs = (
             self.disagg_decode_transfer_queue.pop_transferred()
         )  # the requests which kv has arrived
-        self.waiting_queue.extend(alloc_reqs)
+        self.num_tokens_pre_allocated -= sum(_num_pre_alloc(req) for req in alloc_reqs)
+
+        self.waiting_queue.extend([req.req for req in alloc_reqs])
