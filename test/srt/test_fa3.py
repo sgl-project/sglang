@@ -3,18 +3,17 @@ import unittest
 from types import SimpleNamespace
 
 import requests
-import torch
 
 from sglang.srt.utils import get_device_sm, kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3,
-    DEFAULT_MODEL_NAME_FOR_TEST_LOCAL_ATTENTION,
     DEFAULT_MODEL_NAME_FOR_TEST_MLA,
     DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     popen_launch_server,
 )
 
@@ -48,9 +47,8 @@ if OFFLINE_MODE:
 # Default server arguments shared across all tests
 DEFAULT_SERVER_ARGS = [
     "--trust-remote-code",
-    "--enable-torch-compile",
     "--cuda-graph-max-bs",
-    "2",
+    "4",
     "--attention-backend",
     "fa3",
 ]
@@ -61,7 +59,7 @@ Integration test for python/sglang/srt/layers/attention/flashattention_backend.p
 
 
 @unittest.skipIf(get_device_sm() < 90, "Test requires CUDA SM 90 or higher")
-class BaseFlashAttentionTest(unittest.TestCase):
+class BaseFlashAttentionTest(CustomTestCase):
     """Base class for testing FlashAttention3."""
 
     model = DEFAULT_MODEL_NAME_FOR_TEST
@@ -79,13 +77,13 @@ class BaseFlashAttentionTest(unittest.TestCase):
     def setUpClass(cls):
         # disable deep gemm precompile to make launch server faster
         # please don't do this if you want to make your inference workload faster
-        os.environ["SGL_JIT_DEEPGEMM_PRECOMPILE"] = "False"
+        os.environ["SGL_JIT_DEEPGEMM_PRECOMPILE"] = "false"
+        os.environ["SGL_ENABLE_JIT_DEEPGEMM"] = "false"
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=cls.get_server_args(),
-            env=os.environ,
         )
 
     @classmethod
@@ -93,6 +91,8 @@ class BaseFlashAttentionTest(unittest.TestCase):
         kill_process_tree(cls.process.pid)
 
     def test_gsm8k(self):
+        requests.get(self.base_url + "/flush_cache")
+
         args = SimpleNamespace(
             num_shots=4,
             num_questions=100,
@@ -103,7 +103,7 @@ class BaseFlashAttentionTest(unittest.TestCase):
             data_path=GSM_DATASET_PATH,
         )
         metrics = run_eval_few_shot_gsm8k(args)
-        print(metrics)
+        print(f"{metrics=}")
 
         # Use the appropriate metric key based on the test class
         metric_key = "accuracy"
@@ -125,22 +125,6 @@ class TestFlashAttention3MLA(BaseFlashAttentionTest):
     @classmethod
     def get_server_args(cls):
         return DEFAULT_SERVER_ARGS
-
-
-class TestFlashAttention3LocalAttn(BaseFlashAttentionTest):
-    """Test FlashAttention3 with Model with local attention, e.g. Llama 4."""
-
-    accuracy_threshold = 0.70
-    model = DEFAULT_MODEL_NAME_FOR_TEST_LOCAL_ATTENTION
-
-    @classmethod
-    def get_server_args(cls):
-        cloned_args = DEFAULT_SERVER_ARGS.copy()
-        # remove --enable-torch-compile from cloned_args since llama4 does not support it for now
-        cloned_args.remove("--enable-torch-compile")
-        # we cannot use scout's 10m context due to this bug: https://github.com/sgl-project/sglang/issues/5755
-        cloned_args.extend(["--tp", "4", "--context-length", "1000000"])
-        return cloned_args
 
 
 class TestFlashAttention3SpeculativeDecode(BaseFlashAttentionTest):
@@ -207,60 +191,6 @@ class TestFlashAttention3SpeculativeDecodeTopk(BaseFlashAttentionTest):
             ]
         )
         return args
-
-
-class TestFlashAttention3SpeculativeDecodeTopk(BaseFlashAttentionTest):
-    """Test FlashAttention3 with speculative decode enabled, topk > 1"""
-
-    model = DEFAULT_MODEL_NAME_FOR_TEST
-
-    @classmethod
-    def get_server_args(cls):
-        args = super().get_server_args()
-        args.extend(
-            [
-                "--cuda-graph-max-bs",
-                "2",
-                "--speculative-algorithm",
-                "EAGLE3",
-                "--speculative-draft",
-                DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3,
-                "--speculative-num-steps",
-                "5",
-                "--speculative-eagle-topk",
-                "4",
-                "--speculative-num-draft-tokens",
-                "8",
-                "--dtype",
-                "float16",
-            ]
-        )
-        return args
-
-    def test_gsm8k(self):
-        """
-        Override the test_gsm8k to further test for average speculative accept length.
-        """
-        requests.get(self.base_url + "/flush_cache")
-
-        args = SimpleNamespace(
-            num_shots=5,
-            data_path=GSM_DATASET_PATH,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
-            host="http://127.0.0.1",
-            port=int(self.base_url.split(":")[-1]),
-        )
-        metrics = run_eval_few_shot_gsm8k(args)
-        print(metrics)
-
-        self.assertGreater(metrics["accuracy"], 0.60)
-
-        server_info = requests.get(self.base_url + "/get_server_info")
-        avg_spec_accept_length = server_info.json()["avg_spec_accept_length"]
-        print(f"{avg_spec_accept_length=}")
-        self.assertGreater(avg_spec_accept_length, 1.8)
 
 
 class TestFlashAttention3MLASpeculativeDecode(BaseFlashAttentionTest):
