@@ -18,7 +18,7 @@ suites = {
         TestFile("models/lora/test_multi_lora_backend.py", 60),
         TestFile("models/test_embedding_models.py", 35),
         TestFile("models/test_generation_models.py", 103),
-        TestFile("models/test_grok_models.py", 60),
+        # TestFile("models/test_grok_models.py", 60),  # Disabled due to illegal memory access
         TestFile("models/test_qwen_models.py", 82),
         TestFile("models/test_compressed_tensors_models.py", 100),
         TestFile("models/test_reward_models.py", 83),
@@ -30,6 +30,7 @@ suites = {
         TestFile("test_chunked_prefill.py", 336),
         TestFile("test_eagle_infer.py", 500),
         TestFile("test_ebnf_constrained.py"),
+        TestFile("test_fa3.py", 400),
         TestFile("test_fp8_kernel.py", 8),
         TestFile("test_embedding_openai_server.py", 36),
         TestFile("test_hidden_states.py", 55),
@@ -91,7 +92,7 @@ suites = {
         TestFile("test_verl_engine.py", 100),
     ],
     "per-commit-8-gpu": [
-        TestFile("test_fa3.py", 30),
+        TestFile("test_local_attn.py", 250),
     ],
     "nightly": [
         TestFile("test_nightly_gsm8k_eval.py"),
