@@ -662,6 +662,9 @@ def _compute_initial_expert_location_metadata(
         if data == "trivial":
             logger.info("init_expert_location from init_expert_location=trivial")
             return ExpertLocationMetadata.init_trivial(server_args)
+        if data == "padding":
+            logger.info("init_expert_location from init_expert_location=padding")
+            return ExpertLocationMetadata.init_padding(server_args)
 
         try:
             data_dict = json.loads(data)
