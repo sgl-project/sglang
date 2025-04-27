@@ -999,7 +999,7 @@ async def benchmark(
 
     # Use the first request for all warmup iterations
     test_prompt, test_prompt_len, test_output_len = input_requests[0]
-    if lora_names != None and len(lora_names) != 0:
+    if lora_names is not None and len(lora_names) != 0:
         lora_name = lora_names[0]
     else:
         lora_name = None
@@ -1059,7 +1059,7 @@ async def benchmark(
     tasks: List[asyncio.Task] = []
     async for request in get_request(input_requests, request_rate):
         prompt, prompt_len, output_len = request
-        if lora_names != None and len(lora_names) != 0:
+        if lora_names is not None and len(lora_names) != 0:
             idx = random.randint(0, len(lora_names) - 1)
             lora_name = lora_names[idx]
         else:
