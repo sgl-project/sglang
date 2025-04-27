@@ -2053,6 +2053,11 @@ class Scheduler(
             self.profiler_target_forward_ct = None
             return ProfileReqOutput(success=True, message="Succeeded")
 
+        if get_bool_env_var(
+            "SGLANG_HACK_DISABLE_SLOW_DOWN_WHEN_START_PROFILE", "false"
+        ):
+            self.slow_down(SlowDownReqInput(forward_sleep_time=None))
+
     def stop_profile(self) -> None:
         if self.profiler_activities is None:
             return ProfileReqOutput(
