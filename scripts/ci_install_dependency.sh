@@ -23,7 +23,11 @@ pip install -e "python[all]"
 
 # Install additional dependencies
 pip install torch_memory_saver
-pip install transformers==4.51.0 sentence_transformers accelerate peft pandas datasets timm torchaudio
+pip install transformers==4.51.0 sentence_transformers accelerate peft pandas datasets timm torchaudio==2.6.0
 
 # For compling xgrammar kernels
 pip install cuda-python nvidia-cuda-nvrtc-cu12
+
+# For lmms_evals evaluating MMMU
+git clone --branch v0.3.3 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
+pip install -e lmms-eval/

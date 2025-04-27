@@ -463,6 +463,30 @@ def generate_embedding_convs(
     return convs
 
 
+# Models in which system adds modality tokens at prompt start automatically
+# when media inputs exceed modality tokens in prompt (e.g. 3 images but 2 <image> tokens)
+_MODELS_REQUIRING_MODALITY_SUPPLEMENT = {"deepseek-vl2"}
+
+
+# adapted from https://github.com/vllm-project/vllm/blob/5124f5bf51b83e6f344c1bc6652e8c4d81313b34/vllm/entrypoints/chat_utils.py#L856
+def _get_full_multimodal_text_prompt(
+    modality_token: str, modality_count: int, text_prompt: str
+) -> str:
+    """Combine multimodal prompts for a multimodal language model."""
+
+    # For any existing placeholder in the text prompt, we leave it as is
+    left: int = modality_count - text_prompt.count(modality_token)
+    if left < 0:
+        raise ValueError(
+            f"Found more '{modality_token}' placeholders in input prompt than "
+            "actual multimodal data items."
+        )
+
+    # NOTE: For now we always add missing modality_token at the front of
+    # the prompt. This may change to be customizable in the future.
+    return "\n".join([modality_token] * left + [text_prompt])
+
+
 def generate_chat_conv(
     request: ChatCompletionRequest, template_name: str
 ) -> Conversation:
@@ -520,6 +544,12 @@ def generate_chat_conv(
                         if conv.name != "qwen2-vl"
                         else conv.image_token
                     )
+                add_token_as_needed: bool = (
+                    conv.name in _MODELS_REQUIRING_MODALITY_SUPPLEMENT
+                )
+                if add_token_as_needed:
+                    image_token = ""
+
                 audio_token = conv.audio_token
                 for content in message.content:
                     if content.type == "text":
@@ -533,7 +563,10 @@ def generate_chat_conv(
                     elif content.type == "audio_url":
                         real_content += audio_token
                         conv.append_audio(content.audio_url.url)
-
+                if add_token_as_needed:
+                    real_content = _get_full_multimodal_text_prompt(
+                        conv.image_token, num_image_url, real_content
+                    )
                 conv.append_message(conv.roles[0], real_content)
         elif msg_role == "assistant":
             parsed_content = ""
