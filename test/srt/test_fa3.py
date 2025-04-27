@@ -3,7 +3,6 @@ import unittest
 from types import SimpleNamespace
 
 import requests
-import torch
 
 from sglang.srt.utils import get_device_sm, kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
@@ -93,6 +92,8 @@ class BaseFlashAttentionTest(unittest.TestCase):
         kill_process_tree(cls.process.pid)
 
     def test_gsm8k(self):
+        requests.get(self.base_url + "/flush_cache")
+
         args = SimpleNamespace(
             num_shots=4,
             num_questions=100,
@@ -103,7 +104,7 @@ class BaseFlashAttentionTest(unittest.TestCase):
             data_path=GSM_DATASET_PATH,
         )
         metrics = run_eval_few_shot_gsm8k(args)
-        print(metrics)
+        print(f"{metrics=}")
 
         # Use the appropriate metric key based on the test class
         metric_key = "accuracy"
@@ -207,60 +208,6 @@ class TestFlashAttention3SpeculativeDecodeTopk(BaseFlashAttentionTest):
             ]
         )
         return args
-
-
-class TestFlashAttention3SpeculativeDecodeTopk(BaseFlashAttentionTest):
-    """Test FlashAttention3 with speculative decode enabled, topk > 1"""
-
-    model = DEFAULT_MODEL_NAME_FOR_TEST
-
-    @classmethod
-    def get_server_args(cls):
-        args = super().get_server_args()
-        args.extend(
-            [
-                "--cuda-graph-max-bs",
-                "2",
-                "--speculative-algorithm",
-                "EAGLE3",
-                "--speculative-draft",
-                DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3,
-                "--speculative-num-steps",
-                "5",
-                "--speculative-eagle-topk",
-                "4",
-                "--speculative-num-draft-tokens",
-                "8",
-                "--dtype",
-                "float16",
-            ]
-        )
-        return args
-
-    def test_gsm8k(self):
-        """
-        Override the test_gsm8k to further test for average speculative accept length.
-        """
-        requests.get(self.base_url + "/flush_cache")
-
-        args = SimpleNamespace(
-            num_shots=5,
-            data_path=GSM_DATASET_PATH,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
-            host="http://127.0.0.1",
-            port=int(self.base_url.split(":")[-1]),
-        )
-        metrics = run_eval_few_shot_gsm8k(args)
-        print(metrics)
-
-        self.assertGreater(metrics["accuracy"], 0.60)
-
-        server_info = requests.get(self.base_url + "/get_server_info")
-        avg_spec_accept_length = server_info.json()["avg_spec_accept_length"]
-        print(f"{avg_spec_accept_length=}")
-        self.assertGreater(avg_spec_accept_length, 1.8)
 
 
 class TestFlashAttention3MLASpeculativeDecode(BaseFlashAttentionTest):
