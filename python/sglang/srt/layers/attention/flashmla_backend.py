@@ -134,8 +134,8 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             else:
                 super().init_forward_metadata(forward_batch)
         elif (not USE_FLASHINFER) and forward_batch.forward_mode.is_target_verify():
-            seq_lens_cpu = forward_batch.seq_lens_cpu + self.num_draft_tokens - 1
-            seq_lens = forward_batch.seq_lens + self.num_draft_tokens - 1
+            seq_lens_cpu = forward_batch.seq_lens_cpu + self.num_draft_tokens
+            seq_lens = forward_batch.seq_lens + self.num_draft_tokens
 
             max_seqlen_pad = triton.cdiv(
                 seq_lens_cpu.max().item(), PAGE_SIZE
@@ -467,7 +467,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 q=reshape_q_fp8,
                 k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
                 block_table=self.forward_metadata.block_kv_indices[:bs],
-                cache_seqlens=forward_batch.seq_lens.to(torch.int32),
+                cache_seqlens=forward_batch.seq_lens.to(torch.int32) + self.num_draft_tokens,
                 head_dim_v=self.kv_lora_rank,  # TODO Retrieve from config.
                 tile_scheduler_metadata=self.forward_metadata.flashmla_metadata,
                 num_splits=self.forward_metadata.num_splits,
@@ -483,7 +483,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 q=reshape_q,
                 k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
                 block_table=self.forward_metadata.block_kv_indices[:bs],
-                cache_seqlens=forward_batch.seq_lens.to(torch.int32) + self.num_draft_tokens - 1,
+                cache_seqlens=forward_batch.seq_lens.to(torch.int32) + self.num_draft_tokens,
                 head_dim_v=self.kv_lora_rank,
                 tile_scheduler_metadata=self.forward_metadata.flashmla_metadata,
                 num_splits=self.forward_metadata.num_splits,
