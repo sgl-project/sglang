@@ -329,6 +329,14 @@ class ServerArgs:
                 "eagle speculative decoding."
             )
 
+            model_arch = get_model_arch(self)
+
+            # Auto set draft_model_path DeepSeek-V3/R1
+            if self.speculative_draft_model_path is None and model_arch in [
+                "DeepseekV3ForCausalLM"
+            ]:
+                self.speculative_draft_model_path = self.model_path
+
             # Auto choose parameters
             if self.speculative_num_steps is None:
                 assert (
@@ -339,7 +347,7 @@ class ServerArgs:
                     self.speculative_num_steps,
                     self.speculative_eagle_topk,
                     self.speculative_num_draft_tokens,
-                ) = auto_choose_speculative_params(self)
+                ) = auto_choose_speculative_params(model_arch)
 
             if self.page_size > 1 and self.speculative_eagle_topk > 1:
                 self.speculative_eagle_topk = 1
@@ -1356,12 +1364,7 @@ class DeprecatedAction(argparse.Action):
         raise ValueError(self.help)
 
 
-def auto_choose_speculative_params(self: ServerArgs):
-    """
-    Automatically choose the parameters for speculative decoding.
-
-    You can tune them on your own models and prompts with scripts/playground/bench_speculative.py
-    """
+def get_model_arch(self: ServerArgs):
     if self.decrypted_config_file:
         config_path = self.decrypted_config_file
     else:
@@ -1370,9 +1373,15 @@ def auto_choose_speculative_params(self: ServerArgs):
         raise ValueError(f"{config_path} is not found.")
 
     config = json.load(open(config_path))
+    return config.get("architectures", ["Unknown"])[0]
 
-    arch = config.get("architectures", ["Unknown"])[0]
 
+def auto_choose_speculative_params(arch: str):
+    """
+    Automatically choose the parameters for speculative decoding.
+
+    You can tune them on your own models and prompts with scripts/playground/bench_speculative.py
+    """
     if arch in ["LlamaForCausalLM"]:
         # The default value for llama
         return (5, 4, 8)
