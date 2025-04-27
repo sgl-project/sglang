@@ -113,7 +113,7 @@ class TestDeepseekV3MTP(CustomTestCase):
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_eval_few_shot_gsm8k(args)
-        print(metrics)
+        print(f"{metrics=}")
         self.assertGreater(metrics["accuracy"], 0.94)
 
         server_info = requests.get(self.base_url + "/get_server_info")
