@@ -1363,10 +1363,7 @@ def auto_choose_speculative_params(self: ServerArgs):
 
     You can tune them on your own models and prompts with scripts/playground/bench_speculative.py
     """
-    if self.decrypted_config_file:
-        config_path = self.decrypted_config_file
-    else:
-        config_path = os.path.join(self.model_path, "config.json")
+    config_path = os.path.join(self.model_path, "config.json")
     if not os.path.exists(config_path):
         raise ValueError(f"{config_path} is not found.")
 
