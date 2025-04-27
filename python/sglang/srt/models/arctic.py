@@ -430,7 +430,7 @@ class ArcticModel(nn.Module):
         )
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
-            lambda prefix: ArcticDecoderLayer(config, quant_config, prefix=prefix),
+            lambda layer_id, prefix: ArcticDecoderLayer(config=config, quant_config=quant_config, prefix=prefix),
             prefix=f"{prefix}.layers",
         )
         self._attn_implementation = config._attn_implementation
