@@ -2093,9 +2093,15 @@ class Scheduler(
         print("hi set self.profiler_target_forward_ct = none")
         self.profiler_target_forward_ct = None
 
+        if get_bool_env_var(
+            "SGLANG_HACK_DUMP_EXPERT_DISTRIBUTION_WHEN_STOP_PROFILE", "false"
+        ):
+            self.expert_distribution_handle(ExpertDistributionReq.DUMP_RECORD)
+
         return ProfileReqOutput(success=True, message="Succeeded")
 
     def expert_distribution_handle(self, recv_req: ExpertDistributionReq):
+        print(f"hi expert_distribution_handle {recv_req=}", flush=True)
         dump_output = None
         if recv_req == ExpertDistributionReq.START_RECORD:
             get_global_expert_distribution_recorder().start_record()
