@@ -8,7 +8,6 @@ import random
 import subprocess
 import threading
 import time
-import traceback
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
