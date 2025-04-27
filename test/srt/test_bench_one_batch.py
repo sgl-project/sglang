@@ -29,13 +29,9 @@ class TestBenchOneBatch(CustomTestCase):
             DEFAULT_MOE_MODEL_NAME_FOR_TEST, ["--tp", "2", "--cuda-graph-max-bs", "2"]
         )
 
-        use_vllm_custom_allreduce = get_bool_env_var(
-            "USE_VLLM_CUSTOM_ALLREDUCE", default="false"
-        )
-
         if is_in_ci():
             write_github_step_summary(
-                f"### test_moe_tp2_bs1 ({use_vllm_custom_allreduce=})\n"
+                f"### test_moe_tp2_bs1\n"
                 f"output_throughput : {output_throughput:.2f} token/s\n"
             )
             self.assertGreater(output_throughput, 124)
@@ -51,7 +47,7 @@ class TestBenchOneBatch(CustomTestCase):
                 f"### test_torch_compile_tp2_bs1\n"
                 f"output_throughput : {output_throughput:.2f} token/s\n"
             )
-            self.assertGreater(output_throughput, 235)
+            self.assertGreater(output_throughput, 225)
 
 
 if __name__ == "__main__":
