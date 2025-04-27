@@ -977,6 +977,7 @@ async def benchmark(
     profile: bool,
     pd_seperated: bool = False,
     flush_cache: bool = False,
+    warmup_requests: int = 1,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -993,10 +994,8 @@ async def benchmark(
         async with semaphore:
             return await request_func(request_func_input=request_func_input, pbar=pbar)
 
-    if not hasattr(args, "warmup_requests"):
-        args.warmup_requests = 1
     # Warmup
-    print(f"Starting warmup with {args.warmup_requests} sequences...")
+    print(f"Starting warmup with {warmup_requests} sequences...")
 
     # Use the first request for all warmup iterations
     test_prompt, test_prompt_len, test_output_len = input_requests[0]
@@ -1018,7 +1017,7 @@ async def benchmark(
 
     # Run warmup requests
     warmup_tasks = []
-    for _ in range(args.warmup_requests):
+    for _ in range(warmup_requests):
         warmup_tasks.append(
             asyncio.create_task(request_func(request_func_input=test_input))
         )
@@ -1026,9 +1025,7 @@ async def benchmark(
     warmup_outputs = await asyncio.gather(*warmup_tasks)
 
     # Check if at least one warmup request succeeded
-    if args.warmup_requests > 0 and not any(
-        output.success for output in warmup_outputs
-    ):
+    if warmup_requests > 0 and not any(output.success for output in warmup_outputs):
         raise ValueError(
             "Warmup failed - Please make sure benchmark arguments "
             f"are correctly specified. Error: {warmup_outputs[0].error}"
