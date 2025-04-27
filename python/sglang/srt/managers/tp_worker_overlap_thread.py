@@ -167,7 +167,11 @@ class TpModelWorkerClient:
 
             self.output_queue.put((copy_done, logits_output, next_token_ids))
 
-    def resolve_batch_result(self, launch_done: Optional[threading.Event] = None):
+    def resolve_last_batch_result(self, launch_done: Optional[threading.Event] = None):
+        """
+        This function is called to resolve the last batch result and
+        wait for the current batch to be launched. Used in overlap mode.
+        """
         copy_done, logits_output, next_token_ids = self.output_queue.get()
 
         if launch_done is not None:
