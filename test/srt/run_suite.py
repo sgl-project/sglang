@@ -30,7 +30,6 @@ suites = {
         TestFile("test_chunked_prefill.py", 336),
         TestFile("test_eagle_infer.py", 500),
         TestFile("test_ebnf_constrained.py"),
-        TestFile("test_fa3.py", 200),
         TestFile("test_fp8_kernel.py", 8),
         TestFile("test_embedding_openai_server.py", 36),
         TestFile("test_hidden_states.py", 55),
@@ -69,7 +68,7 @@ suites = {
         TestFile("test_update_weights_from_disk.py", 114),
         TestFile("test_update_weights_from_tensor.py", 48),
         TestFile("test_vertex_endpoint.py", 31),
-        TestFile("test_vision_chunked_prefill.py", 223),
+        TestFile("test_vision_chunked_prefill.py", 99),
         TestFile("test_vlm_accuracy.py", 60),
         TestFile("test_vision_openai_server.py", 537),
         TestFile("test_fim_completion.py", 40),
@@ -90,6 +89,9 @@ suites = {
         TestFile("test_patch_torch.py", 30),
         TestFile("test_update_weights_from_distributed.py", 100),
         TestFile("test_verl_engine.py", 100),
+    ],
+    "per-commit-8-gpu": [
+        TestFile("test_fa3.py", 30),
     ],
     "nightly": [
         TestFile("test_nightly_gsm8k_eval.py"),

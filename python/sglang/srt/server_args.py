@@ -381,6 +381,18 @@ class ServerArgs:
             self.disable_radix_cache = True
             logger.warning("KV cache is forced as chunk cache for decode server")
 
+        if self.enable_memory_saver:
+            try:
+                import torch_memory_saver
+            except ImportError:
+                logger.warning(
+                    "enable_memory_saver is enabled, but "
+                    "torch-memory-saver is not installed. Please install it "
+                    "via `pip3 uninstall torch-memory-saver`. "
+                    "For normal operation, it will be disabled."
+                )
+                raise
+
         os.environ["SGLANG_ENABLE_TORCH_COMPILE"] = (
             "1" if self.enable_torch_compile else "0"
         )
@@ -1362,10 +1374,7 @@ def auto_choose_speculative_params(self: ServerArgs):
 
     You can tune them on your own models and prompts with scripts/playground/bench_speculative.py
     """
-    if self.decrypted_config_file:
-        config_path = self.decrypted_config_file
-    else:
-        config_path = os.path.join(self.model_path, "config.json")
+    config_path = os.path.join(self.model_path, "config.json")
     if not os.path.exists(config_path):
         raise ValueError(f"{config_path} is not found.")
 

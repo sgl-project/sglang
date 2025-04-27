@@ -24,7 +24,7 @@ runtime_common = [
     "hf_transfer",
     "huggingface_hub",
     "interegular",
-    "llguidance>=0.6.15",
+    "llguidance>=0.7.11,<0.8.0",
     "modelscope",
     "ninja",
     "orjson",
