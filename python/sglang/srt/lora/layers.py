@@ -203,10 +203,6 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
             output_dim_q, output_dim_kv = B_buffer_q.shape[-2], B_buffer_kv.shape[-2]
 
             # B_buffer_qkv: (num_lora, output_dim_q + 2 * output_dim_kv, r)
-            # self.B_buffer_qkv = torch.cat(
-            #     (B_buffer_q[0], B_buffer_kv[0], B_buffer_kv[1]), dim=-2
-            # ).contiguous()
-
             if not hasattr(self, "B_buffer_qkv") or self.B_buffer_qkv is None:
                 self.B_buffer_qkv = torch.empty(
                     (
