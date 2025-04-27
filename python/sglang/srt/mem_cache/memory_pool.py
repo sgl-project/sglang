@@ -64,10 +64,16 @@ class ReqToTokenPool:
             self.req_to_token = torch.zeros(
                 (size, max_context_len), dtype=torch.int32, device=device
             )
+            self.req_to_token_local = torch.zeros(
+                (size, max_context_len), dtype=torch.int32, device=device
+            )
         self.free_slots = list(range(size))
 
     def write(self, indices, values):
         self.req_to_token[indices] = values
+    
+    def write_local(self, indices, values):
+        self.req_to_token_local[indices] = values
 
     def available_size(self):
         return len(self.free_slots)
@@ -162,7 +168,7 @@ class TokenToKVPoolAllocator:
     def alloc(self, need_size: int):
         if need_size > len(self.free_slots):
             return None
-
+        
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
         return select_index
@@ -170,7 +176,7 @@ class TokenToKVPoolAllocator:
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
-
+        
         if self.is_not_in_free_group:
             self.free_slots = torch.cat((self.free_slots, free_index))
         else:

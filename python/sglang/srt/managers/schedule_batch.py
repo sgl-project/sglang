@@ -718,6 +718,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     seq_lens: torch.Tensor = None  # shape: [b], int64
     # The output locations of the KV cache
     out_cache_loc: torch.Tensor = None  # shape: [b], int64
+    out_cache_loc_local: torch.Tensor = None
     output_ids: torch.Tensor = None  # shape: [b], int64
 
     # The sum of all sequence lengths
@@ -1040,6 +1041,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.req_to_token_pool.write(
                     (req.req_pool_idx, slice(0, pre_len)), req.prefix_indices
                 )
+                if self.token_to_kv_pool_allocator_local is not None:
+                    self.req_to_token_pool.write_local(
+                    (req.req_pool_idx, slice(0, pre_len)), req.prefix_indices
+                )
 
             # If input_embeds are available, store them
             if req.input_embeds is not None:
@@ -1157,7 +1162,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 out_cache_loc,
                 self.req_to_token_pool.req_to_token.shape[1],
             )
-            # TODO: write out_cache_loc to req_to_token_pool
+            if self.token_to_kv_pool_allocator_local is not None:
+                write_req_to_token_pool_triton[(bs,)](
+                    self.req_to_token_pool.req_to_token_local,
+                    req_pool_indices_tensor,
+                    prefix_lens_tensor,
+                    seq_lens_tensor,
+                    extend_lens_tensor,
+                    out_cache_loc_local,
+                    self.req_to_token_pool.req_to_token_local.shape[1],
+                )
+                
         else:
             pt = 0
             for i in range(bs):
@@ -1165,8 +1180,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     (req_pool_indices[i], slice(prefix_lens[i], seq_lens[i])),
                     out_cache_loc[pt : pt + extend_lens[i]],
                 )
+                if self.token_to_kv_pool_allocator_local is not None:
+                    self.req_to_token_pool.write_local(
+                    (req_pool_indices[i], slice(prefix_lens[i], seq_lens[i])),
+                    out_cache_loc_local[pt : pt + extend_lens[i]],
+                    )
                 pt += extend_lens[i]
-
         if self.model_config.is_encoder_decoder:
             self.prepare_encoder_info_extend(input_ids, seq_lens)
 
@@ -1330,6 +1349,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.input_ids = torch.empty(0, dtype=torch.int64, device=self.device)
         self.seq_lens = torch.empty(0, dtype=torch.int64, device=self.device)
         self.out_cache_loc = torch.empty(0, dtype=torch.int64, device=self.device)
+        self.out_cache_loc_local = torch.empty(0, dtype=torch.int64, device=self.device)
         self.req_pool_indices = torch.empty(0, dtype=torch.int32, device=self.device)
         self.seq_lens_sum = 0
         self.extend_num_tokens = 0
@@ -1406,6 +1426,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.req_to_token_pool.write(
             (self.req_pool_indices, locs), self.out_cache_loc.to(torch.int32)
         )
+        if self.token_to_kv_pool_allocator_local is not None:
+            self.req_to_token_pool.write_local(
+                (self.req_pool_indices, locs), self.out_cache_loc_local.to(torch.int32)
+            )
 
     def filter_batch(
         self,
@@ -1576,6 +1600,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             model_config=self.model_config,
             forward_mode=self.forward_mode,
             out_cache_loc=self.out_cache_loc,
+            out_cache_loc_local=self.out_cache_loc_local,
             return_logprob=self.return_logprob,
             decoding_reqs=self.decoding_reqs,
             spec_algorithm=self.spec_algorithm,

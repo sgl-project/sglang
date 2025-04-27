@@ -185,7 +185,7 @@ class SchedulerOutputProcessorMixin:
             result.bid,
         )
         self.num_generated_tokens += len(batch.reqs)
-
+        
         if self.enable_overlap:
             logits_output, next_token_ids = self.tp_worker.resolve_batch_result(bid)
             next_token_logprobs = logits_output.next_token_logprobs
@@ -208,7 +208,12 @@ class SchedulerOutputProcessorMixin:
                 # Free the one extra delayed token
                 if self.page_size == 1:
                     self.token_to_kv_pool_allocator.free(batch.out_cache_loc[i : i + 1])
+                    if self.token_to_kv_pool_allocator_local is not None:
+                        self.token_to_kv_pool_allocator_local.free(
+                            batch.out_cache_loc_local[i : i + 1]
+                        )
                 else:
+                    # TODO: hybrid cache for page_size >1
                     # Only free when the extra token is in a new page
                     if (
                         len(req.origin_input_ids) + len(req.output_ids) - 1

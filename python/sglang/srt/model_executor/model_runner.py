@@ -813,8 +813,7 @@ class ModelRunner:
                 raise RuntimeError(
                     "Hybrid cache does not support radix cache. Please set --disable-radix-cache"
                 )
-            
-            
+                            
             temp_ratio = (
                 (1 - self.hybrid_ratio) 
                 + self.hybrid_ratio 
