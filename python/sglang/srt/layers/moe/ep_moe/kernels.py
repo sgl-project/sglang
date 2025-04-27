@@ -896,7 +896,7 @@ def ep_scatter(
         p = Path(
             f"/host_home/temp/ep_scatter_data_{torch.cuda.current_device()}_{time.time()}_{random.randint(1000000)}.pickle"
         )
-        print(f"write data to {p}")
+        print(f"{torch.cuda.current_device()=} write data to {p}")
         with open(str(p), "wb") as f:
             pickle.dump(data, f)
 
