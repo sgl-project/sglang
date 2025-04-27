@@ -61,7 +61,6 @@ Please consult the documentation below to learn more about the parameters you ma
 * `revision`: Adjust if a specific version of the model should be used.
 * `skip_tokenizer_init`: Set to true to provide the tokens to the engine and get the output tokens directly, typically used in RLHF. Please see this [example for reference](https://github.com/sgl-project/sglang/blob/main/examples/runtime/token_in_token_out/).
 * `json_model_override_args`: Override model config with the provided JSON.
-* `delete_ckpt_after_loading`: Delete the model checkpoint after loading the model.
 * `disable_fast_image_processor`: Adopt base image processor instead of fast image processor(which is by default). For more detail, see: https://huggingface.co/docs/transformers/main/en/main_classes/image_processor#image-processor
 
 
@@ -127,7 +126,7 @@ Please consult the documentation below to learn more about the parameters you ma
 ## Multi-node distributed serving
 
 * `dist_init_addr`: The TCP address used for initializing PyTorch's distributed backend (e.g. `192.168.0.2:25000`).
-* `nnodes`: Total number of nodes in the cluster. Refer to how to run the [Llama 405B model](https://docs.sglang.ai/references/llama_405B.html#run-405b-fp16-on-two-nodes).
+* `nnodes`: Total number of nodes in the cluster. Refer to how to run the [Llama 405B model](https://docs.sglang.ai/references/multi_node.html#llama-3-1-405b).
 * `node_rank`: Rank (ID) of this node among the `nnodes` in the distributed setup.
 
 
