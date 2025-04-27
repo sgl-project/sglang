@@ -13,12 +13,14 @@
 # ==============================================================================
 
 """Inference-only DeepSeek NextN Speculative Decoding."""
+import logging
 from typing import Iterable, Optional, Tuple
 
 import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -49,6 +51,9 @@ if _is_cuda:
     from sgl_kernel import awq_dequantize
 else:
     from vllm._custom_ops import awq_dequantize
+
+
+logger = logging.getLogger(__name__)
 
 
 class DeepseekModelNextN(nn.Module):
@@ -134,7 +139,9 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
     ) -> None:
         nn.Module.__init__(self)
         self.config = config
+        self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
+        self.determine_n_share_experts_fusion("DeepseekV3ForCausalLMNextN")
 
         self.model = DeepseekModelNextN(
             config, quant_config, prefix=add_prefix("model", prefix)
@@ -182,6 +189,48 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
         ]
+        if self.n_share_experts_fusion > 0:
+            logger.info(
+                f"Cloning {self.n_share_experts_fusion} "
+                "replicas of the shared expert into MoE for DeepseekV3ForCausalLMNextN"
+            )
+            weights_list = list(weights)
+            weights_dict = dict(weights_list)
+            if self.quant_config is None or self.quant_config.get_name() == "w8a8_int8":
+                suffix_list = [
+                    "down_proj.weight",
+                    "down_proj.weight_scale",
+                    "gate_proj.weight",
+                    "gate_proj.weight_scale",
+                    "up_proj.weight",
+                    "up_proj.weight_scale",
+                ]
+            else:
+                suffix_list = [
+                    "down_proj.weight",
+                    "down_proj.weight_scale_inv",
+                    "gate_proj.weight",
+                    "gate_proj.weight_scale_inv",
+                    "up_proj.weight",
+                    "up_proj.weight_scale_inv",
+                ]
+            names_to_remove = []
+            for suffix in suffix_list:
+                shared_expert_weight_name = (
+                    f"model.layers.0.mlp.shared_experts.{suffix}"
+                )
+                for num_repeat in range(self.n_share_experts_fusion):
+                    weights_list.append(
+                        (
+                            f"model.layers.0."
+                            f"mlp.experts."
+                            f"{self.config.n_routed_experts + num_repeat}"
+                            f".{suffix}",
+                            weights_dict[shared_expert_weight_name],
+                        )
+                    )
+                names_to_remove += [shared_expert_weight_name]
+            weights = [w for w in weights_list if w[0] not in names_to_remove]
 
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
@@ -190,8 +239,14 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=self.config.n_routed_experts,
+            num_experts=self.config.n_routed_experts + self.n_share_experts_fusion,
         )
+
+        # Fuse q_a_proj and kv_a_proj_with_mqa along output dimension when q_lora_rank is not None
+        fuse_qkv_a_proj = hasattr(self.config, "q_lora_rank") and (
+            self.config.q_lora_rank is not None
+        )
+        cached_a_proj = {} if fuse_qkv_a_proj else None
 
         nextn_layer_prefix = "model.layers.0"
         nextn_spec_weight_names = [
@@ -264,11 +319,51 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                     if name.endswith(".bias") and name not in params_dict:
                         continue
 
-                    param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight)
+                    # Handle fused_qkv_a_proj
+                    if fuse_qkv_a_proj and (
+                        "q_a_proj" in name or "kv_a_proj_with_mqa" in name
+                    ):
+                        cached_a_proj[name] = loaded_weight
+                        q_a_proj_name = (
+                            name
+                            if "q_a_proj" in name
+                            else name.replace("kv_a_proj_with_mqa", "q_a_proj")
+                        )
+                        kv_a_proj_name = (
+                            name
+                            if "kv_a_proj_with_mqa" in name
+                            else name.replace("q_a_proj", "kv_a_proj_with_mqa")
+                        )
+
+                        # When both q_a_proj and kv_a_proj_with_mqa has been cached, load the fused weight to parameter
+                        if (
+                            q_a_proj_name in cached_a_proj
+                            and kv_a_proj_name in cached_a_proj
+                        ):
+
+                            q_a_proj_weight = cached_a_proj[q_a_proj_name]
+                            kv_a_proj_weight = cached_a_proj[kv_a_proj_name]
+                            fused_weight = torch.cat(
+                                [q_a_proj_weight, kv_a_proj_weight], dim=0
+                            )
+
+                            param_name = name.replace(
+                                "q_a_proj", "fused_qkv_a_proj_with_mqa"
+                            )
+                            param = params_dict[param_name]
+
+                            weight_loader = getattr(
+                                param, "weight_loader", default_weight_loader
+                            )
+                            weight_loader(param, fused_weight)
+                            cached_a_proj.pop(q_a_proj_name)
+                            cached_a_proj.pop(kv_a_proj_name)
+                    else:
+                        param = params_dict[name]
+                        weight_loader = getattr(
+                            param, "weight_loader", default_weight_loader
+                        )
+                        weight_loader(param, loaded_weight)
 
         self_attn = self.model.decoder.self_attn
         if hasattr(self_attn.kv_b_proj, "qweight"):

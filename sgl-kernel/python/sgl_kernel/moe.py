@@ -60,3 +60,33 @@ def moe_fused_gate(
         n_share_experts_fusion,
         routed_scaling_factor,
     )
+
+
+def fp8_blockwise_scaled_grouped_mm(
+    output,
+    a,
+    b,
+    scales_a,
+    scales_b,
+    stride_a,
+    stride_b,
+    stride_c,
+    layout_sfa,
+    layout_sfb,
+    problem_sizes,
+    expert_offsets,
+):
+    torch.ops.sgl_kernel.fp8_blockwise_scaled_grouped_mm.default(
+        output,
+        a,
+        b,
+        scales_a,
+        scales_b,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+    )
