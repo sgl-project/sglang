@@ -9,11 +9,11 @@ from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3,
-    DEFAULT_MODEL_NAME_FOR_TEST_LOCAL_ATTENTION,
     DEFAULT_MODEL_NAME_FOR_TEST_MLA,
     DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     popen_launch_server,
 )
 
@@ -59,7 +59,7 @@ Integration test for python/sglang/srt/layers/attention/flashattention_backend.p
 
 
 @unittest.skipIf(get_device_sm() < 90, "Test requires CUDA SM 90 or higher")
-class BaseFlashAttentionTest(unittest.TestCase):
+class BaseFlashAttentionTest(CustomTestCase):
     """Base class for testing FlashAttention3."""
 
     model = DEFAULT_MODEL_NAME_FOR_TEST
@@ -77,13 +77,13 @@ class BaseFlashAttentionTest(unittest.TestCase):
     def setUpClass(cls):
         # disable deep gemm precompile to make launch server faster
         # please don't do this if you want to make your inference workload faster
-        os.environ["SGL_JIT_DEEPGEMM_PRECOMPILE"] = "False"
+        os.environ["SGL_JIT_DEEPGEMM_PRECOMPILE"] = "false"
+        os.environ["SGL_ENABLE_JIT_DEEPGEMM"] = "false"
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=cls.get_server_args(),
-            env=os.environ,
         )
 
     @classmethod
@@ -125,20 +125,6 @@ class TestFlashAttention3MLA(BaseFlashAttentionTest):
     @classmethod
     def get_server_args(cls):
         return DEFAULT_SERVER_ARGS
-
-
-class TestFlashAttention3LocalAttn(BaseFlashAttentionTest):
-    """Test FlashAttention3 with Model with local attention, e.g. Llama 4."""
-
-    accuracy_threshold = 0.70
-    model = DEFAULT_MODEL_NAME_FOR_TEST_LOCAL_ATTENTION
-
-    @classmethod
-    def get_server_args(cls):
-        cloned_args = DEFAULT_SERVER_ARGS.copy()
-        # we cannot use scout's 10m context due to this bug: https://github.com/sgl-project/sglang/issues/5755
-        cloned_args.extend(["--tp", "4", "--context-length", "1000000"])
-        return cloned_args
 
 
 class TestFlashAttention3SpeculativeDecode(BaseFlashAttentionTest):

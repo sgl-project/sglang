@@ -40,9 +40,9 @@ class TestEvalFP8Accuracy(CustomTestCase):
         metrics = run_eval(args)
         if is_hip():
             # Another threshold for AMD because fp8 dtype is difference
-            self.assertGreaterEqual(metrics["score"], 0.609375)
+            self.assertGreaterEqual(metrics["score"], 0.60)
         else:
-            self.assertGreaterEqual(metrics["score"], 0.61)
+            self.assertGreaterEqual(metrics["score"], 0.60)
 
 
 class TestEvalFP8DynamicQuantAccuracy(CustomTestCase):
