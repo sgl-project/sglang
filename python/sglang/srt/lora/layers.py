@@ -16,7 +16,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from sglang.srt.lora.backend import BaseLoRABackend
+from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 
 
 class BaseLayerWithLoRA(nn.Module):
