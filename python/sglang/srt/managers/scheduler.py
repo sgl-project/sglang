@@ -2085,6 +2085,7 @@ class Scheduler(
         self.profiler_activities = None
 
         # TODO fix?
+        print("hi set self.profiler_target_forward_ct = none")
         self.profiler_target_forward_ct = None
 
         return ProfileReqOutput(success=True, message="Succeeded")
