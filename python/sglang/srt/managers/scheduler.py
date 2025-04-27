@@ -597,7 +597,10 @@ class Scheduler(
             )
             metadata_buffers = [output_id_buffer]
 
-            self.disagg_launch_done = threading.Event()
+            if self.enable_overlap:
+                self.disagg_launch_done = None
+            else:
+                self.disagg_launch_done = threading.Event()
 
             self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(
                 token_to_kv_pool=self.token_to_kv_pool_allocator.get_kvcache(),
