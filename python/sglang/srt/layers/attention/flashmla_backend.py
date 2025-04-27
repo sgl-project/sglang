@@ -244,8 +244,8 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 )
                 mla_metadata, num_splits = get_mla_metadata(
                     seq_lens.to(torch.int32),
-                    Q_LEN * self.num_q_heads // self.num_kv_heads,
-                    self.num_kv_heads,
+                    Q_LEN * self.num_q_heads,
+                    1,
                 )
                 self.cuda_graph_mla_metadata.copy_(mla_metadata)
                 self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
@@ -318,8 +318,8 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             )
             mla_metadata, num_splits = get_mla_metadata(
                 seq_lens.to(torch.int32),
-                Q_LEN * self.num_q_heads // self.num_kv_heads,
-                self.num_kv_heads,
+                Q_LEN * self.num_q_heads,
+                1,
             )
             self.cuda_graph_mla_metadata.copy_(mla_metadata)
             self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
@@ -373,7 +373,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             o, _ = flash_mla_with_kvcache(
                 q=reshape_q_fp8,
                 k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
-                block_table=self.forward_metadata.block_kv_indices,
+                block_table=self.forward_metadata.block_kv_indices[:bs],
                 cache_seqlens=forward_batch.seq_lens.to(torch.int32),
                 head_dim_v=self.kv_lora_rank,  # TODO Retrieve from config.
                 tile_scheduler_metadata=self.forward_metadata.flashmla_metadata,
@@ -390,7 +390,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             o, _ = flash_mla_with_kvcache(
                 q=reshape_q,
                 k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
-                block_table=self.forward_metadata.block_kv_indices,
+                block_table=self.forward_metadata.block_kv_indices[:bs],
                 cache_seqlens=forward_batch.seq_lens.to(torch.int32),
                 head_dim_v=self.kv_lora_rank,  # TODO Retrieve from config.
                 tile_scheduler_metadata=self.forward_metadata.flashmla_metadata,
@@ -478,7 +478,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             o, _ = flash_mla_with_kvcache(
                 q=reshape_q,
                 k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
-                block_table=self.forward_metadata.block_kv_indices,
+                block_table=self.forward_metadata.block_kv_indices[:bs],
                 cache_seqlens=forward_batch.seq_lens.to(torch.int32),
                 head_dim_v=self.kv_lora_rank,
                 tile_scheduler_metadata=self.forward_metadata.flashmla_metadata,
