@@ -1,0 +1,6 @@
+{
+    "local_hostname": "10.10.38.3",
+    "metadata_server": "http://10.10.37.16:8998/metadata",
+    "protocol": "rdma",
+    "device_name": "mlx5_1"
+}

@@ -21,6 +21,7 @@ Life cycle of a request in the decode server
 from __future__ import annotations
 
 import logging
+import os
 from collections import deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional, Tuple
@@ -96,7 +97,10 @@ class DecodePreallocQueue:
         self.tp_size = tp_size
         self.bootstrap_port = bootstrap_port
 
-        self.num_reserved_decode_tokens = 512
+        self.num_reserved_decode_tokens = int(
+            os.environ.get("SGLANG_HACK_PD_DECODE_NUM_RESERVED_DECODE_TOKENS", "512")
+        )
+        print(f"HACK: {self.num_reserved_decode_tokens=}")
 
         # Queue for requests pending pre-allocation
         self.queue: List[DecodeRequest] = []
@@ -179,9 +183,11 @@ class DecodePreallocQueue:
                 continue
 
             if self.req_to_token_pool.available_size() <= 0:
+                # print("hi pop_preallocated break because self.req_to_token_pool.available_size")
                 break
 
             if self.req_to_metadata_buffer_idx_allocator.available_size() <= 0:
+                # print("hi pop_preallocated break because self.req_to_metadata_buffer_idx_allocator")
                 break
 
             required_tokens_for_request = (
@@ -189,6 +195,7 @@ class DecodePreallocQueue:
             )
 
             if required_tokens_for_request > allocatable_tokens:
+                # print(f"hi pop_preallocated break because {required_tokens_for_request=} {allocatable_tokens=}")
                 break
 
             allocatable_tokens -= required_tokens_for_request
@@ -241,6 +248,14 @@ class DecodePreallocQueue:
                 self.scheduler.last_batch.reqs
             )
 
+        # print(f"hi compute {allocatable_tokens=} "
+        #       f"{self.token_to_kv_pool_allocator.available_size()=} "
+        #       f"{self.num_reserved_decode_tokens=} "
+        #       f"{len(self.scheduler.running_batch.reqs)=} "
+        #       f"{len(self.transfer_queue.queue)=} "
+        #       f"{len(self.scheduler.waiting_queue)=} "
+        #       f"{len(self.scheduler.last_batch.reqs) if self.scheduler.last_batch is not None else None=} "
+        #       )
         return allocatable_tokens
 
     def _pre_alloc(self, req: Req) -> torch.Tensor:
@@ -460,6 +475,7 @@ class SchedulerDisaggregationDecodeMixin:
         while True:
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
+            self.model_runner_event_loop_step()
             # polling and allocating kv cache
             self.process_decode_queue()
             batch = self.get_next_disagg_decode_batch_to_run()
@@ -503,6 +519,13 @@ class SchedulerDisaggregationDecodeMixin:
         self.last_batch_in_queue = False  # last batch is modifed in-place, so we need another variable to track if it's extend
 
         while True:
+            # print(f"hi event_loop "
+            #       f"{len(self.disagg_decode_prealloc_queue.queue)=} "
+            #       f"{len(self.disagg_decode_transfer_queue.queue)=} "
+            #       f"{len(self.waiting_queue)=} "
+            #       f"{len(self.running_batch.reqs)=} "
+            #       f"")
+
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
             # polling and allocating kv cache

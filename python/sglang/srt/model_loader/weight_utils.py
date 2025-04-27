@@ -9,6 +9,7 @@ import logging
 import os
 import tempfile
 from collections import defaultdict
+from dataclasses import dataclass
 from typing import (
     Any,
     Callable,
@@ -849,3 +850,23 @@ def kv_cache_scales_loader(
         tp_rank,
     )
     return []
+
+
+@dataclass
+class ModelParamNameInfoMoe:
+    layer_id: int
+    expert_id: int
+
+    @property
+    def category(self):
+        return "moe"
+
+
+@dataclass
+class ModelParamNameInfoOthers:
+    @property
+    def category(self):
+        return "others"
+
+
+ModelParamNameInfo = Union[ModelParamNameInfoMoe, ModelParamNameInfoOthers]

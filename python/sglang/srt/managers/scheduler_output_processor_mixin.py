@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -12,6 +13,8 @@ if TYPE_CHECKING:
         GenerationBatchResult,
         ScheduleBatch,
     )
+
+logger = logging.getLogger(__name__)
 
 
 class SchedulerOutputProcessorMixin:

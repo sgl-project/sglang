@@ -25,8 +25,12 @@ import multiprocessing as multiprocessing
 import os
 import threading
 import time
+import traceback
 from http import HTTPStatus
 from typing import AsyncIterator, Callable, Dict, Optional
+
+from sglang.srt.distributed import get_tensor_model_parallel_rank
+from sglang.srt.model_executor.model_runner import LocalSerializedTensor
 
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
@@ -48,6 +52,7 @@ from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     ConfigureLoggingReq,
     EmbeddingReqInput,
+    EplbRebalanceReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
@@ -58,6 +63,7 @@ from sglang.srt.managers.io_struct import (
     ResumeMemoryOccupationReqInput,
     SeparateReasoningReqInput,
     SetInternalStateReq,
+    SlowDownReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
@@ -337,7 +343,7 @@ async def start_profile_async(obj: Optional[ProfileReqInput] = None):
 @app.api_route("/stop_profile", methods=["GET", "POST"])
 async def stop_profile_async():
     """Stop profiling."""
-    _global_state.tokenizer_manager.stop_profile()
+    await _global_state.tokenizer_manager.stop_profile()
     return Response(
         content="Stop profiling. This will take some time.\n",
         status_code=200,
@@ -367,11 +373,20 @@ async def stop_expert_distribution_record_async():
 @app.api_route("/dump_expert_distribution_record", methods=["GET", "POST"])
 async def dump_expert_distribution_record_async():
     """Dump expert distribution record."""
-    await _global_state.tokenizer_manager.dump_expert_distribution_record()
-    return Response(
-        content="Dump expert distribution record.\n",
-        status_code=200,
-    )
+    content = await _global_state.tokenizer_manager.dump_expert_distribution_record()
+    return ORJSONResponse(content, status_code=200)
+
+
+@app.post("/eplb_rebalance")
+async def eplb_rebalance(obj: Optional[EplbRebalanceReqInput] = None):
+    await _global_state.tokenizer_manager.eplb_rebalance(obj or EplbRebalanceReqInput())
+    return ORJSONResponse({}, status_code=200)
+
+
+@app.post("/eplb_save_expert_distribution")
+async def eplb_save_expert_distribution():
+    await _global_state.tokenizer_manager.eplb_save_expert_distribution()
+    return ORJSONResponse({}, status_code=200)
 
 
 @app.post("/update_weights_from_disk")
@@ -481,6 +496,18 @@ async def resume_memory_occupation(
     try:
         await _global_state.tokenizer_manager.resume_memory_occupation(obj, request)
     except Exception as e:
+        return _create_error_response(e)
+
+
+@app.api_route("/slow_down", methods=["GET", "POST"])
+async def slow_down(obj: SlowDownReqInput, request: Request):
+    try:
+        print(f"hi [http] slow_down START", flush=True)
+        await _global_state.tokenizer_manager.slow_down(obj, request)
+        print(f"hi [http] slow_down END", flush=True)
+    except Exception as e:
+        print(f"hi [http] has error", flush=True)
+        traceback.print_exc()
         return _create_error_response(e)
 
 
