@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -25,6 +26,7 @@ class SchedulerOutputProcessorMixin:
         self: Scheduler,
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
+        launch_done: Optional[threading.Event] = None,
     ):
         skip_stream_req = None
 
@@ -44,7 +46,9 @@ class SchedulerOutputProcessorMixin:
             )
 
             if self.enable_overlap:
-                logits_output, next_token_ids = self.tp_worker.resolve_batch_result()
+                logits_output, next_token_ids = self.tp_worker.resolve_batch_result(
+                    launch_done,
+                )
             else:
                 # Move next_token_ids and logprobs to cpu
                 next_token_ids = next_token_ids.tolist()
@@ -179,6 +183,7 @@ class SchedulerOutputProcessorMixin:
         self: Scheduler,
         batch: ScheduleBatch,
         result: GenerationBatchResult,
+        launch_done: Optional[threading.Event] = None,
     ):
         logits_output, next_token_ids, bid = (
             result.logits_output,
@@ -188,7 +193,9 @@ class SchedulerOutputProcessorMixin:
         self.num_generated_tokens += len(batch.reqs)
 
         if self.enable_overlap:
-            logits_output, next_token_ids = self.tp_worker.resolve_batch_result()
+            logits_output, next_token_ids = self.tp_worker.resolve_batch_result(
+                launch_done
+            )
             next_token_logprobs = logits_output.next_token_logprobs
         elif batch.spec_algorithm.is_none():
             # spec decoding handles output logprobs inside verify process.
