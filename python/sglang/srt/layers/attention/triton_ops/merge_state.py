@@ -63,7 +63,7 @@ def merge_state_kernel(
     )
 
 
-def merge_state(
+def merge_state_triton(
     prefix_output: torch.Tensor,
     prefix_lse: torch.Tensor,
     suffix_output: torch.Tensor,
