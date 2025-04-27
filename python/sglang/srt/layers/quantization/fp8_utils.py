@@ -254,7 +254,7 @@ def apply_fp8_linear(
         else:
             # TODO(kkhuang): temporarily enforce per-tensor activation scaling if weight is per-tensor scaling
             # final solution should be: 1. add support to per-tensor activation scaling.
-            # 2. solve the torch.compile error from weight_scale.numel() == 1 and x_scale.numel() > 1 (below line#320)
+            # 2. solve the torch.compile error from weight_scale.numel() == 1 and x_scale.numel() > 1
             if _is_hip and weight_scale.numel() == 1:
                 qinput, x_scale = ops.scaled_fp8_quant(
                     input_2d,
