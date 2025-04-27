@@ -1,10 +1,11 @@
 use pyo3::prelude::*;
+pub mod logging;
 pub mod router;
 pub mod server;
 pub mod tree;
 
 #[pyclass(eq)]
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Debug)]
 pub enum PolicyType {
     Random,
     RoundRobin,
@@ -12,6 +13,7 @@ pub enum PolicyType {
 }
 
 #[pyclass]
+#[derive(Debug, Clone, PartialEq)]
 struct Router {
     host: String,
     port: u16,
@@ -26,6 +28,7 @@ struct Router {
     max_tree_size: usize,
     max_payload_size: usize,
     verbose: bool,
+    log_dir: Option<String>,
 }
 
 #[pymethods]
@@ -44,7 +47,8 @@ impl Router {
         eviction_interval_secs = 60,
         max_tree_size = 2usize.pow(24),
         max_payload_size = 4 * 1024 * 1024,
-        verbose = false
+        verbose = false,
+        log_dir = None,
     ))]
     fn new(
         worker_urls: Vec<String>,
@@ -60,6 +64,7 @@ impl Router {
         max_tree_size: usize,
         max_payload_size: usize,
         verbose: bool,
+        log_dir: Option<String>,
     ) -> PyResult<Self> {
         Ok(Router {
             host,
@@ -75,6 +80,7 @@ impl Router {
             max_tree_size,
             max_payload_size,
             verbose,
+            log_dir,
         })
     }
 
@@ -107,6 +113,7 @@ impl Router {
                 policy_config,
                 verbose: self.verbose,
                 max_payload_size: self.max_payload_size,
+                log_dir: self.log_dir.clone(),
             })
             .await
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
