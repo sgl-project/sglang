@@ -84,6 +84,7 @@ from sglang.srt.utils import (
     add_api_key_middleware,
     add_prometheus_middleware,
     delete_directory,
+    get_bool_env_var,
     kill_process_tree,
     set_uvicorn_logging_configs,
 )
@@ -126,7 +127,10 @@ async def lifespan(fast_api_app: FastAPI):
 
 
 # Fast API
-app = FastAPI(lifespan=lifespan)
+app = FastAPI(
+    lifespan=lifespan,
+    openapi_url=None if get_bool_env_var("DISABLE_OPENAPI_DOC") else "/openapi.json",
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
