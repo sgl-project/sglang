@@ -831,7 +831,6 @@ class TokenizerManager:
 
         # Get a writer lock for the entire batch update operation
         async with self.model_update_lock.writer_lock:
-            all_success = True
             error_messages = []
 
             # Process each parameter in the batch
@@ -843,13 +842,12 @@ class TokenizerManager:
 
                 # Track success/failure
                 if not result.success:
-                    all_success = False
                     error_messages.append(
                         f"Failed to update parameter {param_info.name}: {result.message}"
                     )
 
             # Return success only if all parameters were updated successfully
-            if all_success:
+            if len(error_messages) == 0:
                 return True, "All parameters successfully updated."
             else:
                 return False, "; ".join(error_messages)

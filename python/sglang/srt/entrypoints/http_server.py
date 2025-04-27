@@ -438,18 +438,9 @@ async def update_weights_from_distributed(
     obj: UpdateWeightsFromDistributedReqInput, request: Request
 ):
     """Update model parameter from distributed online."""
-
-    obj = BatchUpdateWeightsFromDistributedReqInput(parameters=[obj])
-    success, message = (
-        await _global_state.tokenizer_manager.batch_update_weights_from_distributed(
-            obj, request
-        )
+    return await batch_update_weights_from_distributed(
+        BatchUpdateWeightsFromDistributedReqInput(parameters=[obj]), request
     )
-    content = {"success": success, "message": message}
-    if success:
-        return ORJSONResponse(content, status_code=200)
-    else:
-        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
 
 
 @app.post("/batch_update_weights_from_distributed")

@@ -328,7 +328,7 @@ class Engine(EngineBase):
         )
 
     def update_weights_from_distributed(self, name: str, dtype, shape):
-        """Update weights from distributed source."""
+        """Update weights from distributed source. The user can use batch_update_weights_from_distributed to update multiple weights at once."""
         return self.batch_update_weights_from_distributed(
             [{"name": name, "dtype": dtype, "shape": shape}]
         )
@@ -347,18 +347,18 @@ class Engine(EngineBase):
             A tuple of (success, message)
         """
         # Convert torch.dtype objects to strings if needed
-        processed_parameters = []
-        for param in parameters:
-            if not isinstance(param["dtype"], str):
-                dtype_str = str(param["dtype"]).split(".")[-1]
-            else:
-                dtype_str = param["dtype"]
-
-            processed_parameters.append(
-                UpdateWeightsFromDistributedReqInput(
-                    name=param["name"], dtype=dtype_str, shape=param["shape"]
-                )
+        processed_parameters = [
+            UpdateWeightsFromDistributedReqInput(
+                name=param["name"],
+                dtype=(
+                    str(param["dtype"]).split(".")[-1]
+                    if not isinstance(param["dtype"], str)
+                    else param["dtype"]
+                ),
+                shape=param["shape"],
             )
+            for param in parameters
+        ]
 
         obj = BatchUpdateWeightsFromDistributedReqInput(parameters=processed_parameters)
         loop = asyncio.get_event_loop()
