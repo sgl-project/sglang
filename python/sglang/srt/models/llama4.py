@@ -127,16 +127,11 @@ class Llama4MoE(nn.Module):
         return out_aD
 
     def _forward_core(self, hidden_states, forward_mode: ForwardMode):
-        if self._enable_shared_routed_overlap(hidden_states, forward_mode):
+        if hidden_states.shape[0] < 4:
             return self._forward_core_shared_routed_overlap(hidden_states)
         else:
             return self._forward_core_normal(hidden_states)
 
-    @staticmethod
-    def _enable_shared_routed_overlap(hidden_states, forward_mode: ForwardMode):
-        batch_size, _ = hidden_states.shape
-        # After testing, this optimization speeds up when in this scenario
-        return forward_mode.is_decode() and (batch_size < 4)
 
     def _forward_core_normal(self, hidden_states):
         # router_scores: [num_tokens, num_experts]
