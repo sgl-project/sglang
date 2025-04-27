@@ -636,6 +636,7 @@ class InternVisionModel(PreTrainedModel):
         return_dict: Optional[bool] = None,
         pixel_embeds: Optional[torch.FloatTensor] = None,
     ) -> Union[Tuple, BaseModelOutputWithPooling]:
+        pixel_values = pixel_values.to(device=self.device, dtype=self.dtype)
         output_hidden_states = (
             output_hidden_states
             if output_hidden_states is not None
