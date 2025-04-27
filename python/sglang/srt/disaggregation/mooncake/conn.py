@@ -146,6 +146,7 @@ class MooncakeKVManager(BaseKVManager):
             self.transfer_infos: Dict[int, TransferInfo] = {}
             self.decode_kv_args_table: Dict[str, KVArgsRegisterInfo] = {}
             self.disagg_launch_done = launch_kernel_done
+            self.send_kv_done = threading.Event()
             self.start_prefill_thread()
             self._register_to_bootstrap()
 
@@ -190,7 +191,7 @@ class MooncakeKVManager(BaseKVManager):
         # NOTE: When preparing the meatadata, we also need to wait for the kernel launch
         if self.disagg_launch_done is not None:
             self.disagg_launch_done.wait()
-
+        
         # Group by indices
         prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
             prefill_kv_indices, dst_kv_indices
@@ -302,12 +303,15 @@ class MooncakeKVManager(BaseKVManager):
             # TODO: Shall we use KVPoll.Transferring state?
             while True:
                 try:
-                    kv_chunk: TransferKVChunk = self.transfer_queue.get(timeout=0.01)
+                    kv_chunk: TransferKVChunk = self.transfer_queue.get(timeout=0.01) 
                     req = self.transfer_infos[kv_chunk.room]
                     chunked_dst_kv_indice = req.dst_kv_indices[kv_chunk.index_slice]
                     assert len(chunked_dst_kv_indice) == len(
                         kv_chunk.prefill_kv_indices
                     ), f"len(chunked_dst_kv_indice) = {len(chunked_dst_kv_indice)}, len(kv_chunk.prefill_kv_indices) = {len(kv_chunk.prefill_kv_indices)}"
+
+                    if self.send_kv_done is not None:
+                        self.send_kv_done.clear()
 
                     ret = self.send_kvcache(
                         req.mooncake_session_id,
@@ -315,6 +319,10 @@ class MooncakeKVManager(BaseKVManager):
                         self.decode_kv_args_table[req.mooncake_session_id].dst_kv_ptrs,
                         chunked_dst_kv_indice,
                     )
+
+                    if self.send_kv_done is not None:
+                        self.send_kv_done.set()
+
                     if ret != 0:
                         self.request_status[kv_chunk.room] = KVPoll.Failed
                         self.sync_status_to_decode_endpoint(

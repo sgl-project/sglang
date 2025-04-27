@@ -252,6 +252,7 @@ class SchedulerDisaggregationPrefillMixin:
             self.cur_batch = batch
 
             if batch:
+                self.disagg_prefill_bootstrap_queue.send_kv_done.wait()
                 result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), result))
 
