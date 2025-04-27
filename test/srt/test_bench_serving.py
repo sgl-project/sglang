@@ -98,7 +98,7 @@ class TestBenchServing(CustomTestCase):
                 f"### test_offline_throughput_with_triton_attention_backend\n"
                 f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
             )
-            self.assertGreater(res["output_throughput"], 3600)
+            self.assertGreater(res["output_throughput"], 3700)
 
     def test_offline_throughput_default_fp8(self):
         res = run_bench_serving(
@@ -113,7 +113,7 @@ class TestBenchServing(CustomTestCase):
                 f"### test_offline_throughput_default_fp8\n"
                 f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
             )
-            self.assertGreater(res["output_throughput"], 4200)
+            self.assertGreater(res["output_throughput"], 4300)
 
     def test_online_latency_default(self):
         res = run_bench_serving(
