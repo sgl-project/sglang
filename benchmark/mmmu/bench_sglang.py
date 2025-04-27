@@ -10,8 +10,8 @@ The eval output will be logged
 """
 
 import argparse
-import time
 import asyncio
+import time
 from typing import Any, Tuple
 
 import openai
@@ -24,6 +24,7 @@ from eval_utils import (
     process_result,
 )
 from tqdm import tqdm
+
 from sglang.test.test_utils import add_common_sglang_args_and_parse
 
 
@@ -32,6 +33,7 @@ def _get_prefix_suffix(prompt: str) -> Tuple[str, str]:
     prefix = prompt.split("<")[0]
     suffix = prompt.split(">", 1)[1]
     return prefix, suffix
+
 
 async def process_sample(
     client: Any, sample: dict, sampling_params: dict
@@ -60,12 +62,14 @@ async def process_sample(
     )
     return sample, response.choices[0].message.content
 
+
 async def process_sample_with_semaphore(
     semaphore: asyncio.Semaphore, client: Any, sample: dict, sampling_params: dict
 ) -> Tuple[dict, str]:
     """Wrap process_sample with a semaphore for concurrency control."""
     async with semaphore:
         return await process_sample(client, sample, sampling_params)
+
 
 async def eval_mmmu(args) -> None:
     """Main evaluation loop with concurrency control."""
@@ -74,7 +78,9 @@ async def eval_mmmu(args) -> None:
     samples = prepare_samples(eval_args)
     answer_dict = {}
     out_samples = {}
-    client = openai.AsyncOpenAI(api_key="sk", base_url=f"http://127.0.0.1:{args.port}/v1")
+    client = openai.AsyncOpenAI(
+        api_key="sk", base_url=f"http://127.0.0.1:{args.port}/v1"
+    )
     semaphore = asyncio.Semaphore(args.concurrency)
     start = time.time()
     tasks = [
@@ -89,10 +95,13 @@ async def eval_mmmu(args) -> None:
     save_json(args.output_path, out_samples)
     eval_result(model_answer_path=args.output_path, answer_dict=answer_dict)
 
+
 def parse_args():
     parser = argparse.ArgumentParser()
     EvalArgs.add_cli_args(parser)
-    parser.add_argument("--concurrency", type=int, default=1, help="Max concurrent OpenAI calls")
+    parser.add_argument(
+        "--concurrency", type=int, default=1, help="Max concurrent OpenAI calls"
+    )
     args = add_common_sglang_args_and_parse(parser)
     return args
 
@@ -100,6 +109,7 @@ def parse_args():
 def main():
     args = parse_args()
     asyncio.run(eval_mmmu(args))
+
 
 if __name__ == "__main__":
     main()
