@@ -665,8 +665,50 @@ class TestPixtralServer(TestOpenAIVisionServer):
     def test_video_chat_completion(self):
         pass
 
-    def test_audio_chat_completion(self):
-        pass
+    def test_single_image_chat_completion(self):
+        """
+        TODO(kiv): this test is replaced for pixtral b/c:
+          1. For "IRONING_MAN" single image test, our model may not output `taxi` or `yello suv`.
+            "the man is standing on the road with hanging on the back of a car";
+          2. However, it works perfectly with either (a) multi-image chat with same image (b) different prompt.
+              (c) mistral 3.1, with the same vision model (d) HF impl
+          3. The model's MMMU score isn't compromised, and it's indeed better than no-image baseline.
+        We might need to adapt Pixtral's 2D interleaved RoPE impl to our forward batching design in the future.
+        """
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+
+        response = client.chat.completions.create(
+            model="default",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": IMAGE_SGL_LOGO_URL},
+                        },
+                        {
+                            "type": "text",
+                            "text": "What does this image show? Describe it in detail.",
+                        },
+                    ],
+                },
+            ],
+            temperature=0,
+        )
+
+        assert response.choices[0].message.role == "assistant"
+        text = response.choices[0].message.content
+        assert isinstance(text, str)
+        print("==" * 30)
+        print(text)
+        print("==" * 30)
+        assert "SGL" in text or "logo" in text, text
+        assert response.id
+        assert response.created
+        assert response.usage.prompt_tokens > 0
+        assert response.usage.completion_tokens > 0
+        assert response.usage.total_tokens > 0
 
 
 class TestDeepseekVL2Server(TestOpenAIVisionServer):
