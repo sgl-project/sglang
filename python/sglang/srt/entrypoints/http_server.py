@@ -281,7 +281,9 @@ async def generate_from_file_request(file: UploadFile, request: Request):
     )
 
     try:
-        ret = await _global_state.generate_request(obj, request).__anext__()
+        ret = await _global_state.tokenizer_manager.generate_request(
+            obj, request
+        ).__anext__()
         return ret
     except ValueError as e:
         logger.error(f"Error: {e}")
