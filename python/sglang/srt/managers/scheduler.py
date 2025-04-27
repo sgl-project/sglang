@@ -2089,6 +2089,9 @@ class Scheduler(
         self.torch_profiler_output_dir = None
         self.profiler_activities = None
 
+        # TODO fix?
+        self.profiler_target_forward_ct = None
+
         return ProfileReqOutput(success=True, message="Succeeded")
 
     def expert_distribution_handle(self, recv_req: ExpertDistributionReq):
