@@ -239,6 +239,7 @@ class Qwen2Model(nn.Module):
         config: Qwen2Config,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        decoder_layer_type: type[nn.Module] = Qwen2DecoderLayer,
     ) -> None:
         super().__init__()
         self.config = config
@@ -250,9 +251,11 @@ class Qwen2Model(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("embed_tokens", prefix),
         )
+        # Use the provided decoder layer type or default to Qwen2DecoderLayer
+        decoder_layer_type = decoder_layer_type or Qwen2DecoderLayer
         self.layers = make_layers(
             config.num_hidden_layers,
-            lambda idx, prefix: Qwen2DecoderLayer(
+            lambda idx, prefix: decoder_layer_type(
                 layer_id=idx,
                 config=config,
                 quant_config=quant_config,
