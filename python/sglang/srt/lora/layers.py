@@ -136,7 +136,6 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         self.set_lora = True
         self.A_buffer_gate_up = A_buffer
         if self.lora_backend.fuse_stacked_lora_b:
-            # TODO: avoid using contiguous() in GPU.
             # B_buffer_gate_up: (num_lora, 2 * output_dim, r)
             if not hasattr(self, "B_buffer_gate_up") or self.B_buffer_gate_up is None:
                 self.B_buffer_gate_up = torch.empty(
@@ -147,7 +146,7 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
                     ),
                     dtype=B_buffer[0].dtype,
                     device=B_buffer[0].device,
-                ).contiguous()
+                )
             self.B_buffer_gate_up[:, : B_buffer[0].shape[1], :].copy_(B_buffer[0])
             self.B_buffer_gate_up[:, B_buffer[0].shape[1] :, :].copy_(B_buffer[1])
         else:
@@ -212,7 +211,7 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
                     ),
                     dtype=B_buffer_q[0].dtype,
                     device=B_buffer_q[0].device,
-                ).contiguous()
+                )
             self.B_buffer_qkv[:, :output_dim_q, :].copy_(B_buffer_q[0])
             self.B_buffer_qkv[:, output_dim_q : output_dim_q + output_dim_kv, :].copy_(
                 B_buffer_kv[0]

@@ -161,7 +161,10 @@ class LoRAManager:
         bs = forward_batch.batch_size
 
         if hasattr(self, "max_bs_in_cuda_graph") and bs <= self.max_bs_in_cuda_graph:
-            # Do in-place updates when CUDA graph is enabled
+            # Do in-place updates when CUDA graph is enabled. Note that
+            # if CUDA graph is enabled, the batch whose bs <= max_bs_in_cuda_graph
+            # will also use these preallocated buffers, no matter whether
+            # the batch can use CUDA graph or not.
             self.cuda_graph_batch_info.bs = bs
             if forward_batch.forward_mode.is_extend():
                 self.cuda_graph_batch_info.seg_lens[:bs].copy_(
@@ -169,7 +172,6 @@ class LoRAManager:
                 )
             else:
                 self.cuda_graph_batch_info.seg_lens[:bs].fill_(1)
-            self.cuda_graph_batch_info.seg_indptr[0] = 0
             torch.cumsum(
                 self.cuda_graph_batch_info.seg_lens[:bs],
                 dim=0,
