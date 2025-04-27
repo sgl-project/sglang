@@ -61,11 +61,7 @@ class KVClassType(Enum):
     BOOTSTRAP_SERVER = "bootstrap_server"
 
 
-def get_kv_class(
-    transfer_backend: TransferBackend,
-    class_type: KVClassType,
-    fake_transfer: bool = False,
-):
+def get_kv_class(transfer_backend: TransferBackend, class_type: KVClassType):
     from sglang.srt.disaggregation.fake import FakeKVReceiver, FakeKVSender
 
     if transfer_backend == TransferBackend.MOONCAKE:
@@ -78,10 +74,8 @@ def get_kv_class(
 
         class_mapping = {
             KVClassType.MANAGER: MooncakeKVManager,
-            KVClassType.SENDER: MooncakeKVSender if not fake_transfer else FakeKVSender,
-            KVClassType.RECEIVER: (
-                MooncakeKVReceiver if not fake_transfer else FakeKVReceiver
-            ),
+            KVClassType.SENDER: MooncakeKVSender,
+            KVClassType.RECEIVER: (MooncakeKVReceiver),
             KVClassType.BOOTSTRAP_SERVER: MooncakeKVBootstrapServer,
         }
         return class_mapping.get(class_type)
@@ -95,13 +89,20 @@ def get_kv_class(
 
         class_mapping = {
             KVClassType.MANAGER: NixlKVManager,
-            KVClassType.SENDER: NixlKVSender if not fake_transfer else FakeKVSender,
-            KVClassType.RECEIVER: (
-                NixlKVReceiver if not fake_transfer else FakeKVReceiver
-            ),
+            KVClassType.SENDER: NixlKVSender,
+            KVClassType.RECEIVER: (NixlKVReceiver),
             KVClassType.BOOTSTRAP_SERVER: NixlKVBootstrapServer,
         }
         return class_mapping.get(class_type)
+    if transfer_backend == TransferBackend.FAKE:
+        from sglang.srt.disaggregation.fake import FakeKVReceiver, FakeKVSender
+
+        class_mapping = {
+            KVClassType.SENDER: FakeKVSender,
+            KVClassType.RECEIVER: (FakeKVReceiver),
+        }
+        return class_mapping.get(class_type)
+
     raise ValueError(f"Unsupported transfer backend: {transfer_backend}")
 
 

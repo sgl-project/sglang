@@ -815,7 +815,7 @@ def _wait_and_warmup(
                 timeout=600,
             )
             assert res.status_code == 200, f"{res}"
-        elif server_args.disaggregation_mode == "prefill":
+        else:
             logger.info(f"Start of prefill warmup ...")
             json_data = {
                 "sampling_params": {
@@ -841,12 +841,7 @@ def _wait_and_warmup(
             logger.info(
                 f"End of prefill warmup with status {res.status_code}, resp: {res.json()}"
             )
-        else:
-            logger.info(
-                "Skipping warmup request in  mode {}".format(
-                    server_args.disaggregation_mode
-                )
-            )
+
     except Exception:
         last_traceback = get_exception_traceback()
         if pipe_finish_writer is not None:

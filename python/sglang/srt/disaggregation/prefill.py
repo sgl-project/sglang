@@ -118,9 +118,7 @@ class PrefillBootstrapQueue:
     def add(self, req: Req) -> None:
         if req.bootstrap_host == FakeBootstrapHost:
             # Fake transfer for warmup reqs
-            kv_sender_class = get_kv_class(
-                self.transfer_backend, KVClassType.SENDER, fake_transfer=True
-            )
+            kv_sender_class = get_kv_class(TransferBackend.FAKE, KVClassType.SENDER)
         else:
             kv_sender_class = get_kv_class(self.transfer_backend, KVClassType.SENDER)
         req.disagg_kv_sender = kv_sender_class(

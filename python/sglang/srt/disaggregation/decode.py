@@ -136,9 +136,7 @@ class DecodePreallocQueue:
         """Add a request to the pending queue."""
         if req.bootstrap_host == FakeBootstrapHost:
             # Fake transfer for warmup reqs
-            kv_receiver_class = get_kv_class(
-                self.transfer_backend, KVClassType.RECEIVER, fake_transfer=True
-            )
+            kv_receiver_class = get_kv_class(TransferBackend.FAKE, KVClassType.RECEIVER)
         else:
             kv_receiver_class = get_kv_class(
                 self.transfer_backend, KVClassType.RECEIVER
