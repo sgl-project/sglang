@@ -158,6 +158,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
     def dispatch_json(self, key_string: str) -> Optional[XGrammarGrammar]:
         try:
             if key_string == "$$ANY$$":
+                # Note: This builtin JSON grammar includes *all* valid JSON (including, for example, arrays at the root)
                 ctx = self.grammar_compiler.compile_builtin_json_grammar()
             else:
                 ctx = self.grammar_compiler.compile_json_schema(schema=key_string)

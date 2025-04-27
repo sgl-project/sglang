@@ -73,8 +73,15 @@ class ModelConfig:
         )
 
         if enable_multimodal is None:
-            if self.hf_config.architectures == "Llama4ForConditionalGeneration":
+            mm_disabled_models = [
+                "Gemma3ForConditionalGeneration",
+                "Llama4ForConditionalGeneration",
+            ]
+            if self.hf_config.architectures[0] in mm_disabled_models:
                 enable_multimodal = False
+                logger.info(
+                    f"Multimodal is disabled for {self.hf_config.model_type}. To enable it, set --enable-multimodal."
+                )
             else:
                 enable_multimodal = True
 
@@ -155,7 +162,9 @@ class ModelConfig:
             self.attention_arch = AttentionArch.MLA
             self.kv_lora_rank = self.hf_config.kv_lora_rank
             self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
-        elif "DeepseekVL2ForCausalLM" in self.hf_config.architectures:
+        elif "DeepseekVL2ForCausalLM" in self.hf_config.architectures and getattr(
+            self.hf_text_config, "use_mla", True
+        ):
             self.head_dim = 256
             self.attention_arch = AttentionArch.MLA
             self.kv_lora_rank = self.hf_text_config.kv_lora_rank

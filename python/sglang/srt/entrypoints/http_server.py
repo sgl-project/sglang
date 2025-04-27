@@ -25,11 +25,8 @@ import multiprocessing as multiprocessing
 import os
 import threading
 import time
-from ast import Mult
 from http import HTTPStatus
-from typing import AsyncIterator, Callable, Dict, Optional, Union
-
-from sglang.srt.model_executor.model_runner import LocalSerializedTensor
+from typing import AsyncIterator, Callable, Dict, Optional
 
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
@@ -84,10 +81,10 @@ from sglang.srt.openai_api.protocol import ModelCard, ModelList
 from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
-    MultiprocessingSerializer,
     add_api_key_middleware,
     add_prometheus_middleware,
     delete_directory,
+    get_bool_env_var,
     kill_process_tree,
     set_uvicorn_logging_configs,
 )
@@ -130,7 +127,10 @@ async def lifespan(fast_api_app: FastAPI):
 
 
 # Fast API
-app = FastAPI(lifespan=lifespan)
+app = FastAPI(
+    lifespan=lifespan,
+    openapi_url=None if get_bool_env_var("DISABLE_OPENAPI_DOC") else "/openapi.json",
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -281,7 +281,9 @@ async def generate_from_file_request(file: UploadFile, request: Request):
     )
 
     try:
-        ret = await _global_state.generate_request(obj, request).__anext__()
+        ret = await _global_state.tokenizer_manager.generate_request(
+            obj, request
+        ).__anext__()
         return ret
     except ValueError as e:
         logger.error(f"Error: {e}")
@@ -315,11 +317,11 @@ async def classify_request(obj: EmbeddingReqInput, request: Request):
 @app.api_route("/flush_cache", methods=["GET", "POST"])
 async def flush_cache():
     """Flush the radix cache."""
-    _global_state.tokenizer_manager.flush_cache()
+    ret = await _global_state.tokenizer_manager.flush_cache()
     return Response(
         content="Cache flushed.\nPlease check backend logs for more details. "
         "(When there are running or waiting requests, the operation will not be performed.)\n",
-        status_code=200,
+        status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
     )
 
 
