@@ -57,6 +57,7 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.distributed.parallel_state import destroy_distributed_environment
 from sglang.srt.entrypoints.engine import _set_envs_and_config
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
@@ -501,6 +502,9 @@ def latency_test(
         with open(bench_args.result_filename, "a") as fout:
             for result in result_list:
                 fout.write(json.dumps(result) + "\n")
+
+    if server_args.tp_size > 1:
+        destroy_distributed_environment()
 
 
 def main(server_args, bench_args):
