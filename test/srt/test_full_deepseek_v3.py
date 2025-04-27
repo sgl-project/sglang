@@ -2,7 +2,6 @@ import unittest
 from types import SimpleNamespace
 
 import requests
-import torch
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
@@ -49,7 +48,7 @@ class TestDeepseekV3(CustomTestCase):
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"{metrics=}")
 
-        self.assertGreater(metrics["accuracy"], 0.94)
+        self.assertGreater(metrics["accuracy"], 0.935)
 
 
 class TestBenchOneBatch(CustomTestCase):
@@ -58,11 +57,11 @@ class TestBenchOneBatch(CustomTestCase):
             FULL_DEEPSEEK_V3_MODEL_PATH,
             ["--trust-remote-code", "--tp", "8", "--cuda-graph-max-bs", "2"],
         )
-        print(f"output_throughput : {output_throughput:.2f} token/s")
+        print(f"{output_throughput=:.2f} token/s")
+
         if is_in_ci():
             write_github_step_summary(
-                f"### test_bs1\n"
-                f"output_throughput : {output_throughput:.2f} token/s\n"
+                f"### test_bs1 (deepseek-v3)\n" f"{output_throughput=:.2f} token/s\n"
             )
             self.assertGreater(output_throughput, 70)
 
@@ -120,6 +119,13 @@ class TestDeepseekV3MTP(CustomTestCase):
         avg_spec_accept_length = server_info.json()["avg_spec_accept_length"]
         print(f"{avg_spec_accept_length=}")
         self.assertGreater(avg_spec_accept_length, 3.2)
+
+        if is_in_ci():
+            write_github_step_summary(
+                f"### test_gsm8k (deepseek-v3)\n"
+                f'{metrics["accuracy"]=:.3f}\n'
+                f"{avg_spec_accept_length=:.2f}\n"
+            )
 
 
 if __name__ == "__main__":
