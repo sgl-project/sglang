@@ -861,6 +861,21 @@ def ep_scatter(
 
     grid = min(recv_topk.shape[0], 1024 * 8)
 
+    # print(
+    #     f"{torch.cuda.current_device()=} "
+    #     f"{recv_topk.shape=}, {recv_topk.stride()=}, {recv_topk.dtype=}, {recv_topk.device=} "
+    #     f"{recv_x_scale.shape=}, {recv_x_scale.stride()=}, {recv_x_scale.dtype=}, {recv_x_scale.device=} "
+    #     f"{recv_topk.shape=}, {recv_topk.stride()=}, {recv_topk.dtype=}, {recv_topk.device=} "
+    #     f"{num_recv_tokens_per_expert.shape=}, {num_recv_tokens_per_expert.stride()=}, {num_recv_tokens_per_expert.dtype=}, {num_recv_tokens_per_expert.device=} "
+    #     f"{expert_start_loc.shape=}, {expert_start_loc.stride()=}, {expert_start_loc.dtype=}, {expert_start_loc.device=} "
+    #     f"{output_tensor.shape=}, {output_tensor.stride()=}, {output_tensor.dtype=}, {output_tensor.device=} "
+    #     f"{output_tensor_scale.shape=}, {output_tensor_scale.stride()=}, {output_tensor_scale.dtype=}, {output_tensor_scale.device=} "
+    #     f"{m_indices.shape=}, {m_indices.stride()=}, {m_indices.dtype=}, {m_indices.device=} "
+    #     f"{output_index.shape=}, {output_index.stride()=}, {output_index.dtype=}, {output_index.device=} "
+    #     f"{recv_topk.min()=} {recv_topk.max()=} "
+    #     f"{expert_start_loc.tolist()=} "
+    # )
+
     _fwd_kernel_ep_scatter_2[(grid,)](
         recv_topk.shape[0],
         expert_start_loc,
