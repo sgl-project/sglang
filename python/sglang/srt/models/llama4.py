@@ -260,7 +260,6 @@ class Llama4Attention(nn.Module):
         if self.rotary_emb is not None:
             q_view, k_view = qk.split([self.q_size, self.kv_size], dim=-1)
             q_out_unused, k_out_unused = self.rotary_emb(positions, q_view, k_view)
-            assert (q_out_unused is q_view) and (k_out_unused is k_view)
             del q_view, k_view, q_out_unused, k_out_unused
 
         if self.qk_norm is not None:

@@ -34,6 +34,8 @@ from typing import List, Optional, Tuple, Union
 import numpy as np
 import psutil
 import torch
+import triton
+import triton.language as tl
 
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.utils import debug_timing, get_compiler_backend
@@ -405,6 +407,72 @@ def copy_two_array(loc, dst_1, src_1, dst_2, src_2, dtype, store_dtype):
     dst_2[loc] = src_2.to(dtype).view(store_dtype)
 
 
+@triton.jit
+def set_mla_kv_buffer_kernel(
+    kv_buffer_ptr,
+    cache_k_nope_ptr,
+    cache_k_rope_ptr,
+    loc_ptr,
+    buffer_stride: tl.constexpr,
+    nope_stride: tl.constexpr,
+    rope_stride: tl.constexpr,
+    nope_dim: tl.constexpr,
+    rope_dim: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    pid_loc = tl.program_id(0)
+    pid_blk = tl.program_id(1)
+
+    base = pid_blk * BLOCK
+    offs = base + tl.arange(0, BLOCK)
+    total_dim = nope_dim + rope_dim
+    mask = offs < total_dim
+
+    loc = tl.load(loc_ptr + pid_loc)
+    dst_ptr = kv_buffer_ptr + loc * buffer_stride + offs
+
+    if base + BLOCK <= nope_dim:
+        src = tl.load(
+            cache_k_nope_ptr + pid_loc * nope_stride + offs,
+            mask=mask,
+        )
+    else:
+        offs_rope = offs - nope_dim
+        src = tl.load(
+            cache_k_rope_ptr + pid_loc * rope_stride + offs_rope,
+            mask=mask,
+        )
+
+    tl.store(dst_ptr, src, mask=mask)
+
+
+def set_mla_kv_buffer_triton(
+    kv_buffer: torch.Tensor,
+    loc: torch.Tensor,
+    cache_k_nope: torch.Tensor,
+    cache_k_rope: torch.Tensor,
+):
+    nope_dim = cache_k_nope.shape[-1]
+    rope_dim = cache_k_rope.shape[-1]
+    total_dim = nope_dim + rope_dim
+    BLOCK = 128
+    n_loc = loc.numel()
+    grid = (n_loc, triton.cdiv(total_dim, BLOCK))
+
+    set_mla_kv_buffer_kernel[grid](
+        kv_buffer,
+        cache_k_nope,
+        cache_k_rope,
+        loc,
+        kv_buffer.stride(0),
+        cache_k_nope.stride(0),
+        cache_k_rope.stride(0),
+        nope_dim,
+        rope_dim,
+        BLOCK=BLOCK,
+    )
+
+
 class MLATokenToKVPool(KVCache):
     def __init__(
         self,
@@ -503,6 +571,25 @@ class MLATokenToKVPool(KVCache):
             self.kv_buffer[layer_id][loc] = cache_k.view(self.store_dtype)
         else:
             self.kv_buffer[layer_id][loc] = cache_k
+
+    def set_mla_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k_nope: torch.Tensor,
+        cache_k_rope: torch.Tensor,
+    ):
+        layer_id = layer.layer_id
+        if cache_k_nope.dtype != self.dtype:
+            cache_k_nope = cache_k_nope.to(self.dtype)
+            cache_k_rope = cache_k_rope.to(self.dtype)
+        if self.store_dtype != self.dtype:
+            cache_k_nope = cache_k_nope.view(self.store_dtype)
+            cache_k_rope = cache_k_rope.view(self.store_dtype)
+
+        set_mla_kv_buffer_triton(
+            self.kv_buffer[layer_id], loc, cache_k_nope, cache_k_rope
+        )
 
     def get_flat_data(self, indices):
         # prepare a large chunk of contiguous data for efficient transfer
