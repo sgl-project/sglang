@@ -1981,8 +1981,8 @@ class Scheduler(
                 recv_req.num_steps,
                 recv_req.activities,
                 # NOTE fix
-                recv_req.with_stack,
-                # False,
+                # recv_req.with_stack,
+                False,
                 recv_req.record_shapes,
                 recv_req.profile_id,
             )
@@ -2025,7 +2025,7 @@ class Scheduler(
         torchprof_activities = [
             activity_map[a] for a in activities if a in activity_map
         ]
-        print(f"hi {torchprof_activities=}")
+        print(f"hi {torchprof_activities=} {with_stack=} {record_shapes=}")
 
         if torchprof_activities:
             self.torch_profiler = torch.profiler.profile(
