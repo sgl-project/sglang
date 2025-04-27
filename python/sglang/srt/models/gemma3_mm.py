@@ -41,8 +41,8 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
-from sglang.srt.models.siglip import SiglipVisionModel
 from sglang.srt.models.gemma3_causal import Gemma3ForCausalLM
+from sglang.srt.models.siglip import SiglipVisionModel
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
@@ -165,7 +165,6 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
         self.config = config
         self.quant_config = quant_config
 
-        # SiglipVisionModel is not supported in sglang, use CLIPVisionModel instead
         self.vision_tower = SiglipVisionModel(
             config=config.vision_config,
             quant_config=quant_config,

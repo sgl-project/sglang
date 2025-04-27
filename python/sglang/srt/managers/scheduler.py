@@ -235,10 +235,6 @@ class Scheduler(
         # Init tokenizer
         self.init_tokenizer()
 
-        # set load_format to BNB when quantization is detected from HF config
-        if self.model_config.quantization == "bitsandbytes":
-            self.server_args.load_format = "bitsandbytes"
-
         # Set reasoning_parser and think_end_id if --reasoning_parser is enabled
         if self.server_args.reasoning_parser and self.tokenizer:
             reasoning_parser = ReasoningParser(

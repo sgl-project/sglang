@@ -34,13 +34,13 @@ VISION_MODELS = [
     ("unsloth/Llama-3.2-11B-Vision-Instruct-bnb-4bit", "llama_3_vision"),
     ("unsloth/Llama-3.2-11B-Vision-bnb-4bit", "llama_3_vision"),
     ("unsloth/gemma-3-4b-it-bnb-4bit", "gemma-it"),
-    ("unsloth/gemma-3-4b-it-unsloth-bnb-4bit", "gemma-it")
+    ("unsloth/gemma-3-4b-it-unsloth-bnb-4bit", "gemma-it"),
 ]
 LANGUAGE_MODELS = [
     "unsloth/Qwen2.5-7B-Instruct-bnb-4bit",
     "unsloth/Qwen2-7B-Instruct-bnb-4bit",
     "unsloth/Llama-3.2-3B-Instruct-bnb-4bit",
-    "unsloth/gemma-3-1b-it-bnb-4bit"
+    "unsloth/gemma-3-1b-it-bnb-4bit",
 ]
 
 # image

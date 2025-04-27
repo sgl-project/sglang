@@ -12,8 +12,9 @@ from sglang.srt.layers.activation import QuickGELU
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.utils import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from sglang.srt.utils import add_prefix
+
 
 # Adapted from transformers.models.siglip.modeling_siglip.SiglipVisionTransformer
 class SiglipVisionEmbeddings(nn.Module):
@@ -36,7 +37,8 @@ class SiglipVisionEmbeddings(nn.Module):
         self.num_patches = (self.image_size // self.patch_size) ** 2
         self.num_positions = self.num_patches
         self.position_embedding = VocabParallelEmbedding(
-            self.num_positions, self.embed_dim)
+            self.num_positions, self.embed_dim
+        )
         self.register_buffer(
             "position_ids",
             torch.arange(self.num_positions).expand((1, -1)),
@@ -50,10 +52,10 @@ class SiglipVisionEmbeddings(nn.Module):
         )  # shape = [*, width, grid, grid]
         embeddings = patch_embeds.flatten(2).transpose(1, 2)
         # interpolate_pos_encoding is never used in sglang
-        embeddings = embeddings + self.position_embedding(
-                self.position_ids)
+        embeddings = embeddings + self.position_embedding(self.position_ids)
 
         return embeddings
+
 
 # Copied from sglang.srt.models.clip.CLIPMLP
 class SiglipMLP(nn.Module):
@@ -160,6 +162,7 @@ class SiglipEncoderLayer(nn.Module):
         hidden_states = residual + hidden_states
         return hidden_states
 
+
 # Copied from sglang.srt.models.clip.CLIPEncoder
 class SiglipEncoder(nn.Module):
     """
@@ -215,6 +218,7 @@ class SiglipEncoder(nn.Module):
             return hidden_states_pool
         return hidden_states
 
+
 # Adapted from transformers.models.siglip.modeling_siglip.SiglipVisionTransformer
 class SiglipVisionTransformer(nn.Module):
 
@@ -267,6 +271,7 @@ class SiglipVisionTransformer(nn.Module):
         last_hidden_state = self.post_layernorm(last_hidden_state)
 
         return last_hidden_state
+
 
 # Copied from sglang.srt.models.clip.CLIPVisionModel
 class SiglipVisionModel(nn.Module):
