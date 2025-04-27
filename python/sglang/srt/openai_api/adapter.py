@@ -170,7 +170,7 @@ def guess_chat_template_name_from_model_path(model_path):
     chat_template_name = get_conv_template_by_model_path(model_path)
     if chat_template_name is not None:
         logger.info(
-            f"guess chat template name from model path, get chat template name: {chat_template_name}"
+            f"Infer the chat template name from the model path and obtain the result: {chat_template_name}."
         )
 
 
