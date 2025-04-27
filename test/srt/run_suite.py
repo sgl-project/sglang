@@ -93,6 +93,8 @@ suites = {
     ],
     "per-commit-8-gpu": [
         TestFile("test_local_attn.py", 250),
+        TestFile("test_deepep_intranode.py", 120),
+        TestFile("test_deepep_low_latency.py", 120),
     ],
     "nightly": [
         TestFile("test_nightly_gsm8k_eval.py"),
