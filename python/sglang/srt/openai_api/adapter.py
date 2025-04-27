@@ -1198,6 +1198,7 @@ def v1_chat_generate_request(
         bootstrap_host=all_requests[0].bootstrap_host,
         bootstrap_port=all_requests[0].bootstrap_port,
         bootstrap_room=all_requests[0].bootstrap_room,
+        bootstrap_port=all_requests[0].bootstrap_port,
     )
 
     return adapted_request, all_requests if len(all_requests) > 1 else all_requests[0]
