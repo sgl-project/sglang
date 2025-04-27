@@ -229,9 +229,9 @@ class TestMiniCPMVLogits(VisionLLMLogitsBase):
                 input_ids=input_ids,
                 input_embedding=model.get_input_embeddings(),
                 image_data_embedding_func=model.get_image_feature,
-                placeholder_token_ids=[
-                    self.processor.tokenizer.unk_token_id,
-                ],
+                placeholder_tokens={
+                    Modality.IMAGE: self.processor.tokenizer.unk_token_id,
+                },
             )
 
         self.compare_outputs(sglang_output, hf_output)
