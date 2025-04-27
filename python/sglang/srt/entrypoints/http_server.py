@@ -84,9 +84,9 @@ from sglang.srt.utils import (
     add_api_key_middleware,
     add_prometheus_middleware,
     delete_directory,
+    get_bool_env_var,
     kill_process_tree,
     set_uvicorn_logging_configs,
-    get_bool_env_var,
 )
 from sglang.srt.warmup import execute_warmups
 from sglang.utils import get_exception_traceback
