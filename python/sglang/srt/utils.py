@@ -432,7 +432,7 @@ def make_layers(
             pp_rank,
             pp_size,
         )
-        if pp_rank and pp_size
+        if pp_rank is not None and pp_size is not None
         else (0, num_hidden_layers)
     )
     modules = torch.nn.ModuleList(

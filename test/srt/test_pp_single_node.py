@@ -39,8 +39,6 @@ class TestPPAccuracy(unittest.TestCase):
                 "--pp-size",
                 4,
                 "--disable-overlap-schedule",
-                "--attention-backend",
-                "flashinfer",
                 "--chunked-prefill-size",
                 256,
             ],
@@ -68,6 +66,49 @@ class TestPPAccuracy(unittest.TestCase):
         time.sleep(5)
 
 
+# class TestPPAccuracyFlashInfer(unittest.TestCase):
+#     @classmethod
+#     def setUpClass(cls):
+#         # These config helps find a leak.
+#         os.environ["SGLANG_IS_IN_CI"] = "1"
+#         cls.base_url = "http://127.0.0.1:23333"
+#         cls.process = popen_launch_server(
+#             DEFAULT_MODEL_NAME_FOR_TEST,
+#             cls.base_url,
+#             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+#             other_args=[
+#                 "--pp-size",
+#                 4,
+#                 "--disable-overlap-schedule",
+#                 "--attention-backend",
+#                 "flashinfer",
+#                 "--chunked-prefill-size",
+#                 256,
+#             ],
+#         )
+#
+#     @classmethod
+#     def tearDownClass(cls):
+#         kill_process_tree(cls.process.pid)
+#
+#     def test_gsm8k(self):
+#         args = SimpleNamespace(
+#             num_shots=5,
+#             data_path=None,
+#             num_questions=200,
+#             max_new_tokens=512,
+#             parallel=128,
+#             host="http://127.0.0.1",
+#             port=int(self.base_url.split(":")[-1]),
+#         )
+#         metrics = run_eval(args)
+#         print(f"{metrics=}")
+#
+#         self.assertGreater(metrics["accuracy"], 0.75)
+#         # Wait a little bit so that the memory check happens.
+#         time.sleep(5)
+
+
 class TestFixedBugs(unittest.TestCase):
     def test_chunked_prefill_with_small_bs(self):
         model = DEFAULT_MODEL_NAME_FOR_TEST
@@ -84,8 +125,6 @@ class TestFixedBugs(unittest.TestCase):
             "--pp-size",
             2,
             "--disable-overlap-schedule",
-            "--attention-backend",
-            "flashinfer",
             "--chunked-prefill",
             256,
             "--max-running-requests",

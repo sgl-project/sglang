@@ -56,7 +56,6 @@ suites = {
         TestFile("test_openai_server.py", 149),
         TestFile("test_penalty.py", 41),
         TestFile("test_page_size.py", 60),
-        TestFile("test_pp_single_node.py", 150),
         TestFile("test_pytorch_sampling_backend.py", 66),
         TestFile("test_radix_attention.py", 167),
         TestFile("test_reasoning_content.py", 89),
@@ -97,6 +96,8 @@ suites = {
     "per-commit-8-gpu": [
         TestFile("test_local_attn.py", 250),
         TestFile("test_full_deepseek_v3.py", 250),
+        TestFile("test_fa3.py", 30),
+        TestFile("test_pp_single_node.py", 150),
     ],
     "nightly": [
         TestFile("test_nightly_gsm8k_eval.py"),
