@@ -49,6 +49,7 @@ class ServerArgs:
     tokenizer_path: Optional[str] = None
     tokenizer_mode: str = "auto"
     skip_tokenizer_init: bool = False
+    enable_tokenizer_batch_encode: bool = False
     load_format: str = "auto"
     trust_remote_code: bool = False
     dtype: str = "auto"
@@ -155,7 +156,6 @@ class ServerArgs:
     enable_nccl_nvls: bool = False
     disable_outlines_disk_cache: bool = False
     disable_custom_all_reduce: bool = False
-    disable_mla: bool = False
     enable_llama4_multimodal: Optional[bool] = None
     disable_overlap_schedule: bool = False
     enable_mixed_chunk: bool = False
@@ -180,12 +180,12 @@ class ServerArgs:
     tool_call_parser: Optional[str] = None
     enable_hierarchical_cache: bool = False
     hicache_ratio: float = 2.0
-    enable_flashinfer_mla: bool = False  # TODO: remove this argument
-    enable_flashmla: bool = False
+    hicache_size: int = 0
+    hicache_write_policy: str = "write_through_selective"
     flashinfer_mla_disable_ragged: bool = False
     warmups: Optional[str] = None
+    moe_dense_tp_size: Optional[int] = None
     n_share_experts_fusion: int = 0
-    disable_shared_experts_fusion: bool = False
     disable_chunked_prefix_cache: bool = False
     disable_fast_image_processor: bool = False
 
@@ -198,6 +198,7 @@ class ServerArgs:
     disaggregation_mode: str = "null"
     disaggregation_bootstrap_port: int = 8998
     disaggregation_transfer_backend: str = "mooncake"
+    disaggregation_ib_device: Optional[str] = None
 
     def __post_init__(self):
         # Expert parallelism
@@ -230,9 +231,6 @@ class ServerArgs:
             # GPU memory is not known yet or no GPU is available.
             gpu_mem = None
 
-        if is_hip():
-            self.disable_shared_experts_fusion = True
-
         # Set mem fraction static, which depends on the tensor parallelism size
         if self.mem_fraction_static is None:
             if self.tp_size >= 16:
@@ -255,7 +253,12 @@ class ServerArgs:
 
         assert self.chunked_prefill_size % self.page_size == 0
 
-        if self.enable_flashmla is True:
+        assert self.moe_dense_tp_size in {
+            1,
+            None,
+        }, f"moe_dense_tp_size only support 1 and None currently"
+
+        if self.attention_backend == "flashmla":
             logger.warning(
                 "FlashMLA only supports a page_size of 64, change page_size to 64."
             )
@@ -290,13 +293,6 @@ class ServerArgs:
         # Choose grammar backend
         if self.grammar_backend is None:
             self.grammar_backend = "xgrammar"
-
-        # Expert parallelism
-        if self.enable_ep_moe:
-            self.ep_size = self.tp_size
-            logger.info(
-                f"EP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
-            )
 
         self.enable_multimodal: Optional[bool] = self.enable_llama4_multimodal
 
@@ -358,7 +354,18 @@ class ServerArgs:
 
             if self.page_size > 1 and self.speculative_eagle_topk > 1:
                 self.speculative_eagle_topk = 1
-                logger.info("speculative_eagle_topk is changed to 1 when page_size > 1")
+                logger.info(
+                    "speculative_eagle_topk is adjusted to 1 when page_size > 1"
+                )
+
+            if (
+                self.speculative_eagle_topk == 1
+                and self.speculative_num_draft_tokens != self.speculative_num_steps + 1
+            ):
+                logger.info(
+                    "speculative_num_draft_tokens is adjusted to speculative_num_steps + 1 when speculative_eagle_topk == 1"
+                )
+                self.speculative_num_draft_tokens = self.speculative_num_steps + 1
 
             # The token generated from the verify step is counted.
             # If sepculative_num_steps >= speculative_num_draft_tokens, the additional tokens will definitely be discarded.
@@ -391,6 +398,10 @@ class ServerArgs:
 
         os.environ["SGLANG_ENABLE_TORCH_COMPILE"] = (
             "1" if self.enable_torch_compile else "0"
+        )
+        # Set env var before grammar backends init
+        os.environ["SGLANG_DISABLE_OUTLINES_DISK_CACHE"] = (
+            "1" if self.disable_outlines_disk_cache else "0"
         )
 
     @staticmethod
@@ -427,6 +438,11 @@ class ServerArgs:
             "--skip-tokenizer-init",
             action="store_true",
             help="If set, skip init tokenizer and pass input_ids in generate request",
+        )
+        parser.add_argument(
+            "--enable-tokenizer-batch-encode",
+            action="store_true",
+            help="Enable batch tokenization for improved performance when processing multiple text inputs. Do not use with image inputs, pre-tokenized input_ids, or input_embeds.",
         )
         parser.add_argument(
             "--load-format",
@@ -824,7 +840,7 @@ class ServerArgs:
         parser.add_argument(
             "--attention-backend",
             type=str,
-            choices=["flashinfer", "triton", "torch_native", "fa3"],
+            choices=["flashinfer", "triton", "torch_native", "fa3", "flashmla"],
             default=ServerArgs.attention_backend,
             help="Choose the kernels for attention layers.",
         )
@@ -844,13 +860,13 @@ class ServerArgs:
         )
         parser.add_argument(
             "--enable-flashinfer-mla",
-            action="store_true",
-            help="Enable FlashInfer MLA optimization. This argument will be deprecated soon! Please use '--attention-backend flashinfer' instead for switching on flashfiner mla!",
+            action=DeprecatedAction,
+            help="--enable-flashinfer-mla is deprecated. Please use '--attention-backend flashinfer' instead.",
         )
         parser.add_argument(
             "--enable-flashmla",
-            action="store_true",
-            help="Enable FlashMLA decode optimization",
+            action=DeprecatedAction,
+            help="--enable-flashmla is deprecated. Please use '--attention-backend flashmla' instead.",
         )
         parser.add_argument(
             "--flashinfer-mla-disable-ragged",
@@ -976,11 +992,6 @@ class ServerArgs:
             help="Disable the custom all-reduce kernel and fall back to NCCL.",
         )
         parser.add_argument(
-            "--disable-mla",
-            action="store_true",
-            help="Disable Multi-head Latent Attention (MLA) for DeepSeek V2/V3/R1 series models.",
-        )
-        parser.add_argument(
             "--enable-llama4-multimodal",
             default=ServerArgs.enable_llama4_multimodal,
             action="store_true",
@@ -1088,7 +1099,7 @@ class ServerArgs:
         parser.add_argument(
             "--tool-call-parser",
             type=str,
-            choices=["qwen25", "mistral", "llama3"],
+            choices=["qwen25", "mistral", "llama3", "deepseekv3"],
             default=ServerArgs.tool_call_parser,
             help="Specify the parser for handling tool-call interactions. Options include: 'qwen25', 'mistral', and 'llama3'.",
         )
@@ -1100,14 +1111,32 @@ class ServerArgs:
         parser.add_argument(
             "--hicache-ratio",
             type=float,
-            required=False,
             default=ServerArgs.hicache_ratio,
             help="The ratio of the size of host KV cache memory pool to the size of device pool.",
+        )
+        parser.add_argument(
+            "--hicache-size",
+            type=int,
+            default=ServerArgs.hicache_size,
+            help="The size of host KV cache memory pool in gigabytes, which will override the hicache_ratio if set.",
+        )
+        parser.add_argument(
+            "--hicache-write-policy",
+            type=str,
+            choices=["write_back", "write_through", "write_through_selective"],
+            default=ServerArgs.hicache_write_policy,
+            help="The write policy of hierarchical cache.",
         )
         parser.add_argument(
             "--enable-deepep-moe",
             action="store_true",
             help="Enabling DeepEP MoE implementation for EP MoE.",
+        )
+        parser.add_argument(
+            "--moe-dense-tp-size",
+            type=int,
+            default=ServerArgs.moe_dense_tp_size,
+            help="TP size for MoE dense MLP layers. This flag is useful when, with large TP size, there are errors caused by weights in MLP layers having dimension smaller than the min dimension GEMM supports.",
         )
         parser.add_argument(
             "--deepep-mode",
@@ -1121,13 +1150,8 @@ class ServerArgs:
             "--n-share-experts-fusion",
             type=int,
             default=0,
-            help="The number of shared_experts need to be replica to fuse with normal experts in deepseek v3/r1 "
-            "we use tp_size by default.",
-        )
-        parser.add_argument(
-            "--disable-shared-experts-fusion",
-            action="store_true",
-            help="Disable shared experts fusion by setting n_share_experts_fusion to 0.",
+            help="The number of shared_experts need to be replicated to fuse with normal experts in deepseek v3/r1, "
+            "set it to tp_size can get best optimized performace.",
         )
         parser.add_argument(
             "--disable-chunked-prefix-cache",
@@ -1188,6 +1212,12 @@ class ServerArgs:
             type=str,
             default=ServerArgs.disaggregation_transfer_backend,
             help="The backend for disaggregation transfer. Default is mooncake.",
+        )
+        parser.add_argument(
+            "--disaggregation-ib-device",
+            type=str,
+            default=ServerArgs.disaggregation_ib_device,
+            help="The ib device for disaggregation transfer. Default is None, it will be detected automatically if using the mooncake backend.",
         )
 
     @classmethod
