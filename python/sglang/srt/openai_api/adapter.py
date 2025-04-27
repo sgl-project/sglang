@@ -168,9 +168,10 @@ def load_chat_template_for_openai_api(tokenizer_manager, chat_template_arg, mode
 def guess_chat_template_name_from_model_path(model_path):
     global chat_template_name
     chat_template_name = get_conv_template_by_model_path(model_path)
-    logger.info(
-        f"guess chat template name from model path, get chat template name: {chat_template_name}"
-    )
+    if chat_template_name is not None:
+        logger.info(
+            f"guess chat template name from model path, get chat template name: {chat_template_name}"
+        )
 
 
 async def v1_files_create(
