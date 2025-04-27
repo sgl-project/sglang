@@ -1131,7 +1131,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.req_pool_indices = req_pool_indices_tensor
         self.seq_lens = seq_lens_tensor
         self.out_cache_loc = out_cache_loc
-        self.out_cache_loc_local = out_cache_loc_local
+        if self.token_to_kv_pool_allocator_local is not None:
+            self.out_cache_loc_local = out_cache_loc_local
         self.input_embeds = (
             torch.tensor(input_embeds).to(self.device, non_blocking=True)
             if input_embeds

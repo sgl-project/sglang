@@ -895,7 +895,7 @@ class ModelRunner:
                     device=self.device,
                     kvcache=self.token_to_kv_pool,
                 )
-                if self.hybrid_ratio > 0:
+                if self.hybrid_ratio is not None and self.hybrid_ratio > 0:
                     self.token_to_kv_pool_allocator_local = TokenToKVPoolAllocator(
                     self.local_max_num_tokens,
                     dtype=self.kv_cache_dtype,

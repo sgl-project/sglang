@@ -431,7 +431,7 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
                     forward_batch.req_pool_indices, : metadata.max_seq_len_k
                 ]
-                if self.hybrid_ratio > 0:
+                if self.hybrid_ratio is not None and self.hybrid_ratio > 0:
                     metadata.page_table_local = forward_batch.req_to_token_pool.req_to_token_local[
                         forward_batch.req_pool_indices, : metadata.max_seq_len_k
                     ]
@@ -570,7 +570,7 @@ class FlashAttentionBackend(AttentionBackend):
             metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
                 forward_batch.req_pool_indices, : metadata.max_seq_len_k
             ]
-            if self.hybrid_ratio > 0:
+            if self.hybrid_ratio is not None and self.hybrid_ratio > 0:
                 metadata.page_table_local = forward_batch.req_to_token_pool.req_to_token_local[
                 forward_batch.req_pool_indices, : metadata.max_seq_len_k
             ]
