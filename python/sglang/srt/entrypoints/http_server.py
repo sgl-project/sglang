@@ -25,11 +25,8 @@ import multiprocessing as multiprocessing
 import os
 import threading
 import time
-from ast import Mult
 from http import HTTPStatus
-from typing import AsyncIterator, Callable, Dict, Optional, Union
-
-from sglang.srt.model_executor.model_runner import LocalSerializedTensor
+from typing import AsyncIterator, Callable, Dict, Optional
 
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
@@ -84,7 +81,6 @@ from sglang.srt.openai_api.protocol import ModelCard, ModelList
 from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
-    MultiprocessingSerializer,
     add_api_key_middleware,
     add_prometheus_middleware,
     delete_directory,
