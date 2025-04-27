@@ -248,6 +248,7 @@ jobs:
       - name: Install dependencies
         run: |
           bash scripts/ci_install_dependency.sh
+
       - name: Run DeepSeek-V3 test
         timeout-minutes: 40
         run: |
