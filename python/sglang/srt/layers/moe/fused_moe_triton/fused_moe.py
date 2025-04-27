@@ -13,6 +13,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.moe.topk import select_experts
+from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.utils import (
     direct_register_custom_op,
     get_bool_env_var,
@@ -22,26 +23,23 @@ from sglang.srt.utils import (
 )
 
 _is_hip = is_hip()
-
-
-logger = logging.getLogger(__name__)
-padding_size = 128 if bool(int(os.getenv("MOE_PADDING", "0"))) else 0
-
-enable_moe_align_block_size_triton = bool(
-    int(os.getenv("ENABLE_MOE_ALIGN_BLOCK_SIZE_TRITON", "0"))
-)
-
 _is_cuda = is_cuda()
 
 if _is_cuda:
     from sgl_kernel import gelu_and_mul, silu_and_mul
-
-    from sglang.srt.custom_op import scaled_fp8_quant as sgl_scaled_fp8_quant
 else:
     from vllm import _custom_ops as vllm_ops
+    from vllm._custom_ops import scaled_fp8_quant
 
 if _is_cuda or _is_hip:
     from sgl_kernel import moe_align_block_size as sgl_moe_align_block_size
+
+
+logger = logging.getLogger(__name__)
+padding_size = 128 if bool(int(os.getenv("MOE_PADDING", "0"))) else 0
+enable_moe_align_block_size_triton = bool(
+    int(os.getenv("ENABLE_MOE_ALIGN_BLOCK_SIZE_TRITON", "0"))
+)
 
 
 @triton.jit
@@ -770,14 +768,9 @@ def invoke_fused_moe_kernel(
             # activation tensor-wise fp8 quantization, dynamic or static
             padded_size = padding_size
             # activations apply per-token quantization when weights apply per-channel quantization by default
-            if _is_cuda:
-                A, A_scale = sgl_scaled_fp8_quant(
-                    A, A_scale, use_per_token_if_dynamic=per_channel_quant
-                )
-            else:
-                A, A_scale = vllm_ops.scaled_fp8_quant(
-                    A, A_scale, use_per_token_if_dynamic=per_channel_quant
-                )
+            A, A_scale = scaled_fp8_quant(
+                A, A_scale, use_per_token_if_dynamic=per_channel_quant
+            )
         else:
             # activation block-wise fp8 quantization
             assert len(block_shape) == 2
@@ -947,7 +940,10 @@ def get_moe_configs(
     )
     if os.path.exists(config_file_path):
         with open(config_file_path) as f:
-            logger.info("Using configuration from %s for MoE layer.", config_file_path)
+            logger.info(
+                "Using configuration from %s for MoE layer. Please note that due to the large number of configs under fused_moe_triton/configs potentially not being tuned with the corresponding Triton version in your current environment, using the current configs may result in performance degradation. To achieve best performance, you can consider re-tuning the Triton fused MOE kernel in your current environment. For the tuning method, please refer to: https://github.com/sgl-project/sglang/blob/main/benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton.py. ",
+                config_file_path,
+            )
             # If a configuration has been found, return it
             return {int(key): val for key, val in json.load(f).items()}
 
@@ -1554,6 +1550,7 @@ def fused_moe(
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
     no_combine: bool = False,
+    routed_scaling_factor: Optional[float] = None,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -1608,6 +1605,7 @@ def fused_moe(
         topk_group=topk_group,
         num_expert_group=num_expert_group,
         custom_routing_function=custom_routing_function,
+        routed_scaling_factor=routed_scaling_factor,
     )
 
     return fused_experts(

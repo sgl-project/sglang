@@ -15,6 +15,8 @@ from sgl_kernel.attention import (
     cutlass_mla_decode,
     cutlass_mla_get_workspace_size,
     lightning_attention_decode,
+    merge_state,
+    merge_state_v2,
 )
 from sgl_kernel.elementwise import (
     apply_rope_with_cos_sin_cache_inplace,
@@ -39,7 +41,13 @@ from sgl_kernel.gemm import (
     sgl_per_token_group_quant_int8,
     sgl_per_token_quant_fp8,
 )
-from sgl_kernel.moe import moe_align_block_size, moe_fused_gate, topk_softmax
+from sgl_kernel.grammar import apply_token_bitmask_inplace_cuda
+from sgl_kernel.moe import (
+    fp8_blockwise_scaled_grouped_mm,
+    moe_align_block_size,
+    moe_fused_gate,
+    topk_softmax,
+)
 from sgl_kernel.sampling import (
     min_p_sampling_from_probs,
     top_k_renorm_prob,
