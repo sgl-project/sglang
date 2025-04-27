@@ -91,7 +91,7 @@ suites = {
         TestFile("test_verl_engine.py", 100),
     ],
     "per-commit-8-gpu": [
-        TestFile("test_fa3.py", 30),
+        TestFile("test_fa3.py", 600),
     ],
     "nightly": [
         TestFile("test_nightly_gsm8k_eval.py"),
