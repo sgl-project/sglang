@@ -518,7 +518,7 @@ def run_unittest_files(files: List[TestFile], timeout_per_file: float):
 
             filename = os.path.join(os.getcwd(), filename)
             print(
-                f".\n.\nBegin ({i}/{len(files)}):\npython3 {filename}\n.\n.\n",
+                f".\n.\nBegin ({i}/{len(files) - 1}):\npython3 {filename}\n.\n.\n",
                 flush=True,
             )
             tic = time.time()
@@ -530,7 +530,7 @@ def run_unittest_files(files: List[TestFile], timeout_per_file: float):
             elapsed = time.time() - tic
 
             print(
-                f".\n.\nEnd ({i}/{len(files)}):\n{filename=}, {elapsed=:.0f}, {estimated_time=}\n.\n.\n",
+                f".\n.\nEnd ({i}/{len(files) - 1}):\n{filename=}, {elapsed=:.0f}, {estimated_time=}\n.\n.\n",
                 flush=True,
             )
             return process.returncode
