@@ -41,7 +41,7 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
-from sglang.srt.models.clip import CLIPVisionModel
+from sglang.srt.models.siglip import SiglipVisionModel
 from sglang.srt.models.gemma3_causal import Gemma3ForCausalLM
 from sglang.srt.utils import add_prefix
 
@@ -166,26 +166,11 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
         self.quant_config = quant_config
 
         # SiglipVisionModel is not supported in sglang, use CLIPVisionModel instead
-        self.vision_tower = CLIPVisionModel(
+        self.vision_tower = SiglipVisionModel(
             config=config.vision_config,
             quant_config=quant_config,
             prefix=add_prefix("vision_tower", prefix),
         )
-
-        # monkey patch to update the position embedding for the vision tower
-        def monkey_patch_for_vision_tower():
-            embeddings = self.vision_tower.vision_model.embeddings
-            embeddings.num_positions = embeddings.num_patches
-            embeddings.position_embedding = nn.Embedding(
-                embeddings.num_positions, embeddings.embed_dim
-            )
-            embeddings.register_buffer(
-                "position_ids",
-                torch.arange(embeddings.num_positions).expand((1, -1)),
-                persistent=False,
-            )
-
-        monkey_patch_for_vision_tower()
 
         self.multi_modal_projector = Gemma3MultiModalProjector(config)
         self.vocab_size = config.text_config.vocab_size
