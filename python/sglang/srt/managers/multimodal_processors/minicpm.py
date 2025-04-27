@@ -51,9 +51,10 @@ class MiniCPMMultimodalProcessor(BaseMultimodalProcessor):
     async def process_mm_data_async(
         self,
         image_data: List[Union[str, bytes]],
-        input_ids,
+        input_text,
         request_obj,
         max_req_input_len,
+        **kwargs,
     ):
         audio_data = request_obj.audio_data
         if not image_data and not audio_data:
@@ -64,7 +65,7 @@ class MiniCPMMultimodalProcessor(BaseMultimodalProcessor):
             audio_data = [audio_data]
 
         base_output = self.load_mm_data(
-            prompt=input_ids,
+            prompt=input_text,
             max_req_input_len=max_req_input_len,
             audio_data=audio_data,
             image_data=image_data,
@@ -96,7 +97,7 @@ class MiniCPMMultimodalProcessor(BaseMultimodalProcessor):
             audio_start_id = tokenizer.audio_start_id
             audio_end_id = tokenizer.audio_end_id
 
-        im_token_id = tokenizer.unk_token_id
+        im_token_id = tokenizer.unk_id
         pixel_values = res["pixel_values"]
         tgt_sizes = res["tgt_sizes"]
 
