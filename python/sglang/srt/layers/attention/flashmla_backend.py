@@ -367,19 +367,40 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
 
         reshape_q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
 
-        o, _ = flash_mla_with_kvcache(
-            q=reshape_q,
-            k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
-            block_table=self.forward_metadata.block_kv_indices,
-            cache_seqlens=forward_batch.seq_lens.to(torch.int32),
-            head_dim_v=self.kv_lora_rank,  # TODO Retrieve from config.
-            tile_scheduler_metadata=self.forward_metadata.flashmla_metadata,
-            num_splits=self.forward_metadata.num_splits,
-            softmax_scale=layer.scaling,
-            causal=True,
-        )
+        if self.data_type == torch.float8_e4m3fn:
+            reshape_q_fp8 = reshape_q.to(torch.float8_e4m3fn)
 
-        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+            o, _ = flash_mla_with_kvcache(
+                q=reshape_q_fp8,
+                k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
+                block_table=self.forward_metadata.block_kv_indices,
+                cache_seqlens=forward_batch.seq_lens.to(torch.int32),
+                head_dim_v=self.kv_lora_rank,  # TODO Retrieve from config.
+                tile_scheduler_metadata=self.forward_metadata.flashmla_metadata,
+                num_splits=self.forward_metadata.num_splits,
+                softmax_scale=layer.scaling,
+                causal=True,
+                descale_q=torch.ones((1), dtype=torch.float32, device=reshape_q.device),
+                descale_k=torch.ones((1), dtype=torch.float32, device=reshape_q.device)
+            )
+
+            return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+        else:
+            #todo: need check all ausal True or False?
+            o, _ = flash_mla_with_kvcache(
+                q=reshape_q,
+                k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
+                block_table=self.forward_metadata.block_kv_indices,
+                cache_seqlens=forward_batch.seq_lens.to(torch.int32),
+                head_dim_v=self.kv_lora_rank,  # TODO Retrieve from config.
+                tile_scheduler_metadata=self.forward_metadata.flashmla_metadata,
+                num_splits=self.forward_metadata.num_splits,
+                softmax_scale=layer.scaling,
+                causal=True,
+            )
+
+            return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
 
     def forward_extend(
         self,
