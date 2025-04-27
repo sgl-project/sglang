@@ -1050,6 +1050,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Copy prefix and do some basic check
         input_embeds = []
         extend_input_logprob_token_ids = []
+        multimodal_inputs = []
 
         for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
             req.req_pool_idx = req_pool_indices[i]
@@ -1064,6 +1065,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if req.input_embeds is not None:
                 # If req.input_embeds is already a list, append its content directly
                 input_embeds.extend(req.input_embeds)  # Use extend to avoid nesting
+
+            if req.multimodal_inputs is not None:
+                multimodal_inputs.append(req.multimodal_inputs)
 
             req.cached_tokens += pre_len - req.already_computed
             req.already_computed = seq_len
@@ -1147,6 +1151,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if input_embeds
             else None
         )
+        if multimodal_inputs:
+            for mm_input in multimodal_inputs:
+                for mm_item in mm_input.mm_items:
+                    if (
+                        hasattr(mm_item, "pixel_values")
+                        and mm_item.pixel_values is not None
+                    ):
+                        mm_item.pixel_values = mm_item.pixel_values.to(
+                            self.device, non_blocking=True
+                        )
+            self.multimodal_inputs = multimodal_inputs
+        else:
+            self.multimodal_inputs = None
         self.seq_lens_sum = sum(seq_lens)
 
         if self.return_logprob:
@@ -1558,7 +1575,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             extend_seq_lens=extend_seq_lens,
             extend_prefix_lens=extend_prefix_lens,
             extend_logprob_start_lens=extend_logprob_start_lens,
-            multimodal_inputs=[r.multimodal_inputs for r in self.reqs],
+            multimodal_inputs=self.multimodal_inputs,
             encoder_cached=self.encoder_cached,
             encoder_lens=self.encoder_lens,
             encoder_lens_cpu=self.encoder_lens_cpu,
