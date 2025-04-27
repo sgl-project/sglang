@@ -22,6 +22,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
 
+from sglang.srt.mm_utils import has_valid_data
+
 # handle serialization of Image for pydantic
 if TYPE_CHECKING:
     from PIL.Image import Image
@@ -101,12 +103,6 @@ class GenerateReqInput:
     bootstrap_room: Optional[Union[List[int], int]] = None
 
     def contains_mm_input(self) -> bool:
-        def has_valid_data(data) -> bool:
-            if data is None:
-                return False
-            if isinstance(data, list):
-                return any(has_valid_data(item) for item in flatten_nested_list(data))
-            return True
 
         return has_valid_data(self.image_data) or has_valid_data(self.audio_data)
 
@@ -494,13 +490,6 @@ class EmbeddingReqInput:
     modalities: Optional[List[str]] = None
 
     def contains_mm_input(self) -> bool:
-        def has_valid_data(data) -> bool:
-            if data is None:
-                return False
-            if isinstance(data, list):
-                return any(has_valid_data(item) for item in flatten_nested_list(data))
-            return True
-
         return has_valid_data(self.image_data)
 
     def normalize_batch_and_arguments(self):

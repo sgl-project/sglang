@@ -91,6 +91,7 @@ def get_hf_text_config(config: PretrainedConfig):
     if hasattr(config, "language_config"):
         return config.language_config
     if hasattr(config, "thinker_config"):
+        # qwen2.5 omni
         thinker_config = config.thinker_config
         if hasattr(thinker_config, "text_config"):
             setattr(
