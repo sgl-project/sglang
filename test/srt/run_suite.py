@@ -20,9 +20,11 @@ suites = {
         TestFile("models/test_generation_models.py", 103),
         TestFile("models/test_grok_models.py", 60),
         TestFile("models/test_qwen_models.py", 82),
+        TestFile("models/test_compressed_tensors_models.py", 100),
         TestFile("models/test_reward_models.py", 83),
         TestFile("models/test_gme_qwen_models.py", 45),
         TestFile("models/test_clip_models.py", 100),
+        TestFile("models/test_vlm_models.py", 100),
         TestFile("test_abort.py", 51),
         TestFile("test_block_int8.py", 22),
         TestFile("test_chunked_prefill.py", 336),
@@ -43,7 +45,7 @@ suites = {
         TestFile("test_mla_fp8.py", 93),
         TestFile("test_no_chunked_prefill.py", 126),
         TestFile("test_no_overlap_scheduler.py", 262),
-        TestFile("test_openai_server.py", 124),
+        TestFile("test_openai_server.py", 186),
         TestFile("test_penalty.py", 41),
         TestFile("test_page_size.py", 60),
         TestFile("test_pytorch_sampling_backend.py", 66),
@@ -66,7 +68,7 @@ suites = {
         TestFile("test_update_weights_from_disk.py", 114),
         TestFile("test_update_weights_from_tensor.py", 48),
         TestFile("test_vertex_endpoint.py", 31),
-        TestFile("test_vision_chunked_prefill.py", 223),
+        TestFile("test_vision_chunked_prefill.py", 99),
         TestFile("test_vlm_accuracy.py", 60),
         TestFile("test_vision_openai_server.py", 537),
         TestFile("test_fim_completion.py", 40),
@@ -75,6 +77,8 @@ suites = {
         TestFile("test_create_kvindices.py", 2),
         TestFile("test_hicache.py", 60),
         TestFile("test_hicache_mla.py", 90),
+        TestFile("test_fused_moe.py", 30),
+        TestFile("test_triton_moe_channel_fp8_kernel.py", 25),
     ],
     "per-commit-2-gpu": [
         TestFile("models/lora/test_lora_tp.py", 300),
@@ -86,6 +90,9 @@ suites = {
         TestFile("test_update_weights_from_distributed.py", 100),
         TestFile("test_verl_engine.py", 100),
     ],
+    "per-commit-8-gpu": [
+        TestFile("test_fa3.py", 30),
+    ],
     "nightly": [
         TestFile("test_nightly_gsm8k_eval.py"),
     ],
@@ -94,6 +101,7 @@ suites = {
         TestFile("test_awq.py"),
         TestFile("test_gguf.py", 78),
         TestFile("test_gptqmodel_dynamic.py", 72),
+        TestFile("test_bnb.py"),
     ],
 }
 

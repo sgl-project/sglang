@@ -190,6 +190,30 @@ class PagedTokenToKVPoolAllocator:
     def available_size(self):
         return len(self.free_pages) * self.page_size
 
+    def get_kvcache(self):
+        return self._kvcache
+
+    def alloc(self, need_size: int):
+        # page-aligned allocation, returning contiguous indices of pages
+        if self.debug_mode:
+            assert (
+                need_size % self.page_size == 0
+            ), "The allocation size should be page-aligned"
+
+        num_pages = need_size // self.page_size
+        if num_pages > len(self.free_pages):
+            return None
+
+        out_pages = self.free_pages[:num_pages]
+        self.free_pages = self.free_pages[num_pages:]
+
+        out_indices = (
+            out_pages[:, None] * self.page_size
+            + torch.arange(self.page_size, device=self.device)
+        ).reshape(-1)
+
+        return out_indices
+
     def alloc_extend(
         self,
         prefix_lens: torch.Tensor,

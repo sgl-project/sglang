@@ -10,7 +10,7 @@ check-deps: ## Check and install required Python formatting dependencies
 	@command -v black >/dev/null 2>&1 || (echo "Installing black..." && pip install black)
 
 install-deps: ## Install Python formatting tools (isort and black)
-	pip install isort black
+	pip install scikit-build-core isort black
 
 tree: ## Show project directory structure
 	@tree --prune -I "__pycache__|*.egg-info|*.so|build|3rdparty|dist"
@@ -23,10 +23,10 @@ ln: submodule ## Create compilation database
 
 
 install: submodule ## Install package in development mode
-	@pip install -e .
+	@pip install -e . --no-build-isolation
 
-build: submodule ## Build and install wheel package
-	@rm -rf dist/* || true && export MAX_JOBS=$(nproc) && uv build --wheel -Cbuild-dir=build . --verbose --color=always && pip3 install dist/*whl --force-reinstall --no-deps
+build: install-deps submodule ## Build and install wheel package
+	@rm -rf dist/* || true && export MAX_JOBS=$(nproc) && uv build --wheel -Cbuild-dir=build . --verbose --color=always --no-build-isolation && pip3 install dist/*whl --force-reinstall --no-deps
 
 clean: ## Remove build artifacts
 	@rm -rf build dist *.egg-info
@@ -46,7 +46,8 @@ format: check-deps ## Format all source files
 
 FILES_TO_UPDATE = python/sgl_kernel/version.py \
                  pyproject.toml \
-                 pyproject_rocm.toml
+                 pyproject_rocm.toml \
+                 ../docker/Dockerfile.blackwell
 
 update: ## Update version numbers across project files. Usage: make update <new_version>
 	@if [ -z "$(filter-out $@,$(MAKECMDGOALS))" ]; then \

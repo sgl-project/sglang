@@ -33,6 +33,7 @@ class SeparatorStyle(IntEnum):
     ADD_NEW_LINE_SINGLE = auto()
     LLAMA2 = auto()
     LLAMA3 = auto()
+    LLAMA4 = auto()
     CHATGLM = auto()
     CHATML = auto()
     CHATINTERN = auto()
@@ -156,19 +157,30 @@ class Conversation:
                 else:
                     ret += role + ":"
             return ret
-        elif self.sep_style == SeparatorStyle.LLAMA3:
-            ret = "<|begin_of_text|>"
+        elif self.sep_style == SeparatorStyle.LLAMA4:
+            # begin_of_text is added by default
             if self.system_message:
-                ret += system_prompt
+                ret = system_prompt
             else:
-                ret += ""
+                ret = ""
+            for i, (role, message) in enumerate(self.messages):
+                if message:
+                    ret += f"<|header_start|>{role}<|header_end|>\n\n"
+                    ret += f"{message.strip()}<|eot|>"
+                else:
+                    ret += f"<|header_start|>{role}<|header_end|>\n\n"
+            return ret
+        elif self.sep_style == SeparatorStyle.LLAMA3:
+            if self.system_message:
+                ret = system_prompt
+            else:
+                ret = ""
             for i, (role, message) in enumerate(self.messages):
                 if message:
                     ret += f"<|start_header_id|>{role}<|end_header_id|>\n\n"
                     ret += f"{message.strip()}<|eot_id|>"
                 else:
                     ret += f"<|start_header_id|>{role}<|end_header_id|>\n\n"
-            # print(ret)
             return ret
         elif self.sep_style == SeparatorStyle.LLAMA2:
             seps = [self.sep, self.sep2]
@@ -451,6 +463,30 @@ def generate_embedding_convs(
     return convs
 
 
+# Models in which system adds modality tokens at prompt start automatically
+# when media inputs exceed modality tokens in prompt (e.g. 3 images but 2 <image> tokens)
+_MODELS_REQUIRING_MODALITY_SUPPLEMENT = {"deepseek-vl2"}
+
+
+# adapted from https://github.com/vllm-project/vllm/blob/5124f5bf51b83e6f344c1bc6652e8c4d81313b34/vllm/entrypoints/chat_utils.py#L856
+def _get_full_multimodal_text_prompt(
+    modality_token: str, modality_count: int, text_prompt: str
+) -> str:
+    """Combine multimodal prompts for a multimodal language model."""
+
+    # For any existing placeholder in the text prompt, we leave it as is
+    left: int = modality_count - text_prompt.count(modality_token)
+    if left < 0:
+        raise ValueError(
+            f"Found more '{modality_token}' placeholders in input prompt than "
+            "actual multimodal data items."
+        )
+
+    # NOTE: For now we always add missing modality_token at the front of
+    # the prompt. This may change to be customizable in the future.
+    return "\n".join([modality_token] * left + [text_prompt])
+
+
 def generate_chat_conv(
     request: ChatCompletionRequest, template_name: str
 ) -> Conversation:
@@ -508,6 +544,12 @@ def generate_chat_conv(
                         if conv.name != "qwen2-vl"
                         else conv.image_token
                     )
+                add_token_as_needed: bool = (
+                    conv.name in _MODELS_REQUIRING_MODALITY_SUPPLEMENT
+                )
+                if add_token_as_needed:
+                    image_token = ""
+
                 audio_token = conv.audio_token
                 for content in message.content:
                     if content.type == "text":
@@ -521,7 +563,10 @@ def generate_chat_conv(
                     elif content.type == "audio_url":
                         real_content += audio_token
                         conv.append_audio(content.audio_url.url)
-
+                if add_token_as_needed:
+                    real_content = _get_full_multimodal_text_prompt(
+                        conv.image_token, num_image_url, real_content
+                    )
                 conv.append_message(conv.roles[0], real_content)
         elif msg_role == "assistant":
             parsed_content = ""
@@ -558,6 +603,19 @@ register_conv_template(
         sep=" ",
         sep2=" </s><s>",
         stop_str=["[INST]", "[/INST]", "<<SYS>>", "<</SYS>>"],
+    )
+)
+
+# reference: https://huggingface.co/meta-llama/Llama-4-Scout-17B-16E-Instruct/blob/main/chat_template.json
+register_conv_template(
+    Conversation(
+        name="llama-4",
+        system_template="<|header_start|>system<|header_end|>\n\n{system_message}<|eot|>",
+        roles=("user", "assistant"),
+        sep_style=SeparatorStyle.LLAMA4,
+        sep="",
+        stop_str=["<|end_of_text|>", "<|eot|>", "<|eom|>"],
+        image_token="<|image|>",
     )
 )
 

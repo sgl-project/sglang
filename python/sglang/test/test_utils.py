@@ -25,7 +25,12 @@ from sglang.bench_serving import run_benchmark
 from sglang.global_config import global_config
 from sglang.lang.backend.openai import OpenAI
 from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
-from sglang.srt.utils import get_bool_env_var, kill_process_tree, retry
+from sglang.srt.utils import (
+    get_bool_env_var,
+    is_port_available,
+    kill_process_tree,
+    retry,
+)
 from sglang.test.run_eval import run_eval
 from sglang.utils import get_exception_traceback
 
@@ -37,14 +42,15 @@ DEFAULT_FP8_MODEL_NAME_FOR_DYNAMIC_QUANT_ACCURACY_TEST = (
 DEFAULT_FP8_MODEL_NAME_FOR_MODELOPT_QUANT_ACCURACY_TEST = (
     "nvidia/Llama-3.1-8B-Instruct-FP8"
 )
-# TODO(yundai424): right now specifying to an older revision since the latest one
-#  carries kv cache quantization which doesn't work yet
-DEFAULT_FP8_MODEL_NAME_FOR_MODELOPT_QUANT_ACCURACY_TEST_REVISION = (
-    "13858565416dbdc0b4e7a4a677fadfbd5b9e5bb9"
-)
 
 DEFAULT_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.1-8B-Instruct"
+DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3 = "jamesliu1/sglang-EAGLE3-Llama-3.1-Instruct-8B"
+DEFAULT_MODEL_NAME_FOR_TEST_MLA = "lmsys/sglang-ci-dsv3-test"
+DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN = "lmsys/sglang-ci-dsv3-test-NextN"
 DEFAULT_SMALL_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.2-1B-Instruct"
+DEFAULT_MODEL_NAME_FOR_TEST_LOCAL_ATTENTION = (
+    "meta-llama/Llama-4-Scout-17B-16E-Instruct"
+)
 DEFAULT_MOE_MODEL_NAME_FOR_TEST = "mistralai/Mixtral-8x7B-Instruct-v0.1"
 DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST = "Qwen/Qwen1.5-MoE-A2.7B"
 DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST = "Alibaba-NLP/gte-Qwen2-1.5B-instruct"
@@ -101,6 +107,17 @@ def call_generate_lightllm(prompt, temperature, max_tokens, stop=None, url=None)
     assert res.status_code == 200
     pred = res.json()["generated_text"][0]
     return pred
+
+
+def find_available_port(base_port: int):
+    port = base_port + random.randint(100, 1000)
+    while True:
+        if is_port_available(port):
+            return port
+        if port < 60000:
+            port += 42
+        else:
+            port -= 43
 
 
 def call_generate_vllm(prompt, temperature, max_tokens, stop=None, n=1, url=None):
@@ -439,7 +456,9 @@ def popen_launch_server(
 
             return_code = process.poll()
             if return_code is not None:
-                raise Exception(f"Server unexpectedly exits ({return_code=}).")
+                raise Exception(
+                    f"Server unexpectedly exits ({return_code=}). Usually there will be error logs describing the cause far above this line."
+                )
 
             time.sleep(10)
 
@@ -674,8 +693,6 @@ def run_bench_one_batch(model, other_args):
         "python3",
         "-m",
         "sglang.bench_one_batch",
-        "--model-path",
-        model,
         "--batch-size",
         "1",
         "--input",
@@ -684,6 +701,8 @@ def run_bench_one_batch(model, other_args):
         "8",
         *[str(x) for x in other_args],
     ]
+    if model is not None:
+        command += ["--model-path", model]
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
     try:
@@ -1014,7 +1033,7 @@ def run_logprob_check(self: unittest.TestCase, arg: Tuple):
 class CustomTestCase(unittest.TestCase):
     def _callTestMethod(self, method):
         max_retry = int(
-            os.environ.get("SGLANG_TEST_MAX_RETRY", "2" if is_in_ci() else "0")
+            os.environ.get("SGLANG_TEST_MAX_RETRY", "1" if is_in_ci() else "0")
         )
         retry(
             lambda: super(CustomTestCase, self)._callTestMethod(method),
