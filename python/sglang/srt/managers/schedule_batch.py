@@ -374,6 +374,12 @@ class MultimodalInputs:
                 self.mrope_position_delta = torch.cat(
                     [self.mrope_position_delta, other.mrope_position_delta], dim=0
                 )
+
+        for key, val in other.__dict__.items():
+            if "_id" in key:
+                # set token_ids
+                if getattr(self, key, None) is None:
+                    setattr(self, key, getattr(other, key, None))
         # other args would be kept intact
 
 
