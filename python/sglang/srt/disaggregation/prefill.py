@@ -251,14 +251,18 @@ class SchedulerDisaggregationPrefillMixin:
 
             self.cur_batch = batch
 
-            if batch:
-                self.disagg_prefill_bootstrap_queue.send_kv_done.wait()
-                result = self.run_batch(batch)
-                self.result_queue.append((batch.copy(), result))
-
             if self.last_batch:
                 tmp_batch, tmp_result = self.result_queue.popleft()
                 self.process_batch_result_disagg_prefill(tmp_batch, tmp_result)
+
+            if batch:
+                mgr = self.disagg_prefill_bootstrap_queue.kv_manager
+                while not mgr.transfer_queue.empty() and not mgr.send_kv_done.is_set():
+                    pass
+                if self.disagg_prefill_bootstrap_queue.kv_manager.send_kv_done is not None:
+                    self.disagg_prefill_bootstrap_queue.kv_manager.send_kv_done.wait()
+                result = self.run_batch(batch)
+                self.result_queue.append((batch.copy(), result))
 
             if len(self.disagg_prefill_inflight_queue) > 0:
                 self.process_disagg_prefill_inflight_queue()

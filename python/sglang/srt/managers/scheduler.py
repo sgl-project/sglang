@@ -648,7 +648,10 @@ class Scheduler(
             )
             metadata_buffers = [output_id_buffer]
 
-            self.disagg_launch_done = threading.Event()
+            if not self.enable_overlap:
+                self.disagg_launch_done = threading.Event()
+            else:
+                self.disagg_launch_done = None
 
             self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(
                 token_to_kv_pool=self.token_to_kv_pool_allocator.get_kvcache(),
@@ -1983,7 +1986,7 @@ class Scheduler(
                 recv_req.num_steps,
                 recv_req.activities,
                 # NOTE fix
-                recv_req.with_stack,
+                True,
                 # False,
                 recv_req.record_shapes,
                 recv_req.profile_id,
