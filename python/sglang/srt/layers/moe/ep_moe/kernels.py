@@ -1,5 +1,4 @@
 import logging
-import pickle
 import random
 from typing import List, Optional
 
@@ -898,7 +897,7 @@ def ep_scatter(
         )
         print(f"{torch.cuda.current_device()=} write data to {p}")
         with open(str(p), "wb") as f:
-            pickle.dump(data, f)
+            torch.save(data, f)
 
     # print(
     #     f"{torch.cuda.current_device()=} "
