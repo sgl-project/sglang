@@ -2046,8 +2046,7 @@ class Scheduler(
             # The caller will be notified when reaching profiler_target_forward_ct
         else:
             self.profiler_target_forward_ct = None
-            # TODO fix?
-            # return ProfileReqOutput(success=True, message="Succeeded")
+            return ProfileReqOutput(success=True, message="Succeeded")
 
     def stop_profile(self) -> None:
         if self.profiler_activities is None:
