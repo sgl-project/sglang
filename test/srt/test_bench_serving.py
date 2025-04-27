@@ -3,8 +3,8 @@ import unittest
 from sglang.test.test_utils import (
     DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
     DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
-    DEFAULT_FP8_MODEL_NAME_FOR_TEST,
     DEFAULT_MODEL_NAME_FOR_TEST,
+    DEFAULT_MODEL_NAME_FOR_TEST_FP8,
     DEFAULT_MOE_MODEL_NAME_FOR_TEST,
     CustomTestCase,
     is_in_ci,
@@ -104,7 +104,7 @@ class TestBenchServing(CustomTestCase):
 
     def test_offline_throughput_default_fp8(self):
         res = run_bench_serving(
-            model=DEFAULT_FP8_MODEL_NAME_FOR_TEST,
+            model=DEFAULT_MODEL_NAME_FOR_TEST_FP8,
             num_prompts=500,
             request_rate=float("inf"),
             other_server_args=[],

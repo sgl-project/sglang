@@ -275,7 +275,7 @@ class ModelRunner:
                         f"Invalid attention backend for MLA: {server_args.attention_backend}"
                     )
             else:
-                raise ValueError(f"MLA optimization not supported on CPU.")
+                raise ValueError("MLA optimization not supported on CPU.")
 
         if (
             server_args.attention_backend == "fa3"
@@ -285,7 +285,7 @@ class ModelRunner:
                 "FlashAttention3 only supports fp8_e4m3 if using FP8; "
                 "Setting attention backend to triton."
             )
-            server_args.attention_backend = "triton"
+            server_args.attention_backend = "flashinfer"
 
         if server_args.enable_double_sparsity:
             logger.info(
