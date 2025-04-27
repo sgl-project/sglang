@@ -132,7 +132,6 @@ class Llama4MoE(nn.Module):
         else:
             return self._forward_core_normal(hidden_states)
 
-
     def _forward_core_normal(self, hidden_states):
         # router_scores: [num_tokens, num_experts]
         router_logits, _ = self.router(hidden_states)
