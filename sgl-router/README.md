@@ -1,4 +1,4 @@
-c# SGLang Router
+# SGLang Router
 
 SGLang router is a standalone module implemented in Rust to achieve data parallelism across SGLang instances.
 
