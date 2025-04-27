@@ -11,6 +11,7 @@ if TYPE_CHECKING:
         EmbeddingBatchResult,
         GenerationBatchResult,
         ScheduleBatch,
+        Scheduler,
     )
 
 
@@ -21,7 +22,7 @@ class SchedulerOutputProcessorMixin:
     """
 
     def process_batch_result_prefill(
-        self,
+        self: Scheduler,
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
@@ -175,7 +176,7 @@ class SchedulerOutputProcessorMixin:
         self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
 
     def process_batch_result_decode(
-        self,
+        self: Scheduler,
         batch: ScheduleBatch,
         result: GenerationBatchResult,
     ):
@@ -271,7 +272,7 @@ class SchedulerOutputProcessorMixin:
             self.log_decode_stats()
 
     def add_input_logprob_return_values(
-        self,
+        self: Scheduler,
         i: int,
         req: Req,
         output: LogitsProcessorOutput,
@@ -405,7 +406,7 @@ class SchedulerOutputProcessorMixin:
                     assert len(req.input_token_ids_logprobs_idx) == relevant_tokens_len
 
     def add_logprob_return_values(
-        self,
+        self: Scheduler,
         i: int,
         req: Req,
         pt: int,
@@ -436,7 +437,10 @@ class SchedulerOutputProcessorMixin:
         return num_input_logprobs
 
     def stream_output(
-        self, reqs: List[Req], return_logprob: bool, skip_req: Optional[Req] = None
+        self: Scheduler,
+        reqs: List[Req],
+        return_logprob: bool,
+        skip_req: Optional[Req] = None,
     ):
         """Stream the output to detokenizer."""
         if self.is_generation:
@@ -445,7 +449,10 @@ class SchedulerOutputProcessorMixin:
             self.stream_output_embedding(reqs)
 
     def stream_output_generation(
-        self, reqs: List[Req], return_logprob: bool, skip_req: Optional[Req] = None
+        self: Scheduler,
+        reqs: List[Req],
+        return_logprob: bool,
+        skip_req: Optional[Req] = None,
     ):
         rids = []
         finished_reasons: List[BaseFinishReason] = []
@@ -593,7 +600,7 @@ class SchedulerOutputProcessorMixin:
                 )
             )
 
-    def stream_output_embedding(self, reqs: List[Req]):
+    def stream_output_embedding(self: Scheduler, reqs: List[Req]):
         rids = []
         finished_reasons: List[BaseFinishReason] = []
 
