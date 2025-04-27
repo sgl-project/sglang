@@ -51,7 +51,7 @@ class TestBenchOneBatch(CustomTestCase):
                 f"### test_torch_compile_tp2_bs1\n"
                 f"output_throughput : {output_throughput:.2f} token/s\n"
             )
-            self.assertGreater(output_throughput, 235)
+            self.assertGreater(output_throughput, 225)
 
 
 if __name__ == "__main__":

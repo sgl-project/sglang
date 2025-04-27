@@ -994,7 +994,6 @@ async def benchmark(
         async with semaphore:
             return await request_func(request_func_input=request_func_input, pbar=pbar)
 
-
     print(f"Starting warmup with {warmup_requests} sequences...")
 
     # Use the first request for all warmup iterations
@@ -1025,9 +1024,7 @@ async def benchmark(
     warmup_outputs = await asyncio.gather(*warmup_tasks)
 
     # Check if at least one warmup request succeeded
-    if args.warmup_requests > 0 and not any(
-        output.success for output in warmup_outputs
-    ):
+    if warmup_requests > 0 and not any(output.success for output in warmup_outputs):
         raise ValueError(
             "Warmup failed - Please make sure benchmark arguments "
             f"are correctly specified. Error: {warmup_outputs[0].error}"
