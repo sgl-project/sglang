@@ -106,7 +106,8 @@ def run_lora_test_one_by_one(
     test_tag: str = "",
 ):
     """
-    Input a batch of prompts, and run lora tests one by one with several generate requests.
+    Input a batch of prompts, and run lora tests one by one with several generate requests
+    (each request will have bs=1).
     For prompt0, prompt1, ..., promptN,
     we will use adaptor0, adaptor1, ..., adaptorN included in model case,
     We will then compare the outputs of HF and SRT with and without LoRA.
