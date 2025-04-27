@@ -15,12 +15,11 @@ if _is_cuda:
         sglang_per_token_group_quant_fp8,
     )
 
-    if get_bool_env_var("SGL_ENABLE_JIT_DEEPGEMM", default="false"):
-        try:
-            from deep_gemm import ceil_div
-        except ImportError:
-            print("Failed to import ceil_div from deep_gemm.")
-            pass 
+    try:
+        from deep_gemm import ceil_div
+    except ImportError:
+        print("Failed to import ceil_div from deep_gemm.")
+        pass 
 logger = logging.getLogger(__name__)
 
 
