@@ -42,6 +42,7 @@ from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 
+from sglang.srt.disaggregation.utils import FakeBootstrapHost
 from sglang.srt.entrypoints.engine import _launch_subprocesses
 from sglang.srt.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
@@ -814,9 +815,38 @@ def _wait_and_warmup(
                 timeout=600,
             )
             assert res.status_code == 200, f"{res}"
+        elif server_args.disaggregation_mode == "prefill":
+            logger.info(f"Start of prefill warmup ...")
+            json_data = {
+                "sampling_params": {
+                    "temperature": 0.0,
+                    "max_new_tokens": 8,
+                    "ignore_eos": True,
+                },
+                "bootstrap_host": [FakeBootstrapHost] * server_args.dp_size,
+                # This is a hack to ensure fake transfer is enabled during prefill warmup
+                # ensure each dp rank has a unique bootstrap_room during prefill warmup
+                "bootstrap_room": [
+                    i * (2**63 // server_args.dp_size) + (i % server_args.tp_size)
+                    for i in range(server_args.dp_size)
+                ],
+                "input_ids": [[0, 1, 2, 3]] * server_args.dp_size,
+            }
+            res = requests.post(
+                url + request_name,
+                json=json_data,
+                headers=headers,
+                timeout=1800,  # because of deep gemm precache is very long if not precache.
+            )
+            logger.info(
+                f"End of prefill warmup with status {res.status_code}, resp: {res.json()}"
+            )
         else:
-            # Warmup request currently hangs in disaggregation mode, so we skip it.
-            logger.info("Skipping warmup request in disaggregation mode")
+            logger.info(
+                "Skipping warmup request in  mode {}".format(
+                    server_args.disaggregation_mode
+                )
+            )
     except Exception:
         last_traceback = get_exception_traceback()
         if pipe_finish_writer is not None:
