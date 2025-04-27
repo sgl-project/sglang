@@ -290,7 +290,7 @@ class ModelRunner:
                 "FlashAttention3 only supports fp8_e4m3 if using FP8; "
                 "Setting attention backend to triton."
             )
-            server_args.attention_backend = "flashinfer"
+            server_args.attention_backend = "triton"
 
         if server_args.enable_double_sparsity:
             logger.info(
