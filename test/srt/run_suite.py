@@ -30,6 +30,7 @@ suites = {
         TestFile("test_chunked_prefill.py", 336),
         TestFile("test_eagle_infer.py", 500),
         TestFile("test_ebnf_constrained.py"),
+        TestFile("test_fa3.py", 500),
         TestFile("test_fp8_kernel.py", 8),
         TestFile("test_embedding_openai_server.py", 36),
         TestFile("test_hidden_states.py", 55),
@@ -91,7 +92,7 @@ suites = {
         TestFile("test_verl_engine.py", 100),
     ],
     "per-commit-8-gpu": [
-        TestFile("test_fa3.py", 30),
+        TestFile("test_local_attn.py", 100),
     ],
     "nightly": [
         TestFile("test_nightly_gsm8k_eval.py"),

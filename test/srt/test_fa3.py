@@ -10,7 +10,6 @@ from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3,
-    DEFAULT_MODEL_NAME_FOR_TEST_LOCAL_ATTENTION,
     DEFAULT_MODEL_NAME_FOR_TEST_MLA,
     DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -125,22 +124,6 @@ class TestFlashAttention3MLA(BaseFlashAttentionTest):
     @classmethod
     def get_server_args(cls):
         return DEFAULT_SERVER_ARGS
-
-
-class TestFlashAttention3LocalAttn(BaseFlashAttentionTest):
-    """Test FlashAttention3 with Model with local attention, e.g. Llama 4."""
-
-    accuracy_threshold = 0.70
-    model = DEFAULT_MODEL_NAME_FOR_TEST_LOCAL_ATTENTION
-
-    @classmethod
-    def get_server_args(cls):
-        cloned_args = DEFAULT_SERVER_ARGS.copy()
-        # remove --enable-torch-compile from cloned_args since llama4 does not support it for now
-        cloned_args.remove("--enable-torch-compile")
-        # we cannot use scout's 10m context due to this bug: https://github.com/sgl-project/sglang/issues/5755
-        cloned_args.extend(["--tp", "4", "--context-length", "1000000"])
-        return cloned_args
 
 
 class TestFlashAttention3SpeculativeDecode(BaseFlashAttentionTest):
