@@ -168,7 +168,7 @@ class TpModelWorkerClient:
 
             self.output_queue.put((copy_done, logits_output, next_token_ids))
 
-    def resolve_batch_result(self, bid: int):
+    def resolve_batch_result(self):
         copy_done, logits_output, next_token_ids = self.output_queue.get()
         copy_done.synchronize()
         self.launch_done.wait()

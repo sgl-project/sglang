@@ -280,7 +280,7 @@ class SchedulerDisaggregationPrefillMixin:
         # Transfer kv for prefill completed requests and add it into disagg_prefill_infight_queue
         if self.enable_overlap:
             # wait
-            _, next_token_ids = self.tp_worker.resolve_batch_result(bid)
+            _, next_token_ids = self.tp_worker.resolve_batch_result()
         else:
             next_token_ids = result.next_token_ids.tolist()
 
