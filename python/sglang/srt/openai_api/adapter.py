@@ -909,6 +909,7 @@ def v1_chat_generate_request(
 
     # NOTE: with openai API, the prompt's logprobs are always not computed
 
+    is_multimodal = tokenizer_manager.model_config.is_multimodal
     for request in all_requests:
         # Prep the data needed for the underlying GenerateReqInput:
         #  - prompt: The full prompt string.
@@ -918,6 +919,7 @@ def v1_chat_generate_request(
         #    None skips any image processing in GenerateReqInput.
         strict_tag = None
         prompt = ""
+        prompt_ids = []
         if not isinstance(request.messages, str):
             # Apply chat template and its stop strings.
             tools = None
@@ -1019,7 +1021,7 @@ def v1_chat_generate_request(
                     ):
                         encoded = encoded[1:]
                     prompt_ids += encoded
-                if tokenizer_manager.model_config.is_multimodal:
+                if is_multimodal:
                     prompt = tokenizer_manager.tokenizer.decode(prompt_ids)
                 stop = request.stop
                 image_data = None
@@ -1064,8 +1066,9 @@ def v1_chat_generate_request(
                         stop.append(request.stop)
                     else:
                         stop.extend(request.stop)
-                prompt_ids = tokenizer_manager.tokenizer.encode(prompt)
 
+                if not is_multimodal:
+                    prompt_ids = tokenizer_manager.tokenizer.encode(prompt)
         else:
             # Use the raw prompt and stop strings if the messages is already a string.
             prompt_ids = request.messages
@@ -1135,7 +1138,7 @@ def v1_chat_generate_request(
         audio_data_list.append(audio_data)
         modalities_list.append(modalities)
     if len(all_requests) == 1:
-        if tokenizer_manager.model_config.is_multimodal:
+        if is_multimodal:
             # processor will need text input
             prompt_kwargs = {"text": prompts[0]}
         else:
