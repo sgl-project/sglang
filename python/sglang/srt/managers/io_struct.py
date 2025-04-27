@@ -827,6 +827,27 @@ class ProfileReqInput:
     num_steps: Optional[int] = None
     activities: Optional[List[Literal["CPU", "GPU", "MEM", "CUDA_PROFILER"]]] = None
 
+    def __post_init__(self):
+        if self.activities is None:
+            return
+        nsys_profile = False
+        if "CUDA_PROFILER" in self.activities:
+            nsys_profile = True
+        torch_profile = False
+        if (
+            "CPU" in self.activities
+            or "GPU" in self.activities
+            or "MEM" in self.activities
+        ):
+            torch_profile = True
+        if nsys_profile and torch_profile:
+            raise ValueError(
+                "CUDA_PROFILER is for nsys profiler. "
+                "CPU, GPU, and MEM are for torch profiler. "
+                "nsys profiling and torch profiling cannot be used at the same time. "
+                "Please choose one of them."
+            )
+
 
 class ProfileReqType(Enum):
     START_PROFILE = 1
