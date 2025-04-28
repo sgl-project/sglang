@@ -68,7 +68,6 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `revision` | Adjust if a specific version of the model should be used. | None |
 | `skip_tokenizer_init` | Set to `true` to provide the tokens to the engine and get the output tokens directly, typically used in RLHF. See [example](https://github.com/sgl-project/sglang/blob/main/examples/runtime/token_in_token_out/). | `False` |
 | `json_model_override_args` | Override model config with the provided JSON. | `"{}"` |
-| `delete_ckpt_after_loading` | Delete the model checkpoint after loading the model. | `False` |
 | `disable_fast_image_processor` | Adopt base image processor instead of fast image processor (which is by default). See [details](https://huggingface.co/docs/transformers/main/en/main_classes/image_processor#image-processor). | `False` |
 
 ## Serving: HTTP & API
@@ -153,7 +152,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | Arguments | Description | Defaults |
 |----------|-------------|---------|
 | `dist_init_addr` | The TCP address used for initializing PyTorch's distributed backend (e.g. `192.168.0.2:25000`). | None |
-| `nnodes` | Total number of nodes in the cluster. See [Llama 405B guide](https://docs.sglang.ai/references/llama_405B.html#run-405b-fp16-on-two-nodes). | `1` |
+| `nnodes` | Total number of nodes in the cluster. See [Llama 405B guide](https://docs.sglang.ai/references/multi_node.html#llama-3-1-405b). | `1` |
 | `node_rank` | Rank (ID) of this node among the `nnodes` in the distributed setup. | `0` |
 
 ## LoRA
@@ -168,7 +167,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 
 | Arguments | Description | Defaults |
 |----------|-------------|---------|
-| `attention_backend` | This argument specifies the backend for attention computation and KV cache management, which can be `fa3`, `flashinfer`, `triton`, or `torch_native`. When deploying DeepSeek models, use this argument to specify the MLA backend. | None |
+| `attention_backend` | This argument specifies the backend for attention computation and KV cache management, which can be `fa3`, `flashinfer`, `triton`, `cutlass_mla`, or `torch_native`. When deploying DeepSeek models, use this argument to specify the MLA backend. | None |
 | `sampling_backend` | Specifies the backend used for sampling. | None |
 
 ## Constrained Decoding
@@ -211,7 +210,6 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `disable_cuda_graph_padding` | Disable CUDA Graph when padding is needed; otherwise, still use CUDA Graph. | `False` |
 | `disable_outlines_disk_cache` | Disable disk cache for outlines grammar backend. | `False` |
 | `disable_custom_all_reduce` | Disable usage of custom all-reduce kernel. | `False` |
-| `disable_mla` | Disable [Multi-Head Latent Attention](https://arxiv.org/html/2405.04434v5) for Deepseek model. | `False` |
 | `disable_overlap_schedule` | Disable the [Overhead-Scheduler](https://lmsys.org/blog/2024-12-04-sglang-v0-4/#zero-overhead-batch-scheduler). | `False` |
 | `enable_nan_detection` | Enable warning if the logits contain `NaN`. | `False` |
 | `enable_p2p_check` | Turns off the default of always allowing P2P checks when accessing GPU. | `False` |
@@ -231,5 +229,5 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `cuda_graph_bs` | The batch sizes to capture by `CudaGraphRunner`. By default this is done for you. | None |
 | `torchao_config` | Experimental feature that optimizes the model with [torchao](https://github.com/pytorch/ao). Possible choices are: int8dq, int8wo, int4wo-<group_size>, fp8wo, fp8dq-per_tensor, fp8dq-per_row. | `int8dq` |
 | `triton_attention_num_kv_splits` | Use to adjust the number of KV splits in triton kernels. | `8` |
-| `enable_flashinfer_mla` | Use the attention backend with FlashInfer MLA wrapper for DeepSeek models. **This argument will be deprecated in the next release. Please use `--attention_backend flashinfer` instead to enable FlashInfer MLA.** | `False` |
 | `flashinfer_mla_disable_ragged` | Disable the use of the ragged prefill wrapper for the FlashInfer MLA attention backend. Only use it when FlashInfer is being used as the MLA backend. | `False` |
+| `disable_chunked_prefix_cache` | Disable the use of chunked prefix cache for DeepSeek models. Only use it when FA3 is attention backend. | `False` |
