@@ -3,7 +3,6 @@ use actix_web::http::header::{HeaderValue, CONTENT_TYPE};
 use actix_web::{HttpRequest, HttpResponse};
 use bytes::Bytes;
 use futures_util::{StreamExt, TryStreamExt};
-use log::{debug, error, info, warn};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -12,6 +11,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
 use tokio;
+use tracing::{debug, error, info, warn};
 
 fn copy_request_headers(req: &HttpRequest) -> Vec<(String, String)> {
     req.headers()
