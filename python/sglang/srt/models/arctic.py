@@ -37,11 +37,12 @@
 """Inference-only Snowflake Arctic model."""
 
 import logging
-from typing import Iterable, List, Optional, Set, Tuple, Union
+from typing import Iterable, List, Optional, Set, Tuple
 
 import torch
 from torch import nn
 
+from python.sglang.srt.layers.rotary_embedding import RotaryEmbedding
 from sglang.srt.configs.arctic import ArcticConfig
 from sglang.srt.distributed import (
     get_pp_group,
@@ -153,15 +154,15 @@ class ArcticMoE(nn.Module):
 
         if not self.is_moe_layer:
             self.mlp = ArcticMLP(
-                config,
+                config=config,
                 quant_config=quant_config,
                 reduce_results=reduce_results,
                 prefix=f"{prefix}.mlp",
             )
         else:
             self.gate = ReplicatedLinear(
-                self.hidden_size,
-                self.num_experts,
+                input_size=self.hidden_size,
+                output_size=self.num_experts,
                 bias=False,
                 params_dtype=self.params_dtype,
                 quant_config=quant_config,
@@ -171,7 +172,7 @@ class ArcticMoE(nn.Module):
                 raise NotImplementedError("Quantization is not supported yet.")
             else:
                 self.ws = nn.Parameter(
-                    torch.empty(
+                    data=torch.empty(
                         self.num_experts,
                         2 * self.intermediate_size,
                         self.hidden_size,
@@ -180,7 +181,7 @@ class ArcticMoE(nn.Module):
                     )
                 )
                 self.w2s = nn.Parameter(
-                    torch.empty(
+                    data=torch.empty(
                         self.num_experts,
                         self.hidden_size,
                         self.intermediate_size,
@@ -207,10 +208,10 @@ class ArcticMoE(nn.Module):
         loaded_weight: torch.Tensor,
         weight_name: str,
         expert_id: int,
-    ):
-        tp_rank = get_tensor_model_parallel_rank()
-        param_data = param.data
-        shard_size = self.intermediate_size
+    ) -> None:
+        tp_rank: int = get_tensor_model_parallel_rank()
+        param_data: torch.Tensor = param.data
+        shard_size: int = self.intermediate_size
         shard = slice(tp_rank * shard_size, (tp_rank + 1) * shard_size)
         if weight_name.endswith("w1.weight"):
             param_data[expert_id, 0:shard_size, :] = loaded_weight[shard, :]
@@ -226,7 +227,7 @@ class ArcticMoE(nn.Module):
         hidden_states = hidden_states.view(-1, self.hidden_size)
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
-        do_normalize = self.top_k > 1
+        do_normalize: bool = self.top_k > 1
         topk_weights, topk_ids = fused_topk(
             hidden_states, router_logits, self.top_k, renormalize=do_normalize
         )
@@ -256,12 +257,12 @@ class ArcticMoE(nn.Module):
             inplace=True,
         )
         if self.reduce_results and self.tp_size > 1:
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            final_hidden_states: torch.Tensor = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states.view(num_tokens, hidden_size)
 
     def forward(self, hidden_states: torch.Tensor):
         if self.is_moe_layer:
-            final_hidden_states = self.local_moe_fused(hidden_states)
+            final_hidden_states: torch.Tensor = self.local_moe_fused(hidden_states=hidden_states)
         else:
             final_hidden_states = self.mlp(hidden_states)
         return final_hidden_states
@@ -276,14 +277,14 @@ class ArcticAttention(nn.Module):
     ):
         super().__init__()
         self.config = config
-        self.hidden_size = config.hidden_size
-        layer_idx = extract_layer_index(prefix)
+        self.hidden_size: int = config.hidden_size
+        layer_idx: int = extract_layer_index(prefix=prefix)
 
-        tp_size = get_tensor_model_parallel_world_size()
-        self.total_num_heads = config.num_attention_heads
+        tp_size: int = get_tensor_model_parallel_world_size()
+        self.total_num_heads: int = config.num_attention_heads
         assert self.total_num_heads % tp_size == 0
-        self.num_heads = self.total_num_heads // tp_size
-        self.total_num_kv_heads = config.num_key_value_heads
+        self.num_heads: int = self.total_num_heads // tp_size
+        self.total_num_kv_heads: int = config.num_key_value_heads
         if self.total_num_kv_heads >= tp_size:
             assert self.total_num_kv_heads % tp_size == 0
         else:
@@ -298,23 +299,23 @@ class ArcticAttention(nn.Module):
         self.scaling = self.head_dim**-0.5
 
         self.qkv_proj = QKVParallelLinear(
-            self.hidden_size,
-            self.head_dim,
-            self.total_num_heads,
-            self.total_num_kv_heads,
+            hidden_size=self.hidden_size,
+            head_size=self.head_dim,
+            total_num_heads=self.total_num_heads,
+            total_num_kv_heads=self.total_num_kv_heads,
             bias=False,
             quant_config=quant_config,
         )
         self.o_proj = RowParallelLinear(
-            self.total_num_heads * self.head_dim,
-            self.hidden_size,
+            input_size=self.total_num_heads * self.head_dim,
+            output_size=self.hidden_size,
             bias=False,
             reduce_results=True,
             quant_config=quant_config,
         )
 
-        self.rotary_emb = get_rope(
-            self.head_dim,
+        self.rotary_emb: RotaryEmbedding = get_rope(
+            head_size=self.head_dim,
             rotary_dim=self.head_dim,
             max_position=self.max_position_embeddings,
             base=int(self.rope_theta),
@@ -322,9 +323,9 @@ class ArcticAttention(nn.Module):
         )
 
         self.attn = RadixAttention(
-            self.num_heads,
-            self.head_dim,
-            self.scaling,
+            num_heads=self.num_heads,
+            head_dim=self.head_dim,
+            scaling=self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_idx,
             prefix=f"{prefix}.attn",
@@ -352,31 +353,31 @@ class ArcticDecoderLayer(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.hidden_size = config.hidden_size
-        layer_idx = extract_layer_index(prefix)
-        is_moe_layer = (layer_idx + 1) % config.moe_layer_frequency == 0
+        self.hidden_size: int = config.hidden_size
+        layer_idx: int = extract_layer_index(prefix=prefix)
+        is_moe_layer: bool = (layer_idx + 1) % config.moe_layer_frequency == 0
         self.use_residual = config.use_residual and is_moe_layer
         self.self_attn = ArcticAttention(
             config, quant_config=quant_config, prefix=f"{prefix}.self_attn"
         )
         self.block_sparse_moe = ArcticMoE(
-            config,
+            config=config,
             quant_config=quant_config,
             reduce_results=(not self.use_residual),
             prefix=f"{prefix}.block_sparse_moe",
         )
 
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = RMSNorm(hidden_size=config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+            hidden_size=config.hidden_size, eps=config.rms_norm_eps
         )
 
         if self.use_residual:
             self.residual_layernorm = RMSNorm(
-                config.hidden_size, eps=config.rms_norm_eps
+                hidden_size=config.hidden_size, eps=config.rms_norm_eps
             )
             self.residual_mlp = ArcticMLP(
-                config,
+                config=config,
                 is_residual_mlp=True,
                 reduce_results=False,
                 prefix=f"{prefix}.residual_mlp",
@@ -426,15 +427,15 @@ class ArcticModel(nn.Module):
 
         self.vocab_size = config.vocab_size
         self.embed_tokens = VocabParallelEmbedding(
-            self.vocab_size, config.hidden_size, org_num_embeddings=self.vocab_size
+            num_embeddings=self.vocab_size, embedding_dim=config.hidden_size, org_num_embeddings=self.vocab_size
         )
         self.start_layer, self.end_layer, self.layers = make_layers(
-            config.num_hidden_layers,
-            lambda layer_id, prefix: ArcticDecoderLayer(config=config, quant_config=quant_config, prefix=prefix),
+            num_hidden_layers=config.num_hidden_layers,
+            layer_fn=lambda layer_id, prefix: ArcticDecoderLayer(config=config, quant_config=quant_config, prefix=prefix),
             prefix=f"{prefix}.layers",
         )
         self._attn_implementation = config._attn_implementation
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = RMSNorm(hidden_size=config.hidden_size, eps=config.rms_norm_eps)
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -449,7 +450,7 @@ class ArcticModel(nn.Module):
         if input_embeds is not None:
             hidden_states = input_embeds
         else:
-            hidden_states = self.get_input_embeddings(input_ids)
+            hidden_states = self.get_input_embeddings(input_ids=input_ids)
 
         for layer in self.layers[self.start_layer : self.end_layer]:
             hidden_states = layer(positions, hidden_states, forward_batch)
@@ -469,17 +470,17 @@ class ArcticForCausalLM(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        self.config = config
+        self.config: ArcticConfig = config
         self.supports_torch_tp = True
         self.model = ArcticModel(
             config=config,
             quant_config=quant_config,
-            prefix=add_prefix("model", prefix), # Use add_prefix from sglang.srt.utils
+            prefix=add_prefix(name="model", prefix=prefix),
         )
         self.vocab_size = config.vocab_size
         self.lm_head = ParallelLMHead(
-            self.vocab_size,
-            config.hidden_size,
+            num_embeddings=self.vocab_size,
+            embedding_dim=config.hidden_size,
             quant_config=quant_config,
         )
         if self.config.tie_word_embeddings:
@@ -570,7 +571,7 @@ class ArcticForCausalLM(nn.Module):
         logger.info(
             "It will take ~10 minutes loading from the 16-bit weights. "
             "Alternatively, use the prequantized 8-bit weights of arctic "
-            "and set load-format to `sharded_state` will accelerate loading."
+            "and set load-format to `sharded_state`, which will accelerate loading significantly."
         )
         for name, loaded_weight in weights:
             for param_name, weight_name, shard_id in stacked_params_mapping:
