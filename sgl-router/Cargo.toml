@@ -25,6 +25,11 @@ env_logger = "0.11.5"
 log = "0.4.22"
 chrono = "0.4.38"
 tokio = "1.42.0"
+# Added for enhanced logging system
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "chrono"] }
+tracing-log = "0.2"
+tracing-appender = "0.2.3"
 
 [profile.release]
 lto = "thin"
