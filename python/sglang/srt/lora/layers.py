@@ -219,6 +219,8 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
             self.B_buffer_qkv[:, output_dim_q + output_dim_kv :, :].copy_(
                 B_buffer_kv[1]
             )
+
+            # Offsets of q/k/v in output dimension
             if not hasattr(self, "output_offset") or self.output_offset is None:
                 self.output_offset = torch.empty(
                     4, dtype=torch.int32, device=B_buffer_q.device
