@@ -45,19 +45,24 @@ os.environ["DG_CACHE_DIR"] = os.getenv(
 )
 
 
-def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
-    global _BUILTIN_M_LIST
-    global _DO_COMPILE_ALL
-    global _IS_FIRST_RANK_ON_NODE
-
-    # Generate m_max
+def generate_m_range(server_args: ServerArgs):
     m_max = 1024 * 16
     if server_args.chunked_prefill_size < 1:
         m_max = 1024 * 64
     elif server_args.chunked_prefill_size > 8192:
         m_max = server_args.chunked_prefill_size * 2
     m_max = min(1024 * 128, m_max)
-    _BUILTIN_M_LIST = list(range(1, m_max + 1))
+    return m_max
+
+
+def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
+    global _BUILTIN_M_LIST
+    global _DO_COMPILE_ALL
+    global _IS_FIRST_RANK_ON_NODE
+
+    # Generate m_max
+    m_range = generate_m_range(server_args)
+    _BUILTIN_M_LIST = list(range(1, m_range + 1))
 
     _IS_FIRST_RANK_ON_NODE = ServerArgs.base_gpu_id == gpu_id
 
@@ -94,9 +99,13 @@ class DeepGemmKernelHelper:
 
 _INITIALIZATION_DICT: Dict[Tuple[DeepGemmKernelType, int, int, int], bool] = dict()
 
+_HAS_WARN_1 = False
+
 
 def _compile_warning_1():
-    if not _IN_PRECOMPILE_STAGE and _IS_FIRST_RANK_ON_NODE:
+    global _HAS_WARN_1
+    if not _HAS_WARN_1 and not _IN_PRECOMPILE_STAGE and _IS_FIRST_RANK_ON_NODE:
+        _HAS_WARN_1 = True
         logger.warning(
             "Entering DeepGEMM JIT Pre-Complie session. "
             "And it may takes a long time(Typically 10-20 mins) "
@@ -293,7 +302,6 @@ def _maybe_compile_deep_gemm_one_type_all(
         logger.info(
             f"Try DeepGEMM JIT Compiling for "
             f"<{kernel_helper.name}> N={n}, K={k}, num_groups={num_groups} with all Ms."
-            f"{' It only takes a litte time(Typically 1 sec) if you have run `sglang.compile_deep_gemm`. ' if not _IN_PRECOMPILE_STAGE else ''}"
         )
 
         # NOTE(alcanderian): get_num_sms should be change when 2-batch-overlap is introduced

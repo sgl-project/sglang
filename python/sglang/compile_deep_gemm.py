@@ -26,6 +26,7 @@ from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.layers.quantization.deep_gemm import (
     _KERNEL_HELPER_DICT,
     DeepGemmKernelType,
+    generate_m_range,
 )
 from sglang.srt.layers.vocab_parallel_embedding import pad_vocab_size
 from sglang.srt.managers.io_struct import GenerateReqInput
@@ -52,18 +53,19 @@ class WeightConfig(NamedTuple):
 class CompileMapping(NamedTuple):
     weight_name: str
     kernel_type: DeepGemmKernelType
-    parallel_axis: Optional[str] = None  # N, K, G, B
+    parallel_dim: Optional[str] = None  # N, K, G, B
 
 
 @dataclasses.dataclass
 class CompileArgs:
     timeout: int = 3600
-    compile_mode: str = "online"
+    compile_mode: str = "offline"
+    output_dir: Optional[str] = None
 
     # Only use for offline mode
     compile_num_sms: Optional[int] = None
-    compile_m_range: int = 16384
-    compile_workers: int = 4
+    compile_m_range: Optional[int] = None
+    compile_workers: int = 8
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -73,12 +75,22 @@ class CompileArgs:
             type=str,
             choices=["online", "offline"],
             default=CompileArgs.compile_mode,
-            help="Online mode accept server args while offline mode accept config file",
+            help=(
+                "Offline mode use pre-defined parallel config to generate deep_gemm cases. "
+                "While online mode generates cases by capturing server's call."
+            ),
+        )
+        parser.add_argument(
+            "--output-dir",
+            type=str,
+            default=CompileArgs.output_dir,
+            help="directory to save deep_gemm cache",
         )
         parser.add_argument(
             "--compile-num-sms",
             type=int,
             default=CompileArgs.compile_num_sms,
+            help="SMs expect to be used in deep_gemm, must set if using two batch overlap",
         )
         parser.add_argument(
             "--compile-m-range",
@@ -93,11 +105,8 @@ class CompileArgs:
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
-        # use the default value's type to cast the args into correct types.
-        attrs = [(attr.name, type(attr.default)) for attr in dataclasses.fields(cls)]
-        return cls(
-            **{attr: attr_type(getattr(args, attr)) for attr, attr_type in attrs}
-        )
+        attrs = [attr.name for attr in dataclasses.fields(cls)]
+        return cls(**{attr: getattr(args, attr) for attr in attrs})
 
 
 @warmup("compile-deep-gemm")
@@ -130,12 +139,11 @@ def build_deepseek_v3_weights(model_config) -> Dict[str, WeightConfig]:
 
     weights: Dict[str, WeightConfig] = {}
     # MLA normal part
-    weights["q_a_proj"] = WeightConfig(q_lora_rank, hidden_size)
+    weights["fused_qkv_a_proj_with_mqa"] = WeightConfig(
+        q_lora_rank + kv_lora_rank + qk_rope_head_dim, hidden_size
+    )
     weights["q_b_proj"] = WeightConfig(
         num_attention_heads * (qk_nope_head_dim + qk_rope_head_dim), q_lora_rank
-    )
-    weights["kv_a_proj_with_mqa"] = WeightConfig(
-        kv_lora_rank + qk_rope_head_dim, hidden_size
     )
     weights["kv_b_proj"] = WeightConfig(
         num_attention_heads * (qk_nope_head_dim + v_head_dim), kv_lora_rank
@@ -166,6 +174,8 @@ def build_deepseek_v3_weights(model_config) -> Dict[str, WeightConfig]:
     # Other
     weights["lm_head"] = WeightConfig(pad_vocab_size(vocab_size), hidden_size)
 
+    return weights
+
 
 def build_deepseek_v3_mapping(
     server_args: ServerArgs, weights: Dict[str, WeightConfig]
@@ -173,38 +183,30 @@ def build_deepseek_v3_mapping(
     KernelType = DeepGemmKernelType
 
     tp_mapping: List[CompileMapping] = [
-        CompileMapping("lm_head", KernelType.GEMM_NT_F8F8BF16, "N"),
+        # lm_head should never use deep_gemm
+        # CompileMapping("lm_head", KernelType.GEMM_NT_F8F8BF16, "N"),
     ]
-    ep_mapping: List[CompileMapping] = []
     dp_mapping: List[CompileMapping] = [
-        CompileMapping("q_a_proj", KernelType.GEMM_NT_F8F8BF16),
-        CompileMapping("kv_a_proj", KernelType.GEMM_NT_F8F8BF16),
+        CompileMapping("fused_qkv_a_proj_with_mqa", KernelType.GEMM_NT_F8F8BF16),
     ]
 
     # TP/DP attention
-    mapping = [
+    attn_tp_mapping: List[CompileMapping] = [
         CompileMapping("q_b_proj", KernelType.GEMM_NT_F8F8BF16, "N"),
         CompileMapping("kv_b_proj", KernelType.GEMM_NT_F8F8BF16, "N"),
         CompileMapping("w_kc", KernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED, "B"),
         CompileMapping("w_vc", KernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED, "B"),
         CompileMapping("o_proj", KernelType.GEMM_NT_F8F8BF16, "K"),
     ]
-    if not server_args.enable_dp_attention:
-        tp_mapping.extend(mapping)
-    else:
-        dp_mapping.extend(mapping)
 
     # TP/DP moe dense
-    mapping = [
+    moe_dense_tp_mapping: List[CompileMapping] = [
         CompileMapping("gate_up_proj", KernelType.GEMM_NT_F8F8BF16, "N"),
         CompileMapping("down_proj", KernelType.GEMM_NT_F8F8BF16, "K"),
     ]
-    if server_args.moe_dense_tp_size is None:
-        tp_mapping.extend(mapping)
-    else:
-        dp_mapping.extend(mapping)
 
-    # EP moe
+    # TP/EP moe
+    ep_mapping: List[CompileMapping] = []
     if server_args.enable_deepep_moe:
         dp_mapping.extend(
             [
@@ -234,40 +236,69 @@ def build_deepseek_v3_mapping(
                 ),
             ]
         )
-    elif server_args.enable_ep_moe:
-        # shared experts fusion
-        ep_mapping.extend(
-            [
-                CompileMapping(
-                    "experts.gate_up_proj",
-                    KernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED,
-                    "G",
-                ),
-                CompileMapping(
-                    "experts.down_proj", KernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED, "G"
-                ),
-            ]
-        )
-        weights["experts.gate_up_proj"].G += server_args.ep_size
-        weights["experts.down_proj"].G += server_args.ep_size
     else:
-        # TP moe does not use DeepGEMM now
-        pass
+        # shared experts fusion
+        if weights["experts.gate_up_proj"].G == 256:
+            weights["experts.gate_up_proj"]._replace(G=256 + server_args.tp_size)
+            weights["experts.down_proj"]._replace(G=256 + server_args.tp_size)
+        else:
+            tp_mapping.extend(
+                [
+                    CompileMapping(
+                        "shared.gate_up_proj", KernelType.GEMM_NT_F8F8BF16, "N"
+                    ),
+                    CompileMapping(
+                        "shared.down_proj", KernelType.GEMM_NT_F8F8BF16, "K"
+                    ),
+                ]
+            )
+        if server_args.enable_ep_moe:
+            ep_mapping.extend(
+                [
+                    CompileMapping(
+                        "experts.gate_up_proj",
+                        KernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED,
+                        "G",
+                    ),
+                    CompileMapping(
+                        "experts.down_proj",
+                        KernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED,
+                        "G",
+                    ),
+                ]
+            )
+        else:
+            # NOTE: Waiting for TP moe DeepGEMM PR
+            # tp_mapping.extend(
+            #     [
+            #         CompileMapping(
+            #             "experts.gate_up_proj",
+            #             KernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED,
+            #             "N",
+            #         ),
+            #         CompileMapping(
+            #             "experts.down_proj",
+            #             KernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED,
+            #             "K",
+            #         ),
+            #     ]
+            # )
+            pass
 
-    return tp_mapping, ep_mapping, dp_mapping
+    return tp_mapping, attn_tp_mapping, moe_dense_tp_mapping, ep_mapping, dp_mapping
 
 
 def get_parallel_weight_config(
     weights: Dict[str, WeightConfig], mapping: CompileMapping, parallel_size: int
 ):
     target = weights[mapping.weight_name]
-    if parallel_size == 1 or mapping.parallel_axis is None:
+    assert target is not None
+    if parallel_size == 1 or mapping.parallel_dim is None:
         return target
     else:
-        target = WeightConfig(target)  # clone it
-        parallel_index = target._fields.index(mapping.parallel_axis)
-        target[parallel_index] /= parallel_size
-        return target
+        target = target._asdict()
+        target[mapping.parallel_dim] //= parallel_size
+        return WeightConfig(target["N"], target["K"], target["G"], target["B"])
 
 
 def compile_mappings(
@@ -289,9 +320,9 @@ def compile_mappings(
         num_groups = g if b == 1 else b
 
         print(
-            f"DeepGEMM JIT Compiling for "
-            f"<{kernel_helper.name}> N={n}, K={k}, num_groups={num_groups}, "
-            f"with M=1 to {compile_args.compile_m_range})."
+            f"DeepGEMM JIT Compiling for [{mapping.weight_name}], "
+            f"kernel_type=<{kernel_helper.name}> N={n} K={k} num_groups={num_groups}, "
+            f"with num_sms={num_sms} M=1to{compile_args.compile_m_range}."
         )
 
         collected_configs = set()
@@ -312,14 +343,27 @@ def compile_deepseek_v3(
     server_args: ServerArgs, compile_args: CompileArgs, model_config
 ):
     weights = build_deepseek_v3_weights(model_config)
-    tp_mapping, ep_mapping, dp_mapping = build_deepseek_v3_mapping(
-        server_args, model_config
+    tp_mapping, attn_tp_mapping, moe_dense_tp_mapping, ep_mapping, dp_mapping = (
+        build_deepseek_v3_mapping(server_args, weights)
+    )
+
+    attn_tp_size = (
+        (server_args.tp_size // server_args.dp_size)
+        if server_args.enable_dp_attention
+        else server_args.tp_size
+    )
+    moe_dense_tp_size = (
+        server_args.tp_size if server_args.moe_dense_tp_size is None else 1
     )
 
     print("Compiling DP part...")
     compile_mappings(compile_args, weights, dp_mapping, 1)
     print("Compiling TP part...")
     compile_mappings(compile_args, weights, tp_mapping, server_args.tp_size)
+    print("Compiling Attention part...")
+    compile_mappings(compile_args, weights, attn_tp_mapping, attn_tp_size)
+    print("Compiling MLP part...")
+    compile_mappings(compile_args, weights, moe_dense_tp_mapping, moe_dense_tp_size)
     print("Compiling EP part...")
     compile_mappings(compile_args, weights, ep_mapping, server_args.ep_size)
 
@@ -424,12 +468,10 @@ def run_online_compile(server_args: ServerArgs, compile_args: CompileArgs):
 
 
 def run_offline_compile(server_args: ServerArgs, compile_args: CompileArgs):
-    # refine tp_size
-    if server_args.dp_size > 1 and server_args.dp_size != server_args.tp_size:
-        assert server_args.tp_size % server_args.dp_size == 0
-        server_args.tp_size /= server_args.dp_size
+    if compile_args.compile_m_range is None:
+        compile_args.compile_m_range = generate_m_range(server_args)
 
-    config = AutoConfig.from_pretrained(server_args.model, trust_remote_code=True)
+    config = AutoConfig.from_pretrained(server_args.model_path, trust_remote_code=True)
     if config.architectures[0] in ["DeepseekV3ForCausalLM"]:
         compile_deepseek_v3(server_args, compile_args, config)
     else:
@@ -443,6 +485,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
     server_args = ServerArgs.from_cli_args(args)
     compile_args = CompileArgs.from_cli_args(args)
+
+    if compile_args.output_dir is not None:
+        os.environ["DG_CACHE_DIR"] = compile_args.output_dir
 
     if compile_args.compile_mode == "offline":
         print(f"{compile_args=}")
