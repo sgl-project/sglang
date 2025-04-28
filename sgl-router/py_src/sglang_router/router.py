@@ -31,6 +31,7 @@ class Router:
         max_payload_size: Maximum payload size in bytes. Default: 4MB
         max_tree_size: Maximum size of the approximation tree for cache-aware routing. Default: 2^24
         verbose: Enable verbose logging. Default: False
+        log_dir: Directory to store log files. If None, logs are only output to console. Default: None
     """
 
     def __init__(
@@ -48,6 +49,7 @@ class Router:
         max_tree_size: int = 2**24,
         max_payload_size: int = 4 * 1024 * 1024,  # 4MB
         verbose: bool = False,
+        log_dir: Optional[str] = None,
     ):
         self._router = _Router(
             worker_urls=worker_urls,
@@ -63,6 +65,7 @@ class Router:
             max_tree_size=max_tree_size,
             max_payload_size=max_payload_size,
             verbose=verbose,
+            log_dir=log_dir,
         )
 
     def start(self) -> None:
