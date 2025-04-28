@@ -82,6 +82,7 @@ suites = {
         TestFile("test_w8a8_quantization.py", 46),
     ],
     "per-commit-2-gpu": [
+        TestFile("models/lora/test_lora_cuda_graph.py", 250),
         TestFile("models/lora/test_lora_tp.py", 116),
         TestFile("test_data_parallelism.py", 73),
         TestFile("test_dp_attention.py", 137),
