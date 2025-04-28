@@ -1247,6 +1247,7 @@ def v1_chat_generate_response(
         tool_calls = None
         text = ret_item["text"]
 
+        enable_thinking = True
         if isinstance(request, list):
             tool_choice = request[idx].tool_choice
             tools = request[idx].tools
@@ -1259,8 +1260,6 @@ def v1_chat_generate_response(
                 enable_thinking = request[idx].chat_template_kwargs.get(
                     "enable_thinking", True
                 )
-            else:
-                enable_thinking = False
         else:
             tool_choice = request.tool_choice
             tools = request.tools
@@ -1273,8 +1272,6 @@ def v1_chat_generate_response(
                 enable_thinking = request.chat_template_kwargs.get(
                     "enable_thinking", True
                 )
-            else:
-                enable_thinking = False
 
         reasoning_text = None
         if reasoning_parser and separate_reasoning and enable_thinking:
