@@ -1251,20 +1251,28 @@ def v1_chat_generate_response(
             tool_choice = request[idx].tool_choice
             tools = request[idx].tools
             separate_reasoning = request[idx].separate_reasoning
-            
-            if (request[idx].chat_template_kwargs and 
-                request[idx].chat_template_kwargs.get("enable_thinking") is not None):
-                enable_thinking = request[idx].chat_template_kwargs.get("enable_thinking", True)
+
+            if (
+                request[idx].chat_template_kwargs
+                and request[idx].chat_template_kwargs.get("enable_thinking") is not None
+            ):
+                enable_thinking = request[idx].chat_template_kwargs.get(
+                    "enable_thinking", True
+                )
             else:
                 enable_thinking = False
         else:
             tool_choice = request.tool_choice
             tools = request.tools
             separate_reasoning = request.separate_reasoning
-            
-            if (request.chat_template_kwargs and 
-                request.chat_template_kwargs.get("enable_thinking") is not None):
-                enable_thinking = request.chat_template_kwargs.get("enable_thinking", True)
+
+            if (
+                request.chat_template_kwargs
+                and request.chat_template_kwargs.get("enable_thinking") is not None
+            ):
+                enable_thinking = request.chat_template_kwargs.get(
+                    "enable_thinking", True
+                )
             else:
                 enable_thinking = False
 
