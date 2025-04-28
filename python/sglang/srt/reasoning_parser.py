@@ -117,9 +117,9 @@ class DeepSeekR1Detector(BaseReasoningFormatDetector):
         # https://github.com/sgl-project/sglang/pull/3202#discussion_r1950153599
 
 
-class QwQDetector(BaseReasoningFormatDetector):
+class Qwen3Detector(BaseReasoningFormatDetector):
     """
-    Detector for QwQ model.
+    Detector for Qwen3 model.
     Assumes reasoning format:
       (<think>)*(.*)</think>
     Returns all the text before the </think> tag as `reasoning_text`
@@ -131,7 +131,7 @@ class QwQDetector(BaseReasoningFormatDetector):
     """
 
     def __init__(self, stream_reasoning: bool = True):
-        # QwQ is assumed to be reasoning until `</think>` token
+        # Qwen3 is assumed to be reasoning until `</think>` token
         super().__init__(
             "<think>",
             "</think>",
@@ -153,7 +153,7 @@ class ReasoningParser:
 
     DetectorMap: Dict[str, BaseReasoningFormatDetector] = {
         "deepseek-r1": DeepSeekR1Detector,
-        "qwq": QwQDetector,
+        "qwen3": Qwen3Detector,
     }
 
     def __init__(self, model_type: str = None, stream_reasoning: bool = True):
