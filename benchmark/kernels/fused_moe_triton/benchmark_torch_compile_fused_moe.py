@@ -62,7 +62,6 @@ def get_model_config(model_name: str, tp_size: int):
         "hidden_size": config.hidden_size,
         "shard_intermediate_size": shard_intermediate_size,
         "dtype": config.torch_dtype,
-        "block_shape": block_shape,
     }
     print(f"{shape_configs=}")
     return shape_configs
