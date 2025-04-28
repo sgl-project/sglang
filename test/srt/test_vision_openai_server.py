@@ -322,9 +322,9 @@ class TestOpenAIVisionServer(CustomTestCase):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
 
         regex = (
-            r"""\{\n"""
-            + r"""   "color": "[\w]+",\n"""
-            + r"""   "number_of_cars": [\d]+\n"""
+            r"""\{"""
+            + r""""color":"[\w]+","""
+            + r""""number_of_cars":[\d]+"""
             + r"""\}"""
         )
 
