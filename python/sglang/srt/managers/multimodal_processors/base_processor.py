@@ -89,7 +89,11 @@ class BaseMultimodalProcessor(ABC):
             return_tensors="pt",
             **kwargs,
         )
-        if "pixel_values" in result and result["pixel_values"] is not None:
+        if (
+            isinstance(result, dict)
+            and "pixel_values" in result
+            and result["pixel_values"] is not None
+        ):
             result["pixel_values"] = result["pixel_values"].to("cpu")
         return result
 
