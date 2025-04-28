@@ -1439,7 +1439,7 @@ class Scheduler(
             text = f"[All threads of {os.getpid()=}, {self.tp_rank=}]"
             for thread in threading.enumerate():
                 text += f" [{thread.name=} {thread.ident=} {thread.native_id=}]"
-            print(text)
+            print(text, flush=True)
 
         # Check profiler
         if (
