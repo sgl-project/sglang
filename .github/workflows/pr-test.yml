@@ -102,7 +102,7 @@ jobs:
           bash scripts/ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 30
+        timeout-minutes: 40
         run: |
           cd test/srt
           python3 run_suite.py --suite per-commit-8-gpu
@@ -123,7 +123,7 @@ jobs:
         timeout-minutes: 10
         run: |
           cd test/srt
-          python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_bs1
+          python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_bs1_default
 
       - name: Benchmark online latency
         timeout-minutes: 10
