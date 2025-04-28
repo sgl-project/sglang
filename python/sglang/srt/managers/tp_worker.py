@@ -170,13 +170,13 @@ class TpModelWorker:
     def forward_batch_generation(
         self,
         model_worker_batch: ModelWorkerBatch,
-        launch_done: Optional[threading.Event] = None,
         skip_sample: bool = False,
     ) -> Tuple[LogitsProcessorOutput, Optional[torch.Tensor]]:
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
         logits_output = self.model_runner.forward(forward_batch)
-        if launch_done:
-            launch_done.set()
+
+        if model_worker_batch.launch_done is not None:
+            model_worker_batch.launch_done.set()
 
         if skip_sample:
             next_token_ids = None

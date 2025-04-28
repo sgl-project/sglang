@@ -156,6 +156,8 @@ unset CCACHE_READONLY
 python -m uv build --wheel -Cbuild-dir=build --color=always .
 ```
 
+> When encountering this error while compiling using ccache: `ImportError: /usr/local/lib/python3.10/dist-packages/sgl_kernel/common_ops.abi3.so: undefined symbol: _ZN3c108ListType3getERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEENS_4Type24SingletonOrSharedTypePtrIS9_EE`, please modify the last command as follows to resolve it: `python3 -m uv build --wheel -Cbuild-dir=build . --color=always --no-build-isolation` .
+
 ##### Configuring CMake Build Options
 Cmake options can be configuring by adding `-Ccmake.define.<option>=<value>` to the `uv build` flags.
 For example, to enable building FP4 kernels, use:
