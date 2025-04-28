@@ -61,7 +61,7 @@ class CompileArgs:
     compile_mode: str = "online"
 
     # Only use for offline mode
-    compile_num_sms: Optional[int] = int
+    compile_num_sms: Optional[int] = None
     compile_m_range: int = 16384
     compile_workers: int = 4
 
