@@ -26,8 +26,6 @@ from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
 
-multiprocessing.set_start_method("spawn", force=True)
-
 
 @dataclasses.dataclass
 class BenchArgs:
