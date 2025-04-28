@@ -617,7 +617,7 @@ async def tokenize(request: Request):
                 content={"error": "The 'text' field must be a string"},
             )
         
-        tokenizer = _global_state.tokenizer_manager.get_tokenizer()
+        tokenizer = _global_state.tokenizer_manager.tokenizer
         token_ids = tokenizer.encode(text)
         
         return {
@@ -650,8 +650,25 @@ async def detokenize(request: Request):
                     content={"error": "All tokens must be integers"},
                 )
         
-        tokenizer = _global_state.tokenizer_manager.get_tokenizer()
+        tokenizer = _global_state.tokenizer_manager.tokenizer
         text = tokenizer.decode(tokens)
+        
+        # 清理各种可能的特殊标记
+        # 常见的特殊标记列表
+        special_tokens = [
+            "<|begin_of_text|>", "<|endoftext|>", 
+            "<s>", "</s>", "<pad>", 
+            "[CLS]", "[SEP]", "[PAD]", "[MASK]",
+            "<bos>", "<eos>", 
+        ]
+        
+        # 移除所有特殊标记
+        for token in special_tokens:
+            text = text.replace(token, "")
+            
+        # 如果客户端明确要求保留特殊标记，则不进行清理
+        if data.get("keep_special_tokens", False):
+            text = tokenizer.decode(tokens)
         
         return {
             "text": text

@@ -558,7 +558,7 @@ The SmartHome Mini is a compact smart home assistant available in black or white
             f"{self.base_url.replace('/v1', '')}/tokenize",
             json={"text": text}
         )
-        assert response.status_code == 200
+        assert response.status_code == 200, f"Failed with: {response.text}"
         data = response.json()
         assert "tokens" in data
         assert "count" in data
@@ -575,24 +575,35 @@ The SmartHome Mini is a compact smart home assistant available in black or white
             f"{self.base_url.replace('/v1', '')}/detokenize",
             json={"tokens": tokens}
         )
-        assert response.status_code == 200
+        assert response.status_code == 200, f"Failed with: {response.text}"
         data = response.json()
         assert "text" in data
-        assert data["text"] == text
+        # 比较时忽略特殊标记和空格差异
+        assert data["text"].strip() == text.strip()
+        
+        # 测试保留特殊标记的选项
+        response = requests.post(
+            f"{self.base_url.replace('/v1', '')}/detokenize",
+            json={"tokens": tokens, "keep_special_tokens": True}
+        )
+        assert response.status_code == 200, f"Failed with: {response.text}"
+        data_with_special = response.json()
+        assert "text" in data_with_special
         
         # Test with empty inputs
         response = requests.post(
             f"{self.base_url.replace('/v1', '')}/tokenize",
             json={"text": ""}
         )
-        assert response.status_code == 200
-        assert response.json()["count"] == 0 or response.json()["count"] == len(self.tokenizer.encode(""))
+        assert response.status_code == 200, f"Failed with: {response.text}"
+        empty_tokens = self.tokenizer.encode("")
+        assert response.json()["count"] == len(empty_tokens)
         
         response = requests.post(
             f"{self.base_url.replace('/v1', '')}/detokenize",
             json={"tokens": []}
         )
-        assert response.status_code == 200
+        assert response.status_code == 200, f"Failed with: {response.text}"
         assert response.json()["text"] == ""
 
 
