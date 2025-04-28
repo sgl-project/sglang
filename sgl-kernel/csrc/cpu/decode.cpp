@@ -129,10 +129,11 @@ void pack_vnni(
 template <typename scalar_t>
 inline void fill_stub(scalar_t* __restrict__ out, float val, int64_t size) {
   using Vec = at::vec::Vectorized<scalar_t>;
+  constexpr int kVecSize = Vec::size();
   const Vec data_vec = Vec(static_cast<scalar_t>(val));
   int64_t d = 0;
 #pragma GCC unroll 4
-  for (; d <= size - Vec::size(); d += Vec::size()) {
+  for (; d <= size - kVecSize; d += kVecSize) {
     data_vec.store(out + d);
   }
   if (size - d > 0) {
@@ -144,10 +145,11 @@ template <typename scalar_t>
 inline void copy_stub(scalar_t* __restrict__ out, const float* __restrict__ acc, float s, int64_t size) {
   using bVec = at::vec::Vectorized<scalar_t>;
   using fVec = at::vec::Vectorized<float>;
+  constexpr int kVecSize = bVec::size();
   const fVec s_fvec = fVec(s);
   int64_t d = 0;
 #pragma GCC unroll 4
-  for (; d <= size - bVec::size(); d += bVec::size()) {
+  for (; d <= size - kVecSize; d += kVecSize) {
     fVec a_fvec0 = fVec::loadu(acc + d) * s_fvec;
     fVec a_fvec1 = fVec::loadu(acc + d + fVec::size()) * s_fvec;
     bVec out_bvec = convert_from_float_ext<scalar_t>(a_fvec0, a_fvec1);
@@ -161,9 +163,10 @@ inline void copy_stub(scalar_t* __restrict__ out, const float* __restrict__ acc,
 template <typename scalar_t>
 inline void copy_stub(scalar_t* __restrict__ out, const scalar_t* __restrict__ src, int64_t size) {
   using bVec = at::vec::Vectorized<scalar_t>;
+  constexpr int kVecSize = bVec::size();
   int64_t d = 0;
 #pragma GCC unroll 4
-  for (; d <= size - bVec::size(); d += bVec::size()) {
+  for (; d <= size - kVecSize; d += kVecSize) {
     bVec out_bvec = bVec::loadu(src + d);
     out_bvec.store(out + d);
   }
