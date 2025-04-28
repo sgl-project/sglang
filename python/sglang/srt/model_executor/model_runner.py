@@ -271,6 +271,7 @@ class ModelRunner:
                     "fa3",
                     "triton",
                     "flashmla",
+                    "cutlass_mla",
                 ]:
                     logger.info(
                         f"MLA optimization is turned on. Use {server_args.attention_backend} backend."
@@ -926,6 +927,12 @@ class ModelRunner:
             )
 
             self.attn_backend = FlashAttentionBackend(self)
+        elif self.server_args.attention_backend == "cutlass_mla":
+            from sglang.srt.layers.attention.cutlass_mla_backend import (
+                CutlassMLABackend,
+            )
+
+            self.attn_backend = CutlassMLABackend(self)
         else:
             raise ValueError(
                 f"Invalid attention backend: {self.server_args.attention_backend}"
