@@ -7,7 +7,7 @@ It accepts server arguments (the same as launch_server.py).
 Usage:
 python3 -m sglang.compile_deep_gemm --model deepseek-ai/DeepSeek-V3 --tp 8 --trust-remote-code
 
-add `--compile-mode offline` to use offline compile.
+add `--compile-mode online` to use online compile, which is capturing server's call.
 
 """
 
