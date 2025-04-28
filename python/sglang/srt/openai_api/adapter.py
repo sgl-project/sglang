@@ -995,39 +995,34 @@ def v1_chat_generate_request(
                 else:
                     assistant_prefix = None
 
-                base_params = {
-                    "messages": openai_compatible_messages,
-                    "tokenize": True,
-                    "add_generation_prompt": True,
-                    "tools": tools,
-                }
-
                 try:
-                    if request.chat_template_kwargs:
-                        prompt_ids = tokenizer_manager.tokenizer.apply_chat_template(
-                            **base_params,
-                            **request.chat_template_kwargs,
-                        )
-                    else:
-                        prompt_ids = tokenizer_manager.tokenizer.apply_chat_template(
-                            **base_params
-                        )
+                    prompt_ids = tokenizer_manager.tokenizer.apply_chat_template(
+                        openai_compatible_messages,
+                        tokenize=True,
+                        add_generation_prompt=True,
+                        tools=tools,
+                        **(
+                            request.chat_template_kwargs
+                            if request.chat_template_kwargs
+                            else {}
+                        ),
+                    )
                 except:
                     #  This except branch will be triggered when the chosen model
                     #  has a different tools input format that is not compatible
                     #  with openAI's apply_chat_template tool_call format, like Mistral.
                     tools = [t if "function" in t else {"function": t} for t in tools]
-                    base_params["tools"] = tools
-
-                    if request.chat_template_kwargs:
-                        prompt_ids = tokenizer_manager.tokenizer.apply_chat_template(
-                            **base_params,
-                            **request.chat_template_kwargs,
-                        )
-                    else:
-                        prompt_ids = tokenizer_manager.tokenizer.apply_chat_template(
-                            **base_params
-                        )
+                    prompt_ids = tokenizer_manager.tokenizer.apply_chat_template(
+                        openai_compatible_messages,
+                        tokenize=True,
+                        add_generation_prompt=True,
+                        tools=tools,
+                        **(
+                            request.chat_template_kwargs
+                            if request.chat_template_kwargs
+                            else {}
+                        ),
+                    )
 
                 if assistant_prefix:
                     encoded = tokenizer_manager.tokenizer.encode(assistant_prefix)
@@ -1260,19 +1255,33 @@ def v1_chat_generate_response(
         tool_calls = None
         text = ret_item["text"]
 
+        enable_thinking = True
         if isinstance(request, list):
             tool_choice = request[idx].tool_choice
             tools = request[idx].tools
             separate_reasoning = request[idx].separate_reasoning
+
+            if (
+                request[idx].chat_template_kwargs
+                and request[idx].chat_template_kwargs.get("enable_thinking") is not None
+            ):
+                enable_thinking = request[idx].chat_template_kwargs.get(
+                    "enable_thinking", True
+                )
         else:
             tool_choice = request.tool_choice
             tools = request.tools
             separate_reasoning = request.separate_reasoning
 
-        enable_thinking = True
-        if request.chat_template_kwargs.get("enable_thinking"):
-            enable_thinking = request.chat_template_kwargs.get("enable_thinking", True)
+            if (
+                request.chat_template_kwargs
+                and request.chat_template_kwargs.get("enable_thinking") is not None
+            ):
+                enable_thinking = request.chat_template_kwargs.get(
+                    "enable_thinking", True
+                )
 
+        reasoning_text = None
         if reasoning_parser and separate_reasoning and enable_thinking:
             try:
                 parser = ReasoningParser(
@@ -1285,8 +1294,6 @@ def v1_chat_generate_response(
                     HTTPStatus.BAD_REQUEST,
                     "Failed to parse reasoning related info to json format!",
                 )
-        else:
-            reasoning_text = None
 
         if tool_choice != "none" and tools:
             parser = FunctionCallParser(tools, tool_call_parser)
