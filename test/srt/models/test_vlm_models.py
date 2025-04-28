@@ -171,7 +171,7 @@ if __name__ == "__main__":
         "--mem-fraction-static",
         type=float,
         help="Static memory fraction for the model",
-        default=0.6,
+        default=0.75,
     )
 
     # Parse args intended for unittest
