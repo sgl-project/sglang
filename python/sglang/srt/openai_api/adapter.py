@@ -971,6 +971,8 @@ def v1_chat_generate_request(
                     )
 
                 for message in request.messages:
+                    if message.content is None:
+                        message.content = ""
                     if isinstance(message.content, str):
                         openai_compatible_messages.append(
                             {"role": message.role, "content": message.content}
