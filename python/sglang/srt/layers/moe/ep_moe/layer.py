@@ -20,15 +20,15 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.layers.moe.ep_moe.kernels import (
+    deepgemm_post_reorder_triton_kernel,
     gelu_and_mul_triton_kernel,
     grouped_gemm_triton,
+    moe_ep_deepgemm_preproess,
     post_reorder_triton_kernel,
     pre_reorder_triton_kernel,
     run_moe_ep_preproess,
     silu_and_mul_masked_post_quant_fwd,
     silu_and_mul_triton_kernel,
-    moe_ep_deepgemm_preproess,
-    deepgemm_post_reorder_triton_kernel,
 )
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoEMethodBase
@@ -40,7 +40,13 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.utils import DeepEPMode, is_cuda, is_hip, set_weight_attrs, get_bool_env_var
+from sglang.srt.utils import (
+    DeepEPMode,
+    get_bool_env_var,
+    is_cuda,
+    is_hip,
+    set_weight_attrs,
+)
 
 _is_hip = is_hip()
 
@@ -50,6 +56,7 @@ if _is_hip:
 logger = logging.getLogger(__name__)
 
 epmoe_use_deepgemm = get_bool_env_var("EPMOE_USE_DEEPGEMM")
+
 
 class GroupedGemmRunner(torch.nn.Module):
     flashinfer_gemm_warpper = None
@@ -69,8 +76,7 @@ class GroupedGemmRunner(torch.nn.Module):
             128 * 1024 * 1024, dtype=torch.int8, device=device
         )
         cls.flashinfer_gemm_warpper = SegmentGEMMWrapper(workspace_buffer)
-        
-    
+
     # c = a * b
     def forward(
         self,
@@ -201,7 +207,7 @@ class EPMoE(torch.nn.Module):
         )
 
         self.grouped_gemm_runner = None
-        
+
         self.w13_weight_fp8 = (
             self.w13_weight,
             (
@@ -220,8 +226,10 @@ class EPMoE(torch.nn.Module):
             return self.forward_deepgemm(hidden_states, router_logits)
         else:
             return self.forward_normal(hidden_states, router_logits)
-    
-    def forward_deepgemm(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
+
+    def forward_deepgemm(
+        self, hidden_states: torch.Tensor, router_logits: torch.Tensor
+    ):
         assert self.quant_method is not None
 
         topk_weights, topk_ids = select_experts(
@@ -238,12 +246,21 @@ class EPMoE(torch.nn.Module):
         )
 
         # PreReorder
-        m_max, masked_m, expected_m, src2dst, gateup_input, gateup_input_scale = moe_ep_deepgemm_preproess(
-            topk_ids, self.num_experts, hidden_states, self.top_k, self.start_expert_id, self.end_expert_id, self.block_shape
+        m_max, masked_m, expected_m, src2dst, gateup_input, gateup_input_scale = (
+            moe_ep_deepgemm_preproess(
+                topk_ids,
+                self.num_experts,
+                hidden_states,
+                self.top_k,
+                self.start_expert_id,
+                self.end_expert_id,
+                self.block_shape,
+            )
         )
         gateup_input_fp8 = (
             gateup_input,
-            get_col_major_tma_aligned_tensor(gateup_input_scale),)
+            get_col_major_tma_aligned_tensor(gateup_input_scale),
+        )
 
         # GroupGemm-0
         num_groups, m, k = gateup_input_fp8[0].size()
@@ -251,11 +268,11 @@ class EPMoE(torch.nn.Module):
         gateup_output = torch.empty(
             (num_groups, m, n), device=hidden_states.device, dtype=torch.bfloat16
         )
-        
+
         m_grouped_gemm_fp8_fp8_bf16_nt_masked(
             gateup_input_fp8, self.w13_weight_fp8, gateup_output, masked_m, expected_m
         )
-        
+
         # Act
         down_input = torch.empty(
             (
@@ -313,7 +330,7 @@ class EPMoE(torch.nn.Module):
             BLOCK_SIZE=512,
         )
         return output
-    
+
     def forward_normal(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
         assert self.quant_method is not None
 

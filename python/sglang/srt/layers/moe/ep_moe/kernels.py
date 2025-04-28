@@ -711,7 +711,7 @@ def grouped_gemm_triton(
 
 @triton.jit
 def compute_masked_m_triton_kernel(seg_indptr, masked_m, num_experts, N):
-    expert_id = tl.program_id(0)  
+    expert_id = tl.program_id(0)
     start = tl.load(seg_indptr + expert_id)
     end = tl.load(seg_indptr + expert_id + 1)
     tl.store(masked_m + expert_id, (end - start))
@@ -719,7 +719,13 @@ def compute_masked_m_triton_kernel(seg_indptr, masked_m, num_experts, N):
 
 @triton.jit
 def deepgemm_compute_src2dst_triton_kernel(
-    topk_ids, reorder_ids, seg_indptr, src2dst, max_m, num_toks, BLOCK_SIZE: tl.constexpr
+    topk_ids,
+    reorder_ids,
+    seg_indptr,
+    src2dst,
+    max_m,
+    num_toks,
+    BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
     dst_id = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -729,8 +735,8 @@ def deepgemm_compute_src2dst_triton_kernel(
     expert_dst_start = tl.load(seg_indptr + expert_id)
     expert_dst_offset = dst_id - expert_dst_start
     dst_id = expert_id * max_m + expert_dst_offset
-    tl.store(src2dst + src_id, dst_id, mask=mask)   
-  
+    tl.store(src2dst + src_id, dst_id, mask=mask)
+
 
 @triton.jit
 def fill_gateup_input_triton_kernel(
@@ -754,7 +760,7 @@ def fill_gateup_input_triton_kernel(
     topk_ids_ptr = topk_ids_ptr + src_idx * topk
     src_ptr = input_ptr + src_idx * hidden_size
     scale_src_ptr = scale_ptr + src_idx * scale_size
-    
+
     for idx in range(topk):
         expert_id = tl.load(topk_ids_ptr + idx)
         if expert_id >= start_expert_id and expert_id <= end_expert_id:
@@ -772,7 +778,7 @@ def fill_gateup_input_triton_kernel(
                 mask = offset < scale_size
                 in_scale = tl.load(scale_src_ptr + offset, mask=mask)
                 tl.store(scale_dst_ptr + offset, in_scale, mask=mask)
-            
+
 
 def exp2_upper(num: int) -> int:
     for i in range(2, 31):
@@ -782,14 +788,16 @@ def exp2_upper(num: int) -> int:
     return num
 
 
-def moe_ep_deepgemm_preproess(topk_ids: torch.Tensor, 
-                              num_experts: int, 
-                              hidden_states: torch.Tensor, 
-                              top_k: int,  
-                              start_expert_id, 
-                              end_expert_id, 
-                              block_shape,
-                              output_dtype: torch.dtype = torch.float8_e4m3fn,):
+def moe_ep_deepgemm_preproess(
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    hidden_states: torch.Tensor,
+    top_k: int,
+    start_expert_id,
+    end_expert_id,
+    block_shape,
+    output_dtype: torch.dtype = torch.float8_e4m3fn,
+):
     reorder_topk_ids, reorder_ids = torch.sort(topk_ids.view(-1), stable=True)
     seg_indptr = torch.zeros(num_experts + 1, device=topk_ids.device, dtype=torch.int64)
     src2dst = torch.empty(topk_ids.numel(), device=topk_ids.device, dtype=torch.int32)
@@ -798,11 +806,12 @@ def moe_ep_deepgemm_preproess(topk_ids: torch.Tensor,
     compute_seg_indptr_triton_kernel[(num_experts,)](
         reorder_topk_ids, seg_indptr, topk_ids.numel()
     )
-    
+
     grid = lambda meta: (triton.cdiv(topk_ids.numel(), meta["BLOCK_SIZE"]),)
-    compute_masked_m_triton_kernel[(num_experts, )](
-        seg_indptr, masked_m, num_experts, reorder_topk_ids.numel())
-    
+    compute_masked_m_triton_kernel[(num_experts,)](
+        seg_indptr, masked_m, num_experts, reorder_topk_ids.numel()
+    )
+
     # m_max = exp2_upper(torch.max(masked_m).item())
     m_max = exp2_upper(hidden_states.size(0))
     expected_m = (topk_ids.numel() + num_experts - 1) // num_experts
@@ -813,33 +822,47 @@ def moe_ep_deepgemm_preproess(topk_ids: torch.Tensor,
     )
 
     deepgemm_compute_src2dst_triton_kernel[grid](
-        topk_ids, reorder_ids, seg_indptr, src2dst, m_max, topk_ids.numel(), BLOCK_SIZE=256)
-    
+        topk_ids,
+        reorder_ids,
+        seg_indptr,
+        src2dst,
+        m_max,
+        topk_ids.numel(),
+        BLOCK_SIZE=256,
+    )
+
     if block_shape is not None:
         assert len(block_shape) == 2
         block_n, block_k = block_shape[0], block_shape[1]
         if _is_cuda:
-            hidden_states, scale = sglang_per_token_group_quant_fp8(hidden_states, block_k)
+            hidden_states, scale = sglang_per_token_group_quant_fp8(
+                hidden_states, block_k
+            )
         else:
             hidden_states, scale = per_token_group_quant_fp8(hidden_states, block_k)
-    
-        gateup_input_scale = torch.empty((gateup_input.size(0), gateup_input.size(1), scale.size(1)),
-                                        device=hidden_states.device,
-                                        dtype=scale.dtype)
 
-    fill_gateup_input_triton_kernel[(hidden_states.shape[0],)](hidden_states, scale,
-                                    gateup_input,
-                                    gateup_input_scale,
-                                    src2dst,
-                                    topk_ids, 
-                                    start_expert_id, 
-                                    end_expert_id, 
-                                    top_k,
-                                    m_max,
-                                    hidden_states.size(1),
-                                    scale.size(1),
-                                    BLOCK_SIZE=1024)
-    
+        gateup_input_scale = torch.empty(
+            (gateup_input.size(0), gateup_input.size(1), scale.size(1)),
+            device=hidden_states.device,
+            dtype=scale.dtype,
+        )
+
+    fill_gateup_input_triton_kernel[(hidden_states.shape[0],)](
+        hidden_states,
+        scale,
+        gateup_input,
+        gateup_input_scale,
+        src2dst,
+        topk_ids,
+        start_expert_id,
+        end_expert_id,
+        top_k,
+        m_max,
+        hidden_states.size(1),
+        scale.size(1),
+        BLOCK_SIZE=1024,
+    )
+
     # if hidden_states.get_device() == 0:
     #         print("begin")
     #         print("src2dst: ", src2dst)
@@ -853,7 +876,14 @@ def moe_ep_deepgemm_preproess(topk_ids: torch.Tensor,
     #         print("gateup_input_scale: ", gateup_input_scale[31])
     #         print("topk: ", top_k)
 
-    return m_max, masked_m[start_expert_id : (end_expert_id+1)], expected_m, src2dst, gateup_input, gateup_input_scale
+    return (
+        m_max,
+        masked_m[start_expert_id : (end_expert_id + 1)],
+        expected_m,
+        src2dst,
+        gateup_input,
+        gateup_input_scale,
+    )
 
 
 @triton.jit
