@@ -37,6 +37,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.quantization.deep_gemm import _ENABLE_JIT_DEEPGEMM
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -54,8 +55,6 @@ if _is_hip:
     from vllm._custom_ops import scaled_fp8_quant
 
 logger = logging.getLogger(__name__)
-
-epmoe_use_deepgemm = get_bool_env_var("EPMOE_USE_DEEPGEMM")
 
 
 class GroupedGemmRunner(torch.nn.Module):
@@ -222,7 +221,7 @@ class EPMoE(torch.nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
-        if use_deep_gemm and epmoe_use_deepgemm:
+        if use_deep_gemm and _ENABLE_JIT_DEEPGEMM:
             return self.forward_deepgemm(hidden_states, router_logits)
         else:
             return self.forward_normal(hidden_states, router_logits)
