@@ -116,6 +116,7 @@ class DeepSeekR1Detector(BaseReasoningFormatDetector):
         )
         # https://github.com/sgl-project/sglang/pull/3202#discussion_r1950153599
 
+
 class QwQDetector(BaseReasoningFormatDetector):
     """
     Detector for QwQ model.
@@ -137,6 +138,7 @@ class QwQDetector(BaseReasoningFormatDetector):
             force_reasoning=True,
             stream_reasoning=stream_reasoning,
         )
+
 
 class ReasoningParser:
     """
