@@ -35,6 +35,36 @@ logger = logging.getLogger(__name__)
 NixlEngineInfo: TypeAlias = Dict[str, Union[str, int]]
 
 
+# From Mooncake backend.
+def group_concurrent_contiguous(
+    src_indices: npt.NDArray[np.int64], dst_indices: npt.NDArray[np.int64]
+) -> Tuple[List[npt.NDArray[np.int64]], List[npt.NDArray[np.int64]]]:
+    src_groups = []
+    dst_groups = []
+    current_src = [src_indices[0]]
+    current_dst = [dst_indices[0]]
+
+    for i in range(1, len(src_indices)):
+        src_contiguous = src_indices[i] == src_indices[i - 1] + 1
+        dst_contiguous = dst_indices[i] == dst_indices[i - 1] + 1
+        if src_contiguous and dst_contiguous:
+            current_src.append(src_indices[i])
+            current_dst.append(dst_indices[i])
+        else:
+            src_groups.append(current_src)
+            dst_groups.append(current_dst)
+            current_src = [src_indices[i]]
+            current_dst = [dst_indices[i]]
+
+    src_groups.append(current_src)
+    dst_groups.append(current_dst)
+
+    return src_groups, dst_groups
+
+
+GUARD = "NixlMsgGuard".encode("ascii")
+
+
 @dataclasses.dataclass
 class TransferInfo:
     room: int
@@ -362,6 +392,13 @@ class NixlKVManager(BaseKVManager):
             """This thread recvs transfer info from the decode engine"""
             while True:
                 waiting_req_bytes = self.server_socket.recv_multipart()
+                logger.debug(
+                    f"Received multipart with total byte size {sum(len(x) for x in waiting_req_bytes)}"
+                )
+                assert (
+                    waiting_req_bytes[0] == GUARD
+                ), f"First message should be {GUARD}. Foreign traffic?"
+                waiting_req_bytes = waiting_req_bytes[1:]
                 room = waiting_req_bytes[0].decode("ascii")
                 if room == "None":
                     continue
@@ -555,6 +592,7 @@ class NixlKVReceiver(BaseKVReceiver):
             )
             self._connect("tcp://" + self.prefill_server_url).send_multipart(
                 [
+                    GUARD,
                     str(self.bootstrap_room).encode("ascii"),
                     get_local_ip_by_remote().encode("ascii"),
                     str(self.kv_mgr.rank_port).encode("ascii"),
@@ -597,6 +635,7 @@ class NixlKVReceiver(BaseKVReceiver):
 
 class NixlKVBootstrapServer(BaseKVBootstrapServer):
     def __init__(self, port: int):
+        logger.debug(f"NixlKVBootstrapServer started on port {port}")
         self.port = port
         self.app = web.Application()
         self.store = dict()
