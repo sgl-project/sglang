@@ -34,6 +34,7 @@ logger = logging.getLogger(__name__)
 
 MAX_CONTIGUOUS = 32
 
+
 def group_concurrent_contiguous(
     src_indices: npt.NDArray[np.int64], dst_indices: npt.NDArray[np.int64]
 ) -> Tuple[List[npt.NDArray[np.int64]], List[npt.NDArray[np.int64]]]:

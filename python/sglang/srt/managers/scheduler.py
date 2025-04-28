@@ -1435,7 +1435,7 @@ class Scheduler(
         self.forward_ct += 1
 
         # NOTE HACK
-        if self.forward_ct == 10:
+        if self.forward_ct == 5:
             text = f"[All threads of {os.getpid()=}, {self.tp_rank=}]"
             for thread in threading.enumerate():
                 text += f" [{thread.name=} {thread.ident=} {thread.native_id=}]"
