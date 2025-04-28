@@ -318,7 +318,7 @@ class FlashAttentionBackend(AttentionBackend):
         self.target_verify_metadata = {}
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.req_to_token_local = model_runner.req_to_token_pool.req_to_token_local
-        self.hybrid_ratio = model_runner.hybrid_ratio
+        self.is_hybrid = model_runner.is_hybrid
         self.kv_cache_dtype = model_runner.kv_cache_dtype
         self.kv_cache_dtype_str = model_runner.server_args.kv_cache_dtype
         self.page_size = model_runner.page_size
@@ -431,7 +431,7 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
                     forward_batch.req_pool_indices, : metadata.max_seq_len_k
                 ]
-                if self.hybrid_ratio is not None and self.hybrid_ratio > 0:
+                if self.is_hybrid is not None:
                     metadata.page_table_local = forward_batch.req_to_token_pool.req_to_token_local[
                         forward_batch.req_pool_indices, : metadata.max_seq_len_k
                     ]
@@ -570,7 +570,7 @@ class FlashAttentionBackend(AttentionBackend):
             metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
                 forward_batch.req_pool_indices, : metadata.max_seq_len_k
             ]
-            if self.hybrid_ratio is not None and self.hybrid_ratio > 0:
+            if self.is_hybrid is not None:
                 metadata.page_table_local = forward_batch.req_to_token_pool.req_to_token_local[
                 forward_batch.req_pool_indices, : metadata.max_seq_len_k
             ]
@@ -636,18 +636,14 @@ class FlashAttentionBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
-        # Use precomputed metadata across all layers
-        metadata = self.forward_metadata
-        # Check if we should use local attention
-        use_local_attn = (
-            self.attention_chunk_size is not None
-            and metadata.local_attn_metadata is not None
+        use_hybrid_loc = (
+            self.is_hybrid is not None 
             and (hasattr(layer, "use_irope") and layer.use_irope)
         )
         if k is not None:
             assert v is not None
             if save_kv_cache:
-                if not use_local_attn: 
+                if not use_hybrid_loc: 
                     cache_loc = (
                         forward_batch.out_cache_loc
                         if not layer.is_cross_attention
@@ -668,7 +664,9 @@ class FlashAttentionBackend(AttentionBackend):
                         v,
                     )
 
-
+        # Use precomputed metadata across all layers
+        metadata = self.forward_metadata
+        
         # Calculate window size (can be moved to metadata if layer properties don't change)
         # we don't do layer.sliding_window_size - 1 since in model.get_attention_sliding_window_size() we already - 1
         # here is two side inclusive
@@ -686,7 +684,13 @@ class FlashAttentionBackend(AttentionBackend):
             v_descale = layer.v_scale.expand(descale_shape)
             q = q.to(self.kv_cache_dtype)
         causal = not layer.is_cross_attention
-
+        
+        # Check if we should use local attention
+        use_local_attn = (
+            self.attention_chunk_size is not None
+            and metadata.local_attn_metadata is not None
+            and (hasattr(layer, "use_irope") and layer.use_irope)
+        )
         # We do cascade attention for Target Verify with topk > 1
         use_cascade_attn = (
             forward_batch.forward_mode.is_target_verify() and self.topk > 1
@@ -894,19 +898,15 @@ class FlashAttentionBackend(AttentionBackend):
         save_kv_cache=True,
     ) -> torch.Tensor:
         
-        metadata = self.forward_metadata
-    
-        use_local_attention = (
-            self.attention_chunk_size is not None
-            and metadata.local_attn_metadata is not None
+        use_hybrid_loc = (
+            self.is_hybrid is not None 
             and (hasattr(layer, "use_irope") and layer.use_irope)
         )
-        local_attn_metadata = getattr(metadata, "local_attn_metadata", None)
         
         if k is not None:
             assert v is not None
             if save_kv_cache:
-                if not use_local_attention:
+                if not use_hybrid_loc:
                     cache_loc = (
                         forward_batch.out_cache_loc
                         if not layer.is_cross_attention
@@ -926,6 +926,14 @@ class FlashAttentionBackend(AttentionBackend):
                         k,
                         v,
                     )
+        
+        # Use precomputed metadata across all layers
+        metadata = self.forward_metadata
+        local_attn_metadata = getattr(metadata, "local_attn_metadata", None)
+        use_local_attention = (
+            self.attention_chunk_size is not None and local_attn_metadata is not None
+            and (hasattr(layer, "use_irope") and layer.use_irope)
+        )
         # We do cascade attention for Draft Decode with topk > 1
         use_cascade_attn = self.topk > 1
 
@@ -1761,7 +1769,10 @@ class FlashAttentionBackend(AttentionBackend):
 
         cu_seqlens_q = metadata.cu_seqlens_q
         cache_seqlens_int32 = metadata.cache_seqlens_int32
-        page_table = metadata.page_table_local
+        if self.is_hybrid:
+            page_table = metadata.page_table_local
+        else:
+            page_table = metadata.page_table
         if cu_seqlens_q is None or cache_seqlens_int32 is None or page_table is None:
             metadata.local_attn_metadata = None
             return

@@ -257,7 +257,7 @@ class Scheduler(
             TpWorkerClass = TpModelWorkerClient
         else:
             TpWorkerClass = TpModelWorker
-                
+
         self.tp_worker = TpWorkerClass(
             server_args=server_args,
             gpu_id=gpu_id,
@@ -441,7 +441,7 @@ class Scheduler(
             model_override_args=server_args.json_model_override_args,
             is_embedding=server_args.is_embedding,
             enable_multimodal=server_args.enable_multimodal,
-            hybrid_ratio=server_args.hybrid_ratio,
+            enable_hybrid_kvcache=server_args.enable_hybrid_kvcache,
             dtype=server_args.dtype,
             quantization=server_args.quantization,
         )
@@ -470,10 +470,14 @@ class Scheduler(
     def init_memory_pool_and_cache(self):
         server_args = self.server_args
 
-        self.req_to_token_pool, self.token_to_kv_pool_allocator, self.token_to_kv_pool_allocator_local = (
+        self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             self.tp_worker.get_memory_pool()
         )
-
+        
+        if self.tp_worker.worker.model_runner.is_hybrid is not None:
+            self.token_to_kv_pool_allocator_local = self.tp_worker.get_memory_pool_local()
+        else:
+            self.token_to_kv_pool_allocator_local = None
         if (
             server_args.chunked_prefill_size is not None
             and server_args.disable_radix_cache
@@ -1154,7 +1158,7 @@ class Scheduler(
                 self.running_batch = self.update_running_batch(self.running_batch)
                 ret = self.running_batch if not self.running_batch.is_empty() else None
             else:
-                ret = None               
+                ret = None
 
         # Handle DP attention
         if self.server_args.enable_dp_attention or self.server_args.enable_sp_layernorm:
@@ -1277,12 +1281,12 @@ class Scheduler(
             can_run_list,
             self.req_to_token_pool,
             self.token_to_kv_pool_allocator,
-            self.token_to_kv_pool_allocator_local,
             self.tree_cache,
             self.model_config,
             self.enable_overlap,
             self.spec_algorithm,
             self.server_args.enable_custom_logit_processor,
+            self.token_to_kv_pool_allocator_local,
         )
         new_batch.prepare_for_extend()
 

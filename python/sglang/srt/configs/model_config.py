@@ -44,7 +44,7 @@ class ModelConfig:
         model_override_args: Optional[str] = None,
         is_embedding: Optional[bool] = None,
         enable_multimodal: Optional[bool] = None,
-        hybrid_ratio: Optional[float] = None,
+        enable_hybrid_kvcache: Optional[float] = None,
         dtype: str = "auto",
         quantization: Optional[str] = None,
         override_config_file: Optional[str] = None,
@@ -85,7 +85,7 @@ class ModelConfig:
         # Check model type
         self.is_hybrid = is_hybrid_model(
             self.hf_config.architectures, 
-            hybrid_ratio=hybrid_ratio,
+            enable_hybrid_kvcache=enable_hybrid_kvcache,
             context_length=context_length,
             attention_chunk_size=self.attention_chunk_size
         )
@@ -528,18 +528,18 @@ multimodal_model_archs = [
 
 def is_hybrid_model(
     model_architectures: List[str], 
-    hybrid_ratio: Optional[float], 
+    enable_hybrid_kvcache: Optional[float], 
     context_length: Optional[int], 
     attention_chunk_size: Optional[int]
 ):
     
-    if hybrid_ratio is None:
+    if enable_hybrid_kvcache is None:
         return None
-    elif(hybrid_ratio > 0 
+    elif(enable_hybrid_kvcache > 0 
          and model_architectures[0] == "Llama4ForConditionalGeneration"
          and context_length > attention_chunk_size
     ):
-        return hybrid_ratio
+        return enable_hybrid_kvcache
     else:
         return None 
 

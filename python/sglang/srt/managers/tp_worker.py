@@ -69,7 +69,7 @@ class TpModelWorker:
             model_override_args=server_args.json_model_override_args,
             is_embedding=server_args.is_embedding,
             enable_multimodal=server_args.enable_multimodal,
-            hybrid_ratio=server_args.hybrid_ratio,
+            enable_hybrid_kvcache=server_args.enable_hybrid_kvcache,
             dtype=server_args.dtype,
             quantization=server_args.quantization,
         )
@@ -163,18 +163,10 @@ class TpModelWorker:
         return self.model_runner.attention_tp_group.cpu_group
 
     def get_memory_pool(self):
-        if self.model_runner.hybrid_ratio > 0:
-            return (
-                self.model_runner.req_to_token_pool,
-                self.model_runner.token_to_kv_pool_allocator,
-                self.model_runner.token_to_kv_pool_allocator_local
-            )
-        else:
-            return (
-                self.model_runner.req_to_token_pool,
-                self.model_runner.token_to_kv_pool_allocator,
-                None
-            )
+        return (
+            self.model_runner.req_to_token_pool,
+            self.model_runner.token_to_kv_pool_allocator
+        )
 
     def forward_batch_generation(
         self,

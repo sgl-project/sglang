@@ -778,12 +778,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         reqs: List[Req],
         req_to_token_pool: ReqToTokenPool,
         token_to_kv_pool_allocator: TokenToKVPoolAllocator,
-        token_to_kv_pool_allocator_local: TokenToKVPoolAllocator,
         tree_cache: BasePrefixCache,
         model_config: ModelConfig,
         enable_overlap: bool,
         spec_algorithm: SpeculativeAlgorithm,
         enable_custom_logit_processor: bool,
+        token_to_kv_pool_allocator_local: TokenToKVPoolAllocator = None,
     ):
         return_logprob = any(req.return_logprob for req in reqs)
 

@@ -125,7 +125,7 @@ class ModelRunner:
         self.is_draft_worker = is_draft_worker
         self.is_generation = model_config.is_generation
         self.is_multimodal = model_config.is_multimodal
-        self.hybrid_ratio = model_config.is_hybrid
+        self.is_hybrid = model_config.is_hybrid
         self.should_log = tp_rank == 0
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
@@ -800,8 +800,8 @@ class ModelRunner:
                 "Not enough memory. Please try to increase --mem-fraction-static."
             )
         
-        if self.hybrid_ratio is not None:
-            if self.hybrid_ratio < 0 or self.hybrid_ratio > 1:
+        if self.is_hybrid is not None:
+            if self.is_hybrid < 0 or self.is_hybrid > 1:
                 raise RuntimeError(
                     "Invalid hybrid ratio. Please set --hybrid-ratio between 0 and 1."
                 )
@@ -815,8 +815,8 @@ class ModelRunner:
                 )
                             
             temp_ratio = (
-                (1 - self.hybrid_ratio) 
-                + self.hybrid_ratio 
+                (1 - self.is_hybrid) 
+                + self.is_hybrid 
                 * self.attention_chunk_size / self.model_config.context_len
             )
             self.local_max_num_tokens = (
@@ -837,8 +837,8 @@ class ModelRunner:
                 self.max_total_num_tokens
                 // self.server_args.page_size
                 * self.server_args.page_size
-            )            
-            
+            )
+
             
         if self.req_to_token_pool is None:
             self.req_to_token_pool = ReqToTokenPool(
@@ -846,6 +846,7 @@ class ModelRunner:
                 max_context_len=self.model_config.context_len + 4,
                 device=self.device,
                 enable_memory_saver=self.server_args.enable_memory_saver,
+                is_hybrid = self.is_hybrid,
             )
         else:
             # Draft worker shares req_to_token_pool with the target worker.
@@ -895,7 +896,7 @@ class ModelRunner:
                     device=self.device,
                     kvcache=self.token_to_kv_pool,
                 )
-                if self.hybrid_ratio is not None and self.hybrid_ratio > 0:
+                if self.is_hybrid is not None:
                     self.token_to_kv_pool_allocator_local = TokenToKVPoolAllocator(
                     self.local_max_num_tokens,
                     dtype=self.kv_cache_dtype,

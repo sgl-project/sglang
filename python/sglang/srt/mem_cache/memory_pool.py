@@ -52,6 +52,7 @@ class ReqToTokenPool:
         max_context_len: int,
         device: str,
         enable_memory_saver: bool,
+        is_hybrid: float = None
     ):
         memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
@@ -64,9 +65,12 @@ class ReqToTokenPool:
             self.req_to_token = torch.zeros(
                 (size, max_context_len), dtype=torch.int32, device=device
             )
-            self.req_to_token_local = torch.zeros(
-                (size, max_context_len), dtype=torch.int32, device=device
-            )
+            if is_hybrid:
+                self.req_to_token_local = torch.zeros(
+                    (size, max_context_len), dtype=torch.int32, device=device
+                )
+            else:
+                self.req_to_token_local = None
         self.free_slots = list(range(size))
 
     def write(self, indices, values):
@@ -290,8 +294,6 @@ class MHATokenToKVPool(KVCache):
                         )
                     )
                     
-                
-
     def _clear_buffers(self):
         del self.k_buffer
         del self.v_buffer

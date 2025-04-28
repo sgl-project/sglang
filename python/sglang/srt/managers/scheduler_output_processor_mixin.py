@@ -185,7 +185,7 @@ class SchedulerOutputProcessorMixin:
             result.bid,
         )
         self.num_generated_tokens += len(batch.reqs)
-        
+
         if self.enable_overlap:
             logits_output, next_token_ids = self.tp_worker.resolve_batch_result(bid)
             next_token_logprobs = logits_output.next_token_logprobs
@@ -194,7 +194,7 @@ class SchedulerOutputProcessorMixin:
             next_token_ids = next_token_ids.tolist()
             if batch.return_logprob:
                 next_token_logprobs = logits_output.next_token_logprobs.tolist()
-                
+
         self.token_to_kv_pool_allocator.free_group_begin()
 
         # Check finish condition
@@ -265,7 +265,7 @@ class SchedulerOutputProcessorMixin:
             batch.next_batch_sampling_info.sampling_info_done.set()
 
         self.stream_output(batch.reqs, batch.return_logprob)
-        
+
         self.token_to_kv_pool_allocator.free_group_end()
 
         self.forward_ct_decode = (self.forward_ct_decode + 1) % (1 << 30)

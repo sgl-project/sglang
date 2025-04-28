@@ -62,16 +62,6 @@ from sglang.srt.utils import (
 )
 
 
-def contains_layer_gt8(s: str) -> bool:
-    """
-    Return True if `s` contains "language_model.model.layers.#."
-    with # being an integer >= 8.
-    """
-    for m in _pattern.finditer(s):
-        if int(m.group(1)) >= 8:
-            return True
-    return False
-
 @contextmanager
 def device_loading_context(module: torch.nn.Module, target_device: torch.device):
     if target_device.type == "cpu":

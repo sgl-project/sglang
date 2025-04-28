@@ -98,18 +98,13 @@ class TpModelWorkerClient:
         return self.worker.get_attention_tp_cpu_group()
 
     def get_memory_pool(self):
-        if self.worker.model_runner.hybrid_ratio is not None and self.worker.model_runner.hybrid_ratio > 0:
-            return (
-                self.worker.model_runner.req_to_token_pool,
-                self.worker.model_runner.token_to_kv_pool_allocator,
-                self.worker.model_runner.token_to_kv_pool_allocator_local
-            )
-        else:
-            return (
-                self.worker.model_runner.req_to_token_pool,
-                self.worker.model_runner.token_to_kv_pool_allocator,
-                None
-            )
+        return (
+            self.worker.model_runner.req_to_token_pool,
+            self.worker.model_runner.token_to_kv_pool_allocator
+        )
+    
+    def get_memory_pool_local(self):
+        return self.worker.model_runner.token_to_kv_pool_allocator_local
 
     def get_kv_cache(self):
         return self.worker.model_runner.token_to_kv_pool
