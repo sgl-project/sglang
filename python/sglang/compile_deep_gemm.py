@@ -214,6 +214,7 @@ def build_deepseek_v3_mapping(
                 CompileMapping("shared.down_proj", KernelType.GEMM_NT_F8F8BF16),
             ]
         )
+        # FIXME: update replica experts
         ep_mapping.extend(
             [
                 # deepep low latency
@@ -297,6 +298,9 @@ def get_parallel_weight_config(
         return target
     else:
         target = target._asdict()
+        assert (
+            target[mapping.parallel_dim] % parallel_size == 0
+        ), f"{target[mapping.parallel_dim]} vs {parallel_size}"
         target[mapping.parallel_dim] //= parallel_size
         return WeightConfig(target["N"], target["K"], target["G"], target["B"])
 
