@@ -295,7 +295,7 @@ async def async_request_truss(
                             # NOTE: Some completion API might have a last
                             # usage summary response without a token so we
                             # want to check a token was generated
-                            if data["choices"][0]["delta"]["content"]:
+                            if data["choices"][0]["text"]:
                                 timestamp = time.perf_counter()
                                 # First token
                                 if ttft == 0.0:
@@ -307,7 +307,7 @@ async def async_request_truss(
                                     output.itl.append(timestamp - most_recent_timestamp)
 
                                 most_recent_timestamp = timestamp
-                                generated_text += data["choices"][0]["delta"]["content"]
+                                generated_text += data["choices"][0]["text"]
 
                     output.generated_text = generated_text
                     output.success = True
@@ -977,6 +977,7 @@ async def benchmark(
     profile: bool,
     pd_seperated: bool = False,
     flush_cache: bool = False,
+    warmup_requests: int = 1,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -994,11 +995,11 @@ async def benchmark(
             return await request_func(request_func_input=request_func_input, pbar=pbar)
 
     # Warmup
-    print(f"Starting warmup with {args.warmup_requests} sequences...")
+    print(f"Starting warmup with {warmup_requests} sequences...")
 
     # Use the first request for all warmup iterations
     test_prompt, test_prompt_len, test_output_len = input_requests[0]
-    if lora_names != None and len(lora_names) != 0:
+    if lora_names is not None and len(lora_names) != 0:
         lora_name = lora_names[0]
     else:
         lora_name = None
@@ -1016,7 +1017,7 @@ async def benchmark(
 
     # Run warmup requests
     warmup_tasks = []
-    for _ in range(args.warmup_requests):
+    for _ in range(warmup_requests):
         warmup_tasks.append(
             asyncio.create_task(request_func(request_func_input=test_input))
         )
@@ -1024,9 +1025,7 @@ async def benchmark(
     warmup_outputs = await asyncio.gather(*warmup_tasks)
 
     # Check if at least one warmup request succeeded
-    if args.warmup_requests > 0 and not any(
-        output.success for output in warmup_outputs
-    ):
+    if warmup_requests > 0 and not any(output.success for output in warmup_outputs):
         raise ValueError(
             "Warmup failed - Please make sure benchmark arguments "
             f"are correctly specified. Error: {warmup_outputs[0].error}"
@@ -1058,7 +1057,7 @@ async def benchmark(
     tasks: List[asyncio.Task] = []
     async for request in get_request(input_requests, request_rate):
         prompt, prompt_len, output_len = request
-        if lora_names != None and len(lora_names) != 0:
+        if lora_names is not None and len(lora_names) != 0:
             idx = random.randint(0, len(lora_names) - 1)
             lora_name = lora_names[idx]
         else:

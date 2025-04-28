@@ -150,6 +150,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "n_share_experts_fusion, float routed_scaling_factor) -> "
       "(Tensor[])");
   m.impl("moe_fused_gate", torch::kCUDA, &moe_fused_gate);
+  m.def(
+      "fp8_blockwise_scaled_grouped_mm(Tensor output, Tensor a, Tensor b, Tensor scales_a, Tensor scales_b, Tensor "
+      "stride_a, Tensor stride_b, Tensor stride_c, Tensor layout_sfa, Tensor layout_sfb, Tensor problem_sizes, Tensor "
+      "expert_offsets) -> ()");
+  m.impl("fp8_blockwise_scaled_grouped_mm", torch::kCUDA, &fp8_blockwise_scaled_grouped_mm);
 
   /*
    * From csrc/speculative
@@ -228,6 +233,34 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "bool is_causal, float softcap, bool return_softmax, "
       "Generator? gen) -> Tensor[]");
   m.impl("varlen_fwd_sparse", torch::kCUDA, &flash::mha_varlen_fwd_sparse);
+
+  // Sparse Attention utils
+  m.def(
+      "convert_vertical_slash_indexes("
+      "   Tensor! block_count, Tensor! block_offset, "
+      "   Tensor! column_count, Tensor! column_index, "
+      "   Tensor q_seqlens, Tensor q_seqlens, "
+      "   Tensor vertical_indexes, Tensor slash_indexes, "
+      "   int context_size, int block_size_M, int block_size_N, "
+      "   bool causal) -> ()");
+  m.impl("convert_vertical_slash_indexes", torch::kCUDA, &convert_vertical_slash_indexes);
+
+  m.def(
+      "convert_vertical_slash_indexes_mergehead("
+      "   Tensor! block_count, Tensor! block_offset, "
+      "   Tensor! column_count, Tensor! column_index, "
+      "   Tensor q_seqlens, Tensor q_seqlens, "
+      "   Tensor vertical_indexes, Tensor slash_indexes, "
+      "   Tensor vertical_indices_count, Tensor slash_indices_count, "
+      "   int context_size, int block_size_M, int block_size_N, "
+      "   bool causal) -> ()");
+  m.impl("convert_vertical_slash_indexes_mergehead", torch::kCUDA, &convert_vertical_slash_indexes_mergehead);
+
+  /*
+   * From XGrammar
+   */
+  m.def("apply_token_bitmask_inplace_cuda(Tensor logits, Tensor bitmask, Tensor? indices=None) -> ()");
+  m.impl("apply_token_bitmask_inplace_cuda", &ApplyTokenBitmaskInplace);
 }
 
 REGISTER_EXTENSION(common_ops)

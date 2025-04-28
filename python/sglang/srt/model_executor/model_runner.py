@@ -91,10 +91,13 @@ from sglang.srt.utils import (
     set_cuda_arch,
 )
 
-logger = logging.getLogger(__name__)
-
+# Use a small KV cache pool size for tests in CI
 SGLANG_CI_SMALL_KV_SIZE = os.getenv("SGLANG_CI_SMALL_KV_SIZE", None)
+
+# Detect stragger ranks in model loading
 UNBALANCED_MODEL_LOADING_TIMEOUT_S = 300
+
+logger = logging.getLogger(__name__)
 
 
 class ModelRunner:
@@ -179,7 +182,7 @@ class ModelRunner:
         if _ENABLE_JIT_DEEPGEMM:
             update_deep_gemm_config(gpu_id, server_args)
 
-        # If it is a draft model tp_group can be different.
+        # If it is a draft model, tp_group can be different
         self.initialize(min_per_gpu_memory)
 
     def initialize(self, min_per_gpu_memory: float):
@@ -232,7 +235,8 @@ class ModelRunner:
 
         if server_args.attention_backend is None:
             """
-            We auto select the fastest attention backend according to the current offering
+            Auto select the fastest attention backend.
+
             1. Models with MHA Architecture (e.g: Llama, QWen)
                 1.1 We will turn on FA3 on hopper unless user use spec decode with topk > 1 or page_size > 1.
                 1.2 In other cases, we will use flashinfer if available, otherwise use triton.
@@ -242,6 +246,7 @@ class ModelRunner:
             """
 
             if not self.use_mla_backend:
+                # MHA architecture
                 if (
                     is_hopper_with_cuda_12_3()
                     and is_no_spec_infer_or_topk_one(server_args)
@@ -253,6 +258,7 @@ class ModelRunner:
                         "flashinfer" if is_flashinfer_available() else "triton"
                     )
             else:
+                # MLA architecture
                 if is_hopper_with_cuda_12_3():
                     server_args.attention_backend = "fa3"
                 else:
@@ -261,13 +267,13 @@ class ModelRunner:
                 f"Attention backend not set. Use {server_args.attention_backend} backend by default."
             )
         elif self.use_mla_backend:
-            # TODO: add MLA optimization on CPU
             if server_args.device != "cpu":
                 if server_args.attention_backend in [
                     "flashinfer",
                     "fa3",
                     "triton",
                     "flashmla",
+                    "cutlass_mla",
                 ]:
                     logger.info(
                         f"MLA optimization is turned on. Use {server_args.attention_backend} backend."
@@ -277,7 +283,7 @@ class ModelRunner:
                         f"Invalid attention backend for MLA: {server_args.attention_backend}"
                     )
             else:
-                raise ValueError(f"MLA optimization not supported on CPU.")
+                raise ValueError("MLA optimization not supported on CPU.")
 
         if (
             server_args.attention_backend == "fa3"
@@ -311,18 +317,6 @@ class ModelRunner:
                 "Automatically turn off --chunked-prefill-size for multimodal model."
             )
             server_args.chunked_prefill_size = -1
-
-            if self.model_config.hf_config.architectures == [
-                "Qwen2VLForConditionalGeneration"
-            ] or self.model_config.hf_config.architectures == [
-                "Qwen2_5_VLForConditionalGeneration"
-            ]:
-                # TODO: qwen2-vl series does not support radix cache now, set disable_radix_cache=True automatically
-                logger.info("Automatically disable radix cache for qwen-vl series.")
-                server_args.disable_radix_cache = True
-
-        if server_args.enable_deepep_moe:
-            logger.info(f"DeepEP is turned on. DeepEP mode: {server_args.deepep_mode}")
 
         if not self.use_mla_backend:
             server_args.disable_chunked_prefix_cache = True
@@ -986,6 +980,12 @@ class ModelRunner:
             )
 
             self.attn_backend = FlashAttentionBackend(self)
+        elif self.server_args.attention_backend == "cutlass_mla":
+            from sglang.srt.layers.attention.cutlass_mla_backend import (
+                CutlassMLABackend,
+            )
+
+            self.attn_backend = CutlassMLABackend(self)
         else:
             raise ValueError(
                 f"Invalid attention backend: {self.server_args.attention_backend}"
@@ -1017,12 +1017,6 @@ class ModelRunner:
             return
 
         if self.server_args.disable_cuda_graph:
-            logger.warning(
-                "\n\nCUDA Graph is DISABLED.\n"
-                "This will cause significant performance degradation.\n"
-                "CUDA Graph should almost never be disabled in most usage scenarios.\n"
-                "If you encounter OOM issues, please try setting --mem-fraction-static to a lower value (such as 0.8 or 0.7) instead of disabling CUDA Graph.\n"
-            )
             return
 
         tic = time.time()
@@ -1034,7 +1028,7 @@ class ModelRunner:
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         logger.info(
             f"Capture cuda graph end. Time elapsed: {time.time() - tic:.2f} s. "
-            f"avail mem={after_mem:.2f} GB. mem usage={(before_mem - after_mem):.2f} GB."
+            f"mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
         )
 
     def apply_torch_tp(self):
