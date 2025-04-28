@@ -77,16 +77,26 @@ class TransferInfo:
     mooncake_session_id: str
     dst_kv_indices: npt.NDArray[np.int64]
     dst_aux_index: int
+    is_dummy: bool
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
+        if msg[4] == b"" and msg[5] == b"":
+            is_dummy = True
+            dst_kv_indices = np.array([], dtype=np.int64)
+            dst_aux_index = None
+        else:
+            dst_kv_indices = np.frombuffer(msg[4], dtype=np.int64)
+            dst_aux_index = int(msg[5].decode("ascii"))
+            is_dummy = False
         return cls(
             room=int(msg[0].decode("ascii")),
             endpoint=msg[1].decode("ascii"),
             dst_port=int(msg[2].decode("ascii")),
             mooncake_session_id=msg[3].decode("ascii"),
-            dst_kv_indices=np.frombuffer(msg[4], dtype=np.int64),
-            dst_aux_index=int(msg[5].decode("ascii")),
+            dst_kv_indices=dst_kv_indices,
+            dst_aux_index=dst_aux_index,
+            is_dummy=is_dummy,
         )
 
 
@@ -227,7 +237,7 @@ class MooncakeKVManager(BaseKVManager):
             status = future.result()
             if status != 0:
                 # Immediate shutdown on first error (existing tasks will finish)
-                executor.shutdown(wait=False)
+                self.executor.shutdown(wait=False)
                 for f in futures:
                     f.cancel()
                 return status
@@ -294,6 +304,13 @@ class MooncakeKVManager(BaseKVManager):
                 try:
                     kv_chunk: TransferKVChunk = self.transfer_queue.get(timeout=0.01)
                     req = self.transfer_infos[kv_chunk.room]
+                    if req.is_dummy:
+                        if kv_chunk.is_last:
+                            self.request_status[req.room] = KVPoll.Success
+                            self.transfer_infos.pop(req.room)
+                        else:
+                            self.request_status[kv_chunk.room] = KVPoll.Success
+                        continue
                     chunked_dst_kv_indice = req.dst_kv_indices[kv_chunk.index_slice]
                     assert len(chunked_dst_kv_indice) == len(
                         kv_chunk.prefill_kv_indices
@@ -477,6 +494,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
         self.kv_mgr = mgr
         self.session_id = self.kv_mgr.get_session_id()
         self.kv_mgr.update_status(bootstrap_room, KVPoll.Bootstrapping)
+        self.tp_size_per_dp_rank = self.kv_mgr.tp_size // self.kv_mgr.dp_size
 
         if not self.kv_mgr.enable_dp_attention:
             # We assume dp_attention should be activated simultaneously for
@@ -485,48 +503,79 @@ class MooncakeKVReceiver(BaseKVReceiver):
             # prefill instance as well. Therefore, we should skip questioning
             # the prefill dp size to reduce bootstrap overhead.
             self.prefill_dp_size = 1
+            self.prefill_tp_size_per_dp_rank = self.kv_mgr.tp_size // self.kv_mgr.dp_size
         elif self.bootstrap_addr not in self.kv_mgr.prefill_dp_size_table:
-            self.prefill_dp_size, tp_size_per_dp_rank = (
+            self.prefill_dp_size, self.prefill_tp_size_per_dp_rank = (
                 self._get_prefill_dp_size_from_server()
             )
-            # Currently, we don't allow prefill instance and decode instance to
-            # have different TP sizes per DP rank.
-            assert tp_size_per_dp_rank == self.kv_mgr.tp_size // self.kv_mgr.dp_size
+
             if self.prefill_dp_size is None:
                 logger.error(
                     f"Could not fetch prefill dp_size for bootstrap_addr: {self.bootstrap_addr}"
                 )
             else:
                 self.kv_mgr.prefill_dp_size_table[self.bootstrap_addr] = (
-                    self.prefill_dp_size
+                    self.prefill_dp_size, self.prefill_tp_size_per_dp_rank
                 )
+
+            # support prefill instance and decode instance to have different TP sizes per DP rank
+            # only support MLA for now
+            if self.prefill_tp_size_per_dp_rank != self.kv_mgr.tp_size // self.kv_mgr.dp_size:
+                # only support when prefill with TP
+                assert self.prefill_dp_size == 1
         else:
-            self.prefill_dp_size = self.kv_mgr.prefill_dp_size_table[
+            self.prefill_dp_size, self.prefill_tp_size_per_dp_rank = self.kv_mgr.prefill_dp_size_table[
                 self.bootstrap_addr
             ]
 
-        # NOTE: key distinguished by bootstrap_addr and engine_rank
-        self.target_dp_group = bootstrap_room % self.prefill_dp_size
+        self.target_dp_group, self.target_engine_ranks = self._get_target_prefill_mapping(bootstrap_room)
         bootstrap_key = f"{self.bootstrap_addr}_{self.kv_mgr.kv_args.engine_rank}"
 
         if bootstrap_key not in self.kv_mgr.connection_pool:
-            self.bootstrap_info = self._get_bootstrap_info_from_server(
-                self.kv_mgr.kv_args.engine_rank,
-                self.target_dp_group,
-            )
-            if self.bootstrap_info is None:
+            bootstrap_infos = []
+            for target_idx, target_engine_rank in enumerate(self.target_engine_ranks):
+                bootstrap_info = self._get_bootstrap_info_from_server(
+                    target_engine_rank,
+                    self.target_dp_group,
+                )
+                if bootstrap_info is not None:
+                    # default select first prefill target rank as real rank
+                    bootstrap_info["is_dummy"] = not bool(target_idx == 0)
+                    bootstrap_infos.append(bootstrap_info)
+                else:
+                    logger.error(
+                        f"Could not fetch bootstrap info for engine rank: {self.kv_mgr.kv_args.engine_rank} and target_dp_group: {target_dp_group}"
+                    )
+            self.bootstrap_infos = bootstrap_infos
+
+            if len(self.bootstrap_infos) == 0:
                 logger.error(
                     f"Could not fetch bootstrap info for engine rank: {self.kv_mgr.kv_args.engine_rank}"
                 )
             else:
-                self.kv_mgr.connection_pool[bootstrap_key] = self.bootstrap_info
+                self.kv_mgr.connection_pool[bootstrap_key] = self.bootstrap_infos
                 # Register kv_args only once to prefill KVManager according to the info fetched from the bootstrap server
                 self._register_kv_args()
         else:
-            self.bootstrap_info = self.kv_mgr.connection_pool[bootstrap_key]
+            self.bootstrap_infos = self.kv_mgr.connection_pool[bootstrap_key]
 
-        assert self.bootstrap_info is not None
+        assert len(self.bootstrap_infos) > 0
         self.kv_mgr.update_status(bootstrap_room, KVPoll.WaitingForInput)
+
+    def _get_target_prefill_mapping(self, bootstrap_room: int) -> int:
+        if not self.kv_mgr.enable_dp_attention or self.tp_size_per_dp_rank == self.prefill_tp_size_per_dp_rank:
+            # NOTE: key distinguished by bootstrap_addr and engine_rank
+            return bootstrap_room % self.prefill_dp_size, [self.kv_mgr.kv_args.engine_rank]
+
+        if self.tp_size_per_dp_rank < self.prefill_tp_size_per_dp_rank:
+            assert self.prefill_tp_size_per_dp_rank % self.tp_size_per_dp_rank == 0
+            assert self.prefill_dp_size == 1
+            prefill_world_size = self.prefill_tp_size_per_dp_rank * self.prefill_dp_size
+            target_engine_rank = self.kv_mgr.kv_args.engine_rank % self.tp_size_per_dp_rank % prefill_world_size
+            return 0, list(range(target_engine_rank, prefill_world_size, self.tp_size_per_dp_rank))
+        else:
+            raise NotImplementedError(f"decode_tp_size_per_dp_rank: {self.tp_size_per_dp_rank} "
+                                      f"is greater than prefill_tp_size_per_dp_rank: {self.prefill_tp_size_per_dp_rank}")
 
     def _get_bootstrap_info_from_server(self, engine_rank, target_dp_group):
         """Fetch the bootstrap info from the bootstrap server."""
@@ -565,28 +614,29 @@ class MooncakeKVReceiver(BaseKVReceiver):
             return None
 
     def _register_kv_args(self):
-        self.prefill_server_url = (
-            f"{self.bootstrap_info['rank_ip']}:{self.bootstrap_info['rank_port']}"
-        )
-
-        packed_kv_data_ptrs = b"".join(
-            struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
-        )
-        packed_aux_data_ptrs = b"".join(
-            struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.aux_data_ptrs
-        )
-        sock, lock = self._connect("tcp://" + self.prefill_server_url)
-        with lock:
-            sock.send_multipart(
-                [
-                    "None".encode("ascii"),
-                    get_local_ip_by_remote().encode("ascii"),
-                    str(self.kv_mgr.rank_port).encode("ascii"),
-                    self.session_id.encode("ascii"),
-                    packed_kv_data_ptrs,
-                    packed_aux_data_ptrs,
-                ]
+        for bootstrap_info in self.bootstrap_infos:
+            self.prefill_server_url = (
+                f"{bootstrap_info['rank_ip']}:{bootstrap_info['rank_port']}"
             )
+
+            packed_kv_data_ptrs = b"".join(
+                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
+            )
+            packed_aux_data_ptrs = b"".join(
+                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.aux_data_ptrs
+            )
+            sock, lock = self._connect("tcp://" + self.prefill_server_url)
+            with lock:
+                sock.send_multipart(
+                    [
+                        "None".encode("ascii"),
+                        get_local_ip_by_remote().encode("ascii"),
+                        str(self.kv_mgr.rank_port).encode("ascii"),
+                        self.session_id.encode("ascii"),
+                        packed_kv_data_ptrs,
+                        packed_aux_data_ptrs
+                    ]
+                )
 
     @classmethod
     def _connect(cls, endpoint: str):
@@ -599,25 +649,27 @@ class MooncakeKVReceiver(BaseKVReceiver):
             return cls._socket_cache[endpoint], cls._socket_locks[endpoint]
 
     def init(self, kv_indices: npt.NDArray[np.int64], aux_index: Optional[int] = None):
-        self.prefill_server_url = (
-            f"{self.bootstrap_info['rank_ip']}:{self.bootstrap_info['rank_port']}"
-        )
-        logger.debug(
-            f"Fetched bootstrap info: {self.bootstrap_info} for engine rank: {self.kv_mgr.kv_args.engine_rank}"
-        )
-
-        sock, lock = self._connect("tcp://" + self.prefill_server_url)
-        with lock:
-            sock.send_multipart(
-                [
-                    str(self.bootstrap_room).encode("ascii"),
-                    get_local_ip_by_remote().encode("ascii"),
-                    str(self.kv_mgr.rank_port).encode("ascii"),
-                    self.session_id.encode("ascii"),
-                    kv_indices.tobytes(),
-                    str(aux_index).encode("ascii"),
-                ]
+        for bootstrap_info in self.bootstrap_infos:
+            self.prefill_server_url = (
+                f"{bootstrap_info['rank_ip']}:{bootstrap_info['rank_port']}"
             )
+            logger.debug(
+                f"Fetched bootstrap info: {bootstrap_info} for engine rank: {self.kv_mgr.kv_args.engine_rank}"
+            )
+            is_dummy = bootstrap_info["is_dummy"]
+
+            sock, lock = self._connect("tcp://" + self.prefill_server_url)
+            with lock:
+                sock.send_multipart(
+                    [
+                        str(self.bootstrap_room).encode("ascii"),
+                        get_local_ip_by_remote().encode("ascii"),
+                        str(self.kv_mgr.rank_port).encode("ascii"),
+                        self.session_id.encode("ascii"),
+                        kv_indices.tobytes() if not is_dummy else b"",
+                        str(aux_index).encode("ascii") if not is_dummy else b"",
+                    ]
+                )
 
     def poll(self) -> KVPoll:
         return self.kv_mgr.check_status(self.bootstrap_room)
