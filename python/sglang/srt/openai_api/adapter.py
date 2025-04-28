@@ -1252,7 +1252,6 @@ def v1_chat_generate_response(
             tools = request[idx].tools
             separate_reasoning = request[idx].separate_reasoning
             
-            # 处理request为列表时的enable_thinking
             if (request[idx].chat_template_kwargs and 
                 request[idx].chat_template_kwargs.get("enable_thinking") is not None):
                 enable_thinking = request[idx].chat_template_kwargs.get("enable_thinking", True)
@@ -1263,7 +1262,6 @@ def v1_chat_generate_response(
             tools = request.tools
             separate_reasoning = request.separate_reasoning
             
-            # 处理request为单个对象时的enable_thinking
             if (request.chat_template_kwargs and 
                 request.chat_template_kwargs.get("enable_thinking") is not None):
                 enable_thinking = request.chat_template_kwargs.get("enable_thinking", True)
