@@ -967,7 +967,7 @@ def get_zmq_socket(
         set_send_opt()
     elif socket_type == zmq.PULL:
         set_recv_opt()
-    elif socket_type == zmq.DEALER:
+    elif socket_type in [zmq.DEALER, zmq.REQ, zmq.REP]:
         set_send_opt()
         set_recv_opt()
     else:
