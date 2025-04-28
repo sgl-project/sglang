@@ -45,7 +45,7 @@ if _is_cuda or _is_hip:
 
 
 logger = logging.getLogger(__name__)
-padding_size = 128 if bool(int(os.getenv("MOE_PADDING", "0"))) else 0
+padding_size = 128 if bool(int(os.getenv("SGLANG_MOE_PADDING", "0"))) else 0
 enable_moe_align_block_size_triton = bool(
     int(os.getenv("ENABLE_MOE_ALIGN_BLOCK_SIZE_TRITON", "0"))
 )
@@ -1327,7 +1327,7 @@ def fused_experts_impl(
     if (
         not (use_fp8_w8a8 or use_int8_w8a8)
         or block_shape is not None
-        or (_is_hip and get_bool_env_var("CK_MOE"))
+        or (_is_hip and get_bool_env_var("SGLANG_AITER_MOE"))
     ):
         padded_size = 0
 

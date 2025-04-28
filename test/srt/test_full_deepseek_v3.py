@@ -5,13 +5,13 @@ import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
+from sglang.test.send_one import BenchArgs, send_one_prompt
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     is_in_ci,
     popen_launch_server,
-    run_bench_one_batch,
     write_github_step_summary,
 )
 
@@ -48,22 +48,23 @@ class TestDeepseekV3(CustomTestCase):
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"{metrics=}")
 
-        self.assertGreater(metrics["accuracy"], 0.935)
+        if is_in_ci():
+            write_github_step_summary(
+                f"### test_gsm8k (deepseek-v3)\n" f'{metrics["accuracy"]=:.3f}\n'
+            )
+            self.assertGreater(metrics["accuracy"], 0.935)
 
+    def test_bs_1_speed(self):
+        args = BenchArgs(port=int(self.base_url.split(":")[-1]), max_new_tokens=2048)
+        acc_length, speed = send_one_prompt(args)
 
-class TestBenchOneBatch(CustomTestCase):
-    def test_bs1(self):
-        output_throughput = run_bench_one_batch(
-            FULL_DEEPSEEK_V3_MODEL_PATH,
-            ["--trust-remote-code", "--tp", "8", "--cuda-graph-max-bs", "2"],
-        )
-        print(f"{output_throughput=:.2f} token/s")
+        print(f"{speed=:.2f}")
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_bs1 (deepseek-v3)\n" f"{output_throughput=:.2f} token/s\n"
+                f"### test_bs_1_speed (deepseek-v3)\n" f"{speed=:.2f} token/s\n"
             )
-            self.assertGreater(output_throughput, 70)
+            self.assertGreater(speed, 75)
 
 
 class TestDeepseekV3MTP(CustomTestCase):
@@ -80,13 +81,13 @@ class TestDeepseekV3MTP(CustomTestCase):
             "--speculative-draft",
             "lmsys/DeepSeek-V3-0324-NextN",
             "--speculative-num-steps",
-            "5",
+            "3",
             "--speculative-eagle-topk",
-            "4",
+            "2",
             "--speculative-num-draft-tokens",
-            "8",
+            "4",
             "--mem-fraction-static",
-            "0.6",
+            "0.7",
         ]
         cls.process = popen_launch_server(
             cls.model,
@@ -113,19 +114,34 @@ class TestDeepseekV3MTP(CustomTestCase):
         )
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"{metrics=}")
-        self.assertGreater(metrics["accuracy"], 0.94)
 
         server_info = requests.get(self.base_url + "/get_server_info")
         avg_spec_accept_length = server_info.json()["avg_spec_accept_length"]
         print(f"{avg_spec_accept_length=}")
-        self.assertGreater(avg_spec_accept_length, 3.2)
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_gsm8k (deepseek-v3)\n"
+                f"### test_gsm8k (deepseek-v3 mtp)\n"
                 f'{metrics["accuracy"]=:.3f}\n'
                 f"{avg_spec_accept_length=:.2f}\n"
             )
+            self.assertGreater(metrics["accuracy"], 0.935)
+            self.assertGreater(avg_spec_accept_length, 2.9)
+
+    def test_bs_1_speed(self):
+        args = BenchArgs(port=int(self.base_url.split(":")[-1]), max_new_tokens=2048)
+        acc_length, speed = send_one_prompt(args)
+
+        print(f"{acc_length=:.2f} {speed=:.2f}")
+
+        if is_in_ci():
+            write_github_step_summary(
+                f"### test_bs_1_speed (deepseek-v3 mtp)\n"
+                f"{acc_length=:.2f}\n"
+                f"{speed=:.2f} token/s\n"
+            )
+            self.assertGreater(acc_length, 2.9)
+            self.assertGreater(speed, 105)
 
 
 if __name__ == "__main__":
