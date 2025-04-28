@@ -133,7 +133,7 @@ def build_deepseek_v3_weights(model_config) -> Dict[str, WeightConfig]:
     hidden_size = model_config.hidden_size
     intermediate_size = model_config.intermediate_size
     n_routed_experts = model_config.n_routed_experts
-    n_shared_experts = model_config.n_routed_experts
+    n_shared_experts = model_config.n_shared_experts
     moe_intermediate_size = model_config.moe_intermediate_size
     vocab_size = model_config.vocab_size
 
