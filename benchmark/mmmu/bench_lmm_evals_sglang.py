@@ -22,11 +22,12 @@ Example usage:
 
 Supported tasks list: https://github.com/EvolvingLMMs-Lab/lmms-eval/tree/main/lmms_eval/tasks
 """
-import subprocess
-import os
+
 import argparse
 import glob
 import json
+import os
+import subprocess
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
@@ -35,54 +36,57 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
+
 def execute_lmms_evaluation(
-        model_version: str,
-        chat_template: str,
-        output_path: str,
-        tasks: str,
-        batch_size: int,
-        tp: int):
-        """
-        Evaluate a VLM on the selected tasks with lmms‑eval.
-        Only `model_version` (checkpoint) and `chat_template` vary;
-        """
-        # -------- fixed settings --------
-        model = "openai_compatible"
-        log_suffix = "openai_compatible"
-        os.makedirs(output_path, exist_ok=True)
+    model_version: str,
+    chat_template: str,
+    output_path: str,
+    tasks: str,
+    batch_size: int,
+    tp: int,
+):
+    """
+    Evaluate a VLM on the selected tasks with lmms‑eval.
+    Only `model_version` (checkpoint) and `chat_template` vary;
+    """
+    # -------- fixed settings --------
+    model = "openai_compatible"
+    log_suffix = "openai_compatible"
+    os.makedirs(output_path, exist_ok=True)
 
-        # -------- compose --model_args --------
-        model_args = (
-            f'model_version="{model_version}",'
-            f'chat_template="{chat_template}",'
-            f"tp={tp}"
-        )
+    # -------- compose --model_args --------
+    model_args = (
+        f'model_version="{model_version}",'
+        f'chat_template="{chat_template}",'
+        f"tp={tp}"
+    )
 
-        # -------- build command list --------
-        cmd = [
-            "python3",
-            "-m",
-            "lmms_eval",
-            "--model",
-            model,
-            "--model_args",
-            model_args,
-            "--tasks",
-            tasks,
-            "--batch_size",
-            str(batch_size),
-            "--log_samples",
-            "--log_samples_suffix",
-            log_suffix,
-            "--output_path",
-            str(output_path),
-        ]
+    # -------- build command list --------
+    cmd = [
+        "python3",
+        "-m",
+        "lmms_eval",
+        "--model",
+        model,
+        "--model_args",
+        model_args,
+        "--tasks",
+        tasks,
+        "--batch_size",
+        str(batch_size),
+        "--log_samples",
+        "--log_samples_suffix",
+        log_suffix,
+        "--output_path",
+        str(output_path),
+    ]
 
-        subprocess.run(
-            cmd,
-            check=True,
-            timeout=3600,
-        )
+    subprocess.run(
+        cmd,
+        check=True,
+        timeout=3600,
+    )
+
 
 def run_eval(args):
     """
@@ -109,16 +113,23 @@ def run_eval(args):
         # Set OpenAI API key and base URL environment variables. Needed for lmm-evals to work.
         os.environ["OPENAI_API_KEY"] = "sk-456"
         os.environ["OPENAI_API_BASE"] = f"{DEFAULT_URL_FOR_TEST}/v1"
-        
+
         # Run evaluation using lmm-evals
-        execute_lmms_evaluation(args.model_path, args.chat_template, "./logs", args.tasks, args.batch_size, args.tp)
+        execute_lmms_evaluation(
+            args.model_path,
+            args.chat_template,
+            "./logs",
+            args.tasks,
+            args.batch_size,
+            args.tp,
+        )
         print("Evaluation completed.")
 
         # Get the result file
         result_files = glob.glob("./logs/*.json")
         if result_files:
             result_file_path = result_files[0]
-            
+
             with open(result_file_path, "r") as f:
                 try:
                     result = json.load(f)
@@ -126,8 +137,10 @@ def run_eval(args):
                 except json.JSONDecodeError as e:
                     print(f"Error parsing JSON file: {e}")
         else:
-            print("No result files found in the logs directory. Evaluation may have failed.")
-            
+            print(
+                "No result files found in the logs directory. Evaluation may have failed."
+            )
+
     except Exception as e:
         print(f"Error during evaluation: {e}")
     finally:
