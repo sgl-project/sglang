@@ -1024,7 +1024,7 @@ def v1_chat_generate_request(
                             tools=tools,
                             **request.chat_template_kwargs,
                         )
-                    else: 
+                    else:
                         prompt_ids = tokenizer_manager.tokenizer.apply_chat_template(
                             openai_compatible_messages,
                             tokenize=True,
