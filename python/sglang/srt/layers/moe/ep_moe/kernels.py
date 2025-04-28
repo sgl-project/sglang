@@ -5,9 +5,8 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
-from sglang.srt.utils import get_bool_env_var, is_cuda
+from sglang.srt.utils import is_cuda
 
 _is_cuda = is_cuda()
 if _is_cuda:
@@ -19,14 +18,9 @@ if _is_cuda:
         from deep_gemm import ceil_div
     except ImportError:
         print("Failed to import ceil_div from deep_gemm.")
-        pass 
+        pass
 logger = logging.getLogger(__name__)
 
-
-import random
-from typing import Dict
-
-import torch.nn.functional as F
 import triton.language as tl
 
 
