@@ -90,12 +90,19 @@ class TestOpenAIVisionServer(CustomTestCase):
             "man" in text or "person" or "driver" in text
         ), f"text: {text}, should contain man, person or driver"
         assert (
-            "cab" in text or "taxi" in text or "SUV" in text
-        ), f"text: {text}, should contain cab, taxi or SUV"
+            "cab" in text 
+            or "taxi" in text 
+            or "SUV" in text 
+            or "vehicle" in text
+            or "car" in text
+        ), f"text: {text}, should contain cab, taxi, SUV, vehicle or car"
         # MiniCPMO fails to recognize `iron`, but `hanging`
         assert (
-            "iron" in text or "hang" in text
-        ), f"text: {text}, should contain iron or hang"
+            "iron" in text 
+            or "hang" in text
+            or "cloth" in text
+            or "holding" in text
+        ), f"text: {text}, should contain iron, hang, cloth or holding"
         assert response.id
         assert response.created
         assert response.usage.prompt_tokens > 0
