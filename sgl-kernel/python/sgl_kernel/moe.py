@@ -1,6 +1,7 @@
 from typing import Optional
 import torch
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
+from sgl_kernel import silu_and_mul
 
 def moe_align_block_size(
     topk_ids,
@@ -282,7 +283,7 @@ def cutlass_moe_fp8(
                        ab_strides1, c_strides1)
 
     intermediate = torch.empty((m * topk, n), device=device, dtype=out_dtype)
-    torch.ops._C.silu_and_mul(intermediate, c1)
+    silu_and_mul(c1, intermediate)
 
     intemediate_q, a2_scale = scaled_fp8_quant(
         intermediate, a2_scale, use_per_token_if_dynamic=per_act_token)
