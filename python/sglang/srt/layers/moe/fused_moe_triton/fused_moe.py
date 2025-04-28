@@ -941,8 +941,7 @@ def get_moe_configs(
     if os.path.exists(config_file_path):
         with open(config_file_path) as f:
             logger.info(
-                "Using configuration from %s for MoE layer. Please note that due to the large number of configs under fused_moe_triton/configs potentially not being tuned with the corresponding Triton version in your current environment, using the current configs may result in performance degradation. To achieve best performance, you can consider re-tuning the Triton fused MOE kernel in your current environment. For the tuning method, please refer to: https://github.com/sgl-project/sglang/blob/main/benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton.py. ",
-                config_file_path,
+                f"Using MoE config from: {config_file_path}. For performance tuning, see: https://github.com/sgl-project/sglang/blob/main/benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton.py"
             )
             # If a configuration has been found, return it
             return {int(key): val for key, val in json.load(f).items()}
@@ -950,11 +949,7 @@ def get_moe_configs(
     # If no optimized configuration is available, we will use the default
     # configuration
     logger.warning(
-        (
-            "Using default MoE config. Performance might be sub-optimal! "
-            "Config file not found at %s, you can tune the config with https://github.com/sgl-project/sglang/blob/main/benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton.py."
-        ),
-        config_file_path,
+        f"Config not found at {config_file_path}, using default. For performance tuning guide: https://github.com/sgl-project/sglang/blob/main/benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton.py"
     )
     return None
 
