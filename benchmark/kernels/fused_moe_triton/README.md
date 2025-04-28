@@ -23,7 +23,7 @@ python benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton.py \
 # Tune Qwen3-235B-A22B-FP8 and TP=4
 python benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton.py \
     --model Qwen/Qwen3-235B-A22B-FP8 \
-    --tp-size 4 \ 
+    --tp-size 4 \
     --dtype fp8_w8a8 \
     --tune
 
