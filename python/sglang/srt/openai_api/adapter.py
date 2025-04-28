@@ -294,8 +294,18 @@ async def process_batch(tokenizer_manager, batch_id: str, batch_request: BatchRe
                 raise ValueError("Streaming requests are not supported in batch mode")
 
             if end_point == "/v1/chat/completions":
-                extra_body_item = {k: v for k, v in body.items() if k not in ChatCompletionRequest.model_fields}
-                request_item = ChatCompletionRequest(**{k: v for k, v in body.items() if k in ChatCompletionRequest.model_fields})
+                extra_body_item = {
+                    k: v
+                    for k, v in body.items()
+                    if k not in ChatCompletionRequest.model_fields
+                }
+                request_item = ChatCompletionRequest(
+                    **{
+                        k: v
+                        for k, v in body.items()
+                        if k in ChatCompletionRequest.model_fields
+                    }
+                )
                 all_requests.append(request_item)
                 all_extra_bodies.append(extra_body_item)
             elif end_point == "/v1/completions":
@@ -303,7 +313,10 @@ async def process_batch(tokenizer_manager, batch_id: str, batch_request: BatchRe
 
         if end_point == "/v1/chat/completions":
             adapted_request, request = v1_chat_generate_request(
-                all_requests, tokenizer_manager, request_ids=request_ids, extra_body=all_extra_bodies
+                all_requests,
+                tokenizer_manager,
+                request_ids=request_ids,
+                extra_body=all_extra_bodies,
             )
         elif end_point == "/v1/completions":
             adapted_request, request = v1_generate_request(
@@ -917,7 +930,11 @@ def v1_chat_generate_request(
     for i, request in enumerate(all_requests):
         # Extract chat_template_kwargs for the current request
         current_extra_body = extra_body[i] if is_batch and extra_body else extra_body
-        chat_template_kwargs = current_extra_body.get("chat_template_kwargs", {}) if current_extra_body else {}
+        chat_template_kwargs = (
+            current_extra_body.get("chat_template_kwargs", {})
+            if current_extra_body
+            else {}
+        )
 
         # Prep the data needed for the underlying GenerateReqInput:
         #  - prompt: The full prompt string.
@@ -1324,11 +1341,25 @@ async def v1_chat_completions(
 ):
     request_json = await raw_request.json()
     # Extract potential extra_body from the request JSON
-    extra_body = {k: v for k, v in request_json.items() if k not in ChatCompletionRequest.model_fields}
-    all_requests = [ChatCompletionRequest(**{k: v for k, v in request_json.items() if k in ChatCompletionRequest.model_fields})]
+    extra_body = {
+        k: v
+        for k, v in request_json.items()
+        if k not in ChatCompletionRequest.model_fields
+    }
+    all_requests = [
+        ChatCompletionRequest(
+            **{
+                k: v
+                for k, v in request_json.items()
+                if k in ChatCompletionRequest.model_fields
+            }
+        )
+    ]
     created = int(time.time())
     # Pass extra_body to v1_chat_generate_request
-    adapted_request, request = v1_chat_generate_request(all_requests, tokenizer_manager, extra_body=extra_body)
+    adapted_request, request = v1_chat_generate_request(
+        all_requests, tokenizer_manager, extra_body=extra_body
+    )
 
     if adapted_request.stream:
         parser_dict = {}

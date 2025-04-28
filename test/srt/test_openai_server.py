@@ -8,9 +8,9 @@ import json
 import re
 import time
 import unittest
-import requests
 
 import openai
+import requests
 
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.utils import kill_process_tree
@@ -555,8 +555,7 @@ The SmartHome Mini is a compact smart home assistant available in black or white
         # Test /tokenize endpoint
         text = "Hello, world! This is a test of the tokenizer API."
         response = requests.post(
-            f"{self.base_url.replace('/v1', '')}/tokenize",
-            json={"text": text}
+            f"{self.base_url.replace('/v1', '')}/tokenize", json={"text": text}
         )
         assert response.status_code == 200, f"Failed with: {response.text}"
         data = response.json()
@@ -564,44 +563,41 @@ The SmartHome Mini is a compact smart home assistant available in black or white
         assert "count" in data
         assert isinstance(data["tokens"], list)
         assert data["count"] == len(data["tokens"])
-        
+
         # Verify tokens are correct by comparing with local tokenizer
         expected_tokens = self.tokenizer.encode(text)
         assert data["tokens"] == expected_tokens
-        
+
         # Test /detokenize endpoint
         tokens = data["tokens"]
         response = requests.post(
-            f"{self.base_url.replace('/v1', '')}/detokenize",
-            json={"tokens": tokens}
+            f"{self.base_url.replace('/v1', '')}/detokenize", json={"tokens": tokens}
         )
         assert response.status_code == 200, f"Failed with: {response.text}"
         data = response.json()
         assert "text" in data
         # 比较时忽略特殊标记和空格差异
         assert data["text"].strip() == text.strip()
-        
+
         # 测试保留特殊标记的选项
         response = requests.post(
             f"{self.base_url.replace('/v1', '')}/detokenize",
-            json={"tokens": tokens, "keep_special_tokens": True}
+            json={"tokens": tokens, "keep_special_tokens": True},
         )
         assert response.status_code == 200, f"Failed with: {response.text}"
         data_with_special = response.json()
         assert "text" in data_with_special
-        
+
         # Test with empty inputs
         response = requests.post(
-            f"{self.base_url.replace('/v1', '')}/tokenize",
-            json={"text": ""}
+            f"{self.base_url.replace('/v1', '')}/tokenize", json={"text": ""}
         )
         assert response.status_code == 200, f"Failed with: {response.text}"
         empty_tokens = self.tokenizer.encode("")
         assert response.json()["count"] == len(empty_tokens)
-        
+
         response = requests.post(
-            f"{self.base_url.replace('/v1', '')}/detokenize",
-            json={"tokens": []}
+            f"{self.base_url.replace('/v1', '')}/detokenize", json={"tokens": []}
         )
         assert response.status_code == 200, f"Failed with: {response.text}"
         assert response.json()["text"] == ""

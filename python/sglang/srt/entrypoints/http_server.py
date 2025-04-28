@@ -40,7 +40,7 @@ import uvicorn
 import uvloop
 from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import ORJSONResponse, Response, StreamingResponse, JSONResponse
+from fastapi.responses import JSONResponse, ORJSONResponse, Response, StreamingResponse
 
 from sglang.srt.entrypoints.engine import _launch_subprocesses
 from sglang.srt.function_call_parser import FunctionCallParser
@@ -616,14 +616,11 @@ async def tokenize(request: Request):
                 status_code=400,
                 content={"error": "The 'text' field must be a string"},
             )
-        
+
         tokenizer = _global_state.tokenizer_manager.tokenizer
         token_ids = tokenizer.encode(text)
-        
-        return {
-            "tokens": token_ids,
-            "count": len(token_ids)
-        }
+
+        return {"tokens": token_ids, "count": len(token_ids)}
     except Exception as e:
         return JSONResponse(
             status_code=500,
@@ -642,37 +639,42 @@ async def detokenize(request: Request):
                 status_code=400,
                 content={"error": "The 'tokens' field must be a list of integers"},
             )
-        
+
         for token in tokens:
             if not isinstance(token, int):
                 return JSONResponse(
                     status_code=400,
                     content={"error": "All tokens must be integers"},
                 )
-        
+
         tokenizer = _global_state.tokenizer_manager.tokenizer
         text = tokenizer.decode(tokens)
-        
+
         # 清理各种可能的特殊标记
         # 常见的特殊标记列表
         special_tokens = [
-            "<|begin_of_text|>", "<|endoftext|>", 
-            "<s>", "</s>", "<pad>", 
-            "[CLS]", "[SEP]", "[PAD]", "[MASK]",
-            "<bos>", "<eos>", 
+            "<|begin_of_text|>",
+            "<|endoftext|>",
+            "<s>",
+            "</s>",
+            "<pad>",
+            "[CLS]",
+            "[SEP]",
+            "[PAD]",
+            "[MASK]",
+            "<bos>",
+            "<eos>",
         ]
-        
+
         # 移除所有特殊标记
         for token in special_tokens:
             text = text.replace(token, "")
-            
+
         # 如果客户端明确要求保留特殊标记，则不进行清理
         if data.get("keep_special_tokens", False):
             text = tokenizer.decode(tokens)
-        
-        return {
-            "text": text
-        }
+
+        return {"text": text}
     except Exception as e:
         return JSONResponse(
             status_code=500,
