@@ -14,9 +14,6 @@ import unittest
 
 import requests
 
-# 添加项目根目录到Python路径
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
-
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
@@ -33,7 +30,7 @@ class TestTokenizerAPI(CustomTestCase):
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = None  # 如果需要API密钥，这里设置
+        cls.api_key = None
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
@@ -108,7 +105,6 @@ class TestTokenizerAPI(CustomTestCase):
         data = response.json()
 
         self.assertIn("text", data)
-        # 比较时忽略开头的特殊标记
         self.assertEqual(data["text"].strip(), text.strip())
 
     def test_detokenize_empty(self):
@@ -140,16 +136,13 @@ class TestTokenizerAPI(CustomTestCase):
 
     def test_detokenize_keep_special_tokens(self):
         """Test detokenizing with the option to keep special tokens."""
-        # 先获取一个包含特殊标记的示例
         text = "Hello, world!"
         tokens = self.tokenizer.encode(text)
 
-        # 正常情况下，特殊标记会被移除
         response = requests.post(f"{self.base_url}/detokenize", json={"tokens": tokens})
         self.assertEqual(response.status_code, 200, f"Failed with: {response.text}")
         data_without_special = response.json()
 
-        # 使用keep_special_tokens=True选项
         response = requests.post(
             f"{self.base_url}/detokenize",
             json={"tokens": tokens, "keep_special_tokens": True},
@@ -157,15 +150,10 @@ class TestTokenizerAPI(CustomTestCase):
         self.assertEqual(response.status_code, 200, f"Failed with: {response.text}")
         data_with_special = response.json()
 
-        # 对于某些模型，这两者可能会有所不同
-        # 这里我们只检查响应格式是否正确
         self.assertIn("text", data_with_special)
         self.assertIsInstance(data_with_special["text"], str)
 
-        # 如果模型确实添加了特殊标记，两个结果应该不同
-        # 但由于测试可能使用不同的模型，我们只在有区别时断言
         if data_with_special["text"] != data_without_special["text"]:
-            # 验证保留特殊标记的版本比不保留的版本更长或包含更多内容
             special_tokens = [
                 "<|begin_of_text|>",
                 "<|endoftext|>",

@@ -576,10 +576,8 @@ The SmartHome Mini is a compact smart home assistant available in black or white
         assert response.status_code == 200, f"Failed with: {response.text}"
         data = response.json()
         assert "text" in data
-        # 比较时忽略特殊标记和空格差异
         assert data["text"].strip() == text.strip()
 
-        # 测试保留特殊标记的选项
         response = requests.post(
             f"{self.base_url.replace('/v1', '')}/detokenize",
             json={"tokens": tokens, "keep_special_tokens": True},
