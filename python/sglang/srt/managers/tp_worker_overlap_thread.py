@@ -40,7 +40,7 @@ from sglang.utils import get_exception_traceback
 logger = logging.getLogger(__name__)
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend())
+# @torch.compile(dynamic=True, backend=get_compiler_backend())
 def resolve_future_token_ids(input_ids, future_token_ids_map):
     input_ids[:] = torch.where(
         input_ids < 0,

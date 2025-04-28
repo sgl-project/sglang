@@ -256,11 +256,10 @@ class SchedulerDisaggregationPrefillMixin:
                 self.process_batch_result_disagg_prefill(tmp_batch, tmp_result)
 
             if batch:
-                mgr = self.disagg_prefill_bootstrap_queue.kv_manager
-                while not mgr.transfer_queue.empty() and not mgr.send_kv_done.is_set():
-                    pass
-                if self.disagg_prefill_bootstrap_queue.kv_manager.send_kv_done is not None:
-                    self.disagg_prefill_bootstrap_queue.kv_manager.send_kv_done.wait()
+                # mgr = self.disagg_prefill_bootstrap_queue.kv_manager
+                # while not mgr.transfer_queue.empty():
+                #     mgr.send_kv_done.wait()
+
                 result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), result))
 

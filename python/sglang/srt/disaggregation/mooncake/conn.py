@@ -154,7 +154,7 @@ class MooncakeKVManager(BaseKVManager):
             # Determine the number of threads to use for kv sender
             cpu_count = os.cpu_count()
             self.executor = concurrent.futures.ThreadPoolExecutor(
-                min(cpu_count // 4, 16)
+                min(cpu_count // 4, 2)
             )
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.start_decode_thread()
