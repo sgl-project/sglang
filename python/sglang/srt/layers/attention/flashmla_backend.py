@@ -593,7 +593,7 @@ class FlashMLAMultiStepDraftBackend:
         kv_indices = torch.zeros(
             (
                 self.speculative_num_steps,
-                forward_batch.batch_size * self.topk * max_blocks_per_seq,
+                forward_batch.batch_size * self.topk * max_blocks_per_seq * PAGE_SIZE,
             ),
             dtype=torch.int32,
             device="cuda",
