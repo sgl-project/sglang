@@ -66,6 +66,7 @@ from sglang.srt.utils import (
     assert_pkg_version,
     configure_logger,
     get_zmq_socket,
+    is_cuda,
     kill_process_tree,
     launch_dummy_health_check_server,
     maybe_set_triton_cache_manager,
@@ -77,6 +78,8 @@ from sglang.version import __version__
 
 logger = logging.getLogger(__name__)
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+
+_is_cuda = is_cuda()
 
 
 class Engine(EngineBase):
@@ -451,6 +454,12 @@ def _set_envs_and_config(server_args: ServerArgs):
             "Please uninstall the old version and "
             "reinstall the latest version by following the instructions "
             "at https://docs.flashinfer.ai/installation.html.",
+        )
+    if _is_cuda:
+        assert_pkg_version(
+            "sgl-kernel",
+            "0.1.0",
+            "Please reinstall the latest version with `pip install sgl-kernel --force-reinstall`",
         )
 
     def sigchld_handler(signum, frame):
