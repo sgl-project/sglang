@@ -709,39 +709,6 @@ def grouped_gemm_triton(
     return c
 
 
-# @triton.jit
-# def fill_masked_m_triton_kernel(topk_ids, masked_m, num_experts, N, BLOCK_SIZE: tl.constexpr):
-#     expert_id = tl.program_id(0)
-#     masked_m_tensor = 0
-    
-#     for start_off in tl.range(0, N, BLOCK_SIZE):
-#         topk_ids_off = tl.arange(0, BLOCK_SIZE) + start_off
-#         topk_ids_mask = topk_ids_off < N
-#         topk_ids_tensor = tl.load(topk_ids + topk_ids_off, topk_ids_mask, other=num_experts)
-#         masked_m_tensor += tl.sum(tl.where(topk_ids_tensor == expert_id, 1, 0))
-#     tl.store(masked_m + expert_id, masked_m_tensor)
-
-
-# @triton.jit
-# def deepgemm_compute_src2dst_triton_kernel(topk_ids, src2dst, max_m, num_experts, N, BLOCK_SIZE: tl.constexpr):
-#     expert_id = tl.program_id(0)
-#     expert_len = 0
-#     start_dst = max_m * expert_id
-    
-#     for i in tl.range(0, N, BLOCK_SIZE):
-#         off = tl.arange(0, BLOCK_SIZE) + i
-#         mask = off < N
-#         topk_ids_tensor = tl.load(topk_ids + off, mask, other=num_experts)
-#         src2dst_tensor  = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
-#         src2dst_mask    = topk_ids_tensor == expert_id
-#         for j in tl.range(0, BLOCK_SIZE):
-#             if topk_ids_tensor[j] == expert_id:
-#                 src2dst_mask[j] = 1
-#                 src2dst_tensor[j] = start_dst + expert_len
-
-#         tl.store(src2dst + off, src2dst_tensor, src2dst_mask)
-
-
 @triton.jit
 def compute_masked_m_triton_kernel(seg_indptr, masked_m, num_experts, N):
     expert_id = tl.program_id(0)  
