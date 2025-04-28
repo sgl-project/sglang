@@ -255,6 +255,7 @@ def test_sparse_attention(
 
 
 # sparse attention utils
+# origin
 @pytest.mark.parametrize("causal", [True, False])
 def test_convert_vertical_slash_indexes(causal):
     # Prepare small, hand-checkable inputs
@@ -308,6 +309,7 @@ def test_convert_vertical_slash_indexes(causal):
     assert torch.equal(column_index, expected_column_index)
 
 
+# mergehead
 @pytest.mark.parametrize("causal", [True, False])
 def test_convert_vertical_slash_indexes_mergehead(causal):
     # Prepare small, hand-checkable inputs for mergehead version
