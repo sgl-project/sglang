@@ -886,6 +886,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
         return query, key
 
+    # https://github.com/huggingface/transformers/blob/397a5ede33863d6f7137c771a68d40036cac0396/src/transformers/models/qwen2_5_omni/modeling_qwen2_5_omni.py#L271
     @staticmethod
     def get_rope_index_omni(
         input_ids: Optional[torch.Tensor],
