@@ -271,6 +271,7 @@ class ModelRunner:
                     "fa3",
                     "triton",
                     "flashmla",
+                    "cutlass_mla",
                 ]:
                     logger.info(
                         f"MLA optimization is turned on. Use {server_args.attention_backend} backend."
@@ -926,6 +927,12 @@ class ModelRunner:
             )
 
             self.attn_backend = FlashAttentionBackend(self)
+        elif self.server_args.attention_backend == "cutlass_mla":
+            from sglang.srt.layers.attention.cutlass_mla_backend import (
+                CutlassMLABackend,
+            )
+
+            self.attn_backend = CutlassMLABackend(self)
         else:
             raise ValueError(
                 f"Invalid attention backend: {self.server_args.attention_backend}"
@@ -968,7 +975,7 @@ class ModelRunner:
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         logger.info(
             f"Capture cuda graph end. Time elapsed: {time.time() - tic:.2f} s. "
-            f"avail mem={after_mem:.2f} GB. mem usage={(before_mem - after_mem):.2f} GB."
+            f"mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
         )
 
     def apply_torch_tp(self):
