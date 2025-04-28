@@ -20,6 +20,13 @@ python benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton.py \
     --dtype fp8_w8a8 \
     --tune
 
+# Tune Qwen3-235B-A22B-FP8 and TP=4
+python benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton.py \
+    --model Qwen/Qwen3-235B-A22B-FP8 \
+    --tp-size 4 \
+    --dtype fp8_w8a8 \
+    --tune
+
 # Tune DeepSeek-V3 with FP8, TP=8 and n_share_experts_fusion=8
 python benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton.py \
     --model deepseek-ai/DeepSeek-V3-0324 \
