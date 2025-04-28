@@ -30,10 +30,20 @@ def get_model_config(model_name: str, tp_size: int):
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
         shard_intermediate_size = 2 * intermediate_size // tp_size
+    elif config.architectures[0] == "Qwen3MoeForCausalLM":
+       E = config.num_experts
+       topk = config.num_experts_per_tok
+       intermediate_size = config.moe_intermediate_size
+       shard_intermediate_size = 2 * intermediate_size // tp_size
     elif config.architectures[0] in ["DeepseekV2ForCausalLM", "DeepseekV3ForCausalLM"]:
-        E = config.n_routed_experts
+        n_share_fusion_experts = args.n_share_experts_fusion
+        E = (
+            config.n_routed_experts + n_share_fusion_experts
+            if config.architectures[0] in ["DeepseekV3ForCausalLM"]
+            else config.n_routed_experts
+        )
         topk = config.num_experts_per_tok
-        intermediate_size = config.intermediate_size
+        intermediate_size = config.moe_intermediate_size
         shard_intermediate_size = 2 * intermediate_size // tp_size
     elif config.architectures[0] in [
         "Grok1ForCausalLM",
@@ -51,12 +61,29 @@ def get_model_config(model_name: str, tp_size: int):
         intermediate_size = config.intermediate_size
         shard_intermediate_size = 2 * intermediate_size // tp_size
 
+    vllm_version_num = (
+        vllm.__version_tuple__[0] * 100
+        + vllm.__version_tuple__[1] * 10
+        + vllm.__version_tuple__[2]
+    )
+    block_shape = None
+    if (
+        hasattr(config, "quantization_config")
+        and "weight_block_size" in config.quantization_config
+    ):
+        block_shape = config.quantization_config["weight_block_size"]
+        assert len(block_shape) == 2
+        assert (
+            vllm_version_num >= 66
+        ), "Block-wise quantized fp8 fused_moe is only supported for VLLM>=0.6.6.post1"
+
     shape_configs = {
         "num_experts": E,
         "topk": topk,
         "hidden_size": config.hidden_size,
         "shard_intermediate_size": shard_intermediate_size,
         "dtype": config.torch_dtype,
+        "block_shape": block_shape,
     }
     print(f"{shape_configs=}")
     return shape_configs
