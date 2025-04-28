@@ -812,7 +812,6 @@ def moe_ep_deepgemm_preproess(
         seg_indptr, masked_m, num_experts, reorder_topk_ids.numel()
     )
 
-    # m_max = exp2_upper(torch.max(masked_m).item())
     m_max = exp2_upper(hidden_states.size(0))
     expected_m = (topk_ids.numel() + num_experts - 1) // num_experts
     gateup_input = torch.empty(
@@ -862,19 +861,6 @@ def moe_ep_deepgemm_preproess(
         scale.size(1),
         BLOCK_SIZE=1024,
     )
-
-    # if hidden_states.get_device() == 0:
-    #         print("begin")
-    #         print("src2dst: ", src2dst)
-    #         print("seg_indptr: ", seg_indptr)
-    #         print("m_max:", m_max)
-    #         print("topk_ids: ", topk_ids)
-    #         print("hidden_state: ", hidden_states)
-    # if hidden_states.get_device() == 7:
-    #         print("masked_m:", masked_m[start_expert_id : (end_expert_id+1)])
-    #         print("gateup_input: ", gateup_input[31])
-    #         print("gateup_input_scale: ", gateup_input_scale[31])
-    #         print("topk: ", top_k)
 
     return (
         m_max,
