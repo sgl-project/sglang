@@ -941,7 +941,7 @@ def get_moe_configs(
     if os.path.exists(config_file_path):
         with open(config_file_path) as f:
             logger.info(
-                f"Using MoE config from: {config_file_path}. For performance tuning, see: https://github.com/sgl-project/sglang/blob/main/benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton.py"
+                f"Using MoE config from: {config_file_path}. For performance retuning, see: https://github.com/sgl-project/sglang/blob/main/benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton.py"
             )
             # If a configuration has been found, return it
             return {int(key): val for key, val in json.load(f).items()}
