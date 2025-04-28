@@ -64,7 +64,7 @@ class TestVLMModels(CustomTestCase):
         model = "openai_compatible"
         tp = 1
         tasks = "mmmu_val"
-        batch_size = 1
+        batch_size = 2
         log_suffix = "openai_compatible"
         os.makedirs(output_path, exist_ok=True)
 
@@ -125,6 +125,9 @@ class TestVLMModels(CustomTestCase):
                         "--chat-template",
                         model.chat_template,
                         "--trust-remote-code",
+                        "--cuda-graph-max-bs",
+                        "32",
+                        "--enable-multimodal",
                         "--mem-fraction-static",
                         str(self.parsed_args.mem_fraction_static),  # Use class variable
                     ],
@@ -171,7 +174,7 @@ if __name__ == "__main__":
         "--mem-fraction-static",
         type=float,
         help="Static memory fraction for the model",
-        default=0.6,
+        default=0.8,
     )
 
     # Parse args intended for unittest

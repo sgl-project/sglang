@@ -54,20 +54,21 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 
 | Arguments | Description | Defaults |
 |----------|-------------|---------|
-| `model_path` | Path to the model that will be served. | None |
-| `tokenizer_path` | Defaults to the `model_path`. | None |
+| `model_path` | The path of the model weights. This can be a local folder or a Hugging Face repo ID. | None |
+| `tokenizer_path` | The path of the tokenizer. Defaults to the `model_path`. | None |
 | `tokenizer_mode` | See [different mode](https://huggingface.co/docs/transformers/en/main_classes/tokenizer). | `auto` |
-| `load_format` | The format the weights are loaded in. | `auto` |
-| `trust_remote_code` | If `true`, will use locally cached config files, otherwise use remote configs in HuggingFace. | `False` |
-| `dtype` | Dtype used for the model. | `bfloat16` |
-| `kv_cache_dtype` | Dtype of the kv cache. | `dtype` |
-| `context_length` | The number of tokens our model can process *including the input*. Note that extending the default might lead to strange behavior. | None |
+| `load_format` | The format of the model weights to load.  | `auto` |
+| `trust_remote_code` | Whether or not to allow for custom models defined on the Hub in their own modeling files. | `False` |
+| `dtype` | Dtype used for the model. | `auto` |
+| `kv_cache_dtype` | Dtype of the kv cache. | `auto` |
+| `context_length` | The model's maximum context length. Defaults to None (will use the value from the model's config.json instead). Note that extending the default might lead to strange behavior. | None |
 | `device` | The device we put the model. | None |
-| `chat_template` | The chat template to use. See [multi-modal templates](https://docs.sglang.ai/backend/openai_api_vision.ipynb#Chat-Template). **Make sure the correct `chat_template` is passed, or performance degradation may occur!!!!** | None |
+| `device` | The device we put the model. | None |
+| `served_model_name` | Override the model name returned by the v1/models endpoint in OpenAI API server.| None |
 | `is_embedding` | Set to `true` to perform [embedding](./openai_api_embeddings.ipynb) / [encode](https://docs.sglang.ai/backend/native_api#Encode-(embedding-model)) and [reward](https://docs.sglang.ai/backend/native_api#Classify-(reward-model)) tasks. | `False` |
 | `revision` | Adjust if a specific version of the model should be used. | None |
 | `skip_tokenizer_init` | Set to `true` to provide the tokens to the engine and get the output tokens directly, typically used in RLHF. See [example](https://github.com/sgl-project/sglang/blob/main/examples/runtime/token_in_token_out/). | `False` |
-| `json_model_override_args` | Override model config with the provided JSON. | `"{}"` |
+| `json_model_override_args` | A dictionary in JSON string format used to override default model configurations. | `"{}"` |
 | `disable_fast_image_processor` | Adopt base image processor instead of fast image processor (which is by default). See [details](https://huggingface.co/docs/transformers/main/en/main_classes/image_processor#image-processor). | `False` |
 
 ## Serving: HTTP & API
@@ -187,17 +188,6 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `speculative_num_draft_tokens` | The number of tokens proposed in a draft. | None |
 | `speculative_eagle_topk` | The number of top candidates we keep for verification at each step for [Eagle](https://arxiv.org/html/2406.16858v1). | None |
 | `speculative_token_map` | Optional, the path to the high frequency token list of [FR-Spec](https://arxiv.org/html/2502.14856v1), used for accelerating [Eagle](https://arxiv.org/html/2406.16858v1). | None |
-
-## Double Sparsity
-
-| Arguments | Description | Defaults |
-|----------|-------------|---------|
-| `enable_double_sparsity` | Enables [double sparsity](https://arxiv.org/html/2408.07092v2) which increases throughput. | `False` |
-| `ds_channel_config_path` | The double sparsity config. See [a guide on how to generate the config for your model](https://github.com/andy-yang-1/DoubleSparse/tree/main/config). | None |
-| `ds_heavy_channel_num` | Number of channel indices to keep for each layer. | `32` |
-| `ds_heavy_token_num` | Number of tokens used for attention during decode. Skip sparse decoding if `min_seq_len` in batch is less than this number. | `256` |
-| `ds_heavy_channel_type` | The type of heavy channels. Options are `q`, `k` or `qk`. | `qk` |
-| `ds_sparse_decode_threshold` | Don't apply sparse decoding if `max_seq_len` in batch < this threshold. | `4096` |
 
 ## Debug options
 
