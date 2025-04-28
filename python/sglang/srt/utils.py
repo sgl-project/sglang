@@ -1177,9 +1177,11 @@ def get_device_memory_capacity(device: str = None):
         gpu_mem = get_amdgpu_memory_capacity()
     elif device == "hpu":
         gpu_mem = get_hpu_memory_capacity()
+    elif device == "xpu":
+        gpu_mem = torch.xpu.det_device_properties().total_memory
     else:
-        # GPU memory is not known yet or no GPU is available.
-        gpu_mem = None
+        # Only CPU available
+        gpu_mem = psutil.virtual_memory().total
 
     return gpu_mem
 
