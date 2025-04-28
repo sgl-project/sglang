@@ -113,7 +113,7 @@ class PrefillBootstrapQueue:
             kv_args,
             DisaggregationMode.PREFILL,
             self.scheduler.server_args,
-            self.scheduler.disagg_launch_done,
+            # self.scheduler.disagg_launch_done,
         )
         return kv_manager
 
