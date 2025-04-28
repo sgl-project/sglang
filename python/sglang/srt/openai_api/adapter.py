@@ -1269,7 +1269,6 @@ def v1_chat_generate_response(
                 enable_thinking = False
 
         reasoning_text = None
-
         if reasoning_parser and separate_reasoning and enable_thinking:
             try:
                 parser = ReasoningParser(
