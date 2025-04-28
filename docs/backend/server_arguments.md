@@ -156,15 +156,6 @@ Please consult the documentation below to learn more about the parameters you ma
 * `speculative_token_map`: Optional, the path to the high frequency token list of [FR-Spec](https://arxiv.org/html/2502.14856v1), used for accelerating [Eagle](https://arxiv.org/html/2406.16858v1).
 
 
-## Double Sparsity
-
-* `enable_double_sparsity`: Enables [double sparsity](https://arxiv.org/html/2408.07092v2) which increases throughput.
-* `ds_channel_config_path`: The double sparsity config. For a guide on how to generate the config for your model see [this repo](https://github.com/andy-yang-1/DoubleSparse/tree/main/config).
-* `ds_heavy_channel_num`: Number of channel indices to keep for each layer.
-* `ds_heavy_token_num`: Number of tokens used for attention during decode. Skip sparse decoding if `min_seq_len` in batch < this number.
-* `ds_heavy_channel_type`: The type of heavy channels. Either `q`, `k` or `qk`.
-* `ds_sparse_decode_threshold`: Don't apply sparse decoding if `max_seq_len` in batch < this threshold.
-
 ## Debug options
 
 *Note: We recommend to stay with the defaults and only use these options for debugging for best possible performance.*
