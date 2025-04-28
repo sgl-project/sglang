@@ -65,7 +65,8 @@ void launch_sm90_fp8_blockwise_scaled_mm(
   using LayoutD = cutlass::layout::RowMajor;
   constexpr int AlignmentD = AlignmentC;
 
-  using ScaleConfig = decltype(cutlass::detail::sm90_trivial_blockwise_scale_config(TileShape{}));
+  using ScaleTileShape = Shape<_1, _128, _128>;
+  using ScaleConfig = decltype(cutlass::detail::sm90_trivial_blockwise_scale_config(ScaleTileShape{}));
   using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
   using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
 
