@@ -1,15 +1,15 @@
+use crate::logging::{self, LoggingConfig};
 use crate::router::PolicyConfig;
 use crate::router::Router;
 use actix_web::{
     error, get, post, web, App, Error, HttpRequest, HttpResponse, HttpServer, Responder,
 };
 use bytes::Bytes;
-use env_logger::Builder;
 use futures_util::StreamExt;
-use log::{info, LevelFilter};
 use std::collections::HashMap;
-use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+use tracing::{info, Level};
 
 #[derive(Debug)]
 pub struct AppState {
@@ -148,30 +148,29 @@ pub struct ServerConfig {
     pub policy_config: PolicyConfig,
     pub verbose: bool,
     pub max_payload_size: usize,
+    pub log_dir: Option<String>,
 }
 
 pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
-    // Initialize logger
-    Builder::new()
-        .format(|buf, record| {
-            use chrono::Local;
-            writeln!(
-                buf,
-                "[Router (Rust)] {} - {} - {}",
-                Local::now().format("%Y-%m-%d %H:%M:%S"),
-                record.level(),
-                record.args()
-            )
-        })
-        .filter(
-            None,
-            if config.verbose {
-                LevelFilter::Debug
+    // Only initialize logging if not already done (for Python bindings support)
+    static LOGGING_INITIALIZED: AtomicBool = AtomicBool::new(false);
+
+    let _log_guard = if !LOGGING_INITIALIZED.swap(true, Ordering::SeqCst) {
+        Some(logging::init_logging(LoggingConfig {
+            level: if config.verbose {
+                Level::DEBUG
             } else {
-                LevelFilter::Info
+                Level::INFO
             },
-        )
-        .init();
+            json_format: false,
+            log_dir: config.log_dir.clone(),
+            colorize: true,
+            log_file_name: "sgl-router".to_string(),
+            log_targets: None,
+        }))
+    } else {
+        None
+    };
 
     info!("🚧 Initializing router on {}:{}", config.host, config.port);
     info!("🚧 Initializing workers on {:?}", config.worker_urls);
@@ -189,7 +188,7 @@ pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
     let app_state = web::Data::new(
         AppState::new(
             config.worker_urls.clone(),
-            client,
+            client.clone(), // Clone the client here
             config.policy_config.clone(),
         )
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?,
