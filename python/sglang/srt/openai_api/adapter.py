@@ -1251,14 +1251,26 @@ def v1_chat_generate_response(
             tool_choice = request[idx].tool_choice
             tools = request[idx].tools
             separate_reasoning = request[idx].separate_reasoning
+            
+            # 处理request为列表时的enable_thinking
+            if (request[idx].chat_template_kwargs and 
+                request[idx].chat_template_kwargs.get("enable_thinking") is not None):
+                enable_thinking = request[idx].chat_template_kwargs.get("enable_thinking", True)
+            else:
+                enable_thinking = False
         else:
             tool_choice = request.tool_choice
             tools = request.tools
             separate_reasoning = request.separate_reasoning
+            
+            # 处理request为单个对象时的enable_thinking
+            if (request.chat_template_kwargs and 
+                request.chat_template_kwargs.get("enable_thinking") is not None):
+                enable_thinking = request.chat_template_kwargs.get("enable_thinking", True)
+            else:
+                enable_thinking = False
 
-        enable_thinking = True
-        if request.chat_template_kwargs.get("enable_thinking"):
-            enable_thinking = request.chat_template_kwargs.get("enable_thinking", True)
+        reasoning_text = None
 
         if reasoning_parser and separate_reasoning and enable_thinking:
             try:
@@ -1272,8 +1284,6 @@ def v1_chat_generate_response(
                     HTTPStatus.BAD_REQUEST,
                     "Failed to parse reasoning related info to json format!",
                 )
-        else:
-            reasoning_text = None
 
         if tool_choice != "none" and tools:
             parser = FunctionCallParser(tools, tool_call_parser)
