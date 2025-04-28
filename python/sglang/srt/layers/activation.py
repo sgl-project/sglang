@@ -165,8 +165,8 @@ def get_act_fn(
     return act_fn
 
 
-if not _is_cuda:
-    logger.info(
-        "sgl-kernel is not available on Non-NV platforms. Fallback to other kernel libraries."
-    )
-    from vllm.model_executor.layers.activation import GeluAndMul, SiluAndMul
+# if not _is_cuda:
+#     logger.info(
+#         "sgl-kernel is not available on Non-NV platforms. Fallback to other kernel libraries."
+#     )
+#     from vllm.model_executor.layers.activation import GeluAndMul, SiluAndMul

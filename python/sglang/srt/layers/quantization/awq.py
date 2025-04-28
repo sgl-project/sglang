@@ -14,8 +14,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.utils import is_cuda
 
 _is_cuda = is_cuda()
-if _is_cuda:
-    from sgl_kernel import awq_dequantize
+from sgl_kernel import awq_dequantize
 
 logger = logging.getLogger(__name__)
 

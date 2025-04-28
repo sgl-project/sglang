@@ -176,8 +176,8 @@ class Gemma3RMSNorm(nn.Module):
         return f"{tuple(self.weight.shape)}, eps={self.eps}"
 
 
-if not (_is_cuda or _is_hip):
-    logger.info(
-        "sgl-kernel layernorm implementation is not available on current platform. Fallback to other kernel libraries."
-    )
-    from vllm.model_executor.layers.layernorm import GemmaRMSNorm, RMSNorm
+# if not (_is_cuda or _is_hip):
+#     logger.info(
+#         "sgl-kernel layernorm implementation is not available on current platform. Fallback to other kernel libraries."
+#     )
+#     from vllm.model_executor.layers.layernorm import GemmaRMSNorm, RMSNorm
