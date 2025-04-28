@@ -20,6 +20,7 @@ Life cycle of a request in the prefill server
 from __future__ import annotations
 
 import logging
+import threading
 from collections import deque
 from typing import TYPE_CHECKING, List, Optional
 
@@ -256,7 +257,10 @@ class SchedulerDisaggregationPrefillMixin:
             self.running_batch.batch_is_full = False
 
     def process_batch_result_disagg_prefill(
-        self: Scheduler, batch: ScheduleBatch, result: GenerationBatchResult
+        self: Scheduler,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
+        launch_done: Optional[threading.Event] = None,
     ) -> None:
         """
         Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue
@@ -280,7 +284,7 @@ class SchedulerDisaggregationPrefillMixin:
         # Transfer kv for prefill completed requests and add it into disagg_prefill_infight_queue
         if self.enable_overlap:
             # wait
-            _, next_token_ids = self.tp_worker.resolve_batch_result(bid)
+            _, next_token_ids = self.tp_worker.resolve_last_batch_result(launch_done)
         else:
             next_token_ids = result.next_token_ids.tolist()
 

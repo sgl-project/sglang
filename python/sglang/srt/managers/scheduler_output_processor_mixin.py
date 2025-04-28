@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -11,6 +12,7 @@ if TYPE_CHECKING:
         EmbeddingBatchResult,
         GenerationBatchResult,
         ScheduleBatch,
+        Scheduler,
     )
 
 
@@ -21,9 +23,10 @@ class SchedulerOutputProcessorMixin:
     """
 
     def process_batch_result_prefill(
-        self,
+        self: Scheduler,
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
+        launch_done: Optional[threading.Event] = None,
     ):
         skip_stream_req = None
 
@@ -43,7 +46,11 @@ class SchedulerOutputProcessorMixin:
             )
 
             if self.enable_overlap:
-                logits_output, next_token_ids = self.tp_worker.resolve_batch_result(bid)
+                logits_output, next_token_ids = (
+                    self.tp_worker.resolve_last_batch_result(
+                        launch_done,
+                    )
+                )
             else:
                 # Move next_token_ids and logprobs to cpu
                 next_token_ids = next_token_ids.tolist()
@@ -175,9 +182,10 @@ class SchedulerOutputProcessorMixin:
         self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
 
     def process_batch_result_decode(
-        self,
+        self: Scheduler,
         batch: ScheduleBatch,
         result: GenerationBatchResult,
+        launch_done: Optional[threading.Event] = None,
     ):
         logits_output, next_token_ids, bid = (
             result.logits_output,
@@ -187,7 +195,9 @@ class SchedulerOutputProcessorMixin:
         self.num_generated_tokens += len(batch.reqs)
 
         if self.enable_overlap:
-            logits_output, next_token_ids = self.tp_worker.resolve_batch_result(bid)
+            logits_output, next_token_ids = self.tp_worker.resolve_last_batch_result(
+                launch_done
+            )
             next_token_logprobs = logits_output.next_token_logprobs
         elif batch.spec_algorithm.is_none():
             # spec decoding handles output logprobs inside verify process.
@@ -271,7 +281,7 @@ class SchedulerOutputProcessorMixin:
             self.log_decode_stats()
 
     def add_input_logprob_return_values(
-        self,
+        self: Scheduler,
         i: int,
         req: Req,
         output: LogitsProcessorOutput,
@@ -405,7 +415,7 @@ class SchedulerOutputProcessorMixin:
                     assert len(req.input_token_ids_logprobs_idx) == relevant_tokens_len
 
     def add_logprob_return_values(
-        self,
+        self: Scheduler,
         i: int,
         req: Req,
         pt: int,
@@ -436,7 +446,10 @@ class SchedulerOutputProcessorMixin:
         return num_input_logprobs
 
     def stream_output(
-        self, reqs: List[Req], return_logprob: bool, skip_req: Optional[Req] = None
+        self: Scheduler,
+        reqs: List[Req],
+        return_logprob: bool,
+        skip_req: Optional[Req] = None,
     ):
         """Stream the output to detokenizer."""
         if self.is_generation:
@@ -445,7 +458,10 @@ class SchedulerOutputProcessorMixin:
             self.stream_output_embedding(reqs)
 
     def stream_output_generation(
-        self, reqs: List[Req], return_logprob: bool, skip_req: Optional[Req] = None
+        self: Scheduler,
+        reqs: List[Req],
+        return_logprob: bool,
+        skip_req: Optional[Req] = None,
     ):
         rids = []
         finished_reasons: List[BaseFinishReason] = []
@@ -593,7 +609,7 @@ class SchedulerOutputProcessorMixin:
                 )
             )
 
-    def stream_output_embedding(self, reqs: List[Req]):
+    def stream_output_embedding(self: Scheduler, reqs: List[Req]):
         rids = []
         finished_reasons: List[BaseFinishReason] = []
 

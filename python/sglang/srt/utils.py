@@ -1944,7 +1944,7 @@ def get_local_ip_by_remote() -> str:
         s.connect(("2001:4860:4860::8888", 80))  # Doesn't need to be reachable
         return s.getsockname()[0]
     except Exception:
-        raise ValueError(f"Can not get local ip")
+        raise ValueError("Can not get local ip")
 
 
 def is_page_size_one(server_args):
@@ -1970,6 +1970,7 @@ def is_fa3_default_architecture(hf_config):
         "Llama4ForConditionalGeneration",
         "LlamaForCausalLM",
         "MistralForCausalLM",
+        "MixtralForCausalLM",
         "Gemma2ForCausalLM",
         "Gemma3ForConditionalGeneration",
     }
