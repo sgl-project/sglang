@@ -159,6 +159,7 @@ class _DeepEPDispatcherImplBase:
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
+        overlap_shared_experts: bool = False,
     ):
         raise NotImplementedError
 
@@ -340,21 +341,18 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
                 device=hidden_states.device,
                 dtype=hidden_states.dtype,
             )
-        if overlap_shared_experts:
-            return output, None, previous_event
-        else:
-            previous_event = Buffer.capture() if self.async_finish else None
-            return output, previous_event
+        previous_event = Buffer.capture() if self.async_finish else None
+        return output, previous_event
 
     def combine_b(self, output, previous_event, overlap_shared_experts: bool = False):
         hidden_states, event = self._combine_core(output, previous_event)
         self.handle = None
         self.src2dst = None
         if overlap_shared_experts:
-            return hidden_states, None, event
+            return hidden_states, event, None
         else:
             event.current_stream_wait() if self.async_finish else ()
-            return hidden_states
+            return hidden_states, None, None
 
     def _combine_core(self, x: torch.Tensor, previous_event):
         buffer = self._get_buffer()
@@ -497,6 +495,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
+        overlap_shared_experts: bool = False,
     ):
         hidden_states, event, hook = self._combine_core(
             hidden_states,
@@ -509,10 +508,10 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         self, hidden_states, event, hook, overlap_shared_experts: bool = False
     ):
         if overlap_shared_experts:
-            return hidden_states, hook, event
+            return hidden_states, event, hook
         else:
             hook() if self.return_recv_hook else event.current_stream_wait()
-            return hidden_states
+            return hidden_states, None, None
 
     def _combine_core(
         self,
@@ -629,7 +628,8 @@ class DeepEPDispatcher:
         forward_mode, inner_state = self._combine_intermediate_state
         del self._combine_intermediate_state
         return self._get_impl(forward_mode).combine_b(
-            *inner_state, overlap_shared_experts
+            *inner_state,
+            overlap_shared_experts=overlap_shared_experts,
         )
 
     def _get_impl(self, forward_mode: ForwardMode) -> _DeepEPDispatcherImplBase:
