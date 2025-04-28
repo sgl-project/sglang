@@ -41,20 +41,20 @@ class TestMoEDeepEPEvalAccuracyLarge(CustomTestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    # def test_gsm8k(self):
-    #     args = SimpleNamespace(
-    #         num_shots=8,
-    #         data_path=None,
-    #         num_questions=1400,
-    #         parallel=1400,
-    #         max_new_tokens=512,
-    #         host="http://127.0.0.1",
-    #         port=int(self.base_url.split(":")[-1]),
-    #     )
-    #     metrics = run_eval_few_shot_gsm8k(args)
-    #     print(metrics)
+    def test_gsm8k(self):
+        args = SimpleNamespace(
+            num_shots=8,
+            data_path=None,
+            num_questions=200,
+            parallel=64,
+            max_new_tokens=512,
+            host="http://127.0.0.1",
+            port=int(self.base_url.split(":")[-1]),
+        )
+        metrics = run_eval_few_shot_gsm8k(args)
+        print(f"Eval accuracy of GSM8K: {metrics=}")
 
-    #     self.assertGreater(metrics["accuracy"], 0.945)
+        self.assertGreater(metrics["accuracy"], 0.935)
 
     def test_mmlu(self):
         args = SimpleNamespace(
@@ -66,6 +66,7 @@ class TestMoEDeepEPEvalAccuracyLarge(CustomTestCase):
         )
 
         metrics = run_eval(args)
+        print(f"Eval accuracy of MMLU: {metrics=}")
         self.assertGreater(metrics["score"], 0.89)
 
 
