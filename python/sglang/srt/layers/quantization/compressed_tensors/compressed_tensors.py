@@ -45,10 +45,14 @@ from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 try:
 
     from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
-    W4A16SPARSE24_SUPPORTED_BITS, WNA16_SUPPORTED_BITS, CompressedTensors24,
-    CompressedTensorsW4A16Sparse24,
-    CompressedTensorsW8A8Int8,
-    CompressedTensorsW8A16Fp8, CompressedTensorsWNA16)
+        W4A16SPARSE24_SUPPORTED_BITS,
+        WNA16_SUPPORTED_BITS,
+        CompressedTensors24,
+        CompressedTensorsW4A16Sparse24,
+        CompressedTensorsW8A8Int8,
+        CompressedTensorsW8A16Fp8,
+        CompressedTensorsWNA16,
+    )
 
     VLLM_AVAILABLE = True
 except ImportError:
