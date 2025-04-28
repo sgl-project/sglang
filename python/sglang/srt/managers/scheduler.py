@@ -248,9 +248,6 @@ class Scheduler(
         if not self.is_generation:
             self.enable_overlap = False
             logger.info("Overlap scheduler is disabled for embedding models.")
-        if self.model_config.is_multimodal:
-            self.enable_overlap = False
-            logger.info("Overlap scheduler is disabled for multimodal models.")
 
         # Launch a tensor parallel worker
         if self.enable_overlap:
@@ -578,6 +575,10 @@ class Scheduler(
                 bootstrap_port=self.server_args.disaggregation_bootstrap_port,
                 transfer_backend=self.transfer_backend,
             )
+
+            # Metric for pre-allocation
+            self.num_tokens_pre_allocated = 0
+
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             # *2 for the headroom.
             buffer_size = self.max_running_requests * 2
@@ -593,7 +594,7 @@ class Scheduler(
             )
             metadata_buffers = [output_id_buffer]
 
-            self.disagg_prefill_pending_queue = PrefillBootstrapQueue(
+            self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(
                 token_to_kv_pool=self.token_to_kv_pool_allocator.get_kvcache(),
                 req_to_metadata_buffer_idx_allocator=req_to_metadata_buffer_idx_allocator,
                 metadata_buffers=metadata_buffers,
@@ -641,6 +642,7 @@ class Scheduler(
             self.cur_batch = batch
 
             if batch:
+                batch.launch_done = threading.Event()
                 result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), result))
 
@@ -652,7 +654,7 @@ class Scheduler(
                         forward_mode=ForwardMode.DUMMY_FIRST,
                         next_batch_sampling_info=self.tp_worker.cur_sampling_info,
                     )
-                    self.process_batch_result(tmp_batch, None)
+                    self.process_batch_result(tmp_batch, None, batch.launch_done)
 
             if self.last_batch:
                 # Process the results of the last batch
@@ -660,7 +662,10 @@ class Scheduler(
                 tmp_batch.next_batch_sampling_info = (
                     self.tp_worker.cur_sampling_info if batch else None
                 )
-                self.process_batch_result(tmp_batch, tmp_result)
+                # NOTE: we should use current launched batch's launch_done event Instead of the last batch's
+                self.process_batch_result(
+                    tmp_batch, tmp_result, batch.launch_done if batch else None
+                )
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.check_memory()
@@ -787,6 +792,7 @@ class Scheduler(
                 return_hidden_states=recv_req.return_hidden_states,
                 eos_token_ids=self.model_config.hf_eos_token_id,
                 bootstrap_host=recv_req.bootstrap_host,
+                bootstrap_port=recv_req.bootstrap_port,
                 bootstrap_room=recv_req.bootstrap_room,
             )
             req.tokenizer = self.tokenizer
@@ -901,7 +907,7 @@ class Scheduler(
     def _add_request_to_queue(self, req: Req):
         req.queue_time_start = time.time()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self.disagg_prefill_pending_queue.add(req)
+            self.disagg_prefill_bootstrap_queue.add(req)
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.disagg_decode_prealloc_queue.add(req)
         else:
@@ -991,8 +997,15 @@ class Scheduler(
             f"#cached-token: {adder.log_hit_tokens}, "
             f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
             f"#running-req: {running_bs}, "
-            f"#queue-req: {len(self.waiting_queue)}, "
         )
+
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            f += f"#unbootstrapped-req: {len(self.disagg_prefill_bootstrap_queue.queue)}, "
+            f += f"#queue-req: {len(self.waiting_queue)}, "
+            f += f"#transferring-req: {len(self.disagg_prefill_inflight_queue)} "
+        else:
+            f += f"#queue-req: {len(self.waiting_queue)}"
+
         logger.info(f)
 
         if self.enable_metrics:
@@ -1028,15 +1041,14 @@ class Scheduler(
                 gap_latency / self.server_args.decode_log_interval
             )
 
+        msg = (
+            f"Decode batch. "
+            f"#running-req: {num_running_reqs}, "
+            f"#token: {num_used}, "
+            f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
+        )
+
         if self.spec_algorithm.is_none():
-            msg = (
-                f"Decode batch. "
-                f"#running-req: {num_running_reqs}, "
-                f"#token: {num_used}, "
-                f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
-                f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
-                f"#queue-req: {len(self.waiting_queue)}, "
-            )
             spec_accept_length = 0
         else:
             spec_accept_length = (
@@ -1045,15 +1057,15 @@ class Scheduler(
             self.cum_spec_accept_length += self.spec_num_total_accepted_tokens
             self.cum_spec_accept_count += self.spec_num_total_forward_ct
             self.spec_num_total_accepted_tokens = self.spec_num_total_forward_ct = 0
-            msg = (
-                f"Decode batch. "
-                f"#running-req: {num_running_reqs}, "
-                f"#token: {num_used}, "
-                f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
-                f"accept len: {spec_accept_length:.2f}, "
-                f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
-                f"#queue-req: {len(self.waiting_queue)}, "
-            )
+            msg += f"accept len: {spec_accept_length:.2f}, "
+
+        if self.disaggregation_mode == DisaggregationMode.DECODE:
+            msg += f"pre-allocated usage: {self.num_tokens_pre_allocated / self.max_total_num_tokens:.2f}, "
+
+        msg += (
+            f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
+            f"#queue-req: {len(self.waiting_queue)}"
+        )
 
         logger.info(msg)
         if self.enable_metrics:
@@ -1406,14 +1418,15 @@ class Scheduler(
         self,
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
+        launch_done: Optional[threading.Event] = None,
     ):
         if batch.forward_mode.is_decode():
-            self.process_batch_result_decode(batch, result)
+            self.process_batch_result_decode(batch, result, launch_done)
         elif batch.forward_mode.is_extend():
-            self.process_batch_result_prefill(batch, result)
+            self.process_batch_result_prefill(batch, result, launch_done)
         elif batch.forward_mode.is_idle():
             if self.enable_overlap:
-                self.tp_worker.resolve_batch_result(result.bid)
+                self.tp_worker.resolve_last_batch_result(launch_done)
                 if batch.next_batch_sampling_info:
                     batch.next_batch_sampling_info.update_regex_vocab_mask()
                     self.current_stream.synchronize()
