@@ -8,6 +8,7 @@ import json
 import re
 import time
 import unittest
+import requests
 
 import openai
 
@@ -548,6 +549,51 @@ The SmartHome Mini is a compact smart home assistant available in black or white
         models = list(client.models.list())
         assert len(models) == 1
         assert isinstance(getattr(models[0], "max_model_len", None), int)
+
+    def test_tokenizer_endpoints(self):
+        """Test the tokenizer endpoints."""
+        # Test /tokenize endpoint
+        text = "Hello, world! This is a test of the tokenizer API."
+        response = requests.post(
+            f"{self.base_url.replace('/v1', '')}/tokenize",
+            json={"text": text}
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert "tokens" in data
+        assert "count" in data
+        assert isinstance(data["tokens"], list)
+        assert data["count"] == len(data["tokens"])
+        
+        # Verify tokens are correct by comparing with local tokenizer
+        expected_tokens = self.tokenizer.encode(text)
+        assert data["tokens"] == expected_tokens
+        
+        # Test /detokenize endpoint
+        tokens = data["tokens"]
+        response = requests.post(
+            f"{self.base_url.replace('/v1', '')}/detokenize",
+            json={"tokens": tokens}
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert "text" in data
+        assert data["text"] == text
+        
+        # Test with empty inputs
+        response = requests.post(
+            f"{self.base_url.replace('/v1', '')}/tokenize",
+            json={"text": ""}
+        )
+        assert response.status_code == 200
+        assert response.json()["count"] == 0 or response.json()["count"] == len(self.tokenizer.encode(""))
+        
+        response = requests.post(
+            f"{self.base_url.replace('/v1', '')}/detokenize",
+            json={"tokens": []}
+        )
+        assert response.status_code == 200
+        assert response.json()["text"] == ""
 
 
 # -------------------------------------------------------------------------

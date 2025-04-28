@@ -40,7 +40,7 @@ import uvicorn
 import uvloop
 from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import ORJSONResponse, Response, StreamingResponse
+from fastapi.responses import ORJSONResponse, Response, StreamingResponse, JSONResponse
 
 from sglang.srt.entrypoints.engine import _launch_subprocesses
 from sglang.srt.function_call_parser import FunctionCallParser
@@ -603,6 +603,64 @@ async def openai_v1_files(file: UploadFile = File(...), purpose: str = Form("bat
     return await v1_files_create(
         file, purpose, _global_state.tokenizer_manager.server_args.file_storage_path
     )
+
+
+@app.post("/tokenize", response_class=ORJSONResponse)
+async def tokenize(request: Request):
+    """Tokenize text using the model's tokenizer."""
+    try:
+        data = await request.json()
+        text = data.get("text", "")
+        if not isinstance(text, str):
+            return JSONResponse(
+                status_code=400,
+                content={"error": "The 'text' field must be a string"},
+            )
+        
+        tokenizer = _global_state.tokenizer_manager.get_tokenizer()
+        token_ids = tokenizer.encode(text)
+        
+        return {
+            "tokens": token_ids,
+            "count": len(token_ids)
+        }
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"Failed to tokenize: {str(e)}"},
+        )
+
+
+@app.post("/detokenize", response_class=ORJSONResponse)
+async def detokenize(request: Request):
+    """Detokenize token IDs using the model's tokenizer."""
+    try:
+        data = await request.json()
+        tokens = data.get("tokens", [])
+        if not isinstance(tokens, list):
+            return JSONResponse(
+                status_code=400,
+                content={"error": "The 'tokens' field must be a list of integers"},
+            )
+        
+        for token in tokens:
+            if not isinstance(token, int):
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "All tokens must be integers"},
+                )
+        
+        tokenizer = _global_state.tokenizer_manager.get_tokenizer()
+        text = tokenizer.decode(tokens)
+        
+        return {
+            "text": text
+        }
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"Failed to detokenize: {str(e)}"},
+        )
 
 
 @app.delete("/v1/files/{file_id}")

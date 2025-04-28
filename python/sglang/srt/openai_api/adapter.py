@@ -280,6 +280,7 @@ async def process_batch(tokenizer_manager, batch_id: str, batch_request: BatchRe
         end_point = batch_storage[batch_id].endpoint
         file_request_list = []
         all_requests = []
+        all_extra_bodies = []
         request_ids = []
         for line_id, line in enumerate(lines):
             request_data = json.loads(line)
@@ -293,13 +294,16 @@ async def process_batch(tokenizer_manager, batch_id: str, batch_request: BatchRe
                 raise ValueError("Streaming requests are not supported in batch mode")
 
             if end_point == "/v1/chat/completions":
-                all_requests.append(ChatCompletionRequest(**body))
+                extra_body_item = {k: v for k, v in body.items() if k not in ChatCompletionRequest.model_fields}
+                request_item = ChatCompletionRequest(**{k: v for k, v in body.items() if k in ChatCompletionRequest.model_fields})
+                all_requests.append(request_item)
+                all_extra_bodies.append(extra_body_item)
             elif end_point == "/v1/completions":
                 all_requests.append(CompletionRequest(**body))
 
         if end_point == "/v1/chat/completions":
             adapted_request, request = v1_chat_generate_request(
-                all_requests, tokenizer_manager, request_ids=request_ids
+                all_requests, tokenizer_manager, request_ids=request_ids, extra_body=all_extra_bodies
             )
         elif end_point == "/v1/completions":
             adapted_request, request = v1_generate_request(
@@ -715,10 +719,7 @@ def v1_generate_response(
 
 
 async def v1_completions(tokenizer_manager, raw_request: Request):
-    try:
-        request_json = await raw_request.json()
-    except Exception as e:
-        return create_error_response("Invalid request body, error: ", str(e))
+    request_json = await raw_request.json()
     all_requests = [CompletionRequest(**request_json)]
     created = int(time.time())
     adapted_request, request = v1_generate_request(all_requests)
@@ -898,6 +899,7 @@ def v1_chat_generate_request(
     all_requests: List[ChatCompletionRequest],
     tokenizer_manager,
     request_ids: List[str] = None,
+    extra_body: List[Dict] | Dict = None,
 ):
     input_ids = []
     prompts = []
@@ -910,10 +912,13 @@ def v1_chat_generate_request(
     modalities_list = []
     lora_paths = []
 
-    # NOTE: with openai API, the prompt's logprobs are always not computed
+    is_batch = isinstance(extra_body, list)
 
-    is_multimodal = tokenizer_manager.model_config.is_multimodal
-    for request in all_requests:
+    for i, request in enumerate(all_requests):
+        # Extract chat_template_kwargs for the current request
+        current_extra_body = extra_body[i] if is_batch and extra_body else extra_body
+        chat_template_kwargs = current_extra_body.get("chat_template_kwargs", {}) if current_extra_body else {}
+
         # Prep the data needed for the underlying GenerateReqInput:
         #  - prompt: The full prompt string.
         #  - stop: Custom stop tokens.
@@ -922,7 +927,6 @@ def v1_chat_generate_request(
         #    None skips any image processing in GenerateReqInput.
         strict_tag = None
         prompt = ""
-        prompt_ids = []
         if not isinstance(request.messages, str):
             # Apply chat template and its stop strings.
             tools = None
@@ -943,33 +947,6 @@ def v1_chat_generate_request(
 
             if chat_template_name is None:
                 openai_compatible_messages = []
-                if (
-                    tools
-                    and tokenizer_manager.server_args.tool_call_parser == "deepseekv3"
-                ):
-                    # add function call prompt to deepseekv3
-                    openai_compatible_messages.append(
-                        {
-                            "role": "system",
-                            "content": """You are a helpful Assistant.
-                    ## Tools
-                    ### Function
-                    You have the following functions available:
-                    """
-                            + "".join(
-                                [
-                                    f"""
-                        - `{tool['name']}`:
-                        ```json
-                        {json.dumps(tool)}
-                        ```
-                        """
-                                    for tool in tools
-                                ]
-                            ),
-                        }
-                    )
-
                 for message in request.messages:
                     if isinstance(message.content, str):
                         openai_compatible_messages.append(
@@ -982,16 +959,9 @@ def v1_chat_generate_request(
                                 openai_compatible_messages.append(
                                     {"role": message.role, "content": content["text"]}
                                 )
-                if (
-                    openai_compatible_messages
-                    and openai_compatible_messages[-1]["role"] == "assistant"
-                ):
-                    if request.continue_final_message:
-                        # Remove the final assistant message so its content can be continued.
-                        assistant_prefix = openai_compatible_messages[-1]["content"]
-                        openai_compatible_messages = openai_compatible_messages[:-1]
-                    else:
-                        assistant_prefix = None
+                if openai_compatible_messages[-1]["role"] == "assistant":
+                    assistant_prefix = openai_compatible_messages[-1]["content"]
+                    openai_compatible_messages = openai_compatible_messages[:-1]
                 else:
                     assistant_prefix = None
 
@@ -1001,6 +971,7 @@ def v1_chat_generate_request(
                         tokenize=True,
                         add_generation_prompt=True,
                         tools=tools,
+                        **chat_template_kwargs,
                     )
                 except:
                     #  This except branch will be triggered when the chosen model
@@ -1012,6 +983,7 @@ def v1_chat_generate_request(
                         tokenize=True,
                         add_generation_prompt=True,
                         tools=tools,
+                        **chat_template_kwargs,
                     )
 
                 if assistant_prefix:
@@ -1022,7 +994,7 @@ def v1_chat_generate_request(
                     ):
                         encoded = encoded[1:]
                     prompt_ids += encoded
-                if is_multimodal:
+                if tokenizer_manager.model_config.is_multimodal:
                     prompt = tokenizer_manager.tokenizer.decode(prompt_ids)
                 stop = request.stop
                 image_data = None
@@ -1030,33 +1002,7 @@ def v1_chat_generate_request(
                 modalities = []
             else:
                 conv = generate_chat_conv(request, chat_template_name)
-                # If we should continue the final assistant message, adjust the conversation.
-                if (
-                    request.continue_final_message
-                    and request.messages
-                    and request.messages[-1].role == "assistant"
-                ):
-                    # Remove the auto-added blank assistant turn, if present.
-                    if conv.messages and conv.messages[-1][1] is None:
-                        conv.messages.pop()
-                    # Rebuild the prompt from the conversation.
-                    prompt = conv.get_prompt()
-                    # Strip any trailing stop tokens or separators that indicate end-of-assistant.
-                    if isinstance(conv.stop_str, list):
-                        for stop_token in conv.stop_str:
-                            if prompt.endswith(stop_token):
-                                prompt = prompt[: -len(stop_token)]
-                    elif isinstance(conv.stop_str, str) and prompt.endswith(
-                        conv.stop_str
-                    ):
-                        prompt = prompt[: -len(conv.stop_str)]
-                    if conv.sep and prompt.endswith(conv.sep):
-                        prompt = prompt[: -len(conv.sep)]
-                    if getattr(conv, "sep2", None) and prompt.endswith(conv.sep2):
-                        prompt = prompt[: -len(conv.sep2)]
-                else:
-                    prompt = conv.get_prompt()
-
+                prompt = conv.get_prompt()
                 image_data = conv.image_data
                 audio_data = conv.audio_data
                 modalities = conv.modalities
@@ -1067,9 +1013,7 @@ def v1_chat_generate_request(
                         stop.append(request.stop)
                     else:
                         stop.extend(request.stop)
-
-                if not is_multimodal:
-                    prompt_ids = tokenizer_manager.tokenizer.encode(prompt)
+                prompt_ids = tokenizer_manager.tokenizer.encode(prompt)
         else:
             # Use the raw prompt and stop strings if the messages is already a string.
             prompt_ids = request.messages
@@ -1109,8 +1053,6 @@ def v1_chat_generate_request(
             sampling_params["json_schema"] = convert_json_schema_to_str(
                 request.response_format.json_schema.schema_
             )
-        elif request.response_format and request.response_format.type == "json_object":
-            sampling_params["json_schema"] = '{"type": "object"}'
         elif (
             request.response_format and request.response_format.type == "structural_tag"
         ):
@@ -1139,7 +1081,7 @@ def v1_chat_generate_request(
         audio_data_list.append(audio_data)
         modalities_list.append(modalities)
     if len(all_requests) == 1:
-        if is_multimodal:
+        if tokenizer_manager.model_config.is_multimodal:
             # processor will need text input
             prompt_kwargs = {"text": prompts[0]}
         else:
@@ -1178,8 +1120,6 @@ def v1_chat_generate_request(
         rid=request_ids,
         modalities=modalities_list,
         lora_path=lora_paths,
-        bootstrap_host=all_requests[0].bootstrap_host,
-        bootstrap_room=all_requests[0].bootstrap_room,
     )
 
     return adapted_request, all_requests if len(all_requests) > 1 else all_requests[0]
@@ -1254,7 +1194,7 @@ def v1_chat_generate_response(
             tools = request.tools
             separate_reasoning = request.separate_reasoning
 
-        if reasoning_parser and separate_reasoning:
+        if reasoning_parser and separate_reasoning and enable_thinking:
             try:
                 parser = ReasoningParser(
                     model_type=reasoning_parser, stream_reasoning=False
@@ -1382,13 +1322,13 @@ def v1_chat_generate_response(
 async def v1_chat_completions(
     tokenizer_manager, raw_request: Request, cache_report=False
 ):
-    try:
-        request_json = await raw_request.json()
-    except Exception as e:
-        return create_error_response("Invalid request body, error: ", str(e))
-    all_requests = [ChatCompletionRequest(**request_json)]
+    request_json = await raw_request.json()
+    # Extract potential extra_body from the request JSON
+    extra_body = {k: v for k, v in request_json.items() if k not in ChatCompletionRequest.model_fields}
+    all_requests = [ChatCompletionRequest(**{k: v for k, v in request_json.items() if k in ChatCompletionRequest.model_fields})]
     created = int(time.time())
-    adapted_request, request = v1_chat_generate_request(all_requests, tokenizer_manager)
+    # Pass extra_body to v1_chat_generate_request
+    adapted_request, request = v1_chat_generate_request(all_requests, tokenizer_manager, extra_body=extra_body)
 
     if adapted_request.stream:
         parser_dict = {}
@@ -1806,10 +1746,7 @@ def v1_embedding_response(ret, model_path, to_file=False):
 
 
 async def v1_embeddings(tokenizer_manager, raw_request: Request):
-    try:
-        request_json = await raw_request.json()
-    except Exception as e:
-        return create_error_response("Invalid request body, error: ", str(e))
+    request_json = await raw_request.json()
     all_requests = [EmbeddingRequest(**request_json)]
     adapted_request, request = v1_embedding_request(all_requests, tokenizer_manager)
 
