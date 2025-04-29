@@ -34,11 +34,7 @@
 
 using namespace cute;
 
-template <
-    typename SchedulerType,
-    typename OutType,
-    typename TileShape,
-    typename ClusterShape>
+template <typename SchedulerType, typename OutType, typename TileShape, typename ClusterShape>
 void launch_sm90_fp8_blockwise_scaled_mm(
     torch::Tensor& out,
     const torch::Tensor& a,
@@ -76,8 +72,7 @@ void launch_sm90_fp8_blockwise_scaled_mm(
   using EpilogueTileType = cutlass::epilogue::collective::EpilogueTileAuto;
   using StoreEpilogueCompute = typename cutlass::epilogue::fusion::Sm90EVT<cutlass::epilogue::fusion::Sm90AccFetch>;
 
-  using KernelSchedule =
-      cutlass::gemm::KernelTmaWarpSpecializedCooperativeFP8BlockScaledAccum;
+  using KernelSchedule = cutlass::gemm::KernelTmaWarpSpecializedCooperativeFP8BlockScaledAccum;
   using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
       ArchTag,
       OperatorClass,
@@ -98,11 +93,11 @@ void launch_sm90_fp8_blockwise_scaled_mm(
   using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
       ArchTag,
       OperatorClass,
-      ElementA, 
-      cute::tuple<LayoutA, LayoutSFA>, 
+      ElementA,
+      cute::tuple<LayoutA, LayoutSFA>,
       AlignmentA,
-      ElementB, 
-      cute::tuple<LayoutB, LayoutSFB>, 
+      ElementB,
+      cute::tuple<LayoutB, LayoutSFB>,
       AlignmentB,
       ElementAccumulator,
       TileShape,
@@ -145,12 +140,7 @@ void launch_sm90_fp8_blockwise_scaled_mm(
   LayoutSFB layout_sfb = ScaleConfig::tile_atom_to_shape_SFB(make_shape(m, n, k, 1));
 
   typename GemmKernel::MainloopArguments mainloop_args{
-      a_ptr, stride_a, 
-      b_ptr, stride_b, 
-      4,
-      a_s_ptr, layout_sfa,
-      b_s_ptr, layout_sfb
-  };
+      a_ptr, stride_a, b_ptr, stride_b, 4, a_s_ptr, layout_sfa, b_s_ptr, layout_sfb};
   typename GemmKernel::EpilogueArguments epilogue_args{{}, nullptr, stride_d, o_ptr, stride_d};
 
   typename Gemm::Arguments args = {
@@ -320,17 +310,11 @@ void sm90_fp8_blockwise_dispatch_shape(
   auto k = a.size(1);
   auto n = b.size(1);
   if (k > 3 * n) {
-    launch_sm90_fp8_blockwise_scaled_mm<
-        cutlass::gemm::StreamKScheduler,
-        OutType,
-        TileShape,
-        ClusterShape>(out, a, b, scales_a, scales_b);
+    launch_sm90_fp8_blockwise_scaled_mm<cutlass::gemm::StreamKScheduler, OutType, TileShape, ClusterShape>(
+        out, a, b, scales_a, scales_b);
   } else {
-    launch_sm90_fp8_blockwise_scaled_mm<
-        cutlass::gemm::PersistentScheduler,
-        OutType,
-        TileShape,
-        ClusterShape>(out, a, b, scales_a, scales_b);
+    launch_sm90_fp8_blockwise_scaled_mm<cutlass::gemm::PersistentScheduler, OutType, TileShape, ClusterShape>(
+        out, a, b, scales_a, scales_b);
   }
 }
 

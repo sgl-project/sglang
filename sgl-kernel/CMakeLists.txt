@@ -176,6 +176,7 @@ set(SOURCES
     "csrc/attention/cascade.cu"
     "csrc/attention/merge_attn_states.cu"
     "csrc/attention/cutlass_mla_kernel.cu"
+    "csrc/attention/vertical_slash_index.cu"
     "csrc/attention/lightning_attention_decode_kernel.cu"
     "csrc/elementwise/activation.cu"
     "csrc/elementwise/fused_add_rms_norm_kernel.cu"
