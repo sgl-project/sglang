@@ -153,8 +153,7 @@ class ServerArgs:
     enable_nccl_nvls: bool = False
     disable_outlines_disk_cache: bool = False
     disable_custom_all_reduce: bool = False
-    enable_llama4_multimodal: Optional[bool] = None
-    enable_gemma3_multimodal: Optional[bool] = None
+    enable_multimodal: Optional[bool] = None
     disable_overlap_schedule: bool = False
     enable_mixed_chunk: bool = False
     enable_dp_attention: bool = False
@@ -202,7 +201,7 @@ class ServerArgs:
         # Expert parallelism
         if self.enable_ep_moe:
             self.ep_size = self.tp_size
-            logger.info(
+            logger.warning(
                 f"EP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
 
@@ -244,19 +243,25 @@ class ServerArgs:
                 self.chunked_prefill_size = 2048
             else:
                 self.chunked_prefill_size = 8192
-
         assert self.chunked_prefill_size % self.page_size == 0
 
         assert self.moe_dense_tp_size in {
             1,
             None,
-        }, f"moe_dense_tp_size only support 1 and None currently"
+        }, "moe_dense_tp_size only support 1 and None currently"
 
         if self.attention_backend == "flashmla":
             logger.warning(
                 "FlashMLA only supports a page_size of 64, change page_size to 64."
             )
             self.page_size = 64
+
+        if self.attention_backend == "cutlass_mla":
+            logger.warning(
+                "Cutlass MLA only supports a page_size of 128, change page_size to 128."
+            )
+            self.page_size = 128
+
         # Set cuda graph max batch size
         if self.cuda_graph_max_bs is None:
             # Based on detailed statistics, when serving TP1/TP2 models on lower-end GPUs with HBM<25G, you can either disable cuda graph or set `cuda_graph_max_bs` to a very small value to reduce the memory overhead of creating cuda graphs, with almost no impact on performance. However, when serving models with TP4 or TP8, we need to enable cuda graph to maintain high performance. In this case, we can set `cuda_graph_max_bs` to 80 (half of the default value 160) to reduce the memory overhead of creating cuda graphs. Looking at the logs from TP4 serving of qwen2-72b, a value of 80 is sufficient and can reduce the memory overhead of creating cuda graphs on lower-end GPUs compared to the original 160, avoiding OOM issues.
@@ -271,6 +276,7 @@ class ServerArgs:
             self.attention_backend = "torch_native"
             self.sampling_backend = "pytorch"
 
+        # Set kernel backends
         if self.sampling_backend is None:
             self.sampling_backend = (
                 "flashinfer" if is_flashinfer_available() else "pytorch"
@@ -286,10 +292,6 @@ class ServerArgs:
         if self.grammar_backend is None:
             self.grammar_backend = "xgrammar"
 
-        self.enable_multimodal: Optional[bool] = (
-            self.enable_llama4_multimodal or self.enable_gemma3_multimodal
-        )
-
         # Data parallelism attention
         if self.enable_dp_attention:
             self.schedule_conservativeness = self.schedule_conservativeness * 0.3
@@ -302,8 +304,8 @@ class ServerArgs:
                 f"DP attention is enabled. The chunked prefill size is adjusted to {self.chunked_prefill_size} to avoid MoE kernel issues. "
             )
 
-        self.enable_sp_layernorm = False
         # DeepEP MoE
+        self.enable_sp_layernorm = False
         if self.enable_deepep_moe:
             if self.deepep_mode == "auto":
                 assert (
@@ -313,7 +315,7 @@ class ServerArgs:
             self.enable_sp_layernorm = (
                 self.dp_size < self.tp_size if self.enable_dp_attention else True
             )
-            logger.info(
+            logger.warning(
                 f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
 
@@ -322,14 +324,11 @@ class ServerArgs:
             # NEXTN shares the same implementation of EAGLE
             self.speculative_algorithm = "EAGLE"
 
-        if (
-            self.speculative_algorithm == "EAGLE"
-            or self.speculative_algorithm == "EAGLE3"
-        ):
+        if self.speculative_algorithm in ("EAGLE", "EAGLE3"):
             if self.max_running_requests is None:
                 self.max_running_requests = 48
             self.disable_overlap_schedule = True
-            logger.info(
+            logger.warning(
                 "Overlap scheduler is disabled because of using "
                 "eagle speculative decoding."
             )
@@ -348,7 +347,7 @@ class ServerArgs:
 
             if self.page_size > 1 and self.speculative_eagle_topk > 1:
                 self.speculative_eagle_topk = 1
-                logger.info(
+                logger.warning(
                     "speculative_eagle_topk is adjusted to 1 when page_size > 1"
                 )
 
@@ -356,7 +355,7 @@ class ServerArgs:
                 self.speculative_eagle_topk == 1
                 and self.speculative_num_draft_tokens != self.speculative_num_steps + 1
             ):
-                logger.info(
+                logger.warning(
                     "speculative_num_draft_tokens is adjusted to speculative_num_steps + 1 when speculative_eagle_topk == 1"
                 )
                 self.speculative_num_draft_tokens = self.speculative_num_steps + 1
@@ -427,7 +426,7 @@ class ServerArgs:
         parser.add_argument(
             "--skip-tokenizer-init",
             action="store_true",
-            help="If set, skip init tokenizer and pass input_ids in generate request",
+            help="If set, skip init tokenizer and pass input_ids in generate request.",
         )
         parser.add_argument(
             "--enable-tokenizer-batch-encode",
@@ -566,6 +565,7 @@ class ServerArgs:
             "name, a tag name, or a commit id. If unspecified, will use "
             "the default version.",
         )
+
         # Memory and scheduling
         parser.add_argument(
             "--mem-fraction-static",
@@ -830,7 +830,14 @@ class ServerArgs:
         parser.add_argument(
             "--attention-backend",
             type=str,
-            choices=["flashinfer", "triton", "torch_native", "fa3", "flashmla"],
+            choices=[
+                "flashinfer",
+                "triton",
+                "torch_native",
+                "fa3",
+                "flashmla",
+                "cutlass_mla",
+            ],
             default=ServerArgs.attention_backend,
             help="Choose the kernels for attention layers.",
         )
@@ -982,16 +989,10 @@ class ServerArgs:
             help="Disable the custom all-reduce kernel and fall back to NCCL.",
         )
         parser.add_argument(
-            "--enable-llama4-multimodal",
-            default=ServerArgs.enable_llama4_multimodal,
+            "--enable-multimodal",
+            default=ServerArgs.enable_multimodal,
             action="store_true",
-            help="Enable the multimodal functionality for Llama-4.",
-        )
-        parser.add_argument(
-            "--enable-gemma3-multimodal",
-            default=ServerArgs.enable_gemma3_multimodal,
-            action="store_true",
-            help="Enable the multimodal functionality for Gemma-3.",
+            help="Enable the multimodal functionality for the served model. If the model being served is not multimodal, nothing will happen",
         )
         parser.add_argument(
             "--disable-overlap-schedule",
@@ -1373,10 +1374,7 @@ def auto_choose_speculative_params(self: ServerArgs):
 
     You can tune them on your own models and prompts with scripts/playground/bench_speculative.py
     """
-    if self.decrypted_config_file:
-        config_path = self.decrypted_config_file
-    else:
-        config_path = os.path.join(self.model_path, "config.json")
+    config_path = os.path.join(self.model_path, "config.json")
     if not os.path.exists(config_path):
         raise ValueError(f"{config_path} is not found.")
 

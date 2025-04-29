@@ -42,6 +42,7 @@ class RouterArgs:
     max_tree_size: int = 2**24
     max_payload_size: int = 4 * 1024 * 1024  # 4MB
     verbose: bool = False
+    log_dir: Optional[str] = None
 
     @staticmethod
     def add_cli_args(
@@ -142,6 +143,12 @@ class RouterArgs:
             action="store_true",
             help="Enable verbose logging",
         )
+        parser.add_argument(
+            f"--{prefix}log-dir",
+            type=str,
+            default=None,
+            help="Directory to store log files. If not specified, logs are only output to console.",
+        )
 
     @classmethod
     def from_cli_args(
@@ -174,6 +181,7 @@ class RouterArgs:
             max_tree_size=getattr(args, f"{prefix}max_tree_size"),
             max_payload_size=getattr(args, f"{prefix}max_payload_size"),
             verbose=getattr(args, f"{prefix}verbose", False),
+            log_dir=getattr(args, f"{prefix}log_dir", None),
         )
 
 
@@ -220,6 +228,7 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
             max_tree_size=router_args.max_tree_size,
             max_payload_size=router_args.max_payload_size,
             verbose=router_args.verbose,
+            log_dir=router_args.log_dir,
         )
 
         router.start()

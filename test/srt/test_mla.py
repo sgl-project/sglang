@@ -26,6 +26,8 @@ class TestMLA(CustomTestCase):
                 "--enable-torch-compile",
                 "--cuda-graph-max-bs",
                 "2",
+                "--chunked-prefill-size",
+                "256",
             ],
         )
 
