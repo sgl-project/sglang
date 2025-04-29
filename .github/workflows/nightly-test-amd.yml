@@ -50,4 +50,4 @@ jobs:
 
       - name: Nightly Test
         run: |
-          docker exec -w /sglang-checkout/test/srt -e SGLANG_IS_IN_CI=1 ci_sglang python3 run_suite.py --suite nightly --timeout-per-file 3600
+          docker exec -w /sglang-checkout/test/srt -e SGLANG_IS_IN_CI=1 ci_sglang python3 run_suite.py --suite nightly-amd --timeout-per-file 3600

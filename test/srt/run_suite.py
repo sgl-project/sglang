@@ -98,6 +98,9 @@ suites = {
     "nightly": [
         TestFile("test_nightly_gsm8k_eval.py"),
     ],
+    "nightly-amd": [
+        TestFile("test_nightly_gsm8k_eval_amd.py"),
+    ],
     "vllm_dependency_test": [
         TestFile("test_vllm_dependency.py"),
         TestFile("test_awq.py"),
