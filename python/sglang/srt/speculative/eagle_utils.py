@@ -114,6 +114,8 @@ class EagleDraftInput:
         paged_kernel_lens: torch.Tensor,
         paged_kernel_lens_sum: int,
         req_to_token: torch.Tensor,
+        use_flashmla: bool = False,
+        block_kv_indices: Optional[torch.Tensor] = None,
     ):
         bs = self.accept_length.numel()
 
@@ -126,17 +128,32 @@ class EagleDraftInput:
         # TODO: replace cum_kv_seq_len[-1] with paged_kernel_lens_sum to avoid the device sync.
         kv_indices = torch.empty(cum_kv_seq_len[-1], dtype=torch.int32, device="cuda")
 
-        create_flashinfer_kv_indices_triton[(bs,)](
-            req_to_token,
-            req_pool_indices,
-            paged_kernel_lens,
-            cum_kv_seq_len,
-            None,
-            kv_indices,
-            req_to_token.size(1),
-        )
 
-        return kv_indices, cum_kv_seq_len, qo_indptr, None
+        if use_flashmla:
+            # FlashMLA backend
+            assert block_kv_indices is not None
+            create_flashmla_kv_indices_triton[(bs,)](
+                req_to_token,
+                req_pool_indices,
+                paged_kernel_lens,
+                None,
+                block_kv_indices,
+                req_to_token.stride(0),
+                max_seqlen_pad,
+            )
+            return block_kv_indices, cum_kv_seq_len, qo_indptr, None
+        else:
+            # FlashInfer backend
+            create_flashinfer_kv_indices_triton[(bs,)](
+                req_to_token,
+                req_pool_indices,
+                paged_kernel_lens,
+                cum_kv_seq_len,
+                None,
+                kv_indices,
+                req_to_token.size(1),
+            )
+            return kv_indices, cum_kv_seq_len, qo_indptr, None
 
     def filter_batch(self, new_indices: torch.Tensor):
         self.topk_p = self.topk_p[: len(new_indices)]
