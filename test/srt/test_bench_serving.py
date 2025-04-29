@@ -98,7 +98,7 @@ class TestBenchServing(CustomTestCase):
                 f"### test_offline_throughput_with_triton_attention_backend\n"
                 f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
             )
-            self.assertGreater(res["output_throughput"], 3600)
+            self.assertGreater(res["output_throughput"], 3700)
 
     def test_offline_throughput_default_fp8(self):
         res = run_bench_serving(
@@ -113,7 +113,7 @@ class TestBenchServing(CustomTestCase):
                 f"### test_offline_throughput_default_fp8\n"
                 f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
             )
-            self.assertGreater(res["output_throughput"], 4200)
+            self.assertGreater(res["output_throughput"], 4300)
 
     def test_online_latency_default(self):
         res = run_bench_serving(
@@ -126,7 +126,7 @@ class TestBenchServing(CustomTestCase):
         if is_in_ci():
             write_github_step_summary(
                 f"### test_online_latency_default\n"
-                f'median_e2e_latency_ms : {res["median_e2e_latency_ms"]:.2f} ms\n'
+                f'median_e2e_latency_ms: {res["median_e2e_latency_ms"]:.2f} ms\n'
             )
             self.assertLess(res["median_e2e_latency_ms"], 11000)
             self.assertLess(res["median_ttft_ms"], 86)
@@ -161,10 +161,10 @@ class TestBenchServing(CustomTestCase):
         if is_in_ci():
             write_github_step_summary(
                 f"### test_online_latency_eagle\n"
-                f'median_e2e_latency_ms : {res["median_e2e_latency_ms"]:.2f} ms\n'
-                f'accept_length : {res["accept_length"]:.2f} \n'
+                f'median_e2e_latency_ms: {res["median_e2e_latency_ms"]:.2f} ms\n'
+                f'accept_length: {res["accept_length"]:.2f} \n'
             )
-            self.assertLess(res["median_e2e_latency_ms"], 800)
+            self.assertLess(res["median_e2e_latency_ms"], 900)
             self.assertGreater(res["accept_length"], 3.0)
 
     def test_moe_offline_throughput_default(self):

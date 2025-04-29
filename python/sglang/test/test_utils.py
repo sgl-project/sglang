@@ -518,7 +518,7 @@ def run_unittest_files(files: List[TestFile], timeout_per_file: float):
 
             filename = os.path.join(os.getcwd(), filename)
             print(
-                f".\n.\nBegin ({i}/{len(files)}):\npython3 {filename}\n.\n.\n",
+                f".\n.\nBegin ({i}/{len(files) - 1}):\npython3 {filename}\n.\n.\n",
                 flush=True,
             )
             tic = time.time()
@@ -530,7 +530,7 @@ def run_unittest_files(files: List[TestFile], timeout_per_file: float):
             elapsed = time.time() - tic
 
             print(
-                f".\n.\nEnd ({i}/{len(files)}):\n{filename=}, {elapsed=:.0f}, {estimated_time=}\n.\n.\n",
+                f".\n.\nEnd ({i}/{len(files) - 1}):\n{filename=}, {elapsed=:.0f}, {estimated_time=}\n.\n.\n",
                 flush=True,
             )
             return process.returncode
@@ -726,6 +726,44 @@ def run_bench_one_batch(model, other_args):
 
         lastline = output.split("\n")[-3]
         output_throughput = float(lastline.split(" ")[-2])
+    finally:
+        kill_process_tree(process.pid)
+
+    return output_throughput
+
+
+def run_bench_offline_throughput(model, other_args):
+    command = [
+        "python3",
+        "-m",
+        "sglang.bench_offline_throughput",
+        "--num-prompts",
+        "1",
+        "--dataset-name",
+        "random",
+        "--random-input-len",
+        "256",
+        "--random-output-len",
+        "256",
+        "--model-path",
+        model,
+        *[str(x) for x in other_args],
+    ]
+
+    print(f"{command=}")
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    try:
+        stdout, stderr = process.communicate()
+        output = stdout.decode()
+        error = stderr.decode()
+        print(f"Output: {output}", flush=True)
+        print(f"Error: {error}", flush=True)
+
+        output_throughput = -1
+        for line in output.split("\n"):
+            if "Last generation throughput (tok/s):" in line:
+                output_throughput = float(line.split(":")[-1])
     finally:
         kill_process_tree(process.pid)
 
