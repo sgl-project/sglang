@@ -14,10 +14,6 @@ from functools import partial
 from typing import TYPE_CHECKING, Callable, List, Optional, Union
 
 import torch
-import torch._dynamo
-
-torch._dynamo.config.suppress_errors = True
-
 
 from sglang.global_config import global_config
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -285,18 +281,6 @@ class FlashInferAttnBackend(AttentionBackend):
             self.cuda_graph_qk_indptr = [x.clone() for x in self.kv_indptr]
             self.cuda_graph_qo_indptr = [x.clone() for x in self.kv_indptr]
 
-            # Force allocation
-            self.cuda_graph_custom_mask[0] = 0
-            for i in range(len(self.cuda_graph_qk_indptr)):
-                if len(self.cuda_graph_qk_indptr[i]) > 0:
-                    self.cuda_graph_qk_indptr[i][0] = 0
-            for i in range(len(self.cuda_graph_qo_indptr)):
-                if len(self.cuda_graph_qo_indptr[i]) > 0:
-                    self.cuda_graph_qo_indptr[i][0] = 0
-
-        # Force synchronization to ensure all tensors are allocated
-        torch.cuda.synchronize()
-
     def init_forward_metadata_capture_cuda_graph(
         self,
         bs: int,
@@ -500,21 +484,14 @@ class FlashInferAttnBackend(AttentionBackend):
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
 
-        # Use dynamo-safe wrapper for the forward call
-        def safe_forward_call(q, kv_cache):
-            return decode_wrapper.forward(
-                q,
-                kv_cache,
-                sm_scale=layer.scaling,
-                logits_soft_cap=layer.logit_cap,
-                k_scale=layer.k_scale,
-                v_scale=layer.v_scale,
-            )
-
         # Call the wrapped function
-        o = safe_forward_call(
+        o = decode_wrapper.forward(
             q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
             forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+            sm_scale=layer.scaling,
+            logits_soft_cap=layer.logit_cap,
+            k_scale=layer.k_scale,
+            v_scale=layer.v_scale,
         )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
@@ -1252,12 +1229,6 @@ def fast_decode_plan(
     with torch.cuda.device(self.device):
 
         if self.use_tensor_cores:
-            # Convert indptr to CPU, as the authors intended
-            if global_override_indptr_cpu is not None:
-                indptr_host = global_override_indptr_cpu
-            else:
-                indptr_host = indptr.cpu()
-
             # ALSO convert last_page_len to CPU
             last_page_len_host = last_page_len.cpu()
 
@@ -1283,11 +1254,7 @@ def fast_decode_plan(
                     False,  # causal
                 )
             except Exception as e:
-                # Log the error for debugging
-                import logging
-
-                logging.error(f"Error in tensor core plan: {e}")
-                raise
+                raise RuntimeError(f"Error in standard plan: {e}")
         else:
             try:
                 # Make sure we pass exactly 15 arguments for standard version
@@ -1309,11 +1276,7 @@ def fast_decode_plan(
                     empty_kv_cache,
                 )
             except Exception as e:
-                # Log the error for debugging
-                import logging
-
-                logging.error(f"Error in standard plan: {e}")
-                raise
+                raise RuntimeError(f"Error in standard plan: {e}")
 
     self._pos_encoding_mode = pos_encoding_mode
     self._window_left = window_left

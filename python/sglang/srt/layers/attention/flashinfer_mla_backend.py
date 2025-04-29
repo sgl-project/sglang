@@ -10,14 +10,11 @@ More details can be found in https://docs.flashinfer.ai/api/mla.html
 """
 
 from dataclasses import dataclass
-from functools import partial, wraps
+from functools import partial
 from typing import TYPE_CHECKING, Callable, Optional, Union
 
 import torch
-import torch._dynamo
 import triton
-
-torch._dynamo.config.suppress_errors = True
 
 from sglang.global_config import global_config
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -203,21 +200,12 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         else:
             cuda_graph_kv_indices = kv_indices_buf
 
-        # Ensure tensors are properly allocated by forcing a synchronization
         self.cuda_graph_kv_indices = cuda_graph_kv_indices
         self.cuda_graph_qo_indptr = self.q_indptr_decode.clone()
         self.cuda_graph_kv_indptr = self.kv_indptr.clone()
         self.cuda_graph_kv_lens = torch.ones(
             (max_bs,), dtype=torch.int32, device=self.device
         )
-
-        # Force allocation by performing a small operation and synchronizing
-        # This ensures all tensors are properly allocated in GPU memory
-        self.cuda_graph_kv_indices[0] = 0
-        self.cuda_graph_qo_indptr[0] = 0
-        self.cuda_graph_kv_indptr[0] = 0
-        self.cuda_graph_kv_lens[0] = 1
-        torch.cuda.synchronize()
 
         # For fast decode plan in graph replaying
         self.cuda_graph_qo_indptr_cpu = self.cuda_graph_qo_indptr.to("cpu")
@@ -830,6 +818,7 @@ def fast_mla_decode_plan(
     sm_scale: float,
     q_data_type: torch.dtype,
     kv_data_type: torch.dtype,
+    use_profiler: bool = False,
 ) -> None:
     """A faster version of BatchMLAPagedAttentionWrapper::plan,
     for skipping the stream synchronization in original plan function during
@@ -838,11 +827,12 @@ def fast_mla_decode_plan(
     self._causal = causal
     self._page_size = page_size
     self._sm_scale = sm_scale
+    self._use_profiler = use_profiler
 
     with self.device as device:
         try:
             # Standard version with just the required arguments (no use_profiler)
-            self._cached_module.plan(
+            self._cached_module.plan.default(
                 self._float_workspace_buffer,
                 self._int_workspace_buffer,
                 self._pin_memory_int_workspace_buffer,
@@ -854,30 +844,4 @@ def fast_mla_decode_plan(
                 causal,
             )
         except Exception as e:
-            # Log error for debugging
-            import logging
-
-            logging.error(f"Error in MLA plan: {e}")
-
-            # Try alternate version with more arguments if needed
-            try:
-                self._cached_module.plan(
-                    self._float_workspace_buffer,
-                    self._int_workspace_buffer,
-                    self._pin_memory_int_workspace_buffer,
-                    qo_indptr_cpu,
-                    kv_indptr_cpu,
-                    kv_indices,  # Include kv_indices which was missing
-                    kv_len_arr_cpu,
-                    num_heads,
-                    head_dim_ckv,
-                    head_dim_kpe,
-                    page_size,
-                    causal,
-                    sm_scale,
-                    q_data_type,
-                    kv_data_type,
-                )
-            except Exception as e2:
-                logging.error(f"Error in alternate MLA plan: {e2}")
-                raise
+            raise RuntimeError(f"Error in alternate MLA plan: {e}")
