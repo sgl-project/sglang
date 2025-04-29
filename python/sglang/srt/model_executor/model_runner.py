@@ -574,7 +574,7 @@ class ModelRunner:
             )
             if model_supports_hip_attention:
                 model_supports_hip_attention = self.model.hip_attention_supported
-            
+
             if self.server_args.hip_attention_config.using_extend:
                 if not model_supports_hip_attention:
                     raise RuntimeError(
@@ -966,17 +966,17 @@ class ModelRunner:
             if self.model_config.attention_chunk_size is not None:
                 # NOTE: this should handle only llama4, for now.
                 assert self.model_config.hf_config.architectures[0] in [
-                    "Llama4ForConditionalGeneration", 
+                    "Llama4ForConditionalGeneration",
                 ], self.model_config.hf_config.architectures
-                
+
                 num_layers = self.model_config.num_hidden_layers
                 attention_chunk_size = self.model_config.attention_chunk_size
-                
+
                 mask_factors = []
                 mask_sizes = []
                 sa_factors = []
                 sa_sizes = []
-                
+
                 for layer_id in range(num_layers):
                     use_rope = (layer_id + 1) % 4 != 0
                     if use_rope:
@@ -991,7 +991,7 @@ class ModelRunner:
                         mask_sizes.append(self.server_args.hip_max_mask_cache_size)
                         sa_factors.append(self.server_args.hip_max_sa_cache_factor)
                         sa_sizes.append(self.server_args.hip_max_sa_cache_size)
-                
+
                 self.token_to_kv_pool = MHATokenToHiPOffloadKVPool(
                     max_token_size=self.max_total_num_tokens,
                     max_mask_cache_factor=mask_factors,

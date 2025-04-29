@@ -290,7 +290,7 @@ class Llama4Attention(nn.Module):
             use_irope=self.use_rope,
             orig_context_len=getattr(
                 config, "orig_context_len", max_position_embeddings
-            )
+            ),
         )
 
     def _get_attn_scale(self, positions: torch.Tensor) -> torch.Tensor:
