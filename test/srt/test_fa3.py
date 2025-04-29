@@ -48,7 +48,7 @@ if OFFLINE_MODE:
 DEFAULT_SERVER_ARGS = [
     "--trust-remote-code",
     "--cuda-graph-max-bs",
-    "4",
+    "8",
     "--attention-backend",
     "fa3",
 ]
