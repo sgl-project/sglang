@@ -1142,12 +1142,8 @@ class MiniCPMV:
             if name.startswith("model.vision_tower") and name not in params_dict:
                 continue
 
-            if "vpm" in name and "out_proj" in name:
-                name = name.replace(r"attn.out_proj", r"attn.proj")
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-                continue
+            # adapt to VisionAttention
+            name = name.replace(r"self_attn.out_proj", r"self_attn.proj")
 
             if "sampler" in name:
                 param = params_dict[name]

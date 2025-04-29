@@ -1884,12 +1884,8 @@ class MiniCPMO(MiniCPMBaseModel):
                         name = param_name
 
             # adapt to VisionAttention
-            if "vpm" in name and "out_proj" in name:
-                name = name.replace(r"attn.out_proj", r"attn.proj")
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-                continue
+            if "vpm" in name:
+                name = name.replace(r"self_attn.out_proj", r"self_attn.proj")
 
             if not self.config.init_tts and "tts" in name:
                 continue
