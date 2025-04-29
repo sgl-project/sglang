@@ -14,8 +14,9 @@ from functools import partial, wraps
 from typing import TYPE_CHECKING, Callable, Optional, Union
 
 import torch
-import triton
 import torch._dynamo
+import triton
+
 torch._dynamo.config.suppress_errors = True
 
 from sglang.global_config import global_config
@@ -209,7 +210,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         self.cuda_graph_kv_lens = torch.ones(
             (max_bs,), dtype=torch.int32, device=self.device
         )
-        
+
         # Force allocation by performing a small operation and synchronizing
         # This ensures all tensors are properly allocated in GPU memory
         self.cuda_graph_kv_indices[0] = 0
@@ -217,7 +218,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         self.cuda_graph_kv_indptr[0] = 0
         self.cuda_graph_kv_lens[0] = 1
         torch.cuda.synchronize()
-        
+
         # For fast decode plan in graph replaying
         self.cuda_graph_qo_indptr_cpu = self.cuda_graph_qo_indptr.to("cpu")
         self.cuda_graph_kv_indptr_cpu = self.cuda_graph_kv_indptr.to("cpu")
@@ -399,11 +400,11 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                     k,
                     v,
                 )
-        
+
         # Reshape inputs
         reshaped_q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
         k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-        
+
         # Direct call to run without the wrapper
         o = decode_wrapper.run(
             reshaped_q[:, :, : layer.v_head_dim],
@@ -855,8 +856,9 @@ def fast_mla_decode_plan(
         except Exception as e:
             # Log error for debugging
             import logging
+
             logging.error(f"Error in MLA plan: {e}")
-            
+
             # Try alternate version with more arguments if needed
             try:
                 self._cached_module.plan(
@@ -865,7 +867,7 @@ def fast_mla_decode_plan(
                     self._pin_memory_int_workspace_buffer,
                     qo_indptr_cpu,
                     kv_indptr_cpu,
-                    kv_indices, # Include kv_indices which was missing
+                    kv_indices,  # Include kv_indices which was missing
                     kv_len_arr_cpu,
                     num_heads,
                     head_dim_ckv,

@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Union
 
 import torch
 import torch._dynamo
+
 torch._dynamo.config.suppress_errors = True
 
 
@@ -55,6 +56,7 @@ class PrefillMetadata:
     prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper]
     use_ragged: bool
     extend_no_prefix: bool
+
 
 # Reuse this workspace buffer across all flashinfer wrappers
 global_workspace_buffer = None
@@ -282,7 +284,7 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             self.cuda_graph_qk_indptr = [x.clone() for x in self.kv_indptr]
             self.cuda_graph_qo_indptr = [x.clone() for x in self.kv_indptr]
-            
+
             # Force allocation
             self.cuda_graph_custom_mask[0] = 0
             for i in range(len(self.cuda_graph_qk_indptr)):
@@ -291,7 +293,7 @@ class FlashInferAttnBackend(AttentionBackend):
             for i in range(len(self.cuda_graph_qo_indptr)):
                 if len(self.cuda_graph_qo_indptr[i]) > 0:
                     self.cuda_graph_qo_indptr[i][0] = 0
-        
+
         # Force synchronization to ensure all tensors are allocated
         torch.cuda.synchronize()
 
@@ -508,11 +510,11 @@ class FlashInferAttnBackend(AttentionBackend):
                 k_scale=layer.k_scale,
                 v_scale=layer.v_scale,
             )
-        
+
         # Call the wrapped function
         o = safe_forward_call(
             q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-            forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+            forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
         )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
@@ -1185,7 +1187,7 @@ def fast_decode_plan(
     batch_size = len(last_page_len)
     if logits_soft_cap is None:
         logits_soft_cap = 0.0
-        
+
     # Handle data types consistently
     if data_type is not None:
         if q_data_type is None:
@@ -1194,7 +1196,7 @@ def fast_decode_plan(
             kv_data_type = data_type
     elif q_data_type is None:
         q_data_type = "float16"
-        
+
     if kv_data_type is None:
         kv_data_type = q_data_type
 
@@ -1218,19 +1220,19 @@ def fast_decode_plan(
         self._paged_kv_indices_buf = indices
         self._paged_kv_last_page_len_buf = last_page_len
         if self.use_tensor_cores:
-            self._qo_indptr_buf = qo_indptr_host.to(self.device, non_blocking=non_blocking)
+            self._qo_indptr_buf = qo_indptr_host.to(
+                self.device, non_blocking=non_blocking
+            )
 
     # Create empty tensors for dtype info if needed
     empty_q_data = torch.empty(
         0,
         dtype=(
-            getattr(torch, q_data_type)
-            if isinstance(q_data_type, str)
-            else q_data_type
+            getattr(torch, q_data_type) if isinstance(q_data_type, str) else q_data_type
         ),
         device=self.device,
     )
-    
+
     empty_kv_cache = torch.empty(
         0,
         dtype=(
@@ -1248,7 +1250,7 @@ def fast_decode_plan(
     )
 
     with torch.cuda.device(self.device):
-        
+
         if self.use_tensor_cores:
             # Convert indptr to CPU, as the authors intended
             if global_override_indptr_cpu is not None:
@@ -1259,10 +1261,8 @@ def fast_decode_plan(
             # ALSO convert last_page_len to CPU
             last_page_len_host = last_page_len.cpu()
 
-            kv_lens_arr_host = get_seq_lens(
-                indptr_host, last_page_len_host, page_size
-            )
-            
+            kv_lens_arr_host = get_seq_lens(indptr_host, last_page_len_host, page_size)
+
             try:
                 # Make sure we pass exactly 15 arguments for tensor core version
                 self._plan_info = self._cached_module.plan(
@@ -1285,6 +1285,7 @@ def fast_decode_plan(
             except Exception as e:
                 # Log the error for debugging
                 import logging
+
                 logging.error(f"Error in tensor core plan: {e}")
                 raise
         else:
@@ -1310,6 +1311,7 @@ def fast_decode_plan(
             except Exception as e:
                 # Log the error for debugging
                 import logging
+
                 logging.error(f"Error in standard plan: {e}")
                 raise
 
@@ -1319,4 +1321,3 @@ def fast_decode_plan(
     self._sm_scale = sm_scale
     self._rope_scale = rope_scale
     self._rope_theta = rope_theta
-
