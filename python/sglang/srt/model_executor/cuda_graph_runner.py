@@ -141,6 +141,12 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
         if gpu_mem is not None and gpu_mem > 96 * 1024:
             capture_bs += list(range(160, 257, 8))
 
+        if model_runner.server_args.enable_dp_mla:
+            # reduce cuda graph number when occupy too much gpu memory
+            capture_bs = [bs for bs in capture_bs if bs <= 64]
+            capture_bs += list(range(64 + 16, 129, 16))
+            capture_bs += list(range(128 + 32, 257, 32))
+
     if max(capture_bs) > model_runner.req_to_token_pool.size:
         # In some case (e.g., with a small GPU or --max-running-requests), the #max-running-requests
         # is very small. We add more values here to make sure we capture the maximum bs.
@@ -187,6 +193,7 @@ class CudaGraphRunner:
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
         self.enable_dp_attention = model_runner.server_args.enable_dp_attention
+        self.enable_dp_mla = model_runner.server_args.enable_dp_mla
         self.enable_sp_layernorm = model_runner.server_args.enable_sp_layernorm
         self.speculative_algorithm = model_runner.server_args.speculative_algorithm
         self.tp_size = model_runner.server_args.tp_size
@@ -289,7 +296,9 @@ class CudaGraphRunner:
                 self.global_num_tokens_gpu = torch.zeros(
                     (self.dp_size,), dtype=torch.int32
                 )
-
+        if self.enable_dp_mla:
+            self.gathered_buffer_tp2dp = self.model_runner.get_gathered_buffer_tp2dp()
+            self.gathered_buffer_dp2tp = self.model_runner.get_gathered_buffer_dp2tp()
         # Capture
         try:
             with self.model_capture_mode():
@@ -424,6 +433,13 @@ class CudaGraphRunner:
             global_num_tokens = None
             gathered_buffer = None
 
+        if self.enable_dp_mla:
+            gathered_buffer_tp2dp = self.gathered_buffer_tp2dp[:num_tokens]
+            gathered_buffer_dp2tp = self.gathered_buffer_dp2tp[:num_tokens]
+        else:
+            gathered_buffer_tp2dp = None
+            gathered_buffer_dp2tp = None
+
         spec_info = self.get_spec_info(num_tokens)
         if self.capture_hidden_mode != CaptureHiddenMode.FULL:
             self.capture_hidden_mode = (
@@ -453,11 +469,14 @@ class CudaGraphRunner:
             positions=positions,
             global_num_tokens_gpu=global_num_tokens,
             gathered_buffer=gathered_buffer,
+            gathered_buffer_tp2dp=gathered_buffer_tp2dp,
+            gathered_buffer_dp2tp=gathered_buffer_dp2tp,
             mrope_positions=mrope_positions,
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
             capture_hidden_mode=self.capture_hidden_mode,
             lora_paths=lora_paths,
+            can_run_dp_cuda_graph=True,
         )
 
         if lora_paths is not None:
@@ -478,6 +497,8 @@ class CudaGraphRunner:
         def run_once():
             # Clean intermediate result cache for DP attention
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
+            forward_batch.dp_mla_tp2dp_plan_meta = None
+            forward_batch.dp_mla_dp2tp_plan_meta = None
 
             kwargs = {}
             if (
