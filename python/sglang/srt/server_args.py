@@ -1343,6 +1343,7 @@ class PortArgs:
                     port_base + 3
                 )  # TokenizerManager to DataParallelController
             else:
+                # scheduler_input_port = port_base + 3 + 1 + dp_rank
                 scheduler_input_port = dp_controller_zmq_ports[dp_rank]
 
             return PortArgs(
