@@ -824,6 +824,7 @@ register_conv_template(
     )
 )
 
+
 @register_conv_template_matching_function
 def match_deepseek_janus_pro(model_path: str):
     if (
@@ -905,3 +906,10 @@ def match_openbmb_minicpm(model_path: str):
         return "minicpmv"
     elif "minicpm-o" in model_path:
         return "minicpmo"
+
+
+@register_conv_template_matching_function
+def match_moonshot_kimivl(model_path: str):
+    model_path = model_path.lower()
+    if "kimi" in model_path and "vl" in model_path:
+        return "kimi-vl"
