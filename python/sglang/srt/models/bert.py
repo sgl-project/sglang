@@ -11,7 +11,12 @@ from sglang.srt.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
+from sglang.srt.layers.pooler import (
+    CrossEncodingPooler,
+    EmbeddingPoolerOutput,
+    Pooler,
+    PoolingType,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
@@ -319,7 +324,23 @@ class BertOutput(nn.Module):
         return hidden_states
 
 
-class BertModel(nn.Module):
+class BertPooler(nn.Module):
+
+    def __init__(self, config: BertConfig):
+        super().__init__()
+        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
+        self.activation = nn.Tanh()
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # We "pool" the model by simply taking the hidden state corresponding
+        # to the first token.
+        first_token_tensor = hidden_states[0, :]
+        pooled_output = self.dense(first_token_tensor)
+        pooled_output = self.activation(pooled_output)
+        return pooled_output
+
+
+class BertBaseModel(nn.Module):
 
     def __init__(
         self,
@@ -327,6 +348,7 @@ class BertModel(nn.Module):
         config: BertConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        add_pooling_layer: bool = False,
     ):
         super().__init__()
         self.config = config
@@ -334,8 +356,8 @@ class BertModel(nn.Module):
         self.encoder = BertEncoder(
             config=config, quant_config=quant_config, prefix=f"encoder"
         )
-        self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
-        # self.pooler = BertPooler(config)
+
+        self.pooler = BertPooler(config) if add_pooling_layer else None
 
     @torch.no_grad()
     def forward(
@@ -344,9 +366,7 @@ class BertModel(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
-        get_embedding: bool = False,
     ) -> torch.Tensor:
-        assert get_embedding == True
         # Your tokenized IDs
 
         hidden_states = self.embeddings(
@@ -355,9 +375,10 @@ class BertModel(nn.Module):
         )
 
         hidden_states = self.encoder(hidden_states, forward_batch=forward_batch)
-        return self.pooler(hidden_states, forward_batch)
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
+        return hidden_states
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "query", "q"),
@@ -368,7 +389,7 @@ class BertModel(nn.Module):
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
             name = name.replace("self", "self_attn")
-            if "pooler" in name:
+            if self.pooler is None and "pooler" in name:
                 continue
             for param_name, weight_name, shard_id in stacked_params_mapping:
 
@@ -391,8 +412,97 @@ class BertModel(nn.Module):
                 weight_loader(param, loaded_weight)
 
 
-class Contriever(BertModel):
+class BertEmbeddingModel(nn.Module):
+    def __init__(
+        self,
+        *,
+        config: BertConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ):
+        super().__init__()
+        self.bert = BertBaseModel(
+            config=config, quant_config=quant_config, prefix=prefix
+        )
+        self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
+        get_embedding: bool = False,
+    ) -> torch.Tensor:
+        assert get_embedding == True
+        hidden_states = self.bert(input_ids, positions, forward_batch, input_embeds)
+        return self.pooler(hidden_states, forward_batch)
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        self.bert.load_weights(weights)
+
+
+class BertForSequenceClassification(nn.Module):
+    def __init__(
+        self,
+        *,
+        config: BertConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ):
+        super().__init__()
+        self.bert = BertBaseModel(
+            config=config,
+            quant_config=quant_config,
+            prefix=prefix,
+            add_pooling_layer=True,
+        )
+        self.classifier = nn.Linear(config.hidden_size, config.num_labels)
+        self.pooler = CrossEncodingPooler(config, self.classifier, self.bert.pooler)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
+        get_embedding: bool = True,
+    ) -> torch.Tensor:
+        assert (
+            get_embedding
+        ), "BertForSequenceClassification is only used for embedding. Please add --is-embedding when you launch the server."
+
+        hidden_states = self.bert(input_ids, positions, forward_batch, input_embeds)
+
+        return self.pooler(hidden_states, forward_batch)
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        self_weights = []
+
+        def weight_filter():
+            for name, weight in weights:
+                if name.startswith("bert."):
+                    yield (name[len("bert.") :], weight)
+                else:
+                    self_weights.append((name, weight))
+
+        self.bert.load_weights(weight_filter())
+
+        params_dict = dict(self.named_parameters())
+
+        for name, loaded_weight in self_weights:
+            if name.startswith("classifier"):
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+
+
+class Contriever(BertEmbeddingModel):
     pass
 
 
-EntryClass = [BertModel, Contriever]
+class BertModel(BertEmbeddingModel):
+    pass
+
+
+EntryClass = [BertModel, Contriever, BertForSequenceClassification, BertEmbeddingModel]

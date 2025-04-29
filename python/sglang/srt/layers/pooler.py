@@ -3,10 +3,12 @@
 
 from dataclasses import dataclass
 from enum import IntEnum
+from typing import Optional
 
 import torch
 import torch.nn as nn
 
+from sglang.srt.layers.activation import get_cross_encoder_activation_function
 from sglang.srt.model_executor.model_runner import ForwardBatch
 
 
@@ -54,3 +56,49 @@ class Pooler(nn.Module):
             pooled_data = nn.functional.normalize(pooled_data, p=2, dim=1)
 
         return EmbeddingPoolerOutput(embeddings=pooled_data)
+
+
+# Adapted from vllm
+class CrossEncodingPooler(nn.Module):
+    def __init__(
+        self,
+        config,
+        classifier: nn.Module,
+        pooler: Optional[nn.Module] = None,
+    ):
+        super().__init__()
+        self.classifier = classifier
+        self.pooler = pooler
+        # self.default_activation_function = get_cross_encoder_activation_function(config)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> EmbeddingPoolerOutput:
+        """Pools sentence pair scores from the hidden_states."""
+
+        prompt_lens = forward_batch.extend_seq_lens
+
+        offset = 0
+        pooled_data_lst = []
+        for prompt_len in prompt_lens:
+            pooled_data_i = hidden_states[offset : offset + prompt_len]
+
+            if self.pooler is not None:
+                final_shape_tensor = self.pooler(pooled_data_i)
+            else:
+                final_shape_tensor = self.classifier(pooled_data_i)
+
+            pooled_data_lst.append(final_shape_tensor)
+            offset += prompt_len
+
+        pooled_output = torch.stack(pooled_data_lst)
+
+        if self.pooler is not None:
+            # apply classifier once on the full batch if possible
+            pooled_output = self.classifier(pooled_output)
+
+        # scores = self.default_activation_function(pooled_output).squeeze(-1)
+
+        return EmbeddingPoolerOutput(embeddings=pooled_output)

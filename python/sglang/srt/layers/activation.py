@@ -165,6 +165,10 @@ def get_act_fn(
     return act_fn
 
 
+def get_cross_encoder_activation_function(config):
+    return nn.Sigmoid() if config.num_labels == 1 else nn.Identity()
+
+
 if not _is_cuda:
     logger.info(
         "sgl-kernel is not available on Non-NV platforms. Fallback to other kernel libraries."
