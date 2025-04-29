@@ -123,6 +123,7 @@ jobs:
         timeout-minutes: 10
         run: |
           cd test/srt
+          python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_bs1_small
           python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_bs1_default
 
       - name: Benchmark online latency
