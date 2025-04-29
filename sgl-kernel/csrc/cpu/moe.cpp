@@ -794,9 +794,6 @@ void shared_expert_kernel_impl(
       int64_t n_size = std::min(N - nb0 * BLOCK_N, BLOCK_N);
       int64_t m_size = std::min(M - mb * BLOCK_M, BLOCK_M);
 
-      // int64_t mb_start = mb * BLOCK_M;
-      // int64_t mb_size = std::min(M - mb_start, BLOCK_M);
-
       // A shape [m_size, K]
       const scalar_t* A = input + mb * BLOCK_M * K;
 

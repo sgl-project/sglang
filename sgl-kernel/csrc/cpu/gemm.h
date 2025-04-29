@@ -27,10 +27,10 @@ template <>
 inline bool can_use_brgemm<at::Half>(int M) {
   return true;
 }
-// TODO: add u8s8 brgemm, this requires PyTorch 2.7
+// this requires PyTorch 2.7 or above
 template <>
 inline bool can_use_brgemm<int8_t>(int M) {
-  return false;
+  return M > 4;
 }
 
 template <>
