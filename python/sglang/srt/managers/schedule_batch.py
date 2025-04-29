@@ -1584,6 +1584,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 worker_batch,
                 self.token_to_kv_pool_allocator.page_size,
                 self.req_to_token_pool,
+                disable_prefix_cache=global_server_args_dict["disable_radix_cache"],
             )
 
         return worker_batch

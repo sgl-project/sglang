@@ -47,7 +47,9 @@ if _is_hpu:
         compute_hpu_attn_bias_prefill,
         get_decode_all_buckets,
         get_decode_batch_bucket,
+        get_prefill_all_prefix_seq_len_buckets,
         get_prefill_all_seq_len_buckets,
+        get_prefill_prefix_seq_len_bucket,
         get_prefill_seq_len_bucket,
         prepare_hpu_attn_bias_prefill,
         to_hpu_and_pad_1d,
@@ -67,8 +69,10 @@ HPUForwardBatch = namedtuple(
         "out_cache_loc",
         "positions",
         "attn_bias",
-        "seq_pos",
-        "seq_idx",
+        "q_seq_pos",
+        "q_seq_idx",
+        "kv_seq_pos",
+        "kv_seq_idx",
         "valid_seq_len",
         "extend_seq_lens",
         "page_size",
@@ -95,32 +99,53 @@ def create_hpu_forward_batch(forward_batch: ForwardBatch, model_runner: ModelRun
     batch_size = forward_batch.batch_size
     page_size = model_runner.token_to_kv_pool_allocator.page_size
     if forward_batch.forward_mode.is_extend():
-        seq_len_list = forward_batch.extend_seq_lens
-        sum_seq_len = seq_len_list.sum()
-        max_prompt_len = get_prefill_seq_len_bucket(sum_seq_len)
-        attn_bias, seq_pos, seq_idx = prepare_hpu_attn_bias_prefill(
-            seq_lens=seq_len_list,
-            max_prompt_len=max_prompt_len,
-            dtype=model_runner.dtype,
+        prompt_lens = forward_batch.extend_seq_lens
+        prefix_lens = forward_batch.extend_prefix_lens
+        if sum(prefix_lens) > 0:
+            max_prefix_len = get_prefill_prefix_seq_len_bucket(
+                sum(prefix_lens), page_size
+            )
+            max_prompt_len = get_prefill_seq_len_bucket(sum(prompt_lens))
+        else:
+            max_prefix_len = 0
+            max_prompt_len = get_prefill_seq_len_bucket(sum(prompt_lens))
+        attn_bias, q_seq_pos, q_seq_idx, kv_seq_pos, kv_seq_idx = (
+            prepare_hpu_attn_bias_prefill(
+                prompt_lens=prompt_lens,
+                max_prompt_len=max_prompt_len,
+                prefix_lens=prefix_lens,
+                max_prefix_len=max_prefix_len,
+                dtype=model_runner.dtype,
+            )
         )
         attn_bias = attn_bias.to("hpu")
-        seq_pos = seq_pos.to("hpu")
-        seq_idx = seq_idx.to("hpu")
-        padding_len = max_prompt_len - sum_seq_len
+        q_seq_pos = q_seq_pos.to("hpu")
+        q_seq_idx = q_seq_idx.to("hpu")
+        kv_seq_pos = kv_seq_pos.to("hpu")
+        kv_seq_idx = kv_seq_idx.to("hpu")
+        padding_len = max_prompt_len - sum(prompt_lens)
         max_prefill_seqs = model_runner.server_args.max_running_requests
         input_ids = to_hpu_and_pad_1d(forward_batch.input_ids, padding_len)
         positions = to_hpu_and_pad_1d(forward_batch.positions, padding_len)
-        valid_seq_len = sum_seq_len.to("hpu", dtype=torch.int64)
+        valid_seq_len = prompt_lens.sum().to("hpu", dtype=torch.int64)
         extend_seq_lens_padded = to_hpu_and_pad_1d(
             forward_batch.extend_seq_lens, max_prefill_seqs - batch_size
         )
         out_cache_loc = to_hpu_and_pad_1d(forward_batch.out_cache_loc, padding_len)
         batch_size = 1
-        block_list = None
+        block_list = (
+            None
+            if forward_batch.hpu_metadata is None
+            else forward_batch.hpu_metadata.block_list.to("hpu")
+        )
         block_mapping = None
         block_groups = None
         block_usage = None
-        use_contiguous_pa = None
+        use_contiguous_pa = (
+            None
+            if forward_batch.hpu_metadata is None
+            else forward_batch.hpu_metadata.use_contiguous_pa
+        )
     else:
         padded_batch_size = get_decode_batch_bucket(batch_size)
         padding_len = padded_batch_size - batch_size
@@ -137,8 +162,10 @@ def create_hpu_forward_batch(forward_batch: ForwardBatch, model_runner: ModelRun
             page_size, forward_batch.hpu_metadata.block_usage, model_runner.dtype
         )
 
-        seq_pos = None
-        seq_idx = None
+        q_seq_idx = None
+        q_seq_pos = None
+        kv_seq_idx = None
+        kv_seq_pos = None
         extend_seq_lens_padded = None
         block_list = forward_batch.hpu_metadata.block_list.to("hpu")
         block_mapping = forward_batch.hpu_metadata.block_mapping.to("hpu")
@@ -153,8 +180,10 @@ def create_hpu_forward_batch(forward_batch: ForwardBatch, model_runner: ModelRun
         out_cache_loc=out_cache_loc,
         positions=positions,
         attn_bias=attn_bias,
-        seq_pos=seq_pos,
-        seq_idx=seq_idx,
+        q_seq_pos=q_seq_pos,
+        q_seq_idx=q_seq_idx,
+        kv_seq_pos=kv_seq_pos,
+        kv_seq_idx=kv_seq_idx,
         valid_seq_len=valid_seq_len,
         extend_seq_lens=extend_seq_lens_padded,
         page_size=page_size,
@@ -169,17 +198,26 @@ def create_hpu_forward_batch(forward_batch: ForwardBatch, model_runner: ModelRun
 
 
 def create_hpu_dummy_batch_prefill(
-    seq_len, dtype, page_size, max_running_requests, attn_backend, token_to_kv_pool
+    prefix_len,
+    prompt_len,
+    dtype,
+    page_size,
+    max_running_requests,
+    attn_backend,
+    token_to_kv_pool,
 ):
+    seq_len = prefix_len + prompt_len
     return HPUForwardBatch(
         forward_mode=ForwardMode.EXTEND,
         batch_size=1,
-        input_ids=torch.zeros(seq_len, dtype=torch.int64, device="hpu"),
-        out_cache_loc=torch.arange(seq_len, dtype=torch.int64, device="hpu"),
-        positions=torch.zeros(seq_len, dtype=torch.int64, device="hpu"),
-        attn_bias=torch.zeros(1, 1, seq_len, seq_len, dtype=dtype, device="hpu"),
-        seq_pos=torch.zeros(1, seq_len, dtype=torch.int64, device="hpu"),
-        seq_idx=torch.zeros(1, seq_len, dtype=torch.int64, device="hpu"),
+        input_ids=torch.zeros(prompt_len, dtype=torch.int64, device="hpu"),
+        out_cache_loc=torch.arange(prompt_len, dtype=torch.int64, device="hpu"),
+        positions=torch.zeros(prompt_len, dtype=torch.int64, device="hpu"),
+        attn_bias=torch.zeros(1, 1, prompt_len, seq_len, dtype=dtype, device="hpu"),
+        q_seq_pos=torch.zeros(1, prompt_len, dtype=torch.int64, device="hpu"),
+        q_seq_idx=torch.zeros(1, prompt_len, dtype=torch.int64, device="hpu"),
+        kv_seq_pos=torch.zeros(1, seq_len, dtype=torch.int64, device="hpu"),
+        kv_seq_idx=torch.zeros(1, seq_len, dtype=torch.int64, device="hpu"),
         valid_seq_len=torch.ones((), dtype=torch.int64, device="hpu"),
         extend_seq_lens=torch.ones(
             max_running_requests,
@@ -187,7 +225,9 @@ def create_hpu_dummy_batch_prefill(
             device="hpu",
         ),
         page_size=page_size,
-        block_list=None,
+        block_list=torch.zeros(
+            prefix_len // page_size, dtype=torch.int64, device="hpu"
+        ),
         block_mapping=None,
         block_groups=None,
         block_usage=None,
@@ -198,7 +238,13 @@ def create_hpu_dummy_batch_prefill(
 
 
 def create_hpu_dummy_batch_decode(
-    batch_size, block_num, dtype, page_size, attn_backend, token_to_kv_pool
+    batch_size,
+    block_num,
+    dtype,
+    page_size,
+    attn_backend,
+    token_to_kv_pool,
+    disable_prefix_cache=False,
 ):
     return HPUForwardBatch(
         forward_mode=ForwardMode.DECODE,
@@ -207,8 +253,10 @@ def create_hpu_dummy_batch_decode(
         out_cache_loc=torch.zeros(batch_size, dtype=torch.int64, device="hpu"),
         positions=torch.zeros(batch_size, dtype=torch.int64, device="hpu"),
         attn_bias=torch.zeros(block_num, page_size, dtype=dtype, device="hpu"),
-        seq_pos=None,
-        seq_idx=None,
+        q_seq_pos=None,
+        q_seq_idx=None,
+        kv_seq_pos=None,
+        kv_seq_idx=None,
         valid_seq_len=torch.ones(batch_size, dtype=torch.int64, device="hpu"),
         extend_seq_lens=None,
         page_size=page_size,
@@ -220,7 +268,7 @@ def create_hpu_dummy_batch_decode(
         block_usage=torch.zeros(block_num, dtype=torch.bfloat16, device="hpu"),
         attn_backend=attn_backend,
         token_to_kv_pool=token_to_kv_pool,
-        use_contiguous_pa=USE_CONTIGUOUS_PA,
+        use_contiguous_pa=USE_CONTIGUOUS_PA and disable_prefix_cache,
     )
 
 
@@ -239,7 +287,11 @@ class HPUAdapter:
         if input_batch.forward_mode.is_extend():
             input_batch.attn_bias.copy_(
                 compute_hpu_attn_bias_prefill(
-                    input_batch.seq_pos, input_batch.seq_idx, self.dtype
+                    input_batch.q_seq_pos,
+                    input_batch.q_seq_idx,
+                    input_batch.kv_seq_pos,
+                    input_batch.kv_seq_idx,
+                    self.dtype,
                 )
             )
         return self.model(*args, **kwargs)
@@ -296,9 +348,17 @@ class HPUGraphRunner:
     def capture(self):
         # prefill
         time_start = time.perf_counter()
+        max_prefill_tokens = self.model_runner.server_args.max_prefill_tokens
         prefill_seq_len_buckets = get_prefill_all_seq_len_buckets()
-        for seq_len in prefill_seq_len_buckets:
-            self.capture_prefill(seq_len)
+        if self.model_runner.server_args.disable_radix_cache:
+            prefill_prefix_len_buckets = [0]
+        else:
+            prefill_prefix_len_buckets = get_prefill_all_prefix_seq_len_buckets()
+        for prompt_len in prefill_seq_len_buckets:
+            for prefix_len in prefill_prefix_len_buckets:
+                if prefix_len + prompt_len > max_prefill_tokens:
+                    continue
+                self.capture_prefill(prefix_len, prompt_len)
         time_end = time.perf_counter()
         logger.info(f"Capture prefill time: {time_end - time_start} seconds")
 
@@ -310,10 +370,13 @@ class HPUGraphRunner:
         time_end = time.perf_counter()
         logger.info(f"Capture decode time: {time_end - time_start} seconds")
 
-    def capture_prefill(self, seq_len):
-        logger.info(f"Capture prefill with seq_len: {seq_len}")
+    def capture_prefill(self, prefix_len, prompt_len):
+        logger.info(
+            f"Capture prefill with prefix_len: {prefix_len} and prompt_len: {prompt_len}"
+        )
         forward_batch = create_hpu_dummy_batch_prefill(
-            seq_len,
+            prefix_len,
+            prompt_len,
             self.model_runner.dtype,
             self.model_runner.token_to_kv_pool_allocator.page_size,
             self.model_runner.server_args.max_running_requests,
@@ -338,6 +401,7 @@ class HPUGraphRunner:
             page_size,
             self.model_runner.attn_backend,
             self.model_runner.token_to_kv_pool,
+            disable_prefix_cache=self.model_runner.server_args.disable_radix_cache,
         )
         self.model_runner.attn_backend.init_forward_metadata(forward_batch)
         for i in range(3):

@@ -41,7 +41,7 @@ runtime_common = [
     "transformers==4.51.1",
     "uvicorn",
     "uvloop",
-    "xgrammar==0.1.17",
+    "xgrammar==0.1.18",
 ]
 
 srt = [
@@ -85,7 +85,7 @@ srt_xpu = ["sglang[runtime_common]", "outlines>=0.0.44,<=0.1.11"]
 srt_hpu = ["sglang[runtime_common]",
            "outlines>=0.0.44,<=0.1.11",
            "numpy<2",
-           "vllm @ git+https://github.com/HabanaAI/vllm-fork.git@873b5017da95113a7a8ec55749ce15b63935dc45"]
+           "vllm @ git+https://github.com/HabanaAI/vllm-fork.git@367c11bef18eeff3b975aedabdceb7d4450d04e2"]
 
 # CPU: currently, there are no pre-built vllm wheels for CPU.
 # To install vllm for CPU, please follow the instruction here:

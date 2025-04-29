@@ -388,14 +388,11 @@ class ServerArgs:
             "1" if self.disable_outlines_disk_cache else "0"
         )
 
-        if is_hpu():
+        if self.device == "hpu":
             if self.max_running_requests is None:
                 self.max_running_requests = 128
 
             self.page_size = 128  # Currently, HPU only supports page size of 128
-            self.disable_radix_cache = (
-                True  # Currently, HPU does not support radix cache
-            )
             if self.max_prefill_tokens is None:
                 self.max_prefill_tokens = (
                     4096  # Currently, HPU prefer smaller prefill batches

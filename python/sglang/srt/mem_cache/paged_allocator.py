@@ -426,6 +426,9 @@ class HeapPagedTokenToKVPoolAllocator:
         extend_num_tokens: int,
     ):
         bs = len(prefix_lens)
+        prefix_lens = prefix_lens.to("cpu")
+        seq_lens = seq_lens.to("cpu")
+        last_loc = last_loc.to("cpu")
         out_indices_list = alloc_extend_kernel_python(
             prefix_lens,
             seq_lens,
@@ -451,6 +454,7 @@ class HeapPagedTokenToKVPoolAllocator:
         last_loc: torch.Tensor,
     ):
         bs = len(seq_lens)
+        last_loc = last_loc.to("cpu")
         out_indices_list = alloc_decode_kernel_python(
             last_loc,
             self.free_pages,
@@ -473,11 +477,13 @@ class HeapPagedTokenToKVPoolAllocator:
             return
 
         if self.is_not_in_free_group:
-            free_page_indices = torch.unique(free_index // self.page_size).tolist()
+            free_page_indices = torch.unique(
+                free_index.to("cpu") // self.page_size
+            ).tolist()
             for page in free_page_indices:
                 heapq.heappush(self.free_pages, page)
         else:
-            self.free_group.append(free_index)
+            self.free_group.append(free_index.to("cpu"))
 
     def free_group_begin(self):
         self.is_not_in_free_group = False

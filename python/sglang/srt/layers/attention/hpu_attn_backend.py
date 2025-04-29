@@ -68,6 +68,31 @@ class HPUAttnBackend(AttentionBackend):
         key = k.view(1, -1, layer.tp_k_head_num, layer.qk_head_dim)
         value = v.view(1, -1, layer.tp_v_head_num, layer.v_head_dim)
 
+        key_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        value_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+        key_cache = key_cache.view(
+            -1, forward_batch.page_size, layer.tp_k_head_num, layer.qk_head_dim
+        )
+        value_cache = value_cache.view(
+            -1, forward_batch.page_size, layer.tp_v_head_num, layer.v_head_dim
+        )
+
+        if forward_batch.use_contiguous_pa:
+
+            def fetch_key_cache(cache, blocks):
+                return cache[: blocks.size(0)]
+
+            def fetch_value_cache(cache, blocks):
+                return cache[: blocks.size(0)]
+
+        else:
+
+            def fetch_key_cache(cache, blocks):
+                return cache.index_select(0, blocks.flatten())
+
+            def fetch_value_cache(cache, blocks):
+                return cache.index_select(0, blocks.flatten())
+
         output = ops.prompt_attention(
             impl="fsdpa",
             query=query,
@@ -81,6 +106,11 @@ class HPUAttnBackend(AttentionBackend):
             softmax_op=self.softmax,
             matmul_av_op=self.matmul_av,
             fsdpa_op=self.fused_scaled_dot_product_attention,
+            block_list=forward_batch.block_list,
+            keys_fetch_func=fetch_key_cache,
+            values_fetch_func=fetch_value_cache,
+            key_cache=key_cache,
+            value_cache=value_cache,
         )
         output = output.reshape(q.shape)
 
