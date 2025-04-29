@@ -288,36 +288,38 @@ def build_deepseek_v3_mapping(
                 ]
             )
         if server_args.enable_ep_moe:
-            ep_mapping.extend(
-                [
-                    CompileMapping(
-                        "experts.gate_up_proj",
-                        KernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED,
-                        "G",
-                    ),
-                    CompileMapping(
-                        "experts.down_proj",
-                        KernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED,
-                        "G",
-                    ),
-                ]
-            )
+            # NOTE: Waiting for EP moe DeepGEMM PR
+            # ep_mapping.extend(
+            #     [
+            #         CompileMapping(
+            #             "experts.gate_up_proj",
+            #             KernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG,
+            #             "G",
+            #         ),
+            #         CompileMapping(
+            #             "experts.down_proj",
+            #             KernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG,
+            #             "G",
+            #         ),
+            #     ]
+            # )
+            pass
         else:
             # NOTE: Waiting for TP moe DeepGEMM PR
-            tp_mapping.extend(
-                [
-                    CompileMapping(
-                        "experts.gate_up_proj",
-                        KernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG,
-                        "N",
-                    ),
-                    CompileMapping(
-                        "experts.down_proj",
-                        KernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG,
-                        "K",
-                    ),
-                ]
-            )
+            # tp_mapping.extend(
+            #     [
+            #         CompileMapping(
+            #             "experts.gate_up_proj",
+            #             KernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG,
+            #             "N",
+            #         ),
+            #         CompileMapping(
+            #             "experts.down_proj",
+            #             KernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG,
+            #             "K",
+            #         ),
+            #     ]
+            # )
             pass
 
     return tp_mapping, attn_tp_mapping, moe_dense_tp_mapping, ep_mapping, dp_mapping
@@ -340,15 +342,23 @@ def get_parallel_weight_config(
 
 
 def compile_mappings(
+    mapping_name: str,
     compile_args: CompileArgs,
     weights: Dict[str, WeightConfig],
     mappings: List[CompileMapping],
     parallel_size: int,
 ):
+    if len(mappings) == 0:
+        return
+
     if compile_args.compile_num_sms is None:
         num_sms = get_device_core_count()
     else:
         num_sms = compile_args.compile_num_sms
+
+    print(
+        f"Compiling [{mapping_name}] part..., parallel_size={parallel_size}, num_sms={num_sms}"
+    )
 
     for mapping in mappings:
         kernel_helper = _KERNEL_HELPER_DICT[mapping.kernel_type]
@@ -394,16 +404,13 @@ def compile_deepseek_v3(
         server_args.tp_size if server_args.moe_dense_tp_size is None else 1
     )
 
-    print("Compiling DP part...")
-    compile_mappings(compile_args, weights, dp_mapping, 1)
-    print("Compiling TP part...")
-    compile_mappings(compile_args, weights, tp_mapping, server_args.tp_size)
-    print("Compiling Attention part...")
-    compile_mappings(compile_args, weights, attn_tp_mapping, attn_tp_size)
-    print("Compiling MLP part...")
-    compile_mappings(compile_args, weights, moe_dense_tp_mapping, moe_dense_tp_size)
-    print("Compiling EP part...")
-    compile_mappings(compile_args, weights, ep_mapping, server_args.ep_size)
+    compile_mappings("DP", compile_args, weights, dp_mapping, 1)
+    compile_mappings("TP", compile_args, weights, tp_mapping, server_args.tp_size)
+    compile_mappings("Attention", compile_args, weights, attn_tp_mapping, attn_tp_size)
+    compile_mappings(
+        "MLP", compile_args, weights, moe_dense_tp_mapping, moe_dense_tp_size
+    )
+    compile_mappings("EP", compile_args, weights, ep_mapping, server_args.ep_size)
 
 
 def launch_server_internal(server_args):
