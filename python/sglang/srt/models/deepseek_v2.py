@@ -283,7 +283,7 @@ class DeepseekV2MoE(nn.Module):
                 if self.gate.e_score_correction_bias is not None
                 else None
             )
-            self.overlap_shared_experts = True
+            self.overlap_shared_experts = self.ep_size > 1
             self.async_finish = True  # TODO
             self.return_recv_hook = True
             self.deepep_dispatcher = DeepEPDispatcher(
