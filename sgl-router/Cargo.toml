@@ -21,16 +21,15 @@ serde_json = "1.0"
 pyo3 = { version = "0.22.5", features = ["extension-module"] }
 dashmap = "6.1.0"
 http = "1.1.0"
-env_logger = "0.11.5"
-log = "0.4.22"
-chrono = "0.4.38"
 tokio = "1.42.0"
 # Added for enhanced logging system
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "chrono"] }
 tracing-log = "0.2"
 tracing-appender = "0.2.3"
-
+kube = { version = "0.88.1", features = ["runtime", "derive"] }
+k8s-openapi = { version = "0.21.0", features = ["v1_29"] }
+futures = "0.3"
 [profile.release]
 lto = "thin"
 codegen-units = 1
