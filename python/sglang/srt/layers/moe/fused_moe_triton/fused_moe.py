@@ -943,7 +943,7 @@ def get_moe_configs(
             # Please note that although we find the config files, performance might still be suboptimal.
             # This is because the tuning environment might differ from your current environment.
             # For example, updating the Triton version might cause all old configs to become suboptimal.
-            # To achieve the best performance, consider retuning the Triton fused MOE kernel in your environment.
+            # To achieve the best performance, consider re-tuning the Triton fused MOE kernel in your environment.
             # For the tuning method, refer to: https://github.com/sgl-project/sglang/tree/main/benchmark/kernels/fused_moe_triton
             logger.info("Using MoE kernel config from %s.", config_file_path)
             # If a configuration has been found, return it
