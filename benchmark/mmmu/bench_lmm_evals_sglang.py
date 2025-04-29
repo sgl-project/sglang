@@ -14,7 +14,7 @@ Example usage:
     python bench_lmm_evals_sglang.py \
   --model-path "Qwen/Qwen2.5-VL-3B-Instruct" \
   --chat-template "qwen2-vl" \
-  --tasks "mmmu_pro, mmmu_val" \
+  --tasks "mmmu_pro,mmmu_val" \
   --mem-fraction-static 0.6 \
   --timeout 300 \
   --batch-size 1 \
@@ -170,7 +170,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--tasks",
         type=str,
-        help="Multi Modal task to be evaluated. Tasks should be comma seperated values.",
+        help="Multi Modal task to be evaluated. Tasks should be comma seperated values without space. Example: --tasks=mmmu_pro,mmmu_val",
         required=True,
     )
     parser.add_argument(
