@@ -824,7 +824,6 @@ register_conv_template(
     )
 )
 
-
 @register_conv_template_matching_function
 def match_deepseek_janus_pro(model_path: str):
     if (
