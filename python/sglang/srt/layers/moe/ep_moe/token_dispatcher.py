@@ -257,7 +257,8 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_idx = topk_idx.to(torch.int64)
         # NOTE fix
         if _enable_jit_deepgemm:
-            hidden_states = per_token_cast_to_fp8(hidden_states)
+            # hidden_states = per_token_cast_to_fp8(hidden_states)
+            hidden_states = sglang_per_token_group_quant_fp8(hidden_states, 128)
         previous_event = Buffer.capture() if self.async_finish else None
         return hidden_states, topk_idx, topk_weights, previous_event
 

@@ -648,6 +648,11 @@ class Scheduler(
             )
             metadata_buffers = [output_id_buffer]
 
+            if not self.enable_overlap:
+                self.disagg_launch_done = threading.Event()
+            else:
+                self.disagg_launch_done = None
+
             self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(
                 token_to_kv_pool=self.token_to_kv_pool_allocator.get_kvcache(),
                 req_to_metadata_buffer_idx_allocator=req_to_metadata_buffer_idx_allocator,
@@ -1428,6 +1433,13 @@ class Scheduler(
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
         self.forward_ct += 1
+
+        # NOTE HACK
+        if self.forward_ct == 5:
+            text = f"[All threads of {os.getpid()=}, {self.tp_rank=}]"
+            for thread in threading.enumerate():
+                text += f" [{thread.name=} {thread.ident=} {thread.native_id=}]"
+            print(text, flush=True)
 
         # Check profiler
         if (

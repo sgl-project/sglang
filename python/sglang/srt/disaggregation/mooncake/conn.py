@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import concurrent.futures
 import dataclasses
 import logging
 import os
@@ -33,6 +32,8 @@ from sglang.srt.utils import get_free_port, get_ip, get_local_ip_by_remote
 
 logger = logging.getLogger(__name__)
 
+MAX_CONTIGUOUS = 32
+
 
 def group_concurrent_contiguous(
     src_indices: npt.NDArray[np.int64], dst_indices: npt.NDArray[np.int64]
@@ -45,7 +46,7 @@ def group_concurrent_contiguous(
     for i in range(1, len(src_indices)):
         src_contiguous = src_indices[i] == src_indices[i - 1] + 1
         dst_contiguous = dst_indices[i] == dst_indices[i - 1] + 1
-        if src_contiguous and dst_contiguous:
+        if src_contiguous and dst_contiguous and len(current_src) < MAX_CONTIGUOUS:
             current_src.append(src_indices[i])
             current_dst.append(dst_indices[i])
         else:
@@ -146,11 +147,6 @@ class MooncakeKVManager(BaseKVManager):
             self.start_prefill_thread()
             self._register_to_bootstrap()
 
-            # Determine the number of threads to use for kv sender
-            cpu_count = os.cpu_count()
-            self.executor = concurrent.futures.ThreadPoolExecutor(
-                max_workers=cpu_count if cpu_count is not None else 64
-            )
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.start_decode_thread()
             self.connection_pool: Dict[str, Dict[str, Union[str, int]]] = {}
@@ -190,17 +186,11 @@ class MooncakeKVManager(BaseKVManager):
         )
 
         num_layers = len(self.kv_args.kv_data_ptrs)
-        layers_params = [
-            (
-                self.kv_args.kv_data_ptrs[layer_id],
-                dst_kv_ptrs[layer_id],
-                self.kv_args.kv_item_lens[layer_id],
-            )
-            for layer_id in range(num_layers)
-        ]
+        for layer_id in range(num_layers):
+            src_ptr = self.kv_args.kv_data_ptrs[layer_id]
+            dst_ptr = dst_kv_ptrs[layer_id]
+            item_len = self.kv_args.kv_item_lens[layer_id]
 
-        # Worker function for processing a single layer
-        def process_layer(src_ptr: int, dst_ptr: int, item_len: int) -> int:
             for prefill_index, decode_index in zip(prefill_kv_blocks, dst_kv_blocks):
                 src_addr = src_ptr + int(prefill_index[0]) * item_len
                 dst_addr = dst_ptr + int(decode_index[0]) * item_len
@@ -211,26 +201,6 @@ class MooncakeKVManager(BaseKVManager):
                 )
                 if status != 0:
                     return status
-            return 0
-
-        futures = [
-            self.executor.submit(
-                process_layer,
-                src_ptr,
-                dst_ptr,
-                item_len,
-            )
-            for (src_ptr, dst_ptr, item_len) in layers_params
-        ]
-
-        for future in concurrent.futures.as_completed(futures):
-            status = future.result()
-            if status != 0:
-                # Immediate shutdown on first error (existing tasks will finish)
-                executor.shutdown(wait=False)
-                for f in futures:
-                    f.cancel()
-                return status
 
         return 0
 
