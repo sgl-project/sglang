@@ -160,7 +160,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 
 | Arguments | Description | Defaults |
 |----------|-------------|---------|
-| `lora_paths` | List of adapters to apply to your model. Each batch element uses the proper LoRA adapter. `cuda_graph` and `radix_attention` are not supported with this, so they must be disabled manually. See related [issues](https://github.com/sgl-project/sglang/issues/2929). | None |
+| `lora_paths` | List of adapters to apply to your model. Each batch element uses the proper LoRA adapter. `radix_attention` is not supported with this, so it must be disabled manually. See related [issues](https://github.com/sgl-project/sglang/issues/2929). | None |
 | `max_loras_per_batch` | Maximum number of LoRAs allowed in a running batch, including the base model. | `8` |
 | `lora_backend` | Backend used to run GEMM kernels for LoRA modules. Can be `triton` or `flashinfer`. | `triton` |
 
