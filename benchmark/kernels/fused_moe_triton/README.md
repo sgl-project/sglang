@@ -1,4 +1,4 @@
-## Benchmark Kernels
+## Tuning Triton MoE Kernels
 
 This directory contains benchmarking tools for MoE (Mixture of Experts) kernels.
 
