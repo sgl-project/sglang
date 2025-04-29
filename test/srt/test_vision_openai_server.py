@@ -47,11 +47,6 @@ class TestOpenAIVisionServer(CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             api_key=cls.api_key,
-            other_args=[
-                "--chat-template",
-                "chatml-llava",
-                # "--log-requests",
-            ],
         )
         cls.base_url += "/v1"
 
@@ -491,8 +486,6 @@ class TestQwen2VLServer(TestOpenAIVisionServer):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             api_key=cls.api_key,
             other_args=[
-                "--chat-template",
-                "qwen2-vl",
                 "--mem-fraction-static",
                 "0.4",
             ],
@@ -512,8 +505,6 @@ class TestQwen2_5_VLServer(TestOpenAIVisionServer):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             api_key=cls.api_key,
             other_args=[
-                "--chat-template",
-                "qwen2-vl",
                 "--mem-fraction-static",
                 "0.4",
             ],
@@ -533,8 +524,6 @@ class TestVLMContextLengthIssue(CustomTestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             api_key=cls.api_key,
             other_args=[
-                "--chat-template",
-                "qwen2-vl",
                 "--context-length",
                 "300",
                 "--mem-fraction-static=0.80",
@@ -589,10 +578,6 @@ class TestMllamaServer(TestOpenAIVisionServer):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             api_key=cls.api_key,
-            other_args=[
-                "--chat-template",
-                "llama_3_vision",
-            ],
         )
         cls.base_url += "/v1"
 
@@ -612,8 +597,6 @@ class TestMinicpmvServer(TestOpenAIVisionServer):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--trust-remote-code",
-                "--chat-template",
-                "minicpmv",
                 "--mem-fraction-static",
                 "0.4",
             ],
@@ -633,8 +616,6 @@ class TestMinicpmoServer(TestOpenAIVisionServer):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--trust-remote-code",
-                "--chat-template",
-                "minicpmo",
                 "--mem-fraction-static",
                 "0.7",
             ],
@@ -658,8 +639,6 @@ class TestDeepseekVL2Server(TestOpenAIVisionServer):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--trust-remote-code",
-                "--chat-template",
-                "deepseek-vl2",
                 "--context-length",
                 "4096",
             ],
@@ -706,8 +685,6 @@ class TestJanusProServer(TestOpenAIVisionServer):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--trust-remote-code",
-                "--chat-template",
-                "janus-pro",
                 "--mem-fraction-static",
                 "0.4",
             ],
@@ -760,8 +737,6 @@ class TestGemma3itServer(TestOpenAIVisionServer):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--trust-remote-code",
-                "--chat-template",
-                "gemma-it",
                 "--mem-fraction-static",
                 "0.75",
                 "--enable-multimodal",
