@@ -240,6 +240,15 @@ impl Router {
         })
     }
 
+    /// Get a reference to the worker URLs shared across threads
+    pub fn get_worker_urls(&self) -> Arc<RwLock<Vec<String>>> {
+        match self {
+            Router::RoundRobin { worker_urls, .. } => Arc::clone(worker_urls),
+            Router::Random { worker_urls, .. } => Arc::clone(worker_urls),
+            Router::CacheAware { worker_urls, .. } => Arc::clone(worker_urls),
+        }
+    }
+
     fn wait_for_healthy_workers(
         worker_urls: &[String],
         timeout_secs: u64,
