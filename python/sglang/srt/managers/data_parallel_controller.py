@@ -92,19 +92,6 @@ class DataParallelController:
             dp_port_args = self.launch_dp_schedulers(server_args, port_args)
             self.control_message_step = 1
 
-        # Only node rank 0 runs the real data parallel controller that dispatches the requests.
-        if server_args.node_rank == 0:
-            for dp_rank in range(server_args.dp_size):
-                logger.debug(
-                    f"Node rank 0 binding to dispatcher for dp controller {dp_rank}. scheduler_input_ipc_name: {dp_port_args[dp_rank].scheduler_input_ipc_name}"
-                )
-                self.workers[dp_rank] = get_zmq_socket(
-                    self.context,
-                    zmq.PUSH,
-                    dp_port_args[dp_rank].scheduler_input_ipc_name,
-                    True,
-                )
-
         self.max_req_input_len = None
 
     def launch_dp_schedulers(self, server_args, port_args):
@@ -212,10 +199,22 @@ class DataParallelController:
 
     def launch_dp_attention_schedulers(self, server_args, port_args):
         self._dispatch_free_ports(server_args)
-        self.launch_tensor_parallel_group(server_args, port_args, 0, None)
         dp_port_args = []
         for dp_rank in range(server_args.dp_size):
             dp_port_args.append(PortArgs.init_new(server_args, dp_rank))
+        # Only node rank 0 runs the real data parallel controller that dispatches the requests.
+        if server_args.node_rank == 0:
+            for dp_rank in range(server_args.dp_size):
+                logger.debug(
+                    f"Node rank 0 binding to dispatcher for dp controller {dp_rank}. scheduler_input_ipc_name: {dp_port_args[dp_rank].scheduler_input_ipc_name}"
+                )
+                self.workers[dp_rank] = get_zmq_socket(
+                    self.context,
+                    zmq.PUSH,
+                    dp_port_args[dp_rank].scheduler_input_ipc_name,
+                    True,
+                )
+        self.launch_tensor_parallel_group(server_args, port_args, 0, None)
         return dp_port_args
 
     def launch_tensor_parallel_group(
