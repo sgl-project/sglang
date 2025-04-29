@@ -86,6 +86,17 @@ fptr_t mscclpp_init_context(
     const std::vector<int64_t>& rank_to_ib,
     const int64_t context_selection);
 void mscclpp_allreduce(fptr_t _context, torch::Tensor& inp, torch::Tensor& out, int64_t nthreads, int64_t nblocks);
+void all_to_all(fptr_t _fa, torch::Tensor& output, torch::Tensor& input, torch::Tensor& plan_meta, fptr_t _reg_buffer);
+void all_to_all_plan(
+    fptr_t _fa,
+    torch::Tensor& output,
+    torch::Tensor& input,
+    torch::Tensor& output_split_sizes,
+    torch::Tensor& input_split_sizes,
+    int64_t chunk_size,
+    torch::Tensor& output_split_offsets,
+    torch::Tensor& input_split_offsets,
+    torch::Tensor& plan_meta);
 #endif
 
 /*

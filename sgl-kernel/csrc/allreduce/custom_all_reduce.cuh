@@ -18,21 +18,23 @@
 namespace sglang {
 
 constexpr int kMaxBlocks = 36;
+constexpr int kMaxAll2AllBlocks = 78;
+constexpr int kSignalBlocks = std::max(kMaxBlocks, kMaxAll2AllBlocks);
 // Counter may overflow, but it's fine since unsigned int overflow is
 // well-defined behavior.
 using FlagType = uint32_t;
 struct Signal {
-  alignas(128) FlagType self_counter[kMaxBlocks][8];
+  alignas(128) FlagType self_counter[kSignalBlocks][8];
   // Two sets of peer counters are needed for two syncs. The reason is that
   // it's possible for peer GPU block to arrive at the second sync point while
   // the current GPU block haven't passed the first sync point. Thus, peer GPU
   // may write counter+1 while current GPU is busy waiting for counter. We use
   // alternating counter array to avoid this possibility.
-  alignas(128) FlagType peer_counter[2][kMaxBlocks][8];
+  alignas(128) FlagType peer_counter[2][kSignalBlocks][8];
 };
 
 struct __align__(16) RankData {
-  const void* __restrict__ ptrs[8];
+  void* __restrict__ ptrs[8];
 };
 
 struct __align__(16) RankSignals {
