@@ -204,6 +204,9 @@ class Scheduler(
 
         # Init inter-process communication
         context = zmq.Context(2)
+        logger.debug(
+            f"TP rank {self.tp_rank}, DP rank {self.dp_rank}, attn_tp_rank {self.attn_tp_rank}"
+        )
         if self.attn_tp_rank == 0:
             self.recv_from_tokenizer = get_zmq_socket(
                 context, zmq.PULL, port_args.scheduler_input_ipc_name, False

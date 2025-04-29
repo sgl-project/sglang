@@ -96,7 +96,7 @@ class DataParallelController:
         if server_args.node_rank == 0:
             for dp_rank in range(server_args.dp_size):
                 logger.debug(
-                    f"Binding to dp controller ->  {dp_rank} at {dp_port_args[dp_rank].scheduler_input_ipc_name}"
+                    f"Node rank 0 binding to dispatcher for dp controller {dp_rank}. scheduler_input_ipc_name: {dp_port_args[dp_rank].scheduler_input_ipc_name}"
                 )
                 self.workers[dp_rank] = get_zmq_socket(
                     self.context,
@@ -165,7 +165,8 @@ class DataParallelController:
 
     def _dispatch_free_ports(self, server_args: ServerArgs):
         if server_args.node_rank == 0:
-            free_ports = [get_free_port() for _ in range(server_args.dp_size + 10)]
+            free_ports = {i: get_free_port() for i in range(server_args.dp_size)}
+            logger.debug(f"Free ports: {free_ports}")
 
             # broadcast dp_port_args to all dp ranks
             rep_socket = get_zmq_socket(
@@ -207,7 +208,7 @@ class DataParallelController:
             except zmq.Again:
                 logger.error("Handshake timeout with node 0")
                 raise
-        PortArgs.register_free_ports(free_ports)
+        PortArgs.register_dp_controller_to_attn_tp_rk0_port(free_ports)
 
     def launch_dp_attention_schedulers(self, server_args, port_args):
         self._dispatch_free_ports(server_args)
@@ -249,6 +250,7 @@ class DataParallelController:
                     server_args.tp_size,
                     server_args.dp_size,
                 )
+                logger.info(f"DP controller: dp_rank {dp_rank} tp_rank {tp_rank}")
                 # compute zmq ports for this dp rank
                 rank_port_args = PortArgs.init_new(server_args, dp_rank)
                 # Data parallelism resues the tensor parallelism group,

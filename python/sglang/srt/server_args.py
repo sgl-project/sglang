@@ -1280,7 +1280,6 @@ ZMQ_TCP_PORT_DELTA = 233
 
 
 dp_controller_zmq_ports: dict[int, int] = {}
-free_ports = []
 
 
 @dataclasses.dataclass
@@ -1299,9 +1298,9 @@ class PortArgs:
     rpc_ipc_name: str
 
     @staticmethod
-    def register_free_ports(ports: list[int]):
-        global free_ports
-        free_ports.extend(ports)
+    def register_dp_controller_to_attn_tp_rk0_port(ports: dict[int, int]):
+        global dp_controller_zmq_ports
+        dp_controller_zmq_ports = ports
 
     @staticmethod
     def init_new(server_args, dp_rank: Optional[int] = None) -> "PortArgs":
@@ -1344,9 +1343,6 @@ class PortArgs:
                     port_base + 3
                 )  # TokenizerManager to DataParallelController
             else:
-                if dp_rank not in dp_controller_zmq_ports:
-                    dp_controller_zmq_ports[dp_rank] = free_ports[-1]
-                    free_ports.pop()
                 scheduler_input_port = dp_controller_zmq_ports[dp_rank]
 
             return PortArgs(
