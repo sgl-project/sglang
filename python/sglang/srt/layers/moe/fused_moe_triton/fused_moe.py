@@ -940,10 +940,12 @@ def get_moe_configs(
     )
     if os.path.exists(config_file_path):
         with open(config_file_path) as f:
-            logger.info(
-                "Using configuration from %s for MoE layer. Please note that due to the large number of configs under fused_moe_triton/configs potentially not being tuned with the corresponding Triton version in your current environment, using the current configs may result in performance degradation. To achieve best performance, you can consider re-tuning the Triton fused MOE kernel in your current environment. For the tuning method, please refer to: https://github.com/sgl-project/sglang/blob/main/benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton.py. ",
-                config_file_path,
-            )
+            # Please note that although we find the config files, performance might still be suboptimal.
+            # This is because the tuning environment might differ from your current environment.
+            # For example, updating the Triton version might cause all old configs to become suboptimal.
+            # To achieve the best performance, consider re-tuning the Triton fused MOE kernel in your environment.
+            # For the tuning method, refer to: https://github.com/sgl-project/sglang/tree/main/benchmark/kernels/fused_moe_triton
+            logger.info("Using MoE kernel config from %s.", config_file_path)
             # If a configuration has been found, return it
             return {int(key): val for key, val in json.load(f).items()}
 
@@ -951,8 +953,8 @@ def get_moe_configs(
     # configuration
     logger.warning(
         (
-            "Using default MoE config. Performance might be sub-optimal! "
-            "Config file not found at %s, you can tune the config with https://github.com/sgl-project/sglang/blob/main/benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton.py."
+            "Using default MoE kernel config. Performance might be sub-optimal! "
+            "Config file not found at %s, you can create them with https://github.com/sgl-project/sglang/tree/main/benchmark/kernels/fused_moe_triton"
         ),
         config_file_path,
     )
