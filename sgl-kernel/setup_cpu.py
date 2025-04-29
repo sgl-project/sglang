@@ -14,9 +14,9 @@
 # ==============================================================================
 
 import os
+import platform
 import shutil
 import sys
-import platform
 from pathlib import Path
 
 import torch
@@ -38,6 +38,7 @@ else:
 
 if "bdist_wheel" in sys.argv and "--plat-name" not in sys.argv:
     sys.argv.extend(["--plat-name", plat_name])
+
 
 def _get_version():
     with open(root / "pyproject.toml") as f:

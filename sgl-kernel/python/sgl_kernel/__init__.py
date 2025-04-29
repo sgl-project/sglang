@@ -1,8 +1,8 @@
 import ctypes
 import os
+import platform
 
 import torch
-import platform
 
 SYSTEM_ARCH = platform.machine()
 
