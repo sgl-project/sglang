@@ -19,7 +19,7 @@ def launch_server(args):
         for i in range(NUM_LORAS):
             lora_name = f"lora{i}"
             cmd += f"{lora_name}={lora_path} "
-    cmd += f"--disable-radix --disable-cuda-graph "
+    cmd += f"--disable-radix "
     cmd += f"--max-loras-per-batch {args.max_loras_per_batch} "
     cmd += f"--max-running-requests {args.max_running_requests} "
     cmd += f"--lora-backend {args.lora_backend} "
