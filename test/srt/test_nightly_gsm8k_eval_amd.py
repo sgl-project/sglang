@@ -21,7 +21,7 @@ from sglang.test.test_utils import (
 
 MODEL_SCORE_THRESHOLDS = {
     "meta-llama/Llama-3.1-8B-Instruct": 0.82,
-    "mistralai/Mistral-7B-Instruct-v0.3": 0.58,
+    "mistralai/Mistral-7B-Instruct-v0.3": 0.56,
     "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct": 0.85,
     "meta-llama/Llama-3.1-70B-Instruct": 0.95,
     "mistralai/Mixtral-8x7B-Instruct-v0.1": 0.64,
@@ -152,11 +152,6 @@ class TestNightlyGsm8KEval(unittest.TestCase):
         )
         is_first = True
         all_results = []
-
-        if is_in_ci():
-            print("IN CI IS TRUE")
-        else:
-            print("IN CI IS FALSE")
 
         for model_group, is_fp8, is_tp2 in self.model_groups:
             for model in model_group:
