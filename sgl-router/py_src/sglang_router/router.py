@@ -1,4 +1,4 @@
-from typing import List, Optional, Dict
+from typing import Dict, List, Optional
 
 from sglang_router_rs import PolicyType
 from sglang_router_rs import Router as _Router
@@ -65,7 +65,7 @@ class Router:
     ):
         if selector is None:
             selector = {}
-            
+
         self._router = _Router(
             worker_urls=worker_urls,
             policy=policy,

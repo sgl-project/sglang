@@ -2,7 +2,7 @@ import argparse
 import dataclasses
 import logging
 import sys
-from typing import List, Optional, Dict
+from typing import Dict, List, Optional
 
 from sglang_router import Router
 from sglang_router_rs import PolicyType
@@ -212,20 +212,23 @@ class RouterArgs:
             service_discovery=getattr(args, f"{prefix}service_discovery", False),
             selector=cls._parse_selector(getattr(args, f"{prefix}selector", None)),
             service_discovery_port=getattr(args, f"{prefix}service_discovery_port"),
-            service_discovery_namespace=getattr(args, f"{prefix}service_discovery_namespace", None),
+            service_discovery_namespace=getattr(
+                args, f"{prefix}service_discovery_namespace", None
+            ),
         )
-        
+
     @staticmethod
     def _parse_selector(selector_list):
         if not selector_list:
             return {}
-        
+
         selector = {}
         for item in selector_list:
             if "=" in item:
                 key, value = item.split("=", 1)
                 selector[key] = value
         return selector
+
 
 def policy_from_str(policy_str: str) -> PolicyType:
     """Convert policy string to PolicyType enum."""

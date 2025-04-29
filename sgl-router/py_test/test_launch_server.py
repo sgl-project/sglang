@@ -72,18 +72,20 @@ def popen_launch_router(
 
     if max_payload_size is not None:
         command.extend(["--router-max-payload-size", str(max_payload_size)])
-        
+
     if service_discovery:
         command.append("--router-service-discovery")
-        
+
     if selector:
         command.extend(["--router-selector"] + selector)
-        
+
     if service_discovery_port != 80:
         command.extend(["--router-service-discovery-port", str(service_discovery_port)])
 
     if service_discovery_namespace:
-        command.extend(["--router-service-discovery-namespace", service_discovery_namespace])
+        command.extend(
+            ["--router-service-discovery-namespace", service_discovery_namespace]
+        )
 
     if log_dir is not None:
         command.extend(["--log-dir", log_dir])

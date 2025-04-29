@@ -86,19 +86,17 @@ class TestLaunchRouter(unittest.TestCase):
     def test_launch_router_with_service_discovery(self):
         # Test router startup with service discovery enabled but no selectors
         args = self.create_router_args(
-            worker_urls=[], 
-            service_discovery=True,
-            selector=["app=test-worker"]
+            worker_urls=[], service_discovery=True, selector=["app=test-worker"]
         )
         self.run_router_process(args)
 
     def test_launch_router_with_service_discovery_namespace(self):
         # Test router startup with service discovery enabled and namespace specified
         args = self.create_router_args(
-            worker_urls=[], 
+            worker_urls=[],
             service_discovery=True,
             selector=["app=test-worker"],
-            service_discovery_namespace="test-namespace"
+            service_discovery_namespace="test-namespace",
         )
         self.run_router_process(args)
 
