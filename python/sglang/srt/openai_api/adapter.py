@@ -715,7 +715,10 @@ def v1_generate_response(
 
 
 async def v1_completions(tokenizer_manager, raw_request: Request):
-    request_json = await raw_request.json()
+    try:
+        request_json = await raw_request.json()
+    except Exception as e:
+        return create_error_response("Invalid request body, error: ", str(e))
     all_requests = [CompletionRequest(**request_json)]
     created = int(time.time())
     adapted_request, request = v1_generate_request(all_requests)
@@ -966,10 +969,10 @@ def v1_chat_generate_request(
                             ),
                         }
                     )
-                    # TODO fix the compatible issues with xgrammar
-                    strict_tag = None
 
                 for message in request.messages:
+                    if message.content is None:
+                        message.content = ""
                     if isinstance(message.content, str):
                         openai_compatible_messages.append(
                             {"role": message.role, "content": message.content}
@@ -1000,6 +1003,11 @@ def v1_chat_generate_request(
                         tokenize=True,
                         add_generation_prompt=True,
                         tools=tools,
+                        **(
+                            request.chat_template_kwargs
+                            if request.chat_template_kwargs
+                            else {}
+                        ),
                     )
                 except:
                     #  This except branch will be triggered when the chosen model
@@ -1011,6 +1019,11 @@ def v1_chat_generate_request(
                         tokenize=True,
                         add_generation_prompt=True,
                         tools=tools,
+                        **(
+                            request.chat_template_kwargs
+                            if request.chat_template_kwargs
+                            else {}
+                        ),
                     )
 
                 if assistant_prefix:
@@ -1086,7 +1099,7 @@ def v1_chat_generate_request(
 
         sampling_params = {
             "temperature": request.temperature,
-            "max_new_tokens": request.max_tokens,
+            "max_new_tokens": request.max_tokens or request.max_completion_tokens,
             "min_new_tokens": request.min_tokens,
             "stop": stop,
             "stop_token_ids": request.stop_token_ids,
@@ -1178,6 +1191,7 @@ def v1_chat_generate_request(
         modalities=modalities_list,
         lora_path=lora_paths,
         bootstrap_host=all_requests[0].bootstrap_host,
+        bootstrap_port=all_requests[0].bootstrap_port,
         bootstrap_room=all_requests[0].bootstrap_room,
     )
 
@@ -1244,16 +1258,34 @@ def v1_chat_generate_response(
         tool_calls = None
         text = ret_item["text"]
 
+        enable_thinking = True
         if isinstance(request, list):
             tool_choice = request[idx].tool_choice
             tools = request[idx].tools
             separate_reasoning = request[idx].separate_reasoning
+
+            if (
+                request[idx].chat_template_kwargs
+                and request[idx].chat_template_kwargs.get("enable_thinking") is not None
+            ):
+                enable_thinking = request[idx].chat_template_kwargs.get(
+                    "enable_thinking", True
+                )
         else:
             tool_choice = request.tool_choice
             tools = request.tools
             separate_reasoning = request.separate_reasoning
 
-        if reasoning_parser and separate_reasoning:
+            if (
+                request.chat_template_kwargs
+                and request.chat_template_kwargs.get("enable_thinking") is not None
+            ):
+                enable_thinking = request.chat_template_kwargs.get(
+                    "enable_thinking", True
+                )
+
+        reasoning_text = None
+        if reasoning_parser and separate_reasoning and enable_thinking:
             try:
                 parser = ReasoningParser(
                     model_type=reasoning_parser, stream_reasoning=False
@@ -1265,8 +1297,6 @@ def v1_chat_generate_response(
                     HTTPStatus.BAD_REQUEST,
                     "Failed to parse reasoning related info to json format!",
                 )
-        else:
-            reasoning_text = None
 
         if tool_choice != "none" and tools:
             parser = FunctionCallParser(tools, tool_call_parser)
@@ -1381,7 +1411,10 @@ def v1_chat_generate_response(
 async def v1_chat_completions(
     tokenizer_manager, raw_request: Request, cache_report=False
 ):
-    request_json = await raw_request.json()
+    try:
+        request_json = await raw_request.json()
+    except Exception as e:
+        return create_error_response("Invalid request body, error: ", str(e))
     all_requests = [ChatCompletionRequest(**request_json)]
     created = int(time.time())
     adapted_request, request = v1_chat_generate_request(all_requests, tokenizer_manager)
@@ -1802,7 +1835,10 @@ def v1_embedding_response(ret, model_path, to_file=False):
 
 
 async def v1_embeddings(tokenizer_manager, raw_request: Request):
-    request_json = await raw_request.json()
+    try:
+        request_json = await raw_request.json()
+    except Exception as e:
+        return create_error_response("Invalid request body, error: ", str(e))
     all_requests = [EmbeddingRequest(**request_json)]
     adapted_request, request = v1_embedding_request(all_requests, tokenizer_manager)
 
