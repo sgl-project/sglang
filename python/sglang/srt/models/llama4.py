@@ -1,6 +1,3 @@
-# TODO: prefetch 4 layers in same time
-# TODO: check sliding window fetch shape
-
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -528,6 +525,8 @@ class Llama4ForCausalLM(LlamaForCausalLM):
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
+    # TODO(ainl): prefetch 4 layers in same time
+    # TODO(ainl): check sliding window fetch shape
     hip_attention_supported = True
 
     def __init__(
