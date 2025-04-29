@@ -122,7 +122,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `chunked_prefill_size` | Perform prefill in chunks of this size. Larger sizes speed up prefill but increase VRAM usage. Decrease if CUDA runs out of memory. | None |
 | `max_prefill_tokens` | Token budget for how many tokens can be accepted in one prefill batch. The actual limit is the max of this value and `context_length`. | `16384` |
 | `schedule_policy` | The scheduling policy to control how waiting prefill requests are processed by a single engine. | `"fcfs"` |
-| `schedule_conservativeness` | Controls how conservative the server is when accepting new requests. High conservativeness may cause starvation; low conservativeness may slow down decode. | `1.0` |
+| `schedule_conservativeness` | Controls how conservative the server is when accepting new prefill requests. High conservativeness may cause starvation; low conservativeness may slow down decode. | `1.0` |
 | `cpu_offload_gb` | Amount of RAM (in GB) to reserve for offloading model parameters to the CPU. | `0` |
 
 ## Other runtime options
