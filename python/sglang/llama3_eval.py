@@ -8,6 +8,7 @@ import re
 import shutil
 from collections import defaultdict
 from dataclasses import dataclass
+from typing import Optional
 
 import httpx
 import numpy as np
@@ -237,7 +238,8 @@ def analyze(task, response_path, model_size):
         total: int = 0
         meta_correct: int = 0
 
-        average: float = None
+        average: Optional[float] = None
+        meta_average: Optional[float] = None
 
     subtask_name_to_stats = defaultdict(lambda: Stats())
 
