@@ -56,12 +56,15 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         self,
         model_runner: ModelRunner,
         skip_prefill: bool = False,
+        top_k: int = Q_LEN,
         kv_indptr_buf: Optional[torch.Tensor] = None,
         kv_last_page_len_buf: Optional[torch.Tensor] = None,
     ):
         super().__init__(
             model_runner, skip_prefill, kv_indptr_buf, kv_last_page_len_buf
         )
+
+        self.top_k = top_k
 
         self.num_q_heads = (
             model_runner.model_config.num_attention_heads // get_attention_tp_size()
@@ -110,7 +113,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 )
                 mla_metadata, num_splits = get_mla_metadata(
                     forward_batch.seq_lens.to(torch.int32),
-                    Q_LEN * self.num_q_heads,
+                    self.top_k * self.num_q_heads,
                     1,
                 )
                 self.forward_metadata = FlashMLADecodeMetadata(
@@ -141,7 +144,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             )
             mla_metadata, num_splits = get_mla_metadata(
                 forward_batch.seq_lens.to(torch.int32),
-                Q_LEN * self.num_q_heads // self.num_kv_heads,
+                self.top_k * self.num_q_heads // self.num_kv_heads,
                 self.num_kv_heads,
             )
 
@@ -171,7 +174,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
 
         self.cuda_graph_mla_metadata, self.cuda_graph_num_splits = get_mla_metadata(
             torch.ones(max_bs, dtype=torch.int32, device=cuda_graph_kv_indices.device),
-            Q_LEN * self.num_q_heads,
+            self.top_k * self.num_q_heads,
             1,
         )
         self.cuda_graph_kv_indices = cuda_graph_kv_indices
@@ -207,7 +210,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 )
                 mla_metadata, num_splits = get_mla_metadata(
                     seq_lens.to(torch.int32),
-                    Q_LEN * self.num_q_heads,
+                    self.top_k * self.num_q_heads,
                     1,
                 )
                 self.cuda_graph_mla_metadata.copy_(mla_metadata)
@@ -232,7 +235,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 )
                 mla_metadata, num_splits = get_mla_metadata(
                     seq_lens.to(torch.int32),
-                    Q_LEN * self.num_q_heads // self.num_kv_heads,
+                    self.top_k * self.num_q_heads // self.num_kv_heads,
                     self.num_kv_heads,
                 )
                 self.cuda_graph_mla_metadata.copy_(mla_metadata)
@@ -281,7 +284,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             )
             mla_metadata, num_splits = get_mla_metadata(
                 seq_lens.to(torch.int32),
-                Q_LEN * self.num_q_heads,
+                self.top_k * self.num_q_heads,
                 1,
             )
             self.cuda_graph_mla_metadata.copy_(mla_metadata)
@@ -307,7 +310,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             )
             mla_metadata, num_splits = get_mla_metadata(
                 seq_lens.to(torch.int32),
-                Q_LEN * self.num_q_heads // self.num_kv_heads,
+                self.top_k * self.num_q_heads // self.num_kv_heads,
                 self.num_kv_heads,
             )
             self.cuda_graph_mla_metadata.copy_(mla_metadata)
@@ -420,10 +423,7 @@ class FlashMLAMultiStepDraftBackend:
     ):
         from sglang.srt.speculative.eagle_utils import generate_draft_decode_kv_indices
 
-        if topk > 1:
-            raise ValueError(
-                f"Currently FlashMLA only supports topk=1 for speculative decoding"
-            )
+        # FlashMLA supports topk >= 1
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
         self.generate_draft_decode_kv_indices = generate_draft_decode_kv_indices
@@ -438,7 +438,10 @@ class FlashMLAMultiStepDraftBackend:
             device=model_runner.device,
         )
 
-        # todo: kv_last_page_len_buf?
+        # todo: kv_last_page_len_buf?????
+        self.q_indptr_decode = torch.arange(
+            0, max_bs + 1, dtype=torch.int32, device=model_runner.device
+        )
 
         self.attn_backends = []
         for i in range(self.speculative_num_steps):
@@ -446,12 +449,12 @@ class FlashMLAMultiStepDraftBackend:
                 FlashMLABackend(
                     model_runner,
                     skip_prefill=True,
+                    top_k=self.topk,
                     kv_indptr_buf=self.kv_indptr[i],
-                    kv_last_page_len_buf=None,
+                    kv_last_page_len_buf=self.q_indptr_decode,
                 )
             )
 
-        # todo: ???
         self.max_context_len = self.attn_backends[0].max_context_len
 
         # Cached variables for generate_draft_decode_kv_indices
