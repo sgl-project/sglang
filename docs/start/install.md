@@ -159,21 +159,6 @@ sky status --endpoint 30000 sglang
 3. To further scale up your deployment with autoscaling and failure recovery, check out the [SkyServe + SGLang guide](https://github.com/skypilot-org/skypilot/tree/master/llm/sglang#serving-llama-2-with-sglang-for-more-traffic-using-skyserve).
 </details>
 
-## Method 7: Compatibility with GH200/GB200 and Jetson for ubuntu 22.04 and Ubuntu 24.04
-
-#### SBSA
-```bash
-pip install --upgrade pip
-pip install uv
-uv pip install flashinfer-python "sglang[all]>=0.4.5" --index-url https://pypi.jetson-ai-lab.dev/sbsa/cu128
-```
-#### Jetson JetPack 6
-```bash
-pip install --upgrade pip
-pip install uv
-uv pip install flashinfer-python "sglang[all]>=0.4.5" --index-url https://pypi.jetson-ai-lab.dev/jp6/cu126
-```
-
 ## Common Notes
 
 - [FlashInfer](https://github.com/flashinfer-ai/flashinfer) is the default attention kernel backend. It only supports sm75 and above. If you encounter any FlashInfer-related issues on sm75+ devices (e.g., T4, A10, A100, L4, L40S, H100), please switch to other kernels by adding `--attention-backend triton --sampling-backend pytorch` and open an issue on GitHub.
