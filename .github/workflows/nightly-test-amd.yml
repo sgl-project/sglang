@@ -52,5 +52,4 @@ jobs:
       - name: Nightly Test
         run: |
           docker exec -w /sglang-checkout/test/srt -e SGLANG_IS_IN_CI=1 -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" ci_sglang python3 run_suite.py --suite nightly-amd --timeout-per-file 7200
-          cat github_summary.md
-          echo "$(<job_summary.md )" >> $GITHUB_STEP_SUMMARY
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY
