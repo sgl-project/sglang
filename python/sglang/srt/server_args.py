@@ -64,6 +64,7 @@ class ServerArgs:
     # Port for the HTTP server
     host: str = "127.0.0.1"
     port: int = 30000
+    root_path: str = ""
 
     # Memory and scheduling
     mem_fraction_static: Optional[float] = None
@@ -413,6 +414,9 @@ class ServerArgs:
         )
         parser.add_argument(
             "--port", type=int, default=ServerArgs.port, help="The port of the server."
+        )
+        parser.add_argument(
+            "--root-path", type=str, default=ServerArgs.root_path, help="App is behind a path based routing proxy."
         )
         parser.add_argument(
             "--tokenizer-mode",
