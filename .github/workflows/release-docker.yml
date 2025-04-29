@@ -14,8 +14,8 @@ jobs:
     environment: 'prod'
     strategy:
       matrix:
-        cuda_version: ['11.8.0', '12.1.1', '12.4.1', '12.5.1']
-        build_type: ['all', 'srt']
+        cuda_version: ['12.4.1']
+        build_type: ['all']
     steps:
       - name: Delete huge unnecessary tools folder
         run: rm -rf /opt/hostedtoolcache
