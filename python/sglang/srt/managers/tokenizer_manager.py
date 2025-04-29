@@ -66,7 +66,8 @@ from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
-    FlushCacheReq,
+    FlushCacheReqInput,
+    FlushCacheReqOutput,
     GenerateReqInput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
@@ -264,6 +265,9 @@ class TokenizerManager:
         self.resume_memory_occupation_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.flush_cache_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
         self.start_profile_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -313,6 +317,10 @@ class TokenizerManager:
                 (
                     ResumeMemoryOccupationReqOutput,
                     self.resume_memory_occupation_communicator.handle_recv,
+                ),
+                (
+                    FlushCacheReqOutput,
+                    self.flush_cache_communicator.handle_recv,
                 ),
                 (
                     ProfileReqOutput,
@@ -411,10 +419,58 @@ class TokenizerManager:
             input_ids = self.tokenizer.encode(input_text)
 
         image_inputs: Dict = await self.mm_processor.process_mm_data_async(
-            obj.image_data, input_text or input_ids, obj, self.max_req_input_len
+            image_data=obj.image_data,
+            input_text=input_text or input_ids,
+            request_obj=obj,
+            max_req_input_len=self.max_req_input_len,
         )
         if image_inputs and "input_ids" in image_inputs:
             input_ids = image_inputs["input_ids"]
+
+        self._validate_token_len(obj, input_ids)
+        return self._create_tokenized_object(
+            obj, input_text, input_ids, input_embeds, image_inputs
+        )
+
+    def _validate_token_len(
+        self, obj: Union[GenerateReqInput, EmbeddingReqInput], input_ids: List[int]
+    ) -> None:
+        """Validates that the input token count and the requested token count doesn't exceed the model's context length."""
+
+        input_token_num = len(input_ids) if input_ids is not None else 0
+        # Check if input alone exceeds context length
+        if input_token_num >= self.context_len:
+            raise ValueError(
+                f"The input ({input_token_num} tokens) is longer than the "
+                f"model's context length ({self.context_len} tokens)."
+            )
+
+        # Check total tokens (input + max_new_tokens)
+        max_new_tokens = obj.sampling_params.get("max_new_tokens")
+        if (
+            max_new_tokens is not None
+            and (max_new_tokens + input_token_num) >= self.context_len
+        ):
+            total_tokens = max_new_tokens + input_token_num
+            error_msg = (
+                f"Requested token count exceeds the model's maximum context length "
+                f"of {self.context_len} tokens. You requested a total of {total_tokens} "
+                f"tokens: {input_token_num} tokens from the input messages and "
+                f"{max_new_tokens} tokens for the completion. Please reduce the number "
+                f"of tokens in the input messages or the completion to fit within the limit."
+            )
+            raise ValueError(error_msg)
+
+    def _create_tokenized_object(
+        self,
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
+        input_text: str,
+        input_ids: List[int],
+        input_embeds: Optional[Union[List[float], None]] = None,
+        image_inputs: Optional[Dict] = None,
+    ) -> Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]:
+        """Create a tokenized request object from common parameters."""
+
         if self.is_generation:
             return_logprob = obj.return_logprob
             logprob_start_len = obj.logprob_start_len
@@ -424,29 +480,6 @@ class TokenizerManager:
                 SessionParams(**obj.session_params) if obj.session_params else None
             )
 
-        input_token_num = len(input_ids) if input_ids is not None else 0
-        if input_token_num >= self.context_len:
-            raise ValueError(
-                f"The input ({input_token_num} tokens) is longer than the "
-                f"model's context length ({self.context_len} tokens)."
-            )
-
-        if (
-            obj.sampling_params.get("max_new_tokens") is not None
-            and obj.sampling_params.get("max_new_tokens") + input_token_num
-            >= self.context_len
-        ):
-            raise ValueError(
-                f"Requested token count exceeds the model's maximum context length "
-                f"of {self.context_len} tokens. You requested a total of "
-                f"{obj.sampling_params.get('max_new_tokens') + input_token_num} "
-                f"tokens: {input_token_num} tokens from the input messages and "
-                f"{obj.sampling_params.get('max_new_tokens')} tokens for the "
-                f"completion. Please reduce the number of tokens in the input "
-                f"messages or the completion to fit within the limit."
-            )
-
-        # Parse sampling parameters
         sampling_params = SamplingParams(**obj.sampling_params)
         sampling_params.normalize(self.tokenizer)
         sampling_params.verify()
@@ -465,6 +498,7 @@ class TokenizerManager:
                 token_ids_logprob,
                 obj.stream,
                 bootstrap_host=obj.bootstrap_host,
+                bootstrap_port=obj.bootstrap_port,
                 bootstrap_room=obj.bootstrap_room,
                 lora_path=obj.lora_path,
                 input_embeds=input_embeds,
@@ -482,6 +516,50 @@ class TokenizerManager:
             )
 
         return tokenized_obj
+
+    async def _batch_tokenize_and_process(
+        self, batch_size: int, obj: Union[GenerateReqInput, EmbeddingReqInput]
+    ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]]:
+        """Handle batch tokenization for text inputs only."""
+        logger.debug(f"Starting batch tokenization for {batch_size} text requests")
+
+        # Collect requests and texts
+        requests = [obj[i] for i in range(batch_size)]
+        texts = [req.text for req in requests]
+
+        # Batch tokenize all texts
+        encoded = self.tokenizer(texts)
+        input_ids_list = encoded["input_ids"]
+
+        # Process all requests
+        tokenized_objs = []
+        for i, req in enumerate(requests):
+            self._validate_token_len(obj[i], input_ids_list[i])
+            tokenized_objs.append(
+                self._create_tokenized_object(
+                    req, req.text, input_ids_list[i], None, None
+                )
+            )
+        logger.debug(f"Completed batch processing for {batch_size} requests")
+        return tokenized_objs
+
+    def _validate_batch_tokenization_constraints(
+        self, batch_size: int, obj: Union[GenerateReqInput, EmbeddingReqInput]
+    ) -> None:
+        """Validate constraints for batch tokenization processing."""
+        for i in range(batch_size):
+            if self.is_generation and obj[i].image_data:
+                raise ValueError(
+                    "For image input processing do not set `enable_tokenizer_batch_encode`."
+                )
+            if obj[i].input_ids is not None:
+                raise ValueError(
+                    "Batch tokenization is not needed for pre-tokenized input_ids. Do not set `enable_tokenizer_batch_encode`."
+                )
+            if obj[i].input_embeds is not None:
+                raise ValueError(
+                    "Batch tokenization is not needed for input_embeds. Do not set `enable_tokenizer_batch_encode`."
+                )
 
     def _send_one_request(
         self,
@@ -560,14 +638,27 @@ class TokenizerManager:
 
         generators = []
         rids = []
+
         if getattr(obj, "parallel_sample_num", 1) == 1:
-            # Send all requests
-            for i in range(batch_size):
-                tmp_obj = obj[i]
-                tokenized_obj = await self._tokenize_one_request(tmp_obj)
-                self._send_one_request(tmp_obj, tokenized_obj, created_time)
-                generators.append(self._wait_one_response(tmp_obj, request))
-                rids.append(tmp_obj.rid)
+            if self.server_args.enable_tokenizer_batch_encode:
+                # Validate batch tokenization constraints
+                self._validate_batch_tokenization_constraints(batch_size, obj)
+
+                tokenized_objs = await self._batch_tokenize_and_process(batch_size, obj)
+
+                for i, tokenized_obj in enumerate(tokenized_objs):
+                    tmp_obj = obj[i]
+                    self._send_one_request(tmp_obj, tokenized_obj, created_time)
+                    generators.append(self._wait_one_response(tmp_obj, request))
+                    rids.append(tmp_obj.rid)
+            else:
+                # Sequential tokenization and processing
+                for i in range(batch_size):
+                    tmp_obj = obj[i]
+                    tokenized_obj = await self._tokenize_one_request(tmp_obj)
+                    self._send_one_request(tmp_obj, tokenized_obj, created_time)
+                    generators.append(self._wait_one_response(tmp_obj, request))
+                    rids.append(tmp_obj.rid)
         else:
             # FIXME: When using batch and parallel_sample_num together, the perf is not optimal.
             if batch_size > 128:
@@ -628,9 +719,8 @@ class TokenizerManager:
                     except StopAsyncIteration:
                         pass
 
-    def flush_cache(self):
-        req = FlushCacheReq()
-        self.send_to_scheduler.send_pyobj(req)
+    async def flush_cache(self) -> FlushCacheReqOutput:
+        return (await self.flush_cache_communicator(FlushCacheReqInput()))[0]
 
     def abort_request(self, rid: str):
         if rid not in self.rid_to_state:
@@ -650,6 +740,7 @@ class TokenizerManager:
             output_dir=output_dir,
             num_steps=num_steps,
             activities=activities,
+            profile_id=str(time.time()),
         )
         result = (await self.start_profile_communicator(req))[0]
         if not result.success:

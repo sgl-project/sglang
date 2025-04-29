@@ -38,12 +38,12 @@ jobs:
           else
             DEVICE_FLAG="--device /dev/dri"
           fi
-          docker pull lmsysorg/sglang:v0.4.5-rocm630
+          docker pull ghcr.io/saienduri/sglang-aiter-v0.1.1:428
           docker run -dt --user root --device=/dev/kfd $DEVICE_FLAG \
             -v ${{ github.workspace }}:/sglang-checkout --ipc=host --group-add video \
             --cap-add=SYS_PTRACE -e HF_TOKEN=${HF_TOKEN} --security-opt seccomp=unconfined \
             -w /sglang-checkout --name ci_sglang \
-            lmsysorg/sglang:v0.4.5-rocm630
+            ghcr.io/saienduri/sglang-aiter-v0.1.1:428
 
       - name: Install dependencies
         run: |
@@ -82,12 +82,12 @@ jobs:
           else
             DEVICE_FLAG="--device /dev/dri"
           fi
-          docker pull lmsysorg/sglang:v0.4.5-rocm630
+          docker pull ghcr.io/saienduri/sglang-aiter-v0.1.1:428
           docker run -dt --user root --device=/dev/kfd $DEVICE_FLAG \
             -v ${{ github.workspace }}:/sglang-checkout --ipc=host --group-add video \
             --cap-add=SYS_PTRACE -e HF_TOKEN=${{ secrets.AMD_HF_TOKEN }} --security-opt seccomp=unconfined \
             -w /sglang-checkout --name ci_sglang \
-            lmsysorg/sglang:v0.4.5-rocm630
+            ghcr.io/saienduri/sglang-aiter-v0.1.1:428
 
       - name: Install dependencies
         run: |
@@ -120,12 +120,12 @@ jobs:
           else
             DEVICE_FLAG="--device /dev/dri"
           fi
-          docker pull lmsysorg/sglang:v0.4.5-rocm630
+          docker pull ghcr.io/saienduri/sglang-aiter-v0.1.1:428
           docker run -dt --user root --device=/dev/kfd $DEVICE_FLAG \
             -v ${{ github.workspace }}:/sglang-checkout --ipc=host --group-add video \
             --cap-add=SYS_PTRACE -e HF_TOKEN=${HF_TOKEN} --security-opt seccomp=unconfined \
             -w /sglang-checkout --name ci_sglang \
-            lmsysorg/sglang:v0.4.5-rocm630
+            ghcr.io/saienduri/sglang-aiter-v0.1.1:428
 
       - name: Install dependencies
         run: |
@@ -149,7 +149,7 @@ jobs:
   finish:
     if: always()
     needs: [
-      accuracy-test-1-gpu-amd, mla-test-1-gpu-amd
+      accuracy-test-1-gpu-amd, mla-test-1-gpu-amd, bench-test-2-gpu-amd
     ]
     runs-on: ubuntu-latest
     steps:

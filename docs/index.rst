@@ -20,8 +20,8 @@ The core features include:
    :maxdepth: 1
    :caption: Backend Tutorial
 
-   references/llama4
    references/deepseek
+   references/llama4
    backend/send_request.ipynb
    backend/openai_api_completions.ipynb
    backend/openai_api_vision.ipynb
@@ -54,6 +54,7 @@ The core features include:
    backend/structured_outputs_for_reasoning_models.ipynb
    backend/custom_chat_template.md
    backend/quantization.md
+   backend/lora.ipynb
 
 .. toctree::
    :maxdepth: 1
