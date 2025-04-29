@@ -22,7 +22,7 @@ from utils import (
     TORCH_DTYPES,
     LoRAAdaptor,
     LoRAModelCase,
-    run_batch_lora_test,
+    run_lora_test_one_by_one,
 )
 
 from sglang.test.test_utils import CustomTestCase, is_in_ci
@@ -89,7 +89,7 @@ class TestMultiLoRABackend(CustomTestCase):
             )
             for torch_dtype in TORCH_DTYPES:
                 for backend in BACKENDS:
-                    run_batch_lora_test(
+                    run_lora_test_one_by_one(
                         batch_prompts,
                         model_case,
                         torch_dtype,
