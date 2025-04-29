@@ -182,16 +182,17 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
                         "type": "object",
                         "properties": {
                             "a": {
-                                "type": "int",
+                                "type": "integer",
                                 "description": "First integer",
                             },
                             "b": {
-                                "type": "int",
+                                "type": "integer",
                                 "description": "Second integer",
                             },
                         },
                         "required": ["a", "b"],
                     },
+                    "strict": True,  # Llama-3.2-1B is flaky in tool call. It won't always respond with parameters unless we set strict.
                 },
             }
         ]
@@ -218,7 +219,7 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
                 # Record the function name on first occurrence
                 function_name = tool_call.function.name or function_name
                 # In case of multiple chunks, JSON fragments may need to be concatenated
-                if tool_call.function.arguments:
+                if tool_call.function.arguments is not None:
                     argument_fragments.append(tool_call.function.arguments)
 
         self.assertEqual(function_name, "add", "Function name should be 'add'")
@@ -258,11 +259,11 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
                         "type": "object",
                         "properties": {
                             "int_a": {
-                                "type": "int",
+                                "type": "integer",
                                 "description": "First integer",
                             },
                             "int_b": {
-                                "type": "int",
+                                "type": "integer",
                                 "description": "Second integer",
                             },
                         },
