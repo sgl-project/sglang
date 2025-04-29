@@ -1527,12 +1527,19 @@ async def v1_chat_completions(
                     new_stream_buffer = stream_buffer + delta
 
                     enable_thinking = True
-                    if request.chat_template_kwargs and request.chat_template_kwargs.get("enable_thinking") is not None:
-                        enable_thinking = request.chat_template_kwargs.get("enable_thinking", True)
+                    if (
+                        request.chat_template_kwargs
+                        and request.chat_template_kwargs.get("enable_thinking")
+                        is not None
+                    ):
+                        enable_thinking = request.chat_template_kwargs.get(
+                            "enable_thinking", True
+                        )
 
                     if (
                         tokenizer_manager.server_args.reasoning_parser
-                        and request.separate_reasoning and enable_thinking
+                        and request.separate_reasoning
+                        and enable_thinking
                     ):
                         if index not in reasoning_parser_dict:
                             reasoning_parser_dict[index] = ReasoningParser(
