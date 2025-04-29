@@ -4,11 +4,11 @@ _enable_jit_deepgemm = False
 try:
     from deep_ep import Buffer
 
+    from sglang.srt.layers.quantization.deep_gemm import get_enable_jit_deepgemm
     from sglang.srt.layers.quantization.fp8_kernel import (
         sglang_per_token_group_quant_fp8,
     )
 
-    from sglang.srt.layers.quantization.deep_gemm import get_enable_jit_deepgemm
     _enable_jit_deepgemm = get_enable_jit_deepgemm()
     use_deepep = True
 except ImportError:
@@ -297,7 +297,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             recv_x,
             recv_topk_idx,
             recv_topk_weights,
-            num_recv_tokens_per_expert_list, 
+            num_recv_tokens_per_expert_list,
             self.handle,
             event,
         ) = buffer.dispatch(
