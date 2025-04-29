@@ -228,8 +228,16 @@ def build_deepseek_v3_mapping(
         if compile_args.compile_redundant_experts is not None:
             r_experts = compile_args.compile_redundant_experts
             n_experts = weights["experts.gate_up_proj"].G
-            weights["experts.gate_up_proj"]._replace(G=n_experts + r_experts)
-            weights["experts.down_proj"]._replace(G=n_experts + r_experts)
+            weights["experts.gate_up_proj"] = weights["experts.gate_up_proj"]._replace(
+                G=n_experts + r_experts
+            )
+            weights["experts.down_proj"] = weights["experts.down_proj"]._replace(
+                G=n_experts + r_experts
+            )
+            print(
+                f'Extend num experts to {weights["experts.gate_up_proj"].G} '
+                f"by num_redundant_experts={r_experts}"
+            )
 
         ep_mapping.extend(
             [
@@ -258,8 +266,16 @@ def build_deepseek_v3_mapping(
         if weights["experts.gate_up_proj"].G == 256:
             r_experts = server_args.tp_size
             n_experts = weights["experts.gate_up_proj"].G
-            weights["experts.gate_up_proj"]._replace(G=n_experts + r_experts)
-            weights["experts.down_proj"]._replace(G=n_experts + r_experts)
+            weights["experts.gate_up_proj"] = weights["experts.gate_up_proj"]._replace(
+                G=n_experts + r_experts
+            )
+            weights["experts.down_proj"] = weights["experts.down_proj"]._replace(
+                G=n_experts + r_experts
+            )
+            print(
+                f'Extend num experts to {weights["experts.gate_up_proj"].G} '
+                f"by tp_size={r_experts}"
+            )
         else:
             tp_mapping.extend(
                 [
@@ -465,17 +481,7 @@ def refine_server_args(server_args: ServerArgs, compile_args: CompileArgs):
 
 
 def run_online_compile(server_args: ServerArgs, compile_args: CompileArgs):
-    print(
-        "Begin DeepGEMM Kernels compilation...\n"
-        "It may take a long time and timeout maybe raised "
-        "while the compilation is still in progress.\n"
-        "Just feel free to restart the command "
-        "until the compilation is fully finished.\n"
-    )
-
     proc = launch_server_process_and_send_one_request(server_args, compile_args)
-
-    print("\nDeepGEMM Kernels compilation finished successfully.")
 
     # Sleep for safety
     time.sleep(10)
@@ -511,6 +517,14 @@ if __name__ == "__main__":
     if compile_args.output_dir is not None:
         os.environ["DG_CACHE_DIR"] = compile_args.output_dir
 
+    print(
+        "Begin DeepGEMM Kernels compilation...\n"
+        "It may take a long time and timeout maybe raised "
+        "while the compilation is still in progress.\n"
+        "Just feel free to restart the command "
+        "until the compilation is fully finished.\n"
+    )
+
     if compile_args.compile_mode == "offline":
         print(f"{compile_args=}")
         print(f"{server_args=}")
@@ -518,9 +532,10 @@ if __name__ == "__main__":
 
     elif compile_args.compile_mode == "online":
         multiprocessing.set_start_method("spawn", force=True)
-
         refine_server_args(server_args, compile_args)
         run_online_compile(server_args, compile_args)
 
     else:
         raise NotImplementedError(f"Unknown compile mode: {compile_args.compile_mode}")
+
+    print("\nDeepGEMM Kernels compilation finished successfully.")
