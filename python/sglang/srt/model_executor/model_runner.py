@@ -208,7 +208,7 @@ class ModelRunner:
         self.start_layer = getattr(self.model, "start_layer", 0)
         self.end_layer = getattr(
             self.model, "end_layer", self.model_config.num_hidden_layers
-        )
+        )  # End layer is exclusive
         self.num_effective_layers = self.end_layer - self.start_layer
 
         # Apply torchao quantization
