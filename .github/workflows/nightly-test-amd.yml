@@ -1,4 +1,4 @@
-name: Nightly Test AMD
+name: Nightly Test (AMD)
 
 on:
   pull_request:
@@ -19,6 +19,8 @@ jobs:
   nightly-test:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
     runs-on: linux-mi300-gpu-2
+    env:
+      GITHUB_STEP_SUMMARY: ${{ github.workspace }}/github_summary.md
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -31,6 +33,7 @@ jobs:
           else
             DEVICE_FLAG="--device /dev/dri"
           fi
+          touch ${{ github.workspace }}/github_summary.md
           docker pull ghcr.io/saienduri/sglang-aiter-v0.1.1:428
           docker run -dt --user root --device=/dev/kfd $DEVICE_FLAG \
             -v ${{ github.workspace }}:/sglang-checkout --ipc=host --group-add video \
@@ -50,4 +53,4 @@ jobs:
 
       - name: Nightly Test
         run: |
-          docker exec -w /sglang-checkout/test/srt -e SGLANG_IS_IN_CI=1 ci_sglang python3 run_suite.py --suite nightly-amd --timeout-per-file 7200
+          docker exec -w /sglang-checkout/test/srt -e SGLANG_IS_IN_CI=1 -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" ci_sglang python3 run_suite.py --suite nightly-amd --timeout-per-file 7200
