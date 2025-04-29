@@ -33,6 +33,23 @@ MODEL_SCORE_THRESHOLDS = {
     "neuralmagic/Qwen2-57B-A14B-Instruct-FP8": 0.82,
 }
 
+# Models currently failing on AMD MI300x.
+failing_models = {
+    "google/gemma-2-27b-it",
+    "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8",
+    "neuralmagic/gemma-2-2b-it-FP8",
+    "neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8"
+}
+
+def remove_failing_models(model_str):
+    models = model_str.split(",")
+    filtered = [m for m in models if m not in failing_models]
+    return ",".join(filtered)
+
+DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1 = remove_failing_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1)
+DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2 = remove_failing_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2)
+DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1 = remove_failing_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1)
+DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2 = remove_failing_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2)
 
 def parse_models(model_string):
     return [model.strip() for model in model_string.split(",") if model.strip()]
