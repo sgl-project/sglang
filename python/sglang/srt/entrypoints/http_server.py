@@ -1074,7 +1074,7 @@ def _execute_server_warmup(
 
     # Send a warmup request
     request_name = "/generate" if model_info["is_generation"] else "/encode"
-    max_new_tokens = 128 if model_info["is_generation"] else 1
+    max_new_tokens = 8 if model_info["is_generation"] else 1
     json_data = {
         "sampling_params": {
             "temperature": 0,
@@ -1087,14 +1087,7 @@ def _execute_server_warmup(
         if server_args.dp_size == 1:
             json_data["input_ids"] = json_data["input_ids"][0]
     else:
-        passkey = "The passkey is $000310$. " * 3
-        filler = "The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again. "
-        repeat = int(128 * 1024 / 24 / 2)
-        text = f"<|header_start|>user<|header_end|>\n\nYour task is find the passkey value from the text. {filler * repeat} {passkey} {filler * repeat}.<|eot|><|header_start|>assistant<|header_end|>\n\nThe passkey is $"
-
-        # json_data["text"] = ["The capital city of France is"] * server_args.dp_size
-        json_data["text"] = [text] * server_args.dp_size
-
+        json_data["text"] = ["The capital city of France is"] * server_args.dp_size
         # TODO Workaround the bug that embedding errors for list of size 1
         if server_args.dp_size == 1:
             json_data["text"] = json_data["text"][0]
