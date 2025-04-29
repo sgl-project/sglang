@@ -193,6 +193,7 @@ class TestPrefixChunkInfo(CustomTestCase):
                     self.max_bs * self.max_seq_len,
                     device=self.device,
                 ),
+                out_cache_loc_local=None,
                 seq_lens_sum=sum(seq_lens_cpu),
                 forward_mode=ForwardMode.EXTEND,
                 req_pool_indices=torch.arange(batch_size, device=self.device),

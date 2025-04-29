@@ -111,6 +111,8 @@ class EAGLEDraftCudaGraphRunner:
         req_pool_indices = self.req_pool_indices[:num_seqs]
         seq_lens = self.seq_lens[:num_seqs]
         out_cache_loc = self.out_cache_loc[: num_tokens * self.speculative_num_steps]
+        # TODO hybrid cache
+        out_cache_loc_local = None
         positions = self.positions[:num_tokens]
         topk_p = self.topk_p[:num_seqs]
         topk_index = self.topk_index[:num_seqs]
@@ -132,6 +134,7 @@ class EAGLEDraftCudaGraphRunner:
             req_to_token_pool=self.model_runner.req_to_token_pool,
             token_to_kv_pool=self.model_runner.token_to_kv_pool,
             out_cache_loc=out_cache_loc,
+            out_cache_loc_local = out_cache_loc_local,
             seq_lens_sum=seq_lens.sum(),
             return_logprob=False,
             positions=positions,

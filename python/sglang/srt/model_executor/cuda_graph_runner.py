@@ -374,6 +374,9 @@ class CudaGraphRunner:
         req_pool_indices = self.req_pool_indices[:bs]
         seq_lens = self.seq_lens[:bs]
         out_cache_loc = self.out_cache_loc[:num_tokens]
+        #TODO hybrid cache
+        out_cache_loc_local = None 
+            
         positions = self.positions[:num_tokens]
         if self.is_encoder_decoder:
             encoder_lens = self.encoder_lens[:bs]
@@ -414,6 +417,7 @@ class CudaGraphRunner:
             token_to_kv_pool=self.model_runner.token_to_kv_pool,
             attn_backend=self.model_runner.attn_backend,
             out_cache_loc=out_cache_loc,
+            out_cache_loc_local=out_cache_loc_local, 
             seq_lens_sum=seq_lens.sum(),
             encoder_lens=encoder_lens,
             return_logprob=False,
