@@ -694,9 +694,14 @@ class ModelRunner:
             self.device, self.gpu_id, distributed=self.tp_size > 1
         )
         if self.use_mla_backend:
+            num_layers = (
+                self.model_config.num_hidden_layers
+                if not self.is_draft_worker
+                else self.model_config.hf_config.num_nextn_predict_layers
+            )
             cell_size = (
                 (self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim)
-                * self.model_config.num_hidden_layers
+                * num_layers
                 * torch._utils._element_size(self.kv_cache_dtype)
             )
         else:
@@ -853,7 +858,11 @@ class ModelRunner:
                 dtype=self.kv_cache_dtype,
                 kv_lora_rank=self.model_config.kv_lora_rank,
                 qk_rope_head_dim=self.model_config.qk_rope_head_dim,
-                layer_num=self.model_config.num_hidden_layers,
+                layer_num=(
+                    self.model_config.num_hidden_layers
+                    if not self.is_draft_worker
+                    else self.model_config.hf_config.num_nextn_predict_layers
+                ),
                 device=self.device,
                 enable_memory_saver=self.server_args.enable_memory_saver,
             )

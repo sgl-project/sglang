@@ -72,6 +72,7 @@ class TpModelWorker:
             enable_hybrid_kvcache=server_args.enable_hybrid_kvcache,
             dtype=server_args.dtype,
             quantization=server_args.quantization,
+            is_draft_model=is_draft_worker,
         )
         self.model_runner = ModelRunner(
             model_config=self.model_config,
