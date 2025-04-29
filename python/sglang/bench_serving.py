@@ -1379,24 +1379,35 @@ def run_benchmark(args_: argparse.Namespace):
     if not hasattr(args, "flush_cache"):
         args.flush_cache = False
 
-    return asyncio.run(
-        benchmark(
-            backend=backend,
-            api_url=api_url,
-            base_url=base_url,
-            model_id=model_id,
-            tokenizer=tokenizer,
-            input_requests=input_requests,
-            request_rate=args.request_rate,
-            max_concurrency=args.max_concurrency,
-            disable_tqdm=args.disable_tqdm,
-            lora_names=args.lora_name,
-            extra_request_body=extra_request_body,
-            profile=args.profile,
-            pd_seperated=args.pd_seperated,
-            flush_cache=args.flush_cache,
-        )
+    # Handle multiple concurrency values
+    max_concurrencies = (
+        [args.max_concurrency]
+        if not isinstance(args.max_concurrency, list)
+        else args.max_concurrency
     )
+    results = []
+    for concurrency in max_concurrencies:
+        print(f"\nRunning benchmark with concurrency: {concurrency}")
+        result = asyncio.run(
+            benchmark(
+                backend=backend,
+                api_url=api_url,
+                base_url=base_url,
+                model_id=model_id,
+                tokenizer=tokenizer,
+                input_requests=input_requests,
+                request_rate=args.request_rate,
+                max_concurrency=concurrency,
+                disable_tqdm=args.disable_tqdm,
+                lora_names=args.lora_name,
+                extra_request_body=extra_request_body,
+                profile=args.profile,
+                pd_seperated=args.pd_seperated,
+                flush_cache=args.flush_cache,
+            )
+        )
+        results.append(result)
+    return results[0] if len(results) == 1 else results
 
 
 def set_ulimit(target_soft_limit=65535):
@@ -1507,6 +1518,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--max-concurrency",
         type=int,
+        nargs="+",
         default=None,
         help="Maximum number of concurrent requests. This can be used "
         "to help simulate an environment where a higher level component "
@@ -1515,7 +1527,9 @@ if __name__ == "__main__":
         "initiated, this argument will control how many are actually allowed "
         "to execute at a time. This means that when used in combination, the "
         "actual request rate may be lower than specified with --request-rate, "
-        "if the server is not processing requests fast enough to keep up.",
+        "if the server is not processing requests fast enough to keep up. "
+        "You can provide multiple values to test different concurrency levels. "
+        "e.g. --max-concurrency 10 20 30",
     )
     parser.add_argument("--output-file", type=str, help="Output JSONL file name.")
     parser.add_argument(
