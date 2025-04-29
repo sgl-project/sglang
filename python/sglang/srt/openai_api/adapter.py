@@ -968,6 +968,8 @@ def v1_chat_generate_request(
                     )
 
                 for message in request.messages:
+                    if message.content is None:
+                        message.content = ""
                     if isinstance(message.content, str):
                         openai_compatible_messages.append(
                             {"role": message.role, "content": message.content}
@@ -998,6 +1000,11 @@ def v1_chat_generate_request(
                         tokenize=True,
                         add_generation_prompt=True,
                         tools=tools,
+                        **(
+                            request.chat_template_kwargs
+                            if request.chat_template_kwargs
+                            else {}
+                        ),
                     )
                 except:
                     #  This except branch will be triggered when the chosen model
@@ -1009,6 +1016,11 @@ def v1_chat_generate_request(
                         tokenize=True,
                         add_generation_prompt=True,
                         tools=tools,
+                        **(
+                            request.chat_template_kwargs
+                            if request.chat_template_kwargs
+                            else {}
+                        ),
                     )
 
                 if assistant_prefix:
@@ -1084,7 +1096,7 @@ def v1_chat_generate_request(
 
         sampling_params = {
             "temperature": request.temperature,
-            "max_new_tokens": request.max_tokens,
+            "max_new_tokens": request.max_tokens or request.max_completion_tokens,
             "min_new_tokens": request.min_tokens,
             "stop": stop,
             "stop_token_ids": request.stop_token_ids,
@@ -1176,6 +1188,7 @@ def v1_chat_generate_request(
         modalities=modalities_list,
         lora_path=lora_paths,
         bootstrap_host=all_requests[0].bootstrap_host,
+        bootstrap_port=all_requests[0].bootstrap_port,
         bootstrap_room=all_requests[0].bootstrap_room,
     )
 
@@ -1243,28 +1256,47 @@ def v1_chat_generate_response(
         tool_calls = None
         text = ret_item["text"]
 
+        enable_thinking = True
         if isinstance(request, list):
             tool_choice = request[idx].tool_choice
             tools = request[idx].tools
             separate_reasoning = request[idx].separate_reasoning
+
+            if (
+                request[idx].chat_template_kwargs
+                and request[idx].chat_template_kwargs.get("enable_thinking") is not None
+            ):
+                enable_thinking = request[idx].chat_template_kwargs.get(
+                    "enable_thinking", True
+                )
         else:
             tool_choice = request.tool_choice
             tools = request.tools
             separate_reasoning = request.separate_reasoning
 
-        try:
-            reasoning_text, text = parser_manager.handle_reasoning(
-                text=text,
-                reasoning_parser=reasoning_parser,
-                separate_reasoning=separate_reasoning,
-                stream=False,
-            )
-        except Exception as e:
-            logger.error(f"Exception: {e}")
-            return create_error_response(
-                HTTPStatus.BAD_REQUEST,
-                "Failed to parse reasoning related info to json format!",
-            )
+            if (
+                request.chat_template_kwargs
+                and request.chat_template_kwargs.get("enable_thinking") is not None
+            ):
+                enable_thinking = request.chat_template_kwargs.get(
+                    "enable_thinking", True
+                )
+
+        reasoning_text = None
+        if reasoning_parser and separate_reasoning and enable_thinking:
+            try:
+                reasoning_text, text = parser_manager.handle_reasoning(
+                    text=text,
+                    reasoning_parser=reasoning_parser,
+                    separate_reasoning=separate_reasoning,
+                    stream=False,
+                )
+            except Exception as e:
+                logger.error(f"Exception: {e}")
+                return create_error_response(
+                    HTTPStatus.BAD_REQUEST,
+                    "Failed to parse reasoning related info to json format!",
+                )
 
         try:
             text, tool_calls, finish_reason_type = parser_manager.handle_tool_calls(
