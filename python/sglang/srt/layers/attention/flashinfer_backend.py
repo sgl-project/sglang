@@ -15,6 +15,11 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Union
 
 import torch
 
+if os.environ["SGLANG_ENABLE_TORCH_COMPILE"] == "1":
+    import torch._dynamo
+
+    torch._dynamo.config.suppress_errors = True
+
 from sglang.global_config import global_config
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton

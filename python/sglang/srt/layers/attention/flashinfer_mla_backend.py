@@ -9,12 +9,18 @@ and uses BatchMLAPaged wrapper for decoding.
 More details can be found in https://docs.flashinfer.ai/api/mla.html
 """
 
+import os
 from dataclasses import dataclass
 from functools import partial
 from typing import TYPE_CHECKING, Callable, Optional, Union
 
 import torch
 import triton
+
+if os.environ["SGLANG_ENABLE_TORCH_COMPILE"] == "1":
+    import torch._dynamo
+
+    torch._dynamo.config.suppress_errors = True
 
 from sglang.global_config import global_config
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
