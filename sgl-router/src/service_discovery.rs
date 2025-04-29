@@ -6,12 +6,12 @@ use kube::{
     runtime::WatchStreamExt,
     Client,
 };
-use log::{error, info, warn};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tokio::task;
 use tokio::time;
+use tracing::{error, info, warn};
 
 /// Represents the service discovery configuration
 #[derive(Debug, Clone)]
