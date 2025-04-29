@@ -948,6 +948,22 @@ def v1_chat_generate_request(
 
             if chat_template_name is None:
                 openai_compatible_messages = []
+
+                for message in request.messages:
+                    if message.content is None:
+                        message.content = ""
+                    if isinstance(message.content, str):
+                        openai_compatible_messages.append(
+                            {"role": message.role, "content": message.content}
+                        )
+                    else:
+                        content_list = message.dict()["content"]
+                        for content in content_list:
+                            if content["type"] == "text":
+                                openai_compatible_messages.append(
+                                    {"role": message.role, "content": content["text"]}
+                                )
+
                 if (
                     tools
                     and tokenizer_manager.server_args.tool_call_parser == "deepseekv3"
@@ -974,21 +990,6 @@ def v1_chat_generate_request(
                             ),
                         }
                     )
-
-                for message in request.messages:
-                    if message.content is None:
-                        message.content = ""
-                    if isinstance(message.content, str):
-                        openai_compatible_messages.append(
-                            {"role": message.role, "content": message.content}
-                        )
-                    else:
-                        content_list = message.dict()["content"]
-                        for content in content_list:
-                            if content["type"] == "text":
-                                openai_compatible_messages.append(
-                                    {"role": message.role, "content": content["text"]}
-                                )
                 if (
                     openai_compatible_messages
                     and openai_compatible_messages[-1]["role"] == "assistant"
