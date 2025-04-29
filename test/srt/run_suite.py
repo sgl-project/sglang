@@ -64,7 +64,7 @@ suites = {
         TestFile("test_retract_decode.py", 54),
         TestFile("test_server_args.py", 1),
         TestFile("test_skip_tokenizer_init.py", 117),
-        TestFile("test_srt_engine.py", 237),
+        TestFile("test_srt_engine.py", 261),
         TestFile("test_srt_endpoint.py", 130),
         TestFile("test_torch_compile.py", 76),
         TestFile("test_torch_compile_moe.py", 172),
@@ -80,6 +80,7 @@ suites = {
         TestFile("test_vlm_accuracy.py", 60),
         TestFile("test_vision_openai_server.py", 637),
         TestFile("test_w8a8_quantization.py", 46),
+        TestFile("models/lora/test_lora_cuda_graph.py", 250),
     ],
     "per-commit-2-gpu": [
         TestFile("models/lora/test_lora_tp.py", 116),
@@ -93,6 +94,7 @@ suites = {
     ],
     "per-commit-8-gpu": [
         TestFile("test_local_attn.py", 250),
+        TestFile("test_full_deepseek_v3.py", 250),
     ],
     "nightly": [
         TestFile("test_nightly_gsm8k_eval.py"),

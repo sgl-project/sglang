@@ -732,6 +732,44 @@ def run_bench_one_batch(model, other_args):
     return output_throughput
 
 
+def run_bench_offline_throughput(model, other_args):
+    command = [
+        "python3",
+        "-m",
+        "sglang.bench_offline_throughput",
+        "--num-prompts",
+        "1",
+        "--dataset-name",
+        "random",
+        "--random-input-len",
+        "256",
+        "--random-output-len",
+        "256",
+        "--model-path",
+        model,
+        *[str(x) for x in other_args],
+    ]
+
+    print(f"{command=}")
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    try:
+        stdout, stderr = process.communicate()
+        output = stdout.decode()
+        error = stderr.decode()
+        print(f"Output: {output}", flush=True)
+        print(f"Error: {error}", flush=True)
+
+        output_throughput = -1
+        for line in output.split("\n"):
+            if "Last generation throughput (tok/s):" in line:
+                output_throughput = float(line.split(":")[-1])
+    finally:
+        kill_process_tree(process.pid)
+
+    return output_throughput
+
+
 def lcs(X, Y):
     m = len(X)
     n = len(Y)
