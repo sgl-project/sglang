@@ -220,6 +220,9 @@ class CudaGraphRunner:
         if self.enable_torch_compile:
             set_torch_compile_config()
 
+        if self.model_runner.server_args.lora_paths is not None:
+            self.model_runner.lora_manager.init_cuda_graph_batch_info(self.max_bs)
+
         # Graph inputs
         with torch.device("cuda"):
             self.input_ids = torch.zeros((self.max_num_token,), dtype=torch.int64)
@@ -403,6 +406,13 @@ class CudaGraphRunner:
             self.capture_hidden_mode = (
                 spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
             )
+        if self.model_runner.server_args.lora_paths is not None:
+            # Currently, if the lora_path in `lora_paths` is None, the lora backend will use a
+            # different logic to handle lora, so we need to set `lora_paths` to a list of non-None
+            # values if lora is enabled.
+            lora_paths = [next(iter(self.model_runner.server_args.lora_paths))] * bs
+        else:
+            lora_paths = None
 
         forward_batch = ForwardBatch(
             forward_mode=self.capture_forward_mode,
@@ -424,7 +434,11 @@ class CudaGraphRunner:
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
             capture_hidden_mode=self.capture_hidden_mode,
+            lora_paths=lora_paths,
         )
+
+        if lora_paths is not None:
+            self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
 
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata_capture_cuda_graph(
