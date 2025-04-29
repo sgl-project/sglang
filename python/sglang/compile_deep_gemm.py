@@ -67,6 +67,9 @@ class CompileArgs:
     compile_m_range: Optional[int] = None
     compile_workers: int = 8
 
+    # DeepEP redundant experts, will be removed when DeepEP tbo is ready
+    compile_redundant_experts: Optional[int] = None
+
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
         parser.add_argument("--timeout", type=int, default=CompileArgs.timeout)
@@ -101,6 +104,12 @@ class CompileArgs:
             "--compile-workers",
             type=int,
             default=CompileArgs.compile_workers,
+        )
+        parser.add_argument(
+            "--compile-redundant-experts",
+            type=int,
+            default=CompileArgs.compile_redundant_experts,
+            help="num redundant experts for DeepEP+EPLB+DeepGEMM",
         )
 
     @classmethod
@@ -214,7 +223,14 @@ def build_deepseek_v3_mapping(
                 CompileMapping("shared.down_proj", KernelType.GEMM_NT_F8F8BF16),
             ]
         )
-        # FIXME: update replica experts
+
+        # For DeepEP+EPLB redundant expert system
+        if compile_args.compile_redundant_experts is not None:
+            r_experts = compile_args.compile_redundant_experts
+            n_experts = weights["experts.gate_up_proj"].G
+            weights["experts.gate_up_proj"]._replace(G=n_experts + r_experts)
+            weights["experts.down_proj"]._replace(G=n_experts + r_experts)
+
         ep_mapping.extend(
             [
                 # deepep low latency
@@ -238,10 +254,12 @@ def build_deepseek_v3_mapping(
             ]
         )
     else:
-        # shared experts fusion
+        # shared experts fusion just for DeepSeekV3
         if weights["experts.gate_up_proj"].G == 256:
-            weights["experts.gate_up_proj"]._replace(G=256 + server_args.tp_size)
-            weights["experts.down_proj"]._replace(G=256 + server_args.tp_size)
+            r_experts = server_args.tp_size
+            n_experts = weights["experts.gate_up_proj"].G
+            weights["experts.gate_up_proj"]._replace(G=n_experts + r_experts)
+            weights["experts.down_proj"]._replace(G=n_experts + r_experts)
         else:
             tp_mapping.extend(
                 [
@@ -270,20 +288,20 @@ def build_deepseek_v3_mapping(
             )
         else:
             # NOTE: Waiting for TP moe DeepGEMM PR
-            # tp_mapping.extend(
-            #     [
-            #         CompileMapping(
-            #             "experts.gate_up_proj",
-            #             KernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED,
-            #             "N",
-            #         ),
-            #         CompileMapping(
-            #             "experts.down_proj",
-            #             KernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED,
-            #             "K",
-            #         ),
-            #     ]
-            # )
+            tp_mapping.extend(
+                [
+                    CompileMapping(
+                        "experts.gate_up_proj",
+                        KernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG,
+                        "N",
+                    ),
+                    CompileMapping(
+                        "experts.down_proj",
+                        KernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG,
+                        "K",
+                    ),
+                ]
+            )
             pass
 
     return tp_mapping, attn_tp_mapping, moe_dense_tp_mapping, ep_mapping, dp_mapping
