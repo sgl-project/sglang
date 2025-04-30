@@ -464,6 +464,7 @@ class SRTRunner:
         speculative_num_draft_tokens: Optional[int] = None,
         disable_overlap_schedule: bool = False,
         disable_custom_all_reduce: bool = False,
+        torchao_config: Optional[str] = None,
     ):
         self.model_type = model_type
         self.is_generation = model_type == "generation"
@@ -483,6 +484,7 @@ class SRTRunner:
             dtype=get_dtype_str(torch_dtype),
             port=port,
             model_impl=model_impl,
+            torchao_config=torchao_config,
             mem_fraction_static=mem_fraction_static,
             trust_remote_code=trust_remote_code,
             is_embedding=not self.is_generation,

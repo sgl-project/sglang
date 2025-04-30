@@ -130,7 +130,6 @@ def replace_linear_class(
         def forward(self, input: torch.Tensor) -> torch.Tensor:
             return super().forward(input)[0]
 
-    print(sglang_linear_cls)
     return HFCompatibleLinear(
         input_size=linear.in_features,
         output_size=linear.out_features,

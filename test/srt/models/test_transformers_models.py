@@ -29,6 +29,8 @@ class TestTransformersFallbackEndpoint(CustomTestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=["--model-impl", "transformers"],
         )
+        cls.mmlu_lower_bound = 0.65
+        cls.gsm8k_lower_bound = 0.78
 
     @classmethod
     def tearDownClass(cls):
@@ -45,7 +47,7 @@ class TestTransformersFallbackEndpoint(CustomTestCase):
         from sglang.test.run_eval import run_eval
 
         metrics = run_eval(args)
-        self.assertGreaterEqual(metrics["score"], 0.65)
+        self.assertGreaterEqual(metrics["score"], self.mmlu_lower_bound)
 
     def test_gsm8k(self):
         args = SimpleNamespace(
@@ -61,9 +63,10 @@ class TestTransformersFallbackEndpoint(CustomTestCase):
 
         metrics = run_eval(args)
         print(f"{metrics=}")
-        self.assertGreater(metrics["accuracy"], 0.78)
+        self.assertGreater(metrics["accuracy"], self.gsm8k_lower_bound)
 
 
+# TODO: check why there is a tokenizer issue when running the benchmark, the model works fine otherwise
 # class TestTransformersFallbackCustomCodeEndpoint(TestTransformersFallbackEndpoint):
 #     @classmethod
 #     def setUpClass(cls):
@@ -78,6 +81,27 @@ class TestTransformersFallbackEndpoint(CustomTestCase):
 #         )
 
 
+class TestTransformersFallbackTorchAO(TestTransformersFallbackEndpoint):
+    @classmethod
+    def setUpClass(cls):
+        # custom code
+        cls.model = "meta-llama/Llama-3.2-1B-Instruct"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--model-impl",
+                "transformers",
+                "--torchao-config",
+                "int4wo-128",
+            ],
+        )
+        cls.mmlu_lower_bound = 0.25
+        cls.gsm8k_lower_bound = 0.40
+
+
 @dataclasses.dataclass
 class ModelCase:
     model_path: str
@@ -87,12 +111,16 @@ class ModelCase:
     rouge_l_tolerance: float = 1
     skip_long_prompt: bool = False
     trust_remote_code: bool = False
+    torchao_config: str = None
 
 
 # Popular models that run on the CI
 CI_MODELS = [
     ModelCase("meta-llama/Llama-3.2-1B-Instruct", tp_size=1),
     ModelCase("meta-llama/Llama-3.2-1B-Instruct", tp_size=2),
+    # TODO: check why the model is loaded in bf16 for SRTRunner, not a transformers impl issue
+    # ModelCase("meta-llama/Llama-3.2-1B-Instruct", tp_size=1, torchao_config="int4wo-128"),
+    # ModelCase("meta-llama/Llama-3.2-1B-Instruct", tp_size=2, torchao_config="int4wo-128"),
 ]
 
 TORCH_DTYPES = [torch.float16]
@@ -119,6 +147,7 @@ class TestTransformersFallbackEngine(CustomTestCase):
             model_type="generation",
             model_impl="transformers",
             trust_remote_code=model_case.trust_remote_code,
+            torchao_config=model_case.torchao_config,
         ) as srt_runner:
             srt_outputs = srt_runner.forward(prompts, max_new_tokens=max_new_tokens)
 
@@ -128,6 +157,7 @@ class TestTransformersFallbackEngine(CustomTestCase):
             torch_dtype=torch_dtype,
             model_type="generation",
             trust_remote_code=model_case.trust_remote_code,
+            torchao_config=model_case.torchao_config,
         ) as srt_runner:
             srt_transformers_outputs = srt_runner.forward(
                 prompts, max_new_tokens=max_new_tokens
