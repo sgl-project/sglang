@@ -34,15 +34,17 @@ def _get_version():
 operator_namespace = "sgl_kernel"
 include_dirs = [
     root / "include",
+    root / "include" / "impl",
     root / "csrc",
 ]
 
 sources = [
     "csrc/allreduce/custom_all_reduce.hip",
+    "csrc/elementwise/activation.cu",
     "csrc/moe/moe_align_kernel.cu",
     "csrc/moe/moe_topk_softmax_kernels.cu",
-    "csrc/torch_extension_rocm.cc",
     "csrc/speculative/eagle_utils.cu",
+    "csrc/torch_extension_rocm.cc",
 ]
 
 cxx_flags = ["-O3"]
