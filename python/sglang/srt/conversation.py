@@ -806,6 +806,24 @@ register_conv_template(
     )
 )
 
+# Reference: https://huggingface.co/moonshotai/Kimi-VL-A3B-Instruct/blob/main/chat_template.jinja
+register_conv_template(
+    Conversation(
+        name="kimi-vl",
+        system_message="You are a helpful assistant",
+        system_template="<|im_system|>system<|im_middle|>{system_message}",
+        roles=(
+            "<|im_user|>user<|im_middle|>",
+            "<|im_assistant|>assistant<|im_middle|>",
+        ),
+        messages=[],
+        sep="<|im_end|>",
+        sep_style=SeparatorStyle.NO_COLON_SINGLE,
+        stop_str="<|im_end|>",
+        image_token="<|media_start|>image<|media_content|><|media_pad|><|media_end|>",
+    )
+)
+
 
 @register_conv_template_matching_function
 def match_deepseek_janus_pro(model_path: str):
@@ -888,3 +906,10 @@ def match_openbmb_minicpm(model_path: str):
         return "minicpmv"
     elif "minicpm-o" in model_path:
         return "minicpmo"
+
+
+@register_conv_template_matching_function
+def match_moonshot_kimivl(model_path: str):
+    model_path = model_path.lower()
+    if "kimi" in model_path and "vl" in model_path:
+        return "kimi-vl"
