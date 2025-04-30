@@ -22,12 +22,10 @@ from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.qwen2 import Qwen2MLP, Qwen2DecoderLayer, Qwen2Model
-from sglang.srt.models.qwen2 import Qwen2Model
+from sglang.srt.models.qwen2 import Qwen2DecoderLayer, Qwen2MLP, Qwen2Model
 from sglang.srt.utils import add_prefix
 
 MiMoConfig = None
-
 
 
 class MiMoModel(Qwen2Model):
@@ -121,7 +119,11 @@ class MiMoForCausalLM(nn.Module):
 
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
-            if "rotary_emb.inv_freq" in name or "projector" in name or "mtp_layers" in name:
+            if (
+                "rotary_emb.inv_freq" in name
+                or "projector" in name
+                or "mtp_layers" in name
+            ):
                 continue
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
                 # Models trained using ColossalAI may include these tensors in
@@ -164,5 +166,6 @@ class MiMoForCausalLM(nn.Module):
 
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         self.model.load_kv_cache_scales(quantization_param_path)
+
 
 EntryClass = MiMoForCausalLM
