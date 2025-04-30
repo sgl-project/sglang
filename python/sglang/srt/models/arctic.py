@@ -42,7 +42,7 @@ from typing import Iterable, List, Optional, Set, Tuple
 import torch
 from torch import nn
 
-from python.sglang.srt.layers.rotary_embedding import RotaryEmbedding
+from sglang.srt.layers.rotary_embedding import RotaryEmbedding
 from sglang.srt.configs.arctic import ArcticConfig
 from sglang.srt.distributed import (
     get_pp_group,
