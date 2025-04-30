@@ -267,6 +267,7 @@ def sglang_per_token_group_quant_fp8(
     eps: float = 1e-10,
     column_major_scales: bool = False,
     scale_tma_aligned: bool = False,
+    hack_disable: bool = False,
 ):
     x = DisposibleTensor.maybe_unwrap(x)
     assert (
@@ -297,7 +298,7 @@ def sglang_per_token_group_quant_fp8(
             dtype=torch.float32,
         )
 
-    if x.shape[0] > 0:
+    if x.shape[0] > 0 and (not hack_disable):
         sgl_per_token_group_quant_fp8(x, x_q, x_s, group_size, eps, fp8_min, fp8_max)
 
     return x_q, x_s
