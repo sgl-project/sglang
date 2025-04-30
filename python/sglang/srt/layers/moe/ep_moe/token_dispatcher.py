@@ -1,15 +1,13 @@
+from sglang.srt.layers.quantization.deep_gemm import _ENABLE_JIT_DEEPGEMM
 from sglang.srt.utils import DeepEPMode
 
-_enable_jit_deepgemm = False
 try:
     from deep_ep import Buffer
 
-    from sglang.srt.layers.quantization.deep_gemm import get_enable_jit_deepgemm
     from sglang.srt.layers.quantization.fp8_kernel import (
         sglang_per_token_group_quant_fp8,
     )
 
-    _enable_jit_deepgemm = get_enable_jit_deepgemm()
     use_deepep = True
 except ImportError:
     use_deepep = False
@@ -193,7 +191,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         return hidden_states, topk_idx, topk_weights, previous_event
 
     def dispatch_b(self, hidden_states, topk_idx, topk_weights, previous_event):
-        if _enable_jit_deepgemm:
+        if _ENABLE_JIT_DEEPGEMM:
             # TODO hard code 128 block quant,use fp8 communication
             if hidden_states.shape[0] > 0:
                 hidden_states = sglang_per_token_group_quant_fp8(hidden_states, 128)
@@ -311,7 +309,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             previous_event=previous_event,
             async_finish=self.async_finish,
             allocate_on_comm_stream=(previous_event is not None) and self.async_finish,
-            expert_alignment=128 if _enable_jit_deepgemm else 1,
+            expert_alignment=128 if _ENABLE_JIT_DEEPGEMM else 1,
         )
 
         return (
@@ -368,7 +366,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_weights: torch.Tensor,
     ):
         # TODO support deepgemm
-        if _enable_jit_deepgemm:
+        if _ENABLE_JIT_DEEPGEMM:
             output = hidden_states
         else:
             if hidden_states.shape[0] > 0:
