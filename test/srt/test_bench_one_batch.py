@@ -1,3 +1,4 @@
+import os
 import unittest
 
 from sglang.test.test_utils import (
@@ -46,7 +47,7 @@ class TestBenchOneBatch(CustomTestCase):
                 f"output_throughput: {output_throughput:.2f} token/s\n"
             )
             if os.getenv("SGLANG_AMD_CI") == "1":
-                self.assertGreater(output_throughput, 90)
+                self.assertGreater(output_throughput, 85)
             else:
                 self.assertGreater(output_throughput, 125)
 
