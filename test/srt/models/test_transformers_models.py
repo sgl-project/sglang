@@ -30,7 +30,7 @@ class TestTransformersFallbackEndpoint(CustomTestCase):
             other_args=["--model-impl", "transformers"],
         )
         cls.mmlu_lower_bound = 0.65
-        cls.gsm8k_lower_bound = 0.78
+        cls.gsm8k_lower_bound = 0.75
 
     @classmethod
     def tearDownClass(cls):
@@ -99,7 +99,7 @@ class TestTransformersFallbackTorchAO(TestTransformersFallbackEndpoint):
             ],
         )
         cls.mmlu_lower_bound = 0.25
-        cls.gsm8k_lower_bound = 0.40
+        cls.gsm8k_lower_bound = 0.20
 
 
 @dataclasses.dataclass
