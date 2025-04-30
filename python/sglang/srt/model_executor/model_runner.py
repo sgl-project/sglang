@@ -271,6 +271,7 @@ class ModelRunner:
                     "fa3",
                     "triton",
                     "flashmla",
+                    "cutlass_mla",
                 ]:
                     logger.info(
                         f"MLA optimization is turned on. Use {server_args.attention_backend} backend."
@@ -691,9 +692,14 @@ class ModelRunner:
             self.device, self.gpu_id, distributed=self.tp_size > 1
         )
         if self.use_mla_backend:
+            num_layers = (
+                self.model_config.num_hidden_layers
+                if not self.is_draft_worker
+                else self.model_config.hf_config.num_nextn_predict_layers
+            )
             cell_size = (
                 (self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim)
-                * self.model_config.num_hidden_layers
+                * num_layers
                 * torch._utils._element_size(self.kv_cache_dtype)
             )
         else:
@@ -808,7 +814,11 @@ class ModelRunner:
                 dtype=self.kv_cache_dtype,
                 kv_lora_rank=self.model_config.kv_lora_rank,
                 qk_rope_head_dim=self.model_config.qk_rope_head_dim,
-                layer_num=self.model_config.num_hidden_layers,
+                layer_num=(
+                    self.model_config.num_hidden_layers
+                    if not self.is_draft_worker
+                    else self.model_config.hf_config.num_nextn_predict_layers
+                ),
                 device=self.device,
                 enable_memory_saver=self.server_args.enable_memory_saver,
             )
@@ -926,6 +936,12 @@ class ModelRunner:
             )
 
             self.attn_backend = FlashAttentionBackend(self)
+        elif self.server_args.attention_backend == "cutlass_mla":
+            from sglang.srt.layers.attention.cutlass_mla_backend import (
+                CutlassMLABackend,
+            )
+
+            self.attn_backend = CutlassMLABackend(self)
         else:
             raise ValueError(
                 f"Invalid attention backend: {self.server_args.attention_backend}"
@@ -968,7 +984,7 @@ class ModelRunner:
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         logger.info(
             f"Capture cuda graph end. Time elapsed: {time.time() - tic:.2f} s. "
-            f"avail mem={after_mem:.2f} GB. mem usage={(before_mem - after_mem):.2f} GB."
+            f"mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
         )
 
     def apply_torch_tp(self):

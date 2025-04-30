@@ -252,9 +252,6 @@ class Scheduler(
         if not self.is_generation:
             self.enable_overlap = False
             logger.info("Overlap scheduler is disabled for embedding models.")
-        if self.model_config.is_multimodal:
-            self.enable_overlap = False
-            logger.info("Overlap scheduler is disabled for multimodal models.")
 
         # Launch a tensor parallel worker
         if self.enable_overlap:
@@ -649,6 +646,7 @@ class Scheduler(
             self.cur_batch = batch
 
             if batch:
+                batch.launch_done = threading.Event()
                 result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), result))
 
@@ -660,7 +658,7 @@ class Scheduler(
                         forward_mode=ForwardMode.DUMMY_FIRST,
                         next_batch_sampling_info=self.tp_worker.cur_sampling_info,
                     )
-                    self.process_batch_result(tmp_batch, None)
+                    self.process_batch_result(tmp_batch, None, batch.launch_done)
 
             if self.last_batch:
                 # Process the results of the last batch
@@ -668,7 +666,10 @@ class Scheduler(
                 tmp_batch.next_batch_sampling_info = (
                     self.tp_worker.cur_sampling_info if batch else None
                 )
-                self.process_batch_result(tmp_batch, tmp_result)
+                # NOTE: we should use current launched batch's launch_done event Instead of the last batch's
+                self.process_batch_result(
+                    tmp_batch, tmp_result, batch.launch_done if batch else None
+                )
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.check_memory()
@@ -903,6 +904,7 @@ class Scheduler(
                 add_to_grammar_queue = True
 
         if add_to_grammar_queue:
+            req.queue_time_start = time.time()
             self.grammar_queue.append(req)
         else:
             self._add_request_to_queue(req)
@@ -1421,14 +1423,15 @@ class Scheduler(
         self,
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
+        launch_done: Optional[threading.Event] = None,
     ):
         if batch.forward_mode.is_decode():
-            self.process_batch_result_decode(batch, result)
+            self.process_batch_result_decode(batch, result, launch_done)
         elif batch.forward_mode.is_extend():
-            self.process_batch_result_prefill(batch, result)
+            self.process_batch_result_prefill(batch, result, launch_done)
         elif batch.forward_mode.is_idle():
             if self.enable_overlap:
-                self.tp_worker.resolve_batch_result(result.bid)
+                self.tp_worker.resolve_last_batch_result(launch_done)
                 if batch.next_batch_sampling_info:
                     batch.next_batch_sampling_info.update_regex_vocab_mask()
                     self.current_stream.synchronize()
