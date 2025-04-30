@@ -71,6 +71,7 @@ class TpModelWorker:
             enable_multimodal=server_args.enable_multimodal,
             dtype=server_args.dtype,
             quantization=server_args.quantization,
+            is_draft_model=is_draft_worker,
         )
         self.model_runner = ModelRunner(
             model_config=self.model_config,
