@@ -14,6 +14,7 @@
 """Conversion between OpenAI APIs and native SRT APIs"""
 
 import asyncio
+import datetime
 import json
 import logging
 import os
@@ -1008,6 +1009,7 @@ def v1_chat_generate_request(
                         tokenize=True,
                         add_generation_prompt=True,
                         tools=tools,
+                        date_string = datetime.date.today().strftime("%d %b %Y"),
                         **(
                             request.chat_template_kwargs
                             if request.chat_template_kwargs
@@ -1024,6 +1026,7 @@ def v1_chat_generate_request(
                         tokenize=True,
                         add_generation_prompt=True,
                         tools=tools,
+                        date_string = datetime.date.today().strftime("%d %b %Y"),
                         **(
                             request.chat_template_kwargs
                             if request.chat_template_kwargs
