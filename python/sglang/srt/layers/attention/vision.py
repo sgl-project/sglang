@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
+from sgl_kernel.flash_attn import flash_attn_varlen_func
 
 from sglang.srt.distributed import parallel_state
 from sglang.srt.distributed import utils as dist_utils
@@ -22,8 +23,6 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import apply_rotary_pos_emb
 from sglang.srt.utils import add_prefix
-
-from sgl_kernel.flash_attn import flash_attn_varlen_func
 
 ROTARY_EMBED_CLASSES = {
     "normal": apply_rotary_pos_emb,
@@ -225,6 +224,7 @@ class VisionTritonAttention(nn.Module):
 
         return output
 
+
 class VisionFlashAttention(nn.Module):
     def __init__(
         self,
@@ -261,8 +261,9 @@ class VisionFlashAttention(nn.Module):
 
         return output
 
+
 QKV_BACKEND_IMPL = {
-    "context_fwd": VisionTritonAttention,
+    "triton_attn": VisionTritonAttention,
     "sdpa": VisionSdpaAttention,
     "flash_attn": VisionFlashAttention,
 }
@@ -460,5 +461,3 @@ class VisionAttention(nn.Module):
             output = output.view(bsz, s, -1)
 
         return output
-
-

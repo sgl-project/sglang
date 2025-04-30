@@ -154,7 +154,7 @@ class CLIPEncoderLayer(nn.Module):
             qkv_backend = "sdpa"
             softmax_in_single_precision = False
         elif attn_implementation == "flash_attention_2":
-            qkv_backend = "context_fwd"
+            qkv_backend = "triton_attn"
             softmax_in_single_precision = False
         elif attn_implementation == "eager":
             qkv_backend = "sdpa"
