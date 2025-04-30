@@ -1906,11 +1906,11 @@ def fast_topk(values, topk, dim):
 
 
 def _check(cc_major):
-    return (
-        torch.cuda.is_available()
-        and torch.cuda.get_device_capability()[0] == cc_major
-        and tuple(map(int, torch.version.cuda.split(".")[:2])) >= (12, 3)
-    )
+    if not is_cuda():
+        return False
+    return torch.cuda.get_device_capability()[0] == cc_major and tuple(
+        map(int, torch.version.cuda.split(".")[:2])
+    ) >= (12, 3)
 
 
 is_ampere_with_cuda_12_3 = lambda: _check(8)
