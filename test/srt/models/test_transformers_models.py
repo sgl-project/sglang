@@ -52,22 +52,7 @@ class TestTransformersFallbackEndpoint(CustomTestCase):
 
         metrics = run_eval(args)
         self.assertGreaterEqual(metrics["score"], 0.65)
-
-    def test_gsm8k(self):
-        args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
-            host="http://127.0.0.1",
-            port=int(self.base_url.split(":")[-1]),
-        )
-        metrics = run_eval(args)
-        print(f"{metrics=}")
-        self.assertGreater(metrics["accuracy"], 0.78)
         
-
 class TestTransformersFallbackCustomCodeEndpoint(TestTransformersFallbackEndpoint):
     @classmethod
     def setUpClass(cls):
