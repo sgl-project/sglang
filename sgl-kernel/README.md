@@ -17,6 +17,46 @@ For CUDA 12.1 or CUDA 12.4:
 ```bash
 pip3 install sgl-kernel
 ```
+## Build from source
+
+Development build:
+
+```bash
+make build
+```
+
+Note:
+
+The `sgl-kernel` is rapidly evolving. If you experience a compilation failure, try using `make rebuild`.
+
+### Build with [ccache](https://github.com/ccache/ccache)
+```bash
+# or `yum install -y ccache`.
+apt-get install -y ccache
+# Building with ccache is enabled when ccache is installed and CCACHE_DIR is set.
+export CCACHE_DIR=/path/to/your/ccache/dir
+export CCACHE_BACKEND=""
+export CCACHE_KEEP_LOCAL_STORAGE="TRUE"
+unset CCACHE_READONLY
+python -m uv build --wheel -Cbuild-dir=build --color=always .
+```
+
+### Configuring CMake Build Options
+Cmake options can be configuring by adding `-Ccmake.define.<option>=<value>` to the `uv build` flags.
+For example, to enable building FP4 kernels, use:
+```bash
+python -m uv build --wheel -Cbuild-dir=build -Ccmake.define.SGL_KERNEL_ENABLE_FP4=1 --color=always .
+```
+See CMakeLists.txt for more options.
+
+### Parallel Build
+
+We highly recommend you build sgl-kernel with Ninja. Ninja can automatically build sgl-kernel in parallel.
+And if you build the sgl-kernel with cmake, you need to add `CMAKE_BUILD_PARALLEL_LEVEL` for parallel build like:
+
+```bash
+CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) python -m uv build --wheel -Cbuild-dir=build --color=always .
+```
 
 # Developer Guide
 
@@ -132,40 +172,6 @@ To use this with your library functions, simply wrap them with make_pytorch_shim
  m.impl("fwd", torch::kCUDA, make_pytorch_shim(&mha_fwd));
 ```
 
-### Build & Install
-
-Development build:
-
-```bash
-make build
-```
-
-Note:
-
-The `sgl-kernel` is rapidly evolving. If you experience a compilation failure, try using `make rebuild`.
-
-#### Build with [ccache](https://github.com/ccache/ccache)
-```bash
-# or `yum install -y ccache`.
-apt-get install -y ccache
-# Building with ccache is enabled when ccache is installed and CCACHE_DIR is set.
-export CCACHE_DIR=/path/to/your/ccache/dir
-export CCACHE_BACKEND=""
-export CCACHE_KEEP_LOCAL_STORAGE="TRUE"
-unset CCACHE_READONLY
-python -m uv build --wheel -Cbuild-dir=build --color=always .
-```
-
-> When encountering this error while compiling using ccache: `ImportError: /usr/local/lib/python3.10/dist-packages/sgl_kernel/common_ops.abi3.so: undefined symbol: _ZN3c108ListType3getERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEENS_4Type24SingletonOrSharedTypePtrIS9_EE`, please modify the last command as follows to resolve it: `python3 -m uv build --wheel -Cbuild-dir=build . --color=always --no-build-isolation` .
-
-##### Configuring CMake Build Options
-Cmake options can be configuring by adding `-Ccmake.define.<option>=<value>` to the `uv build` flags.
-For example, to enable building FP4 kernels, use:
-```bash
-python -m uv build --wheel -Cbuild-dir=build -Ccmake.define.SGL_KERNEL_ENABLE_FP4=1 --color=always .
-```
-See CMakeLists.txt for more options.
-
 ### Testing & Benchmarking
 
 1. Add pytest tests in [tests/](https://github.com/sgl-project/sglang/tree/main/sgl-kernel/tests), if you need to skip some test, please use `@pytest.mark.skipif`
@@ -179,7 +185,9 @@ See CMakeLists.txt for more options.
 2. Add benchmarks using [triton benchmark](https://triton-lang.org/main/python-api/generated/triton.testing.Benchmark.html) in [benchmark/](https://github.com/sgl-project/sglang/tree/main/sgl-kernel/benchmark)
 3. Run test suite
 
+### FAQ
 
+- When encountering this error while compiling using ccache: `ImportError: /usr/local/lib/python3.10/dist-packages/sgl_kernel/common_ops.abi3.so: undefined symbol: _ZN3c108ListType3getERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEENS_4Type24SingletonOrSharedTypePtrIS9_EE`, please modify the last command as follows to resolve it: `python3 -m uv build --wheel -Cbuild-dir=build . --color=always --no-build-isolation` .
 
 ### Release new version
 
