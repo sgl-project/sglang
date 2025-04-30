@@ -36,6 +36,7 @@ suites = {
         TestFile("test_fa3.py", 376),
         TestFile("test_fim_completion.py", 40),
         TestFile("test_fp8_kernel.py", 8),
+        TestFile("test_function_calling.py", 60),
         TestFile("test_fused_moe.py", 30),
         TestFile("test_hicache.py", 116),
         TestFile("test_hicache_mla.py", 254),
@@ -98,6 +99,9 @@ suites = {
     ],
     "nightly": [
         TestFile("test_nightly_gsm8k_eval.py"),
+    ],
+    "nightly-amd": [
+        TestFile("test_nightly_gsm8k_eval_amd.py"),
     ],
     "vllm_dependency_test": [
         TestFile("test_vllm_dependency.py"),
