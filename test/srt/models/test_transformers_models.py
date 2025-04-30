@@ -1,8 +1,14 @@
+import dataclasses
+import multiprocessing as mp
 import time
 import unittest
 from types import SimpleNamespace
+from typing import List
+
+import torch
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.runners import DEFAULT_PROMPTS, SRTRunner, check_close_model_outputs
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -11,18 +17,6 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-import dataclasses
-import multiprocessing as mp
-import unittest
-from typing import List
-
-import torch
-
-from sglang.test.runners import (
-    DEFAULT_PROMPTS,
-    SRTRunner,
-    check_close_model_outputs,
-)
 
 class TestTransformersFallbackEndpoint(CustomTestCase):
     @classmethod
@@ -49,6 +43,7 @@ class TestTransformersFallbackEndpoint(CustomTestCase):
             num_threads=32,
         )
         from sglang.test.run_eval import run_eval
+
         metrics = run_eval(args)
         self.assertGreaterEqual(metrics["score"], 0.65)
 
@@ -63,16 +58,17 @@ class TestTransformersFallbackEndpoint(CustomTestCase):
             port=int(self.base_url.split(":")[-1]),
         )
         from sglang.test.few_shot_gsm8k import run_eval
+
         metrics = run_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["accuracy"], 0.78)
-        
+
 
 # class TestTransformersFallbackCustomCodeEndpoint(TestTransformersFallbackEndpoint):
 #     @classmethod
 #     def setUpClass(cls):
 #         # custom code
-#         cls.model = "ArthurZ/Ilama-3.2-1B" 
+#         cls.model = "ArthurZ/Ilama-3.2-1B"
 #         cls.base_url = DEFAULT_URL_FOR_TEST
 #         cls.process = popen_launch_server(
 #             cls.model,
@@ -80,6 +76,7 @@ class TestTransformersFallbackEndpoint(CustomTestCase):
 #             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
 #             other_args=["--trust-remote"],
 #         )
+
 
 @dataclasses.dataclass
 class ModelCase:
@@ -99,6 +96,7 @@ CI_MODELS = [
 ]
 
 TORCH_DTYPES = [torch.float16]
+
 
 class TestTransformersFallbackEngine(CustomTestCase):
     @classmethod
@@ -123,7 +121,7 @@ class TestTransformersFallbackEngine(CustomTestCase):
             trust_remote_code=model_case.trust_remote_code,
         ) as srt_runner:
             srt_outputs = srt_runner.forward(prompts, max_new_tokens=max_new_tokens)
-            
+
         with SRTRunner(
             model_path,
             tp_size=model_case.tp_size,
@@ -131,7 +129,9 @@ class TestTransformersFallbackEngine(CustomTestCase):
             model_type="generation",
             trust_remote_code=model_case.trust_remote_code,
         ) as srt_runner:
-            srt_transformers_outputs = srt_runner.forward(prompts, max_new_tokens=max_new_tokens)
+            srt_transformers_outputs = srt_runner.forward(
+                prompts, max_new_tokens=max_new_tokens
+            )
 
         check_close_model_outputs(
             hf_outputs=srt_transformers_outputs,
@@ -154,6 +154,7 @@ class TestTransformersFallbackEngine(CustomTestCase):
                 self.assert_close_logits_and_output_strs(
                     prompts, model_case, torch_dtype
                 )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -16,7 +16,7 @@ import json
 import logging
 import math
 import os
-from enum import IntEnum, auto, Enum
+from enum import Enum, IntEnum, auto
 from typing import List, Optional, Set, Union
 
 import torch
@@ -33,11 +33,13 @@ class AttentionArch(IntEnum):
     MLA = auto()
     MHA = auto()
 
+
 class ModelImpl(str, Enum):
     AUTO = "auto"
     SGLANG = "sglang"
     TRANSFORMERS = "transformers"
-    
+
+
 class ModelConfig:
     def __init__(
         self,
