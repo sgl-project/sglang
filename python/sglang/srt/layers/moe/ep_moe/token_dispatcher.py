@@ -11,6 +11,7 @@ from sglang.srt.utils import (
 
 # TODO do not hardcode
 DEEPEP_NUM_SMS = get_int_env_var("SGLANG_HACK_DEEPEP_NUM_SMS", 24)
+print(f"hi {DEEPEP_NUM_SMS=}")
 
 _enable_jit_deepgemm = False
 try:
