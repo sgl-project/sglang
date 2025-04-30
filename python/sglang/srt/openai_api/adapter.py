@@ -1281,7 +1281,6 @@ def v1_chat_generate_response(
         tool_calls = None
         text = ret_item["text"]
 
-        enable_thinking = True
         if isinstance(request, list):
             tool_choice = request[idx].tool_choice
             tools = request[idx].tools
