@@ -233,7 +233,7 @@ install(TARGETS common_ops LIBRARY DESTINATION sgl_kernel)
 
 # ============================ Optional Install ============================= #
 # set flash-attention sources file
-# BF16 source files
+# Now FA3 support sm80/sm86/sm90
 if (SGL_KERNEL_ENABLE_FA3)
     set(SGL_FLASH_KERNEL_CUDA_FLAGS
         "-DNDEBUG"
@@ -241,6 +241,7 @@ if (SGL_KERNEL_ENABLE_FA3)
         "-O3"
         "-Xcompiler"
         "-fPIC"
+        "-gencode=arch=compute_80,code=sm_80"
         "-gencode=arch=compute_90a,code=sm_90a"
         "-std=c++17"
         "-DCUTE_USE_PACKED_TUPLE=1"
@@ -257,16 +258,16 @@ if (SGL_KERNEL_ENABLE_FA3)
     )
 
     file(GLOB FA3_BF16_GEN_SRCS
-        "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimall_bf16*_sm90.cu")
+        "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimall_bf16*_sm*.cu")
     file(GLOB FA3_BF16_GEN_SRCS_
-        "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimdiff_bf16*_sm90.cu")
+        "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimdiff_bf16*_sm*.cu")
     list(APPEND FA3_BF16_GEN_SRCS ${FA3_BF16_GEN_SRCS_})
 
     # FP16 source files
     file(GLOB FA3_FP16_GEN_SRCS
-        "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimall_fp16*_sm90.cu")
+        "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimall_fp16*_sm*.cu")
     file(GLOB FA3_FP16_GEN_SRCS_
-        "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimdiff_fp16*_sm90.cu")
+        "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimdiff_fp16*_sm*.cu")
     list(APPEND FA3_FP16_GEN_SRCS ${FA3_FP16_GEN_SRCS_})
 
     # FP8 source files
@@ -297,7 +298,7 @@ if (SGL_KERNEL_ENABLE_FA3)
     install(TARGETS flash_ops LIBRARY DESTINATION "sgl_kernel")
 
     target_compile_definitions(flash_ops PRIVATE
-        FLASHATTENTION_DISABLE_SM8x
+        # FLASHATTENTION_DISABLE_SM8x
         FLASHATTENTION_DISABLE_BACKWARD
         FLASHATTENTION_DISABLE_DROPOUT
         FLASHATTENTION_DISABLE_UNEVEN_K
