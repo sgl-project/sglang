@@ -95,6 +95,7 @@ from sglang.srt.managers.io_struct import (
     SetInternalStateReqOutput,
     SlowDownReqInput,
     SlowDownReqOutput,
+    StopAllReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     UpdateWeightFromDiskReqInput,
@@ -855,6 +856,10 @@ class TokenizerManager:
             # cannot run while requests are in progress.
             async with self.model_update_lock.writer_lock:
                 return await self._wait_for_model_update_from_disk(obj)
+
+    def stop_all(self):
+        req = StopAllReq()
+        self.send_to_scheduler.send_pyobj(req)
 
     async def _wait_for_model_update_from_disk(
         self, obj: UpdateWeightFromDiskReqInput
