@@ -26,6 +26,8 @@
 #include <ATen/cuda/CUDAContext.h>
 // clang-format on
 
+#if defined CUDA_VERSION && CUDA_VERSION >= 12040
+
 #ifndef CUDART_INF_FP16
 #define CUDART_INF_FP16 __ushort_as_half((unsigned short)0x7C00U)
 #endif
@@ -249,3 +251,4 @@ void ApplyTokenBitmaskInplace(at::Tensor logits, at::Tensor bitmask, at::optiona
       break;
   }
 }
+#endif

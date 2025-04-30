@@ -13,7 +13,16 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.moe.topk import select_experts
-from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
+from sglang.srt.layers.quantization.fp8_kernel import (
+    per_token_group_quant_fp8,
+    scaled_fp8_quant,
+    sglang_per_token_group_quant_fp8,
+)
+from sglang.srt.layers.quantization.int8_kernel import (
+    per_token_group_quant_int8,
+    per_token_quant_int8,
+    sglang_per_token_group_quant_int8,
+)
 from sglang.srt.utils import (
     direct_register_custom_op,
     get_bool_env_var,
@@ -36,7 +45,7 @@ if _is_cuda or _is_hip:
 
 
 logger = logging.getLogger(__name__)
-padding_size = 128 if bool(int(os.getenv("MOE_PADDING", "0"))) else 0
+padding_size = 128 if bool(int(os.getenv("SGLANG_MOE_PADDING", "0"))) else 0
 enable_moe_align_block_size_triton = bool(
     int(os.getenv("ENABLE_MOE_ALIGN_BLOCK_SIZE_TRITON", "0"))
 )
@@ -746,18 +755,6 @@ def invoke_fused_moe_kernel(
     block_shape: Optional[List[int]] = None,
     no_combine: bool = False,
 ) -> None:
-    from sglang.srt.layers.quantization.int8_kernel import (
-        per_token_group_quant_int8,
-        per_token_quant_int8,
-    )
-
-    if _is_cuda:
-        from sglang.srt.layers.quantization.fp8_kernel import (
-            sglang_per_token_group_quant_fp8,
-        )
-    else:
-        from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
-
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
 
@@ -794,7 +791,10 @@ def invoke_fused_moe_kernel(
             # activation block-wise int8 quantization
             assert len(block_shape) == 2
             block_n, block_k = block_shape[0], block_shape[1]
-            A, A_scale = per_token_group_quant_int8(A, block_k)
+            if _is_cuda:
+                A, A_scale = sglang_per_token_group_quant_int8(A, block_k)
+            else:
+                A, A_scale = per_token_group_quant_int8(A, block_k)
             assert triton.cdiv(A.shape[-1], block_k) == A_scale.shape[-1]
             assert triton.cdiv(B.shape[-2], block_n) == B_scale.shape[-2]
             assert triton.cdiv(B.shape[-1], block_k) == B_scale.shape[-1]
@@ -940,7 +940,12 @@ def get_moe_configs(
     )
     if os.path.exists(config_file_path):
         with open(config_file_path) as f:
-            logger.info("Using configuration from %s for MoE layer.", config_file_path)
+            # Please note that although we find the config files, performance might still be suboptimal.
+            # This is because the tuning environment might differ from your current environment.
+            # For example, updating the Triton version might cause all old configs to become suboptimal.
+            # To achieve the best performance, consider re-tuning the Triton fused MOE kernel in your environment.
+            # For the tuning method, refer to: https://github.com/sgl-project/sglang/tree/main/benchmark/kernels/fused_moe_triton
+            logger.info("Using MoE kernel config from %s.", config_file_path)
             # If a configuration has been found, return it
             return {int(key): val for key, val in json.load(f).items()}
 
@@ -948,8 +953,8 @@ def get_moe_configs(
     # configuration
     logger.warning(
         (
-            "Using default MoE config. Performance might be sub-optimal! "
-            "Config file not found at %s, you can tune the config with https://github.com/sgl-project/sglang/blob/main/benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton.py."
+            "Using default MoE kernel config. Performance might be sub-optimal! "
+            "Config file not found at %s, you can create them with https://github.com/sgl-project/sglang/tree/main/benchmark/kernels/fused_moe_triton"
         ),
         config_file_path,
     )
@@ -1324,7 +1329,7 @@ def fused_experts_impl(
     if (
         not (use_fp8_w8a8 or use_int8_w8a8)
         or block_shape is not None
-        or (_is_hip and get_bool_env_var("CK_MOE"))
+        or (_is_hip and get_bool_env_var("SGLANG_AITER_MOE"))
     ):
         padded_size = 0
 

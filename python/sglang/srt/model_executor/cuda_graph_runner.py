@@ -135,7 +135,7 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
 
         gpu_mem = get_device_memory_capacity()
         # Batch size of each rank will not become so large when DP is on
-        if gpu_mem is not None and gpu_mem > 81920 and server_args.dp_size == 1:
+        if gpu_mem is not None and gpu_mem > 96 * 1024:
             capture_bs += list(range(160, 257, 8))
 
     if max(capture_bs) > model_runner.req_to_token_pool.size:
@@ -220,6 +220,9 @@ class CudaGraphRunner:
         if self.enable_torch_compile:
             set_torch_compile_config()
 
+        if self.model_runner.server_args.lora_paths is not None:
+            self.model_runner.lora_manager.init_cuda_graph_batch_info(self.max_bs)
+
         # Graph inputs
         with torch.device("cuda"):
             self.input_ids = torch.zeros((self.max_num_token,), dtype=torch.int64)
@@ -279,9 +282,9 @@ class CudaGraphRunner:
                 f"Capture cuda graph failed: {e}\n"
                 "Possible solutions:\n"
                 "1. set --mem-fraction-static to a smaller value (e.g., 0.8 or 0.7)\n"
-                "2. set --cuda-graph-max-bs to a smaller value (e.g., 32)\n"
+                "2. set --cuda-graph-max-bs to a smaller value (e.g., 16)\n"
                 "3. disable torch compile by not using --enable-torch-compile\n"
-                "4. disable cuda graph by --disable-cuda-graph\n"
+                "4. disable cuda graph by --disable-cuda-graph. (Not recommonded. Huge perf loss)\n"
                 "Open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose \n"
             )
 
@@ -403,6 +406,13 @@ class CudaGraphRunner:
             self.capture_hidden_mode = (
                 spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
             )
+        if self.model_runner.server_args.lora_paths is not None:
+            # Currently, if the lora_path in `lora_paths` is None, the lora backend will use a
+            # different logic to handle lora, so we need to set `lora_paths` to a list of non-None
+            # values if lora is enabled.
+            lora_paths = [next(iter(self.model_runner.server_args.lora_paths))] * bs
+        else:
+            lora_paths = None
 
         forward_batch = ForwardBatch(
             forward_mode=self.capture_forward_mode,
@@ -424,7 +434,11 @@ class CudaGraphRunner:
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
             capture_hidden_mode=self.capture_hidden_mode,
+            lora_paths=lora_paths,
         )
+
+        if lora_paths is not None:
+            self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
 
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata_capture_cuda_graph(

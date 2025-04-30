@@ -22,7 +22,7 @@ import random
 import tempfile
 from typing import List, Literal, Optional
 
-from sglang.srt.hf_transformers_utils import check_gguf_file
+from sglang.srt.hf_transformers_utils import check_gguf_file, get_config
 from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.utils import (
     configure_ipv6,
@@ -153,8 +153,7 @@ class ServerArgs:
     enable_nccl_nvls: bool = False
     disable_outlines_disk_cache: bool = False
     disable_custom_all_reduce: bool = False
-    enable_llama4_multimodal: Optional[bool] = None
-    enable_gemma3_multimodal: Optional[bool] = None
+    enable_multimodal: Optional[bool] = None
     disable_overlap_schedule: bool = False
     enable_mixed_chunk: bool = False
     enable_dp_attention: bool = False
@@ -202,7 +201,7 @@ class ServerArgs:
         # Expert parallelism
         if self.enable_ep_moe:
             self.ep_size = self.tp_size
-            logger.info(
+            logger.warning(
                 f"EP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
 
@@ -223,20 +222,23 @@ class ServerArgs:
 
         # Set mem fraction static, which depends on the tensor parallelism size
         if self.mem_fraction_static is None:
-            if gpu_mem <= 81920:
-                if self.tp_size >= 16:
-                    self.mem_fraction_static = 0.79
-                elif self.tp_size >= 8:
-                    self.mem_fraction_static = 0.81
-                elif self.tp_size >= 4:
-                    self.mem_fraction_static = 0.85
-                elif self.tp_size >= 2:
-                    self.mem_fraction_static = 0.87
-                else:
-                    self.mem_fraction_static = 0.88
+            if self.tp_size >= 16:
+                self.mem_fraction_static = 0.79
+            elif self.tp_size >= 8:
+                self.mem_fraction_static = 0.81
+            elif self.tp_size >= 4:
+                self.mem_fraction_static = 0.85
+            elif self.tp_size >= 2:
+                self.mem_fraction_static = 0.87
             else:
-                # FIXME: more fine grained auto-selection polices
-                self.mem_fraction_static = (gpu_mem - 1024 * 13) / gpu_mem
+                self.mem_fraction_static = 0.88
+            if gpu_mem > 96 * 1024:
+                mem_fraction = self.mem_fraction_static
+                self.mem_fraction_static = min(
+                    mem_fraction + 48 * 1024 * (1 - mem_fraction) / gpu_mem,
+                    (gpu_mem - 1024 * 18)
+                    / gpu_mem,  # 15 GB + additional 3GB for cuda graph
+                )
 
         # Set chunked prefill size, which depends on the gpu memory capacity
         if self.chunked_prefill_size is None:
@@ -244,19 +246,25 @@ class ServerArgs:
                 self.chunked_prefill_size = 2048
             else:
                 self.chunked_prefill_size = 8192
-
         assert self.chunked_prefill_size % self.page_size == 0
 
         assert self.moe_dense_tp_size in {
             1,
             None,
-        }, f"moe_dense_tp_size only support 1 and None currently"
+        }, "moe_dense_tp_size only support 1 and None currently"
 
         if self.attention_backend == "flashmla":
             logger.warning(
                 "FlashMLA only supports a page_size of 64, change page_size to 64."
             )
             self.page_size = 64
+
+        if self.attention_backend == "cutlass_mla":
+            logger.warning(
+                "Cutlass MLA only supports a page_size of 128, change page_size to 128."
+            )
+            self.page_size = 128
+
         # Set cuda graph max batch size
         if self.cuda_graph_max_bs is None:
             # Based on detailed statistics, when serving TP1/TP2 models on lower-end GPUs with HBM<25G, you can either disable cuda graph or set `cuda_graph_max_bs` to a very small value to reduce the memory overhead of creating cuda graphs, with almost no impact on performance. However, when serving models with TP4 or TP8, we need to enable cuda graph to maintain high performance. In this case, we can set `cuda_graph_max_bs` to 80 (half of the default value 160) to reduce the memory overhead of creating cuda graphs. Looking at the logs from TP4 serving of qwen2-72b, a value of 80 is sufficient and can reduce the memory overhead of creating cuda graphs on lower-end GPUs compared to the original 160, avoiding OOM issues.
@@ -271,6 +279,7 @@ class ServerArgs:
             self.attention_backend = "torch_native"
             self.sampling_backend = "pytorch"
 
+        # Set kernel backends
         if self.sampling_backend is None:
             self.sampling_backend = (
                 "flashinfer" if is_flashinfer_available() else "pytorch"
@@ -286,10 +295,6 @@ class ServerArgs:
         if self.grammar_backend is None:
             self.grammar_backend = "xgrammar"
 
-        self.enable_multimodal: Optional[bool] = (
-            self.enable_llama4_multimodal or self.enable_gemma3_multimodal
-        )
-
         # Data parallelism attention
         if self.enable_dp_attention:
             self.schedule_conservativeness = self.schedule_conservativeness * 0.3
@@ -302,8 +307,8 @@ class ServerArgs:
                 f"DP attention is enabled. The chunked prefill size is adjusted to {self.chunked_prefill_size} to avoid MoE kernel issues. "
             )
 
-        self.enable_sp_layernorm = False
         # DeepEP MoE
+        self.enable_sp_layernorm = False
         if self.enable_deepep_moe:
             if self.deepep_mode == "auto":
                 assert (
@@ -313,7 +318,7 @@ class ServerArgs:
             self.enable_sp_layernorm = (
                 self.dp_size < self.tp_size if self.enable_dp_attention else True
             )
-            logger.info(
+            logger.warning(
                 f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
 
@@ -322,17 +327,22 @@ class ServerArgs:
             # NEXTN shares the same implementation of EAGLE
             self.speculative_algorithm = "EAGLE"
 
-        if (
-            self.speculative_algorithm == "EAGLE"
-            or self.speculative_algorithm == "EAGLE3"
-        ):
+        if self.speculative_algorithm in ("EAGLE", "EAGLE3"):
             if self.max_running_requests is None:
                 self.max_running_requests = 48
             self.disable_overlap_schedule = True
-            logger.info(
+            logger.warning(
                 "Overlap scheduler is disabled because of using "
                 "eagle speculative decoding."
             )
+
+            model_arch = get_model_arch(self)
+
+            # Auto set draft_model_path DeepSeek-V3/R1
+            if self.speculative_draft_model_path is None and model_arch in [
+                "DeepseekV3ForCausalLM"
+            ]:
+                self.speculative_draft_model_path = self.model_path
 
             # Auto choose parameters
             if self.speculative_num_steps is None:
@@ -344,11 +354,11 @@ class ServerArgs:
                     self.speculative_num_steps,
                     self.speculative_eagle_topk,
                     self.speculative_num_draft_tokens,
-                ) = auto_choose_speculative_params(self)
+                ) = auto_choose_speculative_params(model_arch)
 
             if self.page_size > 1 and self.speculative_eagle_topk > 1:
                 self.speculative_eagle_topk = 1
-                logger.info(
+                logger.warning(
                     "speculative_eagle_topk is adjusted to 1 when page_size > 1"
                 )
 
@@ -356,7 +366,7 @@ class ServerArgs:
                 self.speculative_eagle_topk == 1
                 and self.speculative_num_draft_tokens != self.speculative_num_steps + 1
             ):
-                logger.info(
+                logger.warning(
                     "speculative_num_draft_tokens is adjusted to speculative_num_steps + 1 when speculative_eagle_topk == 1"
                 )
                 self.speculative_num_draft_tokens = self.speculative_num_steps + 1
@@ -427,7 +437,7 @@ class ServerArgs:
         parser.add_argument(
             "--skip-tokenizer-init",
             action="store_true",
-            help="If set, skip init tokenizer and pass input_ids in generate request",
+            help="If set, skip init tokenizer and pass input_ids in generate request.",
         )
         parser.add_argument(
             "--enable-tokenizer-batch-encode",
@@ -566,6 +576,7 @@ class ServerArgs:
             "name, a tag name, or a commit id. If unspecified, will use "
             "the default version.",
         )
+
         # Memory and scheduling
         parser.add_argument(
             "--mem-fraction-static",
@@ -830,7 +841,14 @@ class ServerArgs:
         parser.add_argument(
             "--attention-backend",
             type=str,
-            choices=["flashinfer", "triton", "torch_native", "fa3", "flashmla"],
+            choices=[
+                "flashinfer",
+                "triton",
+                "torch_native",
+                "fa3",
+                "flashmla",
+                "cutlass_mla",
+            ],
             default=ServerArgs.attention_backend,
             help="Choose the kernels for attention layers.",
         )
@@ -982,16 +1000,10 @@ class ServerArgs:
             help="Disable the custom all-reduce kernel and fall back to NCCL.",
         )
         parser.add_argument(
-            "--enable-llama4-multimodal",
-            default=ServerArgs.enable_llama4_multimodal,
+            "--enable-multimodal",
+            default=ServerArgs.enable_multimodal,
             action="store_true",
-            help="Enable the multimodal functionality for Llama-4.",
-        )
-        parser.add_argument(
-            "--enable-gemma3-multimodal",
-            default=ServerArgs.enable_gemma3_multimodal,
-            action="store_true",
-            help="Enable the multimodal functionality for Gemma-3.",
+            help="Enable the multimodal functionality for the served model. If the model being served is not multimodal, nothing will happen",
         )
         parser.add_argument(
             "--disable-overlap-schedule",
@@ -1095,9 +1107,9 @@ class ServerArgs:
         parser.add_argument(
             "--tool-call-parser",
             type=str,
-            choices=["qwen25", "mistral", "llama3", "deepseekv3"],
+            choices=["qwen25", "mistral", "llama3", "deepseekv3", "pythonic"],
             default=ServerArgs.tool_call_parser,
-            help="Specify the parser for handling tool-call interactions. Options include: 'qwen25', 'mistral', and 'llama3'.",
+            help="Specify the parser for handling tool-call interactions. Options include: 'qwen25', 'mistral', 'llama3', 'deepseekv3', and 'pythonic'.",
         )
         parser.add_argument(
             "--enable-hierarchical-cache",
@@ -1241,7 +1253,6 @@ class ServerArgs:
         assert (
             self.max_loras_per_batch > 0
             # FIXME
-            and (self.lora_paths is None or self.disable_cuda_graph)
             and (self.lora_paths is None or self.disable_radix_cache)
         ), "compatibility of lora and cuda graph and radix attention is in progress"
         assert self.base_gpu_id >= 0, "base_gpu_id must be non-negative"
@@ -1367,23 +1378,22 @@ class DeprecatedAction(argparse.Action):
         raise ValueError(self.help)
 
 
-def auto_choose_speculative_params(self: ServerArgs):
+def get_model_arch(args: ServerArgs):
+    hf_config = get_config(
+        args.model_path,
+        trust_remote_code=args.trust_remote_code,
+        revision=args.revision,
+        model_override_args=json.loads(args.json_model_override_args),
+    )
+    return hf_config.architectures[0]
+
+
+def auto_choose_speculative_params(arch: str):
     """
     Automatically choose the parameters for speculative decoding.
 
     You can tune them on your own models and prompts with scripts/playground/bench_speculative.py
     """
-    if self.decrypted_config_file:
-        config_path = self.decrypted_config_file
-    else:
-        config_path = os.path.join(self.model_path, "config.json")
-    if not os.path.exists(config_path):
-        raise ValueError(f"{config_path} is not found.")
-
-    config = json.load(open(config_path))
-
-    arch = config.get("architectures", ["Unknown"])[0]
-
     if arch in ["LlamaForCausalLM"]:
         # The default value for llama
         return (5, 4, 8)
