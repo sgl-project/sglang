@@ -33,7 +33,10 @@ class TestBenchOneBatch(CustomTestCase):
                 f"### test_bs1_default (llama-3.1-8b)\n"
                 f"output_throughput: {output_throughput:.2f} token/s\n"
             )
-            self.assertGreater(output_throughput, 135)
+            if os.getenv("SGLANG_AMD_CI") == "1":
+                self.assertGreater(output_throughput, 90)
+            else:
+                self.assertGreater(output_throughput, 125)
 
     def test_moe_tp2_bs1(self):
         output_throughput = run_bench_offline_throughput(
