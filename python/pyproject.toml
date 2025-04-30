@@ -42,6 +42,7 @@ runtime_common = [
     "uvicorn",
     "uvloop",
     "xgrammar==0.1.17",
+    "blobfile==3.0.0"
 ]
 
 srt = [
