@@ -44,6 +44,18 @@ LORA_MODELS_WITH_NONE = [
         ],
         max_loras_per_batch=2,
     ),
+    LoRAModelCase(
+        base="meta-llama/Llama-3.1-8B-Instruct",
+        adaptors=[
+            LoRAAdaptor(
+                name=None,
+            ),
+            LoRAAdaptor(
+                name="algoprog/fact-generation-llama-3.1-8b-instruct-lora",
+            ),
+        ],
+        max_loras_per_batch=2,
+    ),
 ]
 
 
@@ -58,7 +70,6 @@ class TestLoRA(CustomTestCase):
                     torch_dtype,
                     max_new_tokens=32,
                     backend="triton",
-                    disable_cuda_graph=False,
                     test_tag="test_lora_batch_with_none",
                 )
 
