@@ -22,7 +22,8 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import apply_rotary_pos_emb
-from sglang.srt.utils import add_prefix
+from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.utils import add_prefix, logger
 
 ROTARY_EMBED_CLASSES = {
     "normal": apply_rotary_pos_emb,
@@ -52,6 +53,7 @@ class VisionSdpaAttention(nn.Module):
         self.flatten_batch = flatten_batch
         self.softmax_in_single_precision = softmax_in_single_precision
         self.dropout = dropout
+        self.scale = 1.0 / math.sqrt(self.head_size)
 
     @staticmethod
     @lru_cache(maxsize=128)
@@ -148,7 +150,7 @@ class VisionSdpaAttention(nn.Module):
 
         if self.softmax_in_single_precision:
             k = rearrange(k, "b h s d -> b h d s")
-            attn_weights = torch.matmul(q, k) / math.sqrt(self.head_size)
+            attn_weights = torch.matmul(q, k) * (self.head_size**-0.5)
             del k
             # masking
             attention_mask = (~attention_mask) * torch.finfo(q.dtype).min
@@ -230,7 +232,7 @@ class VisionFlashAttention(nn.Module):
         self,
         **kwargs,
     ):
-        self.__init__()
+        super().__init__()
 
     def forward(
         self,
@@ -246,15 +248,15 @@ class VisionFlashAttention(nn.Module):
         Returns:
              [b * s, h, head_size]
         """
-
+        cu_seqlens = cu_seqlens.to(dtype=torch.int32).cuda()
         seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
         max_seqlen = seq_lens.max().item()
         output = flash_attn_varlen_func(
             q,
             k,
             v,
-            cu_seqlens_q=cu_seqlens.cuda(),
-            cu_seqlens_k=cu_seqlens.cuda(),
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
             max_seqlen_q=max_seqlen,
             max_seqlen_k=max_seqlen,
         )
@@ -319,7 +321,12 @@ class VisionAttention(nn.Module):
 
         self.q_size = self.num_attention_heads_per_partition * self.head_size
         self.kv_size = self.num_attention_kv_heads_per_partition * self.head_size
-
+        if global_server_args_dict["use_flash_attn"]:
+            qkv_backend = "flash_attn"
+            logger.warning_once(
+                "Using FlashAttention3 for all multimodal attentions, as specified in server args"
+            )
+        print(f"{qkv_backend=}")
         self.qkv_backend = QKV_BACKEND_IMPL[qkv_backend](
             head_dim=self.head_size,
             num_heads=self.num_attention_heads_per_partition,
