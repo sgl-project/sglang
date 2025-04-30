@@ -223,20 +223,23 @@ class ServerArgs:
 
         # Set mem fraction static, which depends on the tensor parallelism size
         if self.mem_fraction_static is None:
-            if gpu_mem <= 81920:
-                if self.tp_size >= 16:
-                    self.mem_fraction_static = 0.79
-                elif self.tp_size >= 8:
-                    self.mem_fraction_static = 0.81
-                elif self.tp_size >= 4:
-                    self.mem_fraction_static = 0.85
-                elif self.tp_size >= 2:
-                    self.mem_fraction_static = 0.87
-                else:
-                    self.mem_fraction_static = 0.88
+            if self.tp_size >= 16:
+                self.mem_fraction_static = 0.79
+            elif self.tp_size >= 8:
+                self.mem_fraction_static = 0.81
+            elif self.tp_size >= 4:
+                self.mem_fraction_static = 0.85
+            elif self.tp_size >= 2:
+                self.mem_fraction_static = 0.87
             else:
-                # FIXME: more fine grained auto-selection polices
-                self.mem_fraction_static = (gpu_mem - 1024 * 13) / gpu_mem
+                self.mem_fraction_static = 0.88
+            if gpu_mem > 96 * 1024:
+                mem_fraction = self.mem_fraction_static
+                self.mem_fraction_static = min(
+                    mem_fraction + 48 * 1024 * (1 - mem_fraction) / gpu_mem,
+                    (gpu_mem - 1024 * 18)
+                    / gpu_mem,  # 15 GB + additional 3GB for cuda graph
+                )
 
         # Set chunked prefill size, which depends on the gpu memory capacity
         if self.chunked_prefill_size is None:
