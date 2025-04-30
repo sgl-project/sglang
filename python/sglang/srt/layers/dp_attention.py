@@ -257,7 +257,4 @@ def tp_reduce_scatter(
 
 
 def tp_all_gather(output_list: List[torch.Tensor], input_: torch.Tensor):
-    logger.debug(
-        f"tp_all_gather: shape of input_ {input_.shape}, len(output_list) {len(output_list)}, shapes of output_list {[i.shape for i in output_list]}"
-    )
     return get_attention_tp_group().all_gather(input_, tensor_list=output_list)
