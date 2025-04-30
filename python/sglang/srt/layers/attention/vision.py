@@ -328,6 +328,7 @@ class VisionFlashAttention(nn.Module):
         k: torch.Tensor,
         v: torch.Tensor,
         cu_seqlens: Optional[torch.Tensor],
+        attention_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         r"""
@@ -406,7 +407,7 @@ class VisionAttention(nn.Module):
 
         if global_server_args_dict["disable_flash_attn_for_mm"]:
             logger.warning_once("FlashAttention3 is not used for multimodal attentions")
-        else:
+        elif qkv_backend is None:
             qkv_backend = "flash_attn"
 
         self.qkv_backend = QKV_BACKEND_IMPL[qkv_backend](
