@@ -6,9 +6,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import PretrainedConfig
+from transformers import PretrainedConfig, PreTrainedModel
 from transformers.activations import ACT2FN
-from transformers.modeling_outputs import BaseModelOutputWithPast
+from transformers.modeling_outputs import BaseModelOutput, BaseModelOutputWithPast
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VisionPatchEmbed,
     Qwen2_5_VisionRotaryEmbedding,
@@ -43,69 +43,46 @@ class Qwen2_5OmniAudioAttention(nn.Module):
 
     def __init__(
         self,
-        embed_dim: int,
-        num_heads: int,
-        dropout: float = 0.0,
-        is_decoder: bool = False,
-        bias: bool = True,
-        is_causal: bool = False,
-        layer_idx: Optional[int] = None,
-        config: Optional[PretrainedConfig] = None,
-        quant_config: Optional[QuantizationConfig] = None,
+        config: PretrainedConfig,
     ):
         super().__init__()
-        self.embed_dim = embed_dim
-        self.num_heads = num_heads
-        self.dropout = dropout
-        self.head_dim = embed_dim // num_heads
+        self.embed_dim = config.d_model
+        self.num_heads = config.encoder_attention_heads
+        self.dropout = config.attention_dropout
+        self.head_dim = self.embed_dim // self.num_heads
         self.config = config
 
-        if (self.head_dim * num_heads) != self.embed_dim:
+        if (self.head_dim * self.num_heads) != self.embed_dim:
             raise ValueError(
                 f"embed_dim must be divisible by num_heads (got `embed_dim`: {self.embed_dim}"
-                f" and `num_heads`: {num_heads})."
+                f" and `num_heads`: {self.num_heads})."
             )
         self.scaling = self.head_dim**-0.5
-        self.is_decoder = is_decoder
-        self.is_causal = is_causal
+        self.is_decoder = False
+        self.is_causal = False
 
-        if layer_idx is None and is_decoder:
-            logger.warning_once(
-                f"Instantiating a decoder {self.__class__.__name__} without passing `layer_idx` is not recommended and "
-                "will to errors during the forward call, if caching is used. Please make sure to provide a `layer_idx` "
-                "when creating this class."
-            )
-        self.layer_idx = layer_idx
-
-        self.k_proj = nn.Linear(embed_dim, embed_dim, bias=False)
-        self.v_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
-        self.q_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
-        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.k_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=False)
+        self.v_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=True)
+        self.q_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=True)
+        self.out_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=True)
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         cu_seqlens: Optional[torch.Tensor] = None,
-        layer_head_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         """Input shape: Batch x Time x Channel"""
 
-        # if key_value_states are provided this layer is used as a cross-attention layer
-        # for the decoder
         seq_length, _ = hidden_states.size()
 
-        # get query proj
-        # query_states = self.q_proj(hidden_states)
-        query_states = (hidden_states @ self.q_proj.weight.t()) + self.q_proj.bias
-
-        query_states = query_states.reshape(seq_length, self.num_heads, -1)
-
-        # use key_value_states if cross attention
-        current_states = hidden_states
-        key_states = self.k_proj(current_states).reshape(seq_length, self.num_heads, -1)
-        value_states = self.v_proj(current_states).reshape(
+        query_states = self.q_proj(hidden_states).reshape(
             seq_length, self.num_heads, -1
         )
+        key_states = self.k_proj(hidden_states).reshape(seq_length, self.num_heads, -1)
+        value_states = self.v_proj(hidden_states).reshape(
+            seq_length, self.num_heads, -1
+        )
+
         query_states = query_states.transpose(0, 1)
         key_states = key_states.transpose(0, 1)
         value_states = value_states.transpose(0, 1)
@@ -132,14 +109,6 @@ class Qwen2_5OmniAudioAttention(nn.Module):
             query_states.dtype
         )
 
-        if layer_head_mask is not None:
-            if layer_head_mask.size() != (self.num_heads,):
-                raise ValueError(
-                    f"Head mask for a single layer should be of size {(self.num_heads,)}, but is"
-                    f" {layer_head_mask.size()}"
-                )
-            attn_weights = layer_head_mask.view(1, -1, 1, 1) * attn_weights
-
         attn_output = (
             torch.matmul(attn_weights, value_states)
             .transpose(0, 1)
@@ -160,24 +129,12 @@ QWEN2_5_OMNI_AUDIO_ATTENTION_CLASSES = {
 
 
 class Qwen2_5OmniAudioEncoderLayer(nn.Module):
-    def __init__(
-        self,
-        config: PretrainedConfig,
-        quant_config: Optional[QuantizationConfig] = None,
-        layer_id: int = 0,
-    ):
+    def __init__(self, config: PretrainedConfig):
         super().__init__()
         self.embed_dim = config.d_model
         self.self_attn = QWEN2_5_OMNI_AUDIO_ATTENTION_CLASSES[
             config._attn_implementation
-        ](
-            embed_dim=self.embed_dim,
-            num_heads=config.encoder_attention_heads,
-            dropout=config.attention_dropout,
-            config=config,
-            quant_config=quant_config,
-        )
-
+        ](config)
         self.self_attn_layer_norm = nn.LayerNorm(self.embed_dim)
         self.dropout = config.dropout
         self.activation_fn = ACT2FN[config.activation_function]
@@ -190,42 +147,32 @@ class Qwen2_5OmniAudioEncoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
-        layer_head_mask: torch.Tensor,
     ) -> torch.Tensor:
         """
         Args:
             hidden_states (`torch.FloatTensor`): input to the layer of shape `(batch, seq_len, embed_dim)`
-            layer_head_mask (`torch.FloatTensor`): mask for attention heads in a given layer of size
-                `(encoder_attention_heads,)`.
         """
         residual = hidden_states
         hidden_states = self.self_attn_layer_norm(hidden_states)
         hidden_states = self.self_attn(
             hidden_states=hidden_states,
             cu_seqlens=cu_seqlens,
-            layer_head_mask=layer_head_mask,
         )
         hidden_states = residual + hidden_states
         residual = hidden_states
         hidden_states = self.final_layer_norm(hidden_states)
-        hidden_states = (hidden_states @ self.fc1.weight.t()) + (
-            self.fc1.bias if self.fc1.bias is not None else 0
-        )
+        hidden_states = self.fc1(hidden_states)
         hidden_states = self.activation_fn(hidden_states)
-        hidden_states = (hidden_states @ self.fc2.weight.t()) + (
-            self.fc2.bias if self.fc2.bias is not None else 0
-        )
+        hidden_states = self.fc2(hidden_states)
         hidden_states = residual + hidden_states
 
-        if hidden_states.dtype == torch.float16 and (
-            torch.isinf(hidden_states).any() or torch.isnan(hidden_states).any()
-        ):
+        if hidden_states.dtype == torch.float16:
             clamp_value = torch.finfo(hidden_states.dtype).max - 1000
             hidden_states = torch.clamp(
                 hidden_states, min=-clamp_value, max=clamp_value
             )
 
-        outputs = hidden_states
+        outputs = (hidden_states,)
 
         return outputs
 
@@ -667,6 +614,171 @@ class Qwen2_5OmniThinkerModel(nn.Module):
         return hidden_states
 
 
+class Qwen2_5OmniAudioEncoder(PreTrainedModel):
+    """
+    Transformer encoder consisting of *config.encoder_layers* self attention layers. Each layer is a
+    [`Qwen2_5OmniAudioEncoderLayer`].
+
+    Args:
+        config: Qwen2_5OmniAudioEncoderConfig
+    """
+
+    main_input_name = "input_features"
+    _no_split_modules = ["Qwen2_5OmniAudioEncoderLayer"]
+    _supports_sdpa = True
+
+    def __init__(self, config: PretrainedConfig):
+        super().__init__(config)
+        self.dropout = config.dropout
+
+        embed_dim = config.d_model
+        self.num_mel_bins = config.num_mel_bins
+        self.max_source_positions = config.max_source_positions
+        self.embed_scale = math.sqrt(embed_dim) if config.scale_embedding else 1.0
+        self.n_window = config.n_window
+        self.conv1 = nn.Conv1d(self.num_mel_bins, embed_dim, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv1d(embed_dim, embed_dim, kernel_size=3, stride=2, padding=1)
+        self.positional_embedding = SinusoidsPositionEmbedding(
+            self.max_source_positions, embed_dim
+        )
+        self.audio_bos_eos_token = nn.Embedding(2, config.output_dim)
+        self.layers = nn.ModuleList(
+            [Qwen2_5OmniAudioEncoderLayer(config) for _ in range(config.encoder_layers)]
+        )
+        self.ln_post = nn.LayerNorm(config.d_model)
+        self.avg_pooler = nn.AvgPool1d(2, stride=2)
+        self.proj = nn.Linear(config.d_model, config.output_dim)
+        self.gradient_checkpointing = False
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    def _freeze_parameters(self):
+        for param in self.parameters():
+            param.requires_grad = False
+        self._requires_grad = False
+
+    def get_input_embeddings(self) -> nn.Module:
+        return self.conv1
+
+    def set_input_embeddings(self, value: nn.Module):
+        self.conv1 = value
+
+    def forward(
+        self,
+        input_features,
+        feature_lens=None,
+        aftercnn_lens=None,
+    ):
+        chunk_num = torch.ceil(feature_lens / (self.n_window * 2)).long()
+
+        chunk_lengths = torch.tensor(
+            [self.n_window * 2] * chunk_num.sum(),
+            dtype=torch.long,
+            device=feature_lens.device,
+        )
+        tail_chunk_index = F.pad(chunk_num, (1, 0), value=-1).cumsum(0)[1:]
+        chunk_lengths[tail_chunk_index] = feature_lens % (self.n_window * 2)
+        chunk_lengths = torch.where(
+            chunk_lengths == 0, self.n_window * 2, chunk_lengths
+        )
+
+        chunk_list = input_features.split(chunk_lengths.tolist(), dim=1)
+        padded_feature, padded_mask, padded_mask_after_cnn = (
+            self.padded_and_mask_function(
+                chunk_list, chunk_lengths, padding_value=0, padding_side="right"
+            )
+        )
+        padded_embed = nn.functional.gelu(self.conv1(padded_feature)) * padded_mask
+        padded_embed = nn.functional.gelu(self.conv2(padded_embed)).transpose(1, 2)
+
+        padded_embed = padded_embed + self.positional_embedding.positional_embedding[
+            : padded_embed.shape[1], :
+        ].unsqueeze(0).to(padded_embed.dtype)
+        hidden_states = padded_embed[padded_mask_after_cnn]
+        cu_seqlens = torch.cat(
+            (
+                torch.zeros(1, device=padded_mask_after_cnn.device, dtype=torch.int32),
+                padded_mask_after_cnn.sum(1).cumsum(0),
+            )
+        ).to(torch.int32)
+
+        for idx, encoder_layer in enumerate(self.layers):
+            if self.gradient_checkpointing and self.training:
+                layer_outputs = self._gradient_checkpointing_func(
+                    encoder_layer.__call__,
+                    hidden_states,
+                    cu_seqlens,
+                )
+            else:
+                layer_outputs = encoder_layer(
+                    hidden_states,
+                    cu_seqlens,
+                )
+
+            hidden_states = layer_outputs[0]
+
+        hidden_states_list = hidden_states.split(aftercnn_lens.tolist(), dim=0)
+        token_audio_list = []
+        for each_audio_states in hidden_states_list:
+            each_audio_states = self.avg_pooler(
+                each_audio_states.transpose(0, 1)
+            ).transpose_(0, 1)
+            each_audio_states = self.ln_post(each_audio_states)
+            each_audio_states = self.proj(each_audio_states)
+            token_audio_list.append(each_audio_states)
+        token_audio = torch.cat(token_audio_list, dim=0)
+        return BaseModelOutput(last_hidden_state=token_audio)
+
+    def padded_and_mask_function(
+        self, tensor_list, tensor_len, padding_value=0, padding_side="right"
+    ):
+        """
+        Pads a sequence of tensors to their maximum length on indicated `padding_side`.
+        Then prepares a mask so that pad tokens are not attended to.
+        """
+        max_len = tensor_len.max()
+        dim = tensor_list[0].shape[0]
+        padded_tensor = torch.full(
+            size=(len(tensor_list), dim, max_len),
+            fill_value=padding_value,
+            dtype=self.dtype,
+            device=tensor_list[0].device,
+        )
+
+        batch_mask = torch.zeros(
+            (len(tensor_len), max_len),
+            dtype=torch.long,
+            device=padded_tensor.device,
+        )
+        for i, length in enumerate(tensor_len):
+            batch_mask[i, :length] = 1
+            padded_tensor[i, :, :length] = tensor_list[i]
+
+        feature_lens_after_cnn = (tensor_len - 1) // 2 + 1
+        max_len_after_cnn = feature_lens_after_cnn.max()
+        batch_mask_after_cnn = torch.zeros(
+            (len(tensor_len), max_len_after_cnn),
+            dtype=torch.long,
+            device=padded_tensor.device,
+        )
+        for i, length in enumerate(feature_lens_after_cnn):
+            batch_mask_after_cnn[i, :length] = 1
+        return (
+            padded_tensor,
+            batch_mask.unsqueeze(1),
+            batch_mask_after_cnn.bool(),
+        )
+
+    # Ignore copy
+    def _get_feat_extract_output_lengths(self, input_lengths: torch.LongTensor):
+        """
+        Computes the output length of the convolutional layers and the output length of the audio encoder
+        """
+        input_lengths = (input_lengths - 1) // 2 + 1
+        output_lengths = (input_lengths - 2) // 2 + 1
+        return input_lengths, output_lengths
+
+
 class Qwen2_5OmniThinkerForConditionalGeneration(nn.Module):
     _no_split_modules = ["Qwen2_5OmniAudioEncoder", "Qwen2_5OmniVisionEncoder"]
 
@@ -680,14 +792,6 @@ class Qwen2_5OmniThinkerForConditionalGeneration(nn.Module):
 
         self.config = config
         self.text_config = config.text_config
-        try:
-            from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import (
-                Qwen2_5OmniAudioEncoder,
-            )
-        except Exception:
-            raise ImportError(
-                "To use Qwen2.5-Omni, please run `pip install git+https://github.com/huggingface/transformers.git@v4.51.3-Qwen2.5-Omni-preview`"
-            )
 
         self.audio_tower = Qwen2_5OmniAudioEncoder(config.audio_config)
 

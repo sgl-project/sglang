@@ -42,6 +42,7 @@ from sglang.srt.configs import (
     KimiVLConfig,
     MultiModalityConfig,
 )
+from sglang.srt.configs.qwen2_5_omni import Qwen2_5OmniConfig
 from sglang.srt.connector import create_remote_connector
 from sglang.srt.utils import is_remote_url
 

@@ -24,7 +24,6 @@ from transformers import (
     AutoModelForCausalLM,
     AutoModelForVision2Seq,
     AutoProcessor,
-    GenerationConfig,
 )
 
 from sglang.srt.entrypoints.engine import Engine
@@ -376,17 +375,13 @@ class HFRunner:
                 model = base_model
 
             outputs = model.generate(
-                input_ids=input_ids,
-                generation_config=GenerationConfig(
-                    do_sample=False,
-                    temperature=None,
-                    top_p=None,
-                    max_new_tokens=max_new_tokens,
-                    return_dict_in_generate=True,
-                    output_scores=(not output_str_only),
-                    # make sure to disable compile
-                    disable_compile=True,
-                ),
+                input_ids,
+                do_sample=False,
+                temperature=None,
+                top_p=None,
+                max_new_tokens=max_new_tokens,
+                return_dict_in_generate=True,
+                output_scores=(not output_str_only),
             )
 
             text = tokenizer.decode(
