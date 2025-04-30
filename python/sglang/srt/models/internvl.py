@@ -18,7 +18,6 @@ import torch
 
 # Adapted from https://raw.githubusercontent.com/vllm-project/vllm/7f62077af5159c625fe3ad1c812e6c1a2b93ba3b/vllm/model_executor/models/internlm2.py
 # Adapted from https://raw.githubusercontent.com/hehesangsj/sglang/refs/heads/internvl/python/sglang/srt/models/internvl.py
-# Adapted from https://raw.githubusercontent.com/Dao-AILab/flash-attention/refs/heads/main/flash_attn/bert_padding.py
 import torch.nn.functional as F
 from einops import rearrange, repeat
 from sgl_kernel.flash_attn import flash_attn_varlen_func
@@ -39,119 +38,6 @@ from sglang.srt.models.deepseek_janus_pro import DropPath
 from sglang.srt.models.internlm2 import InternLM2ForCausalLM
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
 from sglang.utils import logger
-
-
-class IndexFirstAxis(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, input, indices):
-        ctx.save_for_backward(indices)
-        assert input.ndim >= 2
-        ctx.first_axis_dim, other_shape = input.shape[0], input.shape[1:]
-        second_dim = other_shape.numel()
-        # TD [2022-03-04] For some reason torch.gather is a bit faster than indexing.
-        # return input[indices]
-        return torch.gather(
-            rearrange(input, "b ... -> b (...)"),
-            0,
-            repeat(indices, "z -> z d", d=second_dim),
-        ).reshape(-1, *other_shape)
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        (indices,) = ctx.saved_tensors
-        assert grad_output.ndim >= 2
-        other_shape = grad_output.shape[1:]
-        grad_output = rearrange(grad_output, "b ... -> b (...)")
-        grad_input = torch.zeros(
-            [ctx.first_axis_dim, grad_output.shape[1]],
-            device=grad_output.device,
-            dtype=grad_output.dtype,
-        )
-        # TD [2022-03-04] For some reason torch.scatter is a bit faster than indexing.
-        # grad_input[indices] = grad_output
-        grad_input.scatter_(
-            0, repeat(indices, "z -> z d", d=grad_output.shape[1]), grad_output
-        )
-        return grad_input.reshape(ctx.first_axis_dim, *other_shape), None
-
-
-class IndexPutFirstAxis(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, values, indices, first_axis_dim):
-        ctx.save_for_backward(indices)
-        assert indices.ndim == 1
-        assert values.ndim >= 2
-        output = torch.zeros(
-            first_axis_dim, *values.shape[1:], device=values.device, dtype=values.dtype
-        )
-        # TD [2022-03-04] For some reason torch.scatter is a bit faster than indexing.
-        output[indices] = values
-        # output.scatter_(0, repeat(indices, 'z -> z d', d=values.shape[1]), values)
-        return output
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        (indices,) = ctx.saved_tensors
-        # TD [2022-03-04] For some reason torch.gather is a bit faster than indexing.
-        grad_values = grad_output[indices]
-        # grad_values = torch.gather(grad_output, 0, repeat(indices, 'z -> z d', d=grad_output.shape[1]))
-        return grad_values, None, None
-
-
-index_first_axis = IndexFirstAxis.apply
-index_put_first_axis = IndexPutFirstAxis.apply
-
-
-def unpad_input(hidden_states, attention_mask, unused_mask=None):
-    """
-    Arguments:
-        hidden_states: (batch, seqlen, ...)
-        attention_mask: (batch, seqlen), bool / int, 1 means valid and 0 means not valid.
-        unused_mask: (batch, seqlen), bool / int, 1 means the element is allocated but unused.
-    Return:
-        hidden_states: (total_nnz, ...), where total_nnz = number of tokens selected in attention_mask + unused_mask.
-        indices: (total_nnz), the indices of masked tokens from the flattened input sequence.
-        cu_seqlens: (batch + 1), the cumulative sequence lengths, used to index into hidden_states.
-        max_seqlen_in_batch: int
-        seqused: (batch), returns the number of tokens selected in attention_mask + unused_mask.
-    """
-    all_masks = (
-        (attention_mask + unused_mask) if unused_mask is not None else attention_mask
-    )
-    seqlens_in_batch = all_masks.sum(dim=-1, dtype=torch.int32)
-    used_seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
-    indices = torch.nonzero(all_masks.flatten(), as_tuple=False).flatten()
-    max_seqlen_in_batch = seqlens_in_batch.max().item()
-    cu_seqlens = F.pad(torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0))
-    # TD [2022-03-04] We don't want to index with a bool mask, because Pytorch will expand the
-    # bool mask, then call nonzero to get the indices, then index with those. The indices is @dim
-    # times larger than it needs to be, wasting memory. It's faster and more memory-efficient to
-    # index with integer indices. Moreover, torch's index is a bit slower than it needs to be,
-    # so we write custom forward and backward to make it a bit faster.
-    return (
-        index_first_axis(rearrange(hidden_states, "b s ... -> (b s) ..."), indices),
-        indices,
-        cu_seqlens,
-        max_seqlen_in_batch,
-        used_seqlens_in_batch,
-    )
-
-
-def pad_input(hidden_states, indices, batch, seqlen):
-    """
-    Arguments:
-        hidden_states: (total_nnz, ...), where total_nnz = number of tokens in selected in attention_mask.
-        indices: (total_nnz), the indices that represent the non-masked tokens of the original padded input sequence.
-        batch: int, batch size for the padded sequence.
-        seqlen: int, maximum sequence length for the padded sequence.
-    Return:
-        hidden_states: (batch, seqlen, ...)
-    """
-    dim = hidden_states.shape[-1]
-    # output = torch.zeros((batch * seqlen), dim, device=hidden_states.device, dtype=hidden_states.dtype)
-    # output[indices] = hidden_states
-    output = index_put_first_axis(hidden_states, indices, batch * seqlen)
-    return rearrange(output, "(b s) ... -> b s ...", b=batch)
 
 
 class FlashAttention(nn.Module):
@@ -175,125 +61,49 @@ class FlashAttention(nn.Module):
     def forward(
         self,
         qkv,
-        key_padding_mask=None,
         causal=False,
-        cu_seqlens=None,
         max_s=None,
-        need_weights=False,
     ):
         """Implements the multihead softmax attention.
         Arguments
         ---------
             qkv: The tensor containing the query, key, and value. (B, S, 3, H, D) if key_padding_mask is None
                 if unpadded: (nnz, 3, h, d)
-            key_padding_mask: a bool tensor of shape (B, S)
         """
-        assert not need_weights
         assert qkv.dtype in [torch.float16, torch.bfloat16]
         assert qkv.is_cuda
 
-        if not cu_seqlens:
-            batch_size, seqlen, _, nheads, d = qkv.shape
-
-            if key_padding_mask is None:
-                if batch_size == 0 or seqlen == 0:
-                    output_shape = (batch_size, seqlen, nheads, d)
-                    return (
-                        torch.zeros(output_shape, dtype=qkv.dtype, device=qkv.device),
-                        None,
-                    )
-
-                qkv_reshaped = rearrange(
-                    qkv, "b s three h d -> (b s) three h d", three=3
-                )
-                q, k, v = qkv_reshaped.unbind(1)
-
-                max_s = seqlen
-                cu_seqlens = torch.arange(
-                    0,
-                    (batch_size + 1) * seqlen,
-                    step=seqlen,
-                    dtype=torch.int32,
-                    device=qkv.device,
-                )
-                output_reshaped = flash_attn_varlen_func(
-                    q,
-                    k,
-                    v,
-                    cu_seqlens,
-                    cu_seqlens,
-                    max_s,
-                    max_s,
-                    softmax_scale=self.softmax_scale,
-                    causal=causal,
-                )
-                output = rearrange(
-                    output_reshaped, "(b s) h d -> b s h d", b=batch_size
-                )
-            else:
-                if batch_size == 0 or seqlen == 0:
-                    output_shape = (batch_size, seqlen, nheads, d)
-                    return (
-                        torch.zeros(output_shape, dtype=qkv.dtype, device=qkv.device),
-                        None,
-                    )
-
-                x = rearrange(qkv, "b s three h d -> b s (three h d)", three=3)
-                x_unpad, indices, cu_seqlens, max_s, _ = unpad_input(
-                    x, key_padding_mask
-                )
-                if x_unpad.shape[0] == 0:
-                    output_shape = (batch_size, seqlen, nheads, d)
-                    output = torch.zeros(
-                        output_shape, dtype=qkv.dtype, device=qkv.device
-                    )
-                    return output, None
-                qkv_unpad = rearrange(
-                    x_unpad, "nnz (three h d) -> nnz three h d", three=3, h=nheads, d=d
-                )
-                q_unpad, k_unpad, v_unpad = qkv_unpad.unbind(1)
-                output_unpad = flash_attn_varlen_func(
-                    q_unpad,
-                    k_unpad,
-                    v_unpad,
-                    cu_seqlens,
-                    cu_seqlens,
-                    max_s,
-                    max_s,
-                    softmax_scale=self.softmax_scale,
-                    causal=causal,
-                )
-                output = pad_input(output_unpad, indices, batch_size, seqlen)
-        else:
-            assert (
-                max_s is not None
-            ), "**max_s must be provided when cu_seqlens is specified.**"
-            assert (
-                qkv.dim() == 4
-            ), "**When cu_seqlens is provided, qkv must have shape (nnz, 3, H, D).**"
-            assert (
-                key_padding_mask is None
-            ), "**key_padding_mask should not be provided when cu_seqlens is specified.**"
-
-            nnz, _, nheads, d = qkv.shape
-            if nnz == 0:
-                output = torch.empty((0, nheads, d), dtype=qkv.dtype, device=qkv.device)
-                return output, None
-
-            q, k, v = qkv.unbind(1)
-
-            output = flash_attn_varlen_func(
-                q,
-                k,
-                v,
-                cu_seqlens,
-                cu_seqlens,
-                max_s,
-                max_s,
-                softmax_scale=self.softmax_scale,
-                causal=causal,
+        batch_size, seqlen, _, nheads, d = qkv.shape
+        if batch_size == 0 or seqlen == 0:
+            output_shape = (batch_size, seqlen, nheads, d)
+            return (
+                torch.zeros(output_shape, dtype=qkv.dtype, device=qkv.device),
+                None,
             )
 
+        qkv_reshaped = rearrange(qkv, "b s three h d -> (b s) three h d", three=3)
+        q, k, v = qkv_reshaped.unbind(1)
+
+        max_s = seqlen
+        cu_seqlens = torch.arange(
+            0,
+            (batch_size + 1) * seqlen,
+            step=seqlen,
+            dtype=torch.int32,
+            device=qkv.device,
+        )
+        output_reshaped = flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens,
+            cu_seqlens,
+            max_s,
+            max_s,
+            softmax_scale=self.softmax_scale,
+            causal=causal,
+        )
+        output = rearrange(output_reshaped, "(b s) h d -> b s h d", b=batch_size)
         return output, None
 
 
@@ -319,7 +129,10 @@ class InternAttention(nn.Module):
 
         self.proj = nn.Linear(self.embed_dim, self.embed_dim)
 
-    def _flash_attn(self, x, key_padding_mask=None, need_weights=False):
+    def _flash_attn(
+        self,
+        x,
+    ):
         qkv = self.qkv(x)
         qkv = rearrange(
             qkv, "b s (three h d) -> b s three h d", three=3, h=self.num_heads
@@ -333,9 +146,6 @@ class InternAttention(nn.Module):
 
         context, _ = self.inner_attn(
             qkv,
-            key_padding_mask=key_padding_mask,
-            need_weights=need_weights,
-            causal=False,
         )
         outs = self.proj(rearrange(context, "b s h d -> b s (h d)"))
         outs = self.proj_drop(outs)
@@ -459,18 +269,6 @@ class InternVisionEncoderLayer(nn.Module):
         self.embed_dim = config.hidden_size
         self.intermediate_size = config.intermediate_size
         self.norm_type = config.norm_type
-
-        # self.attn = VisionAttention(
-        #     embed_dim=self.embed_dim,
-        #     num_heads=config.num_attention_heads,
-        #     projection_size=self.embed_dim,
-        #     use_qkv_parallel=True,
-        #     quant_config=quant_config,
-        #     use_context_forward=False,
-        #     dropout=config.attention_dropout,
-        #     softmax_in_single_precision=False,
-        # )
-
         self.attn = InternAttention(config)
         self.mlp = InternMLP(config)
         self.norm1 = NORM2FN[self.norm_type](self.embed_dim, eps=config.layer_norm_eps)
@@ -536,7 +334,6 @@ class InternVisionEncoder(nn.Module):
                 for idx in range(config.num_hidden_layers)
             ]
         )
-        self.gradient_checkpointing = True
 
     def forward(
         self,
@@ -778,8 +575,6 @@ class InternVLChatModel(nn.Module):
         Returns:
             image_features (`torch.Tensor`): Image feature tensor of shape `(num_images, image_length, embed_dim)`).
         """
-
-        print(f"{items=}")
         pixel_values = torch.cat([item.pixel_values for item in items])
         image_features = self.extract_feature(pixel_values)
         return image_features
