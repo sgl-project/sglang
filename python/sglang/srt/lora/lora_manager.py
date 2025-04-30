@@ -185,13 +185,14 @@ class LoRAManager:
                 self.cuda_graph_batch_info.weight_indices[i] = (
                     self.memory_pool.get_buffer_id(lora_path)
                 )
-                lora = self.loras[lora_path]
-                self.cuda_graph_batch_info.lora_ranks[
-                    self.cuda_graph_batch_info.weight_indices[i]
-                ] = lora.config.hf_config["r"]
-                self.cuda_graph_batch_info.scalings[
-                    self.cuda_graph_batch_info.weight_indices[i]
-                ] = lora.scaling
+                if lora_path is not None:
+                    lora = self.loras[lora_path]
+                    self.cuda_graph_batch_info.lora_ranks[
+                        self.cuda_graph_batch_info.weight_indices[i]
+                    ] = lora.config.hf_config["r"]
+                    self.cuda_graph_batch_info.scalings[
+                        self.cuda_graph_batch_info.weight_indices[i]
+                    ] = lora.scaling
             batch_info = self.cuda_graph_batch_info
         else:
             seg_lens = (
@@ -212,9 +213,10 @@ class LoRAManager:
             )
             for i, lora_path in enumerate(forward_batch.lora_paths):
                 weight_indices[i] = self.memory_pool.get_buffer_id(lora_path)
-                lora = self.loras[lora_path]
-                lora_ranks[weight_indices[i]] = lora.config.hf_config["r"]
-                scalings[weight_indices[i]] = lora.scaling
+                if lora_path is not None:
+                    lora = self.loras[lora_path]
+                    lora_ranks[weight_indices[i]] = lora.config.hf_config["r"]
+                    scalings[weight_indices[i]] = lora.scaling
             batch_info = LoRABatchInfo(
                 bs=bs,
                 seg_lens=seg_lens,
