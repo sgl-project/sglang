@@ -8,6 +8,8 @@
 #include <cuda_bf16.h>
 #endif
 
+#include "nv_math_def.h"
+
 template <int lut>
 __device__ inline int lop3(int a, int b, int c) {
   int res;
@@ -158,25 +160,56 @@ __global__ void __launch_bounds__(256) dequantize_weights(
     OutputT* output_ptr = output + 8 * col + 8 * row * qweight_cols;
     *(uint4*)output_ptr = weight_fp16;
   } else if constexpr (std::is_same<OutputT, __nv_bfloat16>::value) {
-    uint4 weight_raw = dequantize_s4_to_bf16x2(qweight[col + row * qweight_cols]);
-    uint4 zero_raw = dequantize_s4_to_bf16x2(qzeros[col + group_idx * qweight_cols]);
-    uint4 scale_raw = *reinterpret_cast<uint4*>(scales + scale_offset);
+    uint4 zero = dequantize_s4_to_bf16x2(qzeros[col + group_idx * qweight_cols]);
+    uint4 weight_bf16 = dequantize_s4_to_bf16x2(qweight[col + row * qweight_cols]);
+    uint4 scale = *reinterpret_cast<uint4*>(scales + scale_offset);
 
-    // Vectorized processing (each uint4 contains 4 nv_bfloat162)
-    nv_bfloat162* weight_vec = reinterpret_cast<nv_bfloat162*>(&weight_raw);
-    nv_bfloat162* zero_vec = reinterpret_cast<nv_bfloat162*>(&zero_raw);
-    nv_bfloat162* scale_vec = reinterpret_cast<nv_bfloat162*>(&scale_raw);
+#if defined(__CUDA_ARCH__)
 
-// Single instruction dual-channel operation
+#if __CUDA_ARCH__ >= 900
+
+    nvgpu::__hsub2_inplace<nv_bfloat162>(&(weight_bf16.x), zero.x);
+    nvgpu::__hmul2_inplace<nv_bfloat162>(&(weight_bf16.x), scale.x);
+    nvgpu::__hsub2_inplace<nv_bfloat162>(&(weight_bf16.y), zero.y);
+    nvgpu::__hmul2_inplace<nv_bfloat162>(&(weight_bf16.y), scale.y);
+    nvgpu::__hsub2_inplace<nv_bfloat162>(&(weight_bf16.z), zero.z);
+    nvgpu::__hmul2_inplace<nv_bfloat162>(&(weight_bf16.z), scale.z);
+    nvgpu::__hsub2_inplace<nv_bfloat162>(&(weight_bf16.w), zero.w);
+    nvgpu::__hmul2_inplace<nv_bfloat162>(&(weight_bf16.w), scale.w);
+
+#else
+
+    nv_bfloat162* zero_vec = reinterpret_cast<nv_bfloat162*>(&zero);
+    nv_bfloat162* weight_vec = reinterpret_cast<nv_bfloat162*>(&weight_bf16);
+    nv_bfloat162* scale_vec = reinterpret_cast<nv_bfloat162*>(&scale);
+
+#if __CUDA_ARCH__ >= 800  // sm_80 does not defines __hmul2 for bfloat16 in cu121
+
 #pragma unroll
     for (int i = 0; i < 4; ++i) {  // uint4 = 4 * nv_bfloat162
       weight_vec[i] = __hmul2(__hsub2(weight_vec[i], zero_vec[i]), scale_vec[i]);
     }
 
+#elif __CUDA_ARCH__ >= 750  // sm_75 does not defines __hsub2 or __hmul2 for bfloat16 in cu121
+
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {  // uint4 = 4 * nv_bfloat162
+      weight_vec[i] = __half22bfloat162(__hmul2(
+          __hsub2(__bfloat1622half2(weight_vec[i]), __bfloat1622half2(zero_vec[i])), __bfloat1622half2(scale_vec[i])));
+    }
+
+#else
+#error "Computability ability < SM_75 is not supported."
+#endif  // __CUDA_ARCH__ >= 800
+
+#endif  // __CUDA_ARCH__ >= 900
+
+#endif  // defined(__CUDA_ARCH__)
+
     // Directly store to OutputT array (guaranteed contiguous memory)
     OutputT* output_ptr = output + 8 * col + row * qweight_cols * 8;
     static_assert(sizeof(uint4) == 8 * sizeof(OutputT), "Memory layout mismatch");
-    *reinterpret_cast<uint4*>(output_ptr) = weight_raw;
+    *reinterpret_cast<uint4*>(output_ptr) = weight_bf16;
   }
 #endif
 }
