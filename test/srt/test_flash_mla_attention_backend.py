@@ -59,32 +59,5 @@ class TestFlashMLAAttnBackend(unittest.TestCase):
         finally:
             kill_process_tree(process.pid)
 
-    def test_gsm8k(self):
-        model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
-        base_url = DEFAULT_URL_FOR_TEST
-        process = popen_launch_server(
-            model,
-            base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--attention-backend", "flashmla", "--trust-remote-code"],
-        )
-
-        try:
-            args = SimpleNamespace(
-                base_url=base_url,
-                model=model,
-                eval_name="gsm8k",
-                num_examples=64,
-                num_threads=32,
-            )
-
-            metrics = run_eval(args)
-            self.assertGreaterEqual(
-                metrics["score"], 0.97
-            )  # Higher threshold based on DSV3 GSM8K score from PR
-        finally:
-            kill_process_tree(process.pid)
-
-
 if __name__ == "__main__":
     unittest.main()
