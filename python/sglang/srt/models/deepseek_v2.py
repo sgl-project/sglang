@@ -753,7 +753,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         q_nope_out = q_nope_out.transpose(0, 1)
 
         k_nope = latent_cache[..., : self.kv_lora_rank]
-        k_nope = self.kv_a_layernorm(k_nope).unsqueeze(1)
+        k_nope = self.kv_a_layernorm(k_nope.contiguous()).unsqueeze(1)
         k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
 
         q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
@@ -1391,6 +1391,9 @@ class DeepseekV2Model(nn.Module):
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         self.dp_size = get_attention_dp_size()
+
+    def get_input_embeddings(self) -> torch.Tensor:
+        return self.embed_tokens
 
     def forward(
         self,
