@@ -820,6 +820,11 @@ class AbortReq:
 
 
 @dataclass
+class StopAllReq:
+    pass
+
+
+@dataclass
 class GetInternalStateReq:
     pass
 
