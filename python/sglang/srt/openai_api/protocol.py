@@ -389,6 +389,7 @@ class ToolCall(BaseModel):
     """Tool call response."""
 
     id: str
+    index: Optional[int] = None
     type: Literal["function"] = "function"
     function: FunctionResponse
 
