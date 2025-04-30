@@ -914,6 +914,9 @@ class TokenizerManager:
             obj.load_format = self.server_args.load_format
         logger.info("Start update_weights. Load format=%s", obj.load_format)
 
+        if obj.abort_all_requests:
+            self.abort_request(abort_all=True)
+
         if True:  # Keep this redundant check to simplify some internal code sync
             # Hold the lock if it is not async. This means that weight sync
             # cannot run while requests are in progress.
@@ -969,6 +972,9 @@ class TokenizerManager:
             self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
         ), "dp_size must be 1 or dp attention must be enabled for update weights from distributed"
 
+        if obj.abort_all_requests:
+            self.abort_request(abort_all=True)
+
         # This means that weight sync
         # cannot run while requests are in progress.
         async with self.model_update_lock.writer_lock:
@@ -984,6 +990,9 @@ class TokenizerManager:
         assert (
             self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
         ), "dp_size must be 1 or dp attention must be enabled for update weights from tensor"
+
+        if obj.abort_all_requests:
+            self.abort_request(abort_all=True)
 
         # This means that weight sync
         # cannot run while requests are in progress.
