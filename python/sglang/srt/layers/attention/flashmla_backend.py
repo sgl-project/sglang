@@ -30,7 +30,7 @@ if TYPE_CHECKING:
 
 # FlashMLA only supports pagesize=64
 PAGE_SIZE = 64
-# S_q = 1 if MTP is disabled
+# S_q = 1 if MTP is disabled, but we currently use topk=1
 Q_LEN = 1
 
 
@@ -64,7 +64,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             model_runner, skip_prefill, kv_indptr_buf, kv_last_page_len_buf
         )
 
-        assert top_k == 1 # todo: no custom mask??
+        assert top_k == 1 # todo: no custom mask so topk must be 1??
         self.top_k = top_k
 
         self.num_q_heads = (
@@ -88,140 +88,66 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         # self.decode_cuda_graph_metadata = {}
         # self.prefill_cuda_graph_metadata = {}  # For verify
 
-    def init_forward_metadata(self, forward_batch: ForwardBatch):
-
+    def update_indices_decode(self, forward_batch: ForwardBatch):
         bs = forward_batch.batch_size
         spec_info = forward_batch.spec_info
-        if forward_batch.forward_mode.is_decode_or_idle():
-            if spec_info is None:
-                max_seqlen_pad = triton.cdiv(
+        assert spec_info is None
+
+        max_seqlen_pad = triton.cdiv(
                     forward_batch.seq_lens_cpu.max().item(), PAGE_SIZE
-                )
-                block_kv_indices = torch.full(
-                    (bs, max_seqlen_pad),
-                    -1,
-                    dtype=torch.int32,
-                    device=forward_batch.seq_lens.device,
-                )
-                create_flashmla_kv_indices_triton[(bs,)](
-                    self.req_to_token,
-                    forward_batch.req_pool_indices,
-                    forward_batch.seq_lens,
-                    None,
-                    block_kv_indices,
-                    self.req_to_token.stride(0),
-                    max_seqlen_pad,
-                )
-                mla_metadata, num_splits = get_mla_metadata(
-                    forward_batch.seq_lens.to(torch.int32),
-                    self.top_k * self.num_q_heads,
-                    1,
-                )
-                self.forward_metadata = FlashMLADecodeMetadata(
-                    mla_metadata,
-                    num_splits,
-                    block_kv_indices,
-                )
-            else:
-                # todo:??
-                # super().init_forward_metadata(forward_batch)
-                assert spec_info is not None
-                assert isinstance(spec_info, EagleDraftInput)
+        )
+        block_kv_indices = torch.full(
+            (bs, max_seqlen_pad),
+            -1,
+            dtype=torch.int32,
+            device=forward_batch.seq_lens.device,
+        )
+        create_flashmla_kv_indices_triton[(bs,)](
+            self.req_to_token,
+            forward_batch.req_pool_indices,
+            forward_batch.seq_lens,
+            None,
+            block_kv_indices,
+            self.req_to_token.stride(0),
+            max_seqlen_pad,
+        )
+        mla_metadata, num_splits = get_mla_metadata(
+            forward_batch.seq_lens.to(torch.int32),
+            self.top_k * self.num_q_heads,
+            1,
+        )
+        self.forward_metadata = FlashMLADecodeMetadata(
+            mla_metadata,
+            num_splits,
+            block_kv_indices,
+        )
+    
+    def update_indices_prefill(self, forward_batch: ForwardBatch):
+        bs = forward_batch.batch_size
+        spec_info = forward_batch.spec_info
 
-                # padded seq_lens in page
-                max_seqlen_pad = triton.cdiv(
-                    forward_batch.seq_lens_cpu.max().item(), PAGE_SIZE
-                )
-                block_kv_indices = torch.full(
-                    (forward_batch.batch_size, max_seqlen_pad),
-                    -1,
-                    dtype=torch.int32,
-                    device=forward_batch.seq_lens.device,
-                )
-
-                # eagle spec info
-                block_kv_indices, _, qo_indptr, custom_mask = (
-                    spec_info.generate_attn_arg_prefill(
-                        req_pool_indices=forward_batch.req_pool_indices,
-                        paged_kernel_lens=forward_batch.seq_lens,
-                        paged_kernel_lens_sum=forward_batch.seq_lens_sum,
-                        req_to_token=self.req_to_token,
-                        use_flashmla=True,
-                    )
-                )
-                
-                mla_metadata, num_splits = get_mla_metadata(
-                    forward_batch.seq_lens.to(torch.int32),
-                    self.topk * self.attn_backends[i].num_q_heads,
-                    1,
-                )
-                self.forward_metadata = FlashMLADecodeMetadata(
-                    mla_metadata,
-                    num_splits,
-                    block_kv_indices,
-                )
-        elif forward_batch.forward_mode.is_draft_extend():
-            assert spec_info is not None
-            assert isinstance(spec_info, EagleDraftInput)
-
-            # padded seq_lens in page
+        if spec_info is None:
             max_seqlen_pad = triton.cdiv(
                 forward_batch.seq_lens_cpu.max().item(), PAGE_SIZE
             )
             block_kv_indices = torch.full(
-                (forward_batch.batch_size, max_seqlen_pad),
+                (bs, max_seqlen_pad),
                 -1,
                 dtype=torch.int32,
                 device=forward_batch.seq_lens.device,
             )
-
-            # eagle spec info
-            block_kv_indices, _, qo_indptr, custom_mask = (
-                spec_info.generate_attn_arg_prefill(
-                    req_pool_indices=forward_batch.req_pool_indices,
-                    paged_kernel_lens=forward_batch.seq_lens,
-                    paged_kernel_lens_sum=forward_batch.seq_lens_sum,
-                    req_to_token=self.req_to_token,
-                    use_flashmla=True,
-                )
-            )
-            
-            mla_metadata, num_splits = get_mla_metadata(
-                forward_batch.seq_lens.to(torch.int32),
-                self.topk * self.attn_backends[i].num_q_heads,
-                1,
-            )
-            self.forward_metadata = FlashMLADecodeMetadata(
-                mla_metadata,
-                num_splits,
+            create_flashmla_kv_indices_triton[(bs,)](
+                self.req_to_token,
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                None,
                 block_kv_indices,
+                self.req_to_token.stride(0),
+                max_seqlen_pad,
             )
-        elif forward_batch.forward_mode.is_target_verify():
-            # padded seq_lens in page
-            max_seqlen_pad = triton.cdiv(
-                forward_batch.seq_lens_cpu.max().item(), PAGE_SIZE
-            )
-            block_kv_indices = torch.full(
-                (forward_batch.batch_size, max_seqlen_pad),
-                -1,
-                dtype=torch.int32,
-                device=forward_batch.seq_lens.device,
-            )
-
-            # eagle spec info
-            block_kv_indices, _, qo_indptr, custom_mask = (
-                spec_info.generate_attn_arg_prefill(
-                    req_pool_indices=forward_batch.req_pool_indices,
-                    paged_kernel_lens=forward_batch.seq_lens,
-                    paged_kernel_lens_sum=forward_batch.seq_lens_sum,
-                    req_to_token=self.req_to_token,
-                    use_flashmla=True,
-                )
-            )
-            
             mla_metadata, num_splits = get_mla_metadata(
                 forward_batch.seq_lens.to(torch.int32),
-                self.topk * self.attn_backends[i].num_q_heads,
+                self.top_k * self.num_q_heads,
                 1,
             )
             self.forward_metadata = FlashMLADecodeMetadata(
@@ -230,8 +156,45 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 block_kv_indices,
             )
         else:
+            # super().init_forward_metadata(forward_batch)
+            # todo: replaced by eagle spec info
+            assert isinstance(spec_info, EagleDraftInput)
+            block_kv_indices, _, qo_indptr, custom_mask = (
+                spec_info.generate_attn_arg_prefill(
+                    req_pool_indices=forward_batch.req_pool_indices,
+                    paged_kernel_lens=forward_batch.seq_lens,
+                    paged_kernel_lens_sum=forward_batch.seq_lens_sum,
+                    req_to_token=self.req_to_token,
+                    use_flashmla=True,
+                )
+            )
+            
+            mla_metadata, num_splits = get_mla_metadata(
+                forward_batch.seq_lens.to(torch.int32),
+                self.topk * self.attn_backends[i].num_q_heads,
+                1,
+            )
+            self.forward_metadata = FlashMLADecodeMetadata(
+                mla_metadata,
+                num_splits,
+                block_kv_indices,
+            )
+
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
+
+        bs = forward_batch.batch_size
+        spec_info = forward_batch.spec_info
+        if forward_batch.forward_mode.is_decode_or_idle():
+            # todo: spec_info should be None here or not?
+            self.update_indices_decode(forward_batch)
+        elif forward_batch.forward_mode.is_draft_extend():
+            self.update_indices_prefill(forward_batch)
+        elif forward_batch.forward_mode.is_target_verify():
+            self.update_indices_prefill(forward_batch)
+        else:
             # todo: ??
-            super().init_forward_metadata(forward_batch)
+            # super().init_forward_metadata(forward_batch)
+            self.update_indices_prefill(forward_batch)
 
     def init_cuda_graph_state(
         self,
