@@ -396,7 +396,7 @@ class ChatCompletionRequest(BaseModel):
     bootstrap_port: Optional[int] = None
     bootstrap_room: Optional[int] = None
 
-
+      
 class ChatMessage(BaseModel):
     role: Optional[str] = None
     content: Optional[str] = None
