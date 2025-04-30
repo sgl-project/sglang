@@ -42,7 +42,6 @@ from typing import Iterable, List, Optional, Set, Tuple
 import torch
 from torch import nn
 
-from sglang.srt.layers.rotary_embedding import RotaryEmbedding
 from sglang.srt.configs.arctic import ArcticConfig
 from sglang.srt.distributed import (
     get_pp_group,
@@ -63,7 +62,7 @@ from sglang.srt.layers.moe.fused_moe_native import fused_moe_forward_native
 from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.rotary_embedding import RotaryEmbedding, get_rope
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
