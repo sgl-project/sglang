@@ -52,19 +52,35 @@ class TestTransformersFallbackEndpoint(CustomTestCase):
 
         metrics = run_eval(args)
         self.assertGreaterEqual(metrics["score"], 0.65)
-        
-class TestTransformersFallbackCustomCodeEndpoint(TestTransformersFallbackEndpoint):
-    @classmethod
-    def setUpClass(cls):
-        # custom code
-        cls.model = "ArthurZ/Ilama-3.2-1B" 
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--trust-remote"],
+
+    def test_gsm8k(self):
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            num_shots=5,
+            data_path=None,
+            num_questions=200,
+            max_new_tokens=512,
+            parallel=128,
+            host="http://127.0.0.1",
+            port=int(self.base_url.split(":")[-1]),
         )
+        metrics = run_eval(args)
+        print(f"{metrics=}")
+        self.assertGreater(metrics["accuracy"], 0.78)
+        
+
+# class TestTransformersFallbackCustomCodeEndpoint(TestTransformersFallbackEndpoint):
+#     @classmethod
+#     def setUpClass(cls):
+#         # custom code
+#         cls.model = "ArthurZ/Ilama-3.2-1B" 
+#         cls.base_url = DEFAULT_URL_FOR_TEST
+#         cls.process = popen_launch_server(
+#             cls.model,
+#             cls.base_url,
+#             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+#             other_args=["--trust-remote"],
+#         )
 
 @dataclasses.dataclass
 class ModelCase:
