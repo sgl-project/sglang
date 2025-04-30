@@ -17,7 +17,7 @@ import numpy.typing as npt
 import requests
 import zmq
 from aiohttp import web
-
+import random
 from sglang.srt.disaggregation.base.conn import (
     BaseKVBootstrapServer,
     BaseKVManager,
@@ -528,19 +528,19 @@ class MooncakeKVReceiver(BaseKVReceiver):
                 self.bootstrap_addr
             ]
 
-        self.target_dp_group, self.target_engine_ranks = self._get_target_prefill_mapping(bootstrap_room)
+        self.target_dp_group, self.target_engine_ranks, real_target_engine_rank = self._get_target_prefill_mapping(bootstrap_room)
         bootstrap_key = f"{self.bootstrap_addr}_{self.kv_mgr.kv_args.engine_rank}"
 
         if bootstrap_key not in self.kv_mgr.connection_pool:
             bootstrap_infos = []
-            for target_idx, target_engine_rank in enumerate(self.target_engine_ranks):
+            for target_engine_rank in self.target_engine_ranks:
                 bootstrap_info = self._get_bootstrap_info_from_server(
                     target_engine_rank,
                     self.target_dp_group,
                 )
                 if bootstrap_info is not None:
                     # default select first prefill target rank as real rank
-                    bootstrap_info["is_dummy"] = not bool(target_idx == 0)
+                    bootstrap_info["is_dummy"] = not bool(target_engine_rank == real_target_engine_rank)
                     bootstrap_infos.append(bootstrap_info)
                 else:
                     logger.error(
@@ -565,14 +565,17 @@ class MooncakeKVReceiver(BaseKVReceiver):
     def _get_target_prefill_mapping(self, bootstrap_room: int) -> int:
         if not self.kv_mgr.enable_dp_attention or self.tp_size_per_dp_rank == self.prefill_tp_size_per_dp_rank:
             # NOTE: key distinguished by bootstrap_addr and engine_rank
-            return bootstrap_room % self.prefill_dp_size, [self.kv_mgr.kv_args.engine_rank]
+            return bootstrap_room % self.prefill_dp_size, [self.kv_mgr.kv_args.engine_rank], self.kv_mgr.kv_args.engine_rank
 
         if self.tp_size_per_dp_rank < self.prefill_tp_size_per_dp_rank:
             assert self.prefill_tp_size_per_dp_rank % self.tp_size_per_dp_rank == 0
             assert self.prefill_dp_size == 1
             prefill_world_size = self.prefill_tp_size_per_dp_rank * self.prefill_dp_size
-            target_engine_rank = self.kv_mgr.kv_args.engine_rank % self.tp_size_per_dp_rank % prefill_world_size
-            return 0, list(range(target_engine_rank, prefill_world_size, self.tp_size_per_dp_rank))
+            target_engine_rank_start  = self.kv_mgr.kv_args.engine_rank % self.tp_size_per_dp_rank % prefill_world_size
+            target_engine_ranks = list(range(target_engine_rank_start, prefill_world_size, self.tp_size_per_dp_rank))
+            # get random rank to avoid transfer traffic
+            real_target_engine_rank = random.choice(target_engine_ranks)
+            return 0, target_engine_ranks, real_target_engine_rank
         else:
             raise NotImplementedError(f"decode_tp_size_per_dp_rank: {self.tp_size_per_dp_rank} "
                                       f"is greater than prefill_tp_size_per_dp_rank: {self.prefill_tp_size_per_dp_rank}")
