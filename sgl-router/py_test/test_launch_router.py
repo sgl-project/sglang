@@ -38,6 +38,10 @@ class TestLaunchRouter(unittest.TestCase):
             max_payload_size=4 * 1024 * 1024,  # 4MB
             verbose=False,
             log_dir=None,
+            service_discovery=False,
+            selector=None,
+            service_discovery_port=80,
+            service_discovery_namespace=None,
         )
 
     def create_router_args(self, **kwargs):
@@ -77,6 +81,23 @@ class TestLaunchRouter(unittest.TestCase):
 
     def test_launch_router_with_empty_worker_urls(self):
         args = self.create_router_args(worker_urls=[])
+        self.run_router_process(args)
+
+    def test_launch_router_with_service_discovery(self):
+        # Test router startup with service discovery enabled but no selectors
+        args = self.create_router_args(
+            worker_urls=[], service_discovery=True, selector=["app=test-worker"]
+        )
+        self.run_router_process(args)
+
+    def test_launch_router_with_service_discovery_namespace(self):
+        # Test router startup with service discovery enabled and namespace specified
+        args = self.create_router_args(
+            worker_urls=[],
+            service_discovery=True,
+            selector=["app=test-worker"],
+            service_discovery_namespace="test-namespace",
+        )
         self.run_router_process(args)
 
 
