@@ -19,7 +19,7 @@
     {% for tool in tools %}
         {% set tool_ns.text = tool_ns.text + '- `' + tool['name'] + '`:\n```json\n' + (tool | tojson) + '\n```\n' %}
     {% endfor %}
-    {% set ns.system_prompt = ns.system_prompt + tool_ns.text %}
+    {% set ns.system_prompt = ns.system_prompt + '\n\n' +  tool_ns.text %}
 {% endif %}
 
 {{ bos_token }}
