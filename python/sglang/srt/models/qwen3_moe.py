@@ -54,6 +54,9 @@ from sglang.srt.models.qwen2_moe import Qwen2MoeMLP as Qwen3MoeMLP
 from sglang.srt.models.qwen2_moe import Qwen2MoeModel
 from sglang.srt.utils import add_prefix
 
+from sglang.srt.layers.moe.ep_moe.layer import EPMoE
+from sglang.srt.managers.schedule_batch import global_server_args_dict
+
 Qwen3MoeConfig = None
 
 
@@ -73,12 +76,15 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 f"the number of experts {config.num_experts}."
             )
 
-        self.experts = FusedMoE(
+        MoEImpl = (
+            EPMoE if global_server_args_dict["enable_ep_moe"] else FusedMoE
+        )
+
+        self.experts = MoEImpl(
             num_experts=config.num_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
-            reduce_results=False,
             renormalize=config.norm_topk_prob,
             quant_config=quant_config,
             prefix=add_prefix("experts", prefix),
@@ -356,7 +362,11 @@ class Qwen3MoeForCausalLM(nn.Module):
             ("gate_up_proj", "up_proj", 1),
         ]
 
-        expert_params_mapping = FusedMoE.make_expert_params_mapping(
+        MoEImpl = (
+            EPMoE if global_server_args_dict["enable_ep_moe"] else FusedMoE
+        )
+
+        expert_params_mapping = MoEImpl.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
