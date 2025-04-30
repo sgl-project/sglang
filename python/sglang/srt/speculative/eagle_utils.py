@@ -280,6 +280,7 @@ class EagleVerifyInput:
             next_power_of_2(bs),
         )
 
+    # todo: flashmla??
     def generate_attn_arg_prefill(
         self,
         req_pool_indices: torch.Tensor,
