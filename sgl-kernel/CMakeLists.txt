@@ -121,12 +121,12 @@ set(SGL_KERNEL_CUDA_FLAGS
     # "--ptxas-options=--verbose,--register-usage-level=10,--warn-on-local-memory-usage"
 )
 
-option(SGL_KERNEL_ENABLE_SM100A "Enable SM100A" OFF)
-option(SGL_KERNEL_ENABLE_SM90A  "Enable SM90A"  OFF)
-option(SGL_KERNEL_ENABLE_BF16   "Enable BF16"   ON)
-option(SGL_KERNEL_ENABLE_FP8    "Enable FP8"    ON)
-option(SGL_KERNEL_ENABLE_FP4    "Enable FP4"    OFF)
-option(SGL_KERNEL_ENABLE_FA3    "Enable FA3"    OFF)
+option(SGL_KERNEL_ENABLE_SM100A           "Enable SM100A"           OFF)
+option(SGL_KERNEL_ENABLE_SM90A            "Enable SM90A"            OFF)
+option(SGL_KERNEL_ENABLE_BF16             "Enable BF16"             ON)
+option(SGL_KERNEL_ENABLE_FP8              "Enable FP8"              ON)
+option(SGL_KERNEL_ENABLE_FP4              "Enable FP4"              OFF)
+option(SGL_KERNEL_ENABLE_FA3              "Enable FA3"              OFF)
 
 if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
@@ -257,17 +257,21 @@ if (SGL_KERNEL_ENABLE_FA3)
         "-Xcompiler=-fno-strict-aliasing"
     )
 
+    # SM8X Logic
+    file(GLOB FA3_SM8X_GEN_SRCS
+        "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdim*_sm80.cu")
+
     file(GLOB FA3_BF16_GEN_SRCS
-        "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimall_bf16*_sm*.cu")
+        "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimall_bf16*_sm90.cu")
     file(GLOB FA3_BF16_GEN_SRCS_
-        "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimdiff_bf16*_sm*.cu")
+        "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimdiff_bf16*_sm90.cu")
     list(APPEND FA3_BF16_GEN_SRCS ${FA3_BF16_GEN_SRCS_})
 
     # FP16 source files
     file(GLOB FA3_FP16_GEN_SRCS
-        "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimall_fp16*_sm*.cu")
+        "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimall_fp16*_sm90.cu")
     file(GLOB FA3_FP16_GEN_SRCS_
-        "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimdiff_fp16*_sm*.cu")
+        "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimdiff_fp16*_sm90.cu")
     list(APPEND FA3_FP16_GEN_SRCS ${FA3_FP16_GEN_SRCS_})
 
     # FP8 source files
@@ -277,7 +281,7 @@ if (SGL_KERNEL_ENABLE_FA3)
         "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimdiff_e4m3*_sm90.cu")
     list(APPEND FA3_FP8_GEN_SRCS ${FA3_FP8_GEN_SRCS_})
 
-    set(FA3_GEN_SRCS ${FA3_BF16_GEN_SRCS} ${FA3_FP16_GEN_SRCS} ${FA3_FP8_GEN_SRCS})
+    set(FA3_GEN_SRCS ${FA3_BF16_GEN_SRCS} ${FA3_FP16_GEN_SRCS} ${FA3_FP8_GEN_SRCS} ${FA3_SM8X_GEN_SRCS})
 
     set(FLASH_SOURCES
         "csrc/flash_extension.cc"
@@ -319,3 +323,4 @@ install(DIRECTORY "${repo-cutlass_SOURCE_DIR}/include/cute/"
 
 install(DIRECTORY "${repo-cutlass_SOURCE_DIR}/include/cutlass/"
         DESTINATION "deep_gemm/include/cutlass")
+
