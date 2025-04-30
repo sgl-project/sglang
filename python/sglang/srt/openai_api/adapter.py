@@ -1624,6 +1624,7 @@ async def v1_chat_completions(
 
                             tool_call = ToolCall(
                                 id=str(call_item.tool_index),
+                                index=call_item.tool_index,
                                 function=FunctionResponse(
                                     name=call_item.name,
                                     arguments=call_item.parameters,
