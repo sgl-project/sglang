@@ -719,6 +719,8 @@ class UpdateWeightFromDiskReqInput:
     model_path: str
     # The format to load the weights
     load_format: Optional[str] = None
+    # Whether to abort all requests before updating weights
+    abort_all_requests: bool = False
 
 
 @dataclass
@@ -734,6 +736,8 @@ class UpdateWeightsFromDistributedReqInput:
     name: str
     dtype: str
     shape: List[int]
+    # Whether to abort all requests before updating weights
+    abort_all_requests: bool = False
 
 
 @dataclass
@@ -755,6 +759,8 @@ class UpdateWeightsFromTensorReqInput:
     load_format: Optional[str] = None
     # Whether to flush the cache after updating weights
     flush_cache: bool = True
+    # Whether to abort all requests before updating weights
+    abort_all_requests: bool = False
 
 
 @dataclass
