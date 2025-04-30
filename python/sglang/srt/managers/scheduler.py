@@ -900,6 +900,7 @@ class Scheduler(
                 add_to_grammar_queue = True
 
         if add_to_grammar_queue:
+            req.queue_time_start = time.time()
             self.grammar_queue.append(req)
         else:
             self._add_request_to_queue(req)

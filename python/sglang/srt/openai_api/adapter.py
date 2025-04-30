@@ -36,6 +36,7 @@ from sglang.srt.conversation import (
     chat_template_exists,
     generate_chat_conv,
     generate_embedding_convs,
+    get_conv_template_by_model_path,
     register_conv_template,
 )
 from sglang.srt.function_call_parser import FunctionCallParser
@@ -163,10 +164,14 @@ def load_chat_template_for_openai_api(tokenizer_manager, chat_template_arg, mode
     else:
         chat_template_name = chat_template_arg
 
-    # Check chat-template
-    # TODO:
-    # 1. Do not import any code from sglang.lang
-    # 2. For VLM, when chat_template_arg is None, set it automatically by guessing from model_path.
+
+def guess_chat_template_name_from_model_path(model_path):
+    global chat_template_name
+    chat_template_name = get_conv_template_by_model_path(model_path)
+    if chat_template_name is not None:
+        logger.info(
+            f"Infer the chat template name from the model path and obtain the result: {chat_template_name}."
+        )
 
 
 async def v1_files_create(
@@ -1613,6 +1618,7 @@ async def v1_chat_completions(
 
                             tool_call = ToolCall(
                                 id=str(call_item.tool_index),
+                                index=call_item.tool_index,
                                 function=FunctionResponse(
                                     name=call_item.name,
                                     arguments=call_item.parameters,
