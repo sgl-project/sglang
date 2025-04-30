@@ -242,6 +242,7 @@ if (SGL_KERNEL_ENABLE_FA3)
         "-Xcompiler"
         "-fPIC"
         "-gencode=arch=compute_80,code=sm_80"
+        "-gencode=arch=compute_86,code=sm_86"
         "-gencode=arch=compute_90a,code=sm_90a"
         "-std=c++17"
         "-DCUTE_USE_PACKED_TUPLE=1"
