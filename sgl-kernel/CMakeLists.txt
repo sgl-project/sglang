@@ -22,7 +22,9 @@ find_package(CUDAToolkit REQUIRED)
 set_property(GLOBAL PROPERTY CUDA_SEPARABLE_COMPILATION ON)
 
 message(STATUS "Detected CUDA_VERSION=${CUDA_VERSION}")
-if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8")
+if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "13.0")
+    message("CUDA_VERSION ${CUDA_VERSION} >= 13.0")
+elseif ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8")
     message("CUDA_VERSION ${CUDA_VERSION} >= 12.8")
 elseif ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4")
     message("CUDA_VERSION ${CUDA_VERSION} >= 12.4")
@@ -128,9 +130,16 @@ option(SGL_KERNEL_ENABLE_FP8    "Enable FP8"    ON)
 option(SGL_KERNEL_ENABLE_FP4    "Enable FP4"    OFF)
 option(SGL_KERNEL_ENABLE_FA3    "Enable FA3"    OFF)
 
-if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
+if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "13.0" OR SGL_KERNEL_ENABLE_SM100A)
+    list(APPEND SGL_KERNEL_CUDA_FLAGS
+        "-gencode=arch=compute_100,code=sm_110"
+        "-gencode=arch=compute_100a,code=sm_110a"
+    )
+elseif ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-gencode=arch=compute_100,code=sm_100"
+        "-gencode=arch=compute_100,code=sm_101"
+        "-gencode=arch=compute_100,code=sm_101a"
         "-gencode=arch=compute_100a,code=sm_100a"
         "-gencode=arch=compute_120,code=sm_120"
     )
