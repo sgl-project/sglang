@@ -1272,16 +1272,13 @@ class ServerArgs:
 
         # FIXME pp constraints
         if self.pp_size > 1:
-            logger.warning(
-                f"Turn off overlap scheule for pipeline parallelism."
-            )
+            logger.warning(f"Turn off overlap scheule for pipeline parallelism.")
             self.disable_overlap_schedule = True
             assert (
                 self.disable_overlap_schedule
                 and self.speculative_algorithm is None
                 and not self.enable_mixed_chunk
-                and not use_mla_backend
-            ), "Pipeline parallelism is not compatible with overlap schedule, speculative decoding, mixed chunked prefill, and mla backend."
+            ), "Pipeline parallelism is not compatible with overlap schedule, speculative decoding, mixed chunked prefill."
 
         assert not (
             self.dp_size > 1 and self.nnodes != 1 and not self.enable_dp_attention
