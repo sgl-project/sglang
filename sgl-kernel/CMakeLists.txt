@@ -43,7 +43,7 @@ include(FetchContent)
 FetchContent_Declare(
     repo-cutlass
     GIT_REPOSITORY https://github.com/NVIDIA/cutlass
-    GIT_TAG        5e497243f7ad13a2aa842143f9b10bbb23d98292
+    GIT_TAG        e94e888df3551224738bfa505787b515eae8352f
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-cutlass)
@@ -176,6 +176,7 @@ set(SOURCES
     "csrc/attention/cascade.cu"
     "csrc/attention/merge_attn_states.cu"
     "csrc/attention/cutlass_mla_kernel.cu"
+    "csrc/attention/vertical_slash_index.cu"
     "csrc/attention/lightning_attention_decode_kernel.cu"
     "csrc/elementwise/activation.cu"
     "csrc/elementwise/fused_add_rms_norm_kernel.cu"
@@ -195,9 +196,11 @@ set(SOURCES
     "csrc/moe/moe_align_kernel.cu"
     "csrc/moe/moe_fused_gate.cu"
     "csrc/moe/moe_topk_softmax_kernels.cu"
+    "csrc/moe/fp8_blockwise_moe_kernel.cu"
     "csrc/speculative/eagle_utils.cu"
     "csrc/speculative/speculative_sampling.cu"
     "csrc/speculative/packbit.cu"
+    "csrc/grammar/apply_token_bitmask_inplace_cuda.cu"
     "csrc/common_extension.cc"
     "${repo-flashinfer_SOURCE_DIR}/csrc/norm.cu"
     "${repo-flashinfer_SOURCE_DIR}/csrc/renorm.cu"
