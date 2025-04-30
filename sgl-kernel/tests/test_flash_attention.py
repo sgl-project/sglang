@@ -11,6 +11,11 @@ from einops import rearrange, repeat
 apply_rotary_emb = None
 
 
+def is_hopper():
+    #  Only Hopper supports different V headdim
+    return torch.cuda.get_device_properties(0).major >= 9
+
+
 def is_fa3_supported(device=None) -> bool:
     #  There some fa3 FYI
     #  FA3 can fail without a enough shared memory for a some shapes, such as higher
@@ -561,7 +566,8 @@ def test_flash_attn_kvcache(
     assert nheads % nheads_k == 0
     dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
     dv_vals = [128, d] if d > 128 and d <= 192 else ([256, 512, d] if d <= 64 else [d])
-    if dtype == torch.float8_e4m3fn:
+    if dtype == torch.float8_e4m3fn or not is_hopper():
+        # for fp8 and ampere arch, we not support v head dim != qk head dim
         dv_vals = [d]
     for dv in dv_vals:
         has_qv = d == 64 and dv >= 256
