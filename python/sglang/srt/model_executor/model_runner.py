@@ -167,7 +167,7 @@ class ModelRunner:
                 "n_share_experts_fusion": server_args.n_share_experts_fusion,
                 "disable_chunked_prefix_cache": server_args.disable_chunked_prefix_cache,
                 "use_mla_backend": self.use_mla_backend,
-                "use_flash_attn": server_args.use_flash_attn,
+                "use_flash_attn": server_args.use_flash_attn_for_mm,
             }
         )
 

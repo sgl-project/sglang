@@ -185,7 +185,7 @@ class ServerArgs:
     n_share_experts_fusion: int = 0
     disable_chunked_prefix_cache: bool = False
     disable_fast_image_processor: bool = False
-    use_flash_attn: bool = False
+    use_flash_attn_for_mm: bool = False
 
     # Debug tensor dumps
     debug_tensor_dump_output_folder: Optional[str] = None
@@ -1230,10 +1230,10 @@ class ServerArgs:
             help="The ib device for disaggregation transfer. Default is None, it will be detected automatically if using the mooncake backend.",
         )
         parser.add_argument(
-            "--use-flash-attn",
+            "--use-flash-attn-for-mm",
             action="store_true",
-            default=ServerArgs.use_flash_attn,
-            help="Use FlashAttention3 for all non-causal attention (mostly for multimodal transformers). Once enabled, performance is improved, while slight accuracy degradation may occur",
+            default=ServerArgs.use_flash_attn_for_mm,
+            help="Use FlashAttention3 for all non-causal attention of multimodal transformers. This will improve performance, but may lead to minor accuracy variations",
         )
 
     @classmethod
