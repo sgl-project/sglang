@@ -287,6 +287,7 @@ class EagleVerifyInput:
         paged_kernel_lens: torch.Tensor,
         paged_kernel_lens_sum: int,
         req_to_token: torch.Tensor,
+        use_flashmla: bool = False,
     ):
         batch_size = len(req_pool_indices)
         qo_indptr = torch.arange(
@@ -308,14 +309,27 @@ class EagleVerifyInput:
             dtype=torch.int32,
             device="cuda",
         )
-        create_flashinfer_kv_indices_triton[(batch_size,)](
-            req_to_token,
-            req_pool_indices,
-            paged_kernel_lens,
-            cum_kv_seq_len,
-            None,
-            kv_indices,
-            req_to_token.size(1),
+
+        # todo: 
+        if use_flashmla:
+            create_flashmla_kv_indices_triton[(batch_size,)](
+                req_to_token,
+                req_pool_indices,
+                paged_kernel_lens,
+                None,
+                block_kv_indices,
+                req_to_token.stride(0),
+                max_seqlen_pad,
+            )
+        else:
+            create_flashinfer_kv_indices_triton[(batch_size,)](
+                req_to_token,
+                req_pool_indices,
+                paged_kernel_lens,
+                cum_kv_seq_len,
+                None,
+                kv_indices,
+                req_to_token.size(1),
         )
         return kv_indices, cum_kv_seq_len, qo_indptr, self.custom_mask
 

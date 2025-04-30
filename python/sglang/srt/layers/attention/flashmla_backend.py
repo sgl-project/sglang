@@ -63,9 +63,6 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             model_runner, skip_prefill, kv_indptr_buf, kv_last_page_len_buf
         )
 
-        top_k = 1
-        self.top_k = top_k
-
         self.num_q_heads = (
             model_runner.model_config.num_attention_heads // get_attention_tp_size()
         )
@@ -87,46 +84,53 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         # self.decode_cuda_graph_metadata = {}
         # self.prefill_cuda_graph_metadata = {}  # For verify
 
-    def update_indices_decode(self, forward_batch: ForwardBatch):
-        print("update_indices_decode with spec_info is None")
+    def update_metadata_decode(self, forward_batch: ForwardBatch):
         bs = forward_batch.batch_size
         spec_info = forward_batch.spec_info
-        assert spec_info is None
+        # assert spec_info is None
 
-        max_seqlen_pad = triton.cdiv(
-                    forward_batch.seq_lens_cpu.max().item(), PAGE_SIZE
-        )
-        block_kv_indices = torch.full(
-            (bs, max_seqlen_pad),
-            -1,
-            dtype=torch.int32,
-            device=forward_batch.seq_lens.device,
-        )
-        create_flashmla_kv_indices_triton[(bs,)](
-            self.req_to_token,
-            forward_batch.req_pool_indices,
-            forward_batch.seq_lens,
-            None,
-            block_kv_indices,
-            self.req_to_token.stride(0),
-            max_seqlen_pad,
-        )
-        mla_metadata, num_splits = get_mla_metadata(
-            forward_batch.seq_lens.to(torch.int32),
-            Q_LEN * self.num_q_heads,
-            1,
-        )
-        self.forward_metadata = FlashMLADecodeMetadata(
-            mla_metadata,
-            num_splits,
-            block_kv_indices,
-        )
-
-    def update_indices_extend(self, forward_batch: ForwardBatch):
-        bs = forward_batch.batch_size
-        spec_info = forward_batch.spec_info
         if spec_info is None:
-            print("update_indices_prefill with spec_info is None")
+            print("update_metadata_decode with spec_info is None")
+            max_seqlen_pad = triton.cdiv(
+                forward_batch.seq_lens_cpu.max().item(), PAGE_SIZE
+            )
+            block_kv_indices = torch.full(
+                (bs, max_seqlen_pad),
+                -1,
+                dtype=torch.int32,
+                device=forward_batch.seq_lens.device,
+            )
+            create_flashmla_kv_indices_triton[(bs,)](
+                self.req_to_token,
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                None,
+                block_kv_indices,
+                self.req_to_token.stride(0),
+                max_seqlen_pad,
+            )
+            mla_metadata, num_splits = get_mla_metadata(
+                forward_batch.seq_lens.to(torch.int32),
+                Q_LEN * self.num_q_heads,
+                1,
+            )
+            self.forward_metadata = FlashMLADecodeMetadata(
+                mla_metadata,
+                num_splits,
+                block_kv_indices,
+            )
+        else:
+            print("update_metadata_decode with spec_info is not None")
+            assert False # temp for debug
+            # todo: why flashinfer mla here?
+            super().init_forward_metadata(forward_batch)
+
+    def update_metadata_extend(self, forward_batch: ForwardBatch):
+        bs = forward_batch.batch_size
+        spec_info = forward_batch.spec_info
+
+        if spec_info is None:
+            print("update_metadata_extend with spec_info is None")
             max_seqlen_pad = triton.cdiv(
                 forward_batch.seq_lens_cpu.max().item(), PAGE_SIZE
             )
@@ -157,9 +161,9 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             )
 
         else:
-            # super().init_forward_metadata(forward_batch)
-            print("update_indices_prefill with spec_info is not None")
+            print("update_metadata_extend with spec_info is not None")
             assert isinstance(spec_info, EagleDraftInput)
+
             block_kv_indices, _, qo_indptr, custom_mask = (
                 spec_info.generate_attn_arg_prefill(
                     req_pool_indices=forward_batch.req_pool_indices,
@@ -184,74 +188,51 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
     def update_indices_verify(self, forward_batch: ForwardBatch):
         bs = forward_batch.batch_size
         spec_info = forward_batch.spec_info
+        assert spec_info is not None
+        print("update_metadata_verify with spec_info is not None")
 
-        if spec_info is None:
-            print("update_indices_prefill with spec_info is None")
-            max_seqlen_pad = triton.cdiv(
-                forward_batch.seq_lens_cpu.max().item(), PAGE_SIZE
-            )
-            block_kv_indices = torch.full(
-                (bs, max_seqlen_pad),
-                -1,
-                dtype=torch.int32,
-                device=forward_batch.seq_lens.device,
-            )
-            create_flashmla_kv_indices_triton[(bs,)](
-                self.req_to_token,
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                None,
-                block_kv_indices,
-                self.req_to_token.stride(0),
-                max_seqlen_pad,
-            )
-            mla_metadata, num_splits = get_mla_metadata(
-                forward_batch.seq_lens.to(torch.int32),
-                Q_LEN * self.num_q_heads,
-                1,
-            )
-            self.forward_metadata = FlashMLADecodeMetadata(
-                mla_metadata,
-                num_splits, #todo: * mtp?
-                block_kv_indices,
-            )
+        draft_token_num = spec_info.draft_token_num
+        spec_steps = spec_info.spec_steps
 
-        else:
-            # super().init_forward_metadata(forward_batch)
-            print("update_indices_prefill with spec_info is not None")
-            assert isinstance(spec_info, EagleDraftInput)
-            block_kv_indices, _, qo_indptr, custom_mask = (
-                spec_info.generate_attn_arg_prefill(
-                    req_pool_indices=forward_batch.req_pool_indices,
-                    paged_kernel_lens=forward_batch.seq_lens,
-                    paged_kernel_lens_sum=forward_batch.seq_lens_sum,
-                    req_to_token=self.req_to_token,
-                    use_flashmla=True,
-                )
+        # todo: if this holds with topk=1?
+        assert draft_token_num == spec_steps
+        mtp_count = draft_token_num
+
+        # todo: update kv cache with spec_info
+        assert isinstance(spec_info, EagleVerifyInput)
+        block_kv_indices, _, qo_indptr, custom_mask = (
+            spec_info.generate_attn_arg_prefill(
+                req_pool_indices=forward_batch.req_pool_indices,
+                paged_kernel_lens=forward_batch.seq_lens,
+                paged_kernel_lens_sum=forward_batch.seq_lens_sum,
+                req_to_token=self.req_to_token,
+                use_flashmla=True,
             )
-            
-            mla_metadata, num_splits = get_mla_metadata(
-                forward_batch.seq_lens.to(torch.int32),
-                Q_LEN * self.num_q_heads,
-                1,
-            )
-            self.forward_metadata = FlashMLADecodeMetadata(
-                mla_metadata,
-                num_splits, #todo: * mtp?
-                block_kv_indices,
-            )
+        )
+        
+        mla_metadata, num_splits = get_mla_metadata(
+            forward_batch.seq_lens.to(torch.int32),
+            mtp_count * self.num_q_heads,
+            1,
+        )
+        self.forward_metadata = FlashMLADecodeMetadata(
+            mla_metadata,
+            num_splits,
+            block_kv_indices,
+        )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
 
         bs = forward_batch.batch_size
         spec_info = forward_batch.spec_info
         if forward_batch.forward_mode.is_decode_or_idle():
-            # todo: spec_info should be None here or not?
-            self.update_indices_decode(forward_batch)
+            # todo: spec_info can be None here? or not?
+            self.update_metadata_decode(forward_batch)
         elif forward_batch.forward_mode.is_draft_extend():
-            self.update_indices_extend(forward_batch)
+            # should be the same as decode?
+            self.update_metadata_extend(forward_batch)
         elif forward_batch.forward_mode.is_target_verify():
-            self.update_indices_verify(forward_batch)
+            self.update_metadata_verify(forward_batch)
         else:
             # todo: ??
             super().init_forward_metadata(forward_batch)
@@ -488,7 +469,10 @@ class FlashMLAMultiStepDraftBackend:
         from sglang.srt.speculative.eagle_utils import generate_draft_decode_kv_indices
 
         # FlashMLA supports topk = 1
-        assert topk == 1
+        if topk > 1:
+            raise ValueError(
+                f"Currently FlashMLA only supports topk=1 for speculative decoding"
+            )
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
         self.generate_draft_decode_kv_indices = generate_draft_decode_kv_indices
@@ -514,7 +498,6 @@ class FlashMLAMultiStepDraftBackend:
                 FlashMLABackend(
                     model_runner,
                     skip_prefill=True,
-                    top_k=self.topk,
                     kv_indptr_buf=self.kv_indptr[i],
                     kv_last_page_len_buf=self.q_indptr_decode,
                 )
