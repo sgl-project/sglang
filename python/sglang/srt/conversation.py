@@ -17,7 +17,7 @@
 # https://github.com/lm-sys/FastChat/blob/main/fastchat/conversation.py
 import dataclasses
 from enum import IntEnum, auto
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 from sglang.srt.openai_api.protocol import ChatCompletionRequest
 
@@ -407,6 +407,7 @@ class Conversation:
 
 # A global registry for all conversation templates
 chat_templates: Dict[str, Conversation] = {}
+matching_function_registry: List[Callable] = []
 
 
 def register_conv_template(template: Conversation, override: bool = False):
@@ -417,6 +418,18 @@ def register_conv_template(template: Conversation, override: bool = False):
         ), f"{template.name} has been registered."
 
     chat_templates[template.name] = template
+
+
+def register_conv_template_matching_function(func):
+    matching_function_registry.append(func)
+
+
+def get_conv_template_by_model_path(model_path):
+    for matching_func in matching_function_registry:
+        conv_name = matching_func(model_path)
+        if conv_name is not None:
+            return conv_name
+    return None
 
 
 def chat_template_exists(template_name: str) -> bool:
@@ -792,3 +805,111 @@ register_conv_template(
         audio_token="(<audio>./</audio>)",
     )
 )
+
+# Reference: https://huggingface.co/moonshotai/Kimi-VL-A3B-Instruct/blob/main/chat_template.jinja
+register_conv_template(
+    Conversation(
+        name="kimi-vl",
+        system_message="You are a helpful assistant",
+        system_template="<|im_system|>system<|im_middle|>{system_message}",
+        roles=(
+            "<|im_user|>user<|im_middle|>",
+            "<|im_assistant|>assistant<|im_middle|>",
+        ),
+        messages=[],
+        sep="<|im_end|>",
+        sep_style=SeparatorStyle.NO_COLON_SINGLE,
+        stop_str="<|im_end|>",
+        image_token="<|media_start|>image<|media_content|><|media_pad|><|media_end|>",
+    )
+)
+
+
+@register_conv_template_matching_function
+def match_deepseek_janus_pro(model_path: str):
+    if (
+        "llama" in model_path.lower()
+        and "3.2" in model_path.lower()
+        and "vision" in model_path.lower()
+    ):
+        return "llama_3_vision"
+
+
+@register_conv_template_matching_function
+def match_deepseek_janus_pro(model_path: str):
+    if "janus" in model_path.lower():
+        return "janus-pro"
+
+
+@register_conv_template_matching_function
+def match_vicuna(model_path: str):
+    if "vicuna" in model_path.lower():
+        return "vicuna_v1.1"
+    if "llava-v1.5" in model_path.lower():
+        return "vicuna_v1.1"
+    if "llava-next-video-7b" in model_path.lower():
+        return "vicuna_v1.1"
+
+
+@register_conv_template_matching_function
+def match_llama2_chat(model_path: str):
+    model_path = model_path.lower()
+    if "llama-2" in model_path and "chat" in model_path:
+        return "llama-2"
+    if (
+        "mistral" in model_path or "mixtral" in model_path
+    ) and "instruct" in model_path:
+        return "llama-2"
+    if "codellama" in model_path and "instruct" in model_path:
+        return "llama-2"
+
+
+@register_conv_template_matching_function
+def match_deepseek_vl(model_path: str):
+    model_path = model_path.lower()
+    if "deepseek" in model_path and "vl2" in model_path:
+        return "deepseek-vl2"
+
+
+@register_conv_template_matching_function
+def match_chat_ml(model_path: str):
+    # import pdb;pdb.set_trace()
+    model_path = model_path.lower()
+    # Now the suffix for qwen2 chat model is "instruct"
+    if "gme" in model_path and "qwen" in model_path and "vl" in model_path:
+        return "gme-qwen2-vl"
+    if "qwen" in model_path and "vl" in model_path:
+        return "qwen2-vl"
+    if (
+        "llava-v1.6-34b" in model_path
+        or "llava-v1.6-yi-34b" in model_path
+        or "llava-next-video-34b" in model_path
+        or "llava-onevision-qwen2" in model_path
+    ):
+        return "chatml-llava"
+
+
+@register_conv_template_matching_function
+def match_gemma_it(model_path: str):
+    model_path = model_path.lower()
+    if "gemma" in model_path and "it" in model_path:
+        return "gemma-it"
+    if "gemma-3" in model_path and "1b" not in model_path:
+        # gemma-3-1b-it is completion model
+        return "gemma-it"
+
+
+@register_conv_template_matching_function
+def match_openbmb_minicpm(model_path: str):
+    model_path = model_path.lower()
+    if "minicpm-v" in model_path:
+        return "minicpmv"
+    elif "minicpm-o" in model_path:
+        return "minicpmo"
+
+
+@register_conv_template_matching_function
+def match_moonshot_kimivl(model_path: str):
+    model_path = model_path.lower()
+    if "kimi" in model_path and "vl" in model_path:
+        return "kimi-vl"

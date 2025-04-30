@@ -58,7 +58,10 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
-from sglang.srt.openai_api.adapter import load_chat_template_for_openai_api
+from sglang.srt.openai_api.adapter import (
+    guess_chat_template_name_from_model_path,
+    load_chat_template_for_openai_api,
+)
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import (
@@ -450,7 +453,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     if server_args.attention_backend == "flashinfer":
         assert_pkg_version(
             "flashinfer_python",
-            "0.2.3",
+            "0.2.5",
             "Please uninstall the old version and "
             "reinstall the latest version by following the instructions "
             "at https://docs.flashinfer.ai/installation.html.",
@@ -584,6 +587,8 @@ def _launch_subprocesses(
         load_chat_template_for_openai_api(
             tokenizer_manager, server_args.chat_template, server_args.model_path
         )
+    else:
+        guess_chat_template_name_from_model_path(server_args.model_path)
 
     if server_args.completion_template:
         load_completion_template_for_openai_api(server_args.completion_template)

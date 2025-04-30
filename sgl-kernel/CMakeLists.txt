@@ -43,7 +43,7 @@ include(FetchContent)
 FetchContent_Declare(
     repo-cutlass
     GIT_REPOSITORY https://github.com/NVIDIA/cutlass
-    GIT_TAG        5e497243f7ad13a2aa842143f9b10bbb23d98292
+    GIT_TAG        e94e888df3551224738bfa505787b515eae8352f
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-cutlass)
@@ -132,6 +132,7 @@ if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-gencode=arch=compute_100,code=sm_100"
         "-gencode=arch=compute_100a,code=sm_100a"
+        "-gencode=arch=compute_120,code=sm_120"
     )
 else()
     list(APPEND SGL_KERNEL_CUDA_FLAGS
