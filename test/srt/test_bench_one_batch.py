@@ -33,10 +33,7 @@ class TestBenchOneBatch(CustomTestCase):
                 f"### test_bs1_default (llama-3.1-8b)\n"
                 f"output_throughput: {output_throughput:.2f} token/s\n"
             )
-            if os.getenv("SGLANG_AMD_CI") == "1":
-                self.assertGreater(output_throughput, 90)
-            else:
-                self.assertGreater(output_throughput, 125)
+            self.assertGreater(output_throughput, 135)
 
     def test_moe_tp2_bs1(self):
         output_throughput = run_bench_offline_throughput(
@@ -48,7 +45,10 @@ class TestBenchOneBatch(CustomTestCase):
                 f"### test_moe_tp2_bs1 (Mixtral-8x7B)\n"
                 f"output_throughput: {output_throughput:.2f} token/s\n"
             )
-            self.assertGreater(output_throughput, 125)
+            if os.getenv("SGLANG_AMD_CI") == "1":
+                self.assertGreater(output_throughput, 90)
+            else:
+                self.assertGreater(output_throughput, 125)
 
     def test_torch_compile_tp2_bs1(self):
         output_throughput = run_bench_offline_throughput(
