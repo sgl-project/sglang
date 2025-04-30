@@ -913,8 +913,6 @@ def _get_enable_thinking_from_request(request_obj):
         and request_obj.chat_template_kwargs
         and request_obj.chat_template_kwargs.get("enable_thinking") is not None
     ):
-        # Return the value directly. The original code's second .get(..., True)
-        # was redundant under the `is not None` check.
         return request_obj.chat_template_kwargs.get("enable_thinking")
     return True
 
