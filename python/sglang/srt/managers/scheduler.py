@@ -434,6 +434,7 @@ class Scheduler(
             server_args.model_path,
             trust_remote_code=server_args.trust_remote_code,
             revision=server_args.revision,
+            model_impl=server_args.model_impl,
             context_length=server_args.context_length,
             model_override_args=server_args.json_model_override_args,
             is_embedding=server_args.is_embedding,

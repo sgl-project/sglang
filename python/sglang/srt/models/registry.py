@@ -48,8 +48,15 @@ class _ModelRegistry:
             architectures = [architectures]
         if not architectures:
             logger.warning("No model architectures are specified")
+            
+        # filter out support architectures
+        normalized_arch = list(
+            filter(lambda model: model in self.models, architectures))
 
-        return architectures
+        # make sure Transformers backend is put at the last as a fallback
+        if len(normalized_arch) != len(architectures):
+            normalized_arch.append("TransformersForCausalLM")
+        return normalized_arch
 
     def resolve_model_cls(
         self,
