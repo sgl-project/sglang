@@ -31,6 +31,7 @@ dump_generated_mlir = int(os.environ.get("WAVE_DUMP_MLIR", 0))
 enable_scheduling_barriers = int(os.environ.get("WAVE_USE_SCHED_BARRIERS", 0))
 
 
+@functools.lru_cache
 def get_wave_speculative_sampling_kernel(
     batch_size,
     num_speculative_tokens,
@@ -62,6 +63,7 @@ def get_wave_speculative_sampling_kernel(
     return speculative_sampling
 
 
+@functools.lru_cache
 def get_wave_speculative_decoding_kernel(batch_size, num_draft_tokens, d, seq_len):
     speculative_decoding, symbols, _, _ = get_speculative_decoding_kernel(
         batch_size,
