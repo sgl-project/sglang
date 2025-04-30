@@ -89,6 +89,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         # self.prefill_cuda_graph_metadata = {}  # For verify
 
     def update_indices_decode(self, forward_batch: ForwardBatch):
+        print("update_indices_decode with spec_info is None")
         bs = forward_batch.batch_size
         spec_info = forward_batch.spec_info
         assert spec_info is None
@@ -127,6 +128,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         spec_info = forward_batch.spec_info
 
         if spec_info is None:
+            print("update_indices_prefill with spec_info is None")
             max_seqlen_pad = triton.cdiv(
                 forward_batch.seq_lens_cpu.max().item(), PAGE_SIZE
             )
@@ -155,8 +157,12 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 num_splits,
                 block_kv_indices,
             )
+
+            # todo: fix kv index here refer to FlashInferMLAIndicesUpdaterPrefill
+
         else:
             # super().init_forward_metadata(forward_batch)
+            print("update_indices_prefill with spec_info is not None")
             # todo: replaced by eagle spec info
             assert isinstance(spec_info, EagleDraftInput)
             block_kv_indices, _, qo_indptr, custom_mask = (
