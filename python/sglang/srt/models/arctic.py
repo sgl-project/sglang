@@ -41,8 +41,8 @@ from typing import Iterable, List, Optional, Set, Tuple
 
 import torch
 from torch import nn
-from vllm.model_executor.layers.fused_moe import fused_experts, fused_topk
-from vllm.model_executor.utils import set_weight_attrs
+from sglang.srt.layers.moe.fused_moe_native import fused_moe_forward_native
+from sglang.srt.layers.moe.topk import select_experts
 
 from python.sglang.srt.layers.rotary_embedding import RotaryEmbedding
 from sglang.srt.configs.arctic import ArcticConfig
@@ -190,18 +190,9 @@ class ArcticMoE(nn.Module):
                         dtype=self.params_dtype,
                     )
                 )
-            set_weight_attrs(
-                self.ws,
-                {
-                    "weight_loader": self.weight_loader,
-                },
-            )
-            set_weight_attrs(
-                self.w2s,
-                {
-                    "weight_loader": self.weight_loader,
-                },
-            )
+            # SGLang handles weight loading through the parameter's __dict__
+            setattr(self.ws, "weight_loader", self.weight_loader)
+            setattr(self.w2s, "weight_loader", self.weight_loader)
 
     def weight_loader(
         self,
@@ -223,54 +214,40 @@ class ArcticMoE(nn.Module):
         if weight_name.endswith("w2.weight"):
             param_data[expert_id, :, :] = loaded_weight[:, shard]
 
-    def local_moe_fused(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        num_tokens, hidden_size = hidden_states.shape
-        hidden_states = hidden_states.view(-1, self.hidden_size)
-        # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states)
-        do_normalize: bool = self.top_k > 1
-        topk_weights, topk_ids = fused_topk(
-            hidden_states, router_logits, self.top_k, renormalize=do_normalize
-        )
-        # topk_ids: (num_tokens, k)
-        if self.is_quant:
-            raise NotImplementedError("Quantization is not supported yet.")
-            # if 2 * num_tokens <= self.num_experts:
-            #     # If much fewer tokens than experts, use selective dequantize.
-            #     ws_dequantized = self.ws.ds_selective_dequantize(topk_ids.flatten())
-            #     w2s_dequantized = self.w2s.ds_selective_dequantize(topk_ids.flatten())
-            #     # We gathered the experts to the tokens so update the mapping.
-            #     topk_ids = torch.arange(
-            #         0,
-            #         topk_ids.numel(),
-            #         device=topk_ids.device,
-            #     ).reshape(topk_ids.shape)
-            # else:
-            #     ws_dequantized = self.ws.ds_dequantize()
-            #     w2s_dequantized = self.w2s.ds_dequantize()
-
-        final_hidden_states = fused_experts(
-            hidden_states,
-            self.ws,
-            self.w2s,
-            topk_weights,
-            topk_ids,
-            inplace=True,
-        )
-        if self.reduce_results and self.tp_size > 1:
-            final_hidden_states: torch.Tensor = tensor_model_parallel_all_reduce(
-                final_hidden_states
-            )
-        return final_hidden_states.view(num_tokens, hidden_size)
-
     def forward(self, hidden_states: torch.Tensor):
         if self.is_moe_layer:
-            final_hidden_states: torch.Tensor = self.local_moe_fused(
-                hidden_states=hidden_states
+            num_tokens, hidden_size = hidden_states.shape
+            hidden_states = hidden_states.view(-1, self.hidden_size)
+            # router_logits: (num_tokens, n_experts)
+            router_logits, _ = self.gate(hidden_states)
+            do_normalize: bool = self.top_k > 1
+            
+            topk_weights, topk_ids = select_experts(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                top_k=self.top_k,
+                use_grouped_topk=False,
+                renormalize=do_normalize,
+                torch_native=True,
             )
+            
+            final_hidden_states = fused_moe_forward_native(
+                layer=self,
+                x=hidden_states,
+                use_grouped_topk=False,
+                top_k=self.top_k,
+                router_logits=router_logits,
+                renormalize=do_normalize,
+                inplace=True,
+            )
+            
+            if self.reduce_results and self.tp_size > 1:
+                final_hidden_states: torch.Tensor = tensor_model_parallel_all_reduce(
+                    final_hidden_states
+                )
+            return final_hidden_states.view(num_tokens, hidden_size)
         else:
-            final_hidden_states = self.mlp(hidden_states)
-        return final_hidden_states
+            return self.mlp(hidden_states)
 
 
 class ArcticAttention(nn.Module):
@@ -593,7 +570,7 @@ class ArcticForCausalLM(nn.Module):
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 param = params_dict[name]
-                weight_loader = param.weight_loader
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
@@ -602,7 +579,7 @@ class ArcticForCausalLM(nn.Module):
                         continue
                     name = name.replace(weight_name, param_name)
                     param = params_dict[name]
-                    weight_loader = param.weight_loader
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
                     weight_loader(param, loaded_weight, shard_id)
                     break
                 else:
@@ -611,7 +588,7 @@ class ArcticForCausalLM(nn.Module):
                             continue
                         name = name.replace(weight_name, param_name)
                         param = params_dict[name]
-                        weight_loader = param.weight_loader
+                        weight_loader = getattr(param, "weight_loader", default_weight_loader)
                         weight_loader(
                             param, loaded_weight, weight_name, expert_id=shard_id
                         )
