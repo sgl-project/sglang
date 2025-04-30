@@ -764,8 +764,6 @@ class TestKimiVLServer(TestOpenAIVisionServer):
                 "kimi-vl",
                 "--context-length",
                 "4096",
-                "--tensor-parallel-size",
-                "2",
                 "--dtype",
                 "bfloat16",
             ],
