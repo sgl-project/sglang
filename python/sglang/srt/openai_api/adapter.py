@@ -909,7 +909,7 @@ def _get_enable_thinking_from_request(request_obj):
         The boolean value of 'enable_thinking' if found and not None, otherwise None.
     """
     if (
-        hasattr(request_obj, "chat_template_kwargs")  # Check if attribute exists
+        hasattr(request_obj, "chat_template_kwargs")
         and request_obj.chat_template_kwargs
         and request_obj.chat_template_kwargs.get("enable_thinking") is not None
     ):
