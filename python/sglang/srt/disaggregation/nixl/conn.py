@@ -142,10 +142,8 @@ class NixlKVManager(BaseKVManager):
             self._start_bootstrap_thread()
             self._register_to_bootstrap()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            # bootstrap key -> (engine_rank - >real source remote, engine_rank -> dummy remote)
-            self.prefill_peer_infos: Dict[
-                str, Tuple[Dict[int, NixlEngineInfo], Dict[int, NixlEngineInfo]]
-            ] = {}
+            # bootstrap key -> (remote_engine_rank -> possible remote source info)
+            self.prefill_peer_infos: Dict[str, list[Dict[int, NixlEngineInfo]]] = {}
             self.transfer_statuses: Dict[int, TransferStatus] = defaultdict(
                 TransferStatus
             )
@@ -453,10 +451,12 @@ class NixlKVReceiver(BaseKVReceiver):
             self.bootstrap_info = self.kv_mgr.prefill_peer_infos[bootstrap_key]
         assert self.bootstrap_info is not None
 
-    # return: (real source remotes, others dummy remotes)
+    # return a list of remotes in a dict, [(remote_engine_rank -> NixlEngineInfo), ...]
+    # In each dict, there are multiple possible remotes named "equal sources".
+    # We only need to select one to split the traffic. i.e. we totally select len(list) remotes.
     def _get_bootstrap_info_from_server(
         self, engine_rank
-    ) -> Optional[Tuple[Dict[int, NixlEngineInfo], Dict[int, NixlEngineInfo]]]:
+    ) -> Optional[List[Dict[int, NixlEngineInfo]]]:
         """Fetch the bootstrap info from the bootstrap server."""
         try:
             if self.kv_mgr.enable_dp_attention:
@@ -494,25 +494,26 @@ class NixlKVReceiver(BaseKVReceiver):
                     for i in range(0, prefill_tp_size, self.kv_mgr.tp_size_of_dp)
                 ]
                 managed_ranks = remote_tp_ranks_grouped[self.kv_mgr.attn_tp_rank]
-                picked_rank = managed_ranks[0]
 
                 assert len(managed_ranks) == num_remote_tp_rank_we_managed
 
                 logger.debug(
-                    f"Rank {self.kv_mgr.kv_args.engine_rank} managed {managed_ranks}, picked {picked_rank} as real source"
+                    f"Rank {self.kv_mgr.kv_args.engine_rank} source can be {managed_ranks}"
                 )
 
-                return {picked_rank: bootstrap_info[picked_rank]}, {
-                    rk: bootstrap_info[rk]
-                    for rk in bootstrap_info.keys()
-                    if rk in managed_ranks and rk != picked_rank
-                }
+                return [
+                    {
+                        rk: bootstrap_info[rk]
+                        for rk in bootstrap_info.keys()
+                        if rk in managed_ranks
+                    }
+                ]
             else:
                 url = f"http://{self.bootstrap_addr}/route?engine_rank={engine_rank}"
                 response = requests.get(url)
                 if response.status_code == 200:
                     bootstrap_info = response.json()
-                    return {engine_rank: bootstrap_info}, {}
+                    return [{engine_rank: bootstrap_info}]
                 else:
                     logger.error(
                         f"Failed to get prefill server info: {response.status_code}, {response.text}"
@@ -531,47 +532,52 @@ class NixlKVReceiver(BaseKVReceiver):
     def init(self, kv_indices: npt.NDArray[np.int64], aux_index: Optional[int] = None):
 
         assert self.bootstrap_info is not None
+        assert self.bootstrap_room is not None
 
-        sources = self.bootstrap_info[0]
-        dummy = self.bootstrap_info[1]
-
-        assert len(sources) == 1, "Only support one source now"
-
-        remote_rank = list(self.bootstrap_info[0].keys())[0]
-
-        self.prefill_server_url = f"{self.bootstrap_info[0][remote_rank]['rank_ip']}:{self.bootstrap_info[0][remote_rank]['rank_port']}"
-
-        logger.debug(
-            f"Fetched bootstrap info for engine rank: {self.kv_mgr.kv_args.engine_rank}, source: {self.bootstrap_info[0].keys()}, dummy: {self.bootstrap_info[1].keys()} "
-        )
-
-        packed_kv_data_ptrs = b"".join(
-            struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
-        )
-        packed_aux_data_ptrs = b"".join(
-            struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.aux_data_ptrs
-        )
-        self._connect("tcp://" + self.prefill_server_url).send_multipart(
-            [
-                str(self.bootstrap_room).encode("ascii"),
-                get_local_ip_by_remote().encode("ascii"),
-                str(self.kv_mgr.rank_port).encode("ascii"),
-                self.kv_mgr.agent.get_agent_metadata(),
-                packed_kv_data_ptrs,
-                kv_indices.tobytes(),
-                packed_aux_data_ptrs,
-                str(aux_index).encode("ascii"),
-                str(self.kv_mgr.kv_args.gpu_id).encode("ascii"),
+        for equal_sources in self.bootstrap_info:
+            remote_rank = list(equal_sources.keys())[
+                self.bootstrap_room % len(equal_sources)
             ]
-        )
+            self.prefill_server_url = f"{equal_sources[remote_rank]['rank_ip']}:{equal_sources[remote_rank]['rank_port']}"
+            logger.debug(
+                f"Fetched bootstrap info for engine rank: {self.kv_mgr.kv_args.engine_rank}, source: {remote_rank}, all: {list(equal_sources.keys())}"
+            )
 
-        for dummy_rank, dummy_info in dummy.items():
-            dummy_url = f"{dummy_info['rank_ip']}:{dummy_info['rank_port']}"
-            self._connect("tcp://" + dummy_url).send_multipart(
+            packed_kv_data_ptrs = b"".join(
+                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
+            )
+            packed_aux_data_ptrs = b"".join(
+                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.aux_data_ptrs
+            )
+
+            logger.debug(
+                f"Sending to {self.prefill_server_url} with bootstrap room {self.bootstrap_room}"
+            )
+            self._connect("tcp://" + self.prefill_server_url).send_multipart(
                 [
                     str(self.bootstrap_room).encode("ascii"),
+                    get_local_ip_by_remote().encode("ascii"),
+                    str(self.kv_mgr.rank_port).encode("ascii"),
+                    self.kv_mgr.agent.get_agent_metadata(),
+                    packed_kv_data_ptrs,
+                    kv_indices.tobytes(),
+                    packed_aux_data_ptrs,
+                    str(aux_index).encode("ascii"),
+                    str(self.kv_mgr.kv_args.gpu_id).encode("ascii"),
                 ]
             )
+
+            for dummy_rank in equal_sources.keys():
+                if dummy_rank == remote_rank:
+                    continue
+                dummy_info = equal_sources[dummy_rank]
+                dummy_url = f"{dummy_info['rank_ip']}:{dummy_info['rank_port']}"
+                self._connect("tcp://" + dummy_url).send_multipart(
+                    [
+                        GUARD,
+                        str(self.bootstrap_room).encode("ascii"),
+                    ]
+                )
 
         self.started_transfer = True
 
