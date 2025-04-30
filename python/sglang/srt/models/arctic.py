@@ -41,6 +41,8 @@ from typing import Iterable, List, Optional, Set, Tuple
 
 import torch
 from torch import nn
+from vllm.model_executor.layers.fused_moe import fused_experts, fused_topk
+from vllm.model_executor.utils import set_weight_attrs
 
 from python.sglang.srt.layers.rotary_embedding import RotaryEmbedding
 from sglang.srt.configs.arctic import ArcticConfig
@@ -51,7 +53,6 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.layers.activation import SiluAndMul
-from vllm.model_executor.layers.fused_moe import fused_experts, fused_topk
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -68,12 +69,9 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from vllm.model_executor.utils import set_weight_attrs
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-
-
-from sglang.srt.utils import make_layers, add_prefix
 from sglang.srt.models.gemma3_causal import extract_layer_index
+from sglang.srt.utils import add_prefix, make_layers
 
 logger = logging.getLogger(__name__)
 
