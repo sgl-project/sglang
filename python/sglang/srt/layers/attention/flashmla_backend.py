@@ -559,25 +559,6 @@ class FlashMLAMultiStepDraftBackend:
         bs = self.topk * num_seqs
         seq_lens_sum = forward_batch.seq_lens_sum
 
-        self.generate_draft_decode_kv_indices[
-            (self.speculative_num_steps, num_seqs, self.topk)
-        ](
-            forward_batch.req_pool_indices,
-            forward_batch.req_to_token_pool.req_to_token,
-            forward_batch.seq_lens,
-            kv_indices_buffer,
-            self.kv_indptr,
-            forward_batch.positions,
-            num_seqs,
-            self.topk,
-            self.pool_len,
-            kv_indices_buffer.shape[1],
-            self.kv_indptr.shape[1],
-            triton.next_power_of_2(num_seqs),
-            triton.next_power_of_2(self.speculative_num_steps),
-            triton.next_power_of_2(bs),
-        )
-
         assert forward_batch.spec_info is not None
         assert isinstance(forward_batch.spec_info, EagleDraftInput)
 
