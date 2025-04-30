@@ -250,14 +250,33 @@ ChatCompletionMessageContentPart = Union[
 ]
 
 
+class FunctionResponse(BaseModel):
+    """Function response."""
+
+    name: Optional[str] = None
+    arguments: Optional[str] = None
+
+
+class ToolCall(BaseModel):
+    """Tool call response."""
+
+    id: str
+    type: Literal["function"] = "function"
+    function: FunctionResponse
+
+
 class ChatCompletionMessageGenericParam(BaseModel):
     role: Literal["system", "assistant", "tool"]
     content: Union[str, List[ChatCompletionMessageContentTextPart], None]
+    reasoning_content: Optional[str] = None
+    tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
 
 
 class ChatCompletionMessageUserParam(BaseModel):
     role: Literal["user"]
     content: Union[str, List[ChatCompletionMessageContentPart]]
+    reasoning_content: Optional[str] = None
+    tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
 
 
 ChatCompletionMessageParam = Union[
@@ -376,21 +395,6 @@ class ChatCompletionRequest(BaseModel):
     bootstrap_host: Optional[str] = None
     bootstrap_port: Optional[int] = None
     bootstrap_room: Optional[int] = None
-
-
-class FunctionResponse(BaseModel):
-    """Function response."""
-
-    name: Optional[str] = None
-    arguments: Optional[str] = None
-
-
-class ToolCall(BaseModel):
-    """Tool call response."""
-
-    id: str
-    type: Literal["function"] = "function"
-    function: FunctionResponse
 
 
 class ChatMessage(BaseModel):
