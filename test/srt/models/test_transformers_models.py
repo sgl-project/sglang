@@ -73,11 +73,12 @@ class TestTransformersFallbackCustomCodeEndpoint(TestTransformersFallbackEndpoin
     def setUpClass(cls):
         # custom code
         cls.model = "ArthurZ/Ilama-3.2-1B" 
+        cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--trust-remote", "true"],
+            other_args=["--trust-remote"],
         )
 
 @dataclasses.dataclass
