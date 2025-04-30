@@ -41,8 +41,6 @@ from typing import Iterable, List, Optional, Set, Tuple
 
 import torch
 from torch import nn
-from sglang.srt.layers.moe.fused_moe_native import fused_moe_forward_native
-from sglang.srt.layers.moe.topk import select_experts
 
 from python.sglang.srt.layers.rotary_embedding import RotaryEmbedding
 from sglang.srt.configs.arctic import ArcticConfig
@@ -61,6 +59,8 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
+from sglang.srt.layers.moe.fused_moe_native import fused_moe_forward_native
+from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -221,7 +221,7 @@ class ArcticMoE(nn.Module):
             # router_logits: (num_tokens, n_experts)
             router_logits, _ = self.gate(hidden_states)
             do_normalize: bool = self.top_k > 1
-            
+
             topk_weights, topk_ids = select_experts(
                 hidden_states=hidden_states,
                 router_logits=router_logits,
@@ -230,7 +230,7 @@ class ArcticMoE(nn.Module):
                 renormalize=do_normalize,
                 torch_native=True,
             )
-            
+
             final_hidden_states = fused_moe_forward_native(
                 layer=self,
                 x=hidden_states,
@@ -240,7 +240,7 @@ class ArcticMoE(nn.Module):
                 renormalize=do_normalize,
                 inplace=True,
             )
-            
+
             if self.reduce_results and self.tp_size > 1:
                 final_hidden_states: torch.Tensor = tensor_model_parallel_all_reduce(
                     final_hidden_states
@@ -579,7 +579,9 @@ class ArcticForCausalLM(nn.Module):
                         continue
                     name = name.replace(weight_name, param_name)
                     param = params_dict[name]
-                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
                     weight_loader(param, loaded_weight, shard_id)
                     break
                 else:
@@ -588,7 +590,9 @@ class ArcticForCausalLM(nn.Module):
                             continue
                         name = name.replace(weight_name, param_name)
                         param = params_dict[name]
-                        weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                        weight_loader = getattr(
+                            param, "weight_loader", default_weight_loader
+                        )
                         weight_loader(
                             param, loaded_weight, weight_name, expert_id=shard_id
                         )
