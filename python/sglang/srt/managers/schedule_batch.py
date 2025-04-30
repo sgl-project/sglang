@@ -35,6 +35,7 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 import copy
 import dataclasses
 import logging
+import threading
 from typing import TYPE_CHECKING, List, Optional, Set, Tuple, Union
 
 import numpy as np
@@ -374,6 +375,12 @@ class MultimodalInputs:
                 self.mrope_position_delta = torch.cat(
                     [self.mrope_position_delta, other.mrope_position_delta], dim=0
                 )
+
+        for key, val in other.__dict__.items():
+            if "_id" in key:
+                # set token_ids
+                if getattr(self, key, None) is None:
+                    setattr(self, key, getattr(other, key, None))
         # other args would be kept intact
 
 
@@ -717,6 +724,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # the check of whether to prefill new requests.
     # This is an optimization to reduce the overhead of the prefill check.
     batch_is_full: bool = False
+
+    # Events
+    launch_done: Optional[threading.Event] = None
 
     # Sampling info
     sampling_info: SamplingBatchInfo = None
@@ -1505,6 +1515,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
             or global_server_args_dict["attention_backend"] == "flashmla"
             or global_server_args_dict["attention_backend"] == "fa3"
+            or global_server_args_dict["attention_backend"] == "cutlass_mla"
         ):
             seq_lens_cpu = self.seq_lens.cpu()
         else:
@@ -1559,6 +1570,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 )
             ),
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
+            launch_done=self.launch_done,
         )
 
     def copy(self):
@@ -1640,6 +1652,9 @@ class ModelWorkerBatch:
     spec_info: Optional[Union[EagleVerifyInput, EagleDraftInput]] = None
     # If set, the output of the batch contains the hidden states of the run.
     capture_hidden_mode: CaptureHiddenMode = None
+
+    # Overlap event
+    launch_done: Optional[threading.Event] = None
 
 
 @triton.jit
