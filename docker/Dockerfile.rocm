@@ -1,8 +1,8 @@
 # Usage (to build SGLang ROCm docker image):
-#   docker build --build-arg SGL_BRANCH=v0.4.3.post2 -t v0.4.3.post2-rocm630 -f Dockerfile.rocm .
+#   docker build --build-arg SGL_BRANCH=v0.4.6.post1 -t v0.4.6.post1-rocm630 -f Dockerfile.rocm .
 
 # default base image
-ARG BASE_IMAGE="rocm/vllm-dev:20250114"
+ARG BASE_IMAGE="rocm/sgl-dev:vllm20250114"
 
 FROM $BASE_IMAGE AS base
 USER root
@@ -17,8 +17,8 @@ ARG TRITON_REPO="https://github.com/ROCm/triton.git"
 ARG TRITON_COMMIT="improve_fa_decode_3.0.0"
 
 
-ARG ATER_REPO="https://github.com/HaiShaw/ater"
-ARG CK_COMMITS="fa05ae"
+ARG AITER_REPO="https://github.com/ROCm/aiter.git"
+ARG AITER_COMMIT="v0.1.1"
 
 RUN git clone ${SGL_REPO} \
     && cd sglang \
@@ -29,6 +29,8 @@ RUN git clone ${SGL_REPO} \
          git checkout ${SGL_BRANCH}; \
        fi \
     && cd sgl-kernel \
+    && rm -f pyproject.toml \
+    && mv pyproject_rocm.toml pyproject.toml \
     && python setup_rocm.py install \
     && cd .. \
     && if [ "$BUILD_TYPE" = "srt" ]; then \
@@ -53,8 +55,9 @@ RUN git clone ${TRITON_REPO} \
     && cd python \
     && python3 setup.py install
 
-RUN git clone ${ATER_REPO} \
-    && cd ater \
+RUN git clone ${AITER_REPO} \
+    && cd aiter \
+    && git checkout ${AITER_COMMIT} \
     && git submodule update --init --recursive \
     && PREBUILD_KERNELS=1 GPU_ARCHS=gfx942 python3 setup.py develop
 
@@ -71,7 +74,7 @@ ENV SGLANG_SET_CPU_AFFINITY=1
 ENV SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
 ENV NCCL_MIN_NCHANNELS=112
 
-ENV MOE_PADDING=1
+ENV SGLANG_MOE_PADDING=1
 ENV VLLM_FP8_PADDING=1
 ENV VLLM_FP8_ACT_PADDING=1
 ENV VLLM_FP8_WEIGHT_PADDING=1

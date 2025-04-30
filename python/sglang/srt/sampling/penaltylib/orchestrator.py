@@ -1,35 +1,25 @@
+from __future__ import annotations
+
 import abc
-import dataclasses
-from typing import List, Set, Type, Union
+from typing import TYPE_CHECKING, Set, Type
 
 import torch
 
-
-@dataclasses.dataclass
-class _ReqLike:
-    origin_input_ids: List[int]
-
-
-@dataclasses.dataclass
-class _BatchLike:
-    reqs: List[_ReqLike]
-
-    def batch_size(self):
-        return len(self.reqs)
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
 
 
 class BatchedPenalizerOrchestrator:
     def __init__(
         self,
         vocab_size: int,
-        batch: _BatchLike,
-        device: str,
-        Penalizers: Set[Type["_BatchedPenalizer"]],
+        batch: ScheduleBatch,
+        penalizers: Set[Type["_BatchedPenalizer"]],
     ):
         self.vocab_size = vocab_size
         self.batch = batch
-        self.device = device
-        self.penalizers = {Penalizer: Penalizer(self) for Penalizer in Penalizers}
+        self.device = batch.device
+        self.penalizers = {Penalizer: Penalizer(self) for Penalizer in penalizers}
 
         is_required = False
         for penalizer in self.penalizers.values():
@@ -37,30 +27,8 @@ class BatchedPenalizerOrchestrator:
             is_required |= pen_is_required
         self.is_required = is_required
 
-        input_ids = [
-            torch.tensor(req.origin_input_ids, dtype=torch.int64, device=self.device)
-            for req in self.reqs()
-        ]
-        if self.is_required:
-            self.cumulate_input_tokens(input_ids=input_ids)
-
     def reqs(self):
         return self.batch.reqs
-
-    def batch_size(self):
-        return self.batch.batch_size()
-
-    def cumulate_input_tokens(self, input_ids: List[torch.Tensor]):
-        """
-        Feed the input tokens to the penalizers.
-
-        Args:
-            input_ids (List[torch.Tensor]): The input tokens.
-        """
-        token_ids = _TokenIDs(orchestrator=self, token_ids=input_ids)
-
-        for penalizer in self.penalizers.values():
-            penalizer.cumulate_input_tokens(input_ids=token_ids)
 
     def cumulate_output_tokens(self, output_ids: torch.Tensor):
         """
@@ -69,13 +37,8 @@ class BatchedPenalizerOrchestrator:
         Args:
             output_ids (torch.Tensor): The output tokens.
         """
-        if not self.is_required:
-            return
-
-        token_ids = _TokenIDs(orchestrator=self, token_ids=output_ids)
-
         for penalizer in self.penalizers.values():
-            penalizer.cumulate_output_tokens(output_ids=token_ids)
+            penalizer.cumulate_output_tokens(output_ids=output_ids)
 
     def apply(self, logits: torch.Tensor) -> torch.Tensor:
         """
@@ -88,48 +51,33 @@ class BatchedPenalizerOrchestrator:
         Returns:
             torch.Tensor: The logits after applying the penalizers.
         """
-        if not self.is_required:
-            return
-
         for penalizer in self.penalizers.values():
-            logits = penalizer.apply(logits)
+            penalizer.apply(logits)
 
-        return logits
-
-    def filter(
-        self,
-        indices_to_keep: List[int],
-        indices_tensor_to_keep: torch.Tensor = None,
-    ):
+    def filter(self, keep_indices: torch.Tensor):
         """
         Filter the penalizers based on the indices to keep in the batch.
 
         Args:
-            indices_to_keep (List[int]): List of indices to keep in the batch.
-            indices_tensor_to_keep (torch.Tensor = None): Tensor of indices to keep in the batch. If not None, it will be used instead of converting indices_to_keep to a tensor.
+            keep_indices (torch.Tensor): Tensor of indices to keep in the batch.
         """
         if not self.is_required:
             return
 
-        empty_indices = len(indices_to_keep) == 0
+        if len(keep_indices) == 0:
+            self.is_required = False
+            for penalizer in self.penalizers.values():
+                penalizer.teardown()
+            return
 
         is_required = False
         for penalizer in self.penalizers.values():
             tmp_is_required = penalizer.is_required()
-            is_required = is_required or tmp_is_required
-            if not tmp_is_required or empty_indices:
-                penalizer.teardown()
+            is_required |= tmp_is_required
+            if tmp_is_required:
+                penalizer.filter(keep_indices=keep_indices)
             else:
-                # create tensor index only when it's needed
-                if indices_tensor_to_keep is None:
-                    indices_tensor_to_keep = torch.tensor(
-                        indices_to_keep, dtype=torch.int32, device=self.device
-                    )
-
-                penalizer.filter(
-                    indices_to_keep=indices_to_keep,
-                    indices_tensor_to_keep=indices_tensor_to_keep,
-                )
+                penalizer.teardown()
         self.is_required = is_required
 
     def merge(self, their: "BatchedPenalizerOrchestrator"):
@@ -146,85 +94,15 @@ class BatchedPenalizerOrchestrator:
         if not self.is_required and not their.is_required:
             return
 
-        self.is_required |= their.is_required
-        for Penalizer, their_penalizer in their.penalizers.items():
-            if Penalizer not in self.penalizers:
-                raise ValueError(f"Penalizer {Penalizer} not found in self.penalizers")
-
-            self.penalizers[Penalizer].merge(their_penalizer)
-
-
-class _TokenIDs:
-    """
-    A class that wraps token IDs to provide additional utility functions to penalizers.
-
-    Attributes:
-        orchestrator (BatchedPenalizerOrchestrator): The orchestrator that this token IDs belong to.
-        token_ids (Union[torch.Tensor, List[torch.Tensor]]): The token IDs.
-        cached_counts (torch.Tensor): The cached occurrence count tensor.
-    """
-
-    def __init__(
-        self,
-        orchestrator: BatchedPenalizerOrchestrator,
-        token_ids: Union[torch.Tensor, List[torch.Tensor]],
-    ):
-        self.orchestrator = orchestrator
-        self.token_ids = token_ids
-        self.cached_counts = None
-
-    def occurrence_count(self) -> torch.Tensor:
-        """
-        Returns a tensor of shape (batch_size, vocab_size) where each element is the number of times the corresponding token appears in the batch.
-
-        Returns:
-            torch.Tensor: The occurrence count tensor.
-        """
-        if self.cached_counts is not None:
-            return self.cached_counts
-
-        token_ids = self.token_ids
-
-        if isinstance(token_ids, list):
-            # TODO: optimize this part
-            padded_token_ids = torch.nn.utils.rnn.pad_sequence(
-                sequences=token_ids,
-                batch_first=True,
-                padding_value=self.orchestrator.vocab_size,
-            )
-            self.cached_counts = torch.zeros(
-                size=(self.orchestrator.batch_size(), self.orchestrator.vocab_size + 1),
-                dtype=torch.int64,
-                device=self.orchestrator.device,
-            ).scatter_add_(
-                dim=1,
-                index=padded_token_ids,
-                src=torch.ones_like(padded_token_ids),
-            )[
-                :, : self.orchestrator.vocab_size
-            ]
-        else:
-            # TODO: optimize this part. We do not need to create this big tensor every time.
-            # We can directly apply the results on the logits.
-            self.cached_counts = torch.zeros(
-                size=(self.orchestrator.batch_size(), self.orchestrator.vocab_size),
-                device=self.orchestrator.device,
-            )
-            self.cached_counts[
-                torch.arange(len(token_ids), device=self.orchestrator.device), token_ids
-            ] = 1
-
-        return self.cached_counts
+        self.is_required = True
+        for penalizer, their_penalizer in their.penalizers.items():
+            self.penalizers[penalizer].merge(their_penalizer)
 
 
 class _BatchedPenalizer(abc.ABC):
     """
     An abstract class for a batched penalizer.
     """
-
-    def __init__(self, orchestrator: BatchedPenalizerOrchestrator):
-        self.orchestrator = orchestrator
-        self._is_prepared = False
 
     def is_prepared(self) -> bool:
         return self._is_prepared
@@ -233,51 +111,40 @@ class _BatchedPenalizer(abc.ABC):
         return self._is_required()
 
     def prepare(self):
-        if not self.is_prepared():
+        if not self._is_prepared:
             self._prepare()
             self._is_prepared = True
 
     def prepare_if_required(self):
-        if self.is_required():
+        if self._is_required():
             self.prepare()
             return True
         else:
             return False
 
     def teardown(self):
-        if self.is_prepared():
-            self._teardown()
-            self._is_prepared = False
+        self._is_prepared = False
 
-    def cumulate_input_tokens(self, input_ids: _TokenIDs):
-        if not self.is_prepared():
-            return
-
-        self._cumulate_input_tokens(input_ids=input_ids)
-
-    def cumulate_output_tokens(self, output_ids: _TokenIDs):
-        if not self.is_prepared():
+    def cumulate_output_tokens(self, output_ids: torch.Tensor):
+        if not self._is_prepared:
             return
 
         self._cumulate_output_tokens(output_ids=output_ids)
 
     def apply(self, logits: torch.Tensor) -> torch.Tensor:
-        if not self.is_prepared():
-            return logits
-
-        return self._apply(logits=logits)
-
-    def filter(self, indices_to_keep: List[int], indices_tensor_to_keep: torch.Tensor):
-        if not self.is_prepared():
+        if not self._is_prepared:
             return
 
-        self._filter(
-            indices_to_keep=indices_to_keep,
-            indices_tensor_to_keep=indices_tensor_to_keep,
-        )
+        self._apply(logits=logits)
+
+    def filter(self, keep_indices: torch.Tensor):
+        if not self._is_prepared:
+            return
+
+        self._filter(keep_indices=keep_indices)
 
     def merge(self, their: "_BatchedPenalizer"):
-        if not self.is_prepared() and not their.is_prepared():
+        if not self._is_prepared and not their._is_prepared:
             return
 
         self.prepare()
@@ -300,23 +167,7 @@ class _BatchedPenalizer(abc.ABC):
         pass
 
     @abc.abstractmethod
-    def _teardown(self):
-        """
-        Tear down the penalizer.
-        Usually, this is where the penalizer frees its tensors.
-        """
-        pass
-
-    @abc.abstractmethod
-    def _cumulate_input_tokens(self, input_ids: _TokenIDs):
-        """
-        Cumulate the input tokens.
-        Orchestrator will call this function to feed the input tokens to the penalizer.
-        """
-        pass
-
-    @abc.abstractmethod
-    def _cumulate_output_tokens(self, output_ids: _TokenIDs):
+    def _cumulate_output_tokens(self, output_ids: torch.Tensor):
         """
         Cumulate the output tokens.
         Orchestrator will call this function to feed the output tokens to the penalizer.
@@ -332,7 +183,7 @@ class _BatchedPenalizer(abc.ABC):
         pass
 
     @abc.abstractmethod
-    def _filter(self, indices_to_keep: List[int], indices_tensor_to_keep: torch.Tensor):
+    def _filter(self, keep_indices: torch.Tensor):
         """
         Filter the penalizer (tensors or underlying data) based on the indices to keep in the batch.
         """

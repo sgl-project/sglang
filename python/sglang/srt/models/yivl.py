@@ -29,8 +29,9 @@ class YiVLForCausalLM(LlavaLlamaForCausalLM):
         self,
         config: LlavaConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
-        super().__init__(config, quant_config)
+        super().__init__(config, quant_config, prefix=prefix)
 
         self.multi_modal_projector = YiVLMultiModalProjector(self.config)
         self.vision_tower_subfolder = self.config.mm_vision_tower.replace(

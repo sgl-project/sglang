@@ -1,18 +1,75 @@
-# DeepSeek Model Usage and Optimizations
+# DeepSeek Usage
 
-SGLang provides several optimizations specifically designed for the DeepSeek model to boost its inference speed. This document outlines current optimizations for DeepSeek. Additionally, the SGLang team is actively developing enhancements for [DeepSeek V3](https://github.com/sgl-project/sglang/issues/2591).
+SGLang provides many optimizations specifically designed for the DeepSeek models, making it the inference engine recommended by the official [DeepSeek team](https://github.com/deepseek-ai/DeepSeek-V3/tree/main?tab=readme-ov-file#62-inference-with-sglang-recommended) from Day 0.
+
+This document outlines current optimizations for DeepSeek.
+Additionally, the SGLang team is actively developing enhancements following this [Roadmap](https://github.com/sgl-project/sglang/issues/2591).
 
 ## Launch DeepSeek V3 with SGLang
 
-SGLang is recognized as one of the top engines for [DeepSeek model inference](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3).
+To run DeepSeek V3/R1 models, the requirements are as follows:
+
+| Weight Type | Configuration |
+|------------|-------------------|
+| **Full precision FP8**<br>*(recommended)* | 8 x H200 |
+| | 8 x MI300X |
+| | 2 x 8 x H100/800/20 |
+| **Full precision BF16** | 2 x 8 x H200 |
+| | 2 x 8 x MI300X |
+| | 4 x 8 x H100/800/20 |
+| | 4 x 8 x A100/A800 |
+| **Quantized weights (AWQ)** | 8 x H100/800/20 |
+| | 8 x A100/A800 |
+| **Quantized weights (int8)** | 16 x A100/800 |
+| | 32 x L40S |
+
+<style>
+.md-typeset__table {
+  width: 100%;
+}
+
+.md-typeset__table table {
+  border-collapse: collapse;
+  margin: 1em 0;
+  border: 2px solid var(--md-typeset-table-color);
+  table-layout: fixed;
+}
+
+.md-typeset__table th {
+  border: 1px solid var(--md-typeset-table-color);
+  border-bottom: 2px solid var(--md-typeset-table-color);
+  background-color: var(--md-default-bg-color--lighter);
+  padding: 12px;
+}
+
+.md-typeset__table td {
+  border: 1px solid var(--md-typeset-table-color);
+  padding: 12px;
+}
+
+.md-typeset__table tr:nth-child(2n) {
+  background-color: var(--md-default-bg-color--lightest);
+}
+</style>
+
+Detailed commands for reference:
+
+- [8 x H200](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#using-docker-recommended)
+- [8 x MI300X](https://docs.sglang.ai/references/amd.html#running-deepseek-v3)
+- [2 x 8 x H200](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-two-h208-nodes)
+- [4 x 8 x A100](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-four-a1008-nodes)
+- [8 x A100 (AWQ)](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-8-a100a800-with-awq-quantization)
+- [16 x A100 (int8)](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-16-a100a800-with-int8-quantization)
+- [32 x L40S (int8)](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-32-l40s-with-int8-quantization)
 
 ### Download Weights
+If you encounter errors when starting the server, ensure the weights have finished downloading. It's recommended to download them beforehand or restart multiple times until all weights are downloaded. Please refer to [DeepSeek V3](https://huggingface.co/deepseek-ai/DeepSeek-V3-Base#61-inference-with-deepseek-infer-demo-example-only) official guide to download the weights.
 
-If you encounter errors when starting the server, ensure the weights have finished downloading. It's recommended to download them beforehand or restart multiple times until all weights are downloaded. Please refer to [DeepSeek V3]([https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#installation--launch](https://huggingface.co/deepseek-ai/DeepSeek-V3-Base#61-inference-with-deepseek-infer-demo-example-only)) offical guide to download the weights.
+### Caching `torch.compile`
+The DeepSeek series have huge model weights, it takes some time to compile the model with `torch.compile` for the first time if you have added the flag `--enable-torch-compile`. You can refer [here](https://docs.sglang.ai/backend/hyperparameter_tuning.html#try-advanced-options) to optimize the caching of compilation results, so that the cache can be used to speed up the next startup.
 
-### Launch with One node of 8 H200
-
-Please refer to [the example](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#using-docker-recommended). **Note that Deepseek V3 is already in FP8. So we should not run it with any quantization arguments like `--quantization fp8 --kv-cache-dtype fp8_e5m2`.** Also, `--enable-dp-attention` can be useful to improve for Deepseek V3/R1's throughput. Please refer to [Data Parallelism Attention](https://docs.sglang.ai/references/deepseek.html#multi-head-latent-attention-mla-throughput-optimizations) for detail.
+### Launch with one node of 8 x H200
+Please refer to [the example](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#using-docker-recommended). **Note that Deepseek V3 is already in FP8. So we should not run it with any quantization arguments like `--quantization fp8 --kv-cache-dtype fp8_e5m2`.
 
 ### Running examples on Multi-node
 
@@ -30,35 +87,41 @@ Please refer to [the example](https://github.com/sgl-project/sglang/tree/main/be
 
 - **Weight Absorption**: By applying the associative law of matrix multiplication to reorder computation steps, this method balances computation and memory access and improves efficiency in the decoding phase.
 
-- **Triton Decoding Kernel Optimization**: In the MLA decoding kernel, there is only one KV head. This optimization reduces memory access to the KV cache by processing multiple query heads within one block, accelerating the decoding process.
+- **MLA Attention Backends**: Currently SGLang supports different optimized MLA attention backends, including [FlashAttention3](https://github.com/Dao-AILab/flash-attention), [Flashinfer](https://docs.flashinfer.ai/api/mla.html), and [Triton](https://github.com/triton-lang/triton) backends. The default FA3 provides good performance across wide workloads.
 
 - **FP8 Quantization**: W8A8 FP8 and KV Cache FP8 quantization enables efficient FP8 inference. Additionally, we have implemented Batched Matrix Multiplication (BMM) operator to facilitate FP8 inference in MLA with weight absorption.
 
 - **CUDA Graph & Torch.compile**: Both MLA and Mixture of Experts (MoE) are compatible with CUDA Graph and Torch.compile, which reduces latency and accelerates decoding speed for small batch sizes.
 
-Overall, with these optimizations, we have achieved up to a 7x acceleration in output throughput compared to the previous version.
+- **Chunked Prefix Cache**: Chunked prefix cache optimization can increase throughput by cutting prefix cache into chunks, processing them with multi-head attention and merging their states. Its improvement can be significant when doing chunked prefill on long sequences. Currently this optimization is only available for FlashAttention3 backend.
+
+Overall, with these optimizations, we have achieved up to **7x** acceleration in output throughput compared to the previous version.
 
 <p align="center">
   <img src="https://lmsys.org/images/blog/sglang_v0_3/deepseek_mla.svg" alt="Multi-head Latent Attention for DeepSeek Series Models">
 </p>
 
-**Usage**: MLA optimization is enabled by default, to disable, use `--disable-mla`.
+**Usage**: MLA optimization is enabled by default.
 
 **Reference**: Check [Blog](https://lmsys.org/blog/2024-09-04-sglang-v0-3/#deepseek-multi-head-latent-attention-mla-throughput-optimizations) and [Slides](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/lmsys_1st_meetup_deepseek_mla.pdf) for more details.
 
 ### Data Parallelism Attention
 
-**Description**: This optimization involves data parallelism (DP) for the MLA attention mechanism of DeepSeek Series Models, which allows for a significant reduction in the KV cache size, enabling larger batch sizes. Each DP worker independently handles different types of batches (prefill, decode, idle), which are then synchronized before and after processing through the Mixture-of-Experts (MoE) layer.
+**Description**: This optimization involves data parallelism (DP) for the MLA attention mechanism of DeepSeek Series Models, which allows for a significant reduction in the KV cache size, enabling larger batch sizes. Each DP worker independently handles different types of batches (prefill, decode, idle), which are then synchronized before and after processing through the Mixture-of-Experts (MoE) layer. If you do not use DP attention, KV cache will be duplicated among all TP ranks.
 
 <p align="center">
   <img src="https://lmsys.org/images/blog/sglang_v0_4/dp_attention.svg" alt="Data Parallelism Attention for DeepSeek Series Models">
 </p>
 
-**Usage**: This optimization is aimed at improving throughput and should be used for scenarios with high QPS (Queries Per Second). Data Parallelism Attention optimization can be enabled by `--enable-dp-attention` for DeepSeek Series Models.
+With data parallelism attention enabled, we have achieved up to **1.9x** decoding throughput improvement compared to the previous version.
 
 <p align="center">
   <img src="https://lmsys.org/images/blog/sglang_v0_4/deepseek_coder_v2.svg" alt="Data Parallelism Attention Performance Comparison">
 </p>
+
+**Usage**:
+- Append `--enable-dp-attention --tp 8 --dp 8` to the server arguments when using 8 H200 GPUs. This optimization improves peak throughput in high batch size scenarios where the server is limited by KV cache capacity. However, it is not recommended for low-latency, small-batch use cases.
+- DP and TP attention can be flexibly combined. For example, to deploy DeepSeek-V3/R1 on 2 nodes with 8 H100 GPUs each, you can specify `--enable-dp-attention --tp 16 --dp 2`. This configuration runs attention with 2 DP groups, each containing 8 TP GPUs.
 
 **Reference**: Check [Blog](https://lmsys.org/blog/2024-12-04-sglang-v0-4/#data-parallelism-attention-for-deepseek-models).
 
@@ -76,22 +139,89 @@ Overall, with these optimizations, we have achieved up to a 7x acceleration in o
 
 - **Weight**: Per-128x128-block quantization for better numerical stability.
 
-**Usage**: turn on by default for DeepSeek V3 models.
+- **DeepGEMM**: The [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM) kernel library optimized for FP8 matrix multiplications.
 
-### Cublas Grouped Gemm
+**Usage**: The activation and weight optimization above are turned on by default for DeepSeek V3 models. DeepGEMM is enabled by default on NVIDIA Hopper GPUs and disabled by default on other devices. DeepGEMM can also be manually turned off by setting the environment variable `SGL_ENABLE_JIT_DEEPGEMM=0`.
 
-**Description**: [Grouped Gemm API](https://docs.nvidia.com/cuda/cublas/index.html#cublasgemmgroupedbatchedex) provided by Cublas 12.5 is attached to SGLang for acceleration of
-settings where a group of matrix multiplication with different shapes needs to be executed. Typical examples are expert parallel in MoE layers, and lora modules in multi-serving Lora layers.
-
-**Usage**: SGLang currently only supports Pytorch 2.5, which is installed with Cuda 12.4 packages together. Users need to work on a Cuda environment >= 12.5 and forcely upgrade the Cublas package in the following way:
-
-1. Make sure the system Cuda version is >= 12.5 with `nvcc -V`
-2. Install sglang under instruction of [official document ](https://docs.sglang.ai/start/install.html)
-3. Reinstall cublas 12.5 through `pip install nvidia-cublas-cu12==12.5.3.2` so that the cublas package is upgraded
-4. Compile the new sgl-kernel library with `cd sgl-kernel && make build`
-
-Then the cublas grouped gemm kernel can be imported with
-```python
-from sgl_kernel import cublas_grouped_gemm
+Before serving the DeepSeek model, precompile the DeepGEMM kernels using:
+```bash
+python3 -m sglang.compile_deep_gemm --model deepseek-ai/DeepSeek-V3 --tp 8 --trust-remote-code
 ```
-Currently Cublas only support grouped gemm kernel for fp16/bf16/fp32 tensors, so fp8 tensors cannot be applied.
+The precompilation process typically takes around 10 minutes to complete.
+
+### Multi-token Prediction
+**Description**: SGLang implements DeepSeek V3 Multi-Token Prediction (MTP) based on [EAGLE speculative decoding](https://docs.sglang.ai/backend/speculative_decoding.html#EAGLE-Decoding). With this optimization, the decoding speed can be improved by **1.8x** for batch size 1 and **1.5x** for batch size 32 respectively on H200 TP8 setting.
+
+**Usage**:
+Add arguments `--speculative-algorithm`, `--speculative-draft-model-path`,
+`--speculative-num-steps`, `--speculative-eagle-topk` and `--speculative-num-draft-tokens` to enable this feature. For example:
+```
+python3 -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3-0324 --speculative-algorithm EAGLE --speculative-draft-model-path lmsys/DeepSeek-V3-0324-NextN --speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 2 --trust-remote-code --tp 8
+```
+- The draft model are available at huggingface: [lmsys/DeepSeek-V3-0324-NextN](https://huggingface.co/lmsys/DeepSeek-V3-0324-NextN), [lmsys/DeepSeek-R1-NextN](https://huggingface.co/lmsys/DeepSeek-R1-NextN). It can also be exported from original DeepSeek-V3/R1 model with [export_deepseek_nextn.py](https://github.com/sgl-project/sglang/blob/main/scripts/export_deepseek_nextn.py) script.
+- The best configuration for `--speculative-num-steps`, `--speculative-eagle-topk` and `--speculative-num-draft-tokens` can be searched with [bench_speculative.py](https://github.com/sgl-project/sglang/blob/main/scripts/playground/bench_speculative.py) script for given batch size. The minimum configuration is `--speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 2`, which can achieve speedup for larger batch sizes.
+When using FlashInfer MLA wrapper (`--attention-backend flashinfer`) with speculative decoding, set the `--speculative-eagle-topk` parameter to `1`. The FlashAttention 3 backend also only supports `--speculative-eagle-topk 1`.
+- To enable DeepSeek MTP for large batch sizes (>32), there are some parameters should be changed (Reference [this discussion](https://github.com/sgl-project/sglang/issues/4543#issuecomment-2737413756)):
+  - Adjust `--max-running-requests` to a larger number. The default value is `32` for MTP. For larger batch sizes, you should increase this value beyond the default value.
+  - Set `--cuda-graph-bs`. It's a list of batch sizes for cuda graph capture. The default captured batch sizes for speculative decoding is set [here](https://github.com/sgl-project/sglang/blob/49420741746c8f3e80e0eb17e7d012bfaf25793a/python/sglang/srt/model_executor/cuda_graph_runner.py#L126). You can include more batch sizes into it.
+
+
+### Reasoning Content for DeepSeek R1
+
+See [Separate Reasoning](https://docs.sglang.ai/backend/separate_reasoning.html).
+
+
+### Function calling for DeepSeek Models
+
+Add arguments `--tool-call-parser deepseekv3` to enable this feature. For example (running on 1 * H20 node):
+
+```
+python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3-0324 --tp 8 --port 30000 --host 0.0.0.0 --mem-fraction-static 0.9 --disable-cuda-graph --tool-call-parser deepseekv3
+```
+
+Sample Request:
+
+```
+curl "http://127.0.0.1:30000/v1/chat/completions" \
+-H "Content-Type: application/json" \
+-d '{"temperature": 0, "max_tokens": 100, "model": "deepseek-ai/DeepSeek-V3-0324", "tools": [{"type": "function", "function": {"name": "query_weather", "description": "Get weather of an city, the user should supply a city first", "parameters": {"type": "object", "properties": {"city": {"type": "string", "description": "The city, e.g. Beijing"}}, "required": ["city"]}}}], "messages": [{"role": "user", "content": "Hows the weather like in Qingdao today"}]}'
+```
+
+Expected Response
+
+```
+{"id": "62af80528930423a82c806651ec66e7c", "object": "chat.completion", "created": 1744431333, "model": "deepseek-ai/DeepSeek-V3-0324", "choices": [{"index": 0, "message": {"role": "assistant", "content": null, "reasoning_content": null, "tool_calls": [{"id": "0", "type": "function", "function": {"name": "query_weather", "arguments": "{\\"city\\": \\"Guangzhou\\"}"}}]}, "logprobs": null, "finish_reason": "tool_calls", "matched_stop": null}], "usage": {"prompt_tokens": 118, "total_tokens": 140, "completion_tokens": 22, "prompt_tokens_details": null}}
+
+```
+Sample Streaming Request:
+```
+curl "http://127.0.0.1:30000/v1/chat/completions" \
+-H "Content-Type: application/json" \
+-d '{"temperature": 0, "max_tokens": 100, "model": "deepseek-ai/DeepSeek-V3-0324","stream":true,"tools": [{"type": "function", "function": {"name": "query_weather", "description": "Get weather of an city, the user should supply a city first", "parameters": {"type": "object", "properties": {"city": {"type": "string", "description": "The city, e.g. Beijing"}}, "required": ["city"]}}}], "messages": [{"role": "user", "content": "Hows the weather like in Qingdao today"}]}'
+```
+Expected Streamed Chunks (simplified for clarity):
+```
+data: {"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"{\""}}]}}]}
+data: {"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"city"}}]}}]}
+data: {"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"\":\""}}]}}]}
+data: {"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"Q"}}]}}]}
+data: {"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"ing"}}]}}]}
+data: {"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"dao"}}]}}]}
+data: {"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"\"}"}}]}}]}
+data: {"choices":[{"delta":{"tool_calls":null}}], "finish_reason": "tool_calls"}
+data: [DONE]
+```
+The client needs to concatenate all arguments fragments to reconstruct the complete tool call:
+```
+{"city": "Qingdao"}
+```
+Important Notes:
+1. Use a lower `"temperature"` value for better results.
+
+
+
+## FAQ
+
+1. **Question**: What should I do if model loading takes too long and NCCL timeout occurs?
+
+    **Answer**: You can try to add `--dist-timeout 3600` when launching the model, this allows for 1-hour timeout.

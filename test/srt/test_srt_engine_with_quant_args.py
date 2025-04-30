@@ -1,10 +1,10 @@
 import unittest
 
 import sglang as sgl
-from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, CustomTestCase
 
 
-class TestSRTEngineWithQuantArgs(unittest.TestCase):
+class TestSRTEngineWithQuantArgs(CustomTestCase):
 
     def test_1_quantization_args(self):
 

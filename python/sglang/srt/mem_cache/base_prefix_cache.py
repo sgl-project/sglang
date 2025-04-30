@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Callable, List, Tuple
+from typing import Any, List, Tuple
 
 
 class BasePrefixCache(ABC):
@@ -26,24 +26,22 @@ class BasePrefixCache(ABC):
         pass
 
     @abstractmethod
-    def evict(self, num_tokens: int, evict_callback: Callable):
+    def evict(self, num_tokens: int):
         pass
 
     @abstractmethod
-    def inc_lock_ref(self, node):
+    def inc_lock_ref(self, node: Any):
         pass
 
     @abstractmethod
-    def dec_lock_ref(self, node):
+    def dec_lock_ref(self, node: Any):
         pass
 
-    @abstractmethod
     def evictable_size(self):
-        pass
+        return 0
 
-    @abstractmethod
     def protected_size(self):
-        raise NotImplementedError()
+        return 0
 
     def total_size(self):
         raise NotImplementedError()

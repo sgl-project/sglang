@@ -18,6 +18,7 @@
 # LoRA layers class inheritance adapted from:
 # https://github.com/vllm-project/vllm/blob/4abf6336ec65c270343eb895e7b18786e9274176/vllm/lora/layers.py
 
+import logging
 import re
 from typing import Dict, List
 
@@ -26,9 +27,11 @@ from torch import nn
 
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.hf_transformers_utils import AutoConfig
-from sglang.srt.lora.backend import BaseLoRABackend
+from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.model_loader.loader import DefaultModelLoader
+
+logger = logging.getLogger(__name__)
 
 
 class LoRALayer(nn.Module):
@@ -36,16 +39,9 @@ class LoRALayer(nn.Module):
         super().__init__()
         self.config: LoRAConfig = config
         self.base_hf_config: AutoConfig = base_hf_config
+
+        # lora weights in cpu. The weights are loaded from checkpoint.
         self.weights: Dict[str, torch.Tensor] = {}
-        self.weight_gpu: Dict[str, torch.Tensor] = {}
-
-    def load_to_gpu(self):
-        for name, weight in self.weights.items():
-            self.weight_gpu[name] = weight.to(torch.float16).to("cuda")
-
-    def offload_from_gpu(self):
-        for name, weight in self.weights.items():
-            self.weight_gpu[name] = None
 
 
 class LoRAAdapter(nn.Module):
@@ -74,19 +70,6 @@ class LoRAAdapter(nn.Module):
         )
 
         self.weights: Dict[str, torch.Tensor] = {}
-        self.weights_gpu: Dict[str, torch.Tensor] = {}
-
-    def load_to_gpu(self):
-        for name, weight in self.weights.items():
-            self.weights_gpu[name] = weight.to(torch.float16).to("cuda")
-        for layer in self.layers:
-            layer.load_to_gpu()
-
-    def offload_from_gpu(self):
-        for name, weight in self.weights.items():
-            self.weights_gpu[name] = None
-        for layer in self.layers:
-            layer.offload_from_gpu()
 
     # initialize the LoRA weights to cpu
     def initialize_weights(self):
@@ -173,6 +156,18 @@ class LoRAAdapter(nn.Module):
             if "gate_proj" in weight_name:
                 up_name = weight_name.replace("gate_proj", "up_proj")
                 gate_up_name = weight_name.replace("gate_proj", "gate_up_proj")
+                if up_name not in weights:
+                    logger.warning(
+                        f"Gate projection {weight_name} does not have a corresponding up projection {up_name}. "
+                        f"Initializing up projection to zero."
+                    )
+                    weights[up_name] = torch.zeros_like(weights[weight_name])
+                    # FIXME: Add gate-only support for flashinfer in future implementations
+                    assert self.lora_backend.name == "triton", (
+                        f"LoRA weight initialization currently only supported for 'triton' backend. "
+                        f"Received backend: {self.lora_backend.name}. Please verify your backend configuration "
+                        f"or consider implementing custom initialization logic for other backends."
+                    )
                 if "lora_A" in weight_name:
                     weights[gate_up_name] = torch.cat(
                         (weights[weight_name], weights[up_name]), 0
@@ -182,4 +177,5 @@ class LoRAAdapter(nn.Module):
                         [weights[weight_name], weights[up_name]], dim=0
                     )
                 weights.pop(weight_name)
-                weights.pop(up_name)
+                if up_name in weights:
+                    weights.pop(up_name)

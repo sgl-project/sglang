@@ -36,6 +36,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe.ep_moe.layer import EPMoE
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -44,8 +45,13 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.managers.expert_distribution import ExpertDistributionRecorder
+from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.utils import add_prefix, make_layers
+
+expert_distribution_recorder = ExpertDistributionRecorder()
 
 
 class Qwen2MoeMLP(nn.Module):
@@ -56,10 +62,15 @@ class Qwen2MoeMLP(nn.Module):
         hidden_act: str,
         quant_config: Optional[QuantizationConfig] = None,
         reduce_results: bool = True,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
-            hidden_size, [intermediate_size] * 2, bias=False, quant_config=quant_config
+            hidden_size,
+            [intermediate_size] * 2,
+            bias=False,
+            quant_config=quant_config,
+            prefix=add_prefix("gate_up_proj", prefix),
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -67,6 +78,7 @@ class Qwen2MoeMLP(nn.Module):
             bias=False,
             quant_config=quant_config,
             reduce_results=reduce_results,
+            prefix=add_prefix("down_proj", prefix),
         )
         if hidden_act != "silu":
             raise ValueError(
@@ -87,6 +99,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -97,18 +110,24 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 f"the number of experts {config.num_experts}."
             )
 
-        self.experts = FusedMoE(
+        MoEImpl = EPMoE if global_server_args_dict["enable_ep_moe"] else FusedMoE
+
+        self.experts = MoEImpl(
             num_experts=config.num_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
-            reduce_results=False,
             renormalize=config.norm_topk_prob,
             quant_config=quant_config,
+            prefix=add_prefix("experts", prefix),
         )
 
         self.gate = ReplicatedLinear(
-            config.hidden_size, config.num_experts, bias=False, quant_config=None
+            config.hidden_size,
+            config.num_experts,
+            bias=False,
+            quant_config=None,
+            prefix=add_prefix("gate", prefix),
         )
         if config.shared_expert_intermediate_size > 0:
             self.shared_expert = Qwen2MoeMLP(
@@ -117,6 +136,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 reduce_results=False,
+                prefix=add_prefix("shared_expert", prefix),
             )
         else:
             self.shared_expert = None
@@ -156,7 +176,9 @@ class Qwen2MoeAttention(nn.Module):
         rope_theta: float = 10000,
         rope_scaling: Optional[Dict[str, Any]] = None,
         max_position_embeddings: int = 8192,
+        qkv_bias: int = True,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -186,8 +208,9 @@ class Qwen2MoeAttention(nn.Module):
             self.head_dim,
             self.total_num_heads,
             self.total_num_kv_heads,
-            bias=True,
+            bias=qkv_bias,
             quant_config=quant_config,
+            prefix=add_prefix("qkv_proj", prefix),
         )
 
         self.o_proj = RowParallelLinear(
@@ -195,6 +218,7 @@ class Qwen2MoeAttention(nn.Module):
             hidden_size,
             bias=False,
             quant_config=quant_config,
+            prefix=add_prefix("o_proj", prefix),
         )
 
         self.rotary_emb = get_rope(
@@ -210,6 +234,8 @@ class Qwen2MoeAttention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            quant_config=quant_config,
+            prefix=add_prefix("attn", prefix),
         )
 
     def forward(
@@ -232,12 +258,14 @@ class Qwen2MoeDecoderLayer(nn.Module):
         config: PretrainedConfig,
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
+        qkv_bias = getattr(config, "qkv_bias", True)
         self.self_attn = Qwen2MoeAttention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
@@ -247,6 +275,8 @@ class Qwen2MoeDecoderLayer(nn.Module):
             rope_scaling=rope_scaling,
             max_position_embeddings=max_position_embeddings,
             quant_config=quant_config,
+            qkv_bias=qkv_bias,
+            prefix=add_prefix("self_attn", prefix),
         )
 
         # Note: Qwen/Qwen2-57B-A14B-Instruct does not have
@@ -257,13 +287,18 @@ class Qwen2MoeDecoderLayer(nn.Module):
         if (layer_id not in mlp_only_layers) and (
             config.num_experts > 0 and (layer_id + 1) % config.decoder_sparse_step == 0
         ):
-            self.mlp = Qwen2MoeSparseMoeBlock(config=config, quant_config=quant_config)
+            self.mlp = Qwen2MoeSparseMoeBlock(
+                config=config,
+                quant_config=quant_config,
+                prefix=add_prefix("mlp", prefix),
+            )
         else:
             self.mlp = Qwen2MoeMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
+                prefix=add_prefix("mlp", prefix),
             )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -300,6 +335,8 @@ class Qwen2MoeModel(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+        decoder_layer_type: type[nn.Module] = Qwen2MoeDecoderLayer,
     ) -> None:
         super().__init__()
         self.padding_idx = config.pad_token_id
@@ -308,12 +345,19 @@ class Qwen2MoeModel(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
+            prefix=add_prefix("embed_tokens", prefix),
         )
-        self.layers = nn.ModuleList(
-            [
-                Qwen2MoeDecoderLayer(config, layer_id, quant_config=quant_config)
-                for layer_id in range(config.num_hidden_layers)
-            ]
+        # Use the provided decoder layer type or default to Qwen2MoeDecoderLayer
+        decoder_layer_type = decoder_layer_type or Qwen2MoeDecoderLayer
+        self.layers = make_layers(
+            config.num_hidden_layers,
+            lambda idx, prefix: decoder_layer_type(
+                layer_id=idx,
+                config=config,
+                quant_config=quant_config,
+                prefix=prefix,
+            ),
+            prefix=add_prefix("layers", prefix),
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -330,6 +374,7 @@ class Qwen2MoeModel(nn.Module):
             hidden_states = input_embeds
         residual = None
         for i in range(len(self.layers)):
+            expert_distribution_recorder.set_current_layer(i)
             layer = self.layers[i]
             hidden_states, residual = layer(
                 positions, hidden_states, forward_batch, residual
@@ -346,13 +391,19 @@ class Qwen2MoeForCausalLM(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.model = Qwen2MoeModel(config, quant_config)
+        self.model = Qwen2MoeModel(
+            config, quant_config, prefix=add_prefix("model", prefix)
+        )
         self.lm_head = ParallelLMHead(
-            config.vocab_size, config.hidden_size, quant_config=quant_config
+            config.vocab_size,
+            config.hidden_size,
+            quant_config=quant_config,
+            prefix=add_prefix("lm_head", prefix),
         )
         self.logits_processor = LogitsProcessor(config)
 
@@ -379,7 +430,9 @@ class Qwen2MoeForCausalLM(nn.Module):
             ("gate_up_proj", "up_proj", 1),
         ]
 
-        expert_params_mapping = FusedMoE.make_expert_params_mapping(
+        MoEImpl = EPMoE if global_server_args_dict["enable_ep_moe"] else FusedMoE
+
+        expert_params_mapping = MoEImpl.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",

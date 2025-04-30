@@ -30,6 +30,7 @@ import weakref
 from collections import namedtuple
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
+from datetime import timedelta
 from multiprocessing import shared_memory
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 from unittest.mock import patch
@@ -138,6 +139,27 @@ if supports_custom_op():
         fake_impl=outplace_all_reduce_fake,
     )
 
+    def reg_all_gather_into_tensor(
+        output: torch.Tensor, input: torch.Tensor, group_name: str
+    ) -> None:
+        assert group_name in _groups, f"Group {group_name} is not found."
+        group = _groups[group_name]()
+        if group is None:
+            raise ValueError(f"Group {group_name} is destroyed.")
+        group._all_gather_into_tensor(output, input)
+
+    def reg_all_gather_into_tensor_fake(
+        output: torch.Tensor, input: torch.Tensor, group_name: str
+    ) -> None:
+        pass
+
+    direct_register_custom_op(
+        op_name="reg_all_gather_into_tensor",
+        op_func=reg_all_gather_into_tensor,
+        mutates_args=["output"],
+        fake_impl=reg_all_gather_into_tensor_fake,
+    )
+
 
 class GroupCoordinator:
     """
@@ -167,6 +189,9 @@ class GroupCoordinator:
     device_group: ProcessGroup  # group for device communication
     use_pynccl: bool  # a hint of whether to use PyNccl
     use_custom_allreduce: bool  # a hint of whether to use CustomAllreduce
+    use_message_queue_broadcaster: (
+        bool  # a hint of whether to use message queue broadcaster
+    )
     # communicators are only created for world size > 1
     pynccl_comm: Optional[Any]  # PyNccl communicator
     ca_comm: Optional[Any]  # Custom allreduce communicator
@@ -219,6 +244,7 @@ class GroupCoordinator:
         self.use_custom_allreduce = use_custom_allreduce
         self.use_hpu_communicator = use_hpu_communicator
         self.use_xpu_communicator = use_xpu_communicator
+        self.use_message_queue_broadcaster = use_message_queue_broadcaster
 
         # lazy import to avoid documentation build error
         from sglang.srt.distributed.device_communicators.custom_all_reduce import (
@@ -238,16 +264,22 @@ class GroupCoordinator:
         self.ca_comm: Optional[CustomAllreduce] = None
         if use_custom_allreduce and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
-            self.ca_comm = CustomAllreduce(
-                group=self.cpu_group,
-                device=self.device,
-            )
+            try:
+                self.ca_comm = CustomAllreduce(
+                    group=self.cpu_group,
+                    device=self.device,
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Setup Custom allreduce failed with {e}. To silence this "
+                    "warning, specify --disable-custom-all-reduce explicitly."
+                )
 
         from sglang.srt.distributed.device_communicators.hpu_communicator import (
             HpuCommunicator,
         )
 
-        self.hpu_communicator: Optional[HpuCommunicator]
+        self.hpu_communicator: Optional[HpuCommunicator] = None
         if use_hpu_communicator and self.world_size > 1:
             self.hpu_communicator = HpuCommunicator(group=self.device_group)
 
@@ -255,7 +287,7 @@ class GroupCoordinator:
             XpuCommunicator,
         )
 
-        self.xpu_communicator: Optional[XpuCommunicator]
+        self.xpu_communicator: Optional[XpuCommunicator] = None
         if use_xpu_communicator and self.world_size > 1:
             self.xpu_communicator = XpuCommunicator(group=self.device_group)
 
@@ -413,11 +445,49 @@ class GroupCoordinator:
         else:
             torch.distributed.all_reduce(input_, group=self.device_group)
 
-    def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    def reduce_scatter(
+        self,
+        output: torch.Tensor,
+        input_list: List[torch.Tensor],
+    ) -> None:
+        # TODO(ch-wan): support other backends
+        torch.distributed.reduce_scatter(output, input_list, group=self.device_group)
+        return output
+
+    def _all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
+        pynccl_comm = self.pynccl_comm
+        if pynccl_comm is not None and not pynccl_comm.disabled:
+            pynccl_comm.all_gather(output, input)
+        else:
+            torch.distributed.all_gather_into_tensor(
+                output, input, group=self.device_group
+            )
+
+    def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
+        if not supports_custom_op():
+            self._all_gather_into_tensor(output, input)
+        else:
+            torch.ops.sglang.reg_all_gather_into_tensor(
+                output, input, group_name=self.unique_name
+            )
+
+    def all_gather(
+        self,
+        input_: torch.Tensor,
+        dim: int = -1,
+        tensor_list: List[torch.Tensor] = None,
+    ) -> torch.Tensor:
         world_size = self.world_size
         # Bypass the function if we are using only 1 GPU.
         if world_size == 1:
             return input_
+
+        if tensor_list is not None:
+            # TODO(ch-wan): support other backends
+            return torch.distributed.all_gather(
+                tensor_list, input_, group=self.device_group
+            )
+
         assert (
             -input_.dim() <= dim < input_.dim()
         ), f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
@@ -440,9 +510,7 @@ class GroupCoordinator:
             output_size, dtype=input_.dtype, device=input_.device
         )
         # All-gather.
-        torch.distributed.all_gather_into_tensor(
-            output_tensor, input_, group=self.device_group
-        )
+        self.all_gather_into_tensor(output_tensor, input_)
         # Reshape
         output_tensor = output_tensor.reshape((world_size,) + input_size)
         output_tensor = output_tensor.movedim(0, dim)
@@ -960,6 +1028,7 @@ def init_distributed_environment(
     distributed_init_method: str = "env://",
     local_rank: int = -1,
     backend: str = "nccl",
+    timeout: Optional[int] = None,
 ):
     logger.debug(
         "world_size=%d rank=%d local_rank=%d " "distributed_init_method=%s backend=%s",
@@ -974,13 +1043,20 @@ def init_distributed_environment(
             "distributed_init_method must be provided when initializing "
             "distributed environment"
         )
+        if timeout is not None:
+            assert isinstance(timeout, (int)), "timeout must be a number"
+            assert timeout > 0, "timeout must be positive"
+            timeout = timedelta(seconds=timeout)
+
         # this backend is used for WORLD
         torch.distributed.init_process_group(
             backend=backend,
             init_method=distributed_init_method,
             world_size=world_size,
             rank=rank,
+            timeout=timeout,
         )
+
     # set the local rank
     # local_rank is not available in torch ProcessGroup,
     # see https://github.com/pytorch/pytorch/issues/122816
@@ -1183,7 +1259,16 @@ def cleanup_dist_env_and_memory(shutdown_ray: bool = False):
         ray.shutdown()
     gc.collect()
     if not current_platform.is_cpu():
-        torch.cuda.empty_cache()
+        if hasattr(torch, "cuda") and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            if hasattr(torch._C, "_host_emptyCache"):
+                torch._C._host_emptyCache()
+            else:
+                logger.warning(
+                    "torch._C._host_emptyCache() only available in Pytorch >=2.5"
+                )
+        elif hasattr(torch, "xpu") and torch.xpu.is_available():
+            torch.xpu.empty_cache()
 
 
 def in_the_same_node_as(pg: ProcessGroup, source_rank: int = 0) -> List[bool]:
@@ -1258,7 +1343,10 @@ vllm_get_world_group = None
 
 
 def monkey_patch_vllm_parallel_state(reverse: bool = False):
-    import vllm.distributed.parallel_state as vllm_parrlel_state
+    try:
+        import vllm.distributed.parallel_state as vllm_parrlel_state
+    except ImportError:
+        return
 
     global vllm_get_pp_group, vllm_get_tp_group, vllm_get_world_group
     if vllm_get_pp_group is None:

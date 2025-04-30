@@ -3,13 +3,13 @@ import triton
 import triton.language as tl
 
 from sglang.srt.managers.schedule_batch import global_server_args_dict
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_cuda, is_hip
 
-is_cuda_available = torch.cuda.is_available()
-if is_cuda_available:
+_is_cuda = is_cuda()
+if _is_cuda:
     CUDA_CAPABILITY = torch.cuda.get_device_capability()
 
-is_hip_ = is_hip()
+_is_hip = is_hip()
 
 if global_server_args_dict.get("attention_reduce_in_fp32", False):
     REDUCE_TRITON_TYPE = tl.float32
@@ -1032,17 +1032,17 @@ def extend_attention_fwd(
         BLOCK_DPE = 0
     BLOCK_DV = triton.next_power_of_2(Lv)
 
-    if is_hip_:
+    if _is_hip:
         BLOCK_M, BLOCK_N = (64, 64)
         num_warps = 4
 
     else:
-        if is_cuda_available and CUDA_CAPABILITY[0] >= 9:
+        if _is_cuda and CUDA_CAPABILITY[0] >= 9:
             if Lq <= 256:
                 BLOCK_M, BLOCK_N = (128, 64)
             else:
                 BLOCK_M, BLOCK_N = (32, 64)
-        elif is_cuda_available and CUDA_CAPABILITY[0] >= 8:
+        elif _is_cuda and CUDA_CAPABILITY[0] >= 8:
             if Lq <= 128:
                 BLOCK_M, BLOCK_N = (128, 128)
             elif Lq <= 256:
@@ -1062,7 +1062,7 @@ def extend_attention_fwd(
     num_stages = 1
 
     extra_kargs = {}
-    if is_hip_:
+    if _is_hip:
         extra_kargs = {"waves_per_eu": 4, "matrix_instr_nonkdim": 16, "kpack": 2}
 
     _fwd_kernel[grid](

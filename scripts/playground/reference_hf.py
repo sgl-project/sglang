@@ -1,6 +1,10 @@
 """
-Usage:
-python3 reference_hf.py --model TinyLlama/TinyLlama-1.1B-Chat-v0.4
+Usage: python3 scripts/playground/reference_hf.py --model-path MODEL_PATH --model-type {text,vlm} [--max-new-tokens NUM] [--dtype DTYPE]
+  --model-path MODEL_PATH: Path to model (default: TinyLlama/TinyLlama-1.1B-Chat-v0.4)
+  --model-type {text,vlm}: Model type, text or vlm (default: text)
+  --max-new-tokens NUM: Max new tokens to generate (default: 16)
+  --dtype DTYPE: Data type for computation (default: float16)
+Note: '--model' is deprecated; use '--model-path'. Runs normal_text() for text, vlm_text_with_image() for vlm.
 
 Reference output:
 ========== Prompt 0 ==========
@@ -178,7 +182,6 @@ if __name__ == "__main__":
         "--model-path",
         type=str,
         default="TinyLlama/TinyLlama-1.1B-Chat-v0.4",
-        # default="meta-llama/Llama-2-7b-chat-hf",
     )
     parser.add_argument("--max-new-tokens", type=int, default=16)
 

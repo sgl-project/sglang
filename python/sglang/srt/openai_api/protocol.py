@@ -16,7 +16,7 @@
 import time
 from typing import Dict, List, Optional, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, root_validator
 from typing_extensions import Literal
 
 
@@ -28,6 +28,7 @@ class ModelCard(BaseModel):
     created: int = Field(default_factory=lambda: int(time.time()))
     owned_by: str = "sglang"
     root: Optional[str] = None
+    max_model_len: Optional[int] = None
 
 
 class ModelList(BaseModel):
@@ -187,7 +188,7 @@ class CompletionResponseChoice(BaseModel):
     index: int
     text: str
     logprobs: Optional[LogProbs] = None
-    finish_reason: Optional[str] = None
+    finish_reason: Literal["stop", "length", "content_filter"]
     matched_stop: Union[None, int, str] = None
 
 
@@ -204,7 +205,7 @@ class CompletionResponseStreamChoice(BaseModel):
     index: int
     text: str
     logprobs: Optional[LogProbs] = None
-    finish_reason: Optional[str] = None
+    finish_reason: Optional[Literal["stop", "length", "content_filter"]] = None
     matched_stop: Union[None, int, str] = None
 
 
@@ -227,20 +228,31 @@ class ChatCompletionMessageContentImageURL(BaseModel):
     detail: Optional[Literal["auto", "low", "high"]] = "auto"
 
 
+class ChatCompletionMessageContentAudioURL(BaseModel):
+    url: str
+
+
 class ChatCompletionMessageContentImagePart(BaseModel):
     type: Literal["image_url"]
     image_url: ChatCompletionMessageContentImageURL
     modalities: Optional[Literal["image", "multi-images", "video"]] = "image"
 
 
+class ChatCompletionMessageContentAudioPart(BaseModel):
+    type: Literal["audio_url"]
+    audio_url: ChatCompletionMessageContentAudioURL
+
+
 ChatCompletionMessageContentPart = Union[
-    ChatCompletionMessageContentTextPart, ChatCompletionMessageContentImagePart
+    ChatCompletionMessageContentTextPart,
+    ChatCompletionMessageContentImagePart,
+    ChatCompletionMessageContentAudioPart,
 ]
 
 
 class ChatCompletionMessageGenericParam(BaseModel):
     role: Literal["system", "assistant", "tool"]
-    content: Union[str, List[ChatCompletionMessageContentTextPart]]
+    content: Union[str, List[ChatCompletionMessageContentTextPart], None]
 
 
 class ChatCompletionMessageUserParam(BaseModel):
@@ -258,12 +270,25 @@ class ResponseFormat(BaseModel):
     json_schema: Optional[JsonSchemaResponseFormat] = None
 
 
+class StructuresResponseFormat(BaseModel):
+    begin: str
+    schema_: Optional[Dict[str, object]] = Field(alias="schema", default=None)
+    end: str
+
+
+class StructuralTagResponseFormat(BaseModel):
+    type: Literal["structural_tag"]
+    structures: List[StructuresResponseFormat]
+    triggers: List[str]
+
+
 class Function(BaseModel):
     """Function descriptions."""
 
     description: Optional[str] = Field(default=None, examples=[None])
     name: Optional[str] = None
     parameters: Optional[object] = None
+    strict: bool = False
 
 
 class Tool(BaseModel):
@@ -295,10 +320,19 @@ class ChatCompletionRequest(BaseModel):
     logit_bias: Optional[Dict[str, float]] = None
     logprobs: bool = False
     top_logprobs: Optional[int] = None
-    max_tokens: Optional[int] = None
+    max_tokens: Optional[int] = Field(
+        default=None,
+        deprecated="max_tokens is deprecated in favor of the max_completion_tokens field",
+        description="The maximum number of tokens that can be generated in the chat completion. ",
+    )
+    max_completion_tokens: Optional[int] = Field(
+        default=None,
+        description="The maximum number of completion tokens for a chat completion request, "
+        "including visible output tokens and reasoning tokens. Input tokens are not included. ",
+    )
     n: int = 1
     presence_penalty: float = 0.0
-    response_format: Optional[ResponseFormat] = None
+    response_format: Optional[Union[ResponseFormat, StructuralTagResponseFormat]] = None
     seed: Optional[int] = None
     stop: Optional[Union[str, List[str]]] = None
     stream: bool = False
@@ -311,6 +345,15 @@ class ChatCompletionRequest(BaseModel):
         default="auto", examples=["none"]
     )  # noqa
 
+    @root_validator(pre=True)
+    def set_tool_choice_default(cls, values):
+        if values.get("tool_choice") is None:
+            if values.get("tools") is None:
+                values["tool_choice"] = "none"
+            else:
+                values["tool_choice"] = "auto"
+        return values
+
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
     top_k: int = -1
     min_p: float = 0.0
@@ -321,9 +364,18 @@ class ChatCompletionRequest(BaseModel):
     stop_token_ids: Optional[List[int]] = None
     no_stop_trim: bool = False
     ignore_eos: bool = False
+    continue_final_message: bool = False
     skip_special_tokens: bool = True
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
     session_params: Optional[Dict] = None
+    separate_reasoning: bool = True
+    stream_reasoning: bool = True
+    chat_template_kwargs: Optional[Dict] = None
+
+    # For PD disaggregation
+    bootstrap_host: Optional[str] = None
+    bootstrap_port: Optional[int] = None
+    bootstrap_room: Optional[int] = None
 
 
 class FunctionResponse(BaseModel):
@@ -337,6 +389,7 @@ class ToolCall(BaseModel):
     """Tool call response."""
 
     id: str
+    index: Optional[int] = None
     type: Literal["function"] = "function"
     function: FunctionResponse
 
@@ -344,6 +397,7 @@ class ToolCall(BaseModel):
 class ChatMessage(BaseModel):
     role: Optional[str] = None
     content: Optional[str] = None
+    reasoning_content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
 
 
@@ -351,7 +405,9 @@ class ChatCompletionResponseChoice(BaseModel):
     index: int
     message: ChatMessage
     logprobs: Optional[Union[LogProbs, ChoiceLogprobs]] = None
-    finish_reason: str
+    finish_reason: Literal[
+        "stop", "length", "tool_calls", "content_filter", "function_call"
+    ]
     matched_stop: Union[None, int, str] = None
 
 
@@ -367,6 +423,7 @@ class ChatCompletionResponse(BaseModel):
 class DeltaMessage(BaseModel):
     role: Optional[str] = None
     content: Optional[str] = None
+    reasoning_content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
 
 
@@ -374,7 +431,9 @@ class ChatCompletionResponseStreamChoice(BaseModel):
     index: int
     delta: DeltaMessage
     logprobs: Optional[Union[LogProbs, ChoiceLogprobs]] = None
-    finish_reason: Optional[str] = None
+    finish_reason: Optional[
+        Literal["stop", "length", "tool_calls", "content_filter", "function_call"]
+    ] = None
     matched_stop: Union[None, int, str] = None
 
 
@@ -387,10 +446,17 @@ class ChatCompletionStreamResponse(BaseModel):
     usage: Optional[UsageInfo] = None
 
 
+class MultimodalEmbeddingInput(BaseModel):
+    text: Optional[str] = None
+    image: Optional[str] = None
+
+
 class EmbeddingRequest(BaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/embeddings/create
-    input: Union[List[int], List[List[int]], str, List[str]]
+    input: Union[
+        List[int], List[List[int]], str, List[str], List[MultimodalEmbeddingInput]
+    ]
     model: str
     encoding_format: str = "float"
     dimensions: int = None

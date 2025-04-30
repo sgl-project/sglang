@@ -18,6 +18,7 @@ import unittest
 import torch
 
 from sglang.test.runners import HFRunner, SRTRunner
+from sglang.test.test_utils import CustomTestCase
 
 MODELS = [
     ("LxzGordon/URM-LLaMa-3.1-8B", 1, 4e-2),
@@ -41,7 +42,7 @@ CONVS = [
 ]
 
 
-class TestRewardModels(unittest.TestCase):
+class TestRewardModels(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):

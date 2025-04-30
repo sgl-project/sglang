@@ -23,13 +23,13 @@ import triton.language as tl
 from sglang.srt.layers.attention.triton_ops.prefill_attention import (
     context_attention_fwd,
 )
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_cuda, is_hip
 
-is_cuda_available = torch.cuda.is_available()
-if is_cuda_available:
+_is_cuda = is_cuda()
+if _is_cuda:
     CUDA_CAPABILITY = torch.cuda.get_device_capability()
 
-is_hip_ = is_hip()
+_is_hip = is_hip()
 
 
 @triton.jit
@@ -74,6 +74,8 @@ def _fwd_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     USE_CUSTOM_MASK: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+    SKIP_PREFIX_CUSTOM_MASK: tl.constexpr,
     STORE_TRANSPOSE: tl.constexpr,
 ):
     cur_seq = tl.program_id(0)
@@ -128,6 +130,7 @@ def _fwd_kernel(
     for start_n in range(0, cur_seq_len_prefix, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         mask_n = (start_n + offs_n) < cur_seq_len_prefix
+
         offs_kv_loc = tl.load(
             kv_indices + cur_seq_kv_start_idx + start_n + offs_n, mask=mask_n, other=0
         )
@@ -160,7 +163,7 @@ def _fwd_kernel(
         if logit_cap > 0:
             qk = logit_cap * tanh(qk / logit_cap)
 
-        if USE_CUSTOM_MASK:
+        if USE_CUSTOM_MASK and not SKIP_PREFIX_CUSTOM_MASK:
             custom_mask = tl.load(
                 mask_ptr
                 + cur_seq_mask_start_idx
@@ -195,7 +198,11 @@ def _fwd_kernel(
 
     # stage 2: compute the triangle part
 
-    cur_block_m_end = tl.minimum(cur_seq_len_extend, (cur_block_m + 1) * BLOCK_M)
+    cur_block_m_end = (
+        cur_seq_len_extend
+        if not IS_CAUSAL
+        else tl.minimum(cur_seq_len_extend, (cur_block_m + 1) * BLOCK_M)
+    )
     for start_n in range(0, cur_block_m_end, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         mask_n = (start_n + offs_n) < cur_block_m_end
@@ -242,12 +249,15 @@ def _fwd_kernel(
             )
             custom_mask &= mask_m[:, None] & mask_n[None, :]
             qk = tl.where(custom_mask, qk, float("-inf"))
-        else:
+        elif IS_CAUSAL:
             mask_causual = (cur_block_m * BLOCK_M + offs_m[:, None]) >= (
                 start_n + offs_n[None, :]
             )
             mask_causual &= mask_m[:, None] & mask_n[None, :]
             qk = tl.where(mask_causual, qk, float("-inf"))
+        else:
+            mask_non_causal = mask_m[:, None] & mask_n[None, :]
+            qk = tl.where(mask_non_causal, qk, float("-inf"))
 
         n_e_max = tl.maximum(tl.max(qk, 1), e_max)
         re_scale = tl.exp(e_max - n_e_max)
@@ -298,10 +308,12 @@ def extend_attention_fwd(
     kv_indptr,
     kv_indices,
     custom_mask,
+    is_causal,
     mask_indptr,
     max_len_extend,
     sm_scale=None,
     logit_cap=0.0,
+    skip_prefix_custom_mask=True,
 ):
     """
     q_extend, k_extend, v_extend, o_extend: contiguous tensors
@@ -328,23 +340,32 @@ def extend_attention_fwd(
         BLOCK_DPE = 0
     BLOCK_DV = triton.next_power_of_2(Lv)
 
-    if is_hip_:
-        BLOCK_M, BLOCK_N = (32, 32)
-        num_warps = 2
+    if _is_hip:
+        BLOCK_M, BLOCK_N = (64, 64)
+        num_warps = 4
 
     else:
-        if is_cuda_available and CUDA_CAPABILITY[0] >= 9:
+        if _is_cuda and CUDA_CAPABILITY[0] >= 9:
             if Lq <= 256:
                 BLOCK_M, BLOCK_N = (128, 64)
             else:
                 BLOCK_M, BLOCK_N = (32, 64)
-        elif is_cuda_available and CUDA_CAPABILITY[0] >= 8:
-            if Lq <= 128:
-                BLOCK_M, BLOCK_N = (128, 128)
-            elif Lq <= 256:
-                BLOCK_M, BLOCK_N = (64, 64)
+        elif _is_cuda and CUDA_CAPABILITY[0] >= 8:
+            # sm86/sm89 has a much smaller shared memory size (100K) than sm80 (160K)
+            if CUDA_CAPABILITY[1] == 9 or CUDA_CAPABILITY[1] == 6:
+                if Lq <= 128:
+                    BLOCK_M, BLOCK_N = (64, 128)
+                elif Lq <= 256:
+                    BLOCK_M, BLOCK_N = (64, 64)
+                else:
+                    BLOCK_M, BLOCK_N = (32, 32)
             else:
-                BLOCK_M, BLOCK_N = (32, 64)
+                if Lq <= 128:
+                    BLOCK_M, BLOCK_N = (128, 128)
+                elif Lq <= 256:
+                    BLOCK_M, BLOCK_N = (64, 64)
+                else:
+                    BLOCK_M, BLOCK_N = (32, 64)
         else:
             BLOCK_M, BLOCK_N = (64, 64) if Lq <= 128 else (32, 32)
 
@@ -355,12 +376,14 @@ def extend_attention_fwd(
     kv_group_num = q_extend.shape[1] // k_extend.shape[1]
 
     USE_CUSTOM_MASK = custom_mask is not None
+    # Skip custom mask for prefix part
+    SKIP_PREFIX_CUSTOM_MASK = skip_prefix_custom_mask
 
     grid = (batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M))
     num_stages = 1
 
     extra_kargs = {}
-    if is_hip_:
+    if _is_hip:
         extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
 
     _fwd_kernel[grid](
@@ -398,7 +421,9 @@ def extend_attention_fwd(
         Lq=Lq,
         Lv=Lv,
         USE_CUSTOM_MASK=USE_CUSTOM_MASK,
-        STORE_TRANSPOSE=is_hip_,
+        IS_CAUSAL=is_causal,
+        SKIP_PREFIX_CUSTOM_MASK=SKIP_PREFIX_CUSTOM_MASK,
+        STORE_TRANSPOSE=_is_hip,
         num_warps=num_warps,
         num_stages=num_stages,
         **extra_kargs,
