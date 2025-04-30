@@ -223,10 +223,13 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
 
+        # print the forward_mode
+        print("forward_mode", forward_batch.forward_mode)
+
         bs = forward_batch.batch_size
         spec_info = forward_batch.spec_info
         if forward_batch.forward_mode.is_decode_or_idle():
-            # todo: spec_info can be None here? or not?
+            assert forward_batch.spec_info is not None
             self.update_metadata_decode(forward_batch)
         elif forward_batch.forward_mode.is_draft_extend():
             # should be the same as decode?
@@ -234,8 +237,9 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         elif forward_batch.forward_mode.is_target_verify():
             self.update_metadata_verify(forward_batch)
         else:
-            # todo: ??
-            super().init_forward_metadata(forward_batch)
+            # todo: EXTEND mode
+            assert forward_batch.spec_info is None
+            self.update_metadata_decode(forward_batch)
             pass
 
     def init_cuda_graph_state(
