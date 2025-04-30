@@ -150,7 +150,7 @@ class VisionSdpaAttention(nn.Module):
 
         if self.softmax_in_single_precision:
             k = rearrange(k, "b h s d -> b h d s")
-            attn_weights = torch.matmul(q, k) * (self.head_size**-0.5)
+            attn_weights = torch.matmul(q, k) * self.scale
             del k
             # masking
             attention_mask = (~attention_mask) * torch.finfo(q.dtype).min
@@ -179,6 +179,94 @@ class VisionSdpaAttention(nn.Module):
 
         # [b, h, s, head_size] --> [b * s, h, head_size]
         output = rearrange(output, "b h s d -> (b s) h d")
+
+        return output
+
+
+class VisionTritonAttention(nn.Module):
+    """
+    Triton-implemented attention without a causal mask
+    """
+
+    def __init__(
+        self,
+        **kwargs,
+    ):
+        super().__init__()
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_seqlens: Optional[torch.Tensor],
+        **kwargs,
+    ) -> torch.Tensor:
+        r"""
+        Args:
+            cu_seqlens: [b]
+        Returns:
+             [b * s, h, head_size]
+        """
+
+        # [b * s, head, head_size]
+        output = torch.empty_like(q)
+        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+        max_seqlen = seq_lens.max().item()
+        context_attention_fwd(
+            q,
+            k,
+            v,
+            output,
+            cu_seqlens.cuda(),
+            seq_lens.cuda(),
+            max_seqlen,
+            is_causal=False,
+        )
+
+        return output
+
+
+class VisionTritonAttention(nn.Module):
+    """
+    Triton-implemented attention without a causal mask
+    """
+
+    def __init__(
+        self,
+        **kwargs,
+    ):
+        super().__init__()
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_seqlens: Optional[torch.Tensor],
+        **kwargs,
+    ) -> torch.Tensor:
+        r"""
+        Args:
+            cu_seqlens: [b]
+        Returns:
+             [b * s, h, head_size]
+        """
+
+        # [b * s, head, head_size]
+        output = torch.empty_like(q)
+        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+        max_seqlen = seq_lens.max().item()
+        context_attention_fwd(
+            q,
+            k,
+            v,
+            output,
+            cu_seqlens.cuda(),
+            seq_lens.cuda(),
+            max_seqlen,
+            is_causal=False,
+        )
 
         return output
 
@@ -294,7 +382,6 @@ class VisionAttention(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         dropout: float = 0.0,
         softmax_in_single_precision: bool = False,
-        rotary_embed: Optional[str] = None,
         flatten_batch: bool = False,
         prefix: str = "",
         proj_bias: bool = True,
@@ -307,11 +394,6 @@ class VisionAttention(nn.Module):
         self.hidden_size_per_attention_head = dist_utils.divide(
             projection_size, num_heads
         )
-
-        self.rotary_embedder = None
-        if rotary_embed is not None:
-            self.rotary_embedder = ROTARY_EMBED_CLASSES[rotary_embed]
-
         self.num_attention_heads_per_partition = dist_utils.divide(
             num_heads, world_size
         )
@@ -326,7 +408,6 @@ class VisionAttention(nn.Module):
             logger.warning_once(
                 "Using FlashAttention3 for all multimodal attentions, as specified in server args"
             )
-        print(f"{qkv_backend=}")
         self.qkv_backend = QKV_BACKEND_IMPL[qkv_backend](
             head_dim=self.head_size,
             num_heads=self.num_attention_heads_per_partition,
@@ -412,15 +493,15 @@ class VisionAttention(nn.Module):
                 rearrange(x, "s b ... -> b s ...").contiguous() for x in (q, k, v)
             ]
 
-        if self.rotary_embedder is not None:
-            assert position_embeddings is not None
+        if position_embeddings is not None:
             cos, sin = position_embeddings
             original_shape = q.shape
-            # -> [(b), s, h, head_size)
-            q = q.view(1, -1, head, self.head_size)
-            k = k.view(1, -1, head, self.head_size)
-            q, k = self.rotary_embedder(q=q, k=k, cos=cos, sin=sin)
-            # -> [b * s, head, head_size]
+            # [total_tokens, head, head_size]
+            q = q.view(-1, head, self.head_size)
+            k = k.view(-1, head, self.head_size)
+
+            q, k = apply_rotary_pos_emb(q, k, cos, sin)
+
             q = q.view(original_shape)
             k = k.view(original_shape)
 
