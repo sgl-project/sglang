@@ -906,7 +906,7 @@ def _get_enable_thinking_from_request(request_obj):
         request_obj: The request object (or an item from a list of requests).
 
     Returns:
-        The boolean value of 'enable_thinking' if found and not None, otherwise None.
+        The boolean value of 'enable_thinking' if found and not True, otherwise True.
     """
     if (
         hasattr(request_obj, "chat_template_kwargs")
