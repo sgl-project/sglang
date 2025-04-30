@@ -97,7 +97,10 @@ class ArcticMLP(nn.Module):
         )
 
         self.w13 = MergedColumnParallelLinear(
-            input_size=self.hidden_size, output_sizes=[self.ffn_dim] * 2, bias=False, quant_config=quant_config
+            input_size=self.hidden_size,
+            output_sizes=[self.ffn_dim] * 2,
+            bias=False,
+            quant_config=quant_config,
         )
         self.w2 = RowParallelLinear(
             self.ffn_dim,
@@ -257,12 +260,16 @@ class ArcticMoE(nn.Module):
             inplace=True,
         )
         if self.reduce_results and self.tp_size > 1:
-            final_hidden_states: torch.Tensor = tensor_model_parallel_all_reduce(final_hidden_states)
+            final_hidden_states: torch.Tensor = tensor_model_parallel_all_reduce(
+                final_hidden_states
+            )
         return final_hidden_states.view(num_tokens, hidden_size)
 
     def forward(self, hidden_states: torch.Tensor):
         if self.is_moe_layer:
-            final_hidden_states: torch.Tensor = self.local_moe_fused(hidden_states=hidden_states)
+            final_hidden_states: torch.Tensor = self.local_moe_fused(
+                hidden_states=hidden_states
+            )
         else:
             final_hidden_states = self.mlp(hidden_states)
         return final_hidden_states
@@ -367,7 +374,9 @@ class ArcticDecoderLayer(nn.Module):
             prefix=f"{prefix}.block_sparse_moe",
         )
 
-        self.input_layernorm = RMSNorm(hidden_size=config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = RMSNorm(
+            hidden_size=config.hidden_size, eps=config.rms_norm_eps
+        )
         self.post_attention_layernorm = RMSNorm(
             hidden_size=config.hidden_size, eps=config.rms_norm_eps
         )
@@ -427,11 +436,15 @@ class ArcticModel(nn.Module):
 
         self.vocab_size = config.vocab_size
         self.embed_tokens = VocabParallelEmbedding(
-            num_embeddings=self.vocab_size, embedding_dim=config.hidden_size, org_num_embeddings=self.vocab_size
+            num_embeddings=self.vocab_size,
+            embedding_dim=config.hidden_size,
+            org_num_embeddings=self.vocab_size,
         )
         self.start_layer, self.end_layer, self.layers = make_layers(
             num_hidden_layers=config.num_hidden_layers,
-            layer_fn=lambda layer_id, prefix: ArcticDecoderLayer(config=config, quant_config=quant_config, prefix=prefix),
+            layer_fn=lambda layer_id, prefix: ArcticDecoderLayer(
+                config=config, quant_config=quant_config, prefix=prefix
+            ),
             prefix=f"{prefix}.layers",
         )
         self._attn_implementation = config._attn_implementation
