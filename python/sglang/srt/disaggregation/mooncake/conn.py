@@ -524,15 +524,25 @@ class MooncakeKVReceiver(BaseKVReceiver):
             ) // (local_tp_size_per_dp_rank // prefill_tp_size_per_dp_rank)
         else:
             # NOTE(shangming): local_tp_size_per_dp_rank < prefill_tp_size_per_dp_rank is not supported.
+            assert (
+                local_tp_size_per_dp_rank < prefill_tp_size_per_dp_rank
+            ), "decode_tp_size_per_dp_rank < prefill_tp_size_per_dp_rank is not supported yet"
+
             # For non-MLA models, one decode rank needs to retrieve KVCache from multiple prefill ranks for non MLA models;
-            # For MLA models, we can retrieve KVCache from any prefill rank, but we still need to maintain
+            self.target_tp_ranks = [
+                rank
+                for rank in range(
+                    (self.kv_mgr.kv_args.engine_rank % local_tp_size_per_dp_rank)
+                    * (prefill_tp_size_per_dp_rank // local_tp_size_per_dp_rank),
+                    (self.kv_mgr.kv_args.engine_rank % local_tp_size_per_dp_rank + 1)
+                    * (prefill_tp_size_per_dp_rank // local_tp_size_per_dp_rank),
+                )
+            ]
+            # For MLA models, we can retrieve KVCache from only one prefill rank, but we still need to maintain
             # multiple connections in the connection pool and have to send dummy requests to other prefill ranks,
             # or the KVPoll will never be set correctly
-            self.target_tp_rank = None
+            self.target_tp_rank = self.target_tp_ranks[0]
 
-        assert (
-            self.target_tp_rank is not None
-        ), "decode_tp_size_per_dp_rank < prefill_tp_size_per_dp_rank is not supported yet"
         self.target_dp_group = bootstrap_room % self.prefill_dp_size
 
         # NOTE: key distinguished by bootstrap_addr and engine_rank
