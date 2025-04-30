@@ -384,6 +384,10 @@ class HFRunner:
                 output_scores=(not output_str_only),
             )
 
+            if lora_paths is not None and lora_paths[i] is not None:
+                # Unload the LoRA model if it is used
+                model.unload()
+
             text = tokenizer.decode(
                 outputs[0][0][len(input_ids[0]) :], skip_special_tokens=True
             )
