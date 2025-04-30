@@ -33,6 +33,8 @@ class EvalArgs:
     prompt_format_file: str = "prompt_format.yaml"
     dataset_path: str = "MMMU/MMMU"
     extra_request_body: Optional[str] = None
+    profile: bool = False
+    profile_number: int = 5
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -64,6 +66,12 @@ class EvalArgs:
             default=EvalArgs.extra_request_body,
             help="Append given JSON object to the request payload. You can use this to specify"
             "additional generate params like sampling params.",
+        )
+        parser.add_argument(
+            "--profile", action="store_true", help="enable mmmu profile"
+        )
+        parser.add_argument(
+            "--profile-number", type=int, default=EvalArgs.profile_number
         )
 
     @classmethod
