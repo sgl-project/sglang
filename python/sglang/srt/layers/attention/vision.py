@@ -403,11 +403,12 @@ class VisionAttention(nn.Module):
 
         self.q_size = self.num_attention_heads_per_partition * self.head_size
         self.kv_size = self.num_attention_kv_heads_per_partition * self.head_size
-        if global_server_args_dict["use_flash_attn"]:
+
+        if global_server_args_dict["disable_flash_attn_for_mm"]:
+            logger.warning_once("FlashAttention3 is not used for multimodal attentions")
+        else:
             qkv_backend = "flash_attn"
-            logger.warning_once(
-                "Using FlashAttention3 for all multimodal attentions, as specified in server args"
-            )
+
         self.qkv_backend = QKV_BACKEND_IMPL[qkv_backend](
             head_dim=self.head_size,
             num_heads=self.num_attention_heads_per_partition,
