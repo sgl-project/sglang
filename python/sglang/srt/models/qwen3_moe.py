@@ -40,6 +40,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe.ep_moe.layer import EPMoE
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -48,14 +49,12 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2_moe import Qwen2MoeMLP as Qwen3MoeMLP
 from sglang.srt.models.qwen2_moe import Qwen2MoeModel
 from sglang.srt.utils import add_prefix
-
-from sglang.srt.layers.moe.ep_moe.layer import EPMoE
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 
 Qwen3MoeConfig = None
 
@@ -76,9 +75,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 f"the number of experts {config.num_experts}."
             )
 
-        MoEImpl = (
-            EPMoE if global_server_args_dict["enable_ep_moe"] else FusedMoE
-        )
+        MoEImpl = EPMoE if global_server_args_dict["enable_ep_moe"] else FusedMoE
 
         self.experts = MoEImpl(
             num_experts=config.num_experts,
@@ -362,9 +359,7 @@ class Qwen3MoeForCausalLM(nn.Module):
             ("gate_up_proj", "up_proj", 1),
         ]
 
-        MoEImpl = (
-            EPMoE if global_server_args_dict["enable_ep_moe"] else FusedMoE
-        )
+        MoEImpl = EPMoE if global_server_args_dict["enable_ep_moe"] else FusedMoE
 
         expert_params_mapping = MoEImpl.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
