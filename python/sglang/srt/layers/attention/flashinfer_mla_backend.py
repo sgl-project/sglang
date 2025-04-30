@@ -824,7 +824,6 @@ def fast_mla_decode_plan(
     sm_scale: float,
     q_data_type: torch.dtype,
     kv_data_type: torch.dtype,
-    use_profiler: bool = False,
 ) -> None:
     """A faster version of BatchMLAPagedAttentionWrapper::plan,
     for skipping the stream synchronization in original plan function during
@@ -833,7 +832,6 @@ def fast_mla_decode_plan(
     self._causal = causal
     self._page_size = page_size
     self._sm_scale = sm_scale
-    self._use_profiler = use_profiler
 
     with self.device as device:
         try:
