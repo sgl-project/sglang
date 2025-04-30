@@ -1,5 +1,5 @@
 # Usage (to build SGLang ROCm docker image):
-#   docker build --build-arg SGL_BRANCH=v0.4.5.post1 -t v0.4.5.post1-rocm630 -f Dockerfile.rocm .
+#   docker build --build-arg SGL_BRANCH=v0.4.6.post1 -t v0.4.6.post1-rocm630 -f Dockerfile.rocm .
 
 # default base image
 ARG BASE_IMAGE="rocm/sgl-dev:vllm20250114"
@@ -18,7 +18,7 @@ ARG TRITON_COMMIT="improve_fa_decode_3.0.0"
 
 
 ARG AITER_REPO="https://github.com/ROCm/aiter.git"
-ARG AITER_COMMIT="testx"
+ARG AITER_COMMIT="v0.1.1"
 
 RUN git clone ${SGL_REPO} \
     && cd sglang \
@@ -74,7 +74,7 @@ ENV SGLANG_SET_CPU_AFFINITY=1
 ENV SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
 ENV NCCL_MIN_NCHANNELS=112
 
-ENV MOE_PADDING=1
+ENV SGLANG_MOE_PADDING=1
 ENV VLLM_FP8_PADDING=1
 ENV VLLM_FP8_ACT_PADDING=1
 ENV VLLM_FP8_WEIGHT_PADDING=1

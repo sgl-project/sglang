@@ -1,6 +1,6 @@
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
-use log::info;
+use tracing::info;
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;

@@ -71,6 +71,7 @@ class TpModelWorker:
             enable_multimodal=server_args.enable_multimodal,
             dtype=server_args.dtype,
             quantization=server_args.quantization,
+            is_draft_model=is_draft_worker,
         )
         self.model_runner = ModelRunner(
             model_config=self.model_config,
@@ -116,6 +117,7 @@ class TpModelWorker:
             ),
             self.model_runner.req_to_token_pool.size,
         )
+        assert self.max_running_requests > 0, "max_running_request is zero"
         self.max_req_len = min(
             self.model_config.context_len - 1,
             self.max_total_num_tokens - 1,
@@ -169,13 +171,13 @@ class TpModelWorker:
     def forward_batch_generation(
         self,
         model_worker_batch: ModelWorkerBatch,
-        launch_done: Optional[threading.Event] = None,
         skip_sample: bool = False,
     ) -> Tuple[LogitsProcessorOutput, Optional[torch.Tensor]]:
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
         logits_output = self.model_runner.forward(forward_batch)
-        if launch_done:
-            launch_done.set()
+
+        if model_worker_batch.launch_done is not None:
+            model_worker_batch.launch_done.set()
 
         if skip_sample:
             next_token_ids = None

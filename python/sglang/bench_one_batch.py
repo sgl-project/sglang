@@ -57,6 +57,7 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.distributed.parallel_state import destroy_distributed_environment
 from sglang.srt.entrypoints.engine import _set_envs_and_config
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
@@ -85,6 +86,7 @@ class BenchArgs:
     correctness_test: bool = False
     # This is only used for correctness test
     cut_len: int = 4
+    log_decode_step: int = 0
     profile: bool = False
     profile_filename_prefix: str = "profile"
 
@@ -105,6 +107,12 @@ class BenchArgs:
         )
         parser.add_argument("--correctness-test", action="store_true")
         parser.add_argument("--cut-len", type=int, default=BenchArgs.cut_len)
+        parser.add_argument(
+            "--log-decode-step",
+            type=int,
+            default=BenchArgs.log_decode_step,
+            help="Log decode latency by step, default is set to zero to disable.",
+        )
         parser.add_argument(
             "--profile", action="store_true", help="Use Torch Profiler."
         )
@@ -207,7 +215,7 @@ def prepare_extend_inputs_for_correctness_test(
 
 
 def prepare_synthetic_inputs_for_latency_test(batch_size, input_len):
-    input_ids = np.ones((batch_size, input_len), dtype=np.int32)
+    input_ids = np.random.randint(0, 10000, (batch_size, input_len), dtype=np.int32)
     sampling_params = SamplingParams(
         temperature=0,
         max_new_tokens=BenchArgs.output_len,
@@ -335,6 +343,7 @@ def latency_test_run_once(
     input_len,
     output_len,
     device,
+    log_decode_step,
     profile,
     profile_filename_prefix,
 ):
@@ -394,9 +403,9 @@ def latency_test_run_once(
         tot_latency += latency
         throughput = batch_size / latency
         decode_latencies.append(latency)
-        if i < 5:
+        if i < 5 or (log_decode_step > 0 and i % log_decode_step == 0):
             rank_print(
-                f"Decode.  latency: {latency:6.5f} s, throughput: {throughput:9.2f} token/s"
+                f"Decode {i}. Batch size: {batch_size}, latency: {latency:6.5f} s, throughput: {throughput:9.2f} token/s"
             )
 
     if profile:
@@ -457,8 +466,9 @@ def latency_test(
         reqs,
         bench_args.batch_size[0],
         bench_args.input_len[0],
-        8,  # shorter decoding to speed up the warmup
+        min(32, bench_args.output_len[0]),  # shorter decoding to speed up the warmup
         server_args.device,
+        log_decode_step=0,
         profile=False,
         profile_filename_prefix="",  # not used
     )
@@ -480,6 +490,7 @@ def latency_test(
             il,
             ol,
             server_args.device,
+            bench_args.log_decode_step,
             bench_args.profile if tp_rank == 0 else None,
             bench_args.profile_filename_prefix,
         )
@@ -492,8 +503,13 @@ def latency_test(
             for result in result_list:
                 fout.write(json.dumps(result) + "\n")
 
+    if server_args.tp_size > 1:
+        destroy_distributed_environment()
+
 
 def main(server_args, bench_args):
+    server_args.cuda_graph_max_bs = max(bench_args.batch_size)
+
     _set_envs_and_config(server_args)
 
     if server_args.model_path:
