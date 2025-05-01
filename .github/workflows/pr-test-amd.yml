@@ -141,10 +141,30 @@ jobs:
           mkdir -p dummy-grok && wget https://sharkpublic.blob.core.windows.net/sharkpublic/sglang/dummy_grok.json -O dummy-grok/config.json
           docker cp ./dummy-grok ci_sglang:/
 
-      - name: Evaluate Benchmark
+      - name: Benchmark dummy grok (TP=2)
         timeout-minutes: 20
         run: |
           docker exec -w /sglang-checkout/test/srt -e SGLANG_IS_IN_CI=1 ci_sglang python3 models/test_dummy_grok_models.py
+
+      - name: Benchmark single latency (TP=2)
+        timeout-minutes: 20
+        run: |
+          docker exec -w /sglang-checkout/test/srt -e SGLANG_IS_IN_CI=1 -e SGLANG_AMD_CI=1 ci_sglang python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_moe_tp2_bs1
+
+      - name: Benchmark single latency + torch.compile (TP=2)
+        timeout-minutes: 20
+        run: |
+          docker exec -w /sglang-checkout/test/srt -e SGLANG_IS_IN_CI=1 ci_sglang python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_torch_compile_tp2_bs1
+
+      - name: Benchmark offline throughput (TP=2)
+        timeout-minutes: 20
+        run: |
+          docker exec -w /sglang-checkout/test/srt -e SGLANG_IS_IN_CI=1 -e SGLANG_AMD_CI=1 ci_sglang python3 -m unittest test_bench_serving.TestBenchServing.test_moe_offline_throughput_default
+
+      - name: Benchmark offline throughput (w/o RadixAttention) (TP=2)
+        timeout-minutes: 20
+        run: |
+          docker exec -w /sglang-checkout/test/srt -e SGLANG_IS_IN_CI=1 -e SGLANG_AMD_CI=1 ci_sglang python3 -m unittest test_bench_serving.TestBenchServing.test_moe_offline_throughput_without_radix_cache
 
   finish:
     if: always()
