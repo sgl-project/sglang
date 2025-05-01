@@ -20,7 +20,7 @@ import logging
 import os
 import random
 import tempfile
-from typing import Dict, List, Literal, Optional
+from typing import List, Literal, Optional
 
 from sglang.srt.hf_transformers_utils import check_gguf_file, get_config
 from sglang.srt.reasoning_parser import ReasoningParser
@@ -57,10 +57,6 @@ class ServerArgs:
     device: Optional[str] = None
     served_model_name: Optional[str] = None
     chat_template: Optional[str] = None
-    chat_template_kwargs_json: Optional[str] = None
-    chat_template_kwargs: Optional[Dict[str, Any]] = (
-        None  # Any due to parsing user provided json, vLLM uses the same typing for the equivalent server argument.
-    )
     completion_template: Optional[str] = None
     is_embedding: bool = False
     revision: Optional[str] = None
@@ -204,19 +200,6 @@ class ServerArgs:
     disaggregation_ib_device: Optional[str] = None
 
     def __post_init__(self):
-        # Parse chat_template_kwargs_json
-        if self.chat_template_kwargs_json:
-            try:
-                self.chat_template_kwargs = json.loads(self.chat_template_kwargs_json)
-            except json.JSONDecodeError as e:
-                logger.error(
-                    f"Error parsing --chat-template-kwargs JSON: {e}. "
-                    f"Input string: '{self.chat_template_kwargs_json}'"
-                )
-                raise ValueError(
-                    "Invalid JSON string provided for --chat-template-kwargs"
-                ) from e
-
         # Expert parallelism
         if self.enable_ep_moe:
             self.ep_size = self.tp_size
@@ -581,13 +564,6 @@ class ServerArgs:
             type=str,
             default=ServerArgs.chat_template,
             help="The buliltin chat template name or the path of the chat template file. This is only used for OpenAI-compatible API server.",
-        )
-        parser.add_argument(
-            "--chat-template-kwargs",
-            type=str,
-            dest="chat_template_kwargs_json",  # Store raw JSON string here
-            default=ServerArgs.chat_template_kwargs_json,
-            help="Additional kwargs to pass to the template renderer (Jinja only), specified as a JSON string. Will be accessible by the chat template.",
         )
         parser.add_argument(
             "--completion-template",

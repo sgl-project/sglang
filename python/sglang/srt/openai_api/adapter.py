@@ -1002,17 +1002,9 @@ def v1_chat_generate_request(
                 else:
                     assistant_prefix = None
 
-                request_kwargs = request.chat_template_kwargs  # Get from request
-                if request_kwargs is not None:
-                    kwargs_to_pass = request_kwargs  # Use request kwargs if they exist (overrides global)
-                else:
-                    kwargs_to_pass = (
-                        tokenizer_manager.server_args.chat_template_kwargs or {}
-                    )
-
                 try:
                     prompt_ids = tokenizer_manager.tokenizer.apply_chat_template(
-                        conversation=openai_compatible_messages,
+                        openai_compatible_messages,
                         tokenize=True,
                         add_generation_prompt=True,
                         tools=tools,
