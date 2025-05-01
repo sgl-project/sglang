@@ -315,7 +315,7 @@ class VisionTritonAttention(nn.Module):
         return output
 
 
-class VisionFlashAttention(nn.Module):
+class VisionFlash3Attention(nn.Module):
     def __init__(
         self,
         **kwargs,
@@ -356,7 +356,7 @@ class VisionFlashAttention(nn.Module):
 QKV_BACKEND_IMPL = {
     "triton_attn": VisionTritonAttention,
     "sdpa": VisionSdpaAttention,
-    "flash_attn": VisionFlashAttention,
+    "fa3": VisionFlash3Attention,
 }
 
 
@@ -408,7 +408,7 @@ class VisionAttention(nn.Module):
         if global_server_args_dict["disable_flash_attn_for_mm"]:
             logger.warning_once("FlashAttention3 is not used for multimodal attentions")
         elif qkv_backend is None:
-            qkv_backend = "flash_attn"
+            qkv_backend = "fa3"
 
         self.qkv_backend = QKV_BACKEND_IMPL[qkv_backend](
             head_dim=self.head_size,

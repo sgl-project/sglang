@@ -138,7 +138,7 @@ class Qwen2_5_VisionBlock(nn.Module):
             flatten_batch = True
         elif attn_implementation == "flash_attention_3":
             softmax_in_single_precision = False
-            qkv_backend = "flash_attn"
+            qkv_backend = "fa3"
             flatten_batch = True
 
         self.attn = VisionAttention(
