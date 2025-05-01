@@ -107,6 +107,7 @@ class FlashInferAttnBackend(AttentionBackend):
         if (
             "Qwen2ForCausalLM" in model_runner.model_config.hf_config.architectures
             or "Qwen3ForCausalLM" in model_runner.model_config.hf_config.architectures
+            or "MiMoForCausalLM" in model_runner.model_config.hf_config.architectures
         ):
             global_config.flashinfer_workspace_size = 512 * 1024 * 1024
 
