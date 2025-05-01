@@ -166,11 +166,11 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 
 ## Kernel backend
 
-| Arguments               | Description | Defaults |
-|-------------------------|-------------|---------|
-| `attention_backend`     | This argument specifies the backend for attention computation and KV cache management, which can be `fa3`, `flashinfer`, `triton`, `cutlass_mla`, or `torch_native`. When deploying DeepSeek models, use this argument to specify the MLA backend. | None |
-| `sampling_backend`      | Specifies the backend used for sampling. | None |
-| `disable_flash_attn_for_mm` |  Use FlashAttention3 for all non-causal attention of multimodal transformers. This will improve performance, but may lead to minor accuracy variations.
+| Arguments              | Description | Defaults |
+|------------------------|-------------|---------|
+| `attention_backend`    | This argument specifies the backend for attention computation and KV cache management, which can be `fa3`, `flashinfer`, `triton`, `cutlass_mla`, or `torch_native`. When deploying DeepSeek models, use this argument to specify the MLA backend. | None |
+| `sampling_backend`     | Specifies the backend used for sampling. | None |
+| `mm_attention_backend` | Set multimodal attention backend.
 
 ## Constrained Decoding
 
