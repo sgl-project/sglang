@@ -141,6 +141,7 @@ class MooncakeKVManager(BaseKVManager):
         self.tp_size = server_args.tp_size
         self.dp_size = server_args.dp_size
         self.enable_dp_attention = server_args.enable_dp_attention
+        self.with_mla = server_args.disaggregation_with_mla
         if not server_args.enable_dp_attention and server_args.dp_size != 1:
             raise ValueError(
                 "If dp_attention is not enabled, dp size must be 1 in disaggregation mode."
@@ -315,11 +316,8 @@ class MooncakeKVManager(BaseKVManager):
                             if kv_chunk.is_last:
                                 self.request_status[req.room] = KVPoll.Success
                                 self.transfer_infos.pop(req.room)
-                            else:
-                                self.request_status[kv_chunk.room] = KVPoll.Success
-                                self.transfer_infos.pop(req.room)
                             continue
-                    chunked_dst_kv_indice = req.dst_kv_indices[kv_chunk.index_slice]
+                        chunked_dst_kv_indice = req.dst_kv_indices[kv_chunk.index_slice]
                         assert len(chunked_dst_kv_indice) == len(
                             kv_chunk.prefill_kv_indices
                         ), f"len(chunked_dst_kv_indice) = {len(chunked_dst_kv_indice)}, len(kv_chunk.prefill_kv_indices) = {len(kv_chunk.prefill_kv_indices)}"
@@ -355,7 +353,7 @@ class MooncakeKVManager(BaseKVManager):
                             self.sync_status_to_decode_endpoint(
                                 req.endpoint, req.dst_port, req.room
                             )
-                    self.transfer_infos.pop(req.room)
+                            self.transfer_infos.pop(req.room)
 
                 except queue.Empty:
                     continue
@@ -504,7 +502,6 @@ class MooncakeKVReceiver(BaseKVReceiver):
         self.kv_mgr = mgr
         self.session_id = self.kv_mgr.get_session_id()
         self.kv_mgr.update_status(bootstrap_room, KVPoll.Bootstrapping)
-        self.tp_size_per_dp_rank = self.kv_mgr.tp_size // self.kv_mgr.dp_size
 
         if self.bootstrap_addr not in self.kv_mgr.prefill_dp_size_table:
             self.prefill_tp_size, self.prefill_dp_size = (
@@ -519,14 +516,8 @@ class MooncakeKVReceiver(BaseKVReceiver):
                     self.prefill_tp_size
                 )
                 self.kv_mgr.prefill_dp_size_table[self.bootstrap_addr] = (
-                    self.prefill_dp_size, self.prefill_tp_size_per_dp_rank
+                    self.prefill_dp_size
                 )
-
-            # support prefill instance and decode instance to have different TP sizes per DP rank
-            # only support MLA for now
-            if self.prefill_tp_size_per_dp_rank != self.kv_mgr.tp_size // self.kv_mgr.dp_size:
-                # only support when prefill with TP
-                assert self.prefill_dp_size == 1
         else:
             self.prefill_tp_size = self.kv_mgr.prefill_tp_size_table[
                 self.bootstrap_addr
@@ -539,6 +530,8 @@ class MooncakeKVReceiver(BaseKVReceiver):
         # have different TP sizes per DP rank, except for models using MLA.
         local_tp_size_per_dp_rank = self.kv_mgr.tp_size // self.kv_mgr.dp_size
         prefill_tp_size_per_dp_rank = self.prefill_tp_size // self.prefill_dp_size
+        self.target_tp_ranks = []
+        self.target_tp_rank = None
         if local_tp_size_per_dp_rank == prefill_tp_size_per_dp_rank:
             self.target_tp_rank = (
                 self.kv_mgr.kv_args.engine_rank % local_tp_size_per_dp_rank
@@ -548,11 +541,6 @@ class MooncakeKVReceiver(BaseKVReceiver):
                 self.kv_mgr.kv_args.engine_rank % local_tp_size_per_dp_rank
             ) // (local_tp_size_per_dp_rank // prefill_tp_size_per_dp_rank)
         else:
-            # NOTE(shangming): local_tp_size_per_dp_rank < prefill_tp_size_per_dp_rank is not supported.
-            assert (
-                local_tp_size_per_dp_rank < prefill_tp_size_per_dp_rank
-            ), "decode_tp_size_per_dp_rank < prefill_tp_size_per_dp_rank is not supported yet"
-
             # For non-MLA models, one decode rank needs to retrieve KVCache from multiple prefill ranks for non MLA models;
             self.target_tp_ranks = [
                 rank
@@ -566,8 +554,13 @@ class MooncakeKVReceiver(BaseKVReceiver):
             # For MLA models, we can retrieve KVCache from only one prefill rank, but we still need to maintain
             # multiple connections in the connection pool and have to send dummy requests to other prefill ranks,
             # or the KVPoll will never be set correctly
-            self.target_tp_rank = self.target_tp_ranks[0]
+            # NOTE: only support MLA for now: select one prefill rank as real rank
+            assert (
+                self.kv_mgr.with_mla == True
+                ), "Only support MLA for decode_tp_size_per_dp_rank < prefill_tp_size_per_dp_rank"
+            self.target_tp_rank = np.random.choice(self.target_tp_ranks)
 
+        self.target_tp_ranks = [self.target_tp_rank] if len(self.target_tp_ranks) == 0 else self.target_tp_ranks
         self.target_dp_group = bootstrap_room % self.prefill_dp_size
 
         # NOTE: key distinguished by bootstrap_addr and engine_rank
@@ -575,18 +568,18 @@ class MooncakeKVReceiver(BaseKVReceiver):
 
         if bootstrap_key not in self.kv_mgr.connection_pool:
             bootstrap_infos = []
-            for target_engine_rank in self.target_engine_ranks:
+            for target_tp_rank in self.target_tp_ranks:
                 bootstrap_info = self._get_bootstrap_info_from_server(
-                    target_engine_rank,
+                    target_tp_rank,
                     self.target_dp_group,
                 )
                 if bootstrap_info is not None:
-                    # default select first prefill target rank as real rank
-                    bootstrap_info["is_dummy"] = not bool(target_engine_rank == real_target_engine_rank)
+                    # NOTE: only support MLA for now: select one prefill rank as real rank
+                    bootstrap_info["is_dummy"] = not bool(target_tp_rank == self.target_tp_rank or self.target_tp_rank is None)
                     bootstrap_infos.append(bootstrap_info)
                 else:
                     logger.error(
-                        f"Could not fetch bootstrap info for engine rank: {self.kv_mgr.kv_args.engine_rank} and target_dp_group: {target_dp_group}"
+                        f"Could not fetch bootstrap info for engine rank: {self.kv_mgr.kv_args.engine_rank} and target_dp_group: {self.target_dp_group}"
                     )
             self.bootstrap_infos = bootstrap_infos
 
@@ -603,24 +596,6 @@ class MooncakeKVReceiver(BaseKVReceiver):
 
         assert len(self.bootstrap_infos) > 0
         self.kv_mgr.update_status(bootstrap_room, KVPoll.WaitingForInput)
-
-    def _get_target_prefill_mapping(self, bootstrap_room: int) -> int:
-        if not self.kv_mgr.enable_dp_attention or self.tp_size_per_dp_rank == self.prefill_tp_size_per_dp_rank:
-            # NOTE: key distinguished by bootstrap_addr and engine_rank
-            return bootstrap_room % self.prefill_dp_size, [self.kv_mgr.kv_args.engine_rank], self.kv_mgr.kv_args.engine_rank
-
-        if self.tp_size_per_dp_rank < self.prefill_tp_size_per_dp_rank:
-            assert self.prefill_tp_size_per_dp_rank % self.tp_size_per_dp_rank == 0
-            assert self.prefill_dp_size == 1
-            prefill_world_size = self.prefill_tp_size_per_dp_rank * self.prefill_dp_size
-            target_engine_rank_start  = self.kv_mgr.kv_args.engine_rank % self.tp_size_per_dp_rank % prefill_world_size
-            target_engine_ranks = list(range(target_engine_rank_start, prefill_world_size, self.tp_size_per_dp_rank))
-            # get random rank to avoid transfer traffic
-            real_target_engine_rank = random.choice(target_engine_ranks)
-            return 0, target_engine_ranks, real_target_engine_rank
-        else:
-            raise NotImplementedError(f"decode_tp_size_per_dp_rank: {self.tp_size_per_dp_rank} "
-                                      f"is greater than prefill_tp_size_per_dp_rank: {self.prefill_tp_size_per_dp_rank}")
 
     def _get_bootstrap_info_from_server(self, engine_rank, target_dp_group):
         """Fetch the bootstrap info from the bootstrap server."""
