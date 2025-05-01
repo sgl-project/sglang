@@ -106,11 +106,12 @@ class EAGLEWorker(TpModelWorker):
         # Init draft worker
         with empty_context():
             super().__init__(
+                server_args=server_args,
                 gpu_id=gpu_id,
                 tp_rank=tp_rank,
-                server_args=server_args,
-                nccl_port=nccl_port,
+                pp_rank=0,  # FIXME
                 dp_rank=dp_rank,
+                nccl_port=nccl_port,
                 is_draft_worker=True,
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
