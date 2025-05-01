@@ -301,10 +301,10 @@ def cutlass_mla_get_workspace_size(
     - `max_seq_len` must be greater than 0.
     - `num_batches` must be greater than 0.
     """
-    
+
     assert max_seq_len > 0, f"max_seq_len must be greater than 0, got {max_seq_len}"
     assert num_batches > 0, f"num_batches must be greater than 0, got {num_batches}"
-    
+
     return torch.ops.sgl_kernel.cutlass_mla_get_workspace_size.default(
         max_seq_len, num_batches, sm_count
     )
