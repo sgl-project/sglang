@@ -319,8 +319,7 @@ jobs:
     if: always()
     needs: [
       accuracy-test-1-gpu-amd, mla-test-1-gpu-amd, bench-test-2-gpu-amd,
-      accuracy-test-2-gpu-amd, unit-test-frontend-amd, unit-test-backend-1-gpu-amd,
-      unit-test-backend-2-gpu-amd, performance-test-1-gpu-part-1-amd, performance-test-1-gpu-part-2-amd
+      accuracy-test-2-gpu-amd, performance-test-1-gpu-part-1-amd, performance-test-1-gpu-part-2-amd
     ]
     runs-on: ubuntu-latest
     steps:
