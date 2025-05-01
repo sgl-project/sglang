@@ -1,14 +1,20 @@
 from __future__ import annotations
 
 import math
-from functools import lru_cache
+from functools import lru_cache, wraps
 from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
-from sgl_kernel.flash_attn import flash_attn_varlen_func
+
+from sglang.srt.utils import is_cuda
+
+_is_cuda = is_cuda()
+
+if _is_cuda:
+    from sgl_kernel.flash_attn import flash_attn_varlen_func
 
 from sglang.srt.distributed import parallel_state
 from sglang.srt.distributed import utils as dist_utils
@@ -28,6 +34,24 @@ from sglang.srt.utils import add_prefix, logger
 ROTARY_EMBED_CLASSES = {
     "normal": apply_rotary_pos_emb,
 }
+
+
+def execute_once(func):
+    has_run = None
+
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        nonlocal has_run
+        if not has_run:
+            func(*args, **kwargs)
+            has_run = True
+
+    return wrapper
+
+
+@execute_once
+def info_once(message: str):
+    logger.info(message)
 
 
 class VisionSdpaAttention(nn.Module):
@@ -227,99 +251,13 @@ class VisionTritonAttention(nn.Module):
         return output
 
 
-class VisionTritonAttention(nn.Module):
-    """
-    Triton-implemented attention without a causal mask
-    """
-
-    def __init__(
-        self,
-        **kwargs,
-    ):
-        super().__init__()
-
-    def forward(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        cu_seqlens: Optional[torch.Tensor],
-        **kwargs,
-    ) -> torch.Tensor:
-        r"""
-        Args:
-            cu_seqlens: [b]
-        Returns:
-             [b * s, h, head_size]
-        """
-
-        # [b * s, head, head_size]
-        output = torch.empty_like(q)
-        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-        max_seqlen = seq_lens.max().item()
-        context_attention_fwd(
-            q,
-            k,
-            v,
-            output,
-            cu_seqlens.cuda(),
-            seq_lens.cuda(),
-            max_seqlen,
-            is_causal=False,
-        )
-
-        return output
-
-
-class VisionTritonAttention(nn.Module):
-    """
-    Triton-implemented attention without a causal mask
-    """
-
-    def __init__(
-        self,
-        **kwargs,
-    ):
-        super().__init__()
-
-    def forward(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        cu_seqlens: Optional[torch.Tensor],
-        **kwargs,
-    ) -> torch.Tensor:
-        r"""
-        Args:
-            cu_seqlens: [b]
-        Returns:
-             [b * s, h, head_size]
-        """
-
-        # [b * s, head, head_size]
-        output = torch.empty_like(q)
-        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-        max_seqlen = seq_lens.max().item()
-        context_attention_fwd(
-            q,
-            k,
-            v,
-            output,
-            cu_seqlens.cuda(),
-            seq_lens.cuda(),
-            max_seqlen,
-            is_causal=False,
-        )
-
-        return output
-
-
 class VisionFlash3Attention(nn.Module):
     def __init__(
         self,
         **kwargs,
     ):
+        if not _is_cuda:
+            raise Exception("VisionFlash3Attention is only available for cuda")
         super().__init__()
 
     def forward(
@@ -379,7 +317,7 @@ class VisionAttention(nn.Module):
         num_heads: int,
         projection_size: int,
         use_qkv_parallel: bool,
-        qkv_backend: str = "sdpa",
+        qkv_backend: Optional[str] = None,
         quant_config: Optional[QuantizationConfig] = None,
         dropout: float = 0.0,
         softmax_in_single_precision: bool = False,
@@ -407,7 +345,8 @@ class VisionAttention(nn.Module):
 
         if global_server_args_dict["disable_flash_attn_for_mm"]:
             logger.warning_once("FlashAttention3 is not used for multimodal attentions")
-        elif qkv_backend is None:
+        else:
+            info_once("Multimodal attention backend not set. Use fa3 as default.")
             qkv_backend = "fa3"
 
         self.qkv_backend = QKV_BACKEND_IMPL[qkv_backend](
@@ -441,7 +380,7 @@ class VisionAttention(nn.Module):
             output_size=embed_dim,
             bias=proj_bias,
             quant_config=quant_config,
-            prefix=add_prefix("out_proj", prefix),
+            prefix=add_prefix("proj", prefix),
         )
 
     def forward(
