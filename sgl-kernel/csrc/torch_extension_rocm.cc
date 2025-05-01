@@ -81,6 +81,12 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "Tensor! tree_mask, Tensor! positions, Tensor! retrive_index, Tensor! retrive_next_token, "
       "Tensor! retrive_next_sibling, int topk, int depth, int draft_token_num) -> ()");
   m.impl("build_tree_kernel_efficient", torch::kCUDA, &build_tree_kernel_efficient);
+
+  /*
+   * From csrc/fht
+   */
+  m.def("fast_hadamard_transform(Tensor x, float scale) -> Tensor");
+  m.impl("fast_hadamard_transform", torch::kCUDA, &fast_hadamard_transform);
 }
 
 REGISTER_EXTENSION(common_ops)

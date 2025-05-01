@@ -329,7 +329,7 @@ class ModelConfig:
                     self.quantization = quantization_override
                     break
             """
-                    
+
             # Verify quantization configurations.
             if self.quantization is None:
                 self.quantization = quant_method

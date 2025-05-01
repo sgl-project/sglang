@@ -1,8 +1,9 @@
+import torch
 from vllm.model_executor.layers.quantization.utils import replace_parameter
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
-    convert_to_channelwise)
+    convert_to_channelwise,
+)
 
-import torch
 
 def process_weights_after_loading(layer):
 
@@ -10,17 +11,14 @@ def process_weights_after_loading(layer):
     w_s_name = "weight_scale"
     i_s_name = "input_scale"
     i_zp_name = "input_zero_point"
-    azp_adj_name = "azp_adj"                    
+    azp_adj_name = "azp_adj"
 
-    print("before_rep:",layer.weight.shape)
     # WEIGHT
     # Cutlass kernels need transposed weight.
     weight = getattr(layer, w_q_name)
     replace_parameter(
-        layer, w_q_name,
-        torch.nn.Parameter(weight.t().data, requires_grad=False))
-    print("after_rep:",layer.weight.shape)
-
+        layer, w_q_name, torch.nn.Parameter(weight.t().data, requires_grad=False)
+    )
 
     # WEIGHT SCALE
     # Cutlass kernels support only per-tensor and per-channel.
@@ -28,12 +26,13 @@ def process_weights_after_loading(layer):
     # scales being passed to the kernel), convert to the per-channel case.
     is_fused_module = len(layer.logical_widths) > 1
     weight_scale = getattr(layer, w_s_name)
-    #if is_fused_module and not False:
-    weight_scale = convert_to_channelwise(weight_scale,
-                                                layer.logical_widths)
+    # if is_fused_module and not False:
+    weight_scale = convert_to_channelwise(weight_scale, layer.logical_widths)
     replace_parameter(
-        layer, w_s_name,
-        torch.nn.Parameter(weight_scale.data.view(-1,1), requires_grad=False))
+        layer,
+        w_s_name,
+        torch.nn.Parameter(weight_scale.data.view(-1, 1), requires_grad=False),
+    )
 
     # INPUT SCALE
     if True:
@@ -41,8 +40,18 @@ def process_weights_after_loading(layer):
 
         if True:
             replace_parameter(
-                layer, i_s_name,
-                torch.nn.Parameter(torch.full((1,1),input_scale.max(),dtype=torch.float32,device=layer.weight.device), requires_grad=False))
+                layer,
+                i_s_name,
+                torch.nn.Parameter(
+                    torch.full(
+                        (1, 1),
+                        input_scale.max(),
+                        dtype=torch.float32,
+                        device=layer.weight.device,
+                    ),
+                    requires_grad=False,
+                ),
+            )
             setattr(layer, i_zp_name, None)
         else:
             input_zero_point = getattr(layer, i_zp_name)
@@ -53,17 +62,16 @@ def process_weights_after_loading(layer):
             range_max = (input_scale * (int8_traits.max - azps)).max()
             range_min = (input_scale * (int8_traits.min - azps)).min()
 
-            scale = (range_max - range_min) / (int8_traits.max -
-                                                int8_traits.min)
+            scale = (range_max - range_min) / (int8_traits.max - int8_traits.min)
             replace_parameter(
-                layer, i_s_name,
-                torch.nn.Parameter(scale, requires_grad=False))
+                layer, i_s_name, torch.nn.Parameter(scale, requires_grad=False)
+            )
 
             # AZP loaded as int8 but used as int32
-            azp = (int8_traits.min -
-                    range_min / scale).to(dtype=torch.int32)
-            replace_parameter(layer, i_zp_name,
-                                torch.nn.Parameter(azp, requires_grad=False))
+            azp = (int8_traits.min - range_min / scale).to(dtype=torch.int32)
+            replace_parameter(
+                layer, i_zp_name, torch.nn.Parameter(azp, requires_grad=False)
+            )
 
     else:
         setattr(layer, i_s_name, None)
@@ -81,13 +89,14 @@ def process_weights_after_loading(layer):
             # cutlass_w8a8 requires azp to be folded into azp_adj
             # in the per-tensor case
             azp_adj = getattr(layer, i_zp_name) * azp_adj
-        setattr(layer, azp_adj_name,
-                torch.nn.Parameter(azp_adj, requires_grad=False))
+        setattr(layer, azp_adj_name, torch.nn.Parameter(azp_adj, requires_grad=False))
     else:
         setattr(layer, azp_adj_name, None)
 
+
 def scaled_int8_quant(x, i_s, i_zp, symmetric):
     pass
+
 
 def cutlass_scaled_mm(x_q, w_q, scale_a, scale_b, out_dtype, bias):
     pass

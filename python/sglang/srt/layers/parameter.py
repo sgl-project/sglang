@@ -50,8 +50,8 @@ class BasevLLMParameter(Parameter):
         return self._weight_loader
 
     def _assert_and_load(self, loaded_weight: torch.Tensor):
-        if self.data.numel()==loaded_weight.numel()==1:
-            loaded_weight=loaded_weight.view(self.data.shape)
+        if self.data.numel() == loaded_weight.numel() == 1:
+            loaded_weight = loaded_weight.view(self.data.shape)
         assert self.data.shape == loaded_weight.shape
         self.data.copy_(loaded_weight)
 
