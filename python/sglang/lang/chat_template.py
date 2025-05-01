@@ -418,6 +418,7 @@ register_chat_template(
     )
 )
 
+# Adapted from https://huggingface.co/OpenGVLab/InternVL2-4B/blob/main/modeling_intern_vit.py
 register_chat_template(
     ChatTemplate(
         name="internvl-2-5",
