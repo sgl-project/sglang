@@ -147,6 +147,8 @@ class VisionLLMLogitsBase(unittest.IsolatedAsyncioTestCase):
             gpu_id=0,
             tp_rank=0,
             tp_size=1,
+            pp_rank=0,
+            pp_size=1,
             nccl_port=12435,
             server_args=ServerArgs(
                 model_path=self.model_path,

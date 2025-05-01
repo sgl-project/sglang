@@ -320,7 +320,16 @@ class ChatCompletionRequest(BaseModel):
     logit_bias: Optional[Dict[str, float]] = None
     logprobs: bool = False
     top_logprobs: Optional[int] = None
-    max_tokens: Optional[int] = None
+    max_tokens: Optional[int] = Field(
+        default=None,
+        deprecated="max_tokens is deprecated in favor of the max_completion_tokens field",
+        description="The maximum number of tokens that can be generated in the chat completion. ",
+    )
+    max_completion_tokens: Optional[int] = Field(
+        default=None,
+        description="The maximum number of completion tokens for a chat completion request, "
+        "including visible output tokens and reasoning tokens. Input tokens are not included. ",
+    )
     n: int = 1
     presence_penalty: float = 0.0
     response_format: Optional[Union[ResponseFormat, StructuralTagResponseFormat]] = None
@@ -361,9 +370,11 @@ class ChatCompletionRequest(BaseModel):
     session_params: Optional[Dict] = None
     separate_reasoning: bool = True
     stream_reasoning: bool = True
+    chat_template_kwargs: Optional[Dict] = None
 
     # For PD disaggregation
     bootstrap_host: Optional[str] = None
+    bootstrap_port: Optional[int] = None
     bootstrap_room: Optional[int] = None
 
 
@@ -378,6 +389,7 @@ class ToolCall(BaseModel):
     """Tool call response."""
 
     id: str
+    index: Optional[int] = None
     type: Literal["function"] = "function"
     function: FunctionResponse
 

@@ -32,6 +32,7 @@ from torch.distributed import ProcessGroup
 from sglang.srt.disaggregation.base import BaseKVManager, BaseKVReceiver, KVArgs, KVPoll
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
+    FakeBootstrapHost,
     KVClassType,
     ReqToMetadataIdxAllocator,
     TransferBackend,
@@ -133,11 +134,16 @@ class DecodePreallocQueue:
 
     def add(self, req: Req) -> None:
         """Add a request to the pending queue."""
-
-        kv_receiver_class = get_kv_class(self.transfer_backend, KVClassType.RECEIVER)
+        if req.bootstrap_host == FakeBootstrapHost:
+            # Fake transfer for warmup reqs
+            kv_receiver_class = get_kv_class(TransferBackend.FAKE, KVClassType.RECEIVER)
+        else:
+            kv_receiver_class = get_kv_class(
+                self.transfer_backend, KVClassType.RECEIVER
+            )
         kv_receiver = kv_receiver_class(
             mgr=self.kv_manager,
-            bootstrap_addr=f"{req.bootstrap_host}:{self.bootstrap_port}",
+            bootstrap_addr=f"{req.bootstrap_host}:{req.bootstrap_port}",
             bootstrap_room=req.bootstrap_room,
         )
         self.queue.append(DecodeRequest(req=req, kv_receiver=kv_receiver))
@@ -307,7 +313,7 @@ class DecodeTransferQueue:
     def extend(self, req_conns) -> None:
         self.queue.extend(req_conns)
 
-    def pop_transferred(self) -> List[Req]:
+    def pop_transferred(self) -> List[DecodeRequest]:
         if not self.queue:
             return []
 
@@ -330,7 +336,7 @@ class DecodeTransferQueue:
                 assert len(decode_req.req.output_ids) == 0
                 assert decode_req.req.transferred_output_id is None
                 decode_req.req.transferred_output_id = output_id
-                transferred_reqs.append(decode_req.req)
+                transferred_reqs.append(decode_req)
                 indices_to_remove.add(i)
             elif poll in [
                 KVPoll.Bootstrapping,
@@ -454,7 +460,7 @@ class SchedulerDisaggregationDecodeMixin:
         return batch, result
 
     @torch.no_grad()
-    def event_loop_normal_disagg_decode(self):
+    def event_loop_normal_disagg_decode(self: Scheduler):
         """A normal scheduler loop for decode worker in disaggregation mode."""
 
         while True:
@@ -497,7 +503,7 @@ class SchedulerDisaggregationDecodeMixin:
             self.last_batch = batch
 
     @torch.no_grad()
-    def event_loop_overlap_disagg_decode(self):
+    def event_loop_overlap_disagg_decode(self: Scheduler):
         result_queue = deque()
         self.last_batch: Optional[ScheduleBatch] = None
         self.last_batch_in_queue = False  # last batch is modifed in-place, so we need another variable to track if it's extend
@@ -641,8 +647,15 @@ class SchedulerDisaggregationDecodeMixin:
 
     def process_decode_queue(self: Scheduler):
         req_conns = self.disagg_decode_prealloc_queue.pop_preallocated()
+
+        def _num_pre_alloc(req):
+            return len(req.req.origin_input_ids) + max(len(req.req.output_ids) - 1, 0)
+
+        self.num_tokens_pre_allocated += sum(_num_pre_alloc(req) for req in req_conns)
         self.disagg_decode_transfer_queue.extend(req_conns)
         alloc_reqs = (
             self.disagg_decode_transfer_queue.pop_transferred()
         )  # the requests which kv has arrived
-        self.waiting_queue.extend(alloc_reqs)
+        self.num_tokens_pre_allocated -= sum(_num_pre_alloc(req) for req in alloc_reqs)
+
+        self.waiting_queue.extend([req.req for req in alloc_reqs])

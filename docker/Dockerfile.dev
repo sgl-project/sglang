@@ -46,6 +46,7 @@ RUN python3 -m pip install --no-cache-dir \
     black \
     isort \
     icdiff \
+    scikit_build_core \
     uv \
     pre-commit
 

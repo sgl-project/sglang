@@ -1,12 +1,12 @@
 # SGLang Engine
 
-## Introduction
-SGLang provides a direct inference engine without the need for an HTTP server. There are generally two use cases:
+SGLang provides a direct inference engine without the need for an HTTP server. There are generally these use cases:
 
-1. **Offline Batch Inference**
-2. **Embedding Generation**
-3. **Custom Server on Top of the Engine**
-4. **Inference Using FastAPI**
+- [Offline Batch Inference](#offline-batch-inference)
+- [Embedding Generation](#embedding-generation)
+- [Custom Server](#custom-server)
+- [Token-In-Token-Out for RLHF](#token-in-token-out-for-rlhf)
+- [Inference Using FastAPI](#inference-using-fastapi)
 
 ## Examples
 
@@ -22,28 +22,28 @@ In this example, we launch an SGLang engine and feed a batch of inputs for embed
 
 This example demonstrates how to create a custom server on top of the SGLang Engine. We use [Sanic](https://sanic.dev/en/) as an example. The server supports both non-streaming and streaming endpoints.
 
-#### Steps:
+#### Steps
 
 1. Install Sanic:
 
-```bash
-pip install sanic
-```
+   ```bash
+   pip install sanic
+   ```
 
 2. Run the server:
 
-```bash
-python custom_server
-```
+   ```bash
+   python custom_server
+   ```
 
 3. Send requests:
 
-```bash
-curl -X POST http://localhost:8000/generate  -H "Content-Type: application/json"  -d '{"prompt": "The Transformer architecture is..."}'
-curl -X POST http://localhost:8000/generate_stream  -H "Content-Type: application/json"  -d '{"prompt": "The Transformer architecture is..."}' --no-buffer
-```
+   ```bash
+   curl -X POST http://localhost:8000/generate  -H "Content-Type: application/json"  -d '{"prompt": "The Transformer architecture is..."}'
+   curl -X POST http://localhost:8000/generate_stream  -H "Content-Type: application/json"  -d '{"prompt": "The Transformer architecture is..."}' --no-buffer
+   ```
 
-This will send both non-streaming and streaming requests to the server.
+   This will send both non-streaming and streaming requests to the server.
 
 ### [Token-In-Token-Out for RLHF](../token_in_token_out)
 

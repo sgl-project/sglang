@@ -24,6 +24,7 @@ from sglang.test.test_utils import (
 
 
 class TestVisionChunkedPrefill(CustomTestCase):
+
     def prepare_video_messages(self, video_path, max_frames_num=8):
         # We import decord here to avoid a strange Segmentation fault (core dumped) issue.
         # The following import order will cause Segmentation fault.
@@ -128,7 +129,7 @@ class TestVisionChunkedPrefill(CustomTestCase):
 
             return responses
 
-    def run_generate(self, chunked_prefill_size, batch, num_frame):
+    def launch_server(self, chunked_prefill_size) -> int:
         # launch server
         model = "lmms-lab/llava-onevision-qwen2-7b-ov"
         # model = "meta-llama/Llama-3.2-11B-Vision-Instruct"
@@ -142,37 +143,45 @@ class TestVisionChunkedPrefill(CustomTestCase):
                 f"{chunked_prefill_size}",
             ],
         )
+        return process.pid
+
+    def _test_chunked_prefill(self, batches, num_frames):
+        # Chunked
         try:
-            return self.generate_for_video(batch, num_frame)
+            chunked_server_pid = self.launch_server(chunked_prefill_size=1024)
+            outputs_chunked = []
+            for batch, num_frame in zip(batches, num_frames):
+                output_chunked = self.generate_for_video(
+                    batch=batch, num_frame=num_frame
+                )
+                outputs_chunked += [output_chunked]
         finally:
-            kill_process_tree(process.pid)
+            kill_process_tree(chunked_server_pid)
+
+        # None-chunked
+        try:
+            no_chunked_server_pid = self.launch_server(chunked_prefill_size=-1)
+            outputs_no_chunked = []
+            for batch, num_frame in zip(batches, num_frames):
+                output_no_chunked = self.generate_for_video(
+                    batch=batch, num_frame=num_frame
+                )
+                outputs_no_chunked += [output_no_chunked]
+
+        finally:
+            kill_process_tree(no_chunked_server_pid)
+
+        for output_chunked, output_no_chunked in zip(
+            outputs_chunked, outputs_no_chunked
+        ):
+            print("output with chunked prefill:")
+            print(output_chunked)
+            print("output without chunked prefill:")
+            print(output_no_chunked)
+            assert output_chunked == output_no_chunked
 
     def test_chunked_prefill(self):
-        output_chunked = self.run_generate(
-            chunked_prefill_size=1024, batch=False, num_frame=1
-        )
-        output_no_chunked = self.run_generate(
-            chunked_prefill_size=-1, batch=False, num_frame=1
-        )
-
-        print("output with chunked prefill:")
-        print(output_chunked)
-        print("output without chunked prefill:")
-        print(output_no_chunked)
-        assert output_chunked == output_no_chunked
-
-        output_chunked = self.run_generate(
-            chunked_prefill_size=1024, batch=True, num_frame=[2, 6, 8, 10]
-        )
-        output_no_chunked = self.run_generate(
-            chunked_prefill_size=-1, batch=True, num_frame=[2, 6, 8, 10]
-        )
-
-        print("output with chunked prefill:")
-        print(output_chunked)
-        print("output without chunked prefill:")
-        print(output_no_chunked)
-        assert output_chunked == output_no_chunked
+        self._test_chunked_prefill(batches=[False, True], num_frames=[1, [2, 6, 8, 10]])
 
 
 if __name__ == "__main__":

@@ -15,6 +15,9 @@ class DisaggregationMode(Enum):
     DECODE = "decode"
 
 
+FakeBootstrapHost = "2.2.2.2"
+
+
 def poll_and_all_reduce(pollers, gloo_group):
     polls = [int(poller.poll()) for poller in pollers]
     tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
@@ -59,6 +62,8 @@ class KVClassType(Enum):
 
 
 def get_kv_class(transfer_backend: TransferBackend, class_type: KVClassType):
+    from sglang.srt.disaggregation.fake import FakeKVReceiver, FakeKVSender
+
     if transfer_backend == TransferBackend.MOONCAKE:
         from sglang.srt.disaggregation.mooncake import (
             MooncakeKVBootstrapServer,
@@ -70,7 +75,7 @@ def get_kv_class(transfer_backend: TransferBackend, class_type: KVClassType):
         class_mapping = {
             KVClassType.MANAGER: MooncakeKVManager,
             KVClassType.SENDER: MooncakeKVSender,
-            KVClassType.RECEIVER: MooncakeKVReceiver,
+            KVClassType.RECEIVER: (MooncakeKVReceiver),
             KVClassType.BOOTSTRAP_SERVER: MooncakeKVBootstrapServer,
         }
         return class_mapping.get(class_type)
@@ -85,10 +90,19 @@ def get_kv_class(transfer_backend: TransferBackend, class_type: KVClassType):
         class_mapping = {
             KVClassType.MANAGER: NixlKVManager,
             KVClassType.SENDER: NixlKVSender,
-            KVClassType.RECEIVER: NixlKVReceiver,
+            KVClassType.RECEIVER: (NixlKVReceiver),
             KVClassType.BOOTSTRAP_SERVER: NixlKVBootstrapServer,
         }
         return class_mapping.get(class_type)
+    if transfer_backend == TransferBackend.FAKE:
+        from sglang.srt.disaggregation.fake import FakeKVReceiver, FakeKVSender
+
+        class_mapping = {
+            KVClassType.SENDER: FakeKVSender,
+            KVClassType.RECEIVER: (FakeKVReceiver),
+        }
+        return class_mapping.get(class_type)
+
     raise ValueError(f"Unsupported transfer backend: {transfer_backend}")
 
 

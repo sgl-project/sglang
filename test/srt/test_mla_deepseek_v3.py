@@ -19,7 +19,7 @@ class TestMLADeepseekV3(CustomTestCase):
     def setUpClass(cls):
         cls.model = "lmsys/sglang-ci-dsv3-test"
         cls.base_url = DEFAULT_URL_FOR_TEST
-        other_args = ["--trust-remote-code"]
+        other_args = ["--trust-remote-code", "--chunked-prefill-size", "256"]
         if torch.cuda.is_available() and torch.version.cuda:
             other_args.extend(["--enable-torch-compile", "--cuda-graph-max-bs", "2"])
         cls.process = popen_launch_server(

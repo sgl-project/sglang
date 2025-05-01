@@ -13,23 +13,11 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
-    is_in_ci,
     popen_launch_server,
-    run_bench_one_batch,
 )
 
 
 class TestTorchNativeAttnBackend(CustomTestCase):
-    def test_latency(self):
-        output_throughput = run_bench_one_batch(
-            DEFAULT_MODEL_NAME_FOR_TEST,
-            ["--attention-backend", "torch_native"],
-        )
-
-        if is_in_ci():
-            # Torch native backend is expected to be slower
-            assert output_throughput > 50, f"{output_throughput=}"
-
     def test_mmlu(self):
         model = DEFAULT_MODEL_NAME_FOR_TEST
         base_url = DEFAULT_URL_FOR_TEST

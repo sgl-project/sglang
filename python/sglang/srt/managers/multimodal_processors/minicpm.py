@@ -97,7 +97,7 @@ class MiniCPMMultimodalProcessor(BaseMultimodalProcessor):
             audio_start_id = tokenizer.audio_start_id
             audio_end_id = tokenizer.audio_end_id
 
-        im_token_id = tokenizer.unk_token_id
+        im_token_id = tokenizer.unk_id
         pixel_values = res["pixel_values"]
         tgt_sizes = res["tgt_sizes"]
 

@@ -182,7 +182,7 @@ class DeepseekVLV2Processor(ProcessorMixin):
         tokenized_str, images, seq_mask, spatial_crop = self.tokenize_with_images(
             messages,
             pil_images[image_index : image_index + image_token_cnt],
-            bos=False,
+            bos=True,
             eos=True,
             cropping=len(pil_images) <= 2,
             max_req_input_len=max_req_input_len,

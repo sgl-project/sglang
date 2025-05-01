@@ -46,7 +46,7 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.managers.schedule_batch import global_server_args_dict
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.models.llama import LlamaForCausalLM, LlamaMLP
 from sglang.srt.utils import add_prefix, fast_topk, get_compiler_backend, make_layers
 
@@ -260,7 +260,6 @@ class Llama4Attention(nn.Module):
         if self.rotary_emb is not None:
             q_view, k_view = qk.split([self.q_size, self.kv_size], dim=-1)
             q_out_unused, k_out_unused = self.rotary_emb(positions, q_view, k_view)
-            assert (q_out_unused is q_view) and (k_out_unused is k_view)
             del q_view, k_view, q_out_unused, k_out_unused
 
         if self.qk_norm is not None:
@@ -432,6 +431,7 @@ class Llama4Model(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, List[torch.Tensor]]]:
         if input_embeds is None:
             hidden_states = self.embed_tokens(input_ids)

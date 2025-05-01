@@ -17,13 +17,14 @@
 """Inference-only LLaMA model compatible with HuggingFace weights."""
 
 import logging
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 import torch
 from torch import nn
 from transformers import LlamaConfig
 
 from sglang.srt.distributed import (
+    get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
@@ -39,11 +40,12 @@ from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     kv_cache_scales_loader,
@@ -275,21 +277,31 @@ class LlamaModel(nn.Module):
         self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-            quant_config=quant_config,
-            prefix=add_prefix("embed_tokens", prefix),
-        )
-        self.layers = make_layers(
+        self.pp_group = get_pp_group()
+        if self.pp_group.is_first_rank:
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                prefix=add_prefix("embed_tokens", prefix),
+            )
+        else:
+            self.embed_tokens = PPMissingLayer()
+
+        self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: LlamaDecoderLayer(
-                config=config, layer_id=idx, quant_config=quant_config, prefix=prefix
+                config=config, quant_config=quant_config, layer_id=idx, prefix=prefix
             ),
+            pp_rank=self.pp_group.rank_in_group,
+            pp_size=self.pp_group.world_size,
             prefix="model.layers",
         )
 
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        if self.pp_group.is_last_rank:
+            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        else:
+            self.norm = PPMissingLayer(return_tuple=True)
         self.layers_to_capture = []
 
     def forward(
@@ -298,14 +310,23 @@ class LlamaModel(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, List[torch.Tensor]]]:
-        if input_embeds is None:
-            hidden_states = self.embed_tokens(input_ids)
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, List[torch.Tensor]], PPProxyTensors]:
+        if self.pp_group.is_first_rank:
+            if input_embeds is None:
+                hidden_states = self.embed_tokens(input_ids)
+            else:
+                hidden_states = input_embeds
+            residual = None
         else:
-            hidden_states = input_embeds
-        residual = None
+            assert pp_proxy_tensors is not None
+            # FIXME(@ying): reduce the number of proxy tensors by not fusing layer norms
+            hidden_states = pp_proxy_tensors["hidden_states"]
+            residual = pp_proxy_tensors["residual"]
+            deferred_norm = None
+
         aux_hidden_states = []
-        for i in range(len(self.layers)):
+        for i in range(self.start_layer, self.end_layer):
             if i in self.layers_to_capture:
                 aux_hidden_states.append(hidden_states + residual)
             layer = self.layers[i]
@@ -315,7 +336,16 @@ class LlamaModel(nn.Module):
                 forward_batch,
                 residual,
             )
-        hidden_states, _ = self.norm(hidden_states, residual)
+
+        if not self.pp_group.is_last_rank:
+            return PPProxyTensors(
+                {
+                    "hidden_states": hidden_states,
+                    "residual": residual,
+                }
+            )
+        else:
+            hidden_states, _ = self.norm(hidden_states, residual)
 
         if len(aux_hidden_states) == 0:
             return hidden_states
@@ -376,6 +406,7 @@ class LlamaForCausalLM(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        self.pp_group = get_pp_group()
         self.config = config
         self.quant_config = quant_config
         self.model = self._init_model(config, quant_config, add_prefix("model", prefix))
@@ -419,23 +450,41 @@ class LlamaForCausalLM(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
         get_embedding: bool = False,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> LogitsProcessorOutput:
+        hidden_states = self.model(
+            input_ids,
+            positions,
+            forward_batch,
+            input_embeds,
+            pp_proxy_tensors=pp_proxy_tensors,
+        )
+
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
-            hidden_states, aux_hidden_states = self.model(
-                input_ids, positions, forward_batch, input_embeds
-            )
-        else:
-            hidden_states = self.model(
-                input_ids, positions, forward_batch, input_embeds
-            )
+            hidden_states, aux_hidden_states = hidden_states
 
-        if not get_embedding:
-            return self.logits_processor(
-                input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
-            )
+        if self.pp_group.is_last_rank:
+            if not get_embedding:
+                return self.logits_processor(
+                    input_ids,
+                    hidden_states,
+                    self.lm_head,
+                    forward_batch,
+                    aux_hidden_states,
+                )
+            else:
+                return self.pooler(hidden_states, forward_batch)
         else:
-            return self.pooler(hidden_states, forward_batch)
+            return hidden_states
+
+    @property
+    def start_layer(self):
+        return self.model.start_layer
+
+    @property
+    def end_layer(self):
+        return self.model.end_layer
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
@@ -491,6 +540,16 @@ class LlamaForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
 
         for name, loaded_weight in weights:
+            layer_id = get_layer_id(name)
+            if (
+                layer_id is not None
+                and hasattr(self.model, "start_layer")
+                and (
+                    layer_id < self.model.start_layer
+                    or layer_id >= self.model.end_layer
+                )
+            ):
+                continue
             if "rotary_emb.inv_freq" in name or "projector" in name:
                 continue
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
@@ -637,6 +696,9 @@ class LlamaForCausalLM(nn.Module):
         self.model.load_kv_cache_scales(quantization_param_path)
 
     def set_eagle3_layers_to_capture(self):
+        if not self.pp_group.is_last_rank:
+            return
+
         self.capture_aux_hidden_states = True
         num_layers = self.config.num_hidden_layers
         self.model.layers_to_capture = [2, num_layers // 2, num_layers - 3]

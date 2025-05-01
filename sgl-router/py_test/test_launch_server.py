@@ -23,6 +23,11 @@ def popen_launch_router(
     policy: str = "cache_aware",
     max_payload_size: int = None,
     api_key: str = None,
+    log_dir: str = None,
+    service_discovery: bool = False,
+    selector: list = None,
+    service_discovery_port: int = 80,
+    service_discovery_namespace: str = None,
 ):
     """
     Launch the router server process.
@@ -35,6 +40,11 @@ def popen_launch_router(
         policy: Router policy, one of "cache_aware", "round_robin", "random"
         max_payload_size: Maximum payload size in bytes
         api_key: API key for the router
+        log_dir: Directory to store log files. If None, logs are only output to console.
+        service_discovery: Enable Kubernetes service discovery
+        selector: List of label selectors in format ["key1=value1", "key2=value2"]
+        service_discovery_port: Port to use for service discovery
+        service_discovery_namespace: Kubernetes namespace to watch for pods. If None, watches all namespaces.
     """
     _, host, port = base_url.split(":")
     host = host[2:]
@@ -62,6 +72,23 @@ def popen_launch_router(
 
     if max_payload_size is not None:
         command.extend(["--router-max-payload-size", str(max_payload_size)])
+
+    if service_discovery:
+        command.append("--router-service-discovery")
+
+    if selector:
+        command.extend(["--router-selector"] + selector)
+
+    if service_discovery_port != 80:
+        command.extend(["--router-service-discovery-port", str(service_discovery_port)])
+
+    if service_discovery_namespace:
+        command.extend(
+            ["--router-service-discovery-namespace", service_discovery_namespace]
+        )
+
+    if log_dir is not None:
+        command.extend(["--log-dir", log_dir])
 
     process = subprocess.Popen(command, stdout=None, stderr=None)
 

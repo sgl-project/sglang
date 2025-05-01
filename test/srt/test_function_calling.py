@@ -182,16 +182,17 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
                         "type": "object",
                         "properties": {
                             "a": {
-                                "type": "int",
+                                "type": "integer",
                                 "description": "First integer",
                             },
                             "b": {
-                                "type": "int",
+                                "type": "integer",
                                 "description": "Second integer",
                             },
                         },
                         "required": ["a", "b"],
                     },
+                    "strict": True,  # Llama-3.2-1B is flaky in tool call. It won't always respond with parameters unless we set strict.
                 },
             }
         ]
@@ -218,7 +219,7 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
                 # Record the function name on first occurrence
                 function_name = tool_call.function.name or function_name
                 # In case of multiple chunks, JSON fragments may need to be concatenated
-                if tool_call.function.arguments:
+                if tool_call.function.arguments is not None:
                     argument_fragments.append(tool_call.function.arguments)
 
         self.assertEqual(function_name, "add", "Function name should be 'add'")
@@ -258,11 +259,11 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
                         "type": "object",
                         "properties": {
                             "int_a": {
-                                "type": "int",
+                                "type": "integer",
                                 "description": "First integer",
                             },
                             "int_b": {
-                                "type": "int",
+                                "type": "integer",
                                 "description": "Second integer",
                             },
                         },
@@ -293,6 +294,138 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
         self.assertEqual(function_name, "sub", "Function name should be 'sub'")
         self.assertEqual(str(args_obj["int_a"]), "5", "Parameter int_a should be 5")
         self.assertEqual(str(args_obj["int_b"]), "7", "Parameter int_b should be 7")
+
+
+class TestOpenAIPythonicFunctionCalling(CustomTestCase):
+    PYTHONIC_TOOLS = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get the current weather for a given location.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "location": {
+                            "type": "string",
+                            "description": "The name of the city or location.",
+                        }
+                    },
+                    "required": ["location"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_tourist_attractions",
+                "description": "Get a list of top tourist attractions for a given city.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "city": {
+                            "type": "string",
+                            "description": "The name of the city to find attractions for.",
+                        }
+                    },
+                    "required": ["city"],
+                },
+            },
+        },
+    ]
+
+    PYTHONIC_MESSAGES = [
+        {
+            "role": "system",
+            "content": (
+                "You are a travel assistant. "
+                "When asked to call functions, ALWAYS respond ONLY with a python list of function calls, "
+                "using this format: [func_name1(param1=value1, param2=value2), func_name2(param=value)]. "
+                "Do NOT use JSON, do NOT use variables, do NOT use any other format. "
+                "Here is an example:\n"
+                '[get_weather(location="Paris"), get_tourist_attractions(city="Paris")]'
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                "I'm planning a trip to Tokyo next week. What's the weather like and what are some top tourist attractions? "
+                "Propose parallel tool calls at once, using the python list of function calls format as shown above."
+            ),
+        },
+    ]
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            api_key=cls.api_key,
+            other_args=[
+                "--tool-call-parser",
+                "pythonic",
+            ],
+        )
+        cls.base_url += "/v1"
+        cls.tokenizer = get_tokenizer(cls.model)
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_pythonic_tool_call_prompt(self):
+        """
+        Test: Explicit prompt for pythonic tool call format without chat template.
+        """
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+        response = client.chat.completions.create(
+            model=self.model,
+            messages=self.PYTHONIC_MESSAGES,
+            tools=self.PYTHONIC_TOOLS,
+            temperature=0.1,
+            stream=False,
+        )
+        tool_calls = response.choices[0].message.tool_calls
+        self.assertIsInstance(tool_calls, list)
+        self.assertGreaterEqual(len(tool_calls), 1)
+        names = [tc.function.name for tc in tool_calls]
+        self.assertIn("get_weather", names)
+        self.assertIn("get_tourist_attractions", names)
+
+    def test_pythonic_tool_call_streaming(self):
+        """
+        Test: Streaming pythonic tool call format; assert tool_call index is present.
+        """
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+        response_stream = client.chat.completions.create(
+            model=self.model,
+            messages=self.PYTHONIC_MESSAGES,
+            tools=self.PYTHONIC_TOOLS,
+            temperature=0.1,
+            stream=True,
+        )
+        found_tool_calls = False
+        found_index = False
+        found_names = set()
+        for chunk in response_stream:
+            choice = chunk.choices[0]
+            if getattr(choice.delta, "tool_calls", None):
+                found_tool_calls = True
+                tool_call = choice.delta.tool_calls[0]
+                if hasattr(tool_call, "index") or (
+                    isinstance(tool_call, dict) and "index" in tool_call
+                ):
+                    found_index = True
+                found_names.add(str(tool_call.function.name))
+
+        self.assertTrue(found_tool_calls, "No tool_calls found in streaming response")
+        self.assertTrue(found_index, "No index field found in any streamed tool_call")
+        self.assertIn("get_weather", found_names)
+        self.assertIn("get_tourist_attractions", found_names)
 
 
 if __name__ == "__main__":
