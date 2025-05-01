@@ -1,3 +1,4 @@
+import os
 import unittest
 
 from sglang.test.test_utils import (
@@ -180,7 +181,10 @@ class TestBenchServing(CustomTestCase):
                 f"### test_moe_offline_throughput_default\n"
                 f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
             )
-            self.assertGreater(res["output_throughput"], 2200)
+            if os.getenv("SGLANG_AMD_CI") == "1":
+                self.assertGreater(res["output_throughput"], 2100)
+            else:
+                self.assertGreater(res["output_throughput"], 2200)
 
     def test_moe_offline_throughput_without_radix_cache(self):
         res = run_bench_serving(
@@ -195,7 +199,10 @@ class TestBenchServing(CustomTestCase):
                 f"### test_moe_offline_throughput_without_radix_cache\n"
                 f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
             )
-            self.assertGreater(res["output_throughput"], 2200)
+            if os.getenv("SGLANG_AMD_CI") == "1":
+                self.assertGreater(res["output_throughput"], 2100)
+            else:
+                self.assertGreater(res["output_throughput"], 2200)
 
 
 if __name__ == "__main__":
