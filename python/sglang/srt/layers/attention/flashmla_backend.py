@@ -125,7 +125,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             # todo: why flashinfer mla here?
             super().init_forward_metadata(forward_batch)
 
-    def update_metadata_extend(self, forward_batch: ForwardBatch):
+    def update_metadata_draft_extend(self, forward_batch: ForwardBatch):
         bs = forward_batch.batch_size
         spec_info = forward_batch.spec_info
 
@@ -221,6 +221,16 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             block_kv_indices,
         )
 
+    def update_metadata_extend(self, forward_batch: ForwardBatch):
+        prefix_lens = forward_batch.extend_prefix_lens
+        extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
+
+        # todo: update metadata for spec extend
+        
+        assert False # temp for debug
+        
+        pass
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
 
         # print the forward_mode
@@ -233,14 +243,13 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             self.update_metadata_decode(forward_batch)
         elif forward_batch.forward_mode.is_draft_extend():
             # should be the same as decode?
-            self.update_metadata_extend(forward_batch)
+            self.update_metadata_draft_extend(forward_batch)
         elif forward_batch.forward_mode.is_target_verify():
             self.update_metadata_verify(forward_batch)
         else:
             # todo: EXTEND mode
             assert forward_batch.spec_info is None
-            self.update_metadata_decode(forward_batch)
-            pass
+            self.update_metadata_extend(forward_batch)
 
     def init_cuda_graph_state(
         self,
