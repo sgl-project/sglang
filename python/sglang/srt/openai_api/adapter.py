@@ -899,6 +899,24 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
     return response
 
 
+def _get_enable_thinking_from_request(request_obj):
+    """Extracts the 'enable_thinking' flag from request chat_template_kwargs.
+
+    Args:
+        request_obj: The request object (or an item from a list of requests).
+
+    Returns:
+        The boolean value of 'enable_thinking' if found and not True, otherwise True.
+    """
+    if (
+        hasattr(request_obj, "chat_template_kwargs")
+        and request_obj.chat_template_kwargs
+        and request_obj.chat_template_kwargs.get("enable_thinking") is not None
+    ):
+        return request_obj.chat_template_kwargs.get("enable_thinking")
+    return True
+
+
 def v1_chat_generate_request(
     all_requests: List[ChatCompletionRequest],
     tokenizer_manager,
@@ -1263,31 +1281,16 @@ def v1_chat_generate_response(
         tool_calls = None
         text = ret_item["text"]
 
-        enable_thinking = True
         if isinstance(request, list):
             tool_choice = request[idx].tool_choice
             tools = request[idx].tools
             separate_reasoning = request[idx].separate_reasoning
-
-            if (
-                request[idx].chat_template_kwargs
-                and request[idx].chat_template_kwargs.get("enable_thinking") is not None
-            ):
-                enable_thinking = request[idx].chat_template_kwargs.get(
-                    "enable_thinking", True
-                )
+            enable_thinking = _get_enable_thinking_from_request(request[idx])
         else:
             tool_choice = request.tool_choice
             tools = request.tools
             separate_reasoning = request.separate_reasoning
-
-            if (
-                request.chat_template_kwargs
-                and request.chat_template_kwargs.get("enable_thinking") is not None
-            ):
-                enable_thinking = request.chat_template_kwargs.get(
-                    "enable_thinking", True
-                )
+            enable_thinking = _get_enable_thinking_from_request(request)
 
         reasoning_text = None
         if reasoning_parser and separate_reasoning and enable_thinking:
@@ -1526,9 +1529,12 @@ async def v1_chat_completions(
                     delta = text[len(stream_buffer) :]
                     new_stream_buffer = stream_buffer + delta
 
+                    enable_thinking = _get_enable_thinking_from_request(request)
+
                     if (
                         tokenizer_manager.server_args.reasoning_parser
                         and request.separate_reasoning
+                        and enable_thinking
                     ):
                         if index not in reasoning_parser_dict:
                             reasoning_parser_dict[index] = ReasoningParser(
