@@ -22,7 +22,7 @@ import random
 import tempfile
 from typing import List, Literal, Optional
 
-from sglang.srt.hf_transformers_utils import check_gguf_file
+from sglang.srt.hf_transformers_utils import check_gguf_file, get_config
 from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.utils import (
     configure_ipv6,
@@ -78,6 +78,8 @@ class ServerArgs:
 
     # Other runtime options
     tp_size: int = 1
+    pp_size: int = 1
+    max_micro_batch_size: Optional[int] = None
     stream_interval: int = 1
     stream_output: bool = False
     random_seed: Optional[int] = None
@@ -222,25 +224,34 @@ class ServerArgs:
 
         # Set mem fraction static, which depends on the tensor parallelism size
         if self.mem_fraction_static is None:
+            parallel_size = self.tp_size * self.pp_size
             if gpu_mem <= 81920:
-                if self.tp_size >= 16:
+                if parallel_size >= 16:
                     self.mem_fraction_static = 0.79
-                elif self.tp_size >= 8:
+                elif parallel_size >= 8:
                     self.mem_fraction_static = 0.81
-                elif self.tp_size >= 4:
+                elif parallel_size >= 4:
                     self.mem_fraction_static = 0.85
-                elif self.tp_size >= 2:
+                elif parallel_size >= 2:
                     self.mem_fraction_static = 0.87
                 else:
                     self.mem_fraction_static = 0.88
             else:
-                # FIXME: more fine grained auto-selection polices
-                self.mem_fraction_static = (gpu_mem - 1024 * 13) / gpu_mem
+                self.mem_fraction_static = 0.88
+            if gpu_mem > 96 * 1024:
+                mem_fraction = self.mem_fraction_static
+                self.mem_fraction_static = min(
+                    mem_fraction + 48 * 1024 * (1 - mem_fraction) / gpu_mem,
+                    (gpu_mem - 1024 * 18)
+                    / gpu_mem,  # 15 GB + additional 3GB for cuda graph
+                )
 
         # Set chunked prefill size, which depends on the gpu memory capacity
         if self.chunked_prefill_size is None:
             if gpu_mem is not None and gpu_mem < 25_000:
                 self.chunked_prefill_size = 2048
+            elif self.disaggregation_mode != "null":
+                self.chunked_prefill_size = 16384
             else:
                 self.chunked_prefill_size = 8192
         assert self.chunked_prefill_size % self.page_size == 0
@@ -333,6 +344,14 @@ class ServerArgs:
                 "eagle speculative decoding."
             )
 
+            model_arch = get_model_arch(self)
+
+            # Auto set draft_model_path DeepSeek-V3/R1
+            if self.speculative_draft_model_path is None and model_arch in [
+                "DeepseekV3ForCausalLM"
+            ]:
+                self.speculative_draft_model_path = self.model_path
+
             # Auto choose parameters
             if self.speculative_num_steps is None:
                 assert (
@@ -343,7 +362,7 @@ class ServerArgs:
                     self.speculative_num_steps,
                     self.speculative_eagle_topk,
                     self.speculative_num_draft_tokens,
-                ) = auto_choose_speculative_params(self)
+                ) = auto_choose_speculative_params(model_arch)
 
             if self.page_size > 1 and self.speculative_eagle_topk > 1:
                 self.speculative_eagle_topk = 1
@@ -631,6 +650,19 @@ class ServerArgs:
             type=int,
             default=ServerArgs.tp_size,
             help="The tensor parallelism size.",
+        )
+        parser.add_argument(
+            "--pipeline-parallel-size",
+            "--pp-size",
+            type=int,
+            default=ServerArgs.pp_size,
+            help="The pipeline parallelism size.",
+        )
+        parser.add_argument(
+            "--max-micro-batch-size",
+            type=int,
+            default=ServerArgs.max_micro_batch_size,
+            help="The maximum micro batch size in pipeline parallelism.",
         )
         parser.add_argument(
             "--stream-interval",
@@ -1096,9 +1128,9 @@ class ServerArgs:
         parser.add_argument(
             "--tool-call-parser",
             type=str,
-            choices=["qwen25", "mistral", "llama3", "deepseekv3"],
+            choices=["qwen25", "mistral", "llama3", "deepseekv3", "pythonic"],
             default=ServerArgs.tool_call_parser,
-            help="Specify the parser for handling tool-call interactions. Options include: 'qwen25', 'mistral', and 'llama3'.",
+            help="Specify the parser for handling tool-call interactions. Options include: 'qwen25', 'mistral', 'llama3', 'deepseekv3', and 'pythonic'.",
         )
         parser.add_argument(
             "--enable-hierarchical-cache",
@@ -1221,6 +1253,7 @@ class ServerArgs:
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
         args.tp_size = args.tensor_parallel_size
+        args.pp_size = args.pipeline_parallel_size
         args.dp_size = args.data_parallel_size
         args.ep_size = args.expert_parallel_size
         attrs = [attr.name for attr in dataclasses.fields(cls)]
@@ -1234,15 +1267,25 @@ class ServerArgs:
 
     def check_server_args(self):
         assert (
-            self.tp_size % self.nnodes == 0
-        ), "tp_size must be divisible by number of nodes"
+            self.tp_size * self.pp_size
+        ) % self.nnodes == 0, "tp_size must be divisible by number of nodes"
+
+        # FIXME pp constraints
+        if self.pp_size > 1:
+            logger.warning(f"Turn off overlap scheule for pipeline parallelism.")
+            self.disable_overlap_schedule = True
+            assert (
+                self.disable_overlap_schedule
+                and self.speculative_algorithm is None
+                and not self.enable_mixed_chunk
+            ), "Pipeline parallelism is not compatible with overlap schedule, speculative decoding, mixed chunked prefill."
+
         assert not (
             self.dp_size > 1 and self.nnodes != 1 and not self.enable_dp_attention
         ), "multi-node data parallel is not supported unless dp attention!"
         assert (
             self.max_loras_per_batch > 0
             # FIXME
-            and (self.lora_paths is None or self.disable_cuda_graph)
             and (self.lora_paths is None or self.disable_radix_cache)
         ), "compatibility of lora and cuda graph and radix attention is in progress"
         assert self.base_gpu_id >= 0, "base_gpu_id must be non-negative"
@@ -1368,20 +1411,22 @@ class DeprecatedAction(argparse.Action):
         raise ValueError(self.help)
 
 
-def auto_choose_speculative_params(self: ServerArgs):
+def get_model_arch(args: ServerArgs):
+    hf_config = get_config(
+        args.model_path,
+        trust_remote_code=args.trust_remote_code,
+        revision=args.revision,
+        model_override_args=json.loads(args.json_model_override_args),
+    )
+    return hf_config.architectures[0]
+
+
+def auto_choose_speculative_params(arch: str):
     """
     Automatically choose the parameters for speculative decoding.
 
     You can tune them on your own models and prompts with scripts/playground/bench_speculative.py
     """
-    config_path = os.path.join(self.model_path, "config.json")
-    if not os.path.exists(config_path):
-        raise ValueError(f"{config_path} is not found.")
-
-    config = json.load(open(config_path))
-
-    arch = config.get("architectures", ["Unknown"])[0]
-
     if arch in ["LlamaForCausalLM"]:
         # The default value for llama
         return (5, 4, 8)
