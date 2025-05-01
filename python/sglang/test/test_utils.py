@@ -770,6 +770,34 @@ def run_bench_offline_throughput(model, other_args):
     return output_throughput
 
 
+def run_bench_one_batch_server(
+    model,
+    base_url,
+    server_args,
+    bench_args,
+    other_server_args,
+    simulate_spec_acc_lens=None,
+):
+    from sglang.bench_one_batch_server import run_benchmark
+
+    if simulate_spec_acc_lens is not None:
+        env = {**os.environ, "SIMULATE_ACC_LEN": str(simulate_spec_acc_lens)}
+    else:
+        env = None
+
+    process = popen_launch_server(
+        model,
+        base_url,
+        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+        other_args=other_server_args,
+        env=env,
+    )
+    try:
+        run_benchmark(server_args=server_args, bench_args=bench_args)
+    finally:
+        kill_process_tree(process.pid)
+
+
 def lcs(X, Y):
     m = len(X)
     n = len(Y)
