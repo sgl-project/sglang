@@ -11,9 +11,13 @@ The eval output will be logged
 
 import argparse
 import asyncio
+import sys
 import time
-from typing import Any, Tuple
+import traceback
+from dataclasses import dataclass, field
+from typing import Any, List, Tuple
 
+import aiohttp
 import openai
 from data_utils import save_json
 from eval_utils import (
@@ -26,6 +30,39 @@ from eval_utils import (
 from tqdm import tqdm
 
 from sglang.test.test_utils import add_common_sglang_args_and_parse
+
+AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=20 * 60 * 60)
+
+
+@dataclass
+class RequestFuncOutput:
+    generated_text: List[str] = field(default_factory=list)
+    prompt_len: List[int] = field(default_factory=list)
+    output_len: List[int] = field(default_factory=list)
+    latency: List[float] = field(default_factory=list)
+    ttft: List[float] = field(default_factory=list)
+    itl: List[float] = field(default_factory=list)  # List of inter-token latencies
+
+    success: bool = False
+    error: str = ""
+
+
+async def async_request_profile(api_url: str) -> RequestFuncOutput:
+    async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
+        output = RequestFuncOutput()
+        try:
+            async with session.post(url=api_url) as response:
+                if response.status == 200:
+                    output.success = True
+                else:
+                    output.error = response.reason or ""
+                    output.success = False
+        except Exception:
+            output.success = False
+            exc_info = sys.exc_info()
+            output.error = "".join(traceback.format_exception(*exc_info))
+
+    return output
 
 
 def _get_prefix_suffix(prompt: str) -> Tuple[str, str]:
@@ -83,13 +120,33 @@ async def eval_mmmu(args) -> None:
     )
     semaphore = asyncio.Semaphore(args.concurrency)
     start = time.time()
+    base_url = f"http://127.0.0.1:{args.port}"
+
+    if args.profile:
+        print("Starting profiler...")
+        profile_output = await async_request_profile(
+            api_url=f"{base_url}/start_profile"
+        )
+        if profile_output.success:
+            print("Profiler started")
+        if args.profile_number != -1:
+            samples = samples[: args.profile_number]
+
     tasks = [
         process_sample_with_semaphore(semaphore, client, sample, sampling_params)
         for sample in samples
     ]
+
     for coro in tqdm(asyncio.as_completed(tasks), total=len(tasks)):
         sample, response = await coro
         process_result(response, sample, answer_dict, out_samples)
+
+    if args.profile:
+        print("Stopping profiler...")
+        profile_output = await async_request_profile(api_url=f"{base_url}/stop_profile")
+        if profile_output.success:
+            print("Profiler stopped")
+
     print(f"Benchmark time: {time.time() - start}")
     args.output_path = f"./val_sglang.json"
     save_json(args.output_path, out_samples)
@@ -102,6 +159,8 @@ def parse_args():
     parser.add_argument(
         "--concurrency", type=int, default=1, help="Max concurrent OpenAI calls"
     )
+    parser.add_argument("--profile-number", type=int, default=-1)
+    parser.add_argument("--profile", action="store_true")
     args = add_common_sglang_args_and_parse(parser)
     return args
 
