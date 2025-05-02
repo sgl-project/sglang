@@ -712,7 +712,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             k_nope = latent_cache[..., : self.kv_lora_rank]
 
             # overlap qk norm
-            if torch.cuda.is_current_stream_capturing():
+            if self.alt_stream is not None and torch.cuda.is_current_stream_capturing():
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
                 q = self.q_a_layernorm(q)
