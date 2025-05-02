@@ -17,6 +17,13 @@ from transformers import AutoModel, AutoProcessor, GenerationConfig
 @torch.no_grad()
 def eval_mmmu(args):
     eval_args = EvalArgs.from_cli_args(args)
+
+    sampling_params = get_sampling_params(eval_args)
+    generation_config = GenerationConfig(
+        max_new_tokens=sampling_params["max_new_tokens"],
+        do_sample=False,
+    )
+
     try:
         from transformers import AutoModelForImageTextToText
 
@@ -29,9 +36,8 @@ def eval_mmmu(args):
         try:
             # check if the model is belongs to internvl
             if "InternVL" in args.model_path:
+                from internvl_utils import load_image
                 from transformers import AutoTokenizer
-
-                from sglang.benchmark.mmmu.internvl_utils import load_image
 
                 tokenizer = AutoTokenizer.from_pretrained(args.model_path)
                 model = AutoModel.from_pretrained(
@@ -64,12 +70,6 @@ def eval_mmmu(args):
 
     samples = prepare_samples(eval_args)
     out_samples = dict()
-
-    sampling_params = get_sampling_params(eval_args)
-    generation_config = GenerationConfig(
-        max_new_tokens=sampling_params["max_new_tokens"],
-        do_sample=False,
-    )
 
     answer_dict = {}
     for sample in tqdm(samples):
