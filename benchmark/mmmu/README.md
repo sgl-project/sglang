@@ -8,7 +8,7 @@ Host the VLM:
 python -m sglang.launch_server --model-path Qwen/Qwen2-VL-7B-Instruct --chat-template qwen2-vl --port 30000
 ```
 
-It's recommended to reduce the memory usage by appending something ike `--mem-fraction-static 0.6` to the command above.
+It's recommended to reduce the memory usage by appending something like `--mem-fraction-static 0.6` to the command above.
 
 Benchmark:
 
