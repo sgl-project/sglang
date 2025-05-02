@@ -418,7 +418,7 @@ class Conversation:
 
 # A global registry for all conversation templates
 chat_templates: Dict[str, Conversation] = {}
-matching_function_registry: List[Callable] = []
+matching_function_registry: Dict[str, Callable] = {}
 
 
 def register_conv_template(template: Conversation, override: bool = False):
@@ -431,12 +431,16 @@ def register_conv_template(template: Conversation, override: bool = False):
     chat_templates[template.name] = template
 
 
-def register_conv_template_matching_function(func):
-    matching_function_registry.append(func)
+def register_conv_template_matching_function(func, override: bool = False):
+    if not override:
+        assert (
+            func.__name__ not in matching_function_registry
+        ), f"template matching function `{func.__name__}` already exists in registry"
+    matching_function_registry[func.__name__] = func
 
 
-def get_conv_template_by_model_path(model_path):
-    for matching_func in matching_function_registry:
+def get_conv_template_by_model_path(model_path: str) -> Optional[str]:
+    for _, matching_func in matching_function_registry.items():
         conv_name = matching_func(model_path)
         if conv_name is not None:
             return conv_name
