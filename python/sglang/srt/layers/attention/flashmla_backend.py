@@ -30,7 +30,7 @@ if TYPE_CHECKING:
 
 # FlashMLA only supports pagesize=64
 PAGE_SIZE = 64
-# S_q = 1 if MTP is disabled, but we currently use topk=1
+# S_q = 1 if MTP is disabled, but > 1 in verify mode if MTP enabled
 Q_LEN = 1
 
 
@@ -273,12 +273,6 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         )
         self.cuda_graph_kv_indices = cuda_graph_kv_indices
 
-        self.forward_metadata = FlashMLADecodeMetadata(
-            self.cuda_graph_mla_metadata,
-            self.cuda_graph_num_splits,
-            self.cuda_graph_kv_indices[:max_bs],
-        )
-
     def init_forward_metadata_capture_cuda_graph(
         self,
         bs: int,
@@ -314,12 +308,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                     self.cuda_graph_num_splits[: bs + 1],
                     self.cuda_graph_kv_indices[:bs, :max_seqlen_pad],
                 )
-        elif forward_mode.is_draft_extend():
-            # todo
-            pass
-        elif forward_mode.is_target_verify():
-            # todo
-            pass
+        # todo: MTP draft extend and verify
         else:
             super().init_forward_metadata_capture_cuda_graph(
                 bs,
@@ -370,12 +359,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             self.forward_metadata.block_kv_indices = self.cuda_graph_kv_indices[
                 :bs, :max_seqlen_pad
             ]
-        elif forward_mode.is_draft_extend():
-            # todo
-            pass
-        elif forward_mode.is_target_verify():
-            # todo
-            pass
+        # todo: MTP draft extend and verify
         else:
             print("super().init_forward_metadata_replay_cuda_graph")
             super().init_forward_metadata_replay_cuda_graph(
@@ -426,7 +410,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             tile_scheduler_metadata=self.forward_metadata.flashmla_metadata,
             num_splits=self.forward_metadata.num_splits,
             softmax_scale=layer.scaling,
-            causal=True,
+            causal=False, # why casual = False?
         )
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
