@@ -21,8 +21,6 @@ from typing import Dict, Optional, Type, Union
 
 import torch
 from huggingface_hub import snapshot_download
-from sglang.srt.configs.internvl import InternVLChatConfig
-from sglang.srt.configs.qwen2_5_o import Qwen2_5OmniConfig
 from transformers import (
     AutoConfig,
     AutoProcessor,
@@ -42,6 +40,7 @@ from sglang.srt.configs import (
     KimiVLConfig,
     MultiModalityConfig,
 )
+from sglang.srt.configs.internvl import InternVLChatConfig
 from sglang.srt.configs.qwen2_5_omni import Qwen2_5OmniConfig
 from sglang.srt.connector import create_remote_connector
 from sglang.srt.utils import is_remote_url

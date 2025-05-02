@@ -103,7 +103,6 @@ class GenerateReqInput:
     bootstrap_room: Optional[Union[List[int], int]] = None
 
     def contains_mm_input(self) -> bool:
-
         return has_valid_data(self.image_data) or has_valid_data(self.audio_data)
 
     def normalize_batch_and_arguments(self):
@@ -490,7 +489,7 @@ class EmbeddingReqInput:
     modalities: Optional[List[str]] = None
 
     def contains_mm_input(self) -> bool:
-        return has_valid_data(self.image_data)
+        return has_valid_data(self.image_data) or has_valid_data(self.audio_data)
 
     def normalize_batch_and_arguments(self):
         # at least one of text, input_ids, or image should be provided
