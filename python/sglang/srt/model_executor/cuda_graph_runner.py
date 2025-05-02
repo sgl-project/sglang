@@ -289,6 +289,7 @@ class CudaGraphRunner:
                 self.global_num_tokens_gpu = torch.zeros(
                     (self.dp_size,), dtype=torch.int32
                 )
+                self.split_indices = torch.zeros((self.dp_size - 1,), dtype=torch.long)
 
         # Capture
         try:
@@ -418,10 +419,21 @@ class CudaGraphRunner:
                     device=input_ids.device,
                 )
             )
+            self.split_indices.copy_(
+                torch.tensor(
+                    [
+                        num_tokens // self.dp_size + (i < bs % self.dp_size)
+                        for i in range(self.dp_size)
+                    ],
+                    dtype=torch.int32,
+                ).cumsum(0)[:-1]
+            )
             global_num_tokens = self.global_num_tokens_gpu
+            split_indices_cpu = self.split_indices.cpu()
             gathered_buffer = self.gathered_buffer[:num_tokens]
         else:
             global_num_tokens = None
+            split_indices_cpu = None
             gathered_buffer = None
 
         spec_info = self.get_spec_info(num_tokens)
@@ -452,6 +464,7 @@ class CudaGraphRunner:
             return_logprob=False,
             positions=positions,
             global_num_tokens_gpu=global_num_tokens,
+            split_indices_cpu=split_indices_cpu,
             gathered_buffer=gathered_buffer,
             mrope_positions=mrope_positions,
             spec_algorithm=self.model_runner.spec_algorithm,

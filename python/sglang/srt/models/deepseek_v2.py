@@ -36,8 +36,11 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.dp_attention import (
+    dp_copy,
     dp_gather_partial,
+    dp_reduce_scatter,
     dp_scatter,
+    get_attention_dp_rank,
     get_attention_dp_size,
     get_attention_tp_rank,
     get_attention_tp_size,
@@ -163,7 +166,12 @@ class DeepseekV2MLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
 
-    def forward(self, x, forward_mode: Optional[ForwardMode] = None):
+    def forward(
+        self,
+        x,
+        forward_mode: Optional[ForwardMode] = None,
+        split_indices_cpu: Optional[torch.Tensor] = None,
+    ):
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
@@ -202,6 +210,8 @@ class DeepseekV2MoE(nn.Module):
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
+        self.dp_size = get_attention_dp_size()
+        self.dp_rank = get_attention_dp_rank()
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
         self.n_share_experts_fusion = global_server_args_dict["n_share_experts_fusion"]
@@ -298,14 +308,21 @@ class DeepseekV2MoE(nn.Module):
             )
 
     def forward(
-        self, hidden_states: torch.Tensor, forward_mode: Optional[ForwardMode] = None
+        self,
+        hidden_states: torch.Tensor,
+        forward_mode: Optional[ForwardMode] = None,
+        split_indices_cpu: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if not global_server_args_dict["enable_deepep_moe"]:
-            return self.forward_normal(hidden_states)
+            return self.forward_normal(hidden_states, split_indices_cpu)
         else:
             return self.forward_deepep(hidden_states, forward_mode)
 
-    def forward_normal(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward_normal(
+        self,
+        hidden_states: torch.Tensor,
+        split_indices_cpu: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         shared_output = self._forward_shared_experts(hidden_states)
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
@@ -316,7 +333,14 @@ class DeepseekV2MoE(nn.Module):
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
         if self.tp_size > 1:
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            if self.tp_size == self.dp_size:
+                tensor_list = list(final_hidden_states.tensor_split(split_indices_cpu))
+                final_hidden_states = tensor_list[self.dp_rank]
+                dp_reduce_scatter(final_hidden_states, tensor_list)
+            else:
+                final_hidden_states = tensor_model_parallel_all_reduce(
+                    final_hidden_states
+                )
         return final_hidden_states
 
     def forward_deepep(
@@ -1113,6 +1137,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         self.enable_dp_attention = global_server_args_dict["enable_dp_attention"]
         self.layer_id = layer_id
         self.dp_size = get_attention_dp_size()
+        self.tp_size = get_tensor_model_parallel_world_size()
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
         self.self_attn = DeepseekV2AttentionMLA(
@@ -1263,18 +1288,30 @@ class DeepseekV2DecoderLayer(nn.Module):
             )
 
         # Fully Connected
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(
+            hidden_states, split_indices_cpu=forward_batch.split_indices_cpu
+        )
 
         # TODO(ch-wan): ues reduce-scatter in MLP to avoid this scatter
         # Scatter
         if self.dp_size != 1:
             # important: forward batch.gathered_buffer is used both after scatter and after gather.
             # be careful about this!
-            hidden_states, global_hidden_states = (
-                forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
-                hidden_states,
-            )
-            dp_scatter(hidden_states, global_hidden_states, forward_batch)
+            if not self.info.is_sparse or self.dp_size != self.tp_size:
+                hidden_states, global_hidden_states = (
+                    forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
+                    hidden_states,
+                )
+                dp_scatter(hidden_states, global_hidden_states, forward_batch)
+            else:
+                if hidden_states.shape[0] != residual.shape[0]:
+                    hidden_states, tmp_hidden_states = (
+                        forward_batch.gathered_buffer[
+                            : forward_batch.input_ids.shape[0]
+                        ],
+                        hidden_states,
+                    )
+                    dp_copy(hidden_states, tmp_hidden_states, forward_batch)
 
         return hidden_states, residual
 
@@ -1342,7 +1379,9 @@ class DeepseekV2DecoderLayer(nn.Module):
             and (not self.info.is_sparse)
             and hidden_states.shape[0] == 0
         ):
-            hidden_states = self.mlp(hidden_states, forward_batch.forward_mode)
+            hidden_states = self.mlp(
+                hidden_states, forward_mode=forward_batch.forward_mode
+            )
 
         if self.is_last_layer and self.attn_tp_size != 1:
             hidden_states += residual

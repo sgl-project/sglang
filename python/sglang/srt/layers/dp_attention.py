@@ -261,3 +261,36 @@ def tp_reduce_scatter(
 
 def tp_all_gather(output_list: List[torch.Tensor], input_: torch.Tensor):
     return get_attention_tp_group().all_gather(input_, tensor_list=output_list)
+
+
+def dp_reduce_scatter(
+    output: torch.Tensor,
+    input_list: List[torch.Tensor],
+):
+    return get_tp_group().reduce_scatter(output, input_list)
+
+
+def dp_copy(
+    local_tokens: torch.Tensor,  # output
+    global_tokens: torch.Tensor,  # input
+    forward_batch: ForwardBatch,
+):
+    # local_num_tokens is not necessarily the same as local_tokens.shape[0],
+    # since local_tokens may be padded for cuda graph
+    local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
+
+    local_tokens.fill_(0)
+    assert local_tokens.is_contiguous()
+    assert global_tokens.is_contiguous()
+    if local_tokens.shape[0] > 0:
+        assert (
+            local_tokens.untyped_storage() is not global_tokens.untyped_storage()
+        ), "aliasing between local_tokens and global_tokens not allowed"
+        memcpy_triton(
+            local_tokens,
+            global_tokens,
+            0,
+            torch.zeros_like(local_start_pos),
+            local_num_tokens,
+            True,
+        )
