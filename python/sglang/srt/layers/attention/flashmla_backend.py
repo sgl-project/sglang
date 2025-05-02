@@ -226,7 +226,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         prefix_lens = forward_batch.extend_prefix_lens
         extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
 
-        # todo: update metadata for spec extend
+        # todo: update metadata for spec extend?
         
         assert False # temp for debug
         
@@ -244,11 +244,12 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             self.update_metadata_decode(forward_batch)
         elif forward_batch.forward_mode.is_draft_extend():
             # should be the same as decode?
+            assert forward_batch.spec_info is not None
             self.update_metadata_draft_extend(forward_batch)
         elif forward_batch.forward_mode.is_target_verify():
+            assert forward_batch.spec_info is not None
             self.update_metadata_verify(forward_batch)
         else:
-            # todo: EXTEND mode
             assert forward_batch.spec_info is None
             super().init_forward_metadata(forward_batch)
             # self.update_metadata_extend(forward_batch)
@@ -427,6 +428,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
     ):
+        # todo: extend mode
         print("forward_extend")
         return super().forward_extend(q, k, v, layer, forward_batch, save_kv_cache)
 
