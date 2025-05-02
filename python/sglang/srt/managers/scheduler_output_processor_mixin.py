@@ -278,7 +278,7 @@ class SchedulerOutputProcessorMixin:
             self.attn_tp_rank == 0
             and self.forward_ct_decode % self.server_args.decode_log_interval == 0
         ):
-            self.log_decode_stats()
+            self.log_decode_stats(running_batch=batch)
 
     def add_input_logprob_return_values(
         self: Scheduler,

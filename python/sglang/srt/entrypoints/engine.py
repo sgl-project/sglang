@@ -126,7 +126,6 @@ class Engine(EngineBase):
             server_args=server_args,
             port_args=port_args,
         )
-
         self.server_args = server_args
         self.tokenizer_manager = tokenizer_manager
         self.scheduler_info = scheduler_info
@@ -301,7 +300,6 @@ class Engine(EngineBase):
         internal_states = loop.run_until_complete(
             self.tokenizer_manager.get_internal_state()
         )
-
         return {
             **dataclasses.asdict(self.tokenizer_manager.server_args),
             **self.scheduler_info,
@@ -461,7 +459,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     if _is_cuda:
         assert_pkg_version(
             "sgl-kernel",
-            "0.1.0",
+            "0.1.1",
             "Please reinstall the latest version with `pip install sgl-kernel --force-reinstall`",
         )
 
@@ -520,25 +518,44 @@ def _launch_subprocesses(
         )
 
         scheduler_pipe_readers = []
-        tp_size_per_node = server_args.tp_size // server_args.nnodes
+
+        nnodes_per_tp_group = max(server_args.nnodes // server_args.pp_size, 1)
+        tp_size_per_node = server_args.tp_size // nnodes_per_tp_group
         tp_rank_range = range(
-            tp_size_per_node * server_args.node_rank,
-            tp_size_per_node * (server_args.node_rank + 1),
+            tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group),
+            tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group + 1),
         )
-        for tp_rank in tp_rank_range:
-            reader, writer = mp.Pipe(duplex=False)
-            gpu_id = (
-                server_args.base_gpu_id
-                + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
-            )
-            proc = mp.Process(
-                target=run_scheduler_process,
-                args=(server_args, port_args, gpu_id, tp_rank, None, writer),
-            )
-            with memory_saver_adapter.configure_subprocess():
-                proc.start()
-            scheduler_procs.append(proc)
-            scheduler_pipe_readers.append(reader)
+
+        pp_size_per_node = max(server_args.pp_size // server_args.nnodes, 1)
+        pp_rank_range = range(
+            pp_size_per_node * (server_args.node_rank // nnodes_per_tp_group),
+            pp_size_per_node * (server_args.node_rank // nnodes_per_tp_group + 1),
+        )
+
+        for pp_rank in pp_rank_range:
+            for tp_rank in tp_rank_range:
+                reader, writer = mp.Pipe(duplex=False)
+                gpu_id = (
+                    server_args.base_gpu_id
+                    + ((pp_rank % pp_size_per_node) * tp_size_per_node)
+                    + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
+                )
+                proc = mp.Process(
+                    target=run_scheduler_process,
+                    args=(
+                        server_args,
+                        port_args,
+                        gpu_id,
+                        tp_rank,
+                        pp_rank,
+                        None,
+                        writer,
+                    ),
+                )
+                with memory_saver_adapter.configure_subprocess():
+                    proc.start()
+                scheduler_procs.append(proc)
+                scheduler_pipe_readers.append(reader)
     else:
         # Launch the data parallel controller
         reader, writer = mp.Pipe(duplex=False)
