@@ -350,7 +350,9 @@ class PixtralHFVisionModel(nn.Module):
               - hidden_states tuple (optional): All hidden states if output_hidden_states=True
         """
         # batch patch images
-        embeds_orig = self.patch_conv(pixel_values.to(self.device).to(self.dtype))
+        embeds_orig = self.patch_conv(
+            pixel_values.to(device=self.device, dtype=self.dtype)
+        )
         # crop the embeddings
         embeds_2d = [
             embed[..., : h // self.patch_size, : w // self.patch_size]
