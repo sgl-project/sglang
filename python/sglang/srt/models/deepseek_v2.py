@@ -543,6 +543,8 @@ class DeepseekV2AttentionMLA(nn.Module):
             prefix=add_prefix("attn_mha", prefix),
         )
 
+        self.alt_stream = torch.cuda.Stream()
+
         self.w_kc = None
         self.w_vc = None
         self.w_scale = None
@@ -706,14 +708,27 @@ class DeepseekV2AttentionMLA(nn.Module):
             q, latent_cache = self.fused_qkv_a_proj_with_mqa(hidden_states)[0].split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
             )
+            k_nope = latent_cache[..., : self.kv_lora_rank]
+
+            current_stream = torch.cuda.current_stream()
+            self.alt_stream.wait_stream(current_stream)
+            with torch.cuda.stream(self.alt_stream):
+                k_nope = self.kv_a_layernorm(k_nope)
             q = self.q_a_layernorm(q)
+            current_stream.wait_stream(self.alt_stream)
+
+            k_nope = k_nope.unsqueeze(1)
             q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
         else:
             q = self.q_proj(hidden_states)[0].view(
                 -1, self.num_local_heads, self.qk_head_dim
             )
             latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
+            k_nope = latent_cache[..., : self.kv_lora_rank]
+            k_nope = self.kv_a_layernorm(k_nope).unsqueeze(1)
+
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
 
         if self.use_deep_gemm_bmm:
             q_nope_val, q_nope_scale, masked_m, expected_m, aligned_m = (
@@ -750,10 +765,6 @@ class DeepseekV2AttentionMLA(nn.Module):
             q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
 
         q_nope_out = q_nope_out.transpose(0, 1)
-
-        k_nope = latent_cache[..., : self.kv_lora_rank]
-        k_nope = self.kv_a_layernorm(k_nope).unsqueeze(1)
-        k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
 
         q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
