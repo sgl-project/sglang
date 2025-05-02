@@ -386,6 +386,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
     ):
+        print("forward_decode")
         cache_loc = forward_batch.out_cache_loc
 
         if k is not None:
@@ -415,6 +416,19 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         )
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+    # forward_extend: using flashinfer_mla_backend
+    def forward_extend(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool = True,
+    ):
+        print("forward_extend")
+        return super().forward_extend(q, k, v, layer, forward_batch, save_kv_cache)
 
     # def forward_extend(
     #     self,
