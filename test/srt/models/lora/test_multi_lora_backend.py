@@ -18,9 +18,10 @@ import unittest
 from typing import List
 
 from utils import (
+    ALL_OTHER_MULTI_LORA_MODELS,
     BACKENDS,
+    CI_MULTI_LORA_MODELS,
     TORCH_DTYPES,
-    LoRAAdaptor,
     LoRAModelCase,
     run_lora_test_one_by_one,
 )
