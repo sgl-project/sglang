@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -58,6 +59,7 @@ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import flatten_nested_list, get_compiler_backend
+from sglang.srt.layers.multi_modal import gpu_tensor_hash
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
@@ -221,7 +223,9 @@ class MultimodalDataItem:
                     for x in tensor_list
                 ]
                 tensor = torch.concat(tensor_list)
-
+            # torch.save(tensor, "feature_tensor_1")
+            if tensor.is_cuda:
+                return gpu_tensor_hash(tensor)
             tensor = tensor.detach().contiguous()
 
             if tensor.dtype == torch.bfloat16:
