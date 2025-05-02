@@ -952,14 +952,12 @@ class Scheduler(
                 req.finished_reason = FINISH_ABORT(
                     f"Invalid request: session id {recv_req.session_params.id} does not exist"
                 )
-                #self._add_request_to_queue(req)
                 return pack_err_batch_str_output(req)
         else:
             # Create a new request from a previous session
             session = self.sessions[recv_req.session_params.id]
             req = session.create_req(recv_req, self.tokenizer)
             if isinstance(req.finished_reason, FINISH_ABORT):
-                #self._add_request_to_queue(req)
                 return pack_err_batch_str_output(req)
 
         # Handle multimodal inputs
@@ -983,7 +981,6 @@ class Scheduler(
                 req.finished_reason = FINISH_ABORT(
                     error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
                 )
-                # self._add_request_to_queue(req)
                 return pack_err_batch_str_output(req)
 
         # Validate prompts length
@@ -1003,7 +1000,6 @@ class Scheduler(
         if error_msg:
             req.origin_input_ids = [0]
             req.sampling_params.max_new_tokens = 0
-            #self._add_request_to_queue(req)
             return pack_err_batch_str_output(req)
 
         # Copy more attributes
@@ -1020,7 +1016,6 @@ class Scheduler(
                 "BadRequestError",
             )
             req.logprob_start_len = len(req.origin_input_ids) - 1
-            #self._add_request_to_queue(req)
             return pack_err_batch_str_output(req)
 
         req.sampling_params.max_new_tokens = min(
@@ -1149,7 +1144,6 @@ class Scheduler(
             True
         )
         if error_msg:
-            # self._add_request_to_queue(req)
             return pack_err_batch_str_output(req)
 
         # Copy more attributes
