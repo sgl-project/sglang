@@ -36,6 +36,7 @@ from sglang.srt.conversation import (
     chat_template_exists,
     generate_chat_conv,
     generate_embedding_convs,
+    get_conv_template_by_model_path,
     register_conv_template,
 )
 from sglang.srt.function_call_parser import FunctionCallParser
@@ -163,10 +164,14 @@ def load_chat_template_for_openai_api(tokenizer_manager, chat_template_arg, mode
     else:
         chat_template_name = chat_template_arg
 
-    # Check chat-template
-    # TODO:
-    # 1. Do not import any code from sglang.lang
-    # 2. For VLM, when chat_template_arg is None, set it automatically by guessing from model_path.
+
+def guess_chat_template_name_from_model_path(model_path):
+    global chat_template_name
+    chat_template_name = get_conv_template_by_model_path(model_path)
+    if chat_template_name is not None:
+        logger.info(
+            f"Infer the chat template name from the model path and obtain the result: {chat_template_name}."
+        )
 
 
 async def v1_files_create(
@@ -894,6 +899,24 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
     return response
 
 
+def _get_enable_thinking_from_request(request_obj):
+    """Extracts the 'enable_thinking' flag from request chat_template_kwargs.
+
+    Args:
+        request_obj: The request object (or an item from a list of requests).
+
+    Returns:
+        The boolean value of 'enable_thinking' if found and not True, otherwise True.
+    """
+    if (
+        hasattr(request_obj, "chat_template_kwargs")
+        and request_obj.chat_template_kwargs
+        and request_obj.chat_template_kwargs.get("enable_thinking") is not None
+    ):
+        return request_obj.chat_template_kwargs.get("enable_thinking")
+    return True
+
+
 def v1_chat_generate_request(
     all_requests: List[ChatCompletionRequest],
     tokenizer_manager,
@@ -971,6 +994,8 @@ def v1_chat_generate_request(
                     )
 
                 for message in request.messages:
+                    if message.content is None:
+                        message.content = ""
                     if isinstance(message.content, str):
                         openai_compatible_messages.append(
                             {"role": message.role, "content": message.content}
@@ -1001,6 +1026,11 @@ def v1_chat_generate_request(
                         tokenize=True,
                         add_generation_prompt=True,
                         tools=tools,
+                        **(
+                            request.chat_template_kwargs
+                            if request.chat_template_kwargs
+                            else {}
+                        ),
                     )
                 except:
                     #  This except branch will be triggered when the chosen model
@@ -1012,6 +1042,11 @@ def v1_chat_generate_request(
                         tokenize=True,
                         add_generation_prompt=True,
                         tools=tools,
+                        **(
+                            request.chat_template_kwargs
+                            if request.chat_template_kwargs
+                            else {}
+                        ),
                     )
 
                 if assistant_prefix:
@@ -1087,7 +1122,7 @@ def v1_chat_generate_request(
 
         sampling_params = {
             "temperature": request.temperature,
-            "max_new_tokens": request.max_tokens,
+            "max_new_tokens": request.max_tokens or request.max_completion_tokens,
             "min_new_tokens": request.min_tokens,
             "stop": stop,
             "stop_token_ids": request.stop_token_ids,
@@ -1179,6 +1214,7 @@ def v1_chat_generate_request(
         modalities=modalities_list,
         lora_path=lora_paths,
         bootstrap_host=all_requests[0].bootstrap_host,
+        bootstrap_port=all_requests[0].bootstrap_port,
         bootstrap_room=all_requests[0].bootstrap_room,
     )
 
@@ -1249,12 +1285,15 @@ def v1_chat_generate_response(
             tool_choice = request[idx].tool_choice
             tools = request[idx].tools
             separate_reasoning = request[idx].separate_reasoning
+            enable_thinking = _get_enable_thinking_from_request(request[idx])
         else:
             tool_choice = request.tool_choice
             tools = request.tools
             separate_reasoning = request.separate_reasoning
+            enable_thinking = _get_enable_thinking_from_request(request)
 
-        if reasoning_parser and separate_reasoning:
+        reasoning_text = None
+        if reasoning_parser and separate_reasoning and enable_thinking:
             try:
                 parser = ReasoningParser(
                     model_type=reasoning_parser, stream_reasoning=False
@@ -1266,8 +1305,6 @@ def v1_chat_generate_response(
                     HTTPStatus.BAD_REQUEST,
                     "Failed to parse reasoning related info to json format!",
                 )
-        else:
-            reasoning_text = None
 
         if tool_choice != "none" and tools:
             parser = FunctionCallParser(tools, tool_call_parser)
@@ -1492,9 +1529,12 @@ async def v1_chat_completions(
                     delta = text[len(stream_buffer) :]
                     new_stream_buffer = stream_buffer + delta
 
+                    enable_thinking = _get_enable_thinking_from_request(request)
+
                     if (
                         tokenizer_manager.server_args.reasoning_parser
                         and request.separate_reasoning
+                        and enable_thinking
                     ):
                         if index not in reasoning_parser_dict:
                             reasoning_parser_dict[index] = ReasoningParser(
@@ -1584,6 +1624,7 @@ async def v1_chat_completions(
 
                             tool_call = ToolCall(
                                 id=str(call_item.tool_index),
+                                index=call_item.tool_index,
                                 function=FunctionResponse(
                                     name=call_item.name,
                                     arguments=call_item.parameters,

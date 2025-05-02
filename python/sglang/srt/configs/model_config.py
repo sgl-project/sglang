@@ -47,6 +47,7 @@ class ModelConfig:
         dtype: str = "auto",
         quantization: Optional[str] = None,
         override_config_file: Optional[str] = None,
+        is_draft_model: bool = False,
     ) -> None:
 
         self.model_path = model_path
@@ -84,6 +85,12 @@ class ModelConfig:
                 )
             else:
                 enable_multimodal = True
+
+        if (
+            is_draft_model
+            and self.hf_config.architectures[0] == "DeepseekV3ForCausalLM"
+        ):
+            self.hf_config.architectures[0] = "DeepseekV3ForCausalLMNextN"
 
         # Check model type
         self.is_generation = is_generation_model(
@@ -169,6 +176,13 @@ class ModelConfig:
             self.attention_arch = AttentionArch.MLA
             self.kv_lora_rank = self.hf_text_config.kv_lora_rank
             self.qk_rope_head_dim = self.hf_text_config.qk_rope_head_dim
+        elif "KimiVLForConditionalGeneration" in self.hf_config.architectures:
+            self.head_dim = 256
+            self.attention_arch = AttentionArch.MLA
+            self.kv_lora_rank = self.hf_text_config.kv_lora_rank
+            self.qk_rope_head_dim = self.hf_text_config.qk_rope_head_dim
+            self.v_head_dim = self.hf_text_config.v_head_dim
+            self.qk_nope_head_dim = self.hf_text_config.qk_nope_head_dim
         else:
             self.attention_arch = AttentionArch.MHA
 
@@ -523,6 +537,7 @@ multimodal_model_archs = [
     "Qwen2VLForConditionalGeneration",
     "Qwen2_5_VLForConditionalGeneration",
     "CLIPModel",
+    "KimiVLForConditionalGeneration",
 ]
 
 
