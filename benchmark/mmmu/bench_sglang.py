@@ -129,8 +129,8 @@ async def eval_mmmu(args) -> None:
         )
         if profile_output.success:
             print("Profiler started")
-        if args.profile_number != -1:
-            samples = samples[: args.profile_number]
+
+        samples = samples[: args.profile_number]
 
     tasks = [
         process_sample_with_semaphore(semaphore, client, sample, sampling_params)
@@ -156,11 +156,6 @@ async def eval_mmmu(args) -> None:
 def parse_args():
     parser = argparse.ArgumentParser()
     EvalArgs.add_cli_args(parser)
-    parser.add_argument(
-        "--concurrency", type=int, default=1, help="Max concurrent OpenAI calls"
-    )
-    parser.add_argument("--profile-number", type=int, default=-1)
-    parser.add_argument("--profile", action="store_true")
     args = add_common_sglang_args_and_parse(parser)
     return args
 
