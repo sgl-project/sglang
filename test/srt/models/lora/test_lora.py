@@ -125,7 +125,7 @@ class TestLoRA(CustomTestCase):
                     torch_dtype=torch_dtype,
                     model_type="generation",
                     lora_paths=[lora_adapter_paths[0], lora_adapter_paths[1]],
-                    max_loras_per_batch=3,
+                    max_loras_per_batch=len(lora_adapter_paths) + 1,
                     lora_backend=backend,
                     disable_radix_cache=True,
                 )
