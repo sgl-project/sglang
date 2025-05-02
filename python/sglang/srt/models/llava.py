@@ -656,7 +656,7 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
         mapping = {}
         for config_cls, archs in auto_model_type._model_mapping.items():
             if isinstance(archs, tuple):
-                mapping[config_cls.__name__] = tuple(map(lambda x: x.__name__, archs))
+                mapping[config_cls.__name__] = tuple(arch.__name__ for arch in archs)
             else:
                 mapping[config_cls.__name__] = archs.__name__
         return mapping
@@ -774,10 +774,6 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
         forward_batch: ForwardBatch,
         get_embedding: bool = False,
     ):
-
-        if get_embedding:
-            raise NotImplementedError()
-
         hidden_states = general_mm_embed_routine(
             input_ids=input_ids,
             forward_batch=forward_batch,
