@@ -52,6 +52,8 @@ class FlashMLADecodeMetadata:
 
 
 class FlashMLABackend(FlashInferMLAAttnBackend):
+    """FlashMLA attention kernels."""
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -355,7 +357,6 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
             self.forward_metadata.mla_metadata = self.cuda_graph_mla_metadata
             self.forward_metadata.num_splits = self.cuda_graph_num_splits[: bs + 1]
-            print("self.forward_metadata.block_kv_indices", self.forward_metadata.block_kv_indices.shape)
             self.forward_metadata.block_kv_indices = self.cuda_graph_kv_indices[
                 :bs, :max_seqlen_pad
             ]
@@ -415,40 +416,40 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
-    def forward_extend(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        layer: RadixAttention,
-        forward_batch: ForwardBatch,
-        save_kv_cache: bool = True,
-    ):
-        cache_loc = forward_batch.out_cache_loc
+    # def forward_extend(
+    #     self,
+    #     q: torch.Tensor,
+    #     k: torch.Tensor,
+    #     v: torch.Tensor,
+    #     layer: RadixAttention,
+    #     forward_batch: ForwardBatch,
+    #     save_kv_cache: bool = True,
+    # ):
+    #     cache_loc = forward_batch.out_cache_loc
 
-        if k is not None:
-            assert v is not None
-            if save_kv_cache:
-                forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+    #     if k is not None:
+    #         assert v is not None
+    #         if save_kv_cache:
+    #             forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
 
-        bs = forward_batch.batch_size
-        k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+    #     bs = forward_batch.batch_size
+    #     k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
 
-        reshape_q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
+    #     reshape_q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
 
-        o, _ = flash_mla_with_kvcache(
-            q=reshape_q,
-            k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
-            block_table=self.forward_metadata.block_kv_indices,
-            cache_seqlens=forward_batch.seq_lens.to(torch.int32),
-            head_dim_v=self.kv_lora_rank,
-            tile_scheduler_metadata=self.forward_metadata.flashmla_metadata,
-            num_splits=self.forward_metadata.num_splits,
-            softmax_scale=layer.scaling,
-            causal=True,
-        )
+    #     o, _ = flash_mla_with_kvcache(
+    #         q=reshape_q,
+    #         k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
+    #         block_table=self.forward_metadata.block_kv_indices,
+    #         cache_seqlens=forward_batch.seq_lens.to(torch.int32),
+    #         head_dim_v=self.kv_lora_rank,
+    #         tile_scheduler_metadata=self.forward_metadata.flashmla_metadata,
+    #         num_splits=self.forward_metadata.num_splits,
+    #         softmax_scale=layer.scaling,
+    #         causal=True,
+    #     )
 
-        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+    #     return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
 
 class FlashMLAMultiStepDraftBackend:
