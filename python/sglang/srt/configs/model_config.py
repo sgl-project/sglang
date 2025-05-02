@@ -303,6 +303,7 @@ class ModelConfig:
             "w8a8_int8",
             "w8a8_fp8",
             "moe_wna16",
+            "quark",
         ]
         compatible_quantization_methods = {
             "modelopt_fp4": ["modelopt"],
@@ -319,7 +320,6 @@ class ModelConfig:
             quant_method = quant_cfg.get("quant_method", "").lower()
 
             # Detect which checkpoint is it
-            """
             for _, method in QUANTIZATION_METHODS.items():
                 quantization_override = method.override_quantization_method(
                     quant_cfg, self.quantization
@@ -328,7 +328,6 @@ class ModelConfig:
                     quant_method = quantization_override
                     self.quantization = quantization_override
                     break
-            """
 
             # Verify quantization configurations.
             if self.quantization is None:

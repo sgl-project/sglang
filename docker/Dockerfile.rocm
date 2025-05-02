@@ -1,5 +1,5 @@
 # Usage (to build SGLang ROCm docker image):
-#   docker build --build-arg SGL_BRANCH=v0.4.6.post1 -t v0.4.6.post1-rocm630 -f Dockerfile.rocm .
+#   docker build --build-arg SGL_BRANCH=v0.4.6.post2 -t v0.4.6.post2-rocm630 -f Dockerfile.rocm .
 
 # default base image
 ARG BASE_IMAGE="rocm/sgl-dev:vllm20250114"
@@ -9,6 +9,7 @@ USER root
 
 WORKDIR /sgl-workspace
 ARG BUILD_TYPE=all
+ARG SGL_REPO="https://github.com/sgl-project/sglang"
 ENV SGL_DEFAULT="main"
 ARG SGL_BRANCH=${SGL_DEFAULT}
 
@@ -19,8 +20,8 @@ ARG TRITON_COMMIT="improve_fa_decode_3.0.0"
 ARG AITER_REPO="https://github.com/ROCm/aiter.git"
 ARG AITER_COMMIT="v0.1.1"
 
-COPY . /sgl-workspace/sglang
-RUN cd sglang \
+RUN git clone ${SGL_REPO} \
+    && cd sglang \
     && if [ "${SGL_BRANCH}" = ${SGL_DEFAULT} ]; then \
          echo "Using ${SGL_DEFAULT}, default branch."; \
        else \

@@ -50,6 +50,10 @@ class QuarkConfig(QuantizationConfig):
         return [torch.float16, torch.bfloat16]
 
     @classmethod
+    def override_quantization_method(cls, x, y):
+        return None
+
+    @classmethod
     def get_min_capability(cls) -> int:
         return 70
 

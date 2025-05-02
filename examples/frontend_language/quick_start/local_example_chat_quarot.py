@@ -57,7 +57,7 @@ def batch():
 
 
 if __name__ == "__main__":
-    runtime = sgl.Runtime(model_path="rcorzine/Meta-Llama-3-8B-quark-w8a8-int8")
+    runtime = sgl.Runtime(model_path="amd/Meta-Llama-3-8B-quark-w8a8-int8-quarot")
     sgl.set_default_backend(runtime)
 
     # Run a single request
