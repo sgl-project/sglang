@@ -19,31 +19,36 @@ import triton.language as tl
 
 
 @triton.jit
-def simple_hash_kernel(
-    input_ptr, output_ptr, n_elements, BLOCK_SIZE: tl.constexpr, PRIME: tl.constexpr
+def hash_kernel(
+    input_ptr,
+    output_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+    PRIME: tl.constexpr,
+    XCONST: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
     block_start = pid * BLOCK_SIZE
     offsets = block_start + tl.arange(0, BLOCK_SIZE)
     mask = offsets < n_elements
 
-    # Load data
     data = tl.load(input_ptr + offsets, mask=mask, other=0)
+    mixed = data ^ (offsets + XCONST)
+    hash_val = mixed * PRIME
+    hash_val = hash_val ^ (hash_val >> 16)
+    hash_val = hash_val * (PRIME ^ XCONST)
+    hash_val = hash_val ^ (hash_val >> 13)
 
-    # Simple hash computation (multiplication and shifts, no xor/shuffle)
-    hash_val = data * PRIME
-    hash_val = hash_val + (hash_val >> 16)
-    hash_val = hash_val * PRIME
-    hash_val = hash_val + (hash_val >> 13)
-
-    # Store intermediate hash values
     tl.store(output_ptr + offsets, hash_val, mask=mask)
 
 
-def gpu_tensor_hash(tensor: torch.Tensor, prime=0x01000193) -> int:
-    assert tensor.is_cuda, "Tensor must be on CUDA device"
-    tensor = tensor.contiguous().view(torch.int32)
+PRIME_1 = -(11400714785074694791 ^ 0xFFFFFFFFFFFFFFFF) - 1
+PRIME_2 = -(14029467366897019727 ^ 0xFFFFFFFFFFFFFFFF) - 1
 
+
+def gpu_tensor_hash(tensor: torch.Tensor, prime=0x01000193) -> int:
+    assert tensor.is_cuda
+    tensor = tensor.contiguous().view(torch.int32)
     n_elements = tensor.numel()
     BLOCK_SIZE = 1024
     grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
@@ -52,11 +57,16 @@ def gpu_tensor_hash(tensor: torch.Tensor, prime=0x01000193) -> int:
         n_elements, dtype=torch.int32, device=tensor.device
     )
 
-    simple_hash_kernel[grid](
-        tensor, intermediate_hashes, n_elements, BLOCK_SIZE=BLOCK_SIZE, PRIME=prime
+    hash_kernel[grid](
+        tensor,
+        intermediate_hashes,
+        n_elements,
+        BLOCK_SIZE=BLOCK_SIZE,
+        PRIME=PRIME_1,
+        XCONST=PRIME_2,
     )
 
-    # Final reduction on GPU (simple sum reduction)
+    # TODO
     final_hash = intermediate_hashes.sum().item()
 
     return final_hash

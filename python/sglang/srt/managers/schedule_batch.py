@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 from enum import Enum, auto
 
-from sglang.srt.layers.multi_modal import gpu_tensor_hash
+from sglang.srt.layers.multimodal import gpu_tensor_hash
 
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -218,7 +218,6 @@ class MultimodalDataItem:
                     for x in tensor_list
                 ]
                 tensor = torch.concat(tensor_list)
-            # torch.save(tensor, "feature_tensor_1")
             if tensor.is_cuda:
                 return gpu_tensor_hash(tensor)
             tensor = tensor.detach().contiguous()
