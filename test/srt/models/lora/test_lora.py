@@ -128,9 +128,8 @@ class TestLoRA(CustomTestCase):
 
         with srt_runner, hf_runner:
             for i, (prompts, lora_paths) in enumerate(batches):
-                truncated_prompts = [p[:20] + "..." for p in prompts]
                 print(
-                    f"\n--- Running Batch {i+1} --- prompts: {truncated_prompts}, lora_paths: {lora_paths}"
+                    f"\n--- Running Batch {i+1} --- prompts: {prompts}, lora_paths: {lora_paths}"
                 )
 
                 srt_outputs = srt_runner.batch_forward(
@@ -141,8 +140,8 @@ class TestLoRA(CustomTestCase):
                     prompts, max_new_tokens=max_new_tokens, lora_paths=lora_paths
                 )
 
-                print("SRT outputs:", [s[:50] + "..." for s in srt_outputs.output_strs])
-                print("HF outputs:", [s[:50] + "..." for s in hf_outputs.output_strs])
+                print("SRT outputs:", [s for s in srt_outputs.output_strs])
+                print("HF outputs:", [s for s in hf_outputs.output_strs])
 
                 # Compare SRT and HF outputs
                 self.assertEqual(
