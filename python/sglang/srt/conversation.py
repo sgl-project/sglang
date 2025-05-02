@@ -48,6 +48,7 @@ class SeparatorStyle(IntEnum):
     DeepSeekVL2 = auto()
     QWEN2_VL_EMBED = auto()
     GEMMA3 = auto()
+    MPT = auto()
 
 
 @dataclasses.dataclass
@@ -327,6 +328,16 @@ class Conversation:
                     ret += role
             return ret
 
+        elif self.sep_style == SeparatorStyle.MPT:
+            ret = system_prompt + self.sep
+            for role, message in self.messages:
+                if message:
+                    if type(message) is tuple:
+                        message, _, _ = message
+                    ret += role + message + self.sep
+                else:
+                    ret += role
+            return ret
         else:
             raise ValueError(f"Invalid style: {self.sep_style}")
 
@@ -570,8 +581,11 @@ def generate_chat_conv(
                             real_content += "\n"  # for video
                         real_content += content.text
                     elif content.type == "image_url":
-                        # NOTE: Only works for llava
-                        real_content += image_token
+                        # NOTE: works for llava and intervl2_5
+                        if conv.name == "internvl-2-5":
+                            real_content = image_token + real_content
+                        else:
+                            real_content += image_token
                         conv.append_image(content.image_url.url)
                     elif content.type == "audio_url":
                         real_content += audio_token
@@ -703,6 +717,19 @@ register_conv_template(
     )
 )
 
+register_conv_template(
+    Conversation(
+        name="internvl-2-5",
+        system_template="<|im_start|>system\n{system_message}",
+        system_message="你是书生·万象，英文名是InternVL，是由上海人工智能实验室、清华大学及多家合作单位联合开发的多模态大语言模型。",
+        roles=("<|im_start|>user\n", "<|im_start|>assistant\n"),
+        sep_style=SeparatorStyle.MPT,
+        sep="<|im_end|>\n",
+        stop_str=["<|im_end|>", "<|action_end|>"],
+        image_token="<image>",
+    )
+)
+
 # Reference: https://huggingface.co/docs/transformers/main/model_doc/qwen2_vl#usage-example
 register_conv_template(
     Conversation(
@@ -806,6 +833,24 @@ register_conv_template(
     )
 )
 
+# Reference: https://huggingface.co/moonshotai/Kimi-VL-A3B-Instruct/blob/main/chat_template.jinja
+register_conv_template(
+    Conversation(
+        name="kimi-vl",
+        system_message="You are a helpful assistant",
+        system_template="<|im_system|>system<|im_middle|>{system_message}",
+        roles=(
+            "<|im_user|>user<|im_middle|>",
+            "<|im_assistant|>assistant<|im_middle|>",
+        ),
+        messages=[],
+        sep="<|im_end|>",
+        sep_style=SeparatorStyle.NO_COLON_SINGLE,
+        stop_str="<|im_end|>",
+        image_token="<|media_start|>image<|media_content|><|media_pad|><|media_end|>",
+    )
+)
+
 
 @register_conv_template_matching_function
 def match_deepseek_janus_pro(model_path: str):
@@ -888,3 +933,10 @@ def match_openbmb_minicpm(model_path: str):
         return "minicpmv"
     elif "minicpm-o" in model_path:
         return "minicpmo"
+
+
+@register_conv_template_matching_function
+def match_moonshot_kimivl(model_path: str):
+    model_path = model_path.lower()
+    if "kimi" in model_path and "vl" in model_path:
+        return "kimi-vl"
