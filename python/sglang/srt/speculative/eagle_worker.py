@@ -261,6 +261,7 @@ class EAGLEWorker(TpModelWorker):
             A tuple of the final logit output of the target model, next tokens accepeted,
             the batch id (used for overlap schedule), and number of accepeted tokens.
         """
+        # print("forward_mode", batch.forward_mode)
         if batch.forward_mode.is_decode():
             with self.draft_tp_context(self.draft_model_runner.tp_group):
                 spec_info = self.draft(batch)

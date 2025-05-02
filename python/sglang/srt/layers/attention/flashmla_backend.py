@@ -87,7 +87,6 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
     def update_metadata_decode(self, forward_batch: ForwardBatch):
         bs = forward_batch.batch_size
         spec_info = forward_batch.spec_info
-        # assert spec_info is None
 
         if spec_info is None:
             print("update_metadata_decode with spec_info is None")
@@ -121,9 +120,9 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             )
         else:
             print("update_metadata_decode with spec_info is not None")
-            assert False # temp for debug
+            assert False # should not reach here
             # todo: why flashinfer mla here?
-            super().init_forward_metadata(forward_batch)
+            # super().init_forward_metadata(forward_batch)
 
     def update_metadata_draft_extend(self, forward_batch: ForwardBatch):
         bs = forward_batch.batch_size
@@ -239,7 +238,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         bs = forward_batch.batch_size
         spec_info = forward_batch.spec_info
         if forward_batch.forward_mode.is_decode_or_idle():
-            assert forward_batch.spec_info is not None
+            assert forward_batch.spec_info is None # todo: validate this assertion?
             self.update_metadata_decode(forward_batch)
         elif forward_batch.forward_mode.is_draft_extend():
             # should be the same as decode?
@@ -249,7 +248,8 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         else:
             # todo: EXTEND mode
             assert forward_batch.spec_info is None
-            self.update_metadata_extend(forward_batch)
+            super().init_forward_metadata(forward_batch)
+            # self.update_metadata_extend(forward_batch)
 
     def init_cuda_graph_state(
         self,
@@ -268,7 +268,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
 
         self.cuda_graph_mla_metadata, self.cuda_graph_num_splits = get_mla_metadata(
             torch.ones(max_bs, dtype=torch.int32, device=cuda_graph_kv_indices.device),
-            self.top_k * self.num_q_heads,
+            Q_LEN * self.num_q_heads,
             1,
         )
         self.cuda_graph_kv_indices = cuda_graph_kv_indices
@@ -304,7 +304,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 )
                 mla_metadata, num_splits = get_mla_metadata(
                     seq_lens.to(torch.int32),
-                    self.top_k * self.num_q_heads,
+                    Q_LEN * self.num_q_heads,
                     1,
                 )
                 self.cuda_graph_mla_metadata.copy_(mla_metadata)
@@ -359,7 +359,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             )
             mla_metadata, num_splits = get_mla_metadata(
                 seq_lens.to(torch.int32),
-                self.top_k * self.num_q_heads,
+                Q_LEN * self.num_q_heads,
                 1,
             )
             self.cuda_graph_mla_metadata.copy_(mla_metadata)
