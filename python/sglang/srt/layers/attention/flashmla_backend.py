@@ -165,6 +165,17 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             print("update_metadata_extend with spec_info is not None")
             assert isinstance(spec_info, EagleDraftInput)
 
+            max_seqlen_pad = triton.cdiv(
+                forward_batch.seq_lens_cpu.max().item(), PAGE_SIZE
+            )
+
+            block_kv_indices = torch.full(
+                (bs, max_seqlen_pad),
+                -1,
+                dtype=torch.int32,
+                device=forward_batch.seq_lens.device,
+            )
+
             block_kv_indices, _, qo_indptr, custom_mask = (
                 spec_info.generate_attn_arg_prefill(
                     req_pool_indices=forward_batch.req_pool_indices,
@@ -201,6 +212,14 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
 
         # todo: update kv cache with spec_info
         assert isinstance(spec_info, EagleVerifyInput)
+
+        block_kv_indices = torch.full(
+                (bs, max_seqlen_pad),
+                -1,
+                dtype=torch.int32,
+                device=forward_batch.seq_lens.device,
+            )
+        
         block_kv_indices, _, qo_indptr, custom_mask = (
             spec_info.generate_attn_arg_prefill(
                 req_pool_indices=forward_batch.req_pool_indices,
@@ -387,7 +406,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
     ):
-        print("forward_decode")
+        print("flashmla backend forward_decode start")
         cache_loc = forward_batch.out_cache_loc
 
         if k is not None:
@@ -415,7 +434,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             softmax_scale=layer.scaling,
             causal=False, # why casual = False?
         )
-
+        print("flashmla backend forward_decode end")
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     # forward_extend: using flashinfer_mla_backend
