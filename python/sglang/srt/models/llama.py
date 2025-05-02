@@ -303,7 +303,7 @@ class LlamaModel(nn.Module):
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: LlamaDecoderLayer(
-                config=config, layer_id=idx, quant_config=quant_config, prefix=prefix
+                config=config, quant_config=quant_config, layer_id=idx, prefix=prefix
             ),
             pp_rank=self.pp_group.rank_in_group,
             pp_size=self.pp_group.world_size,

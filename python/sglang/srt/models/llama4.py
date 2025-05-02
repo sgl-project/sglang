@@ -525,7 +525,7 @@ class Llama4ForCausalLM(LlamaForCausalLM):
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
-    # TODO(ainl): prefetch 4 layers in same time
+    # TODO(ainl): prefetch 4 layers at the same time
     # TODO(ainl): check sliding window fetch shape
     hip_attention_supported = True
 

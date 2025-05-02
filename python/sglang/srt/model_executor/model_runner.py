@@ -569,12 +569,9 @@ class ModelRunner:
                 )
 
         if self.server_args.enable_hip_attention:
-            model_supports_hip_attention = hasattr(
-                self.model, "hip_attention_supported"
+            model_supports_hip_attention = getattr(
+                self.model, "hip_attention_supported", False
             )
-            if model_supports_hip_attention:
-                model_supports_hip_attention = self.model.hip_attention_supported
-
             if self.server_args.hip_attention_config.using_extend:
                 if not model_supports_hip_attention:
                     raise RuntimeError(
@@ -965,9 +962,12 @@ class ModelRunner:
         ):
             if self.model_config.attention_chunk_size is not None:
                 # NOTE: this should handle only llama4, for now.
-                assert self.model_config.hf_config.architectures[0] in [
+                if self.model_config.hf_config.architectures[0] not in [
                     "Llama4ForConditionalGeneration",
-                ], self.model_config.hf_config.architectures
+                ]:
+                    raise RuntimeError(
+                        f"Unsupported model for chunked attention with HiP Attention: {self.model_config.hf_config.architectures[0]}"
+                    )
 
                 num_layers = self.model_config.num_hidden_layers
                 attention_chunk_size = self.model_config.attention_chunk_size
