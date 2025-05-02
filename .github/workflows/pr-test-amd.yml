@@ -173,32 +173,27 @@ jobs:
 
       - name: Benchmark single latency
         timeout-minutes: 10
-        if: always()
         run: |
           docker exec -w /sglang-checkout/test/srt -e SGLANG_AMD_CI=1 -e SGLANG_IS_IN_CI=1 ci_sglang python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_bs1_small
           docker exec -w /sglang-checkout/test/srt -e SGLANG_AMD_CI=1 -e SGLANG_IS_IN_CI=1 ci_sglang python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_bs1_default
 
       - name: Benchmark online latency
         timeout-minutes: 10
-        if: always()
         run: |
           docker exec -w /sglang-checkout/test/srt -e SGLANG_AMD_CI=1 -e SGLANG_IS_IN_CI=1 ci_sglang python3 -m unittest test_bench_serving.TestBenchServing.test_online_latency_default
 
       - name: Benchmark offline throughput
         timeout-minutes: 10
-        if: always()
         run: |
           docker exec -w /sglang-checkout/test/srt -e SGLANG_AMD_CI=1 -e SGLANG_IS_IN_CI=1 ci_sglang python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_default
 
       - name: Benchmark offline throughput (Non-streaming, small batch size)
         timeout-minutes: 10
-        if: always()
         run: |
           docker exec -w /sglang-checkout/test/srt -e SGLANG_AMD_CI=1 -e SGLANG_IS_IN_CI=1 ci_sglang python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_non_stream_small_batch_size
 
       - name: Benchmark online latency (EAGLE)
         timeout-minutes: 10
-        if: always()
         run: |
           docker exec -w /sglang-checkout/test/srt -e SGLANG_AMD_CI=1 -e SGLANG_IS_IN_CI=1 ci_sglang python3 -m unittest test_bench_serving.TestBenchServing.test_online_latency_eagle
 
@@ -237,19 +232,16 @@ jobs:
 
       - name: Benchmark offline throughput (w/o RadixAttention)
         timeout-minutes: 10
-        if: always()
         run: |
           docker exec -w /sglang-checkout/test/srt -e SGLANG_AMD_CI=1 -e SGLANG_IS_IN_CI=1 ci_sglang python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_without_radix_cache
 
       - name: Benchmark offline throughput (w/ Triton)
         timeout-minutes: 10
-        if: always()
         run: |
           docker exec -w /sglang-checkout/test/srt -e SGLANG_AMD_CI=1 -e SGLANG_IS_IN_CI=1 ci_sglang python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_with_triton_attention_backend
 
       - name: Benchmark offline throughput (w/ FP8)
         timeout-minutes: 10
-        if: always()
         run: |
           docker exec -w /sglang-checkout/test/srt -e SGLANG_AMD_CI=1 -e SGLANG_IS_IN_CI=1 ci_sglang python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_default_fp8
 
