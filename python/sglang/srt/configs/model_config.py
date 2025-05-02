@@ -545,6 +545,7 @@ multimodal_model_archs = [
     "Qwen2_5_VLForConditionalGeneration",
     "CLIPModel",
     "KimiVLForConditionalGeneration",
+    "InternVLChatModel",
 ]
 
 def is_hybrid_model(
