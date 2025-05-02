@@ -56,6 +56,7 @@ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import flatten_nested_list, get_compiler_backend
+from sglang.srt.managers.env_vars import CLIP_MAX_NEW_TOKENS_ESTIMATION
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
@@ -562,6 +563,9 @@ class Req:
         # This is because kv is not ready in `process_prefill_chunk`.
         # We use `tmp_end_idx` to store the end index of the kv cache to send.
         self.tmp_end_idx: int = -1
+
+        self.prefill_need_tokens: int = len(self.origin_input_ids) + \
+            min(self.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION)
 
     @property
     def seqlen(self):
@@ -1410,6 +1414,22 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.req_to_token_pool.write(
             (self.req_pool_indices, locs), self.out_cache_loc.to(torch.int32)
         )
+
+    def rem_total_tokens_offset(self, new_token_ratio: float, enable_mixed: bool):
+        rem_total_token_offset = 0
+        if enable_mixed:
+            rem_total_token_offset += len(self.reqs)
+        rem_total_token_offset += sum(
+                [
+                    min(
+                        (r.sampling_params.max_new_tokens - len(r.output_ids)),
+                        CLIP_MAX_NEW_TOKENS_ESTIMATION,
+                    )
+                    * new_token_ratio
+                    for r in self.reqs
+                ]
+            )
+        return rem_total_token_offset
 
     def filter_batch(
         self,

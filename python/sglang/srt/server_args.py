@@ -68,6 +68,7 @@ class ServerArgs:
     # Memory and scheduling
     mem_fraction_static: Optional[float] = None
     max_running_requests: Optional[int] = None
+    max_waiting_requests: Optional[int] = None
     max_total_tokens: Optional[int] = None
     chunked_prefill_size: Optional[int] = None
     max_prefill_tokens: int = 16384
@@ -589,6 +590,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.max_running_requests,
             help="The maximum number of running requests.",
+        )
+        parser.add_argument(
+            "--max-waiting-requests",
+            type=int,
+            default=ServerArgs.max_waiting_requests,
+            help="The maximum number of waiting requests.",
         )
         parser.add_argument(
             "--max-total-tokens",

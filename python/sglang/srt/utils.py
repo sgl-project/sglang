@@ -1990,3 +1990,9 @@ class BumpAllocator:
         output = self._buffer[self._pointer : self._pointer + size]
         self._pointer += size
         return output
+
+class CustomReqError(ValueError):
+    def __init__(self, code: int, message: str):
+        super().__init__()
+        self.code = code
+        self.message = message

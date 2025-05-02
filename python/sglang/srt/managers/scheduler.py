@@ -109,7 +109,7 @@ from sglang.srt.managers.scheduler_output_processor_mixin import (
 from sglang.srt.managers.session_controller import Session
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.tp_worker_overlap_thread import TpModelWorkerClient
-from sglang.srt.managers.utils import validate_input_length
+from sglang.srt.managers.utils import validate_input_length, pack_err_batch_str_output
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
@@ -292,6 +292,7 @@ class Scheduler(
             _,
             _,
         ) = self.tp_worker.get_worker_info()
+        self.max_waiting_requests = server_args.max_waiting_requests
         self.tp_cpu_group = self.tp_worker.get_tp_cpu_group()
         self.attn_tp_cpu_group = self.tp_worker.get_attention_tp_cpu_group()
         self.pad_input_ids_func = self.tp_worker.get_pad_input_ids_func()
@@ -804,15 +805,15 @@ class Scheduler(
                 req.finished_reason = FINISH_ABORT(
                     f"Invalid request: session id {recv_req.session_params.id} does not exist"
                 )
-                self._add_request_to_queue(req)
-                return
+                #self._add_request_to_queue(req)
+                return pack_err_batch_str_output(req)
         else:
             # Create a new request from a previous session
             session = self.sessions[recv_req.session_params.id]
             req = session.create_req(recv_req, self.tokenizer)
             if isinstance(req.finished_reason, FINISH_ABORT):
-                self._add_request_to_queue(req)
-                return
+                #self._add_request_to_queue(req)
+                return pack_err_batch_str_output(req)
 
         # Handle multimodal inputs
         if recv_req.mm_inputs is not None:
@@ -835,20 +836,28 @@ class Scheduler(
                 req.finished_reason = FINISH_ABORT(
                     error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
                 )
-                self._add_request_to_queue(req)
-                return
+                # self._add_request_to_queue(req)
+                return pack_err_batch_str_output(req)
 
         # Validate prompts length
+        cur_rem_tokens = self.rem_total_tokens(self.new_token_ratio, self.is_mixed_chunk) - self.compute_tokens_needed_in_queue()
+        cur_waiting_reqs_num = self.get_queue_len()
+        could_wait = True
+        if self.max_waiting_requests:
+            print(f"{cur_waiting_reqs_num=}, {self.max_waiting_requests-1}")
+            could_wait =  cur_waiting_reqs_num < (self.max_waiting_requests - 1)
         error_msg = validate_input_length(
             req,
             self.max_req_input_len,
             self.server_args.allow_auto_truncate,
+            cur_rem_tokens,
+            could_wait
         )
         if error_msg:
             req.origin_input_ids = [0]
             req.sampling_params.max_new_tokens = 0
-            self._add_request_to_queue(req)
-            return
+            #self._add_request_to_queue(req)
+            return pack_err_batch_str_output(req)
 
         # Copy more attributes
         if recv_req.logprob_start_len == -1 or not recv_req.return_logprob:
@@ -864,8 +873,8 @@ class Scheduler(
                 "BadRequestError",
             )
             req.logprob_start_len = len(req.origin_input_ids) - 1
-            self._add_request_to_queue(req)
-            return
+            #self._add_request_to_queue(req)
+            return pack_err_batch_str_output(req)
 
         req.sampling_params.max_new_tokens = min(
             (
@@ -904,6 +913,33 @@ class Scheduler(
             self.grammar_queue.append(req)
         else:
             self._add_request_to_queue(req)
+
+    def rem_total_tokens(self, new_token_ratio: float, enable_mixed: bool):
+        rem_tokens = self.token_to_kv_pool_allocator.available_size() + self.tree_cache.evictable_size()
+        if self.running_batch:
+           rem_tokens -= self.running_batch.rem_total_tokens_offset(new_token_ratio, enable_mixed)
+        return rem_tokens
+
+    def compute_tokens_needed_in_queue(self):
+        waiting_queue = None
+        needed_tokens = 0
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            waiting_queue = self.disagg_prefill_bootstrap_queue
+        elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            waiting_queue = self.disagg_decode_prealloc_queue
+        else:
+            waiting_queue = self.waiting_queue
+        for req in waiting_queue:
+            needed_tokens += req.prefill_need_tokens
+        return needed_tokens
+
+    def get_queue_len(self):
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            return len(self.disagg_prefill_bootstrap_queue)
+        elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            return len(self.disagg_decode_prealloc_queue)
+        else:
+            return len(self.waiting_queue)
 
     def _add_request_to_queue(self, req: Req):
         req.queue_time_start = time.time()
@@ -954,18 +990,20 @@ class Scheduler(
                     error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
                 )
                 req.queue_time_start = time.time()
-                self.waiting_queue.append(req)
-                return
+                # self.waiting_queue.append(req)
+                return pack_err_batch_str_output(req)
 
         # Validate prompts length
         error_msg = validate_input_length(
             req,
             self.max_req_input_len,
             self.server_args.allow_auto_truncate,
+            0,
+            True
         )
         if error_msg:
-            self._add_request_to_queue(req)
-            return
+            # self._add_request_to_queue(req)
+            return pack_err_batch_str_output(req)
 
         # Copy more attributes
         req.logprob_start_len = len(req.origin_input_ids) - 1
