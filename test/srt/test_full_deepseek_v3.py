@@ -80,8 +80,6 @@ class TestDeepseekV3MTP(CustomTestCase):
             "--trust-remote-code",
             "--speculative-algorithm",
             "EAGLE",
-            "--speculative-draft",
-            "lmsys/DeepSeek-V3-0324-NextN",
             "--speculative-num-steps",
             "3",
             "--speculative-eagle-topk",
