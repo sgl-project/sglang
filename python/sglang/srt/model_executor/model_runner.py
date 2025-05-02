@@ -173,6 +173,7 @@ class ModelRunner:
                 "speculative_accept_threshold_single": server_args.speculative_accept_threshold_single,
                 "speculative_accept_threshold_acc": server_args.speculative_accept_threshold_acc,
                 "use_mla_backend": self.use_mla_backend,
+                "logprobs_normalization": server_args.logprobs_normalization,
             }
         )
 
