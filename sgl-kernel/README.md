@@ -17,6 +17,46 @@ For CUDA 12.1 or CUDA 12.4:
 ```bash
 pip3 install sgl-kernel
 ```
+## Build from source
+
+Development build:
+
+```bash
+make build
+```
+
+Note:
+
+The `sgl-kernel` is rapidly evolving. If you experience a compilation failure, try using `make rebuild`.
+
+### Build with [ccache](https://github.com/ccache/ccache)
+```bash
+# or `yum install -y ccache`.
+apt-get install -y ccache
+# Building with ccache is enabled when ccache is installed and CCACHE_DIR is set.
+export CCACHE_DIR=/path/to/your/ccache/dir
+export CCACHE_BACKEND=""
+export CCACHE_KEEP_LOCAL_STORAGE="TRUE"
+unset CCACHE_READONLY
+python -m uv build --wheel -Cbuild-dir=build --color=always .
+```
+
+### Configuring CMake Build Options
+Cmake options can be configuring by adding `-Ccmake.define.<option>=<value>` to the `uv build` flags.
+For example, to enable building FP4 kernels, use:
+```bash
+python -m uv build --wheel -Cbuild-dir=build -Ccmake.define.SGL_KERNEL_ENABLE_FP4=1 --color=always .
+```
+See CMakeLists.txt for more options.
+
+### Parallel Build
+
+We highly recommend you build sgl-kernel with Ninja. Ninja can automatically build sgl-kernel in parallel.
+And if you build the sgl-kernel with cmake, you need to add `CMAKE_BUILD_PARALLEL_LEVEL` for parallel build like:
+
+```bash
+CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) python -m uv build --wheel -Cbuild-dir=build --color=always .
+```
 
 # Developer Guide
 
@@ -40,6 +80,14 @@ Third-party libraries:
 - [FlashInfer](https://github.com/flashinfer-ai/flashinfer)
 - [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM)
 - [FlashAttention](https://github.com/Dao-AILab/flash-attention)
+
+### FlashAttention FYI
+
+  FA3 can fail without a enough shared memory for a some shapes, such as higher hidden_dim or some special cases. Right now, fa3 is supported for sm80/sm87 and sm86/sm89.
+
+  The main different Between sm80/sm87 and sm86/sm89 is the shared memory size. you can follow the link below for more information https://docs.nvidia.com/cuda/cuda-c-programming-guide/#shared-memory-8-x.
+
+  And for sgl-kernel right now, we can build fa3 on sm80/sm86/sm89/sm90a. Thats mean if you use **A100(tested)**/A*0/**L20(tested)**/L40/L40s/**3090(tested)** you can use fa3.
 
 ### Kernel Development
 
@@ -132,38 +180,6 @@ To use this with your library functions, simply wrap them with make_pytorch_shim
  m.impl("fwd", torch::kCUDA, make_pytorch_shim(&mha_fwd));
 ```
 
-### Build & Install
-
-Development build:
-
-```bash
-make build
-```
-
-Note:
-
-The `sgl-kernel` is rapidly evolving. If you experience a compilation failure, try using `make rebuild`.
-
-#### Build with [ccache](https://github.com/ccache/ccache)
-```bash
-# or `yum install -y ccache`.
-apt-get install -y ccache
-# Building with ccache is enabled when ccache is installed and CCACHE_DIR is set.
-export CCACHE_DIR=/path/to/your/ccache/dir
-export CCACHE_BACKEND=""
-export CCACHE_KEEP_LOCAL_STORAGE="TRUE"
-unset CCACHE_READONLY
-python -m uv build --wheel -Cbuild-dir=build --color=always .
-```
-
-##### Configuring CMake Build Options
-Cmake options can be configuring by adding `-Ccmake.define.<option>=<value>` to the `uv build` flags.
-For example, to enable building FP4 kernels, use:
-```bash
-python -m uv build --wheel -Cbuild-dir=build -Ccmake.define.SGL_KERNEL_ENABLE_FP4=1 --color=always .
-```
-See CMakeLists.txt for more options.
-
 ### Testing & Benchmarking
 
 1. Add pytest tests in [tests/](https://github.com/sgl-project/sglang/tree/main/sgl-kernel/tests), if you need to skip some test, please use `@pytest.mark.skipif`
@@ -177,7 +193,9 @@ See CMakeLists.txt for more options.
 2. Add benchmarks using [triton benchmark](https://triton-lang.org/main/python-api/generated/triton.testing.Benchmark.html) in [benchmark/](https://github.com/sgl-project/sglang/tree/main/sgl-kernel/benchmark)
 3. Run test suite
 
+### FAQ
 
+- When encountering this error while compiling using ccache: `ImportError: /usr/local/lib/python3.10/dist-packages/sgl_kernel/common_ops.abi3.so: undefined symbol: _ZN3c108ListType3getERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEENS_4Type24SingletonOrSharedTypePtrIS9_EE`, please modify the last command as follows to resolve it: `python3 -m uv build --wheel -Cbuild-dir=build . --color=always --no-build-isolation` .
 
 ### Release new version
 
