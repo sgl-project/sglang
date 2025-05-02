@@ -29,7 +29,7 @@ RUN python3 -m pip install --upgrade pip setuptools wheel html5lib six \
          export CUINDEX=121; \
        elif [ "$CUDA_VERSION" = "12.4.1" ]; then \
          export CUINDEX=124; \
-       elif [ "$CUDA_VERSION" = "12.5.1" ]; then \
+       elif [ "$CUDA_VERSION" = "12.8.1" ]; then \
          export CUINDEX=124; \
        elif [ "$CUDA_VERSION" = "11.8.0" ]; then \
          export CUINDEX=118; \
@@ -40,6 +40,8 @@ RUN python3 -m pip install --upgrade pip setuptools wheel html5lib six \
     && python3 -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cu${CUINDEX} \
     && cd sglang \
     && python3 -m pip --no-cache-dir install -e "python[${BUILD_TYPE}]" --find-links https://flashinfer.ai/whl/cu${CUINDEX}/torch2.6/flashinfer-python \
-    && python3 -m pip install nvidia-nccl-cu12==2.26.2.post1 --force-reinstall --no-deps
+    && if [ "$CUDA_VERSION" = "12.8.1" ]; then \
+         python3 -m pip install nvidia-nccl-cu12==2.26.2.post1 --force-reinstall --no-deps; \
+       fi
 
 ENV DEBIAN_FRONTEND=interactive
