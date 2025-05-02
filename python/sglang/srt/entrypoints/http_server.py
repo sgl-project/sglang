@@ -675,6 +675,8 @@ async def vertex_generate(vertex_req: VertexGenerateReqInput, raw_request: Reque
         **(vertex_req.parameters or {}),
     )
     ret = await generate_request(req, raw_request)
+    if isinstance(ret, Response):
+        return ret
     return ORJSONResponse({"predictions": ret})
 
 
