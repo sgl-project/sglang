@@ -27,41 +27,6 @@ from utils import (
 
 from sglang.test.test_utils import CustomTestCase, is_in_ci
 
-CI_MULTI_LORA_MODELS = [
-    # multi-rank case
-    LoRAModelCase(
-        base="meta-llama/Llama-2-7b-hf",
-        adaptors=[
-            LoRAAdaptor(
-                name="winddude/wizardLM-LlaMA-LoRA-7B",
-                prefill_tolerance=1e-1,
-            ),
-            LoRAAdaptor(
-                name="RuterNorway/Llama-2-7b-chat-norwegian-LoRa",
-                prefill_tolerance=3e-1,
-            ),
-        ],
-        max_loras_per_batch=2,
-    ),
-]
-
-ALL_OTHER_MULTI_LORA_MODELS = [
-    LoRAModelCase(
-        base="meta-llama/Llama-3.1-8B-Instruct",
-        adaptors=[
-            LoRAAdaptor(
-                name="algoprog/fact-generation-llama-3.1-8b-instruct-lora",
-                prefill_tolerance=1e-1,
-            ),
-            LoRAAdaptor(
-                name="Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
-                prefill_tolerance=1e-1,
-            ),
-        ],
-        max_loras_per_batch=2,
-    ),
-]
-
 # All prompts are used at once in a batch.
 PROMPTS = [
     "AI is a field of computer science focused on",
