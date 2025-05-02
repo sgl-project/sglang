@@ -158,11 +158,11 @@ class ServerArgs:
     enable_hip_kv_cache_offload: bool = False
     # On-GPU cache size for sparse top-k mask estimation, in tokens
     hip_max_mask_cache_factor: float = 1.2
-    # If the size is not None, we override the dervided value from factor for precise control of cache size.
+    # If the size is not None, we override hip_max_mask_cache_factor for precise control of cache size.
     hip_max_mask_cache_size: Optional[int] = None
     # On-GPU cache size for sparse attention, in tokens
     hip_max_sa_cache_factor: int = 1.2
-    # If the size is not None, we override the dervided value from factor for precise control of cache size.
+    # If the size is not None, we override hip_max_sa_cache_factor for precise control of cache size.
     hip_max_sa_cache_size: Optional[int] = None
 
     # LoRA
@@ -1313,8 +1313,8 @@ class ServerArgs:
             type=int,
             default=ServerArgs.hip_max_mask_cache_size,
             help=(
-                "On-GPU cache size factor for HiP sparse top-k mask estimation kernels. "
-                "Higher priority than factor"
+                "On-GPU cache size for HiP sparse top-k mask estimation kernels. "
+                "Overrides --hip-max-sa-cache-factor. Only use this for precise control of the cache size."
             ),
         )
         parser.add_argument(
@@ -1322,7 +1322,7 @@ class ServerArgs:
             type=float,
             default=ServerArgs.hip_max_sa_cache_factor,
             help=(
-                "On-GPU cache size for HiP sparse attention kernels, in tokens per layer. "
+                "On-GPU cache size factor for HiP sparse attention kernels, in tokens per layer. "
                 "A cache of size proportional to this value will be allocated on the GPU`. "
                 "This will be a major determining factor for mask-cached decoding step latency."
             ),
@@ -1333,7 +1333,7 @@ class ServerArgs:
             default=ServerArgs.hip_max_sa_cache_size,
             help=(
                 "On-GPU cache size for HiP sparse attention kernels, in tokens per layer. "
-                "Higher priority than factor"
+                "Overrides --hip-max-sa-cache-factor. Only use this for precise control of the cache size."
             ),
         )
 
@@ -2033,7 +2033,7 @@ class ServerArgs:
         args.dp_size = args.data_parallel_size
         args.ep_size = args.expert_parallel_size
 
-        if args.enable_hip_attention or (args.hip_attention_config is not None):
+        if args.enable_hip_attention:
             from hip_attn.v1_2 import HiPAttentionConfig
 
             args.hip_attention_config = HiPAttentionConfig(
