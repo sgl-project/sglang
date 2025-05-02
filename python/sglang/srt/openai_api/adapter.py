@@ -984,7 +984,9 @@ def v1_chat_generate_request(
                             if isinstance(chunk, dict) and chunk.get("type") == "text":
                                 new_msg = msg_dict.copy()
                                 new_msg["content"] = chunk["text"]
-                                new_msg = {k: v for k, v in new_msg.items() if v is not None}
+                                new_msg = {
+                                    k: v for k, v in new_msg.items() if v is not None
+                                }
                                 openai_compatible_messages.append(new_msg)
                     else:
                         msg_dict = {k: v for k, v in msg_dict.items() if v is not None}
