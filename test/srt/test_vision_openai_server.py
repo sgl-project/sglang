@@ -714,7 +714,7 @@ class TestPixtralServer(TestOpenAIVisionServer):
 class TestMistral3_1Server(TestOpenAIVisionServer):
     @classmethod
     def setUpClass(cls):
-        cls.model = "mistralai/Mistral-Small-3.1-24B-Instruct-2503"
+        cls.model = "unsloth/Mistral-Small-3.1-24B-Instruct-2503"  # bf16 format
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
         cls.process = popen_launch_server(

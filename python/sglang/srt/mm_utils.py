@@ -29,17 +29,12 @@ LLaVA-Onevision : https://arxiv.org/pdf/2408.03326
 """
 import ast
 import base64
-import hashlib
 import math
 import re
 from io import BytesIO
-from typing import List, Union
 
 import numpy as np
-import torch
 from PIL import Image
-
-from sglang.srt.utils import flatten_nested_list
 
 
 def select_best_resolution(original_size, possible_resolutions):
@@ -342,51 +337,3 @@ def process_images(images, image_processor, model_cfg):
     if all(x.shape == new_images[0].shape for x in new_images):
         new_images = np.stack(new_images, axis=0)
     return new_images
-
-
-def data_hash(data_list, hasher=None) -> int:
-    """
-    Args:
-        data_list: one or more bytes / np.ndarray object(s)
-            for torch tensors, refer to `tensor_hash`
-        hasher: if an existing hasher is provided, it will be updated with data_list
-    Returns:
-        unsigned 32-bit int as digest of data_list
-    """
-
-    hasher = hasher or hashlib.sha256()
-    for item in flatten_nested_list([data_list]):
-        if isinstance(item, np.ndarray):
-            item = np.ascontiguousarray(item).data.tobytes()
-        # hashlib does not take tuples or lists directly
-        hasher.update(item)
-    hash_bytes = hasher.digest()[:8]
-    trunc_hash = int.from_bytes(hash_bytes, byteorder="big", signed=False)
-    return trunc_hash
-
-
-def tensor_hash(tensor_list: Union[torch.Tensor, List[torch.Tensor]]) -> int:
-    """
-    hash a tensor or a tensor list
-    concat to optimize host-device memory footprint
-    """
-    tensor = tensor_list
-    if isinstance(tensor_list, list):
-        tensor_list = flatten_nested_list(tensor_list)
-        tensor_list = [
-            x.flatten() if isinstance(x, torch.Tensor) else x for x in tensor_list
-        ]
-        tensor = torch.concat(tensor_list)
-
-    tensor = tensor.detach().contiguous()
-
-    if tensor.dtype == torch.bfloat16:
-        # memoryview() doesn't support PyTorch's BFloat16 dtype
-        tensor = tensor.float()
-
-    assert isinstance(tensor, torch.Tensor)
-    if tensor.is_cuda:
-        # TODO: improve this
-        tensor = tensor.cpu()
-
-    return data_hash(tensor.numpy())

@@ -897,12 +897,22 @@ def match_llama2_chat(model_path: str):
     model_path = model_path.lower()
     if "llama-2" in model_path and "chat" in model_path:
         return "llama-2"
-    if (
-        "mistral" in model_path or "mixtral" in model_path
-    ) and "instruct" in model_path:
-        return "llama-2"
     if "codellama" in model_path and "instruct" in model_path:
         return "llama-2"
+
+
+@register_conv_template_matching_function
+def match_mistral(model_path: str):
+    model_path = model_path.lower()
+    if any(
+        keyword in model_path
+        for keyword in (
+            "mistral",
+            "mixtral",
+            "pixtral",
+        )
+    ):
+        return "mistral"
 
 
 @register_conv_template_matching_function
