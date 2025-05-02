@@ -638,12 +638,12 @@ register_conv_template(
 register_conv_template(
     Conversation(
         name="mistral",
-        system_template="[SYSTEM_PROMPT]\n<system_message>\n[/SYSTEM_PROMPT]\n\n",
+        system_template="[SYSTEM_PROMPT]\n{system_message}\n[/SYSTEM_PROMPT]\n\n",
         roles=("[INST]", "[/INST]"),
         sep_style=SeparatorStyle.LLAMA2,
         sep=" ",
         sep2=" </s><s>",
-        stop_str=["[INST]", "[/INST]", "[SYSTEM_PROMPT]", "[/SYSTEM_PROMPT]", "</s>"],
+        stop_str=["[INST]", "[/INST]", "[SYSTEM_PROMPT]", "[/SYSTEM_PROMPT]"],
         image_token="[IMG]",
     )
 )
