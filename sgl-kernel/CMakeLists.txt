@@ -88,8 +88,6 @@ include_directories(
     ${repo-cutlass_SOURCE_DIR}/tools/util/include
     ${repo-flashinfer_SOURCE_DIR}/include
     ${repo-flashinfer_SOURCE_DIR}/csrc
-    ${repo-flashmla_SOURCE_DIR}/flash_mla
-    ${repo-flashmla_SOURCE_DIR}/csrc
 )
 
 set(SGL_KERNEL_CUDA_FLAGS
