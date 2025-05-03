@@ -260,7 +260,7 @@ class FunctionResponse(BaseModel):
 class ToolCall(BaseModel):
     """Tool call response."""
 
-    id: str
+    id: Optional[str] = None
     index: Optional[int] = None
     type: Literal["function"] = "function"
     function: FunctionResponse
@@ -269,6 +269,8 @@ class ToolCall(BaseModel):
 class ChatCompletionMessageGenericParam(BaseModel):
     role: Literal["system", "assistant", "tool"]
     content: Union[str, List[ChatCompletionMessageContentTextPart], None]
+    tool_call_id: Optional[str] = None
+    name: Optional[str] = None
     reasoning_content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
 
@@ -276,8 +278,6 @@ class ChatCompletionMessageGenericParam(BaseModel):
 class ChatCompletionMessageUserParam(BaseModel):
     role: Literal["user"]
     content: Union[str, List[ChatCompletionMessageContentPart]]
-    reasoning_content: Optional[str] = None
-    tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
 
 
 ChatCompletionMessageParam = Union[
