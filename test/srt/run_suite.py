@@ -36,6 +36,7 @@ suites = {
         TestFile("test_fa3.py", 376),
         TestFile("test_fim_completion.py", 40),
         TestFile("test_fp8_kernel.py", 8),
+        TestFile("test_function_calling.py", 60),
         TestFile("test_fused_moe.py", 30),
         TestFile("test_hicache.py", 116),
         TestFile("test_hicache_mla.py", 254),
@@ -58,6 +59,7 @@ suites = {
         TestFile("test_pytorch_sampling_backend.py", 66),
         TestFile("test_radix_attention.py", 167),
         TestFile("test_reasoning_content.py", 89),
+        TestFile("test_enable_thinking.py", 70),
         TestFile("test_regex_constrained.py", 64),
         TestFile("test_release_memory_occupation.py", 44),
         TestFile("test_request_length_validation.py", 31),
@@ -80,6 +82,7 @@ suites = {
         TestFile("test_vlm_accuracy.py", 60),
         TestFile("test_vision_openai_server.py", 637),
         TestFile("test_w8a8_quantization.py", 46),
+        TestFile("models/lora/test_lora_cuda_graph.py", 250),
     ],
     "per-commit-2-gpu": [
         TestFile("models/lora/test_lora_tp.py", 116),
@@ -94,9 +97,14 @@ suites = {
     "per-commit-8-gpu": [
         TestFile("test_local_attn.py", 250),
         TestFile("test_full_deepseek_v3.py", 250),
+        TestFile("test_fa3.py", 30),
+        TestFile("test_pp_single_node.py", 150),
     ],
     "nightly": [
         TestFile("test_nightly_gsm8k_eval.py"),
+    ],
+    "nightly-amd": [
+        TestFile("test_nightly_gsm8k_eval_amd.py"),
     ],
     "vllm_dependency_test": [
         TestFile("test_vllm_dependency.py"),
