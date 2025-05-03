@@ -2,18 +2,27 @@
 import asyncio
 import time
 from collections.abc import AsyncGenerator, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional, Union
 
 from fastapi import Request
-from sglang.srt.openai_api.protocol import (ErrorResponse, RerankDocument,
-                                              RerankRequest, RerankResponse,
-                                              RerankResult, RerankUsage,
-                                              ScoreRequest, ScoreResponse,
-                                              ScoreResponseData, UsageInfo,
-                                              EmbeddingRequest)
 from torch.nn import CosineSimilarity
-from concurrent.futures import ThreadPoolExecutor
+
+from sglang.srt.openai_api.protocol import (
+    EmbeddingRequest,
+    ErrorResponse,
+    RerankDocument,
+    RerankRequest,
+    RerankResponse,
+    RerankResult,
+    RerankUsage,
+    ScoreRequest,
+    ScoreResponse,
+    ScoreResponseData,
+    UsageInfo,
+)
 from sglang.utils import make_async
+
 
 class ServingScores:
 
@@ -22,13 +31,8 @@ class ServingScores:
         self.model_config = tokenizer_manager.model_config
         self._tokenizer_executor = ThreadPoolExecutor(max_workers=1)
 
-
     async def _embedding_score(
-        self,
-        model: str,
-        texts_1: list[str],
-        texts_2: list[str],
-        raw_request: Request
+        self, model: str, texts_1: list[str], texts_2: list[str], raw_request: Request
     ) -> ScoreResponse:
 
         from sglang.srt.openai_api.adapter import v1_embedding_request
@@ -38,13 +42,14 @@ class ServingScores:
         input_texts = texts_1 + texts_2
         all_requests = [EmbeddingRequest(input=input_texts, model=model)]
 
-        adapted_request, request = v1_embedding_request(all_requests, self.tokenizer_manager)
-        
+        adapted_request, request = v1_embedding_request(
+            all_requests, self.tokenizer_manager
+        )
+
         ret = await self.tokenizer_manager.generate_request(
-                adapted_request, raw_request
-            ).__anext__()
-        
-        
+            adapted_request, raw_request
+        ).__anext__()
+
         score_data = []
         embeddings = [None] * len(input_texts)
 
@@ -54,13 +59,13 @@ class ServingScores:
         prompt_tokens = 0
 
         for i in range(0, len(texts_1)):
-            emb = ret[i]['embedding']
+            emb = ret[i]["embedding"]
             assert emb is not None
             emb_texts_1.append(emb)
             prompt_tokens += ret[i]["meta_info"]["prompt_tokens"]
 
         for i in range(len(texts_1), len(embeddings)):
-            emb = ret[i]['embedding']
+            emb = ret[i]["embedding"]
             assert emb is not None
             emb_texts_2.append(emb)
             prompt_tokens += ret[i]["meta_info"]["prompt_tokens"]
@@ -70,26 +75,17 @@ class ServingScores:
 
         for idx, (emb_1, emb_2) in enumerate(zip(emb_texts_1, emb_texts_2)):
             pair_score = scorer(emb_1, emb_2)
-            _score_data = ScoreResponseData(index = idx,
-                                            score = pair_score.item())
+            _score_data = ScoreResponseData(index=idx, score=pair_score.item())
             score_data.append(_score_data)
-        
+
         score_response = ScoreResponse(
-            model = model,
-            data = score_data,
-            usage = UsageInfo(prompt_tokens=prompt_tokens)
-
+            model=model, data=score_data, usage=UsageInfo(prompt_tokens=prompt_tokens)
         )
-
 
         return score_response
 
     async def _cross_encoding_score(
-        self,
-        model: str,
-        texts_1: list[str],
-        texts_2: list[str],
-        raw_request: Request
+        self, model: str, texts_1: list[str], texts_2: list[str], raw_request: Request
     ) -> ScoreResponse:
 
         from sglang.srt.openai_api.adapter import v1_embedding_request
@@ -102,13 +98,17 @@ class ServingScores:
 
         input_pairs = [(t1, t2) for t1, t2 in zip(texts_1, texts_2)]
 
-        tokenize_async = make_async(self.tokenizer_manager.tokenizer.__call__,
-                                    executor=self._tokenizer_executor)
+        tokenize_async = make_async(
+            self.tokenizer_manager.tokenizer.__call__, executor=self._tokenizer_executor
+        )
 
         tokenization_kwargs = tokenization_kwargs or {}
         tokenized_prompts = await asyncio.gather(
-            *(tokenize_async(text=t1, text_pair=t2, **tokenization_kwargs)
-              for t1, t2 in input_pairs))
+            *(
+                tokenize_async(text=t1, text_pair=t2, **tokenization_kwargs)
+                for t1, t2 in input_pairs
+            )
+        )
 
         for prompt_inputs, (t1, t2) in zip(tokenized_prompts, input_pairs):
 
@@ -119,12 +119,14 @@ class ServingScores:
 
             request_prompts.append(request_prompt)
             engine_prompts.append(engine_prompt)
-        
-        adapted_request, request = v1_embedding_request(engine_prompts, self.tokenizer_manager)
-        
+
+        adapted_request, request = v1_embedding_request(
+            engine_prompts, self.tokenizer_manager
+        )
+
         ret = await self.tokenizer_manager.generate_request(
-                adapted_request, raw_request
-            ).__anext__()
+            adapted_request, raw_request
+        ).__anext__()
 
         # Non-streaming response
         final_res_batch = [None] * len(engine_prompts)
@@ -137,18 +139,13 @@ class ServingScores:
         score_data = []
         embed = [out for out in final_res_batch if out is not None]
         for idx, emb in enumerate(embed):
-            
-            _score_data = ScoreResponseData(index = idx,
-                                            score = emb.item())
+
+            _score_data = ScoreResponseData(index=idx, score=emb.item())
             score_data.append(_score_data)
-        
+
         score_response = ScoreResponse(
-            model = model,
-            data = score_data,
-            usage = UsageInfo(prompt_tokens=prompt_tokens)
-
+            model=model, data=score_data, usage=UsageInfo(prompt_tokens=prompt_tokens)
         )
-
 
         return score_response
 
@@ -158,32 +155,25 @@ class ServingScores:
 
         if isinstance(request.text_1, str):
             request.text_1 = [request.text_1]
-        
+
         if isinstance(request.text_2, str):
             request.text_2 = [request.text_2]
 
-        
         if self.model_config.is_cross_encoder:
             return await self._cross_encoding_score(
-                model = request.model,
-                texts_1=request.text_1,
-                texts_2=request.text_2
+                model=request.model, texts_1=request.text_1, texts_2=request.text_2
             )
 
         else:
             return await self._embedding_score(
-                model = request.model,
+                model=request.model,
                 texts_1=request.text_1,
                 texts_2=request.text_2,
-                raw_request=raw_request
+                raw_request=raw_request,
             )
 
-    
-
     async def do_rerank(
-        self,
-        request: RerankRequest,
-        raw_request: Optional[Request] = None
+        self, request: RerankRequest, raw_request: Optional[Request] = None
     ) -> Union[RerankResponse, ErrorResponse]:
         """
         Rerank API based on JinaAI's rerank API; implements the same
