@@ -16,12 +16,11 @@ from collections import defaultdict
 from types import SimpleNamespace
 from typing import Optional
 
-from sglang.bench_serving import sync_request_profile
+from sglang.bench_serving import async_request_profile
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
-    CustomTestCase,
     is_in_ci,
     popen_launch_server,
 )
@@ -29,10 +28,12 @@ from sglang.test.test_utils import (
 # VLM models for testing
 MODELS = [
     SimpleNamespace(
-        # model="google/gemma-3-4b-it", chat_template="gemma-it", mmmu_accuracy=0.384
-        model="google/gemma-3-4b-it",
-        chat_template="gemma-it",
-        mmmu_accuracy=0.3378,
+        model="google/gemma-3-4b-it", chat_template="gemma-it", mmmu_accuracy=0.384
+    ),
+    SimpleNamespace(
+        model="Qwen/Qwen2.5-VL-3B-Instruct",
+        chat_template="qwen2-vl",
+        mmmu_accuracy=0.466,
     ),
     # SimpleNamespace(
     #     model="google/gemma-3-4b-it", mmmu_accuracy=0.384
@@ -50,7 +51,7 @@ MODELS = [
 ]
 
 
-class TestVLMModels(CustomTestCase):
+class TestVLMModels(unittest.IsolatedAsyncioTestCase):
     parsed_args = None  # Class variable to store args
 
     @classmethod
@@ -133,7 +134,7 @@ class TestVLMModels(CustomTestCase):
             timeout=3600,
         )
 
-    def test_vlm_mmmu_benchmark(self):
+    async def test_vlm_mmmu_benchmark(self):
         """Test VLM models against MMMU benchmark."""
         models_to_test = MODELS
 
@@ -156,15 +157,15 @@ class TestVLMModels(CustomTestCase):
                         "--cuda-graph-max-bs",
                         "32",
                         "--enable-multimodal",
-                        # "--disable-radix-cache",
                         "--mem-fraction-static",
                         str(self.parsed_args.mem_fraction_static),  # Use class variable
+                        # "--tp=4"
                     ],
                 )
 
                 if args.profile:
                     print("Starting profiler...")
-                    profile_output = sync_request_profile(
+                    profile_output = await async_request_profile(
                         api_url=self.base_url + "/start_profile"
                     )
                     if profile_output.success:
@@ -174,18 +175,21 @@ class TestVLMModels(CustomTestCase):
                 self.run_mmmu_eval(model.model,
                                    self.parsed_args.batch_size,
                                    "./logs",
-                                   limit=str(3) if self.parsed_args.profile else None,
+                                   limit=str(1) if self.parsed_args.profile else None,
                                    )
 
                 if args.profile:
-                    profile_output = sync_request_profile(
+                    profile_output = await async_request_profile(
                         api_url=self.base_url + "/stop_profile"
                     )
                     if profile_output.success:
                         print("Profiler stopped")
-                        print("Waiting for profile data to be saved...")
-                        time.sleep(10000)
-                        print("Wait finished.")
+                    print(
+                        "You should kill the process manually until profiling actually stopped"
+                    )
+                    while True:
+                        time.sleep(10)
+
                 # Get the result file
                 files = glob.glob("./logs/*.json")
 
@@ -245,7 +249,6 @@ if __name__ == "__main__":
              "SGLANG_TORCH_PROFILER_DIR to enable profiler",
         default=False,
     )
-
     # Parse args intended for unittest
     args = parser.parse_args()
 

@@ -42,6 +42,7 @@ from typing import (
 )
 
 import fastapi
+import torch
 import uvloop
 import zmq
 import zmq.asyncio
@@ -814,11 +815,95 @@ class TokenizerManager:
         result = (await self.profile_communicator(req))[0]
         if not result.success:
             raise RuntimeError(result.message)
+
+        if self.profiler_activities:
+            return ProfileReqOutput(
+                success=False,
+                message="Profiling is already in progress. Call /stop_profile first.",
+            )
+
+        if output_dir is None:
+            output_dir = os.getenv("SGLANG_TORCH_PROFILER_DIR", "/tmp")
+        if activities is None:
+            activities = ["CPU", "GPU"]
+
+        self.torch_profiler_output_dir = output_dir
+        self.profiler_activities = activities
+        self.profiler_id = str(time.time())
+        logger.info(
+            "Tokenizer Profiling starts. Traces will be saved to: %s (with id %s)",
+            self.torch_profiler_output_dir,
+            self.profiler_id,
+        )
+
+        activity_map = {
+            "CPU": torch.profiler.ProfilerActivity.CPU,
+            "GPU": torch.profiler.ProfilerActivity.CUDA,
+        }
+        torchprof_activities = [
+            activity_map[a] for a in activities if a in activity_map
+        ]
+
+        if torchprof_activities:
+            self.torch_profiler = torch.profiler.profile(
+                activities=torchprof_activities,
+                # with_stack=with_stack if with_stack is not None else True,
+                with_stack=True,
+                record_shapes=True,
+            )
+            self.torch_profiler.start()
+
+        if "MEM" in activities:
+            torch.cuda.memory._record_memory_history(max_entries=100000)
+
+        if "CUDA_PROFILER" in activities:
+            torch.cuda.cudart().cudaProfilerStart()
+
+        num_steps = False
+        if num_steps:
+            self.profiler_target_forward_ct = self.forward_ct + num_steps
+            # The caller will be notified when reaching profiler_target_forward_ct
+        else:
+            self.profiler_target_forward_ct = None
+            return ProfileReqOutput(success=True, message="Succeeded")
+
         return result
 
     def stop_profile(self):
         self.auto_create_handle_loop()
         req = ProfileReq(type=ProfileReqType.STOP_PROFILE)
+        if self.profiler_activities is None:
+            return
+
+        logger.info("Tokenizer Stop profiling...")
+        if self.torch_profiler is not None:
+            self.torch_profiler.stop()
+            self.torch_profiler.export_chrome_trace(
+                os.path.join(
+                    self.torch_profiler_output_dir,
+                    f"{self.profiler_id}-tokenizer-trace.json.gz",
+                )
+            )
+
+        if "MEM" in self.profiler_activities:
+            memory_profile_path = os.path.join(
+                self.torch_profiler_output_dir,
+                f"{self.profiler_id}-tokenizer-memory.pickle",
+            )
+            torch.cuda.memory._dump_snapshot(memory_profile_path)
+            torch.cuda.memory._record_memory_history(enabled=None)
+
+        if "CUDA_PROFILER" in self.profiler_activities:
+            torch.cuda.cudart().cudaProfilerStop()
+
+        logger.info(
+            "Profiling done. Traces are saved to: %s",
+            self.torch_profiler_output_dir,
+        )
+        self.torch_profiler = None
+        self.torch_profiler_output_dir = None
+        self.profiler_activities = None
+
         self.send_to_scheduler.send_pyobj(req)
 
     async def start_expert_distribution_record(self):

@@ -453,24 +453,6 @@ async def async_request_profile(api_url: str) -> RequestFuncOutput:
     return output
 
 
-def sync_request_profile(api_url: str) -> RequestFuncOutput:
-    output = RequestFuncOutput()
-    try:
-        response = requests.post(api_url, timeout=60)  # Pass headers
-        if response.status_code == 200:
-            output.success = True
-        else:
-            output.error = response.reason or f"Status code: {response.status_code}"
-            output.success = False
-    except Exception as e:
-        output.success = False
-        exc_info = sys.exc_info()
-        output.error = "".join(traceback.format_exception(*exc_info))
-        print(f"Error during sync_request_profile: {output.error}")
-
-    return output
-
-
 def get_model(pretrained_model_name_or_path: str) -> str:
     if os.getenv("SGLANG_USE_MODELSCOPE", "false").lower() == "true":
         import huggingface_hub.constants
