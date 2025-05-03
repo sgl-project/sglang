@@ -29,7 +29,8 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 import torch
 from torch.distributed import Backend
 
-from sglang.utils import logger
+from sglang.srt.distributed import get_tensor_model_parallel_group
+from sglang.utils import info_once, logger
 
 # Handle serialization of Image for pydantic
 if TYPE_CHECKING:
@@ -482,7 +483,6 @@ class GenerateReqInput:
         )
 
 
-# 定义传输模式类型
 TensorTransportMode = Literal["cuda_ipc", "nccl", "copy", "auto"]
 
 
@@ -554,6 +554,8 @@ def serialize_tensors(
         A new dictionary with CUDA tensors replaced by serializable representations
         or placeholders.
     """
+    if data is None:
+        return None
     if not isinstance(data, dict):
         logger.warning(
             "serialize_tensors expected a dict, but got %s. Returning original.",
@@ -642,6 +644,9 @@ def deserialize_tensors(
     return _deserialize_tensor_recursive(data, mode)
 
 
+global_effective_mode: Optional[TensorTransportMode] = None
+
+
 @dataclass
 class TokenizedGenerateReqInput:
     # The request id
@@ -689,69 +694,104 @@ class TokenizedGenerateReqInput:
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
 
-    tensor_transport_mode: TensorTransportMode = "cuda_ipc"
+    tensor_transport_mode: TensorTransportMode = "auto"
 
     def __getstate__(self):
-        state = self.__dict__.copy()
+        # print(f"getting state")
+        state = dict(self.__dict__)
+        global global_effective_mode
 
-        # 自动检测传输模式
-        effective_mode = self._determine_effective_mode()
-        print(f"{effective_mode=}")
-        # 序列化 mm_inputs 中的张量
-        if "mm_inputs" in state and state["mm_inputs"] is not None:
-            state["mm_inputs"] = serialize_tensors(state["mm_inputs"], effective_mode)
+        if global_effective_mode is None:
+            # print(f"{effective_mode=}")
+            if (
+                "mm_inputs" in state
+                and state["mm_inputs"] is not None
+                and self._contains_feature()
+            ):
+                # print(f"{self.mm_inputs=}")
+                effective_mode = self._determine_tensor_transport_mode()
+                global_effective_mode = effective_mode
+                info_once(f"{global_effective_mode=}")
 
-        # 记录序列化模式用于反序列化
-        state["__tensor_transport_mode"] = effective_mode
+        state["mm_inputs"] = serialize_tensors(
+            state["mm_inputs"], global_effective_mode
+        )
+
+        # state["__tensor_transport_mode"] = effective_mode
 
         return state
 
     def __setstate__(self, state):
-        # 获取传输模式 (兼容旧版本序列化数据)
-        transport_mode = state.pop("__tensor_transport_mode", "copy")
-        print(f"setting state")
-        # 反序列化张量
+        # transport_mode = state.pop("__tensor_transport_mode", "copy")
+        global global_effective_mode
+        transport_mode = global_effective_mode
+
+        if global_effective_mode is None:
+            self.__dict__.update(state)
+            return
         if "mm_inputs" in state and state["mm_inputs"] is not None:
             state["mm_inputs"] = deserialize_tensors(state["mm_inputs"], transport_mode)
 
-        # NCCL 模式需要后处理
         if transport_mode == "nccl":
             self._postprocess_nccl_tensors(state["mm_inputs"])
 
         self.__dict__.update(state)
 
-    def _determine_effective_mode(self):
-        """根据运行环境确定最佳传输模式"""
-        # 规则 1: 显式指定时优先使用
+    def _contains_cuda_feature(self) -> bool:
+        if not self.mm_inputs:
+            return False
+        for v in self.mm_inputs["mm_items"]:
+            if isinstance(v.feature, torch.Tensor) and v.feature.is_cuda:
+                print(f"{v.feature=}")
+                print(f"{v=}")
+                print(f"{v.feature.device=}")
+                return True
+        return False
+
+    def _contains_feature(self) -> bool:
+        if not self.mm_inputs:
+            return False
+        for v in self.mm_inputs["mm_items"]:
+            if v is not None:
+                return True
+        return False
+
+    def _determine_tensor_transport_mode(self) -> TensorTransportMode:
+
         if self.tensor_transport_mode != "auto":
             return self.tensor_transport_mode
 
-        # 规则 2: 跨节点时使用 NCCL
         if self._is_cross_node():
             return "nccl"
 
-        # 规则 3: 同节点使用 CUDA IPC
-        if torch.cuda.is_available():
+        if self._contains_cuda_feature():
             return "cuda_ipc"
 
-        # 规则 4: 默认回退到 copy
         return "copy"
 
     def _is_cross_node(self):
-        """检测是否跨节点通信 (需要与分布式初始化逻辑配合)"""
-        # 实现示例 - 实际需要与分布式配置同步
+        print(f"_is_cross_node")
         try:
             import torch.distributed as dist
 
-            from sglang.srt.distributed import get_world_group
-
-            return dist.get_backend() == Backend.NCCL
-        except:
+            print(f"{dist.get_backend()=}")
+            # from sglang.srt.distributed import get_world_group
+            device_group = get_tensor_model_parallel_group().device_group
+            return dist.get_backend(device_group) == Backend.NCCL
+            # return dist.get_backend() == Backend.NCCL
+        except Exception as e:
+            # FIXME: for rank==0 in tp, the dist is not initialized at this point
+            print(f"{e=}")
+            # return get_world_group().pynccl_comm is not None
+            # global _TP
+            # return _TP is not None
+            if torch.distributed.is_initialized():
+                print(torch.distributed.get_world_size())
+                return torch.distributed.get_world_size() > 1
+            # return get_backend() == "nccl"
             return False
 
     def _postprocess_nccl_tensors(self, mm_inputs):
-        """处理 NCCL 模式的张量接收"""
-        # 需要与 Scheduler 的接收逻辑配合
         if not mm_inputs:
             return
 
@@ -760,22 +800,18 @@ class TokenizedGenerateReqInput:
         for key in list(mm_inputs.keys()):
             val = mm_inputs[key]
             if isinstance(val, tuple) and val[0] == "nccl_placeholder":
-                # 解包元组信息
                 _, shape, dtype, stride, device_idx = val
 
-                # 创建接收缓冲区
                 recv_tensor = torch.empty(
                     shape, dtype=dtype, device=torch.device(f"cuda:{device_idx}")
                 )
 
-                # 发起异步接收
                 torch.distributed.recv(
                     tensor=recv_tensor,
-                    src=0,  # 假设总是从 TP rank 0 发送
+                    src=0,
                     group=get_tp_group(),
                 )
 
-                # 替换占位符为实际张量
                 mm_inputs[key] = recv_tensor
 
 
