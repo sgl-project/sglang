@@ -455,6 +455,18 @@ class TokenizerManager:
                 f"Receive: obj={dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}"
             )
 
+        def get_obj_send_size(obj):
+            if isinstance(obj, torch.Tensor):
+                # GPU tensor 也要考虑搬到 CPU 再发
+                return obj.element_size() * obj.nelement()
+            elif isinstance(obj, np.ndarray):
+                return obj.nbytes
+            else:
+                try:
+                    return len(pickle.dumps(obj))
+                except Exception:
+                    return 0
+
         async with self.model_update_lock.reader_lock:
             if obj.is_single:
                 tokenized_obj = await self._tokenize_one_request(obj)

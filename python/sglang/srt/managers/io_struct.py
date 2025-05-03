@@ -26,6 +26,11 @@ from sglang.srt.managers.schedule_batch import BaseFinishReason
 from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.sampling.sampling_params import SamplingParams
 
+import torch
+from torch.distributed import Backend
+
+from sglang.utils import logger
+
 # Handle serialization of Image for pydantic
 if TYPE_CHECKING:
     from PIL.Image import Image
@@ -477,6 +482,166 @@ class GenerateReqInput:
         )
 
 
+# 定义传输模式类型
+TensorTransportMode = Literal["cuda_ipc", "nccl", "copy", "auto"]
+
+
+def _serialize_tensor_recursive(data: Any, mode: TensorTransportMode) -> Any:
+    """Recursively processes data to serialize tensors based on mode."""
+    if isinstance(data, dict):
+        new_dict = {}
+        for k, v in data.items():
+            new_dict[k] = _serialize_tensor_recursive(v, mode)
+        return new_dict
+    elif isinstance(data, list):
+        return [_serialize_tensor_recursive(item, mode) for item in data]
+    elif isinstance(data, torch.Tensor) and data.is_cuda:
+        if mode == "cuda_ipc":
+            try:
+                # Note: _share_cuda_() might have limitations depending on the PyTorch version and context.
+                # It's generally used for multiprocessing within the same machine.
+                storage = data.storage()
+                handle = (
+                    storage._share_cuda_()
+                )  # Returns (manager_handle, storage_handle, size_bytes)
+                # Store handle, shape, dtype, stride, and device index
+                return (
+                    "cuda_ipc",
+                    handle,
+                    data.shape,
+                    data.dtype,
+                    data.stride(),
+                    data.device.index,
+                )
+            except Exception as e:
+                logger.error(
+                    f"Failed to get CUDA IPC handle for tensor: {e}. Falling back to copy.",
+                    exc_info=True,
+                )
+                # Fallback to CPU copy if IPC fails
+                return data.cpu()
+        elif mode == "nccl":
+            # For NCCL, we don't serialize the data itself here.
+            # We just mark it as needing NCCL transfer later.
+            # The actual torch.distributed.send/recv will handle the data.
+            # Store shape, dtype, stride, and device index to recreate the tensor structure.
+            return (
+                "nccl_placeholder",
+                data.shape,
+                data.dtype,
+                data.stride(),
+                data.device.index,
+            )
+        else:  # mode == 'copy' or fallback
+            # Default: move to CPU for standard pickling
+            return data.cpu()
+    else:
+        # Keep non-CUDA tensors or other data types as is
+        return data
+
+
+def serialize_tensors(
+    data: Dict[str, Any], mode: TensorTransportMode
+) -> Dict[str, Any]:
+    """
+    Serializes CUDA tensors within a dictionary based on the specified mode.
+
+    Args:
+        data: The dictionary possibly containing CUDA tensors (e.g., mm_inputs).
+        mode: The transport mode ('cuda_ipc', 'nccl', 'copy').
+
+    Returns:
+        A new dictionary with CUDA tensors replaced by serializable representations
+        or placeholders.
+    """
+    if not isinstance(data, dict):
+        logger.warning(
+            "serialize_tensors expected a dict, but got %s. Returning original.",
+            type(data),
+        )
+        return data
+    return _serialize_tensor_recursive(data, mode)
+
+
+def _deserialize_tensor_recursive(data: Any, mode: TensorTransportMode) -> Any:
+    """Recursively processes data to deserialize tensors based on mode."""
+    if isinstance(data, dict):
+        new_dict = {}
+        for k, v in data.items():
+            new_dict[k] = _deserialize_tensor_recursive(v, mode)
+        return new_dict
+    elif isinstance(data, list):
+        return [_deserialize_tensor_recursive(item, mode) for item in data]
+    elif isinstance(data, tuple) and len(data) > 1:
+        marker = data[0]
+        if marker == "cuda_ipc" and mode == "cuda_ipc":
+            # ('cuda_ipc', handle, shape, dtype, stride, device_index)
+            handle, shape, dtype, stride, device_index = data[1:]
+            try:
+                # Ensure the current process is on the correct device context
+                current_device = torch.device(f"cuda:{device_index}")
+                with torch.cuda.device(current_device):
+                    storage = torch.UntypedStorage._new_shared_cuda(*handle)
+                    # Create a tensor view into the shared storage
+                    tensor = torch.empty(0, dtype=dtype, device=current_device).set_(
+                        storage, storage_offset=0, size=shape, stride=stride
+                    )
+                    # Check if the storage size matches expected size
+                    expected_numel = torch.Size(shape).numel()
+                    if tensor.numel() != expected_numel:
+                        logger.warning(
+                            f"CUDA IPC Deserialization: Reconstructed tensor element count {tensor.numel()} differs from expected {expected_numel}. Shape: {shape}"
+                        )
+                        # Potentially raise error or return None depending on strictness needed
+                        # return None
+                    return tensor
+            except Exception as e:
+                logger.error(
+                    f"Failed to reconstruct tensor from CUDA IPC handle: {e}. Returning None.",
+                    exc_info=True,
+                )
+                return None  # Indicate failure
+        elif marker == "nccl_placeholder" and mode == "nccl":
+            # ('nccl_placeholder', shape, dtype, stride, device_index)
+            # For NCCL, the actual data is received separately.
+            # Here, we might recreate an empty tensor on the correct device
+            # that will be filled by torch.distributed.recv later.
+            _, shape, dtype, stride, device_index = data
+            target_device = torch.device(f"cuda:{device_index}")
+            # Return the placeholder information, the receiving code will use it
+            # Alternatively, create the empty tensor now:
+            # return torch.empty(shape, dtype=dtype, device=target_device).as_strided(shape, stride)
+            return data  # Keep the placeholder, receiver uses info
+        else:
+            # Not a special tensor tuple, return as is
+            return data
+    else:
+        # Keep CPU tensors or other data types as is
+        return data
+
+
+def deserialize_tensors(
+    data: Dict[str, Any], mode: TensorTransportMode
+) -> Dict[str, Any]:
+    """
+    Deserializes tensors within a dictionary based on the specified mode.
+
+    Args:
+        data: The dictionary received, possibly containing serialized tensor representations.
+        mode: The transport mode ('cuda_ipc', 'nccl', 'copy').
+
+    Returns:
+        A new dictionary with tensor representations replaced by actual tensors (or placeholders for NCCL).
+    """
+    if not isinstance(data, dict):
+        logger.warning(
+            "deserialize_tensors expected a dict, but got %s. Returning original.",
+            type(data),
+        )
+        return data
+    return _deserialize_tensor_recursive(data, mode)
+
+
 @dataclass
 class TokenizedGenerateReqInput:
     # The request id
@@ -523,6 +688,95 @@ class TokenizedGenerateReqInput:
 
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
+
+    tensor_transport_mode: TensorTransportMode = "cuda_ipc"
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+
+        # 自动检测传输模式
+        effective_mode = self._determine_effective_mode()
+        print(f"{effective_mode=}")
+        # 序列化 mm_inputs 中的张量
+        if "mm_inputs" in state and state["mm_inputs"] is not None:
+            state["mm_inputs"] = serialize_tensors(state["mm_inputs"], effective_mode)
+
+        # 记录序列化模式用于反序列化
+        state["__tensor_transport_mode"] = effective_mode
+
+        return state
+
+    def __setstate__(self, state):
+        # 获取传输模式 (兼容旧版本序列化数据)
+        transport_mode = state.pop("__tensor_transport_mode", "copy")
+        print(f"setting state")
+        # 反序列化张量
+        if "mm_inputs" in state and state["mm_inputs"] is not None:
+            state["mm_inputs"] = deserialize_tensors(state["mm_inputs"], transport_mode)
+
+        # NCCL 模式需要后处理
+        if transport_mode == "nccl":
+            self._postprocess_nccl_tensors(state["mm_inputs"])
+
+        self.__dict__.update(state)
+
+    def _determine_effective_mode(self):
+        """根据运行环境确定最佳传输模式"""
+        # 规则 1: 显式指定时优先使用
+        if self.tensor_transport_mode != "auto":
+            return self.tensor_transport_mode
+
+        # 规则 2: 跨节点时使用 NCCL
+        if self._is_cross_node():
+            return "nccl"
+
+        # 规则 3: 同节点使用 CUDA IPC
+        if torch.cuda.is_available():
+            return "cuda_ipc"
+
+        # 规则 4: 默认回退到 copy
+        return "copy"
+
+    def _is_cross_node(self):
+        """检测是否跨节点通信 (需要与分布式初始化逻辑配合)"""
+        # 实现示例 - 实际需要与分布式配置同步
+        try:
+            import torch.distributed as dist
+
+            from sglang.srt.distributed import get_world_group
+
+            return dist.get_backend() == Backend.NCCL
+        except:
+            return False
+
+    def _postprocess_nccl_tensors(self, mm_inputs):
+        """处理 NCCL 模式的张量接收"""
+        # 需要与 Scheduler 的接收逻辑配合
+        if not mm_inputs:
+            return
+
+        from sglang.srt.distributed import get_tp_group
+
+        for key in list(mm_inputs.keys()):
+            val = mm_inputs[key]
+            if isinstance(val, tuple) and val[0] == "nccl_placeholder":
+                # 解包元组信息
+                _, shape, dtype, stride, device_idx = val
+
+                # 创建接收缓冲区
+                recv_tensor = torch.empty(
+                    shape, dtype=dtype, device=torch.device(f"cuda:{device_idx}")
+                )
+
+                # 发起异步接收
+                torch.distributed.recv(
+                    tensor=recv_tensor,
+                    src=0,  # 假设总是从 TP rank 0 发送
+                    group=get_tp_group(),
+                )
+
+                # 替换占位符为实际张量
+                mm_inputs[key] = recv_tensor
 
 
 @dataclass
