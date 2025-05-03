@@ -74,10 +74,14 @@ def validate_input_length(
             )
             return error_msg
 
-    cur_need_tokens = len(req.origin_input_ids) + min(
-        req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION
+    req_max_new_tokens = (
+        req.sampling_params.max_new_tokens
+        if req.sampling_params.max_new_tokens is not None
+        else 0
     )
-    print(f"{could_wait=}, {cur_need_tokens=}, {cur_rem_tokens_len=}")
+    cur_need_tokens = len(req.origin_input_ids) + min(
+        req_max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION
+    )
     if not could_wait:
         if cur_need_tokens > cur_rem_tokens_len:
             error_msg = (

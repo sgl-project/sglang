@@ -216,11 +216,11 @@ def prepare_extend_inputs_for_correctness_test(
     return reqs
 
 
-def prepare_synthetic_inputs_for_latency_test(batch_size, input_len):
+def prepare_synthetic_inputs_for_latency_test(batch_size, input_len, output_len):
     input_ids = np.random.randint(0, 10000, (batch_size, input_len), dtype=np.int32)
     sampling_params = SamplingParams(
         temperature=0,
-        max_new_tokens=bench_args.output_len[0],
+        max_new_tokens=output_len,
     )
 
     reqs = []
@@ -456,7 +456,7 @@ def latency_test(
 
     # Prepare inputs for warm up
     reqs = prepare_synthetic_inputs_for_latency_test(
-        bench_args.batch_size[0], bench_args.input_len[0]
+        bench_args.batch_size[0], bench_args.input_len[0], bench_args.output_len[0]
     )
 
     # Warm up
@@ -482,7 +482,7 @@ def latency_test(
     for bs, il, ol in itertools.product(
         bench_args.batch_size, bench_args.input_len, bench_args.output_len
     ):
-        reqs = prepare_synthetic_inputs_for_latency_test(bs, il)
+        reqs = prepare_synthetic_inputs_for_latency_test(bs, il, ol)
         ret = latency_test_run_once(
             bench_args.run_name,
             model_runner,
