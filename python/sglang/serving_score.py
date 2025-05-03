@@ -5,6 +5,7 @@ from collections.abc import AsyncGenerator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional, Union
 
+import torch
 from fastapi import Request
 from torch.nn import CosineSimilarity
 
@@ -74,7 +75,7 @@ class ServingScores:
             emb_texts_1 = emb_texts_1 * len(emb_texts_2)
 
         for idx, (emb_1, emb_2) in enumerate(zip(emb_texts_1, emb_texts_2)):
-            pair_score = scorer(emb_1, emb_2)
+            pair_score = scorer(torch.tensor(emb_1), torch.tensor(emb_2))
             _score_data = ScoreResponseData(index=idx, score=pair_score.item())
             score_data.append(_score_data)
 
@@ -159,7 +160,7 @@ class ServingScores:
         if isinstance(request.text_2, str):
             request.text_2 = [request.text_2]
 
-        if self.model_config.is_cross_encoder:
+        if self.model_config.is_cross_encoder_model:
             return await self._cross_encoding_score(
                 model=request.model, texts_1=request.text_1, texts_2=request.text_2
             )

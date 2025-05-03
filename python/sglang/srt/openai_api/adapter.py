@@ -1855,7 +1855,7 @@ async def v1_scores(tokenizer_manager, raw_request: Request):
     handler = ServingScores(tokenizer_manager)
 
     try:
-        ret = ret = await handler._run_scoring(score_request, raw_request).__anext__()
+        ret = await handler._run_scoring(score_request, raw_request)
     except ValueError as e:
         return create_error_response(str(e))
 
