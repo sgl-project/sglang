@@ -1619,7 +1619,6 @@ async def v1_chat_completions(
                                 call_item.parameters = remaining_call
 
                                 finish_reason_type = "tool_calls"
-                            # print("!!! [Debug], ", "call_item:\n ",  call_item, "\ncalls[0]:\n ", calls[0])
                             tool_call = ToolCall(
                                 id=(
                                     f"call_{base64.urlsafe_b64encode(uuid.uuid4().bytes).rstrip(b'=').decode()}"
