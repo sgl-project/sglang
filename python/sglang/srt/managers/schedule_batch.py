@@ -565,8 +565,9 @@ class Req:
         # We use `tmp_end_idx` to store the end index of the kv cache to send.
         self.tmp_end_idx: int = -1
 
+        max_new_tokens = self.sampling_params.max_new_tokens if self.sampling_params.max_new_tokens is not None else 0
         self.prefill_need_tokens: int = len(self.origin_input_ids) + \
-            min(self.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION)
+            min(max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION)
 
     @property
     def seqlen(self):
