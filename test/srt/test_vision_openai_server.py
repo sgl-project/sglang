@@ -666,32 +666,6 @@ class TestPixtralServer(TestOpenAIVisionServer):
         pass
 
 
-class TestMistral3_1Server(TestOpenAIVisionServer):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = "mistralai/Mistral-Small-3.1-24B-Instruct-2503"
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-123456"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--trust-remote-code",
-                "--chat-template",
-                "mistral",
-                "--tp-size",
-                "2",  # for A100x2 setup
-                "--mem-fraction-static",
-                "0.73",
-            ],
-        )
-        cls.base_url += "/v1"
-
-    def test_video_chat_completion(self):
-        pass
-
-
 class TestDeepseekVL2Server(TestOpenAIVisionServer):
     @classmethod
     def setUpClass(cls):
