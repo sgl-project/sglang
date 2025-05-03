@@ -81,7 +81,6 @@ from sglang.srt.utils import (
     get_available_gpu_memory,
     get_bool_env_var,
     init_custom_process_group,
-    is_ampere_with_cuda_12_3,
     is_cuda,
     is_fa3_default_architecture,
     is_flashinfer_available,
@@ -264,7 +263,7 @@ class ModelRunner:
             if not self.use_mla_backend:
                 # MHA architecture
                 if (
-                    (is_ampere_with_cuda_12_3() or is_hopper_with_cuda_12_3())
+                    is_hopper_with_cuda_12_3()
                     and is_no_spec_infer_or_topk_one(server_args)
                     and is_fa3_default_architecture(self.model_config.hf_config)
                 ):

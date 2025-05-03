@@ -347,10 +347,13 @@ class ServerArgs:
             model_arch = get_model_arch(self)
 
             # Auto set draft_model_path DeepSeek-V3/R1
-            if self.speculative_draft_model_path is None and model_arch in [
-                "DeepseekV3ForCausalLM"
-            ]:
-                self.speculative_draft_model_path = self.model_path
+            if model_arch == "DeepseekV3ForCausalLM":
+                if self.speculative_draft_model_path is None:
+                    self.speculative_draft_model_path = self.model_path
+                else:
+                    logger.warning(
+                        "DeepSeek MTP does not require setting speculative_draft_model_path."
+                    )
 
             # Auto choose parameters
             if self.speculative_num_steps is None:
