@@ -2070,6 +2070,7 @@ class BumpAllocator:
         self._pointer += size
         return output
 
+
 class CustomReqError(ValueError):
     def __init__(self, code: int, message: str):
         super().__init__()

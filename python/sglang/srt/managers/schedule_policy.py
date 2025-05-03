@@ -22,6 +22,11 @@ from typing import Dict, List, Optional, Set, Union
 
 import torch
 
+from sglang.srt.managers.env_vars import (
+    CLIP_MAX_NEW_TOKENS_ESTIMATION,
+    IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD,
+    IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD,
+)
 from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
@@ -30,11 +35,6 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode
-from sglang.srt.managers.env_vars import (
-    CLIP_MAX_NEW_TOKENS_ESTIMATION,
-    IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD,
-    IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD
-)
 
 
 class CacheAwarePolicy(Enum):

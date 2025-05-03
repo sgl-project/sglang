@@ -74,10 +74,7 @@ from sglang.srt.openai_api.protocol import (
 )
 from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.utils import CustomReqError
-from sglang.utils import (
-    convert_json_schema_to_str,
-    get_exception_traceback,
-)
+from sglang.utils import convert_json_schema_to_str, get_exception_traceback
 
 logger = logging.getLogger(__name__)
 
@@ -100,14 +97,15 @@ file_id_storage: Dict[str, str] = {}
 # backend storage directory
 storage_dir = None
 
+
 def pack_error_response(e: ValueError, stream: bool):
     print(str(e))
-    err_func = create_streaming_error_response if stream \
-            else create_error_response
+    err_func = create_streaming_error_response if stream else create_error_response
     if isinstance(e, CustomReqError):
         if stream:
             return err_func(message=e.message, status_code=e.code)
     return err_func(str(e))
+
 
 def create_error_response(
     message: str,

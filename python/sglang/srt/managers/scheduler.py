@@ -114,7 +114,7 @@ from sglang.srt.managers.scheduler_output_processor_mixin import (
 from sglang.srt.managers.session_controller import Session
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.tp_worker_overlap_thread import TpModelWorkerClient
-from sglang.srt.managers.utils import validate_input_length, pack_err_batch_str_output
+from sglang.srt.managers.utils import pack_err_batch_str_output, validate_input_length
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
@@ -984,18 +984,21 @@ class Scheduler(
                 return pack_err_batch_str_output(req)
 
         # Validate prompts length
-        cur_rem_tokens = self.rem_total_tokens(self.new_token_ratio, self.is_mixed_chunk) - self.compute_tokens_needed_in_queue()
+        cur_rem_tokens = (
+            self.rem_total_tokens(self.new_token_ratio, self.is_mixed_chunk)
+            - self.compute_tokens_needed_in_queue()
+        )
         cur_waiting_reqs_num = self.get_queue_len()
         could_wait = True
         if self.max_waiting_requests:
             print(f"{cur_waiting_reqs_num=}, {self.max_waiting_requests-1}")
-            could_wait =  cur_waiting_reqs_num < (self.max_waiting_requests - 1)
+            could_wait = cur_waiting_reqs_num < (self.max_waiting_requests - 1)
         error_msg = validate_input_length(
             req,
             self.max_req_input_len,
             self.server_args.allow_auto_truncate,
             cur_rem_tokens,
-            could_wait
+            could_wait,
         )
         if error_msg:
             req.origin_input_ids = [0]
@@ -1057,9 +1060,14 @@ class Scheduler(
             self._add_request_to_queue(req)
 
     def rem_total_tokens(self, new_token_ratio: float, enable_mixed: bool):
-        rem_tokens = self.token_to_kv_pool_allocator.available_size() + self.tree_cache.evictable_size()
+        rem_tokens = (
+            self.token_to_kv_pool_allocator.available_size()
+            + self.tree_cache.evictable_size()
+        )
         if self.running_batch:
-           rem_tokens -= self.running_batch.rem_total_tokens_offset(new_token_ratio, enable_mixed)
+            rem_tokens -= self.running_batch.rem_total_tokens_offset(
+                new_token_ratio, enable_mixed
+            )
         return rem_tokens
 
     def compute_tokens_needed_in_queue(self):
@@ -1137,11 +1145,7 @@ class Scheduler(
 
         # Validate prompts length
         error_msg = validate_input_length(
-            req,
-            self.max_req_input_len,
-            self.server_args.allow_auto_truncate,
-            0,
-            True
+            req, self.max_req_input_len, self.server_args.allow_auto_truncate, 0, True
         )
         if error_msg:
             return pack_err_batch_str_output(req)
