@@ -40,6 +40,7 @@ logger = logging.getLogger(__name__)
 
 
 SIMULATE_ACC_LEN = os.environ.get("SIMULATE_ACC_LEN")
+FLASHMLA_PAGE_SIZE = 64
 
 
 @dataclass
@@ -132,6 +133,7 @@ class EagleDraftInput:
 
 
         if use_flashmla:
+            assert False # should not reach here
             # FlashMLA backend
             assert block_kv_indices is not None
             assert max_seqlen_pad is not None
@@ -291,7 +293,6 @@ class EagleVerifyInput:
         paged_kernel_lens_sum: int,
         req_to_token: torch.Tensor,
         use_flashmla: bool = False,
-        max_seqlen_pad: Optional[int] = None,
     ):
         print("generate_attn_arg_prefill for EagleVerifyInput")
         batch_size = len(req_pool_indices)
@@ -309,10 +310,11 @@ class EagleVerifyInput:
 
         paged_kernel_lens = paged_kernel_lens + self.draft_token_num
 
-        # todo: 
         if use_flashmla:
-            assert max_seqlen_pad is not None
-
+            max_seqlen_pad = triton.cdiv(
+                paged_kernel_lens.max().item(), FLASHMLA_PAGE_SIZE
+            )
+            
             # block_kv_indices for flashmla
             kv_indices = torch.full(
                 (batch_size, max_seqlen_pad),

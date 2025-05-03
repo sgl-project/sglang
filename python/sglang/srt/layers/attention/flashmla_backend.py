@@ -122,6 +122,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
 
     # todo: remove this, use flashinfer mla for extend
     def update_metadata_draft_extend(self, forward_batch: ForwardBatch):
+        assert False
         bs = forward_batch.batch_size
         spec_info = forward_batch.spec_info
 
@@ -200,15 +201,8 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         draft_token_num = spec_info.draft_token_num
         spec_steps = spec_info.spec_steps
 
-        # print("draft_token_num", draft_token_num)
-        # print("spec_steps", spec_steps)
-
-        # todo: update kv cache with spec_info
         assert isinstance(spec_info, EagleVerifyInput)
 
-        max_seqlen_pad = triton.cdiv(
-            forward_batch.seq_lens_cpu.max().item(), PAGE_SIZE
-        )
         
         block_kv_indices, _, qo_indptr, custom_mask = (
             spec_info.generate_attn_arg_prefill(
@@ -217,13 +211,12 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 paged_kernel_lens_sum=forward_batch.seq_lens_sum,
                 req_to_token=self.req_to_token,
                 use_flashmla=True,
-                max_seqlen_pad=max_seqlen_pad,
             )
         )
         
         mla_metadata, num_splits = get_mla_metadata(
             forward_batch.seq_lens.to(torch.int32),
-            mtp_count * self.num_q_heads,
+            1 * self.num_q_heads, # todo: draft_token_num * self.num_q_heads or 1 * self.num_q_heads?
             1,
         )
         self.forward_metadata = FlashMLADecodeMetadata(
