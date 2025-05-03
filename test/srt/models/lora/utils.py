@@ -143,7 +143,9 @@ def run_lora_test_one_by_one(
         torch_dtype=torch_dtype,
         model_type="generation",
         tp_size=model_case.tp_size,
-        lora_paths=[adaptor.name for adaptor in model_case.adaptors],
+        lora_paths=[
+            adaptor.name for adaptor in model_case.adaptors if adaptor.name is not None
+        ],
         max_loras_per_batch=model_case.max_loras_per_batch,
         lora_backend=backend,
         disable_cuda_graph=disable_cuda_graph,
@@ -288,7 +290,9 @@ def run_lora_test_by_batch(
         torch_dtype=torch_dtype,
         model_type="generation",
         tp_size=model_case.tp_size,
-        lora_paths=[adaptor.name for adaptor in model_case.adaptors],
+        lora_paths=[
+            adaptor.name for adaptor in model_case.adaptors if adaptor.name is not None
+        ],
         max_loras_per_batch=model_case.max_loras_per_batch,
         lora_backend=backend,
         disable_cuda_graph=disable_cuda_graph,
