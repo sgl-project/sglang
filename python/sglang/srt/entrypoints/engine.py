@@ -61,6 +61,9 @@ from sglang.srt.openai_api.adapter import (
     guess_chat_template_name_from_model_path,
     load_chat_template_for_openai_api,
 )
+from sglang.srt.parser.code_completion_parser import (
+    load_completion_template_for_openai_api,
+)
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import (
