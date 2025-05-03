@@ -118,6 +118,7 @@ class TestVLMModels(CustomTestCase):
                         "--enable-multimodal",
                         "--mem-fraction-static",
                         str(self.parsed_args.mem_fraction_static),  # Use class variable
+                        # "--tp=4"
                     ],
                 )
 
