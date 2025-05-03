@@ -261,16 +261,20 @@ class EAGLEWorker(TpModelWorker):
             A tuple of the final logit output of the target model, next tokens accepeted,
             the batch id (used for overlap schedule), and number of accepeted tokens.
         """
-        # print("forward_mode", batch.forward_mode)
+        print("xxx eagle worker forward_mode", batch.forward_mode)
         if batch.forward_mode.is_decode():
+            print("xxx eagle worker forward_mode decode 1")
             with self.draft_tp_context(self.draft_model_runner.tp_group):
+                print("xxx eagle worker forward_mode decode 2 draft")
                 spec_info = self.draft(batch)
+            print("xxx eagle worker forward_mode decode 3 verify")
             logits_output, verify_output, model_worker_batch = self.verify(
                 batch, spec_info
             )
 
             # If it is None, it means all requests are finished
             if batch.spec_info.verified_id is not None:
+                print("xxx eagle worker forward_mode decode 4 extend")
                 with self.draft_tp_context(self.draft_model_runner.tp_group):
                     self.forward_draft_extend_after_decode(batch)
             return (
@@ -280,6 +284,7 @@ class EAGLEWorker(TpModelWorker):
                 sum(verify_output.accept_length_per_req_cpu),
             )
         elif batch.forward_mode.is_idle():
+            print("xxx eagle worker forward_mode idle")
             model_worker_batch = batch.get_model_worker_batch()
             logits_output, next_token_ids = self.target_worker.forward_batch_generation(
                 model_worker_batch
@@ -287,6 +292,7 @@ class EAGLEWorker(TpModelWorker):
 
             return logits_output, next_token_ids, model_worker_batch.bid, 0
         else:
+            print("xxx eagle worker forward_mode extend")
             logits_output, next_token_ids, bid = self.forward_target_extend(batch)
             with self.draft_tp_context(self.draft_model_runner.tp_group):
                 self.forward_draft_extend(

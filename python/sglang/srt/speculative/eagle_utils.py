@@ -9,7 +9,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
+from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton, create_flashmla_kv_indices_triton
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
@@ -116,7 +116,9 @@ class EagleDraftInput:
         req_to_token: torch.Tensor,
         use_flashmla: bool = False,
         block_kv_indices: Optional[torch.Tensor] = None,
+        max_seqlen_pad: Optional[int] = None,
     ):
+        print("generate_attn_arg_prefill for EagleDraftInput")
         bs = self.accept_length.numel()
 
         qo_indptr = torch.zeros((bs + 1,), dtype=torch.int32, device="cuda")
@@ -132,6 +134,7 @@ class EagleDraftInput:
         if use_flashmla:
             # FlashMLA backend
             assert block_kv_indices is not None
+            assert max_seqlen_pad is not None
             create_flashmla_kv_indices_triton[(bs,)](
                 req_to_token,
                 req_pool_indices,
@@ -288,7 +291,9 @@ class EagleVerifyInput:
         paged_kernel_lens_sum: int,
         req_to_token: torch.Tensor,
         use_flashmla: bool = False,
+        max_seqlen_pad: Optional[int] = None,
     ):
+        print("generate_attn_arg_prefill for EagleVerifyInput")
         batch_size = len(req_pool_indices)
         qo_indptr = torch.arange(
             0,
@@ -297,31 +302,42 @@ class EagleVerifyInput:
             dtype=torch.int32,
             device="cuda",
         )
+
         cum_kv_seq_len = torch.zeros(
             (batch_size + 1,), dtype=torch.int32, device="cuda"
         )
 
         paged_kernel_lens = paged_kernel_lens + self.draft_token_num
-        cum_kv_seq_len[1:] = torch.cumsum(paged_kernel_lens, dim=0)
-
-        kv_indices = torch.empty(
-            paged_kernel_lens_sum + self.draft_token_num * batch_size,
-            dtype=torch.int32,
-            device="cuda",
-        )
 
         # todo: 
         if use_flashmla:
+            assert max_seqlen_pad is not None
+
+            # block_kv_indices for flashmla
+            kv_indices = torch.full(
+                (batch_size, max_seqlen_pad),
+                -1,
+                dtype=torch.int32,
+                device=req_pool_indices.device,
+            )
+
             create_flashmla_kv_indices_triton[(batch_size,)](
                 req_to_token,
                 req_pool_indices,
                 paged_kernel_lens,
                 None,
-                block_kv_indices,
+                kv_indices,
                 req_to_token.stride(0),
                 max_seqlen_pad,
             )
         else:
+            cum_kv_seq_len[1:] = torch.cumsum(paged_kernel_lens, dim=0)
+
+            kv_indices = torch.empty(
+                paged_kernel_lens_sum + self.draft_token_num * batch_size,
+                dtype=torch.int32,
+                device="cuda",
+            )
             create_flashinfer_kv_indices_triton[(batch_size,)](
                 req_to_token,
                 req_pool_indices,
