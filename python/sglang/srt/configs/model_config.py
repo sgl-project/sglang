@@ -108,6 +108,9 @@ class ModelConfig:
         self.is_audio_model = enable_multimodal and is_audio_model(
             self.hf_config.architectures
         )
+        self.is_cross_encoder_model = is_cross_encoder_model(
+            self.hf_config.architectures
+        )
         self.is_encoder_decoder = is_encoder_decoder_model(self.hf_config.architectures)
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
 
@@ -562,6 +565,10 @@ def is_image_gen_model(model_architectures: List[str]):
 
 def is_audio_model(model_architectures: List[str]):
     return False
+
+
+def is_cross_encoder_model(model_architectures: List[str]):
+    return "XLMRobertaForSequenceClassification" in model_architectures
 
 
 def is_encoder_decoder_model(model_architectures: List[str]):

@@ -14,6 +14,7 @@
 """Pydantic models for OpenAI API protocol"""
 
 import time
+import uuid
 from typing import Dict, List, Optional, Union
 
 from pydantic import BaseModel, Field, root_validator
@@ -474,3 +475,52 @@ class EmbeddingResponse(BaseModel):
     model: str
     object: str = "list"
     usage: Optional[UsageInfo] = None
+
+
+class ScoreRequest(BaseModel):
+    text_1: Union[str, List[str]]
+    text_2: Union[str, List[str]]
+    model: str
+
+
+class ScoreResponseData(BaseModel):
+    index: int
+    object: str = "score"
+    score: float
+
+
+class ScoreResponse(BaseModel):
+    id: str = Field(default_factory=lambda: f"embd-{uuid.uuid4().hex}")
+    object: str = "list"
+    created: int = Field(default_factory=lambda: int(time.time()))
+    model: str
+    data: list[ScoreResponseData]
+    usage: UsageInfo
+
+
+class RerankRequest(BaseModel):
+    model: str
+    query: str
+    documents: List[str]
+    top_n: int = 0
+
+
+class RerankDocument(BaseModel):
+    text: str
+
+
+class RerankResult(BaseModel):
+    index: int
+    document: RerankDocument
+    relevance_score: float
+
+
+class RerankUsage(BaseModel):
+    total_tokens: int
+
+
+class RerankResponse(BaseModel):
+    id: str
+    model: str
+    usage: RerankUsage
+    results: list[RerankResult]
