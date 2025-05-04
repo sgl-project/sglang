@@ -1511,16 +1511,22 @@ class DeepseekV2DecoderLayer(nn.Module):
                 )
                 dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
                 dp_scatter(residual, hidden_states, forward_batch)
-                hidden_states = self.post_attention_layernorm(hidden_states)
+                # TODO extract this bugfix
+                if hidden_states.shape[0] != 0:
+                    hidden_states = self.post_attention_layernorm(hidden_states)
             else:
                 hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                # TODO extract this bugfix
+                if hidden_states.shape[0] != 0:
+                    hidden_states, residual = self.post_attention_layernorm(
+                        hidden_states, residual
+                    )
+        else:
+            # TODO extract this bugfix
+            if hidden_states.shape[0] != 0:
                 hidden_states, residual = self.post_attention_layernorm(
                     hidden_states, residual
                 )
-        else:
-            hidden_states, residual = self.post_attention_layernorm(
-                hidden_states, residual
-            )
 
         # Fully Connected
         hidden_states = self.mlp(hidden_states)
