@@ -677,6 +677,8 @@ class TestMistral3_1Server(TestOpenAIVisionServer):
                 "--trust-remote-code",
                 "--chat-template",
                 "mistral",
+                "--mem-fraction-static",
+                "0.8",
             ],
         )
         cls.base_url += "/v1"
