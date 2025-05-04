@@ -680,10 +680,8 @@ class TestMistral3_1Server(TestOpenAIVisionServer):
                 "--trust-remote-code",
                 "--chat-template",
                 "mistral",
-                "--tp-size",
-                "2",  # for A100x2 setup
                 "--mem-fraction-static",
-                "0.73",
+                "0.8",
             ],
         )
         cls.base_url += "/v1"
