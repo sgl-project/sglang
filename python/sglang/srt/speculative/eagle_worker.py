@@ -334,6 +334,9 @@ class EAGLEWorker(TpModelWorker):
                 spec_info.verified_id.to(torch.int64)
             )
 
+        print("111 before: seq_lens", batch.seq_lens)
+        print("speculative_num_steps ", self.speculative_num_steps)
+
         # Allocate cache locations
         if self.page_size == 1:
             out_cache_loc, token_to_kv_pool_state_backup = batch.alloc_token_slots(
@@ -398,6 +401,7 @@ class EAGLEWorker(TpModelWorker):
             self.speculative_num_steps,
             self.page_size,
         )
+        print("111 mid: seq_lens", batch.seq_lens)
         batch.out_cache_loc = out_cache_loc
         batch.seq_lens_sum = torch.sum(batch.seq_lens).item()
         spec_info.positions = batch.seq_lens.repeat_interleave(self.topk, dim=0)
@@ -425,6 +429,7 @@ class EAGLEWorker(TpModelWorker):
             score_list, token_list, parents_list = self.draft_forward(forward_batch)
 
         self.token_to_kv_pool_allocator.restore_state(token_to_kv_pool_state_backup)
+        print("111 after: seq_lens", batch.seq_lens)
 
         ret = EagleVerifyInput.create(
             spec_info.verified_id,
@@ -437,6 +442,8 @@ class EAGLEWorker(TpModelWorker):
             self.speculative_num_steps,
             self.server_args.speculative_num_draft_tokens,
         )
+
+        print("111 token_list ", token_list)
         return ret
 
     def draft_forward(self, forward_batch: ForwardBatch):
@@ -515,6 +522,7 @@ class EAGLEWorker(TpModelWorker):
         logits_output.next_token_logits = logits_output.next_token_logits[
             res.accepeted_indices
         ]
+        print("111 accepted_indices ", res.accepeted_indices)
         logits_output.hidden_states = logits_output.hidden_states[res.accepeted_indices]
 
         # Prepare the batch for the next draft forwards.
