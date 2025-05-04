@@ -160,7 +160,7 @@ def _run_subprocess(
         torch.cuda.set_device(rank)
 
         base_gpu_id = rank // tp_size * tp_size
-        
+
         mesh_kwargs = dict(
             mesh_shape=(dp_size, tp_size, 1), mesh_dim_names=["dp", "tp", "pp"]
         )
@@ -197,7 +197,9 @@ def _run_subprocess(
 
             # test update weights
             print(f"subprocess[{rank=}] get_fsdp_state_dict", flush=True)
-            fsdp_state_dict = _get_fsdp_state_dict(hf_model=hf_model, world_size=dp_size * tp_size)
+            fsdp_state_dict = _get_fsdp_state_dict(
+                hf_model=hf_model, world_size=dp_size * tp_size
+            )
 
         engine = VerlEngine(
             model_path=model_path,

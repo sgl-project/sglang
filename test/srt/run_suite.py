@@ -99,7 +99,7 @@ suites = {
         TestFile("test_mla_tp.py", 170),
         TestFile("test_moe_ep.py", 181),
         TestFile("test_patch_torch.py", 19),
-        TestFile("test_update_weights_from_distributed.py", 103)
+        TestFile("test_update_weights_from_distributed.py", 103),
     ],
     "per-commit-4-gpu": [
         TestFile("test_verl_engine.py", 64),
