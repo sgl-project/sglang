@@ -54,7 +54,7 @@ class ChatTemplate:
 
 
 chat_template_registry: Dict[str, ChatTemplate] = {}
-matching_function_registry: List[Callable] = []
+matching_function_registry: Dict[str, Callable] = {}
 
 
 def register_chat_template(template):
@@ -62,7 +62,10 @@ def register_chat_template(template):
 
 
 def register_chat_template_matching_function(func):
-    matching_function_registry.append(func)
+    assert (
+        func.__name__ not in matching_function_registry
+    ), f"template matching function `{func.__name__}` already exists in registry"
+    matching_function_registry[func.__name__] = func
 
 
 def get_chat_template(name):
@@ -70,7 +73,7 @@ def get_chat_template(name):
 
 
 def get_chat_template_by_model_path(model_path):
-    for matching_func in matching_function_registry:
+    for _, matching_func in matching_function_registry.items():
         template = matching_func(model_path)
         if template is not None:
             return template
