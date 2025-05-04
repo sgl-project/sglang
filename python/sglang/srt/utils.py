@@ -39,6 +39,7 @@ import time
 import traceback
 import warnings
 from contextlib import contextmanager
+from dataclasses import field
 from enum import Enum
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
@@ -46,7 +47,19 @@ from importlib.util import find_spec
 from io import BytesIO
 from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Protocol, Set, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Protocol,
+    Set,
+    Tuple,
+    Union,
+)
 
 import numpy as np
 import psutil
@@ -2069,3 +2082,58 @@ class BumpAllocator:
         output = self._buffer[self._pointer : self._pointer + size]
         self._pointer += size
         return output
+
+
+def resolve_obj_by_qualname(qualname: str) -> Any:
+    """
+    Resolve an object by its fully qualified name.
+    """
+    module_name, obj_name = qualname.rsplit(".", 1)
+    module = importlib.import_module(module_name)
+    return getattr(module, obj_name)
+
+
+WeightsMapping = Mapping[str, Optional[str]]
+from dataclasses import dataclass
+
+
+@dataclass
+class WeightsMapper:
+    """Maps the name of each weight if they match the following patterns."""
+
+    orig_to_new_substr: WeightsMapping = field(default_factory=dict)
+    orig_to_new_prefix: WeightsMapping = field(default_factory=dict)
+    orig_to_new_suffix: WeightsMapping = field(default_factory=dict)
+
+    def _map_name(self, key: str) -> Optional[str]:
+        for substr, new_key in self.orig_to_new_substr.items():
+            if substr in key:
+                if new_key is None:
+                    return None
+
+                key = key.replace(substr, new_key, 1)
+
+        for prefix, new_key in self.orig_to_new_prefix.items():
+            if key.startswith(prefix):
+                if new_key is None:
+                    return None
+
+                key = key.replace(prefix, new_key, 1)
+
+        for suffix, new_key in self.orig_to_new_suffix.items():
+            if key.endswith(suffix):
+                if new_key is None:
+                    return None
+
+                key = new_key.join(key.rsplit(suffix, 1))
+
+        return key
+
+    def apply(
+        self, weights: Iterable[Tuple[str, torch.Tensor]]
+    ) -> Iterable[Tuple[str, torch.Tensor]]:
+        return (
+            (out_name, data)
+            for name, data in weights
+            if (out_name := self._map_name(name)) is not None
+        )

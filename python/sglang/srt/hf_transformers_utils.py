@@ -19,6 +19,7 @@ import warnings
 from pathlib import Path
 from typing import Dict, Optional, Type, Union
 
+import torch.nn as nn
 import transformers
 from huggingface_hub import snapshot_download
 from transformers import (
@@ -42,7 +43,7 @@ from sglang.srt.configs import (
 )
 from sglang.srt.configs.internvl import InternVLChatConfig
 from sglang.srt.connector import create_remote_connector
-from sglang.srt.utils import is_remote_url
+from sglang.srt.utils import is_remote_url, resolve_obj_by_qualname
 
 _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
     ChatGLMConfig.model_type: ChatGLMConfig,
@@ -290,3 +291,19 @@ def check_gguf_file(model: Union[str, os.PathLike]) -> bool:
     with open(model, "rb") as f:
         header = f.read(4)
     return header == b"GGUF"
+
+
+def get_cross_encoder_activation_function(config: PretrainedConfig):
+    if (
+        hasattr(config, "sbert_ce_default_activation_function")
+        and config.sbert_ce_default_activation_function is not None
+    ):
+
+        function_name = config.sbert_ce_default_activation_function
+        assert function_name.startswith("torch.nn.modules."), (
+            "Loading of activation functions is restricted to "
+            "torch.nn.modules for security reasons"
+        )
+        return resolve_obj_by_qualname(function_name)()
+    else:
+        return nn.Sigmoid() if config.num_labels == 1 else nn.Identity()

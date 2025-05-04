@@ -91,6 +91,7 @@ class ServingScores:
 
         from sglang.srt.openai_api.adapter import v1_embedding_request
 
+        tokenization_kwargs = None
         request_prompts: list[str] = []
         engine_prompts = []
 
@@ -98,7 +99,6 @@ class ServingScores:
             texts_1 = texts_1 * len(texts_2)
 
         input_pairs = [(t1, t2) for t1, t2 in zip(texts_1, texts_2)]
-
         tokenize_async = make_async(
             self.tokenizer_manager.tokenizer.__call__, executor=self._tokenizer_executor
         )
@@ -121,27 +121,27 @@ class ServingScores:
             request_prompts.append(request_prompt)
             engine_prompts.append(engine_prompt)
 
-        adapted_request, request = v1_embedding_request(
-            engine_prompts, self.tokenizer_manager
-        )
-
-        ret = await self.tokenizer_manager.generate_request(
-            adapted_request, raw_request
-        ).__anext__()
-
-        # Non-streaming response
         final_res_batch = [None] * len(engine_prompts)
-
         prompt_tokens = 0
-        for i in len(engine_prompts):
-            final_res_batch[i] = ret[i]["embedding"]
-            prompt_tokens += ret[i]["meta_info"]["prompt_tokens"]
+
+        for i, engine_prompt in enumerate(engine_prompts):
+
+            adapted_request, request = v1_embedding_request(
+                [engine_prompt], self.tokenizer_manager
+            )
+
+            ret = await self.tokenizer_manager.generate_request(
+                adapted_request, raw_request
+            ).__anext__()
+
+            final_res_batch[i] = ret["embedding"]
+            prompt_tokens += ret["meta_info"]["prompt_tokens"]
 
         score_data = []
         embed = [out for out in final_res_batch if out is not None]
-        for idx, emb in enumerate(embed):
 
-            _score_data = ScoreResponseData(index=idx, score=emb.item())
+        for idx, emb in enumerate(embed):
+            _score_data = ScoreResponseData(index=idx, score=emb)
             score_data.append(_score_data)
 
         score_response = ScoreResponse(
@@ -162,7 +162,10 @@ class ServingScores:
 
         if self.model_config.is_cross_encoder_model:
             return await self._cross_encoding_score(
-                model=request.model, texts_1=request.text_1, texts_2=request.text_2
+                model=request.model,
+                texts_1=request.text_1,
+                texts_2=request.text_2,
+                raw_request=raw_request,
             )
 
         else:
