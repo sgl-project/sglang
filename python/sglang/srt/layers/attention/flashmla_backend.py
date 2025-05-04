@@ -204,8 +204,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
 
         assert isinstance(spec_info, EagleVerifyInput)
 
-        
-        block_kv_indices, _, _, custom_mask = (
+        block_kv_indices, kv_indptr, qo_indptr, custom_mask = (
             spec_info.generate_attn_arg_prefill(
                 req_pool_indices=forward_batch.req_pool_indices,
                 paged_kernel_lens=forward_batch.seq_lens,
@@ -219,7 +218,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         
         mla_metadata, num_splits = get_mla_metadata(
             forward_batch.seq_lens.to(torch.int32),
-            draft_token_num * self.num_q_heads, # todo: draft_token_num * self.num_q_heads or 1 * self.num_q_heads?
+            Q_LEN * self.num_q_heads, # todo: draft_token_num * self.num_q_heads or 1 * self.num_q_heads?
             1,
         )
         self.forward_metadata = FlashMLADecodeMetadata(
@@ -458,6 +457,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 softmax_scale=layer.scaling,
                 causal=True,
             )
+            o = o.squeeze(0)
             return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
         else:
             print("flashmla forward_extend: flashmla -> flashinfer_mla")
