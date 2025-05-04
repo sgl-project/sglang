@@ -69,6 +69,7 @@ from sglang.srt.openai_api.protocol import (
     FunctionResponse,
     LogProbs,
     MultimodalEmbeddingInput,
+    RerankRequest,
     ScoreRequest,
     ToolCall,
     TopLogprob,
@@ -1856,6 +1857,23 @@ async def v1_scores(tokenizer_manager, raw_request: Request):
 
     try:
         ret = await handler._run_scoring(score_request, raw_request)
+    except ValueError as e:
+        return create_error_response(str(e))
+
+    return ret
+
+
+async def v1_rerank(tokenizer_manager, raw_request: Request):
+    try:
+        request_json = await raw_request.json()
+    except Exception as e:
+        return create_error_response("Invalid request body, error: ", str(e))
+
+    rerank_request = RerankRequest(**request_json)
+    handler = ServingScores(tokenizer_manager)
+
+    try:
+        ret = await handler.do_rerank(rerank_request, raw_request)
     except ValueError as e:
         return create_error_response(str(e))
 

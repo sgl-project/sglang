@@ -17,7 +17,6 @@ import traceback
 import urllib.request
 import weakref
 from concurrent.futures import ThreadPoolExecutor
-from functools import partial
 from io import BytesIO
 from json import dumps
 from typing import Any, Callable, List, Optional, Tuple, Type, Union
@@ -515,19 +514,3 @@ async def async_stream_and_merge(llm, prompt, sampling_params):
         cleaned_chunk = trim_overlap(final_text, chunk_text)
         final_text += cleaned_chunk
         yield cleaned_chunk  # yield the non-overlapping portion
-
-
-def make_async(func, executor: Optional[concurrent.futures.Executor] = None):
-    """Take a blocking function, and run it on in an executor thread.
-
-    This function prevents the blocking function from blocking the
-    asyncio event loop.
-    The code in this function needs to be thread safe.
-    """
-
-    def _async_wrapper(*args, **kwargs) -> asyncio.Future:
-        loop = asyncio.get_event_loop()
-        p_func = partial(func, *args, **kwargs)
-        return loop.run_in_executor(executor=executor, func=p_func)
-
-    return _async_wrapper

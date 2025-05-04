@@ -520,7 +520,7 @@ class RerankUsage(BaseModel):
 
 
 class RerankResponse(BaseModel):
-    id: str
+    id: str = Field(default_factory=lambda: f"rerank-{uuid.uuid4().hex}")
     model: str
     usage: RerankUsage
     results: list[RerankResult]

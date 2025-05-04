@@ -74,6 +74,7 @@ from sglang.srt.openai_api.adapter import (
     v1_delete_file,
     v1_embeddings,
     v1_files_create,
+    v1_rerank,
     v1_retrieve_batch,
     v1_retrieve_file,
     v1_retrieve_file_content,
@@ -584,9 +585,15 @@ async def openai_v1_embeddings(raw_request: Request):
     return response
 
 
-@app.post("/v1/score", response_class=ORJSONResponse)
-async def openai_v1_score(raw_request: Request):
+@app.post("/score", response_class=ORJSONResponse)
+async def score(raw_request: Request):
     response = await v1_scores(_global_state.tokenizer_manager, raw_request)
+    return response
+
+
+@app.post("/rerank", response_class=ORJSONResponse)
+async def rerank(raw_request: Request):
+    response = await v1_rerank(_global_state.tokenizer_manager, raw_request)
     return response
 
 
