@@ -977,6 +977,11 @@ class ModelRunner:
             raise ValueError(
                 f"Invalid attention backend: {self.server_args.attention_backend}"
             )
+        if not self.use_mla_backend:
+            from sglang.srt.layers.attention.flashinfer_backend import (
+                    FlashInferAttnBackend,
+                )
+            self.decode_attn_backend = FlashInferAttnBackend(self)
 
     def init_double_sparsity_channel_config(self, selected_channel):
         selected_channel = "." + selected_channel + "_proj"
@@ -1028,14 +1033,21 @@ class ModelRunner:
     def forward_decode(
         self, forward_batch: ForwardBatch, pp_proxy_tensors=None
     ) -> LogitsProcessorOutput:
-        self.attn_backend.init_forward_metadata(forward_batch)
         # FIXME: add pp_proxy_tensors arg to all models
         kwargs = {}
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
-        return self.model.forward(
-            forward_batch.input_ids, forward_batch.positions, forward_batch, **kwargs
-        )
+        if self.decode_attn_backend is not None:
+            forward_batch.attn_backend = self.decode_attn_backend
+            self.decode_attn_backend.init_forward_metadata(forward_batch)
+            return self.model.forward(
+                forward_batch.input_ids, forward_batch.positions, forward_batch, **kwargs
+            )
+        else:
+            self.attn_backend.init_forward_metadata(forward_batch)
+            return self.model.forward(
+                forward_batch.input_ids, forward_batch.positions, forward_batch, **kwargs
+            )
 
     def forward_extend(
         self,
