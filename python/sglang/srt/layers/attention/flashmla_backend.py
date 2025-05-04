@@ -109,6 +109,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             self.req_to_token.stride(0),
             max_seqlen_pad,
         )
+        # print("222 decode block_kv_indices ", block_kv_indices)
         mla_metadata, num_splits = get_mla_metadata(
             forward_batch.seq_lens.to(torch.int32),
             Q_LEN * self.num_q_heads,
@@ -204,7 +205,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         assert isinstance(spec_info, EagleVerifyInput)
 
         
-        block_kv_indices, _, qo_indptr, custom_mask = (
+        block_kv_indices, _, _, custom_mask = (
             spec_info.generate_attn_arg_prefill(
                 req_pool_indices=forward_batch.req_pool_indices,
                 paged_kernel_lens=forward_batch.seq_lens,
@@ -213,10 +214,12 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 use_flashmla=True,
             )
         )
+
+        # print("222 verify block_kv_indices ", block_kv_indices)
         
         mla_metadata, num_splits = get_mla_metadata(
             forward_batch.seq_lens.to(torch.int32),
-            1 * self.num_q_heads, # todo: draft_token_num * self.num_q_heads or 1 * self.num_q_heads?
+            draft_token_num * self.num_q_heads, # todo: draft_token_num * self.num_q_heads or 1 * self.num_q_heads?
             1,
         )
         self.forward_metadata = FlashMLADecodeMetadata(
@@ -243,7 +246,6 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         elif forward_batch.forward_mode.is_draft_extend():
             # should be the same as decode?
             assert forward_batch.spec_info is not None
-            # self.update_metadata_draft_extend(forward_batch)
             super().init_forward_metadata(forward_batch)
         elif forward_batch.forward_mode.is_target_verify():
             assert forward_batch.spec_info is not None
@@ -251,7 +253,6 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         else:
             # extend with flashinfer mla
             super().init_forward_metadata(forward_batch)
-            # self.update_metadata_extend(forward_batch)
 
     def init_cuda_graph_state(
         self,
@@ -386,7 +387,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
     ):
-        print("flashmla forward_decode: flashmla")
+        print("flashmla forward_decode: flashmla with q size = ", q.shape)
         cache_loc = forward_batch.out_cache_loc
 
         if k is not None:
@@ -412,7 +413,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             tile_scheduler_metadata=self.forward_metadata.flashmla_metadata,
             num_splits=self.forward_metadata.num_splits,
             softmax_scale=layer.scaling,
-            causal=False, # why casual = False?
+            causal=True, # why casual = False?
         )
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
@@ -427,6 +428,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         save_kv_cache: bool = True,
     ):
         print("flashmla forward_extend ", forward_batch.forward_mode)
+        print("flashmla forward_extend q size = ", q.shape)
         if forward_batch.forward_mode.is_target_verify():
             # todo: handle verify mode by flashmla
             cache_loc = forward_batch.out_cache_loc
@@ -496,9 +498,9 @@ class FlashMLAMultiStepDraftBackend:
         )
 
         # todo: kv_last_page_len_buf?????
-        self.q_indptr_decode = torch.arange(
-            0, max_bs + 1, dtype=torch.int32, device=model_runner.device
-        )
+        # self.q_indptr_decode = torch.arange(
+        #     0, max_bs + 1, dtype=torch.int32, device=model_runner.device
+        # )
 
         self.attn_backends = []
         for i in range(self.speculative_num_steps):
@@ -507,7 +509,7 @@ class FlashMLAMultiStepDraftBackend:
                     model_runner,
                     skip_prefill=True,
                     kv_indptr_buf=self.kv_indptr[i],
-                    kv_last_page_len_buf=self.q_indptr_decode,
+                    kv_last_page_len_buf=None,
                 )
             )
 
@@ -560,11 +562,11 @@ class FlashMLAMultiStepDraftBackend:
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         print("flashmla_mtp_backend init_forward_metadata", forward_batch.forward_mode)
-        max_blocks_per_seq = (self.max_context_len + PAGE_SIZE - 1) // PAGE_SIZE
+        # max_blocks_per_seq = (self.max_context_len + PAGE_SIZE - 1) // PAGE_SIZE
         kv_indices = torch.zeros(
             (
                 self.speculative_num_steps,
-                forward_batch.batch_size * self.topk * max_blocks_per_seq,
+                forward_batch.batch_size * self.topk * self.max_context_len,
             ),
             dtype=torch.int32,
             device="cuda",
