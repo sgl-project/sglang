@@ -158,7 +158,7 @@ class VerlEngine:
                 )
 
         if self._tp_rank == 0:
-            self._engine.tokenizer_manager.flush_cache()
+            self._engine.flush_cache()
 
     def release_memory_occupation(self):
         if self._tp_rank == 0:
