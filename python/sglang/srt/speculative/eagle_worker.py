@@ -346,9 +346,13 @@ class EAGLEWorker(TpModelWorker):
                     + num_new_pages * (self.page_size * self.topk)
                 )
                 extend_num_tokens = torch.sum(seq_lens - prefix_lens).item()
-                raise NotImplementedError(
-                    "page_size > 1 and top_k > 1 are not supported."
-                )
+                # flashinfer mla: support page_size > 1 and top_k > 1
+                if self.server_args.attention_backend == "flashinfer_mla":
+                    pass
+                else:
+                    raise NotImplementedError(
+                        "page_size > 1 and top_k > 1 are not supported."
+                    )
                 # TODO: Support page_size > 1 and top_k > 1
                 # 1. Duplicate the KV cache in the last partial page for all top-k segments
                 # 2. Modify generate_draft_decode_kv_indices accordingly
