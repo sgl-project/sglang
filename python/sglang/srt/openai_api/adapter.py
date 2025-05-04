@@ -966,32 +966,6 @@ def v1_chat_generate_request(
 
             if chat_template_name is None:
                 openai_compatible_messages = []
-                if (
-                    tools
-                    and tokenizer_manager.server_args.tool_call_parser == "deepseekv3"
-                ):
-                    # add function call prompt to deepseekv3
-                    openai_compatible_messages.append(
-                        {
-                            "role": "system",
-                            "content": """You are a helpful Assistant.
-                    ## Tools
-                    ### Function
-                    You have the following functions available:
-                    """
-                            + "".join(
-                                [
-                                    f"""
-                        - `{tool['name']}`:
-                        ```json
-                        {json.dumps(tool)}
-                        ```
-                        """
-                                    for tool in tools
-                                ]
-                            ),
-                        }
-                    )
 
                 for message in request.messages:
                     if message.content is None:
