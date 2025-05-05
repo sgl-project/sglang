@@ -112,6 +112,9 @@ class PrefillBootstrapQueue:
         kv_args.gpu_id = self.scheduler.gpu_id
         if self.scheduler.server_args.disaggregation_ib_device is None:
             kv_args.ib_device = get_rdma_devices_by_gpu_no(self.scheduler.gpu_id, n=2)
+            logger.info(
+                f"Using Auto Discoveried RDMA devices: {kv_args.ib_device} for prefill"
+            )
         else:
             kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
