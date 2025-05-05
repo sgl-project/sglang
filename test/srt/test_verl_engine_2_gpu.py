@@ -39,31 +39,11 @@ _ENABLE_UPDATE_WEIGHTS = True
 
 # TODO maybe we should add more other models? should we keep it in sync with test_generation_models.py?
 CI_MODELS = [
-    dict(
-        model_path="Qwen/Qwen2.5-0.5B",
-        dp_size=4,
-    ),
-    # Fail to run gemma-2-2b after transformers==4.48.3 -> 4.50.0
-    # dict(model_path="google/gemma-2-2b"),
 ]
 ALL_OTHER_MODELS = [
     dict(model_path="meta-llama/Llama-3.2-1B-Instruct"),
     dict(model_path="Qwen/Qwen2-1.5B"),
-    dict(
-        model_path="Qwen/Qwen2.5-14B-Instruct",
-        mem_fraction_static=0.4,
-        tp_size=8,
-        tight_memory=True,
-        decode_tolerance=1.3,
-    ),  # test_generation_models.py same config (qwen + tp=8) gives 1.22 decode error
-    dict(model_path="HuggingFaceTB/SmolLM-135M-Instruct", tp_size=3),
     dict(model_path="allenai/OLMo-1B-0724-hf"),
-    dict(
-        model_path="THUDM/glm-4-9b-chat",
-        mem_fraction_static=0.1,
-        tp_size=8,
-        tight_memory=True,
-    ),
     dict(model_path="allenai/OLMo-2-1124-7B-Instruct"),
     dict(
         model_path="ibm-granite/granite-3.0-2b-instruct",
