@@ -99,9 +99,7 @@ class TestPerTokenGroupQuantFP8(TestFP8Base):
             out_dtype=self.quant_type,
             device=self.device,
         )
-        A_quant, scale = per_token_group_quant_fp8(
-            x=A, group_size=self.group_size, dtype=self.quant_type
-        )
+        A_quant, scale = per_token_group_quant_fp8(x=A, group_size=self.group_size)
         torch.testing.assert_close(scale, scale_gt)
         diff = (A_quant.to(torch.float16) - A_quant_gt.to(torch.float16)).abs()
         diff_count = (diff > 1e-5).count_nonzero()

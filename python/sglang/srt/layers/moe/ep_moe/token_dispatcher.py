@@ -28,7 +28,7 @@ class DeepEPDispatchMode(IntEnum):
 
 class DeepEPBuffer:
 
-    _buffer: Optional[Buffer] = None
+    _buffer = None
     _dispatch_mode: Optional[DeepEPDispatchMode] = None
     _hidden_size: Optional[int] = None
     _num_max_dispatch_tokens_per_rank: Optional[int] = None
@@ -84,9 +84,7 @@ class DeepEPBuffer:
             num_nvl_bytes,
             num_rdma_bytes,
             low_latency_mode=deepep_mode.enable_low_latency(),
-            num_qps_per_rank=(
-                num_experts // group.size() if deepep_mode.enable_low_latency() else 1
-            ),
+            num_qps_per_rank=(max(num_experts // group.size(), Buffer.num_sms // 2)),
         )
         return cls._buffer
 
@@ -165,7 +163,7 @@ class _DeepEPDispatcherImplBase:
     def combine_b(self, *args, **kwargs):
         raise NotImplementedError
 
-    def _get_buffer(self) -> Buffer:
+    def _get_buffer(self):
         raise NotImplementedError
 
 

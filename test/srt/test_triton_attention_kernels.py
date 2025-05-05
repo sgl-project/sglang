@@ -127,6 +127,7 @@ class TestTritonAttention(CustomTestCase):
             kv_indptr,
             kv_indices,
             custom_mask,
+            True,
             mask_indptr,
             max_len_extend,
         )
@@ -161,6 +162,7 @@ class TestTritonAttention(CustomTestCase):
             kv_indptr,
             kv_indices,
             custom_mask,
+            True,
             mask_indptr,
             max_len_extend,
         )

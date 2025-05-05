@@ -14,7 +14,6 @@
 """DetokenizerManager is a process that detokenizes the token ids."""
 
 import dataclasses
-import json
 import logging
 import os
 import signal

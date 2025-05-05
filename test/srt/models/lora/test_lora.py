@@ -13,286 +13,176 @@
 # ==============================================================================
 
 import multiprocessing as mp
+import os
+import random
 import unittest
+from typing import List
 
-import torch
+from utils import (
+    ALL_OTHER_MULTI_LORA_MODELS,
+    CI_MULTI_LORA_MODELS,
+    TORCH_DTYPES,
+    LoRAModelCase,
+)
 
 from sglang.test.runners import HFRunner, SRTRunner
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, calculate_rouge_l, is_in_ci
 
-LORA_SETS = [
-    # {
-    #     "base": "meta-llama/Llama-2-7b-hf",
-    #     "loras": ["RuterNorway/Llama-2-7b-chat-norwegian-LoRa"],
-    # },
-    {"base": "meta-llama/Llama-2-7b-hf", "loras": ["winddude/wizardLM-LlaMA-LoRA-7B"]},
-    # {"base": "Qwen/Qwen2.5-14B-Instruct", "loras": ["mssongit/Qwen2.5-14B-SFT-LoRA"]},
-    # {"base": "mistralai/Mistral-7B-Instruct-v0.3", "loras": ["/home/ying/test_lora"]},
-    # {
-    # "base": "mistralai/Mistral-7B-Instruct-v0.3",
-    #     "loras": [
-    #         "/home/ying/test_lora",
-    #         "/home/ying/test_lora_1",
-    #         "/home/ying/test_lora_2",
-    #         "/home/ying/test_lora_3",
-    #         "/home/ying/test_lora_4",
-    #     ],
-    # },
-    # {"base": "meta-llama/Llama-2-7b-hf", "loras": ["yard1/llama-2-7b-sql-lora-test"]},
-]
-TORCH_DTYPES = [torch.float16]
-
-PROMPTS = [
+TEST_MULTIPLE_BATCH_PROMPTS = [
     """
-### Instruction:
-Write a poem about the transformers Python library.
-Mention the word "large language models" in that poem.
-### Response:
-The Transformers are large language models,
-They're used to make predictions on text.
-""",
+    ### Instruction:
+    Tell me about llamas and alpacas
+    ### Response:
+    Llamas are large, long-necked animals with a woolly coat. They have two toes on each foot instead of three like other camelids (camels, dromedaries). Llamas live in the Andean mountains of South America where they graze on grasses and shrubs. Alpaca is another name for domesticated llama. The word "alpaca" comes from an Incan language meaning "golden fleece." Alpacas look very similar to llamas but are smaller than their wild relatives. Both species were used by ancient people as pack animals and for meat. Today both llamas and alpacas are raised primarily for their fiber which can be spun into yarn or knitted into clothing.
+    ### Question 2:
+    What do you know about llamas?
+    ### Answer:
+    """,
     """
-### Instruction:
-Tell me about llamas and alpacas
-### Response:
-Llamas are large, long-necked animals with a woolly coat. They have two toes on each foot instead of three like other camelids (camels, dromedaries). Llamas live in the Andean mountains of South America where they graze on grasses and shrubs. Alpaca is another name for domesticated llama. The word "alpaca" comes from an Incan language meaning "golden fleece." Alpacas look very similar to llamas but are smaller than their wild relatives. Both species were used by ancient people as pack animals and for meat. Today both llamas and alpacas are raised primarily for their fiber which can be spun into yarn or knitted into clothing.
-### Question 2:
-What do you know about llamas?
-### Answer:
-""",
+    ### Instruction:
+    Write a poem about the transformers Python library.
+    Mention the word "large language models" in that poem.
+    ### Response:
+    The Transformers are large language models,
+    They're used to make predictions on text.
+    """,
+    "AI is a field of computer science focused on",
+    "Computer science is the study of",
+    "Write a short story.",
+    "What are the main components of a computer?",
 ]
-
-# import json
-#
-# with open("/home/ying/test_prompt/dialogue_choice_prompts.json", "r") as f:
-#     samples = json.load(f)
-# for sample in samples[:5]:
-#     assert sample[0]["role"] == "user"
-#     PROMPTS.append(sample[0]["content"][:2000])
 
 
 class TestLoRA(CustomTestCase):
 
-    def inference(self, prompts, lora_set, tp_size, torch_dtype, max_new_tokens):
-        print("=================== testing inference =======================")
-        base_path = lora_set["base"]
-        all_lora_paths = lora_set["loras"]
-        batch_lora_paths = [None]
-        i = 0
-        for _ in range(len(prompts) - 1):
-            batch_lora_paths.append(all_lora_paths[i])
-            i = (i + 1) % len(all_lora_paths)
-
-        with SRTRunner(
-            base_path,
-            torch_dtype=torch_dtype,
-            model_type="generation",
-            tp_size=tp_size,
-            lora_paths=all_lora_paths,
-            max_loras_per_batch=3,
-            disable_cuda_graph=True,
-            disable_radix_cache=True,
-        ) as srt_runner:
-            srt_outputs = srt_runner.forward(
-                prompts, max_new_tokens=max_new_tokens, lora_paths=batch_lora_paths
-            )
-            srt_outputs_lora_path_none = srt_runner.forward(
-                prompts,
-                max_new_tokens=max_new_tokens,
-                lora_paths=[None] * len(prompts),
-            )
-
-        with HFRunner(
-            base_path, torch_dtype=torch_dtype, model_type="generation"
-        ) as hf_runner:
-            hf_outputs = hf_runner.forward(
-                prompts, max_new_tokens=max_new_tokens, lora_paths=batch_lora_paths
-            )
-
-        with HFRunner(
-            base_path,
-            torch_dtype=torch_dtype,
-            model_type="generation",
-        ) as hf_runner:
-            hf_no_lora_outputs = hf_runner.forward(
-                prompts, max_new_tokens=max_new_tokens
-            )
-
-        with SRTRunner(
-            base_path,
-            tp_size=tp_size,
-            torch_dtype=torch_dtype,
-            model_type="generation",
-        ) as srt_runner:
-            srt_no_lora_outputs = srt_runner.forward(
-                prompts, max_new_tokens=max_new_tokens
-            )
-
-        for i in range(len(prompts)):
-            # compare input logprobs
-            hf_logprobs = torch.Tensor(hf_outputs.top_input_logprobs[i])
-            srt_logprobs = torch.Tensor(srt_outputs.top_input_logprobs[i])
-            hf_no_lora_logprobs = torch.Tensor(hf_no_lora_outputs.top_input_logprobs[i])
-            srt_no_lora_logprobs = torch.Tensor(
-                srt_no_lora_outputs.top_input_logprobs[i]
-            )
-            print(
-                "max input diff between hf_lora and srt_lora",
-                torch.max(abs(hf_logprobs - srt_logprobs)),
-            )
-            print(
-                "max input diff between srt_base and srt_lora",
-                torch.max(abs(srt_no_lora_logprobs - srt_logprobs)),
-            )
-            print(
-                "max input diff between srt_base and hf_base",
-                torch.max(abs(srt_no_lora_logprobs - hf_no_lora_logprobs)),
-            )
-            print(
-                "max input diff between hf_lora and hf_base",
-                torch.max(abs(hf_logprobs - hf_no_lora_logprobs)),
-            )
-
-            # compare output logprobs
-            hf_logprobs = torch.Tensor(hf_outputs.top_output_logprobs[i])
-            srt_logprobs = torch.Tensor(srt_outputs.top_output_logprobs[i])
-            # print(
-            #     "\noutput logprobs diff",
-            #     [
-            #         float(torch.max(abs(hf_logprobs[j] - srt_logprobs[j])))
-            #         for j in range(max_new_tokens)
-            #     ],
-            # )
-            print(
-                "max output diff between hf_lora and srt_lora",
-                torch.max(abs(hf_logprobs - srt_logprobs)),
-                "\n",
-            )
-
-        # compare output strings
-        print(f"{hf_outputs.output_strs=}")
-        print(f"{srt_outputs.output_strs=}")
-        print(f"{hf_no_lora_outputs.output_strs=}")
-        print(f"{srt_no_lora_outputs.output_strs=}")
-        print(f"{srt_outputs_lora_path_none.output_strs=}")
-        for i in range(len(prompts)):
-            assert srt_outputs.output_strs[i].strip(" ") == hf_outputs.output_strs[
-                i
-            ].strip(" "), (
-                srt_outputs.output_strs[i].strip(" "),
-                hf_outputs.output_strs[i].strip(" "),
-            )
-            assert (
-                srt_no_lora_outputs.output_strs[i].strip(" ")
-                == hf_no_lora_outputs.output_strs[i]
-            ), (
-                srt_no_lora_outputs.output_strs[i].strip(" "),
-                hf_no_lora_outputs.output_strs[i],
-            )
-            # assert srt_outputs_lora_path_none == srt_no_lora_outputs
-
-    def serving(self, prompts, lora_set, tp_size, torch_dtype, max_new_tokens):
-        print("=================== testing serving =======================")
-        # test batch forward
-        base_path = lora_set["base"]
-        all_lora_paths = lora_set["loras"]
-        batch_lora_paths = [None]
-        i = 0
-        for _ in range(len(prompts) - 1):
-            batch_lora_paths.append(all_lora_paths[i])
-            i = (i + 1) % len(all_lora_paths)
-
-        with SRTRunner(
-            base_path,
-            tp_size=tp_size,
-            torch_dtype=torch_dtype,
-            model_type="generation",
-            lora_paths=all_lora_paths,
-            max_loras_per_batch=3,
-            disable_cuda_graph=True,
-            disable_radix_cache=True,
-        ) as srt_runner:
-            srt_outputs = srt_runner.batch_forward(
-                prompts, max_new_tokens=max_new_tokens, lora_paths=batch_lora_paths
-            )
-
-        with HFRunner(
-            base_path,
-            torch_dtype=torch_dtype,
-            model_type="generation",
-            output_str_only=True,
-        ) as hf_runner:
-            hf_outputs = hf_runner.forward(
-                prompts, max_new_tokens=max_new_tokens, lora_paths=batch_lora_paths
-            )
-
-        # compare output strings
-        print(f"{hf_outputs.output_strs=}")
-        print(f"{srt_outputs.output_strs=}")
-        for i in range(len(prompts)):
-            assert srt_outputs.output_strs[i].strip(" ") == hf_outputs.output_strs[i], (
-                srt_outputs.output_strs[i].strip(" "),
-                hf_outputs.output_strs[i],
-            )
-
-    def base_inference(self, prompts, lora_set, tp_size, torch_dtype, max_new_tokens):
-        print("=================== testing base inference =======================")
-        base_path = lora_set["base"]
-        all_lora_paths = lora_set["loras"]
-        batch_lora_paths = [None] * len(prompts)
-
-        with SRTRunner(
-            base_path,
-            tp_size=tp_size,
-            torch_dtype=torch_dtype,
-            model_type="generation",
-        ) as srt_runner:
-            srt_no_lora_outputs = srt_runner.forward(
-                prompts, max_new_tokens=max_new_tokens
-            )
-
-        with SRTRunner(
-            base_path,
-            tp_size=tp_size,
-            torch_dtype=torch_dtype,
-            model_type="generation",
-            lora_paths=all_lora_paths,
-        ) as srt_runner:
-            srt_outputs = srt_runner.forward(
-                prompts, max_new_tokens=max_new_tokens, lora_paths=batch_lora_paths
-            )
-
-        for i in range(len(prompts)):
-            srt_no_lora_logprobs = torch.Tensor(
-                srt_no_lora_outputs.top_input_logprobs[i]
-            )
-            srt_logprobs = torch.Tensor(srt_outputs.top_input_logprobs[i])
-            print("max_diff", torch.max(abs(srt_no_lora_logprobs - srt_logprobs)))
-
-        print(f"{srt_no_lora_outputs.output_strs=}")
-        print(f"{srt_outputs.output_strs=}")
-
-        for i in range(len(prompts)):
-            assert srt_outputs.output_strs[i].strip(" ") == hf_outputs.output_strs[i], (
-                srt_outputs.output_strs[i].strip(" "),
-                hf_outputs.output_strs[i],
-            )
-            assert (
-                srt_no_lora_outputs[i].output_strs.strip(" ")
-                == hf_no_lora_outputs[i].output_strs
-            )
-
-    def test_all(self):
-        for lora_set in LORA_SETS:
-            # self.load_lora_adapter(lora_set, 1)
+    def _run_lora_multiple_batch_on_model_cases(self, model_cases: List[LoRAModelCase]):
+        for model_case in model_cases:
             for torch_dtype in TORCH_DTYPES:
-                tp_size = 1
                 max_new_tokens = 32
-                self.inference(PROMPTS, lora_set, tp_size, torch_dtype, max_new_tokens)
-                # self.serving(PROMPTS, lora_set, tp_size, torch_dtype, max_new_tokens)
-                # self.base_inference(
-                #     PROMPTS, lora_set, tp_size, torch_dtype, max_new_tokens
-                # )
+                backend = "triton"
+                base_path = model_case.base
+                lora_adapter_paths = [a.name for a in model_case.adaptors]
+                assert len(lora_adapter_paths) >= 2
+
+                batches = [
+                    (
+                        [
+                            random.choice(TEST_MULTIPLE_BATCH_PROMPTS),
+                            random.choice(TEST_MULTIPLE_BATCH_PROMPTS),
+                            random.choice(TEST_MULTIPLE_BATCH_PROMPTS),
+                        ],
+                        [
+                            None,
+                            lora_adapter_paths[0],
+                            lora_adapter_paths[1],
+                        ],
+                    ),
+                    (
+                        [
+                            random.choice(TEST_MULTIPLE_BATCH_PROMPTS),
+                            random.choice(TEST_MULTIPLE_BATCH_PROMPTS),
+                            random.choice(TEST_MULTIPLE_BATCH_PROMPTS),
+                        ],
+                        [
+                            lora_adapter_paths[0],
+                            None,
+                            lora_adapter_paths[1],
+                        ],
+                    ),
+                    (
+                        [
+                            random.choice(TEST_MULTIPLE_BATCH_PROMPTS),
+                            random.choice(TEST_MULTIPLE_BATCH_PROMPTS),
+                            random.choice(TEST_MULTIPLE_BATCH_PROMPTS),
+                        ],
+                        [lora_adapter_paths[0], lora_adapter_paths[1], None],
+                    ),
+                    (
+                        [
+                            random.choice(TEST_MULTIPLE_BATCH_PROMPTS),
+                            random.choice(TEST_MULTIPLE_BATCH_PROMPTS),
+                            random.choice(TEST_MULTIPLE_BATCH_PROMPTS),
+                        ],
+                        [None, lora_adapter_paths[1], None],
+                    ),
+                    (
+                        [
+                            random.choice(TEST_MULTIPLE_BATCH_PROMPTS),
+                            random.choice(TEST_MULTIPLE_BATCH_PROMPTS),
+                            random.choice(TEST_MULTIPLE_BATCH_PROMPTS),
+                        ],
+                        [None, None, None],
+                    ),
+                ]
+
+                print(
+                    f"\n========== Testing multiple batches on base '{base_path}' with backend={backend}, dtype={torch_dtype} ---"
+                )
+
+                # Initialize runners
+                srt_runner = SRTRunner(
+                    base_path,
+                    torch_dtype=torch_dtype,
+                    model_type="generation",
+                    lora_paths=[lora_adapter_paths[0], lora_adapter_paths[1]],
+                    max_loras_per_batch=len(lora_adapter_paths) + 1,
+                    lora_backend=backend,
+                    disable_radix_cache=True,
+                )
+                hf_runner = HFRunner(
+                    base_path, torch_dtype=torch_dtype, model_type="generation"
+                )
+
+                with srt_runner, hf_runner:
+                    for i, (prompts, lora_paths) in enumerate(batches):
+                        print(
+                            f"\n--- Running Batch {i+1} --- prompts: {prompts}, lora_paths: {lora_paths}"
+                        )
+
+                        srt_outputs = srt_runner.batch_forward(
+                            prompts,
+                            max_new_tokens=max_new_tokens,
+                            lora_paths=lora_paths,
+                        )
+
+                        hf_outputs = hf_runner.forward(
+                            prompts,
+                            max_new_tokens=max_new_tokens,
+                            lora_paths=lora_paths,
+                        )
+
+                        print("SRT outputs:", [s for s in srt_outputs.output_strs])
+                        print("HF outputs:", [s for s in hf_outputs.output_strs])
+
+                        for srt_out, hf_out in zip(
+                            srt_outputs.output_strs, hf_outputs.output_strs
+                        ):
+                            srt_str = srt_out.strip()
+                            hf_str = hf_out.strip()
+                            rouge_tol = model_case.rouge_l_tolerance
+                            rouge_score = calculate_rouge_l([srt_str], [hf_str])[0]
+                            if rouge_score < rouge_tol:
+                                raise AssertionError(
+                                    f"ROUGE-L score {rouge_score} below tolerance {rouge_tol} "
+                                    f"for base '{base_path}', adaptor '{lora_paths}', backend '{backend}', prompt: '{prompts}...'"
+                                )
+
+                        print(f"--- Batch {i+1} Comparison Passed --- ")
+
+    def test_ci_lora_models(self):
+        self._run_lora_multiple_batch_on_model_cases(CI_MULTI_LORA_MODELS)
+
+    def test_all_lora_models(self):
+        if is_in_ci():
+            return
+
+        filtered_models = []
+        for model_case in ALL_OTHER_MULTI_LORA_MODELS:
+            if "ONLY_RUN" in os.environ and os.environ["ONLY_RUN"] != model_case.base:
+                continue
+            filtered_models.append(model_case)
+
+        self._run_lora_multiple_batch_on_model_cases(filtered_models)
 
 
 if __name__ == "__main__":
