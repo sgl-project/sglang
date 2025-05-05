@@ -38,8 +38,7 @@ _ENABLE_UPDATE_WEIGHTS = True
 # _ENABLE_UPDATE_WEIGHTS = False
 
 # TODO maybe we should add more other models? should we keep it in sync with test_generation_models.py?
-CI_MODELS = [
-]
+CI_MODELS = []
 ALL_OTHER_MODELS = [
     dict(model_path="meta-llama/Llama-3.2-1B-Instruct"),
     dict(model_path="Qwen/Qwen2-1.5B"),
