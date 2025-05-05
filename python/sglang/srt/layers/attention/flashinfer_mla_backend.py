@@ -9,12 +9,19 @@ and uses BatchMLAPaged wrapper for decoding.
 More details can be found in https://docs.flashinfer.ai/api/mla.html
 """
 
+import os
 from dataclasses import dataclass
 from functools import partial
 from typing import TYPE_CHECKING, Callable, Optional, Union
 
 import torch
 import triton
+
+if os.environ["SGLANG_ENABLE_TORCH_COMPILE"] == "1":
+    import logging
+
+    torch._logging.set_logs(dynamo=logging.ERROR)
+    torch._dynamo.config.suppress_errors = True
 
 from sglang.global_config import global_config
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -388,14 +395,17 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                     k,
                     v,
                 )
+
+        # Reshape inputs
         reshaped_q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
         k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-        reshaped_k = k_buffer.view(-1, 1, layer.head_dim)
+
+        # Direct call to run without the wrapper
         o = decode_wrapper.run(
             reshaped_q[:, :, : layer.v_head_dim],
             reshaped_q[:, :, layer.v_head_dim :],
-            reshaped_k[:, :, : layer.v_head_dim],
-            reshaped_k[:, :, layer.v_head_dim :],
+            k_buffer[:, :, : layer.v_head_dim],
+            k_buffer[:, :, layer.v_head_dim :],
         )
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
@@ -825,16 +835,18 @@ def fast_mla_decode_plan(
     self._sm_scale = sm_scale
 
     with self.device as device:
-        stream = torch.cuda.current_stream(device).cuda_stream
-        self._cached_module.plan(
-            self._float_workspace_buffer,
-            self._int_workspace_buffer,
-            self._pin_memory_int_workspace_buffer,
-            qo_indptr_cpu,
-            kv_indptr_cpu,
-            kv_len_arr_cpu,
-            num_heads,
-            head_dim_ckv,
-            causal,
-            stream,
-        )
+        try:
+            # Standard version with just the required arguments (no use_profiler)
+            self._cached_module.plan.default(
+                self._float_workspace_buffer,
+                self._int_workspace_buffer,
+                self._pin_memory_int_workspace_buffer,
+                qo_indptr_cpu,
+                kv_indptr_cpu,
+                kv_len_arr_cpu,
+                num_heads,
+                head_dim_ckv,
+                causal,
+            )
+        except Exception as e:
+            raise RuntimeError(f"Error in alternate MLA plan: {e}")
