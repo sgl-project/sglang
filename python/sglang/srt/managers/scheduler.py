@@ -507,7 +507,11 @@ class Scheduler(
             self.tree_cache = ChunkCache(
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+<<<<<<< HEAD
                 token_to_kv_pool_allocator_local=self.token_to_kv_pool_allocator_local,
+=======
+                page_size=self.page_size,
+>>>>>>> f8e46093 (Fix prefill OOM error in the case of large page size (#5081))
             )
         else:
             if self.enable_hierarchical_cache:
