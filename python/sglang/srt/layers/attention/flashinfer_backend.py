@@ -16,8 +16,9 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Union
 import torch
 
 if os.environ["SGLANG_ENABLE_TORCH_COMPILE"] == "1":
-    import torch._dynamo
+    import logging
 
+    torch._logging.set_logs(dynamo=logging.ERROR)
     torch._dynamo.config.suppress_errors = True
 
 from sglang.global_config import global_config
