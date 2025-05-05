@@ -263,14 +263,15 @@ class EAGLEWorker(TpModelWorker):
         """
         print("xxx eagle worker forward_mode", batch.forward_mode)
         if batch.forward_mode.is_decode():
-            print("xxx eagle worker forward_mode decode 1")
+            # print("xxx eagle worker forward_mode decode 1 seq_lens", batch.seq_lens)
             with self.draft_tp_context(self.draft_model_runner.tp_group):
-                print("xxx eagle worker forward_mode decode 2 draft")
+                print("xxx eagle worker forward_mode decode 2 draft seq_lens", batch.seq_lens)
                 spec_info = self.draft(batch)
-            print("xxx eagle worker forward_mode decode 3 verify")
+            print("xxx eagle worker forward_mode decode 3 verify seq_lens", batch.seq_lens)
             logits_output, verify_output, model_worker_batch = self.verify(
                 batch, spec_info
             )
+            print("xxx eagle worker forward_mode decode 4 last seq_lens", batch.seq_lens)
 
             # If it is None, it means all requests are finished
             if batch.spec_info.verified_id is not None:
