@@ -21,7 +21,7 @@ import os
 import time
 from collections import namedtuple
 from contextlib import contextmanager
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 import tqdm
@@ -31,6 +31,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
+    PPProxyTensors,
 )
 from sglang.srt.utils import is_hpu
 
@@ -366,7 +367,10 @@ class HPUGraphRunner:
         return logits_output
 
     def replay(
-        self, forward_batch: ForwardBatch, skip_attn_backend_init: bool = False
+        self,
+        forward_batch: ForwardBatch,
+        skip_attn_backend_init: bool = False,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> LogitsProcessorOutput:
         if not skip_attn_backend_init:
             self.model_runner.attn_backend.init_forward_metadata(forward_batch)
