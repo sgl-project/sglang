@@ -1,6 +1,9 @@
 """
 Usage:
-python3 -m unittest test_flash_mla_attention_backend.TestFlashMLAAttnBackend.test_mmlu
+python3 -m unittest test.srt.test_flashmla_attn.TestFlashMLAAttnBackend.test_mmlu
+
+Or if you are in the test/srt directory:
+python3 -m unittest test_flashmla_attn.TestFlashMLAAttnBackend.test_mmlu
 """
 
 import unittest
