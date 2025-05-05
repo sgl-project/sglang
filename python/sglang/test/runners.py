@@ -423,6 +423,10 @@ class HFRunner:
                     )
                 del input_logits
 
+            if lora_paths is not None and lora_paths[i] is not None:
+                # Unload the LoRA adapter if it is used
+                model.unload()
+
         return ModelOutput(
             output_strs=output_strs,
             top_input_logprobs=top_input_logprobs,

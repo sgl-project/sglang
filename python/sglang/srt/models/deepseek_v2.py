@@ -421,6 +421,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         reduce_results: bool = True,
         layer_id: int = None,
         prefix: str = "",
+        alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         super().__init__()
         self.layer_id = layer_id
@@ -542,6 +543,8 @@ class DeepseekV2AttentionMLA(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("attn_mha", prefix),
         )
+
+        self.alt_stream = alt_stream
 
         self.w_kc = None
         self.w_vc = None
@@ -706,14 +709,32 @@ class DeepseekV2AttentionMLA(nn.Module):
             q, latent_cache = self.fused_qkv_a_proj_with_mqa(hidden_states)[0].split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
             )
-            q = self.q_a_layernorm(q)
+            k_nope = latent_cache[..., : self.kv_lora_rank]
+
+            # overlap qk norm
+            if self.alt_stream is not None and torch.cuda.is_current_stream_capturing():
+                current_stream = torch.cuda.current_stream()
+                self.alt_stream.wait_stream(current_stream)
+                q = self.q_a_layernorm(q)
+                with torch.cuda.stream(self.alt_stream):
+                    k_nope = self.kv_a_layernorm(k_nope)
+                current_stream.wait_stream(self.alt_stream)
+            else:
+                q = self.q_a_layernorm(q)
+                k_nope = self.kv_a_layernorm(k_nope)
+
+            k_nope = k_nope.unsqueeze(1)
             q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
         else:
             q = self.q_proj(hidden_states)[0].view(
                 -1, self.num_local_heads, self.qk_head_dim
             )
             latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
+            k_nope = latent_cache[..., : self.kv_lora_rank]
+            k_nope = self.kv_a_layernorm(k_nope).unsqueeze(1)
+
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
 
         if self.use_deep_gemm_bmm:
             q_nope_val, q_nope_scale, masked_m, expected_m, aligned_m = (
@@ -750,21 +771,15 @@ class DeepseekV2AttentionMLA(nn.Module):
             q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
 
         q_nope_out = q_nope_out.transpose(0, 1)
-
-        k_nope = latent_cache[..., : self.kv_lora_rank]
-        k_nope = self.kv_a_layernorm(k_nope).unsqueeze(1)
-        k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
-
         q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
-
-        k = torch.cat([k_nope, k_pe], dim=-1)
 
         if self.attention_backend == "fa3":
             attn_output = self.attn_mqa(
-                q_nope_out, k, k_nope, forward_batch, q_rope=q_pe
+                q_nope_out, k_nope, k_nope, forward_batch, q_rope=q_pe, k_rope=k_pe
             )
         else:
             q = torch.cat([q_nope_out, q_pe], dim=-1)
+            k = torch.cat([k_nope, k_pe], dim=-1)
             attn_output = self.attn_mqa(q, k, k_nope, forward_batch)
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
@@ -1105,6 +1120,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         is_nextn: bool = False,
         prefix: str = "",
+        alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -1134,6 +1150,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             layer_id=layer_id,
             reduce_results=False,
             prefix=add_prefix("self_attn", prefix),
+            alt_stream=alt_stream,
         )
 
         self.info = self._compute_info(config, layer_id=layer_id, is_nextn=is_nextn)
@@ -1377,6 +1394,7 @@ class DeepseekV2Model(nn.Module):
             config.hidden_size,
             enable_tp=not global_server_args_dict["enable_dp_attention"],
         )
+        self.alt_stream = torch.cuda.Stream()
         self.layers = nn.ModuleList(
             [
                 DeepseekV2DecoderLayer(
@@ -1384,6 +1402,7 @@ class DeepseekV2Model(nn.Module):
                     layer_id,
                     quant_config=quant_config,
                     prefix=add_prefix(f"layers.{layer_id}", prefix),
+                    alt_stream=self.alt_stream,
                 )
                 for layer_id in range(config.num_hidden_layers)
             ]
@@ -1391,6 +1410,9 @@ class DeepseekV2Model(nn.Module):
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         self.dp_size = get_attention_dp_size()
+
+    def get_input_embeddings(self) -> torch.Tensor:
+        return self.embed_tokens
 
     def forward(
         self,
@@ -1503,11 +1525,20 @@ class DeepseekV2ForCausalLM(nn.Module):
             input_ids, hidden_states, self.lm_head, forward_batch
         )
 
-    def post_load_weights(self):
+    def post_load_weights(self, is_nextn=False):
 
         # Perform post-processing after loading weights
-        for layer_id in range(self.config.num_hidden_layers):
-            self_attn = self.model.layers[layer_id].self_attn
+        layer_ids = (
+            range(self.config.num_hidden_layers)
+            if not is_nextn
+            else [self.config.num_hidden_layers]
+        )
+        for layer_id in layer_ids:
+            self_attn = (
+                self.model.layers[layer_id].self_attn
+                if not is_nextn
+                else self.model.decoder.self_attn
+            )
             if hasattr(self_attn.kv_b_proj, "qweight"):
                 # AWQ compatible
                 if _is_cuda:
@@ -1613,7 +1644,20 @@ class DeepseekV2ForCausalLM(nn.Module):
                 self_attn.w_vc = w_vc.contiguous()
                 self_attn.use_deep_gemm_bmm = True
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
+        if is_nextn:
+            if hasattr(self.config, "num_nextn_predict_layers"):
+                num_nextn_layers = self.config.num_nextn_predict_layers
+                assert num_nextn_layers == 1, "Only 1 nextn layer is supportted"
+                # compatible with old design
+                nextn_layer_id = (
+                    0
+                    if self.config.num_hidden_layers == 1
+                    else self.config.num_hidden_layers
+                )
+            else:
+                raise ValueError("num_nextn_predict_layers is not in the config")
+
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("gate_up_proj", "gate_proj", 0),
@@ -1641,12 +1685,19 @@ class DeepseekV2ForCausalLM(nn.Module):
                     "up_proj.weight_scale_inv",
                 ]
             names_to_remove = []
-            for moe_layer in tqdm(
+
+            moe_layers = (
                 range(
                     self.config.first_k_dense_replace,
                     self.config.num_hidden_layers,
                     self.config.moe_layer_freq,
-                ),
+                )
+                if not is_nextn
+                else [nextn_layer_id]
+            )
+
+            for moe_layer in tqdm(
+                moe_layers,
                 desc=f"Cloning {self.n_share_experts_fusion} "
                 "replicas of the shared expert into MoE",
             ):
@@ -1687,18 +1738,46 @@ class DeepseekV2ForCausalLM(nn.Module):
         )
         cached_a_proj = {} if fuse_qkv_a_proj else None
 
+        if is_nextn:
+            nextn_layer_prefix = f"model.layers.{nextn_layer_id}"
+            nextn_spec_weight_names = [
+                "shared_head.norm",
+                "eh_proj",
+                "enorm",
+                "hnorm",
+            ]
+
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
-            # TODO(HandH1998): Modify it when nextn is supported.
-            if hasattr(self.config, "num_nextn_predict_layers"):
-                num_nextn_layers = self.config.num_nextn_predict_layers
-                if num_nextn_layers > 0 and name.startswith("model.layers"):
-                    name_list = name.split(".")
-                    if (
-                        len(name_list) >= 3
-                        and int(name_list[2]) >= self.config.num_hidden_layers
-                    ):
-                        continue
+            if not is_nextn:
+                if hasattr(self.config, "num_nextn_predict_layers"):
+                    num_nextn_layers = self.config.num_nextn_predict_layers
+                    if num_nextn_layers > 0 and name.startswith("model.layers"):
+                        name_list = name.split(".")
+                        if (
+                            len(name_list) >= 3
+                            and int(name_list[2]) >= self.config.num_hidden_layers
+                        ):
+                            continue
+            else:
+                if not name.startswith(nextn_layer_prefix):
+                    continue
+
+                # Use shared head and embed weights from target model
+                if "shared_head.head" in name or "embed_tokens" in name:
+                    continue
+
+                is_decoder = True
+                # For nextn specific weights
+                for weight_name in nextn_spec_weight_names:
+                    if weight_name in name:
+                        name = name.replace(nextn_layer_prefix, "model")
+                        is_decoder = False
+                        break
+                # For decoder layer weights
+                if is_decoder:
+                    name = name.replace(nextn_layer_prefix, "model.decoder")
+
             if "rotary_emb.inv_freq" in name:
                 continue
             for param_name, weight_name, shard_id in stacked_params_mapping:
@@ -1787,7 +1866,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                         )
                         weight_loader(param, loaded_weight)
 
-        self.post_load_weights()
+        self.post_load_weights(is_nextn=is_nextn)
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
