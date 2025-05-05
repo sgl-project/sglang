@@ -96,6 +96,7 @@ from sglang.srt.utils import (
     monkey_patch_vllm_gguf_config,
     set_cpu_offload_max_bytes,
     set_cuda_arch,
+    get_scheduler_device,
 )
 
 _is_hpu = is_hpu()
@@ -834,7 +835,7 @@ class ModelRunner:
             self.req_to_token_pool = ReqToTokenPool(
                 size=max_num_reqs + 1,
                 max_context_len=self.model_config.context_len + 4,
-                device=self.device,
+                device=get_scheduler_device(self.device),
                 enable_memory_saver=self.server_args.enable_memory_saver,
             )
         else:
@@ -891,7 +892,7 @@ class ModelRunner:
                 self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
                     self.max_total_num_tokens,
                     dtype=self.kv_cache_dtype,
-                    device=self.device,
+                    device=get_scheduler_device(self.device),
                     kvcache=self.token_to_kv_pool,
                 )
             else:
@@ -900,7 +901,7 @@ class ModelRunner:
                         self.max_total_num_tokens,
                         page_size=self.page_size,
                         dtype=self.kv_cache_dtype,
-                        device=self.device,
+                        device=get_scheduler_device(self.device),
                         kvcache=self.token_to_kv_pool,
                     )
                 else:
@@ -908,7 +909,7 @@ class ModelRunner:
                         self.max_total_num_tokens,
                         page_size=self.page_size,
                         dtype=self.kv_cache_dtype,
-                        device=self.device,
+                        device=get_scheduler_device(self.device),
                         kvcache=self.token_to_kv_pool,
                     )
         else:
