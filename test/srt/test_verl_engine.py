@@ -39,7 +39,10 @@ _ENABLE_UPDATE_WEIGHTS = True
 
 # TODO maybe we should add more other models? should we keep it in sync with test_generation_models.py?
 CI_MODELS = [
-    dict(model_path="meta-llama/Llama-3.1-8B-Instruct"),
+    dict(
+        model_path="Qwen/Qwen2.5-0.5B",
+        dp_size=4,
+    ),
     # Fail to run gemma-2-2b after transformers==4.48.3 -> 4.50.0
     # dict(model_path="google/gemma-2-2b"),
 ]
@@ -83,7 +86,7 @@ class TestVerlEngine(CustomTestCase):
         index: int,
         model_path: str,
         mem_fraction_static: float = 0.4,
-        dp_size: int = 2,
+        dp_size: int = 1,
         tp_size: int = 2,
         tight_memory: bool = False,
         prefill_tolerance: float = 0.1,
@@ -167,7 +170,7 @@ def _run_subprocess(
         inference_device_mesh_device = init_device_mesh("cuda", **mesh_kwargs)
         inference_device_mesh_cpu = init_device_mesh("cpu", **mesh_kwargs)
         print(
-            f"subprocess[{rank=},{torch.cuda.current_device()}] {inference_device_mesh_device=} {inference_device_mesh_cpu=}"
+            f"subprocess[{rank=},{base_gpu_id=}] {inference_device_mesh_device=} {inference_device_mesh_cpu=}"
         )
 
         # hf model is used for comparison
