@@ -15,7 +15,7 @@ PD Disaggregation resolves these by separating the two stages, enabling tailored
 
 For the design details, please refer to [link](https://docs.google.com/document/d/1rQXJwKd5b9b1aOzLh98mnyMhBMhlxXA5ATZTHoQrwvc/edit?tab=t.0).
 
-Currently, we support Mooncake and NIXL as the transfer engine. 
+Currently, we support Mooncake and NIXL as the transfer engine.
 
 
 ## Mooncake
@@ -36,7 +36,7 @@ TODO
 ```bash
 $ python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --disaggregation-mode prefill --disaggregation-ib-device mlx5_roce0
 $ python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --disaggregation-mode decode --port 30001 --base-gpu-id 1 --disaggregation-ib-device mlx5_roce0
-$ python -m sglang.srt.disaggregation.mini_lb --prefill http://127.0.0.1:30000 --decode http://127.0.0.1:30001 --host 0.0.0.0 --port 8000  
+$ python -m sglang.srt.disaggregation.mini_lb --prefill http://127.0.0.1:30000 --decode http://127.0.0.1:30001 --host 0.0.0.0 --port 8000
 ```
 
 ### Llama Multi-Node
