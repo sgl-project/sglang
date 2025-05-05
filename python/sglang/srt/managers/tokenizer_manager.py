@@ -442,6 +442,10 @@ class TokenizerManager:
         # Tokenize
         input_embeds = None
         input_text = obj.text
+        token_type_ids = None
+        is_cross_encoder_request = (
+            isinstance(obj, EmbeddingReqInput) and obj.is_cross_encoder_request
+        )
         if obj.input_embeds is not None:
             if not self.server_args.disable_radix_cache:
                 raise ValueError(
@@ -460,7 +464,14 @@ class TokenizerManager:
                     "accept text prompts. Please provide input_ids or re-initialize "
                     "the engine with skip_tokenizer_init=False."
                 )
-            input_ids = self.tokenizer.encode(input_text)
+            encoded = self.tokenizer(
+                input_text, return_token_type_ids=is_cross_encoder_request
+            )
+
+            input_ids = encoded["input_ids"]
+            if is_cross_encoder_request:
+                input_ids = encoded["input_ids"][0]
+                token_type_ids = encoded.get("token_type_ids", [None])[0]
 
         image_inputs: Optional[Dict] = None
         if obj.contains_mm_input():
@@ -573,6 +584,7 @@ class TokenizerManager:
                 input_text,
                 input_ids,
                 image_inputs,
+                token_type_ids,
                 sampling_params,
             )
 
