@@ -8,6 +8,7 @@ from typing import List, Optional
 
 import numpy as np
 import PIL
+import torch
 from PIL import Image
 from transformers import BaseImageProcessorFast
 
@@ -89,7 +90,9 @@ class BaseMultimodalProcessor(ABC):
             return_tensors="pt",
             **kwargs,
         )
-        if "pixel_values" in result and result["pixel_values"] is not None:
+        if "pixel_values" in result and isinstance(
+            result["pixel_values"], torch.Tensor
+        ):
             result["pixel_values"] = result["pixel_values"].to("cpu")
         return result
 

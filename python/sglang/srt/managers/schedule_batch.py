@@ -1069,8 +1069,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # If req.input_embeds is already a list, append its content directly
                 input_embeds.extend(req.input_embeds)  # Use extend to avoid nesting
 
-            if req.multimodal_inputs is not None:
-                multimodal_inputs.append(req.multimodal_inputs)
+            multimodal_inputs.append(req.multimodal_inputs)
 
             req.cached_tokens += pre_len - req.already_computed
             req.already_computed = seq_len
@@ -1155,11 +1154,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             else None
         )
         for mm_input in multimodal_inputs:
+            if mm_input is None:
+                continue
             for mm_item in mm_input.mm_items:
-                if hasattr(mm_item, "pixel_values") and isinstance(
-                    mm_item.pixel_values, torch.Tensor
-                ):
-                    mm_item.pixel_values = mm_item.pixel_values.to(
+                pixel_values = getattr(mm_item, "pixel_values", None)
+                if isinstance(pixel_values, torch.Tensor):
+                    mm_item.pixel_values = pixel_values.to(
                         self.device, non_blocking=True
                     )
         self.multimodal_inputs = multimodal_inputs
@@ -1468,6 +1468,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.encoder_lens_cpu = [self.encoder_lens_cpu[i] for i in keep_indices]
 
         self.reqs = [self.reqs[i] for i in keep_indices]
+        self.multimodal_inputs = [self.multimodal_inputs[i] for i in keep_indices]
         self.req_pool_indices = self.req_pool_indices[keep_indices_device]
         self.seq_lens = self.seq_lens[keep_indices_device]
         self.out_cache_loc = None
@@ -1516,6 +1517,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.top_logprobs_nums = [0] * len(self.reqs) + other.top_logprobs_nums
             self.token_ids_logprobs = [None] * len(self.reqs) + other.token_ids_logprobs
         self.reqs.extend(other.reqs)
+        self.multimodal_inputs.extend(other.multimodal_inputs)
 
         self.return_logprob |= other.return_logprob
         self.has_stream |= other.has_stream
