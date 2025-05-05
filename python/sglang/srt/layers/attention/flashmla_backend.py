@@ -109,16 +109,16 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             self.req_to_token.stride(0),
             max_seqlen_pad,
         )
-        # print("222 decode block_kv_indices ", block_kv_indices)
-        mla_metadata, num_splits = get_mla_metadata(
-            forward_batch.seq_lens.to(torch.int32),
-            Q_LEN * self.num_q_heads,
-            1,
-        )
+
+        # mla_metadata, num_splits = get_mla_metadata(
+        #     forward_batch.seq_lens.to(torch.int32),
+        #     Q_LEN * self.num_q_heads,
+        #     1,
+        # )
         self.forward_metadata = FlashMLADecodeMetadata(
-            mla_metadata,
-            num_splits,
-            block_kv_indices,
+            # mla_metadata,
+            # num_splits,
+            block_kv_indices=block_kv_indices,
         )
 
     # todo: remove this, use flashinfer mla for extend
@@ -214,17 +214,15 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             )
         )
 
-        # print("222 verify block_kv_indices ", block_kv_indices)
-        
-        mla_metadata, num_splits = get_mla_metadata(
-            forward_batch.seq_lens.to(torch.int32),
-            Q_LEN * self.num_q_heads, # todo: draft_token_num * self.num_q_heads or 1 * self.num_q_heads?
-            1,
-        )
+        # mla_metadata, num_splits = get_mla_metadata(
+        #     forward_batch.seq_lens.to(torch.int32),
+        #     (draft_token_num - Q_LEN) * self.num_q_heads, # todo: draft_token_num * self.num_q_heads or 1 * self.num_q_heads?
+        #     1,
+        # )
         self.forward_metadata = FlashMLADecodeMetadata(
-            mla_metadata,
-            num_splits,
-            block_kv_indices,
+            # mla_metadata,
+            # num_splits,
+            block_kv_indices=block_kv_indices,
         )
 
     def update_metadata_extend(self, forward_batch: ForwardBatch):
@@ -403,14 +401,20 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
 
         reshape_q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
 
+        mla_metadata, num_splits = get_mla_metadata(
+            forward_batch.seq_lens.to(torch.int32),
+            Q_LEN * self.num_q_heads,
+            1,
+        )
+
         o, _ = flash_mla_with_kvcache(
             q=reshape_q,
             k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
             block_table=self.forward_metadata.block_kv_indices,
             cache_seqlens=forward_batch.seq_lens.to(torch.int32),
             head_dim_v=self.kv_lora_rank,  # TODO Retrieve from config.
-            tile_scheduler_metadata=self.forward_metadata.flashmla_metadata,
-            num_splits=self.forward_metadata.num_splits,
+            tile_scheduler_metadata=mla_metadata,
+            num_splits=num_splits,
             softmax_scale=layer.scaling,
             causal=True, # why casual = False?
         )
@@ -427,9 +431,13 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         save_kv_cache: bool = True,
     ):
         print("flashmla forward_extend ", forward_batch.forward_mode)
-        print("flashmla forward_extend q size = ", q.shape)
         if forward_batch.forward_mode.is_target_verify():
+            spec_info = forward_batch.spec_info
+            assert spec_info is not None
+            assert isinstance(spec_info, EagleVerifyInput)
+
             # todo: handle verify mode by flashmla
+            print("flashmla forward_extend q size = ", q.shape)
             cache_loc = forward_batch.out_cache_loc
 
             if k is not None:
@@ -446,18 +454,30 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
 
             reshape_q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
 
+            print("reshape_q.shape = ", reshape_q.shape)
+            print("reshape_q.shape[1] = ", reshape_q.shape[1])
+
+            mla_metadata, num_splits = get_mla_metadata(
+                forward_batch.seq_lens.to(torch.int32),
+                reshape_q.shape[1] * self.num_q_heads,
+                1,
+            )
+            # self.forward_metadata.flashmla_metadata = mla_metadata
+            # self.forward_metadata.num_splits = num_splits
+
             o, _ = flash_mla_with_kvcache(
                 q=reshape_q,
                 k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
                 block_table=self.forward_metadata.block_kv_indices,
                 cache_seqlens=forward_batch.seq_lens.to(torch.int32),
                 head_dim_v=self.kv_lora_rank,  # TODO Retrieve from config.
-                tile_scheduler_metadata=self.forward_metadata.flashmla_metadata,
-                num_splits=self.forward_metadata.num_splits,
+                tile_scheduler_metadata=mla_metadata,
+                num_splits=num_splits,
                 softmax_scale=layer.scaling,
                 causal=True,
             )
-            o = o.squeeze(0)
+            # print("flashmla forward_extend o size = ", o.shape)
+            # print("after verify, o = ", o)
             return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
         else:
             print("flashmla forward_extend: flashmla -> flashinfer_mla")
