@@ -726,7 +726,7 @@ class StreamExecutor:
 
         src_rids = [state.stream_executor.sid for state in expr.states]
         self.backend.concatenate_and_append(src_rids, self.sid)
-        
+
     def _execute_separate_reasoning(self, expr: SglSeparateReasoning):
         if self.stream:
             # separate reasoning for stream is not supported
@@ -741,6 +741,7 @@ class StreamExecutor:
             self.backend.role_end_generate(self)
 
         from sglang.srt.reasoning_parser import ReasoningParser
+
         reasoning_parser = ReasoningParser(expr.model_type)
         other = expr.expr
         if not other:
@@ -752,14 +753,18 @@ class StreamExecutor:
             self.set_var(other.name, normal_text)
             self.set_var(reasoning_name, reasoning)
             # the variable is ready to be used
-            self.variable_event[reasoning_name].set() 
-            self.text_ = self.text_[:self.cur_role_begin_pos] + normal_text
+            self.variable_event[reasoning_name].set()
+            self.text_ = self.text_[: self.cur_role_begin_pos] + normal_text
         elif isinstance(other, SglExprList):
             for x in other.expr_list:
-                self._execute_separate_reasoning(SglSeparateReasoning(expr.model_type, x))
-        
+                self._execute_separate_reasoning(
+                    SglSeparateReasoning(expr.model_type, x)
+                )
+
     def _init_var_event(self, expr):
-        if isinstance(expr, (SglGen, SglSelect, SglVarScopeBegin, SglSeparateReasoning)):
+        if isinstance(
+            expr, (SglGen, SglSelect, SglVarScopeBegin, SglSeparateReasoning)
+        ):
             self.variable_event[expr.name] = threading.Event()
             if self.stream:
                 self.stream_var_event[expr.name] = threading.Event()
