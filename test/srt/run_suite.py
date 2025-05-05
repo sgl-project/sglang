@@ -110,6 +110,7 @@ suites = {
     "per-commit-4-gpu": [
         TestFile("test_local_attn.py", 250),
         TestFile("test_pp_single_node.py", 150),
+        TestFile("test_verl_engine.py", 64),
     ],
     "per-commit-8-gpu": [
         # Disabled deepep tests temporarily because it takes too much time.
