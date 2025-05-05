@@ -40,7 +40,7 @@ parser.add_argument(
 )
 parser.add_argument(
     "--max-file-size",
-    type=str,
+    type=int,
     default=5 * 1024**3,
     help="max size (in bytes) of each safetensors file",
 )
