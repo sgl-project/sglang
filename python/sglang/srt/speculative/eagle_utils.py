@@ -292,6 +292,7 @@ class EagleVerifyInput:
         paged_kernel_lens: torch.Tensor,
         paged_kernel_lens_sum: int,
         req_to_token: torch.Tensor,
+        kv_indices: Optional[torch.Tensor] = None,
         use_flashmla: bool = False,
     ):
         print("generate_attn_arg_prefill for EagleVerifyInput")
@@ -316,12 +317,15 @@ class EagleVerifyInput:
             )
             
             # block_kv_indices for flashmla
-            kv_indices = torch.full(
-                (batch_size, max_seqlen_pad),
-                -1,
-                dtype=torch.int32,
-                device=req_pool_indices.device,
-            )
+            if kv_indices is None:
+                kv_indices = torch.full(
+                    (batch_size, max_seqlen_pad),
+                    -1,
+                    dtype=torch.int32,
+                    device=req_pool_indices.device,
+                )
+                assert max_seqlen_pad == kv_indices.stride(0)
+                max_seqlen_pad = kv_indices.stride(0)
 
             create_flashmla_kv_indices_triton[(batch_size,)](
                 req_to_token,
