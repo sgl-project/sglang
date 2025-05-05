@@ -126,7 +126,7 @@ set(SGL_KERNEL_CUDA_FLAGS
 )
 
 option(SGL_KERNEL_ENABLE_SM110A           "Enable SM110A"           OFF)
-option(SGL_KERNEL_ENABLE_SM100A           "Enable SM103A"           OFF)
+option(SGL_KERNEL_ENABLE_SM103A           "Enable SM103A"           OFF)
 option(SGL_KERNEL_ENABLE_SM100A           "Enable SM100A"           OFF)
 option(SGL_KERNEL_ENABLE_SM90A            "Enable SM90A"            OFF)
 option(SGL_KERNEL_ENABLE_BF16             "Enable BF16"             ON)
