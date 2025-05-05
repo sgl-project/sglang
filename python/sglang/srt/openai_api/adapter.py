@@ -40,8 +40,12 @@ from sglang.srt.conversation import (
     get_conv_template_by_model_path,
     register_conv_template,
 )
-from sglang.srt.function_call.function_call_parser import FunctionCallParser
-from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
+from sglang.srt.function_call_parser import FunctionCallParser
+from sglang.srt.managers.io_struct import (
+    EmbeddingReqInput,
+    GenerateReqInput,
+    V1RerankReqInput,
+)
 from sglang.srt.openai_api.protocol import (
     BatchRequest,
     BatchResponse,
@@ -71,6 +75,7 @@ from sglang.srt.openai_api.protocol import (
     MultimodalEmbeddingInput,
     ScoringRequest,
     ScoringResponse,
+    RerankResponse,
     ToolCall,
     TopLogprob,
     UsageInfo,
@@ -1921,6 +1926,64 @@ async def v1_embeddings(tokenizer_manager, raw_request: Request):
         ret = [ret]
 
     response = v1_embedding_response(ret, tokenizer_manager.model_path)
+
+    return response
+
+
+def v1_rerank_request(obj: V1RerankReqInput):
+    if obj.query is None:
+        raise ValueError("query is required")
+    if obj.documents is None or len(obj.documents) == 0:
+        raise ValueError("documents is required")
+
+    pairs = []
+    for doc in obj.documents:
+        pairs.append([obj.query, doc])
+
+    adapted_request = EmbeddingReqInput(
+        text=pairs,
+        is_cross_encoder_request=True,
+    )
+
+    return adapted_request
+
+
+def v1_rerank_response(ret, obj: V1RerankReqInput):
+
+    response = []
+    for idx, ret_item in enumerate(ret):
+        response.append(
+            RerankResponse(
+                score=ret[idx]["embedding"],
+                document=obj.documents[idx],
+                index=idx,
+                meta_info=ret[idx]["meta_info"],
+            )
+        )
+
+    response.sort(key=lambda x: x.score, reverse=True)
+
+    return response
+
+
+async def v1_rerank(tokenizer_manager, obj: V1RerankReqInput, raw_request: Request):
+    adapted_request = v1_rerank_request(obj)
+
+    try:
+        ret = await tokenizer_manager.generate_request(
+            adapted_request, raw_request
+        ).__anext__()
+
+    except ValueError as e:
+        return create_error_response(str(e))
+
+    if not isinstance(ret, list):
+        ret = [ret]
+
+    response = v1_rerank_response(
+        ret,
+        obj,
+    )
 
     return response
 
