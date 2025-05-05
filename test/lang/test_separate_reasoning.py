@@ -21,20 +21,15 @@ class TestSeparateReasoning(CustomTestCase):
         self.assertIsInstance(expr, SglExprList)
         self.assertEqual(len(expr.expr_list), 2)
         self.assertEqual(expr.expr_list[0], test_gen)
-        self.assertIsInstance(expr.expr_list[1], SglSeparateReasoning)
-        self.assertEqual(expr.expr_list[1].model_type, "deepseek-r1")
+        reasoning_expr = expr.expr_list[1]
+        self.assertIsInstance(reasoning_expr, SglSeparateReasoning)
+        self.assertEqual(reasoning_expr.model_type, "deepseek-r1")
+        self.assertEqual(reasoning_expr.name, "test_reasoning_content")
 
         # Test with another valid model type
         expr = separate_reasoning(test_gen, model_type="qwen3")
         self.assertIsInstance(expr, SglExprList)
         self.assertEqual(expr.expr_list[1].model_type, "qwen3")
-
-    def test_separate_reasoning_requires_expr_or_name(self):
-        """Test that separate_reasoning requires either expr or name parameter."""
-        with self.assertRaises(ValueError) as context:
-            # Creating SglSeparateReasoning directly without expr or name
-            SglSeparateReasoning(model_type="deepseek-r1")
-        self.assertIn("Either expr or name must be provided", str(context.exception))
 
     def test_separate_reasoning_name_processing(self):
         """Test that separate_reasoning correctly processes names."""
