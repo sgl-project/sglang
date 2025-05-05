@@ -17,6 +17,7 @@ import base64
 import builtins
 import ctypes
 import dataclasses
+import importlib
 import io
 import ipaddress
 import itertools
@@ -35,8 +36,10 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import warnings
 from contextlib import contextmanager
+from enum import Enum
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
 from importlib.util import find_spec
@@ -76,10 +79,34 @@ time_infos = {}
 
 HIP_FP8_E4M3_FNUZ_MAX = 224.0
 
+_warned_bool_env_var_keys = set()
+
 
 def get_bool_env_var(name: str, default: str = "false") -> bool:
     value = os.getenv(name, default)
-    return value.lower() in ("true", "1")
+    value = value.lower()
+
+    truthy_values = ("true", "1")
+    falsy_values = ("false", "0")
+
+    if (value not in truthy_values) and (value not in falsy_values):
+        if value not in _warned_bool_env_var_keys:
+            logger.warning(
+                f"get_bool_env_var({name}) see non-understandable value={value} and treat as false"
+            )
+        _warned_bool_env_var_keys.add(value)
+
+    return value in truthy_values
+
+
+def get_int_env_var(name: str, default: int = 0) -> int:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
 
 
 # https://pytorch.org/docs/stable/notes/hip.html#checking-for-hip
@@ -125,11 +152,7 @@ def is_flashinfer_available():
     """
     if not get_bool_env_var("SGLANG_IS_FLASHINFER_AVAILABLE", default="true"):
         return False
-    return is_cuda()
-
-
-def is_cuda_available():
-    return is_cuda()
+    return importlib.util.find_spec("flashinfer") is not None and is_cuda()
 
 
 _ENABLE_TORCH_INFERENCE_MODE = get_bool_env_var(
@@ -261,7 +284,7 @@ def get_available_gpu_memory(device, gpu_id, distributed=False, empty_cache=True
     When distributed is True, the available memory is the minimum available memory of all GPUs.
     """
     if device == "cuda":
-        num_gpus = cuda_device_count_stateless()
+        num_gpus = torch.cuda.device_count()
         assert gpu_id < num_gpus
 
         if torch.cuda.current_device() != gpu_id:
@@ -392,16 +415,40 @@ class LayerFn(Protocol):
 def make_layers(
     num_hidden_layers: int,
     layer_fn: LayerFn,
+    pp_rank: Optional[int] = None,
+    pp_size: Optional[int] = None,
     prefix: str = "",
+    return_tuple: bool = False,
 ) -> Tuple[int, int, torch.nn.ModuleList]:
     """Make a list of layers with the given layer function"""
+    # circula imports
+    from sglang.srt.distributed import get_pp_indices
+    from sglang.srt.layers.utils import PPMissingLayer
+
+    assert not pp_size or num_hidden_layers >= pp_size
+    start_layer, end_layer = (
+        get_pp_indices(
+            num_hidden_layers,
+            pp_rank,
+            pp_size,
+        )
+        if pp_rank is not None and pp_size is not None
+        else (0, num_hidden_layers)
+    )
     modules = torch.nn.ModuleList(
-        [
+        [PPMissingLayer(return_tuple=return_tuple) for _ in range(start_layer)]
+        + [
             maybe_offload_to_cpu(layer_fn(idx=idx, prefix=add_prefix(idx, prefix)))
-            for idx in range(num_hidden_layers)
+            for idx in range(start_layer, end_layer)
+        ]
+        + [
+            PPMissingLayer(return_tuple=return_tuple)
+            for _ in range(end_layer, num_hidden_layers)
         ]
     )
-    return modules
+    if pp_rank is None or pp_size is None:
+        return modules
+    return modules, start_layer, end_layer
 
 
 def set_random_seed(seed: int) -> None:
@@ -512,13 +559,18 @@ def load_audio(audio_file: str, sr: int = 16000, mono: bool = True) -> np.ndarra
     import soundfile as sf
     from scipy.signal import resample
 
-    # print(f"loading {audio_file}")
     # Load audio data
     if isinstance(audio_file, bytes):
         audio, original_sr = sf.read(BytesIO(audio_file))
     elif audio_file.startswith("data:"):
         audio_file = audio_file.split(",")[1]
         audio, original_sr = sf.read(BytesIO(base64.b64decode(audio_file)))
+    elif audio_file.startswith("http://") or audio_file.startswith("https://"):
+        timeout = int(os.getenv("REQUEST_TIMEOUT", "5"))
+        response = requests.get(audio_file, stream=True, timeout=timeout)
+        audio_file = BytesIO(response.content)
+        response.close()
+        audio, original_sr = sf.read(audio_file)
     elif isinstance(audio_file, str):
         audio, original_sr = sf.read(audio_file)
     else:
@@ -536,10 +588,41 @@ def load_audio(audio_file: str, sr: int = 16000, mono: bool = True) -> np.ndarra
     return audio
 
 
-def load_image(image_file: Union[str, bytes]) -> tuple[Image, tuple[int, int]]:
-    image = image_size = None
+def encode_video(video_path, frame_count_limit=None):
+    # Lazy import because decord is not available on some arm platforms.
+    from decord import VideoReader, cpu
 
-    if isinstance(image_file, bytes):
+    if not os.path.exists(video_path):
+        logger.error(f"Video {video_path} does not exist")
+        return []
+
+    if frame_count_limit == 0:
+        return []
+
+    def uniform_sample(l, n):
+        gap = len(l) / n
+        idxs = [int(i * gap + gap / 2) for i in range(n)]
+        return [l[i] for i in idxs]
+
+    vr = VideoReader(video_path, ctx=cpu(0))
+    sample_fps = round(vr.get_avg_fps() / 1)  # FPS
+    frame_indices = [i for i in range(0, len(vr), sample_fps)]
+    if frame_count_limit is not None and len(frame_indices) > frame_count_limit:
+        frame_indices = uniform_sample(frame_indices, frame_count_limit)
+
+    frames = vr.get_batch(frame_indices).asnumpy()
+    frames = [Image.fromarray(v.astype("uint8")) for v in frames]
+    return frames
+
+
+def load_image(
+    image_file: Union[Image.Image, str, bytes],
+) -> tuple[Image.Image, tuple[int, int]]:
+    image = image_size = None
+    if isinstance(image_file, Image.Image):
+        image = image_file
+        image_size = (image.width, image.height)
+    elif isinstance(image_file, bytes):
         image = Image.open(BytesIO(image_file))
     elif image_file.startswith("http://") or image_file.startswith("https://"):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
@@ -563,6 +646,10 @@ def load_image(image_file: Union[str, bytes]) -> tuple[Image, tuple[int, int]]:
 
 
 def suppress_other_loggers():
+    warnings.filterwarnings(
+        "ignore", category=UserWarning, message="The given NumPy array is not writable"
+    )
+
     try:
         from vllm.logger import logger as vllm_default_logger
     except ImportError:
@@ -576,10 +663,6 @@ def suppress_other_loggers():
         logging.WARN
     )
     logging.getLogger("vllm.config").setLevel(logging.ERROR)
-
-    warnings.filterwarnings(
-        "ignore", category=UserWarning, message="The given NumPy array is not writable"
-    )
 
 
 def assert_pkg_version(pkg: str, min_version: str, message: str):
@@ -736,6 +819,8 @@ def add_api_key_middleware(app, api_key: str):
             return await call_next(request)
         if request.url.path.startswith("/health"):
             return await call_next(request)
+        if request.url.path.startswith("/metrics"):
+            return await call_next(request)
         if request.headers.get("Authorization") != "Bearer " + api_key:
             return ORJSONResponse(content={"error": "Unauthorized"}, status_code=401)
         return await call_next(request)
@@ -810,13 +895,61 @@ def broadcast_pyobj(
     rank: int,
     dist_group: Optional[torch.distributed.ProcessGroup] = None,
     src: int = 0,
+    force_cpu_device: bool = True,
 ):
-    """Broadcast inputs from rank=0 to all other ranks with torch.dist backend."""
+    """Broadcast inputs from src rank to all other ranks with torch.dist backend.
+    The `rank` here refer to the source rank on global process group (regardless
+    of dist_group argument).
+    """
+    device = torch.device(
+        "cuda" if torch.cuda.is_available() and not force_cpu_device else "cpu"
+    )
 
-    if rank == 0:
+    if rank == src:
+        if len(data) == 0:
+            tensor_size = torch.tensor([0], dtype=torch.long, device=device)
+            dist.broadcast(tensor_size, src=src, group=dist_group)
+        else:
+            serialized_data = pickle.dumps(data)
+            size = len(serialized_data)
+
+            tensor_data = torch.ByteTensor(
+                np.frombuffer(serialized_data, dtype=np.uint8)
+            ).to(device)
+            tensor_size = torch.tensor([size], dtype=torch.long, device=device)
+
+            dist.broadcast(tensor_size, src=src, group=dist_group)
+            dist.broadcast(tensor_data, src=src, group=dist_group)
+        return data
+    else:
+        tensor_size = torch.tensor([0], dtype=torch.long, device=device)
+        dist.broadcast(tensor_size, src=src, group=dist_group)
+        size = tensor_size.item()
+
+        if size == 0:
+            return []
+
+        tensor_data = torch.empty(size, dtype=torch.uint8, device=device)
+        dist.broadcast(tensor_data, src=src, group=dist_group)
+
+        serialized_data = bytes(tensor_data.cpu().numpy())
+        data = pickle.loads(serialized_data)
+        return data
+
+
+def point_to_point_pyobj(
+    data: List[Any],
+    rank: int,
+    group: Optional[torch.distributed.ProcessGroup] = None,
+    src: int = 0,
+    dst: int = 1,
+):
+    """Send data from src to dst in group."""
+
+    if rank == src:
         if len(data) == 0:
             tensor_size = torch.tensor([0], dtype=torch.long)
-            dist.broadcast(tensor_size, src=src, group=dist_group)
+            dist.send(tensor_size, dst=dst, group=group)
         else:
             serialized_data = pickle.dumps(data)
             size = len(serialized_data)
@@ -825,23 +958,27 @@ def broadcast_pyobj(
             )
             tensor_size = torch.tensor([size], dtype=torch.long)
 
-            dist.broadcast(tensor_size, src=src, group=dist_group)
-            dist.broadcast(tensor_data, src=src, group=dist_group)
+            dist.send(tensor_size, dst=dst, group=group)
+            dist.send(tensor_data, dst=dst, group=group)
         return data
-    else:
+
+    elif rank == dst:
         tensor_size = torch.tensor([0], dtype=torch.long)
-        dist.broadcast(tensor_size, src=src, group=dist_group)
+        dist.recv(tensor_size, src=src, group=group)
         size = tensor_size.item()
 
         if size == 0:
             return []
 
         tensor_data = torch.empty(size, dtype=torch.uint8)
-        dist.broadcast(tensor_data, src=src, group=dist_group)
+        dist.recv(tensor_data, src=src, group=group)
 
         serialized_data = bytes(tensor_data.cpu().numpy())
         data = pickle.loads(serialized_data)
         return data
+
+    # Other ranks in pp_group do nothing
+    return []
 
 
 step_counter = 0
@@ -887,6 +1024,8 @@ def get_zmq_socket(
         buf_size = -1
 
     socket = context.socket(socket_type)
+    if endpoint.find("[") != -1:
+        socket.setsockopt(zmq.IPV6, 1)
 
     def set_send_opt():
         socket.setsockopt(zmq.SNDHWM, 0)
@@ -1101,6 +1240,20 @@ def get_hpu_memory_capacity():
         raise RuntimeError(
             "hl-smi not found. Ensure Habana drivers are installed and accessible."
         )
+
+
+def get_device_memory_capacity(device: str = None):
+    if is_cuda():
+        gpu_mem = get_nvgpu_memory_capacity()
+    elif is_hip():
+        gpu_mem = get_amdgpu_memory_capacity()
+    elif device == "hpu":
+        gpu_mem = get_hpu_memory_capacity()
+    else:
+        # GPU memory is not known yet or no GPU is available.
+        gpu_mem = None
+
+    return gpu_mem
 
 
 # Copy from pytorch and OpenRLHF to allow creating multiple main groups.
@@ -1381,47 +1534,6 @@ def disable_request_logging() -> bool:
     return get_bool_env_var("SGLANG_DISABLE_REQUEST_LOGGING")
 
 
-@lru_cache(maxsize=8)
-def _cuda_device_count_stateless(cuda_visible_devices: Optional[str] = None) -> int:
-    # Note: cuda_visible_devices is not used, but we keep it as an argument for
-    # LRU Cache purposes.
-
-    # Code below is based on
-    # https://github.com/pytorch/pytorch/blob/
-    # c1cd946818442aca8c7f812b16d187ce1586c3bc/
-    # torch/cuda/__init__.py#L831C1-L831C17
-    import torch.version
-
-    if not torch.cuda._is_compiled():
-        return 0
-    if is_hip():
-        # ROCm uses amdsmi instead of nvml for stateless device count
-        # This requires a sufficiently modern version of Torch 2.4.0
-        raw_count = (
-            torch.cuda._device_count_amdsmi()
-            if (hasattr(torch.cuda, "_device_count_amdsmi"))
-            else -1
-        )
-    else:
-        raw_count = torch.cuda._device_count_nvml()
-    r = torch._C._cuda_getDeviceCount() if raw_count < 0 else raw_count
-    return r
-
-
-# Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/utils.py
-def cuda_device_count_stateless() -> int:
-    """Get number of CUDA devices, caching based on the value of
-    CUDA_VISIBLE_DEVICES at the time of call.
-
-    This should be used instead of torch.cuda.device_count()
-    unless CUDA_VISIBLE_DEVICES has already been set to the desired
-    value."""
-
-    # This can be removed and simply replaced with torch.cuda.get_device_count
-    # after https://github.com/pytorch/pytorch/pull/122815 is released.
-    return _cuda_device_count_stateless(os.environ.get("CUDA_VISIBLE_DEVICES", None))
-
-
 def dataclass_to_string_truncated(
     data, max_length=2048, skip_names: Optional[Set[str]] = None
 ):
@@ -1486,14 +1598,43 @@ def permute_weight(x: torch.Tensor) -> torch.Tensor:
 
 class MultiprocessingSerializer:
     @staticmethod
-    def serialize(obj):
+    def serialize(obj, output_str: bool = False):
+        """
+        Serialize a Python object using ForkingPickler.
+
+        Args:
+            obj: The object to serialize.
+            output_str (bool): If True, return a base64-encoded string instead of raw bytes.
+
+        Returns:
+            bytes or str: The serialized object.
+        """
         buf = io.BytesIO()
         ForkingPickler(buf).dump(obj)
         buf.seek(0)
-        return buf.read()
+        output = buf.read()
+
+        if output_str:
+            # Convert bytes to base64-encoded string
+            output = base64.b64encode(output).decode("utf-8")
+
+        return output
 
     @staticmethod
     def deserialize(data):
+        """
+        Deserialize a previously serialized object.
+
+        Args:
+            data (bytes or str): The serialized data, optionally base64-encoded.
+
+        Returns:
+            The deserialized Python object.
+        """
+        if isinstance(data, str):
+            # Decode base64 string to bytes
+            data = base64.b64decode(data)
+
         return ForkingPickler.loads(data)
 
 
@@ -1602,6 +1743,7 @@ def get_ip() -> str:
 def get_open_port() -> int:
     port = os.getenv("SGLANG_PORT")
     if port is not None:
+        port = int(port)
         while True:
             try:
                 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -1628,6 +1770,45 @@ def is_valid_ipv6_address(address: str) -> bool:
         return True
     except ValueError:
         return False
+
+
+def configure_ipv6(dist_init_addr):
+    addr = dist_init_addr
+    end = addr.find("]")
+    if end == -1:
+        raise ValueError("invalid IPv6 address format: missing ']'")
+
+    host = addr[: end + 1]
+
+    # this only validates the address without brackets: we still need the below checks.
+    # if it's invalid, immediately raise an error so we know it's not formatting issues.
+    if not is_valid_ipv6_address(host[1:end]):
+        raise ValueError(f"invalid IPv6 address: {host}")
+
+    port_str = None
+    if len(addr) > end + 1:
+        if addr[end + 1] == ":":
+            port_str = addr[end + 2 :]
+        else:
+            raise ValueError("received IPv6 address format: expected ':' after ']'")
+
+    if not port_str:
+        raise ValueError(
+            "a port must be specified in IPv6 address (format: [ipv6]:port)"
+        )
+
+    try:
+        port = int(port_str)
+    except ValueError:
+        raise ValueError(f"invalid port in IPv6 address: '{port_str}'")
+    return port, host
+
+
+def rank0_log(msg: str):
+    from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+    if get_tensor_model_parallel_rank() == 0:
+        logger.info(msg)
 
 
 def rank0_print(msg: str):
@@ -1733,3 +1914,161 @@ def parse_connector_type(url: str) -> str:
         return ""
 
     return m.group(1)
+
+
+def retry(
+    fn,
+    max_retry: int,
+    initial_delay: float = 2.0,
+    max_delay: float = 60.0,
+    should_retry: Callable[[Any], bool] = lambda e: True,
+):
+    for try_index in itertools.count():
+        try:
+            return fn()
+        except Exception as e:
+            if try_index >= max_retry:
+                raise Exception(f"retry() exceed maximum number of retries.")
+
+            if not should_retry(e):
+                raise Exception(f"retry() observe errors that should not be retried.")
+
+            delay = min(initial_delay * (2**try_index), max_delay) * (
+                0.75 + 0.25 * random.random()
+            )
+
+            logger.warning(
+                f"retry() failed once ({try_index}th try, maximum {max_retry} retries). Will delay {delay:.2f}s and retry. Error: {e}"
+            )
+            traceback.print_exc()
+
+            time.sleep(delay)
+
+
+def flatten_nested_list(nested_list):
+    if isinstance(nested_list, list):
+        return [
+            item for sublist in nested_list for item in flatten_nested_list(sublist)
+        ]
+    else:
+        return [nested_list]
+
+
+class DeepEPMode(Enum):
+    normal = "normal"
+    low_latency = "low_latency"
+    auto = "auto"
+
+    def enable_normal(self):
+        return self in [DeepEPMode.normal, DeepEPMode.auto]
+
+    def enable_low_latency(self):
+        return self in [DeepEPMode.low_latency, DeepEPMode.auto]
+
+    def resolve(self, forward_mode):
+        if self != DeepEPMode.auto:
+            return self
+
+        if forward_mode.is_decode():
+            return DeepEPMode.low_latency
+        else:
+            return DeepEPMode.normal
+
+
+def fast_topk(values, topk, dim):
+    if topk == 1:
+        # Use max along the specified dimension to get both value and index
+        return torch.max(values, dim=dim, keepdim=True)
+    else:
+        # Use topk for efficiency with larger k values
+        return torch.topk(values, topk, dim=dim)
+
+
+def _check(cc_major):
+    if not is_cuda():
+        return False
+    return torch.cuda.get_device_capability()[0] == cc_major and tuple(
+        map(int, torch.version.cuda.split(".")[:2])
+    ) >= (12, 3)
+
+
+is_ampere_with_cuda_12_3 = lambda: _check(8)
+is_hopper_with_cuda_12_3 = lambda: _check(9)
+
+
+def get_free_port():
+    # try ipv4
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("", 0))
+            return s.getsockname()[1]
+    except OSError:
+        # try ipv6
+        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as s:
+            s.bind(("", 0))
+            return s.getsockname()[1]
+
+
+def get_local_ip_by_remote() -> str:
+    # try ipv4
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))  # Doesn't need to be reachable
+        return s.getsockname()[0]
+    except Exception:
+        pass
+
+    # try ipv6
+    try:
+        s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+        # Google's public DNS server, see
+        # https://developers.google.com/speed/public-dns/docs/using#addresses
+        s.connect(("2001:4860:4860::8888", 80))  # Doesn't need to be reachable
+        return s.getsockname()[0]
+    except Exception:
+        raise ValueError("Can not get local ip")
+
+
+def is_page_size_one(server_args):
+    return server_args.page_size == 1
+
+
+# TODO(hebiao064): Accelerate FA3 Spec Decode with topk > 1.
+# TODO(hebiao064): Improve the acc rate for FA3 Spec Decode with topk == 1 and page_size > 1.
+def is_no_spec_infer_or_topk_one(server_args):
+    return server_args.speculative_eagle_topk is None or (
+        server_args.speculative_eagle_topk is not None
+        and server_args.speculative_eagle_topk == 1
+        and is_page_size_one(server_args)
+    )
+
+
+def is_fa3_default_architecture(hf_config):
+    architectures = getattr(hf_config, "architectures", None)
+    if not isinstance(architectures, list) or not architectures:
+        return False
+    default_archs = {
+        "Qwen2ForCausalLM",
+        "Llama4ForConditionalGeneration",
+        "LlamaForCausalLM",
+        "MistralForCausalLM",
+        "MixtralForCausalLM",
+        "Gemma2ForCausalLM",
+        "Gemma3ForConditionalGeneration",
+        "Qwen3ForCausalLM",
+        "Qwen3MoeForCausalLM",
+    }
+    return architectures[0] in default_archs
+
+
+# Can be more general if it is used in multiple places (keep it simple and thus not general now)
+class BumpAllocator:
+    def __init__(self, buffer_size: int, dtype, device):
+        self._buffer = torch.zeros((buffer_size,), dtype=dtype, device=device)
+        self._pointer = 0
+
+    def allocate(self, size: int):
+        assert self._pointer + size <= len(self._buffer)
+        output = self._buffer[self._pointer : self._pointer + size]
+        self._pointer += size
+        return output

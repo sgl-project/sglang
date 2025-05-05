@@ -21,14 +21,7 @@ from typing import Dict, Iterable, List, Optional, Set, Tuple, TypedDict
 
 import torch
 from torch import nn
-from transformers import (
-    AutoModel,
-    BatchFeature,
-    Gemma3Config,
-    Gemma3Processor,
-    PreTrainedModel,
-)
-from transformers.models.gemma3.processing_gemma3 import Gemma3ProcessorKwargs
+from transformers import AutoModel, Gemma3Config, PreTrainedModel
 
 from sglang.srt.hf_transformers_utils import get_processor
 from sglang.srt.layers.layernorm import Gemma3RMSNorm
@@ -38,7 +31,11 @@ from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternTokenPairs,
     general_mm_embed_routine,
 )
-from sglang.srt.managers.schedule_batch import MultimodalInputs
+from sglang.srt.managers.schedule_batch import (
+    MultimodalDataItem,
+    MultimodalInputs,
+    flatten_nested_list,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
@@ -268,78 +265,28 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.language_model.get_input_embeddings()
 
-    def get_image_feature(self, image_input: MultimodalInputs):
+    def get_attention_sliding_window_size(self):
+        """
+        This value is used to initialize attention backends in `ForwardBatch`.
+        """
+        return self.language_model.get_attention_sliding_window_size()
+
+    def get_image_feature(self, items: List[MultimodalDataItem]):
         """
         Projects the last hidden state from the vision model into language model space.
 
-        Args:
-            pixel_values (`torch.FloatTensor]` of shape `(batch_size, channels, height, width)`)
-               The tensors corresponding to the input images.
         Returns:
             image_features (`torch.Tensor`): Image feature tensor of shape `(num_images, image_length, embed_dim)`).
         """
-        pixel_values = image_input.pixel_values
+        pixel_values = torch.stack(
+            flatten_nested_list([item.pixel_values for item in items]), dim=0
+        )
         pixel_values = pixel_values.to("cuda")
         pixel_values = pixel_values.to(dtype=self.language_model.dtype())
 
         vision_outputs = self.vision_tower(pixel_values=pixel_values).last_hidden_state
         image_features = self.multi_modal_projector(vision_outputs)
         return image_features
-
-    def embed_mm_inputs(
-        self,
-        input_ids: torch.Tensor,
-        forward_batch: ForwardBatch,
-        image_input: MultimodalInputs,
-    ) -> torch.Tensor:
-        if input_ids is None:
-            raise ValueError("Unimplemented")
-        # boolean-masking image tokens
-        special_image_mask = torch.isin(
-            input_ids,
-            torch.tensor(image_input.pad_values, device=input_ids.device),
-        ).unsqueeze(-1)
-        num_image_tokens_in_input_ids = special_image_mask.sum()
-
-        inputs_embeds = None
-        if num_image_tokens_in_input_ids == 0:
-            inputs_embeds = self.get_input_embeddings()(input_ids)
-            return inputs_embeds
-        else:
-            # print(f"image tokens from input_ids: {inputs_embeds[special_image_mask].numel()}")
-            image_features = self.get_image_feature(image_input.pixel_values)
-
-            # print(f"image tokens from image embeddings: {image_features.numel()}")
-            num_image_tokens_in_embedding = (
-                image_features.shape[0] * image_features.shape[1]
-            )
-
-            if num_image_tokens_in_input_ids != num_image_tokens_in_embedding:
-                num_image = num_image_tokens_in_input_ids // image_features.shape[1]
-                image_features = image_features[:num_image, :]
-                logger.warning(
-                    f"Number of images does not match number of special image tokens in the input text. "
-                    f"Got {num_image_tokens_in_input_ids} image tokens in the text but {num_image_tokens_in_embedding} "
-                    "tokens from image embeddings."
-                )
-
-            # Important: clamp after extracting original image boundaries
-            input_ids.clamp_(min=0, max=self.vocab_size - 1)
-
-            inputs_embeds = self.get_input_embeddings()(input_ids)
-
-            special_image_mask = special_image_mask.expand_as(inputs_embeds).to(
-                inputs_embeds.device
-            )
-
-            image_features = image_features.to(
-                inputs_embeds.device, inputs_embeds.dtype
-            )
-            inputs_embeds = inputs_embeds.masked_scatter(
-                special_image_mask, image_features
-            )
-
-        return inputs_embeds
 
     @torch.no_grad()
     def forward(
@@ -399,22 +346,15 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
         else:
             llm_input_ids = input_ids
 
-        inputs_embeds = general_mm_embed_routine(
+        hs = general_mm_embed_routine(
             input_ids=llm_input_ids,
             forward_batch=forward_batch,
-            embed_tokens=self.get_input_embeddings(),
-            mm_data_embedding_func=self.get_image_feature,
-        )
-
-        outputs = self.language_model(
-            input_ids=None,
+            language_model=self.language_model,
+            image_data_embedding_func=self.get_image_feature,
             positions=positions,
-            forward_batch=forward_batch,
-            input_embeds=inputs_embeds,
-            **kwargs,
         )
 
-        return outputs
+        return hs
 
     def tie_weights(self):
         return self.language_model.tie_weights()

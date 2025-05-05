@@ -2,7 +2,7 @@ from typing import Tuple
 
 import torch
 
-from sglang.srt.lora.backend import BaseLoRABackend
+from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.utils import LoRABatchInfo
 from sglang.srt.utils import is_flashinfer_available
 
@@ -37,13 +37,16 @@ class FlashInferLoRABackend(BaseLoRABackend):
         self, x: torch.Tensor, weights: torch.Tensor, *args, **kwargs
     ) -> torch.Tensor:
 
-        return self.segment_gemm.run(
-            x=x,
-            weights=weights,
-            batch_size=self.batch_info.bs,
-            weight_column_major=True,
-            seg_indptr=self.batch_info.seg_indptr,
-            weight_indices=self.batch_info.weight_indices,
+        return (
+            self.segment_gemm.run(
+                x=x,
+                weights=weights,
+                batch_size=self.batch_info.bs,
+                weight_column_major=True,
+                seg_indptr=self.batch_info.seg_indptr,
+                weight_indices=self.batch_info.weight_indices,
+            )
+            * self.batch_info.scalings[0]
         )
 
     def run_qkv_lora(
@@ -90,7 +93,7 @@ class FlashInferLoRABackend(BaseLoRABackend):
             weights=kv_lora_b[1],
         )
 
-        return lora_output
+        return lora_output * self.batch_info.scalings[0]
 
     def run_gate_up_lora(
         self,
@@ -125,4 +128,4 @@ class FlashInferLoRABackend(BaseLoRABackend):
             weights=gate_up_lora_b[1],
         )
 
-        return lora_output
+        return lora_output * self.batch_info.scalings[0]

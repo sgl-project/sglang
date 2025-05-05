@@ -19,10 +19,16 @@ from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
-from transformers import AutoModelForCausalLM, AutoModelForVision2Seq, AutoProcessor
+from transformers import (
+    AutoModel,
+    AutoModelForCausalLM,
+    AutoModelForVision2Seq,
+    AutoProcessor,
+)
 
+from sglang.srt.entrypoints.engine import Engine
 from sglang.srt.hf_transformers_utils import get_tokenizer
-from sglang.srt.server import Engine
+from sglang.srt.utils import load_image
 from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER, calculate_rouge_l
 
 DEFAULT_PROMPTS = [
@@ -45,6 +51,8 @@ NUM_TOP_LOGPROBS = 5
 def get_dtype_str(torch_dtype):
     if torch_dtype is torch.float16:
         return "float16"
+    if torch_dtype is torch.float32:
+        return "float32"
     else:
         raise NotImplementedError()
 
@@ -140,7 +148,6 @@ class HFRunner:
     def _get_gme_qwen2_vl_embeddings(
         self, prompts, image_data: Optional[List[str]] = None
     ):
-        from sglang.srt.utils import load_image
 
         images = None
         if image_data is not None:
@@ -183,25 +190,18 @@ class HFRunner:
             if attention_mask is not None:
                 attention_mask = attention_mask.to(inputs_embeds.device)
 
-        outputs = self.model.model(
-            input_ids=None,
+        outputs = self.model(
+            input_ids=input_ids,
             position_ids=position_ids,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
+            output_hidden_states=True,
+            return_dict=True,
             inputs_embeds=inputs_embeds,
+            image_grid_thw=image_grid_thw,
         )
 
-        pooling_mask = attention_mask if pooling_mask is None else pooling_mask
-        left_padding = pooling_mask[:, -1].sum() == pooling_mask.shape[0]  # TODO
-        if left_padding:
-            embeddings = outputs.last_hidden_state[:, -1]
-        else:
-            sequence_lengths = pooling_mask.sum(dim=1) - 1
-            batch_size = outputs.last_hidden_state.shape[0]
-            embeddings = outputs.last_hidden_state[
-                torch.arange(batch_size, device=outputs.last_hidden_state.device),
-                sequence_lengths,
-            ]
+        embeddings = outputs.hidden_states[-1][:, -1]
         embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
         return embeddings.contiguous()
 
@@ -225,6 +225,9 @@ class HFRunner:
                     trust_remote_code=False,
                     low_cpu_mem_usage=True,
                 ).cuda()
+                self.processor = AutoProcessor.from_pretrained(model_path)
+            elif "clip" in model_path.lower():
+                self.model = AutoModel.from_pretrained(model_path).cuda()
                 self.processor = AutoProcessor.from_pretrained(model_path)
             else:
                 self.model = _get_sentence_transformer_embedding_model(
@@ -272,6 +275,23 @@ class HFRunner:
                     assert not self.output_str_only
                     if "gme-qwen2-vl" in model_path.lower():
                         logits = self._get_gme_qwen2_vl_embeddings(prompts, image_data)
+                    elif "clip" in model_path.lower():
+                        if image_data is not None:
+                            image = load_image(image_data)
+                            inputs = self.processor(
+                                images=image[0], return_tensors="pt"
+                            )
+                            logits = self.model.get_image_features(
+                                pixel_values=inputs.data["pixel_values"].cuda(),
+                            ).tolist()
+                        else:
+                            inputs = self.tokenizer(
+                                prompts, padding=True, return_tensors="pt"
+                            )
+                            logits = self.model.get_text_features(
+                                input_ids=inputs.data["input_ids"].cuda(),
+                                attention_mask=inputs.data["attention_mask"].cuda(),
+                            ).tolist()
                     else:
                         logits = self.model.encode(prompts).tolist()
                     out_queue.put(ModelOutput(embed_logits=logits))
@@ -403,6 +423,10 @@ class HFRunner:
                     )
                 del input_logits
 
+            if lora_paths is not None and lora_paths[i] is not None:
+                # Unload the LoRA adapter if it is used
+                model.unload()
+
         return ModelOutput(
             output_strs=output_strs,
             top_input_logprobs=top_input_logprobs,
@@ -422,6 +446,7 @@ class SRTRunner:
         port: int = DEFAULT_PORT_FOR_SRT_TEST_RUNNER,
         lora_paths: List[str] = None,
         max_loras_per_batch: int = 4,
+        attention_backend: Optional[str] = None,
         lora_backend: str = "triton",
         disable_cuda_graph: bool = False,
         disable_radix_cache: bool = False,
@@ -462,6 +487,7 @@ class SRTRunner:
             lora_paths=lora_paths,
             max_loras_per_batch=max_loras_per_batch,
             lora_backend=lora_backend,
+            attention_backend=attention_backend,
             disable_cuda_graph=disable_cuda_graph,
             disable_radix_cache=disable_radix_cache,
             chunked_prefill_size=chunked_prefill_size,

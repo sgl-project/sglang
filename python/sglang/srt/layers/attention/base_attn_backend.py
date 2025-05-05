@@ -47,7 +47,7 @@ class AttentionBackend(ABC):
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
         seq_lens_cpu: Optional[torch.Tensor],
     ):
-        """Init the metadata for a forward pass for replying a cuda graph."""
+        """Init the metadata for a forward pass for replaying a cuda graph."""
         raise NotImplementedError()
 
     def get_cuda_graph_seq_len_fill_value(self):
@@ -62,6 +62,7 @@ class AttentionBackend(ABC):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
+        **kwargs,
     ):
         """Run forward on an attention layer."""
         if forward_batch.forward_mode.is_decode():
@@ -72,6 +73,7 @@ class AttentionBackend(ABC):
                 layer,
                 forward_batch,
                 save_kv_cache=save_kv_cache,
+                **kwargs,
             )
         else:
             return self.forward_extend(
@@ -81,6 +83,7 @@ class AttentionBackend(ABC):
                 layer,
                 forward_batch,
                 save_kv_cache=save_kv_cache,
+                **kwargs,
             )
 
     def forward_decode(

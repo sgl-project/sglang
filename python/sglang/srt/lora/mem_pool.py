@@ -163,10 +163,11 @@ class LoRAMemoryPool:
         if uid is None:
             for i in range(self.num_layer):
                 for k in self.A_buffer.keys():
-                    self.A_buffer[k][i][buffer_id] *= 0
+                    self.A_buffer[k][i][buffer_id] = 0
             return
 
         assert lora_adapter is not None
+        lora_rank = lora_adapter.config.hf_config["r"]
         for layer_id in range(self.num_layer):
             layer_weights = lora_adapter.layers[layer_id].weights
             temp_A_buffer: Dict[str, torch.Tensor] = {}
@@ -208,17 +209,22 @@ class LoRAMemoryPool:
                         )
 
             for name, weights in temp_A_buffer.items():
-                self.A_buffer[name][layer_id][buffer_id].copy_(weights)
+                c = get_stacked_multiply(name)
+                self.A_buffer[name][layer_id][buffer_id][: lora_rank * c, :].copy_(
+                    weights
+                )
 
             for name, weights in temp_B_buffer.items():
                 c = get_stacked_multiply(name)
                 if c > 1:
                     for stacked_id in range(c):
-                        self.B_buffer[name][layer_id][stacked_id][buffer_id].copy_(
-                            weights[stacked_id]
-                        )
+                        self.B_buffer[name][layer_id][stacked_id][buffer_id][
+                            :, :lora_rank
+                        ].copy_(weights[stacked_id])
                 else:
-                    self.B_buffer[name][layer_id][0][buffer_id].copy_(weights)
+                    self.B_buffer[name][layer_id][0][buffer_id][:, :lora_rank].copy_(
+                        weights
+                    )
 
     def get_tensor(
         self, weight_name: str, layer_id: int, lora_type: LoRAType

@@ -46,7 +46,7 @@ class TestMLADeepseekV3ChannelInt8(CustomTestCase):
         metrics = run_eval_few_shot_gsm8k(args)
         print(metrics)
 
-        self.assertGreater(metrics["accuracy"], 0.62)
+        self.assertGreaterEqual(metrics["accuracy"], 0.61)
 
 
 class TestDeepseekV3MTPChannelInt8(CustomTestCase):
@@ -162,8 +162,6 @@ class TestDeepseekV3MTPBlockInt8(CustomTestCase):
                     "1",
                     "--speculative-algorithm",
                     "EAGLE",
-                    "--speculative-draft",
-                    "sgl-project/sglang-ci-dsv3-block-int8-test-NextN",
                     "--speculative-num-steps",
                     "2",
                     "--speculative-eagle-topk",

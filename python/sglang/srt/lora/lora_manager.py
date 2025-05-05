@@ -22,7 +22,7 @@ import torch
 
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.hf_transformers_utils import AutoConfig
-from sglang.srt.lora.backend import BaseLoRABackend, get_backend_from_name
+from sglang.srt.lora.backend.base_backend import BaseLoRABackend, get_backend_from_name
 from sglang.srt.lora.layers import BaseLayerWithLoRA, get_lora_layer
 from sglang.srt.lora.lora import LoRAAdapter
 from sglang.srt.lora.lora_config import LoRAConfig
@@ -72,6 +72,23 @@ class LoRAManager:
         self.init_loras()
         self.init_lora_memory_pool()
 
+    def init_cuda_graph_batch_info(self, max_bs_in_cuda_graph: int):
+        self.max_bs_in_cuda_graph = max_bs_in_cuda_graph
+        with torch.device("cuda"):
+            self.cuda_graph_batch_info = LoRABatchInfo(
+                bs=self.max_bs_in_cuda_graph,
+                seg_lens=torch.zeros(self.max_bs_in_cuda_graph, dtype=torch.int32),
+                seg_indptr=torch.zeros(
+                    self.max_bs_in_cuda_graph + 1, dtype=torch.int32
+                ),
+                max_len=0,
+                weight_indices=torch.zeros(
+                    self.max_bs_in_cuda_graph, dtype=torch.int32
+                ),
+                lora_ranks=torch.zeros(self.max_loras_per_batch, dtype=torch.int32),
+                scalings=torch.zeros(self.max_loras_per_batch, dtype=torch.float),
+            )
+
     def init_loras(self):
         # Config of each LoRA adapter
         self.configs: Dict[str, LoRAConfig] = {}
@@ -103,11 +120,14 @@ class LoRAManager:
             self.loras[name] = lora_adapter
 
         # misc lora configs
-        # FIXME remove the restrictions after implementing unified paging
         self.max_lora_dim: int = max([x.hf_config["r"] for x in self.configs.values()])
-        self.scaling: float = list(self.loras.values())[0].scaling
-        assert all(x.hf_config["r"] == self.max_lora_dim for x in self.configs.values())
-        assert all(x.scaling == self.scaling for x in self.loras.values())
+
+        if self.lora_backend == "flashinfer":
+            # FIXME remove the restrictions after supporting multi-rank for flashinfer backend
+            max_lora_dim = max([x.hf_config["r"] for x in self.configs.values()])
+            scaling = list(self.loras.values())[0].scaling
+            assert all(x.hf_config["r"] == max_lora_dim for x in self.configs.values())
+            assert all(x.scaling == scaling for x in self.loras.values())
 
         # Convert original model layers to layers with LoRA
         self.convert_to_lora_layers()
@@ -133,31 +153,72 @@ class LoRAManager:
         assert len(cur_uids) <= self.max_loras_per_batch
         self.memory_pool.prepare_lora_batch(cur_uids, self.loras)
 
-        # FIXME: Handle lora uid with None more safely
-        if cur_uids == set([None]):
-            return
-
-        # set up batch info shared by all lora moruldes
+        # set up batch info shared by all lora modules
         bs = forward_batch.batch_size
-        seg_lens = (
-            forward_batch.extend_seq_lens
-            if forward_batch.forward_mode.is_extend()
-            else torch.ones(bs, device=self.device)
-        )
-        seg_indptr = torch.zeros((bs + 1,), dtype=torch.int32, device=self.device)
-        seg_indptr[1:] = torch.cumsum(seg_lens, dim=0)
-        max_len = int(torch.max(seg_lens))
-        weight_indices = torch.empty((bs,), dtype=torch.int64, device=self.device)
-        for i, lora_path in enumerate(forward_batch.lora_paths):
-            weight_indices[i] = self.memory_pool.get_buffer_id(lora_path)
 
-        batch_info = LoRABatchInfo(
-            bs=bs,
-            seg_lens=seg_lens,
-            seg_indptr=seg_indptr,
-            max_len=max_len,
-            weight_indices=weight_indices,
-        )
+        if (
+            hasattr(self, "max_bs_in_cuda_graph")
+            and bs <= self.max_bs_in_cuda_graph
+            and forward_batch.forward_mode.is_cuda_graph()
+        ):
+            # Do in-place updates when CUDA graph is enabled and the batch forward mode
+            # could use CUDA graph.
+            self.cuda_graph_batch_info.bs = bs
+            self.cuda_graph_batch_info.seg_lens[:bs].fill_(1)
+            torch.cumsum(
+                self.cuda_graph_batch_info.seg_lens[:bs],
+                dim=0,
+                out=self.cuda_graph_batch_info.seg_indptr[1 : bs + 1],
+            )
+            self.cuda_graph_batch_info.max_len = int(
+                torch.max(self.cuda_graph_batch_info.seg_lens[:bs])
+            )
+
+            for i, lora_path in enumerate(forward_batch.lora_paths):
+                self.cuda_graph_batch_info.weight_indices[i] = (
+                    self.memory_pool.get_buffer_id(lora_path)
+                )
+                if lora_path is not None:
+                    lora = self.loras[lora_path]
+                    self.cuda_graph_batch_info.lora_ranks[
+                        self.cuda_graph_batch_info.weight_indices[i]
+                    ] = lora.config.hf_config["r"]
+                    self.cuda_graph_batch_info.scalings[
+                        self.cuda_graph_batch_info.weight_indices[i]
+                    ] = lora.scaling
+            batch_info = self.cuda_graph_batch_info
+        else:
+            seg_lens = (
+                forward_batch.extend_seq_lens
+                if forward_batch.forward_mode.is_extend()
+                else torch.ones(bs, device=self.device)
+            )
+            seg_indptr = torch.zeros((bs + 1,), dtype=torch.int32, device=self.device)
+            seg_indptr[1:] = torch.cumsum(seg_lens, dim=0)
+            max_len = int(torch.max(seg_lens))
+            weight_indices = torch.empty((bs,), dtype=torch.int64, device=self.device)
+
+            lora_ranks = torch.zeros(
+                (self.max_loras_per_batch,), dtype=torch.int64, device="cuda"
+            )
+            scalings = torch.zeros(
+                (self.max_loras_per_batch,), dtype=torch.float, device="cuda"
+            )
+            for i, lora_path in enumerate(forward_batch.lora_paths):
+                weight_indices[i] = self.memory_pool.get_buffer_id(lora_path)
+                if lora_path is not None:
+                    lora = self.loras[lora_path]
+                    lora_ranks[weight_indices[i]] = lora.config.hf_config["r"]
+                    scalings[weight_indices[i]] = lora.scaling
+            batch_info = LoRABatchInfo(
+                bs=bs,
+                seg_lens=seg_lens,
+                seg_indptr=seg_indptr,
+                max_len=max_len,
+                weight_indices=weight_indices,
+                lora_ranks=lora_ranks,
+                scalings=scalings,
+            )
         self.lora_backend.set_batch_info(batch_info)
 
         # call set_lora_info for each lora modules
@@ -189,9 +250,7 @@ class LoRAManager:
                     )
 
     def set_lora_module(self, module_name, module):
-        lora_module = get_lora_layer(
-            module, self.max_lora_dim, self.scaling, self.lora_backend
-        )
+        lora_module = get_lora_layer(module, self.lora_backend)
         replace_submodule(self.base_model, module_name, lora_module)
         return lora_module
 

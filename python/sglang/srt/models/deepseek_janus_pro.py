@@ -51,7 +51,7 @@ from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternTokenPairs,
     general_mm_embed_routine,
 )
-from sglang.srt.managers.schedule_batch import MultimodalInputs, global_server_args_dict
+from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaForCausalLM
@@ -252,7 +252,7 @@ def resample_patch_embed(
     try:
         from torch import vmap
     except ImportError:
-        from functorch import vmap
+        from torch.func import vmap
 
     assert len(patch_embed.shape) == 4, "Four dimensions expected"
     assert len(new_size) == 2, "New shape should only be hw"
@@ -1084,7 +1084,7 @@ def create_siglip_vit(
     )
 
     if ckpt_path:
-        state_dict = torch.load(ckpt_path, map_location="cpu")
+        state_dict = torch.load(ckpt_path, map_location="cpu", weights_only=True)
 
         incompatible_keys = model.load_state_dict(state_dict, strict=False)
         print(
@@ -1959,8 +1959,8 @@ class MultiModalityCausalLM(MultiModalityPreTrainedModel):
         )
         self.logits_processor = LogitsProcessor(config)
 
-    def get_image_feature(self, image_input: MultimodalInputs) -> torch.Tensor:
-        pixel_values = image_input.pixel_values
+    def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        pixel_values = torch.concat([item.pixel_values for item in items], dim=0)
         bs, n = pixel_values.shape[0:2]
         pixel_values = pixel_values.to(
             device=self.vision_model.device, dtype=self.vision_model.dtype
@@ -1976,7 +1976,7 @@ class MultiModalityCausalLM(MultiModalityPreTrainedModel):
         return images_embeds
 
     def get_input_embeddings(self) -> nn.Embedding:
-        return self.language_model.model.embed_tokens
+        return self.language_model.get_input_embeddings()
 
     @torch.no_grad()
     def forward(
@@ -1984,22 +1984,17 @@ class MultiModalityCausalLM(MultiModalityPreTrainedModel):
         input_ids: torch.LongTensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
+        get_embedding: bool = False,
     ) -> torch.Tensor:
-
-        inputs_embeds = general_mm_embed_routine(
+        hidden_states = general_mm_embed_routine(
             input_ids=input_ids,
             forward_batch=forward_batch,
-            embed_tokens=self.get_input_embeddings(),
-            mm_data_embedding_func=self.get_image_feature,
+            image_data_embedding_func=self.get_image_feature,
+            language_model=self.language_model,
+            positions=positions,
         )
 
-        return self.language_model(
-            input_ids=None,
-            positions=positions,
-            forward_batch=forward_batch,
-            input_embeds=inputs_embeds,
-            get_embedding=False,
-        )
+        return hidden_states
 
     def prepare_gen_img_embeds(self, image_ids: torch.LongTensor):
         return self.gen_aligner(self.gen_embed(image_ids))

@@ -13,6 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 
+import platform
 import sys
 from pathlib import Path
 
@@ -20,9 +21,7 @@ from setuptools import find_packages, setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 root = Path(__file__).parent.resolve()
-
-if "bdist_wheel" in sys.argv and "--plat-name" not in sys.argv:
-    sys.argv.extend(["--plat-name", "manylinux2014_x86_64"])
+arch = platform.machine().lower()
 
 
 def _get_version():
@@ -48,7 +47,7 @@ sources = [
 
 cxx_flags = ["-O3"]
 libraries = ["hiprtc", "amdhip64", "c10", "torch", "torch_python"]
-extra_link_args = ["-Wl,-rpath,$ORIGIN/../../torch/lib", "-L/usr/lib/x86_64-linux-gnu"]
+extra_link_args = ["-Wl,-rpath,$ORIGIN/../../torch/lib", f"-L/usr/lib/{arch}-linux-gnu"]
 
 hipcc_flags = [
     "-DNDEBUG",
@@ -74,7 +73,7 @@ ext_modules = [
         },
         libraries=libraries,
         extra_link_args=extra_link_args,
-        py_limited_api=True,
+        py_limited_api=False,
     ),
 ]
 
