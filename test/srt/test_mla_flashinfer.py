@@ -118,8 +118,6 @@ class TestFlashinferMLAMTP(CustomTestCase):
                     "1",
                     "--speculative-algorithm",
                     "EAGLE",
-                    "--speculative-draft",
-                    "lmsys/sglang-ci-dsv3-test-NextN",
                     "--speculative-num-steps",
                     "3",
                     "--speculative-eagle-topk",
