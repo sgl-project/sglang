@@ -34,10 +34,10 @@ from sglang.srt.disaggregation.utils import (
     ReqToMetadataIdxAllocator,
     TransferBackend,
     get_kv_class,
+    get_rdma_devices_by_gpu_no,
     kv_to_page_indices,
     kv_to_page_num,
     poll_and_all_reduce,
-    get_rdma_devices_by_gpu_no,
 )
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req, ScheduleBatch
 

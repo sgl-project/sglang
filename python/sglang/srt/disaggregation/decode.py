@@ -37,9 +37,9 @@ from sglang.srt.disaggregation.utils import (
     ReqToMetadataIdxAllocator,
     TransferBackend,
     get_kv_class,
+    get_rdma_devices_by_gpu_no,
     kv_to_page_indices,
     poll_and_all_reduce,
-    get_rdma_devices_by_gpu_no,
 )
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPoolAllocator
