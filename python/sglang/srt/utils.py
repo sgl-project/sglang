@@ -333,10 +333,9 @@ def get_available_gpu_memory(device, gpu_id, distributed=False, empty_cache=True
         # TODO: rename the variables in the current function to be not GPU specific
         free_gpu_memory = psutil.virtual_memory().available
     elif device == "npu":
-        import torch_npu
-
         num_gpus = torch.npu.device_count()
         assert gpu_id < num_gpus
+
         if torch.npu.current_device() != gpu_id:
             print(
                 f"WARNING: current device is not {gpu_id}, but {torch.npu.current_device()}, ",
@@ -1463,7 +1462,6 @@ def get_compiler_backend() -> str:
         return "hpu_backend"
 
     if hasattr(torch, "npu") and torch.npu.is_available():
-        import torch_npu
         import torchair
 
         config = torchair.CompilerConfig()
