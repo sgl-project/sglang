@@ -925,6 +925,7 @@ class MHATokenToKVPoolHost(HostKVCache):
         super().__init__(
             device_pool, host_to_device_ratio, host_size, pin_memory, device, page_size
         )
+        self.start_layer = device_pool.start_layer
 
     def get_size_per_token(self):
         self.head_num = self.device_pool.head_num
@@ -1008,6 +1009,7 @@ class MLATokenToKVPoolHost(HostKVCache):
         super().__init__(
             device_pool, host_to_device_ratio, host_size, pin_memory, device, page_size
         )
+        self.start_layer = device_pool.start_layer
 
     def get_size_per_token(self):
         self.kv_lora_rank = self.device_pool.kv_lora_rank
