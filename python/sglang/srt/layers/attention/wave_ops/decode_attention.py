@@ -29,7 +29,7 @@ from iree.turbine.kernel.wave.utils.general_utils import (
 from iree.turbine.kernel.wave.utils.run_utils import (
     set_default_run_config,
 )
-from iree.turbine.kernel.wave.constraints import MMAType
+from iree.turbine.kernel.wave.constraints import MMAType, GenericDot, MMAOperand
 from iree.turbine.kernel.wave.templates.paged_decode_attention import (
     get_paged_decode_attention_kernels,
     paged_decode_attention_shape,
@@ -648,16 +648,16 @@ def decode_attention_wave(
     k_buffer,
     v_buffer,
     o,
-    req_to_token,
     b_req_idx,
-    b_seq_len,
+    req_to_token,
     attn_logits,
     attn_logits_max,
     num_kv_splits,
+    max_kv_splits,
     sm_scale,
     logit_cap=0.0,
 ):
-
+    mha = (q.shape[1] // v_buffer.shape[2]) == 1
     num_seqs, num_query_heads, head_size = q.shape
     _, _, num_kv_heads, _ = k_buffer.shape
     _, _, _, head_size_kv = v_buffer.shape
@@ -673,7 +673,14 @@ def decode_attention_wave(
     )
 
     # Get the kernels (either compile or load from cache).
-    mfma_variant = (MMAType.F32_16x16x16_F16, MMAType.F32_16x16x16_F16)
+    if mha:
+        mfma_variant = (
+            GenericDot(along_dim=MMAOperand.M, k_vec_size=4, k_mult=1),
+            GenericDot(along_dim=MMAOperand.M, k_vec_size=1, k_mult=64),
+        )
+    else:
+        mfma_variant = (MMAType.F32_16x16x16_F16, MMAType.F32_16x16x16_F16)
+
     (
         phase_0,
         phase_1,
@@ -682,10 +689,11 @@ def decode_attention_wave(
     ) = get_paged_decode_attention_kernels(
         shape,
         mfma_variant,
-        num_kv_splits,
+        max_kv_splits,
         k_buffer.shape,
         v_buffer.shape,
         req_to_token.shape,
+        mha,
     )
     hyperparams_0.update(get_default_scheduling_params())
     hyperparams_1.update(get_default_scheduling_params())
@@ -697,6 +705,8 @@ def decode_attention_wave(
         subs=hyperparams_0,
         canonicalize=True,
         run_bench=False,
+        use_buffer_load_ops=False,
+        use_buffer_store_ops=False,
     )
     options = set_default_run_config(options)
     phase_0 = wave_compile(options, phase_0)
@@ -707,7 +717,6 @@ def decode_attention_wave(
         k_buffer,
         v_buffer,
         b_req_idx,
-        b_seq_len,
         req_to_token,
         attn_logits,
         attn_logits_max,
@@ -722,16 +731,17 @@ def decode_attention_wave(
         subs=hyperparams_1,
         canonicalize=True,
         run_bench=False,
+        use_buffer_load_ops=False,
+        use_buffer_store_ops=False,
     )
     options = set_default_run_config(options)
     phase_1 = wave_compile(options, phase_1)
 
-    mb_sv = phase_1(attn_logits, attn_logits_max, b_seq_len, o)
+    mb_sv = phase_1(attn_logits, attn_logits_max, b_req_idx, o)
     if dump_generated_mlir:
         filename = f"wave_decode_attention_phase1_{'x'.join(map(str, shape))}.mlir"
         with open(filename, "w") as f:
             f.write(mb_sv.module_op.get_asm())
-
 
 
 def decode_attention_fwd(
@@ -739,30 +749,31 @@ def decode_attention_fwd(
     k_buffer,
     v_buffer,
     o,
-    req_to_token,
     b_req_idx,
-    b_seq_len,
+    req_to_token,
     attn_logits,
     attn_logits_max,
     num_kv_splits,
+    max_kv_splits,
     sm_scale,
     logit_cap=0.0,
 ):
-    assert num_kv_splits == attn_logits.shape[2]
-    kv_group_num = q.shape[1] // v_buffer.shape[1]
+    assert max_kv_splits == attn_logits.shape[2]
+    kv_group_num = q.shape[1] // v_buffer.shape[2]
 
     if kv_group_num == 1:
         # MHA
-        decode_attention_fwd_normal(
+        decode_attention_wave(
             q,
             k_buffer,
             v_buffer,
             o,
             req_to_token,
             b_req_idx,
-            b_seq_len,
             attn_logits,
+            attn_logits_max,
             num_kv_splits,
+            max_kv_splits,
             sm_scale,
             logit_cap,
         )
@@ -775,10 +786,10 @@ def decode_attention_fwd(
             o,
             req_to_token,
             b_req_idx,
-            b_seq_len,
             attn_logits,
             attn_logits_max,
             num_kv_splits,
+            max_kv_splits,
             sm_scale,
             logit_cap,
         )
