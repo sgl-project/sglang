@@ -513,3 +513,8 @@ class ScoringResponse(BaseModel):
     model: str
     usage: Optional[UsageInfo] = None
     object: str = "scoring"
+class RerankResponse(BaseModel):
+    score: float
+    document: str
+    index: int
+    meta_info: Optional[dict] = None

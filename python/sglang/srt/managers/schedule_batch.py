@@ -439,6 +439,7 @@ class Req:
         origin_input_ids_unpadded: Optional[Tuple[int]] = None,
         lora_path: Optional[str] = None,
         input_embeds: Optional[List[List[float]]] = None,
+        token_type_ids: List[int] = None,
         session_id: Optional[str] = None,
         custom_logit_processor: Optional[str] = None,
         return_hidden_states: bool = False,
@@ -462,6 +463,9 @@ class Req:
         self.fill_ids = None
         self.session_id = session_id
         self.input_embeds = input_embeds
+
+        # for corss-endoder model
+        self.token_type_ids = token_type_ids
 
         # Sampling info
         if isinstance(sampling_params.custom_params, dict):
@@ -831,6 +835,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Batched arguments to model runner
     input_ids: torch.Tensor = None  # shape: [b], int64
     input_embeds: torch.Tensor = None  # shape: [b, hidden_size], float32
+    token_type_ids: torch.Tensor = None  # shape: [b], int64
     req_pool_indices: torch.Tensor = None  # shape: [b], int64
     seq_lens: torch.Tensor = None  # shape: [b], int64
     # The output locations of the KV cache
@@ -1132,6 +1137,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         prefix_lens = [len(r.prefix_indices) for r in reqs]
         extend_lens = [r.extend_input_len for r in reqs]
 
+        token_type_ids = [
+            r.token_type_ids for r in reqs if r.token_type_ids is not None
+        ]
+
         req_pool_indices_tensor = torch.tensor(req_pool_indices, dtype=torch.int64).to(
             self.device, non_blocking=True
         )
@@ -1144,6 +1153,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         prefix_lens_tensor = torch.tensor(
             prefix_lens, dtype=torch.int64, device=self.device
         )
+
+        token_type_ids_tensor = None
+        if len(token_type_ids) > 0:
+            token_type_ids_tensor = torch.tensor(
+                sum(token_type_ids, []), dtype=torch.int64
+            ).to(self.device, non_blocking=True)
+
         extend_lens_tensor = seq_lens_tensor - prefix_lens_tensor
 
         # Copy prefix and do some basic check
@@ -1259,6 +1275,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         self.device, non_blocking=True
                     )
         self.multimodal_inputs = multimodal_inputs
+        self.token_type_ids = token_type_ids_tensor
         self.seq_lens_sum = sum(seq_lens)
 
         if self.return_logprob:
@@ -1687,6 +1704,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             lora_paths=[req.lora_path for req in self.reqs],
             sampling_info=self.sampling_info,
             input_embeds=self.input_embeds,
+            token_type_ids=self.token_type_ids,
             spec_algorithm=self.spec_algorithm,
             spec_info=self.spec_info,
             capture_hidden_mode=(
@@ -1779,6 +1797,9 @@ class ModelWorkerBatch:
 
     # The input Embeds
     input_embeds: Optional[torch.tensor] = None
+
+    # For corss-encoder model
+    token_type_ids: Optional[torch.Tensor] = None
 
     # Speculative decoding
     spec_algorithm: SpeculativeAlgorithm = None
