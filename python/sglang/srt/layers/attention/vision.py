@@ -267,8 +267,8 @@ class VisionTritonAttention(nn.Module):
             k,
             v,
             output,
-            cu_seqlens.cuda(),
-            seq_lens.cuda(),
+            cu_seqlens.to(q.device),
+            seq_lens.to(q.device),
             max_seqlen,
             is_causal=False,
         )
