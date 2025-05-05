@@ -7,6 +7,7 @@ from typing import List
 
 import numpy as np
 import pynvml
+import pyverbs.device as d
 import torch
 import torch.distributed as dist
 
