@@ -745,6 +745,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     out_cache_loc: torch.Tensor = None  # shape: [b], int64
     output_ids: torch.Tensor = None  # shape: [b], int64
 
+    # For multimodal inputs
+    multimodal_inputs: Optional[List] = None
+
     # The sum of all sequence lengths
     seq_lens_sum: int = None
 
