@@ -536,7 +536,7 @@ class ModelRunner:
 
         def get_weight_iter(config):
             iter = loader._get_weights_iterator(
-                DefaultModelLoader.Source.init_new(config, model)
+                DefaultModelLoader.Source.init_new(config, self.model)
             )
             return iter
 
