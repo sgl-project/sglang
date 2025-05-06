@@ -270,7 +270,6 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             ]
         # todo: extend & verify with flashmla
         else:
-            print("super().init_forward_metadata_replay_cuda_graph")
             super().init_forward_metadata_replay_cuda_graph(
                 bs,
                 req_pool_indices,
@@ -418,9 +417,6 @@ class FlashMLAMultiStepDraftBackend:
         assert forward_batch.spec_info is not None
         assert isinstance(forward_batch.spec_info, EagleDraftInput)
 
-        print("flashmla_mtp_backend spec_steps", self.speculative_num_steps)
-
-
         for i in range(self.speculative_num_steps - 1):
             forward_batch.spec_info.kv_indptr = self.kv_indptr[i, : bs + 1]
             forward_batch.spec_info.kv_indices = kv_indices_buffer[i][
@@ -429,7 +425,6 @@ class FlashMLAMultiStepDraftBackend:
             call_fn(i, forward_batch)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        print("flashmla_mtp_backend init_forward_metadata", forward_batch.forward_mode)
         # max_blocks_per_seq = (self.max_context_len + PAGE_SIZE - 1) // PAGE_SIZE
         kv_indices = torch.zeros(
             (

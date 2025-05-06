@@ -119,7 +119,6 @@ class EagleDraftInput:
         block_kv_indices: Optional[torch.Tensor] = None,
         max_seqlen_pad: Optional[int] = None,
     ):
-        print("generate_attn_arg_prefill for EagleDraftInput")
         bs = self.accept_length.numel()
 
         qo_indptr = torch.zeros((bs + 1,), dtype=torch.int32, device="cuda")
@@ -295,7 +294,6 @@ class EagleVerifyInput:
         kv_indices: Optional[torch.Tensor] = None,
         use_flashmla: bool = False,
     ):
-        print("generate_attn_arg_prefill for EagleVerifyInput")
         batch_size = len(req_pool_indices)
         qo_indptr = torch.arange(
             0,

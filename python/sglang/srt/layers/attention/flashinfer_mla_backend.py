@@ -340,6 +340,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
     ):
+
         cache_loc = forward_batch.out_cache_loc
         logits_soft_cap = layer.logit_cap
         prefill_wrapper_paged = self.forward_metadata.prefill_wrapper
@@ -370,6 +371,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 k_buf[:, :, : layer.v_head_dim],
                 k_buf[:, :, layer.v_head_dim :],
             )
+
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def forward_decode(
@@ -405,6 +407,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             k_buffer[:, :, : layer.v_head_dim],
             k_buffer[:, :, layer.v_head_dim :],
         )
+
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
 
