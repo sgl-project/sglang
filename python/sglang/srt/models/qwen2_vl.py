@@ -42,7 +42,7 @@ from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternTokenPairs,
+    MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
@@ -442,18 +442,6 @@ class Qwen2VLForConditionalGeneration(nn.Module):
         "up_proj": ("gate_up_proj", 1),
     }
 
-    def calculate_num_image_tokens(self, image_grid_thw: Tuple[int, int, int]):
-        processor = cached_get_processor(self.config._name_or_path)
-        grid_t, grid_h, grid_w = image_grid_thw
-        num_image_tokens = (
-            grid_t
-            * grid_h
-            * grid_w
-            // processor.image_processor.merge_size
-            // processor.image_processor.merge_size
-        )
-        return num_image_tokens
-
     def __init__(
         self,
         config: Qwen2VLConfig,
@@ -490,15 +478,11 @@ class Qwen2VLForConditionalGeneration(nn.Module):
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
 
-    # Use grid_t * grid_w * grid_h to pad tokens for each image
-    # add replaced padding by unique image hash
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         # Get all special token IDs
-        im_start_id: int = mm_inputs.im_start_id
-        im_end_id: int = mm_inputs.im_end_id
+        im_token_id: int = mm_inputs.im_token_id
 
-        media_token_pairs = [(im_start_id, im_end_id)]
-        pattern = MultiModalityDataPaddingPatternTokenPairs(media_token_pairs)
+        pattern = MultiModalityDataPaddingPatternMultimodalTokens([im_token_id])
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:

@@ -209,6 +209,20 @@ std::vector<at::Tensor> moe_fused_gate(
     int64_t n_share_experts_fusion,
     double routed_scaling_factor);
 
+void fp8_blockwise_scaled_grouped_mm(
+    torch::Tensor& output,
+    const torch::Tensor& a,
+    const torch::Tensor& b,
+    const torch::Tensor& scales_a,
+    const torch::Tensor& scales_b,
+    const torch::Tensor& stride_a,
+    const torch::Tensor& stride_b,
+    const torch::Tensor& stride_c,
+    const torch::Tensor& layout_sfa,
+    const torch::Tensor& layout_sfb,
+    const torch::Tensor& problem_sizes,
+    const torch::Tensor& expert_offsets);
+
 /*
  * From csrc/speculative
  */
@@ -338,3 +352,38 @@ std::vector<at::Tensor> mha_varlen_fwd_sparse(
     const bool return_softmax,
     c10::optional<at::Generator> gen_);
 }  // namespace flash
+
+void convert_vertical_slash_indexes(
+    torch::Tensor& block_count,      // [BATCH, N_HEADS, NUM_ROWS]
+    torch::Tensor& block_offset,     // [BATCH, N_HEADS, NUM_ROWS, NNZ_S]
+    torch::Tensor& column_count,     // [BATCH, N_HEADS, NUM_ROWS]
+    torch::Tensor& column_index,     // [BATCH, N_HEADS, NUM_ROWS, NNZ_V]
+    torch::Tensor q_seqlens,         // [BATCH, ]
+    torch::Tensor kv_seqlens,        // [BATCH, ]
+    torch::Tensor vertical_indexes,  // [BATCH, N_HEADS, NNZ_V]
+    torch::Tensor slash_indexes,     // [BATCH, N_HEADS, NNZ_S]
+    int64_t context_size,
+    int64_t block_size_M,
+    int64_t block_size_N,
+    bool causal);
+
+void convert_vertical_slash_indexes_mergehead(
+    torch::Tensor& block_count,            // [BATCH, N_HEADS, NUM_ROWS]
+    torch::Tensor& block_offset,           // [BATCH, N_HEADS, NUM_ROWS, NNZ_S]
+    torch::Tensor& column_count,           // [BATCH, N_HEADS, NUM_ROWS]
+    torch::Tensor& column_index,           // [BATCH, N_HEADS, NUM_ROWS, NNZ_V]
+    torch::Tensor q_seqlens,               // [BATCH, ]
+    torch::Tensor kv_seqlens,              // [BATCH, ]
+    torch::Tensor vertical_indexes,        // [BATCH, N_HEADS, NNZ_V]
+    torch::Tensor slash_indexes,           // [BATCH, N_HEADS, NNZ_S]
+    torch::Tensor vertical_indices_count,  // [N_HEADS, ]
+    torch::Tensor slash_indices_count,
+    int64_t context_size,
+    int64_t block_size_M,
+    int64_t block_size_N,
+    bool causal);
+
+/*
+ * From XGrammar
+ */
+void ApplyTokenBitmaskInplace(at::Tensor logits, at::Tensor bitmask, at::optional<at::Tensor> indices = at::nullopt);

@@ -6,7 +6,9 @@ try:
     import torch_memory_saver
 
     _primary_memory_saver = torch_memory_saver.TorchMemorySaver()
-except ImportError:
+    import_error = None
+except ImportError as e:
+    import_error = e
     pass
 
 logger = logging.getLogger(__name__)
@@ -15,6 +17,13 @@ logger = logging.getLogger(__name__)
 class TorchMemorySaverAdapter(ABC):
     @staticmethod
     def create(enable: bool):
+        if enable and import_error is not None:
+            logger.warning(
+                "enable_memory_saver is enabled, but "
+                "torch-memory-saver is not installed. Please install it "
+                "via `pip3 install torch-memory-saver`. "
+            )
+            raise import_error
         return (
             _TorchMemorySaverAdapterReal() if enable else _TorchMemorySaverAdapterNoop()
         )
