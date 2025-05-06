@@ -30,7 +30,7 @@ if is_cuda():
 
 logger = logging.getLogger(__name__)
 
-_BUILTIN_M_LIST = list(range(1, 1024 * 16 + 1))
+_BUILTIN_M_LIST = range(1, 1024 * 16 + 1)
 _ENABLE_JIT_DEEPGEMM_PRECOMPILE = get_bool_env_var(
     "SGL_JIT_DEEPGEMM_PRECOMPILE", "true"
 )
@@ -62,7 +62,7 @@ def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
 
     # Generate m_max
     m_range = generate_m_range(server_args)
-    _BUILTIN_M_LIST = list(range(1, m_range + 1))
+    _BUILTIN_M_LIST = range(1, m_range + 1)
 
     _IS_FIRST_RANK_ON_NODE = ServerArgs.base_gpu_id == gpu_id
 
@@ -298,15 +298,15 @@ def _maybe_compile_deep_gemm_one_type_all(
         _INITIALIZATION_DICT[query_key] = True
 
         kernel_helper = _KERNEL_HELPER_DICT[kernel_type]
+        num_sms = get_num_sms()
+
         _compile_warning_1()
         logger.info(
-            f"Try DeepGEMM JIT Compiling for "
-            f"<{kernel_helper.name}> N={n}, K={k}, num_groups={num_groups} with all Ms."
+            f"DeepGEMM Loading/Compiling libs for "
+            f"<{kernel_helper.name}> N={n}, K={k}, num_groups={num_groups}, num_sms={num_sms}."
             f"{' It only takes a litte time (typically 1 sec) if you have run `python3 -m sglang.compile_deep_gemm`. ' if not _IN_PRECOMPILE_STAGE else ''}"
         )
 
-        # NOTE(alcanderian): get_num_sms should be change when 2-batch-overlap is introduced
-        num_sms = get_num_sms()
         collected_configs = set()
         for m in m_list if m_list is not None else _BUILTIN_M_LIST:
             # Put config into set to get unique configs and reduce cases to be compiled
