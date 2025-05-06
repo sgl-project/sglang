@@ -1250,7 +1250,9 @@ class ServerArgs:
             "--disaggregation-ib-device",
             type=str,
             default=ServerArgs.disaggregation_ib_device,
-            help="The ib device for disaggregation transfer. Default is None, it will be detected automatically if using the mooncake backend.",
+            help="The InfiniBand devices for disaggregation transfer, accepts single device (e.g., --disaggregation-ib-device mlx5_0) "
+            "or multiple comma-separated devices (e.g., --disaggregation-ib-device mlx5_0,mlx5_1). "
+            "Default is None, which triggers automatic device detection when mooncake backend is enabled.",
         )
 
     @classmethod
