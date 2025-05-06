@@ -48,6 +48,10 @@ CI_MODELS = [
 ]
 ALL_OTHER_MODELS = [
     dict(
+        model_path="Qwen/Qwen2.5-0.5B",
+        dp_size=4,
+    ),
+    dict(
         model_path="Qwen/Qwen2.5-14B-Instruct",
         mem_fraction_static=0.4,
         tp_size=8,
