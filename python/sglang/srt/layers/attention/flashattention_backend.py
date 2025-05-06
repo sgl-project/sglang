@@ -338,7 +338,7 @@ class FlashAttentionBackend(AttentionBackend):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
         metadata = FlashAttentionMetadata()
         seqlens_in_batch = forward_batch.seq_lens
-        batch_size = len(seqlens_in_batch)
+        batch_size = forward_batch.batch_size
         device = seqlens_in_batch.device
 
         if forward_batch.forward_mode.is_decode_or_idle():
@@ -623,6 +623,9 @@ class FlashAttentionBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache=True,
+        # For multi-head latent attention
+        q_rope: Optional[torch.Tensor] = None,
+        k_rope: Optional[torch.Tensor] = None,
     ):
         if k is not None:
             assert v is not None
@@ -637,11 +640,11 @@ class FlashAttentionBackend(AttentionBackend):
                         layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                     )
                 else:
-                    forward_batch.token_to_kv_pool.set_kv_buffer(
+                    forward_batch.token_to_kv_pool.set_mla_kv_buffer(
                         layer,
                         cache_loc,
                         k,
-                        v,
+                        k_rope,
                     )
 
         # Use precomputed metadata across all layers
@@ -815,9 +818,15 @@ class FlashAttentionBackend(AttentionBackend):
                 c_kv_cache = c_kv.view(
                     -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
                 )
-                q_all = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
-                q_nope = q_all[:, :, : layer.v_head_dim]
-                q_rope = q_all[:, :, layer.v_head_dim :]
+                if q_rope is not None:
+                    q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+                    q_rope = q_rope.view(
+                        -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
+                    )
+                else:
+                    q_all = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+                    q_nope = q_all[:, :, : layer.v_head_dim]
+                    q_rope = q_all[:, :, layer.v_head_dim :]
 
                 result = flash_attn_with_kvcache(
                     q=q_rope,
@@ -877,6 +886,9 @@ class FlashAttentionBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache=True,
+        # For multi-head latent attention
+        q_rope: Optional[torch.Tensor] = None,
+        k_rope: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if k is not None:
             assert v is not None
@@ -891,11 +903,11 @@ class FlashAttentionBackend(AttentionBackend):
                         layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                     )
                 else:
-                    forward_batch.token_to_kv_pool.set_kv_buffer(
+                    forward_batch.token_to_kv_pool.set_mla_kv_buffer(
                         layer,
                         cache_loc,
                         k,
-                        v,
+                        k_rope,
                     )
 
         # Use precomputed metadata across all layers
@@ -1047,9 +1059,15 @@ class FlashAttentionBackend(AttentionBackend):
                 -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
             )
 
-            q_all = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
-            q_nope = q_all[:, :, : layer.v_head_dim]
-            q_rope = q_all[:, :, layer.v_head_dim :]
+            if q_rope is not None:
+                q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+                q_rope = q_rope.view(
+                    -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
+                )
+            else:
+                q_all = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+                q_nope = q_all[:, :, : layer.v_head_dim]
+                q_rope = q_all[:, :, layer.v_head_dim :]
             max_seqlen_q = metadata.max_seq_len_q
 
             result = flash_attn_with_kvcache(
@@ -1569,8 +1587,9 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.max_seq_len_k = max_len
 
                 metadata.cache_seqlens_int32 = seq_lens.to(torch.int32)
-                metadata.cu_seqlens_k = torch.nn.functional.pad(
-                    torch.cumsum(seq_lens, dim=0, dtype=torch.int32), (1, 0)
+                # Optimize cumulative sequence length calculation
+                metadata.cu_seqlens_k[1:].copy_(
+                    torch.cumsum(seq_lens, dim=0, dtype=torch.int32)
                 )
 
                 max_seq_pages = (

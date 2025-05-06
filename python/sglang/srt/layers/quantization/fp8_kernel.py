@@ -16,19 +16,17 @@ import functools
 import json
 import logging
 import os
-from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.layers.quantization.deep_gemm import _ENABLE_JIT_DEEPGEMM
 from sglang.srt.utils import (
     direct_register_custom_op,
-    get_bool_env_var,
     get_device_core_count,
     get_device_name,
-    get_device_sm,
     is_cuda,
     is_hip,
     supports_custom_op,
@@ -43,22 +41,16 @@ else:
     fp8_max = torch.finfo(_fp8_type).max
 fp8_min = -fp8_max
 
-_enable_jit_deepgemm = False
-_enable_jit_deepgemm_bmm = False
 if _is_cuda:
-    import deep_gemm
     from sgl_kernel import (
         sgl_per_tensor_quant_fp8,
         sgl_per_token_group_quant_fp8,
         sgl_per_token_quant_fp8,
     )
 
-    sm_version = get_device_sm()
-    if sm_version == 90:
-        if get_bool_env_var("SGL_ENABLE_JIT_DEEPGEMM", default="false"):
-            _enable_jit_deepgemm = True
-        if get_bool_env_var("SGL_ENABLE_JIT_DEEPGEMM_BMM", default="false"):
-            _enable_jit_deepgemm_bmm = True
+    from sglang.srt.layers.quantization.deep_gemm import (
+        gemm_nt_f8f8bf16 as deep_gemm_gemm_nt_f8f8bf16,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -71,10 +63,7 @@ if supports_custom_op():
         Bs: torch.Tensor,
         C: torch.Tensor,
     ) -> None:
-        M, K = A.shape
-        N, _ = B.shape
-        with _log_jit_build(M, N, K):
-            deep_gemm.gemm_fp8_fp8_bf16_nt((A, As), (B, Bs), C)
+        deep_gemm_gemm_nt_f8f8bf16((A, As), (B, Bs), C)
 
     def deep_gemm_fp8_fp8_bf16_nt_fake(
         A: torch.Tensor,
@@ -715,25 +704,6 @@ def get_w8a8_block_fp8_configs(
     return None
 
 
-@contextmanager
-def _log_jit_build(M: int, N: int, K: int):
-    from deep_gemm.jit.runtime import RuntimeCache
-
-    origin_func = RuntimeCache.__getitem__
-
-    def __patched_func(self, *args, **kwargs):
-        ret = origin_func(self, *args, **kwargs)
-        if ret is None:
-            logger.warning(
-                f"DeepGEMM JIT code generation <gemm_fp8_fp8_bf16_nt>: M={M}, N={N}, K={K}. Please wait."
-            )
-        return ret
-
-    RuntimeCache.__getitem__ = __patched_func
-    yield
-    RuntimeCache.__getitem__ = origin_func
-
-
 def w8a8_block_fp8_matmul(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -804,12 +774,11 @@ def w8a8_block_fp8_matmul(
     )
 
     # deepgemm only support bf16
-    if C.dtype == torch.bfloat16 and _enable_jit_deepgemm:
+    if C.dtype == torch.bfloat16 and _ENABLE_JIT_DEEPGEMM:
         if supports_custom_op():
             torch.ops.sglang.deep_gemm_fp8_fp8_bf16_nt(A, As, B, Bs, C)
         else:
-            with _log_jit_build(M, N, K):
-                deep_gemm.gemm_fp8_fp8_bf16_nt((A, As), (B, Bs), C)
+            deep_gemm_gemm_nt_f8f8bf16((A, As), (B, Bs), C)
     else:
         kernel = (
             _w8a8_block_fp8_matmul_unrolledx4

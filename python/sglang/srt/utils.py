@@ -12,6 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 """Common utilities."""
+
 import base64
 import builtins
 import ctypes
@@ -96,6 +97,16 @@ def get_bool_env_var(name: str, default: str = "false") -> bool:
         _warned_bool_env_var_keys.add(value)
 
     return value in truthy_values
+
+
+def get_int_env_var(name: str, default: int = 0) -> int:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
 
 
 # https://pytorch.org/docs/stable/notes/hip.html#checking-for-hip
@@ -404,16 +415,40 @@ class LayerFn(Protocol):
 def make_layers(
     num_hidden_layers: int,
     layer_fn: LayerFn,
+    pp_rank: Optional[int] = None,
+    pp_size: Optional[int] = None,
     prefix: str = "",
+    return_tuple: bool = False,
 ) -> Tuple[int, int, torch.nn.ModuleList]:
     """Make a list of layers with the given layer function"""
+    # circula imports
+    from sglang.srt.distributed import get_pp_indices
+    from sglang.srt.layers.utils import PPMissingLayer
+
+    assert not pp_size or num_hidden_layers >= pp_size
+    start_layer, end_layer = (
+        get_pp_indices(
+            num_hidden_layers,
+            pp_rank,
+            pp_size,
+        )
+        if pp_rank is not None and pp_size is not None
+        else (0, num_hidden_layers)
+    )
     modules = torch.nn.ModuleList(
-        [
+        [PPMissingLayer(return_tuple=return_tuple) for _ in range(start_layer)]
+        + [
             maybe_offload_to_cpu(layer_fn(idx=idx, prefix=add_prefix(idx, prefix)))
-            for idx in range(num_hidden_layers)
+            for idx in range(start_layer, end_layer)
+        ]
+        + [
+            PPMissingLayer(return_tuple=return_tuple)
+            for _ in range(end_layer, num_hidden_layers)
         ]
     )
-    return modules
+    if pp_rank is None or pp_size is None:
+        return modules
+    return modules, start_layer, end_layer
 
 
 def set_random_seed(seed: int) -> None:
@@ -862,12 +897,15 @@ def broadcast_pyobj(
     src: int = 0,
     force_cpu_device: bool = True,
 ):
-    """Broadcast inputs from rank=0 to all other ranks with torch.dist backend."""
+    """Broadcast inputs from src rank to all other ranks with torch.dist backend.
+    The `rank` here refer to the source rank on global process group (regardless
+    of dist_group argument).
+    """
     device = torch.device(
         "cuda" if torch.cuda.is_available() and not force_cpu_device else "cpu"
     )
 
-    if rank == 0:
+    if rank == src:
         if len(data) == 0:
             tensor_size = torch.tensor([0], dtype=torch.long, device=device)
             dist.broadcast(tensor_size, src=src, group=dist_group)
@@ -897,6 +935,50 @@ def broadcast_pyobj(
         serialized_data = bytes(tensor_data.cpu().numpy())
         data = pickle.loads(serialized_data)
         return data
+
+
+def point_to_point_pyobj(
+    data: List[Any],
+    rank: int,
+    group: Optional[torch.distributed.ProcessGroup] = None,
+    src: int = 0,
+    dst: int = 1,
+):
+    """Send data from src to dst in group."""
+
+    if rank == src:
+        if len(data) == 0:
+            tensor_size = torch.tensor([0], dtype=torch.long)
+            dist.send(tensor_size, dst=dst, group=group)
+        else:
+            serialized_data = pickle.dumps(data)
+            size = len(serialized_data)
+            tensor_data = torch.ByteTensor(
+                np.frombuffer(serialized_data, dtype=np.uint8)
+            )
+            tensor_size = torch.tensor([size], dtype=torch.long)
+
+            dist.send(tensor_size, dst=dst, group=group)
+            dist.send(tensor_data, dst=dst, group=group)
+        return data
+
+    elif rank == dst:
+        tensor_size = torch.tensor([0], dtype=torch.long)
+        dist.recv(tensor_size, src=src, group=group)
+        size = tensor_size.item()
+
+        if size == 0:
+            return []
+
+        tensor_data = torch.empty(size, dtype=torch.uint8)
+        dist.recv(tensor_data, src=src, group=group)
+
+        serialized_data = bytes(tensor_data.cpu().numpy())
+        data = pickle.loads(serialized_data)
+        return data
+
+    # Other ranks in pp_group do nothing
+    return []
 
 
 step_counter = 0
@@ -1158,6 +1240,20 @@ def get_hpu_memory_capacity():
         raise RuntimeError(
             "hl-smi not found. Ensure Habana drivers are installed and accessible."
         )
+
+
+def get_device_memory_capacity(device: str = None):
+    if is_cuda():
+        gpu_mem = get_nvgpu_memory_capacity()
+    elif is_hip():
+        gpu_mem = get_amdgpu_memory_capacity()
+    elif device == "hpu":
+        gpu_mem = get_hpu_memory_capacity()
+    else:
+        # GPU memory is not known yet or no GPU is available.
+        gpu_mem = None
+
+    return gpu_mem
 
 
 # Copy from pytorch and OpenRLHF to allow creating multiple main groups.
@@ -1708,6 +1804,13 @@ def configure_ipv6(dist_init_addr):
     return port, host
 
 
+def rank0_log(msg: str):
+    from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+    if get_tensor_model_parallel_rank() == 0:
+        logger.info(msg)
+
+
 def rank0_print(msg: str):
     from sglang.srt.distributed import get_tensor_model_parallel_rank
 
@@ -1881,13 +1984,16 @@ def fast_topk(values, topk, dim):
         return torch.topk(values, topk, dim=dim)
 
 
-def is_hopper_with_cuda_12_3():
+def _check(cc_major):
     if not is_cuda():
         return False
-    is_hopper = torch.cuda.get_device_capability()[0] == 9
-    cuda_version = torch.version.cuda.split(".")
-    is_cuda_compatible = int(cuda_version[0]) == 12 and int(cuda_version[1]) >= 3
-    return is_hopper and is_cuda_compatible
+    return torch.cuda.get_device_capability()[0] == cc_major and tuple(
+        map(int, torch.version.cuda.split(".")[:2])
+    ) >= (12, 3)
+
+
+is_ampere_with_cuda_12_3 = lambda: _check(8)
+is_hopper_with_cuda_12_3 = lambda: _check(9)
 
 
 def get_free_port():
@@ -1920,7 +2026,7 @@ def get_local_ip_by_remote() -> str:
         s.connect(("2001:4860:4860::8888", 80))  # Doesn't need to be reachable
         return s.getsockname()[0]
     except Exception:
-        raise ValueError(f"Can not get local ip")
+        raise ValueError("Can not get local ip")
 
 
 def is_page_size_one(server_args):
@@ -1946,7 +2052,11 @@ def is_fa3_default_architecture(hf_config):
         "Llama4ForConditionalGeneration",
         "LlamaForCausalLM",
         "MistralForCausalLM",
+        "MixtralForCausalLM",
         "Gemma2ForCausalLM",
+        "Gemma3ForConditionalGeneration",
+        "Qwen3ForCausalLM",
+        "Qwen3MoeForCausalLM",
     }
     return architectures[0] in default_archs
 
