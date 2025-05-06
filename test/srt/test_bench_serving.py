@@ -170,7 +170,8 @@ class TestBenchServing(CustomTestCase):
                 f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
             )
             if os.getenv("SGLANG_AMD_CI") == "1":
-                self.assertGreater(res["output_throughput"], 2000)  # TODO: not set yet
+                self.assertGreater(res["output_throughput"], 2000)
+                # TODO: not set yet, need AMD machine
             else:
                 self.assertGreater(res["output_throughput"], 2500)
 
@@ -195,7 +196,8 @@ class TestBenchServing(CustomTestCase):
             )
             self.assertLess(res["median_e2e_latency_ms"], 16000)
             if os.getenv("SGLANG_AMD_CI") == "1":
-                self.assertLess(res["median_ttft_ms"], 150)  # TODO: not set yet
+                self.assertLess(res["median_ttft_ms"], 150)
+                # TODO: not set yet, need AMD machine
             else:
                 self.assertLess(res["median_ttft_ms"], 90)
             self.assertLess(res["median_itl_ms"], 8)
