@@ -1,4 +1,4 @@
-## Benchmark Kernels
+## Tuning Triton MoE Kernels
 
 This directory contains benchmarking tools for MoE (Mixture of Experts) kernels.
 
@@ -16,6 +16,13 @@ python benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton.py \
 # Tune Qwen2-57B with FP8 and TP=4
 python benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton.py \
     --model Qwen/Qwen2-57B-A14B-Instruct \
+    --tp-size 4 \
+    --dtype fp8_w8a8 \
+    --tune
+
+# Tune Qwen3-235B-A22B-FP8 and TP=4
+python benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton.py \
+    --model Qwen/Qwen3-235B-A22B-FP8 \
     --tp-size 4 \
     --dtype fp8_w8a8 \
     --tune
