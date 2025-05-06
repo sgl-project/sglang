@@ -38,8 +38,7 @@ _ENABLE_UPDATE_WEIGHTS = True
 # _ENABLE_UPDATE_WEIGHTS = False
 
 # TODO maybe we should add more other models? should we keep it in sync with test_generation_models.py?
-CI_MODELS = []
-ALL_OTHER_MODELS = [
+ALL_MODELS = [
     dict(model_path="meta-llama/Llama-3.2-1B-Instruct"),
     dict(model_path="Qwen/Qwen2-1.5B"),
     dict(model_path="allenai/OLMo-1B-0724-hf"),
@@ -107,14 +106,15 @@ class TestVerlEngine(CustomTestCase):
             p.join()
 
     def test_ci_models(self):
-        for index, model_info in enumerate(CI_MODELS):
+        ci_models = [random.choice(ALL_MODELS)]
+        for index, model_info in enumerate(ci_models):
             self.assert_fragment_e2e_execution(index=index, **model_info)
 
     def test_others(self):
         if is_in_ci():
             return
 
-        for index, model_info in enumerate(ALL_OTHER_MODELS):
+        for index, model_info in enumerate(ALL_MODELS):
             self.assert_fragment_e2e_execution(index=index, **model_info)
 
     # def test_adhoc(self):
