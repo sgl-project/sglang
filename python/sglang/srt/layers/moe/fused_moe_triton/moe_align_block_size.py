@@ -1,13 +1,11 @@
 import os
+from typing import Tuple
+
 import torch
 import triton
 import triton.language as tl
-from typing import Tuple
-from sglang.srt.utils import (
-    is_cuda,
-    is_hip,
-)
 
+from sglang.srt.utils import is_cuda, is_hip
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -199,12 +197,13 @@ def moe_align_block_size(
         (max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device
     )
     num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
-    
+
     from sglang.srt.utils import is_cuda, is_hip
+
     enable_moe_align_block_size_triton = bool(
         int(os.getenv("ENABLE_MOE_ALIGN_BLOCK_SIZE_TRITON", "0"))
     )
-    
+
     if enable_moe_align_block_size_triton:
         moe_align_block_size_triton(
             topk_ids,

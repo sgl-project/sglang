@@ -12,17 +12,16 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.moe.fused_moe_triton.moe_align_block_size import (
-    moe_align_block_size
-)
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe_awq import (
-    fused_moe_kernel_gptq_awq
-)
-from sglang.srt.layers.moe.fused_moe_triton.fused_moe_fp8 import (
-    fused_moe_kernel
+    fused_moe_kernel_gptq_awq,
 )
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe_config import (
-    try_get_optimal_moe_config, get_config_dtype_str
+    get_config_dtype_str,
+    try_get_optimal_moe_config,
+)
+from sglang.srt.layers.moe.fused_moe_triton.fused_moe_fp8 import fused_moe_kernel
+from sglang.srt.layers.moe.fused_moe_triton.moe_align_block_size import (
+    moe_align_block_size,
 )
 from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.fp8_kernel import (
