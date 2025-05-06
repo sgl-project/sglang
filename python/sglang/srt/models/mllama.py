@@ -37,7 +37,7 @@ from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaDecoderLayer, LlamaMLP
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, get_device
 
 
 class ColumnParallelConv2dPatch(torch.nn.Module):
@@ -885,7 +885,7 @@ class MllamaForConditionalGeneration(nn.Module):
                 dtype=torch.float32,
             )
             batched_ar_ids = torch.ones(
-                bs, max_num_images, dtype=torch.int64, device="cuda"
+                bs, max_num_images, dtype=torch.int64, device=get_device()
             )
             batched_ar_mask = torch.zeros(
                 bs, max_num_images, max_num_tiles, dtype=torch.int64

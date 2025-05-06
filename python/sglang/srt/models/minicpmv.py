@@ -59,7 +59,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2Config, Qwen2ForCausalLM
-from sglang.srt.utils import add_prefix, flatten_nested_list
+from sglang.srt.utils import add_prefix, flatten_nested_list, get_device
 
 RawImageType = Union[Image.Image, torch.Tensor]
 
@@ -999,7 +999,7 @@ class MiniCPMV2_6(MiniCPMBaseModel):
                 prefix=prefix,
             )
 
-        return resampler.to(device="cuda", dtype=torch.get_default_dtype())
+        return resampler.to(device=get_device(), dtype=torch.get_default_dtype())
 
     def get_vision_embedding(
         self,
