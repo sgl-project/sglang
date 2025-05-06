@@ -489,7 +489,7 @@ class TokenizerManager:
 
         self._validate_token_len(obj, input_ids)
         return self._create_tokenized_object(
-            obj, input_text, input_ids, input_embeds, image_inputs
+            obj, input_text, input_ids, input_embeds, image_inputs, token_type_ids
         )
 
     def _validate_token_len(
@@ -528,6 +528,7 @@ class TokenizerManager:
         input_ids: List[int],
         input_embeds: Optional[Union[List[float], None]] = None,
         image_inputs: Optional[Dict] = None,
+        token_type_ids: Optional[List[int]] = None,
     ) -> Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]:
         """Create a tokenized request object from common parameters."""
 

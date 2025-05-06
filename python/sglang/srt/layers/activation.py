@@ -180,7 +180,8 @@ def get_cross_encoder_activation_function(config: PretrainedConfig):
         )
         return resolve_obj_by_qualname(function_name)()
     else:
-        return nn.Sigmoid() if config.num_labels == 1 else nn.Identity()
+        # adapat bge-reranker
+        return nn.Identity()
 
 
 if not _is_cuda:
