@@ -56,11 +56,14 @@ class TpModelWorkerClient:
         server_args: ServerArgs,
         gpu_id: int,
         tp_rank: int,
+        pp_rank: int,
         dp_rank: Optional[int],
         nccl_port: int,
     ):
         # Load the model
-        self.worker = TpModelWorker(server_args, gpu_id, tp_rank, dp_rank, nccl_port)
+        self.worker = TpModelWorker(
+            server_args, gpu_id, tp_rank, pp_rank, dp_rank, nccl_port
+        )
         self.max_running_requests = self.worker.max_running_requests
         self.device = self.worker.device
         self.gpu_id = gpu_id
@@ -91,8 +94,11 @@ class TpModelWorkerClient:
     def get_pad_input_ids_func(self):
         return self.worker.get_pad_input_ids_func()
 
-    def get_tp_cpu_group(self):
-        return self.worker.get_tp_cpu_group()
+    def get_tp_group(self):
+        return self.worker.get_tp_group()
+
+    def get_attention_tp_group(self):
+        return self.worker.get_attention_tp_group()
 
     def get_attention_tp_cpu_group(self):
         return self.worker.get_attention_tp_cpu_group()
@@ -132,7 +138,6 @@ class TpModelWorkerClient:
             batch_pt += 1
 
             # Create event
-            self.launch_done = threading.Event()
             copy_done = torch.get_device_module(self.device).Event()
 
             # Resolve future tokens in the input
@@ -141,7 +146,7 @@ class TpModelWorkerClient:
 
             # Run forward
             logits_output, next_token_ids = self.worker.forward_batch_generation(
-                model_worker_batch, self.launch_done
+                model_worker_batch
             )
 
             # Update the future token ids map
@@ -168,10 +173,16 @@ class TpModelWorkerClient:
 
             self.output_queue.put((copy_done, logits_output, next_token_ids))
 
-    def resolve_batch_result(self, bid: int):
+    def resolve_last_batch_result(self, launch_done: Optional[threading.Event] = None):
+        """
+        This function is called to resolve the last batch result and
+        wait for the current batch to be launched. Used in overlap mode.
+        """
         copy_done, logits_output, next_token_ids = self.output_queue.get()
+
+        if launch_done is not None:
+            launch_done.wait()
         copy_done.synchronize()
-        self.launch_done.wait()
 
         if logits_output.next_token_logprobs is not None:
             logits_output.next_token_logprobs = (

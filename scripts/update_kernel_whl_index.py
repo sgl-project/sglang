@@ -14,7 +14,9 @@ def update_wheel_index(cuda_version="118"):
     for path in sorted(pathlib.Path("sgl-kernel/dist").glob("*.whl")):
         with open(path, "rb") as f:
             sha256 = hashlib.sha256(f.read()).hexdigest()
-        ver = re.findall(r"sgl_kernel-([0-9.]+(?:\.post[0-9]+)?)-", path.name)[0]
+        ver = re.findall(
+            r"sgl_kernel-([0-9.]+(?:\.post[0-9]+)?)(?:\+cu[0-9]+)?-", path.name
+        )[0]
         full_url = f"{base_url}/v{ver}/{path.name}#sha256={sha256}"
         with (index_dir / "index.html").open("a") as f:
             f.write(f'<a href="{full_url}">{path.name}</a><br>\n')

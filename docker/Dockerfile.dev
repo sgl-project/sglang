@@ -11,6 +11,7 @@ RUN apt-get update && apt-get install -y \
     wget \
     curl \
     locales \
+    lsof \
     git \
     git-lfs \
     zsh \
@@ -45,6 +46,7 @@ RUN python3 -m pip install --no-cache-dir \
     black \
     isort \
     icdiff \
+    scikit_build_core \
     uv \
     pre-commit
 

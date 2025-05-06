@@ -38,12 +38,12 @@ jobs:
           else
             DEVICE_FLAG="--device /dev/dri"
           fi
-          docker pull lmsysorg/sglang:v0.4.5-rocm630
+          docker pull ghcr.io/saienduri/sglang-aiter-v0.1.1:428
           docker run -dt --user root --device=/dev/kfd $DEVICE_FLAG \
             -v ${{ github.workspace }}:/sglang-checkout --ipc=host --group-add video \
             --cap-add=SYS_PTRACE -e HF_TOKEN=${HF_TOKEN} --security-opt seccomp=unconfined \
             -w /sglang-checkout --name ci_sglang \
-            lmsysorg/sglang:v0.4.5-rocm630
+            ghcr.io/saienduri/sglang-aiter-v0.1.1:428
 
       - name: Install dependencies
         run: |
@@ -55,16 +55,50 @@ jobs:
           docker exec -w / ci_sglang git clone https://github.com/merrymercy/human-eval.git
           docker exec -w /human-eval ci_sglang pip install -e .
 
-          docker exec -w / ci_sglang mkdir -p /dummy-grok
-          mkdir -p dummy-grok && wget https://sharkpublic.blob.core.windows.net/sharkpublic/sglang/dummy_grok.json -O dummy-grok/config.json
-          docker cp ./dummy-grok ci_sglang:/
-
       - name: Evaluate Accuracy
         timeout-minutes: 20
         run: |
           docker exec -w /sglang-checkout/test/srt -e SGLANG_IS_IN_CI=1 ci_sglang python3 test_eval_accuracy_large.py
           docker exec -w /sglang-checkout/test/srt -e SGLANG_IS_IN_CI=1 ci_sglang python3 test_eval_fp8_accuracy.py
           docker exec -w /sglang-checkout/test/srt -e SGLANG_IS_IN_CI=1 ci_sglang python3 models/test_qwen_models.py
+
+  accuracy-test-2-gpu-amd:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+        github.event.pull_request.draft == false
+    runs-on: linux-mi300-gpu-2
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup docker
+        run: |
+          # Ensure GPU isolation if pod is part of kubernetes setup with DEVICE_FLAG.
+          if [ -f "/etc/podinfo/gha-render-devices" ]; then
+            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+          else
+            DEVICE_FLAG="--device /dev/dri"
+          fi
+          docker pull ghcr.io/saienduri/sglang-aiter-v0.1.1:428
+          docker run -dt --user root --device=/dev/kfd $DEVICE_FLAG \
+            -v ${{ github.workspace }}:/sglang-checkout --ipc=host --group-add video \
+            --cap-add=SYS_PTRACE -e HF_TOKEN=${HF_TOKEN} --security-opt seccomp=unconfined \
+            -w /sglang-checkout --name ci_sglang \
+            ghcr.io/saienduri/sglang-aiter-v0.1.1:428
+
+      - name: Install dependencies
+        run: |
+          docker exec ci_sglang pip install --upgrade pip
+          docker exec ci_sglang pip uninstall sgl-kernel -y || true
+          docker exec -w /sglang-checkout/sgl-kernel ci_sglang bash -c "rm -f pyproject.toml && mv pyproject_rocm.toml pyproject.toml && python3 setup_rocm.py install"
+          docker exec ci_sglang pip install -e "python[dev_hip]"
+
+          docker exec -w / ci_sglang git clone https://github.com/merrymercy/human-eval.git
+          docker exec -w /human-eval ci_sglang pip install -e .
+
+      - name: Evaluate accuracy (TP=2)
+        timeout-minutes: 20
+        run: |
+          docker exec -w /sglang-checkout/test/srt -e SGLANG_IS_IN_CI=1 ci_sglang python3 test_moe_eval_accuracy_large.py
 
   mla-test-1-gpu-amd:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
@@ -82,12 +116,12 @@ jobs:
           else
             DEVICE_FLAG="--device /dev/dri"
           fi
-          docker pull lmsysorg/sglang:v0.4.5-rocm630
+          docker pull ghcr.io/saienduri/sglang-aiter-v0.1.1:428
           docker run -dt --user root --device=/dev/kfd $DEVICE_FLAG \
             -v ${{ github.workspace }}:/sglang-checkout --ipc=host --group-add video \
             --cap-add=SYS_PTRACE -e HF_TOKEN=${{ secrets.AMD_HF_TOKEN }} --security-opt seccomp=unconfined \
             -w /sglang-checkout --name ci_sglang \
-            lmsysorg/sglang:v0.4.5-rocm630
+            ghcr.io/saienduri/sglang-aiter-v0.1.1:428
 
       - name: Install dependencies
         run: |
@@ -103,6 +137,113 @@ jobs:
         timeout-minutes: 20
         run: |
           docker exec -w /sglang-checkout/test/srt -e SGLANG_IS_IN_CI=1 ci_sglang python3 test_mla.py
+
+  performance-test-1-gpu-part-1-amd:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+        github.event.pull_request.draft == false
+    runs-on: linux-mi300-gpu-1
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup docker
+        run: |
+          # Ensure GPU isolation if pod is part of kubernetes setup with DEVICE_FLAG.
+          if [ -f "/etc/podinfo/gha-render-devices" ]; then
+            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+          else
+            DEVICE_FLAG="--device /dev/dri"
+          fi
+          docker pull ghcr.io/saienduri/sglang-aiter-v0.1.1:428
+          docker run -dt --user root --device=/dev/kfd $DEVICE_FLAG \
+            -v ${{ github.workspace }}:/sglang-checkout --ipc=host --group-add video \
+            --cap-add=SYS_PTRACE -e HF_TOKEN=${HF_TOKEN} --security-opt seccomp=unconfined \
+            -w /sglang-checkout --name ci_sglang \
+            ghcr.io/saienduri/sglang-aiter-v0.1.1:428
+
+      - name: Install dependencies
+        run: |
+          docker exec ci_sglang pip install --upgrade pip
+          docker exec ci_sglang pip uninstall sgl-kernel -y || true
+          docker exec -w /sglang-checkout/sgl-kernel ci_sglang bash -c "rm -f pyproject.toml && mv pyproject_rocm.toml pyproject.toml && python3 setup_rocm.py install"
+          docker exec ci_sglang pip install -e "python[dev_hip]"
+
+          docker exec -w / ci_sglang git clone https://github.com/merrymercy/human-eval.git
+          docker exec -w /human-eval ci_sglang pip install -e .
+
+      - name: Benchmark single latency
+        timeout-minutes: 10
+        run: |
+          docker exec -w /sglang-checkout/test/srt -e SGLANG_AMD_CI=1 -e SGLANG_IS_IN_CI=1 ci_sglang python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_bs1_small
+          docker exec -w /sglang-checkout/test/srt -e SGLANG_AMD_CI=1 -e SGLANG_IS_IN_CI=1 ci_sglang python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_bs1_default
+
+      - name: Benchmark online latency
+        timeout-minutes: 10
+        run: |
+          docker exec -w /sglang-checkout/test/srt -e SGLANG_AMD_CI=1 -e SGLANG_IS_IN_CI=1 ci_sglang python3 -m unittest test_bench_serving.TestBenchServing.test_online_latency_default
+
+      - name: Benchmark offline throughput
+        timeout-minutes: 10
+        run: |
+          docker exec -w /sglang-checkout/test/srt -e SGLANG_AMD_CI=1 -e SGLANG_IS_IN_CI=1 ci_sglang python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_default
+
+      - name: Benchmark offline throughput (Non-streaming, small batch size)
+        timeout-minutes: 10
+        run: |
+          docker exec -w /sglang-checkout/test/srt -e SGLANG_AMD_CI=1 -e SGLANG_IS_IN_CI=1 ci_sglang python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_non_stream_small_batch_size
+
+      - name: Benchmark online latency (EAGLE)
+        timeout-minutes: 10
+        run: |
+          docker exec -w /sglang-checkout/test/srt -e SGLANG_AMD_CI=1 -e SGLANG_IS_IN_CI=1 ci_sglang python3 -m unittest test_bench_serving.TestBenchServing.test_online_latency_eagle
+
+  performance-test-1-gpu-part-2-amd:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+        github.event.pull_request.draft == false
+    runs-on: linux-mi300-gpu-1
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup docker
+        run: |
+          # Ensure GPU isolation if pod is part of kubernetes setup with DEVICE_FLAG.
+          if [ -f "/etc/podinfo/gha-render-devices" ]; then
+            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+          else
+            DEVICE_FLAG="--device /dev/dri"
+          fi
+          docker pull ghcr.io/saienduri/sglang-aiter-v0.1.1:428
+          docker run -dt --user root --device=/dev/kfd $DEVICE_FLAG \
+            -v ${{ github.workspace }}:/sglang-checkout --ipc=host --group-add video \
+            --cap-add=SYS_PTRACE -e HF_TOKEN=${HF_TOKEN} --security-opt seccomp=unconfined \
+            -w /sglang-checkout --name ci_sglang \
+            ghcr.io/saienduri/sglang-aiter-v0.1.1:428
+
+      - name: Install dependencies
+        run: |
+          docker exec ci_sglang pip install --upgrade pip
+          docker exec ci_sglang pip uninstall sgl-kernel -y || true
+          docker exec -w /sglang-checkout/sgl-kernel ci_sglang bash -c "rm -f pyproject.toml && mv pyproject_rocm.toml pyproject.toml && python3 setup_rocm.py install"
+          docker exec ci_sglang pip install -e "python[dev_hip]"
+
+          docker exec -w / ci_sglang git clone https://github.com/merrymercy/human-eval.git
+          docker exec -w /human-eval ci_sglang pip install -e .
+
+      - name: Benchmark offline throughput (w/o RadixAttention)
+        timeout-minutes: 10
+        run: |
+          docker exec -w /sglang-checkout/test/srt -e SGLANG_AMD_CI=1 -e SGLANG_IS_IN_CI=1 ci_sglang python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_without_radix_cache
+
+      - name: Benchmark offline throughput (w/ Triton)
+        timeout-minutes: 10
+        run: |
+          docker exec -w /sglang-checkout/test/srt -e SGLANG_AMD_CI=1 -e SGLANG_IS_IN_CI=1 ci_sglang python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_with_triton_attention_backend
+
+      - name: Benchmark offline throughput (w/ FP8)
+        timeout-minutes: 10
+        run: |
+          docker exec -w /sglang-checkout/test/srt -e SGLANG_AMD_CI=1 -e SGLANG_IS_IN_CI=1 ci_sglang python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_default_fp8
 
   bench-test-2-gpu-amd:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
@@ -120,12 +261,12 @@ jobs:
           else
             DEVICE_FLAG="--device /dev/dri"
           fi
-          docker pull lmsysorg/sglang:v0.4.5-rocm630
+          docker pull ghcr.io/saienduri/sglang-aiter-v0.1.1:428
           docker run -dt --user root --device=/dev/kfd $DEVICE_FLAG \
             -v ${{ github.workspace }}:/sglang-checkout --ipc=host --group-add video \
             --cap-add=SYS_PTRACE -e HF_TOKEN=${HF_TOKEN} --security-opt seccomp=unconfined \
             -w /sglang-checkout --name ci_sglang \
-            lmsysorg/sglang:v0.4.5-rocm630
+            ghcr.io/saienduri/sglang-aiter-v0.1.1:428
 
       - name: Install dependencies
         run: |
@@ -141,15 +282,36 @@ jobs:
           mkdir -p dummy-grok && wget https://sharkpublic.blob.core.windows.net/sharkpublic/sglang/dummy_grok.json -O dummy-grok/config.json
           docker cp ./dummy-grok ci_sglang:/
 
-      - name: Evaluate Benchmark
+      - name: Benchmark dummy grok (TP=2)
         timeout-minutes: 20
         run: |
           docker exec -w /sglang-checkout/test/srt -e SGLANG_IS_IN_CI=1 ci_sglang python3 models/test_dummy_grok_models.py
 
+      - name: Benchmark single latency (TP=2)
+        timeout-minutes: 20
+        run: |
+          docker exec -w /sglang-checkout/test/srt -e SGLANG_IS_IN_CI=1 -e SGLANG_AMD_CI=1 ci_sglang python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_moe_tp2_bs1
+
+      - name: Benchmark single latency + torch.compile (TP=2)
+        timeout-minutes: 20
+        run: |
+          docker exec -w /sglang-checkout/test/srt -e SGLANG_IS_IN_CI=1 ci_sglang python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_torch_compile_tp2_bs1
+
+      - name: Benchmark offline throughput (TP=2)
+        timeout-minutes: 20
+        run: |
+          docker exec -w /sglang-checkout/test/srt -e SGLANG_IS_IN_CI=1 -e SGLANG_AMD_CI=1 ci_sglang python3 -m unittest test_bench_serving.TestBenchServing.test_moe_offline_throughput_default
+
+      - name: Benchmark offline throughput (w/o RadixAttention) (TP=2)
+        timeout-minutes: 20
+        run: |
+          docker exec -w /sglang-checkout/test/srt -e SGLANG_IS_IN_CI=1 -e SGLANG_AMD_CI=1 ci_sglang python3 -m unittest test_bench_serving.TestBenchServing.test_moe_offline_throughput_without_radix_cache
+
   finish:
     if: always()
     needs: [
-      accuracy-test-1-gpu-amd, mla-test-1-gpu-amd
+      accuracy-test-1-gpu-amd, mla-test-1-gpu-amd, bench-test-2-gpu-amd,
+      accuracy-test-2-gpu-amd, performance-test-1-gpu-part-1-amd, performance-test-1-gpu-part-2-amd
     ]
     runs-on: ubuntu-latest
     steps:
