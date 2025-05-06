@@ -66,9 +66,7 @@ class TestDisaggregationMooncake(CustomTestCase):
             "--port",
             str(cls.base_port + 100),
             "--tp",
-            "2",
-            "--mem-fraction-static",
-            "0.45",
+            "1",
         ]
         cls.process_prefill = popen_launch_pd_server(
             cls.model,
@@ -88,9 +86,9 @@ class TestDisaggregationMooncake(CustomTestCase):
             "--port",
             str(cls.base_port + 200),
             "--tp",
-            "2",
-            "--mem-fraction-static",
-            "0.45",
+            "1",
+            "--base-gpu-id",
+            "1",
         ]
         cls.process_decode = popen_launch_pd_server(
             cls.model,

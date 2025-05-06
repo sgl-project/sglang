@@ -87,6 +87,30 @@ jobs:
           cd test/srt
           python3 run_suite.py --suite per-commit-2-gpu
 
+  unit-test-backend-pd:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+        github.event.pull_request.draft == false
+    runs-on: 2-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci_install_dependency_rdma.sh
+
+      - name: Check rdma driver
+        run: |
+          show_gids
+          ibv_devinfo
+          ibv_devices
+
+      - name: Run test
+        timeout-minutes: 5
+        run: |
+          cd test/srt
+          python3 run_suite.py --suite per-commit-rdma
+
   unit-test-backend-8-gpu:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false
@@ -97,7 +121,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci_install_dependency_rdma.sh
+          bash scripts/ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 40
