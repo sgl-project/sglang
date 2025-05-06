@@ -1,22 +1,36 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/utils/quant_utils.py
 
+from functools import lru_cache
 from types import MappingProxyType
 from typing import List, Mapping, Tuple, Union
 
 import torch
 
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, is_hip
 
 _is_cuda = is_cuda()
+_is_hip = is_hip()
 
 if not _is_cuda:
     from vllm._custom_ops import scaled_fp8_quant
 
 
+@lru_cache()
 def is_fp8_fnuz() -> bool:
-    # only device 0 is checked, this assumes MI300 platforms are homogeneous
-    return "gfx94" in torch.cuda.get_device_properties(0).gcnArchName
+    if _is_hip:
+        # only device 0 is checked, this assumes MI300 platforms are homogeneous
+        return "gfx94" in torch.cuda.get_device_properties(0).gcnArchName
+    return False
+
+
+if is_fp8_fnuz():
+    fp8_dtype = torch.float8_e4m3fn
+    fp8_max = 224.0
+else:
+    fp8_dtype = torch.float8_e4m3fnuz
+    fp8_max = torch.finfo(fp8_dtype).max
+fp8_min = -fp8_max
 
 
 def is_layer_skipped(
