@@ -20,6 +20,7 @@ Life cycle of a request in the prefill server
 from __future__ import annotations
 
 import logging
+import threading
 from collections import deque
 from typing import TYPE_CHECKING, List, Optional
 
@@ -28,6 +29,7 @@ import torch
 from sglang.srt.disaggregation.base import BaseKVManager, KVArgs, KVPoll
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
+    FakeBootstrapHost,
     KVClassType,
     ReqToMetadataIdxAllocator,
     TransferBackend,
@@ -115,7 +117,11 @@ class PrefillBootstrapQueue:
         return kv_manager
 
     def add(self, req: Req) -> None:
-        kv_sender_class = get_kv_class(self.transfer_backend, KVClassType.SENDER)
+        if req.bootstrap_host == FakeBootstrapHost:
+            # Fake transfer for warmup reqs
+            kv_sender_class = get_kv_class(TransferBackend.FAKE, KVClassType.SENDER)
+        else:
+            kv_sender_class = get_kv_class(self.transfer_backend, KVClassType.SENDER)
         req.disagg_kv_sender = kv_sender_class(
             mgr=self.kv_manager,
             bootstrap_addr=f"{req.bootstrap_host}:{self.bootstrap_port}",
@@ -176,17 +182,25 @@ class SchedulerDisaggregationPrefillMixin:
     """
 
     @torch.no_grad()
-    def event_loop_normal_disagg_prefill(self):
+    def event_loop_normal_disagg_prefill(self: Scheduler):
         """A normal scheduler loop for prefill worker in disaggregation mode."""
 
         while True:
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
             self.waiting_queue.extend(
-                self.disagg_prefill_pending_queue.pop_bootstrapped()
+                self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
             self.process_prefill_chunk()
             batch = self.get_new_batch_prefill()
+
+            # Handle DP attention
+            if (
+                self.server_args.enable_dp_attention
+                or self.server_args.enable_sp_layernorm
+            ):
+                batch, _ = self.prepare_dp_attn_batch(batch)
+
             self.cur_batch = batch
 
             if batch:
@@ -206,17 +220,25 @@ class SchedulerDisaggregationPrefillMixin:
             self.running_batch.batch_is_full = False
 
     @torch.no_grad()
-    def event_loop_overlap_disagg_prefill(self):
+    def event_loop_overlap_disagg_prefill(self: Scheduler):
         self.result_queue = deque()
 
         while True:
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
             self.waiting_queue.extend(
-                self.disagg_prefill_pending_queue.pop_bootstrapped()
+                self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
             self.process_prefill_chunk()
             batch = self.get_new_batch_prefill()
+
+            # Handle DP attention
+            if (
+                self.server_args.enable_dp_attention
+                or self.server_args.enable_sp_layernorm
+            ):
+                batch, _ = self.prepare_dp_attn_batch(batch)
+
             self.cur_batch = batch
 
             if batch:
@@ -240,7 +262,10 @@ class SchedulerDisaggregationPrefillMixin:
             self.running_batch.batch_is_full = False
 
     def process_batch_result_disagg_prefill(
-        self: Scheduler, batch: ScheduleBatch, result: GenerationBatchResult
+        self: Scheduler,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
+        launch_done: Optional[threading.Event] = None,
     ) -> None:
         """
         Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue
@@ -264,7 +289,7 @@ class SchedulerDisaggregationPrefillMixin:
         # Transfer kv for prefill completed requests and add it into disagg_prefill_infight_queue
         if self.enable_overlap:
             # wait
-            _, next_token_ids = self.tp_worker.resolve_batch_result(bid)
+            _, next_token_ids = self.tp_worker.resolve_last_batch_result(launch_done)
         else:
             next_token_ids = result.next_token_ids.tolist()
 
@@ -310,7 +335,7 @@ class SchedulerDisaggregationPrefillMixin:
                 raise Exception("Transferring failed")
 
         for req in done_reqs:
-            self.disagg_prefill_pending_queue.req_to_metadata_buffer_idx_allocator.free(
+            self.disagg_prefill_bootstrap_queue.req_to_metadata_buffer_idx_allocator.free(
                 req.metadata_buffer_index
             )
 
@@ -326,9 +351,8 @@ class SchedulerDisaggregationPrefillMixin:
                 # only finished requests to running_batch.
                 self.last_batch.filter_batch(chunked_req_to_exclude=self.chunked_req)
                 self.tree_cache.cache_unfinished_req(self.chunked_req)
-                if (
-                    self.enable_overlap
-                ):  # Delay KV transfer to process_batch_result_disagg_prefill when overlap is enabled to ensure results are resolved
+                if self.enable_overlap:
+                    # Delay KV transfer to process_batch_result_disagg_prefill when overlap is enabled to ensure results are resolved
                     self.chunked_req.tmp_end_idx = min(
                         len(self.chunked_req.fill_ids),
                         len(self.chunked_req.origin_input_ids),
@@ -374,7 +398,7 @@ class SchedulerDisaggregationPrefillMixin:
             .numpy()
         )
         if last_chunk is True:
-            self.disagg_prefill_pending_queue.store_prefill_results(
+            self.disagg_prefill_bootstrap_queue.store_prefill_results(
                 req.metadata_buffer_index, token_id
             )
         page_indices = kv_to_page_indices(kv_indices, page_size)
