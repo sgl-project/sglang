@@ -344,8 +344,9 @@ class VisionAttention(nn.Module):
         self.kv_size = self.num_attention_kv_heads_per_partition * self.head_size
 
         if global_server_args_dict["mm_attention_backend"] is None:
-            info_once("Multimodal attention backend not set. Use sdpa as default.")
-            qkv_backend = "sdpa"
+            if qkv_backend is None:
+                qkv_backend = "sdpa"
+            info_once(f"Multimodal attention backend not set. Use {qkv_backend} as default.")
         else:
             qkv_backend = global_server_args_dict["mm_attention_backend"]
 
