@@ -20,5 +20,11 @@
     "runArgs": [
         "--gpus",
         "all"
-    ]
+    ],
+    // The two lines below ensures that your local changes in the sglang
+    // repo is automatically synced to the sglang pip package installed
+    // in the dev docker container. You can remove / comment out these
+    // two lines if you prefer to sync code changes manually.
+    "workspaceMount": "source=${localWorkspaceFolder},target=/sgl-workspace/sglang,type=bind",
+    "workspaceFolder": "/sgl-workspace/sglang"
 }
