@@ -14,6 +14,7 @@
 """Conversion between OpenAI APIs and native SRT APIs"""
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -970,17 +971,19 @@ def v1_chat_generate_request(
                 for message in request.messages:
                     if message.content is None:
                         message.content = ""
-                    if isinstance(message.content, str):
-                        openai_compatible_messages.append(
-                            {"role": message.role, "content": message.content}
-                        )
+                    msg_dict = message.dict()
+                    if isinstance(msg_dict.get("content"), list):
+                        for chunk in msg_dict["content"]:
+                            if isinstance(chunk, dict) and chunk.get("type") == "text":
+                                new_msg = msg_dict.copy()
+                                new_msg["content"] = chunk["text"]
+                                new_msg = {
+                                    k: v for k, v in new_msg.items() if v is not None
+                                }
+                                openai_compatible_messages.append(new_msg)
                     else:
-                        content_list = message.dict()["content"]
-                        for content in content_list:
-                            if content["type"] == "text":
-                                openai_compatible_messages.append(
-                                    {"role": message.role, "content": content["text"]}
-                                )
+                        msg_dict = {k: v for k, v in msg_dict.items() if v is not None}
+                        openai_compatible_messages.append(msg_dict)
                 if (
                     openai_compatible_messages
                     and openai_compatible_messages[-1]["role"] == "assistant"
@@ -1290,7 +1293,8 @@ def v1_chat_generate_response(
                     text, call_info_list = parser.parse_non_stream(text)
                     tool_calls = [
                         ToolCall(
-                            id=str(call_info.tool_index),
+                            id=f"call_{base64.urlsafe_b64encode(uuid.uuid4().bytes).rstrip(b'=').decode()}",
+                            index=call_info.tool_index,
                             function=FunctionResponse(
                                 name=call_info.name, arguments=call_info.parameters
                             ),
@@ -1406,6 +1410,7 @@ async def v1_chat_completions(
         reasoning_parser_dict = {}
 
         async def generate_stream_resp():
+            tool_call_first = True
             is_firsts = {}
             stream_buffers = {}
             n_prev_tokens = {}
@@ -1572,7 +1577,6 @@ async def v1_chat_completions(
                         # 2) if we found calls, we output them as separate chunk(s)
                         for call_item in calls:
                             # transform call_item -> FunctionResponse + ToolCall
-
                             if finish_reason_type == "stop":
                                 latest_delta_len = 0
                                 if isinstance(call_item.parameters, str):
@@ -1595,15 +1599,19 @@ async def v1_chat_completions(
                                 call_item.parameters = remaining_call
 
                                 finish_reason_type = "tool_calls"
-
                             tool_call = ToolCall(
-                                id=str(call_item.tool_index),
+                                id=(
+                                    f"call_{base64.urlsafe_b64encode(uuid.uuid4().bytes).rstrip(b'=').decode()}"
+                                    if tool_call_first
+                                    else None
+                                ),
                                 index=call_item.tool_index,
                                 function=FunctionResponse(
                                     name=call_item.name,
                                     arguments=call_item.parameters,
                                 ),
                             )
+                            tool_call_first = False
                             choice_data = ChatCompletionResponseStreamChoice(
                                 index=index,
                                 delta=DeltaMessage(tool_calls=[tool_call]),

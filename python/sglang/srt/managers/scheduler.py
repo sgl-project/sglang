@@ -502,6 +502,7 @@ class Scheduler(
             self.tree_cache = ChunkCache(
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                page_size=self.page_size,
             )
         else:
             if self.enable_hierarchical_cache:

@@ -18,8 +18,9 @@ import torch
 import triton
 
 if os.environ["SGLANG_ENABLE_TORCH_COMPILE"] == "1":
-    import torch._dynamo
+    import logging
 
+    torch._logging.set_logs(dynamo=logging.ERROR)
     torch._dynamo.config.suppress_errors = True
 
 from sglang.global_config import global_config
@@ -354,7 +355,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
 
         if self.forward_metadata.use_ragged:
             # ragged prefill
-            o, _ = self.prefill_wrapper_ragged.forward_return_lse(
+            o = self.prefill_wrapper_ragged.forward(
                 qall,
                 k.view(-1, layer.tp_k_head_num, layer.head_dim),
                 v.view(-1, layer.tp_k_head_num, layer.v_head_dim),
