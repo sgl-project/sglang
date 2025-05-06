@@ -39,8 +39,16 @@ pip install git+https://github.com/deepseek-ai/FlashMLA.git
 # Check if sudo is available, and install disaggregation requirement
 if command -v sudo >/dev/null 2>&1; then
     sudo apt-get update
-    sudo apt-get install -y libibverbs-dev
+    sudo apt-get install libibverbs-dev pciutils rdma-core ibverbs-utils infiniband-diags ibutils -y
+    sudo modprobe ib_core
+    sudo modprobe ib_uverbs
+    sudo modprobe rdma_cm
+    sudo systemctl restart rdma
 else
     apt-get update
-    apt-get install -y libibverbs-dev
+    apt-get install libibverbs-dev pciutils rdma-core ibverbs-utils infiniband-diags ibutils -y
+    modprobe ib_core
+    modprobe ib_uverbs
+    modprobe rdma_cm
+    systemctl restart rdma
 fi
