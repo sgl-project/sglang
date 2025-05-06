@@ -14,13 +14,15 @@ except ImportError:
 
 from sglang.srt.layers.quantization.deep_gemm import _ENABLE_JIT_DEEPGEMM
 from sglang.srt.layers.quantization.fp8_kernel import (
+    fp8_dtype,
+    fp8_max,
+    is_fp8_fnuz,
     per_token_group_quant_fp8,
     scaled_fp8_quant,
     sglang_per_token_quant_fp8,
     static_quant_fp8,
     w8a8_block_fp8_matmul,
 )
-from sglang.srt.layers.quantization.utils import fp8_dtype, fp8_max, is_fp8_fnuz
 from sglang.srt.utils import (
     get_bool_env_var,
     get_cuda_version,

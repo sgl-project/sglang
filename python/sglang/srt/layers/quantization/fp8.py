@@ -42,6 +42,8 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.fp8_kernel import (
+    fp8_dtype,
+    is_fp8_fnuz,
     per_token_group_quant_fp8,
     scaled_fp8_quant,
 )
@@ -56,8 +58,6 @@ from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.utils import (
     all_close_1d,
     convert_to_channelwise,
-    fp8_dtype,
-    is_fp8_fnuz,
     is_layer_skipped,
     per_tensor_dequantize,
     requantize_with_max_scale,

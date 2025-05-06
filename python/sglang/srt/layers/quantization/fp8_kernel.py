@@ -16,6 +16,7 @@ import functools
 import json
 import logging
 import os
+from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -23,7 +24,6 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.quantization.deep_gemm import _ENABLE_JIT_DEEPGEMM
-from sglang.srt.layers.quantization.utils import fp8_dtype, fp8_max, fp8_min
 from sglang.srt.utils import (
     direct_register_custom_op,
     get_device_core_count,
@@ -48,6 +48,24 @@ if _is_cuda:
     )
 
 logger = logging.getLogger(__name__)
+
+
+@lru_cache()
+def is_fp8_fnuz() -> bool:
+    if _is_hip:
+        # only device 0 is checked, this assumes MI300 platforms are homogeneous
+        return "gfx94" in torch.cuda.get_device_properties(0).gcnArchName
+    return False
+
+
+if is_fp8_fnuz():
+    fp8_dtype = torch.float8_e4m3fnuz
+    fp8_max = 224.0
+else:
+    fp8_dtype = torch.float8_e4m3fn
+    fp8_max = torch.finfo(fp8_dtype).max
+fp8_min = -fp8_max
+
 
 if supports_custom_op():
 
@@ -193,7 +211,7 @@ def per_token_group_quant_fp8(
     ), "the last dimension of `x` cannot be divisible by `group_size`"
     assert x.is_contiguous(), "`x` is not contiguous"
 
-    x_q = torch.empty_like(x, device=x.device, dtype=_fp8_type)
+    x_q = torch.empty_like(x, device=x.device, dtype=fp8_dtype)
     M = x.numel() // group_size
     N = group_size
     if column_major_scales:
