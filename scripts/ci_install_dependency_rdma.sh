@@ -44,19 +44,11 @@ echo "tzdata tzdata/Zones/Etc select UTC" | sudo debconf-set-selections
 if command -v sudo >/dev/null 2>&1; then
     sudo ln -fs /usr/share/zoneinfo/UTC /etc/localtime
     sudo apt-get update
+    sudo dpkg --configure -a
     sudo apt-get install -y tzdata
     sudo apt-get install libibverbs-dev pciutils rdma-core ibverbs-utils infiniband-diags ibutils -y
     sudo modprobe ib_core
     sudo modprobe ib_uverbs
     sudo modprobe rdma_cm
     sudo systemctl restart rdma
-else
-    ln -fs /usr/share/zoneinfo/UTC /etc/localtime
-    apt-get update
-    apt-get install -y tzdata
-    apt-get install libibverbs-dev pciutils rdma-core ibverbs-utils infiniband-diags ibutils -y
-    modprobe ib_core
-    modprobe ib_uverbs
-    modprobe rdma_cm
-    systemctl restart rdma
 fi
