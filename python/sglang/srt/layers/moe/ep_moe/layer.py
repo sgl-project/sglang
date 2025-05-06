@@ -2,6 +2,7 @@ import logging
 from typing import Callable, List, Optional, Tuple
 
 import torch
+from torch.nn import Module
 
 try:
     from deep_gemm import (
@@ -12,8 +13,6 @@ try:
     use_deep_gemm = True
 except ImportError:
     use_deep_gemm = False
-
-from torch.nn import Module
 
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import (
@@ -37,22 +36,16 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
+from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.utils import is_cuda, is_hip, set_weight_attrs
-
-_is_cuda = is_cuda()
-
-if _is_cuda:
-    from sglang.srt.custom_op import scaled_fp8_quant as sgl_scaled_fp8_quant
-else:
-    from vllm import _custom_ops as vllm_ops
-
-
-logger = logging.getLogger(__name__)
+from sglang.srt.utils import DeepEPMode, is_hip, set_weight_attrs
 
 _is_hip = is_hip()
 
-_buffer = None
+if _is_hip:
+    from vllm._custom_ops import scaled_fp8_quant
+
+logger = logging.getLogger(__name__)
 
 
 class GroupedGemmRunner(torch.nn.Module):
@@ -143,6 +136,7 @@ class EPMoE(torch.nn.Module):
         correction_bias: Optional[torch.Tensor] = None,
         custom_routing_function: Optional[Callable] = None,
         activation: str = "silu",
+        routed_scaling_factor: Optional[float] = None,
     ):
         super().__init__()
 
@@ -171,6 +165,7 @@ class EPMoE(torch.nn.Module):
         self.correction_bias = correction_bias
         self.custom_routing_function = custom_routing_function
         self.activation = activation
+        self.routed_scaling_factor = routed_scaling_factor
 
         if quant_config is None:
             self.quant_method: Optional[QuantizeMethodBase] = UnquantizedEPMoEMethod()
@@ -222,6 +217,7 @@ class EPMoE(torch.nn.Module):
             num_expert_group=self.num_expert_group,
             correction_bias=self.correction_bias,
             custom_routing_function=self.custom_routing_function,
+            routed_scaling_factor=self.routed_scaling_factor,
         )
 
         reorder_topk_ids, src2dst, seg_indptr = run_moe_ep_preproess(
@@ -741,20 +737,12 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
             )
 
             for expert in range(layer.num_experts_per_partition):
-                if _is_cuda:
-                    w13_weight[expert, :, :], layer.w13_weight_scale[expert] = (
-                        sgl_scaled_fp8_quant(layer.w13_weight.data[expert, :, :])
-                    )
-                    w2_weight[expert, :, :], layer.w2_weight_scale[expert] = (
-                        sgl_scaled_fp8_quant(layer.w2_weight.data[expert, :, :])
-                    )
-                else:
-                    w13_weight[expert, :, :], layer.w13_weight_scale[expert] = (
-                        vllm_ops.scaled_fp8_quant(layer.w13_weight.data[expert, :, :])
-                    )
-                    w2_weight[expert, :, :], layer.w2_weight_scale[expert] = (
-                        vllm_ops.scaled_fp8_quant(layer.w2_weight.data[expert, :, :])
-                    )
+                w13_weight[expert, :, :], layer.w13_weight_scale[expert] = (
+                    scaled_fp8_quant(layer.w13_weight.data[expert, :, :])
+                )
+                w2_weight[expert, :, :], layer.w2_weight_scale[expert] = (
+                    scaled_fp8_quant(layer.w2_weight.data[expert, :, :])
+                )
             layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
             layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
             return
@@ -814,7 +802,8 @@ class DeepEPMoE(EPMoE):
         correction_bias: Optional[torch.Tensor] = None,
         custom_routing_function: Optional[Callable] = None,
         activation: str = "silu",
-        deepep_mode: str = "auto",
+        routed_scaling_factor: Optional[float] = None,
+        deepep_mode: DeepEPMode = DeepEPMode.auto,
     ):
         super().__init__(
             num_experts,
@@ -832,9 +821,10 @@ class DeepEPMoE(EPMoE):
             correction_bias,
             custom_routing_function,
             activation,
+            routed_scaling_factor,
         )
         self.deepep_mode = deepep_mode
-        if self.deepep_mode in ["low_latency", "auto"]:
+        if self.deepep_mode.enable_low_latency():
             assert use_deep_gemm, f"DeepEP {self.deepep_mode} mode requires deep_gemm"
         self.w13_weight_fp8 = (
             self.w13_weight,
@@ -858,13 +848,10 @@ class DeepEPMoE(EPMoE):
         expected_m: int,
         forward_mode: ForwardMode,
     ):
-        if self.deepep_mode == "normal" or (
-            self.deepep_mode == "auto" and not forward_mode.is_decode()
-        ):
+        resolved_deepep_mode = self.deepep_mode.resolve(forward_mode)
+        if resolved_deepep_mode == DeepEPMode.normal:
             return self.forward_normal(hidden_states, reorder_topk_ids, seg_indptr)
-        elif self.deepep_mode == "low_latency" or (
-            self.deepep_mode == "auto" and forward_mode.is_decode()
-        ):
+        elif resolved_deepep_mode == DeepEPMode.low_latency:
             return self.forward_deepgemm_masked(hidden_states, masked_m, expected_m)
         else:
             raise ValueError(f"Invalid deepep_mode: {self.deepep_mode}")
@@ -990,9 +977,6 @@ class DeepEPMoE(EPMoE):
     ):
         assert self.quant_method is not None
         assert self.activation == "silu"
-        assert (
-            hidden_states_fp8[0].size(0) % 4 == 0
-        ), f"TMA alignment error: {hidden_states_fp8[0].size(0)}"
 
         # GroupGemm-0
         num_groups, m, k = hidden_states_fp8[0].size()

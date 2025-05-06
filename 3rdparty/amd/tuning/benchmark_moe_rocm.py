@@ -15,7 +15,7 @@ from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
     get_config_file_name,
 )
 
-padding_size = 128 if bool(int(os.getenv("MOE_PADDING", "0"))) else 0
+padding_size = 128 if bool(int(os.getenv("SGLANG_MOE_PADDING", "0"))) else 0
 
 
 def main(model, tp_size, dtype: str, batches):

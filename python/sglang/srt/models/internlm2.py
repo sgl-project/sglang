@@ -145,6 +145,7 @@ class InternLM2Attention(nn.Module):
             self.scaling,
             self.num_kv_heads,
             layer_id,
+            quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
         )
 
@@ -288,6 +289,9 @@ class InternLM2ForCausalLM(nn.Module):
             config.vocab_size, config.hidden_size, prefix=add_prefix("output", prefix)
         )
         self.logits_processor = LogitsProcessor(config)
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.model.tok_embeddings
 
     @torch.no_grad()
     def forward(
