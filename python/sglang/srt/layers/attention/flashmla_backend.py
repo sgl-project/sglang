@@ -128,7 +128,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
 
         # print the forward_mode
-        print("flashmla_backend init_forward_metadata ", forward_batch.forward_mode)
+        # print("flashmla_backend init_forward_metadata ", forward_batch.forward_mode)
 
         bs = forward_batch.batch_size
         spec_info = forward_batch.spec_info
