@@ -4,6 +4,7 @@ Minimal HTTP load balancer for prefill and decode servers for testing.
 
 import asyncio
 import dataclasses
+import logging
 import random
 import urllib
 from itertools import chain
@@ -14,6 +15,27 @@ import orjson
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
+
+from sglang.srt.disaggregation.utils import DisaggregationMode, PDRegistryRequest
+
+
+def setup_logger():
+    logger = logging.getLogger("pdlb")
+    logger.setLevel(logging.INFO)
+
+    formatter = logging.Formatter(
+        "[PDLB (Python)] %(asctime)s - %(levelname)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    handler = logging.StreamHandler()
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+
+    return logger
+
+
+logger = setup_logger()
 
 
 @dataclasses.dataclass
@@ -269,6 +291,30 @@ async def get_models():
             raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/register")
+async def register(obj: PDRegistryRequest):
+    if obj.mode == DisaggregationMode.PREFILL:
+        load_balancer.prefill_configs.append(PrefillConfig(obj.url, obj.bootstrap_port))
+        logger.info(
+            f"Registered prefill server: {obj.url} with bootstrap port: {obj.bootstrap_port}"
+        )
+    elif obj.mode == DisaggregationMode.DECODE:
+        load_balancer.decode_servers.append(obj.url)
+        logger.info(f"Registered decode server: {obj.url}")
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid mode. Must be either PREFILL or DECODE.",
+        )
+
+    logger.info(
+        f"#Prefill servers: {len(load_balancer.prefill_configs)}, "
+        f"#Decode servers: {len(load_balancer.decode_servers)}"
+    )
+
+    return Response(status_code=200)
+
+
 def run(prefill_configs, decode_addrs, host, port):
     global load_balancer
     load_balancer = MiniLoadBalancer(prefill_configs, decode_addrs)
@@ -280,10 +326,10 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Mini Load Balancer Server")
     parser.add_argument(
-        "--prefill", required=True, type=str, nargs="+", help="URLs for prefill servers"
+        "--prefill", type=str, default=[], nargs="+", help="URLs for prefill servers"
     )
     parser.add_argument(
-        "--decode", required=True, type=str, nargs="+", help="URLs for decode servers"
+        "--decode", type=str, default=[], nargs="+", help="URLs for decode servers"
     )
     parser.add_argument(
         "--prefill-bootstrap-ports",

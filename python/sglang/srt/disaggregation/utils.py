@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import dataclasses
 from collections import deque
 from enum import Enum
-from typing import List
+from typing import List, Optional
 
 import numpy as np
 import torch
@@ -119,3 +120,20 @@ def kv_to_page_indices(kv_indices: np.ndarray, page_size: int):
 def kv_to_page_num(num_kv_indices: int, page_size: int):
     # ceil(num_kv_indices / page_size)
     return (num_kv_indices + page_size - 1) // page_size
+
+
+@dataclasses.dataclass
+class PDRegistryRequest:
+    """A request to register a machine itself to the LB."""
+
+    mode: DisaggregationMode
+    url: str
+    bootstrap_port: Optional[int] = None
+
+    def __post_init__(self):
+        if self.mode == DisaggregationMode.NULL:
+            raise ValueError("Disaggregation mode cannot be NULL.")
+        elif self.mode == DisaggregationMode.PREFILL and self.bootstrap_port is None:
+            raise ValueError("Bootstrap port must be set in PREFILL mode.")
+        elif self.mode == DisaggregationMode.DECODE and self.bootstrap_port is not None:
+            raise ValueError("Bootstrap port must not be set in DECODE mode.")
