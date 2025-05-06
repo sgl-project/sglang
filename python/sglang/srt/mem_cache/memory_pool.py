@@ -764,7 +764,7 @@ class HostKVCache(abc.ABC):
         self.size = self.size - (self.size % self.page_size)
         self.start_layer = device_pool.start_layer
         self.end_layer = device_pool.end_layer
-        
+
         assert (
             self.size > device_pool.size
         ), "The host memory should be larger than the device memory with the current protocol"
