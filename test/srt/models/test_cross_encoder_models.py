@@ -8,7 +8,10 @@ from transformers import AutoConfig, AutoTokenizer
 from sglang.test.runners import TEST_RERANK_QUERY_DOCS, HFRunner, SRTRunner
 from sglang.test.test_utils import CustomTestCase, is_in_ci
 
-MODELS = [("cross-encoder/ms-marco-MiniLM-L6-v2", 1, 1e-2)]
+MODELS = [
+    ("cross-encoder/ms-marco-MiniLM-L6-v2", 1, 1e-2),
+    ("BAAI/bge-reranker-v2-m3", 1, 1e-2),
+]
 ATTENTION_BACKEND = ["torch_native", "triton"]
 
 TORCH_DTYPES = [torch.float32]
@@ -47,9 +50,6 @@ class TestCrossEncoderModels(CustomTestCase):
         ) as srt_runner:
             srt_scores = srt_runner.forward(prompts).scores
 
-        print("hf_scores", hf_scores)
-        print("srt_scores", srt_scores)
-
         for i in range(len(srt_scores)):
             score_difference = hf_scores[i] - srt_scores[i]
 
@@ -75,7 +75,6 @@ class TestCrossEncoderModels(CustomTestCase):
         for model, tp_size, prefill_tolerance in models_to_test:
             for attention_backend in ATTENTION_BACKEND:
                 for queryDocs in TEST_RERANK_QUERY_DOCS:
-                    print("queryDocs", queryDocs)
                     prompts = self.preprocess_prompts(queryDocs)
                     for torch_dtype in TORCH_DTYPES:
                         self.assert_close_prefill_logits(
