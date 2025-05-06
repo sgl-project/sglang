@@ -101,9 +101,8 @@ jobs:
 
       - name: Check rdma driver
         run: |
-          show_gids
-          ibv_devinfo
-          ibv_devices
+          lspci | grep -i 'infiniband\|mellanox'
+          dpkg -l | grep -E 'rdma-core|ibverbs-utils|infiniband-diags'
 
       - name: Run test
         timeout-minutes: 5
