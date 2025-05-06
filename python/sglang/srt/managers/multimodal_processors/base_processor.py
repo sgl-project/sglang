@@ -8,7 +8,6 @@ from typing import List, Optional
 
 import numpy as np
 import PIL
-from decord import VideoReader, cpu
 from PIL import Image
 from transformers import BaseImageProcessorFast
 
@@ -94,7 +93,12 @@ class BaseMultimodalProcessor(ABC):
 
     @abstractmethod
     async def process_mm_data_async(
-        self, image_data, input_text, max_req_input_len, **kwargs
+        self,
+        image_data,
+        input_text,
+        request_obj,
+        max_req_input_len,
+        **kwargs,
     ):
         pass
 
@@ -102,7 +106,12 @@ class BaseMultimodalProcessor(ABC):
         """
         estimate the total frame count from all visual input
         """
+        # Lazy import because decord is not available on some arm platforms.
+        from decord import VideoReader, cpu
+
         # Before processing inputs
+        if not image_data or len(image_data) == 0:
+            return []
         estimated_frames_list = []
         for image in image_data:
             if isinstance(image, str) and image.startswith("video:"):
@@ -214,6 +223,9 @@ class BaseMultimodalProcessor(ABC):
             discard_alpha_channel: if True, discards the alpha channel in the returned images
 
         """
+
+        if image_data is None:
+            image_data = []
         if isinstance(multimodal_tokens.image_token, int):
             multimodal_tokens.image_token = (
                 self._processor.tokenizer.convert_ids_to_tokens(
@@ -228,6 +240,8 @@ class BaseMultimodalProcessor(ABC):
             prompt = self._processor.tokenizer.decode(prompt)
         else:
             prompt = prompt
+
+        assert isinstance(prompt, str)
         if return_text:
             import re
 

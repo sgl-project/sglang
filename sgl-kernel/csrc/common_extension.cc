@@ -58,16 +58,16 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   /*
    * From csrc/elementwise
    */
-  m.def("rmsnorm(Tensor! output, Tensor input, Tensor weight, float eps, int cuda_stream) -> ()");
+  m.def("rmsnorm(Tensor! output, Tensor input, Tensor weight, float eps, bool enable_pdl) -> ()");
   m.impl("rmsnorm", torch::kCUDA, &rmsnorm);
 
-  m.def("fused_add_rmsnorm(Tensor! input, Tensor! residual, Tensor weight, float eps) -> ()");
+  m.def("fused_add_rmsnorm(Tensor! input, Tensor! residual, Tensor weight, float eps, bool enable_pdl) -> ()");
   m.impl("fused_add_rmsnorm", torch::kCUDA, &sgl_fused_add_rmsnorm);
 
-  m.def("gemma_rmsnorm(Tensor! output, Tensor input, Tensor weight, float eps, int cuda_stream) -> ()");
+  m.def("gemma_rmsnorm(Tensor! output, Tensor input, Tensor weight, float eps, bool enable_pdl) -> ()");
   m.impl("gemma_rmsnorm", torch::kCUDA, &gemma_rmsnorm);
 
-  m.def("gemma_fused_add_rmsnorm(Tensor! input, Tensor! residual, Tensor weight, float eps, int cuda_stream) -> ()");
+  m.def("gemma_fused_add_rmsnorm(Tensor! input, Tensor! residual, Tensor weight, float eps, bool enable_pdl) -> ()");
   m.impl("gemma_fused_add_rmsnorm", torch::kCUDA, &gemma_fused_add_rmsnorm);
 
   m.def("silu_and_mul(Tensor! out, Tensor input, int cuda_stream) -> ()");
@@ -146,9 +146,15 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("topk_softmax", torch::kCUDA, &topk_softmax);
 
   m.def(
-      "moe_fused_gate(Tensor input, Tensor bias, int num_expert_group, int topk_group, int topk) -> "
+      "moe_fused_gate(Tensor input, Tensor bias, int num_expert_group, int topk_group, int topk, int "
+      "n_share_experts_fusion, float routed_scaling_factor) -> "
       "(Tensor[])");
   m.impl("moe_fused_gate", torch::kCUDA, &moe_fused_gate);
+  m.def(
+      "fp8_blockwise_scaled_grouped_mm(Tensor output, Tensor a, Tensor b, Tensor scales_a, Tensor scales_b, Tensor "
+      "stride_a, Tensor stride_b, Tensor stride_c, Tensor layout_sfa, Tensor layout_sfb, Tensor problem_sizes, Tensor "
+      "expert_offsets) -> ()");
+  m.impl("fp8_blockwise_scaled_grouped_mm", torch::kCUDA, &fp8_blockwise_scaled_grouped_mm);
 
   /*
    * From csrc/speculative
@@ -186,29 +192,24 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("bmm_fp8", torch::kCUDA, &bmm_fp8);
 
   m.def(
-      "min_p_sampling_from_probs(Tensor probs, Tensor uniform_samples, Tensor! samples, Tensor? maybe_min_p_arr, float "
-      "min_p_val, bool deterministic, int cuda_stream) -> ()");
+      "min_p_sampling_from_probs(Tensor probs, Tensor output, Tensor? maybe_indices, Tensor? maybe_min_p_arr, float "
+      "min_p_val, bool deterministic, Generator? gen) -> ()");
   m.impl("min_p_sampling_from_probs", torch::kCUDA, &min_p_sampling_from_probs);
 
-  m.def(
-      "top_k_renorm_probs(Tensor probs, Tensor! renorm_probs, Tensor? maybe_top_k_arr, int top_k_val, int "
-      "cuda_stream) -> ()");
+  m.def("top_k_renorm_probs(Tensor probs, Tensor! renorm_probs, Tensor? maybe_top_k_arr, int top_k_val) -> ()");
   m.impl("top_k_renorm_probs", torch::kCUDA, &top_k_renorm_probs);
 
-  m.def(
-      "top_p_renorm_probs(Tensor probs, Tensor! renorm_probs, Tensor? maybe_top_p_arr, float top_p_val, int "
-      "cuda_stream) -> ()");
+  m.def("top_p_renorm_probs(Tensor probs, Tensor! renorm_probs, Tensor? maybe_top_p_arr, float top_p_val) -> ()");
   m.impl("top_p_renorm_probs", torch::kCUDA, &top_p_renorm_probs);
 
   m.def(
-      "top_k_top_p_sampling_from_probs(Tensor probs, Tensor uniform_samples, Tensor! samples, Tensor! success, Tensor? "
-      "maybe_top_k_arr, float top_k_val, Tensor? maybe_top_p_arr, float top_p_val, bool deterministic, int "
-      "cuda_stream) -> ()");
+      "top_k_top_p_sampling_from_probs(Tensor probs, Tensor output, Tensor? maybe_indices, Tensor? maybe_top_k_arr, "
+      "float top_k_val, Tensor? maybe_top_p_arr, float top_p_val, bool deterministic, Generator? gen) -> ()");
   m.impl("top_k_top_p_sampling_from_probs", torch::kCUDA, &top_k_top_p_sampling_from_probs);
 
   m.def(
-      "top_p_sampling_from_probs(Tensor probs, Tensor uniform_samples, Tensor! samples, Tensor! success, Tensor? "
-      "maybe_top_p_arr, float top_p_val, bool deterministic, int cuda_stream) -> ()");
+      "top_p_sampling_from_probs(Tensor probs, Tensor output, Tensor? maybe_indices, Tensor? "
+      "maybe_top_p_arr, float top_p_val, bool deterministic, Generator? gen) -> ()");
   m.impl("top_p_sampling_from_probs", torch::kCUDA, &top_p_sampling_from_probs);
 
   /*
@@ -232,6 +233,34 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "bool is_causal, float softcap, bool return_softmax, "
       "Generator? gen) -> Tensor[]");
   m.impl("varlen_fwd_sparse", torch::kCUDA, &flash::mha_varlen_fwd_sparse);
+
+  // Sparse Attention utils
+  m.def(
+      "convert_vertical_slash_indexes("
+      "   Tensor! block_count, Tensor! block_offset, "
+      "   Tensor! column_count, Tensor! column_index, "
+      "   Tensor q_seqlens, Tensor q_seqlens, "
+      "   Tensor vertical_indexes, Tensor slash_indexes, "
+      "   int context_size, int block_size_M, int block_size_N, "
+      "   bool causal) -> ()");
+  m.impl("convert_vertical_slash_indexes", torch::kCUDA, &convert_vertical_slash_indexes);
+
+  m.def(
+      "convert_vertical_slash_indexes_mergehead("
+      "   Tensor! block_count, Tensor! block_offset, "
+      "   Tensor! column_count, Tensor! column_index, "
+      "   Tensor q_seqlens, Tensor q_seqlens, "
+      "   Tensor vertical_indexes, Tensor slash_indexes, "
+      "   Tensor vertical_indices_count, Tensor slash_indices_count, "
+      "   int context_size, int block_size_M, int block_size_N, "
+      "   bool causal) -> ()");
+  m.impl("convert_vertical_slash_indexes_mergehead", torch::kCUDA, &convert_vertical_slash_indexes_mergehead);
+
+  /*
+   * From XGrammar
+   */
+  m.def("apply_token_bitmask_inplace_cuda(Tensor logits, Tensor bitmask, Tensor? indices=None) -> ()");
+  m.impl("apply_token_bitmask_inplace_cuda", &ApplyTokenBitmaskInplace);
 }
 
 REGISTER_EXTENSION(common_ops)

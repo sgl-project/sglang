@@ -24,6 +24,8 @@ class TestHierarchicalMLA(CustomTestCase):
             other_args=[
                 "--trust-remote-code",
                 "--enable-hierarchical-cache",
+                "--hicache-ratio",
+                2,
             ],
         )
 
