@@ -69,6 +69,7 @@ DEFAULT_REASONING_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
 DEFAULT_AWQ_MOE_MODEL_NAME_FOR_TEST = (
     "hugging-quants/Mixtral-8x7B-Instruct-v0.1-AWQ-INT4"
 )
+DEFAULT_ENABLE_THINKING_MODEL_NAME_FOR_TEST = "Qwen/Qwen3-30B-A3B"
 
 # Nightly tests
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1 = "meta-llama/Llama-3.1-8B-Instruct,mistralai/Mistral-7B-Instruct-v0.3,deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct,google/gemma-2-27b-it"
@@ -730,6 +731,72 @@ def run_bench_one_batch(model, other_args):
         kill_process_tree(process.pid)
 
     return output_throughput
+
+
+def run_bench_offline_throughput(model, other_args):
+    command = [
+        "python3",
+        "-m",
+        "sglang.bench_offline_throughput",
+        "--num-prompts",
+        "1",
+        "--dataset-name",
+        "random",
+        "--random-input-len",
+        "256",
+        "--random-output-len",
+        "256",
+        "--model-path",
+        model,
+        *[str(x) for x in other_args],
+    ]
+
+    print(f"{command=}")
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    try:
+        stdout, stderr = process.communicate()
+        output = stdout.decode()
+        error = stderr.decode()
+        print(f"Output: {output}", flush=True)
+        print(f"Error: {error}", flush=True)
+
+        output_throughput = -1
+        for line in output.split("\n"):
+            if "Last generation throughput (tok/s):" in line:
+                output_throughput = float(line.split(":")[-1])
+    finally:
+        kill_process_tree(process.pid)
+
+    return output_throughput
+
+
+def run_bench_one_batch_server(
+    model,
+    base_url,
+    server_args,
+    bench_args,
+    other_server_args,
+    simulate_spec_acc_lens=None,
+):
+    from sglang.bench_one_batch_server import run_benchmark
+
+    if simulate_spec_acc_lens is not None:
+        env = {**os.environ, "SIMULATE_ACC_LEN": str(simulate_spec_acc_lens)}
+    else:
+        env = None
+
+    process = popen_launch_server(
+        model,
+        base_url,
+        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+        other_args=other_server_args,
+        env=env,
+    )
+    try:
+        run_benchmark(server_args=server_args, bench_args=bench_args)
+    finally:
+        kill_process_tree(process.pid)
 
 
 def lcs(X, Y):
