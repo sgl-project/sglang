@@ -537,7 +537,6 @@ class TestEAGLEServerTriton(TestEAGLEServer):
             ],
         )
 
-
 class TestEAGLEServerPageSize(TestEAGLEServer):
     @classmethod
     def setUpClass(cls):
