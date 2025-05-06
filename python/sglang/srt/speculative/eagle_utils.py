@@ -308,6 +308,7 @@ class EagleVerifyInput:
         cum_kv_seq_len = torch.zeros(
             (batch_size + 1,), dtype=torch.int32, device="cuda"
         )
+        paged_kernel_lens = paged_kernel_lens + self.draft_token_num
 
         if use_flashmla:
             max_seqlen_pad = triton.cdiv(
@@ -335,7 +336,6 @@ class EagleVerifyInput:
                 max_seqlen_pad,
             )
         else:
-            paged_kernel_lens = paged_kernel_lens + self.draft_token_num
             cum_kv_seq_len[1:] = torch.cumsum(paged_kernel_lens, dim=0)
 
             kv_indices = torch.empty(
