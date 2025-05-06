@@ -47,8 +47,10 @@ if command -v sudo >/dev/null 2>&1; then
     sudo dpkg --configure -a
     sudo apt-get install -y tzdata
     sudo apt-get install libibverbs-dev pciutils rdma-core ibverbs-utils infiniband-diags ibutils -y
-    sudo modprobe ib_core
+    lspci | grep -i 'infiniband\|mellanox'
+    sudo modprobe mlx5_core
     sudo modprobe ib_uverbs
+    sudo modprobe ib_core
     sudo modprobe rdma_cm
     sudo systemctl restart rdma
 fi
