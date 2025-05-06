@@ -20,11 +20,12 @@ from enum import IntEnum, auto
 from typing import List, Optional, Set, Union
 
 import torch
+from transformers import PretrainedConfig
+
 from sglang.srt.hf_transformers_utils import get_config, get_context_length
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_bool_env_var, is_hip
-from transformers import PretrainedConfig
 
 logger = logging.getLogger(__name__)
 
