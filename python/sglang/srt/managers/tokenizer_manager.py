@@ -65,6 +65,7 @@ from sglang.srt.managers.io_struct import (
     BatchMultimodalOut,
     BatchStrOut,
     BatchTokenIDOut,
+    BatchUpdateWeightsFromDistributedReqInput,
     CloseSessionReqInput,
     ConfigureLoggingReq,
     EmbeddingReqInput,
@@ -821,21 +822,39 @@ class TokenizerManager:
         result = (await self.init_weights_update_group_communicator(obj))[0]
         return result.success, result.message
 
-    async def update_weights_from_distributed(
+    async def batch_update_weights_from_distributed(
         self,
-        obj: UpdateWeightsFromDistributedReqInput,
+        obj: BatchUpdateWeightsFromDistributedReqInput,
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
+        """Update multiple model parameters from distributed in a single request."""
         self.auto_create_handle_loop()
         assert (
             self.server_args.dp_size == 1
-        ), "dp_size must be for update weights from distributed"
+        ), "dp_size must be 1 for update weights from distributed"
 
-        # This means that weight sync
-        # cannot run while requests are in progress.
+        # Get a writer lock for the entire batch update operation
         async with self.model_update_lock.writer_lock:
-            result = (await self.update_weights_from_distributed_communicator(obj))[0]
-            return result.success, result.message
+            error_messages = []
+
+            # Process each parameter in the batch
+            for param_info in obj.parameters:
+                # Send the update request to the communicator
+                result = (
+                    await self.update_weights_from_distributed_communicator(param_info)
+                )[0]
+
+                # Track success/failure
+                if not result.success:
+                    error_messages.append(
+                        f"Failed to update parameter {param_info.name}: {result.message}"
+                    )
+
+            # Return success only if all parameters were updated successfully
+            if len(error_messages) == 0:
+                return True, "All parameters successfully updated."
+            else:
+                return False, "; ".join(error_messages)
 
     async def update_weights_from_tensor(
         self,

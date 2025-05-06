@@ -67,6 +67,7 @@ def init_process(
     tp_size,
     model_name,
     backend,
+    batched,
     checking_parameters,
     tie_word_embeddings,
 ):
@@ -94,6 +95,7 @@ def init_process(
             tie_word_embeddings,
             state_dict_key_to_shape,
             backend,
+            batched,
             tp_size,
         )
 
@@ -206,6 +208,7 @@ def init_process_sgl(
     tie_word_embeddings,
     state_dict_key_to_shape,
     backend,
+    batched,
     tp_size,
 ):
     torch.cuda.set_device(rank)
@@ -295,22 +298,47 @@ def init_process_sgl(
         update_parameters.remove("lm_head.weight")
 
     # Get weights from the training engine and update the inference engine.
-    for parameter_name in update_parameters:
-        if backend == "Engine":
-            engine.update_weights_from_distributed(
-                parameter_name,
-                dtype=torch.bfloat16,
-                shape=state_dict_key_to_shape[parameter_name],
-            )
-        else:
-            requests.post(
-                f"{url}/update_weights_from_distributed",
-                json={
+    print(f"rank {rank} using {'batch' if batched else 'individual'} parameter updates")
+
+    if batched:
+        # Prepare batch of parameters
+        parameters = []
+        for parameter_name in update_parameters:
+            parameters.append(
+                {
                     "name": parameter_name,
                     "dtype": "bfloat16",
                     "shape": state_dict_key_to_shape[parameter_name],
-                },
+                }
             )
+
+        # Use batch update API
+        if backend == "Engine":
+            engine.batch_update_weights_from_distributed(parameters)
+        else:
+            requests.post(
+                f"{url}/batch_update_weights_from_distributed",
+                json={"parameters": parameters},
+            )
+    else:
+        # Use individual parameter updates
+        for parameter_name in update_parameters:
+            if backend == "Engine":
+                engine.update_weights_from_distributed(
+                    parameter_name,
+                    dtype=torch.bfloat16,
+                    shape=state_dict_key_to_shape[parameter_name],
+                )
+            else:
+                requests.post(
+                    f"{url}/update_weights_from_distributed",
+                    json={
+                        "name": parameter_name,
+                        "dtype": "bfloat16",
+                        "shape": state_dict_key_to_shape[parameter_name],
+                    },
+                )
+
     torch.cuda.synchronize()
     time_end_update = time.time()
 
@@ -360,6 +388,7 @@ def test_update_weights_from_distributed(
     dp_size,
     model_name,
     backend,
+    batched,
     state_dict_key_to_shape,
     truncate_size,
     checking_parameters,
@@ -384,6 +413,7 @@ def test_update_weights_from_distributed(
             tp_size,
             model_name,
             backend,
+            batched,
             checking_parameters,
             tie_word_embeddings,
         ),
@@ -535,31 +565,34 @@ class TestUpdateWeightsFromDistributed(CustomTestCase):
     def test_update_weights_from_distributed(self):
 
         assert torch.cuda.device_count() >= 2, "At least 2 GPUs are required"
-        # test_suits : tp, dp, model_name, backend
+        # test_suits : tp, dp, model_name, backend, batched
         if is_in_ci():
             mode = random.choice(["Engine", "Server"])
+            batched = random.choice([True, False])
             test_suits = [
-                (1, 1, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, mode),
+                (1, 1, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, mode, batched),
             ]
         else:
             test_suits = [
-                (1, 1, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, "Engine"),
-                (1, 1, DEFAULT_MODEL_NAME_FOR_TEST, "Sever"),
+                (1, 1, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, "Engine", False),
+                (1, 1, DEFAULT_MODEL_NAME_FOR_TEST, "Server", False),
+                (1, 1, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, "Engine", True),
+                (1, 1, DEFAULT_MODEL_NAME_FOR_TEST, "Server", True),
             ]
 
             if torch.cuda.device_count() >= 4:
                 test_suits.extend(
                     [
-                        (2, 1, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, "Engine"),
-                        (1, 2, DEFAULT_MODEL_NAME_FOR_TEST, "Server"),
+                        (2, 1, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, "Engine", False),
+                        (1, 2, DEFAULT_MODEL_NAME_FOR_TEST, "Server", False),
                     ]
                 )
 
             if torch.cuda.device_count() >= 5:
                 test_suits.extend(
                     [
-                        (2, 2, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, "Engine"),
-                        (2, 2, DEFAULT_MODEL_NAME_FOR_TEST, "Server"),
+                        (2, 2, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, "Engine", False),
+                        (2, 2, DEFAULT_MODEL_NAME_FOR_TEST, "Server", False),
                     ]
                 )
 
@@ -595,12 +628,13 @@ class TestUpdateWeightsFromDistributed(CustomTestCase):
             "lm_head.weight",
         ]
 
-        for tp_size, dp_size, model_name, backend in test_suits:
+        for tp_size, dp_size, model_name, backend, batched in test_suits:
             test_update_weights_from_distributed(
                 tp_size,
                 dp_size,
                 model_name,
                 backend,
+                batched,
                 model_state_dict_shapes[model_name],
                 truncate_size,
                 checking_parameters,

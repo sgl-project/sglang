@@ -46,6 +46,7 @@ from sglang.srt.disaggregation.utils import FakeBootstrapHost
 from sglang.srt.entrypoints.engine import _launch_subprocesses
 from sglang.srt.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
+    BatchUpdateWeightsFromDistributedReqInput,
     CloseSessionReqInput,
     ConfigureLoggingReq,
     EmbeddingReqInput,
@@ -444,8 +445,18 @@ async def update_weights_from_distributed(
     obj: UpdateWeightsFromDistributedReqInput, request: Request
 ):
     """Update model parameter from distributed online."""
+    return await batch_update_weights_from_distributed(
+        BatchUpdateWeightsFromDistributedReqInput(parameters=[obj]), request
+    )
+
+
+@app.post("/batch_update_weights_from_distributed")
+async def batch_update_weights_from_distributed(
+    obj: BatchUpdateWeightsFromDistributedReqInput, request: Request
+):
+    """Update multiple model parameters from distributed in a single request."""
     success, message = (
-        await _global_state.tokenizer_manager.update_weights_from_distributed(
+        await _global_state.tokenizer_manager.batch_update_weights_from_distributed(
             obj, request
         )
     )
