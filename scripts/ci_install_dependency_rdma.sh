@@ -37,8 +37,13 @@ pip install -e lmms-eval/
 pip install git+https://github.com/deepseek-ai/FlashMLA.git
 
 # Check if sudo is available, and install disaggregation requirement
+export DEBIAN_FRONTEND=noninteractive
+echo "tzdata tzdata/Areas select Etc" | sudo debconf-set-selections
+echo "tzdata tzdata/Zones/Etc select UTC" | sudo debconf-set-selections
+
 if command -v sudo >/dev/null 2>&1; then
     sudo apt-get update
+    sudo apt-get install -y --no-install-recommends tzdata
     sudo apt-get install libibverbs-dev pciutils rdma-core ibverbs-utils infiniband-diags ibutils -y
     sudo modprobe ib_core
     sudo modprobe ib_uverbs
@@ -46,6 +51,7 @@ if command -v sudo >/dev/null 2>&1; then
     sudo systemctl restart rdma
 else
     apt-get update
+    apt-get install -y --no-install-recommends tzdata
     apt-get install libibverbs-dev pciutils rdma-core ibverbs-utils infiniband-diags ibutils -y
     modprobe ib_core
     modprobe ib_uverbs
