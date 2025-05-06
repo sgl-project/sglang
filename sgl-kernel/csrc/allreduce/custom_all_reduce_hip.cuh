@@ -572,11 +572,11 @@ class CustomAllreduce {
     CUDACHECK(hipIpcCloseMemHandle(ptr));
   }
 }
-};  // namespace vllm
+};  // namespace sglang
 /**
  * To inspect PTX/SASS, copy paste this header file to compiler explorer and add
  a template instantiation:
  * template void sglang::CustomAllreduce::allreduce<half>(hipStream_t, half *,
  half *, int, int, int);
 */
-}  // namespace vllm
+}  // namespace sglang

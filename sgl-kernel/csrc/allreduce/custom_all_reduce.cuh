@@ -486,4 +486,4 @@ class CustomAllreduce {
  * template void sglang::CustomAllreduce::allreduce<half>(cudaStream_t, half *,
  half *, int, int, int);
 */
-}  // namespace vllm
+}  // namespace sglang
