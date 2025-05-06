@@ -636,7 +636,7 @@ def sample_mmmu_requests(
 
         from datasets import load_dataset
     except ImportError:
-        raise ImportError("Please install datasets: pip install datasets pillow")
+        raise ImportError("Please install datasets: pip install datasets")
 
     print("Loading MMMU dataset from HuggingFace...")
 
@@ -1149,9 +1149,6 @@ async def benchmark(
         test_prompt = test_prompt.split("</image>")[-1]
     else:
         image_data = None
-
-    print(f"DEBUG: test_prompt: {test_prompt}")
-    print(f"DEBUG: image_data: {image_data}")
 
     # Create the test input once
     test_input = RequestFuncInput(
