@@ -317,6 +317,11 @@ def format_results(results: List[TaskResult]) -> str:
     return "\n".join(output)
 
 
+def get_bool_env_var(name: str, default: str = "false") -> bool:
+    value = os.getenv(name, default)
+    return value.lower() in ("true", "1")
+
+
 def write_in_github_step_summary(results: List[TaskResult]):
     """Write formatted results to GitHub step summary."""
     if not os.environ.get("GITHUB_STEP_SUMMARY"):
@@ -349,7 +354,8 @@ def main():
             result = runner.run_task(config)
             results.append(result)
 
-        write_in_github_step_summary(results)
+        if get_bool_env_var("SGLANG_IS_IN_CI"):
+            write_in_github_step_summary(results)
     except Exception as e:
         logger.error(f"Error: {e}")
         raise
