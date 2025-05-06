@@ -72,6 +72,7 @@ class TpModelWorker:
                 if not is_draft_worker
                 else server_args.speculative_draft_model_path
             ),
+            is_draft_model=is_draft_worker,
         )
 
         self.model_runner = ModelRunner(
