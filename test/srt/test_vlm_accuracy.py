@@ -147,6 +147,8 @@ class VisionLLMLogitsBase(unittest.IsolatedAsyncioTestCase):
             gpu_id=0,
             tp_rank=0,
             tp_size=1,
+            pp_rank=0,
+            pp_size=1,
             nccl_port=12435,
             server_args=ServerArgs(
                 model_path=self.model_path,
@@ -229,9 +231,9 @@ class TestMiniCPMVLogits(VisionLLMLogitsBase):
                 input_ids=input_ids,
                 input_embedding=model.get_input_embeddings(),
                 image_data_embedding_func=model.get_image_feature,
-                placeholder_token_ids=[
-                    self.processor.tokenizer.unk_token_id,
-                ],
+                placeholder_tokens={
+                    Modality.IMAGE: self.processor.tokenizer.unk_token_id,
+                },
             )
 
         self.compare_outputs(sglang_output, hf_output)

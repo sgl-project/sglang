@@ -9,12 +9,19 @@ and uses BatchMLAPaged wrapper for decoding.
 More details can be found in https://docs.flashinfer.ai/api/mla.html
 """
 
+import os
 from dataclasses import dataclass
 from functools import partial
 from typing import TYPE_CHECKING, Callable, Optional, Union
 
 import torch
 import triton
+
+if os.environ["SGLANG_ENABLE_TORCH_COMPILE"] == "1":
+    import logging
+
+    torch._logging.set_logs(dynamo=logging.ERROR)
+    torch._dynamo.config.suppress_errors = True
 
 from sglang.global_config import global_config
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -340,7 +347,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
     ):
-
         cache_loc = forward_batch.out_cache_loc
         logits_soft_cap = layer.logit_cap
         prefill_wrapper_paged = self.forward_metadata.prefill_wrapper
@@ -354,7 +360,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
 
         if self.forward_metadata.use_ragged:
             # ragged prefill
-            o, _ = self.prefill_wrapper_ragged.forward_return_lse(
+            o = self.prefill_wrapper_ragged.forward(
                 qall,
                 k.view(-1, layer.tp_k_head_num, layer.head_dim),
                 v.view(-1, layer.tp_k_head_num, layer.v_head_dim),
@@ -365,22 +371,12 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         else:
             # mla paged prefill
             k_buf = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(torch.bfloat16)
-            # if get_tensor_model_parallel_rank() == 0 and (layer.layer_id in [0,1,59,60]) and forward_batch.forward_mode == ForwardMode.TARGET_VERIFY:
-            #     global g_count
-            #     g_count += 1
-            #     output_path = "./output_flashinfer/"
-            #     torch.save(qall, f"{output_path}/{g_count:03d}_0_q")
-            #     torch.save(k_buf.view(-1, 64, 1, self.kv_cache_dim)[0:2], f"{output_path}/{g_count:03d}_1_cache")
             o = prefill_wrapper_paged.run(
                 qall[:, :, : layer.v_head_dim],
                 qall[:, :, layer.v_head_dim :],
                 k_buf[:, :, : layer.v_head_dim],
                 k_buf[:, :, layer.v_head_dim :],
             )
-            # if get_tensor_model_parallel_rank() == 0 and (layer.layer_id in [0,1,59,60]) and forward_batch.forward_mode == ForwardMode.TARGET_VERIFY:
-            #     print(f"{o.shape=}")
-            #     torch.save(o, f"{output_path}/{g_count:03d}_3_o")
-
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def forward_decode(
@@ -404,16 +400,18 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                     k,
                     v,
                 )
+
+        # Reshape inputs
         reshaped_q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
         k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
         reshaped_k = k_buffer.view(-1, 1, layer.head_dim).to(torch.bfloat16)
+        # Direct call to run without the wrapper
         o = decode_wrapper.run(
             reshaped_q[:, :, : layer.v_head_dim],
             reshaped_q[:, :, layer.v_head_dim :],
-            reshaped_k[:, :, : layer.v_head_dim],
-            reshaped_k[:, :, layer.v_head_dim :],
+            k_buffer[:, :, : layer.v_head_dim],
+            k_buffer[:, :, layer.v_head_dim :],
         )
-
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
 
@@ -841,16 +839,18 @@ def fast_mla_decode_plan(
     self._sm_scale = sm_scale
 
     with self.device as device:
-        stream = torch.cuda.current_stream(device).cuda_stream
-        self._cached_module.plan(
-            self._float_workspace_buffer,
-            self._int_workspace_buffer,
-            self._pin_memory_int_workspace_buffer,
-            qo_indptr_cpu,
-            kv_indptr_cpu,
-            kv_len_arr_cpu,
-            num_heads,
-            head_dim_ckv,
-            causal,
-            stream,
-        )
+        try:
+            # Standard version with just the required arguments (no use_profiler)
+            self._cached_module.plan.default(
+                self._float_workspace_buffer,
+                self._int_workspace_buffer,
+                self._pin_memory_int_workspace_buffer,
+                qo_indptr_cpu,
+                kv_indptr_cpu,
+                kv_len_arr_cpu,
+                num_heads,
+                head_dim_ckv,
+                causal,
+            )
+        except Exception as e:
+            raise RuntimeError(f"Error in alternate MLA plan: {e}")

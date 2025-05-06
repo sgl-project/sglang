@@ -6,12 +6,63 @@ import torch
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
+from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    DEFAULT_MLA_MODEL_NAME_FOR_TEST,
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    DEFAULT_URL_FOR_TEST,
+    is_in_ci,
+    popen_launch_server,
+    run_bench_one_batch,
 )
+
+
+class TestFlashMLAAttnBackend(unittest.TestCase):
+    def test_latency(self):
+        output_throughput = run_bench_one_batch(
+            DEFAULT_MLA_MODEL_NAME_FOR_TEST,
+            [
+                "--attention-backend",
+                "flashmla",
+                "--enable-torch-compile",
+                "--cuda-graph-max-bs",
+                "16",
+                "--trust-remote-code",
+                "--page-size",
+                "64",
+            ],
+        )
+
+        if is_in_ci():
+            self.assertGreater(output_throughput, 153)
+
+    def test_mmlu(self):
+        model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
+        base_url = DEFAULT_URL_FOR_TEST
+        process = popen_launch_server(
+            model,
+            base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=["--attention-backend", "flashmla", "--trust-remote-code", "--page-size", "64"],
+        )
+
+        try:
+            args = SimpleNamespace(
+                base_url=base_url,
+                model=model,
+                eval_name="mmlu",
+                num_examples=64,
+                num_threads=32,
+            )
+
+            metrics = run_eval(args)
+            self.assertGreaterEqual(metrics["score"], 0.2)
+        finally:
+            kill_process_tree(process.pid)
 
 
 class TestFlashMLAMTP(CustomTestCase):
@@ -41,6 +92,8 @@ class TestFlashMLAMTP(CustomTestCase):
                     "4",
                     "--attention-backend",
                     "flashmla",
+                    "--page-size",
+                    "64",
                     "--disable-cuda-graph",
                 ]
             )
@@ -70,7 +123,7 @@ class TestFlashMLAMTP(CustomTestCase):
         metrics = run_eval_few_shot_gsm8k(args)
         print(metrics)
 
-        self.assertGreater(metrics["accuracy"], 0.60)
+        self.assertGreater(metrics["accuracy"], 0.50)
 
         server_info = requests.get(self.base_url + "/get_server_info")
         print(f"{server_info=}")

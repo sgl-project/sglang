@@ -4,7 +4,7 @@ This document explains how to add support for new language models and vision‐l
 
 ## How to Support a new Language Model
 
-To support a new model in SGLang, you only need to add a single file under the [SGLang Models Directory](https://github.com/sgl-project/sglang/tree/main/python/sgllang/srt/models). You can learn from existing model implementations and create a new file for your model. For most models, you should be able to find a similar model to start with (e.g., starting from Llama). Also refer how to [port a Model from vLLM to SGLang](#port-a-model-from-vllm-to-sglang)
+To support a new model in SGLang, you only need to add a single file under the [SGLang Models Directory](https://github.com/sgl-project/sglang/tree/main/python/sglang/srt/models). You can learn from existing model implementations and create a new file for your model. For most models, you should be able to find a similar model to start with (e.g., starting from Llama). Also refer how to [port a Model from vLLM to SGLang](#port-a-model-from-vllm-to-sglang)
 
 ## How to Support a new Vision-Language model
 
@@ -58,7 +58,7 @@ The [vLLM Models Directory](https://github.com/vllm-project/vllm/tree/main/vllm/
 To port a model from vLLM to SGLang:
 
 - Compare these two files for guidance:
-  - [SGLang Llama Implementation](https://github.com/sgl-project/sglang/blob/main/python/sgllang/srt/models/llama.py)
+  - [SGLang Llama Implementation](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/models/llama.py)
   - [vLLM Llama Implementation](https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/llama.py)
 - The major differences include:
   - **Replace vLLM’s `Attention` with `RadixAttention`** (ensure you pass `layer_id` to `RadixAttention`).
