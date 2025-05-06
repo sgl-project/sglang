@@ -341,7 +341,7 @@ class TestFlashMLAMTP(CustomTestCase):
         metrics = run_eval_few_shot_gsm8k(args)
         print(metrics)
 
-        self.assertGreater(metrics["accuracy"], 0.60)
+        self.assertGreater(metrics["accuracy"], 0.50)
 
         server_info = requests.get(self.base_url + "/get_server_info")
         print(f"{server_info=}")

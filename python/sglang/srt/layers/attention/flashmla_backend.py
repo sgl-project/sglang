@@ -216,7 +216,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
 
         mla_metadata, num_splits = get_mla_metadata(
             forward_batch.seq_lens.to(torch.int32),
-            Q_LEN * self.num_q_heads,
+            verify_tokens * self.num_q_heads,
             1,
         )
 
@@ -248,6 +248,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         elif forward_batch.forward_mode.is_target_verify():
             assert forward_batch.spec_info is not None
             self.update_metadata_verify(forward_batch)
+            # super().init_forward_metadata(forward_batch)
         else:
             # extend with flashinfer mla
             super().init_forward_metadata(forward_batch)
@@ -416,15 +417,6 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             seq_lens = seq_lens[:bs]
             seq_lens_cpu = seq_lens_cpu[:bs]
             max_seqlen_pad = triton.cdiv(seq_lens_cpu.max().item(), PAGE_SIZE)
-            create_flashmla_kv_indices_triton[(bs,)](
-                self.req_to_token,
-                req_pool_indices[:bs],
-                seq_lens,
-                None,
-                self.cuda_graph_kv_indices,
-                self.req_to_token.stride(0),
-                self.cuda_graph_kv_indices.stride(0),
-            )
 
             block_kv_indices, kv_indptr, qo_indptr, custom_mask = (
             spec_info.generate_attn_arg_prefill(
@@ -553,12 +545,11 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 softmax_scale=layer.scaling,
                 causal=True,
             )
-            # print("flashmla forward_extend o size = ", o.shape)
-            # print("after verify, o = ", o)
             return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
         else:
             print("flashmla forward_extend: flashmla -> flashinfer_mla")
             return super().forward_extend(q, k, v, layer, forward_batch, save_kv_cache)
+        # return super().forward_extend(q, k, v, layer, forward_batch, save_kv_cache)
 
 
 class FlashMLAMultiStepDraftBackend:
