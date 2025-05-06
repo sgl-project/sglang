@@ -762,7 +762,9 @@ class HostKVCache(abc.ABC):
             self.size = int(device_pool.size * host_to_device_ratio)
         # Align the host memory pool size to the page size
         self.size = self.size - (self.size % self.page_size)
-
+        self.start_layer = device_pool.start_layer
+        self.end_layer = device_pool.end_layer
+        
         assert (
             self.size > device_pool.size
         ), "The host memory should be larger than the device memory with the current protocol"
@@ -925,7 +927,6 @@ class MHATokenToKVPoolHost(HostKVCache):
         super().__init__(
             device_pool, host_to_device_ratio, host_size, pin_memory, device, page_size
         )
-        self.start_layer = device_pool.start_layer
 
     def get_size_per_token(self):
         self.head_num = self.device_pool.head_num
@@ -1009,7 +1010,6 @@ class MLATokenToKVPoolHost(HostKVCache):
         super().__init__(
             device_pool, host_to_device_ratio, host_size, pin_memory, device, page_size
         )
-        self.start_layer = device_pool.start_layer
 
     def get_size_per_token(self):
         self.kv_lora_rank = self.device_pool.kv_lora_rank
