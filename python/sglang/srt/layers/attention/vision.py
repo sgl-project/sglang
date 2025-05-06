@@ -94,7 +94,7 @@ class VisionAttention(nn.Module):
             input_size=embed_dim,
             output_size=embed_dim,
             quant_config=quant_config,
-            prefix=add_prefix("out_proj", prefix),
+            prefix=add_prefix("proj", prefix),
         )
 
     def forward(
@@ -271,6 +271,8 @@ class VisionSdpaAttention(nn.Module):
         Returns:
              [b * s, h, head_size]
         """
+        if self.flatten_batch:
+            assert bsz == 1, "flatten_batch is True, bsz must be 1"
 
         s = q.shape[0] // bsz
 
