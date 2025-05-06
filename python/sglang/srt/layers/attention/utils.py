@@ -49,8 +49,8 @@ def create_flashmla_kv_indices_triton(
     kv_indices_ptr,
     req_to_token_ptr_stride: tl.constexpr,
     kv_indices_ptr_stride: tl.constexpr,
+    PAGED_SIZE: tl.constexpr = 64,
 ):
-    PAGED_SIZE: tl.constexpr = 64
     BLOCK_SIZE: tl.constexpr = 4096
     NUM_PAGE_PER_BLOCK: tl.constexpr = 64
     pid = tl.program_id(axis=0)

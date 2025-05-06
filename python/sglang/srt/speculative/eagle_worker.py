@@ -34,14 +34,9 @@ from sglang.srt.speculative.eagle_utils import (
     select_top_k_tokens,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.utils import (
-    empty_context,
-    fast_topk,
-    get_available_gpu_memory,
-    is_cuda_available,
-)
+from sglang.srt.utils import empty_context, fast_topk, get_available_gpu_memory, is_cuda
 
-if is_cuda_available():
+if is_cuda():
     from sgl_kernel import segment_packbits
 
 logger = logging.getLogger(__name__)
@@ -111,11 +106,12 @@ class EAGLEWorker(TpModelWorker):
         # Init draft worker
         with empty_context():
             super().__init__(
+                server_args=server_args,
                 gpu_id=gpu_id,
                 tp_rank=tp_rank,
-                server_args=server_args,
-                nccl_port=nccl_port,
+                pp_rank=0,  # FIXME
                 dp_rank=dp_rank,
+                nccl_port=nccl_port,
                 is_draft_worker=True,
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
