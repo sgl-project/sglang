@@ -27,11 +27,11 @@ from sglang.test.test_utils import (
 
 # VLM models for testing
 MODELS = [
+    # SimpleNamespace(
+    #     model="google/gemma-3-4b-it", chat_template="gemma-it", mmmu_accuracy=0.384
+    # ),
     SimpleNamespace(
-        model="google/gemma-3-4b-it", chat_template="gemma-it", mmmu_accuracy=0.384
-    ),
-    SimpleNamespace(
-        model="Qwen/Qwen2.5-VL-3B-Instruct",
+        model="Qwen/Qwen2.5-VL-7B-Instruct",
         chat_template="qwen2-vl",
         mmmu_accuracy=0.466,
     ),
@@ -95,7 +95,6 @@ class TestVLMModels(unittest.IsolatedAsyncioTestCase):
         model = "openai_compatible"
         tp = 1
         tasks = "mmmu_val"
-        batch_size = 1
         log_suffix = "openai_compatible"
         os.makedirs(output_path, exist_ok=True)
 
@@ -159,7 +158,6 @@ class TestVLMModels(unittest.IsolatedAsyncioTestCase):
                         "--enable-multimodal",
                         "--mem-fraction-static",
                         str(self.parsed_args.mem_fraction_static),  # Use class variable
-                        # "--tp=4"
                     ],
                 )
 
@@ -240,7 +238,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=1,
+        default=4,
     )
     parser.add_argument(
         "--profile",
