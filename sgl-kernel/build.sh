@@ -8,11 +8,15 @@ PYTHON_ROOT_PATH=/opt/python/cp${PYTHON_VERSION//.}-cp${PYTHON_VERSION//.}
 ARCH=$(uname -i)
 echo "ARCH:  $ARCH"
 if [ ${ARCH} = "aarch64" ]; then
-   BUILDER_NAME="pytorch/manylinuxaarch64-builder"
    LIBCUDA_ARCH="sbsa"
+   BUILDER_NAME="pytorch/manylinuxaarch64-builder"
 else
-   BUILDER_NAME="pytorch/manylinux-builder"
    LIBCUDA_ARCH=${ARCH}
+   if [ ${CUDA_VERSION} = "12.8" ]; then
+      BUILDER_NAME="pytorch/manylinux2_28-builder"
+   else
+      BUILDER_NAME="pytorch/manylinux-builder"
+   fi
 fi
 
 if [ ${CUDA_VERSION} = "12.8" ]; then
