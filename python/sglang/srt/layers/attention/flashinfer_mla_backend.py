@@ -144,7 +144,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         self.prefill_cuda_graph_metadata = {}  # For verify
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        print("flashinfer_mla_backend init_forward_metadata", forward_batch.forward_mode)
         if forward_batch.forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
                 forward_batch.req_pool_indices,
@@ -341,8 +340,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
     ):
-        print("flashinfer_mla forward_extend ", forward_batch.forward_mode)
-        print("flashinfer_mla forward_extend q size = ", q.shape)
         cache_loc = forward_batch.out_cache_loc
         logits_soft_cap = layer.logit_cap
         prefill_wrapper_paged = self.forward_metadata.prefill_wrapper
@@ -373,7 +370,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 k_buf[:, :, : layer.v_head_dim],
                 k_buf[:, :, layer.v_head_dim :],
             )
-        # print("flashinfer_mla_backend forward_extend end")
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def forward_decode(
@@ -385,8 +381,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
     ):
-        print("flashinfer_mla_backend forward_decode ", forward_batch.forward_mode)
-        print("flashinfer_mla forward_decode q size = ", q.shape)
         decode_wrapper = self.forward_metadata.decode_wrapper
         cache_loc = forward_batch.out_cache_loc
 
@@ -740,8 +734,6 @@ class FlashInferMLAMultiStepDraftBackend:
         assert forward_batch.spec_info is not None
         assert isinstance(forward_batch.spec_info, EagleDraftInput)
 
-        print("flashinfer_mla_mtp_backend spec_steps", self.speculative_num_steps)
-
         for i in range(self.speculative_num_steps - 1):
             forward_batch.spec_info.kv_indptr = self.kv_indptr[i, : bs + 1]
             forward_batch.spec_info.kv_indices = kv_indices_buffer[i][
@@ -750,7 +742,6 @@ class FlashInferMLAMultiStepDraftBackend:
             call_fn(i, forward_batch)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        print("flashinfer_mla_mtp_backend init_forward_metadata", forward_batch.forward_mode)
         kv_indices = torch.zeros(
             (
                 self.speculative_num_steps,
