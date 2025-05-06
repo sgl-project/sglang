@@ -948,7 +948,7 @@ class Fp8MoEMethod:
         topk_ids: torch.Tensor,
         activation: str = "silu",
         no_combine: bool = False,
-    ) -> bool:
+    ) -> Optional[torch.Tensor]:
         if use_hip_int4:
             # TODO: add triton kernel and add check use_aiter_moe
             assert not no_combine, f"{no_combine=} is not supported."
