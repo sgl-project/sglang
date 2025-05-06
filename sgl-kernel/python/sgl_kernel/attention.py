@@ -1,4 +1,4 @@
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 
@@ -10,13 +10,44 @@ def lightning_attention_decode(q, k, v, past_kv, slope, output, new_kv):
 
 
 def merge_state(
-    v_a: torch.Tensor, s_a: torch.Tensor, v_b: torch.Tensor, s_b: torch.Tensor
+    v_a: torch.Tensor,
+    s_a: torch.Tensor,
+    v_b: torch.Tensor,
+    s_b: torch.Tensor,
+    v_merged: Optional[torch.Tensor] = None,
+    s_merged: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     s_a = s_a.to(torch.float32)
     s_b = s_b.to(torch.float32)
-    v_merged = torch.empty_like(v_a)
-    s_merged = torch.empty_like(s_a)
+    # Avoid creating new tensors if they are already provided
+    if v_merged is None:
+        v_merged = torch.empty_like(v_a)
+    if s_merged is None:
+        s_merged = torch.empty_like(s_a)
     torch.ops.sgl_kernel.merge_state.default(v_a, s_a, v_b, s_b, v_merged, s_merged)
+    return v_merged, s_merged
+
+
+def merge_state_v2(
+    v_a: torch.Tensor,
+    s_a: torch.Tensor,
+    v_b: torch.Tensor,
+    s_b: torch.Tensor,
+    v_merged: Optional[torch.Tensor] = None,
+    s_merged: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    s_a = s_a.to(torch.float32)
+    s_b = s_b.to(torch.float32)
+    # TODO(DefTruth): Currently, the custom merge_attn_states kernel
+    # does not support the FP8 data type and non - CUDA devices.
+    # It may be necessary to fall back to using the Triton kernel.
+
+    # Avoid creating new tensors if they are already provided
+    if v_merged is None:
+        v_merged = torch.empty_like(v_a)
+    if s_merged is None:
+        s_merged = torch.empty_like(s_a)
+    torch.ops.sgl_kernel.merge_state_v2.default(v_a, s_a, v_b, s_b, v_merged, s_merged)
     return v_merged, s_merged
 
 
@@ -43,9 +74,12 @@ def cutlass_mla_decode(
         f"but got D_q = {D_q}, D_ckv = {D_ckv}, D_latent = {D_latent}, D_rope = {D_rope}"
     )
     assert H == 128, f"H must be 128, but got {H}"
-    # TODO: There is currently an illegal memory access issue with page size !=
-    # 128. Change this when it is fixed.
-    assert PAGE_SIZE == 128, f"PAGE_SIZE must be 128, but got {PAGE_SIZE}"
+
+    assert len(page_table.shape) == 2
+    B_block_table, block_num = page_table.shape
+    assert B_block_table == B_q
+    assert block_num > 0, f"block num must be greater than 0, got {block_num}"
+    assert block_num % (128 / PAGE_SIZE) == 0
 
     # TODO(kaixih@nvidia): support fp8
     assert q_nope_and_q_pe.dtype in (
@@ -76,6 +110,8 @@ def cutlass_mla_decode(
 def cutlass_mla_get_workspace_size(
     max_seq_len: int, num_batches: int, sm_count: int = 0
 ) -> int:
+    assert max_seq_len > 0, f"max_seq_len must be greater than 0, got {max_seq_len}"
+    assert num_batches > 0, f"num_batches must be greater than 0, got {num_batches}"
     return torch.ops.sgl_kernel.cutlass_mla_get_workspace_size.default(
         max_seq_len, num_batches, sm_count
     )

@@ -96,8 +96,9 @@ class GenerateReqInput:
     return_hidden_states: bool = False
 
     # For disaggregated inference
-    bootstrap_host: Optional[str] = None
-    bootstrap_room: Optional[int] = None
+    bootstrap_host: Optional[Union[List[str], str]] = None
+    bootstrap_port: Optional[Union[List[int], int]] = None
+    bootstrap_room: Optional[Union[List[int], int]] = None
 
     def normalize_batch_and_arguments(self):
         """
@@ -397,6 +398,15 @@ class GenerateReqInput:
                 else None
             ),
             return_hidden_states=self.return_hidden_states,
+            bootstrap_host=(
+                self.bootstrap_host[i] if self.bootstrap_host is not None else None
+            ),
+            bootstrap_port=(
+                self.bootstrap_port[i] if self.bootstrap_port is not None else None
+            ),
+            bootstrap_room=(
+                self.bootstrap_room[i] if self.bootstrap_room is not None else None
+            ),
         )
 
 
@@ -441,6 +451,7 @@ class TokenizedGenerateReqInput:
 
     # For disaggregated inference
     bootstrap_host: Optional[str] = None
+    bootstrap_port: Optional[int] = None
     bootstrap_room: Optional[int] = None
 
 
@@ -457,6 +468,8 @@ class EmbeddingReqInput:
     image_data: Optional[
         Union[List[List[Union[Image, str]]], List[Union[Image, str]], Union[Image, str]]
     ] = None
+    # The audio input. Like image data, it can be a file name, a url, or base64 encoded string.
+    audio_data: Optional[Union[List[str], str]] = None
     # The token ids for text; one can either specify text or input_ids.
     input_ids: Optional[Union[List[List[int]], List[int]]] = None
     # The request id.
@@ -665,8 +678,13 @@ class BatchEmbeddingOut:
 
 
 @dataclass
-class FlushCacheReq:
+class FlushCacheReqInput:
     pass
+
+
+@dataclass
+class FlushCacheReqOutput:
+    success: bool
 
 
 @dataclass
@@ -834,6 +852,7 @@ class ProfileReq:
     activities: Optional[List[str]] = None
     with_stack: Optional[bool] = None
     record_shapes: Optional[bool] = None
+    profile_id: Optional[str] = None
 
 
 @dataclass

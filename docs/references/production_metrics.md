@@ -2,7 +2,7 @@
 
 SGLang exposes the following metrics via Prometheus. The metrics are namespaced by `$name` (the model name).
 
-An example of the monitoring dashboard is available in [examples/monitoring/grafana.json](../examples/monitoring/grafana.json).
+An example of the monitoring dashboard is available in [examples/monitoring/grafana.json](../examples/monitoring/grafana/dashboards/json/sglang-dashboard.json).
 
 Here is an example of the metrics:
 
@@ -127,44 +127,88 @@ sglang:num_queue_reqs{model_name="meta-llama/Llama-3.1-8B-Instruct"} 2826.0
 
 ## Setup Guide
 
-To setup a monitoring dashboard, you can use the following docker compose file: [examples/monitoring/docker-compose.yaml](../examples/monitoring/docker-compose.yaml).
+This section describes how to set up the monitoring stack (Prometheus + Grafana) provided in the `examples/monitoring` directory.
 
-Assume you have sglang server running at `localhost:30000`, to start the server, ensure you have `--enable-metrics` flag enabled:
+### Prerequisites
 
-```bash
-python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
---port 30000 --host 0.0.0.0 --enable-metrics
-```
+- Docker and Docker Compose installed
+- SGLang server running with metrics enabled
 
-To start the monitoring dashboard (prometheus + grafana), cd to `examples/monitoring` and run:
+### Usage
 
-```bash
-docker compose -f compose.yaml -p monitoring up
-```
+1.  **Start your SGLang server with metrics enabled:**
 
-Then you can access the Grafana dashboard at http://localhost:3000.
+    ```bash
+    python -m sglang.launch_server --model-path <your_model_path> --port 30000 --enable-metrics
+    ```
+    Replace `<your_model_path>` with the actual path to your model (e.g., `meta-llama/Meta-Llama-3.1-8B-Instruct`). Ensure the server is accessible from the monitoring stack (you might need `--host 0.0.0.0` if running in Docker). By default, the metrics endpoint will be available at `http://<sglang_server_host>:30000/metrics`.
 
-### Grafana Dashboard
+2.  **Navigate to the monitoring example directory:**
+    ```bash
+    cd examples/monitoring
+    ```
 
-In a new Grafana setup, ensure that you have the `Prometheus` data source enabled. To check that, go to `http://localhost:3000/connections/datasources` and ensure that `Prometheus` is enabled.
+3.  **Start the monitoring stack:**
+    ```bash
+    docker compose up -d
+    ```
+    This command will start Prometheus and Grafana in the background.
 
-If not, click `Add data source` -> `Prometheus`, set Prometheus URL to `http://localhost:9090`, and click `Save & Test`.
+4.  **Access the monitoring interfaces:**
+    *   **Grafana:** Open your web browser and go to [http://localhost:3000](http://localhost:3000).
+    *   **Prometheus:** Open your web browser and go to [http://localhost:9090](http://localhost:9090).
 
-To import the Grafana dashboard, click `+` -> `Import` -> `Upload JSON file` -> `Upload` and select [grafana.json](../examples/monitoring/grafana.json).
+5.  **Log in to Grafana:**
+    *   Default Username: `admin`
+    *   Default Password: `admin`
+    You will be prompted to change the password upon your first login.
+
+6.  **View the Dashboard:**
+    The SGLang dashboard is pre-configured and should be available automatically. Navigate to `Dashboards` -> `Browse` -> `SGLang Monitoring` folder -> `SGLang Dashboard`.
 
 ### Troubleshooting
 
-#### Check if the variables are created
+*   **Port Conflicts:** If you encounter errors like "port is already allocated," check if other services (including previous instances of Prometheus/Grafana) are using ports `9090` or `3000`. Use `docker ps` to find running containers and `docker stop <container_id>` to stop them, or use `lsof -i :<port>` to find other processes using the ports. You might need to adjust the ports in the `docker-compose.yaml` file if they permanently conflict with other essential services on your system.
 
-The example dashboard assume you have the following variables avaliable:
-- `model_name` (name: `model_name`, label: `model name`, Data source: `Prometheus`, Type: `Label values`)
-- `instance` (name: `instance`, label: `instance`, Data source: `Prometheus`, Type: `Label values`)
+To modify Grafana's port to the other one(like 3090) in your Docker Compose file, you need to explicitly specify the port mapping under the grafana service.
 
-If you don't have these variables, you can create them manually.
+    Option 1: Add GF_SERVER_HTTP_PORT to the environment section:
+    ```
+      environment:
+    - GF_AUTH_ANONYMOUS_ENABLED=true
+    - GF_SERVER_HTTP_PORT=3090  # <-- Add this line
+    ```
+    Option 2: Use port mapping:
+    ```
+    grafana:
+      image: grafana/grafana:latest
+      container_name: grafana
+      ports:
+      - "3090:3000"  # <-- Host:Container port mapping
+    ```
+*   **Connection Issues:**
+    *   Ensure both Prometheus and Grafana containers are running (`docker ps`).
+    *   Verify the Prometheus data source configuration in Grafana (usually auto-configured via `grafana/datasources/datasource.yaml`). Go to `Connections` -> `Data sources` -> `Prometheus`. The URL should point to the Prometheus service (e.g., `http://prometheus:9090`).
+    *   Confirm that your SGLang server is running and the metrics endpoint (`http://<sglang_server_host>:30000/metrics`) is accessible *from the Prometheus container*. If SGLang is running on your host machine and Prometheus is in Docker, use `host.docker.internal` (on Docker Desktop) or your machine's network IP instead of `localhost` in the `prometheus.yaml` scrape configuration.
+*   **No Data on Dashboard:**
+    *   Generate some traffic to your SGLang server to produce metrics. For example, run a benchmark:
+        ```bash
+        python3 -m sglang.bench_serving --backend sglang --dataset-name random --num-prompts 100 --random-input 128 --random-output 128
+        ```
+    *   Check the Prometheus UI (`http://localhost:9090`) under `Status` -> `Targets` to see if the SGLang endpoint is being scraped successfully.
+    *   Verify the `model_name` and `instance` labels in your Prometheus metrics match the variables used in the Grafana dashboard. You might need to adjust the Grafana dashboard variables or the labels in your Prometheus configuration.
 
-To create a variable, go to dashboard settings, `Variables` -> `New variable`.
+### Configuration Files
 
-You should be able to see the preview the values (e.g. `meta-llama/Llama-3.1-8B-Instruct` for `model_name`).
+The monitoring setup is defined by the following files within the `examples/monitoring` directory:
+
+*   `docker-compose.yaml`: Defines the Prometheus and Grafana services.
+*   `prometheus.yaml`: Prometheus configuration, including scrape targets.
+*   `grafana/datasources/datasource.yaml`: Configures the Prometheus data source for Grafana.
+*   `grafana/dashboards/config/dashboard.yaml`: Tells Grafana to load dashboards from the specified path.
+*   `grafana/dashboards/json/sglang-dashboard.json`: The actual Grafana dashboard definition in JSON format.
+
+You can customize the setup by modifying these files. For instance, you might need to update the `static_configs` target in `prometheus.yaml` if your SGLang server runs on a different host or port.
 
 #### Check if the metrics are being collected
 

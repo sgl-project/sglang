@@ -85,7 +85,7 @@ def send_one_batch(base_url, num_prompts, batch_size):
             request_rate=float("inf"),
             max_concurrency=batch_size,
             disable_tqdm=False,
-            lora_name=None,
+            lora_names=None,
             extra_request_body={},
             profile=None,
         )
@@ -176,16 +176,11 @@ def main(args, server_args):
                 ]
             )
 
-        if server_args.enable_flashinfer_mla:
+        if server_args.attention_backend:
             other_args.extend(
                 [
-                    "--enable-flashinfer-mla",
-                ]
-            )
-        if server_args.enable_flashmla:
-            other_args.extend(
-                [
-                    "--enable-flashmla",
+                    "--attention-backend",
+                    server_args.attention_backend,
                 ]
             )
 
