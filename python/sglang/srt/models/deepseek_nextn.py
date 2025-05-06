@@ -42,13 +42,17 @@ from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer, DeepseekV3ForCausalLM
-from sglang.srt.utils import BumpAllocator, add_prefix, is_cuda, is_hip
+from sglang.srt.utils import BumpAllocator, add_prefix, is_cuda, is_hip, is_hpu
+
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
+_is_hpu = is_hpu()
 
 if _is_cuda:
     from sgl_kernel import awq_dequantize
+elif _is_hpu:
+    pass
 else:
     from vllm._custom_ops import awq_dequantize
 

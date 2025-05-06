@@ -6,11 +6,13 @@ from typing import List, Mapping, Tuple, Union
 import torch
 
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, is_hpu
 
 _is_cuda = is_cuda()
+_is_hpu = is_hpu()
 
-if not _is_cuda:
+
+if not (_is_cuda or _is_hpu):
     from vllm._custom_ops import scaled_fp8_quant
 
 

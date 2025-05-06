@@ -17,6 +17,7 @@ import builtins
 import ctypes
 import dataclasses
 import importlib
+import importlib.util
 import io
 import ipaddress
 import itertools
@@ -136,8 +137,19 @@ def is_cuda_alike():
     return is_cuda() or is_hip()
 
 
+_is_hpu = None
+
+
 def is_hpu() -> bool:
-    return hasattr(torch, "hpu") and torch.hpu.is_available()
+    global _is_hpu
+    if _is_hpu is None:
+        if importlib.util.find_spec("habana_frameworks") is not None:
+            import habana_frameworks.torch
+
+            _is_hpu = True
+        else:
+            _is_hpu = False
+    return _is_hpu
 
 
 def is_xpu() -> bool:

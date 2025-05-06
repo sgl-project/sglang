@@ -137,8 +137,30 @@ if _is_hpu:
     USE_CONTIGUOUS_PA = get_bool_env_var("SGLANG_HPU_USE_CONTIGUOUS_PA", "true")
     SKIP_WARMUP = get_bool_env_var("SGLANG_HPU_SKIP_WARMUP", "false")
 
-    from vllm.utils import make_tensor_with_pad
+    from typing import TypeVar, Union
+
     from vllm_hpu_extension.bucketing.linear import find_bucket
+
+    T = TypeVar("T")
+
+    def make_tensor_with_pad(
+        x: list[list[T]],
+        pad: T,
+        dtype: torch.dtype,
+        *,
+        max_len: int,
+        device: Optional[Union[str, torch.device]] = None,
+    ) -> torch.Tensor:
+        """
+        Make a padded tensor from 2D inputs.
+
+        The padding is applied to the end of each inner list until it reaches
+        `max_len`.
+        """
+        padded_len = max_len - len(x[0])
+        return torch.nn.functional.pad(
+            torch.tensor(x, dtype=dtype), (0, 0, 0, padded_len), value=pad
+        ).to(device)
 
     def get_prefill_all_seq_len_buckets():
         return list(

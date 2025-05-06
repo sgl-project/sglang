@@ -64,23 +64,26 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cuda,
     is_hip,
+    is_hpu,
     print_warning_once,
     set_weight_attrs,
 )
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
+_is_hpu = is_hpu()
 
 if _is_hip:
     from aiter import ActivationType
     from aiter.fused_moe_bf16_asm import asm_moe, ck_moe_2stages, ck_moe_2stages_win4
     from aiter.ops.shuffle import shuffle_weight
 
-if not _is_cuda:
+if not (_is_cuda or _is_hpu):
     from vllm._custom_ops import scaled_fp8_quant
 
 
 ACTIVATION_SCHEMES = ["static", "dynamic"]
+
 
 logger = logging.getLogger(__name__)
 
