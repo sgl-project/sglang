@@ -1,4 +1,4 @@
-# Adapted from qwen2.py
+# Adapted from https://github.com/vllm-project/vllm/pull/17433/files  and deepseek_nextn.py
 
 from functools import partial
 from typing import Any, Dict, Iterable, Optional, Tuple
@@ -19,9 +19,13 @@ from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
-from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+from sglang.srt.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.mimo import MiMoForCausalLM
 from sglang.srt.models.qwen2 import (
     Qwen2Attention,
     Qwen2DecoderLayer,
@@ -33,126 +37,132 @@ from sglang.srt.utils import add_prefix
 MiMoConfig = None
 
 
-class MiMoMTPLayers(nn.Module):
-    def __init__(self, config):
+class MiMoMultiTokenPredictorLayer(nn.Module):
+
+    def __init__(
+        self,
+        config: MiMoConfig,
+        prefix: str,
+        quant_config: Optional[QuantizationConfig] = None,
+    ) -> None:
         super().__init__()
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+
         self.token_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hidden_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.input_proj = nn.Linear(
             config.hidden_size * 2, config.hidden_size, bias=False
         )
+        self.mtp_block = Qwen2DecoderLayer(
+            config=config, quant_config=quant_config, prefix=prefix
+        )
         self.final_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.self_attn = Qwen2Attention(config, layer_idx=0)
-        self.mlp = Qwen2MLP(config)
 
     def forward(
         self,
-        input_embeds,
-        hidden_states,
-        attention_mask,
-        position_ids,
-        past_key_values: Optional[Cache] = None,
-        output_attentions: Optional[bool] = False,
-        use_cache: Optional[bool] = False,
-        position_embedding: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        cache_position=None,
-        **kwargs
-    ):
-        input_embeds = self.token_layernorm(input_embeds)
-        previous_hidden_states = self.hidden_layernorm(hidden_states)
+        inputs_embeds: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+
+        assert inputs_embeds is not None
+        # masking inputs at position 0, as not needed by MTP
+        inputs_embeds[positions == 0] = 0
+        inputs_embeds = self.token_layernorm(inputs_embeds)
+        previous_hidden_states = self.hidden_layernorm(
+            forward_batch.spec_info.hidden_states
+        )
+
         hidden_states = self.input_proj(
-            torch.cat([previous_hidden_states, input_embeds], dim=-1)
+            torch.cat([previous_hidden_states, inputs_embeds], dim=-1)
         )
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-        hidden_states, _ = self.self_attn(
-            hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            output_attentions=output_attentions,
-            use_cache=use_cache,
-            cache_position=cache_position,
-            position_embedding=position_embedding,
-            **kwargs
+
+        hidden_states, residual = self.mtp_block(
+            positions=positions,
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+            residual=None,
         )
         hidden_states = residual + hidden_states
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
-        hidden_states = self.final_layernorm(hidden_states)
-        return hidden_states
+        return self.final_layernorm(hidden_states)
 
 
-class MiMoModel(Qwen2Model):
-    def __init__(
-        self,
-        config: MiMoConfig,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-    ) -> None:
-        super().__init__(
-            config=config,
-            quant_config=quant_config,
-            prefix=prefix,
-            decoder_layer_type=Qwen2DecoderLayer,
-        )
-        self.mtp_layers = nn.ModuleList(
-            [MiMoMTPLayers(config) for _ in range(config.num_nextn_predict_layers)]
-        )
-
-
-class MiMoForCausalLM(nn.Module):
-    # BitandBytes specific attributes
-    default_bitsandbytes_target_modules = [
-        ".gate_proj.",
-        ".down_proj.",
-        ".up_proj.",
-        ".q_proj.",
-        ".k_proj.",
-        ".v_proj.",
-        ".o_proj.",
-    ]
-    bitsandbytes_stacked_params_mapping = {
-        # shard_name, weight_name, index
-        "q_proj": ("qkv_proj", 0),
-        "k_proj": ("qkv_proj", 1),
-        "v_proj": ("qkv_proj", 2),
-        "gate_proj": ("gate_up_proj", 0),
-        "up_proj": ("gate_up_proj", 1),
-    }
+class MiMoMultiTokenPredictor(nn.Module):
 
     def __init__(
         self,
         config: MiMoConfig,
-        quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-    ) -> None:
+        quant_config: Optional[QuantizationConfig] = None,
+    ):
         super().__init__()
-        self.config = config
-        self.quant_config = quant_config
-        self.model = MiMoModel(
-            config, quant_config=quant_config, prefix=add_prefix("model", prefix)
-        )
-        if config.tie_word_embeddings:
-            self.lm_head = self.model.embed_tokens
-        else:
-            self.lm_head = ParallelLMHead(
-                config.vocab_size,
-                config.hidden_size,
-                quant_config=quant_config,
-                prefix=add_prefix("lm_head", prefix),
-            )
-        self.logits_processor = LogitsProcessor(config)
-        self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
 
-    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.model.get_input_embeddings(input_ids)
+        self.mtp_start_layer_idx = config.num_hidden_layers
+        self.num_mtp_layers = config.num_nextn_predict_layers
+
+        self.embed_tokens = VocabParallelEmbedding(
+            config.vocab_size,
+            config.hidden_size,
+        )
+
+        self.mtp_layers = torch.nn.ModuleDict(
+            {
+                str(idx): MiMoMultiTokenPredictorLayer(
+                    config,
+                    f"{prefix}.layers.{idx}",
+                    quant_config=quant_config,
+                )
+                for idx in range(
+                    self.mtp_start_layer_idx,
+                    self.mtp_start_layer_idx + self.num_mtp_layers,
+                )
+            }
+        )
+
+        self.logits_processor = LogitsProcessor(config.vocab_size)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor:
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
+
+        hidden_states = self.mtp_layers[str(self.mtp_start_layer_idx + spec_step_idx)](
+            input_ids,
+            positions,
+            forward_batch,
+        )
+        return self.logits_processor(
+            input_ids, hidden_states, self.lm_head, forward_batch
+        )
+
+
+class MiMoMTP(nn.Module):
+    def __init__(
+        self,
+        config: MiMoConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        nn.Module.__init__(self)
+        self.config = config
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.quant_config = quant_config
+
+        self.model = MiMoMultiTokenPredictor(
+            config, add_prefix("model", prefix), quant_config
+        )
+        self.lm_head = ParallelLMHead(
+            config.vocab_size,
+            config.hidden_size,
+            quant_config=quant_config,
+            # prefix=add_prefix("model.shared_head.head", prefix),
+        )
+        self.logits_processor = LogitsProcessor(config)
 
     @torch.no_grad()
     def forward(
@@ -160,16 +170,10 @@ class MiMoForCausalLM(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        input_embeds: torch.Tensor = None,
-        get_embedding: bool = False,
+        spec_step_idx: int = 0,
     ) -> torch.Tensor:
-        hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
-        if not get_embedding:
-            return self.logits_processor(
-                input_ids, hidden_states, self.lm_head, forward_batch
-            )
-        else:
-            return self.pooler(hidden_states, forward_batch)
+        assert spec_step_idx == 0, "mimo_mtp only support predict one token now"
+        return self.model(input_ids, positions, forward_batch)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
@@ -182,6 +186,7 @@ class MiMoForCausalLM(nn.Module):
         ]
 
         params_dict = dict(self.named_parameters())
+        print(params_dict.keys())
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name or "projector" in name:
                 continue
@@ -193,10 +198,14 @@ class MiMoForCausalLM(nn.Module):
                 continue
             if name.startswith("model.vision_tower") and name not in params_dict:
                 continue
+            name = self.map_model_name_to_mtp_param_name(name)
+            name = name.replace("0", "36")
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
+                if "mtp_layers" not in name:
+                    break
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
@@ -209,23 +218,31 @@ class MiMoForCausalLM(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
+                if "mtp_layers" not in name and (
+                    "embed_tokens" not in name and "lm_head" not in name
+                ):
+                    continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
 
-    def get_embed_and_head(self):
-        return self.model.embed_tokens.weight, self.lm_head.weight
+    def map_model_name_to_mtp_param_name(self, name: str) -> str:
+        import re
 
-    def set_embed_and_head(self, embed, head):
-        del self.model.embed_tokens.weight
-        del self.lm_head.weight
-        self.model.embed_tokens.weight = embed
-        self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        name_without_prefix = [
+            "token_layernorm",
+            "hidden_layernorm",
+            "input_proj",
+            "final_layernorm",
+        ]
+        for sub_name in name_without_prefix:
+            if sub_name in name:
+                return name
+        pattern = r"model.mtp_layers.(\d+)."
+        group = re.match(pattern, name)
+        if group is not None:
+            name = name.replace(group.group(), group.group() + "mtp_block.")
+        return name
 
-    def load_kv_cache_scales(self, quantization_param_path: str) -> None:
-        self.model.load_kv_cache_scales(quantization_param_path)
 
-
-EntryClass = MiMoForCausalLM
+EntryClass = MiMoMTP
