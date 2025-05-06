@@ -3,6 +3,7 @@ python3 -m unittest test_vertex_endpoint.TestVertexEndpoint.test_vertex_generate
 """
 
 import unittest
+from http import HTTPStatus
 
 import requests
 
@@ -48,6 +49,15 @@ class TestVertexEndpoint(CustomTestCase):
     def test_vertex_generate(self):
         for parameters in [None, {"sampling_params": {"max_new_tokens": 4}}]:
             self.run_generate(parameters)
+
+    def test_vertex_generate_fail(self):
+        data = {
+            "instances": [
+                {"prompt": "The capital of France is"},
+            ],
+        }
+        response = requests.post(self.base_url + "/vertex_generate", json=data)
+        assert response.status_code == HTTPStatus.BAD_REQUEST
 
 
 if __name__ == "__main__":
