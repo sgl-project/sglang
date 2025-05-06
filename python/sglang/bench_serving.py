@@ -693,6 +693,7 @@ def sample_random_requests(
     tokenizer: PreTrainedTokenizerBase,
     dataset_path: str,
     random_sample: bool = True,
+    return_text: bool = True,
 ) -> List[Tuple[str, int, int]]:
     input_lens = np.random.randint(
         max(int(input_len * range_ratio), 1),
@@ -753,20 +754,26 @@ def sample_random_requests(
             else:
                 ratio = (input_lens[i] + prompt_len - 1) // prompt_len
                 input_ids = (prompt_token_ids * ratio)[: input_lens[i]]
-            prompt = tokenizer.decode(input_ids)
-            input_requests.append((prompt, int(input_lens[i]), int(output_lens[i])))
+            input_content = input_ids
+            if return_text:
+                input_content = tokenizer.decode(input_content)
+            input_requests.append(
+                (input_content, int(input_lens[i]), int(output_lens[i]))
+            )
     else:
         # Sample token ids from random integers. This can cause some NaN issues.
         offsets = np.random.randint(0, tokenizer.vocab_size, size=num_prompts)
         input_requests = []
         for i in range(num_prompts):
-            prompt = tokenizer.decode(
-                [
-                    (offsets[i] + i + j) % tokenizer.vocab_size
-                    for j in range(input_lens[i])
-                ]
+            input_content = [
+                (offsets[i] + i + j) % tokenizer.vocab_size
+                for j in range(input_lens[i])
+            ]
+            if return_text:
+                input_content = tokenizer.decode(input_content)
+            input_requests.append(
+                (input_content, int(input_lens[i]), int(output_lens[i]))
             )
-            input_requests.append((prompt, int(input_lens[i]), int(output_lens[i])))
 
     print(f"#Input tokens: {np.sum(input_lens)}")
     print(f"#Output tokens: {np.sum(output_lens)}")

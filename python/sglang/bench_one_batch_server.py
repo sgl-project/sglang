@@ -112,13 +112,14 @@ def run_one_case(
         tokenizer=tokenizer,
         dataset_path="",
         random_sample=True,
+        return_text=False,
     )
 
     tic = time.time()
     response = requests.post(
         url + "/generate",
         json={
-            "text": [text for text, _, _ in input_requests],
+            "input_ids": [input_ids for input_ids, _, _ in input_requests],
             "sampling_params": {
                 "temperature": 0,
                 "max_new_tokens": output_len,
