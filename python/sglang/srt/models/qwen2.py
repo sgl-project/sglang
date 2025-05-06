@@ -91,6 +91,7 @@ class Qwen2MLP(nn.Module):
 class Qwen2Attention(nn.Module):
     def __init__(
         self,
+        config: Qwen2Config,
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
@@ -154,6 +155,10 @@ class Qwen2Attention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            orig_context_len=getattr(
+                config, "orig_context_len", max_position_embeddings
+            ),
+            rope=self.rotary_emb,
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
         )
@@ -166,7 +171,13 @@ class Qwen2Attention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self.rotary_emb(positions, q, k)
+
+        # RoPE is applied inside the attention kernel in HiP Attention
+        if (forward_batch.hip_metadata_cache_pool is None) or (
+            not forward_batch.hip_metadata_cache_pool.hip_config.using_extend
+        ):
+            q, k = self.rotary_emb(positions, q, k)
+
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
         return output
@@ -186,6 +197,7 @@ class Qwen2DecoderLayer(nn.Module):
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
         self.self_attn = Qwen2Attention(
+            config=config,
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
@@ -286,7 +298,10 @@ class Qwen2Model(nn.Module):
         else:
             hidden_states = input_embeds
         residual = None
+
+        forward_batch.on_model_start()
         for i in range(len(self.layers)):
+            forward_batch.on_layer_start(i)
             layer = self.layers[i]
             hidden_states, residual = layer(
                 positions,
@@ -294,7 +309,11 @@ class Qwen2Model(nn.Module):
                 forward_batch,
                 residual,
             )
+            forward_batch.on_layer_end(i)
+        forward_batch.on_model_end()
+
         hidden_states, _ = self.norm(hidden_states, residual)
+
         return hidden_states
 
     # If this function is called, it should always initialize KV cache scale
@@ -340,6 +359,7 @@ class Qwen2ForCausalLM(nn.Module):
         "gate_proj": ("gate_up_proj", 0),
         "up_proj": ("gate_up_proj", 1),
     }
+    hip_attention_supported = True
 
     def __init__(
         self,

@@ -38,6 +38,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import debug_timing, get_compiler_backend
 
 logger = logging.getLogger(__name__)
@@ -131,6 +132,18 @@ class KVCache(abc.ABC):
 
     def register_layer_transfer_counter(self, layer_transfer_counter):
         self.layer_transfer_counter = layer_transfer_counter
+
+    def on_model_start(self, forward_batch: ForwardBatch):
+        pass
+
+    def on_model_end(self, forward_batch: ForwardBatch):
+        pass
+
+    def on_layer_start(self, forward_batch: ForwardBatch, layer_id: int):
+        pass
+
+    def on_layer_end(self, forward_batch: ForwardBatch, layer_id: int):
+        pass
 
 
 class TokenToKVPoolAllocator:

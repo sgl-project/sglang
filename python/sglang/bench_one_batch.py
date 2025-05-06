@@ -147,6 +147,7 @@ def load_model(server_args, port_args, tp_rank):
         enable_multimodal=server_args.enable_multimodal,
         dtype=server_args.dtype,
         quantization=server_args.quantization,
+        is_context_extended=server_args.enable_hip_attention,
     )
     model_runner = ModelRunner(
         model_config=model_config,
@@ -251,6 +252,7 @@ def extend(reqs, model_runner):
         enable_overlap=False,
         spec_algorithm=SpeculativeAlgorithm.NONE,
         enable_custom_logit_processor=False,
+        hip_attention_config=model_runner.server_args.hip_attention_config,
     )
     batch.prepare_for_extend()
     _maybe_prepare_dp_attn_batch(batch, model_runner)
