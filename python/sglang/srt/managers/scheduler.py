@@ -41,6 +41,7 @@ from sglang.srt.disaggregation.decode import (
     DecodeTransferQueue,
     SchedulerDisaggregationDecodeMixin,
 )
+from sglang.srt.disaggregation.kv_events import EventPublisherFactory, KVEventBatch
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
@@ -197,6 +198,7 @@ class Scheduler(
         self.enable_overlap = not server_args.disable_overlap_schedule
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
         self.enable_metrics = server_args.enable_metrics
+        self.enable_kv_cache_events = server_args.kv_events_config is not None
         self.stream_interval = server_args.stream_interval
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
@@ -204,7 +206,6 @@ class Scheduler(
         self.gpu_id = gpu_id
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
         self.page_size = server_args.page_size
-
         # Distributed rank info
         self.dp_size = server_args.dp_size
         self.attn_tp_rank, self.attn_tp_size, self.attn_dp_rank = (
@@ -422,6 +423,7 @@ class Scheduler(
 
         # Init metrics stats
         self.init_metrics()
+        self.init_kv_events(server_args.kv_events_config)
 
         # Init request dispatcher
         self._request_dispatcher = TypeBasedDispatcher(
@@ -515,6 +517,7 @@ class Scheduler(
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                     page_size=self.page_size,
                     disable=server_args.disable_radix_cache,
+                    enable_kv_cache_events=self.enable_kv_cache_events,
                 )
 
         self.decode_mem_cache_buf_multiplier = (
@@ -546,6 +549,10 @@ class Scheduler(
                     "engine_type": engine_type,
                 },
             )
+
+    def init_kv_events(self, kv_events_config: Optional[str]):
+        if self.enable_kv_cache_events:
+            self.kv_event_publisher = EventPublisherFactory.create(kv_events_config)
 
     def init_disaggregation(self):
         self.transfer_backend = TransferBackend(
@@ -1154,6 +1161,7 @@ class Scheduler(
             self.stats.avg_request_queue_latency = total_queue_latency / num_new_seq
 
             self.metrics_collector.log_stats(self.stats)
+        self._publish_kv_events()
 
     def log_decode_stats(
         self, can_run_cuda_graph: bool, running_batch: ScheduleBatch = None
@@ -1213,6 +1221,7 @@ class Scheduler(
             self.stats.num_grammar_queue_reqs = len(self.grammar_queue)
             self.stats.spec_accept_length = spec_accept_length
             self.metrics_collector.log_stats(self.stats)
+        self._publish_kv_events()
 
     def check_memory(self):
         available_size = (
@@ -1260,6 +1269,7 @@ class Scheduler(
             self.stats.num_queue_reqs = len(self.waiting_queue)
             self.stats.num_grammar_queue_reqs = len(self.grammar_queue)
             self.metrics_collector.log_stats(self.stats)
+        self._publish_kv_events()
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
         # Merge the prefill batch into the running batch
@@ -2193,6 +2203,13 @@ class Scheduler(
         if self.pp_size > 1:
             prefix += f" PP{self.pp_rank}"
         return prefix
+
+    def _publish_kv_events(self):
+        if self.enable_kv_cache_events:
+            events = self.tree_cache.take_events()
+            if events:
+                batch = KVEventBatch(ts=time.time(), events=events)
+                self.kv_event_publisher.publish(batch)
 
 
 def is_health_check_generate_req(recv_req):

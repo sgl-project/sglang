@@ -48,3 +48,6 @@ class BasePrefixCache(ABC):
 
     def pretty_print(self):
         raise NotImplementedError()
+
+    def take_events(self):
+        return []
