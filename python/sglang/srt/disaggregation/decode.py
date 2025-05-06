@@ -21,6 +21,7 @@ Life cycle of a request in the decode server
 from __future__ import annotations
 
 import logging
+import os
 from collections import deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional, Tuple
@@ -97,7 +98,9 @@ class DecodePreallocQueue:
         self.tp_size = tp_size
         self.bootstrap_port = bootstrap_port
 
-        self.num_reserved_decode_tokens = 512
+        self.num_reserved_decode_tokens = int(
+            os.environ.get("SGLANG_NUM_RESERVED_DECODE_TOKENS", "512")
+        )
 
         # Queue for requests pending pre-allocation
         self.queue: List[DecodeRequest] = []

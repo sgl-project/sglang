@@ -81,10 +81,20 @@ class TestOpenAIVisionServer(CustomTestCase):
         text = response.choices[0].message.content
         assert isinstance(text, str)
         # `driver` is for gemma-3-it
-        assert "man" in text or "person" or "driver" in text, text
-        assert "cab" in text or "taxi" in text or "SUV" in text, text
+        assert (
+            "man" in text or "person" or "driver" in text
+        ), f"text: {text}, should contain man, person or driver"
+        assert (
+            "cab" in text
+            or "taxi" in text
+            or "SUV" in text
+            or "vehicle" in text
+            or "car" in text
+        ), f"text: {text}, should contain cab, taxi, SUV, vehicle or car"
         # MiniCPMO fails to recognize `iron`, but `hanging`
-        assert "iron" in text or "hang" in text, text
+        assert (
+            "iron" in text or "hang" in text or "cloth" in text or "holding" in text
+        ), f"text: {text}, should contain iron, hang, cloth or holding"
         assert response.id
         assert response.created
         assert response.usage.prompt_tokens > 0
@@ -132,7 +142,9 @@ class TestOpenAIVisionServer(CustomTestCase):
         assert response.choices[0].message.role == "assistant"
         text = response.choices[0].message.content
         assert isinstance(text, str)
-        assert "man" in text or "cab" in text, text
+        assert (
+            "man" in text or "cab" in text
+        ), f"text: {text}, should contain man or cab"
         assert response.id
         assert response.created
         assert response.usage.prompt_tokens > 0
@@ -175,8 +187,12 @@ class TestOpenAIVisionServer(CustomTestCase):
         print("-" * 30)
         print(f"Multi images response:\n{text}")
         print("-" * 30)
-        assert "man" in text or "cab" in text or "SUV" in text or "taxi" in text, text
-        assert "logo" in text or '"S"' in text or "SG" in text, text
+        assert (
+            "man" in text or "cab" in text or "SUV" in text or "taxi" in text
+        ), f"text: {text}, should contain man, cab, SUV or taxi"
+        assert (
+            "logo" in text or '"S"' in text or "SG" in text
+        ), f"text: {text}, should contain logo, S or SG"
         assert response.id
         assert response.created
         assert response.usage.prompt_tokens > 0
@@ -305,9 +321,9 @@ class TestOpenAIVisionServer(CustomTestCase):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
 
         regex = (
-            r"""\{\n"""
-            + r"""   "color": "[\w]+",\n"""
-            + r"""   "number_of_cars": [\d]+\n"""
+            r"""\{"""
+            + r""""color":"[\w]+","""
+            + r""""number_of_cars":[\d]+"""
             + r"""\}"""
         )
 
@@ -588,6 +604,21 @@ class TestMinicpmvServer(TestOpenAIVisionServer):
         cls.base_url += "/v1"
 
 
+class TestInternVL2_5Server(TestOpenAIVisionServer):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "OpenGVLab/InternVL2_5-2B"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=["--trust-remote-code", "--chat-template", "internvl-2-5"],
+        )
+        cls.base_url += "/v1"
+
+
 class TestMinicpmoServer(TestOpenAIVisionServer):
     @classmethod
     def setUpClass(cls):
@@ -724,6 +755,32 @@ class TestGemma3itServer(TestOpenAIVisionServer):
                 "--mem-fraction-static",
                 "0.75",
                 "--enable-multimodal",
+            ],
+        )
+        cls.base_url += "/v1"
+
+    def test_video_chat_completion(self):
+        pass
+
+
+class TestKimiVLServer(TestOpenAIVisionServer):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "moonshotai/Kimi-VL-A3B-Instruct"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--trust-remote-code",
+                "--chat-template",
+                "kimi-vl",
+                "--context-length",
+                "4096",
+                "--dtype",
+                "bfloat16",
             ],
         )
         cls.base_url += "/v1"

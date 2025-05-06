@@ -162,8 +162,6 @@ class TestDeepseekV3MTPBlockInt8(CustomTestCase):
                     "1",
                     "--speculative-algorithm",
                     "EAGLE",
-                    "--speculative-draft",
-                    "sgl-project/sglang-ci-dsv3-block-int8-test-NextN",
                     "--speculative-num-steps",
                     "2",
                     "--speculative-eagle-topk",
