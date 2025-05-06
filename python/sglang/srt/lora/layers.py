@@ -136,11 +136,19 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         self.set_lora = True
         self.A_buffer_gate_up = A_buffer
         if self.lora_backend.fuse_stacked_lora_b:
-            # TODO: avoid using contiguous() in GPU.
             # B_buffer_gate_up: (num_lora, 2 * output_dim, r)
-            self.B_buffer_gate_up = torch.cat(
-                (B_buffer[0], B_buffer[1]), dim=-2
-            ).contiguous()
+            if not hasattr(self, "B_buffer_gate_up") or self.B_buffer_gate_up is None:
+                self.B_buffer_gate_up = torch.empty(
+                    (
+                        B_buffer[0].shape[0],
+                        2 * B_buffer[0].shape[1],
+                        B_buffer[0].shape[2],
+                    ),
+                    dtype=B_buffer[0].dtype,
+                    device=B_buffer[0].device,
+                )
+            self.B_buffer_gate_up[:, : B_buffer[0].shape[1], :].copy_(B_buffer[0])
+            self.B_buffer_gate_up[:, B_buffer[0].shape[1] :, :].copy_(B_buffer[1])
         else:
             self.B_buffer_gate_up = (B_buffer[0], B_buffer[1])
 
@@ -171,7 +179,7 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
 
 
 class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
-    def init__(
+    def __init__(
         self,
         base_layer: QKVParallelLinear,
         lora_backend: BaseLoRABackend,
@@ -194,12 +202,30 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
             output_dim_q, output_dim_kv = B_buffer_q.shape[-2], B_buffer_kv.shape[-2]
 
             # B_buffer_qkv: (num_lora, output_dim_q + 2 * output_dim_kv, r)
-            self.B_buffer_qkv = torch.cat(
-                (B_buffer_q[0], B_buffer_kv[0], B_buffer_kv[1]), dim=-2
-            ).contiguous()
+            if not hasattr(self, "B_buffer_qkv") or self.B_buffer_qkv is None:
+                self.B_buffer_qkv = torch.empty(
+                    (
+                        B_buffer_q[0].shape[0],
+                        output_dim_q + 2 * output_dim_kv,
+                        B_buffer_q[0].shape[2],
+                    ),
+                    dtype=B_buffer_q[0].dtype,
+                    device=B_buffer_q[0].device,
+                )
+            self.B_buffer_qkv[:, :output_dim_q, :].copy_(B_buffer_q[0])
+            self.B_buffer_qkv[:, output_dim_q : output_dim_q + output_dim_kv, :].copy_(
+                B_buffer_kv[0]
+            )
+            self.B_buffer_qkv[:, output_dim_q + output_dim_kv :, :].copy_(
+                B_buffer_kv[1]
+            )
 
             # Offsets of q/k/v in output dimension
-            self.output_offset = torch.tensor(
+            if not hasattr(self, "output_offset") or self.output_offset is None:
+                self.output_offset = torch.empty(
+                    4, dtype=torch.int32, device=B_buffer_q.device
+                )
+            self.output_offset[:4] = torch.tensor(
                 [
                     0,
                     output_dim_q,
