@@ -59,90 +59,98 @@ def flash_attn_with_kvcache(
     sm_margin=0,  # Can be tuned if some SMs are used for communication
     return_softmax_lse=False,
 ):
-    """
-    If k and v are not None, k_cache and v_cache will be updated *inplace* with the new values from
-    k and v. This is useful for incremental decoding: you can pass in the cached keys/values from
-    the previous step, and update them with the new keys/values from the current step, and do
-    attention with the updated cache, all in 1 kernel.
+    r"""
+    Compute Flash Attention with optional incremental key/value cache update, rotary embedding,
+    sliding window local attention, and support for multi-query/grouped-query attention.
 
-    If you pass in k / v, you must make sure that the cache is large enough to hold the new values.
-    For example, the KV cache could be pre-allocated with the max sequence length, and you can use
-    cache_seqlens to keep track of the current sequence lengths of each sequence in the batch.
+    This function updates `k_cache` and `v_cache` *inplace* with new values from `k` and `v`
+    when provided. This is useful for incremental decoding: you can pass cached keys/values
+    from the previous step, update them with the new keys/values for the current step, and perform
+    attention using the updated cache, all in a single kernel call.
 
-    Also apply rotary embedding if rotary_cos and rotary_sin are passed in. The key @k will be
-    rotated by rotary_cos and rotary_sin at indices cache_seqlens, cache_seqlens + 1, etc.
-    If causal or local (i.e., window_size != (-1, -1)), the query @q will be rotated by rotary_cos
-    and rotary_sin at indices cache_seqlens, cache_seqlens + 1, etc.
-    If not causal and not local, the query @q will be rotated by rotary_cos and rotary_sin at
-    indices cache_seqlens only (i.e. we consider all tokens in @q to be at position cache_seqlens).
+    The cache should be pre-allocated with sufficient space for the maximum sequence length, and
+    `cache_seqlens` should track the current valid length for each batch element.
 
-    See tests/test_flash_attn.py::test_flash_attn_kvcache for examples of how to use this function.
+    Rotary embedding is applied to keys and queries if `rotary_cos` and `rotary_sin` are provided,
+    using the appropriate indices depending on whether attention is causal or local.
 
-    Supports multi-query and grouped-query attention (MQA/GQA) by passing in KV with fewer heads
-    than Q. Note that the number of heads in Q must be divisible by the number of heads in KV.
-    For example, if Q has 6 heads and K, V have 2 heads, head 0, 1, 2 of Q will attention to head
-    0 of K, V, and head 3, 4, 5 of Q will attention to head 1 of K, V.
+    Supports multi-query/grouped-query attention (MQA/GQA) by allowing KV heads to be fewer than query heads.
+    The number of query heads must be divisible by the number of KV heads.
 
-    If causal=True, the causal mask is aligned to the bottom right corner of the attention matrix.
-    For example, if seqlen_q = 2 and seqlen_k = 5, the causal mask (1 = keep, 0 = masked out) is:
-        1 1 1 1 0
-        1 1 1 1 1
-    If seqlen_q = 5 and seqlen_k = 2, the causal mask is:
-        0 0
-        0 0
-        0 0
-        1 0
-        1 1
-    If the row of the mask is all zero, the output will be zero.
+    If `causal=True`, the causal mask aligns to the bottom-right of the attention matrix.
+    If `window_size` is set (not `(-1, -1)`), implements sliding window local attention.
 
-    If window_size != (-1, -1), implements sliding window local attention. Query at position i
-    will only attend to keys between
-    [i + seqlen_k - seqlen_q - window_size[0], i + seqlen_k - seqlen_q + window_size[1]] inclusive.
+    Backward pass is **not supported**.
 
-    Note: Does not support backward pass.
+    Parameters
+    ----------
+    q : torch.Tensor
+        Query tensor of shape (batch_size, seqlen, nheads, headdim).
+    k_cache : torch.Tensor
+        Key cache tensor. Shape:
+            - (batch_size_cache, seqlen_cache, nheads_k, headdim) if no page_table,
+            - (num_blocks, page_block_size, nheads_k, headdim) if page_table is used
+              (paged KV cache; page_block_size must be a multiple of 256).
+    v_cache : torch.Tensor
+        Value cache tensor. Shape matches `k_cache`, but the last dimension is `headdim_v`.
+    k : torch.Tensor, optional
+        New key tensor to insert into the cache, shape (batch_size, seqlen_new, nheads_k, headdim).
+        Concatenated to cache at indices specified by `cache_seqlens`.
+    v : torch.Tensor, optional
+        New value tensor, similar to `k`.
+    qv : torch.Tensor, optional
+        Optional query-value tensor, shape (batch_size, seqlen, nheads, headdim_v).
+    rotary_cos : torch.Tensor, optional
+        Rotary embedding cosine component, shape (seqlen_ro, rotary_dim / 2).
+        Applied to `k` and `q` if provided (only if `k` and `v` are present).
+        `rotary_dim` must be divisible by 16.
+    rotary_sin : torch.Tensor, optional
+        Rotary embedding sine component, same shape as `rotary_cos`.
+    cache_seqlens : int or torch.Tensor
+        The current sequence lengths of the KV cache (scalar or (batch_size,)).
+    cache_batch_idx : torch.Tensor, optional
+        Indices for batch lookup into the KV cache, shape (batch_size,). Default is [0, ..., batch_size-1].
+        If not unique, and `k`/`v` are provided, updated cache values may come from any duplicate index.
+    cache_leftpad : torch.Tensor, optional
+        Left padding offset for the KV cache, shape (batch_size,). If None, assume 0.
+    page_table : torch.Tensor, optional
+        Mapping for paged KV cache, shape (batch_size, max_num_blocks_per_seq), dtype torch.int32.
+    softmax_scale : float, optional
+        Scaling factor for QK^T before softmax. Defaults to 1 / sqrt(headdim).
+    causal : bool, default = False
+        Whether to apply a causal mask (for autoregressive models).
+    window_size : Tuple[int, int], default = (-1, -1)
+        If not (-1, -1), implements sliding window local attention with the given (left, right) window.
+    softcap : float, default = 0.0
+        If > 0, activates softcapping attention.
+    rotary_interleaved : bool, default = False
+        If True, rotary embedding interleaves pairs of dimensions (0&1, 2&3, ...). If False, uses GPT-NeoX style.
+    num_splits : int, default = 0
+        If > 1, splits the key/value into this many chunks along the sequence. If 0, uses heuristic.
+    return_softmax_lse : bool, default = False
+        Whether to also return the logsumexp of attention scores.
 
-    Arguments:
-        q: (batch_size, seqlen, nheads, headdim)
-        k_cache: (batch_size_cache, seqlen_cache, nheads_k, headdim) if there's no page_table,
-            or (num_blocks, page_block_size, nheads_k, headdim) if there's a page_table (i.e. paged KV cache)
-            page_block_size must be a multiple of 256.
-        v_cache: (batch_size_cache, seqlen_cache, nheads_k, headdim_v) if there's no page_table,
-            or (num_blocks, page_block_size, nheads_k, headdim_v) if there's a page_table (i.e. paged KV cache)
-        k [optional]: (batch_size, seqlen_new, nheads_k, headdim). If not None, we concatenate
-            k with k_cache, starting at the indices specified by cache_seqlens.
-        v [optional]: (batch_size, seqlen_new, nheads_k, headdim_v). Similar to k.
-        qv [optional]: (batch_size, seqlen, nheads, headdim_v)
-        rotary_cos [optional]: (seqlen_ro, rotary_dim / 2). If not None, we apply rotary embedding
-            to k and q. Only applicable if k and v are passed in. rotary_dim must be divisible by 16.
-        rotary_sin [optional]: (seqlen_ro, rotary_dim / 2). Similar to rotary_cos.
-        cache_seqlens: int, or (batch_size,), dtype torch.int32. The sequence lengths of the
-            KV cache.
-        cache_batch_idx: (batch_size,), dtype torch.int32. The indices used to index into the KV cache.
-            If None, we assume that the batch indices are [0, 1, 2, ..., batch_size - 1].
-            If the indices are not distinct, and k and v are provided, the values updated in the cache
-                 might come from any of the duplicate indices.
-        cache_leftpad: (batch_size,), dtype torch.int32. The index that the KV cache starts. If None, assume 0.
-        page_table [optional]: (batch_size, max_num_blocks_per_seq), dtype torch.int32.
-        softmax_scale: float. The scaling of QK^T before applying softmax.
-            Default to 1 / sqrt(headdim).
-        causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
-        window_size: (left, right). If not (-1, -1), implements sliding window local attention.
-        softcap: float. Anything > 0 activates softcapping attention.
-        rotary_interleaved: bool. Only applicable if rotary_cos and rotary_sin are passed in.
-            If True, rotary embedding will combine dimensions 0 & 1, 2 & 3, etc. If False,
-            rotary embedding will combine dimensions 0 & rotary_dim / 2, 1 & rotary_dim / 2 + 1
-            (i.e. GPT-NeoX style).
-        num_splits: int. If > 1, split the key/value into this many chunks along the sequence.
-           If num_splits == 1, we don't split the key/value. If num_splits == 0, we use a heuristic
-           to automatically determine the number of splits.
-           Don't change this unless you know what you are doing.
-        return_softmax_lse: bool. Whether to return the logsumexp of the attention scores.
+    Returns
+    -------
+    out : torch.Tensor
+        Attention output, shape (batch_size, seqlen, nheads, headdim).
+    softmax_lse : torch.Tensor, optional
+        If `return_softmax_lse` is True, also returns (batch_size, nheads, seqlen) tensor of
+        logsumexp per row of the attention logits before softmax.
 
-    Return:
-        out: (batch_size, seqlen, nheads, headdim).
-        softmax_lse [optional, if return_softmax_lse=True]: (batch_size, nheads, seqlen). The
-            logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
-            normalization factor).
+    Examples
+    --------
+    See `tests/test_flash_attn.py::test_flash_attn_kvcache` for usage examples.
+
+    Notes
+    -----
+    - The cache (`k_cache`, `v_cache`) must be large enough to accommodate new keys/values from `k`/`v`.
+    - Sliding window local attention restricts queries to attend to keys in a specified window.
+    - Causal masking aligns to the bottom right of the attention matrix. Rows with all zeros in the mask
+      result in output rows of all zeros.
+    - Multi-query/grouped-query attention is supported by using fewer KV heads than query heads, as long as
+      the number of query heads is divisible by the number of KV heads.
+    - Backward (gradient) computation is **not supported**.
     """
     if not is_fa3_supported():
         raise NotImplementedError(
@@ -237,6 +245,77 @@ def flash_attn_varlen_func(
     sm_margin=0,
     return_softmax_lse=False,
 ):
+    r"""
+    Compute Flash Attention for variable-length sequences, supporting efficient attention
+    across batches with sequences of different lengths.
+
+    Parameters
+    ----------
+    q : torch.Tensor
+        Query tensor of shape (total_q, nheads, headdim), where `total_q` is the sum of all query lengths
+        across the batch.
+    k : torch.Tensor
+        Key tensor of shape (total_k, nheads_k, headdim).
+    v : torch.Tensor
+        Value tensor of shape (total_k, nheads_k, headdim_v).
+    cu_seqlens_q : torch.Tensor
+        Cumulative sequence lengths for queries. 1D tensor of shape (batch_size_q + 1,).
+        Defines the start and end indices for each query sequence in the batch.
+    cu_seqlens_k : torch.Tensor
+        Cumulative sequence lengths for keys/values. 1D tensor of shape (batch_size_k + 1,).
+        Defines the start and end indices for each key/value sequence in the batch.
+    max_seqlen_q : int
+        Maximum sequence length for queries in the batch.
+    max_seqlen_k : int
+        Maximum sequence length for keys/values in the batch.
+    seqused_q : torch.Tensor, optional
+        Optional 1D tensor indicating which query tokens are used (mask), shape (total_q,).
+        If None, all queries are used.
+    seqused_k : torch.Tensor, optional
+        Optional 1D tensor indicating which key tokens are used (mask), shape (total_k,).
+        If None, all keys are used.
+    softmax_scale : float, optional
+        Scaling factor for QK^T before applying softmax. Defaults to 1 / sqrt(headdim) if None.
+    causal : bool, default = False
+        Whether to apply a causal mask (for autoregressive attention).
+    qv : torch.Tensor, optional
+        Optional query-value tensor for attention output, shape (total_q, nheads, headdim_v).
+    q_descale : torch.Tensor, optional
+        Optional tensor to rescale queries before attention.
+    k_descale : torch.Tensor, optional
+        Optional tensor to rescale keys before attention.
+    v_descale : torch.Tensor, optional
+        Optional tensor to rescale values before attention.
+    window_size : Tuple[int, int], default = (-1, -1)
+        If not (-1, -1), applies sliding window local attention with the given (left, right) window.
+    softcap : float, default = 0.0
+        If > 0, activates softcapping for attention scores.
+    num_splits : int, default = 1
+        If > 1, splits the key/value tensors into chunks for processing. Useful for very long sequences.
+    pack_gqa : torch.Tensor, optional
+        Optional tensor for packed grouped-query attention (GQA) management.
+    sm_margin : int, default = 0
+        Softmax margin for numerical stability.
+    return_softmax_lse : bool, default = False
+        Whether to return the logsumexp of the attention scores for each query.
+
+    Returns
+    -------
+    out : torch.Tensor
+        Attention output tensor, shape (total_q, nheads, headdim_v).
+    softmax_lse : torch.Tensor, optional
+        If `return_softmax_lse` is True, returns a tensor of shape (batch_size_q, nheads, max_seqlen_q)
+        containing the logsumexp of attention scores for each output query row.
+
+    Notes
+    -----
+    - This function supports variable-length sequences within a batch using cumulative sequence length arrays.
+    - Sliding window local attention can be enabled via `window_size`.
+    - Supports both standard and grouped-query attention (GQA).
+    - Efficient for distributed or packed inference scenarios.
+    - For usage examples, see relevant unit tests or documentation.
+
+    """
     if not is_fa3_supported():
         raise NotImplementedError(
             "flash_attn at sgl-kernel is only supported on sm90 and above"

@@ -98,6 +98,52 @@ Steps to add a new kernel:
 3. Create torch extension in [csrc/common_extension.cc](https://github.com/sgl-project/sglang/blob/main/sgl-kernel/csrc/common_extension.cc)
 4. Update [CMakeLists.txt](https://github.com/sgl-project/sglang/blob/main/sgl-kernel/CMakeLists.txt) to include new CUDA source
 5. Expose Python interface in [python](https://github.com/sgl-project/sglang/blob/main/sgl-kernel/python/sgl_kernel)
+6. Add comment for Python inferface like:
+
+```python
+def init_custom_ar(
+    ipc_tensors: List[int], rank_data: torch.Tensor, rank: int, full_nvlink: bool
+) -> int:
+    r"""
+    Initialize custom All-Reduce (AR) communication resources for distributed training.
+
+    Parameters
+    ----------
+    ipc_tensors : List[int]
+        List of IPC (Inter-Process Communication) handles or identifiers, used for
+        inter-process or inter-GPU tensor sharing.
+        Each item typically represents a handle to a GPU resource that can be
+        shared across processes or nodes.
+    rank_data : torch.Tensor
+        Tensor containing data relevant to the current process's rank, which may
+        include metadata or buffer pointers necessary for AR setup.
+        Shape and dtype depend on the distributed backend and communication pattern.
+    rank : int
+        The rank (unique integer identifier) of the current process within the
+        distributed group. Usually ranges from 0 to (world_size - 1).
+    full_nvlink : bool
+        Whether to enable full NVLink topology optimizations for communication.
+        If True, assumes all participating GPUs are fully connected via NVLink for
+        potentially higher bandwidth and lower latency.
+
+    Returns
+    -------
+    status : int
+        Status code indicating whether initialization was successful.
+        Typically, 0 indicates success and non-zero indicates failure.
+
+    Note
+    ----
+    This function is typically used in distributed deep learning setups where
+    custom AR (All-Reduce) implementations are required to maximize performance
+    on multi-GPU systems, especially when leveraging advanced interconnects
+    such as NVLink.
+    """
+    return torch.ops.sgl_kernel.init_custom_ar.default(
+        ipc_tensors, rank_data, rank, full_nvlink
+    )
+
+```
 
 ### Development Tips
 

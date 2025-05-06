@@ -145,37 +145,66 @@ def sparse_attn_func(
     return_softmax_lse=False,
     out=None,
 ):
-    """Compute attention with vertical and slash sparsity patterns.
-    Most Arguments are the same with the flash_attn_func interface, except for 4 extra args:
-    block_count and block_offset for slash sparsity patterns, and
-    column_count and column_index for vertical sparsity patterns.
-    For more details please refer to Appendix C.4.2 of paper https://arxiv.org/abs/2407.02490.
+    r"""
+    Compute attention with vertical and slash sparsity patterns.
 
-    Arguments:
-        q: (batch_size, seqlen, nheads, headdim)
-        k: (batch_size, seqlen, nheads_k, headdim)
-        v: (batch_size, seqlen, nheads_k, headdim)
-        block_count: (batch_size, nheads, cdiv(seqlen, BLOCK_M))
-        block_offset: (batch_size, nheads, cdiv(seqlen, BLOCK_M), NNZ_S)
-        column_count: (batch_size, nheads, cdiv(seqlen, BLOCK_M))
-        column_index: (batch_size, nheads, cdiv(seqlen, BLOCK_M), NNZ_V)
-        dropout_p: float. Dropout probability.
-        softmax_scale: float. The scaling of QK^T before applying softmax.
-            Default to 1 / sqrt(headdim).
-        causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
-        alibi_slopes: (nheads,) or (batch_size, nheads), fp32. A bias of
-            (-alibi_slope * |i + seqlen_k - seqlen_q - j|)
-            is added to the attention score of query i and key j.
-        deterministic: bool. Whether to use the deterministic implementation of the backward pass,
-            which is slightly slower and uses more memory. The forward pass is always deterministic.
-        return_attn_probs: bool. Whether to return the attention probabilities. This option is for
-           testing only. The returned probabilities are not guaranteed to be correct
-           (they might not have the right scaling).
-    Return:
-        out: (batch_size, seqlen, nheads, headdim).
-        softmax_lse [optional, if return_softmax_lse=True]: (batch_size, nheads, seqlen). The
-            logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
-            normalization factor).
+    This function implements sparse attention using the "vertical" and "slash" patterns as described in
+    [MInference 1.0](https://arxiv.org/abs/2407.02490), optimized for long-context LLM pre-filling.
+    The interface closely matches `flash_attn_func`, with four additional arguments to specify sparsity patterns:
+    `block_count` and `block_offset` for slash sparsity; `column_count` and `column_index` for vertical sparsity.
+    For more details, see Appendix C.4.2 of the paper.
+
+    Parameters
+    ----------
+    q : torch.Tensor
+        Query tensor of shape (batch_size, seqlen, nheads, headdim).
+    k : torch.Tensor
+        Key tensor of shape (batch_size, seqlen, nheads_k, headdim).
+    v : torch.Tensor
+        Value tensor of shape (batch_size, seqlen, nheads_k, headdim).
+    block_count : torch.Tensor
+        For slash sparsity: (batch_size, nheads, ceil(seqlen / BLOCK_M)).
+        Specifies the number of nonzero blocks per row block.
+    block_offset : torch.Tensor
+        For slash sparsity: (batch_size, nheads, ceil(seqlen / BLOCK_M), NNZ_S).
+        Specifies the block indices of nonzero blocks for each row block.
+    column_count : torch.Tensor
+        For vertical sparsity: (batch_size, nheads, ceil(seqlen / BLOCK_M)).
+        Specifies the number of nonzero columns per block.
+    column_index : torch.Tensor
+        For vertical sparsity: (batch_size, nheads, ceil(seqlen / BLOCK_M), NNZ_V).
+        Specifies the column indices of nonzero columns for each block.
+    dropout_p : float
+        Dropout probability for attention weights.
+    softmax_scale : float, optional
+        Scaling factor applied to QK^T before softmax, defaults to 1 / sqrt(headdim).
+    causal : bool, optional
+        Whether to apply a causal mask (for autoregressive modeling). Default: False.
+    alibi_slopes : torch.Tensor, optional
+        (nheads,) or (batch_size, nheads), fp32. Adds a bias of
+        (-alibi_slope * |i + seqlen_k - seqlen_q - j|) to attention scores.
+    deterministic : bool, optional
+        Use deterministic backward pass. Slightly slower and uses more memory. Forward is always deterministic.
+    return_attn_probs : bool, optional
+        If True, returns attention probabilities for testing (not guaranteed to be correctly scaled).
+
+    Returns
+    -------
+    out : torch.Tensor
+        Output tensor of shape (batch_size, seqlen, nheads, headdim).
+    softmax_lse : torch.Tensor, optional
+        (batch_size, nheads, seqlen). The logsumexp of each row of the attention score matrix QK^T * scaling.
+        Returned if `return_attn_probs` or similar debugging flag is set.
+
+    Notes
+    -----
+    - The vertical and slash sparsity patterns are designed to reduce computation and memory usage in long-context LLMs,
+      as detailed in MInference 1.0 ([arXiv:2407.02490](https://arxiv.org/abs/2407.02490)), Appendix C.4.2.
+    - The function supports dropout, ALiBi positional bias, and both deterministic and non-deterministic backward passes.
+    - The sparsity patterns are specified using the provided block-related arguments, enabling dynamic and efficient
+      sparse attention calculation on GPU.
+    - This function is intended for expert users familiar with advanced attention mechanisms and the MInference approach.
+
     """
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
@@ -224,44 +253,74 @@ def sparse_attn_varlen_func(
     return_softmax_lse=False,
     out=None,
 ):
-    """Compute attention with vertical and slash sparsity patterns.
-    Most Arguments are the same with the flash_attn_varlen_func interface, except for 4 extra args:
-    block_count and block_offset for slash sparsity patterns, and
-    column_count and column_index for vertical sparsity patterns.
-    For more details please refer to Appendix C.4.2 of paper https://arxiv.org/abs/2407.02490.
+    r"""
+    Compute attention with vertical and slash sparsity patterns (variable-length sequences).
 
-    Arguments:
-        q: (total_q, nheads, headdim), where total_q = total number of query tokens in the batch.
-        k: (total_k, nheads_k, headdim), where total_k = total number of key tokens in the batch.
-        v: (total_k, nheads_k, headdim), where total_k = total number of key tokens in the batch.
-        block_count: (batch_size, nheads, cdiv(seqlen, BLOCK_M))
-        block_offset: (batch_size, nheads, cdiv(seqlen, BLOCK_M), NNZ_S)
-        column_count: (batch_size, nheads, cdiv(seqlen, BLOCK_M))
-        column_index: (batch_size, nheads, cdiv(seqlen, BLOCK_M), NNZ_V)
-        cu_seqlens_q: (batch_size + 1,), dtype torch.int32. The cumulative sequence lengths
-           of the sequences in the batch, used to index into q.
-        cu_seqlens_k: (batch_size + 1,), dtype torch.int32. The cumulative sequence lengths
-           of the sequences in the batch, used to index into kv.
-        max_seqlen_q: int. Maximum query sequence length in the batch.
-        max_seqlen_k: int. Maximum key sequence length in the batch.
-        dropout_p: float. Dropout probability.
-        softmax_scale: float. The scaling of QK^T before applying softmax.
-            Default to 1 / sqrt(headdim).
-        causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
-        softcap: float. Anything > 0 activates softcapping attention.
-        alibi_slopes: (nheads,) or (batch_size, nheads), fp32. A bias of
-            (-alibi_slope * |i + seqlen_k - seqlen_q - j|)
-            is added to the attention score of query i and key j.
-        deterministic: bool. Whether to use the deterministic implementation of the backward pass,
-            which is slightly slower and uses more memory. The forward pass is always deterministic.
-        return_attn_probs: bool. Whether to return the attention probabilities. This option is for
-           testing only. The returned probabilities are not guaranteed to be correct
-           (they might not have the right scaling).
-    Return:
-        out: (total, nheads, headdim).
-        softmax_lse [optional, if return_softmax_lse=True]: (nheads, total_q_seqlen). The
-            logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
-            normalization factor).
+    This function implements sparse attention using "vertical" and "slash" patterns for batches of
+    variable-length sequences, as described in [MInference 1.0](https://arxiv.org/abs/2407.02490), Appendix C.4.2.
+    The interface closely follows `flash_attn_varlen_func`, with four additional arguments to specify sparsity:
+    `block_count` and `block_offset` for slash sparsity; `column_count` and `column_index` for vertical sparsity.
+
+    Parameters
+    ----------
+    q : torch.Tensor
+        Query tensor of shape (total_q, nheads, headdim), where total_q is the sum of all query token counts in the batch.
+    k : torch.Tensor
+        Key tensor of shape (total_k, nheads_k, headdim), where total_k is the sum of all key token counts in the batch.
+    v : torch.Tensor
+        Value tensor of shape (total_k, nheads_k, headdim).
+    block_count : torch.Tensor
+        For slash sparsity: (batch_size, nheads, ceil(seqlen / BLOCK_M)).
+        Number of nonzero blocks per row block.
+    block_offset : torch.Tensor
+        For slash sparsity: (batch_size, nheads, ceil(seqlen / BLOCK_M), NNZ_S).
+        Block indices of nonzero blocks for each row block.
+    column_count : torch.Tensor
+        For vertical sparsity: (batch_size, nheads, ceil(seqlen / BLOCK_M)).
+        Number of nonzero columns per block.
+    column_index : torch.Tensor
+        For vertical sparsity: (batch_size, nheads, ceil(seqlen / BLOCK_M), NNZ_V).
+        Column indices of nonzero columns for each block.
+    cu_seqlens_q : torch.Tensor
+        (batch_size + 1,), dtype torch.int32. Cumulative sequence lengths for queries, used to index into `q`.
+    cu_seqlens_k : torch.Tensor
+        (batch_size + 1,), dtype torch.int32. Cumulative sequence lengths for keys, used to index into `k`/`v`.
+    max_seqlen_q : int
+        Maximum query sequence length in the batch.
+    max_seqlen_k : int
+        Maximum key sequence length in the batch.
+    dropout_p : float
+        Dropout probability for attention weights.
+    softmax_scale : float, optional
+        Scaling factor applied to QK^T before softmax. Defaults to 1 / sqrt(headdim).
+    causal : bool, optional
+        Whether to apply a causal mask (for autoregressive modeling). Default: False.
+    softcap : float, optional
+        If > 0, activates softcapping attention.
+    alibi_slopes : torch.Tensor, optional
+        (nheads,) or (batch_size, nheads), fp32. Adds a bias of
+        (-alibi_slope * |i + seqlen_k - seqlen_q - j|) to attention scores.
+    deterministic : bool, optional
+        Use deterministic backward pass (slower, more memory). Forward pass is always deterministic.
+    return_attn_probs : bool, optional
+        If True, returns attention probabilities for testing (not guaranteed to be correctly scaled).
+
+    Returns
+    -------
+    out : torch.Tensor
+        Output tensor of shape (total_q, nheads, headdim).
+    softmax_lse : torch.Tensor, optional
+        (nheads, total_q_seqlen). The logsumexp of each row of the attention score matrix QK^T * scaling.
+        Returned if `return_attn_probs` or similar debugging flag is set.
+
+    Notes
+    -----
+    - Supports both "vertical" and "slash" sparsity patterns, as detailed in MInference 1.0 ([arXiv:2407.02490](https://arxiv.org/abs/2407.02490)), Appendix C.4.2.
+    - Handles batches of variable-length sequences using `cu_seqlens_q` and `cu_seqlens_k`.
+    - Sparsity patterns are provided via block-related arguments for efficient GPU-based inference.
+    - Dropout, ALiBi positional bias, causal masking, and optional softcapping are supported.
+    - Intended for use in large-scale LLM prefill acceleration with MInference.
+
     """
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)

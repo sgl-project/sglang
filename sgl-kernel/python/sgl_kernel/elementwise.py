@@ -157,6 +157,36 @@ def _check_shape(input: torch.Tensor, output: torch.Tensor) -> None:
 
 
 def silu_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
+    r"""
+    Apply the SiLU (Sigmoid Linear Unit, also known as the swish activation) function
+    to the input tensor, and multiply the result element-wise by the original input.
+
+    The operation performed is: `output = input * SiLU(input)`, where
+    `SiLU(x) = x * sigmoid(x)`.
+
+    Parameters
+    ----------
+    input : torch.Tensor
+        The input tensor to which the SiLU activation and elementwise multiplication
+        are applied. Can be of any shape and should be a floating-point tensor.
+    out : torch.Tensor, optional
+        Optional output tensor to store the result. If provided, the result is
+        written in-place to this tensor. Otherwise, a new tensor is allocated
+        and returned.
+
+    Returns
+    -------
+    output : torch.Tensor
+        The result tensor after applying `input * SiLU(input)`. Has the same shape
+        and dtype as the input.
+
+    Note
+    ----
+    This function is commonly used in neural network layers where the "silu and mul"
+    (sometimes called "gated SiLU" or "swish-gated") pattern is required. Using the
+    optional `out` parameter can save memory and computation in performance-critical
+    scenarios.
+    """
     if input.shape[-1] * input.dtype.itemsize % 16 != 0:
         raise ValueError("The pointers must be multiple of 16 bytes.")
     if out is not None:
@@ -172,6 +202,38 @@ def silu_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
 
 
 def gelu_tanh_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
+    r"""
+    Apply the GELU activation function (using the tanh approximation) to the input tensor,
+    and multiply the result element-wise by the original input.
+
+    The operation performed is: `output = input * GELU(input)`, where
+    GELU (with tanh approximation) is defined as:
+      GELU(x) = 0.5 * x * (1 + tanh(√(2/π) * (x + 0.044715 * x^3)))
+
+    Parameters
+    ----------
+    input : torch.Tensor
+        The input tensor on which the GELU activation (tanh approximation) and
+        elementwise multiplication are applied. Should be a floating-point tensor
+        of any shape.
+    out : torch.Tensor, optional
+        Optional output tensor to store the result. If provided, the result is
+        written in-place to this tensor. Otherwise, a new tensor is created
+        and returned.
+
+    Returns
+    -------
+    output : torch.Tensor
+        The result tensor after applying `input * GELU(input)`. Shape and dtype
+        are the same as the input.
+
+    Note
+    ----
+    This function is useful in advanced neural network architectures where
+    "gated GELU" or similar element-wise gated activations are required.
+    Using the optional `out` parameter can help optimize memory usage and
+    computation in performance-sensitive scenarios.
+    """
     if input.shape[-1] * input.dtype.itemsize % 16 != 0:
         raise ValueError("The pointers must be multiple of 16 bytes.")
     if out is not None:
@@ -187,6 +249,36 @@ def gelu_tanh_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Te
 
 
 def gelu_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
+    r"""
+    Apply the GELU (Gaussian Error Linear Unit) activation function to the input tensor,
+    and multiply the result element-wise by the original input tensor.
+
+    The operation performed is: `output = input * GELU(input)`, where
+    GELU(x) = 0.5 * x * (1 + erf(x / sqrt(2)))
+    or may use an approximation such as the tanh-based version.
+
+    Parameters
+    ----------
+    input : torch.Tensor
+        The input tensor. Should be a floating-point tensor of any shape.
+    out : torch.Tensor, optional
+        Optional tensor to store the output. If provided, the operation is performed
+        in-place and the result is written to this tensor. If not provided, a new
+        tensor is allocated and returned.
+
+    Returns
+    -------
+    output : torch.Tensor
+        The result tensor after applying `input * GELU(input)`. Shape and dtype
+        match the input tensor.
+
+    Note
+    ----
+    This function is typically used in neural network architectures that require
+    "gated GELU" or element-wise gated activation patterns. Providing the `out`
+    parameter allows for more memory-efficient and potentially faster computation
+    in performance-critical contexts.
+    """
     if input.shape[-1] * input.dtype.itemsize % 16 != 0:
         raise ValueError("The pointers must be multiple of 16 bytes.")
     if out is not None:
