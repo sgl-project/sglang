@@ -16,7 +16,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 
-from sglang.srt.disaggregation.utils import DisaggregationMode, PDRegistryRequest
+from sglang.srt.disaggregation.utils import PDRegistryRequest
 
 
 def setup_logger():
@@ -293,14 +293,14 @@ async def get_models():
 
 @app.post("/register")
 async def register(obj: PDRegistryRequest):
-    if obj.mode == DisaggregationMode.PREFILL:
+    if obj.mode == "prefill":
         load_balancer.prefill_configs.append(
             PrefillConfig(obj.registry_url, obj.bootstrap_port)
         )
         logger.info(
             f"Registered prefill server: {obj.registry_url} with bootstrap port: {obj.bootstrap_port}"
         )
-    elif obj.mode == DisaggregationMode.DECODE:
+    elif obj.mode == "decode":
         load_balancer.decode_servers.append(obj.registry_url)
         logger.info(f"Registered decode server: {obj.registry_url}")
     else:
