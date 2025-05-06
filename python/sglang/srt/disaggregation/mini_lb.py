@@ -294,13 +294,15 @@ async def get_models():
 @app.post("/register")
 async def register(obj: PDRegistryRequest):
     if obj.mode == DisaggregationMode.PREFILL:
-        load_balancer.prefill_configs.append(PrefillConfig(obj.url, obj.bootstrap_port))
+        load_balancer.prefill_configs.append(
+            PrefillConfig(obj.registry_url, obj.bootstrap_port)
+        )
         logger.info(
-            f"Registered prefill server: {obj.url} with bootstrap port: {obj.bootstrap_port}"
+            f"Registered prefill server: {obj.registry_url} with bootstrap port: {obj.bootstrap_port}"
         )
     elif obj.mode == DisaggregationMode.DECODE:
-        load_balancer.decode_servers.append(obj.url)
-        logger.info(f"Registered decode server: {obj.url}")
+        load_balancer.decode_servers.append(obj.registry_url)
+        logger.info(f"Registered decode server: {obj.registry_url}")
     else:
         raise HTTPException(
             status_code=400,

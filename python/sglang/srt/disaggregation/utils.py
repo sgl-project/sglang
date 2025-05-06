@@ -127,7 +127,7 @@ class PDRegistryRequest:
     """A request to register a machine itself to the LB."""
 
     mode: DisaggregationMode
-    url: str
+    registry_url: str
     bootstrap_port: Optional[int] = None
 
     def __post_init__(self):
