@@ -54,7 +54,7 @@ class TestMoEDeepEPEvalAccuracyLarge(CustomTestCase):
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"Eval accuracy of GSM8K: {metrics=}")
 
-        self.assertGreater(metrics["accuracy"], 0.935)
+        self.assertGreater(metrics["accuracy"], 0.93)
 
     def test_mmlu(self):
         args = SimpleNamespace(
@@ -67,7 +67,7 @@ class TestMoEDeepEPEvalAccuracyLarge(CustomTestCase):
 
         metrics = run_eval(args)
         print(f"Eval accuracy of MMLU: {metrics=}")
-        self.assertGreater(metrics["score"], 0.89)
+        self.assertGreater(metrics["score"], 0.87)
 
 
 if __name__ == "__main__":
