@@ -51,6 +51,10 @@ class MiniLoadBalancer:
         self.decode_servers = decode_servers
 
     def select_pair(self):
+        # TODO: return some message instead of panic
+        assert len(self.prefill_configs) > 0, "No prefill servers available"
+        assert len(self.decode_servers) > 0, "No decode servers available"
+
         prefill_config = random.choice(self.prefill_configs)
         decode_server = random.choice(self.decode_servers)
         return prefill_config.url, prefill_config.bootstrap_port, decode_server
