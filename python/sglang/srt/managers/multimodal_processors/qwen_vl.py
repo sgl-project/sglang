@@ -1,6 +1,7 @@
 import asyncio
 import math
-from typing import List, Union
+from typing import Dict, List, Union
+import re
 
 import torch
 from PIL import Image
@@ -23,7 +24,7 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
 
     def __init__(self, hf_config, server_args, _processor):
         super().__init__(hf_config, server_args, _processor)
-        self.IMAGE_TOKEN = "<|vision_start|><|image_pad|><|vision_end|>"
+        self.IMAGE_TOKEN = re.compile(r"<\|vision_start\|>(?:<\|image_pad\|>)+<\|vision_end\|>")
         self.IM_START_TOKEN_ID = hf_config.vision_start_token_id
         self.IM_END_TOKEN_ID = hf_config.vision_end_token_id
         self.image_token_id = hf_config.image_token_id
@@ -38,7 +39,7 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
 
     async def process_mm_data_async(
         self,
-        image_data: List[Union[str, bytes]],
+        image_data: List[Union[str, bytes, Dict]],
         input_text,
         request_obj,
         max_req_input_len,
@@ -117,26 +118,45 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
         async def resize_image_async(image):
             return resize_image(image)
 
-        if base_output.images:
+        using_precomputed_features = base_output.images and any(
+            isinstance(image, MultimodalDataItem) for image in base_output.images)
+
+        if using_precomputed_features and not all(
+                isinstance(image, MultimodalDataItem) for image in base_output.images):
+            raise ValueError("Unsupported mixture of images and precomputed MM data.")
+
+        if base_output.images and not using_precomputed_features:
             resize_tasks = [resize_image_async(image) for image in base_output.images]
             base_output.images = await asyncio.gather(*resize_tasks)
 
         ret = self.process_mm_data(
             input_text=base_output.input_text,
-            images=base_output.images,
+            images=None if using_precomputed_features else base_output.images,
         )
-
+        input_ids = ret["input_ids"].flatten().tolist()
+        image_grid_thw = None
+        video_grid_thw = None  # TODO
         items = []
 
-        input_ids = ret["input_ids"].flatten().tolist()
-        if "pixel_values" in ret:
+        if base_output.images:
+            if using_precomputed_features:
+                pixel_values = None
+                image_grid_thw = torch.concat([
+                    torch.as_tensor(item.image_grid_thws) for item in base_output.images
+                ])
+                precomputed_features = torch.concat([
+                    torch.as_tensor(item.precomputed_features) for item in base_output.images
+                ])
+            else:
+                pixel_values = ret["pixel_values"]
+                image_grid_thw = ret["image_grid_thw"]
+                precomputed_features = None
             items += [
                 MultimodalDataItem(
-                    pixel_values=ret["pixel_values"],
-                    image_grid_thws=torch.concat([ret["image_grid_thw"]]),
-                    # TODO
-                    video_grid_thws=None,
-                    second_per_grid_ts=ret.get("second_per_grid_ts", None),
+                    pixel_values=pixel_values,
+                    image_grid_thws=image_grid_thw,
+                    video_grid_thws=video_grid_thw,
+                    precomputed_features=precomputed_features,
                     modality=Modality.IMAGE,
                 )
             ]
@@ -151,8 +171,8 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
                 self.hf_config.vision_config, "tokens_per_second", None
             ),
             input_ids=torch.tensor(input_ids).unsqueeze(0),
-            image_grid_thw=ret.get("image_grid_thw", None),
-            video_grid_thw=ret.get("video_grid_thw", None),
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
             second_per_grid_ts=ret.get("second_per_grid_ts", None),
         )
         mrope_positions = mrope_positions.squeeze(1)
