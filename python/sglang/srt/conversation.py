@@ -17,7 +17,7 @@
 # https://github.com/lm-sys/FastChat/blob/main/fastchat/conversation.py
 import dataclasses
 from enum import IntEnum, auto
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 from sglang.srt.openai_api.protocol import ChatCompletionRequest
 
@@ -48,6 +48,7 @@ class SeparatorStyle(IntEnum):
     DeepSeekVL2 = auto()
     QWEN2_VL_EMBED = auto()
     GEMMA3 = auto()
+    MPT = auto()
 
 
 @dataclasses.dataclass
@@ -327,6 +328,16 @@ class Conversation:
                     ret += role
             return ret
 
+        elif self.sep_style == SeparatorStyle.MPT:
+            ret = system_prompt + self.sep
+            for role, message in self.messages:
+                if message:
+                    if type(message) is tuple:
+                        message, _, _ = message
+                    ret += role + message + self.sep
+                else:
+                    ret += role
+            return ret
         else:
             raise ValueError(f"Invalid style: {self.sep_style}")
 
@@ -407,6 +418,7 @@ class Conversation:
 
 # A global registry for all conversation templates
 chat_templates: Dict[str, Conversation] = {}
+matching_function_registry: List[Callable] = []
 
 
 def register_conv_template(template: Conversation, override: bool = False):
@@ -417,6 +429,18 @@ def register_conv_template(template: Conversation, override: bool = False):
         ), f"{template.name} has been registered."
 
     chat_templates[template.name] = template
+
+
+def register_conv_template_matching_function(func):
+    matching_function_registry.append(func)
+
+
+def get_conv_template_by_model_path(model_path):
+    for matching_func in matching_function_registry:
+        conv_name = matching_func(model_path)
+        if conv_name is not None:
+            return conv_name
+    return None
 
 
 def chat_template_exists(template_name: str) -> bool:
@@ -461,6 +485,30 @@ def generate_embedding_convs(
         convs.append(conv)
 
     return convs
+
+
+# Models in which system adds modality tokens at prompt start automatically
+# when media inputs exceed modality tokens in prompt (e.g. 3 images but 2 <image> tokens)
+_MODELS_REQUIRING_MODALITY_SUPPLEMENT = {"deepseek-vl2"}
+
+
+# adapted from https://github.com/vllm-project/vllm/blob/5124f5bf51b83e6f344c1bc6652e8c4d81313b34/vllm/entrypoints/chat_utils.py#L856
+def _get_full_multimodal_text_prompt(
+    modality_token: str, modality_count: int, text_prompt: str
+) -> str:
+    """Combine multimodal prompts for a multimodal language model."""
+
+    # For any existing placeholder in the text prompt, we leave it as is
+    left: int = modality_count - text_prompt.count(modality_token)
+    if left < 0:
+        raise ValueError(
+            f"Found more '{modality_token}' placeholders in input prompt than "
+            "actual multimodal data items."
+        )
+
+    # NOTE: For now we always add missing modality_token at the front of
+    # the prompt. This may change to be customizable in the future.
+    return "\n".join([modality_token] * left + [text_prompt])
 
 
 def generate_chat_conv(
@@ -520,6 +568,12 @@ def generate_chat_conv(
                         if conv.name != "qwen2-vl"
                         else conv.image_token
                     )
+                add_token_as_needed: bool = (
+                    conv.name in _MODELS_REQUIRING_MODALITY_SUPPLEMENT
+                )
+                if add_token_as_needed:
+                    image_token = ""
+
                 audio_token = conv.audio_token
                 for content in message.content:
                     if content.type == "text":
@@ -527,13 +581,19 @@ def generate_chat_conv(
                             real_content += "\n"  # for video
                         real_content += content.text
                     elif content.type == "image_url":
-                        # NOTE: Only works for llava
-                        real_content += image_token
+                        # NOTE: works for llava and intervl2_5
+                        if conv.name == "internvl-2-5":
+                            real_content = image_token + real_content
+                        else:
+                            real_content += image_token
                         conv.append_image(content.image_url.url)
                     elif content.type == "audio_url":
                         real_content += audio_token
                         conv.append_audio(content.audio_url.url)
-
+                if add_token_as_needed:
+                    real_content = _get_full_multimodal_text_prompt(
+                        conv.image_token, num_image_url, real_content
+                    )
                 conv.append_message(conv.roles[0], real_content)
         elif msg_role == "assistant":
             parsed_content = ""
@@ -657,6 +717,19 @@ register_conv_template(
     )
 )
 
+register_conv_template(
+    Conversation(
+        name="internvl-2-5",
+        system_template="<|im_start|>system\n{system_message}",
+        system_message="你是书生·万象，英文名是InternVL，是由上海人工智能实验室、清华大学及多家合作单位联合开发的多模态大语言模型。",
+        roles=("<|im_start|>user\n", "<|im_start|>assistant\n"),
+        sep_style=SeparatorStyle.MPT,
+        sep="<|im_end|>\n",
+        stop_str=["<|im_end|>", "<|action_end|>"],
+        image_token="<image>",
+    )
+)
+
 # Reference: https://huggingface.co/docs/transformers/main/model_doc/qwen2_vl#usage-example
 register_conv_template(
     Conversation(
@@ -759,3 +832,111 @@ register_conv_template(
         audio_token="(<audio>./</audio>)",
     )
 )
+
+# Reference: https://huggingface.co/moonshotai/Kimi-VL-A3B-Instruct/blob/main/chat_template.jinja
+register_conv_template(
+    Conversation(
+        name="kimi-vl",
+        system_message="You are a helpful assistant",
+        system_template="<|im_system|>system<|im_middle|>{system_message}",
+        roles=(
+            "<|im_user|>user<|im_middle|>",
+            "<|im_assistant|>assistant<|im_middle|>",
+        ),
+        messages=[],
+        sep="<|im_end|>",
+        sep_style=SeparatorStyle.NO_COLON_SINGLE,
+        stop_str="<|im_end|>",
+        image_token="<|media_start|>image<|media_content|><|media_pad|><|media_end|>",
+    )
+)
+
+
+@register_conv_template_matching_function
+def match_llama_3_vision(model_path: str):
+    if (
+        "llama" in model_path.lower()
+        and "3.2" in model_path.lower()
+        and "vision" in model_path.lower()
+    ):
+        return "llama_3_vision"
+
+
+@register_conv_template_matching_function
+def match_deepseek_janus_pro(model_path: str):
+    if "janus" in model_path.lower():
+        return "janus-pro"
+
+
+@register_conv_template_matching_function
+def match_vicuna(model_path: str):
+    if "vicuna" in model_path.lower():
+        return "vicuna_v1.1"
+    if "llava-v1.5" in model_path.lower():
+        return "vicuna_v1.1"
+    if "llava-next-video-7b" in model_path.lower():
+        return "vicuna_v1.1"
+
+
+@register_conv_template_matching_function
+def match_llama2_chat(model_path: str):
+    model_path = model_path.lower()
+    if "llama-2" in model_path and "chat" in model_path:
+        return "llama-2"
+    if (
+        "mistral" in model_path or "mixtral" in model_path
+    ) and "instruct" in model_path:
+        return "llama-2"
+    if "codellama" in model_path and "instruct" in model_path:
+        return "llama-2"
+
+
+@register_conv_template_matching_function
+def match_deepseek_vl(model_path: str):
+    model_path = model_path.lower()
+    if "deepseek" in model_path and "vl2" in model_path:
+        return "deepseek-vl2"
+
+
+@register_conv_template_matching_function
+def match_chat_ml(model_path: str):
+    # import pdb;pdb.set_trace()
+    model_path = model_path.lower()
+    # Now the suffix for qwen2 chat model is "instruct"
+    if "gme" in model_path and "qwen" in model_path and "vl" in model_path:
+        return "gme-qwen2-vl"
+    if "qwen" in model_path and "vl" in model_path:
+        return "qwen2-vl"
+    if (
+        "llava-v1.6-34b" in model_path
+        or "llava-v1.6-yi-34b" in model_path
+        or "llava-next-video-34b" in model_path
+        or "llava-onevision-qwen2" in model_path
+    ):
+        return "chatml-llava"
+
+
+@register_conv_template_matching_function
+def match_gemma_it(model_path: str):
+    model_path = model_path.lower()
+    if "gemma" in model_path and "it" in model_path:
+        return "gemma-it"
+    if "gemma-3" in model_path and "1b" not in model_path:
+        # gemma-3-1b-it is completion model
+        return "gemma-it"
+
+
+@register_conv_template_matching_function
+def match_openbmb_minicpm(model_path: str):
+    model_path = model_path.lower()
+    if "minicpm-v" in model_path:
+        return "minicpmv"
+    elif "minicpm-o" in model_path:
+        return "minicpmo"
+
+
+@register_conv_template_matching_function
+def match_moonshot_kimivl(model_path: str):
+    model_path = model_path.lower()
+    if "kimi" in model_path and "vl" in model_path:
+        return "kimi-vl"
