@@ -64,9 +64,15 @@ inline void unpack_B(
   constexpr int BLOCK_N = block_size_n();
   static_assert(BLOCK_N == 32);
 
+  // prefetch distance
+  constexpr int PREFETCH_SIZE_K = 64;
+
 #pragma GCC unroll 4
   for (int k = 0; k < K2; ++k) {
     __m512i b8 = _mm512_loadu_si512(b_ptr + k * ldb2);
+    if constexpr (PREFETCH_SIZE_K > 0) {
+      _mm_prefetch(b_ptr + (k + PREFETCH_SIZE_K) * ldb2, _MM_HINT_T0);
+    }
 
     __m256i b8_0 = _mm512_extracti32x8_epi32(b8, 0);
     __m256i b8_1 = _mm512_extracti32x8_epi32(b8, 1);
@@ -133,7 +139,8 @@ struct tinygemm_kernel_nn<at::BFloat16, at::Float8_e4m3fn, has_bias, BLOCK_M, BL
     const int KB = div_up(K, BLOCK_K);
 
     // prefetch distance
-    constexpr int PREFETCH_SIZE_K = 0;
+    constexpr int PREFETCH_SIZE_K = 64;
+    constexpr int PREFETCH_SIZE_KB = 1;
 
     __m512bh va;
     __m512bh vb[COLS];
@@ -148,7 +155,7 @@ struct tinygemm_kernel_nn<at::BFloat16, at::Float8_e4m3fn, has_bias, BLOCK_M, BL
       if constexpr (has_bias) {
         vc[i] = _mm512_loadu_ps(bias + col * 16);
       } else {
-        vc[i] = _mm512_set1_ps(0.f);
+        vc[i] = _mm512_setzero_ps();
       }
     };
     Unroll<ROWS * COLS>{}(loadc);
@@ -164,6 +171,9 @@ struct tinygemm_kernel_nn<at::BFloat16, at::Float8_e4m3fn, has_bias, BLOCK_M, BL
 
       if constexpr (col == 0) {
         va = (__m512bh)(_mm512_set1_ps(a_ptr[row * lda2 + k]));
+        if constexpr (PREFETCH_SIZE_K > 0) {
+          _mm_prefetch(a_ptr + row * lda2 + k + PREFETCH_SIZE_K, _MM_HINT_T0);
+        }
       }
       if constexpr (row == 0) {
         if constexpr (col % 2 == 0) {
@@ -184,8 +194,11 @@ struct tinygemm_kernel_nn<at::BFloat16, at::Float8_e4m3fn, has_bias, BLOCK_M, BL
       int kb_end = std::min(K, kb_start + BLOCK_K2);
       // 1. load scale vector
       vscale = _mm512_set1_ps(scale[kb]);
+      if constexpr (PREFETCH_SIZE_KB > 0) {
+        _mm_prefetch(scale + kb + PREFETCH_SIZE_KB, _MM_HINT_T0);
+      }
       // 2. zero vsum for each block
-      Unroll<ROWS * COLS>{}([&](auto i) { vsum[i] = _mm512_set1_ps(0.f); });
+      Unroll<ROWS * COLS>{}([&](auto i) { vsum[i] = _mm512_setzero_ps(); });
       // 3. accumulate across each block
       for (int k = kb_start; k < kb_end; ++k) {
         Unroll<ROWS * COLS>{}(compute, k);
