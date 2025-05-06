@@ -3,15 +3,15 @@ import concurrent.futures
 import dataclasses
 import multiprocessing as mp
 import os
+import re
 from abc import ABC, abstractmethod
-from typing import List, Optional
+from typing import List, Optional, Union
 
 import numpy as np
-import PIL
 from PIL import Image
 from transformers import BaseImageProcessorFast
 
-from sglang.srt.managers.schedule_batch import Modality
+from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.utils import encode_video, load_audio, load_image
 
 
@@ -21,13 +21,13 @@ class BaseMultiModalProcessorOutput:
     input_text: str
 
     # frames loaded from image and video, in given order
-    images: Optional[list[PIL.Image]] = None
+    images: Optional[list[Union[Image.Image, MultimodalDataItem]]] = None
 
     # audios
-    audios: Optional[list[np.ndarray]] = None
+    audios: Optional[list[Union[np.ndarray, MultimodalDataItem]]] = None
 
     def normalize(self):
-        for field_name in ["image_sizes", "images", "audios"]:
+        for field_name in ["images", "audios"]:
             field = getattr(self, field_name, None)
             if field is not None and isinstance(field, list) and len(field) == 0:
                 setattr(self, field_name, None)
@@ -35,16 +35,28 @@ class BaseMultiModalProcessorOutput:
 
 @dataclasses.dataclass
 class MultimodalSpecialTokens:
-    image_token: Optional[str] = None
-    video_token: Optional[str] = None
-    audio_token: Optional[str] = None
+    image_token: Optional[Union[str, re.Pattern]] = None
+    video_token: Optional[Union[str, re.Pattern]] = None
+    audio_token: Optional[Union[str, re.Pattern]] = None
 
-    def collect(self) -> list[str]:
-        return [
-            token
-            for token in [self.image_token, self.video_token, self.audio_token]
-            if token
-        ]
+    def __post_init__(self):
+        if isinstance(self.image_token, str):
+            self.image_token = re.compile(re.escape(self.image_token))
+        if isinstance(self.video_token, str):
+            self.video_token = re.compile(re.escape(self.video_token))
+        if isinstance(self.audio_token, str):
+            self.audio_token = re.compile(re.escape(self.audio_token))
+
+    def collect(self) -> re.Pattern:
+        tokens = [self.image_token, self.video_token, self.audio_token]
+        patterns = []
+        flags = 0
+        for t in tokens:
+            if t is not None:
+                patterns.append(t.pattern)
+                flags |= t.flags
+        combined = "(" + "|".join(f"(?:{p})" for p in patterns) + ")"
+        return re.compile(combined, flags)
 
 
 class BaseMultimodalProcessor(ABC):
@@ -131,6 +143,10 @@ class BaseMultimodalProcessor(ABC):
         data, is_video, is_audio, frame_count_limit=None, discard_alpha_channel=True
     ):
         """Static method that can be pickled for multiprocessing"""
+        if isinstance(data, dict):
+            return MultimodalDataItem.from_dict(data)
+        if isinstance(data, MultimodalDataItem):
+            return data
         try:
             if is_audio:
                 return load_audio(data)
@@ -170,7 +186,7 @@ class BaseMultimodalProcessor(ABC):
         image_index, audio_index = 0, 0
 
         for text_part in text_parts:
-            if text_part == multimodal_tokens.image_token:
+            if multimodal_tokens.image_token and multimodal_tokens.image_token.match(text_part):
                 data = image_data[image_index]
                 is_video = isinstance(data, str) and data.startswith("video:")
                 estimated_frames = estimated_frames_list[image_index]
@@ -187,7 +203,7 @@ class BaseMultimodalProcessor(ABC):
                 )
                 task_info.append((Modality.IMAGE, data, frame_count_limit))
                 image_index += 1
-            elif text_part == multimodal_tokens.audio_token:
+            elif multimodal_tokens.audio_token and multimodal_tokens.audio_token.match(text_part):
                 data = audio_data[audio_index]
                 futures.append(
                     self.io_executor.submit(
@@ -223,17 +239,20 @@ class BaseMultimodalProcessor(ABC):
             discard_alpha_channel: if True, discards the alpha channel in the returned images
 
         """
+        if not return_text:
+            raise NotImplementedError()
 
         if image_data is None:
             image_data = []
         if isinstance(multimodal_tokens.image_token, int):
-            multimodal_tokens.image_token = (
+            multimodal_tokens.image_token = re.compile(re.escape(
                 self._processor.tokenizer.convert_ids_to_tokens(
                     multimodal_tokens.image_token
                 )
-            )
+            ))
         else:
             multimodal_tokens.image_token = multimodal_tokens.image_token
+        multimodal_tokens_pattern = multimodal_tokens.collect()
 
         if isinstance(prompt, list) and return_text:
             assert len(prompt) and isinstance(prompt[0], int)
@@ -242,16 +261,8 @@ class BaseMultimodalProcessor(ABC):
             prompt = prompt
 
         assert isinstance(prompt, str)
-        if return_text:
-            import re
-
-            pattern = (
-                "("
-                + "|".join(re.escape(sep) for sep in multimodal_tokens.collect())
-                + ")"
-            )
-            # split text into list of normal text and special tokens
-            text_parts = re.split(pattern, prompt)
+        # split text into list of normal text and special tokens
+        text_parts = re.split(multimodal_tokens_pattern, prompt)
 
         futures, task_info = self.submit_data_loading_tasks(
             text_parts=text_parts,
@@ -261,12 +272,12 @@ class BaseMultimodalProcessor(ABC):
             discard_alpha_channel=discard_alpha_channel,
         )
         # Process results
-        image_sizes, images, audios = [], [], []
+        images, audios = [], []
         new_text = ""
         task_ptr = 0
 
         for text_part in text_parts:
-            if text_part in multimodal_tokens.collect():
+            if multimodal_tokens_pattern.match(text_part):
                 task_type, data, frame_limit = task_info[task_ptr]
                 result = futures[task_ptr].result()
                 task_ptr += 1
@@ -274,13 +285,12 @@ class BaseMultimodalProcessor(ABC):
                 if task_type == Modality.IMAGE:
                     frames = [result] if not isinstance(result, list) else result
                     if frames:
-                        image_sizes += frames[0].size * len(frames)
                         images += frames
-                        new_text += multimodal_tokens.image_token * len(frames)
+                        new_text += text_part * len(frames)
                 elif task_type == Modality.AUDIO:
                     # audio
                     audios.append(result)
-                    new_text += multimodal_tokens.audio_token
+                    new_text += text_part
                 # TODO: handle video
             else:
                 new_text += text_part
