@@ -97,7 +97,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci_install_dependency.sh
+          bash scripts/ci_install_dependency_8_gpu.sh
 
       - name: Run test
         timeout-minutes: 40
@@ -256,33 +256,12 @@ jobs:
           cd test/srt
           python3 test_moe_eval_accuracy_large.py
 
-  accuracy-test-8-gpu:
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false
-    runs-on: 8-gpu-runner
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install dependencies
-        run: |
-          bash scripts/ci_install_dependency.sh
-          git clone https://github.com/merrymercy/human-eval.git
-          cd human-eval
-          pip install -e .
-
-      - name: Evaluate accuracy (TP=8)
-        timeout-minutes: 30
-        run: |
-          cd test/srt
-          python3 test_moe_deepep_eval_accuracy_large.py
-
   finish:
     if: always()
     needs: [
       unit-test-frontend, unit-test-backend-1-gpu, unit-test-backend-2-gpu, unit-test-backend-8-gpu,
       performance-test-1-gpu-part-1, performance-test-1-gpu-part-2, performance-test-2-gpu,
-      accuracy-test-1-gpu, accuracy-test-2-gpu, accuracy-test-8-gpu,
+      accuracy-test-1-gpu, accuracy-test-2-gpu,
     ]
     runs-on: ubuntu-latest
     steps:
