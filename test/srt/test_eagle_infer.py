@@ -40,7 +40,7 @@ class TestEAGLEEngine(CustomTestCase):
         "speculative_eagle_topk": 4,
         "speculative_num_draft_tokens": 8,
         "mem_fraction_static": 0.7,
-        "cuda_graph_max_bs": 4,
+        "cuda_graph_max_bs": 5,
     }
     NUM_CONFIGS = 2
 
@@ -154,7 +154,7 @@ class TestEAGLEEngineTokenMap(TestEAGLEEngine):
         "speculative_num_draft_tokens": 8,
         "speculative_token_map": "thunlp/LLaMA3-Instruct-8B-FR-Spec/freq_32768.pt",
         "mem_fraction_static": 0.7,
-        "cuda_graph_max_bs": 4,
+        "cuda_graph_max_bs": 5,
         "dtype": "float16",
     }
     NUM_CONFIGS = 1
@@ -169,7 +169,7 @@ class TestEAGLE3Engine(TestEAGLEEngine):
         "speculative_eagle_topk": 16,
         "speculative_num_draft_tokens": 64,
         "mem_fraction_static": 0.7,
-        "cuda_graph_max_bs": 4,
+        "cuda_graph_max_bs": 5,
         "dtype": "float16",
     }
     NUM_CONFIGS = 1
