@@ -97,7 +97,9 @@ class DecodePreallocQueue:
         self.tp_size = tp_size
         self.bootstrap_port = bootstrap_port
 
-        self.num_reserved_decode_tokens = 512
+        self.num_reserved_decode_tokens = int(
+            os.environ.get("SGLANG_NUM_RESERVED_DECODE_TOKENS", "512")
+        )
 
         # Queue for requests pending pre-allocation
         self.queue: List[DecodeRequest] = []

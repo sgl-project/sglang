@@ -29,7 +29,10 @@ class TestBenchServing(CustomTestCase):
                 f"### test_offline_throughput_default\n"
                 f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
             )
-            self.assertGreater(res["output_throughput"], 3800)
+            if os.getenv("SGLANG_AMD_CI") == "1":
+                self.assertGreater(res["output_throughput"], 3500)
+            else:
+                self.assertGreater(res["output_throughput"], 3800)
 
     def test_offline_throughput_non_stream_small_batch_size(self):
         res = run_bench_serving(
@@ -64,7 +67,10 @@ class TestBenchServing(CustomTestCase):
                 f"### test_offline_throughput_without_radix_cache\n"
                 f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
             )
-            self.assertGreater(res["output_throughput"], 3800)
+            if os.getenv("SGLANG_AMD_CI") == "1":
+                self.assertGreater(res["output_throughput"], 3500)
+            else:
+                self.assertGreater(res["output_throughput"], 3800)
 
     def test_offline_throughput_without_chunked_prefill(self):
         res = run_bench_serving(
@@ -99,7 +105,10 @@ class TestBenchServing(CustomTestCase):
                 f"### test_offline_throughput_with_triton_attention_backend\n"
                 f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
             )
-            self.assertGreater(res["output_throughput"], 3700)
+            if os.getenv("SGLANG_AMD_CI") == "1":
+                self.assertGreater(res["output_throughput"], 3500)
+            else:
+                self.assertGreater(res["output_throughput"], 3700)
 
     def test_offline_throughput_default_fp8(self):
         res = run_bench_serving(
@@ -114,7 +123,10 @@ class TestBenchServing(CustomTestCase):
                 f"### test_offline_throughput_default_fp8\n"
                 f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
             )
-            self.assertGreater(res["output_throughput"], 4300)
+            if os.getenv("SGLANG_AMD_CI") == "1":
+                self.assertGreater(res["output_throughput"], 4000)
+            else:
+                self.assertGreater(res["output_throughput"], 4300)
 
     def test_online_latency_default(self):
         res = run_bench_serving(
@@ -130,7 +142,10 @@ class TestBenchServing(CustomTestCase):
                 f'median_e2e_latency_ms: {res["median_e2e_latency_ms"]:.2f} ms\n'
             )
             self.assertLess(res["median_e2e_latency_ms"], 11000)
-            self.assertLess(res["median_ttft_ms"], 86)
+            if os.getenv("SGLANG_AMD_CI") == "1":
+                self.assertLess(res["median_ttft_ms"], 115)
+            else:
+                self.assertLess(res["median_ttft_ms"], 86)
             self.assertLess(res["median_itl_ms"], 10)
 
     def test_online_latency_eagle(self):
@@ -165,7 +180,10 @@ class TestBenchServing(CustomTestCase):
                 f'median_e2e_latency_ms: {res["median_e2e_latency_ms"]:.2f} ms\n'
                 f'accept_length: {res["accept_length"]:.2f} \n'
             )
-            self.assertLess(res["median_e2e_latency_ms"], 900)
+            if os.getenv("SGLANG_AMD_CI") == "1":
+                self.assertLess(res["median_e2e_latency_ms"], 1450)
+            else:
+                self.assertLess(res["median_e2e_latency_ms"], 900)
             self.assertGreater(res["accept_length"], 3.0)
 
     def test_moe_offline_throughput_default(self):
