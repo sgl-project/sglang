@@ -185,27 +185,14 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_weights: torch.Tensor,
     ):
         topk_idx = topk_idx.to(torch.int64)
+        if _ENABLE_JIT_DEEPGEMM:
+            # TODO hard code 128 block quant,use fp8 communication
+            hidden_states = sglang_per_token_group_quant_fp8(hidden_states, 128)
         previous_event = Buffer.capture() if self.async_finish else None
         return hidden_states, topk_idx, topk_weights, previous_event
 
     def dispatch_b(self, hidden_states, topk_idx, topk_weights, previous_event):
         if _ENABLE_JIT_DEEPGEMM:
-            # TODO hard code 128 block quant,use fp8 communication
-            if hidden_states.shape[0] > 0:
-                hidden_states = sglang_per_token_group_quant_fp8(hidden_states, 128)
-            else:
-                hidden_states = (
-                    torch.empty_like(
-                        hidden_states,
-                        device=hidden_states.device,
-                        dtype=torch.float8_e4m3fn,
-                    ),
-                    torch.empty(
-                        hidden_states.shape[:-1] + (hidden_states.shape[-1] // 128,),
-                        device=hidden_states.device,
-                        dtype=torch.float32,
-                    ),
-                )
             (
                 hidden_states,
                 topk_idx,
