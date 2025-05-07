@@ -499,12 +499,12 @@ class PrefillAdder:
                     ),
                 )
             else:
-                if self.rem_chunk_tokens == 0:
+                # Make sure at least one page is available
+                trunc_len = self.rem_chunk_tokens - self.tree_cache.page_size + 1
+                if trunc_len <= 0:
                     return AddReqResult.OTHER
 
                 # Chunked prefill
-                trunc_len = self.rem_chunk_tokens
-
                 req.extend_input_len = trunc_len
                 req.fill_ids = req.fill_ids[: len(req.prefix_indices) + trunc_len]
 
