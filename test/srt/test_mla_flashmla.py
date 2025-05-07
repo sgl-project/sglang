@@ -94,7 +94,7 @@ class TestFlashMLAMTP(CustomTestCase):
                     "flashmla",
                     "--page-size",
                     "64",
-                    "--disable-cuda-graph",
+                    # "--disable-cuda-graph",
                 ]
             )
         cls.process = popen_launch_server(
