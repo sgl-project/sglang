@@ -36,6 +36,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe.ep_moe.layer import EPMoE
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -45,9 +46,10 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.managers.expert_distribution import ExpertDistributionRecorder
+from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, make_layers
 
 expert_distribution_recorder = ExpertDistributionRecorder()
 
@@ -108,12 +110,13 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 f"the number of experts {config.num_experts}."
             )
 
-        self.experts = FusedMoE(
+        MoEImpl = EPMoE if global_server_args_dict["enable_ep_moe"] else FusedMoE
+
+        self.experts = MoEImpl(
             num_experts=config.num_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
-            reduce_results=False,
             renormalize=config.norm_topk_prob,
             quant_config=quant_config,
             prefix=add_prefix("experts", prefix),
@@ -231,6 +234,7 @@ class Qwen2MoeAttention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
         )
 
@@ -261,8 +265,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
-        # note: replace config.num_hidden_layers < 80 with True once its available in transformers 4.50.0
-        qkv_bias = getattr(config, "qkv_bias", config.num_hidden_layers < 80)
+        qkv_bias = getattr(config, "qkv_bias", True)
         self.self_attn = Qwen2MoeAttention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
@@ -333,6 +336,7 @@ class Qwen2MoeModel(nn.Module):
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        decoder_layer_type: type[nn.Module] = Qwen2MoeDecoderLayer,
     ) -> None:
         super().__init__()
         self.padding_idx = config.pad_token_id
@@ -343,16 +347,17 @@ class Qwen2MoeModel(nn.Module):
             config.hidden_size,
             prefix=add_prefix("embed_tokens", prefix),
         )
-        self.layers = nn.ModuleList(
-            [
-                Qwen2MoeDecoderLayer(
-                    config,
-                    layer_id,
-                    quant_config=quant_config,
-                    prefix=add_prefix(f"layers.{layer_id}", prefix),
-                )
-                for layer_id in range(config.num_hidden_layers)
-            ]
+        # Use the provided decoder layer type or default to Qwen2MoeDecoderLayer
+        decoder_layer_type = decoder_layer_type or Qwen2MoeDecoderLayer
+        self.layers = make_layers(
+            config.num_hidden_layers,
+            lambda idx, prefix: decoder_layer_type(
+                layer_id=idx,
+                config=config,
+                quant_config=quant_config,
+                prefix=prefix,
+            ),
+            prefix=add_prefix("layers", prefix),
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -425,7 +430,9 @@ class Qwen2MoeForCausalLM(nn.Module):
             ("gate_up_proj", "up_proj", 1),
         ]
 
-        expert_params_mapping = FusedMoE.make_expert_params_mapping(
+        MoEImpl = EPMoE if global_server_args_dict["enable_ep_moe"] else FusedMoE
+
+        expert_params_mapping = MoEImpl.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",

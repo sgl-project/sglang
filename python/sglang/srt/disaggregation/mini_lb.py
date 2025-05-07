@@ -1,11 +1,14 @@
 """
-Minimal HTTP load balancer for prefill and decode servers for testing purpose.
+Minimal HTTP load balancer for prefill and decode servers for testing.
 """
 
 import asyncio
+import dataclasses
+import logging
 import random
 import urllib
 from itertools import chain
+from typing import List, Optional
 
 import aiohttp
 import orjson
@@ -13,73 +16,111 @@ import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 
+from sglang.srt.disaggregation.utils import PDRegistryRequest
+
+
+def setup_logger():
+    logger = logging.getLogger("pdlb")
+    logger.setLevel(logging.INFO)
+
+    formatter = logging.Formatter(
+        "[PDLB (Python)] %(asctime)s - %(levelname)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    handler = logging.StreamHandler()
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+
+    return logger
+
+
+logger = setup_logger()
+
+
+@dataclasses.dataclass
+class PrefillConfig:
+    url: str
+    bootstrap_port: Optional[int] = None
+
 
 class MiniLoadBalancer:
-    def __init__(self, prefill_servers, decode_servers):
-        self.prefill_servers = prefill_servers
+    def __init__(self, prefill_configs: List[PrefillConfig], decode_servers: List[str]):
+        self.prefill_configs = prefill_configs
+        self.prefill_servers = [p.url for p in prefill_configs]
         self.decode_servers = decode_servers
 
     def select_pair(self):
-        return random.choice(self.prefill_servers), random.choice(self.decode_servers)
+        # TODO: return some message instead of panic
+        assert len(self.prefill_configs) > 0, "No prefill servers available"
+        assert len(self.decode_servers) > 0, "No decode servers available"
 
-    async def generate_request(self, request_data):
-        prefill_server, decode_server = self.select_pair()
+        prefill_config = random.choice(self.prefill_configs)
+        decode_server = random.choice(self.decode_servers)
+        return prefill_config.url, prefill_config.bootstrap_port, decode_server
 
-        # Parse and transform prefill_server
-        parsed_url = urllib.parse.urlparse(prefill_server)
-        hostname = parsed_url.hostname
-        bootstrap_host = f"{hostname}"
+    async def generate(
+        self, modified_request, prefill_server, decode_server, endpoint
+    ) -> ORJSONResponse:
+        assert endpoint[0] != "/", f"Endpoint should not start with '/': {endpoint}"
 
-        modified_request = request_data.copy()
-        modified_request.update(
-            {
-                "bootstrap_host": bootstrap_host,
-                "bootstrap_room": random.randint(0, 2**63 - 1),
-            }
-        )
-
-        async with aiohttp.ClientSession() as session:
-            # Create the tasks
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(
+                total=3600
+            )  # Add timeout for request reliability
+        ) as session:
             tasks = [
-                session.post(f"{prefill_server}/generate", json=modified_request),
-                session.post(f"{decode_server}/generate", json=modified_request),
+                session.post(f"{prefill_server}/{endpoint}", json=modified_request),
+                session.post(f"{decode_server}/{endpoint}", json=modified_request),
             ]
+            # Wait for both responses to complete. Prefill should end first.
+            _, decode_response = await asyncio.gather(*tasks)
 
-            prefill_response = None
-            decode_response = None
+            return ORJSONResponse(
+                content=await decode_response.json(),
+                status_code=decode_response.status,
+            )
 
-            # Process responses as they arrive
-            for i, response in enumerate(asyncio.as_completed(tasks)):
-                response = await response
-                # Check if this is the prefill or decode response based on order created
-                if i == 0:  # First completed task
-                    if str(response.url).startswith(prefill_server):
-                        prefill_response = response
-                        if response.status != 200:
-                            raise HTTPException(
-                                status_code=response.status,
-                                detail=f"Prefill server error: Status {response.status} Details: {await response.text()}",
-                            )
-                    else:
-                        decode_response = response
-                        if response.status != 200:
-                            raise HTTPException(
-                                status_code=response.status,
-                                detail=f"Decode server error: Status {response.status} Details: {await response.text()}",
-                            )
-                else:  # Second completed task
-                    if str(response.url).startswith(prefill_server):
-                        prefill_response = response
-                    else:
-                        decode_response = response
+    async def generate_stream(
+        self, modified_request, prefill_server, decode_server, endpoint="generate"
+    ):
+        assert endpoint[0] != "/", f"Endpoint should not start with '/': {endpoint}"
 
-                    if response.status != 200:
-                        raise HTTPException(
-                            status_code=response.status,
-                            detail=f"{'Prefill' if str(response.url).startswith(prefill_server) else 'Decode'} server error: Status {response.status} Details: {await response.text()}",
-                        )
+        async def stream_results():
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(
+                    total=3600
+                )  # Add timeout for request reliability
+            ) as session:
+                try:
+                    # Create the tasks for both prefill and decode requests
+                    tasks = [
+                        session.post(
+                            f"{prefill_server}/{endpoint}", json=modified_request
+                        ),
+                        session.post(
+                            f"{decode_server}/{endpoint}", json=modified_request
+                        ),
+                    ]
+                    # Wait for both responses to complete. Since this is streaming, they return immediately.
+                    prefill_response, decode_response = await asyncio.gather(*tasks)
+                    async for chunk in decode_response.content:
+                        yield chunk
+                except Exception as e:
+                    error_msg = {
+                        "error": {"message": f"Stream processing error: {str(e)}"}
+                    }
+                    yield b"data: " + orjson.dumps(
+                        error_msg, option=orjson.OPT_NON_STR_KEYS
+                    ) + b"\n\n"
+                finally:
+                    if prefill_response is not None:
+                        await prefill_response.release()
 
-            return await decode_response.json()
+        return StreamingResponse(
+            stream_results(),
+            media_type="text/event-stream",
+        )
 
 
 app = FastAPI()
@@ -156,7 +197,46 @@ async def get_model_info():
 
 @app.post("/generate")
 async def handle_generate_request(request_data: dict):
-    prefill_server, decode_server = load_balancer.select_pair()
+    prefill_server, bootstrap_port, decode_server = load_balancer.select_pair()
+
+    # Parse and transform prefill_server for bootstrap data
+    parsed_url = urllib.parse.urlparse(prefill_server)
+    hostname = parsed_url.hostname
+    modified_request = request_data.copy()
+
+    batch_size = _get_request_batch_size(modified_request)
+    if batch_size is not None:
+        modified_request.update(
+            {
+                "bootstrap_host": [hostname] * batch_size,
+                "bootstrap_port": [bootstrap_port] * batch_size,
+                "bootstrap_room": [
+                    _generate_bootstrap_room() for _ in range(batch_size)
+                ],
+            }
+        )
+    else:
+        modified_request.update(
+            {
+                "bootstrap_host": hostname,
+                "bootstrap_port": bootstrap_port,
+                "bootstrap_room": _generate_bootstrap_room(),
+            }
+        )
+
+    if request_data.get("stream", False):
+        return await load_balancer.generate_stream(
+            modified_request, prefill_server, decode_server, "generate"
+        )
+    else:
+        return await load_balancer.generate(
+            modified_request, prefill_server, decode_server, "generate"
+        )
+
+
+@app.post("/v1/chat/completions")
+async def handle_completion_request(request_data: dict):
+    prefill_server, bootstrap_port, decode_server = load_balancer.select_pair()
 
     # Parse and transform prefill_server for bootstrap data
     parsed_url = urllib.parse.urlparse(prefill_server)
@@ -165,82 +245,38 @@ async def handle_generate_request(request_data: dict):
     modified_request.update(
         {
             "bootstrap_host": hostname,
+            "bootstrap_port": bootstrap_port,
             "bootstrap_room": random.randint(0, 2**63 - 1),
         }
     )
 
-    # Check if streaming is requested
     if request_data.get("stream", False):
-
-        async def stream_results():
-            async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=3600)
-            ) as session:
-                try:
-                    # Create the tasks
-                    tasks = [
-                        session.post(
-                            f"{prefill_server}/generate", json=modified_request
-                        ),
-                        session.post(
-                            f"{decode_server}/generate", json=modified_request
-                        ),
-                    ]
-
-                    prefill_response = None
-                    decode_response = None
-
-                    # Process responses as they arrive
-                    for i, response_task in enumerate(asyncio.as_completed(tasks)):
-                        response = await response_task
-
-                        # Check the response immediately
-                        if str(response.url).startswith(prefill_server):
-                            prefill_response = response
-                            if response.status != 200:
-                                error_msg = {
-                                    "error": {
-                                        "message": f"Prefill server error: Status {response.status}, Details: {await response.text()}"
-                                    }
-                                }
-                                yield b"data: " + orjson.dumps(
-                                    error_msg, option=orjson.OPT_NON_STR_KEYS
-                                ) + b"\n\n"
-                                return
-                        else:
-                            decode_response = response
-                            if response.status != 200:
-                                error_msg = {
-                                    "error": {
-                                        "message": f"Decode server error: Status {response.status}"
-                                    }
-                                }
-                                yield b"data: " + orjson.dumps(
-                                    error_msg, option=orjson.OPT_NON_STR_KEYS
-                                ) + b"\n\n"
-                                return
-
-                    # Stream successful decode server response
-                    async for line in decode_response.content:
-                        yield line
-                    yield b"data: [DONE]\n\n"
-
-                except Exception as e:
-                    error_msg = {
-                        "error": {"message": f"Stream processing error: {str(e)}"}
-                    }
-                    yield b"data: " + orjson.dumps(
-                        error_msg, option=orjson.OPT_NON_STR_KEYS
-                    ) + b"\n\n"
-
-        return StreamingResponse(
-            stream_results(),
-            media_type="text/event-stream",
+        return await load_balancer.generate_stream(
+            modified_request,
+            prefill_server,
+            decode_server,
+            endpoint="v1/chat/completions",
+        )
+    else:
+        return await load_balancer.generate(
+            modified_request,
+            prefill_server,
+            decode_server,
+            endpoint="v1/chat/completions",
         )
 
-    # Non-streaming case
-    result = await load_balancer.generate_request(request_data)
-    return ORJSONResponse(content=result)
+
+def _generate_bootstrap_room():
+    return random.randint(0, 2**63 - 1)
+
+
+# We may utilize `GenerateReqInput`'s logic later
+def _get_request_batch_size(request):
+    if (text := request.get("text")) is not None:
+        return None if isinstance(text, str) else len(text)
+    if (input_ids := request.get("input_ids")) is not None:
+        return None if isinstance(input_ids[0], int) else len(input_ids)
+    return None
 
 
 @app.get("/v1/models")
@@ -259,9 +295,35 @@ async def get_models():
             raise HTTPException(status_code=500, detail=str(e))
 
 
-def run(prefill_addrs, decode_addrs, host, port):
+@app.post("/register")
+async def register(obj: PDRegistryRequest):
+    if obj.mode == "prefill":
+        load_balancer.prefill_configs.append(
+            PrefillConfig(obj.registry_url, obj.bootstrap_port)
+        )
+        logger.info(
+            f"Registered prefill server: {obj.registry_url} with bootstrap port: {obj.bootstrap_port}"
+        )
+    elif obj.mode == "decode":
+        load_balancer.decode_servers.append(obj.registry_url)
+        logger.info(f"Registered decode server: {obj.registry_url}")
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid mode. Must be either PREFILL or DECODE.",
+        )
+
+    logger.info(
+        f"#Prefill servers: {len(load_balancer.prefill_configs)}, "
+        f"#Decode servers: {len(load_balancer.decode_servers)}"
+    )
+
+    return Response(status_code=200)
+
+
+def run(prefill_configs, decode_addrs, host, port):
     global load_balancer
-    load_balancer = MiniLoadBalancer(prefill_addrs, decode_addrs)
+    load_balancer = MiniLoadBalancer(prefill_configs, decode_addrs)
     uvicorn.run(app, host=host, port=port)
 
 
@@ -270,10 +332,16 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Mini Load Balancer Server")
     parser.add_argument(
-        "--prefill", required=True, help="Comma-separated URLs for prefill servers"
+        "--prefill", type=str, default=[], nargs="+", help="URLs for prefill servers"
     )
     parser.add_argument(
-        "--decode", required=True, help="Comma-separated URLs for decode servers"
+        "--decode", type=str, default=[], nargs="+", help="URLs for decode servers"
+    )
+    parser.add_argument(
+        "--prefill-bootstrap-ports",
+        type=int,
+        nargs="+",
+        help="Bootstrap ports for prefill servers",
     )
     parser.add_argument(
         "--host", default="0.0.0.0", help="Host to bind the server (default: 0.0.0.0)"
@@ -282,4 +350,20 @@ if __name__ == "__main__":
         "--port", type=int, default=8000, help="Port to bind the server (default: 8000)"
     )
     args = parser.parse_args()
-    run(args.prefill.split(","), args.decode.split(","), args.host, args.port)
+
+    bootstrap_ports = args.prefill_bootstrap_ports
+    if bootstrap_ports is None:
+        bootstrap_ports = [None] * len(args.prefill)
+    elif len(bootstrap_ports) == 1:
+        bootstrap_ports = bootstrap_ports * len(args.prefill)
+    else:
+        if len(bootstrap_ports) != len(args.prefill):
+            raise ValueError(
+                "Number of prefill URLs must match number of bootstrap ports"
+            )
+
+    prefill_configs = [
+        PrefillConfig(url, port) for url, port in zip(args.prefill, bootstrap_ports)
+    ]
+
+    run(prefill_configs, args.decode, args.host, args.port)

@@ -43,10 +43,13 @@ class ModelConfig:
         context_length: Optional[int] = None,
         model_override_args: Optional[str] = None,
         is_embedding: Optional[bool] = None,
+        enable_multimodal: Optional[bool] = None,
         dtype: str = "auto",
         quantization: Optional[str] = None,
         override_config_file: Optional[str] = None,
+        is_draft_model: bool = False,
     ) -> None:
+
         self.model_path = model_path
         self.revision = revision
         self.quantization = quantization
@@ -70,14 +73,41 @@ class ModelConfig:
             self.hf_text_config, "attention_chunk_size", None
         )
 
+        if enable_multimodal is None:
+            mm_disabled_models = [
+                "Gemma3ForConditionalGeneration",
+                "Llama4ForConditionalGeneration",
+            ]
+            if self.hf_config.architectures[0] in mm_disabled_models:
+                enable_multimodal = False
+                logger.info(
+                    f"Multimodal is disabled for {self.hf_config.model_type}. To enable it, set --enable-multimodal."
+                )
+            else:
+                enable_multimodal = True
+
+        if (
+            is_draft_model
+            and self.hf_config.architectures[0] == "DeepseekV3ForCausalLM"
+        ):
+            self.hf_config.architectures[0] = "DeepseekV3ForCausalLMNextN"
+
         # Check model type
         self.is_generation = is_generation_model(
             self.hf_config.architectures, is_embedding
         )
-        self.is_multimodal = is_multimodal_model(self.hf_config.architectures)
-        self.is_multimodal_gen = is_multimodal_gen_model(self.hf_config.architectures)
-        self.is_image_gen = is_image_gen_model(self.hf_config.architectures)
-        self.is_audio_model = is_audio_model(self.hf_config.architectures)
+        self.is_multimodal = enable_multimodal and is_multimodal_model(
+            self.hf_config.architectures
+        )
+        self.is_multimodal_gen = enable_multimodal and is_multimodal_gen_model(
+            self.hf_config.architectures
+        )
+        self.is_image_gen = enable_multimodal and is_image_gen_model(
+            self.hf_config.architectures
+        )
+        self.is_audio_model = enable_multimodal and is_audio_model(
+            self.hf_config.architectures
+        )
         self.is_encoder_decoder = is_encoder_decoder_model(self.hf_config.architectures)
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
 
@@ -139,11 +169,20 @@ class ModelConfig:
             self.attention_arch = AttentionArch.MLA
             self.kv_lora_rank = self.hf_config.kv_lora_rank
             self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
-        elif "DeepseekVL2ForCausalLM" in self.hf_config.architectures:
+        elif "DeepseekVL2ForCausalLM" in self.hf_config.architectures and getattr(
+            self.hf_text_config, "use_mla", True
+        ):
             self.head_dim = 256
             self.attention_arch = AttentionArch.MLA
             self.kv_lora_rank = self.hf_text_config.kv_lora_rank
             self.qk_rope_head_dim = self.hf_text_config.qk_rope_head_dim
+        elif "KimiVLForConditionalGeneration" in self.hf_config.architectures:
+            self.head_dim = 256
+            self.attention_arch = AttentionArch.MLA
+            self.kv_lora_rank = self.hf_text_config.kv_lora_rank
+            self.qk_rope_head_dim = self.hf_text_config.qk_rope_head_dim
+            self.v_head_dim = self.hf_text_config.v_head_dim
+            self.qk_nope_head_dim = self.hf_text_config.qk_nope_head_dim
         else:
             self.attention_arch = AttentionArch.MHA
 
@@ -239,7 +278,7 @@ class ModelConfig:
             # check if is modelopt model -- modelopt doesn't have corresponding field
             # in hf `config.json` but has a standalone `hf_quant_config.json` in the root directory
             # example: https://huggingface.co/nvidia/Llama-3.1-8B-Instruct-FP8/tree/main
-            is_local = os.path.isdir(self.model_path)
+            is_local = os.path.exists(self.model_path)
             modelopt_quant_config = {"quant_method": "modelopt"}
             if not is_local:
                 from huggingface_hub import HfApi
@@ -279,6 +318,7 @@ class ModelConfig:
             "moe_wna16",
         ]
         compatible_quantization_methods = {
+            "modelopt_fp4": ["modelopt"],
             "w8a8_int8": ["compressed-tensors", "compressed_tensors"],
             "w8a8_fp8": ["compressed-tensors", "compressed_tensors"],
         }
@@ -485,8 +525,8 @@ multimodal_model_archs = [
     "Gemma3ForConditionalGeneration",
     "Grok1VForCausalLM",
     "Grok1AForCausalLM",
-    # TODO: add multimodal support for "Llama4ForConditionalGeneration",
     "LlavaLlamaForCausalLM",
+    "Llama4ForConditionalGeneration",
     "LlavaMistralForCausalLM",
     "LlavaQwenForCausalLM",
     "LlavaVidForCausalLM",
@@ -497,6 +537,8 @@ multimodal_model_archs = [
     "Qwen2VLForConditionalGeneration",
     "Qwen2_5_VLForConditionalGeneration",
     "CLIPModel",
+    "KimiVLForConditionalGeneration",
+    "InternVLChatModel",
 ]
 
 
