@@ -5,7 +5,12 @@ PYTHON_VERSION=$1
 CUDA_VERSION=$2
 PYTHON_ROOT_PATH=/opt/python/cp${PYTHON_VERSION//.}-cp${PYTHON_VERSION//.}
 
-ARCH=$(uname -i)
+if [ -z "$3" ]; then
+   ARCH=$(uname -i)
+else
+   ARCH=$3
+fi
+
 echo "ARCH:  $ARCH"
 if [ ${ARCH} = "aarch64" ]; then
    LIBCUDA_ARCH="sbsa"
