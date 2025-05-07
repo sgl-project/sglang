@@ -50,9 +50,6 @@ pip install cuda-python nvidia-cuda-nvrtc-cu12
 git clone --branch v0.3.3 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
 pip install -e lmms-eval/
 
-# Install FlashMLA for attention backend tests
-pip install git+https://github.com/deepseek-ai/FlashMLA.git
-
 # Install system dependencies
 # apt-get update && apt-get install -y libibverbs-dev infiniband-diags libmlx5-1 rdma-core openssh-server perftest ibverbs-providers libibumad3 libibverbs1 libnl-3-200 libnl-route-3-200 librdmacm1 rdma-core-dev infiniband-diags-dev libibverbs-dev libibverbs-utils librdmacm-dev librdmacm-utils ibverbs-utils rdma-core-utils
 apt install curl wget git sudo libibverbs-dev -y

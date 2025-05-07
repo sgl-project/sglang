@@ -17,6 +17,7 @@ limitations under the License.
 #include <torch/library.h>
 
 #include "sgl_kernel_ops.h"
+#include "flash_api.h"
 
 TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   /*
@@ -261,6 +262,18 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
    */
   m.def("apply_token_bitmask_inplace_cuda(Tensor logits, Tensor bitmask, Tensor? indices=None) -> ()");
   m.impl("apply_token_bitmask_inplace_cuda", &ApplyTokenBitmaskInplace);
+
+  /*
+   * From FlashMLA
+   */
+  m.def(
+      "flash_mla_with_kvcache(Tensor q, Tensor kv_cache, Tensor block_table, Tensor cache_seqlens, int dv, "
+      "Tensor tile_scheduler_metadata, Tensor num_splits, bool causal) -> (Tensor, Tensor)");
+  m.impl("flash_mla_with_kvcache", torch::kCUDA, &flash_mla_with_kvcache);
+  
+  m.def(
+      "get_mla_metadata(Tensor cache_seqlens, int q_heads_per_kv_head, int num_kv_heads) -> (Tensor, Tensor)");
+  m.impl("get_mla_metadata", torch::kCUDA, &get_mla_metadata);
 }
 
 REGISTER_EXTENSION(common_ops)

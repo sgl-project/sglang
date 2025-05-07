@@ -80,6 +80,7 @@ Third-party libraries:
 - [FlashInfer](https://github.com/flashinfer-ai/flashinfer)
 - [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM)
 - [FlashAttention](https://github.com/Dao-AILab/flash-attention)
+- [FlashMLA](https://github.com/deepseek-ai/FlashMLA)
 
 ### FlashAttention FYI
 

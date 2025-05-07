@@ -231,6 +231,10 @@ set(SOURCES
     "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_fp16_causal_sm80.cu"
     "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_fp16_sm80.cu"
     "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/flash_sparse_api.cpp"
+    "${repo-flashmla_SOURCE_DIR}/csrc/flash_api.cpp"
+    "${repo-flashmla_SOURCE_DIR}/csrc/kernels/get_mla_metadata.cu"
+    "${repo-flashmla_SOURCE_DIR}/csrc/kernels/mla_combine.cu"
+    "${repo-flashmla_SOURCE_DIR}/csrc/kernels/splitkv_mla.cu"
 )
 
 Python_add_library(common_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})

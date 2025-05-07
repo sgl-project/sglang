@@ -8,11 +8,11 @@ Enable speculative sampling in FlashMLA
 """
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Optional, Union, Tuple
 
 import torch
 import triton
-from flash_mla import flash_mla_with_kvcache, get_mla_metadata
+from torch.ops.sgl_kernel import flash_mla_with_kvcache, get_mla_metadata
 
 from sglang.global_config import global_config
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
