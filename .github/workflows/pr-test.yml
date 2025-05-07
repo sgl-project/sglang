@@ -103,6 +103,8 @@ jobs:
         run: |
           lspci | grep -i 'infiniband\|mellanox'
           lsmod | grep mlx5
+          ibv_devinfo
+          ibv_devices
           show_gids
 
       - name: Run test
