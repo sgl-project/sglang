@@ -73,6 +73,15 @@ FetchContent_Declare(
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-flash-attention)
+# FlashMLA
+FetchContent_Declare(
+    repo-flashmla
+    GIT_REPOSITORY https://github.com/deepseek-ai/FlashMLA.git
+    GIT_TAG        main
+    GIT_SHALLOW    OFF
+)
+FetchContent_Populate(repo-flashmla)
+
 
 # ccache option
 option(ENABLE_CCACHE "Whether to use ccache" ON)
@@ -90,6 +99,8 @@ include_directories(
     ${repo-cutlass_SOURCE_DIR}/tools/util/include
     ${repo-flashinfer_SOURCE_DIR}/include
     ${repo-flashinfer_SOURCE_DIR}/csrc
+    ${repo-flashmla_SOURCE_DIR}/flash_mla
+    ${repo-flashmla_SOURCE_DIR}/csrc
 )
 
 set(SGL_KERNEL_CUDA_FLAGS
