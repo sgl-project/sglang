@@ -261,21 +261,15 @@ class EAGLEWorker(TpModelWorker):
             A tuple of the final logit output of the target model, next tokens accepeted,
             the batch id (used for overlap schedule), and number of accepeted tokens.
         """
-        # print("xxx eagle worker forward_mode", batch.forward_mode)
         if batch.forward_mode.is_decode():
-            # print("xxx eagle worker forward_mode decode 1 seq_lens", batch.seq_lens)
             with self.draft_tp_context(self.draft_model_runner.tp_group):
-                # print("xxx eagle worker forward_mode decode 2 draft seq_lens", batch.seq_lens)
                 spec_info = self.draft(batch)
-            # print("xxx eagle worker forward_mode decode 3 verify seq_lens", batch.seq_lens)
             logits_output, verify_output, model_worker_batch = self.verify(
                 batch, spec_info
             )
-            # print("xxx eagle worker forward_mode decode 4 last seq_lens", batch.seq_lens)
 
             # If it is None, it means all requests are finished
             if batch.spec_info.verified_id is not None:
-                # print("xxx eagle worker forward_mode decode 4 extend")
                 with self.draft_tp_context(self.draft_model_runner.tp_group):
                     self.forward_draft_extend_after_decode(batch)
             return (
@@ -285,7 +279,6 @@ class EAGLEWorker(TpModelWorker):
                 sum(verify_output.accept_length_per_req_cpu),
             )
         elif batch.forward_mode.is_idle():
-            # print("xxx eagle worker forward_mode idle")
             model_worker_batch = batch.get_model_worker_batch()
             logits_output, next_token_ids = self.target_worker.forward_batch_generation(
                 model_worker_batch
@@ -293,7 +286,6 @@ class EAGLEWorker(TpModelWorker):
 
             return logits_output, next_token_ids, model_worker_batch.bid, 0
         else:
-            # print("xxx eagle worker forward_mode extend")
             logits_output, next_token_ids, bid = self.forward_target_extend(batch)
             with self.draft_tp_context(self.draft_model_runner.tp_group):
                 self.forward_draft_extend(
@@ -334,9 +326,6 @@ class EAGLEWorker(TpModelWorker):
             batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
                 spec_info.verified_id.to(torch.int64)
             )
-
-        # print("111 before: seq_lens", batch.seq_lens)
-        # print("speculative_num_steps ", self.speculative_num_steps)
 
         # Allocate cache locations
         if self.page_size == 1:
@@ -402,7 +391,6 @@ class EAGLEWorker(TpModelWorker):
             self.speculative_num_steps,
             self.page_size,
         )
-        # print("111 mid: seq_lens", batch.seq_lens)
         batch.out_cache_loc = out_cache_loc
         batch.seq_lens_sum = torch.sum(batch.seq_lens).item()
         spec_info.positions = batch.seq_lens.repeat_interleave(self.topk, dim=0)
@@ -430,7 +418,6 @@ class EAGLEWorker(TpModelWorker):
             score_list, token_list, parents_list = self.draft_forward(forward_batch)
 
         self.token_to_kv_pool_allocator.restore_state(token_to_kv_pool_state_backup)
-        # print("111 after: seq_lens", batch.seq_lens)
 
         ret = EagleVerifyInput.create(
             spec_info.verified_id,
@@ -444,7 +431,6 @@ class EAGLEWorker(TpModelWorker):
             self.server_args.speculative_num_draft_tokens,
         )
 
-        # print("111 token_list ", token_list)
         return ret
 
     def draft_forward(self, forward_batch: ForwardBatch):
@@ -523,7 +509,6 @@ class EAGLEWorker(TpModelWorker):
         logits_output.next_token_logits = logits_output.next_token_logits[
             res.accepeted_indices
         ]
-        # print("111 accepted_indices ", res.accepeted_indices)
         logits_output.hidden_states = logits_output.hidden_states[res.accepeted_indices]
 
         # Prepare the batch for the next draft forwards.

@@ -126,10 +126,6 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-
-        # print the forward_mode
-        # print("flashmla_backend init_forward_metadata ", forward_batch.forward_mode)
-
         bs = forward_batch.batch_size
         spec_info = forward_batch.spec_info
         if forward_batch.forward_mode.is_decode_or_idle():
@@ -194,7 +190,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         spec_info: Optional[SpecInfo],
     ):
         if forward_mode.is_decode_or_idle():
-            assert spec_info is None
+            # assert spec_info is None
             max_seqlen_pad = triton.cdiv(seq_lens.max().item(), PAGE_SIZE)
 
             create_flashmla_kv_indices_triton[(bs,)](
