@@ -97,7 +97,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci_install_dependency.sh
+          bash scripts/ci_install_dependency_8_gpu.sh
 
       - name: Run test
         timeout-minutes: 40
@@ -259,9 +259,9 @@ jobs:
   finish:
     if: always()
     needs: [
-      unit-test-frontend, unit-test-backend-1-gpu, unit-test-backend-2-gpu,
+      unit-test-frontend, unit-test-backend-1-gpu, unit-test-backend-2-gpu, unit-test-backend-8-gpu,
       performance-test-1-gpu-part-1, performance-test-1-gpu-part-2, performance-test-2-gpu,
-      accuracy-test-1-gpu, accuracy-test-2-gpu
+      accuracy-test-1-gpu, accuracy-test-2-gpu,
     ]
     runs-on: ubuntu-latest
     steps:
