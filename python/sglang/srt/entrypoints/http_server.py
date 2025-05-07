@@ -42,7 +42,10 @@ from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 
-from sglang.srt.disaggregation.utils import FakeBootstrapHost
+from sglang.srt.disaggregation.utils import (
+    FakeBootstrapHost,
+    register_disaggregation_server,
+)
 from sglang.srt.entrypoints.engine import _launch_subprocesses
 from sglang.srt.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
@@ -870,6 +873,14 @@ def _wait_and_warmup(
 
     if server_args.debug_tensor_dump_input_file:
         kill_process_tree(os.getpid())
+
+    if server_args.pdlb_url is not None:
+        register_disaggregation_server(
+            server_args.disaggregation_mode,
+            server_args.port,
+            server_args.disaggregation_bootstrap_port,
+            server_args.pdlb_url,
+        )
 
     if launch_callback is not None:
         launch_callback()
