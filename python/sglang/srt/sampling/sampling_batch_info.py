@@ -30,6 +30,11 @@ class SamplingBatchInfo:
     # Whether any request needs min_p sampling
     need_min_p_sampling: bool
 
+    # Use thinking_budget to truncate thinking
+    thinking_budgets: torch.Tensor
+    num_thinking_tokens: torch.Tensor
+    think_end_ids: torch.Tensor
+
     # Masking tensors for grammar-guided structured outputs
     vocab_size: int
     grammars: Optional[List] = None
@@ -76,6 +81,16 @@ class SamplingBatchInfo:
         min_ps = torch.tensor(
             [r.sampling_params.min_p for r in reqs], dtype=torch.float
         ).to(device, non_blocking=True)
+        think_end_ids = torch.tensor(
+            [r.tokenzier.think_end_id for r in reqs], dtype=torch.int64
+        ).to(device, non_blocking=True)
+        num_thinking_tokens = torch.tensor(
+            [0 for _ in reqs], dtype=torch.int64
+        ).to(device, non_blocking=True)
+        thinking_budgets = torch.tensor(
+            [r.sampling_params.thinking_budget for r in reqs], dtype=torch.int64
+        ).to(device, non_blocking=True)
+
 
         # Check if any request has custom logit processor
         has_custom_logit_processor = (
@@ -132,6 +147,9 @@ class SamplingBatchInfo:
             top_ps=top_ps,
             top_ks=top_ks,
             min_ps=min_ps,
+            think_end_ids=think_end_ids,
+            num_thinking_tokens=num_thinking_tokens,
+            thinking_budgets=thinking_budgets,
             is_all_greedy=all(r.sampling_params.top_k <= 1 for r in reqs),
             need_min_p_sampling=any(r.sampling_params.min_p > 0 for r in reqs),
             vocab_size=vocab_size,
@@ -145,6 +163,17 @@ class SamplingBatchInfo:
 
     def __len__(self):
         return len(self.temperatures)
+
+    def apply_thinking_budgets(self, next_token_logits: torch.Tensor):
+        has_budget = self.thinking_budgets > 0
+        self.num_thinking_tokens[has_budget] += 1
+        should_stop = self.num_thinking_tokens >= self.thinking_budgets
+        next_token_logits[should_stop, :] = float("-inf")
+        next_token_logits[should_stop, self.think_end_ids[should_stop]] = 0.0
+
+    def update_thinking_budgets(self, next_token_ids: torch.Tensor):
+        stopped = next_token_ids == self.think_end_ids
+        self.thinking_budgets[stopped] = -1
 
     def update_regex_vocab_mask(self):
         if not self.grammars:
