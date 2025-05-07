@@ -186,7 +186,7 @@ class Engine(EngineBase):
             stream=stream,
             bootstrap_host=bootstrap_host,
             bootstrap_port=bootstrap_port,
-            bootstrap_room=bootstrap_room
+            bootstrap_room=bootstrap_room,
         )
         loop = asyncio.get_event_loop()
         generator = self.tokenizer_manager.generate_request(obj, None)
