@@ -393,6 +393,8 @@ class DeepseekV2MoE(nn.Module):
         else:
             return None
 
+    def _forward_select_experts(self, hidden_states):
+        return TODO
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
     import math
