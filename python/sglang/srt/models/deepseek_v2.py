@@ -331,29 +331,12 @@ class DeepseekV2MoE(nn.Module):
             router_logits = self.gate(hidden_states)
             shared_output = self._forward_shared_experts(hidden_states)
 
-        if (
-            forward_mode is not None
-            and not forward_mode.is_idle()
-            and hidden_states.shape[0] > 0
-        ):
-            topk_weights, topk_idx = select_experts(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-                top_k=self.top_k,
-                use_grouped_topk=True,
-                renormalize=self.renormalize,
-                topk_group=self.topk_group,
-                num_expert_group=self.num_expert_group,
-                correction_bias=self.correction_bias,
-                routed_scaling_factor=self.routed_scaling_factor,
-            )
-        else:
-            topk_idx = torch.full(
-                (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device
-            )
-            topk_weights = torch.empty(
-                (0, self.top_k), dtype=torch.float32, device=hidden_states.device
-            )
+        topk_weights, topk_idx = self._forward_select_experts(
+            forward_mode=forward_mode,
+            hidden_states=hidden_states,
+            router_logits=router_logits,
+        )
+
         if self.ep_size > 1:
             # TODO(ch-wan): allow users to set num_max_dispatch_tokens_per_rank value
             (
@@ -398,8 +381,31 @@ class DeepseekV2MoE(nn.Module):
         else:
             return None
 
-    def _forward_select_experts(self, hidden_states):
-        return TODO
+    def _forward_select_experts(self, forward_mode, hidden_states, router_logits):
+        if (
+            forward_mode is not None
+            and not forward_mode.is_idle()
+            and hidden_states.shape[0] > 0
+        ):
+            topk_weights, topk_idx = select_experts(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                top_k=self.top_k,
+                use_grouped_topk=True,
+                renormalize=self.renormalize,
+                topk_group=self.topk_group,
+                num_expert_group=self.num_expert_group,
+                correction_bias=self.correction_bias,
+                routed_scaling_factor=self.routed_scaling_factor,
+            )
+        else:
+            topk_idx = torch.full(
+                (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device
+            )
+            topk_weights = torch.empty(
+                (0, self.top_k), dtype=torch.float32, device=hidden_states.device
+            )
+        return topk_weights, topk_idx
 
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
