@@ -897,68 +897,11 @@ class MRotaryEmbedding(RotaryEmbedding):
         audio_seqlens: Optional[torch.LongTensor] = None,
         second_per_grids: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Calculate the 3D rope index based on image and video's temporal, height and width in LLM.
-
-        Explanation:
-            Each embedding sequence contains vision embedding and text embedding or just contains text embedding.
-
-            For pure text embedding sequence, the rotary position embedding has no difference with modern LLMs.
-            Examples:
-                input_ids: [T T T T T], here T is for text.
-                temporal position_ids: [0, 1, 2, 3, 4]
-                height position_ids: [0, 1, 2, 3, 4]
-                width position_ids: [0, 1, 2, 3, 4]
-
-            For vision and text embedding sequence, we calculate 3D rotary position embedding for vision part
-            and 1D rotary position embedding for text part.
-            Examples:
-                Temporal (Time): 3 patches, representing different segments of the video in time.
-                Height: 2 patches, dividing each frame vertically.
-                Width: 2 patches, dividing each frame horizontally.
-                We also have some important parameters:
-                fps (Frames Per Second): The video's frame rate, set to 1. This means one frame is processed each second.
-                tokens_per_second: This is a crucial parameter. It dictates how many "time-steps" or "temporal tokens" are conceptually packed into a one-second interval of the video. In this case, we have 25 tokens per second. So each second of the video will be represented with 25 separate time points. It essentially defines the temporal granularity.
-                temporal_patch_size: The number of frames that compose one temporal patch. Here, it's 2 frames.
-                interval: The step size for the temporal position IDs, calculated as tokens_per_second * temporal_patch_size / fps. In this case, 25 * 2 / 1 = 50. This means that each temporal patch will be have a difference of 50 in the temporal position IDs.
-                input_ids: [V V V V V V V V V V V V T T T T T], here V is for vision.
-                vision temporal position_ids: [0, 0, 0, 0, 50, 50, 50, 50, 100, 100, 100, 100]
-                vision height position_ids: [0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1]
-                vision width position_ids: [0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1]
-                text temporal position_ids: [101, 102, 103, 104, 105]
-                text height position_ids: [101, 102, 103, 104, 105]
-                text width position_ids: [101, 102, 103, 104, 105]
-                Here we calculate the text start position_ids as the max vision position_ids plus 1.
-
-        Args:
-            input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
-                Indices of input sequence tokens in the vocabulary. Padding will be ignored by default should you provide
-                it.
-            image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
-                The temporal, height and width of feature shape of each image in LLM.
-            video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
-                The temporal, height and width of feature shape of each video in LLM.
-
-                - 1 for tokens that are **not masked**,
-                - 0 for tokens that are **masked**.
-            use_audio_in_video (`bool`, *optional*):
-                 If set to `True`, use the audio in video.
-            audio_seqlens (`torch.LongTensor` of shape `(num_audios)`, *optional*):
-                The length of feature shape of each audio in LLM.
-            second_per_grids (`torch.LongTensor` of shape `(num_videos)`, *optional*):
-                The time interval (in seconds) for each grid along the temporal dimension in the 3D position IDs.
-
-        Returns:
-            position_ids (`torch.LongTensor` of shape `(3, batch_size, sequence_length)`)
-            mrope_position_deltas (`torch.Tensor` of shape `(batch_size)`)
-        """
         image_token_id = config.image_token_index
         video_token_id = config.video_token_index
         audio_token_id = config.audio_token_index
         vision_start_token_id = config.vision_start_token_id
-        vision_end_token_id = config.vision_end_token_id
         audio_start_token_id = config.audio_start_token_id
-        audio_end_token_id = config.audio_end_token_id
         position_id_per_seconds = config.position_id_per_seconds
         seconds_per_chunk = config.seconds_per_chunk
         spatial_merge_size = config.vision_config.spatial_merge_size
@@ -1441,41 +1384,6 @@ class MRotaryEmbedding(RotaryEmbedding):
         except Exception as e:
             logger.info(f"Please consider disabling chunked_prefill: {e}")
             raise
-
-    @staticmethod
-    def _pad_to_list_of_tensors_1d(tensor_list, padding_value=0, padding_side="left"):
-        lengths = [len(tensor) for tensor in tensor_list]
-        max_length = max(lengths)
-        pad_len = [max_length - leng for leng in lengths]
-        for idx in range(len(tensor_list)):
-            if pad_len[idx] != 0:
-                if padding_side == "left":
-                    tensor_list[idx] = torch.cat(
-                        [
-                            torch.full(
-                                size=[pad_len[idx]],
-                                fill_value=padding_value,
-                                dtype=tensor_list[idx].dtype,
-                                device=tensor_list[idx].device,
-                            ),
-                            tensor_list[idx],
-                        ],
-                        dim=0,
-                    )
-                else:
-                    tensor_list[idx] = torch.cat(
-                        [
-                            tensor_list[idx],
-                            torch.full(
-                                size=[pad_len[idx]],
-                                fill_value=padding_value,
-                                dtype=tensor_list[idx].dtype,
-                                device=tensor_list[idx].device,
-                            ),
-                        ],
-                        dim=0,
-                    )
-        return tensor_list
 
     # Copied from https://github.com/huggingface/transformers/blob/c8e0e603de9b3d49161a15fe6e8ea84badfb5d02/src/transformers/models/qwen2_vl/modeling_qwen2_vl.py#L1439
     @staticmethod

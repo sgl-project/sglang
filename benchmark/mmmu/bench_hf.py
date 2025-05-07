@@ -49,12 +49,13 @@ def eval_mmmu(args):
                     max_new_tokens=sampling_params["max_new_tokens"], do_sample=False
                 )
 
-            else:model = AutoModel.from_pretrained(
-                args.model_path,
-                torch_dtype="auto",
-                trust_remote_code=True,
-                init_tts=False,
-            )
+            else:
+                model = AutoModel.from_pretrained(
+                    args.model_path,
+                    torch_dtype="auto",
+                    trust_remote_code=True,
+                    init_tts=False,
+                )
         except Exception as second_exception:
             raise RuntimeError(
                 f"Failed to load model: First attempt failed with {first_exception}, "
