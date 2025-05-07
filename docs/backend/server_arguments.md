@@ -100,7 +100,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 
 | Arguments | Description | Defaults |
 |-----------|-------------|---------|
-| `dp_size` | Will be deprecated. The number of data-parallel copies of the model. [SGLang router](../router/router.md) is recommended instead of the current naive data parallel. | `1` |
+| `dp_size` | The number of data-parallel copies of the model on non-DeepSeek models, or the group size of data parallel attention on DeepSeek models. More detailed usage of data parallel attention can be found [here](https://docs.sglang.ai/references/deepseek.html#data-parallelism-attention). | `1` |
 | `load_balance_method` | Will be deprecated. Load balancing strategy for data parallel requests. | `"round_robin"` |
 
 ### Expert parallelism
