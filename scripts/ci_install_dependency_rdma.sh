@@ -44,6 +44,7 @@ echo "tzdata tzdata/Zones/Etc select UTC" | sudo debconf-set-selections
 if command -v sudo >/dev/null 2>&1; then
     sudo apt update
     sudo apt install curl git sudo libibverbs-dev -y
-    sudo apt install rdma-core infiniband-diags openssh-server perftest ibverbs-providers libibumad3 libibverbs1 libnl-3-200 libnl-route-3-200 librdmacm1 -y
+    sudo apt install rdma-core infiniband-diags openssh-server pciutils perftest ibverbs-providers ibverbs-utils ibutils libibumad3 libibverbs1 libnl-3-200 libnl-route-3-200 librdmacm1 -y
     lspci | grep -i 'infiniband\|mellanox'
+    sudo systemctl restart rdma
 fi
