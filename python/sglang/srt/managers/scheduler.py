@@ -2086,7 +2086,7 @@ class Scheduler(
         if self.profiler_activities is None:
             return ProfileReqOutput(
                 success=False,
-                message="Profiling is already not in progress. Call /start_profile first.",
+                message="Profiling is not in progress. Call /start_profile first.",
             )
 
         logger.info("Stop profiling...")
