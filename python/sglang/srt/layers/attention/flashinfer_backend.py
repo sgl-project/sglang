@@ -45,8 +45,8 @@ class WrapperDispatch(Enum):
 @dataclass
 class DecodeMetadata:
     decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper]
-    use_cascade: bool
-    cascade_wrapper: MultiLevelCascadeAttentionWrapper
+    use_cascade: bool = False
+    cascade_wrapper: Optional[MultiLevelCascadeAttentionWrapper] = None
 
 
 @dataclass
@@ -212,7 +212,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     encoder_lens=forward_batch.encoder_lens,
                     spec_info=forward_batch.spec_info,
                 )
-                self.forward_metadata = DecodeMetadata(self.decode_wrappers, False, None)
+                self.forward_metadata = DecodeMetadata(self.decode_wrappers)
         elif forward_batch.forward_mode.is_draft_extend():
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
@@ -492,7 +492,6 @@ class FlashInferAttnBackend(AttentionBackend):
                 forward_batch.token_to_kv_pool.set_kv_buffer(
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
-
         if self.forward_metadata.use_cascade:
             o = self.forward_metadata.cascade_wrapper.forward(
                 q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
@@ -720,11 +719,11 @@ def should_use_cascade_decode(forward_batch: ForwardBatch) -> bool:
     request_tokens = req_to_token[req_pool_indices][:, :batch_min_seq_len]
     max_common_prefix_len = calc_max_common_prefix_length(request_tokens)
     forward_batch.max_common_prefix_len = max_common_prefix_len
-
+    print(f'max common prefix len: {max_common_prefix_len}')
     if max_common_prefix_len < 512:
         return False
 
-    batch_avg_seq_len = forward_batch.seq_lens.mean().item()
+    batch_avg_seq_len = forward_batch.seq_lens.sum().item() // forward_batch.batch_size
     common_ratio = max_common_prefix_len / batch_avg_seq_len
     if common_ratio < 0.5:
         return False
@@ -766,14 +765,13 @@ class FlashInferIndicesUpdaterCascadeDecode:
         max_common_prefix_len: int,
         cascade_decode_wrapper: MultiLevelCascadeAttentionWrapper,
     ):
-        bs = seq_lens.size()
+        bs = seq_lens.size(0)
         self.qo_indptr_arr_level_0[1] = max_common_prefix_len
         self.qo_indptr_arr_level_1[1:bs+1] = torch.cumsum(seq_lens, dim=0)
         self.shared_kv_page_indices[:max_common_prefix_len] = self.req_to_token[req_pool_indices[0]][:max_common_prefix_len]
         self.shared_kv_page_indptr[1] = max_common_prefix_len
         unique_prefix_lens = seq_lens - max_common_prefix_len
         self.unique_kv_page_indptr[1:bs+1] = torch.cumsum(unique_prefix_lens, dim=0)
-        self.unique_kv_last_page_len[:bs] = seq_lens % self.page_size
         tmp_kv_start_idx = torch.full((bs,), max_common_prefix_len, dtype=torch.int32, device=seq_lens.device)
         create_flashinfer_kv_indices_triton[(bs,)](
             self.req_to_token,
@@ -788,13 +786,14 @@ class FlashInferIndicesUpdaterCascadeDecode:
         cascade_decode_wrapper.begin_forward(
             [self.qo_indptr_arr_level_0, self.qo_indptr_arr_level_1[:bs+1]],
             [self.shared_kv_page_indptr, self.unique_kv_page_indptr[:bs+1]],
-            [self.shared_kv_page_indices, self.unique_kv_page_indices[0]],#todo
+            [self.shared_kv_page_indices, self.unique_kv_page_indices],
             [self.shared_kv_last_page_len, self.unique_kv_last_page_len[:bs]],
             self.num_qo_heads,
             self.num_kv_heads,
             self.head_dim,
-            self.page_size,
-            causal=True
+            1,
+            causal=True,
+            q_data_type=self.q_data_type,
         )
 
 
