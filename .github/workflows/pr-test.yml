@@ -103,10 +103,7 @@ jobs:
         run: |
           lspci | grep -i 'infiniband\|mellanox'
           lsmod | grep mlx5
-          ibv_devinfo
-          ibv_devices
           show_gids
-          dpkg -l | grep -E 'rdma-core|ibverbs-utils|infiniband-diags'
 
       - name: Run test
         timeout-minutes: 5
