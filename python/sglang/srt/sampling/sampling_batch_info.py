@@ -84,13 +84,12 @@ class SamplingBatchInfo:
         think_end_ids = torch.tensor(
             [r.tokenizer.think_end_id or -1 for r in reqs], dtype=torch.int64
         ).to(device, non_blocking=True)
-        num_thinking_tokens = torch.tensor(
-            [0 for _ in reqs], dtype=torch.int64
-        ).to(device, non_blocking=True)
+        num_thinking_tokens = torch.tensor([0 for _ in reqs], dtype=torch.int64).to(
+            device, non_blocking=True
+        )
         thinking_budgets = torch.tensor(
             [r.sampling_params.thinking_budget or -1 for r in reqs], dtype=torch.int64
         ).to(device, non_blocking=True)
-
 
         # Check if any request has custom logit processor
         has_custom_logit_processor = (
