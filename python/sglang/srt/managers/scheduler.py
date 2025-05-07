@@ -52,7 +52,11 @@ from sglang.srt.disaggregation.utils import (
     TransferBackend,
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
-from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
+from sglang.srt.hf_transformers_utils import (
+    get_processor,
+    get_tokenizer,
+    get_tokenizer_from_processor,
+)
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.expert_distribution import ExpertDistributionRecorder
@@ -475,7 +479,7 @@ class Scheduler(
                     revision=server_args.revision,
                     use_fast=not server_args.disable_fast_image_processor,
                 )
-                self.tokenizer = self.processor.tokenizer
+                self.tokenizer = get_tokenizer_from_processor(self.processor)
             else:
                 self.tokenizer = get_tokenizer(
                     server_args.tokenizer_path,
@@ -498,6 +502,7 @@ class Scheduler(
             self.tree_cache = ChunkCache(
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                page_size=self.page_size,
             )
         else:
             if self.enable_hierarchical_cache:
@@ -919,6 +924,10 @@ class Scheduler(
                     "Please set --enable-custom-logits-processor to enable this feature."
                 )
                 custom_logit_processor = None
+
+            if recv_req.bootstrap_port is None:
+                # Use default bootstrap port
+                recv_req.bootstrap_port = self.server_args.disaggregation_bootstrap_port
 
             req = Req(
                 recv_req.rid,
