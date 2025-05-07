@@ -33,7 +33,7 @@ RUN python3 -m pip install --upgrade pip setuptools wheel html5lib six \
        elif [ "$CUDA_VERSION" = "12.4.1" ]; then \
          export CUINDEX=124; \
        elif [ "$CUDA_VERSION" = "12.8.1" ]; then \
-         export CUINDEX=128; \
+         export CUINDEX=124; \
        elif [ "$CUDA_VERSION" = "11.8.0" ]; then \
          export CUINDEX=118; \
          python3 -m pip install --no-cache-dir sgl-kernel -i https://docs.sglang.ai/whl/cu118; \
