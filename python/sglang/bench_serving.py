@@ -722,13 +722,9 @@ def sample_mmmu_requests(
                 output_len = fixed_output_len if fixed_output_len is not None else 256
 
                 filtered_dataset.append((prompt, prompt_len, output_len))
-            else:
-                continue
+
         except Exception as e:
             print(f"Error processing example {i}: {e}")
-            import traceback
-
-            traceback.print_exc()
 
     print(f"\nCreated {len(filtered_dataset)} MMMU prompts")
     return filtered_dataset
