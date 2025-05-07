@@ -350,7 +350,6 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
     ):
-        # TODO support deepgemm
         if _ENABLE_JIT_DEEPGEMM:
             output = hidden_states
         else:
