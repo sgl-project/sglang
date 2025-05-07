@@ -9,7 +9,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton, create_flashmla_kv_indices_triton
+from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
@@ -115,9 +115,6 @@ class EagleDraftInput:
         paged_kernel_lens: torch.Tensor,
         paged_kernel_lens_sum: int,
         req_to_token: torch.Tensor,
-        use_flashmla: bool = False,
-        block_kv_indices: Optional[torch.Tensor] = None,
-        max_seqlen_pad: Optional[int] = None,
     ):
         bs = self.accept_length.numel()
 
@@ -130,34 +127,17 @@ class EagleDraftInput:
         # TODO: replace cum_kv_seq_len[-1] with paged_kernel_lens_sum to avoid the device sync.
         kv_indices = torch.empty(cum_kv_seq_len[-1], dtype=torch.int32, device="cuda")
 
-
-        if use_flashmla:
-            assert False # should not reach here
-            # FlashMLA backend
-            assert block_kv_indices is not None
-            assert max_seqlen_pad is not None
-            create_flashmla_kv_indices_triton[(bs,)](
-                req_to_token,
-                req_pool_indices,
-                paged_kernel_lens,
-                None, #kv_start_idx
-                block_kv_indices,
-                req_to_token.stride(0),
-                max_seqlen_pad,
-            )
-            return block_kv_indices, cum_kv_seq_len, qo_indptr, None
-        else:
-            # FlashInfer backend
-            create_flashinfer_kv_indices_triton[(bs,)](
-                req_to_token,
-                req_pool_indices,
-                paged_kernel_lens,
-                cum_kv_seq_len,
-                None, #kv_start_idx
-                kv_indices,
-                req_to_token.size(1),
-            )
-            return kv_indices, cum_kv_seq_len, qo_indptr, None
+        # FlashInfer backend
+        create_flashinfer_kv_indices_triton[(bs,)](
+            req_to_token,
+            req_pool_indices,
+            paged_kernel_lens,
+            cum_kv_seq_len,
+            None, #kv_start_idx
+            kv_indices,
+            req_to_token.size(1),
+        )
+        return kv_indices, cum_kv_seq_len, qo_indptr, None
 
     def filter_batch(self, new_indices: torch.Tensor):
         self.topk_p = self.topk_p[: len(new_indices)]
@@ -284,15 +264,12 @@ class EagleVerifyInput:
             next_power_of_2(bs),
         )
 
-    # todo: flashmla??
     def generate_attn_arg_prefill(
         self,
         req_pool_indices: torch.Tensor,
         paged_kernel_lens: torch.Tensor,
         paged_kernel_lens_sum: int,
         req_to_token: torch.Tensor,
-        kv_indices: Optional[torch.Tensor] = None,
-        use_flashmla: bool = False,
     ):
         batch_size = len(req_pool_indices)
         qo_indptr = torch.arange(
@@ -308,47 +285,22 @@ class EagleVerifyInput:
         )
         paged_kernel_lens = paged_kernel_lens + self.draft_token_num
 
-        if use_flashmla:
-            max_seqlen_pad = triton.cdiv(
-                paged_kernel_lens.max().item(), FLASHMLA_PAGE_SIZE
-            )
-            
-            # block_kv_indices for flashmla
-            if kv_indices is None:
-                kv_indices = torch.full(
-                    (batch_size, max_seqlen_pad),
-                    -1,
-                    dtype=torch.int32,
-                    device=req_pool_indices.device,
-                )
-                assert max_seqlen_pad == kv_indices.stride(0)
-                max_seqlen_pad = kv_indices.stride(0)
+        
+        cum_kv_seq_len[1:] = torch.cumsum(paged_kernel_lens, dim=0)
 
-            create_flashmla_kv_indices_triton[(batch_size,)](
-                req_to_token,
-                req_pool_indices,
-                paged_kernel_lens,
-                None, #kv_start_idx
-                kv_indices,
-                req_to_token.stride(0),
-                max_seqlen_pad,
-            )
-        else:
-            cum_kv_seq_len[1:] = torch.cumsum(paged_kernel_lens, dim=0)
-
-            kv_indices = torch.empty(
-                paged_kernel_lens_sum + self.draft_token_num * batch_size,
-                dtype=torch.int32,
-                device="cuda",
-            )
-            create_flashinfer_kv_indices_triton[(batch_size,)](
-                req_to_token,
-                req_pool_indices,
-                paged_kernel_lens,
-                cum_kv_seq_len,
-                None, #kv_start_idx
-                kv_indices,
-                req_to_token.size(1),
+        kv_indices = torch.empty(
+            paged_kernel_lens_sum + self.draft_token_num * batch_size,
+            dtype=torch.int32,
+            device="cuda",
+        )
+        create_flashinfer_kv_indices_triton[(batch_size,)](
+            req_to_token,
+            req_pool_indices,
+            paged_kernel_lens,
+            cum_kv_seq_len,
+            None, #kv_start_idx
+            kv_indices,
+            req_to_token.size(1),
         )
         return kv_indices, cum_kv_seq_len, qo_indptr, self.custom_mask
 

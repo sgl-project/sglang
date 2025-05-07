@@ -82,7 +82,6 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         self.q_data_type = model_runner.dtype
         self.kv_cache_dim = self.kv_lora_rank + self.qk_rope_head_dim
 
-        # todo: cuda graph support
         self.cuda_graph_qo_indptr = None
         self.cuda_graph_kv_indptr = None
 
@@ -192,7 +191,6 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         spec_info: Optional[SpecInfo],
     ):
         if forward_mode.is_decode_or_idle():
-            # assert spec_info is None
             max_seqlen_pad = triton.cdiv(seq_lens.max().item(), PAGE_SIZE)
 
             create_flashmla_kv_indices_triton[(bs,)](
@@ -216,7 +214,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 self.cuda_graph_num_splits[: bs + 1],
                 self.cuda_graph_kv_indices[:bs, :max_seqlen_pad],
             )
-        # todo: extend & verify with flashmla
+        # todo: extend with flashmla
         else:
             super().init_forward_metadata_capture_cuda_graph(
                 bs,
@@ -266,7 +264,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             self.forward_metadata.block_kv_indices = self.cuda_graph_kv_indices[
                 :bs, :max_seqlen_pad
             ]
-        # todo: extend & verify with flashmla
+        # todo: extend with flashmla
         else:
             super().init_forward_metadata_replay_cuda_graph(
                 bs,
@@ -320,7 +318,6 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         )
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
-    # forward_extend: using flashinfer_mla_backend
     def forward_extend(
         self,
         q: torch.Tensor,

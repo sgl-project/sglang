@@ -263,7 +263,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 qo_indptr=self.cuda_graph_qo_indptr[: bs + 1],
                 kv_indptr=self.cuda_graph_kv_indptr[: bs + 1],
                 kv_indices=self.cuda_graph_kv_indices,
-                # kv_indices=torch.empty(65536,dtype=torch.int32,device="cuda"),
                 kv_len_arr=self.cuda_graph_kv_lens[:bs],
                 backend="auto",
             )

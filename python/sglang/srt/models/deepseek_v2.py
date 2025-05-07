@@ -602,21 +602,6 @@ class DeepseekV2AttentionMLA(nn.Module):
                 return AttnForwardMethod.MHA_CHUNKED_KV
             else:
                 return AttnForwardMethod.MLA
-        # elif self.attention_backend == "flashmla":
-        #     # if (
-        #     #     forward_batch.forward_mode.is_extend()
-        #     #     and not self.disable_chunked_prefix_cache
-        #     #     and not forward_batch.forward_mode.is_target_verify()
-        #     #     and not forward_batch.forward_mode.is_draft_extend()
-        #     #     and (
-        #     #         sum_extend_prefix_lens >= self.chunked_prefix_cache_threshold
-        #     #         or sum_extend_prefix_lens == 0
-        #     #     )
-        #     # ):
-        #     #     return AttnForwardMethod.MHA
-        #     # else:
-        #     #     return AttnForwardMethod.MLA
-            # return AttnForwardMethod.MLA
         else:
             # Triton: Use normal computation for prefill and use weight absorption for extend/decode
             if (
