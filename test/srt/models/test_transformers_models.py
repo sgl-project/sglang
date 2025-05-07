@@ -1,6 +1,5 @@
 import dataclasses
 import multiprocessing as mp
-import time
 import unittest
 from types import SimpleNamespace
 from typing import List
@@ -66,26 +65,10 @@ class TestTransformersFallbackEndpoint(CustomTestCase):
         self.assertGreater(metrics["accuracy"], self.gsm8k_lower_bound)
 
 
-# TODO: check why there is a tokenizer issue when running the benchmark, the model works fine otherwise
-# class TestTransformersFallbackCustomCodeEndpoint(TestTransformersFallbackEndpoint):
-#     @classmethod
-#     def setUpClass(cls):
-#         # custom code
-#         cls.model = "ArthurZ/Ilama-3.2-1B"
-#         cls.base_url = DEFAULT_URL_FOR_TEST
-#         cls.process = popen_launch_server(
-#             cls.model,
-#             cls.base_url,
-#             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-#             other_args=["--trust-remote"],
-#         )
-
-
 class TestTransformersFallbackTorchAO(TestTransformersFallbackEndpoint):
     @classmethod
     def setUpClass(cls):
-        # custom code
-        cls.model = "meta-llama/Llama-3.2-1B-Instruct"
+        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -112,18 +95,14 @@ class ModelCase:
     skip_long_prompt: bool = False
     trust_remote_code: bool = False
     torchao_config: str = None
+    torch_dtype: torch.dtype = torch.float16
 
 
 # Popular models that run on the CI
 CI_MODELS = [
-    ModelCase("meta-llama/Llama-3.2-1B-Instruct", tp_size=1),
-    ModelCase("meta-llama/Llama-3.2-1B-Instruct", tp_size=2),
-    # TODO: check why the model is loaded in bf16 for SRTRunner, not a transformers impl issue
-    # ModelCase("meta-llama/Llama-3.2-1B-Instruct", tp_size=1, torchao_config="int4wo-128"),
-    # ModelCase("meta-llama/Llama-3.2-1B-Instruct", tp_size=2, torchao_config="int4wo-128"),
+    ModelCase(DEFAULT_MODEL_NAME_FOR_TEST, tp_size=1),
+    ModelCase(DEFAULT_MODEL_NAME_FOR_TEST, tp_size=2),
 ]
-
-TORCH_DTYPES = [torch.float16]
 
 
 class TestTransformersFallbackEngine(CustomTestCase):
@@ -135,7 +114,6 @@ class TestTransformersFallbackEngine(CustomTestCase):
         self,
         prompts: List[str],
         model_case: ModelCase,
-        torch_dtype: torch.dtype,
     ) -> None:
         model_path = model_case.model_path
         max_new_tokens = 32
@@ -143,7 +121,7 @@ class TestTransformersFallbackEngine(CustomTestCase):
         with SRTRunner(
             model_path,
             tp_size=model_case.tp_size,
-            torch_dtype=torch_dtype,
+            torch_dtype=model_case.torch_dtype,
             model_type="generation",
             model_impl="transformers",
             trust_remote_code=model_case.trust_remote_code,
@@ -154,7 +132,7 @@ class TestTransformersFallbackEngine(CustomTestCase):
         with SRTRunner(
             model_path,
             tp_size=model_case.tp_size,
-            torch_dtype=torch_dtype,
+            torch_dtype=model_case.torch_dtype,
             model_type="generation",
             trust_remote_code=model_case.trust_remote_code,
             torchao_config=model_case.torchao_config,
@@ -174,16 +152,12 @@ class TestTransformersFallbackEngine(CustomTestCase):
 
     def test_ci_models(self):
         for model_case in CI_MODELS:
-            for torch_dtype in TORCH_DTYPES:
-                # Skip long prompts for models that do not have a long context
-                prompts = DEFAULT_PROMPTS
-                if model_case.skip_long_prompt:
-                    prompts = [p for p in DEFAULT_PROMPTS if len(p) < 1000]
-
-                # Assert the logits and output strs are close
-                self.assert_close_logits_and_output_strs(
-                    prompts, model_case, torch_dtype
-                )
+            # Skip long prompts for models that do not have a long context
+            prompts = DEFAULT_PROMPTS
+            if model_case.skip_long_prompt:
+                prompts = [p for p in DEFAULT_PROMPTS if len(p) < 1000]
+            # Assert the logits and output strs are close
+            self.assert_close_logits_and_output_strs(prompts, model_case)
 
 
 if __name__ == "__main__":
