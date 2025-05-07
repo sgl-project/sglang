@@ -1428,7 +1428,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 )
         return hidden_states, residual
 
-    def _forward_ffn_with_scattered_input_comm_after_attn(
+    def _forward_ffn_with_scattered_input_comm_after_mlp(
         self, hidden_states, residual, forward_batch
     ):
         if self.is_last_layer and self.attn_tp_size != 1:
