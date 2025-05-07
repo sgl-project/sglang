@@ -42,15 +42,8 @@ echo "tzdata tzdata/Areas select Etc" | sudo debconf-set-selections
 echo "tzdata tzdata/Zones/Etc select UTC" | sudo debconf-set-selections
 
 if command -v sudo >/dev/null 2>&1; then
-    sudo ln -fs /usr/share/zoneinfo/UTC /etc/localtime
-    sudo apt-get update
-    sudo dpkg --configure -a
-    sudo apt-get install -y tzdata
-    sudo apt-get install libibverbs-dev pciutils rdma-core ibverbs-utils infiniband-diags ibutils -y
+    sudo apt update
+    sudo apt install curl git sudo libibverbs-dev -y
+    sudo apt install rdma-core infiniband-diags openssh-server perftest ibverbs-providers libibumad3 libibverbs1 libnl-3-200 libnl-route-3-200 librdmacm1 -y
     lspci | grep -i 'infiniband\|mellanox'
-    sudo modprobe mlx5_core
-    sudo modprobe ib_uverbs
-    sudo modprobe ib_core
-    sudo modprobe rdma_cm
-    sudo systemctl restart rdma
 fi
