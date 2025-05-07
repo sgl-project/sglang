@@ -186,7 +186,9 @@ class BaseMultimodalProcessor(ABC):
         image_index, audio_index = 0, 0
 
         for text_part in text_parts:
-            if multimodal_tokens.image_token and multimodal_tokens.image_token.match(text_part):
+            if multimodal_tokens.image_token and multimodal_tokens.image_token.match(
+                text_part
+            ):
                 data = image_data[image_index]
                 is_video = isinstance(data, str) and data.startswith("video:")
                 estimated_frames = estimated_frames_list[image_index]
@@ -203,7 +205,9 @@ class BaseMultimodalProcessor(ABC):
                 )
                 task_info.append((Modality.IMAGE, data, frame_count_limit))
                 image_index += 1
-            elif multimodal_tokens.audio_token and multimodal_tokens.audio_token.match(text_part):
+            elif multimodal_tokens.audio_token and multimodal_tokens.audio_token.match(
+                text_part
+            ):
                 data = audio_data[audio_index]
                 futures.append(
                     self.io_executor.submit(
@@ -245,11 +249,13 @@ class BaseMultimodalProcessor(ABC):
         if image_data is None:
             image_data = []
         if isinstance(multimodal_tokens.image_token, int):
-            multimodal_tokens.image_token = re.compile(re.escape(
-                self._processor.tokenizer.convert_ids_to_tokens(
-                    multimodal_tokens.image_token
+            multimodal_tokens.image_token = re.compile(
+                re.escape(
+                    self._processor.tokenizer.convert_ids_to_tokens(
+                        multimodal_tokens.image_token
+                    )
                 )
-            ))
+            )
         else:
             multimodal_tokens.image_token = multimodal_tokens.image_token
         multimodal_tokens_pattern = multimodal_tokens.collect()

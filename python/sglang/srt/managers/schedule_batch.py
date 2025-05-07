@@ -259,27 +259,23 @@ class MultimodalDataItem:
         self.pad_value = self.hash % (1 << 30)
 
     def is_audio(self):
-        return (
-            self.modality == Modality.AUDIO
-        ) and (
-            self.precomputed_features is not None or
-            not MultimodalDataItem.is_empty_list(self.audio_features)
+        return (self.modality == Modality.AUDIO) and (
+            self.precomputed_features is not None
+            or not MultimodalDataItem.is_empty_list(self.audio_features)
         )
 
     def is_image(self):
         return (
             self.modality == Modality.IMAGE or self.modality == Modality.MULTI_IMAGES
         ) and (
-            self.precomputed_features is not None or
-            not MultimodalDataItem.is_empty_list(self.pixel_values)
+            self.precomputed_features is not None
+            or not MultimodalDataItem.is_empty_list(self.pixel_values)
         )
 
     def is_video(self):
-        return (
-            self.modality == Modality.VIDEO
-        ) and (
-            self.precomputed_features is not None or
-            not MultimodalDataItem.is_empty_list(self.pixel_values)
+        return (self.modality == Modality.VIDEO) and (
+            self.precomputed_features is not None
+            or not MultimodalDataItem.is_empty_list(self.pixel_values)
         )
 
     def is_valid(self) -> bool:
