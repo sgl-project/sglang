@@ -15,6 +15,7 @@ limitations under the License.
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <cuda.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <cuda_runtime_api.h>
@@ -56,6 +57,7 @@ constexpr int CVT_FP4_SF_VEC_SIZE = 16;
 // Convert 8 float32 values into 8 e2m1 values (represented as one uint32_t).
 inline __device__ uint32_t fp32_vec_to_e2m1(float (&array)[8]) {
   // PTX instructions used here requires sm100a.
+#if CUDA_VERSION >= 12080
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000) && __CUDA_ARCH_HAS_FEATURE__(SM100_ALL)
   uint32_t val;
   asm volatile(
@@ -83,11 +85,13 @@ inline __device__ uint32_t fp32_vec_to_e2m1(float (&array)[8]) {
 #else
   return 0;
 #endif
+#endif
 }
 
 // Convert 4 float2 values into 8 e2m1 values (represented as one uint32_t).
 inline __device__ uint32_t fp32_vec_to_e2m1(float2 (&array)[4]) {
   // PTX instructions used here requires sm100a.
+#if CUDA_VERSION >= 12080
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000) && __CUDA_ARCH_HAS_FEATURE__(SM100_ALL)
   uint32_t val;
   asm volatile(
@@ -114,6 +118,7 @@ inline __device__ uint32_t fp32_vec_to_e2m1(float2 (&array)[4]) {
   return val;
 #else
   return 0;
+#endif
 #endif
 }
 

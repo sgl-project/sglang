@@ -5,8 +5,6 @@ import logging
 import pkgutil
 from functools import lru_cache
 
-from transformers import PROCESSOR_MAPPING
-
 from sglang.srt.managers.multimodal_processors.base_processor import (
     BaseMultimodalProcessor,
 )
@@ -64,5 +62,3 @@ def get_mm_processor(
         f"No processor registered for architecture: {hf_config.architectures}.\n"
         f"Registered architectures: {[model_cls.__name__ for model_cls in PROCESSOR_MAPPING.keys()]}"
     )
-
-    self.image_proce

@@ -11,13 +11,38 @@ from sglang.srt.utils import is_cuda
 _is_cuda = is_cuda()
 
 try:
-    import vllm
+    from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
+    from vllm.model_executor.layers.quantization.gptq import GPTQLinearMethod
+    from vllm.model_executor.layers.quantization.gptq_marlin import (
+        GPTQMarlinLinearMethod,
+        GPTQMarlinMoEMethod,
+    )
+    from vllm.model_executor.layers.quantization.marlin import MarlinLinearMethod
+    from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+        check_marlin_supported,
+    )
+    from vllm.scalar_type import scalar_types
 
     VLLM_AVAILABLE = True
 except ImportError:
     VLLM_AVAILABLE = False
 
+    GPTQLinearMethod = MarlinLinearMethod = QuantizeMethodBase = Any
+
+    class scalar_types:
+        uint4b8 = "uint4b8"
+        uint8b128 = "uint8b128"
+
+
 logger = logging.getLogger(__name__)
+
+
+def check_marlin_format(hf_quant_cfg: Dict[str, Any]) -> bool:
+    # compat: gptqmodel and autogptq (eol) main use checkpoint_format: str
+    # compat: autogptq <=0.7.1 is_marlin_format: bool
+    return hf_quant_cfg.get("checkpoint_format") == "marlin" or hf_quant_cfg.get(
+        "is_marlin_format", False
+    )
 
 
 class GPTQConfig(QuantizationConfig):
@@ -117,12 +142,8 @@ class GPTQConfig(QuantizationConfig):
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
-    ) -> Optional["GPTQLinearMethod"]:
-        if not VLLM_AVAILABLE:
-            raise ImportError("vllm is not installed")
-
-        from vllm.model_executor.layers.quantization.gptq import GPTQLinearMethod
-
+    ) -> Optional[GPTQLinearMethod]:
+        # Delay the import to avoid circular dependency
         from sglang.srt.layers.quantization import get_linear_quant_method
 
         return get_linear_quant_method(self, layer, prefix, GPTQLinearMethod)
@@ -131,16 +152,11 @@ class GPTQConfig(QuantizationConfig):
 class GPTQMarlinConfig(QuantizationConfig):
     """Config class for GPTQ Marlin"""
 
-    if VLLM_AVAILABLE:
-        from vllm.scalar_type import scalar_types
-
-        # (num_bits, is_sym) -> quant_type
-        TYPE_MAP = {
-            (4, True): scalar_types.uint4b8,
-            (8, True): scalar_types.uint8b128,
-        }
-    else:
-        raise ImportError("vllm is not installed")
+    # (num_bits, is_sym) -> quant_type
+    TYPE_MAP = {
+        (4, True): scalar_types.uint4b8,
+        (8, True): scalar_types.uint8b128,
+    }
 
     def __init__(
         self,
@@ -197,6 +213,7 @@ class GPTQMarlinConfig(QuantizationConfig):
                 "Unsupported quantization config: " f"bits={weight_bits}, sym={is_sym}"
             )
 
+        # (num_bits, is_sym) -> quant_type
         self.quant_type = self.TYPE_MAP[(weight_bits, is_sym)]
 
     def __repr__(self) -> str:
@@ -253,13 +270,15 @@ class GPTQMarlinConfig(QuantizationConfig):
 
     @classmethod
     def override_quantization_method(cls, hf_quant_cfg, user_quant) -> Optional[str]:
+        is_marlin_format = check_marlin_format(hf_quant_cfg)
+
         can_convert = cls.is_gptq_marlin_compatible(hf_quant_cfg)
 
         is_valid_user_quant = (
             user_quant is None or user_quant == "marlin" or user_quant == "gptq_marlin"
         )
 
-        if can_convert and is_valid_user_quant:
+        if not is_marlin_format and can_convert and is_valid_user_quant:
             msg = (
                 "The model is convertible to {} during runtime."
                 " Using {} kernel.".format(cls.get_name(), cls.get_name())
@@ -267,7 +286,7 @@ class GPTQMarlinConfig(QuantizationConfig):
             logger.info(msg)
             return cls.get_name()
 
-        if can_convert and user_quant == "gptq":
+        if not is_marlin_format and can_convert and user_quant == "gptq":
             logger.info(
                 "Detected that the model can run with gptq_marlin"
                 ", however you specified quantization=gptq explicitly,"
@@ -278,15 +297,8 @@ class GPTQMarlinConfig(QuantizationConfig):
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
-    ) -> Optional["QuantizeMethodBase"]:
-        if not VLLM_AVAILABLE:
-            raise ImportError("vllm is not installed")
-
-        from vllm.model_executor.layers.quantization.gptq_marlin import (
-            GPTQMarlinLinearMethod,
-            GPTQMarlinMoEMethod,
-        )
-
+    ) -> Optional[QuantizeMethodBase]:
+        # Delay the import to avoid circular dependency
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
         from sglang.srt.layers.quantization import get_linear_quant_method
 
@@ -304,18 +316,11 @@ class GPTQMarlinConfig(QuantizationConfig):
 
     @classmethod
     def is_gptq_marlin_compatible(cls, quant_config: Dict[str, Any]):
-        if not VLLM_AVAILABLE:
-            return False
-
         quant_method = quant_config.get("quant_method", "").lower()
         num_bits = quant_config.get("bits")
         group_size = quant_config.get("group_size")
         sym = quant_config.get("sym")
         desc_act = quant_config.get("desc_act")
-
-        from vllm.model_executor.layers.quantization.utils.marlin_utils import (
-            check_marlin_supported,
-        )
 
         if not _is_cuda:
             return False
@@ -406,11 +411,7 @@ class MarlinConfig(QuantizationConfig):
 
     @classmethod
     def override_quantization_method(cls, hf_quant_cfg, user_quant) -> Optional[str]:
-        # compat: autogptq >=0.8.0 use checkpoint_format: str
-        # compat: autogptq <=0.7.1 is_marlin_format: bool
-        is_marlin_format = hf_quant_cfg.get(
-            "checkpoint_format"
-        ) == "marlin" or hf_quant_cfg.get("is_marlin_format", False)
+        is_marlin_format = check_marlin_format(hf_quant_cfg)
 
         is_valid_user_quant = (
             user_quant is None or user_quant == "gptq" or user_quant == "marlin"
@@ -427,13 +428,8 @@ class MarlinConfig(QuantizationConfig):
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
-    ) -> Optional["MarlinLinearMethod"]:
-        if not VLLM_AVAILABLE:
-            raise ImportError("vllm is not installed")
-
-        from vllm.model_executor.layers.quantization.marlin import MarlinLinearMethod
-
-        # Delay import to avoid circular dependency
+    ) -> Optional[MarlinLinearMethod]:
+        # Delay the import to avoid circular dependency
         from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 
         if isinstance(layer, LinearBase) or (

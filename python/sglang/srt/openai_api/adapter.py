@@ -14,13 +14,14 @@
 """Conversion between OpenAI APIs and native SRT APIs"""
 
 import asyncio
+import base64
 import json
 import logging
 import os
 import time
 import uuid
 from http import HTTPStatus
-from typing import Any, Dict, List, Set
+from typing import Dict, List
 
 from fastapi import HTTPException, Request, UploadFile
 from fastapi.responses import ORJSONResponse, StreamingResponse
@@ -36,6 +37,7 @@ from sglang.srt.conversation import (
     chat_template_exists,
     generate_chat_conv,
     generate_embedding_convs,
+    get_conv_template_by_model_path,
     register_conv_template,
 )
 from sglang.srt.function_call_parser import FunctionCallParser
@@ -163,10 +165,14 @@ def load_chat_template_for_openai_api(tokenizer_manager, chat_template_arg, mode
     else:
         chat_template_name = chat_template_arg
 
-    # Check chat-template
-    # TODO:
-    # 1. Do not import any code from sglang.lang
-    # 2. For VLM, when chat_template_arg is None, set it automatically by guessing from model_path.
+
+def guess_chat_template_name_from_model_path(model_path):
+    global chat_template_name
+    chat_template_name = get_conv_template_by_model_path(model_path)
+    if chat_template_name is not None:
+        logger.info(
+            f"Infer the chat template name from the model path and obtain the result: {chat_template_name}."
+        )
 
 
 async def v1_files_create(
@@ -715,7 +721,10 @@ def v1_generate_response(
 
 
 async def v1_completions(tokenizer_manager, raw_request: Request):
-    request_json = await raw_request.json()
+    try:
+        request_json = await raw_request.json()
+    except Exception as e:
+        return create_error_response("Invalid request body, error: ", str(e))
     all_requests = [CompletionRequest(**request_json)]
     created = int(time.time())
     adapted_request, request = v1_generate_request(all_requests)
@@ -891,12 +900,31 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
     return response
 
 
+def _get_enable_thinking_from_request(request_obj):
+    """Extracts the 'enable_thinking' flag from request chat_template_kwargs.
+
+    Args:
+        request_obj: The request object (or an item from a list of requests).
+
+    Returns:
+        The boolean value of 'enable_thinking' if found and not True, otherwise True.
+    """
+    if (
+        hasattr(request_obj, "chat_template_kwargs")
+        and request_obj.chat_template_kwargs
+        and request_obj.chat_template_kwargs.get("enable_thinking") is not None
+    ):
+        return request_obj.chat_template_kwargs.get("enable_thinking")
+    return True
+
+
 def v1_chat_generate_request(
     all_requests: List[ChatCompletionRequest],
     tokenizer_manager,
     request_ids: List[str] = None,
 ):
     input_ids = []
+    prompts = []
     sampling_params_list = []
     image_data_list = []
     audio_data_list = []
@@ -908,6 +936,7 @@ def v1_chat_generate_request(
 
     # NOTE: with openai API, the prompt's logprobs are always not computed
 
+    is_multimodal = tokenizer_manager.model_config.is_multimodal
     for request in all_requests:
         # Prep the data needed for the underlying GenerateReqInput:
         #  - prompt: The full prompt string.
@@ -916,6 +945,8 @@ def v1_chat_generate_request(
         #  - audio_data: None or a list of audio strings (URLs).
         #    None skips any image processing in GenerateReqInput.
         strict_tag = None
+        prompt = ""
+        prompt_ids = []
         if not isinstance(request.messages, str):
             # Apply chat template and its stop strings.
             tools = None
@@ -936,21 +967,33 @@ def v1_chat_generate_request(
 
             if chat_template_name is None:
                 openai_compatible_messages = []
+
                 for message in request.messages:
-                    if isinstance(message.content, str):
-                        openai_compatible_messages.append(
-                            {"role": message.role, "content": message.content}
-                        )
+                    if message.content is None:
+                        message.content = ""
+                    msg_dict = message.dict()
+                    if isinstance(msg_dict.get("content"), list):
+                        for chunk in msg_dict["content"]:
+                            if isinstance(chunk, dict) and chunk.get("type") == "text":
+                                new_msg = msg_dict.copy()
+                                new_msg["content"] = chunk["text"]
+                                new_msg = {
+                                    k: v for k, v in new_msg.items() if v is not None
+                                }
+                                openai_compatible_messages.append(new_msg)
                     else:
-                        content_list = message.dict()["content"]
-                        for content in content_list:
-                            if content["type"] == "text":
-                                openai_compatible_messages.append(
-                                    {"role": message.role, "content": content["text"]}
-                                )
-                if openai_compatible_messages[-1]["role"] == "assistant":
-                    assistant_prefix = openai_compatible_messages[-1]["content"]
-                    openai_compatible_messages = openai_compatible_messages[:-1]
+                        msg_dict = {k: v for k, v in msg_dict.items() if v is not None}
+                        openai_compatible_messages.append(msg_dict)
+                if (
+                    openai_compatible_messages
+                    and openai_compatible_messages[-1]["role"] == "assistant"
+                ):
+                    if request.continue_final_message:
+                        # Remove the final assistant message so its content can be continued.
+                        assistant_prefix = openai_compatible_messages[-1]["content"]
+                        openai_compatible_messages = openai_compatible_messages[:-1]
+                    else:
+                        assistant_prefix = None
                 else:
                     assistant_prefix = None
 
@@ -960,6 +1003,11 @@ def v1_chat_generate_request(
                         tokenize=True,
                         add_generation_prompt=True,
                         tools=tools,
+                        **(
+                            request.chat_template_kwargs
+                            if request.chat_template_kwargs
+                            else {}
+                        ),
                     )
                 except:
                     #  This except branch will be triggered when the chosen model
@@ -971,6 +1019,11 @@ def v1_chat_generate_request(
                         tokenize=True,
                         add_generation_prompt=True,
                         tools=tools,
+                        **(
+                            request.chat_template_kwargs
+                            if request.chat_template_kwargs
+                            else {}
+                        ),
                     )
 
                 if assistant_prefix:
@@ -981,23 +1034,54 @@ def v1_chat_generate_request(
                     ):
                         encoded = encoded[1:]
                     prompt_ids += encoded
+                if is_multimodal:
+                    prompt = tokenizer_manager.tokenizer.decode(prompt_ids)
                 stop = request.stop
                 image_data = None
                 audio_data = None
                 modalities = []
             else:
                 conv = generate_chat_conv(request, chat_template_name)
-                prompt = conv.get_prompt()
+                # If we should continue the final assistant message, adjust the conversation.
+                if (
+                    request.continue_final_message
+                    and request.messages
+                    and request.messages[-1].role == "assistant"
+                ):
+                    # Remove the auto-added blank assistant turn, if present.
+                    if conv.messages and conv.messages[-1][1] is None:
+                        conv.messages.pop()
+                    # Rebuild the prompt from the conversation.
+                    prompt = conv.get_prompt()
+                    # Strip any trailing stop tokens or separators that indicate end-of-assistant.
+                    if isinstance(conv.stop_str, list):
+                        for stop_token in conv.stop_str:
+                            if prompt.endswith(stop_token):
+                                prompt = prompt[: -len(stop_token)]
+                    elif isinstance(conv.stop_str, str) and prompt.endswith(
+                        conv.stop_str
+                    ):
+                        prompt = prompt[: -len(conv.stop_str)]
+                    if conv.sep and prompt.endswith(conv.sep):
+                        prompt = prompt[: -len(conv.sep)]
+                    if getattr(conv, "sep2", None) and prompt.endswith(conv.sep2):
+                        prompt = prompt[: -len(conv.sep2)]
+                else:
+                    prompt = conv.get_prompt()
+
                 image_data = conv.image_data
                 audio_data = conv.audio_data
                 modalities = conv.modalities
-                stop = conv.stop_str or []
+                stop = conv.stop_str or [] if not request.ignore_eos else []
+
                 if request.stop:
                     if isinstance(request.stop, str):
                         stop.append(request.stop)
                     else:
                         stop.extend(request.stop)
-                prompt_ids = tokenizer_manager.tokenizer.encode(prompt)
+
+                if not is_multimodal:
+                    prompt_ids = tokenizer_manager.tokenizer.encode(prompt)
         else:
             # Use the raw prompt and stop strings if the messages is already a string.
             prompt_ids = request.messages
@@ -1005,15 +1089,17 @@ def v1_chat_generate_request(
             image_data = None
             audio_data = None
             modalities = []
+            prompt = request.messages
         input_ids.append(prompt_ids)
         return_logprobs.append(request.logprobs)
         logprob_start_lens.append(-1)
         top_logprobs_nums.append(request.top_logprobs or 0)
         lora_paths.append(request.lora_path)
+        prompts.append(prompt)
 
         sampling_params = {
             "temperature": request.temperature,
-            "max_new_tokens": request.max_tokens,
+            "max_new_tokens": request.max_tokens or request.max_completion_tokens,
             "min_new_tokens": request.min_tokens,
             "stop": stop,
             "stop_token_ids": request.stop_token_ids,
@@ -1035,6 +1121,8 @@ def v1_chat_generate_request(
             sampling_params["json_schema"] = convert_json_schema_to_str(
                 request.response_format.json_schema.schema_
             )
+        elif request.response_format and request.response_format.type == "json_object":
+            sampling_params["json_schema"] = '{"type": "object"}'
         elif (
             request.response_format and request.response_format.type == "structural_tag"
         ):
@@ -1063,10 +1151,14 @@ def v1_chat_generate_request(
         audio_data_list.append(audio_data)
         modalities_list.append(modalities)
     if len(all_requests) == 1:
-        if isinstance(input_ids[0], str):
-            prompt_kwargs = {"text": input_ids[0]}
+        if is_multimodal:
+            # processor will need text input
+            prompt_kwargs = {"text": prompts[0]}
         else:
-            prompt_kwargs = {"input_ids": input_ids[0]}
+            if isinstance(input_ids[0], str):
+                prompt_kwargs = {"text": input_ids[0]}
+            else:
+                prompt_kwargs = {"input_ids": input_ids[0]}
         sampling_params_list = sampling_params_list[0]
         image_data_list = image_data_list[0]
         audio_data_list = audio_data_list[0]
@@ -1076,10 +1168,14 @@ def v1_chat_generate_request(
         modalities_list = modalities_list[0]
         lora_paths = lora_paths[0]
     else:
-        if isinstance(input_ids[0], str):
-            prompt_kwargs = {"text": input_ids}
+        if tokenizer_manager.model_config.is_multimodal:
+            # processor will need text input
+            prompt_kwargs = {"text": prompts}
         else:
-            prompt_kwargs = {"input_ids": input_ids}
+            if isinstance(input_ids[0], str):
+                prompt_kwargs = {"text": input_ids}
+            else:
+                prompt_kwargs = {"input_ids": input_ids}
 
     adapted_request = GenerateReqInput(
         **prompt_kwargs,
@@ -1094,6 +1190,9 @@ def v1_chat_generate_request(
         rid=request_ids,
         modalities=modalities_list,
         lora_path=lora_paths,
+        bootstrap_host=all_requests[0].bootstrap_host,
+        bootstrap_port=all_requests[0].bootstrap_port,
+        bootstrap_room=all_requests[0].bootstrap_room,
     )
 
     return adapted_request, all_requests if len(all_requests) > 1 else all_requests[0]
@@ -1163,12 +1262,15 @@ def v1_chat_generate_response(
             tool_choice = request[idx].tool_choice
             tools = request[idx].tools
             separate_reasoning = request[idx].separate_reasoning
+            enable_thinking = _get_enable_thinking_from_request(request[idx])
         else:
             tool_choice = request.tool_choice
             tools = request.tools
             separate_reasoning = request.separate_reasoning
+            enable_thinking = _get_enable_thinking_from_request(request)
 
-        if reasoning_parser and separate_reasoning:
+        reasoning_text = None
+        if reasoning_parser and separate_reasoning and enable_thinking:
             try:
                 parser = ReasoningParser(
                     model_type=reasoning_parser, stream_reasoning=False
@@ -1180,8 +1282,6 @@ def v1_chat_generate_response(
                     HTTPStatus.BAD_REQUEST,
                     "Failed to parse reasoning related info to json format!",
                 )
-        else:
-            reasoning_text = None
 
         if tool_choice != "none" and tools:
             parser = FunctionCallParser(tools, tool_call_parser)
@@ -1193,7 +1293,8 @@ def v1_chat_generate_response(
                     text, call_info_list = parser.parse_non_stream(text)
                     tool_calls = [
                         ToolCall(
-                            id=str(call_info.tool_index),
+                            id=f"call_{base64.urlsafe_b64encode(uuid.uuid4().bytes).rstrip(b'=').decode()}",
+                            index=call_info.tool_index,
                             function=FunctionResponse(
                                 name=call_info.name, arguments=call_info.parameters
                             ),
@@ -1296,7 +1397,10 @@ def v1_chat_generate_response(
 async def v1_chat_completions(
     tokenizer_manager, raw_request: Request, cache_report=False
 ):
-    request_json = await raw_request.json()
+    try:
+        request_json = await raw_request.json()
+    except Exception as e:
+        return create_error_response("Invalid request body, error: ", str(e))
     all_requests = [ChatCompletionRequest(**request_json)]
     created = int(time.time())
     adapted_request, request = v1_chat_generate_request(all_requests, tokenizer_manager)
@@ -1306,6 +1410,7 @@ async def v1_chat_completions(
         reasoning_parser_dict = {}
 
         async def generate_stream_resp():
+            tool_call_first = True
             is_firsts = {}
             stream_buffers = {}
             n_prev_tokens = {}
@@ -1403,9 +1508,12 @@ async def v1_chat_completions(
                     delta = text[len(stream_buffer) :]
                     new_stream_buffer = stream_buffer + delta
 
+                    enable_thinking = _get_enable_thinking_from_request(request)
+
                     if (
                         tokenizer_manager.server_args.reasoning_parser
                         and request.separate_reasoning
+                        and enable_thinking
                     ):
                         if index not in reasoning_parser_dict:
                             reasoning_parser_dict[index] = ReasoningParser(
@@ -1469,7 +1577,6 @@ async def v1_chat_completions(
                         # 2) if we found calls, we output them as separate chunk(s)
                         for call_item in calls:
                             # transform call_item -> FunctionResponse + ToolCall
-
                             if finish_reason_type == "stop":
                                 latest_delta_len = 0
                                 if isinstance(call_item.parameters, str):
@@ -1492,14 +1599,19 @@ async def v1_chat_completions(
                                 call_item.parameters = remaining_call
 
                                 finish_reason_type = "tool_calls"
-
                             tool_call = ToolCall(
-                                id=str(call_item.tool_index),
+                                id=(
+                                    f"call_{base64.urlsafe_b64encode(uuid.uuid4().bytes).rstrip(b'=').decode()}"
+                                    if tool_call_first
+                                    else None
+                                ),
+                                index=call_item.tool_index,
                                 function=FunctionResponse(
                                     name=call_item.name,
                                     arguments=call_item.parameters,
                                 ),
                             )
+                            tool_call_first = False
                             choice_data = ChatCompletionResponseStreamChoice(
                                 index=index,
                                 delta=DeltaMessage(tool_calls=[tool_call]),
@@ -1717,7 +1829,10 @@ def v1_embedding_response(ret, model_path, to_file=False):
 
 
 async def v1_embeddings(tokenizer_manager, raw_request: Request):
-    request_json = await raw_request.json()
+    try:
+        request_json = await raw_request.json()
+    except Exception as e:
+        return create_error_response("Invalid request body, error: ", str(e))
     all_requests = [EmbeddingRequest(**request_json)]
     adapted_request, request = v1_embedding_request(all_requests, tokenizer_manager)
 

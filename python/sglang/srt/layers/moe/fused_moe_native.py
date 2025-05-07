@@ -8,6 +8,7 @@ from typing import Callable, Optional
 import torch
 from torch.nn import functional as F
 
+from sglang.srt.layers.activation import GeluAndMul, SiluAndMul
 from sglang.srt.layers.moe.topk import select_experts
 
 
@@ -23,9 +24,15 @@ def fused_moe_forward_native(
     custom_routing_function: Optional[Callable] = None,
     correction_bias: Optional[torch.Tensor] = None,
     activation: str = "silu",
+    apply_router_weight_on_input: bool = False,
     inplace: bool = True,
     no_combine: bool = False,
+    routed_scaling_factor: Optional[float] = None,
 ) -> torch.Tensor:
+
+    if apply_router_weight_on_input:
+        raise NotImplementedError()
+
     topk_weights, topk_ids = select_experts(
         hidden_states=x,
         router_logits=router_logits,
@@ -36,6 +43,7 @@ def fused_moe_forward_native(
         num_expert_group=num_expert_group,
         custom_routing_function=custom_routing_function,
         correction_bias=correction_bias,
+        routed_scaling_factor=routed_scaling_factor,
         torch_native=True,
     )
 
@@ -66,10 +74,8 @@ def moe_forward_native(
     custom_routing_function: Optional[Callable] = None,
     correction_bias: Optional[torch.Tensor] = None,
     activation: str = "silu",
+    routed_scaling_factor: Optional[float] = None,
 ) -> torch.Tensor:
-
-    from sglang.srt.layers.activation import GeluAndMul, SiluAndMul
-
     topk_weights, topk_ids = select_experts(
         hidden_states=x,
         router_logits=router_logits,
@@ -81,6 +87,7 @@ def moe_forward_native(
         custom_routing_function=custom_routing_function,
         correction_bias=correction_bias,
         torch_native=True,
+        routed_scaling_factor=routed_scaling_factor,
     )
 
     # Ref code from https://huggingface.co/deepseek-ai/DeepSeek-V2/blob/e0828e3cc0a03408724b80c3cc92c8e072db8d01/modeling_deepseek.py#L589
