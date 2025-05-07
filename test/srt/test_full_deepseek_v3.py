@@ -35,7 +35,9 @@ class TestDeepseekV3(CustomTestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    def test_gsm8k(self):
+    def test_a_gsm8k(
+        self,
+    ):  # Append an "a" to make this test run first (alphabetically) to warm up the server
         args = SimpleNamespace(
             num_shots=8,
             data_path=None,
@@ -78,8 +80,6 @@ class TestDeepseekV3MTP(CustomTestCase):
             "--trust-remote-code",
             "--speculative-algorithm",
             "EAGLE",
-            "--speculative-draft",
-            "lmsys/DeepSeek-V3-0324-NextN",
             "--speculative-num-steps",
             "3",
             "--speculative-eagle-topk",
@@ -100,7 +100,9 @@ class TestDeepseekV3MTP(CustomTestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    def test_gsm8k(self):
+    def test_a_gsm8k(
+        self,
+    ):  # Append an "a" to make this test run first (alphabetically) to warm up the server
         requests.get(self.base_url + "/flush_cache")
 
         args = SimpleNamespace(
