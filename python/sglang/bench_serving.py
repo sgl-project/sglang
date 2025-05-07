@@ -1208,7 +1208,7 @@ async def benchmark(
             image_data = image_match.group(1) if image_match else None
             prompt = image_match.group(2) if image_match else prompt
         else:
-            continue
+            image_data = None
 
         request_func_input = RequestFuncInput(
             model=model_id,
