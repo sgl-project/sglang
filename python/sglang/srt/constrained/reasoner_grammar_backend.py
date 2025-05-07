@@ -52,6 +52,18 @@ class ReasonerGrammarObject(BaseGrammarObject):
         return self.grammar.allocate_vocab_mask(vocab_size, batch_size, device)
 
     def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
+        if (
+            self.is_in_reasoning
+            and self.thinking_budget is not None
+            and self.num_thinking_tokens >= self.thinking_budget
+        ):
+            # If the thinking budget is reached, we stop thinking
+            tokens = torch.tensor([self.think_end_id], dtype=torch.int64).to(
+                vocab_mask.device, non_blocking=True
+            )
+            vocab_mask = vocab_mask[idx]
+            vocab_mask.fill_(1)
+            vocab_mask.scatter_(0, tokens, torch.zeros_like(tokens, dtype=torch.bool))
         if not self.is_in_reasoning:
             self.grammar.fill_vocab_mask(vocab_mask, idx)
 
@@ -66,10 +78,10 @@ class ReasonerGrammarObject(BaseGrammarObject):
         if token == self.think_end_id:
             self.is_in_reasoning = False
             logger.info(f"num_thinking_tokens: {self.num_thinking_tokens}")
-
+        if self.is_in_reasoning:
+            self.num_thinking_tokens += 1
         if not self.is_in_reasoning and token != self.think_end_id:
             self.grammar.accept_token(token)
-            self.num_thinking_tokens += 1
 
     def try_jump_forward(self, tokenizer):
         return self.grammar.try_jump_forward(tokenizer)
