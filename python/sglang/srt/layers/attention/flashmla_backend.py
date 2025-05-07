@@ -179,6 +179,8 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         )
         self.cuda_graph_kv_indices = cuda_graph_kv_indices
 
+        super().init_cuda_graph_state(max_bs, block_kv_indices)
+
     def init_forward_metadata_capture_cuda_graph(
         self,
         bs: int,
@@ -421,7 +423,6 @@ class FlashMLAMultiStepDraftBackend:
             call_fn(i, forward_batch)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        # max_blocks_per_seq = (self.max_context_len + PAGE_SIZE - 1) // PAGE_SIZE
         kv_indices = torch.zeros(
             (
                 self.speculative_num_steps,
