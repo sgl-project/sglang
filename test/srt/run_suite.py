@@ -51,6 +51,7 @@ suites = {
         TestFile("test_mla_int8_deepseek_v3.py", 389),
         TestFile("test_mla_flashinfer.py", 395),
         TestFile("test_mla_fp8.py", 153),
+        TestFile("test_flashmla.py", 300),
         TestFile("test_no_chunked_prefill.py", 108),
         TestFile("test_no_overlap_scheduler.py", 216),
         TestFile("test_openai_server.py", 149),
@@ -95,6 +96,9 @@ suites = {
         TestFile("test_verl_engine.py", 64),
     ],
     "per-commit-8-gpu": [
+        TestFile("test_deepep_intranode.py", 50),
+        TestFile("test_deepep_low_latency.py", 50),
+        TestFile("test_moe_deepep_eval_accuracy_large.py", 250),
         TestFile("test_local_attn.py", 250),
         TestFile("test_full_deepseek_v3.py", 250),
         TestFile("test_fa3.py", 30),

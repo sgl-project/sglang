@@ -502,6 +502,7 @@ class Scheduler(
             self.tree_cache = ChunkCache(
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                page_size=self.page_size,
             )
         else:
             if self.enable_hierarchical_cache:
@@ -923,6 +924,10 @@ class Scheduler(
                     "Please set --enable-custom-logits-processor to enable this feature."
                 )
                 custom_logit_processor = None
+
+            if recv_req.bootstrap_port is None:
+                # Use default bootstrap port
+                recv_req.bootstrap_port = self.server_args.disaggregation_bootstrap_port
 
             req = Req(
                 recv_req.rid,

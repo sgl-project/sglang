@@ -198,6 +198,7 @@ class ServerArgs:
     disaggregation_bootstrap_port: int = 8998
     disaggregation_transfer_backend: str = "mooncake"
     disaggregation_ib_device: Optional[str] = None
+    pdlb_url: Optional[str] = None
 
     def __post_init__(self):
         # Expert parallelism
@@ -554,7 +555,7 @@ class ServerArgs:
             "--device",
             type=str,
             default=ServerArgs.device,
-            help="The device to use ('cuda', 'xpu', 'hpu', 'cpu'). Defaults to auto-detection if not specified.",
+            help="The device to use ('cuda', 'xpu', 'hpu', 'npu', 'cpu'). Defaults to auto-detection if not specified.",
         )
         parser.add_argument(
             "--served-model-name",
@@ -1250,7 +1251,15 @@ class ServerArgs:
             "--disaggregation-ib-device",
             type=str,
             default=ServerArgs.disaggregation_ib_device,
-            help="The ib device for disaggregation transfer. Default is None, it will be detected automatically if using the mooncake backend.",
+            help="The InfiniBand devices for disaggregation transfer, accepts single device (e.g., --disaggregation-ib-device mlx5_0) "
+            "or multiple comma-separated devices (e.g., --disaggregation-ib-device mlx5_0,mlx5_1). "
+            "Default is None, which triggers automatic device detection when mooncake backend is enabled.",
+        )
+        parser.add_argument(
+            "--pdlb-url",
+            type=str,
+            default=None,
+            help="The URL of the PD disaggregation load balancer. If set, the prefill/decode server will register with the load balancer.",
         )
 
     @classmethod
