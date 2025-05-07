@@ -69,17 +69,27 @@ class TransferInfo:
     dst_kv_indices: npt.NDArray[np.int64]
     dst_aux_index: int
     required_dst_info_num: int
+    is_dummy: bool
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
+        if msg[4] == b"" and msg[5] == b"":
+            is_dummy = True
+            dst_kv_indices = np.array([], dtype=np.int64)
+            dst_aux_index = None
+        else:
+            dst_kv_indices = np.frombuffer(msg[4], dtype=np.int64)
+            dst_aux_index = int(msg[5].decode("ascii"))
+            is_dummy = False
         return cls(
             room=int(msg[0].decode("ascii")),
             endpoint=msg[1].decode("ascii"),
             dst_port=int(msg[2].decode("ascii")),
             mooncake_session_id=msg[3].decode("ascii"),
-            dst_kv_indices=np.frombuffer(msg[4], dtype=np.int64),
-            dst_aux_index=int(msg[5].decode("ascii")),
+            dst_kv_indices=dst_kv_indices,
+            dst_aux_index=dst_aux_index,
             required_dst_info_num=int(msg[6].decode("ascii")),
+            is_dummy=is_dummy,
         )
 
 
@@ -301,50 +311,57 @@ class MooncakeKVManager(BaseKVManager):
                     polls = []
                     dst_ranks_infos = []
                     for req in reqs_to_be_processed:
-                        chunked_dst_kv_indice = req.dst_kv_indices[kv_chunk.index_slice]
-                        assert len(chunked_dst_kv_indice) == len(
-                            kv_chunk.prefill_kv_indices
-                        ), f"len(chunked_dst_kv_indice) = {len(chunked_dst_kv_indice)}, len(kv_chunk.prefill_kv_indices) = {len(kv_chunk.prefill_kv_indices)}"
+                        if not req.is_dummy:
+                            chunked_dst_kv_indice = req.dst_kv_indices[
+                                kv_chunk.index_slice
+                            ]
+                            assert len(chunked_dst_kv_indice) == len(
+                                kv_chunk.prefill_kv_indices
+                            ), f"len(chunked_dst_kv_indice) = {len(chunked_dst_kv_indice)}, len(kv_chunk.prefill_kv_indices) = {len(kv_chunk.prefill_kv_indices)}"
 
-                        ret = self.send_kvcache(
-                            req.mooncake_session_id,
-                            kv_chunk.prefill_kv_indices,
-                            self.decode_kv_args_table[
-                                req.mooncake_session_id
-                            ].dst_kv_ptrs,
-                            chunked_dst_kv_indice,
-                        )
-                        if ret != 0:
-                            self.request_status[kv_chunk.room] = KVPoll.Failed
-                            self.sync_status_to_decode_endpoint(
-                                req.endpoint, req.dst_port, req.room
-                            )
-                            continue
-
-                        if kv_chunk.is_last:
-                            # Only the last chunk we need to send the aux data
-                            ret = self.send_aux(
+                            ret = self.send_kvcache(
                                 req.mooncake_session_id,
-                                kv_chunk.prefill_aux_index,
+                                kv_chunk.prefill_kv_indices,
                                 self.decode_kv_args_table[
                                     req.mooncake_session_id
-                                ].dst_aux_ptrs,
-                                req.dst_aux_index,
+                                ].dst_kv_ptrs,
+                                chunked_dst_kv_indice,
                             )
-                            polls.append(True if ret == 0 else False)
-                            dst_ranks_infos.append(
-                                (req.endpoint, req.dst_port, req.room)
-                            )
-
-                            # Only sync status when all the dst ranks have received the kvcache
-                            if len(polls) == req.required_dst_info_num:
-                                self.request_status[req.room] = (
-                                    KVPoll.Success if all(polls) else KVPoll.Failed
+                            if ret != 0:
+                                self.request_status[kv_chunk.room] = KVPoll.Failed
+                                self.sync_status_to_decode_endpoint(
+                                    req.endpoint, req.dst_port, req.room
                                 )
-                                for endpoint, dst_port, room in dst_ranks_infos:
-                                    self.sync_status_to_decode_endpoint(
-                                        endpoint, dst_port, room
+                                continue
+
+                            if kv_chunk.is_last:
+                                # Only the last chunk we need to send the aux data
+                                ret = self.send_aux(
+                                    req.mooncake_session_id,
+                                    kv_chunk.prefill_aux_index,
+                                    self.decode_kv_args_table[
+                                        req.mooncake_session_id
+                                    ].dst_aux_ptrs,
+                                    req.dst_aux_index,
+                                )
+                                polls.append(True if ret == 0 else False)
+                                dst_ranks_infos.append(
+                                    (req.endpoint, req.dst_port, req.room)
+                                )
+
+                                # Only sync status when all the dst ranks have received the kvcache
+                                if len(polls) == req.required_dst_info_num:
+                                    self.request_status[req.room] = (
+                                        KVPoll.Success if all(polls) else KVPoll.Failed
                                     )
+                                    for endpoint, dst_port, room in dst_ranks_infos:
+                                        self.sync_status_to_decode_endpoint(
+                                            endpoint, dst_port, room
+                                        )
+                        else:
+                            # Dummy request means the decode instance is not used, so its status can be marked as success directly
+                            # Dummy request does not need to sync status to decode endpoint
+                            self.request_status[req.room] = KVPoll.Success
 
                     self.transfer_infos.pop(req.room)
 
@@ -528,6 +545,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
                 self.kv_mgr.kv_args.engine_rank % local_tp_size_per_dp_rank
             )
             self.required_dst_info_num = 1
+            self.target_tp_ranks = [self.target_tp_rank]
         elif local_tp_size_per_dp_rank > prefill_tp_size_per_dp_rank:
             assert (
                 self.kv_mgr.is_mla_backend
@@ -538,11 +556,8 @@ class MooncakeKVReceiver(BaseKVReceiver):
             self.required_dst_info_num = (
                 local_tp_size_per_dp_rank // prefill_tp_size_per_dp_rank
             )
+            self.target_tp_ranks = [self.target_tp_rank]
         else:
-            # NOTE(shangming): local_tp_size_per_dp_rank < prefill_tp_size_per_dp_rank is not supported.
-            assert (
-                local_tp_size_per_dp_rank < prefill_tp_size_per_dp_rank
-            ), "decode_tp_size_per_dp_rank < prefill_tp_size_per_dp_rank is not supported yet"
             assert (
                 self.kv_mgr.is_mla_backend
             ), "PD with different TP sizes per DP rank is not yet supported for non-MLA models"
@@ -570,22 +585,37 @@ class MooncakeKVReceiver(BaseKVReceiver):
         bootstrap_key = f"{self.bootstrap_addr}_{self.kv_mgr.kv_args.engine_rank}"
 
         if bootstrap_key not in self.kv_mgr.connection_pool:
-            self.bootstrap_info = self._get_bootstrap_info_from_server(
-                self.target_tp_rank,
-                self.target_dp_group,
-            )
-            if self.bootstrap_info is None:
+            bootstrap_infos = []
+            for target_tp_rank in self.target_tp_ranks:
+                bootstrap_info = self._get_bootstrap_info_from_server(
+                    target_tp_rank,
+                    self.target_dp_group,
+                )
+                if bootstrap_info is not None:
+                    # NOTE: only support MLA for now: select one prefill rank as real rank
+                    bootstrap_info["is_dummy"] = not bool(
+                        target_tp_rank == self.target_tp_rank
+                        or self.target_tp_rank is None
+                    )
+                    bootstrap_infos.append(bootstrap_info)
+                else:
+                    logger.error(
+                        f"Could not fetch bootstrap info for engine rank: {self.kv_mgr.kv_args.engine_rank} and target_dp_group: {self.target_dp_group}"
+                    )
+            self.bootstrap_infos = bootstrap_infos
+
+            if len(self.bootstrap_infos) == 0:
                 logger.error(
                     f"Could not fetch bootstrap info for engine rank: {self.kv_mgr.kv_args.engine_rank}"
                 )
             else:
-                self.kv_mgr.connection_pool[bootstrap_key] = self.bootstrap_info
+                self.kv_mgr.connection_pool[bootstrap_key] = self.bootstrap_infos
                 # Register kv_args only once to prefill KVManager according to the info fetched from the bootstrap server
                 self._register_kv_args()
         else:
-            self.bootstrap_info = self.kv_mgr.connection_pool[bootstrap_key]
+            self.bootstrap_infos = self.kv_mgr.connection_pool[bootstrap_key]
 
-        assert self.bootstrap_info is not None
+        assert len(self.bootstrap_infos) > 0
         self.kv_mgr.update_status(bootstrap_room, KVPoll.WaitingForInput)
 
     def _get_bootstrap_info_from_server(self, engine_rank, target_dp_group):
@@ -625,28 +655,29 @@ class MooncakeKVReceiver(BaseKVReceiver):
             return None
 
     def _register_kv_args(self):
-        self.prefill_server_url = (
-            f"{self.bootstrap_info['rank_ip']}:{self.bootstrap_info['rank_port']}"
-        )
-
-        packed_kv_data_ptrs = b"".join(
-            struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
-        )
-        packed_aux_data_ptrs = b"".join(
-            struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.aux_data_ptrs
-        )
-        sock, lock = self._connect("tcp://" + self.prefill_server_url)
-        with lock:
-            sock.send_multipart(
-                [
-                    "None".encode("ascii"),
-                    get_local_ip_by_remote().encode("ascii"),
-                    str(self.kv_mgr.rank_port).encode("ascii"),
-                    self.session_id.encode("ascii"),
-                    packed_kv_data_ptrs,
-                    packed_aux_data_ptrs,
-                ]
+        for bootstrap_info in self.bootstrap_infos:
+            self.prefill_server_url = (
+                f"{bootstrap_info['rank_ip']}:{bootstrap_info['rank_port']}"
             )
+            packed_kv_data_ptrs = b"".join(
+                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
+            )
+            packed_aux_data_ptrs = b"".join(
+                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.aux_data_ptrs
+            )
+
+            sock, lock = self._connect("tcp://" + self.prefill_server_url)
+            with lock:
+                sock.send_multipart(
+                    [
+                        "None".encode("ascii"),
+                        get_local_ip_by_remote().encode("ascii"),
+                        str(self.kv_mgr.rank_port).encode("ascii"),
+                        self.session_id.encode("ascii"),
+                        packed_kv_data_ptrs,
+                        packed_aux_data_ptrs,
+                    ]
+                )
 
     @classmethod
     def _connect(cls, endpoint: str):
@@ -659,26 +690,28 @@ class MooncakeKVReceiver(BaseKVReceiver):
             return cls._socket_cache[endpoint], cls._socket_locks[endpoint]
 
     def init(self, kv_indices: npt.NDArray[np.int64], aux_index: Optional[int] = None):
-        self.prefill_server_url = (
-            f"{self.bootstrap_info['rank_ip']}:{self.bootstrap_info['rank_port']}"
-        )
-        logger.debug(
-            f"Fetched bootstrap info: {self.bootstrap_info} for engine rank: {self.kv_mgr.kv_args.engine_rank}"
-        )
-
-        sock, lock = self._connect("tcp://" + self.prefill_server_url)
-        with lock:
-            sock.send_multipart(
-                [
-                    str(self.bootstrap_room).encode("ascii"),
-                    get_local_ip_by_remote().encode("ascii"),
-                    str(self.kv_mgr.rank_port).encode("ascii"),
-                    self.session_id.encode("ascii"),
-                    kv_indices.tobytes(),
-                    str(aux_index).encode("ascii"),
-                    str(self.required_dst_info_num).encode("ascii"),
-                ]
+        for bootstrap_info in self.bootstrap_infos:
+            self.prefill_server_url = (
+                f"{bootstrap_info['rank_ip']}:{bootstrap_info['rank_port']}"
             )
+            logger.debug(
+                f"Fetched bootstrap info: {bootstrap_info} for engine rank: {self.kv_mgr.kv_args.engine_rank}"
+            )
+            is_dummy = bootstrap_info["is_dummy"]
+
+            sock, lock = self._connect("tcp://" + self.prefill_server_url)
+            with lock:
+                sock.send_multipart(
+                    [
+                        str(self.bootstrap_room).encode("ascii"),
+                        get_local_ip_by_remote().encode("ascii"),
+                        str(self.kv_mgr.rank_port).encode("ascii"),
+                        self.session_id.encode("ascii"),
+                        kv_indices.tobytes() if not is_dummy else b"",
+                        str(aux_index).encode("ascii") if not is_dummy else b"",
+                        str(self.required_dst_info_num).encode("ascii"),
+                    ]
+                )
 
     def poll(self) -> KVPoll:
         return self.kv_mgr.check_status(self.bootstrap_room)
