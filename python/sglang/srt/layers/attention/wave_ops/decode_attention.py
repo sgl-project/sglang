@@ -692,14 +692,10 @@ def decode_attention_wave(
         max_kv_splits,
         k_buffer.shape,
         v_buffer.shape,
-        req_to_token.shape,
-        mha,
+        mha=mha,
     )
     hyperparams_0.update(get_default_scheduling_params())
     hyperparams_1.update(get_default_scheduling_params())
-
-    log2e = 1.44269504089
-    dk_sqrt = math.sqrt(1.0 / head_size)
 
     options = WaveCompileOptions(
         subs=hyperparams_0,
@@ -711,9 +707,8 @@ def decode_attention_wave(
     options = set_default_run_config(options)
     phase_0 = wave_compile(options, phase_0)
 
-    # TODO: Add scaling of QK as part of kernel.
     mb_qk = phase_0(
-        q * dk_sqrt * log2e,
+        q,
         k_buffer,
         v_buffer,
         b_req_idx,
