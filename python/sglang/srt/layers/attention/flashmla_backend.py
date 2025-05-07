@@ -325,7 +325,6 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             self.forward_metadata.block_kv_indices = self.cuda_graph_kv_indices[
                 :bs, :max_seqlen_pad
             ]
-        # todo: extend & verify with flashmla
         else:
             super().init_forward_metadata_replay_cuda_graph(
                 bs,
