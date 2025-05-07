@@ -82,7 +82,7 @@ class SamplingBatchInfo:
             [r.sampling_params.min_p for r in reqs], dtype=torch.float
         ).to(device, non_blocking=True)
         think_end_ids = torch.tensor(
-            [r.tokenizer.think_end_id or -1 for r in reqs], dtype=torch.int64
+            [getattr(r.tokenizer, "think_end_id", -1) for r in reqs], dtype=torch.int64
         ).to(device, non_blocking=True)
         num_thinking_tokens = torch.tensor([0 for _ in reqs], dtype=torch.int64).to(
             device, non_blocking=True
