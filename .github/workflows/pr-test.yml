@@ -100,7 +100,7 @@ jobs:
           bash scripts/ci_install_dependency_8_gpu.sh
 
       - name: Run test
-        timeout-minutes: 40
+        timeout-minutes: 20
         run: |
           cd test/srt
           python3 run_suite.py --suite per-commit-8-gpu
