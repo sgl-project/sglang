@@ -140,7 +140,7 @@ class EagleDraftInput:
                 req_to_token,
                 req_pool_indices,
                 paged_kernel_lens,
-                None, #kv_indptr
+                None, #kv_start_idx
                 block_kv_indices,
                 req_to_token.stride(0),
                 max_seqlen_pad,
