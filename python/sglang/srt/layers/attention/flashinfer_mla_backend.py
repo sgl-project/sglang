@@ -355,7 +355,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
 
         if self.forward_metadata.use_ragged:
             # ragged prefill
-            o, _ = self.prefill_wrapper_ragged.forward_return_lse(
+            o = self.prefill_wrapper_ragged.forward(
                 qall,
                 k.view(-1, layer.tp_k_head_num, layer.head_dim),
                 v.view(-1, layer.tp_k_head_num, layer.v_head_dim),
