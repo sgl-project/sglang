@@ -173,7 +173,9 @@ class SamplingBatchInfo:
             self.num_thinking_tokens,
             out=self.num_thinking_tokens,
         )
-        should_stop = has_budget & (self.num_thinking_tokens - 1 > self.thinking_budgets)
+        should_stop = has_budget & (
+            self.num_thinking_tokens - 1 > self.thinking_budgets
+        )
         next_token_logits.masked_fill_(should_stop.unsqueeze(0), float("-inf"))
         batch_indices = torch.nonzero(should_stop, as_tuple=True)[0]
         if len(batch_indices) > 0:

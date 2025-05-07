@@ -4,14 +4,9 @@ python3 -m unittest test_thinking_budget.TestThinkingBudget.test_chat_completion
 """
 
 import unittest
-import requests
 
+import requests
 from transformers import AutoTokenizer
-import requests
-
-# generate an answer
-
-
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
@@ -20,6 +15,9 @@ from sglang.test.test_utils import (
     CustomTestCase,
     popen_launch_server,
 )
+
+# generate an answer
+
 
 class TestThinkingBudget(CustomTestCase):
     @classmethod
@@ -42,7 +40,7 @@ class TestThinkingBudget(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
-    
+
     def test_chat_completion_with_thinking_budget_20(self):
         # Test non-streaming with "enable_thinking": True, reasoning_content should not be empty
         client = requests.post(
@@ -50,7 +48,9 @@ class TestThinkingBudget(CustomTestCase):
             headers={"Authorization": f"Bearer {self.api_key}"},
             json={
                 "model": self.model,
-                "messages": [{"role": "user", "content": "9.11 and 9.8, which is greater?"}],
+                "messages": [
+                    {"role": "user", "content": "9.11 and 9.8, which is greater?"}
+                ],
                 "temperature": 0,
                 "separate_reasoning": True,
                 "chat_template_kwargs": {"enable_thinking": True},
@@ -75,7 +75,9 @@ class TestThinkingBudget(CustomTestCase):
             headers={"Authorization": f"Bearer {self.api_key}"},
             json={
                 "model": self.model,
-                "messages": [{"role": "user", "content": "9.11 and 9.8, which is greater?"}],
+                "messages": [
+                    {"role": "user", "content": "9.11 and 9.8, which is greater?"}
+                ],
                 "temperature": 0,
                 "separate_reasoning": True,
                 "chat_template_kwargs": {"enable_thinking": True},
@@ -91,6 +93,7 @@ class TestThinkingBudget(CustomTestCase):
             200,
             f"Reasoning content length {len(tokens)} not equal to 200, tokens: {tokens}, reasoning_content: {reasoning_content}",
         )
+
 
 if __name__ == "__main__":
     unittest.main()
