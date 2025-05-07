@@ -18,42 +18,40 @@ KV caching events
 """
 
 import atexit
+import logging
 import queue
 import threading
 import time
-import logging
 from abc import ABC, abstractmethod
 from collections import deque
 from itertools import count
 from queue import Queue
-from pydantic import BaseModel
 from typing import Any, Callable, Optional, Union
 
 import msgspec
 import zmq
-
-# from vllm.config import KVEventsConfig
-# from vllm.logger import init_logger
+from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
 
 
 class EventBatch(
-        msgspec.Struct,
-        array_like=True,  # type: ignore[call-arg]
-        omit_defaults=True,  # type: ignore[call-arg]
-        gc=False,  # type: ignore[call-arg]
+    msgspec.Struct,
+    array_like=True,  # type: ignore[call-arg]
+    omit_defaults=True,  # type: ignore[call-arg]
+    gc=False,  # type: ignore[call-arg]
 ):
     ts: float
     events: list[Any]
 
 
 class KVCacheEvent(
-        msgspec.Struct,
-        array_like=True,  # type: ignore[call-arg]
-        omit_defaults=True,  # type: ignore[call-arg]
-        gc=False,  # type: ignore[call-arg]
-        tag=True):
+    msgspec.Struct,
+    array_like=True,  # type: ignore[call-arg]
+    omit_defaults=True,  # type: ignore[call-arg]
+    gc=False,  # type: ignore[call-arg]
+    tag=True,
+):
     """Base class for all KV cache-related events"""
 
 
@@ -126,6 +124,7 @@ class ZmqEventPublisher(EventPublisher):
     topic:
         Topic to publish events to.
     """
+
     SHUTDOWN_TIMEOUT: float = 1.0
     END_SEQ = (-1).to_bytes(8, "big", signed=True)
 
@@ -152,17 +151,17 @@ class ZmqEventPublisher(EventPublisher):
 
         # Payload
         self._seq_gen = count()
-        self._topic_bytes = topic.encode('utf-8')
+        self._topic_bytes = topic.encode("utf-8")
 
         # Thread
         self._running = True
         logger.info("Starting ZMQ publisher thread")
 
-        self._thread = threading.Thread(target=self._publisher_thread,
-                                        daemon=True,
-                                        name="zmq-publisher")
+        self._thread = threading.Thread(
+            target=self._publisher_thread, daemon=True, name="zmq-publisher"
+        )
         self._thread.start()
-        
+
         atexit.register(self.shutdown)
 
     def publish(self, events: EventBatch) -> None:
@@ -210,9 +209,12 @@ class ZmqEventPublisher(EventPublisher):
             self._pub.set_hwm(self._hwm)
             # Heuristic: bind if wildcard / * present, else connect.
             # bind stable, connect volatile convention
-            if ("*" in self._endpoint or "::" in self._endpoint
-                    or self._endpoint.startswith("ipc://")
-                    or self._endpoint.startswith("inproc://")):
+            if (
+                "*" in self._endpoint
+                or "::" in self._endpoint
+                or self._endpoint.startswith("ipc://")
+                or self._endpoint.startswith("inproc://")
+            ):
                 self._pub.bind(self._endpoint)
             else:
                 self._pub.connect(self._endpoint)
@@ -253,8 +255,7 @@ class ZmqEventPublisher(EventPublisher):
 
                 payload = self._pack.encode(event)
                 seq_bytes = seq.to_bytes(8, "big")
-                self._pub.send_multipart(
-                    (self._topic_bytes, seq_bytes, payload))
+                self._pub.send_multipart((self._topic_bytes, seq_bytes, payload))
 
                 self._buffer.append((seq, payload))
                 self._event_queue.task_done()
@@ -281,10 +282,12 @@ class ZmqEventPublisher(EventPublisher):
                 # (identity, empty_delim) are stripped off by the router
                 # receiving payload is (seq_bytes, payload)
                 self._replay.send_multipart(
-                    (client_id, b"", seq.to_bytes(8, "big"), buf))
+                    (client_id, b"", seq.to_bytes(8, "big"), buf)
+                )
         # Send end of sequence marker
         # receiving payload is (-1, b""")
         self._replay.send_multipart((client_id, b"", self.END_SEQ, b""))
+
 
 class KVEventsConfig(BaseModel):
     """Configuration for KV event publishing."""
@@ -325,6 +328,7 @@ class KVEventsConfig(BaseModel):
         """Parse the CLI value for the event publisher config."""
         return KVEventsConfig.model_validate_json(cli_value)
 
+
 class EventPublisherFactory:
     _registry: dict[str, Callable[..., EventPublisher]] = {
         "null": NullEventPublisher,
@@ -332,8 +336,7 @@ class EventPublisherFactory:
     }
 
     @classmethod
-    def register_publisher(cls, name: str,
-                           ctor: Callable[..., EventPublisher]) -> None:
+    def register_publisher(cls, name: str, ctor: Callable[..., EventPublisher]) -> None:
         if name in cls._registry:
             raise KeyError(f"publisher '{name}' already registered")
         cls._registry[name] = ctor

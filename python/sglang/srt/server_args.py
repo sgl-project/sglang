@@ -765,7 +765,8 @@ class ServerArgs:
             "--kv-events-config",
             type=str,
             default=None,
-            help="The configurations for event publishing.")
+            help="The configurations for event publishing.",
+        )
         parser.add_argument(
             "--decode-log-interval",
             type=int,

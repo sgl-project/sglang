@@ -27,11 +27,15 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.disaggregation.kv_events import (
+    AllBlocksCleared,
+    BlockRemoved,
+    BlockStored,
+    KVCacheEvent,
+)
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPoolAllocator
-from sglang.srt.disaggregation.kv_events import (AllBlocksCleared, BlockRemoved,
-                                                 BlockStored, KVCacheEvent)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -461,13 +465,15 @@ class RadixCache(BasePrefixCache):
         if self.enable_kv_cache_events:
             block_hash = hash(tuple(node.key))
             parent_block_hash = hash(tuple(node.parent.key))
-            self.kv_event_queue.append(BlockStored(
-                block_hashes=[block_hash],
-                parent_block_hash=parent_block_hash,
-                token_ids=node.key,
-                block_size=len(node.key),
-                lora_id=None,
-            ))
+            self.kv_event_queue.append(
+                BlockStored(
+                    block_hashes=[block_hash],
+                    parent_block_hash=parent_block_hash,
+                    token_ids=node.key,
+                    block_size=len(node.key),
+                    lora_id=None,
+                )
+            )
 
     def _record_remove_event(self, node: TreeNode):
         if self.enable_kv_cache_events:
@@ -477,10 +483,10 @@ class RadixCache(BasePrefixCache):
     def _record_all_cleared_event(self):
         if self.enable_kv_cache_events:
             self.kv_event_queue.append(AllBlocksCleared())
-    
+
     def take_events(self):
         """Atomically takes all events and clears the queue.
-        
+
         Returns:
             A list of KV cache events.
         """

@@ -42,6 +42,7 @@ from sglang.srt.disaggregation.decode import (
     DecodeTransferQueue,
     SchedulerDisaggregationDecodeMixin,
 )
+from sglang.srt.disaggregation.kv_events import EventPublisherFactory, KVEventBatch
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
@@ -119,7 +120,6 @@ from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
-from sglang.srt.disaggregation.kv_events import EventPublisherFactory, KVEventBatch
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
@@ -559,7 +559,7 @@ class Scheduler(
                     "engine_type": engine_type,
                 },
             )
-    
+
     def init_kv_events(self, kv_events_config: Optional[str]):
         if self.enable_kv_cache_events:
             self.kv_event_publisher = EventPublisherFactory.create(kv_events_config)
@@ -2173,7 +2173,7 @@ class Scheduler(
         if self.pp_size > 1:
             prefix += f" PP{self.pp_rank}"
         return prefix
-    
+
     def _publish_kv_events(self):
         if self.enable_kv_cache_events:
             events = self.tree_cache.take_events()
