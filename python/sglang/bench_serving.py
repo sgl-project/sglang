@@ -350,9 +350,7 @@ async def async_request_sglang_generate(
         }
 
         # Add image data if available
-        if request_func_input.image_data and request_func_input.image_data.startswith(
-            "data:image"
-        ):
+        if request_func_input.image_data:
             payload["image_data"] = request_func_input.image_data
 
         headers = get_auth_headers()
@@ -677,25 +675,22 @@ def sample_mmmu_requests(
 
             if image is not None:
                 if hasattr(image, "save"):
-                    try:
-                        # Convert RGBA images to RGB before encoding
-                        if image.mode == "RGBA":
-                            image = image.convert("RGB")
+                    # Convert RGBA images to RGB before encoding
+                    if image.mode == "RGBA":
+                        image = image.convert("RGB")
 
-                        # Encode image to base64
-                        buffered = io.BytesIO()
-                        image.save(buffered, format="JPEG")
-                        img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
-                        image_path = f"data:image/jpeg;base64,{img_str}"
-                    except Exception as e:
-                        continue
+                    # Encode image to base64
+                    buffered = io.BytesIO()
+                    image.save(buffered, format="JPEG")
+                    img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
+                    image_path = f"data:image/jpeg;base64,{img_str}"
                 else:
                     continue
 
-                # Extract the question and options
+                # Extract the question
                 question = example.get("question")
 
-                # Create the prompt with image, question and options
+                # Create the prompt with image, question
                 prompt = f"Question: {question}\n\nAnswer: "
                 prompt = tokenizer.apply_chat_template(
                     [
@@ -1140,9 +1135,9 @@ async def benchmark(
     if "<image>" in test_prompt:
         import re
 
-        image_match = re.search(r"<image>(.*?)</image>", test_prompt)
+        image_match = re.search(r"<image>(.*?)</image>(.*)", test_prompt)
         image_data = image_match.group(1) if image_match else None
-        test_prompt = test_prompt.split("</image>")[-1]
+        test_prompt = image_match.group(2) if image_match else test_prompt
     else:
         image_data = None
 
@@ -1209,11 +1204,11 @@ async def benchmark(
         if "<image>" in prompt:
             import re
 
-            image_match = re.search(r"<image>(.*?)</image>", prompt)
+            image_match = re.search(r"<image>(.*?)</image>(.*)", prompt)
             image_data = image_match.group(1) if image_match else None
-            prompt = prompt.split("</image>")[-1]
+            prompt = image_match.group(2) if image_match else prompt
         else:
-            image_data = None
+            continue
 
         request_func_input = RequestFuncInput(
             model=model_id,
