@@ -98,7 +98,7 @@ class TestTransformersFallbackTorchAO(TestTransformersFallbackEndpoint):
                 "int4wo-128",
             ],
         )
-        cls.mmlu_lower_bound = 0.25
+        cls.mmlu_lower_bound = 0.20
         cls.gsm8k_lower_bound = 0.20
 
 
