@@ -162,3 +162,9 @@ def register_disaggregation_server(
         warnings.warn(
             f"Failed to register disaggregation server: {res.status_code} {res.text}"
         )
+
+
+def is_mla_backend(target_kv_pool) -> bool:
+    from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+
+    return isinstance(target_kv_pool, MLATokenToKVPool)

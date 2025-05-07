@@ -110,6 +110,7 @@ class MooncakeKVManager(BaseKVManager):
         args: KVArgs,
         disaggregation_mode: DisaggregationMode,
         server_args: ServerArgs,
+        is_mla_backend: Optional[bool] = False,
     ):
         self.kv_args = args
         self.engine = MooncakeTransferEngine(
@@ -117,6 +118,7 @@ class MooncakeKVManager(BaseKVManager):
             gpu_id=self.kv_args.gpu_id,
             ib_device=self.kv_args.ib_device,
         )
+        self.is_mla_backend = is_mla_backend
         self.disaggregation_mode = disaggregation_mode
         # for p/d multi node infer
         self.bootstrap_port = server_args.disaggregation_bootstrap_port
@@ -527,6 +529,9 @@ class MooncakeKVReceiver(BaseKVReceiver):
             )
             self.required_dst_info_num = 1
         elif local_tp_size_per_dp_rank > prefill_tp_size_per_dp_rank:
+            assert (
+                self.kv_mgr.is_mla_backend
+            ), "PD with different TP sizes per DP rank is not yet supported for non-MLA models"
             self.target_tp_rank = (
                 self.kv_mgr.kv_args.engine_rank % local_tp_size_per_dp_rank
             ) // (local_tp_size_per_dp_rank // prefill_tp_size_per_dp_rank)
@@ -538,6 +543,9 @@ class MooncakeKVReceiver(BaseKVReceiver):
             assert (
                 local_tp_size_per_dp_rank < prefill_tp_size_per_dp_rank
             ), "decode_tp_size_per_dp_rank < prefill_tp_size_per_dp_rank is not supported yet"
+            assert (
+                self.kv_mgr.is_mla_backend
+            ), "PD with different TP sizes per DP rank is not yet supported for non-MLA models"
 
             # For non-MLA models, one decode rank needs to retrieve KVCache from multiple prefill ranks for non MLA models;
             self.target_tp_ranks = [
@@ -549,6 +557,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
                     * (prefill_tp_size_per_dp_rank // local_tp_size_per_dp_rank),
                 )
             ]
+
             # For MLA models, we can retrieve KVCache from only one prefill rank, but we still need to maintain
             # multiple connections in the connection pool and have to send dummy requests to other prefill ranks,
             # or the KVPoll will never be set correctly
