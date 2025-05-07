@@ -77,7 +77,7 @@ FetchContent_Populate(repo-flash-attention)
 FetchContent_Declare(
     repo-flashmla
     GIT_REPOSITORY https://github.com/deepseek-ai/FlashMLA.git
-    GIT_TAG        main
+    GIT_TAG        9edee0c022cd0938148a18e334203b0aab43aa19
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-flashmla)
