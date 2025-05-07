@@ -29,6 +29,7 @@ from sglang.srt.utils import (
     get_device_name,
     is_cuda,
     is_hip,
+    log_info_on_rank0,
     supports_custom_op,
 )
 
@@ -685,10 +686,7 @@ def get_w8a8_block_fp8_configs(
     )
     if os.path.exists(config_file_path):
         with open(config_file_path) as f:
-            logger.info(
-                "Using configuration from %s for W8A8 Block FP8 kernel.",
-                config_file_path,
-            )
+            log_info_on_rank0(f"Using configuration from {config_file_path} for W8A8 Block FP8 kernel.")
             # If a configuration has been found, return it
             return {int(key): val for key, val in json.load(f).items()}
 
