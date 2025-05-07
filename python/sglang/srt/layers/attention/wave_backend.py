@@ -93,7 +93,7 @@ class WaveAttnBackend(AttentionBackend):
     ):
         # Lazy import to avoid the initialization of cuda context
         # TODO: Switch to wave decode.
-        from sglang.srt.layers.attention.wave_ops.decode_attention import (
+        from sglang.srt.layers.attention.triton_ops.decode_attention import (
             decode_attention_fwd,
         )
         from sglang.srt.layers.attention.wave_ops.extend_attention import (
@@ -210,12 +210,12 @@ class WaveAttnBackend(AttentionBackend):
                 bs = kv_indptr.shape[0] - 1
 
             attn_logits = torch.empty(
-                (self.max_kv_splits, bs, self.v_head_dim, self.num_head),
+                (bs, self.num_head, self.max_kv_splits, self.v_head_dim),
                 dtype=torch.float32,
                 device=self.device,
             )
             attn_lse = torch.empty(
-                (self.max_kv_splits, bs, self.num_head),
+                (bs, self.num_head, self.max_kv_splits),
                 dtype=torch.float32,
                 device=self.device,
             )
