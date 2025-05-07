@@ -273,12 +273,13 @@ class Scheduler(
             self.recv_from_rpc = get_zmq_socket(
                 context, zmq.DEALER, port_args.rpc_ipc_name, False
             )
-            self.idle_sleeper = IdleSleeper(
-                [
-                    self.recv_from_tokenizer,
-                    self.recv_from_rpc,
-                ]
-            )
+            if self.server_args.sleep_on_idle:
+                self.idle_sleeper = IdleSleeper(
+                    [
+                        self.recv_from_tokenizer,
+                        self.recv_from_rpc,
+                    ]
+                )
         else:
             self.recv_from_tokenizer = None
             self.recv_from_rpc = None
