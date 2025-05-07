@@ -472,8 +472,6 @@ class FlashMLAMultiStepDraftBackend:
             device=model_runner.device,
         )
 
-        # todo: kv_last_page_len_buf?
-
         self.attn_backends = []
         for i in range(self.speculative_num_steps):
             self.attn_backends.append(
