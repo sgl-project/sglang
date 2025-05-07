@@ -127,6 +127,7 @@ class ServerArgs:
 
     # Kernel backend
     attention_backend: Optional[str] = None
+    enable_flashinfer_attention_decode: bool = False
     sampling_backend: Optional[str] = None
     grammar_backend: Optional[str] = None
 
@@ -872,6 +873,11 @@ class ServerArgs:
             ],
             default=ServerArgs.attention_backend,
             help="Choose the kernels for attention layers.",
+        )
+        parser.add_argument(
+            "--enable-flashinfer-attention-decode",
+            action="store_true",
+            help="Use flashinfer attention backend for decode, it's only suggested for Qwen3-series in H20.",
         )
         parser.add_argument(
             "--sampling-backend",

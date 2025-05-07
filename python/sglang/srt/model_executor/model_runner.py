@@ -143,6 +143,7 @@ class ModelRunner:
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
         self.attention_chunk_size = model_config.attention_chunk_size
+        self.decode_attn_backend = None
 
         # Model-specific adjustment
         self.model_specific_adjustment()
@@ -977,7 +978,7 @@ class ModelRunner:
             raise ValueError(
                 f"Invalid attention backend: {self.server_args.attention_backend}"
             )
-        if not self.use_mla_backend:
+        if self.server_args.enable_flashinfer_attention_decode:
             from sglang.srt.layers.attention.flashinfer_backend import (
                     FlashInferAttnBackend,
                 )

@@ -211,9 +211,13 @@ class CudaGraphRunner:
         # Attention backend
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
-        self.model_runner.decode_attn_backend.init_cuda_graph_state(self.max_num_token)
+        if self.model_runner.decode_attn_backend is None:
+            self.decode_attn_backend = self.model_runner.attn_backend
+        else:
+            self.decode_attn_backend = self.model_runner.decode_attn_backend
+        self.decode_attn_backend.init_cuda_graph_state(self.max_num_token)
         self.seq_len_fill_value = (
-            self.model_runner.decode_attn_backend.get_cuda_graph_seq_len_fill_value()
+            self.decode_attn_backend.get_cuda_graph_seq_len_fill_value()
         )
         # FIXME(lsyin): leave it here for now, I don't know whether it is necessary
         self.encoder_len_fill_value = 0
@@ -445,7 +449,7 @@ class CudaGraphRunner:
             seq_lens=seq_lens,
             req_to_token_pool=self.model_runner.req_to_token_pool,
             token_to_kv_pool=self.model_runner.token_to_kv_pool,
-            attn_backend=self.model_runner.decode_attn_backend,
+            attn_backend=self.decode_attn_backend,
             out_cache_loc=out_cache_loc,
             seq_lens_sum=seq_lens.sum(),
             encoder_lens=encoder_lens,
@@ -464,7 +468,7 @@ class CudaGraphRunner:
             self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
 
         # Attention backend
-        self.model_runner.decode_attn_backend.init_forward_metadata_capture_cuda_graph(
+        self.decode_attn_backend.init_forward_metadata_capture_cuda_graph(
             bs,
             num_tokens,
             req_pool_indices,
@@ -574,7 +578,7 @@ class CudaGraphRunner:
             self.hidden_states[:raw_num_token] = forward_batch.spec_info.hidden_states
 
         # Attention backend
-        self.model_runner.decode_attn_backend.init_forward_metadata_replay_cuda_graph(
+        self.decode_attn_backend.init_forward_metadata_replay_cuda_graph(
             bs,
             self.req_pool_indices,
             self.seq_lens,
