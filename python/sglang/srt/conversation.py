@@ -853,7 +853,7 @@ register_conv_template(
 
 
 @register_conv_template_matching_function
-def match_deepseek_janus_pro(model_path: str):
+def match_llama_3_vision(model_path: str):
     if (
         "llama" in model_path.lower()
         and "3.2" in model_path.lower()
