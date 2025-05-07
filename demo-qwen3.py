@@ -16,6 +16,7 @@ response = client.chat.completions.create(
     extra_body={
         "chat_template_kwargs": {"enable_thinking": True},
         "separate_reasoning": True,
+        "thinking_budget": 1000,
     },
 )
 
@@ -132,3 +133,6 @@ $$
 # TODO: Add doc
 # TODO: Add test
 # TODO: 模仿stop_token_ids进行实现
+
+# Q: 如何强行插入一个token？
+# A: 通过修改mask

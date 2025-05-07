@@ -13,20 +13,30 @@
 # ==============================================================================
 """The baseclass of a backend for reasoner grammar-guided constrained decoding."""
 
+import logging
 from concurrent.futures import Future
 from typing import List, Optional, Tuple
 
 import torch
 
-from .base_grammar_backend import BaseGrammarBackend, BaseGrammarObject
+from .base_grammar_backend import BaseGrammarBackend, BaseGrammarObject, CacheKey
+
+logger = logging.getLogger(__name__)
 
 
 class ReasonerGrammarObject(BaseGrammarObject):
-    def __init__(self, grammar: BaseGrammarObject, think_end_id):
+    def __init__(
+        self,
+        grammar: BaseGrammarObject,
+        think_end_id,
+        thinking_budget: Optional[int] = None,
+    ):
         super().__init__()
         self.grammar = grammar
         self.think_end_id = think_end_id
         self.is_in_reasoning = True
+        self.thinking_budget = thinking_budget
+        self.num_thinking_tokens = 0
 
     @property
     def finished(self):
@@ -55,9 +65,11 @@ class ReasonerGrammarObject(BaseGrammarObject):
     def accept_token(self, token: int):
         if token == self.think_end_id:
             self.is_in_reasoning = False
+            logger.info(f"num_thinking_tokens: {self.num_thinking_tokens}")
 
         if not self.is_in_reasoning and token != self.think_end_id:
             self.grammar.accept_token(token)
+            self.num_thinking_tokens += 1
 
     def try_jump_forward(self, tokenizer):
         return self.grammar.try_jump_forward(tokenizer)
@@ -81,16 +93,22 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
         self.grammar_backend = grammar_backend
         self.think_end_id = think_end_id
 
-    def get_cached_value(self, key: Tuple[str, str]) -> Optional[ReasonerGrammarObject]:
+    def get_cached_value(self, key: CacheKey) -> Optional[ReasonerGrammarObject]:
         grammar = self.grammar_backend.get_cached_value(key)
-        return ReasonerGrammarObject(grammar, self.think_end_id) if grammar else None
+        return (
+            ReasonerGrammarObject(grammar, self.think_end_id, key[2])
+            if grammar
+            else None
+        )
 
-    def get_future_value(self, key: Tuple[str, str]) -> Future:
+    def get_future_value(self, key: CacheKey) -> Future:
         grammar = Future()
 
         def callback(f: Future):
             if result := f.result():
-                grammar.set_result(ReasonerGrammarObject(result, self.think_end_id))
+                grammar.set_result(
+                    ReasonerGrammarObject(result, self.think_end_id, key[2])
+                )
             else:
                 grammar.set_result(None)
 
