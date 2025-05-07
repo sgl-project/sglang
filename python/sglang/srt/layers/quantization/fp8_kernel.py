@@ -687,7 +687,8 @@ def get_w8a8_block_fp8_configs(
     if os.path.exists(config_file_path):
         with open(config_file_path) as f:
             log_info_on_rank0(
-                f"Using configuration from {config_file_path} for W8A8 Block FP8 kernel."
+                logger,
+                f"Using configuration from {config_file_path} for W8A8 Block FP8 kernel.",
             )
             # If a configuration has been found, return it
             return {int(key): val for key, val in json.load(f).items()}

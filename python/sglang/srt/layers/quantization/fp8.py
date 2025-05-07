@@ -64,6 +64,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cuda,
     is_hip,
+    log_info_on_rank0,
     print_warning_once,
     set_weight_attrs,
 )
@@ -97,10 +98,7 @@ class Fp8Config(QuantizationConfig):
     ) -> None:
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
         if is_checkpoint_fp8_serialized:
-            logger.warning(
-                "Detected fp8 checkpoint. Please note that the "
-                "format is experimental and subject to change."
-            )
+            log_info_on_rank0(logger, "Detected fp8 checkpoint.")
         if activation_scheme not in ACTIVATION_SCHEMES:
             raise ValueError(f"Unsupported activation scheme {activation_scheme}")
         self.activation_scheme = activation_scheme
