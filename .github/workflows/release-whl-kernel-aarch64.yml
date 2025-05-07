@@ -13,7 +13,7 @@ on:
         required: false
 
 concurrency:
-  group: release-sglang-kernels-${{ github.ref }}
+  group: release-sglang-kernels-aarch64-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
