@@ -1141,9 +1141,7 @@ class ModelRunner:
                 axis=-1,
             )
         sampling_info = forward_batch.sampling_info
-        if any(b > 0 for b in sampling_info.thinking_budgets):
-            sampling_info.apply_thinking_budgets(logits_output.next_token_logits)
-
+        sampling_info.apply_thinking_budgets(logits_output.next_token_logits)
         self._preprocess_logits(logits_output, forward_batch.sampling_info)
 
         # Sample the next tokens
@@ -1155,7 +1153,6 @@ class ModelRunner:
             forward_batch.token_ids_logprobs,
         )
         sampling_info.update_thinking_budgets(next_token_ids)
-        
         return next_token_ids
 
     @property

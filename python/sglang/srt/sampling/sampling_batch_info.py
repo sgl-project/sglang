@@ -166,12 +166,16 @@ class SamplingBatchInfo:
 
     def apply_thinking_budgets(self, next_token_logits: torch.Tensor):
         has_budget = self.thinking_budgets > 0
+        if not has_budget.any():
+            return
         self.num_thinking_tokens[has_budget] += 1
         should_stop = self.num_thinking_tokens > self.thinking_budgets
         next_token_logits[should_stop, :] = float("-inf")
         next_token_logits[should_stop, self.think_end_ids[should_stop]] = 0.0
 
     def update_thinking_budgets(self, next_token_ids: torch.Tensor):
+        if not torch.any(self.thinking_budgets > 0):
+            return
         stopped = next_token_ids == self.think_end_ids
         self.thinking_budgets[stopped] = -1
 
