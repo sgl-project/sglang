@@ -2097,6 +2097,7 @@ class BumpAllocator:
         self._pointer += size
         return output
 
+
 def log_info_on_rank0(logger, msg):
     from sglang.srt.distributed import get_tensor_model_parallel_rank
 

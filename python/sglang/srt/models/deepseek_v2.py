@@ -1488,7 +1488,9 @@ class DeepseekV2ForCausalLM(nn.Module):
             ):
                 self.n_share_experts_fusion = 0
                 global_server_args_dict["n_share_experts_fusion"] = 0
-                log_info_on_rank0("Only Deepseek V3/R1 can use shared experts fusion optimization. Shared experts fusion optimization is disabled.")
+                log_info_on_rank0(
+                    "Only Deepseek V3/R1 can use shared experts fusion optimization. Shared experts fusion optimization is disabled."
+                )
             else:
                 assert (
                     self.n_share_experts_fusion == self.tp_size
@@ -1502,7 +1504,9 @@ class DeepseekV2ForCausalLM(nn.Module):
             ):
                 self.n_share_experts_fusion = self.tp_size
                 global_server_args_dict["n_share_experts_fusion"] = self.tp_size
-                log_info_on_rank0("Deepseek V3/R1 with fp8 can use shared experts fusion optimization when SM version >=90. Shared experts fusion optimization is enabled.")
+                log_info_on_rank0(
+                    "Deepseek V3/R1 with fp8 can use shared experts fusion optimization when SM version >=90. Shared experts fusion optimization is enabled."
+                )
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
