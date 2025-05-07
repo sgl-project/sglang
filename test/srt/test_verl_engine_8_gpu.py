@@ -42,15 +42,12 @@ CI_MODELS = [
     dict(
         model_path="Qwen/Qwen2.5-0.5B",
         dp_size=4,
+        tp_size=2, #default to 2
     ),
     # Fail to run gemma-2-2b after transformers==4.48.3 -> 4.50.0
     # dict(model_path="google/gemma-2-2b"),
 ]
 ALL_OTHER_MODELS = [
-    dict(
-        model_path="Qwen/Qwen2.5-0.5B",
-        dp_size=4,
-    ),
     dict(
         model_path="Qwen/Qwen2.5-14B-Instruct",
         mem_fraction_static=0.4,
