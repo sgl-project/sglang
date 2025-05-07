@@ -87,7 +87,6 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
 
         bs = forward_batch.batch_size
-        spec_info = forward_batch.spec_info
         if forward_batch.forward_mode.is_decode_or_idle():
             max_seqlen_pad = triton.cdiv(
                 forward_batch.seq_lens_cpu.max().item(), PAGE_SIZE
@@ -442,7 +441,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 )
             return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
-
+#TODO: multi step kv indices optimization
 class FlashMLAMultiStepDraftBackend:
     """
     Wrap multiple flashmla attention backends as one for multiple consecutive
@@ -463,8 +462,6 @@ class FlashMLAMultiStepDraftBackend:
             )
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
-        self.generate_draft_decode_kv_indices = generate_draft_decode_kv_indices
-
         max_bs = model_runner.req_to_token_pool.size * self.topk
         self.kv_indptr = torch.zeros(
             (
@@ -488,67 +485,29 @@ class FlashMLAMultiStepDraftBackend:
                 )
             )
 
-        # todo: ???
-        self.max_context_len = self.attn_backends[0].max_context_len
-
-        # Cached variables for generate_draft_decode_kv_indices
-        self.pool_len = model_runner.req_to_token_pool.req_to_token.shape[1]
-
     def common_template(
         self,
         forward_batch: ForwardBatch,
-        kv_indices_buffer: torch.Tensor,
         call_fn: Callable,
     ):
-        num_seqs = forward_batch.batch_size
-        bs = self.topk * num_seqs
-        seq_lens_sum = forward_batch.seq_lens_sum
-
         assert forward_batch.spec_info is not None
         assert isinstance(forward_batch.spec_info, EagleDraftInput)
 
         for i in range(self.speculative_num_steps - 1):
-            forward_batch.spec_info.kv_indptr = self.kv_indptr[i, : bs + 1]
-            forward_batch.spec_info.kv_indices = kv_indices_buffer[i][
-                : seq_lens_sum * self.topk + bs * (i + 1)
-            ]
             call_fn(i, forward_batch)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        max_blocks_per_seq = (self.max_context_len + PAGE_SIZE - 1) // PAGE_SIZE
-        kv_indices = torch.zeros(
-            (
-                self.speculative_num_steps,
-                forward_batch.batch_size * self.topk * max_blocks_per_seq * PAGE_SIZE,
-            ),
-            dtype=torch.int32,
-            device="cuda",
-        )
-
         def call_fn(i, forward_batch):
             assert forward_batch.spec_info is not None
             assert isinstance(forward_batch.spec_info, EagleDraftInput)
-            forward_batch.spec_info.kv_indptr = (
-                forward_batch.spec_info.kv_indptr.clone()
-            )
-            forward_batch.spec_info.kv_indices = (
-                forward_batch.spec_info.kv_indices.clone()
-            )
             self.attn_backends[i].init_forward_metadata(forward_batch)
 
-        self.common_template(forward_batch, kv_indices, call_fn)
+        self.common_template(forward_batch, call_fn)
 
     def init_cuda_graph_state(self, max_bs: int):
-        max_blocks_per_seq = (self.max_context_len + PAGE_SIZE - 1) // PAGE_SIZE
-        self.cuda_graph_kv_indices = torch.zeros(
-            (self.speculative_num_steps, max_bs, max_blocks_per_seq),
-            dtype=torch.int32,
-            device="cuda",
-        )
-
         for i in range(self.speculative_num_steps):
             self.attn_backends[i].init_cuda_graph_state(
-                max_bs, block_kv_indices=self.cuda_graph_kv_indices[i]
+                max_bs, block_kv_indices=None
             )
 
     def init_forward_metadata_capture_cuda_graph(self, forward_batch: ForwardBatch):
@@ -563,7 +522,7 @@ class FlashMLAMultiStepDraftBackend:
                 spec_info=forward_batch.spec_info,
             )
 
-        self.common_template(forward_batch, self.cuda_graph_kv_indices, call_fn)
+        self.common_template(forward_batch, call_fn)
 
     def init_forward_metadata_replay_cuda_graph(
         self, forward_batch: ForwardBatch, bs: int
@@ -580,4 +539,4 @@ class FlashMLAMultiStepDraftBackend:
                 seq_lens_cpu=forward_batch.seq_lens_cpu,
             )
 
-        self.common_template(forward_batch, self.cuda_graph_kv_indices, call_fn)
+        self.common_template(forward_batch, call_fn)
