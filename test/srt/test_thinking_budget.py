@@ -1,6 +1,7 @@
 """
 Usage:
-python3 -m unittest test_thinking_budget.TestThinkingBudget.test_chat_completion_with_thinking_budget
+python3 -m unittest test_thinking_budget.TestThinkingBudget.test_chat_completion_with_thinking_budget_20
+python3 -m unittest test_thinking_budget.TestThinkingBudget.test_chat_completion_with_thinking_budget_200
 """
 
 import unittest
@@ -15,8 +16,6 @@ from sglang.test.test_utils import (
     CustomTestCase,
     popen_launch_server,
 )
-
-# generate an answer
 
 
 class TestThinkingBudget(CustomTestCase):
@@ -42,8 +41,7 @@ class TestThinkingBudget(CustomTestCase):
         kill_process_tree(cls.process.pid)
 
     def test_chat_completion_with_thinking_budget_20(self):
-        # Test non-streaming with "enable_thinking": True, reasoning_content should not be empty
-        client = requests.post(
+        response = requests.post(
             f"{self.base_url}/v1/chat/completions",
             headers={"Authorization": f"Bearer {self.api_key}"},
             json={
@@ -57,8 +55,8 @@ class TestThinkingBudget(CustomTestCase):
                 "thinking_budget": 20,
             },
         )
-        self.assertEqual(client.status_code, 200, f"Failed with: {client.text}")
-        data = client.json()
+        self.assertEqual(response.status_code, 200, f"Failed with: {response.text}")
+        data = response.json()
         reasoning_content = data["choices"][0]["message"]["reasoning_content"]
         tokens = self.tokenizer.encode(reasoning_content)
         self.assertEqual(
@@ -68,9 +66,7 @@ class TestThinkingBudget(CustomTestCase):
         )
 
     def test_chat_completion_with_thinking_budget_200(self):
-        pass
-        # Test non-streaming with "enable_thinking": True, reasoning_content should not be empty
-        client = requests.post(
+        response = requests.post(
             f"{self.base_url}/v1/chat/completions",
             headers={"Authorization": f"Bearer {self.api_key}"},
             json={
@@ -84,8 +80,8 @@ class TestThinkingBudget(CustomTestCase):
                 "thinking_budget": 200,
             },
         )
-        self.assertEqual(client.status_code, 200, f"Failed with: {client.text}")
-        data = client.json()
+        self.assertEqual(response.status_code, 200, f"Failed with: {response.text}")
+        data = response.json()
         reasoning_content = data["choices"][0]["message"]["reasoning_content"]
         tokens = self.tokenizer.encode(reasoning_content)
         self.assertEqual(
