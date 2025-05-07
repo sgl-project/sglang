@@ -140,7 +140,7 @@ class EagleDraftInput:
                 req_to_token,
                 req_pool_indices,
                 paged_kernel_lens,
-                None,
+                None, #kv_indptr
                 block_kv_indices,
                 req_to_token.stride(0),
                 max_seqlen_pad,
@@ -153,7 +153,7 @@ class EagleDraftInput:
                 req_pool_indices,
                 paged_kernel_lens,
                 cum_kv_seq_len,
-                None,
+                None, #kv_start_idx
                 kv_indices,
                 req_to_token.size(1),
             )
@@ -328,7 +328,7 @@ class EagleVerifyInput:
                 req_to_token,
                 req_pool_indices,
                 paged_kernel_lens,
-                None,
+                None, #kv_start_idx
                 kv_indices,
                 req_to_token.stride(0),
                 max_seqlen_pad,
@@ -346,7 +346,7 @@ class EagleVerifyInput:
                 req_pool_indices,
                 paged_kernel_lens,
                 cum_kv_seq_len,
-                None,
+                None, #kv_start_idx
                 kv_indices,
                 req_to_token.size(1),
         )
