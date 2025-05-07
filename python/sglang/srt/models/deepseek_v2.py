@@ -705,6 +705,27 @@ class DeepseekV2AttentionMLA(nn.Module):
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
+        state = self.forward_absorb_stage_prepare(
+            positions,
+            hidden_states,
+            forward_batch,
+            zero_allocator,
+        )
+        return self.forward_absorb_stage_core(state, zero_allocator)
+
+    def forward_absorb_stage_prepare(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        zero_allocator: BumpAllocator,
+    ):
+        if hidden_states.shape[0] == 0:
+            assert (
+                not self.o_proj.reduce_results
+            ), "short-circuiting allreduce will lead to hangs"
+            return (hidden_states,)
+
         if self.q_lora_rank is not None:
             q, latent_cache = self.fused_qkv_a_proj_with_mqa(hidden_states)[0].split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
@@ -772,6 +793,19 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         q_nope_out = q_nope_out.transpose(0, 1)
         q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+
+        return q_nope_out, q_pe, k_nope, k_pe, forward_batch
+
+    def forward_absorb_stage_core(
+        self,
+        state,
+        zero_allocator: BumpAllocator,
+    ) -> torch.Tensor:
+        if len(state) == 1:
+            (hidden_states,) = state
+            return hidden_states
+
+        q_nope_out, q_pe, k_nope, k_pe, forward_batch = state
 
         if self.attention_backend == "fa3":
             attn_output = self.attn_mqa(
