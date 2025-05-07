@@ -68,6 +68,7 @@ class TransferInfo:
     mooncake_session_id: str
     dst_kv_indices: npt.NDArray[np.int64]
     dst_aux_index: int
+    required_dst_info_num: int
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -78,6 +79,7 @@ class TransferInfo:
             mooncake_session_id=msg[3].decode("ascii"),
             dst_kv_indices=np.frombuffer(msg[4], dtype=np.int64),
             dst_aux_index=int(msg[5].decode("ascii")),
+            required_dst_info_num=int(msg[6].decode("ascii")),
         )
 
 
@@ -274,15 +276,18 @@ class MooncakeKVManager(BaseKVManager):
                         f"Register KVArgs from {mooncake_session_id} successfully"
                     )
                     continue
-                room = int(room)
-                if room not in self.transfer_infos:
-                    self.transfer_infos[room] = {}
-                self.transfer_infos[room][mooncake_session_id] = TransferInfo.from_zmq(
-                    waiting_req_bytes
-                )
+                else:
+                    required_dst_info_num = int(waiting_req_bytes[6].decode("ascii"))
+                    room = int(room)
+                    if room not in self.transfer_infos:
+                        self.transfer_infos[room] = {}
 
-                # NOTE: after bootstrapping we can mark the req as waiting for input
-                self.request_status[room] = KVPoll.WaitingForInput
+                    self.transfer_infos[room][mooncake_session_id] = (
+                        TransferInfo.from_zmq(waiting_req_bytes)
+                    )
+                    # NOTE: after bootstrapping we can mark the req as waiting for input
+                    if len(self.transfer_infos[room]) == required_dst_info_num:
+                        self.request_status[room] = KVPoll.WaitingForInput
 
         def transfer_thread():
             # TODO: Shall we use KVPoll.Transferring state?
@@ -291,6 +296,8 @@ class MooncakeKVManager(BaseKVManager):
                     kv_chunk: TransferKVChunk = self.transfer_queue.get(timeout=0.01)
                     # Note(shangming): might need to assert MLA is used when prefill instances and decode instances have different tp_size_per_dp_rank
                     reqs_to_be_processed = self.transfer_infos[kv_chunk.room].values()
+                    polls = []
+                    dst_ranks_infos = []
                     for req in reqs_to_be_processed:
                         chunked_dst_kv_indice = req.dst_kv_indices[kv_chunk.index_slice]
                         assert len(chunked_dst_kv_indice) == len(
@@ -322,12 +329,21 @@ class MooncakeKVManager(BaseKVManager):
                                 ].dst_aux_ptrs,
                                 req.dst_aux_index,
                             )
-                            self.request_status[req.room] = (
-                                KVPoll.Success if ret == 0 else KVPoll.Failed
+                            polls.append(True if ret == 0 else False)
+                            dst_ranks_infos.append(
+                                (req.endpoint, req.dst_port, req.room)
                             )
-                            self.sync_status_to_decode_endpoint(
-                                req.endpoint, req.dst_port, req.room
-                            )
+
+                            # Only sync status when all the dst ranks have received the kvcache
+                            if len(polls) == req.required_dst_info_num:
+                                self.request_status[req.room] = (
+                                    KVPoll.Success if all(polls) else KVPoll.Failed
+                                )
+                                for endpoint, dst_port, room in dst_ranks_infos:
+                                    self.sync_status_to_decode_endpoint(
+                                        endpoint, dst_port, room
+                                    )
+
                     self.transfer_infos.pop(req.room)
 
                 except queue.Empty:
@@ -509,10 +525,14 @@ class MooncakeKVReceiver(BaseKVReceiver):
             self.target_tp_rank = (
                 self.kv_mgr.kv_args.engine_rank % local_tp_size_per_dp_rank
             )
+            self.required_dst_info_num = 1
         elif local_tp_size_per_dp_rank > prefill_tp_size_per_dp_rank:
             self.target_tp_rank = (
                 self.kv_mgr.kv_args.engine_rank % local_tp_size_per_dp_rank
             ) // (local_tp_size_per_dp_rank // prefill_tp_size_per_dp_rank)
+            self.required_dst_info_num = (
+                local_tp_size_per_dp_rank // prefill_tp_size_per_dp_rank
+            )
         else:
             # NOTE(shangming): local_tp_size_per_dp_rank < prefill_tp_size_per_dp_rank is not supported.
             assert (
@@ -533,6 +553,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
             # multiple connections in the connection pool and have to send dummy requests to other prefill ranks,
             # or the KVPoll will never be set correctly
             self.target_tp_rank = self.target_tp_ranks[0]
+            self.required_dst_info_num = 1
 
         self.target_dp_group = bootstrap_room % self.prefill_dp_size
 
@@ -646,6 +667,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
                     self.session_id.encode("ascii"),
                     kv_indices.tobytes(),
                     str(aux_index).encode("ascii"),
+                    str(self.required_dst_info_num).encode("ascii"),
                 ]
             )
 
