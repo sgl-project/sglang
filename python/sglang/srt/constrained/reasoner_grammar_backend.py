@@ -13,30 +13,20 @@
 # ==============================================================================
 """The baseclass of a backend for reasoner grammar-guided constrained decoding."""
 
-import logging
 from concurrent.futures import Future
 from typing import List, Optional, Tuple
 
 import torch
 
-from .base_grammar_backend import BaseGrammarBackend, BaseGrammarObject, CacheKey
-
-logger = logging.getLogger(__name__)
+from .base_grammar_backend import BaseGrammarBackend, BaseGrammarObject
 
 
 class ReasonerGrammarObject(BaseGrammarObject):
-    def __init__(
-        self,
-        grammar: BaseGrammarObject,
-        think_end_id,
-        thinking_budget: Optional[int] = None,
-    ):
+    def __init__(self, grammar: BaseGrammarObject, think_end_id):
         super().__init__()
         self.grammar = grammar
         self.think_end_id = think_end_id
         self.is_in_reasoning = True
-        self.thinking_budget = thinking_budget
-        self.num_thinking_tokens = 0
 
     @property
     def finished(self):
@@ -52,18 +42,6 @@ class ReasonerGrammarObject(BaseGrammarObject):
         return self.grammar.allocate_vocab_mask(vocab_size, batch_size, device)
 
     def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
-        if (
-            self.is_in_reasoning
-            and self.thinking_budget is not None
-            and self.num_thinking_tokens >= self.thinking_budget
-        ):
-            # If the thinking budget is reached, we stop thinking
-            tokens = torch.tensor([self.think_end_id], dtype=torch.int64).to(
-                vocab_mask.device, non_blocking=True
-            )
-            vocab_mask = vocab_mask[idx]
-            vocab_mask.fill_(1)
-            vocab_mask.scatter_(0, tokens, torch.zeros_like(tokens, dtype=torch.bool))
         if not self.is_in_reasoning:
             self.grammar.fill_vocab_mask(vocab_mask, idx)
 
@@ -77,9 +55,7 @@ class ReasonerGrammarObject(BaseGrammarObject):
     def accept_token(self, token: int):
         if token == self.think_end_id:
             self.is_in_reasoning = False
-            logger.info(f"num_thinking_tokens: {self.num_thinking_tokens}")
-        if self.is_in_reasoning:
-            self.num_thinking_tokens += 1
+
         if not self.is_in_reasoning and token != self.think_end_id:
             self.grammar.accept_token(token)
 
@@ -105,22 +81,16 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
         self.grammar_backend = grammar_backend
         self.think_end_id = think_end_id
 
-    def get_cached_value(self, key: CacheKey) -> Optional[ReasonerGrammarObject]:
+    def get_cached_value(self, key: Tuple[str, str]) -> Optional[ReasonerGrammarObject]:
         grammar = self.grammar_backend.get_cached_value(key)
-        return (
-            ReasonerGrammarObject(grammar, self.think_end_id, key[2])
-            if grammar
-            else None
-        )
+        return ReasonerGrammarObject(grammar, self.think_end_id) if grammar else None
 
-    def get_future_value(self, key: CacheKey) -> Future:
+    def get_future_value(self, key: Tuple[str, str]) -> Future:
         grammar = Future()
 
         def callback(f: Future):
             if result := f.result():
-                grammar.set_result(
-                    ReasonerGrammarObject(result, self.think_end_id, key[2])
-                )
+                grammar.set_result(ReasonerGrammarObject(result, self.think_end_id))
             else:
                 grammar.set_result(None)
 

@@ -18,7 +18,7 @@ from abc import ABC, abstractmethod
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from threading import Event, Lock
-from typing import Dict, List, Optional, Tuple, TypeAlias
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
@@ -109,13 +109,10 @@ class CacheEntry:
     event: Event
 
 
-CacheKey: TypeAlias = Tuple[str, str, Optional[int]]
-
-
 class BaseGrammarBackend:
     def __init__(self):
         self.executor = ThreadPoolExecutor()
-        self.cache: Dict[CacheKey, CacheEntry] = {}
+        self.cache: Dict[Tuple[str, str], CacheEntry] = {}
         self.cache_lock = Lock()
 
     def _not_supported(self, key_type: str, key_string: str) -> None:
@@ -141,8 +138,8 @@ class BaseGrammarBackend:
     def dispatch_structural_tag(self, key_string: str) -> Optional[BaseGrammarObject]:
         return self._not_supported("structural_tag", key_string)
 
-    def _init_value_dispatch(self, key: CacheKey) -> Optional[BaseGrammarObject]:
-        key_type, key_string, _ = key
+    def _init_value_dispatch(self, key: Tuple[str, str]) -> Optional[BaseGrammarObject]:
+        key_type, key_string = key
         if key_type == "json":
             return self.dispatch_json(key_string)
         elif key_type == "regex":
@@ -154,7 +151,7 @@ class BaseGrammarBackend:
         else:
             return self.dispatch_fallback(key_type, key_string)
 
-    def _init_value(self, key: CacheKey) -> Optional[BaseGrammarObject]:
+    def _init_value(self, key: Tuple[str, str]) -> Optional[BaseGrammarObject]:
         with self.cache_lock:
             if key in self.cache:
                 cache_hit = True
@@ -171,7 +168,7 @@ class BaseGrammarBackend:
             entry.event.set()
         return entry.value.copy() if entry.value else None
 
-    def get_cached_value(self, key: CacheKey) -> Optional[BaseGrammarObject]:
+    def get_cached_value(self, key: Tuple[str, str]) -> Optional[BaseGrammarObject]:
         with self.cache_lock:
             entry = self.cache.get(key)
             if not entry or not entry.event.is_set():
@@ -179,7 +176,7 @@ class BaseGrammarBackend:
             val = self.cache[key].value
             return val.copy() if val else None
 
-    def get_future_value(self, key: CacheKey) -> Future:
+    def get_future_value(self, key: Tuple[str, str]) -> Future:
         return self.executor.submit(self._init_value, key)
 
     def reset(self):

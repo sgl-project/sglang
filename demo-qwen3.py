@@ -16,7 +16,7 @@ response = client.chat.completions.create(
     extra_body={
         "chat_template_kwargs": {"enable_thinking": True},
         "separate_reasoning": True,
-        "thinking_budget": 200,
+        "thinking_budget": 20,
     },
 )
 
