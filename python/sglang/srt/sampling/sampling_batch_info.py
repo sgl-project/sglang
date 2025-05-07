@@ -167,16 +167,28 @@ class SamplingBatchInfo:
         has_budget = self.thinking_budgets > 0
         if not has_budget.any():
             return
-        self.num_thinking_tokens[has_budget] += 1
-        should_stop = self.num_thinking_tokens > self.thinking_budgets
-        next_token_logits[should_stop, :] = float("-inf")
-        next_token_logits[should_stop, self.think_end_ids[should_stop]] = 0.0
+        torch.where(
+            has_budget,
+            self.num_thinking_tokens + 1,
+            self.num_thinking_tokens,
+            out=self.num_thinking_tokens,
+        )
+        should_stop = has_budget & (self.num_thinking_tokens - 1 > self.thinking_budgets)
+        next_token_logits.masked_fill_(should_stop.unsqueeze(0), float("-inf"))
+        batch_indices = torch.nonzero(should_stop, as_tuple=True)[0]
+        if len(batch_indices) > 0:
+            end_token_indices = self.think_end_ids[batch_indices]
+            next_token_logits[batch_indices, end_token_indices] = 0.0
 
     def update_thinking_budgets(self, next_token_ids: torch.Tensor):
         if not torch.any(self.thinking_budgets > 0):
             return
-        stopped = next_token_ids == self.think_end_ids
-        self.thinking_budgets[stopped] = -1
+        torch.where(
+            next_token_ids == self.think_end_ids,
+            torch.tensor(-1, device=self.thinking_budgets.device),
+            self.thinking_budgets,
+            out=self.thinking_budgets,
+        )
 
     def update_regex_vocab_mask(self):
         if not self.grammars:
