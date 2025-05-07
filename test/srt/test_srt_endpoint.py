@@ -4,6 +4,7 @@ python3 -m unittest test_srt_endpoint.TestSRTEndpoint.test_logprob_with_chunked_
 """
 
 import json
+import multiprocessing
 import random
 import time
 import unittest
@@ -512,6 +513,62 @@ class TestSRTEndpoint(CustomTestCase):
 
         for f in futures:
             f.result()
+
+    def test_abort(self):
+        # Test aborting a request
+        num_requests = 4
+        request_ids = [f"aborted_request_{i}" for i in range(num_requests)]
+        # Queue for returning results from the process
+        results_queue = multiprocessing.Queue()
+
+        def process_func(queue):
+            def run_one(rid):
+                prompt = """
+                System: You are a helpful assistant.
+                User: What is the capital of France?
+                Assistant: The capital of France is
+                """
+                response = requests.post(
+                    self.base_url + "/generate",
+                    json={
+                        "rid": rid,
+                        "text": prompt,
+                        "sampling_params": {
+                            "temperature": 0,
+                            "max_new_tokens": 2048,
+                        },
+                    },
+                )
+                response_json = response.json()
+                return response_json
+
+            with ThreadPoolExecutor(num_requests) as executor:
+                process_results = list(executor.map(run_one, request_ids))
+
+            queue.put(process_results)
+
+        p = multiprocessing.Process(target=process_func, args=(results_queue,))
+        p.start()
+
+        time.sleep(0.5)
+
+        for rid in request_ids:
+            response = requests.post(
+                self.base_url + "/abort",
+                json={"rid": rid},
+            )
+            response.raise_for_status()
+
+        p.join()
+
+        all_results = results_queue.get(timeout=10)
+        self.assertEqual(len(all_results), num_requests)
+        for i, response_json in enumerate(all_results):
+            rid = request_ids[i]
+
+            # Check if the finish reason is 'abort'
+            finish_type = response_json["meta_info"]["finish_reason"]["type"]
+            self.assertEqual(finish_type, "abort")
 
 
 if __name__ == "__main__":

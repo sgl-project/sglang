@@ -49,6 +49,7 @@ from sglang.srt.disaggregation.utils import (
 from sglang.srt.entrypoints.engine import _launch_subprocesses
 from sglang.srt.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
+    AbortReq,
     CloseSessionReqInput,
     ConfigureLoggingReq,
     EmbeddingReqInput,
@@ -565,6 +566,16 @@ async def separate_reasoning_request(obj: SeparateReasoningReqInput, request: Re
     }
 
     return ORJSONResponse(content=response_data, status_code=200)
+
+
+@app.post("/abort")
+async def abort_request(obj: AbortReq, request: Request):
+    """Abort a request."""
+    try:
+        _global_state.tokenizer_manager.proactive_abort_request(rid=obj.rid)
+        return Response(status_code=200)
+    except Exception as e:
+        return _create_error_response(e)
 
 
 ##### OpenAI-compatible API endpoints #####
