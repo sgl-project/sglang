@@ -12,6 +12,7 @@ logger = logging.getLogger(__name__)
 
 class LoadFormat(str, enum.Enum):
     AUTO = "auto"
+    PREFETCH_AUTO = "prefetch_auto"
     PT = "pt"
     SAFETENSORS = "safetensors"
     NPCACHE = "npcache"
@@ -34,6 +35,10 @@ class LoadConfig:
         "auto" will try to load the weights in the safetensors format and
             fall back to the pytorch bin format if safetensors format is
             not available.
+        "prefetch_auto" like "auto" but performs concurrent mmap with
+            MAP_POPULATE to prefetch weight files into the page cache.
+            This helps maximize storage bandwidth and improve model loading
+            performance, especially on systems with high disk I/O capacity.
         "pt" will load the weights in the pytorch bin format.
         "safetensors" will load the weights in the safetensors format.
         "npcache" will load the weights in pytorch format and store
