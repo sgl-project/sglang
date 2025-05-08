@@ -921,7 +921,7 @@ def sample_hf_dataset_requests(
     )
     df = df.with_columns(
         prompts=pl.col('conversation') \
-            .list.filter(pl.element().struct.field("role") == "user") \
+            .list.eval(pl.element().filter(pl.element().struct.field("role") == "user")) \
             .list.eval(pl.element().struct.field("content")),
     )
 
