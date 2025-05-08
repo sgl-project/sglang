@@ -302,6 +302,7 @@ class _SinglePassGatherer(ABC):
 class _DetailSinglePassGatherer(_SinglePassGatherer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self._topk_ids_of_layer = TODO
 
     def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
         TODO
