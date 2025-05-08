@@ -463,7 +463,7 @@ class _Accumulator(ABC):
         self,
         forward_pass_id: int,
         gatherer_key: str,
-        single_pass_data: torch.Tensor,
+        single_pass_data: Dict,
     ):
         raise NotImplementedError
 
@@ -509,7 +509,7 @@ class _DetailAccumulator(_Accumulator):
         self,
         forward_pass_id: int,
         gatherer_key: str,
-        single_pass_data: torch.Tensor,
+        single_pass_data: Dict,
     ):
         single_pass_global_physical_count = single_pass_data["global_physical_count"].to("cpu").clone()
         if self._save_dir is None:
@@ -582,7 +582,7 @@ class _StatAccumulator(_Accumulator):
         self,
         forward_pass_id: int,
         gatherer_key: str,
-        single_pass_data: torch.Tensor,
+        single_pass_data: Dict,
     ):
         # Can optimize if overhead here is large
         self._buffer_global_physical_count += single_pass_data["global_physical_count"].cpu()
@@ -636,7 +636,7 @@ class _StatAndUtilizationRateAccumulator(_StatAccumulator):
         self,
         forward_pass_id: int,
         gatherer_key: str,
-        single_pass_data: torch.Tensor,
+        single_pass_data: Dict,
     ):
         super().append(forward_pass_id, gatherer_key, single_pass_data)
         self._append_utilization_rate(forward_pass_id, single_pass_data["global_physical_count"])
