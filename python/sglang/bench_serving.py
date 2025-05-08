@@ -1039,6 +1039,9 @@ def calculate_metrics(
 def wrap_multi_round_request_func(request_func: Callable) -> Callable:
     print("Enable multi-round request function")
 
+    def compute_inner_input_prompt():
+        return TODO
+
     async def f(
         request_func_input: RequestFuncInput,
         pbar: Optional[tqdm] = None,
@@ -1046,9 +1049,11 @@ def wrap_multi_round_request_func(request_func: Callable) -> Callable:
         prompts: List[str] = request_func_input.prompt
         outputs = []
         for i in range(len(prompts)):
-            inner_input_prompt = TODO
             inner_input = RequestFuncInput(
-                prompt=inner_input_prompt,
+                prompt=compute_inner_input_prompt(
+                    user_texts=prompts[:i + 1],
+                    assistant_texts=TODO,
+                ),
                 model=request_func_input.model,
                 api_url=request_func_input.api_url,
                 prompt_len=request_func_input.prompt_len,
