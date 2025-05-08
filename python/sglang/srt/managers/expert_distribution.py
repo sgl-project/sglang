@@ -323,7 +323,11 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
         TODO
 
     def collect(self) -> Dict:
-        return TODO
+        return dict(
+            metadata=TODO,
+            topk_ids_of_layer=TODO,
+            objects=TODO,
+        )
 
 
 class _LayerBasedSinglePassGatherer(_SinglePassGatherer):
