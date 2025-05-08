@@ -60,15 +60,22 @@ class XGrammarGrammar(BaseGrammarObject):
 
         # Fix (from vLLM team): postpone the import of apply_token_bitmask_inplace_kernels to the
         # class init site to avoid re-initializing CUDA in forked subprocess.
-        from xgrammar.kernels import apply_token_bitmask_inplace_kernels
+        try:
+            from xgrammar.kernels.apply_token_bitmask_inplace_cuda import (
+                apply_token_bitmask_inplace_cuda,
+            )
+        except ImportError:
+            apply_token_bitmask_inplace_cuda = None
+
+        from xgrammar.kernels.apply_token_bitmask_inplace_cpu import (
+            apply_token_bitmask_inplace_cpu,
+        )
 
         self.use_token_bitmask_triton = get_bool_env_var(
             "SGLANG_TOKEN_BITMASK_TRITON", "false"
         )
-        self.apply_vocab_mask_cuda = apply_token_bitmask_inplace_kernels.get(
-            "cuda", None
-        )
-        self.apply_vocab_mask_cpu = apply_token_bitmask_inplace_kernels.get("cpu", None)
+        self.apply_vocab_mask_cuda = apply_token_bitmask_inplace_cuda
+        self.apply_vocab_mask_cpu = apply_token_bitmask_inplace_cpu
 
     def accept_token(self, token: int):
         assert self.matcher.accept_token(token)
