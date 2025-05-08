@@ -231,6 +231,7 @@ class ModelConfig:
             enable_multimodal=server_args.enable_multimodal,
             dtype=server_args.dtype,
             quantization=server_args.quantization,
+            model_impl=server_args.model_impl,
             **kwargs,
         )
 
