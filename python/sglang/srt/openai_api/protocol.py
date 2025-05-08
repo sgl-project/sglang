@@ -182,6 +182,7 @@ class CompletionRequest(BaseModel):
     skip_special_tokens: bool = True
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
     session_params: Optional[Dict] = None
+    return_hidden_states: Optional[bool] = False
 
 
 class CompletionResponseChoice(BaseModel):
@@ -190,6 +191,7 @@ class CompletionResponseChoice(BaseModel):
     logprobs: Optional[LogProbs] = None
     finish_reason: Literal["stop", "length", "content_filter"]
     matched_stop: Union[None, int, str] = None
+    hidden_states: Optional[object] = None
 
 
 class CompletionResponse(BaseModel):
@@ -206,6 +208,7 @@ class CompletionResponseStreamChoice(BaseModel):
     text: str
     logprobs: Optional[LogProbs] = None
     finish_reason: Optional[Literal["stop", "length", "content_filter"]] = None
+    hidden_states: Optional[object] = None
     matched_stop: Union[None, int, str] = None
 
 
