@@ -1,5 +1,5 @@
 #pragma once
-
+#include "common.h"
 #include <ATen/native/CPUBlas.h>
 
 // amx-bf16
