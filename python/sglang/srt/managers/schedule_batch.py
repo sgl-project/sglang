@@ -1583,6 +1583,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 )
             ),
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
+            rids=[r.rid for r in self.reqs],
         )
 
     def copy(self):
@@ -1666,6 +1667,8 @@ class ModelWorkerBatch:
     spec_info: Optional[Union[EagleVerifyInput, EagleDraftInput]] = None
     # If set, the output of the batch contains the hidden states of the run.
     capture_hidden_mode: CaptureHiddenMode = None
+
+    rids: Optional[List[str]] = None
 
 
 @triton.jit

@@ -261,6 +261,7 @@ class ForwardBatch:
 
     tbo_parent_token_range: Optional[Tuple[int, int]] = None
     tbo_children: Optional[List["ForwardBatch"]] = None
+    rids: Optional[List[str]] = None
 
     @classmethod
     def init_new(
@@ -303,6 +304,7 @@ class ForwardBatch:
             capture_hidden_mode=batch.capture_hidden_mode,
             input_embeds=batch.input_embeds,
             extend_input_logprob_token_ids_gpu=extend_input_logprob_token_ids_gpu,
+            rids=batch.rids,
         )
 
         # For DP attention
