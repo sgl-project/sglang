@@ -509,9 +509,7 @@ class _DetailAccumulator(_Accumulator):
         gatherer_key: str,
         single_pass_data: torch.Tensor,
     ):
-        single_pass_global_physical_count = single_pass_global_physical_count.to(
-            "cpu"
-        ).clone()
+        single_pass_global_physical_count = single_pass_data["global_physical_count"].to("cpu").clone()
         if self._save_dir is None:
             single_pass_global_physical_count = (
                 single_pass_global_physical_count.tolist()
@@ -585,7 +583,7 @@ class _StatAccumulator(_Accumulator):
         single_pass_data: torch.Tensor,
     ):
         # Can optimize if overhead here is large
-        self._buffer_global_physical_count += single_pass_global_physical_count.cpu()
+        self._buffer_global_physical_count += single_pass_data["global_physical_count"].cpu()
 
     def reset(self):
         self._buffer_global_physical_count[...] = 0
@@ -638,10 +636,8 @@ class _StatAndUtilizationRateAccumulator(_StatAccumulator):
         gatherer_key: str,
         single_pass_data: torch.Tensor,
     ):
-        super().append(forward_pass_id, gatherer_key, single_pass_global_physical_count)
-        self._append_utilization_rate(
-            forward_pass_id, single_pass_global_physical_count
-        )
+        super().append(forward_pass_id, gatherer_key, single_pass_data)
+        self._append_utilization_rate(forward_pass_id, single_pass_data["global_physical_count"])
 
     def reset(self):
         super().reset()
