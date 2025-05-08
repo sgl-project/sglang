@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 if _is_cuda:
     from sglang.srt.layers.quantization.fp8_kernel import (
-        sglang_per_token_group_quant_fp8,
+        sglang_per_token_group_quant_fp8 as per_token_group_quant_fp8,
     )
 
     try:
@@ -662,10 +662,7 @@ def grouped_gemm_triton(
     if block_shape is not None:
         assert len(block_shape) == 2
         block_n, block_k = block_shape[0], block_shape[1]
-        if _is_cuda:
-            a, scale_a = sglang_per_token_group_quant_fp8(a, block_k)
-        else:
-            a, scale_a = per_token_group_quant_fp8(a, block_k)
+        a, scale_a = per_token_group_quant_fp8(a, block_k)
 
         assert triton.cdiv(a.shape[-1], block_k) == scale_a.shape[-1]
         assert triton.cdiv(b.shape[-2], block_n) == scale_b.shape[-2]
