@@ -513,6 +513,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             base=rope_theta,
             rope_scaling=rope_scaling,
             is_neox_style=False,
+            device=global_server_args_dict["device"],
         )
 
         if rope_scaling:
@@ -1393,7 +1394,7 @@ class DeepseekV2Model(nn.Module):
             config.hidden_size,
             enable_tp=not global_server_args_dict["enable_dp_attention"],
         )
-        self.alt_stream = torch.cuda.Stream()
+        self.alt_stream = None if global_server_args_dict["device"] == "cpu" else torch.cuda.Stream()
         self.layers = nn.ModuleList(
             [
                 DeepseekV2DecoderLayer(
@@ -1496,7 +1497,8 @@ class DeepseekV2ForCausalLM(nn.Module):
                 ), f"Shared experts fusion optimization is enabled in DeepSeek V3/R1, set it to {self.tp_size} can get best optimized performace."
         elif self.n_share_experts_fusion == 0:
             if (
-                torch.cuda.get_device_capability("cuda") >= (9, 0)
+                _is_cuda
+                and torch.cuda.get_device_capability("cuda") >= (9, 0)
                 and self.config.architectures[0] == architecture
                 and self.config.n_routed_experts == 256
                 and (not global_server_args_dict["enable_deepep_moe"])
