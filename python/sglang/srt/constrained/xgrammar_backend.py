@@ -18,7 +18,7 @@ import logging
 from typing import List, Optional, Tuple, Union
 
 import torch
-import xgrammar as xgr
+import xgrammar
 from xgrammar import (
     CompiledGrammar,
     GrammarCompiler,
@@ -59,9 +59,11 @@ class XGrammarGrammar(BaseGrammarObject):
         self.override_stop_tokens = override_stop_tokens
         self.finished = False
 
-        self.apply_vocab_mask_cpu = (
-            xgr.kernels.apply_token_bitmask_inplace_cpu.apply_token_bitmask_inplace_cpu
+        from xgrammar.kernels.apply_token_bitmask_inplace_cpu import (
+            apply_token_bitmask_inplace_cpu,
         )
+
+        self.apply_vocab_mask_cpu = apply_token_bitmask_inplace_cpu
 
     def accept_token(self, token: int):
         assert self.matcher.accept_token(token)
