@@ -1039,7 +1039,11 @@ def calculate_metrics(
 def wrap_multi_round_request_func(request_func: Callable) -> Callable:
     print("Enable multi-round request function")
 
-    def compute_inner_input_prompt():
+    def compute_inner_input_prompt(
+        user_texts: List[str],
+        assistant_texts: List[str],
+    ):
+        assert len(user_texts) == len(assistant_texts) + 1
         return TODO
 
     async def f(
