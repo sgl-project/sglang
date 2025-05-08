@@ -90,6 +90,8 @@ from sglang.srt.managers.io_struct import (
     ResumeMemoryOccupationReqInput,
     ResumeMemoryOccupationReqOutput,
     SessionParams,
+    SlowDownReqInput,
+    SlowDownReqOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     UpdateWeightFromDiskReqInput,
@@ -259,6 +261,9 @@ class TokenizerManager:
         self.resume_memory_occupation_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.slow_down_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
         self.flush_cache_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -311,6 +316,10 @@ class TokenizerManager:
                 (
                     ResumeMemoryOccupationReqOutput,
                     self.resume_memory_occupation_communicator.handle_recv,
+                ),
+                (
+                    SlowDownReqOutput,
+                    self.slow_down_communicator.handle_recv,
                 ),
                 (
                     FlushCacheReqOutput,
@@ -869,6 +878,14 @@ class TokenizerManager:
     ):
         self.auto_create_handle_loop()
         await self.resume_memory_occupation_communicator(obj)
+
+    async def slow_down(
+        self,
+        obj: SlowDownReqInput,
+        request: Optional[fastapi.Request] = None,
+    ):
+        self.auto_create_handle_loop()
+        await self.slow_down_communicator(obj)
 
     async def open_session(
         self, obj: OpenSessionReqInput, request: Optional[fastapi.Request] = None
