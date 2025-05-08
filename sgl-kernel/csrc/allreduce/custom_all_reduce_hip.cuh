@@ -26,7 +26,7 @@ typedef __hip_bfloat16 nv_bfloat16;
     }                                                                                      \
   } while (0)
 
-namespace vllm {
+namespace sglang {
 
 constexpr int kMaxBlocks = 64;
 // note: we don't want to use atomics for signals because peer atomics are no
@@ -572,11 +572,11 @@ class CustomAllreduce {
     CUDACHECK(hipIpcCloseMemHandle(ptr));
   }
 }
-};  // namespace vllm
+};  // namespace sglang
 /**
  * To inspect PTX/SASS, copy paste this header file to compiler explorer and add
  a template instantiation:
- * template void vllm::CustomAllreduce::allreduce<half>(hipStream_t, half *,
+ * template void sglang::CustomAllreduce::allreduce<half>(hipStream_t, half *,
  half *, int, int, int);
 */
-}  // namespace vllm
+}  // namespace sglang

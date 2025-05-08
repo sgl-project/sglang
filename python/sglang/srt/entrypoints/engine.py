@@ -163,6 +163,9 @@ class Engine(EngineBase):
         custom_logit_processor: Optional[Union[List[str], str]] = None,
         return_hidden_states: bool = False,
         stream: bool = False,
+        bootstrap_host: Optional[Union[List[str], str]] = None,
+        bootstrap_port: Optional[Union[List[int], int]] = None,
+        bootstrap_room: Optional[Union[List[int], int]] = None,
     ) -> Union[Dict, Iterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -181,6 +184,9 @@ class Engine(EngineBase):
             custom_logit_processor=custom_logit_processor,
             return_hidden_states=return_hidden_states,
             stream=stream,
+            bootstrap_host=bootstrap_host,
+            bootstrap_port=bootstrap_port,
+            bootstrap_room=bootstrap_room,
         )
         loop = asyncio.get_event_loop()
         generator = self.tokenizer_manager.generate_request(obj, None)
@@ -227,6 +233,9 @@ class Engine(EngineBase):
         lora_path: Optional[List[Optional[str]]] = None,
         custom_logit_processor: Optional[Union[List[str], str]] = None,
         stream: bool = False,
+        bootstrap_host: Optional[Union[List[str], str]] = None,
+        bootstrap_port: Optional[Union[List[int], int]] = None,
+        bootstrap_room: Optional[Union[List[int], int]] = None,
     ) -> Union[Dict, AsyncIterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -244,6 +253,9 @@ class Engine(EngineBase):
             lora_path=lora_path,
             stream=stream,
             custom_logit_processor=custom_logit_processor,
+            bootstrap_host=bootstrap_host,
+            bootstrap_port=bootstrap_port,
+            bootstrap_room=bootstrap_room,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
 
@@ -348,8 +360,8 @@ class Engine(EngineBase):
         load_format: Optional[str] = None,
         flush_cache: bool = True,
     ):
-        """Update weights from distributed source. If there are going to be more updates, set `flush_cache` to be true
-        to avoid duplicated operations such as clearing cache."""
+        """Update weights from distributed source. If there are going to be more updates, set `flush_cache` to be false
+        to avoid duplicated cache cleaning operation."""
         obj = UpdateWeightsFromTensorReqInput(
             serialized_named_tensors=[
                 MultiprocessingSerializer.serialize(named_tensors)

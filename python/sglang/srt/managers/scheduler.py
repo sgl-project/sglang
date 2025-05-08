@@ -925,6 +925,10 @@ class Scheduler(
                 )
                 custom_logit_processor = None
 
+            if recv_req.bootstrap_port is None:
+                # Use default bootstrap port
+                recv_req.bootstrap_port = self.server_args.disaggregation_bootstrap_port
+
             req = Req(
                 recv_req.rid,
                 recv_req.input_text,
