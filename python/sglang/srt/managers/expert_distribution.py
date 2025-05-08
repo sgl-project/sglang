@@ -310,6 +310,8 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
         self._metadata = dict(
             input_ids=forward_batch.input_ids.clone().cpu(),
             positions=forward_batch.positions.clone().cpu(),
+            extend_seq_lens=forward_batch.extend_seq_lens_cpu,
+            forward_mode=forward_batch.forward_mode.value,
         )
 
     def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
