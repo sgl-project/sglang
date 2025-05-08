@@ -2,7 +2,21 @@ import torch
 
 
 class _WrapperTensor(torch.Tensor):
-    pass
+    @staticmethod
+    def __new__(cls, inner: torch.Tensor):
+        r = torch.Tensor._make_wrapper_subclass(
+            cls,
+            inner.shape,
+            strides=inner.stride,
+            dtype=inner.dtype,
+            device=inner.device,
+            layout=inner.layout,
+            requires_grad=inner.requires_grad,
+        )
+
+        r._spec = spec
+        r._local_tensor = local_tensor
+        return r
 
 
 class DisposableTensor(_WrapperTensor):
