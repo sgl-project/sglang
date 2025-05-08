@@ -882,6 +882,18 @@ def sample_generated_shared_prefix_requests(
     return input_requests
 
 
+def sample_chatbot_arena_conversations_requests():
+    return sample_hf_dataset_requests()
+
+
+def sample_wildchat_requests():
+    return sample_hf_dataset_requests()
+
+
+def sample_hf_dataset_requests():
+    return TODO
+
+
 async def get_request(
     input_requests: List[Tuple[str, int, int]],
     request_rate: float,
