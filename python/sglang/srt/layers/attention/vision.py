@@ -346,7 +346,7 @@ class VisionAttention(nn.Module):
         if global_server_args_dict["mm_attention_backend"] is None:
             if qkv_backend is None:
                 qkv_backend = "sdpa"
-            info_once(f"Multimodal attention backend not set. Use {qkv_backend} as default.")
+            info_once(f"Multimodal attention backend not set. Use {qkv_backend}.")
         else:
             qkv_backend = global_server_args_dict["mm_attention_backend"]
 
