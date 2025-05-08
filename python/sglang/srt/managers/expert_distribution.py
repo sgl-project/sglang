@@ -317,6 +317,7 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
     def on_forward_pass_start(self, forward_batch: ForwardBatch):
         assert self._metadata is None
         self._metadata = dict(
+            rids=forward_batch.rids,
             input_ids=forward_batch.input_ids.cpu().tolist(),
             positions=forward_batch.positions.cpu().tolist(),
             extend_seq_lens=forward_batch.extend_seq_lens_cpu,
