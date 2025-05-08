@@ -14,9 +14,7 @@ class _WrapperTensor(torch.Tensor):
             layout=inner.layout,
             requires_grad=inner.requires_grad,
         )
-
-        r._spec = spec
-        r._local_tensor = local_tensor
+        r._inner = inner
         return r
 
 
