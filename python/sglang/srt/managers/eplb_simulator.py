@@ -26,16 +26,6 @@ _ = compute_utilization_rate, compute_gpu_physical_count
 
 
 def read_mode_detail_per_token(dir_data):
-    def _concat_tokens(processed_records):
-        return {
-            k: torch.concat([r[k] for r in processed_records], dim=0)
-            for k in processed_records[0].keys()
-        }
-
-    def _sort_by_rid(pack):
-        sort_index = torch.argsort(pack["rids"], stable=True)
-        return {k: v[sort_index, ...] for k, v in pack.items()}
-
     def _handle_record(record):
         rids_raw = torch.tensor([int(rid, 16) & ((1 << 64) - 1) for rid in record["rids"]])
         input_ids = record["input_ids"]
@@ -57,6 +47,20 @@ def read_mode_detail_per_token(dir_data):
             topk_ids=topk_ids,
         )
 
+    def _concat_tokens(processed_records):
+        return {
+            k: torch.concat([r[k] for r in processed_records], dim=0)
+            for k in processed_records[0].keys()
+        }
+
+    def _sort_by_rid(pack):
+        sort_index = torch.argsort(pack["rids"], stable=True)
+        return {k: v[sort_index, ...] for k, v in pack.items()}
+
+    def _compute_df_metadata(pack):
+        df_metadata = TODO
+        return {**pack, "df_metadata": df_metadata}
+
     processed_records = []
     for path in tqdm(list(Path(dir_data).glob("*.pt"))):
         data_pack = torch.load(path, weights_only=True)
@@ -64,8 +68,8 @@ def read_mode_detail_per_token(dir_data):
 
     pack = _concat_tokens(processed_records)
     pack = _sort_by_rid(pack)
-
-    return TODO
+    pack = _compute_df_metadata(pack)
+    return pack
 
 
 # ------------------------------------------- TODO refactor below ---------------------------------------------
