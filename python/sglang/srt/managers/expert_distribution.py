@@ -325,7 +325,6 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
     ):
         self._objects.append(
             dict(
-                forward_pass_id=_current_forward_pass_id.value,
                 layer_id=layer_idx,
                 debug_name=_current_debug_name.value,
                 num_tokens_per_rank=num_tokens_per_rank.clone().cpu(),
