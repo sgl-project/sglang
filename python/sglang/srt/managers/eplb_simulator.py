@@ -47,7 +47,8 @@ def read_mode_detail_per_token(dir_data):
         input_ids = record["input_ids"]
         extend_seq_lens = torch.tensor(record["extend_seq_lens"])
         forward_mode = record["forward_mode"]
-        topk_ids_of_layer = record["topk_ids_of_layer"]
+        topk_ids = einops.rearrange(record["topk_ids_of_layer"],
+                                    "num_layer num_token top_k -> num_token num_layer top_k")
 
         rids_repeat_num = extend_seq_lens if forward_mode == ForwardMode.EXTEND.value else torch.full(
             (len(rids_raw),), 1)
@@ -59,7 +60,7 @@ def read_mode_detail_per_token(dir_data):
             rids=rids_repeated,
             forward_modes=forward_mode_repeated,
             input_ids=input_ids,
-            topk_ids_of_layer=topk_ids_of_layer,
+            topk_ids=topk_ids,
         )
 
     processed_records = []
