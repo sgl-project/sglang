@@ -16,7 +16,7 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_IMAGE_URL,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-    DEFAULT_SMALL_VLM_MODEL_NAME,
+    DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -195,7 +195,7 @@ class TestSkipTokenizerInitVLM(TestSkipTokenizerInit):
         cls.image_url = DEFAULT_IMAGE_URL
         response = requests.get(cls.image_url)
         cls.image = Image.open(BytesIO(response.content))
-        cls.model = DEFAULT_SMALL_VLM_MODEL_NAME
+        cls.model = DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST
         cls.tokenizer = AutoTokenizer.from_pretrained(cls.model, use_fast=False)
         cls.processor = AutoProcessor.from_pretrained(cls.model, trust_remote_code=True)
         cls.base_url = DEFAULT_URL_FOR_TEST

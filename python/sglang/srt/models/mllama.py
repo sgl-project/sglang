@@ -203,7 +203,7 @@ class MllamaVisionEncoderLayer(nn.Module):
             use_qkv_parallel=True,
             quant_config=quant_config,
             dropout=0.0,
-            use_context_forward=False,
+            qkv_backend="sdpa",
             softmax_in_single_precision=False,
             flatten_batch=False,
             prefix=add_prefix("self_attn", prefix),

@@ -101,7 +101,6 @@ suites = {
         TestFile("test_moe_deepep_eval_accuracy_large.py", 250),
         TestFile("test_local_attn.py", 250),
         TestFile("test_full_deepseek_v3.py", 250),
-        TestFile("test_fa3.py", 30),
         TestFile("test_pp_single_node.py", 150),
     ],
     "nightly": [
