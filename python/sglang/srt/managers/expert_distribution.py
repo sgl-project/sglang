@@ -225,7 +225,7 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
 
     def dump_record(self):
         """Dump the expert distribution record and reset the recorder after dumping."""
-        output = self._accumulator.dump(hack_objects=self._hack_objects)
+        output = self._accumulator.dump()
         self._reset()
         return output
 
@@ -493,7 +493,7 @@ class _Accumulator(ABC):
     def reset(self):
         raise NotImplementedError
 
-    def dump(self, hack_objects):
+    def dump(self):
         raise NotImplementedError
 
     def flush_buffer_depending_on_expert_location_metadata(self):
@@ -552,20 +552,19 @@ class _DetailAccumulator(_Accumulator):
     def reset(self):
         self._records.clear()
 
-    def dump(self, hack_objects):
+    def dump(self):
         if self._save_dir is None:
             # TODO make it unified with the other branch
             return deepcopy(self._records)
         else:
             path_output = Path(self._save_dir) / f"{time.time()}-{self._rank}.pt"
             logger.info(
-                f"Write expert distribution to {path_output} ({len(hack_objects) if hack_objects is not None else None=})"
+                f"Write expert distribution to {path_output}"
             )
             output = dict(
                 records=self._records,
                 # NOTE: This may change during recording, so here we say it is the "last" one
                 last_physical_to_logical_map=self._expert_location_metadata.physical_to_logical_map,
-                hack_objects=hack_objects,
             )
             torch.save(output, str(path_output))
             return [dict(path_output=str(path_output))]
@@ -614,7 +613,7 @@ class _StatAccumulator(_Accumulator):
         self._buffer_global_physical_count[...] = 0
         self._logical_count[...] = 0
 
-    def dump(self, hack_objects):
+    def dump(self):
         self.flush_buffer_depending_on_expert_location_metadata()
 
         return dict(
