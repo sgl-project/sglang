@@ -27,7 +27,6 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
     from sglang.srt.speculative.spec_info import SpecInfo
 
-from sgl_kernel import sgl_per_tensor_quant_fp8
 
 # FlashMLA only supports pagesize=64
 PAGE_SIZE = 64
@@ -465,7 +464,6 @@ class FlashMLAMultiStepDraftBackend:
         call_fn: Callable,
     ):
         assert forward_batch.spec_info is not None
-        assert isinstance(forward_batch.spec_info, EagleDraftInput)
 
         for i in range(self.speculative_num_steps - 1):
             call_fn(i, forward_batch)
@@ -473,7 +471,6 @@ class FlashMLAMultiStepDraftBackend:
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         def call_fn(i, forward_batch):
             assert forward_batch.spec_info is not None
-            assert isinstance(forward_batch.spec_info, EagleDraftInput)
             self.attn_backends[i].init_forward_metadata(forward_batch)
 
         self.common_template(forward_batch, call_fn)
