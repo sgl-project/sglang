@@ -1,4 +1,4 @@
-# Adapted from https://github.com/vllm-project/vllm/tree/main/vllm/model_executor/layers/quantization/compressed_tensors
+# Adapted from https://github.com/vllm-project/vllm/tree/v0.8.2/vllm/model_executor/layers/quantization/compressed_tensors
 # SPDX-License-Identifier: Apache-2.0
 
 import enum
@@ -10,28 +10,20 @@ import torch
 from compressed_tensors import CompressionFormat
 from compressed_tensors.quantization import QuantizationStrategy
 
-from sglang.srt.layers.moe.fused_moe_triton import (
-    FusedMoE,
-    FusedMoEMethodBase,
-    FusedMoeWeightScaleSupported,
-)
-from sglang.srt.layers.moe.topk import select_experts
+from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz, scaled_fp8_quant
 from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
 from sglang.srt.layers.quantization.utils import (
     all_close_1d,
-    is_cuda,
-    is_fp8_fnuz,
     per_tensor_dequantize,
     replace_parameter,
 )
-from sglang.srt.utils import set_weight_attrs
+from sglang.srt.utils import is_cuda, set_weight_attrs
 
 _is_cuda = is_cuda()
 
-if _is_cuda:
-    from sglang.srt.custom_op import scaled_fp8_quant as sgl_scaled_fp8_quant
-else:
+if not _is_cuda:
     from vllm import _custom_ops as vllm_ops
+    from vllm._custom_ops import scaled_fp8_quant
 
 try:
     import vllm
@@ -55,7 +47,11 @@ __all__ = [
 ]
 
 
-class CompressedTensorsMoEMethod(FusedMoEMethodBase):
+class CompressedTensorsMoEMethod:
+    def __new__(cls, *args, **kwargs):
+        if cls is CompressedTensorsMoEMethod:
+            return super().__new__(cls)
+        return super().__new__(cls)
 
     @staticmethod
     def get_moe_method(
@@ -69,7 +65,7 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
         if quant_config._is_wNa16_group_channel(weight_quant, input_quant):
             if not VLLM_AVAILABLE:
                 raise ImportError(
-                    "vllm is not installed, to use CompressedTensorsWNA16MoEMethod, please install vllm"
+                    "vllm is not installed, to use CompressedTensorsWNA16MoEMethod, please install vllm."
                 )
             return CompressedTensorsWNA16MoEMethod(quant_config)
         elif quant_config._is_fp8_w8a8(weight_quant, input_quant):
@@ -91,16 +87,6 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
             "input_activations"
         )
 
-        if not (
-            self.weight_quant.strategy == QuantizationStrategy.TENSOR
-            and self.input_quant.strategy == QuantizationStrategy.TENSOR
-        ):
-            raise ValueError(
-                "For FP8 Fused MoE layers, only per-tensor scales "
-                "for weights and activations are supported. Found "
-                f"{self.weight_quant}, {self.input_quant}"
-            )
-
         self.static_input_scales = not self.input_quant.dynamic
 
     def create_weights(
@@ -112,6 +98,7 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
         params_dtype = torch.float8_e4m3fn
 
@@ -141,27 +128,50 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
         set_weight_attrs(w2_weight, extra_weight_attrs)
 
         # WEIGHT_SCALES
-        # Allocate 2 scales for w1 and w3 respectively.
-        # They will be combined to a single scale after weight loading.
-        w13_weight_scale = torch.nn.Parameter(
-            torch.ones(num_experts, 2, dtype=torch.float32), requires_grad=False
-        )
-        layer.register_parameter("w13_weight_scale", w13_weight_scale)
+        # per-tensor quantization
+        if self.weight_quant.strategy == QuantizationStrategy.TENSOR:
+            # Allocate 2 scales for w1 and w3 respectively.
+            # They will be combined to a single scale after weight loading.
+            w13_weight_scale = torch.nn.Parameter(
+                torch.ones(num_experts, 2, dtype=torch.float32), requires_grad=False
+            )
+            w2_weight_scale = torch.nn.Parameter(
+                torch.ones(num_experts, dtype=torch.float32), requires_grad=False
+            )
+            weight_quant_method = FusedMoeWeightScaleSupported.TENSOR.value
+        elif self.weight_quant.strategy == QuantizationStrategy.CHANNEL:
+            w13_weight_scale = torch.nn.Parameter(
+                torch.ones(
+                    num_experts,
+                    2 * intermediate_size_per_partition,
+                    1,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
+            w2_weight_scale = torch.nn.Parameter(
+                torch.ones(num_experts, hidden_size, 1, dtype=torch.float32),
+                requires_grad=False,
+            )
+            weight_quant_method = FusedMoeWeightScaleSupported.CHANNEL.value
+        else:
+            raise ValueError(
+                f"Unsupported weight quantization strategy: {self.weight_quant.strategy}"
+            )
 
-        w2_weight_scale = torch.nn.Parameter(
-            torch.ones(num_experts, dtype=torch.float32), requires_grad=False
-        )
+        layer.register_parameter("w13_weight_scale", w13_weight_scale)
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
         # Add the quantization method used (per tensor/grouped/channel)
         # to ensure the weight scales are loaded in properly
-        extra_weight_attrs.update(
-            {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value}
-        )
+        extra_weight_attrs.update({"quant_method": weight_quant_method})
         set_weight_attrs(w13_weight_scale, extra_weight_attrs)
         set_weight_attrs(w2_weight_scale, extra_weight_attrs)
 
         # INPUT_SCALES
         if self.static_input_scales:
+            assert (
+                self.input_quant.strategy == QuantizationStrategy.TENSOR
+            ), "Only per-tensor quantization is supported for static input scales"
             w13_input_scale = torch.nn.Parameter(
                 torch.ones(num_experts, dtype=torch.float32), requires_grad=False
             )
@@ -228,31 +238,29 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
                 layer.w2_input_scale = torch.nn.Parameter(
                     w2_input_scale, requires_grad=False
                 )
-
-        # Fp8 moe kernel needs single weight scale for w13 per expert.
-        # We take the max then dequant and requant each expert.
-        assert layer.w13_weight_scale is not None
-        shard_size = layer.intermediate_size_per_partition
-        max_w13_scales = layer.w13_weight_scale.max(dim=1).values
-        for expert_id in range(layer.local_num_experts):
-            start = 0
-            for shard_id in range(2):
-                dq_weight = per_tensor_dequantize(
-                    layer.w13_weight[expert_id][start : start + shard_size, :],
-                    layer.w13_weight_scale[expert_id][shard_id],
-                )
-
-                if _is_cuda:
-                    layer.w13_weight[expert_id][start : start + shard_size, :], _ = (
-                        sgl_scaled_fp8_quant(dq_weight, max_w13_scales[expert_id])
+        if self.weight_quant.strategy == QuantizationStrategy.TENSOR:
+            # Fp8 moe kernel needs single weight scale for w13 per expert.
+            # We take the max then dequant and requant each expert.
+            assert layer.w13_weight_scale is not None
+            shard_size = layer.intermediate_size_per_partition
+            max_w13_scales = layer.w13_weight_scale.max(dim=1).values
+            for expert_id in range(layer.local_num_experts):
+                start = 0
+                for shard_id in range(2):
+                    dq_weight = per_tensor_dequantize(
+                        layer.w13_weight[expert_id][start : start + shard_size, :],
+                        layer.w13_weight_scale[expert_id][shard_id],
                     )
-                else:
-                    layer.w13_weight[expert_id][start : start + shard_size, :], _ = (
-                        vllm_ops.scaled_fp8_quant(dq_weight, max_w13_scales[expert_id])
-                    )
-                start += shard_size
+                    (
+                        layer.w13_weight[expert_id][start : start + shard_size, :],
+                        _,
+                    ) = scaled_fp8_quant(dq_weight, max_w13_scales[expert_id])
 
-        layer.w13_weight_scale = torch.nn.Parameter(max_w13_scales, requires_grad=False)
+                    start += shard_size
+
+            layer.w13_weight_scale = torch.nn.Parameter(
+                max_w13_scales, requires_grad=False
+            )
 
     def apply(
         self,
@@ -270,8 +278,13 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
         scoring_func: str = "softmax",
         correction_bias: Optional[torch.Tensor] = None,
         activation: str = "silu",
+        inplace: bool = True,
+        no_combine: bool = False,
+        apply_router_weight_on_input: bool = False,
+        routed_scaling_factor: Optional[float] = None,
     ) -> torch.Tensor:
-        from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
+        from sglang.srt.layers.moe.fused_moe_triton import fused_experts
+        from sglang.srt.layers.moe.topk import select_experts
 
         topk_weights, topk_ids = select_experts(
             hidden_states=x,
@@ -283,6 +296,7 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
             num_expert_group=num_expert_group,
             custom_routing_function=custom_routing_function,
             correction_bias=correction_bias,
+            routed_scaling_factor=routed_scaling_factor,
         )
 
         return fused_experts(
@@ -291,13 +305,16 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
             layer.w2_weight,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
-            inplace=True,
+            inplace=inplace,
             activation=activation,
             use_fp8_w8a8=True,
+            per_channel_quant=self.weight_quant.strategy
+            == QuantizationStrategy.CHANNEL,
             w1_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
             a1_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,
+            apply_router_weight_on_input=apply_router_weight_on_input,
         )
 
 
@@ -565,7 +582,7 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
                 requires_grad=False,
             )
 
-        marlin_w13_qweight = ops.gptq_marlin_moe_repack(
+        marlin_w13_qweight = vllm_ops.gptq_marlin_moe_repack(
             layer.w13_weight_packed,
             layer.w13_g_idx_sort_indices,
             layer.w13_weight_packed.shape[1] * self.packed_factor,
@@ -573,7 +590,7 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             self.num_bits,
         )
         replace_tensor("w13_weight_packed", marlin_w13_qweight)
-        marlin_w2_qweight = ops.gptq_marlin_moe_repack(
+        marlin_w2_qweight = vllm_ops.gptq_marlin_moe_repack(
             layer.w2_weight_packed,
             layer.w2_g_idx_sort_indices,
             layer.w2_weight_packed.shape[1] * self.packed_factor,
@@ -616,12 +633,11 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         scoring_func: str = "softmax",
         correction_bias: Optional[torch.Tensor] = None,
         activation: str = "silu",
+        routed_scaling_factor: Optional[float] = None,
     ) -> torch.Tensor:
+        from sglang.srt.layers.moe.topk import select_experts
+
         assert activation == "silu", "Only SiLU activation is supported."
-        if not VLLM_AVAILABLE:
-            raise ImportError(
-                "vllm is not installed, to use fused_marlin_moe, please install vllm"
-            )
         if expert_map is not None:
             raise NotImplementedError(
                 "Expert Parallelism is not supported for " "fused Marlin MoE method."
@@ -638,6 +654,7 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             custom_routing_function=custom_routing_function,
             scoring_func=scoring_func,
             correction_bias=correction_bias,
+            routed_scaling_factor=routed_scaling_factor,
         )
 
         return torch.ops.vllm.fused_marlin_moe(

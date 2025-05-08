@@ -1,11 +1,6 @@
-import json
 import logging
-import time
-from collections import defaultdict
 from http import HTTPStatus
-from typing import Dict, List, Optional, Tuple
-
-import torch
+from typing import Optional
 
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
 

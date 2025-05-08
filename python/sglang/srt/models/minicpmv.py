@@ -54,12 +54,12 @@ from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternTokenPairs,
     general_mm_embed_routine,
 )
-from sglang.srt.managers.schedule_batch import MultimodalInputs
+from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2Config, Qwen2ForCausalLM
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, flatten_nested_list
 
 RawImageType = Union[Image.Image, torch.Tensor]
 
@@ -661,7 +661,7 @@ def get_version_by_config(config: PretrainedConfig) -> Tuple[int, ...]:
     return tuple(int(x) for x in version_str.split("."))
 
 
-class MiniCPMVBaseModel(nn.Module):
+class MiniCPMBaseModel(nn.Module):
     """
     The abstract class of MiniCPMV can only be inherited, but cannot be
     instantiated.
@@ -853,7 +853,7 @@ class MiniCPMVBaseModel(nn.Module):
         return vlm_embedding, vision_hidden_states
 
     def get_input_embeddings(self) -> nn.Embedding:
-        return self.llm.get_input_embedding()
+        return self.llm.get_input_embeddings()
 
     def forward(
         self,
@@ -862,23 +862,14 @@ class MiniCPMVBaseModel(nn.Module):
         forward_batch: ForwardBatch,
         **kwargs: Any,
     ) -> torch.Tensor:
-        inputs_embeds = general_mm_embed_routine(
+        hidden_states = general_mm_embed_routine(
             input_ids=input_ids,
             forward_batch=forward_batch,
-            embed_tokens=self.get_input_embeddings(),
-            mm_data_embedding_func=self.get_image_features,
-        )
-
-        hidden_states = self.llm.model(
-            input_ids=None,
+            image_data_embedding_func=self.get_image_feature,
+            language_model=self.llm,
             positions=positions,
-            forward_batch=forward_batch,
-            input_embeds=inputs_embeds,
         )
-
-        return self.logits_processor(
-            input_ids, hidden_states, self.llm.lm_head, forward_batch
-        )
+        return hidden_states
 
     def init_llm(
         self,
@@ -913,11 +904,11 @@ class MiniCPMVBaseModel(nn.Module):
     ) -> torch.Tensor:
         raise NotImplementedError
 
-    def get_image_features(self, image_inputs: MultimodalInputs) -> torch.Tensor:
+    def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         raise NotImplementedError
 
 
-class MiniCPMV2_6(MiniCPMVBaseModel):
+class MiniCPMV2_6(MiniCPMBaseModel):
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
@@ -1023,14 +1014,13 @@ class MiniCPMV2_6(MiniCPMVBaseModel):
         )
         return vision_embedding
 
-    def get_image_features(
-        self,
-        image_inputs: MultimodalInputs,
-    ) -> torch.Tensor:
+    def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         # list of tensors
-        pixel_values = image_inputs.pixel_values
-
-        tgt_sizes = image_inputs.tgt_sizes
+        pixel_values = flatten_nested_list([item.pixel_values for item in items])
+        tgt_sizes = torch.stack(
+            flatten_nested_list([item.tgt_size for item in items]), dim=0
+        )
+        assert len(pixel_values) == tgt_sizes.shape[0]
 
         device = self.vpm.embeddings.position_embedding.weight.device
         dtype = self.vpm.embeddings.position_embedding.weight.dtype
@@ -1040,10 +1030,10 @@ class MiniCPMV2_6(MiniCPMVBaseModel):
 
         max_patches = (tgt_sizes[:, 0] * tgt_sizes[:, 1]).max().item()
         assert isinstance(max_patches, int)
-
         all_pixel_values = torch.nn.utils.rnn.pad_sequence(
             all_pixel_values_lst, batch_first=True, padding_value=0.0
         )
+
         B, L, _ = all_pixel_values.shape
         all_pixel_values = all_pixel_values.permute(0, 2, 1).reshape(B, 3, -1, L)
         patch_attn_mask = torch.zeros(
