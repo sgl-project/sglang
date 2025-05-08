@@ -328,7 +328,7 @@ async def process_batch(tokenizer_manager, batch_id: str, batch_request: BatchRe
                 )
             else:
                 responses = v1_generate_response(
-                    request, 
+                    request,
                     ret,
                     tokenizer_manager,
                     created,
@@ -764,8 +764,10 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
                     prompt_tokens[index] = content["meta_info"]["prompt_tokens"]
                     completion_tokens[index] = content["meta_info"]["completion_tokens"]
                     cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
-                    hidden_states = hidden_states or content["meta_info"].get("hidden_states", None)
-                    
+                    hidden_states = hidden_states or content["meta_info"].get(
+                        "hidden_states", None
+                    )
+
                     if not stream_buffer:  # The first chunk
                         if request.echo:
                             if isinstance(request.prompt, str):
@@ -881,7 +883,7 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
                                     finish_reason=finish_reason_type,
                                 )
                             ],
-                            model=request.model 
+                            model=request.model,
                         )
                         yield f"data: {hidden_states_chunk.model_dump_json()}\n\n"
                     final_usage_chunk = CompletionStreamResponse(
@@ -1291,7 +1293,7 @@ def v1_chat_generate_response(
         else:
             include_hidden_states = False
         if include_hidden_states and ret_item["meta_info"].get("hidden_states", None):
-            hidden_states = ret_item["meta_info"]["hidden_states"][-1] # Last token only.
+            hidden_states = ret_item["meta_info"]["hidden_states"]  # Last token only.
         else:
             hidden_states = None
 
@@ -1469,7 +1471,9 @@ async def v1_chat_completions(
                 ):
                     index = content.get("index", 0)
                     text = content["text"]
-                    hidden_states = hidden_states or content["meta_info"].get("hidden_states", None)
+                    hidden_states = hidden_states or content["meta_info"].get(
+                        "hidden_states", None
+                    )
 
                     is_first = is_firsts.get(index, True)
                     stream_buffer = stream_buffers.get(index, "")
@@ -1756,11 +1760,11 @@ async def v1_chat_completions(
                         choices=[
                             ChatCompletionResponseStreamChoice(
                                 index=index,
-                                delta=DeltaMessage(hidden_states = hidden_states),
+                                delta=DeltaMessage(hidden_states=hidden_states),
                                 finish_reason=finish_reason_type,
                             )
                         ],
-                        model=request.model
+                        model=request.model,
                     )
                     yield f"data: {hidden_states_chunk.model_dump_json()}\n\n"
                 final_usage_chunk = ChatCompletionStreamResponse(
