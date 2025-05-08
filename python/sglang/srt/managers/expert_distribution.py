@@ -324,7 +324,7 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
         )
 
     def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
-        TODO
+        self._topk_ids_of_layer[layer_idx, :topk_ids.shape[0], :] = topk_ids.cpu()
 
     def on_deepep_dispatch_normal(
         self,
