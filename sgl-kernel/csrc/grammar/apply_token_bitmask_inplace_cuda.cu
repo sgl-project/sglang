@@ -27,10 +27,7 @@
 // clang-format on
 
 #if !defined(CUDA_VERSION) || CUDA_VERSION < 12040
-void ApplyTokenBitmaskInplace(
-    at::Tensor logits,
-    at::Tensor bitmask,
-    at::optional<at::Tensor> indices = at::nullopt) {
+void ApplyTokenBitmaskInplace(at::Tensor logits, at::Tensor bitmask, at::optional<at::Tensor> indices = at::nullopt) {
   TORCH_CHECK(false, "CUDA version must be >= 12.4 for ApplyTokenBitmaskInplace");
 }
 #else
@@ -121,7 +118,7 @@ __global__ void __launch_bounds__(THREADS_PER_THREAD_BLOCK) LogitsBitmaskKernel(
   }
 }
 
-template <typename T, typename = std::enable_if_t<std::is_integral<T>::value>>
+template <typename T, typename = std::enable_if_t<std::is_integral<T>::value> >
 constexpr auto CeilDiv(T numerator, T denominator) {
   return (numerator + denominator - 1) / denominator;
 }
@@ -145,19 +142,19 @@ void ApplyTokenBitmaskInplaceDispatchToBitsPerThread(
   if (num_bits_per_thread <= 4 && kAlignment <= 4) {
     const dim3 grid(CeilDiv(vocab_size, THREADS_PER_THREAD_BLOCK * 4), num_rows);
     LogitsBitmaskKernel<T, PackedT, 4>
-        <<<grid, block, 0, stream>>>(logits, bitmask, indices, vocab_size, logits_stride, bitmask_stride);
+        <<<grid, block, 0, stream> > >(logits, bitmask, indices, vocab_size, logits_stride, bitmask_stride);
   } else if (num_bits_per_thread <= 8 && kAlignment <= 8) {
     const dim3 grid(CeilDiv(vocab_size, THREADS_PER_THREAD_BLOCK * 8), num_rows);
     LogitsBitmaskKernel<T, PackedT, 8>
-        <<<grid, block, 0, stream>>>(logits, bitmask, indices, vocab_size, logits_stride, bitmask_stride);
+        <<<grid, block, 0, stream> > >(logits, bitmask, indices, vocab_size, logits_stride, bitmask_stride);
   } else if (num_bits_per_thread <= 16 && kAlignment <= 16) {
     const dim3 grid(CeilDiv(vocab_size, THREADS_PER_THREAD_BLOCK * 16), num_rows);
     LogitsBitmaskKernel<T, PackedT, 16>
-        <<<grid, block, 0, stream>>>(logits, bitmask, indices, vocab_size, logits_stride, bitmask_stride);
+        <<<grid, block, 0, stream> > >(logits, bitmask, indices, vocab_size, logits_stride, bitmask_stride);
   } else {
     const dim3 grid(CeilDiv(vocab_size, THREADS_PER_THREAD_BLOCK * 32), num_rows);
     LogitsBitmaskKernel<T, PackedT, 32>
-        <<<grid, block, 0, stream>>>(logits, bitmask, indices, vocab_size, logits_stride, bitmask_stride);
+        <<<grid, block, 0, stream> > >(logits, bitmask, indices, vocab_size, logits_stride, bitmask_stride);
   }
 }
 
