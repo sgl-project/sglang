@@ -19,7 +19,6 @@ import json
 import logging
 import os
 import time
-from turtle import Turtle
 import uuid
 from http import HTTPStatus
 from typing import Dict, List
