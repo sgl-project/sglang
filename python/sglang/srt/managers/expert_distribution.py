@@ -299,6 +299,20 @@ class _SinglePassGatherer(ABC):
         raise NotImplementedError
 
 
+class _DetailSinglePassGatherer(_SinglePassGatherer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
+        TODO
+
+    def reset(self):
+        TODO
+
+    def collect(self) -> Dict:
+        return TODO
+
+
 class _LayerBasedSinglePassGatherer(_SinglePassGatherer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
