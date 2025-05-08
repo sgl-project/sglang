@@ -39,6 +39,8 @@ def read_expert_distribution_recorder_mode_detail_per_token(dir_data):
                 (len(rids_raw),), 1)
             rids_repeated = torch.repeat_interleave(rids_raw, rids_repeat_num)
 
+            forward_mode_repeated = torch.full((len(input_ids),), forward_mode)
+
     return TODO
 
 
