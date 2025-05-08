@@ -54,13 +54,13 @@ struct IsPersistent {
   static const bool value = v;
 };
 
-template <typename T, typename PersistenceOption = IsPersistent<true>>
+template <typename T, typename PersistenceOption = IsPersistent<true> >
 struct MlaSm100 {
   using Element = T;
   using ElementAcc = float;
   using ElementOut = T;
 
-  using TileShape = Shape<_128, _128, Shape<_512, _64>>;
+  using TileShape = Shape<_128, _128, Shape<_512, _64> >;
   using TileShapeH = cute::tuple_element_t<0, TileShape>;
   using TileShapeD = cute::tuple_element_t<2, TileShape>;
 
