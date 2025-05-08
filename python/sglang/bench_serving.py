@@ -517,8 +517,8 @@ def get_dataset(args, tokenizer):
         )
     elif args.dataset_name == "chatbot-arena-conversations":
         input_requests = sample_chatbot_arena_conversations_requests()
-    elif args.dataset_name == "wildchat":
-        input_requests = sample_wildchat_requests()
+    elif args.dataset_name == "wildchat-1m":
+        input_requests = sample_wildchat_1m_requests()
     else:
         raise ValueError(f"Unknown dataset: {args.dataset_name}")
     input_requests = input_requests[args.skip_num_prompts:]
@@ -883,14 +883,24 @@ def sample_generated_shared_prefix_requests(
 
 
 def sample_chatbot_arena_conversations_requests():
-    return sample_hf_dataset_requests()
+    return sample_hf_dataset_requests(
+        dataset_name="lmsys/chatbot_arena_conversations",
+    )
 
 
-def sample_wildchat_requests():
-    return sample_hf_dataset_requests()
+def sample_wildchat_1m_requests():
+    return sample_hf_dataset_requests(
+        dataset_name="allenai/WildChat-1M",
+    )
 
 
-def sample_hf_dataset_requests():
+def sample_hf_dataset_requests(
+    dataset_name: str,
+):
+    from datasets import load_dataset
+
+    load_dataset(dataset_name)
+
     return TODO
 
 
