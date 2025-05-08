@@ -162,6 +162,18 @@ jobs:
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_default_fp8
 
+      - name: Benchmark VLM offline throughput
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_serving.TestBenchServing.test_vlm_offline_throughput
+
+      - name: Benchmark VLM online latency
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_serving.TestBenchServing.test_vlm_online_latency
+
   performance-test-2-gpu:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false
