@@ -88,6 +88,7 @@ from sglang.srt.utils import (
     get_int_env_var,
     is_cuda,
     is_hip,
+    log_info_on_rank0,
 )
 
 _is_hip = is_hip()
@@ -356,6 +357,7 @@ class DeepseekV2MoE(nn.Module):
                 topk_idx,
                 topk_weights,
                 reorder_topk_ids,
+                num_recv_tokens_per_expert,
                 seg_indptr,
                 masked_m,
                 expected_m,
@@ -367,10 +369,13 @@ class DeepseekV2MoE(nn.Module):
             )
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
+            topk_idx=topk_idx,
+            topk_weights=topk_weights,
             reorder_topk_ids=reorder_topk_ids,
             seg_indptr=seg_indptr,
             masked_m=masked_m,
             expected_m=expected_m,
+            num_recv_tokens_per_expert=num_recv_tokens_per_expert,
             forward_mode=forward_mode,
         )
         if self.ep_size > 1:
@@ -1485,8 +1490,9 @@ class DeepseekV2ForCausalLM(nn.Module):
             ):
                 self.n_share_experts_fusion = 0
                 global_server_args_dict["n_share_experts_fusion"] = 0
-                logger.info(
-                    "Only Deepseek V3/R1 can use shared experts fusion optimization. Shared experts fusion optimization is disabled."
+                log_info_on_rank0(
+                    logger,
+                    "Only Deepseek V3/R1 can use shared experts fusion optimization. Shared experts fusion optimization is disabled.",
                 )
             else:
                 assert (
@@ -1501,8 +1507,9 @@ class DeepseekV2ForCausalLM(nn.Module):
             ):
                 self.n_share_experts_fusion = self.tp_size
                 global_server_args_dict["n_share_experts_fusion"] = self.tp_size
-                logger.info(
-                    "Deepseek V3/R1 with fp8 can use shared experts fusion optimization when SM version >=90. Shared experts fusion optimization is enabled."
+                log_info_on_rank0(
+                    logger,
+                    "Deepseek V3/R1 with fp8 can use shared experts fusion optimization when SM version >=90. Shared experts fusion optimization is enabled.",
                 )
 
     def get_input_embeddings(self) -> nn.Embedding:

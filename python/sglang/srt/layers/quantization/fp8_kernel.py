@@ -30,6 +30,7 @@ from sglang.srt.utils import (
     get_device_name,
     is_cuda,
     is_hip,
+    log_info_on_rank0,
     supports_custom_op,
 )
 
@@ -307,8 +308,8 @@ def sglang_per_token_group_quant_fp8(
             device=x.device,
             dtype=torch.float32,
         )
-
-    sgl_per_token_group_quant_fp8(x, x_q, x_s, group_size, eps, fp8_min, fp8_max)
+    if x.shape[0] > 0:
+        sgl_per_token_group_quant_fp8(x, x_q, x_s, group_size, eps, fp8_min, fp8_max)
 
     return x_q, x_s
 
@@ -698,9 +699,9 @@ def get_w8a8_block_fp8_configs(
     )
     if os.path.exists(config_file_path):
         with open(config_file_path) as f:
-            logger.info(
-                "Using configuration from %s for W8A8 Block FP8 kernel.",
-                config_file_path,
+            log_info_on_rank0(
+                logger,
+                f"Using configuration from {config_file_path} for W8A8 Block FP8 kernel.",
             )
             # If a configuration has been found, return it
             return {int(key): val for key, val in json.load(f).items()}
