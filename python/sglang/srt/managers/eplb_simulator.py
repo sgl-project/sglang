@@ -24,7 +24,7 @@ from tqdm.auto import tqdm
 _ = compute_utilization_rate, compute_gpu_physical_count
 
 
-def read_expert_distribution_recorder_dir():
+def read_expert_distribution_recorder_mode_detail_per_token():
     return TODO
 
 
