@@ -22,11 +22,14 @@ class _WrapperTensor(torch.Tensor):
     def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
         def unwrap(e):
             if isinstance(e, cls):
-                return e._inner
+                return e._unwrap()
             else:
                 return e
 
         return func(*tree_map(unwrap, args), **tree_map(unwrap, kwargs))
+
+    def _unwrap(self):
+        raise NotImplementedError
 
 
 class DisposableTensor(_WrapperTensor):
