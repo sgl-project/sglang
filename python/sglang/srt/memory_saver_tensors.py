@@ -39,4 +39,5 @@ class DisposableTensor(_WrapperTensor):
 
 
 class LazyTensor(_WrapperTensor):
-    pass
+    def _unwrap(self):
+        return TODO
