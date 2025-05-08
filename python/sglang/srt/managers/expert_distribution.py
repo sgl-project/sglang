@@ -302,10 +302,14 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
         super().__init__(expert_location_metadata, rank)
         self._topk_ids_of_layer = TODO
         self._objects = TODO
+        self._metadata: Optional[Dict[str, Any]] = None
         assert not server_args.enable_two_batch_overlap, "DetailSinglePassGatherer does not support TBO yet"
 
     def on_forward_pass_start(self, forward_batch: ForwardBatch):
-        TODO
+        assert self._metadata is None
+        self._metadata = dict(
+            TODO=TODO,
+        )
 
     def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
         TODO
@@ -328,7 +332,9 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
         )
 
     def reset(self):
-        TODO
+        TODO(self._topk_ids_of_layer)
+        TODO(self._objects)
+        self._metadata = None
 
     def collect(self) -> Dict:
         return dict(
