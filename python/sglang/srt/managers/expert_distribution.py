@@ -575,20 +575,23 @@ class _DetailAccumulator(_Accumulator):
         gatherer_key: str,
         single_pass_data: Dict,
     ):
-        single_pass_global_physical_count = (
-            single_pass_data["global_physical_count"].to("cpu").clone()
-        )
-        if self._save_dir is None:
-            single_pass_global_physical_count = (
-                single_pass_global_physical_count.tolist()
-            )
+        def _process_object(obj):
+            if not isinstance(obj, torch.Tensor):
+                return obj
+
+            obj = obj.cpu().clone()
+            if self._save_dir is None:
+                obj = obj.tolist()
+            return obj
+
+        single_pass_data_processed = {k: _process_object(v) for k, v in single_pass_data.items()}
 
         self._records.append(
             dict(
                 forward_pass_id=forward_pass_id,
                 rank=self._rank,
                 gatherer_key=gatherer_key,
-                physical_count=single_pass_global_physical_count,
+                **single_pass_data_processed,
             )
         )
 
