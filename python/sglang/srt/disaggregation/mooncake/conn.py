@@ -233,7 +233,7 @@ class MooncakeKVManager(BaseKVManager):
             status = future.result()
             if status != 0:
                 # Immediate shutdown on first error (existing tasks will finish)
-                executor.shutdown(wait=False)
+                self.executor.shutdown(wait=False)
                 for f in futures:
                     f.cancel()
                 return status
@@ -265,7 +265,7 @@ class MooncakeKVManager(BaseKVManager):
         self._connect("tcp://" + remote + ":" + str(dst_port)).send_multipart(
             [
                 str(room).encode("ascii"),
-                str(self.request_status[room]).encode("ascii"),
+                str(self.check_status(room)).encode("ascii"),
             ]
         )
 
@@ -299,7 +299,7 @@ class MooncakeKVManager(BaseKVManager):
                     )
                     # NOTE: after bootstrapping we can mark the req as waiting for input
                     if len(self.transfer_infos[room]) == required_dst_info_num:
-                        self.request_status[room] = KVPoll.WaitingForInput
+                        self.update_status(room, KVPoll.WaitingForInput)
 
         def transfer_thread():
             # TODO: Shall we use KVPoll.Transferring state?
@@ -328,7 +328,7 @@ class MooncakeKVManager(BaseKVManager):
                                 chunked_dst_kv_indice,
                             )
                             if ret != 0:
-                                self.request_status[kv_chunk.room] = KVPoll.Failed
+                                self.update_status(kv_chunk.room, KVPoll.Failed)
                                 self.sync_status_to_decode_endpoint(
                                     req.endpoint, req.dst_port, req.room
                                 )
@@ -351,8 +351,9 @@ class MooncakeKVManager(BaseKVManager):
 
                                 # Only sync status when all the dst ranks have received the kvcache
                                 if len(polls) == req.required_dst_info_num:
-                                    self.request_status[req.room] = (
-                                        KVPoll.Success if all(polls) else KVPoll.Failed
+                                    self.update_status(
+                                        req.room,
+                                        KVPoll.Success if all(polls) else KVPoll.Failed,
                                     )
                                     for endpoint, dst_port, room in dst_ranks_infos:
                                         self.sync_status_to_decode_endpoint(
@@ -361,9 +362,10 @@ class MooncakeKVManager(BaseKVManager):
                         else:
                             # Dummy request means the decode instance is not used, so its status can be marked as success directly
                             # Dummy request does not need to sync status to decode endpoint
-                            self.request_status[req.room] = KVPoll.Success
+                            self.update_status(req.room, KVPoll.Success)
 
-                    self.transfer_infos.pop(req.room)
+                    if self.check_status(kv_chunk.room) == KVPoll.Success:
+                        self.transfer_infos.pop(kv_chunk.room)
 
                 except queue.Empty:
                     continue
@@ -380,7 +382,7 @@ class MooncakeKVManager(BaseKVManager):
                 (bootstrap_room, status) = self.server_socket.recv_multipart()
                 status = int(status.decode("ascii"))
                 bootstrap_room = int(bootstrap_room.decode("ascii"))
-                self.request_status[bootstrap_room] = status
+                self.update_status(bootstrap_room, status)
 
         threading.Thread(target=decode_thread).start()
 
@@ -404,7 +406,7 @@ class MooncakeKVManager(BaseKVManager):
                 prefill_aux_index=aux_index,
             )
         )
-        self.request_status[bootstrap_room] = KVPoll.WaitingForInput
+        self.update_status(bootstrap_room, KVPoll.WaitingForInput)
 
     def check_status(self, bootstrap_room: int):
         # TOOD: do we really need the poll()?
@@ -581,8 +583,10 @@ class MooncakeKVReceiver(BaseKVReceiver):
 
         self.target_dp_group = bootstrap_room % self.prefill_dp_size
 
-        # NOTE: key distinguished by bootstrap_addr and engine_rank
-        bootstrap_key = f"{self.bootstrap_addr}_{self.kv_mgr.kv_args.engine_rank}"
+        # NOTE: key distinguished by bootstrap_addr, target_dp_group, and engine_rank
+        bootstrap_key = (
+            f"{self.bootstrap_addr}_{self.target_dp_group}_{self.target_tp_rank}"
+        )
 
         if bootstrap_key not in self.kv_mgr.connection_pool:
             bootstrap_infos = []
