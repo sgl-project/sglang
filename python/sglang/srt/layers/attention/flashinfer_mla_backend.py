@@ -34,9 +34,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
 from sglang.srt.utils import is_flashinfer_available
 
-from sglang.srt.distributed import get_tensor_model_parallel_rank
-g_count = 0
-
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -147,10 +144,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         self.prefill_cuda_graph_metadata = {}  # For verify
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        # if get_tensor_model_parallel_rank() == 0:
-        #     spec_info = forward_batch.spec_info
-        #     print(f">> [FlashInferMLAAttnBackend: {forward_batch.forward_mode=}, {spec_info=}")
-
         if forward_batch.forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
                 forward_batch.req_pool_indices,
@@ -370,7 +363,9 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             )
         else:
             # mla paged prefill
-            k_buf = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(torch.bfloat16)
+            k_buf = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
+                q.dtype
+            )
             o = prefill_wrapper_paged.run(
                 qall[:, :, : layer.v_head_dim],
                 qall[:, :, layer.v_head_dim :],
@@ -403,8 +398,9 @@ class FlashInferMLAAttnBackend(AttentionBackend):
 
         # Reshape inputs
         reshaped_q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
-        k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-        reshaped_k = k_buffer.view(-1, 1, layer.head_dim).to(torch.bfloat16)
+        k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
+            q.dtype
+        )
         # Direct call to run without the wrapper
         o = decode_wrapper.run(
             reshaped_q[:, :, : layer.v_head_dim],

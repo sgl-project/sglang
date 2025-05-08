@@ -20,21 +20,17 @@ from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttn
 from sglang.srt.layers.attention.utils import create_flashmla_kv_indices_triton
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
-
-from sglang.srt.distributed import get_tensor_model_parallel_rank
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
     from sglang.srt.speculative.spec_info import SpecInfo
 
-from sgl_kernel import sgl_per_tensor_quant_fp8
 
 # FlashMLA only supports pagesize=64
 PAGE_SIZE = 64
-# TODO The current setup is hard-coded and will be changed after integrating with MTP.
-Q_LEN = 1
+
 
 @dataclass
 class FlashMLADecodeMetadata:
@@ -54,6 +50,8 @@ class FlashMLADecodeMetadata:
 
 
 class FlashMLABackend(FlashInferMLAAttnBackend):
+    """Flashmla attention kernels."""
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -108,7 +106,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             )
             mla_metadata, num_splits = get_mla_metadata(
                 forward_batch.seq_lens.to(torch.int32),
-                Q_LEN * self.num_q_heads,
+                self.num_q_heads,
                 1,
             )
             self.forward_metadata = FlashMLADecodeMetadata(
@@ -120,9 +118,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             seq_lens_cpu = forward_batch.seq_lens_cpu + self.num_draft_tokens
             seq_lens = forward_batch.seq_lens + self.num_draft_tokens
 
-            max_seqlen_pad = triton.cdiv(
-                seq_lens_cpu.max().item(), PAGE_SIZE
-            )
+            max_seqlen_pad = triton.cdiv(seq_lens_cpu.max().item(), PAGE_SIZE)
             block_kv_indices = torch.full(
                 (bs, max_seqlen_pad),
                 -1,
@@ -168,18 +164,23 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         else:
             cuda_graph_kv_indices = block_kv_indices
 
-        self.cuda_graph_mla_metadata, self.cuda_graph_num_splits = get_mla_metadata(
-            torch.ones(max_bs, dtype=torch.int32, device=cuda_graph_kv_indices.device),
-            Q_LEN * self.num_q_heads,
-            1,
-        )
+        if self.num_draft_tokens:
+            self.cuda_graph_mla_metadata, self.cuda_graph_num_splits = get_mla_metadata(
+                torch.ones(
+                    max_bs, dtype=torch.int32, device=cuda_graph_kv_indices.device
+                ),
+                self.num_draft_tokens * self.num_q_heads,
+                1,
+            )
+        else:
+            self.cuda_graph_mla_metadata, self.cuda_graph_num_splits = get_mla_metadata(
+                torch.ones(
+                    max_bs, dtype=torch.int32, device=cuda_graph_kv_indices.device
+                ),
+                self.num_q_heads,
+                1,
+            )
         self.cuda_graph_kv_indices = cuda_graph_kv_indices
-
-        self.forward_metadata = FlashMLADecodeMetadata(
-            self.cuda_graph_mla_metadata,
-            self.cuda_graph_num_splits,
-            self.cuda_graph_kv_indices[:max_bs],
-        )
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -192,55 +193,54 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         spec_info: Optional[SpecInfo],
     ):
         if forward_mode.is_decode_or_idle():
-            if spec_info is None:
-                max_seqlen_pad = triton.cdiv(seq_lens.max().item(), PAGE_SIZE)
+            max_seqlen_pad = triton.cdiv(seq_lens.max().item(), PAGE_SIZE)
 
-                create_flashmla_kv_indices_triton[(bs,)](
-                    self.req_to_token,
-                    req_pool_indices,
-                    seq_lens,
-                    None,
-                    self.cuda_graph_kv_indices,
-                    self.req_to_token.stride(0),
-                    self.cuda_graph_kv_indices.stride(0),
-                )
-                mla_metadata, num_splits = get_mla_metadata(
-                    seq_lens.to(torch.int32),
-                    Q_LEN * self.num_q_heads,
-                    1,
-                )
-                self.cuda_graph_mla_metadata.copy_(mla_metadata)
-                self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
-                self.forward_metadata = FlashMLADecodeMetadata(
-                    self.cuda_graph_mla_metadata,
-                    self.cuda_graph_num_splits[: bs + 1],
-                    self.cuda_graph_kv_indices[:bs, :max_seqlen_pad],
-                )
+            create_flashmla_kv_indices_triton[(bs,)](
+                self.req_to_token,
+                req_pool_indices,
+                seq_lens,
+                None,
+                self.cuda_graph_kv_indices,
+                self.req_to_token.stride(0),
+                self.cuda_graph_kv_indices.stride(0),
+            )
+            mla_metadata, num_splits = get_mla_metadata(
+                seq_lens.to(torch.int32),
+                self.num_q_heads,
+                1,
+            )
+            self.cuda_graph_mla_metadata.copy_(mla_metadata)
+            self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
+            self.forward_metadata = FlashMLADecodeMetadata(
+                self.cuda_graph_mla_metadata,
+                self.cuda_graph_num_splits[: bs + 1],
+                self.cuda_graph_kv_indices[:bs, :max_seqlen_pad],
+            )
         elif forward_mode.is_target_verify():
-            if spec_info is None:
-                max_seqlen_pad = triton.cdiv(seq_lens.max().item(), PAGE_SIZE)
+            seq_lens = seq_lens + self.num_draft_tokens
+            max_seqlen_pad = triton.cdiv(seq_lens.max().item(), PAGE_SIZE)
 
-                create_flashmla_kv_indices_triton[(bs,)](
-                    self.req_to_token,
-                    req_pool_indices,
-                    seq_lens,
-                    None,
-                    self.cuda_graph_kv_indices,
-                    self.req_to_token.stride(0),
-                    self.cuda_graph_kv_indices.stride(0),
-                )
-                mla_metadata, num_splits = get_mla_metadata(
-                    seq_lens.to(torch.int32),
-                    Q_LEN * self.num_q_heads,
-                    1,
-                )
-                self.cuda_graph_mla_metadata.copy_(mla_metadata)
-                self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
-                self.forward_metadata = FlashMLADecodeMetadata(
-                    self.cuda_graph_mla_metadata,
-                    self.cuda_graph_num_splits[: bs + 1],
-                    self.cuda_graph_kv_indices[:bs, :max_seqlen_pad],
-                )
+            create_flashmla_kv_indices_triton[(bs,)](
+                self.req_to_token,
+                req_pool_indices,
+                seq_lens,
+                None,
+                self.cuda_graph_kv_indices,
+                self.req_to_token.stride(0),
+                self.cuda_graph_kv_indices.stride(0),
+            )
+            mla_metadata, num_splits = get_mla_metadata(
+                seq_lens.to(torch.int32),
+                self.num_draft_tokens * self.num_q_heads,
+                1,
+            )
+            self.cuda_graph_mla_metadata.copy_(mla_metadata)
+            self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
+            self.forward_metadata = FlashMLADecodeMetadata(
+                self.cuda_graph_mla_metadata,
+                self.cuda_graph_num_splits[: bs + 1],
+                self.cuda_graph_kv_indices[:bs, :max_seqlen_pad],
+            )
         else:
             super().init_forward_metadata_capture_cuda_graph(
                 bs,
@@ -280,7 +280,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             )
             mla_metadata, num_splits = get_mla_metadata(
                 seq_lens.to(torch.int32),
-                Q_LEN * self.num_q_heads,
+                self.num_q_heads,
                 1,
             )
             self.cuda_graph_mla_metadata.copy_(mla_metadata)
@@ -291,8 +291,8 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 :bs, :max_seqlen_pad
             ]
         elif forward_mode.is_target_verify():
-            seq_lens = seq_lens[:bs]
-            seq_lens_cpu = seq_lens_cpu[:bs]
+            seq_lens = seq_lens[:bs] + self.num_draft_tokens
+            seq_lens_cpu = seq_lens_cpu[:bs] + self.num_draft_tokens
             max_seqlen_pad = triton.cdiv(seq_lens_cpu.max().item(), PAGE_SIZE)
             create_flashmla_kv_indices_triton[(bs,)](
                 self.req_to_token,
@@ -305,7 +305,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             )
             mla_metadata, num_splits = get_mla_metadata(
                 seq_lens.to(torch.int32),
-                Q_LEN * self.num_q_heads,
+                self.num_draft_tokens * self.num_q_heads,
                 1,
             )
             self.cuda_graph_mla_metadata.copy_(mla_metadata)
@@ -368,12 +368,12 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 softmax_scale=layer.scaling,
                 causal=True,
                 descale_q=torch.ones((1), dtype=torch.float32, device=reshape_q.device),
-                descale_k=torch.ones((1), dtype=torch.float32, device=reshape_q.device)
+                descale_k=torch.ones((1), dtype=torch.float32, device=reshape_q.device),
             )
 
             return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
         else:
-            #todo: need check all causal True or False?
+            # todo: need check all causal True or False?
             o, _ = flash_mla_with_kvcache(
                 q=reshape_q,
                 k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
@@ -388,7 +388,6 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
 
             return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
-
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -398,8 +397,11 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
     ):
-        if forward_batch.forward_mode == ForwardMode.EXTEND or forward_batch.forward_mode == ForwardMode.DRAFT_EXTEND:
-            return super().forward_extend(q,k,v,layer, forward_batch, save_kv_cache)
+        if (
+            forward_batch.forward_mode == ForwardMode.EXTEND
+            or forward_batch.forward_mode == ForwardMode.DRAFT_EXTEND
+        ):
+            return super().forward_extend(q, k, v, layer, forward_batch, save_kv_cache)
         else:
             cache_loc = forward_batch.out_cache_loc
 
@@ -418,21 +420,27 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                     q=reshape_q_fp8,
                     k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
                     block_table=self.forward_metadata.block_kv_indices[:bs],
-                    cache_seqlens=forward_batch.seq_lens.to(torch.int32) + self.num_draft_tokens,
+                    cache_seqlens=forward_batch.seq_lens.to(torch.int32)
+                    + self.num_draft_tokens,
                     head_dim_v=self.kv_lora_rank,
                     tile_scheduler_metadata=self.forward_metadata.flashmla_metadata,
                     num_splits=self.forward_metadata.num_splits,
                     softmax_scale=layer.scaling,
                     causal=True,
-                    descale_q=torch.ones((1), dtype=torch.float32, device=reshape_q.device),
-                    descale_k=torch.ones((1), dtype=torch.float32, device=reshape_q.device)
+                    descale_q=torch.ones(
+                        (1), dtype=torch.float32, device=reshape_q.device
+                    ),
+                    descale_k=torch.ones(
+                        (1), dtype=torch.float32, device=reshape_q.device
+                    ),
                 )
             else:
                 o, _ = flash_mla_with_kvcache(
                     q=reshape_q,
                     k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
                     block_table=self.forward_metadata.block_kv_indices[:bs],
-                    cache_seqlens=forward_batch.seq_lens.to(torch.int32) + self.num_draft_tokens,
+                    cache_seqlens=forward_batch.seq_lens.to(torch.int32)
+                    + self.num_draft_tokens,
                     head_dim_v=self.kv_lora_rank,
                     tile_scheduler_metadata=self.forward_metadata.flashmla_metadata,
                     num_splits=self.forward_metadata.num_splits,
@@ -441,7 +449,8 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 )
             return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
-#TODO: multi step kv indices optimization
+
+# TODO: multi step kv indices optimization
 class FlashMLAMultiStepDraftBackend:
     """
     Wrap multiple flashmla attention backends as one for multiple consecutive
@@ -489,7 +498,6 @@ class FlashMLAMultiStepDraftBackend:
         call_fn: Callable,
     ):
         assert forward_batch.spec_info is not None
-        assert isinstance(forward_batch.spec_info, EagleDraftInput)
 
         for i in range(self.speculative_num_steps - 1):
             call_fn(i, forward_batch)
@@ -497,16 +505,13 @@ class FlashMLAMultiStepDraftBackend:
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         def call_fn(i, forward_batch):
             assert forward_batch.spec_info is not None
-            assert isinstance(forward_batch.spec_info, EagleDraftInput)
             self.attn_backends[i].init_forward_metadata(forward_batch)
 
         self.common_template(forward_batch, call_fn)
 
     def init_cuda_graph_state(self, max_bs: int):
         for i in range(self.speculative_num_steps):
-            self.attn_backends[i].init_cuda_graph_state(
-                max_bs, block_kv_indices=None
-            )
+            self.attn_backends[i].init_cuda_graph_state(max_bs, block_kv_indices=None)
 
     def init_forward_metadata_capture_cuda_graph(self, forward_batch: ForwardBatch):
         def call_fn(i, forward_batch):
