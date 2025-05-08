@@ -19,6 +19,7 @@ from sglang.srt.managers.expert_location import (
     ExpertLocationMetadata,
     ModelConfigForExpertLocation,
 )
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from tqdm.auto import tqdm
 
 _ = compute_utilization_rate, compute_gpu_physical_count
@@ -28,11 +29,16 @@ def read_expert_distribution_recorder_mode_detail_per_token(dir_data):
     for path in tqdm(list(Path(dir_data).glob("*.pt"))):
         data_pack = torch.load(path, weights_only=True)
         for record in data_pack["records"]:
-            rids = [int(rid, 16) & ((1 << 64) - 1) for rid in record["rids"]]
+            rids_raw = torch.tensor([int(rid, 16) & ((1 << 64) - 1) for rid in record["rids"]])
             input_ids = record["input_ids"]
-            extend_seq_lens = record["extend_seq_lens"]
+            extend_seq_lens = torch.tensor(record["extend_seq_lens"])
             forward_mode = record["forward_mode"]
             topk_ids_of_layer = record["topk_ids_of_layer"]
+
+            rids_repeat_num = extend_seq_lens if forward_mode == ForwardMode.EXTEND.value else torch.full(
+                (len(rids_raw),), 1)
+            rids_repeated = torch.repeat_interleave(rids_raw, rids_repeat_num)
+
     return TODO
 
 
