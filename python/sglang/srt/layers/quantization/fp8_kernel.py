@@ -308,8 +308,8 @@ def sglang_per_token_group_quant_fp8(
             device=x.device,
             dtype=torch.float32,
         )
-
-    sgl_per_token_group_quant_fp8(x, x_q, x_s, group_size, eps, fp8_min, fp8_max)
+    if x.shape[0] > 0:
+        sgl_per_token_group_quant_fp8(x, x_q, x_s, group_size, eps, fp8_min, fp8_max)
 
     return x_q, x_s
 
