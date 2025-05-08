@@ -44,7 +44,7 @@ jobs:
           bash scripts/ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 20
+        timeout-minutes: 10
         run: |
           cd test/lang
           python3 run_suite.py --suite per-commit
@@ -66,7 +66,7 @@ jobs:
           bash scripts/ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 60
+        timeout-minutes: 30
         run: |
           cd test/srt
           python3 run_suite.py --suite per-commit --auto-partition-id ${{ matrix.part }} --auto-partition-size 8
@@ -255,9 +255,6 @@ jobs:
   unit-test-backend-pd:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false
-    needs: [
-      accuracy-test-1-gpu, accuracy-test-2-gpu,
-    ]
     runs-on: 8-gpu-runner
     steps:
       - name: Checkout code
@@ -291,7 +288,7 @@ jobs:
           bash scripts/ci_install_dependency_8_gpu.sh
 
       - name: Run test
-        timeout-minutes: 28
+        timeout-minutes: 25
         run: |
           cd test/srt
           python3 run_suite.py --suite per-commit-8-gpu

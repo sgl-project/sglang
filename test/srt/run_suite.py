@@ -85,6 +85,9 @@ suites = {
         TestFile("test_w8a8_quantization.py", 46),
         TestFile("models/lora/test_lora_cuda_graph.py", 250),
     ],
+    "per-commit-pd": [
+        TestFile("test_disaggregation.py", 90),
+    ],
     "per-commit-2-gpu": [
         TestFile("models/lora/test_lora_tp.py", 116),
         TestFile("test_data_parallelism.py", 73),
@@ -98,7 +101,6 @@ suites = {
     "per-commit-8-gpu": [
         TestFile("test_deepep_intranode.py", 50),
         TestFile("test_deepep_low_latency.py", 50),
-        TestFile("test_disaggregation.py", 90),
         TestFile("test_moe_deepep_eval_accuracy_large.py", 250),
         TestFile("test_local_attn.py", 250),
         TestFile("test_full_deepseek_v3.py", 250),
