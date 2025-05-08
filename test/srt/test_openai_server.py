@@ -115,8 +115,13 @@ class TestOpenAIServer(CustomTestCase):
             assert hidden_states is not None, "hidden_states is not returned"
             hidden_states = np.asarray(hidden_states[1:])
             assert (
-                len(hidden_states.shape) > 1
+                len(hidden_states.shape) == 2
             ), f"hidden_states shape is not correct, was {hidden_states.shape}"
+        else:
+            hidden_states = response.choices[0].hidden_states
+            assert (
+                hidden_states is None
+            ), "hidden_states was returned and should not have been"
 
     def run_completion_stream(
         self,
@@ -205,8 +210,20 @@ class TestOpenAIServer(CustomTestCase):
             ), f"index {index} is not found in the response"
 
         if return_hidden_states:
-            assert hidden_states
-            assert np.asarray(hidden_states).shape[0] == 1
+            assert hidden_states is not None, "hidden_states is not returned"
+            if len(hidden_states) > 1:
+                hidden_states = hidden_states[1:]
+            try:
+                hidden_states = np.asarray(hidden_states)
+            except Exception as e:
+                raise Exception(f"Failed to convert hidden states to numpy array: {e}")
+            assert (
+                len(hidden_states.shape) == 2
+            ), f"hidden_states shape is not correct, was {hidden_states.shape}"
+        else:
+            assert (
+                hidden_states is None
+            ), "hidden_states was returned and should not have been"
 
     def run_chat_completion(self, logprobs, parallel_sample_num, return_hidden_states):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
@@ -252,8 +269,13 @@ class TestOpenAIServer(CustomTestCase):
             assert hidden_states is not None, "hidden_states is not returned"
             hidden_states = np.asarray(hidden_states[1:])
             assert (
-                len(hidden_states.shape) > 1
+                len(hidden_states.shape) == 2
             ), f"hidden_states shape is not correct, was {hidden_states.shape}"
+        else:
+            hidden_states = response.choices[0].hidden_states
+            assert (
+                hidden_states is None
+            ), "hidden_states was returned and should not have been"
 
     def run_chat_completion_stream(self, logprobs, parallel_sample_num=1):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
@@ -322,10 +344,10 @@ class TestOpenAIServer(CustomTestCase):
             assert response.created
 
             if (
-                hasattr(response.choices[0], "hidden_states")
-                and response.choices[0].hidden_states is not None
+                hasattr(response.choices[0].delta, "hidden_states")
+                and response.choices[0].delta.hidden_states is not None
             ):
-                hidden_states = response.choices[0].hidden_states
+                hidden_states = response.choices[0].delta.hidden_states
 
         for index in [i for i in range(parallel_sample_num)]:
             assert not is_firsts.get(
@@ -333,8 +355,16 @@ class TestOpenAIServer(CustomTestCase):
             ), f"index {index} is not found in the response"
 
         if return_hidden_states:
-            assert hidden_states
-            assert np.asarray(hidden_states).shape[0] == 1
+            assert hidden_states is not None, "hidden_states is not returned"
+            hidden_states = np.asarray(hidden_states)
+            assert len(hidden_states.shape) == 3 and hidden_states.shape[:2] == (
+                1,
+                1,
+            ), f"hidden_states shape is not correct, was {hidden_states.shape}"
+        else:
+            assert (
+                hidden_states is None
+            ), "hidden_states was returned and should not have been"
 
     def _create_batch(self, mode, client):
         if mode == "completion":
