@@ -7,12 +7,14 @@ on:
       - "python/**"
       - "scripts/**"
       - "test/**"
+      - ".github/workflows/pr-test.yml"
   pull_request:
     branches: [ main ]
     paths:
       - "python/**"
       - "scripts/**"
       - "test/**"
+      - ".github/workflows/pr-test.yml"
   workflow_dispatch:
     inputs:
       version:
@@ -87,24 +89,6 @@ jobs:
           cd test/srt
           python3 run_suite.py --suite per-commit-2-gpu
 
-  unit-test-backend-8-gpu:
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false
-    runs-on: 8-gpu-runner
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install dependencies
-        run: |
-          bash scripts/ci_install_dependency_8_gpu.sh
-
-      - name: Run test
-        timeout-minutes: 40
-        run: |
-          cd test/srt
-          python3 run_suite.py --suite per-commit-8-gpu
-
   performance-test-1-gpu-part-1:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false
@@ -177,6 +161,18 @@ jobs:
         run: |
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_default_fp8
+
+      - name: Benchmark VLM offline throughput
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_serving.TestBenchServing.test_vlm_offline_throughput
+
+      - name: Benchmark VLM online latency
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_serving.TestBenchServing.test_vlm_online_latency
 
   performance-test-2-gpu:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
@@ -256,12 +252,35 @@ jobs:
           cd test/srt
           python3 test_moe_eval_accuracy_large.py
 
+  large-scale-test-8-gpu:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+        github.event.pull_request.draft == false
+    needs: [
+      unit-test-frontend, unit-test-backend-1-gpu, unit-test-backend-2-gpu,
+      performance-test-1-gpu-part-1, performance-test-1-gpu-part-2, performance-test-2-gpu,
+      accuracy-test-1-gpu, accuracy-test-2-gpu,
+    ]
+    runs-on: 8-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci_install_dependency_8_gpu.sh
+
+      - name: Run test
+        timeout-minutes: 25
+        run: |
+          cd test/srt
+          python3 run_suite.py --suite per-commit-8-gpu
+
   finish:
     if: always()
     needs: [
-      unit-test-frontend, unit-test-backend-1-gpu, unit-test-backend-2-gpu, unit-test-backend-8-gpu,
+      unit-test-frontend, unit-test-backend-1-gpu, unit-test-backend-2-gpu,
       performance-test-1-gpu-part-1, performance-test-1-gpu-part-2, performance-test-2-gpu,
-      accuracy-test-1-gpu, accuracy-test-2-gpu,
+      accuracy-test-1-gpu, accuracy-test-2-gpu, large-scale-test-8-gpu,
     ]
     runs-on: ubuntu-latest
     steps:
