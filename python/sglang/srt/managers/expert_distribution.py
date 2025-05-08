@@ -314,7 +314,7 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
             ),
             dtype=torch.int32,
         )
-        self._objects: List[Dict[str, Any]] = []
+        self._misc_objects: List[Dict[str, Any]] = []
         assert (
             not server_args.enable_two_batch_overlap
         ), "DetailSinglePassGatherer does not support TBO yet"
@@ -340,7 +340,7 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
         num_tokens_per_rdma_rank,
         num_tokens_per_expert,
     ):
-        self._objects.append(
+        self._misc_objects.append(
             dict(
                 layer_id=layer_idx,
                 num_tokens_per_rank=num_tokens_per_rank.cpu().tolist(),
@@ -351,7 +351,7 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
 
     def reset(self):
         self._topk_ids_of_layer[...] = 0
-        self._objects.clear()
+        self._misc_objects.clear()
         self._metadata = None
 
     def collect(self) -> Dict:
@@ -359,7 +359,7 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
         return dict(
             **self._metadata,
             topk_ids_of_layer=self._topk_ids_of_layer[:, :num_tokens, :],
-            objects=self._objects,
+            misc_objects=self._misc_objects,
         )
 
 
