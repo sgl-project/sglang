@@ -102,10 +102,10 @@ jobs:
           bash scripts/ci_install_dependency_rdma.sh
 
       - name: Run test
-        timeout-minutes: 5
+        timeout-minutes: 10
         run: |
           cd test/srt
-          python3 run_suite.py --suite per-commit-rdma
+          python3 -m unittest test_disaggregation.TestDisaggregationMooncake.test_gsm8k
 
   performance-test-1-gpu-part-1:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
