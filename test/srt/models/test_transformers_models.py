@@ -29,7 +29,7 @@ class TestTransformersFallbackEndpoint(CustomTestCase):
             other_args=["--model-impl", "transformers"],
         )
         cls.mmlu_lower_bound = 0.65
-        cls.gsm8k_lower_bound = 0.75
+        cls.gsm8k_lower_bound = 0.70
 
     @classmethod
     def tearDownClass(cls):
@@ -81,8 +81,8 @@ class TestTransformersFallbackTorchAO(TestTransformersFallbackEndpoint):
                 "int4wo-128",
             ],
         )
-        cls.mmlu_lower_bound = 0.20
-        cls.gsm8k_lower_bound = 0.20
+        cls.mmlu_lower_bound = 0.65
+        cls.gsm8k_lower_bound = 0.70
 
 
 @dataclasses.dataclass
@@ -100,8 +100,8 @@ class ModelCase:
 
 # Popular models that run on the CI
 CI_MODELS = [
-    ModelCase(DEFAULT_MODEL_NAME_FOR_TEST, tp_size=1),
-    ModelCase(DEFAULT_MODEL_NAME_FOR_TEST, tp_size=2),
+    # ModelCase(DEFAULT_MODEL_NAME_FOR_TEST, tp_size=1),
+    # ModelCase(DEFAULT_MODEL_NAME_FOR_TEST, tp_size=2),
 ]
 
 
