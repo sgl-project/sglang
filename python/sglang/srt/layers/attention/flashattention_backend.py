@@ -338,7 +338,7 @@ class FlashAttentionBackend(AttentionBackend):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
         metadata = FlashAttentionMetadata()
         seqlens_in_batch = forward_batch.seq_lens
-        batch_size = len(seqlens_in_batch)
+        batch_size = forward_batch.batch_size
         device = seqlens_in_batch.device
 
         if forward_batch.forward_mode.is_decode_or_idle():
@@ -625,6 +625,7 @@ class FlashAttentionBackend(AttentionBackend):
         save_kv_cache=True,
         # For multi-head latent attention
         q_rope: Optional[torch.Tensor] = None,
+        k_rope: Optional[torch.Tensor] = None,
     ):
         if k is not None:
             assert v is not None
@@ -639,11 +640,11 @@ class FlashAttentionBackend(AttentionBackend):
                         layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                     )
                 else:
-                    forward_batch.token_to_kv_pool.set_kv_buffer(
+                    forward_batch.token_to_kv_pool.set_mla_kv_buffer(
                         layer,
                         cache_loc,
                         k,
-                        v,
+                        k_rope,
                     )
 
         # Use precomputed metadata across all layers
@@ -887,6 +888,7 @@ class FlashAttentionBackend(AttentionBackend):
         save_kv_cache=True,
         # For multi-head latent attention
         q_rope: Optional[torch.Tensor] = None,
+        k_rope: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if k is not None:
             assert v is not None
@@ -901,11 +903,11 @@ class FlashAttentionBackend(AttentionBackend):
                         layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                     )
                 else:
-                    forward_batch.token_to_kv_pool.set_kv_buffer(
+                    forward_batch.token_to_kv_pool.set_mla_kv_buffer(
                         layer,
                         cache_loc,
                         k,
-                        v,
+                        k_rope,
                     )
 
         # Use precomputed metadata across all layers
@@ -1523,12 +1525,9 @@ class FlashAttentionBackend(AttentionBackend):
                     metadata.max_seq_len_k = seq_lens_cpu.max().item() + (
                         self.speculative_step_id + 1
                     )
-                    metadata.cu_seqlens_k.copy_(
-                        torch.nn.functional.pad(
-                            torch.cumsum(
-                                metadata.cache_seqlens_int32, dim=0, dtype=torch.int32
-                            ),
-                            (1, 0),
+                    metadata.cu_seqlens_k[1:].copy_(
+                        torch.cumsum(
+                            metadata.cache_seqlens_int32, dim=0, dtype=torch.int32
                         )
                     )
 
@@ -1552,12 +1551,9 @@ class FlashAttentionBackend(AttentionBackend):
                     # metadata.max_seq_len_q = self.topk, already set in capture
                     metadata.max_seq_len_k = seq_lens_cpu.max().item()
                     # metadata.cu_seqlens_q already set in capture
-                    metadata.cu_seqlens_k.copy_(
-                        torch.nn.functional.pad(
-                            torch.cumsum(
-                                metadata.cache_seqlens_int32, dim=0, dtype=torch.int32
-                            ),
-                            (1, 0),
+                    metadata.cu_seqlens_k[1:].copy_(
+                        torch.cumsum(
+                            metadata.cache_seqlens_int32, dim=0, dtype=torch.int32
                         )
                     )
 
@@ -1585,8 +1581,9 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.max_seq_len_k = max_len
 
                 metadata.cache_seqlens_int32 = seq_lens.to(torch.int32)
-                metadata.cu_seqlens_k = torch.nn.functional.pad(
-                    torch.cumsum(seq_lens, dim=0, dtype=torch.int32), (1, 0)
+                # Optimize cumulative sequence length calculation
+                metadata.cu_seqlens_k[1:].copy_(
+                    torch.cumsum(seq_lens, dim=0, dtype=torch.int32)
                 )
 
                 max_seq_pages = (
@@ -1613,13 +1610,8 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.max_seq_len_k = (
                     seq_lens_cpu.max().item() + self.speculative_num_draft_tokens
                 )
-                metadata.cu_seqlens_k.copy_(
-                    torch.nn.functional.pad(
-                        torch.cumsum(
-                            metadata.cache_seqlens_int32, dim=0, dtype=torch.int32
-                        ),
-                        (1, 0),
-                    )
+                metadata.cu_seqlens_k[1:].copy_(
+                    torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
                 )
                 max_seq_pages = (
                     metadata.max_seq_len_k + self.page_size - 1
@@ -1638,13 +1630,8 @@ class FlashAttentionBackend(AttentionBackend):
                 # metadata.max_seq_len_q = self.speculative_num_draft_tokens, already set in capture
                 metadata.max_seq_len_k = seq_lens_cpu.max().item()
                 # metadata.cu_seqlens_q already set in capture
-                metadata.cu_seqlens_k.copy_(
-                    torch.nn.functional.pad(
-                        torch.cumsum(
-                            metadata.cache_seqlens_int32, dim=0, dtype=torch.int32
-                        ),
-                        (1, 0),
-                    )
+                metadata.cu_seqlens_k[1:].copy_(
+                    torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
                 )
                 page_table = self.req_to_token[
                     req_pool_indices, : metadata.max_seq_len_k
@@ -1702,14 +1689,11 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata_expand.cache_seqlens_int32.copy_(
                     mask.sum(dim=1).to(torch.int32)
                 )
-                metadata_expand.cu_seqlens_k.copy_(
-                    torch.nn.functional.pad(
-                        torch.cumsum(
-                            metadata_expand.cache_seqlens_int32,
-                            dim=0,
-                            dtype=torch.int32,
-                        ),
-                        (1, 0),
+                metadata_expand.cu_seqlens_k[1:].copy_(
+                    torch.cumsum(
+                        metadata_expand.cache_seqlens_int32,
+                        dim=0,
+                        dtype=torch.int32,
                     )
                 )
                 metadata_expand.max_seq_len_k = (
@@ -1720,11 +1704,8 @@ class FlashAttentionBackend(AttentionBackend):
             # Only support encoder size 1 for now
             metadata.encoder_max_seq_len_k = encoder_lens[0]
             metadata.encoder_lens_int32.copy_(encoder_lens[:1])
-            metadata.encoder_cu_seqlens_k.copy_(
-                torch.nn.functional.pad(
-                    torch.cumsum(metadata.encoder_lens_int32, dim=0, dtype=torch.int32),
-                    (1, 0),
-                )
+            metadata.encoder_cu_seqlens_k[1:].copy_(
+                torch.cumsum(metadata.encoder_lens_int32, dim=0, dtype=torch.int32)
             )
 
             metadata.encoder_page_table[:, : metadata.encoder_max_seq_len_k].copy_(

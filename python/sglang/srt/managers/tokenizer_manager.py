@@ -54,7 +54,11 @@ from sglang.srt.disaggregation.utils import (
     TransferBackend,
     get_kv_class,
 )
-from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
+from sglang.srt.hf_transformers_utils import (
+    get_processor,
+    get_tokenizer,
+    get_tokenizer_from_processor,
+)
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOut,
@@ -86,6 +90,8 @@ from sglang.srt.managers.io_struct import (
     ResumeMemoryOccupationReqInput,
     ResumeMemoryOccupationReqOutput,
     SessionParams,
+    SlowDownReqInput,
+    SlowDownReqOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     UpdateWeightFromDiskReqInput,
@@ -161,17 +167,7 @@ class TokenizerManager:
         # Read model args
         self.model_path = server_args.model_path
         self.served_model_name = server_args.served_model_name
-        self.model_config = ModelConfig(
-            server_args.model_path,
-            trust_remote_code=server_args.trust_remote_code,
-            revision=server_args.revision,
-            context_length=server_args.context_length,
-            model_override_args=server_args.json_model_override_args,
-            is_embedding=server_args.is_embedding,
-            enable_multimodal=server_args.enable_multimodal,
-            dtype=server_args.dtype,
-            quantization=server_args.quantization,
-        )
+        self.model_config = ModelConfig.from_server_args(server_args)
 
         self.is_generation = self.model_config.is_generation
         self.is_image_gen = self.model_config.is_image_gen
@@ -199,7 +195,7 @@ class TokenizerManager:
                 self.tokenizer = self.processor = None
             else:
                 self.processor = _processor
-                self.tokenizer = self.processor.tokenizer
+                self.tokenizer = get_tokenizer_from_processor(self.processor)
                 os.environ["TOKENIZERS_PARALLELISM"] = "false"
         else:
             self.mm_processor = get_dummy_processor()
@@ -265,6 +261,9 @@ class TokenizerManager:
         self.resume_memory_occupation_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.slow_down_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
         self.flush_cache_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -317,6 +316,10 @@ class TokenizerManager:
                 (
                     ResumeMemoryOccupationReqOutput,
                     self.resume_memory_occupation_communicator.handle_recv,
+                ),
+                (
+                    SlowDownReqOutput,
+                    self.slow_down_communicator.handle_recv,
                 ),
                 (
                     FlushCacheReqOutput,
@@ -875,6 +878,14 @@ class TokenizerManager:
     ):
         self.auto_create_handle_loop()
         await self.resume_memory_occupation_communicator(obj)
+
+    async def slow_down(
+        self,
+        obj: SlowDownReqInput,
+        request: Optional[fastapi.Request] = None,
+    ):
+        self.auto_create_handle_loop()
+        await self.slow_down_communicator(obj)
 
     async def open_session(
         self, obj: OpenSessionReqInput, request: Optional[fastapi.Request] = None

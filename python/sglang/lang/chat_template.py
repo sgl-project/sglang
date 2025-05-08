@@ -270,6 +270,29 @@ register_chat_template(
     )
 )
 
+register_chat_template(
+    ChatTemplate(
+        name="janus",
+        default_system_prompt=None,
+        role_prefix_and_suffix={
+            "system": (
+                "",
+                "",
+            ),
+            "user": (
+                "<｜User｜>",
+                "",
+            ),
+            "assistant": (
+                "<｜Assistant｜>",
+                "<｜end▁of▁sentence｜>",
+            ),
+        },
+        stop_str=("<｜end▁of▁sentence｜>",),
+        image_token="<image_placeholder>\n",
+    )
+)
+
 # The difference between "llama-3-instruct-llava" and "llama-3-instruct" is that llava uses a different image_token.
 register_chat_template(
     ChatTemplate(
@@ -392,6 +415,20 @@ register_chat_template(
             ),
         },
         style=ChatTemplateStyle.PLAIN,
+    )
+)
+
+# Adapted from https://huggingface.co/OpenGVLab/InternVL2-4B/blob/main/modeling_intern_vit.py
+register_chat_template(
+    ChatTemplate(
+        name="internvl-2-5",
+        default_system_prompt="你是书生·万象，英文名是InternVL，是由上海人工智能实验室、清华大学及多家合作单位联合开发的多模态大语言模型。",
+        role_prefix_and_suffix={
+            "system": ("<|im_start|>system\n", "<|im_end|>\n"),
+            "user": ("<|im_start|>user\n", "<|im_end|>\n"),
+            "assistant": ("<|im_start|>assistant\n", "<|im_end|>\n"),
+        },
+        stop_str=["<|im_end|>", "<|action_end|>"],
     )
 )
 
@@ -563,6 +600,13 @@ def match_gemma3_instruct(model_path: str):
     if "gemma-3" in model_path and "1b" not in model_path:
         # gemma-3-1b-it is completion model
         return get_chat_template("gemma-it")
+
+
+@register_chat_template_matching_function
+def match_internvl_chat(model_path: str):
+    model_path = model_path.lower()
+    if "internvl" in model_path:
+        return get_chat_template("internvl-2-5")
 
 
 if __name__ == "__main__":

@@ -42,6 +42,10 @@ from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 
+from sglang.srt.disaggregation.utils import (
+    FakeBootstrapHost,
+    register_disaggregation_server,
+)
 from sglang.srt.entrypoints.engine import _launch_subprocesses
 from sglang.srt.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
@@ -58,6 +62,7 @@ from sglang.srt.managers.io_struct import (
     ResumeMemoryOccupationReqInput,
     SeparateReasoningReqInput,
     SetInternalStateReq,
+    SlowDownReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
@@ -84,6 +89,7 @@ from sglang.srt.utils import (
     add_api_key_middleware,
     add_prometheus_middleware,
     delete_directory,
+    get_bool_env_var,
     kill_process_tree,
     set_uvicorn_logging_configs,
 )
@@ -126,7 +132,10 @@ async def lifespan(fast_api_app: FastAPI):
 
 
 # Fast API
-app = FastAPI(lifespan=lifespan)
+app = FastAPI(
+    lifespan=lifespan,
+    openapi_url=None if get_bool_env_var("DISABLE_OPENAPI_DOC") else "/openapi.json",
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -277,7 +286,9 @@ async def generate_from_file_request(file: UploadFile, request: Request):
     )
 
     try:
-        ret = await _global_state.generate_request(obj, request).__anext__()
+        ret = await _global_state.tokenizer_manager.generate_request(
+            obj, request
+        ).__anext__()
         return ret
     except ValueError as e:
         logger.error(f"Error: {e}")
@@ -484,6 +495,19 @@ async def resume_memory_occupation(
         return _create_error_response(e)
 
 
+@app.api_route("/slow_down", methods=["GET", "POST"])
+async def slow_down(obj: SlowDownReqInput, request: Request):
+    """Slow down the system deliberately. Only for testing. Example scenario:
+    when we want to test performance of D in large-scale PD disaggregation and have no enough nodes for P,
+    we can use this to slow down D to let it have enough running sequences, and then disable slowdown
+    to let it run in full batch size.
+    """
+    try:
+        await _global_state.tokenizer_manager.slow_down(obj, request)
+    except Exception as e:
+        return _create_error_response(e)
+
+
 @app.api_route("/open_session", methods=["GET", "POST"])
 async def open_session(obj: OpenSessionReqInput, request: Request):
     """Open a session, and return its unique session id."""
@@ -668,6 +692,8 @@ async def vertex_generate(vertex_req: VertexGenerateReqInput, raw_request: Reque
         **(vertex_req.parameters or {}),
     )
     ret = await generate_request(req, raw_request)
+    if isinstance(ret, Response):
+        return ret
     return ORJSONResponse({"predictions": ret})
 
 
@@ -815,8 +841,32 @@ def _wait_and_warmup(
             )
             assert res.status_code == 200, f"{res}"
         else:
-            # Warmup request currently hangs in disaggregation mode, so we skip it.
-            logger.info("Skipping warmup request in disaggregation mode")
+            logger.info(f"Start of prefill warmup ...")
+            json_data = {
+                "sampling_params": {
+                    "temperature": 0.0,
+                    "max_new_tokens": 8,
+                    "ignore_eos": True,
+                },
+                "bootstrap_host": [FakeBootstrapHost] * server_args.dp_size,
+                # This is a hack to ensure fake transfer is enabled during prefill warmup
+                # ensure each dp rank has a unique bootstrap_room during prefill warmup
+                "bootstrap_room": [
+                    i * (2**63 // server_args.dp_size) + (i % server_args.tp_size)
+                    for i in range(server_args.dp_size)
+                ],
+                "input_ids": [[0, 1, 2, 3]] * server_args.dp_size,
+            }
+            res = requests.post(
+                url + request_name,
+                json=json_data,
+                headers=headers,
+                timeout=1800,  # because of deep gemm precache is very long if not precache.
+            )
+            logger.info(
+                f"End of prefill warmup with status {res.status_code}, resp: {res.json()}"
+            )
+
     except Exception:
         last_traceback = get_exception_traceback()
         if pipe_finish_writer is not None:
@@ -837,6 +887,14 @@ def _wait_and_warmup(
 
     if server_args.debug_tensor_dump_input_file:
         kill_process_tree(os.getpid())
+
+    if server_args.pdlb_url is not None:
+        register_disaggregation_server(
+            server_args.disaggregation_mode,
+            server_args.port,
+            server_args.disaggregation_bootstrap_port,
+            server_args.pdlb_url,
+        )
 
     if launch_callback is not None:
         launch_callback()

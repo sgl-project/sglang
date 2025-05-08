@@ -22,7 +22,7 @@ import random
 import tempfile
 from typing import List, Literal, Optional
 
-from sglang.srt.hf_transformers_utils import check_gguf_file
+from sglang.srt.hf_transformers_utils import check_gguf_file, get_config
 from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.utils import (
     configure_ipv6,
@@ -78,6 +78,8 @@ class ServerArgs:
 
     # Other runtime options
     tp_size: int = 1
+    pp_size: int = 1
+    max_micro_batch_size: Optional[int] = None
     stream_interval: int = 1
     stream_output: bool = False
     random_seed: Optional[int] = None
@@ -185,6 +187,7 @@ class ServerArgs:
     n_share_experts_fusion: int = 0
     disable_chunked_prefix_cache: bool = False
     disable_fast_image_processor: bool = False
+    mm_attention_backend: Optional[str] = None
 
     # Debug tensor dumps
     debug_tensor_dump_output_folder: Optional[str] = None
@@ -196,12 +199,13 @@ class ServerArgs:
     disaggregation_bootstrap_port: int = 8998
     disaggregation_transfer_backend: str = "mooncake"
     disaggregation_ib_device: Optional[str] = None
+    pdlb_url: Optional[str] = None
 
     def __post_init__(self):
         # Expert parallelism
         if self.enable_ep_moe:
             self.ep_size = self.tp_size
-            logger.info(
+            logger.warning(
                 f"EP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
 
@@ -222,40 +226,55 @@ class ServerArgs:
 
         # Set mem fraction static, which depends on the tensor parallelism size
         if self.mem_fraction_static is None:
+            parallel_size = self.tp_size * self.pp_size
             if gpu_mem <= 81920:
-                if self.tp_size >= 16:
+                if parallel_size >= 16:
                     self.mem_fraction_static = 0.79
-                elif self.tp_size >= 8:
+                elif parallel_size >= 8:
                     self.mem_fraction_static = 0.81
-                elif self.tp_size >= 4:
+                elif parallel_size >= 4:
                     self.mem_fraction_static = 0.85
-                elif self.tp_size >= 2:
+                elif parallel_size >= 2:
                     self.mem_fraction_static = 0.87
                 else:
                     self.mem_fraction_static = 0.88
             else:
-                # FIXME: more fine grained auto-selection polices
-                self.mem_fraction_static = (gpu_mem - 1024 * 13) / gpu_mem
+                self.mem_fraction_static = 0.88
+            if gpu_mem > 96 * 1024:
+                mem_fraction = self.mem_fraction_static
+                self.mem_fraction_static = min(
+                    mem_fraction + 48 * 1024 * (1 - mem_fraction) / gpu_mem,
+                    (gpu_mem - 1024 * 18)
+                    / gpu_mem,  # 15 GB + additional 3GB for cuda graph
+                )
 
         # Set chunked prefill size, which depends on the gpu memory capacity
         if self.chunked_prefill_size is None:
             if gpu_mem is not None and gpu_mem < 25_000:
                 self.chunked_prefill_size = 2048
+            elif self.disaggregation_mode != "null":
+                self.chunked_prefill_size = 16384
             else:
                 self.chunked_prefill_size = 8192
-
         assert self.chunked_prefill_size % self.page_size == 0
 
         assert self.moe_dense_tp_size in {
             1,
             None,
-        }, f"moe_dense_tp_size only support 1 and None currently"
+        }, "moe_dense_tp_size only support 1 and None currently"
 
         if self.attention_backend == "flashmla":
             logger.warning(
                 "FlashMLA only supports a page_size of 64, change page_size to 64."
             )
             self.page_size = 64
+
+        if self.attention_backend == "cutlass_mla":
+            logger.warning(
+                "Cutlass MLA only supports a page_size of 128, change page_size to 128."
+            )
+            self.page_size = 128
+
         # Set cuda graph max batch size
         if self.cuda_graph_max_bs is None:
             # Based on detailed statistics, when serving TP1/TP2 models on lower-end GPUs with HBM<25G, you can either disable cuda graph or set `cuda_graph_max_bs` to a very small value to reduce the memory overhead of creating cuda graphs, with almost no impact on performance. However, when serving models with TP4 or TP8, we need to enable cuda graph to maintain high performance. In this case, we can set `cuda_graph_max_bs` to 80 (half of the default value 160) to reduce the memory overhead of creating cuda graphs. Looking at the logs from TP4 serving of qwen2-72b, a value of 80 is sufficient and can reduce the memory overhead of creating cuda graphs on lower-end GPUs compared to the original 160, avoiding OOM issues.
@@ -270,6 +289,7 @@ class ServerArgs:
             self.attention_backend = "torch_native"
             self.sampling_backend = "pytorch"
 
+        # Set kernel backends
         if self.sampling_backend is None:
             self.sampling_backend = (
                 "flashinfer" if is_flashinfer_available() else "pytorch"
@@ -297,18 +317,21 @@ class ServerArgs:
                 f"DP attention is enabled. The chunked prefill size is adjusted to {self.chunked_prefill_size} to avoid MoE kernel issues. "
             )
 
-        self.enable_sp_layernorm = False
         # DeepEP MoE
+        self.enable_sp_layernorm = False
         if self.enable_deepep_moe:
             if self.deepep_mode == "auto":
                 assert (
                     not self.enable_dp_attention
                 ), "DeepEP MoE `auto` mode is not supported with DP Attention."
+            if self.deepep_mode == "normal":
+                logger.warning("Cuda graph is disabled because deepep_mode=`normal`")
+                self.disable_cuda_graph = True
             self.ep_size = self.tp_size
             self.enable_sp_layernorm = (
                 self.dp_size < self.tp_size if self.enable_dp_attention else True
             )
-            logger.info(
+            logger.warning(
                 f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
 
@@ -317,17 +340,25 @@ class ServerArgs:
             # NEXTN shares the same implementation of EAGLE
             self.speculative_algorithm = "EAGLE"
 
-        if (
-            self.speculative_algorithm == "EAGLE"
-            or self.speculative_algorithm == "EAGLE3"
-        ):
+        if self.speculative_algorithm in ("EAGLE", "EAGLE3"):
             if self.max_running_requests is None:
                 self.max_running_requests = 48
             self.disable_overlap_schedule = True
-            logger.info(
+            logger.warning(
                 "Overlap scheduler is disabled because of using "
                 "eagle speculative decoding."
             )
+
+            model_arch = get_model_arch(self)
+
+            # Auto set draft_model_path DeepSeek-V3/R1
+            if model_arch == "DeepseekV3ForCausalLM":
+                if self.speculative_draft_model_path is None:
+                    self.speculative_draft_model_path = self.model_path
+                else:
+                    logger.warning(
+                        "DeepSeek MTP does not require setting speculative_draft_model_path."
+                    )
 
             # Auto choose parameters
             if self.speculative_num_steps is None:
@@ -339,11 +370,11 @@ class ServerArgs:
                     self.speculative_num_steps,
                     self.speculative_eagle_topk,
                     self.speculative_num_draft_tokens,
-                ) = auto_choose_speculative_params(self)
+                ) = auto_choose_speculative_params(model_arch)
 
             if self.page_size > 1 and self.speculative_eagle_topk > 1:
                 self.speculative_eagle_topk = 1
-                logger.info(
+                logger.warning(
                     "speculative_eagle_topk is adjusted to 1 when page_size > 1"
                 )
 
@@ -351,7 +382,7 @@ class ServerArgs:
                 self.speculative_eagle_topk == 1
                 and self.speculative_num_draft_tokens != self.speculative_num_steps + 1
             ):
-                logger.info(
+                logger.warning(
                     "speculative_num_draft_tokens is adjusted to speculative_num_steps + 1 when speculative_eagle_topk == 1"
                 )
                 self.speculative_num_draft_tokens = self.speculative_num_steps + 1
@@ -422,7 +453,7 @@ class ServerArgs:
         parser.add_argument(
             "--skip-tokenizer-init",
             action="store_true",
-            help="If set, skip init tokenizer and pass input_ids in generate request",
+            help="If set, skip init tokenizer and pass input_ids in generate request.",
         )
         parser.add_argument(
             "--enable-tokenizer-batch-encode",
@@ -528,7 +559,7 @@ class ServerArgs:
             "--device",
             type=str,
             default=ServerArgs.device,
-            help="The device to use ('cuda', 'xpu', 'hpu', 'cpu'). Defaults to auto-detection if not specified.",
+            help="The device to use ('cuda', 'xpu', 'hpu', 'npu', 'cpu'). Defaults to auto-detection if not specified.",
         )
         parser.add_argument(
             "--served-model-name",
@@ -561,6 +592,7 @@ class ServerArgs:
             "name, a tag name, or a commit id. If unspecified, will use "
             "the default version.",
         )
+
         # Memory and scheduling
         parser.add_argument(
             "--mem-fraction-static",
@@ -626,6 +658,19 @@ class ServerArgs:
             type=int,
             default=ServerArgs.tp_size,
             help="The tensor parallelism size.",
+        )
+        parser.add_argument(
+            "--pipeline-parallel-size",
+            "--pp-size",
+            type=int,
+            default=ServerArgs.pp_size,
+            help="The pipeline parallelism size.",
+        )
+        parser.add_argument(
+            "--max-micro-batch-size",
+            type=int,
+            default=ServerArgs.max_micro_batch_size,
+            help="The maximum micro batch size in pipeline parallelism.",
         )
         parser.add_argument(
             "--stream-interval",
@@ -825,7 +870,14 @@ class ServerArgs:
         parser.add_argument(
             "--attention-backend",
             type=str,
-            choices=["flashinfer", "triton", "torch_native", "fa3", "flashmla"],
+            choices=[
+                "flashinfer",
+                "triton",
+                "torch_native",
+                "fa3",
+                "flashmla",
+                "cutlass_mla",
+            ],
             default=ServerArgs.attention_backend,
             help="Choose the kernels for attention layers.",
         )
@@ -1084,9 +1136,9 @@ class ServerArgs:
         parser.add_argument(
             "--tool-call-parser",
             type=str,
-            choices=["qwen25", "mistral", "llama3", "deepseekv3"],
+            choices=["qwen25", "mistral", "llama3", "deepseekv3", "pythonic"],
             default=ServerArgs.tool_call_parser,
-            help="Specify the parser for handling tool-call interactions. Options include: 'qwen25', 'mistral', and 'llama3'.",
+            help="Specify the parser for handling tool-call interactions. Options include: 'qwen25', 'mistral', 'llama3', 'deepseekv3', and 'pythonic'.",
         )
         parser.add_argument(
             "--enable-hierarchical-cache",
@@ -1203,12 +1255,29 @@ class ServerArgs:
             "--disaggregation-ib-device",
             type=str,
             default=ServerArgs.disaggregation_ib_device,
-            help="The ib device for disaggregation transfer. Default is None, it will be detected automatically if using the mooncake backend.",
+            help="The InfiniBand devices for disaggregation transfer, accepts single device (e.g., --disaggregation-ib-device mlx5_0) "
+            "or multiple comma-separated devices (e.g., --disaggregation-ib-device mlx5_0,mlx5_1). "
+            "Default is None, which triggers automatic device detection when mooncake backend is enabled.",
+        )
+        parser.add_argument(
+            "--pdlb-url",
+            type=str,
+            default=None,
+            help="The URL of the PD disaggregation load balancer. If set, the prefill/decode server will register with the load balancer.",
+        )
+
+        parser.add_argument(
+            "--mm-attention-backend",
+            type=str,
+            choices=["sdpa", "fa3", "triton_attn"],
+            default=ServerArgs.mm_attention_backend,
+            help="Set multimodal attention backend.",
         )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
         args.tp_size = args.tensor_parallel_size
+        args.pp_size = args.pipeline_parallel_size
         args.dp_size = args.data_parallel_size
         args.ep_size = args.expert_parallel_size
         attrs = [attr.name for attr in dataclasses.fields(cls)]
@@ -1222,15 +1291,25 @@ class ServerArgs:
 
     def check_server_args(self):
         assert (
-            self.tp_size % self.nnodes == 0
-        ), "tp_size must be divisible by number of nodes"
+            self.tp_size * self.pp_size
+        ) % self.nnodes == 0, "tp_size must be divisible by number of nodes"
+
+        # FIXME pp constraints
+        if self.pp_size > 1:
+            logger.warning(f"Turn off overlap scheule for pipeline parallelism.")
+            self.disable_overlap_schedule = True
+            assert (
+                self.disable_overlap_schedule
+                and self.speculative_algorithm is None
+                and not self.enable_mixed_chunk
+            ), "Pipeline parallelism is not compatible with overlap schedule, speculative decoding, mixed chunked prefill."
+
         assert not (
             self.dp_size > 1 and self.nnodes != 1 and not self.enable_dp_attention
         ), "multi-node data parallel is not supported unless dp attention!"
         assert (
             self.max_loras_per_batch > 0
             # FIXME
-            and (self.lora_paths is None or self.disable_cuda_graph)
             and (self.lora_paths is None or self.disable_radix_cache)
         ), "compatibility of lora and cuda graph and radix attention is in progress"
         assert self.base_gpu_id >= 0, "base_gpu_id must be non-negative"
@@ -1356,23 +1435,22 @@ class DeprecatedAction(argparse.Action):
         raise ValueError(self.help)
 
 
-def auto_choose_speculative_params(self: ServerArgs):
+def get_model_arch(args: ServerArgs):
+    hf_config = get_config(
+        args.model_path,
+        trust_remote_code=args.trust_remote_code,
+        revision=args.revision,
+        model_override_args=json.loads(args.json_model_override_args),
+    )
+    return hf_config.architectures[0]
+
+
+def auto_choose_speculative_params(arch: str):
     """
     Automatically choose the parameters for speculative decoding.
 
     You can tune them on your own models and prompts with scripts/playground/bench_speculative.py
     """
-    if self.decrypted_config_file:
-        config_path = self.decrypted_config_file
-    else:
-        config_path = os.path.join(self.model_path, "config.json")
-    if not os.path.exists(config_path):
-        raise ValueError(f"{config_path} is not found.")
-
-    config = json.load(open(config_path))
-
-    arch = config.get("architectures", ["Unknown"])[0]
-
     if arch in ["LlamaForCausalLM"]:
         # The default value for llama
         return (5, 4, 8)

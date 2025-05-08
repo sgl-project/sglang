@@ -532,7 +532,7 @@ class VisionTransformerBlock(nn.Module):
             num_heads=num_heads,
             projection_size=dim,
             use_qkv_parallel=True,
-            use_context_forward=False,
+            qkv_backend="sdpa",
             softmax_in_single_precision=False,
             dropout=attn_drop,
         )
