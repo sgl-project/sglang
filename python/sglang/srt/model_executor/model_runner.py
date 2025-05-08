@@ -980,8 +980,9 @@ class ModelRunner:
             )
         if self.server_args.enable_flashinfer_attention_decode:
             from sglang.srt.layers.attention.flashinfer_backend import (
-                    FlashInferAttnBackend,
-                )
+                FlashInferAttnBackend,
+            )
+
             self.decode_attn_backend = FlashInferAttnBackend(self)
 
     def init_double_sparsity_channel_config(self, selected_channel):
@@ -1042,12 +1043,18 @@ class ModelRunner:
             forward_batch.attn_backend = self.decode_attn_backend
             self.decode_attn_backend.init_forward_metadata(forward_batch)
             return self.model.forward(
-                forward_batch.input_ids, forward_batch.positions, forward_batch, **kwargs
+                forward_batch.input_ids,
+                forward_batch.positions,
+                forward_batch,
+                **kwargs,
             )
         else:
             self.attn_backend.init_forward_metadata(forward_batch)
             return self.model.forward(
-                forward_batch.input_ids, forward_batch.positions, forward_batch, **kwargs
+                forward_batch.input_ids,
+                forward_batch.positions,
+                forward_batch,
+                **kwargs,
             )
 
     def forward_extend(
