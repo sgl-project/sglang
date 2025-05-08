@@ -397,6 +397,9 @@ class ChatCompletionRequest(BaseModel):
     bootstrap_port: Optional[int] = None
     bootstrap_room: Optional[int] = None
 
+    # Hidden States
+    return_hidden_states: Optional[bool] = False
+
 
 class ChatMessage(BaseModel):
     role: Optional[str] = None
@@ -413,6 +416,7 @@ class ChatCompletionResponseChoice(BaseModel):
         "stop", "length", "tool_calls", "content_filter", "function_call"
     ]
     matched_stop: Union[None, int, str] = None
+    hidden_states: Optional[object] = None
 
 
 class ChatCompletionResponse(BaseModel):
@@ -429,6 +433,7 @@ class DeltaMessage(BaseModel):
     content: Optional[str] = None
     reasoning_content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
+    hidden_states: Optional[object] = None
 
 
 class ChatCompletionResponseStreamChoice(BaseModel):
