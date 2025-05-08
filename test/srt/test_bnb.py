@@ -252,8 +252,6 @@ class TestVisionModel(CustomTestCase):
         for model, template in models_to_test:
             with self.subTest(model=model):
                 other_args = [
-                    "--chat-template",
-                    template,
                     "--mem-fraction-static",
                     "0.6",
                     "--load-format",
