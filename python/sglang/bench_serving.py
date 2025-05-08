@@ -25,7 +25,7 @@ from argparse import ArgumentParser
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
+from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union, Callable
 
 import aiohttp
 import numpy as np
@@ -883,18 +883,24 @@ def sample_generated_shared_prefix_requests(
 
 
 def sample_chatbot_arena_conversations_requests():
+    import polars as pl
+
     return sample_hf_dataset_requests(
         dataset_name="lmsys/chatbot_arena_conversations",
         column_id="question_id",
         column_conversation="conversation_a",
+        expr_timestamp=(pl.col("tstamp") * 1_000_000).cast(pl.DateTime("us")),
     )
 
 
 def sample_wildchat_1m_requests():
+    import polars as pl
+
     return sample_hf_dataset_requests(
         dataset_name="allenai/WildChat-1M",
         column_id="conversation_hash",
         column_conversation="conversation",
+        expr_timestamp=pl.col("timestamp").str.strptime(pl.Datetime, fmt="%Y-%m-%dT%H:%M:%S"),
     )
 
 
@@ -902,6 +908,7 @@ def sample_hf_dataset_requests(
     dataset_name: str,
     column_id: str,
     column_conversation: str,
+    expr_timestamp,
 ):
     from datasets import load_dataset
     import polars as pl
@@ -909,6 +916,7 @@ def sample_hf_dataset_requests(
     df = load_dataset(dataset_name).to_polars()
     df = df.select(
         id=pl.col(column_id),
+        timestamp=expr_timestamp,
         conversation=pl.col(column_conversation),
     )
 
