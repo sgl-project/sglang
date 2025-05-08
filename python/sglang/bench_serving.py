@@ -1052,7 +1052,7 @@ def wrap_multi_round_request_func(request_func: Callable) -> Callable:
                 {"role": "assistant", "content": history_assistant_texts[i]},
             ]
         conversations.append({"role": "user", "content": gen_prompt})
-        
+
         output_text = tokenizer.apply_chat_template(
             conversations,
             add_generation_prompt=True,
