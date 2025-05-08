@@ -1,4 +1,5 @@
 import torch
+from torch.utils._pytree import tree_map
 
 
 class _WrapperTensor(torch.Tensor):
@@ -16,6 +17,16 @@ class _WrapperTensor(torch.Tensor):
         )
         r._inner = inner
         return r
+
+    @classmethod
+    def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
+        def unwrap(e):
+            if isinstance(e, cls):
+                return e._inner
+            else:
+                return e
+
+        return func(*tree_map(unwrap, args), **tree_map(unwrap, kwargs))
 
 
 class DisposableTensor(_WrapperTensor):
