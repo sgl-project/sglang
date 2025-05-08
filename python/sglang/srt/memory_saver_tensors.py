@@ -39,5 +39,12 @@ class DisposableTensor(_WrapperTensor):
 
 
 class LazyTensor(_WrapperTensor):
+    @classmethod
+    def __new__(cls, *args, **kwargs):
+        r = torch.Tensor._make_wrapper_subclass(cls, *args, **kwargs)
+        r._create_args = args
+        r._create_kwargs = kwargs
+        return r
+
     def _unwrap(self):
         return TODO
