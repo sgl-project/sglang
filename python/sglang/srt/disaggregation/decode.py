@@ -542,6 +542,15 @@ class SchedulerDisaggregationDecodeMixin:
                         self.prepare_dp_attn_batch(batch)
                     result = self.run_batch(batch)
                     result_queue.append((batch.copy(), result))
+
+                    # Triggering the sampling_info_done event.
+                    if not self.last_batch_in_queue:
+                        next_batch_sampling_info=self.tp_worker.cur_sampling_info
+                        if next_batch_sampling_info:
+                            next_batch_sampling_info.update_regex_vocab_mask()
+                            self.current_stream.synchronize()
+                            next_batch_sampling_info.sampling_info_done.set()
+                    
                     last_batch_in_queue = True
             elif prepare_dp_attn_flag:
                 batch, result = self._prepare_idle_batch_and_run(
@@ -554,6 +563,9 @@ class SchedulerDisaggregationDecodeMixin:
             # Process the results of the previous batch but skip if the last batch is extend
             if self.last_batch and self.last_batch_in_queue:
                 tmp_batch, tmp_result = result_queue.popleft()
+                tmp_batch.next_batch_sampling_info = (
+                    self.tp_worker.cur_sampling_info if batch else None
+                )
                 self.process_batch_result(tmp_batch, tmp_result)
 
             if batch is None and (
@@ -602,6 +614,10 @@ class SchedulerDisaggregationDecodeMixin:
 
     def get_new_prebuilt_batch(self: Scheduler) -> Optional[ScheduleBatch]:
         """Create a schedulebatch for fake completed prefill"""
+        # Check if the grammar is ready in the grammar queue
+        if self.grammar_queue:
+            self.move_ready_grammar_requests()
+
         if len(self.waiting_queue) == 0:
             return None
 

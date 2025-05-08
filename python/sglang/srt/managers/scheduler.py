@@ -1062,7 +1062,9 @@ class Scheduler(
             self.waiting_queue.append(req)
 
     def _extend_requests_to_queue(self, reqs: List[Req], is_retracted: bool = False):
-        if self.disaggregation_mode == DisaggregationMode.DECODE:
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            self.disagg_prefill_bootstrap_queue.extend(reqs)
+        elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.disagg_decode_prealloc_queue.extend(reqs)
         else:
             self.waiting_queue.extend(reqs)
