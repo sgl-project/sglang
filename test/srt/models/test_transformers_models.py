@@ -100,8 +100,8 @@ class ModelCase:
 
 # Popular models that run on the CI
 CI_MODELS = [
-    # ModelCase(DEFAULT_MODEL_NAME_FOR_TEST, tp_size=1),
-    # ModelCase(DEFAULT_MODEL_NAME_FOR_TEST, tp_size=2),
+    ModelCase(DEFAULT_MODEL_NAME_FOR_TEST, tp_size=1),
+    ModelCase(DEFAULT_MODEL_NAME_FOR_TEST, tp_size=2),
 ]
 
 
