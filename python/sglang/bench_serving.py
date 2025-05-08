@@ -515,6 +515,10 @@ def get_dataset(args, tokenizer):
             tokenizer=tokenizer,
             args=args,
         )
+    elif args.dataset_name == "chatbot-arena-conversations":
+        input_requests = sample_chatbot_arena_conversations_requests()
+    elif args.dataset_name == "wildchat":
+        input_requests = sample_wildchat_requests()
     else:
         raise ValueError(f"Unknown dataset: {args.dataset_name}")
     input_requests = input_requests[args.skip_num_prompts :]
