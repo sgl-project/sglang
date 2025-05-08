@@ -1036,7 +1036,7 @@ def calculate_metrics(
     return metrics, output_lens
 
 
-def wrap_multi_round_request_func(request_func: Callable) -> Callable:
+def wrap_multi_round_request_func(request_func: Callable, tokenizer) -> Callable:
     print("Enable multi-round request function")
 
     def compute_inner_input_prompt(
@@ -1109,8 +1109,9 @@ async def benchmark(
     else:
         raise ValueError(f"Unknown backend: {backend}")
 
-    if TODO:
-        request_func = wrap_multi_round_request_func(request_func)
+    is_multi_round = isinstance(input_requests[0][0], list)
+    if is_multi_round:
+        request_func = wrap_multi_round_request_func(request_func, tokenizer=tokenizer)
 
     # Limit concurrency
     # From https://github.com/vllm-project/vllm/pull/9390
@@ -1216,6 +1217,9 @@ async def benchmark(
             )
         )
     outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
+    
+    if is_multi_round:
+        outputs = [x for output in outputs for x in output]
 
     # Stop profiler
     if profile:
