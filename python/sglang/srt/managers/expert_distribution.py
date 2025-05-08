@@ -141,9 +141,9 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         if not self._recording:
             return
         for gatherer_key, gatherer in self._single_pass_gatherers.items():
-            single_pass_global_physical_count = gatherer.collect_global_physical_count()
+            single_pass_data = gatherer.collect()
             self._accumulator.append(
-                forward_pass_id, gatherer_key, single_pass_global_physical_count
+                forward_pass_id, gatherer_key, single_pass_data
             )
 
     def flush_buffer_depending_on_expert_location_metadata(self):
@@ -296,7 +296,7 @@ class _SinglePassGatherer(ABC):
     def reset(self):
         raise NotImplementedError
 
-    def collect_global_physical_count(self) -> torch.Tensor:
+    def collect(self) -> torch.Tensor:
         raise NotImplementedError
 
 
@@ -344,7 +344,7 @@ class _SelectExpertsSinglePassGatherer(_LayerBasedSinglePassGatherer):
 
         self._on_layer_data(layer_idx, global_physical_count)
 
-    def collect_global_physical_count(self) -> torch.Tensor:
+    def collect(self) -> torch.Tensor:
         return super()._collect_objects(
             pad_len=self._expert_location_metadata.num_physical_experts
         )
@@ -357,7 +357,7 @@ class _DeepepNormalSinglePassGatherer(_LayerBasedSinglePassGatherer):
         assert isinstance(local_physical_count_of_layer, list)
         self._on_layer_data(layer_idx, local_physical_count_of_layer)
 
-    def collect_global_physical_count(self) -> torch.Tensor:
+    def collect(self) -> torch.Tensor:
         local_physical_count = super()._collect_objects(
             pad_len=self._expert_location_metadata.num_local_physical_experts
         )
@@ -390,7 +390,7 @@ class _DeepepLowLatencySinglePassGatherer(_SinglePassGatherer):
     def reset(self):
         self._data[...] = 0
 
-    def collect_global_physical_count(self) -> torch.Tensor:
+    def collect(self) -> torch.Tensor:
         # Can optimize if bottleneck
         return _convert_local_to_global_physical_count(
             self._data,
@@ -461,7 +461,7 @@ class _Accumulator(ABC):
         self,
         forward_pass_id: int,
         gatherer_key: str,
-        single_pass_global_physical_count: torch.Tensor,
+        single_pass_data: torch.Tensor,
     ):
         raise NotImplementedError
 
@@ -507,7 +507,7 @@ class _DetailAccumulator(_Accumulator):
         self,
         forward_pass_id: int,
         gatherer_key: str,
-        single_pass_global_physical_count: torch.Tensor,
+        single_pass_data: torch.Tensor,
     ):
         single_pass_global_physical_count = single_pass_global_physical_count.to(
             "cpu"
@@ -582,7 +582,7 @@ class _StatAccumulator(_Accumulator):
         self,
         forward_pass_id: int,
         gatherer_key: str,
-        single_pass_global_physical_count: torch.Tensor,
+        single_pass_data: torch.Tensor,
     ):
         # Can optimize if overhead here is large
         self._buffer_global_physical_count += single_pass_global_physical_count.cpu()
@@ -636,7 +636,7 @@ class _StatAndUtilizationRateAccumulator(_StatAccumulator):
         self,
         forward_pass_id: int,
         gatherer_key: str,
-        single_pass_global_physical_count: torch.Tensor,
+        single_pass_data: torch.Tensor,
     ):
         super().append(forward_pass_id, gatherer_key, single_pass_global_physical_count)
         self._append_utilization_rate(
