@@ -304,6 +304,9 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
         self._objects = TODO
         assert not server_args.enable_two_batch_overlap, "DetailSinglePassGatherer does not support TBO yet"
 
+    def on_forward_pass_start(self, forward_batch: ForwardBatch):
+        TODO
+
     def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
         TODO
 
