@@ -21,7 +21,6 @@ from typing import Iterable, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
-from torch.nn import LayerNorm
 from transformers import Glm4Config
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
@@ -39,8 +38,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaMLP as Glm4MLP
 from sglang.srt.utils import add_prefix, make_layers
-
-LoraConfig = None
 
 
 class Glm4Attention(nn.Module):
@@ -220,7 +217,6 @@ class Glm4Model(nn.Module):
         )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.layers_to_capture = []
 
     @torch.no_grad()
     def forward(
@@ -234,12 +230,8 @@ class Glm4Model(nn.Module):
             hidden_states = self.embed_tokens(input_ids)
         else:
             hidden_states = input_embeds
-        aux_hidden_states = []
         residual = None
-        for i in range(len(self.layers)):
-            if i in self.layers_to_capture:
-                aux_hidden_states.append(hidden_states)
-            layer = self.layers[i]
+        for layer in self.layers:
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
@@ -248,34 +240,7 @@ class Glm4Model(nn.Module):
             )
         hidden_states, _ = self.norm(hidden_states, residual)
 
-        if len(aux_hidden_states) == 0:
-            return hidden_states
-
-        return hidden_states, aux_hidden_states
-
-    # If this function is called, it should always initialize KV cache scale
-    # factors (or else raise an exception). Thus, handled exceptions should
-    # make sure to leave KV cache scale factors in a known good (dummy) state
-    def load_kv_cache_scales(self, quantization_param_path: str) -> None:
-        tp_size = get_tensor_model_parallel_world_size()
-        tp_rank = get_tensor_model_parallel_rank()
-        for layer_idx, scaling_factor in kv_cache_scales_loader(
-            quantization_param_path,
-            tp_rank,
-            tp_size,
-            self.config.num_hidden_layers,
-            self.config.__class__.model_type,
-        ):
-            if not isinstance(self.layers[layer_idx], nn.Identity):
-                layer_self_attn = self.layers[layer_idx].self_attn
-
-            if hasattr(layer_self_attn.attn, "k_scale"):
-                layer_self_attn.attn.k_scale = scaling_factor
-                layer_self_attn.attn.v_scale = scaling_factor
-            else:
-                raise RuntimeError(
-                    "Self attention has no KV cache scaling " "factor attribute!"
-                )
+        return hidden_states
 
 
 class Glm4ForCausalLM(nn.Module):
@@ -325,14 +290,6 @@ class Glm4ForCausalLM(nn.Module):
         for name, loaded_weight in weights:
             if self.config.tie_word_embeddings and "lm_head.weight" in name:
                 continue
-            # Handle FP8 kv-scale remapping
-            if "scale" in name:
-                name = maybe_remap_kv_scale_name(name, params_dict)
-                if name is None:
-                    continue
-            # Skip loading kv_scale from ckpts towards new design.
-            if name.endswith(".kv_scale") and name not in params_dict:
-                continue
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
@@ -342,12 +299,6 @@ class Glm4ForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                # Skip loading kv_scale from ckpts towards new design.
-                if name.endswith(".kv_scale") and name not in params_dict:
-                    continue
                 if name in params_dict.keys():
                     param = params_dict[name]
                     weight_loader = getattr(
