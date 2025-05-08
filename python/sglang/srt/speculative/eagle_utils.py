@@ -133,7 +133,7 @@ class EagleDraftInput:
             req_pool_indices,
             paged_kernel_lens,
             cum_kv_seq_len,
-            None, #kv_start_idx
+            None,  # kv_start_idx
             kv_indices,
             req_to_token.size(1),
         )
@@ -285,7 +285,6 @@ class EagleVerifyInput:
         )
         paged_kernel_lens = paged_kernel_lens + self.draft_token_num
 
-        
         cum_kv_seq_len[1:] = torch.cumsum(paged_kernel_lens, dim=0)
 
         kv_indices = torch.empty(
@@ -298,7 +297,7 @@ class EagleVerifyInput:
             req_pool_indices,
             paged_kernel_lens,
             cum_kv_seq_len,
-            None, #kv_start_idx
+            None,  # kv_start_idx
             kv_indices,
             req_to_token.size(1),
         )

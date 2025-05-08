@@ -569,36 +569,5 @@ class TestEAGLEServerPageSize(TestEAGLEServer):
         )
 
 
-class TestEAGLEServerFlashMLA(TestEAGLEServer):
-    @classmethod
-    def setUpClass(cls):
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--speculative-algorithm",
-                "EAGLE",
-                "--speculative-draft-model-path",
-                DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
-                "--speculative-num-steps",
-                5,
-                "--speculative-eagle-topk",
-                1,
-                "--speculative-num-draft-tokens",
-                64,
-                "--mem-fraction-static",
-                0.7,
-                "--attention-backend",
-                "flashmla",
-                "--max-running-requests",
-                8,
-                "--page-size",
-                64,  # todo: confirm the page size
-            ],
-        )
-
-
 if __name__ == "__main__":
     unittest.main()

@@ -85,7 +85,6 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         self.cuda_graph_qo_indptr = None
         self.cuda_graph_kv_indptr = None
 
-
     def update_metadata_decode(self, forward_batch: ForwardBatch):
         bs = forward_batch.batch_size
         spec_info = forward_batch.spec_info
@@ -93,9 +92,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         # ignore spec_info for this
         assert spec_info is None or isinstance(spec_info, EagleDraftInput)
 
-        max_seqlen_pad = triton.cdiv(
-            forward_batch.seq_lens_cpu.max().item(), PAGE_SIZE
-        )
+        max_seqlen_pad = triton.cdiv(forward_batch.seq_lens_cpu.max().item(), PAGE_SIZE)
         block_kv_indices = torch.full(
             (bs, max_seqlen_pad),
             -1,
@@ -157,8 +154,8 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             cuda_graph_kv_indices = block_kv_indices
 
         self.cuda_graph_qo_indptr = torch.arange(
-                0, max_bs + 1, dtype=torch.int32, device="cuda"
-            )
+            0, max_bs + 1, dtype=torch.int32, device="cuda"
+        )
         if block_kv_indices is not None:
             self.cuda_graph_kv_indptr = block_kv_indices.clone()
         else:
@@ -178,7 +175,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         )
         self.cuda_graph_kv_indices = cuda_graph_kv_indices
 
-        super().init_cuda_graph_state(max_bs, block_kv_indices)
+        # super().init_cuda_graph_state(max_bs, block_kv_indices)
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -314,7 +311,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             tile_scheduler_metadata=self.forward_metadata.flashmla_metadata,
             num_splits=self.forward_metadata.num_splits,
             softmax_scale=layer.scaling,
-            causal=True, # why casual = False?
+            causal=True,
         )
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
