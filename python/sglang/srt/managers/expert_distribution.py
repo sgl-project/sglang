@@ -153,6 +153,9 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         self._on_hook(
             "on_deepep_dispatch_normal",
             local_physical_count_of_layer=local_physical_count_of_layer,
+            num_tokens_per_rank=num_tokens_per_rank,
+            num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
+            num_tokens_per_expert=num_tokens_per_expert,
         )
 
     def on_deepep_dispatch_low_latency(
@@ -265,7 +268,10 @@ class _SinglePassGatherer(ABC):
         pass
 
     def on_deepep_dispatch_normal(
-        self, layer_idx: int, local_physical_count_of_layer: List[int]
+        self, layer_idx: int, local_physical_count_of_layer: List[int],
+        num_tokens_per_rank,
+        num_tokens_per_rdma_rank,
+        num_tokens_per_expert,
     ):
         pass
 
@@ -297,7 +303,10 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
         TODO
 
     def on_deepep_dispatch_normal(
-        self, layer_idx: int, local_physical_count_of_layer: List[int]
+        self, layer_idx: int, local_physical_count_of_layer: List[int],
+        num_tokens_per_rank,
+        num_tokens_per_rdma_rank,
+        num_tokens_per_expert,
     ):
         self._objects.append(
             dict(
@@ -370,7 +379,10 @@ class _SelectExpertsSinglePassGatherer(_LayerBasedSinglePassGatherer):
 
 class _DeepepNormalSinglePassGatherer(_LayerBasedSinglePassGatherer):
     def on_deepep_dispatch_normal(
-        self, layer_idx: int, local_physical_count_of_layer: List[int]
+        self, layer_idx: int, local_physical_count_of_layer: List[int],
+        num_tokens_per_rank,
+        num_tokens_per_rdma_rank,
+        num_tokens_per_expert,
     ):
         assert isinstance(local_physical_count_of_layer, list)
         self._on_layer_data(layer_idx, local_physical_count_of_layer)
