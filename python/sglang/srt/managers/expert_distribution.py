@@ -263,6 +263,8 @@ class _SinglePassGatherer(ABC):
         expert_location_metadata: "ExpertLocationMetadata",
         rank: int,
     ) -> "_SinglePassGatherer":
+        if TODO:
+            return _DetailSinglePassGatherer(server_args, expert_location_metadata, rank)
         if server_args.enable_deepep_moe:
             # `auto` has many restrictions now, so we lower the priority to implement low-latency capturing for auto
             if server_args.deepep_mode in ["normal", "auto"]:
@@ -300,9 +302,15 @@ class _SinglePassGatherer(ABC):
 
 
 class _DetailSinglePassGatherer(_SinglePassGatherer):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(
+        self,
+        server_args: ServerArgs,
+        expert_location_metadata: "ExpertLocationMetadata",
+        rank: int,
+    ):
+        super().__init__(expert_location_metadata, rank)
         self._topk_ids_of_layer = TODO
+        assert not server_args.enable_two_batch_overlap, "DetailSinglePassGatherer does not support TBO yet"
 
     def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
         TODO
