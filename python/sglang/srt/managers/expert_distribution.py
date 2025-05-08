@@ -11,7 +11,6 @@ from typing import Any, Dict, List, Optional, Type
 import einops
 import torch
 import torch.distributed
-
 from sglang.srt.managers.expert_location import ExpertLocationMetadata
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import ServerArgs
@@ -296,6 +295,9 @@ class _SinglePassGatherer(ABC):
 
 
 class _DetailSinglePassGatherer(_SinglePassGatherer):
+    # DeepSeek V3 has this value; should generalize later
+    _TOP_K_NUM = 8
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -304,7 +306,9 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
     ):
         super().__init__(expert_location_metadata, rank)
         self._metadata: Optional[Dict[str, Any]] = None
-        self._topk_ids_of_layer = TODO
+        self._topk_ids_of_layer = torch.zeros(
+            (expert_location_metadata.num_layers, server_args.chunked_prefill_size, self._TOP_K_NUM),
+            dtype=torch.int32)
         self._objects: List[Dict[str, Any]] = []
         assert (
             not server_args.enable_two_batch_overlap
@@ -388,8 +392,8 @@ class _SelectExpertsSinglePassGatherer(_LayerBasedSinglePassGatherer):
         torch.cuda.synchronize()
 
         global_physical_count = [
-            0
-        ] * self._expert_location_metadata.num_physical_experts
+                                    0
+                                ] * self._expert_location_metadata.num_physical_experts
         for token_record in topk_ids_list:
             for global_physical_expert_idx in token_record:
                 global_physical_count[global_physical_expert_idx] += 1
@@ -472,7 +476,7 @@ def _convert_local_to_global_physical_count(
 
     ans = torch.zeros((num_layers, num_physical_experts), dtype=dtype, device=device)
     ans[
-        :, num_local_physical_experts * rank : num_local_physical_experts * (rank + 1)
+    :, num_local_physical_experts * rank: num_local_physical_experts * (rank + 1)
     ] = local_physical_count
     return ans
 
