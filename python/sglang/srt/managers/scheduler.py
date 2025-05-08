@@ -455,6 +455,7 @@ class Scheduler(
     def init_tokenizer(self):
         server_args = self.server_args
 
+<<<<<<< HEAD
         self.model_config = ModelConfig(
             server_args.model_path,
             trust_remote_code=server_args.trust_remote_code,
@@ -467,6 +468,9 @@ class Scheduler(
             dtype=server_args.dtype,
             quantization=server_args.quantization,
         )
+=======
+        self.model_config = ModelConfig.from_server_args(server_args)
+>>>>>>> b6cf3532 (Tiny refactor ModelConfig.from_server_args (#5219))
         self.is_generation = self.model_config.is_generation
 
         if server_args.skip_tokenizer_init:
