@@ -248,7 +248,7 @@ class _SinglePassGatherer(ABC):
         expert_location_metadata: "ExpertLocationMetadata",
         rank: int,
     ) -> "_SinglePassGatherer":
-        if TODO:
+        if server_args.expert_distribution_recorder_mode == "detail_per_token":
             return _DetailSinglePassGatherer(server_args, expert_location_metadata, rank)
         if server_args.enable_deepep_moe:
             # `auto` has many restrictions now, so we lower the priority to implement low-latency capturing for auto
@@ -487,7 +487,8 @@ class _Accumulator(ABC):
         return {
             "stat": _StatAccumulator,
             "stat_ut": _StatAndUtilizationRateAccumulator,
-            "detail": _DetailAccumulator,
+            "stat_per_pass": _DetailAccumulator,
+            "detail_per_token": _DetailAccumulator,
         }[server_args.expert_distribution_recorder_mode]
 
     def __init__(self, expert_location_metadata: "ExpertLocationMetadata", rank: int):
