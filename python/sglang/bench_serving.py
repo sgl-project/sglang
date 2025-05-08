@@ -25,7 +25,7 @@ from argparse import ArgumentParser
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
+from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union, Callable
 
 import aiohttp
 import numpy as np
@@ -1036,6 +1036,10 @@ def calculate_metrics(
     return metrics, output_lens
 
 
+def wrap_multi_round_request_func(request_func: Callable) -> Callable:
+    return TODO
+
+
 async def benchmark(
     backend: str,
     api_url: str,
@@ -1057,6 +1061,9 @@ async def benchmark(
         request_func = ASYNC_REQUEST_FUNCS[backend]
     else:
         raise ValueError(f"Unknown backend: {backend}")
+
+    if TODO:
+        request_func = wrap_multi_round_request_func(request_func)
 
     # Limit concurrency
     # From https://github.com/vllm-project/vllm/pull/9390
