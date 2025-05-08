@@ -376,7 +376,7 @@ class ForwardBatch:
         valid_inputs = [x for x in self.mm_inputs if x is not None]
 
         # TODO: is it expensive?
-        # a workaround to avoid importing `MultimodalInputs`
+        # a hack to avoid importing `MultimodalInputs`
         merged = valid_inputs[0].__class__(mm_items=[])
 
         # Merge remaining inputs

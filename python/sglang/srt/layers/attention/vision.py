@@ -19,7 +19,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.quantization import QuantizationConfig
-from sglang.srt.layers.rotary_embedding import apply_rotary_pos_emb, rotate_half
+from sglang.srt.layers.rotary_embedding import apply_rotary_pos_emb
 from sglang.srt.utils import add_prefix
 
 

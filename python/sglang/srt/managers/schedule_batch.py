@@ -164,30 +164,31 @@ class MultimodalDataItem:
 
     modality: Modality
 
-    hash: int = None
-    pad_value: int = None
-
-    aspect_ratio_id: Optional[List[torch.Tensor]] = None
-    aspect_ratio_mask: Optional[List[torch.Tensor]] = None
-
+    # modality: image
+    pixel_values: Union[torch.Tensor, np.array] = None
+    # [num_images, (n, w, h)]
+    tgt_size: Tuple[int, int] = None
     image_sizes: Tuple[int, int] = None
     image_offsets: Optional[list] = None
-
-    # the real data, pixel_values or audio_features
-    # data: Union[List[torch.Tensor], List[np.array]]
-    pixel_values: Union[torch.Tensor, np.array] = None
     image_grid_thws: Union[torch.Tensor, np.array] = None
-    video_grid_thws: Union[torch.Tensor, np.array] = None
-
+    aspect_ratio_id: Optional[List[torch.Tensor]] = None
+    aspect_ratio_mask: Optional[List[torch.Tensor]] = None
     image_emb_mask: Optional[torch.Tensor] = None
     image_spatial_crop: Optional[torch.Tensor] = None
     second_per_grid_ts: Optional[List[torch.Tensor]] = None
 
-    # [num_images, (n, w, h)]
-    tgt_size: Tuple[int, int] = None
+    # modality: video
+    video_grid_thws: Union[torch.Tensor, np.array] = None
 
+    # modality: audio
     audio_features: Union[torch.Tensor, np.array] = None
     audio_feature_lens: Optional[List[torch.Tensor]] = None
+
+    # general
+    attention_mask: Optional[torch.Tensor] = None
+    feature_attention_mask: Optional[torch.Tensor] = None
+    hash: int = None
+    pad_value: int = None
 
     @staticmethod
     def is_empty_list(l):
@@ -301,8 +302,9 @@ class MultimodalInputs:
     video_token_id: Optional[int] = None
 
     # audio
-    audio_start_id: Optional[torch.Tensor] = None
-    audio_end_id: Optional[torch.Tensor] = None
+    audio_token_id: Optional[int] = None
+    audio_start_id: Optional[int] = None
+    audio_end_id: Optional[int] = None
 
     @staticmethod
     def from_dict(obj: dict):
@@ -326,6 +328,7 @@ class MultimodalInputs:
             "slice_end_id",
             "audio_start_id",
             "audio_end_id",
+            "audio_token_id",
         ]
         for arg in optional_args:
             if arg in obj:
