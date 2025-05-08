@@ -173,6 +173,7 @@ class ModelRunner:
                 "speculative_accept_threshold_single": server_args.speculative_accept_threshold_single,
                 "speculative_accept_threshold_acc": server_args.speculative_accept_threshold_acc,
                 "use_mla_backend": self.use_mla_backend,
+                "mm_attention_backend": server_args.mm_attention_backend,
             }
         )
 
@@ -557,12 +558,7 @@ class ModelRunner:
             return iter
 
         def model_load_weights(model, iter):
-            model.load_weights(iter)
-            for _, module in self.model.named_modules():
-                quant_method = getattr(module, "quant_method", None)
-                if quant_method is not None:
-                    with device_loading_context(module, target_device):
-                        quant_method.process_weights_after_loading(module)
+            DefaultModelLoader.load_weights_and_postprocess(model, iter, target_device)
             return model
 
         with set_default_torch_dtype(self.model_config.dtype):
