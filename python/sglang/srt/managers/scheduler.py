@@ -644,7 +644,6 @@ class Scheduler(
 
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
-
             if batch:
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
@@ -991,7 +990,6 @@ class Scheduler(
         cur_waiting_reqs_num = self.get_queue_len()
         could_wait = True
         if self.max_waiting_requests:
-            print(f"{cur_waiting_reqs_num=}, {self.max_waiting_requests-1}")
             could_wait = cur_waiting_reqs_num < (self.max_waiting_requests - 1)
         error_msg = validate_input_length(
             req,
@@ -1071,23 +1069,23 @@ class Scheduler(
         return rem_tokens
 
     def compute_tokens_needed_in_queue(self):
-        waiting_queue = None
         needed_tokens = 0
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            waiting_queue = self.disagg_prefill_bootstrap_queue
+            for req in self.disagg_prefill_bootstrap_queue.queue:
+                needed_tokens += req.prefill_need_tokens
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            waiting_queue = self.disagg_decode_prealloc_queue
+            for decode_req in self.disagg_decode_prealloc_queue.queue:
+                needed_tokens += decode_req.req.prefill_need_tokens
         else:
-            waiting_queue = self.waiting_queue
-        for req in waiting_queue:
-            needed_tokens += req.prefill_need_tokens
+            for req in self.waiting_queue:
+                needed_tokens += req.prefill_need_tokens
         return needed_tokens
 
     def get_queue_len(self):
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            return len(self.disagg_prefill_bootstrap_queue)
+            return len(self.disagg_prefill_bootstrap_queue.queue)
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            return len(self.disagg_decode_prealloc_queue)
+            return len(self.disagg_decode_prealloc_queue.queue)
         else:
             return len(self.waiting_queue)
 
