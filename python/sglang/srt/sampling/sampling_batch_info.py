@@ -31,8 +31,8 @@ class SamplingBatchInfo:
     need_min_p_sampling: bool
 
     # Use thinking_budget to truncate thinking
-    num_thinking_tokens: torch.Tensor
-    think_end_ids: torch.Tensor
+    num_thinking_tokens: Optional[torch.Tensor] = None
+    think_end_ids: Optional[torch.Tensor] = None
     thinking_budgets: Optional[torch.Tensor] = None
 
     # Masking tensors for grammar-guided structured outputs
