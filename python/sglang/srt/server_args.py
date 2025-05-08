@@ -133,6 +133,7 @@ class ServerArgs:
     # Speculative decoding
     speculative_algorithm: Optional[str] = None
     speculative_draft_model_path: Optional[str] = None
+    speculative_draft_model_revision: Optional[str] = None
     speculative_num_steps: Optional[int] = None
     speculative_eagle_topk: Optional[int] = None
     speculative_num_draft_tokens: Optional[int] = None
