@@ -12,6 +12,7 @@ import einops
 import torch
 import torch.distributed
 from sglang.srt.managers.expert_location import ExpertLocationMetadata
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import Withable, get_bool_env_var
 
@@ -46,7 +47,7 @@ class ExpertDistributionRecorder:
         yield
 
     @contextmanager
-    def with_forward_pass(self, forward_pass_id: int):
+    def with_forward_pass(self, forward_pass_id: int, forward_batch: ForwardBatch):
         yield
 
     def on_select_experts(self, topk_ids: torch.Tensor):
@@ -114,19 +115,20 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         return self._current_debug_name.with_value(debug_name)
 
     @contextmanager
-    def with_forward_pass(self, forward_pass_id: int):
+    def with_forward_pass(self, forward_pass_id: int, forward_batch: ForwardBatch):
         with self._current_forward_pass_id.with_value(forward_pass_id):
-            self._on_forward_pass_start()
+            self._on_forward_pass_start(forward_batch)
             try:
                 yield
             finally:
                 self._on_forward_pass_end(forward_pass_id)
 
-    def _on_forward_pass_start(self):
+    def _on_forward_pass_start(self, forward_batch: ForwardBatch):
         if not self._recording:
             return
         for gatherer_key, gatherer in self._single_pass_gatherers.items():
             gatherer.reset()
+            gatherer.on_forward_pass_start(forward_batch)
 
     def _on_forward_pass_end(self, forward_pass_id: int):
         if not self._recording:
@@ -263,6 +265,9 @@ class _SinglePassGatherer(ABC):
     def __init__(self, expert_location_metadata: "ExpertLocationMetadata", rank: int):
         self._expert_location_metadata = expert_location_metadata
         self._rank = rank
+
+    def on_forward_pass_start(self, forward_batch: ForwardBatch):
+        pass
 
     def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
         pass
