@@ -300,9 +300,9 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
         rank: int,
     ):
         super().__init__(expert_location_metadata, rank)
+        self._metadata: Optional[Dict[str, Any]] = None
         self._topk_ids_of_layer = TODO
         self._objects: List[Dict[str, Any]] = []
-        self._metadata: Optional[Dict[str, Any]] = None
         assert not server_args.enable_two_batch_overlap, "DetailSinglePassGatherer does not support TBO yet"
 
     def on_forward_pass_start(self, forward_batch: ForwardBatch):
@@ -339,9 +339,9 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
 
     def collect(self) -> Dict:
         return dict(
-            metadata=TODO,
-            topk_ids_of_layer=TODO,
-            objects=TODO,
+            metadata=self._metadata,
+            topk_ids_of_layer=self._topk_ids_of_layer[TODO],
+            objects=self._objects,
         )
 
 
