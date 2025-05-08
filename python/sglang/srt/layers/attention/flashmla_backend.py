@@ -166,11 +166,18 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         else:
             cuda_graph_kv_indices = block_kv_indices
 
-        self.cuda_graph_mla_metadata, self.cuda_graph_num_splits = get_mla_metadata(
-            torch.ones(max_bs, dtype=torch.int32, device=cuda_graph_kv_indices.device),
-            self.num_q_heads,
-            1,
-        )
+        if self.num_draft_tokens:
+            self.cuda_graph_mla_metadata, self.cuda_graph_num_splits = get_mla_metadata(
+                torch.ones(max_bs, dtype=torch.int32, device=cuda_graph_kv_indices.device),
+                self.num_draft_tokens * self.num_q_heads,
+                1,
+            )
+        else:
+            self.cuda_graph_mla_metadata, self.cuda_graph_num_splits = get_mla_metadata(
+                torch.ones(max_bs, dtype=torch.int32, device=cuda_graph_kv_indices.device),
+                self.num_q_heads,
+                1,
+            )
         self.cuda_graph_kv_indices = cuda_graph_kv_indices
 
 
