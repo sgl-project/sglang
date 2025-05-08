@@ -1114,6 +1114,7 @@ async def benchmark(
 
     is_multi_round = isinstance(input_requests[0][0], list)
     if is_multi_round:
+        assert args.disable_ignore_eos, "multi-round requires disable-ignore-eos"
         request_func = wrap_multi_round_request_func(request_func, tokenizer=tokenizer)
 
     # Limit concurrency
