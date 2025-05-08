@@ -34,9 +34,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
 from sglang.srt.utils import is_flashinfer_available
 
-from sglang.srt.distributed import get_tensor_model_parallel_rank
-g_count = 0
-
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -147,10 +144,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         self.prefill_cuda_graph_metadata = {}  # For verify
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        # if get_tensor_model_parallel_rank() == 0:
-        #     spec_info = forward_batch.spec_info
-        #     print(f">> [FlashInferMLAAttnBackend: {forward_batch.forward_mode=}, {spec_info=}")
-
         if forward_batch.forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
                 forward_batch.req_pool_indices,
@@ -372,21 +365,12 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         else:
             # mla paged prefill
             k_buf = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(torch.bfloat16)
-            # if get_tensor_model_parallel_rank() == 0 and (layer.layer_id in [0,1,59,60]) and forward_batch.forward_mode == ForwardMode.TARGET_VERIFY:
-            #     global g_count
-            #     g_count += 1
-            #     output_path = "./output_flashinfer/"
-            #     torch.save(qall, f"{output_path}/{g_count:03d}_0_q")
-            #     torch.save(k_buf.view(-1, 64, 1, self.kv_cache_dim)[0:2], f"{output_path}/{g_count:03d}_1_cache")
             o = prefill_wrapper_paged.run(
                 qall[:, :, : layer.v_head_dim],
                 qall[:, :, layer.v_head_dim :],
                 k_buf[:, :, : layer.v_head_dim],
                 k_buf[:, :, layer.v_head_dim :],
             )
-            # if get_tensor_model_parallel_rank() == 0 and (layer.layer_id in [0,1,59,60]) and forward_batch.forward_mode == ForwardMode.TARGET_VERIFY:
-            #     print(f"{o.shape=}")
-            #     torch.save(o, f"{output_path}/{g_count:03d}_3_o")
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
