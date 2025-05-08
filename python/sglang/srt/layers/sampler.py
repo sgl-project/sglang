@@ -87,10 +87,19 @@ class Sampler(nn.Module):
                     # https://github.com/flashinfer-ai/flashinfer/issues/708
                     # so we use the torch implementation.
 
-                    # clamp to avoid -inf
-                    logprobs = torch.log(
-                        top_p_normalize_probs_torch(probs, sampling_info.top_ps)
-                    ).clamp(min=torch.finfo(probs.dtype).min)
+                    normalization_mode = global_server_args_dict.get(
+                        "logprobs_normalization", "none"
+                    )
+                    if normalization_mode == "none":
+                        # OpenAI style
+                        logprobs = torch.log(probs).clamp(
+                            min=torch.finfo(probs.dtype).min
+                        )
+                    else:
+                        # clamp to avoid -inf
+                        logprobs = torch.log(
+                            top_p_normalize_probs_torch(probs, sampling_info.top_ps)
+                        ).clamp(min=torch.finfo(probs.dtype).min)
 
                 max_top_k_round, batch_size = 32, probs.shape[0]
                 if sampling_info.need_min_p_sampling:
@@ -121,10 +130,19 @@ class Sampler(nn.Module):
                 )
 
                 if return_logprob:
-                    # clamp to avoid -inf
-                    logprobs = torch.log(
-                        top_p_normalize_probs_torch(probs, sampling_info.top_ps)
-                    ).clamp(min=torch.finfo(probs.dtype).min)
+                    normalization_mode = global_server_args_dict.get(
+                        "logprobs_normalization", "none"
+                    )
+                    if normalization_mode == "none":
+                        # OpenAI style
+                        logprobs = torch.log(probs).clamp(
+                            min=torch.finfo(probs.dtype).min
+                        )
+                    else:
+                        # clamp to avoid -inf
+                        logprobs = torch.log(
+                            top_p_normalize_probs_torch(probs, sampling_info.top_ps)
+                        ).clamp(min=torch.finfo(probs.dtype).min)
             else:
                 raise ValueError(
                     f"Invalid sampling backend: {global_server_args_dict['sampling_backend']}"
