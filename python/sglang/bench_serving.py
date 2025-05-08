@@ -1378,21 +1378,24 @@ async def benchmark(
         else:
             output_file_name = f"{args.backend}_{now}_{args.num_prompts}_sharegpt.jsonl"
 
+    result_details = {
+        "input_lens": [output.prompt_len for output in outputs],
+        "output_lens": output_lens,
+        "ttfts": [output.ttft for output in outputs],
+        "itls": [output.itl for output in outputs],
+        "generated_texts": [output.generated_text for output in outputs],
+        "errors": [output.error for output in outputs],
+    }
+
     # Append results to a JSONL file
     with open(output_file_name, "a") as file:
-        file.write(json.dumps(result) + "\n")
+        if args.output_details:
+            result_for_dump = result | result_details
+        else:
+            result_for_dump = result
+        file.write(json.dumps(result_for_dump) + "\n")
 
-    result.update(
-        {
-            "input_lens": [output.prompt_len for output in outputs],
-            "output_lens": output_lens,
-            "ttfts": [output.ttft for output in outputs],
-            "itls": [output.itl for output in outputs],
-            "generated_texts": [output.generated_text for output in outputs],
-            "errors": [output.error for output in outputs],
-        }
-    )
-    return result
+    return result | result_details
 
 
 def check_chat_template(model_path):
@@ -1666,6 +1669,9 @@ if __name__ == "__main__":
         "if the server is not processing requests fast enough to keep up.",
     )
     parser.add_argument("--output-file", type=str, help="Output JSONL file name.")
+    parser.add_argument(
+        "--output-details", action="store_true", help="Output details of benchmarking."
+    )
     parser.add_argument(
         "--disable-tqdm",
         action="store_true",
