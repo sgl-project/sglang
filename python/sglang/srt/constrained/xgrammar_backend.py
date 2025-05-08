@@ -58,17 +58,32 @@ class XGrammarGrammar(BaseGrammarObject):
         self.override_stop_tokens = override_stop_tokens
         self.finished = False
 
-        # Fix (from vLLM team): postpone the import of apply_token_bitmask_inplace_kernels to the
-        # class init site to avoid re-initializing CUDA in forked subprocess.
-        from xgrammar.kernels import apply_token_bitmask_inplace_kernels
+        self.apply_vocab_mask_cpu = None
+        try:
+            from xgrammar.kernels.apply_token_bitmask_inplace_cpu import (
+                apply_token_bitmask_inplace_cpu,
+            )
+
+            self.apply_vocab_mask_cpu = apply_token_bitmask_inplace_cpu
+        except ImportError:
+            pass
+
+        self.apply_vocab_mask_cuda = None
+        try:
+            if torch.cuda.is_available():
+                from xgrammar.kernels.apply_token_bitmask_inplace_cuda import (
+                    apply_token_bitmask_inplace_cuda,
+                )
+
+                self.apply_vocab_mask_cuda = apply_token_bitmask_inplace_cuda
+        except ImportError:
+            pass
+        except RuntimeError:
+            pass
 
         self.use_token_bitmask_triton = get_bool_env_var(
             "SGLANG_TOKEN_BITMASK_TRITON", "false"
         )
-        self.apply_vocab_mask_cuda = apply_token_bitmask_inplace_kernels.get(
-            "cuda", None
-        )
-        self.apply_vocab_mask_cpu = apply_token_bitmask_inplace_kernels.get("cpu", None)
 
     def accept_token(self, token: int):
         assert self.matcher.accept_token(token)
