@@ -41,4 +41,6 @@ if command -v sudo >/dev/null 2>&1; then
     sudo apt update
     sudo apt install curl git sudo libibverbs-dev -y
     sudo apt install rdma-core infiniband-diags openssh-server pciutils perftest ibverbs-providers libibumad3 libibverbs1 libnl-3-200 libnl-route-3-200 librdmacm1 -y
+    sudo ldconfig
+    ldconfig -p | grep libibverbs.so.1
 fi
