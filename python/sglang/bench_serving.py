@@ -1046,7 +1046,15 @@ def wrap_multi_round_request_func(request_func: Callable) -> Callable:
         prompts: List[str] = request_func_input.prompt
         outputs = []
         for i in range(len(prompts)):
-            inner_input = TODO
+            inner_input = RequestFuncInput(
+                prompt=TODO,
+                model=request_func_input.model_id,
+                api_url=request_func_input.api_url,
+                prompt_len=request_func_input.prompt_len,
+                output_len=request_func_input.output_len,
+                lora_name=request_func_input.lora_name,
+                extra_request_body=request_func_input.extra_request_body,
+            )
             outputs.append(await request_func(inner_input, pbar=pbar if i == len(prompts) - 1 else None))
         return outputs
 
