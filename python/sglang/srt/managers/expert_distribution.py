@@ -313,9 +313,9 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
                 forward_pass_id=_current_forward_pass_id.value,
                 layer_id=layer_idx,
                 debug_name=_current_debug_name.value,
-                num_tokens_per_rank=num_tokens_per_rank.tolist(),
-                num_tokens_per_rdma_rank=num_tokens_per_rdma_rank.tolist(),
-                num_tokens_per_expert=num_tokens_per_expert.tolist(),
+                num_tokens_per_rank=num_tokens_per_rank.clone().cpu(),
+                num_tokens_per_rdma_rank=num_tokens_per_rdma_rank.clone().cpu(),
+                num_tokens_per_expert=num_tokens_per_expert.clone().cpu(),
             )
         )
 
