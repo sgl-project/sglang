@@ -308,7 +308,8 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
     def on_forward_pass_start(self, forward_batch: ForwardBatch):
         assert self._metadata is None
         self._metadata = dict(
-            TODO=TODO,
+            input_ids=forward_batch.input_ids.clone().cpu(),
+            positions=forward_batch.positions.clone().cpu(),
         )
 
     def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
