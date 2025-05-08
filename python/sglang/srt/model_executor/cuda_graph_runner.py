@@ -212,6 +212,7 @@ class CudaGraphRunner:
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
         from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend
+
         if isinstance(self.model_runner.attn_backend, FlashMLABackend):
             self.model_runner.attn_backend.init_cuda_graph_state(self.max_bs)
         else:
