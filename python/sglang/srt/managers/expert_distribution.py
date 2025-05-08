@@ -290,10 +290,25 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
     ):
         super().__init__(expert_location_metadata, rank)
         self._topk_ids_of_layer = TODO
+        self._objects = TODO
         assert not server_args.enable_two_batch_overlap, "DetailSinglePassGatherer does not support TBO yet"
 
     def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
         TODO
+
+    def on_deepep_dispatch_normal(
+        self, layer_idx: int, local_physical_count_of_layer: List[int]
+    ):
+        self._objects.append(
+            dict(
+                forward_pass_id=_current_forward_pass_id.value,
+                layer_id=layer_idx,
+                debug_name=_current_debug_name.value,
+                num_tokens_per_rank=num_tokens_per_rank.tolist(),
+                num_tokens_per_rdma_rank=num_tokens_per_rdma_rank.tolist(),
+                num_tokens_per_expert=num_tokens_per_expert.tolist(),
+            )
+        )
 
     def reset(self):
         TODO
