@@ -11,7 +11,6 @@ from typing import Any, Dict, List, Optional, Type
 import einops
 import torch
 import torch.distributed
-
 from sglang.srt.managers.expert_location import ExpertLocationMetadata
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import Withable, get_bool_env_var
@@ -296,7 +295,7 @@ class _SinglePassGatherer(ABC):
     def reset(self):
         raise NotImplementedError
 
-    def collect(self) -> torch.Tensor:
+    def collect(self) -> Dict:
         raise NotImplementedError
 
 
@@ -336,18 +335,19 @@ class _SelectExpertsSinglePassGatherer(_LayerBasedSinglePassGatherer):
         torch.cuda.synchronize()
 
         global_physical_count = [
-            0
-        ] * self._expert_location_metadata.num_physical_experts
+                                    0
+                                ] * self._expert_location_metadata.num_physical_experts
         for token_record in topk_ids_list:
             for global_physical_expert_idx in token_record:
                 global_physical_count[global_physical_expert_idx] += 1
 
         self._on_layer_data(layer_idx, global_physical_count)
 
-    def collect(self) -> torch.Tensor:
-        return super()._collect_objects(
+    def collect(self) -> Dict:
+        global_physical_count = super()._collect_objects(
             pad_len=self._expert_location_metadata.num_physical_experts
         )
+        return dict(global_physical_count=global_physical_count)
 
 
 class _DeepepNormalSinglePassGatherer(_LayerBasedSinglePassGatherer):
@@ -361,12 +361,13 @@ class _DeepepNormalSinglePassGatherer(_LayerBasedSinglePassGatherer):
         local_physical_count = super()._collect_objects(
             pad_len=self._expert_location_metadata.num_local_physical_experts
         )
-        return _convert_local_to_global_physical_count(
+        global_physical_count = _convert_local_to_global_physical_count(
             local_physical_count,
             rank=self._rank,
             num_local_physical_experts=self._expert_location_metadata.num_local_physical_experts,
             num_physical_experts=self._expert_location_metadata.num_physical_experts,
         )
+        return dict(global_physical_count=global_physical_count)
 
 
 class _DeepepLowLatencySinglePassGatherer(_SinglePassGatherer):
@@ -412,7 +413,7 @@ def _convert_local_to_global_physical_count(
 
     ans = torch.zeros((num_layers, num_physical_experts), dtype=dtype, device=device)
     ans[
-        :, num_local_physical_experts * rank : num_local_physical_experts * (rank + 1)
+    :, num_local_physical_experts * rank: num_local_physical_experts * (rank + 1)
     ] = local_physical_count
     return ans
 
