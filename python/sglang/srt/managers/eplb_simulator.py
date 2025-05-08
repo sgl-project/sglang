@@ -24,6 +24,10 @@ from tqdm.auto import tqdm
 _ = compute_utilization_rate, compute_gpu_physical_count
 
 
+def read_expert_distribution_recorder_dir():
+    return TODO
+
+
 # ------------------------------------------- TODO refactor below ---------------------------------------------
 
 @dataclass
@@ -45,9 +49,9 @@ class MyExpertLocationMetadata:
 
     @staticmethod
     def init_by_eplb(
-            server_args: MyServerArgs,
-            logical_count: torch.Tensor,
-            num_physical_experts: int,
+        server_args: MyServerArgs,
+        logical_count: torch.Tensor,
+        num_physical_experts: int,
     ):
         model_config_for_expert_location = _MY_MODEL_CONFIG_FOR_EXPERT_LOCATION
 
@@ -84,10 +88,10 @@ def read_physical_count_of_forward_pass_id_and_rank(dir_data: Path):
         last_physical_to_logical_map = data_pack["last_physical_to_logical_map"]
         for record in data_pack["records"]:
             assert (
-                    physical_count_of_forward_pass_id_and_rank[
-                        record["forward_pass_id"]
-                    ].get(record["rank"])
-                    is None
+                physical_count_of_forward_pass_id_and_rank[
+                    record["forward_pass_id"]
+                ].get(record["rank"])
+                is None
             )
             physical_count_of_forward_pass_id_and_rank[record["forward_pass_id"]][
                 record["rank"]
@@ -103,7 +107,7 @@ def read_physical_count_of_forward_pass(dir_data: Path):
 
     items = []
     for forward_pass_id, physical_count_of_rank in sorted(
-            physical_count_of_forward_pass_id_and_rank.items()
+        physical_count_of_forward_pass_id_and_rank.items()
     ):
         physical_count_of_rank_tensor = torch.stack(
             [
@@ -120,8 +124,8 @@ def read_physical_count_of_forward_pass(dir_data: Path):
 
 
 def scan_combinations(
-        logical_count_of_seq: torch.Tensor,
-        override_eplb_input_logical_count: Optional[torch.Tensor] = None,
+    logical_count_of_seq: torch.Tensor,
+    override_eplb_input_logical_count: Optional[torch.Tensor] = None,
 ):
     num_gpu_per_node = 8
     server_args_list = [
@@ -192,9 +196,9 @@ def analyze_actual_utilization_rate(dir_data: Path, num_gpu: int):
 
 
 def simulate_execution(
-        logical_count_of_seq: torch.Tensor,
-        server_args: MyServerArgs,
-        override_eplb_input_logical_count: Optional[torch.Tensor] = None,
+    logical_count_of_seq: torch.Tensor,
+    server_args: MyServerArgs,
+    override_eplb_input_logical_count: Optional[torch.Tensor] = None,
 ):
     model_config_for_expert_location = _MY_MODEL_CONFIG_FOR_EXPERT_LOCATION
 
@@ -206,8 +210,8 @@ def simulate_execution(
 
     if server_args.enable_expert_location_by_eplb:
         num_physical_expert = (
-                model_config_for_expert_location.num_logical_experts
-                + server_args.ep_num_redundant_experts
+            model_config_for_expert_location.num_logical_experts
+            + server_args.ep_num_redundant_experts
         )
 
         if server_args.init_expert_location == "from_variable":
@@ -263,8 +267,8 @@ def simulate_execution(
 
 
 def simulate_batching(
-        logical_count_of_seq: torch.Tensor,  # (num_seq, num_layer, num_logical_expert)
-        num_tokens_in_batch_overall: int,
+    logical_count_of_seq: torch.Tensor,  # (num_seq, num_layer, num_logical_expert)
+    num_tokens_in_batch_overall: int,
 ) -> torch.Tensor:
     """output: (num_batch, num_layer, num_logical_expert)"""
     tensor_chunks = chunker(
@@ -278,9 +282,9 @@ def simulate_batching(
 
 
 def simulate_logical_to_physical(
-        logical_count_of_whatever: torch.Tensor,  # (*, num_layer, num_logical_expert)
-        logical_to_all_physical_map: torch.Tensor,  # (num_layer, num_logical_experts, X)
-        num_physical_expert: int,
+    logical_count_of_whatever: torch.Tensor,  # (*, num_layer, num_logical_expert)
+    logical_to_all_physical_map: torch.Tensor,  # (num_layer, num_logical_experts, X)
+    num_physical_expert: int,
 ):
     """output: (*, num_layer, num_physical_expert)"""
     num_whatever, num_layer, num_logical_expert = logical_count_of_whatever.shape
