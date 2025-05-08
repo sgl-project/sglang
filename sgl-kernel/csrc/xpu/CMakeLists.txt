@@ -32,8 +32,8 @@ FetchContent_Populate(repo-cutlass-sycl)
 include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/../../include
     ${CMAKE_CURRENT_SOURCE_DIR}/../../csrc
-    ${repo-cutlass-fork_SOURCE_DIR}/include
-    ${repo-cutlass-fork_SOURCE_DIR}/tools/util/include
+    ${repo-cutlass-sycl_SOURCE_DIR}/include
+    ${repo-cutlass-sycl_SOURCE_DIR}/tools/util/include
 )
 
 add_subdirectory(sycl)
@@ -65,8 +65,8 @@ target_include_directories(common_ops PRIVATE ${TORCH_INCLUDE_DIRS})
 # install
 install(TARGETS common_ops LIBRARY DESTINATION sgl_kernel)
 
-install(DIRECTORY "${repo-cutlass-fork_SOURCE_DIR}/include/cute/"
+install(DIRECTORY "${repo-cutlass-sycl_SOURCE_DIR}/include/cute/"
         DESTINATION "deep_gemm/include/cute")
 
-install(DIRECTORY "${repo-cutlass-fork_SOURCE_DIR}/include/cutlass/"
+install(DIRECTORY "${repo-cutlass-sycl_SOURCE_DIR}/include/cutlass/"
         DESTINATION "deep_gemm/include/cutlass")
