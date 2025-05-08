@@ -33,7 +33,9 @@ class _WrapperTensor(torch.Tensor):
 
 
 class DisposableTensor(_WrapperTensor):
-    pass
+    def _unwrap(self):
+        assert self._inner is not None, "Cannot use a DisposableTensor that is already disposed"
+        return self._inner
 
 
 class LazyTensor(_WrapperTensor):
