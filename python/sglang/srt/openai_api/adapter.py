@@ -881,7 +881,7 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
                                     finish_reason=finish_reason_type,
                                 )
                             ],
-                            model=request.model
+                            model=request.model 
                         )
                         yield f"data: {hidden_states_chunk.model_dump_json()}\n\n"
                     final_usage_chunk = CompletionStreamResponse(
