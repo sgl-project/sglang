@@ -1040,10 +1040,18 @@ def wrap_multi_round_request_func(request_func: Callable) -> Callable:
     print("Enable multi-round request function")
 
     def compute_inner_input_prompt(
-        user_texts: List[str],
-        assistant_texts: List[str],
+        history_user_texts: List[str],
+        history_assistant_texts: List[str],
+        gen_prompt: str,
     ):
-        assert len(user_texts) == len(assistant_texts) + 1
+        assert len(history_user_texts) == len(history_assistant_texts)
+        conversations = []
+        for i in range(len(history_assistant_texts)):
+            conversations += [
+                {"role": "user", "content": history_user_texts[i]},
+                {"role": "assistant", "content": history_assistant_texts[i]},
+            ]
+        conversations.append({"role": "user", "content": gen_prompt})
         return TODO
 
     async def f(
@@ -1055,8 +1063,9 @@ def wrap_multi_round_request_func(request_func: Callable) -> Callable:
         for i in range(len(prompts)):
             inner_input = RequestFuncInput(
                 prompt=compute_inner_input_prompt(
-                    user_texts=prompts[:i + 1],
-                    assistant_texts=[o.generated_text for o in outputs],
+                    history_user_texts=prompts[:i],
+                    history_assistant_texts=[o.generated_text for o in outputs],
+                    gen_prompt=prompts[i],
                 ),
                 model=request_func_input.model,
                 api_url=request_func_input.api_url,
