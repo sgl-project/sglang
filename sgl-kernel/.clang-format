@@ -1,4 +1,5 @@
 BasedOnStyle: Google
+SpacesInAngles: false
 IndentWidth: 2
 ColumnLimit: 120
 AllowShortFunctionsOnASingleLine: Empty
