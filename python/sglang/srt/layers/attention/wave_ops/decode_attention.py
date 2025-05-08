@@ -686,6 +686,8 @@ def decode_attention_wave(
         phase_1,
         hyperparams_0,
         hyperparams_1,
+        dynamic_symbols,
+        dynamic_symbols_map,
     ) = get_paged_decode_attention_kernels(
         shape,
         mfma_variant,
@@ -703,6 +705,8 @@ def decode_attention_wave(
         run_bench=False,
         use_buffer_load_ops=False,
         use_buffer_store_ops=False,
+        dynamic_symbols=dynamic_symbols,
+        dynamic_symbols_map=dynamic_symbols_map,
     )
     options = set_default_run_config(options)
     phase_0 = wave_compile(options, phase_0)
@@ -728,6 +732,8 @@ def decode_attention_wave(
         run_bench=False,
         use_buffer_load_ops=False,
         use_buffer_store_ops=False,
+        dynamic_symbols=dynamic_symbols,
+        dynamic_symbols_map=dynamic_symbols_map,
     )
     options = set_default_run_config(options)
     phase_1 = wave_compile(options, phase_1)
