@@ -349,9 +349,10 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
         self._metadata = None
 
     def collect(self) -> Dict:
+        num_tokens = len(self._metadata['input_ids'])
         return dict(
             metadata=self._metadata,
-            topk_ids_of_layer=self._topk_ids_of_layer[TODO],
+            topk_ids_of_layer=self._topk_ids_of_layer[:, :num_tokens, :],
             objects=self._objects,
         )
 
