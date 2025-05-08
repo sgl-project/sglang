@@ -101,14 +101,6 @@ jobs:
         run: |
           bash scripts/ci_install_dependency_rdma.sh
 
-      - name: Check rdma driver
-        run: |
-          lspci | grep -i 'infiniband\|mellanox'
-          lsmod | grep mlx5
-          ibv_devinfo
-          ibv_devices
-          show_gids
-
       - name: Run test
         timeout-minutes: 5
         run: |

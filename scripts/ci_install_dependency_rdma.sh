@@ -37,18 +37,8 @@ pip install -e lmms-eval/
 pip install git+https://github.com/deepseek-ai/FlashMLA.git
 
 # Check if sudo is available, and install disaggregation requirement
-export DEBIAN_FRONTEND=noninteractive
-echo "tzdata tzdata/Areas select Etc" | sudo debconf-set-selections
-echo "tzdata tzdata/Zones/Etc select UTC" | sudo debconf-set-selections
-
 if command -v sudo >/dev/null 2>&1; then
     sudo apt update
-    sudo ln -fs /usr/share/zoneinfo/UTC /etc/localtime
-    sudo apt-get update
-    sudo dpkg --configure -a
-    sudo apt-get install -y tzdata
     sudo apt install curl git sudo libibverbs-dev -y
-    sudo apt install rdma-core infiniband-diags openssh-server pciutils ibverbs-utils perftest ibverbs-providers libibumad3 libibverbs1 libnl-3-200 libnl-route-3-200 librdmacm1 -y
-    sudo modprobe mlx5_core
-    sudo modprobe ib_uverbs
+    sudo apt install rdma-core infiniband-diags openssh-server pciutils perftest ibverbs-providers libibumad3 libibverbs1 libnl-3-200 libnl-route-3-200 librdmacm1 -y
 fi
