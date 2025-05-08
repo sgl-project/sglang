@@ -26,8 +26,8 @@ _ = compute_utilization_rate, compute_gpu_physical_count
 
 
 def read_mode_detail_per_token(dir_data):
-    def _handle_data_pack(data_pack):
-        processed_records = [_handle_record(record) for record in data_pack["records"]]
+    def _concat_tokens(processed_records):
+        return TODO
 
     def _handle_record(record):
         rids_raw = torch.tensor([int(rid, 16) & ((1 << 64) - 1) for rid in record["rids"]])
@@ -49,9 +49,11 @@ def read_mode_detail_per_token(dir_data):
             topk_ids_of_layer=topk_ids_of_layer,
         )
 
+    processed_records = []
     for path in tqdm(list(Path(dir_data).glob("*.pt"))):
         data_pack = torch.load(path, weights_only=True)
-        TODO
+        processed_records += [_handle_record(record) for record in data_pack["records"]]
+    TODO
 
     return TODO
 
