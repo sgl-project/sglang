@@ -62,7 +62,7 @@ def read_mode_detail_per_token(dir_data):
     for path in tqdm(list(Path(dir_data).glob("*.pt"))):
         data_pack = torch.load(path, weights_only=True)
         processed_records += [_handle_record(record) for record in data_pack["records"]]
-    TODO
+    concated_records = _concat_tokens(processed_records)
 
     return TODO
 
