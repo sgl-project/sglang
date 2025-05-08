@@ -10,16 +10,14 @@ import torch
 from compressed_tensors import CompressionFormat
 from compressed_tensors.quantization import QuantizationStrategy
 
-from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
+from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz, scaled_fp8_quant
 from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
 from sglang.srt.layers.quantization.utils import (
     all_close_1d,
-    is_cuda,
-    is_fp8_fnuz,
     per_tensor_dequantize,
     replace_parameter,
 )
-from sglang.srt.utils import set_weight_attrs
+from sglang.srt.utils import is_cuda, set_weight_attrs
 
 _is_cuda = is_cuda()
 
