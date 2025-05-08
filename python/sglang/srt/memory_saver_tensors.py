@@ -7,7 +7,8 @@ class _WrapperTensor(torch.Tensor):
         r = torch.Tensor._make_wrapper_subclass(
             cls,
             inner.shape,
-            strides=inner.stride,
+            strides=inner.stride(),
+            storage_offset=inner.storage_offset(),
             dtype=inner.dtype,
             device=inner.device,
             layout=inner.layout,
