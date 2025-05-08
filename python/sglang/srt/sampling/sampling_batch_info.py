@@ -93,6 +93,10 @@ class SamplingBatchInfo:
                 [r.sampling_params.thinking_budget or -1 for r in reqs],
                 dtype=torch.int64,
             ).to(device, non_blocking=True)
+        else:
+            think_end_ids = None
+            num_thinking_tokens = None
+            thinking_budgets = None
         # Check if any request has custom logit processor
         has_custom_logit_processor = (
             batch.enable_custom_logit_processor  # check the flag first.
