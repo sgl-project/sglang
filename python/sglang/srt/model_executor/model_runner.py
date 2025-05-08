@@ -1097,7 +1097,8 @@ class ModelRunner:
             self.dummy_function()
 
         with get_global_expert_distribution_recorder().with_forward_pass(
-            self.forward_pass_id, forward_batch,
+            self.forward_pass_id,
+            forward_batch,
         ):
             with fine_grained_benchmark.maybe_benchmark(
                 forward_batch, self.tp_rank, self.forward_pass_id

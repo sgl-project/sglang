@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional, Type
 import einops
 import torch
 import torch.distributed
+
 from sglang.srt.managers.expert_location import ExpertLocationMetadata
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import ServerArgs
@@ -135,9 +136,7 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             return
         for gatherer_key, gatherer in self._single_pass_gatherers.items():
             single_pass_data = gatherer.collect()
-            self._accumulator.append(
-                forward_pass_id, gatherer_key, single_pass_data
-            )
+            self._accumulator.append(forward_pass_id, gatherer_key, single_pass_data)
 
     def flush_buffer_depending_on_expert_location_metadata(self):
         self._accumulator.flush_buffer_depending_on_expert_location_metadata()
@@ -249,7 +248,9 @@ class _SinglePassGatherer(ABC):
         rank: int,
     ) -> "_SinglePassGatherer":
         if server_args.expert_distribution_recorder_mode == "detail_per_token":
-            return _DetailSinglePassGatherer(server_args, expert_location_metadata, rank)
+            return _DetailSinglePassGatherer(
+                server_args, expert_location_metadata, rank
+            )
         if server_args.enable_deepep_moe:
             # `auto` has many restrictions now, so we lower the priority to implement low-latency capturing for auto
             if server_args.deepep_mode in ["normal", "auto"]:
@@ -273,7 +274,9 @@ class _SinglePassGatherer(ABC):
         pass
 
     def on_deepep_dispatch_normal(
-        self, layer_idx: int, local_physical_count_of_layer: List[int],
+        self,
+        layer_idx: int,
+        local_physical_count_of_layer: List[int],
         num_tokens_per_rank,
         num_tokens_per_rdma_rank,
         num_tokens_per_expert,
@@ -303,7 +306,9 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
         self._metadata: Optional[Dict[str, Any]] = None
         self._topk_ids_of_layer = TODO
         self._objects: List[Dict[str, Any]] = []
-        assert not server_args.enable_two_batch_overlap, "DetailSinglePassGatherer does not support TBO yet"
+        assert (
+            not server_args.enable_two_batch_overlap
+        ), "DetailSinglePassGatherer does not support TBO yet"
 
     def on_forward_pass_start(self, forward_batch: ForwardBatch):
         assert self._metadata is None
@@ -318,7 +323,9 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
         TODO
 
     def on_deepep_dispatch_normal(
-        self, layer_idx: int, local_physical_count_of_layer: List[int],
+        self,
+        layer_idx: int,
+        local_physical_count_of_layer: List[int],
         num_tokens_per_rank,
         num_tokens_per_rdma_rank,
         num_tokens_per_expert,
@@ -381,8 +388,8 @@ class _SelectExpertsSinglePassGatherer(_LayerBasedSinglePassGatherer):
         torch.cuda.synchronize()
 
         global_physical_count = [
-                                    0
-                                ] * self._expert_location_metadata.num_physical_experts
+            0
+        ] * self._expert_location_metadata.num_physical_experts
         for token_record in topk_ids_list:
             for global_physical_expert_idx in token_record:
                 global_physical_count[global_physical_expert_idx] += 1
@@ -398,7 +405,9 @@ class _SelectExpertsSinglePassGatherer(_LayerBasedSinglePassGatherer):
 
 class _DeepepNormalSinglePassGatherer(_LayerBasedSinglePassGatherer):
     def on_deepep_dispatch_normal(
-        self, layer_idx: int, local_physical_count_of_layer: List[int],
+        self,
+        layer_idx: int,
+        local_physical_count_of_layer: List[int],
         num_tokens_per_rank,
         num_tokens_per_rdma_rank,
         num_tokens_per_expert,
@@ -463,7 +472,7 @@ def _convert_local_to_global_physical_count(
 
     ans = torch.zeros((num_layers, num_physical_experts), dtype=dtype, device=device)
     ans[
-    :, num_local_physical_experts * rank: num_local_physical_experts * (rank + 1)
+        :, num_local_physical_experts * rank : num_local_physical_experts * (rank + 1)
     ] = local_physical_count
     return ans
 
@@ -561,7 +570,9 @@ class _DetailAccumulator(_Accumulator):
         gatherer_key: str,
         single_pass_data: Dict,
     ):
-        single_pass_global_physical_count = single_pass_data["global_physical_count"].to("cpu").clone()
+        single_pass_global_physical_count = (
+            single_pass_data["global_physical_count"].to("cpu").clone()
+        )
         if self._save_dir is None:
             single_pass_global_physical_count = (
                 single_pass_global_physical_count.tolist()
@@ -585,9 +596,7 @@ class _DetailAccumulator(_Accumulator):
             return deepcopy(self._records)
         else:
             path_output = Path(self._save_dir) / f"{time.time()}-{self._rank}.pt"
-            logger.info(
-                f"Write expert distribution to {path_output}"
-            )
+            logger.info(f"Write expert distribution to {path_output}")
             output = dict(
                 records=self._records,
                 # NOTE: This may change during recording, so here we say it is the "last" one
@@ -634,7 +643,9 @@ class _StatAccumulator(_Accumulator):
         single_pass_data: Dict,
     ):
         # Can optimize if overhead here is large
-        self._buffer_global_physical_count += single_pass_data["global_physical_count"].cpu()
+        self._buffer_global_physical_count += single_pass_data[
+            "global_physical_count"
+        ].cpu()
 
     def reset(self):
         self._buffer_global_physical_count[...] = 0
@@ -688,7 +699,9 @@ class _StatAndUtilizationRateAccumulator(_StatAccumulator):
         single_pass_data: Dict,
     ):
         super().append(forward_pass_id, gatherer_key, single_pass_data)
-        self._append_utilization_rate(forward_pass_id, single_pass_data["global_physical_count"])
+        self._append_utilization_rate(
+            forward_pass_id, single_pass_data["global_physical_count"]
+        )
 
     def reset(self):
         super().reset()
