@@ -30,8 +30,6 @@ if TYPE_CHECKING:
 
 # FlashMLA only supports pagesize=64
 PAGE_SIZE = 64
-# TODO The current setup is hard-coded and will be changed after integrating with MTP.
-Q_LEN = 1
 
 
 @dataclass
@@ -108,7 +106,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             )
             mla_metadata, num_splits = get_mla_metadata(
                 forward_batch.seq_lens.to(torch.int32),
-                Q_LEN * self.num_q_heads,
+                self.num_q_heads,
                 1,
             )
             self.forward_metadata = FlashMLADecodeMetadata(
@@ -170,7 +168,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
 
         self.cuda_graph_mla_metadata, self.cuda_graph_num_splits = get_mla_metadata(
             torch.ones(max_bs, dtype=torch.int32, device=cuda_graph_kv_indices.device),
-            Q_LEN * self.num_q_heads,
+            self.num_q_heads,
             1,
         )
         self.cuda_graph_kv_indices = cuda_graph_kv_indices
@@ -200,7 +198,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             )
             mla_metadata, num_splits = get_mla_metadata(
                 seq_lens.to(torch.int32),
-                Q_LEN * self.num_q_heads,
+                self.num_q_heads,
                 1,
             )
             self.cuda_graph_mla_metadata.copy_(mla_metadata)
@@ -274,7 +272,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             )
             mla_metadata, num_splits = get_mla_metadata(
                 seq_lens.to(torch.int32),
-                Q_LEN * self.num_q_heads,
+                self.num_q_heads,
                 1,
             )
             self.cuda_graph_mla_metadata.copy_(mla_metadata)
