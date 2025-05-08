@@ -1037,7 +1037,15 @@ def calculate_metrics(
 
 
 def wrap_multi_round_request_func(request_func: Callable) -> Callable:
-    return TODO
+    print("Enable multi-round request function")
+
+    async def f(
+        request_func_input: RequestFuncInput,
+        pbar: Optional[tqdm] = None,
+    ) -> RequestFuncOutput:
+        return TODO
+
+    return f
 
 
 async def benchmark(
