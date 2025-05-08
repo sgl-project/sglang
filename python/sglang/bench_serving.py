@@ -25,7 +25,7 @@ from argparse import ArgumentParser
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union, Callable
+from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
 
 import aiohttp
 import numpy as np
@@ -918,6 +918,11 @@ def sample_hf_dataset_requests(
         id=pl.col(column_id),
         timestamp=expr_timestamp,
         conversation=pl.col(column_conversation),
+    )
+    df = df.with_columns(
+        prompts=pl.col('conversation') \
+            .list.filter(pl.element().struct.field("role") == "user") \
+            .list.eval(pl.element().struct.field("content")),
     )
 
     return TODO
