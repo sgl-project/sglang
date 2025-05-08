@@ -306,7 +306,6 @@ class MooncakeKVManager(BaseKVManager):
             while True:
                 try:
                     kv_chunk: TransferKVChunk = self.transfer_queue.get(timeout=0.01)
-                    # Note(shangming): might need to assert MLA is used when prefill instances and decode instances have different tp_size_per_dp_rank
                     reqs_to_be_processed = self.transfer_infos[kv_chunk.room].values()
                     polls = []
                     dst_ranks_infos = []
@@ -583,7 +582,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
 
         self.target_dp_group = bootstrap_room % self.prefill_dp_size
 
-        # NOTE: key distinguished by bootstrap_addr, target_dp_group, and engine_rank
+        # NOTE: key distinguished by bootstrap_addr, target_dp_group, and target_tp_rank
         bootstrap_key = (
             f"{self.bootstrap_addr}_{self.target_dp_group}_{self.target_tp_rank}"
         )
