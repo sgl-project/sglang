@@ -25,6 +25,7 @@ limitations under the License.
 #include <device/sm100_mla.hpp>
 #include <kernel/sm100_mla_tile_scheduler.hpp>
 
+// clang-format off
 #if !defined(CUDA_VERSION) || CUDA_VERSION < 12040
 void cutlass_mla_decode(
     torch::Tensor const& out,
@@ -222,3 +223,4 @@ int64_t cutlass_mla_get_workspace_size(int64_t max_seq_len, int64_t num_batches,
 }
 
 #endif
+// clang-format on

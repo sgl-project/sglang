@@ -24,7 +24,6 @@
 #include <cuda_runtime.h>
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
-// clang-format on
 
 #if !defined(CUDA_VERSION) || CUDA_VERSION < 12040
 void ApplyTokenBitmaskInplace(at::Tensor logits, at::Tensor bitmask, at::optional<at::Tensor> indices = at::nullopt) {
@@ -256,3 +255,4 @@ void ApplyTokenBitmaskInplace(at::Tensor logits, at::Tensor bitmask, at::optiona
   }
 }
 #endif
+// clang-format on
