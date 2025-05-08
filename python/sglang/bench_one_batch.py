@@ -137,17 +137,7 @@ def load_model(server_args, port_args, tp_rank):
     suppress_other_loggers()
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
 
-    model_config = ModelConfig(
-        server_args.model_path,
-        trust_remote_code=server_args.trust_remote_code,
-        revision=server_args.revision,
-        context_length=server_args.context_length,
-        model_override_args=server_args.json_model_override_args,
-        is_embedding=server_args.is_embedding,
-        enable_multimodal=server_args.enable_multimodal,
-        dtype=server_args.dtype,
-        quantization=server_args.quantization,
-    )
+    model_config = ModelConfig.from_server_args(server_args)
     model_runner = ModelRunner(
         model_config=model_config,
         mem_fraction_static=server_args.mem_fraction_static,

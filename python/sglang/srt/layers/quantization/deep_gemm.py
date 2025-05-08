@@ -28,6 +28,11 @@ if is_cuda():
         if get_bool_env_var("SGL_ENABLE_JIT_DEEPGEMM", default="true"):
             _ENABLE_JIT_DEEPGEMM = True
 
+
+def get_enable_jit_deepgemm():
+    return _ENABLE_JIT_DEEPGEMM
+
+
 logger = logging.getLogger(__name__)
 
 _BUILTIN_M_LIST = list(range(1, 1024 * 16 + 1))
