@@ -27,7 +27,8 @@ _ = compute_utilization_rate, compute_gpu_physical_count
 def read_expert_distribution_recorder_mode_detail_per_token(dir_data):
     for path in tqdm(list(Path(dir_data).glob("*.pt"))):
         data_pack = torch.load(path, weights_only=True)
-        TODO
+        for record in data_pack["records"]:
+            TODO
     return TODO
 
 
