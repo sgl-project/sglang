@@ -1,7 +1,9 @@
 """
 python3 -m unittest test_openai_server.TestOpenAIServer.test_batch
 python3 -m unittest test_openai_server.TestOpenAIServer.test_completion
-
+python3 -m unittest test_openai_server.TestOpenAIServer.test_completion_stream
+python3 -m unittest test_openai_server.TestOpenAIServer.test_chat_completion
+python3 -m unittest test_openai_server.TestOpenAIServer.test_chat_completion_stream
 """
 
 import json
@@ -43,7 +45,7 @@ class TestOpenAIServer(CustomTestCase):
         kill_process_tree(cls.process.pid)
 
     def run_completion(
-        self, echo, logprobs, use_list_input, parallel_sample_num, token_input
+        self, echo, logprobs, use_list_input, parallel_sample_num, token_input, return_hidden_states
     ):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
         prompt = "The capital of France is"
@@ -70,6 +72,7 @@ class TestOpenAIServer(CustomTestCase):
             echo=echo,
             logprobs=logprobs,
             n=parallel_sample_num,
+            extra_body=dict(return_hidden_states=return_hidden_states),
         )
 
         assert len(response.choices) == num_choices * parallel_sample_num
@@ -100,8 +103,12 @@ class TestOpenAIServer(CustomTestCase):
         assert response.usage.completion_tokens > 0
         assert response.usage.total_tokens > 0
 
+        if return_hidden_states:
+            assert response.choices[0].hidden_states
+            assert np.asarray(response.choices[0].hidden_states).shape[0] == 1
+
     def run_completion_stream(
-        self, echo, logprobs, use_list_input, parallel_sample_num, token_input
+        self, echo, logprobs, use_list_input, parallel_sample_num, token_input, return_hidden_states
     ):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
         prompt = "The capital of France is"
@@ -130,9 +137,11 @@ class TestOpenAIServer(CustomTestCase):
             stream=True,
             stream_options={"include_usage": True},
             n=parallel_sample_num,
+            extra_body=dict(return_hidden_states=return_hidden_states),
         )
 
         is_firsts = {}
+        hidden_states = None
         for response in generator:
             usage = response.usage
             if usage is not None:
@@ -167,12 +176,19 @@ class TestOpenAIServer(CustomTestCase):
             assert response.id
             assert response.created
 
+            if hasattr(response.choices[0], 'hidden_states') and response.choices[0].hidden_states is not None:
+                hidden_states = response.choices[0].hidden_states
+
         for index in [i for i in range(parallel_sample_num * num_choices)]:
             assert not is_firsts.get(
                 index, True
             ), f"index {index} is not found in the response"
 
-    def run_chat_completion(self, logprobs, parallel_sample_num):
+        if return_hidden_states:
+            assert hidden_states
+            assert np.asarray(hidden_states).shape[0] == 1
+
+    def run_chat_completion(self, logprobs, parallel_sample_num, return_hidden_states):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
         response = client.chat.completions.create(
             model=self.model,
@@ -187,6 +203,7 @@ class TestOpenAIServer(CustomTestCase):
             logprobs=logprobs is not None and logprobs > 0,
             top_logprobs=logprobs,
             n=parallel_sample_num,
+            extra_body=dict(return_hidden_states=return_hidden_states),
         )
 
         if logprobs:
@@ -210,6 +227,10 @@ class TestOpenAIServer(CustomTestCase):
         assert response.usage.completion_tokens > 0
         assert response.usage.total_tokens > 0
 
+        if return_hidden_states:
+            assert response.choices[0].hidden_states
+            assert np.asarray(response.choices[0].hidden_states).shape[0] == 1
+
     def run_chat_completion_stream(self, logprobs, parallel_sample_num=1):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
         generator = client.chat.completions.create(
@@ -224,9 +245,12 @@ class TestOpenAIServer(CustomTestCase):
             stream=True,
             stream_options={"include_usage": True},
             n=parallel_sample_num,
+            extra_body=dict(return_hidden_states=True),
         )
 
         is_firsts = {}
+        hidden_states = None
+        top_logprob_tokens = []
         for response in generator:
             usage = response.usage
             if usage is not None:
@@ -257,7 +281,11 @@ class TestOpenAIServer(CustomTestCase):
                 assert (
                     ret_num_top_logprobs == logprobs
                 ), f"{ret_num_top_logprobs} vs {logprobs}"
+                top_logprob_tokens.append(
+                    response.choices[0].logprobs.content[0].top_logprobs[0].token
+                )
 
+            assert len(top_logprob_tokens) <= 2 or len(set(top_logprob_tokens)) > 1, "Top Logprob tokens should not repeat"
             assert (
                 isinstance(data.content, str)
                 or isinstance(data.reasoning_content, str)
@@ -267,10 +295,17 @@ class TestOpenAIServer(CustomTestCase):
             assert response.id
             assert response.created
 
+            if hasattr(response.choices[0], 'hidden_states') and response.choices[0].hidden_states is not None:
+                hidden_states = response.choices[0].hidden_states
+
         for index in [i for i in range(parallel_sample_num)]:
             assert not is_firsts.get(
                 index, True
             ), f"index {index} is not found in the response"
+
+        if return_hidden_states:
+            assert hidden_states
+            assert np.asarray(hidden_states).shape[0] == 1
 
     def _create_batch(self, mode, client):
         if mode == "completion":
@@ -424,13 +459,15 @@ class TestOpenAIServer(CustomTestCase):
                 for use_list_input in [True, False]:
                     for parallel_sample_num in [1, 2]:
                         for token_input in [False, True]:
-                            self.run_completion(
-                                echo,
-                                logprobs,
-                                use_list_input,
-                                parallel_sample_num,
-                                token_input,
-                            )
+                            for return_hidden_states in [False, True]:
+                                self.run_completion(
+                                    echo,
+                                    logprobs,
+                                    use_list_input,
+                                    parallel_sample_num,
+                                    token_input,
+                                    return_hidden_states,
+                                )
 
     def test_completion_stream(self):
         # parallel sampling adn list input are not supported in streaming mode
@@ -439,23 +476,27 @@ class TestOpenAIServer(CustomTestCase):
                 for use_list_input in [True, False]:
                     for parallel_sample_num in [1, 2]:
                         for token_input in [False, True]:
-                            self.run_completion_stream(
-                                echo,
-                                logprobs,
-                                use_list_input,
-                                parallel_sample_num,
-                                token_input,
-                            )
+                            for return_hidden_states in [False, True]:
+                                self.run_completion_stream(
+                                    echo,
+                                    logprobs,
+                                    use_list_input,
+                                    parallel_sample_num,
+                                    token_input,
+                                    return_hidden_states,
+                                )
 
     def test_chat_completion(self):
         for logprobs in [None, 5]:
             for parallel_sample_num in [1, 2]:
-                self.run_chat_completion(logprobs, parallel_sample_num)
+                for return_hidden_states in [False, True]:
+                    self.run_chat_completion(logprobs, parallel_sample_num, return_hidden_states)
 
     def test_chat_completion_stream(self):
         for logprobs in [None, 5]:
             for parallel_sample_num in [1, 2]:
-                self.run_chat_completion_stream(logprobs, parallel_sample_num)
+                for return_hidden_states in [False, True]:                
+                    self.run_chat_completion_stream(logprobs, parallel_sample_num, return_hidden_states)
 
     def test_batch(self):
         for mode in ["completion", "chat"]:
