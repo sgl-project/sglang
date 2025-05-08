@@ -1043,7 +1043,12 @@ def wrap_multi_round_request_func(request_func: Callable) -> Callable:
         request_func_input: RequestFuncInput,
         pbar: Optional[tqdm] = None,
     ) -> RequestFuncOutput:
-        return TODO
+        prompts: List[str] = request_func_input.prompt
+        outputs = []
+        for i in range(len(prompts)):
+            inner_input = TODO
+            outputs.append(await request_func(inner_input, pbar=pbar if i == len(prompts) - 1 else None))
+        return outputs
 
     return f
 
