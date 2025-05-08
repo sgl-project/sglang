@@ -27,9 +27,15 @@ _ = compute_utilization_rate, compute_gpu_physical_count
 
 def read_mode_detail_per_token(dir_data):
     def _concat_tokens(processed_records):
+        concat_dim_of_key = {
+            "rids": 0,
+            "forward_modes": 0,
+            "input_ids": 0,
+            "topk_ids_of_layer": 1,  # different
+        }
         return {
-            k: TODO
-            for k in ["rids", "forward_modes", "input_ids", "topk_ids_of_layer"]
+            k: torch.concat([r[k] for r in processed_records], dim=concat_dim_of_key[k])
+            for k in concat_dim_of_key.keys()
         }
 
     def _handle_record(record):
