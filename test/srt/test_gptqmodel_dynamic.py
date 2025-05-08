@@ -43,16 +43,7 @@ def check_quant_method(model_path: str, use_marlin_kernel: bool):
         pass
 
     server_args = ServerArgs(model_path=model_path, dtype=torch.float16)
-    model_config = ModelConfig(
-        server_args.model_path,
-        trust_remote_code=server_args.trust_remote_code,
-        revision=server_args.revision,
-        context_length=server_args.context_length,
-        model_override_args=server_args.json_model_override_args,
-        is_embedding=server_args.is_embedding,
-        dtype=server_args.dtype,
-        quantization=server_args.quantization,
-    )
+    model_config = ModelConfig.from_server_args(server_args)
 
     load_config = LoadConfig()
     device_config = DeviceConfig("cuda")

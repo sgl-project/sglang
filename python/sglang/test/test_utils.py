@@ -66,9 +66,11 @@ DEFAULT_MODEL_NAME_FOR_TEST_LOCAL_ATTENTION = (
 )
 DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST = "Alibaba-NLP/gte-Qwen2-1.5B-instruct"
 DEFAULT_REASONING_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
+DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-V3-0324"
 DEFAULT_AWQ_MOE_MODEL_NAME_FOR_TEST = (
     "hugging-quants/Mixtral-8x7B-Instruct-v0.1-AWQ-INT4"
 )
+DEFAULT_ENABLE_THINKING_MODEL_NAME_FOR_TEST = "Qwen/Qwen3-30B-A3B"
 
 # Nightly tests
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1 = "meta-llama/Llama-3.1-8B-Instruct,mistralai/Mistral-7B-Instruct-v0.3,deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct,google/gemma-2-27b-it"
@@ -77,7 +79,8 @@ DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1 = "neuralmagic/Meta-Llama-3.1-8B-Ins
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2 = "neuralmagic/Meta-Llama-3.1-70B-Instruct-FP8,neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8,neuralmagic/Qwen2-72B-Instruct-FP8,neuralmagic/Qwen2-57B-A14B-Instruct-FP8,neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8"
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_QUANT_TP1 = "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4,hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4,hugging-quants/Mixtral-8x7B-Instruct-v0.1-AWQ-INT4"
 DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN = "Qwen/Qwen2.5-1.5B-Instruct"
-DEFAULT_SMALL_VLM_MODEL_NAME = "Qwen/Qwen2-VL-2B"
+DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST = "Qwen/Qwen2.5-VL-3B-Instruct"
+DEFAULT_VLM_CHAT_TEMPLATE_FOR_TEST = "qwen2-vl"
 
 DEFAULT_IMAGE_URL = "https://github.com/sgl-project/sglang/blob/main/test/lang/example_image.png?raw=true"
 DEFAULT_VIDEO_URL = "https://raw.githubusercontent.com/EvolvingLMMs-Lab/sglang/dev/onevision_local/assets/jobs.mp4"
@@ -768,6 +771,34 @@ def run_bench_offline_throughput(model, other_args):
         kill_process_tree(process.pid)
 
     return output_throughput
+
+
+def run_bench_one_batch_server(
+    model,
+    base_url,
+    server_args,
+    bench_args,
+    other_server_args,
+    simulate_spec_acc_lens=None,
+):
+    from sglang.bench_one_batch_server import run_benchmark
+
+    if simulate_spec_acc_lens is not None:
+        env = {**os.environ, "SIMULATE_ACC_LEN": str(simulate_spec_acc_lens)}
+    else:
+        env = None
+
+    process = popen_launch_server(
+        model,
+        base_url,
+        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+        other_args=other_server_args,
+        env=env,
+    )
+    try:
+        run_benchmark(server_args=server_args, bench_args=bench_args)
+    finally:
+        kill_process_tree(process.pid)
 
 
 def lcs(X, Y):

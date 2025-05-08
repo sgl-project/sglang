@@ -87,7 +87,7 @@ Please refer to [the example](https://github.com/sgl-project/sglang/tree/main/be
 
 - **Weight Absorption**: By applying the associative law of matrix multiplication to reorder computation steps, this method balances computation and memory access and improves efficiency in the decoding phase.
 
-- **MLA Attention Backends**: Currently SGLang supports different optimized MLA attention backends, including [FlashAttention3](https://github.com/Dao-AILab/flash-attention), [Flashinfer](https://docs.flashinfer.ai/api/mla.html), and [Triton](https://github.com/triton-lang/triton) backends. The default FA3 provides good performance across wide workloads.
+- **MLA Attention Backends**: Currently SGLang supports different optimized MLA attention backends, including [FlashAttention3](https://github.com/Dao-AILab/flash-attention), [Flashinfer](https://docs.flashinfer.ai/api/mla.html), [FlashMLA](https://github.com/deepseek-ai/FlashMLA), [CutlassMLA](https://github.com/sgl-project/sglang/pull/5390), and [Triton](https://github.com/triton-lang/triton) backends. The default FA3 provides good performance across wide workloads.
 
 - **FP8 Quantization**: W8A8 FP8 and KV Cache FP8 quantization enables efficient FP8 inference. Additionally, we have implemented Batched Matrix Multiplication (BMM) operator to facilitate FP8 inference in MLA with weight absorption.
 
@@ -153,14 +153,12 @@ The precompilation process typically takes around 10 minutes to complete.
 **Description**: SGLang implements DeepSeek V3 Multi-Token Prediction (MTP) based on [EAGLE speculative decoding](https://docs.sglang.ai/backend/speculative_decoding.html#EAGLE-Decoding). With this optimization, the decoding speed can be improved by **1.8x** for batch size 1 and **1.5x** for batch size 32 respectively on H200 TP8 setting.
 
 **Usage**:
-Add arguments `--speculative-algorithm`, `--speculative-draft-model-path`,
-`--speculative-num-steps`, `--speculative-eagle-topk` and `--speculative-num-draft-tokens` to enable this feature. For example:
+Add arguments `--speculative-algorithm`, `--speculative-num-steps`, `--speculative-eagle-topk` and `--speculative-num-draft-tokens` to enable this feature. For example:
 ```
-python3 -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3-0324 --speculative-algorithm EAGLE --speculative-draft-model-path lmsys/DeepSeek-V3-0324-NextN --speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 2 --trust-remote-code --tp 8
+python3 -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3-0324 --speculative-algorithm EAGLE --speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 2 --trust-remote-code --tp 8
 ```
-- The draft model are available at huggingface: [lmsys/DeepSeek-V3-0324-NextN](https://huggingface.co/lmsys/DeepSeek-V3-0324-NextN), [lmsys/DeepSeek-R1-NextN](https://huggingface.co/lmsys/DeepSeek-R1-NextN). It can also be exported from original DeepSeek-V3/R1 model with [export_deepseek_nextn.py](https://github.com/sgl-project/sglang/blob/main/scripts/export_deepseek_nextn.py) script.
 - The best configuration for `--speculative-num-steps`, `--speculative-eagle-topk` and `--speculative-num-draft-tokens` can be searched with [bench_speculative.py](https://github.com/sgl-project/sglang/blob/main/scripts/playground/bench_speculative.py) script for given batch size. The minimum configuration is `--speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 2`, which can achieve speedup for larger batch sizes.
-When using FlashInfer MLA wrapper (`--attention-backend flashinfer`) with speculative decoding, set the `--speculative-eagle-topk` parameter to `1`. The FlashAttention 3 backend also only supports `--speculative-eagle-topk 1`.
+- FlashAttention3 and Triton backend fully supports MTP usage. For FlashInfer backend (`--attention-backend flashinfer`) with speculative decoding,`--speculative-eagle-topk` parameter should be set to `1`. MTP support for the FlashMLA backend and CutlassMLA backend is still under development.
 - To enable DeepSeek MTP for large batch sizes (>32), there are some parameters should be changed (Reference [this discussion](https://github.com/sgl-project/sglang/issues/4543#issuecomment-2737413756)):
   - Adjust `--max-running-requests` to a larger number. The default value is `32` for MTP. For larger batch sizes, you should increase this value beyond the default value.
   - Set `--cuda-graph-bs`. It's a list of batch sizes for cuda graph capture. The default captured batch sizes for speculative decoding is set [here](https://github.com/sgl-project/sglang/blob/49420741746c8f3e80e0eb17e7d012bfaf25793a/python/sglang/srt/model_executor/cuda_graph_runner.py#L126). You can include more batch sizes into it.
@@ -173,10 +171,10 @@ See [Separate Reasoning](https://docs.sglang.ai/backend/separate_reasoning.html)
 
 ### Function calling for DeepSeek Models
 
-Add arguments `--tool-call-parser deepseekv3` to enable this feature. For example (running on 1 * H20 node):
+Add arguments `--tool-call-parser deepseekv3` and `--chat-template ./examples/chat_template/tool_chat_template_deepseekv3.jinja`(recommended) to enable this feature. For example (running on 1 * H20 node):
 
 ```
-python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3-0324 --tp 8 --port 30000 --host 0.0.0.0 --mem-fraction-static 0.9 --disable-cuda-graph --tool-call-parser deepseekv3
+python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3-0324 --tp 8 --port 30000 --host 0.0.0.0 --mem-fraction-static 0.9 --disable-cuda-graph --tool-call-parser deepseekv3 --chat-template ./examples/chat_template/tool_chat_template_deepseekv3.jinja
 ```
 
 Sample Request:
@@ -190,7 +188,7 @@ curl "http://127.0.0.1:30000/v1/chat/completions" \
 Expected Response
 
 ```
-{"id": "62af80528930423a82c806651ec66e7c", "object": "chat.completion", "created": 1744431333, "model": "deepseek-ai/DeepSeek-V3-0324", "choices": [{"index": 0, "message": {"role": "assistant", "content": null, "reasoning_content": null, "tool_calls": [{"id": "0", "type": "function", "function": {"name": "query_weather", "arguments": "{\\"city\\": \\"Guangzhou\\"}"}}]}, "logprobs": null, "finish_reason": "tool_calls", "matched_stop": null}], "usage": {"prompt_tokens": 118, "total_tokens": 140, "completion_tokens": 22, "prompt_tokens_details": null}}
+{"id":"6501ef8e2d874006bf555bc80cddc7c5","object":"chat.completion","created":1745993638,"model":"deepseek-ai/DeepSeek-V3-0324","choices":[{"index":0,"message":{"role":"assistant","content":null,"reasoning_content":null,"tool_calls":[{"id":"0","index":null,"type":"function","function":{"name":"query_weather","arguments":"{\"city\": \"Qingdao\"}"}}]},"logprobs":null,"finish_reason":"tool_calls","matched_stop":null}],"usage":{"prompt_tokens":116,"total_tokens":138,"completion_tokens":22,"prompt_tokens_details":null}}
 
 ```
 Sample Streaming Request:
@@ -217,6 +215,7 @@ The client needs to concatenate all arguments fragments to reconstruct the compl
 ```
 Important Notes:
 1. Use a lower `"temperature"` value for better results.
+2. To receive more consistent tool call results, it is recommended to use `--chat-template examples/chat_template/tool_chat_template_deepseekv3.jinja`. It provides an improved unified prompt.
 
 
 

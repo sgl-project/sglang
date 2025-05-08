@@ -59,8 +59,8 @@ from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.deep_gemm import _ENABLE_JIT_DEEPGEMM
 from sglang.srt.layers.quantization.fp8_kernel import (
-    per_tensor_quant_mla_deep_gemm_masked_fp8,
     per_tensor_quant_mla_fp8,
+    per_token_group_quant_mla_deep_gemm_masked_fp8,
 )
 from sglang.srt.layers.quantization.fp8_utils import (
     block_quant_to_tensor_quant,
@@ -88,6 +88,7 @@ from sglang.srt.utils import (
     get_int_env_var,
     is_cuda,
     is_hip,
+    log_info_on_rank0,
 )
 
 _is_hip = is_hip()
@@ -356,6 +357,7 @@ class DeepseekV2MoE(nn.Module):
                 topk_idx,
                 topk_weights,
                 reorder_topk_ids,
+                num_recv_tokens_per_expert,
                 seg_indptr,
                 masked_m,
                 expected_m,
@@ -367,10 +369,13 @@ class DeepseekV2MoE(nn.Module):
             )
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
+            topk_idx=topk_idx,
+            topk_weights=topk_weights,
             reorder_topk_ids=reorder_topk_ids,
             seg_indptr=seg_indptr,
             masked_m=masked_m,
             expected_m=expected_m,
+            num_recv_tokens_per_expert=num_recv_tokens_per_expert,
             forward_mode=forward_mode,
         )
         if self.ep_size > 1:
@@ -421,6 +426,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         reduce_results: bool = True,
         layer_id: int = None,
         prefix: str = "",
+        alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         super().__init__()
         self.layer_id = layer_id
@@ -542,6 +548,8 @@ class DeepseekV2AttentionMLA(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("attn_mha", prefix),
         )
+
+        self.alt_stream = alt_stream
 
         self.w_kc = None
         self.w_vc = None
@@ -706,20 +714,36 @@ class DeepseekV2AttentionMLA(nn.Module):
             q, latent_cache = self.fused_qkv_a_proj_with_mqa(hidden_states)[0].split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
             )
-            q = self.q_a_layernorm(q)
+            k_nope = latent_cache[..., : self.kv_lora_rank]
+
+            # overlap qk norm
+            if self.alt_stream is not None and torch.cuda.is_current_stream_capturing():
+                current_stream = torch.cuda.current_stream()
+                self.alt_stream.wait_stream(current_stream)
+                q = self.q_a_layernorm(q)
+                with torch.cuda.stream(self.alt_stream):
+                    k_nope = self.kv_a_layernorm(k_nope)
+                current_stream.wait_stream(self.alt_stream)
+            else:
+                q = self.q_a_layernorm(q)
+                k_nope = self.kv_a_layernorm(k_nope)
+
+            k_nope = k_nope.unsqueeze(1)
             q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
         else:
             q = self.q_proj(hidden_states)[0].view(
                 -1, self.num_local_heads, self.qk_head_dim
             )
             latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
+            k_nope = latent_cache[..., : self.kv_lora_rank]
+            k_nope = self.kv_a_layernorm(k_nope).unsqueeze(1)
+
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
 
         if self.use_deep_gemm_bmm:
             q_nope_val, q_nope_scale, masked_m, expected_m, aligned_m = (
-                per_tensor_quant_mla_deep_gemm_masked_fp8(
-                    q_nope.transpose(0, 1), dtype=torch.float8_e4m3fn
-                )
+                per_token_group_quant_mla_deep_gemm_masked_fp8(q_nope.transpose(0, 1))
             )
             q_nope_out = q_nope.new_empty(
                 (self.num_local_heads, aligned_m, self.kv_lora_rank)
@@ -750,11 +774,6 @@ class DeepseekV2AttentionMLA(nn.Module):
             q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
 
         q_nope_out = q_nope_out.transpose(0, 1)
-
-        k_nope = latent_cache[..., : self.kv_lora_rank]
-        k_nope = self.kv_a_layernorm(k_nope.contiguous()).unsqueeze(1)
-        k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
-
         q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
         if self.attention_backend == "fa3":
@@ -769,8 +788,8 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         if self.use_deep_gemm_bmm:
             attn_output_val, attn_output_scale, masked_m, expected_m, aligned_m = (
-                per_tensor_quant_mla_deep_gemm_masked_fp8(
-                    attn_output.transpose(0, 1), dtype=torch.float8_e4m3fn
+                per_token_group_quant_mla_deep_gemm_masked_fp8(
+                    attn_output.transpose(0, 1)
                 )
             )
             attn_bmm_output = attn_output.new_empty(
@@ -1104,6 +1123,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         is_nextn: bool = False,
         prefix: str = "",
+        alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -1133,6 +1153,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             layer_id=layer_id,
             reduce_results=False,
             prefix=add_prefix("self_attn", prefix),
+            alt_stream=alt_stream,
         )
 
         self.info = self._compute_info(config, layer_id=layer_id, is_nextn=is_nextn)
@@ -1376,6 +1397,7 @@ class DeepseekV2Model(nn.Module):
             config.hidden_size,
             enable_tp=not global_server_args_dict["enable_dp_attention"],
         )
+        self.alt_stream = torch.cuda.Stream()
         self.layers = nn.ModuleList(
             [
                 DeepseekV2DecoderLayer(
@@ -1383,6 +1405,7 @@ class DeepseekV2Model(nn.Module):
                     layer_id,
                     quant_config=quant_config,
                     prefix=add_prefix(f"layers.{layer_id}", prefix),
+                    alt_stream=self.alt_stream,
                 )
                 for layer_id in range(config.num_hidden_layers)
             ]
@@ -1467,8 +1490,9 @@ class DeepseekV2ForCausalLM(nn.Module):
             ):
                 self.n_share_experts_fusion = 0
                 global_server_args_dict["n_share_experts_fusion"] = 0
-                logger.info(
-                    "Only Deepseek V3/R1 can use shared experts fusion optimization. Shared experts fusion optimization is disabled."
+                log_info_on_rank0(
+                    logger,
+                    "Only Deepseek V3/R1 can use shared experts fusion optimization. Shared experts fusion optimization is disabled.",
                 )
             else:
                 assert (
@@ -1483,8 +1507,9 @@ class DeepseekV2ForCausalLM(nn.Module):
             ):
                 self.n_share_experts_fusion = self.tp_size
                 global_server_args_dict["n_share_experts_fusion"] = self.tp_size
-                logger.info(
-                    "Deepseek V3/R1 with fp8 can use shared experts fusion optimization when SM version >=90. Shared experts fusion optimization is enabled."
+                log_info_on_rank0(
+                    logger,
+                    "Deepseek V3/R1 with fp8 can use shared experts fusion optimization when SM version >=90. Shared experts fusion optimization is enabled.",
                 )
 
     def get_input_embeddings(self) -> nn.Embedding:

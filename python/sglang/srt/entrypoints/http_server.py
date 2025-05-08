@@ -42,7 +42,10 @@ from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 
-from sglang.srt.disaggregation.utils import FakeBootstrapHost
+from sglang.srt.disaggregation.utils import (
+    FakeBootstrapHost,
+    register_disaggregation_server,
+)
 from sglang.srt.entrypoints.engine import _launch_subprocesses
 from sglang.srt.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
@@ -59,6 +62,7 @@ from sglang.srt.managers.io_struct import (
     ResumeMemoryOccupationReqInput,
     SeparateReasoningReqInput,
     SetInternalStateReq,
+    SlowDownReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
@@ -491,6 +495,19 @@ async def resume_memory_occupation(
         return _create_error_response(e)
 
 
+@app.api_route("/slow_down", methods=["GET", "POST"])
+async def slow_down(obj: SlowDownReqInput, request: Request):
+    """Slow down the system deliberately. Only for testing. Example scenario:
+    when we want to test performance of D in large-scale PD disaggregation and have no enough nodes for P,
+    we can use this to slow down D to let it have enough running sequences, and then disable slowdown
+    to let it run in full batch size.
+    """
+    try:
+        await _global_state.tokenizer_manager.slow_down(obj, request)
+    except Exception as e:
+        return _create_error_response(e)
+
+
 @app.api_route("/open_session", methods=["GET", "POST"])
 async def open_session(obj: OpenSessionReqInput, request: Request):
     """Open a session, and return its unique session id."""
@@ -675,6 +692,8 @@ async def vertex_generate(vertex_req: VertexGenerateReqInput, raw_request: Reque
         **(vertex_req.parameters or {}),
     )
     ret = await generate_request(req, raw_request)
+    if isinstance(ret, Response):
+        return ret
     return ORJSONResponse({"predictions": ret})
 
 
@@ -868,6 +887,14 @@ def _wait_and_warmup(
 
     if server_args.debug_tensor_dump_input_file:
         kill_process_tree(os.getpid())
+
+    if server_args.pdlb_url is not None:
+        register_disaggregation_server(
+            server_args.disaggregation_mode,
+            server_args.port,
+            server_args.disaggregation_bootstrap_port,
+            server_args.pdlb_url,
+        )
 
     if launch_callback is not None:
         launch_callback()
