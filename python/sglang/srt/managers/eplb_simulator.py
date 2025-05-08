@@ -38,6 +38,10 @@ def read_mode_detail_per_token(dir_data):
             for k in concat_dim_of_key.keys()
         }
 
+    def _sort_by_rid(pack):
+        sort_index = torch.argsort(pack["rids"], stable=True)
+        return TODO
+
     def _handle_record(record):
         rids_raw = torch.tensor([int(rid, 16) & ((1 << 64) - 1) for rid in record["rids"]])
         input_ids = record["input_ids"]
@@ -62,7 +66,9 @@ def read_mode_detail_per_token(dir_data):
     for path in tqdm(list(Path(dir_data).glob("*.pt"))):
         data_pack = torch.load(path, weights_only=True)
         processed_records += [_handle_record(record) for record in data_pack["records"]]
-    concated_records = _concat_tokens(processed_records)
+
+    pack = _concat_tokens(processed_records)
+    pack = _sort_by_rid(pack)
 
     return TODO
 
