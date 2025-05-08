@@ -1052,7 +1052,14 @@ def wrap_multi_round_request_func(request_func: Callable) -> Callable:
                 {"role": "assistant", "content": history_assistant_texts[i]},
             ]
         conversations.append({"role": "user", "content": gen_prompt})
-        return TODO
+        
+        output_text = tokenizer.apply_chat_template(
+            conversations,
+            add_generation_prompt=True,
+            tokenize=False,
+        )
+        output_text = output_text.replace(tokenizer.bos_token, "")
+        return output_text
 
     async def f(
         request_func_input: RequestFuncInput,
