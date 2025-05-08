@@ -2,7 +2,7 @@ import torch
 from torch.utils._pytree import tree_map
 
 
-class DisposableTensor(torch.Tensor):
+class _WrapperTensor(torch.Tensor):
     @classmethod
     def __new__(cls, inner: torch.Tensor):
         r = torch.Tensor._make_wrapper_subclass(
@@ -29,9 +29,15 @@ class DisposableTensor(torch.Tensor):
         return func(*tree_map(unwrap, args), **tree_map(unwrap, kwargs))
 
     def _unwrap(self):
+        raise NotImplementedError
+
+
+class DisposableTensor(_WrapperTensor):
+    def _unwrap(self):
         assert self._inner is not None, "Cannot use a DisposableTensor that is already disposed"
         return self._inner
 
 
-class LazyTensor(torch.Tensor):
-    TODO
+class LazyTensor(_WrapperTensor):
+    def _unwrap(self):
+        return TODO
