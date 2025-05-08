@@ -24,7 +24,6 @@ from sglang.test.test_utils import (
 )
 
 
-
 class TestFlashMLAAttnBackend(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -84,6 +83,7 @@ class TestFlashMLAAttnLatency(unittest.TestCase):
 
         if is_in_ci():
             self.assertGreater(output_throughput, 100)
+
 
 class TestFlashMLAMTP(CustomTestCase):
     @classmethod
@@ -150,6 +150,7 @@ class TestFlashMLAMTP(CustomTestCase):
         avg_spec_accept_length = server_info.json()["avg_spec_accept_length"]
         print(f"{avg_spec_accept_length=}")
         self.assertGreater(avg_spec_accept_length, 2.5)
+
 
 if __name__ == "__main__":
     unittest.main()
