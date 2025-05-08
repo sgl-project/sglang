@@ -301,7 +301,7 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
     ):
         super().__init__(expert_location_metadata, rank)
         self._topk_ids_of_layer = TODO
-        self._objects = TODO
+        self._objects: List[Dict[str, Any]] = []
         self._metadata: Optional[Dict[str, Any]] = None
         assert not server_args.enable_two_batch_overlap, "DetailSinglePassGatherer does not support TBO yet"
 
@@ -326,16 +326,15 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
         self._objects.append(
             dict(
                 layer_id=layer_idx,
-                debug_name=_current_debug_name.value,
-                num_tokens_per_rank=num_tokens_per_rank.clone().cpu(),
-                num_tokens_per_rdma_rank=num_tokens_per_rdma_rank.clone().cpu(),
-                num_tokens_per_expert=num_tokens_per_expert.clone().cpu(),
+                num_tokens_per_rank=num_tokens_per_rank.cpu().tolist(),
+                num_tokens_per_rdma_rank=num_tokens_per_rdma_rank.cpu().tolist(),
+                num_tokens_per_expert=num_tokens_per_expert.cpu().tolist(),
             )
         )
 
     def reset(self):
         TODO(self._topk_ids_of_layer)
-        TODO(self._objects)
+        self._objects.clear()
         self._metadata = None
 
     def collect(self) -> Dict:
