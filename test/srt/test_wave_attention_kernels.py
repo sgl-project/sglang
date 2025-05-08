@@ -218,8 +218,6 @@ class TestWaveAttention(unittest.TestCase):
             sm_scale,
         )
 
-        k_buffer = k_buffer.view(B, seq_len, H_KV, D)
-        v_buffer = v_buffer.view(B, seq_len, H_KV, D_V)
         attn_logits = torch.empty(
             (max_kv_splits, B, D_V, H_Q),
             dtype=torch.float32,
