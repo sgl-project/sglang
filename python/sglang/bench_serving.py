@@ -1049,14 +1049,14 @@ def wrap_multi_round_request_func(request_func: Callable) -> Callable:
     async def f(
         request_func_input: RequestFuncInput,
         pbar: Optional[tqdm] = None,
-    ) -> RequestFuncOutput:
+    ) -> List[RequestFuncOutput]:
         prompts: List[str] = request_func_input.prompt
         outputs = []
         for i in range(len(prompts)):
             inner_input = RequestFuncInput(
                 prompt=compute_inner_input_prompt(
                     user_texts=prompts[:i + 1],
-                    assistant_texts=TODO,
+                    assistant_texts=[o.generated_text for o in outputs],
                 ),
                 model=request_func_input.model,
                 api_url=request_func_input.api_url,
