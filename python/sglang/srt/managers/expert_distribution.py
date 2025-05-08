@@ -344,7 +344,7 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
         )
 
     def reset(self):
-        TODO(self._topk_ids_of_layer)
+        self._topk_ids_of_layer[...] = 0
         self._objects.clear()
         self._metadata = None
 
