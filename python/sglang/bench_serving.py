@@ -68,6 +68,7 @@ class RequestFuncOutput:
     latency: float = 0.0
     ttft: float = 0.0  # Time to first token
     itl: List[float] = field(default_factory=list)  # List of inter-token latencies
+    prompt: str = ""
     prompt_len: int = 0
     error: str = ""
     output_len: int = 0
@@ -76,6 +77,7 @@ class RequestFuncOutput:
     def init_new(request_func_input: RequestFuncInput):
         output = RequestFuncOutput()
         output.prompt_len = request_func_input.prompt_len
+        output.prompt = request_func_input.prompt
         return output
 
 
