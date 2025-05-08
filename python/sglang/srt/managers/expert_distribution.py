@@ -107,14 +107,6 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             for k in self._accumulator.get_single_pass_gatherer_keys()
         }
 
-        self._hack_objects = (
-            []
-            if get_bool_env_var(
-                "SGLANG_HACK_EXPERT_DISTRIBUTION_RECORDER_EXTRA_OBJECTS", "false"
-            )
-            else None
-        )
-
     def with_current_layer(self, layer_idx):
         return self._current_layer_idx.with_value(layer_idx)
 
@@ -162,18 +154,6 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             "on_deepep_dispatch_normal",
             local_physical_count_of_layer=local_physical_count_of_layer,
         )
-
-        if self._hack_objects is not None:
-            self._hack_objects.append(
-                dict(
-                    forward_pass_id=self._current_forward_pass_id.value,
-                    layer_id=self._current_layer_idx.value,
-                    debug_name=self._current_debug_name.value,
-                    num_tokens_per_rank=num_tokens_per_rank.tolist(),
-                    num_tokens_per_rdma_rank=num_tokens_per_rdma_rank.tolist(),
-                    num_tokens_per_expert=num_tokens_per_expert.tolist(),
-                )
-            )
 
     def on_deepep_dispatch_low_latency(
         self, local_physical_count_of_layer: torch.Tensor
