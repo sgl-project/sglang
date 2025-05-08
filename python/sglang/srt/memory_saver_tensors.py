@@ -3,7 +3,7 @@ from torch.utils._pytree import tree_map
 
 
 class _WrapperTensor(torch.Tensor):
-    @staticmethod
+    @classmethod
     def __new__(cls, inner: torch.Tensor):
         r = torch.Tensor._make_wrapper_subclass(
             cls,
