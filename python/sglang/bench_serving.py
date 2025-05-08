@@ -25,7 +25,7 @@ from argparse import ArgumentParser
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union, Callable
+from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Tuple, Union
 
 import aiohttp
 import numpy as np
@@ -74,7 +74,7 @@ class RequestFuncOutput:
 
 
 def remove_prefix(text: str, prefix: str) -> str:
-    return text[len(prefix):] if text.startswith(prefix) else text
+    return text[len(prefix) :] if text.startswith(prefix) else text
 
 
 def remove_suffix(text: str, suffix: str) -> str:
@@ -395,8 +395,8 @@ async def async_request_sglang_generate(
                                     if num_new_tokens == 0:
                                         continue
                                     adjust_itl = (
-                                                     timestamp - most_recent_timestamp
-                                                 ) / num_new_tokens
+                                        timestamp - most_recent_timestamp
+                                    ) / num_new_tokens
                                     output.itl.extend([adjust_itl] * num_new_tokens)
 
                                 most_recent_timestamp = timestamp
@@ -521,7 +521,7 @@ def get_dataset(args, tokenizer):
         input_requests = sample_wildchat_1m_requests()
     else:
         raise ValueError(f"Unknown dataset: {args.dataset_name}")
-    input_requests = input_requests[args.skip_num_prompts:]
+    input_requests = input_requests[args.skip_num_prompts :]
     return input_requests
 
 
@@ -905,7 +905,9 @@ def sample_wildchat_1m_requests(
         dataset_name="allenai/WildChat-1M",
         column_id="conversation_hash",
         column_conversation="conversation",
-        expr_timestamp=pl.col("timestamp").str.strptime(pl.Datetime, fmt="%Y-%m-%dT%H:%M:%S"),
+        expr_timestamp=pl.col("timestamp").str.strptime(
+            pl.Datetime, fmt="%Y-%m-%dT%H:%M:%S"
+        ),
         num_requests=num_requests,
     )
 
@@ -917,8 +919,8 @@ def sample_hf_dataset_requests(
     expr_timestamp,
     num_requests: int,
 ):
-    from datasets import load_dataset
     import polars as pl
+    from datasets import load_dataset
 
     df = load_dataset(dataset_name).to_polars()
     df = df.select(
@@ -927,16 +929,13 @@ def sample_hf_dataset_requests(
         conversation=pl.col(column_conversation),
     )
     df = df.with_columns(
-        prompts=pl.col('conversation') \
-            .list.eval(pl.element().filter(pl.element().struct.field("role") == "user")) \
-            .list.eval(pl.element().struct.field("content")),
+        prompts=pl.col("conversation")
+        .list.eval(pl.element().filter(pl.element().struct.field("role") == "user"))
+        .list.eval(pl.element().struct.field("content")),
     )
     df = df[:num_requests]
 
-    return [
-        (row["prompts"], None, 10000)
-        for row in df.iter_rows(named=True)
-    ]
+    return [(row["prompts"], None, 10000) for row in df.iter_rows(named=True)]
 
 
 async def get_request(
@@ -1010,9 +1009,9 @@ def calculate_metrics(
         output_throughput_retokenized=sum(retokenized_output_lens) / dur_s,
         total_throughput=(total_input + sum(output_lens)) / dur_s,
         total_throughput_retokenized=(total_input + sum(retokenized_output_lens))
-                                     / dur_s,
+        / dur_s,
         mean_ttft_ms=np.mean(ttfts or 0)
-                     * 1000,  # ttfts is empty if streaming is not supported by backend
+        * 1000,  # ttfts is empty if streaming is not supported by backend
         median_ttft_ms=np.median(ttfts or 0) * 1000,
         std_ttft_ms=np.std(ttfts or 0) * 1000,
         p99_ttft_ms=np.percentile(ttfts or 0, 99) * 1000,
@@ -1081,7 +1080,11 @@ def wrap_multi_round_request_func(request_func: Callable, tokenizer) -> Callable
                 lora_name=request_func_input.lora_name,
                 extra_request_body=request_func_input.extra_request_body,
             )
-            outputs.append(await request_func(inner_input, pbar=pbar if i == len(prompts) - 1 else None))
+            outputs.append(
+                await request_func(
+                    inner_input, pbar=pbar if i == len(prompts) - 1 else None
+                )
+            )
         return outputs
 
     return f
@@ -1217,7 +1220,7 @@ async def benchmark(
             )
         )
     outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
-    
+
     if is_multi_round:
         outputs = [x for output in outputs for x in output]
 
@@ -1654,27 +1657,27 @@ if __name__ == "__main__":
         type=float,
         default=0.0,
         help="Range of sampled ratio of input/output length, "
-             "used only for random dataset.",
+        "used only for random dataset.",
     )
     parser.add_argument(
         "--request-rate",
         type=float,
         default=float("inf"),
         help="Number of requests per second. If this is inf, then all the requests are sent at time 0. "
-             "Otherwise, we use Poisson process to synthesize the request arrival times. Default is inf.",
+        "Otherwise, we use Poisson process to synthesize the request arrival times. Default is inf.",
     )
     parser.add_argument(
         "--max-concurrency",
         type=int,
         default=None,
         help="Maximum number of concurrent requests. This can be used "
-             "to help simulate an environment where a higher level component "
-             "is enforcing a maximum number of concurrent requests. While the "
-             "--request-rate argument controls the rate at which requests are "
-             "initiated, this argument will control how many are actually allowed "
-             "to execute at a time. This means that when used in combination, the "
-             "actual request rate may be lower than specified with --request-rate, "
-             "if the server is not processing requests fast enough to keep up.",
+        "to help simulate an environment where a higher level component "
+        "is enforcing a maximum number of concurrent requests. While the "
+        "--request-rate argument controls the rate at which requests are "
+        "initiated, this argument will control how many are actually allowed "
+        "to execute at a time. This means that when used in combination, the "
+        "actual request rate may be lower than specified with --request-rate, "
+        "if the server is not processing requests fast enough to keep up.",
     )
     parser.add_argument("--output-file", type=str, help="Output JSONL file name.")
     parser.add_argument(
@@ -1703,7 +1706,7 @@ if __name__ == "__main__":
         metavar='{"key1": "value1", "key2": "value2"}',
         type=str,
         help="Append given JSON object to the request payload. You can use this to specify"
-             "additional generate params like sampling params.",
+        "additional generate params like sampling params.",
     )
     parser.add_argument(
         "--apply-chat-template",
@@ -1714,7 +1717,7 @@ if __name__ == "__main__":
         "--profile",
         action="store_true",
         help="Use Torch Profiler. The endpoint must be launched with "
-             "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
+        "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
     )
     parser.add_argument(
         "--enable-expert-distribution-record",
