@@ -899,7 +899,7 @@ def sample_hf_dataset_requests(
 ):
     from datasets import load_dataset
 
-    load_dataset(dataset_name)
+    df = load_dataset(dataset_name).to_polars()
 
     return TODO
 
