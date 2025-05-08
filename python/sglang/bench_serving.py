@@ -885,21 +885,32 @@ def sample_generated_shared_prefix_requests(
 def sample_chatbot_arena_conversations_requests():
     return sample_hf_dataset_requests(
         dataset_name="lmsys/chatbot_arena_conversations",
+        column_id="question_id",
+        column_conversation="conversation_a",
     )
 
 
 def sample_wildchat_1m_requests():
     return sample_hf_dataset_requests(
         dataset_name="allenai/WildChat-1M",
+        column_id="conversation_hash",
+        column_conversation="conversation",
     )
 
 
 def sample_hf_dataset_requests(
     dataset_name: str,
+    column_id: str,
+    column_conversation: str,
 ):
     from datasets import load_dataset
+    import polars as pl
 
     df = load_dataset(dataset_name).to_polars()
+    df = df.select(
+        id=pl.col(column_id),
+        conversation=pl.col(column_conversation),
+    )
 
     return TODO
 
