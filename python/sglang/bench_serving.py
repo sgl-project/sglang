@@ -933,7 +933,10 @@ def sample_hf_dataset_requests(
     )
     df = df[:num_requests]
 
-    return TODO
+    return [
+        (row["prompts"], None, 10000)
+        for row in df.iter_rows(named=True)
+    ]
 
 
 async def get_request(
