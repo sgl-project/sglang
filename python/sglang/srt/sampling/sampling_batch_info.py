@@ -31,12 +31,12 @@ class SamplingBatchInfo:
     need_min_p_sampling: bool
 
     # Use thinking_budget to truncate thinking
-    thinking_budgets: torch.Tensor
     num_thinking_tokens: torch.Tensor
     think_end_ids: torch.Tensor
+    thinking_budgets: Optional[torch.Tensor] = None
 
     # Masking tensors for grammar-guided structured outputs
-    vocab_size: int
+    vocab_size: int = 0
     grammars: Optional[List] = None
     vocab_mask: Optional[torch.Tensor] = None
     apply_mask_func: Optional[Callable[[torch.Tensor, torch.Tensor], None]] = None
@@ -81,16 +81,16 @@ class SamplingBatchInfo:
         min_ps = torch.tensor(
             [r.sampling_params.min_p for r in reqs], dtype=torch.float
         ).to(device, non_blocking=True)
-        think_end_ids = torch.tensor(
-            [getattr(r.tokenizer, "think_end_id", -1) for r in reqs], dtype=torch.int64
-        ).to(device, non_blocking=True)
-        num_thinking_tokens = torch.tensor([0 for _ in reqs], dtype=torch.int64).to(
-            device, non_blocking=True
-        )
-        thinking_budgets = torch.tensor(
-            [r.sampling_params.thinking_budget or -1 for r in reqs], dtype=torch.int64
-        ).to(device, non_blocking=True)
-
+        if any(hasattr(r.tokenizer, "think_end_id") for r in reqs):
+            think_end_ids = torch.tensor(
+                [getattr(r.tokenizer, "think_end_id", -1) for r in reqs], dtype=torch.int64
+            ).to(device, non_blocking=True)
+            num_thinking_tokens = torch.tensor([0 for _ in reqs], dtype=torch.int64).to(
+                device, non_blocking=True
+            )
+            thinking_budgets = torch.tensor(
+                [r.sampling_params.thinking_budget or -1 for r in reqs], dtype=torch.int64
+            ).to(device, non_blocking=True)
         # Check if any request has custom logit processor
         has_custom_logit_processor = (
             batch.enable_custom_logit_processor  # check the flag first.
