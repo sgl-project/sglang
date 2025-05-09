@@ -6,6 +6,7 @@ import einops
 import polars as pl
 import torch
 from sglang.srt.eplb_simulator.configs import MyServerArgs, MY_MODEL_CONFIG_FOR_EXPERT_LOCATION
+from sglang.srt.eplb_simulator.reader import ExpertDistributionModeDetailPerTokenAndBenchServingPack
 from sglang.srt.managers import deepseek_eplb
 from sglang.srt.managers.expert_distribution import (
     compute_gpu_physical_count,
@@ -14,20 +15,21 @@ from sglang.srt.managers.expert_distribution import (
 from sglang.srt.managers.expert_location import ExpertLocationMetadata
 
 
-def _compute_logical_count_of_batch(
+def simulate_execution_given_pack(
+    pack: ExpertDistributionModeDetailPerTokenAndBenchServingPack,
     server_args: MyServerArgs,
     assert_physical_equal_logical_expert: bool,
 ):
     num_physical_expert = _compute_num_physical_experts(server_args)
 
     token_indices_of_batch = _simulate_scheduled_pack_indices_given_seq_metadata(
-        df_metadata,
+        pack.df_metadata,
         phase=phase,
         num_tokens_in_batch_overall=server_args.num_tokens_in_batch_overall,
     )
 
     vanilla_physical_count_of_batch = compute_global_physical_count_from_topk_ids(
-        topk_ids=topk_ids,
+        topk_ids=pack.topk_ids,
         num_physical_expert=num_physical_expert,
     )
 

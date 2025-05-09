@@ -14,7 +14,7 @@ from transformers import AutoTokenizer
 @dataclass
 class ExpertDistributionModeDetailPerTokenAndBenchServingPack:
     topk_ids: torch.Tensor
-    df: pl.DataFrame
+    df_metadata: pl.DataFrame
 
 
 def read_expert_distribution_mode_detail_per_token_and_bench_serving(dir_data):
@@ -36,7 +36,7 @@ def read_expert_distribution_mode_detail_per_token_and_bench_serving(dir_data):
 
     return ExpertDistributionModeDetailPerTokenAndBenchServingPack(
         topk_ids=pack_expert_distribution["topk_ids"],
-        df=df,
+        df_metadata=df,
     )
 
 
