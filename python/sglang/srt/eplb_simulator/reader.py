@@ -125,6 +125,7 @@ def read_bench_serving(path: Path):
         input_ids=pl.col("input_text").map_elements(tokenizer.encode, return_dtype=pl.List(pl.Int32)),
         output_ids=pl.col("output_text").map_elements(tokenizer.encode, return_dtype=pl.List(pl.Int32)),
         history_ids=pl.col("history_text").map_elements(tokenizer.encode, return_dtype=pl.List(pl.Int32)),
+        dataset_timestamp=pl.col("dataset_timestamp").str.to_datetime(),
     )
 
     return df
