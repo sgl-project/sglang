@@ -7,19 +7,19 @@ class _WrapperTensor(torch.Tensor):
     def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
         def unwrap(e):
             if isinstance(e, cls):
-                return e._unwrap()
+                return e._unwrap_impl()
             else:
                 return e
 
         return func(*tree_map(unwrap, args), **tree_map(unwrap, kwargs))
 
     def __repr__(self, *args, **kwargs):
-        return "WrapperTensor:" + self._unwrap().__repr__(*args, **kwargs)
+        return "WrapperTensor:" + self._unwrap_impl().__repr__(*args, **kwargs)
 
     def __str__(self):
-        return "WrapperTensor:" + str(self._unwrap())
+        return "WrapperTensor:" + str(self._unwrap_impl())
 
-    def _unwrap(self):
+    def _unwrap_impl(self):
         raise NotImplementedError
 
 
@@ -42,7 +42,7 @@ class DisposableTensor(_WrapperTensor):
     def dispose(self):
         self._inner = None
 
-    def _unwrap(self):
+    def _unwrap_impl(self):
         assert self._inner is not None, "Cannot use a DisposableTensor that is already disposed"
         return self._inner
 
@@ -56,7 +56,7 @@ class LazyTensor(_WrapperTensor):
         r._inner = None
         return r
 
-    def _unwrap(self):
+    def _unwrap_impl(self):
         if self._inner is None:
             self._inner = torch.empty(*self._create_args, **self._create_kwargs)
         return self._inner
