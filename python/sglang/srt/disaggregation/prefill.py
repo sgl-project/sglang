@@ -252,7 +252,7 @@ class SchedulerDisaggregationPrefillMixin:
                 self.result_queue.append((batch.copy(), result))
 
                 # Triggering the sampling_info_done event.
-                if not self.last_batch_in_queue:
+                if self.last_batch is None:
                     next_batch_sampling_info=self.tp_worker.cur_sampling_info
                     if next_batch_sampling_info:
                         next_batch_sampling_info.update_regex_vocab_mask()
