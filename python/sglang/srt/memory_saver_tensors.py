@@ -5,19 +5,20 @@ from torch.utils._pytree import tree_map
 class _WrapperTensor(torch.Tensor):
     @classmethod
     def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
-        def unwrap(e):
-            if isinstance(e, cls):
-                return e._unwrap_impl()
-            else:
-                return e
-
-        return func(*tree_map(unwrap, args), **tree_map(unwrap, kwargs))
+        return func(*tree_map(cls.unwrap, args), **tree_map(cls.unwrap, kwargs))
 
     def __repr__(self, *args, **kwargs):
         return "WrapperTensor:" + self._unwrap_impl().__repr__(*args, **kwargs)
 
     def __str__(self):
         return "WrapperTensor:" + str(self._unwrap_impl())
+
+    @classmethod
+    def unwrap(cls, x: torch.Tensor):
+        if isinstance(x, cls):
+            return x._unwrap_impl()
+        else:
+            return x
 
     def _unwrap_impl(self):
         raise NotImplementedError
