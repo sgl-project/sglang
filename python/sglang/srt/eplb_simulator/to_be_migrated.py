@@ -21,35 +21,6 @@ _ = compute_utilization_rate, compute_gpu_physical_count
 
 # ------------------------------------------- TODO refactor below ---------------------------------------------
 
-@dataclass
-class MyExpertLocationMetadata:
-    physical_to_logical_map: torch.Tensor  # (layers, num_physical_experts)
-    logical_to_all_physical_map: torch.Tensor  # (layers, num_logical_experts, X)
-
-    @staticmethod
-    def init_by_eplb(
-        server_args: MyServerArgs,
-        logical_count: torch.Tensor,
-        num_physical_experts: int,
-    ):
-        model_config_for_expert_location = _MY_MODEL_CONFIG_FOR_EXPERT_LOCATION
-
-        physical_to_logical_map, logical_to_all_physical_map, _ = (
-            deepseek_eplb.rebalance_experts(
-                weight=logical_count,
-                num_replicas=num_physical_experts,
-                num_groups=model_config_for_expert_location.num_groups,
-                num_nodes=server_args.nnodes,
-                num_gpus=server_args.tp_size,
-                hack_shuffle=server_args.deepseek_eplb_hack_shuffle,
-            )
-        )
-
-        return MyExpertLocationMetadata(
-            physical_to_logical_map=physical_to_logical_map,
-            logical_to_all_physical_map=logical_to_all_physical_map,
-        )
-
 
 
 def read_physical_count_of_forward_pass_id_and_rank(dir_data: Path):

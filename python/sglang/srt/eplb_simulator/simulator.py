@@ -1,5 +1,8 @@
+from dataclasses import dataclass
+
 import torch
 from sglang.srt.eplb_simulator.configs import MyServerArgs, MY_MODEL_CONFIG_FOR_EXPERT_LOCATION
+from sglang.srt.managers import deepseek_eplb
 from sglang.srt.managers.expert_distribution import (
     compute_gpu_physical_count,
     compute_utilization_rate,
@@ -35,6 +38,7 @@ def simulate_execution_given_logical_count_of_batch(
 
 def compute_physical_count_of_batch(
     logical_count_of_batch: torch.Tensor,
+    server_args: MyServerArgs,
     model_config_for_expert_location=MY_MODEL_CONFIG_FOR_EXPERT_LOCATION,
 ):
     if server_args.enable_expert_location_by_eplb:
@@ -93,3 +97,33 @@ def simulate_logical_to_physical_by_random_dispatching(
                 )
 
     return physical_count_of_whatever
+
+
+@dataclass
+class MyExpertLocationMetadata:
+    physical_to_logical_map: torch.Tensor  # (layers, num_physical_experts)
+    logical_to_all_physical_map: torch.Tensor  # (layers, num_logical_experts, X)
+
+    @staticmethod
+    def init_by_eplb(
+        server_args: MyServerArgs,
+        logical_count: torch.Tensor,
+        num_physical_experts: int,
+    ):
+        model_config_for_expert_location = MY_MODEL_CONFIG_FOR_EXPERT_LOCATION
+
+        physical_to_logical_map, logical_to_all_physical_map, _ = (
+            deepseek_eplb.rebalance_experts(
+                weight=logical_count,
+                num_replicas=num_physical_experts,
+                num_groups=model_config_for_expert_location.num_groups,
+                num_nodes=server_args.nnodes,
+                num_gpus=server_args.tp_size,
+                hack_shuffle=server_args.deepseek_eplb_hack_shuffle,
+            )
+        )
+
+        return MyExpertLocationMetadata(
+            physical_to_logical_map=physical_to_logical_map,
+            logical_to_all_physical_map=logical_to_all_physical_map,
+        )
