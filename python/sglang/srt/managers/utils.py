@@ -35,7 +35,14 @@ def validate_input_length(
                 "the max context length. Truncated. "
                 f"{len(req.origin_input_ids)=}, {max_req_input_len=}."
             )
-            req.origin_input_ids = req.origin_input_ids[:max_req_input_len]
+            input_len = len(req.origin_input_ids)
+            num_to_truncate = input_len - max_req_input_len
+            trunc_first = num_to_truncate // 2
+            trunc_last = num_to_truncate - trunc_first
+            req.origin_input_ids = (
+                req.origin_input_ids[:input_len // 2 - trunc_first] 
+                + req.origin_input_ids[input_len // 2 + trunc_last:]
+            )
             return None
         else:
             error_msg = (

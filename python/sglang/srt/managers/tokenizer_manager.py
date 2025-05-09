@@ -565,7 +565,7 @@ class TokenizerManager:
         self, obj: Union[GenerateReqInput, EmbeddingReqInput], input_ids: List[int]
     ) -> None:
         """Validates that the input token count and the requested token count doesn't exceed the model's context length."""
-
+        
         input_token_num = len(input_ids) if input_ids is not None else 0
         # Check if input alone exceeds context length
         if input_token_num >= self.context_len:
@@ -587,14 +587,26 @@ class TokenizerManager:
             and (max_new_tokens + input_token_num) >= self.context_len
         ):
             total_tokens = max_new_tokens + input_token_num
-            error_msg = (
-                f"Requested token count exceeds the model's maximum context length "
-                f"of {self.context_len} tokens. You requested a total of {total_tokens} "
-                f"tokens: {input_token_num} tokens from the input messages and "
-                f"{max_new_tokens} tokens for the completion. Please reduce the number "
-                f"of tokens in the input messages or the completion to fit within the limit."
-            )
-            raise ValueError(error_msg)
+            if self.server_args.allow_auto_truncate:
+                logger.warning(
+                    "Request length is longer than the KV cache pool size or "
+                    "the max context length. Truncated. "
+                    f"{total_tokens=}, {self.context_len=}."
+                )
+                num_trunc = total_tokens - self.context_len + 1
+                trunc_first = num_trunc // 2
+                for _ in range(num_trunc):
+                    input_ids.pop(input_token_num // 2 + 1 - trunc_first)
+                assert (max_new_tokens + len(input_ids)) < self.context_len, f'({max_new_tokens} + {len(input_ids)}) < {self.context_len}'
+            else:
+                error_msg = (
+                    f"Requested token count exceeds the model's maximum context length "
+                    f"of {self.context_len} tokens. You requested a total of {total_tokens} "
+                    f"tokens: {input_token_num} tokens from the input messages and "
+                    f"{max_new_tokens} tokens for the completion. Please reduce the number "
+                    f"of tokens in the input messages or the completion to fit within the limit."
+                )
+                raise ValueError(error_msg)
 
         if isinstance(obj, GenerateReqInput):
             if (
