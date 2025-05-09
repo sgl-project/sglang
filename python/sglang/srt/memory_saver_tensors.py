@@ -33,6 +33,9 @@ class DisposableTensor(_WrapperTensor):
         r._inner = inner
         return r
 
+    def dispose(self):
+        self._inner = None
+
     def _unwrap(self):
         assert self._inner is not None, "Cannot use a DisposableTensor that is already disposed"
         return self._inner
