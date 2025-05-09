@@ -1,5 +1,5 @@
 import torch
-from sglang.srt.eplb_simulator.configs import MyServerArgs
+from sglang.srt.eplb_simulator.configs import MyServerArgs, MY_MODEL_CONFIG_FOR_EXPERT_LOCATION
 from sglang.srt.managers.expert_distribution import (
     compute_gpu_physical_count,
     compute_utilization_rate,
@@ -35,6 +35,7 @@ def simulate_execution_given_logical_count_of_batch(
 
 def compute_physical_count_of_batch(
     logical_count_of_batch: torch.Tensor,
+    model_config_for_expert_location=MY_MODEL_CONFIG_FOR_EXPERT_LOCATION,
 ):
     if server_args.enable_expert_location_by_eplb:
         num_physical_expert = (
