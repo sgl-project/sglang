@@ -56,4 +56,36 @@ def read_mode_detail_per_token(dir_data):
 
 
 def read_bench_serving_output(path: Path):
-    return pl.DataFrame(json.loads(path.read_text()))
+    df = pl.DataFrame(json.loads(path.read_text()))
+    df = unnest_all(df, separator="/")
+    return df
+
+
+def unnest_all(df: pl.DataFrame, separator=".") -> pl.DataFrame:
+    """https://github.com/pola-rs/polars/issues/12353"""
+    return df.select(_unnest_all(df.schema, separator))
+
+
+def _unnest_all(schema, separator):
+    for (col, *fields), dtype in _unnest(schema, []):
+        expr = pl.col(col)
+
+        for field in fields:
+            expr = expr.struct[field]
+
+        if col == "":
+            name = separator.join(fields)
+        else:
+            name = separator.join([col] + fields)
+
+        yield expr.alias(name)
+
+
+def _unnest(schema, path):
+    for name, dtype in schema.items():
+        base_type = dtype.base_type()
+
+        if base_type == pl.Struct:
+            yield from _unnest(dtype.to_schema(), path + [name])
+        else:
+            yield path + [name], dtype
