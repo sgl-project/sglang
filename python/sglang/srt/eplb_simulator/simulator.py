@@ -44,28 +44,39 @@ def simulate_execution_given_logical_count_of_batch(
 def _simulate_physical_count_of_batch(
     logical_count_of_batch: torch.Tensor,
     server_args: MyServerArgs,
-):
-    if server_args.enable_expert_location_by_eplb:
-        return _simulate_logical_to_physical_by_random_dispatching(
-            logical_count_of_whatever=logical_count_of_batch,
-            logical_to_all_physical_map=expert_location_metadata.logical_to_all_physical_map,
-            num_physical_expert=num_physical_expert,
-        )
-    else:
-        return logical_count_of_batch
-
-
-def _simulate_expert_location_metadata(
-    logical_count_of_batch: torch.Tensor,
-    server_args: MyServerArgs,
     model_config_for_expert_location=MY_MODEL_CONFIG_FOR_EXPERT_LOCATION,
-) -> List["MyExpertLocationMetadata"]:
+):
     num_batches, _, _ = logical_count_of_batch.shape
     num_physical_expert = (
         model_config_for_expert_location.num_logical_experts
         + server_args.ep_num_redundant_experts
     )
 
+    if server_args.enable_expert_location_by_eplb:
+        expert_location_metadata_arr = _simulate_expert_location_metadata_arr(
+            logical_count_of_batch=logical_count_of_batch,
+            server_args=server_args,
+            num_physical_expert=num_physical_expert,
+        )
+        outputs = [
+            _simulate_logical_to_physical_by_random_dispatching(
+                logical_count_of_whatever=logical_count_of_batch[batch_index, :, :],
+                logical_to_all_physical_map=expert_location_metadata_arr[batch_index].logical_to_all_physical_map,
+                num_physical_expert=num_physical_expert,
+            )
+            for batch_index in range(num_batches)
+        ]
+        return torch.stack(outputs)
+    else:
+        return logical_count_of_batch
+
+
+def _simulate_expert_location_metadata_arr(
+    logical_count_of_batch: torch.Tensor,
+    server_args: MyServerArgs,
+    num_physical_expert: int,
+) -> List["MyExpertLocationMetadata"]:
+    num_batches, _, _ = logical_count_of_batch.shape
     return [
         MyExpertLocationMetadata.init_by_eplb(
             server_args,
