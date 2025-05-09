@@ -19,7 +19,7 @@ _Phase = Union[Literal["prefill", "decode"]]
 
 def simulate_execution_given_pack(
     pack: ExpertDistributionModeDetailPerTokenAndBenchServingPack,
-    phase: str,
+    phase: _Phase,
     server_args: MyServerArgs,
     assert_physical_equal_logical_expert: bool,
 ):
