@@ -22,7 +22,18 @@ def _simulate_scheduled_tokens_given_seq_metadata(
     df_metadata: pl.DataFrame,
     phase: Union[Literal["prefill", "decode"]],
 ):
-    TODO
+    if phase == "prefill":
+        return _simulate_scheduled_tokens_given_seq_metadata_prefill(df_metadata)
+    if phase == "decode":
+        return _simulate_scheduled_tokens_given_seq_metadata_decode(df_metadata)
+
+
+def _simulate_scheduled_tokens_given_seq_metadata_prefill(df_metadata: pl.DataFrame):
+    return TODO
+
+
+def _simulate_scheduled_tokens_given_seq_metadata_decode(df_metadata: pl.DataFrame):
+    return TODO
 
 
 def _simulate_execution_given_logical_count_of_batch(
