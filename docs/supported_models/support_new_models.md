@@ -16,7 +16,7 @@ standard LLM support:
    in [model_config.py](https://github.com/sgl-project/sglang/blob/0ab3f437aba729b348a683ab32b35b214456efc7/python/sglang/srt/configs/model_config.py#L561)
    to return `True` for your model.
 
-2. **Process Multimodal Data**:
+2. **Multimodal Data Processor**:
    Define a new `Processor` class that inherits from `BaseMultimodalProcessor` and register this processor as your
    model’s dedicated processor.
    See [multimodal_processor.py](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/managers/multimodal_processor.py)
@@ -27,7 +27,7 @@ standard LLM support:
    expanded (if necessary) and padded with multimodal-data-hashes so that SGLang can recognize different multimodal data
    with `RadixAttention`.
 
-4. **Adapt with Vision Attention**:
+4. **Adapt to Vision Attention**:
    Adapt the multi-headed `Attention` of ViT with SGLang’s `VisionAttention`.
 
 You can refer to [Qwen2VL](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/models/qwen2_vl.py) or
