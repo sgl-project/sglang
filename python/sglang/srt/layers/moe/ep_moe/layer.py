@@ -79,18 +79,18 @@ class GroupedGemmRunner(torch.nn.Module):
 
     # c = a * b
     def forward(
-            self,
-            a: torch.Tensor,
-            b: torch.Tensor,
-            c: torch.Tensor,
-            batch_size: int,
-            weight_column_major: bool,
-            seg_indptr: Optional[torch.Tensor] = None,
-            weight_indices: Optional[torch.Tensor] = None,
-            use_fp8_w8a8: bool = False,
-            scale_a: torch.Tensor = None,
-            scale_b: torch.Tensor = None,
-            block_shape: Optional[List[int]] = None,
+        self,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        c: torch.Tensor,
+        batch_size: int,
+        weight_column_major: bool,
+        seg_indptr: Optional[torch.Tensor] = None,
+        weight_indices: Optional[torch.Tensor] = None,
+        use_fp8_w8a8: bool = False,
+        scale_a: torch.Tensor = None,
+        scale_b: torch.Tensor = None,
+        block_shape: Optional[List[int]] = None,
     ):
         if self.use_flashinfer:
             # TODO: flashinfer
@@ -130,23 +130,23 @@ class EPMoE(torch.nn.Module):
     """
 
     def __init__(
-            self,
-            num_experts: int,
-            top_k: int,
-            hidden_size: int,
-            intermediate_size: int,
-            params_dtype: Optional[torch.dtype] = None,
-            renormalize: bool = True,
-            use_grouped_topk: bool = False,
-            num_expert_group: Optional[int] = None,
-            topk_group: Optional[int] = None,
-            quant_config: Optional[QuantizationConfig] = None,
-            tp_size: Optional[int] = None,
-            prefix: str = "",
-            correction_bias: Optional[torch.Tensor] = None,
-            custom_routing_function: Optional[Callable] = None,
-            activation: str = "silu",
-            routed_scaling_factor: Optional[float] = None,
+        self,
+        num_experts: int,
+        top_k: int,
+        hidden_size: int,
+        intermediate_size: int,
+        params_dtype: Optional[torch.dtype] = None,
+        renormalize: bool = True,
+        use_grouped_topk: bool = False,
+        num_expert_group: Optional[int] = None,
+        topk_group: Optional[int] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+        tp_size: Optional[int] = None,
+        prefix: str = "",
+        correction_bias: Optional[torch.Tensor] = None,
+        custom_routing_function: Optional[Callable] = None,
+        activation: str = "silu",
+        routed_scaling_factor: Optional[float] = None,
     ):
         super().__init__()
 
@@ -383,11 +383,11 @@ class EPMoE(torch.nn.Module):
 
     @classmethod
     def make_expert_params_mapping(
-            cls,
-            ckpt_gate_proj_name: str,
-            ckpt_down_proj_name: str,
-            ckpt_up_proj_name: str,
-            num_experts: int,
+        cls,
+        ckpt_gate_proj_name: str,
+        ckpt_down_proj_name: str,
+        ckpt_up_proj_name: str,
+        num_experts: int,
     ) -> List[Tuple[str, str, int, str]]:
         return [
             # (param_name, weight_name, expert_id, shard_id)
@@ -410,12 +410,12 @@ class EPMoE(torch.nn.Module):
         ]
 
     def weight_loader(
-            self,
-            param: torch.nn.Parameter,
-            loaded_weight: torch.Tensor,
-            weight_name: str,
-            shard_id: str,
-            expert_id: int,
+        self,
+        param: torch.nn.Parameter,
+        loaded_weight: torch.Tensor,
+        weight_name: str,
+        shard_id: str,
+        expert_id: int,
     ) -> None:
         if expert_id < self.start_expert_id or expert_id > self.end_expert_id:
             return
@@ -447,20 +447,20 @@ class EPMoE(torch.nn.Module):
             raise ValueError(f"Expected shard_id w1,w2 or w3 but got {shard_id}")
 
     def _load_fp8_scale(
-            self,
-            param: torch.nn.Parameter,
-            loaded_weight: torch.Tensor,
-            weight_name: str,
-            shard_id: str,
-            expert_id: int,
+        self,
+        param: torch.nn.Parameter,
+        loaded_weight: torch.Tensor,
+        weight_name: str,
+        shard_id: str,
+        expert_id: int,
     ) -> None:
         param_data = param.data
 
         # Input scales can be loaded directly and should be equal.
         if "input_scale" in weight_name:
             if (
-                    param_data[expert_id] != 1
-                    and (param_data[expert_id] - loaded_weight).abs() > 1e-5
+                param_data[expert_id] != 1
+                and (param_data[expert_id] - loaded_weight).abs() > 1e-5
             ):
                 raise ValueError(
                     "input_scales of w1 and w3 of a layer "
@@ -498,13 +498,13 @@ class EPMoE(torch.nn.Module):
 class UnquantizedEPMoEMethod(FusedMoEMethodBase, CustomOp):
 
     def create_weights(
-            self,
-            layer: torch.nn.Module,
-            num_experts_per_partition: int,
-            hidden_size: int,
-            intermediate_size: int,
-            params_dtype: torch.dtype,
-            **extra_weight_attrs,
+        self,
+        layer: torch.nn.Module,
+        num_experts_per_partition: int,
+        hidden_size: int,
+        intermediate_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
     ):
         # Fused gate_up_proj (column parallel)
         w13_weight = torch.nn.Parameter(
@@ -563,16 +563,16 @@ class UnquantizedEPMoEMethod(FusedMoEMethodBase, CustomOp):
         set_weight_attrs(w2_weight_scale, extra_weight_attrs)
 
     def apply(
-            self,
-            layer: torch.nn.Module,
-            x: torch.Tensor,
-            router_logits: torch.Tensor,
-            top_k: int,
-            renormalize: bool,
-            use_grouped_topk: bool,
-            topk_group: Optional[int] = None,
-            num_expert_group: Optional[int] = None,
-            custom_routing_function: Optional[Callable] = None,
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        top_k: int,
+        renormalize: bool,
+        use_grouped_topk: bool,
+        topk_group: Optional[int] = None,
+        num_expert_group: Optional[int] = None,
+        custom_routing_function: Optional[Callable] = None,
     ) -> torch.Tensor:
         raise NotImplementedError
 
@@ -591,13 +591,13 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
         self.block_quant = self.quant_config.weight_block_size is not None
 
     def create_weights(
-            self,
-            layer: Module,
-            num_experts_per_partition: int,
-            hidden_size: int,
-            intermediate_size: int,
-            params_dtype: torch.dtype,
-            **extra_weight_attrs,
+        self,
+        layer: Module,
+        num_experts_per_partition: int,
+        hidden_size: int,
+        intermediate_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
     ):
 
         if self.quant_config.is_checkpoint_fp8_serialized:
@@ -774,16 +774,16 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
             return
 
     def apply(
-            self,
-            layer: torch.nn.Module,
-            x: torch.Tensor,
-            router_logits: torch.Tensor,
-            top_k: int,
-            renormalize: bool,
-            use_grouped_topk: bool,
-            topk_group: Optional[int] = None,
-            num_expert_group: Optional[int] = None,
-            custom_routing_function: Optional[Callable] = None,
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        top_k: int,
+        renormalize: bool,
+        use_grouped_topk: bool,
+        topk_group: Optional[int] = None,
+        num_expert_group: Optional[int] = None,
+        custom_routing_function: Optional[Callable] = None,
     ) -> torch.Tensor:
         raise NotImplementedError
 
@@ -796,24 +796,24 @@ class DeepEPMoE(EPMoE):
     _has_printed = False
 
     def __init__(
-            self,
-            num_experts: int,
-            top_k: int,
-            hidden_size: int,
-            intermediate_size: int,
-            params_dtype: Optional[torch.dtype] = None,
-            renormalize: bool = True,
-            use_grouped_topk: bool = False,
-            num_expert_group: Optional[int] = None,
-            topk_group: Optional[int] = None,
-            quant_config: Optional[QuantizationConfig] = None,
-            tp_size: Optional[int] = None,
-            prefix: str = "",
-            correction_bias: Optional[torch.Tensor] = None,
-            custom_routing_function: Optional[Callable] = None,
-            activation: str = "silu",
-            routed_scaling_factor: Optional[float] = None,
-            deepep_mode: DeepEPMode = DeepEPMode.auto,
+        self,
+        num_experts: int,
+        top_k: int,
+        hidden_size: int,
+        intermediate_size: int,
+        params_dtype: Optional[torch.dtype] = None,
+        renormalize: bool = True,
+        use_grouped_topk: bool = False,
+        num_expert_group: Optional[int] = None,
+        topk_group: Optional[int] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+        tp_size: Optional[int] = None,
+        prefix: str = "",
+        correction_bias: Optional[torch.Tensor] = None,
+        custom_routing_function: Optional[Callable] = None,
+        activation: str = "silu",
+        routed_scaling_factor: Optional[float] = None,
+        deepep_mode: DeepEPMode = DeepEPMode.auto,
     ):
         super().__init__(
             num_experts,
@@ -850,16 +850,16 @@ class DeepEPMoE(EPMoE):
         )
 
     def forward(
-            self,
-            hidden_states: torch.Tensor,
-            topk_idx: torch.Tensor,
-            topk_weights: torch.Tensor,
-            reorder_topk_ids: torch.Tensor,
-            seg_indptr: torch.Tensor,
-            masked_m: torch.Tensor,
-            expected_m: int,
-            num_recv_tokens_per_expert: List[int],
-            forward_mode: ForwardMode,
+        self,
+        hidden_states: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        reorder_topk_ids: torch.Tensor,
+        seg_indptr: torch.Tensor,
+        masked_m: torch.Tensor,
+        expected_m: int,
+        num_recv_tokens_per_expert: List[int],
+        forward_mode: ForwardMode,
     ):
         resolved_deepep_mode = self.deepep_mode.resolve(forward_mode)
         if resolved_deepep_mode == DeepEPMode.normal:
@@ -875,10 +875,10 @@ class DeepEPMoE(EPMoE):
             raise ValueError(f"Invalid deepep_mode: {self.deepep_mode}")
 
     def forward_normal(
-            self,
-            hidden_states: torch.Tensor,
-            reorder_topk_ids: torch.Tensor,
-            seg_indptr: torch.Tensor,
+        self,
+        hidden_states: torch.Tensor,
+        reorder_topk_ids: torch.Tensor,
+        seg_indptr: torch.Tensor,
     ):
         assert self.quant_method is not None
         assert self.activation == "silu"
@@ -902,18 +902,12 @@ class DeepEPMoE(EPMoE):
         )
 
         # GroupGemm-0
-        gateup_output = torch.empty(
-            hidden_states.shape[0],
-            self.w13_weight.shape[1],
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
-        )
-
         if hidden_states.shape[0] > 0:
             gateup_output = self.grouped_gemm_runner(
                 a=hidden_states,
                 b=self.w13_weight,
-                c=gateup_output,
+                c=None,
+                c_dtype=hidden_states.dtype,
                 batch_size=self.num_experts_per_partition,
                 weight_column_major=True,
                 seg_indptr=seg_indptr,
@@ -926,6 +920,13 @@ class DeepEPMoE(EPMoE):
                     else self.w13_weight_scale
                 ),
                 block_shape=self.block_shape,
+            )
+        else:
+            gateup_output = torch.empty(
+                hidden_states.shape[0],
+                self.w13_weight.shape[1],
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
             )
 
         # Act
@@ -959,7 +960,7 @@ class DeepEPMoE(EPMoE):
             )
         else:
             raise ValueError(f"Unsupported activation: {self.activation=}")
-   
+
         del gateup_output
 
         # GroupGemm-1
@@ -990,11 +991,11 @@ class DeepEPMoE(EPMoE):
         return down_output
 
     def forward_deepgemm_contiguous(
-            self,
-            hidden_states_fp8: Tuple[torch.Tensor, torch.Tensor],
-            topk_idx,
-            topk_weights,
-            num_recv_tokens_per_expert: List[int],
+        self,
+        hidden_states_fp8: Tuple[torch.Tensor, torch.Tensor],
+        topk_idx,
+        topk_weights,
+        num_recv_tokens_per_expert: List[int],
     ):
         hidden_states_fp8, hidden_states_scale = hidden_states_fp8
         assert self.quant_method is not None
@@ -1090,10 +1091,10 @@ class DeepEPMoE(EPMoE):
         return gather_out
 
     def forward_deepgemm_masked(
-            self,
-            hidden_states_fp8: Tuple[torch.Tensor, torch.Tensor],
-            masked_m: torch.Tensor,
-            expected_m: int,
+        self,
+        hidden_states_fp8: Tuple[torch.Tensor, torch.Tensor],
+        masked_m: torch.Tensor,
+        expected_m: int,
     ):
         assert self.quant_method is not None
         assert self.activation == "silu"
