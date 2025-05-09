@@ -13,8 +13,8 @@ class _WrapperTensor(torch.Tensor):
 
         return func(*tree_map(unwrap, args), **tree_map(unwrap, kwargs))
 
-    def __repr__(self):
-        return "WrapperTensor:" + repr(self._unwrap())
+    def __repr__(self, *args, **kwargs):
+        return "WrapperTensor:" + self._unwrap().__repr__(*args, **kwargs)
 
     def __str__(self):
         return "WrapperTensor:" + str(self._unwrap())
