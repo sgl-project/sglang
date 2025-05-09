@@ -764,8 +764,8 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
                     prompt_tokens[index] = content["meta_info"]["prompt_tokens"]
                     completion_tokens[index] = content["meta_info"]["completion_tokens"]
                     cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
-                    hidden_states = hidden_states or content["meta_info"].get(
-                        "hidden_states", None
+                    hidden_states = (
+                        content["meta_info"].get("hidden_states", None) or hidden_states
                     )
 
                     if not stream_buffer:  # The first chunk
@@ -878,9 +878,10 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
                             created=created,
                             choices=[
                                 CompletionResponseStreamChoice(
+                                    text="",
                                     index=index,
                                     hidden_states=hidden_states,
-                                    finish_reason=finish_reason_type,
+                                    finish_reason=None,
                                 )
                             ],
                             model=request.model,
@@ -1465,14 +1466,15 @@ async def v1_chat_completions(
             prompt_tokens = {}
             completion_tokens = {}
             cached_tokens = {}
+            hidden_states = None
             try:
                 async for content in tokenizer_manager.generate_request(
                     adapted_request, raw_request
                 ):
                     index = content.get("index", 0)
                     text = content["text"]
-                    hidden_states = hidden_states or content["meta_info"].get(
-                        "hidden_states", None
+                    hidden_states = (
+                        content["meta_info"].get("hidden_states", None) or hidden_states
                     )
 
                     is_first = is_firsts.get(index, True)
