@@ -2,7 +2,7 @@ import torch
 from torch.utils._pytree import tree_map
 
 
-class _WrapperTensor(torch.Tensor):
+class WrapperTensor(torch.Tensor):
     @classmethod
     def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
         return func(*tree_map(cls.unwrap, args), **tree_map(cls.unwrap, kwargs))
@@ -24,7 +24,7 @@ class _WrapperTensor(torch.Tensor):
         raise NotImplementedError
 
 
-class DisposableTensor(_WrapperTensor):
+class DisposableTensor(WrapperTensor):
     @staticmethod
     def __new__(cls, inner: torch.Tensor):
         r = torch.Tensor._make_wrapper_subclass(
@@ -48,7 +48,7 @@ class DisposableTensor(_WrapperTensor):
         return self._inner
 
 
-class LazyTensor(_WrapperTensor):
+class LazyTensor(WrapperTensor):
     @staticmethod
     def __new__(cls, *args, **kwargs):
         r = torch.Tensor._make_wrapper_subclass(cls, *args, **kwargs)
