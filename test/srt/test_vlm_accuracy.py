@@ -106,7 +106,6 @@ class VisionLLMLogitsBase(unittest.IsolatedAsyncioTestCase):
 
         np.testing.assert_allclose(hf_np, sg_np)
 
-
     def get_completion_request(self) -> ChatCompletionRequest:
         json_str = f"""
         {{
@@ -258,16 +257,21 @@ class TestQwenVLSeesImage(VisionLLMLogitsBase):
         cls.processor = AutoProcessor.from_pretrained(
             cls.model_path, trust_remote_code=True, use_fast=True
         )
-        cls.visual = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            cls.model_path, torch_dtype=torch.bfloat16
-        ).eval().visual.to(cls.device)
+        cls.visual = (
+            Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                cls.model_path, torch_dtype=torch.bfloat16
+            )
+            .eval()
+            .visual.to(cls.device)
+        )
 
     def setUp(self):
         self.engine = Engine(
             model_path=self.model_path,
             chat_template=self.chat_template,
             device=self.device.type,
-            mem_fraction_static=0.8)
+            mem_fraction_static=0.8,
+        )
 
     def tearDown(self):
         self.engine.shutdown()
@@ -279,21 +283,28 @@ class TestQwenVLSeesImage(VisionLLMLogitsBase):
         output = await self.engine.async_generate(
             prompt=text,
             image_data=[self.main_image],
-            sampling_params=dict(temperature=0.0))
+            sampling_params=dict(temperature=0.0),
+        )
         self.assertIn("taxi", output["text"].lower())
 
     async def test_qwen_vl_sees_precomputed_features(self):
         req = self.get_completion_request()
         processor_output = self.get_processor_output(req=req)
         with torch.inference_mode():
-            precomputed_features = self.visual(processor_output["pixel_values"],
-                                               processor_output["image_grid_thw"])
+            precomputed_features = self.visual(
+                processor_output["pixel_values"], processor_output["image_grid_thw"]
+            )
         output = await self.engine.async_generate(
             input_ids=processor_output["input_ids"][0].detach().cpu().tolist(),
-            image_data=[dict(modality="IMAGE",
-                             image_grid_thws=processor_output["image_grid_thw"],
-                             precomputed_features=precomputed_features)],
-            sampling_params=dict(temperature=0.0))
+            image_data=[
+                dict(
+                    modality="IMAGE",
+                    image_grid_thws=processor_output["image_grid_thw"],
+                    precomputed_features=precomputed_features,
+                )
+            ],
+            sampling_params=dict(temperature=0.0),
+        )
         self.assertIn("taxi", output["text"].lower())
 
 

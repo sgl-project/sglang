@@ -1,7 +1,7 @@
 import asyncio
 import math
-from typing import Dict, List, Union
 import re
+from typing import Dict, List, Union
 
 import torch
 from PIL import Image
@@ -24,7 +24,9 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
 
     def __init__(self, hf_config, server_args, _processor):
         super().__init__(hf_config, server_args, _processor)
-        self.IMAGE_TOKEN = re.compile(r"<\|vision_start\|>(?:<\|image_pad\|>)+<\|vision_end\|>")
+        self.IMAGE_TOKEN = re.compile(
+            r"<\|vision_start\|>(?:<\|image_pad\|>)+<\|vision_end\|>"
+        )
         self.IM_START_TOKEN_ID = hf_config.vision_start_token_id
         self.IM_END_TOKEN_ID = hf_config.vision_end_token_id
         self.image_token_id = hf_config.image_token_id
@@ -119,10 +121,12 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
             return resize_image(image)
 
         using_precomputed_features = base_output.images and any(
-            isinstance(image, MultimodalDataItem) for image in base_output.images)
+            isinstance(image, MultimodalDataItem) for image in base_output.images
+        )
 
         if using_precomputed_features and not all(
-                isinstance(image, MultimodalDataItem) for image in base_output.images):
+            isinstance(image, MultimodalDataItem) for image in base_output.images
+        ):
             raise ValueError("Unsupported mixture of images and precomputed MM data.")
 
         if base_output.images and not using_precomputed_features:
@@ -141,12 +145,18 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
         if base_output.images:
             if using_precomputed_features:
                 pixel_values = None
-                image_grid_thw = torch.concat([
-                    torch.as_tensor(item.image_grid_thws) for item in base_output.images
-                ])
-                precomputed_features = torch.concat([
-                    torch.as_tensor(item.precomputed_features) for item in base_output.images
-                ])
+                image_grid_thw = torch.concat(
+                    [
+                        torch.as_tensor(item.image_grid_thws)
+                        for item in base_output.images
+                    ]
+                )
+                precomputed_features = torch.concat(
+                    [
+                        torch.as_tensor(item.precomputed_features)
+                        for item in base_output.images
+                    ]
+                )
             else:
                 pixel_values = ret["pixel_values"]
                 image_grid_thw = ret["image_grid_thw"]

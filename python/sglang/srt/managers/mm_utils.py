@@ -368,12 +368,12 @@ def general_mm_embed_routine(
     input_ids: torch.Tensor,
     forward_batch: ForwardBatch,
     language_model: nn.Module,
-    image_data_embedding_func: Optional[Callable[
-        [List[MultimodalDataItem]], torch.Tensor
-    ]] = None,
-    audio_data_embedding_func: Optional[Callable[
-        [List[MultimodalDataItem]], torch.Tensor
-    ]] = None,
+    image_data_embedding_func: Optional[
+        Callable[[List[MultimodalDataItem]], torch.Tensor]
+    ] = None,
+    audio_data_embedding_func: Optional[
+        Callable[[List[MultimodalDataItem]], torch.Tensor]
+    ] = None,
     placeholder_tokens: Optional[dict[Modality, List[int]]] = None,
     **kwargs,
 ) -> torch.Tensor:
