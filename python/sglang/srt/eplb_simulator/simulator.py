@@ -52,7 +52,7 @@ def _simulate_scheduled_tokens_given_seq_metadata_decode(df_metadata: pl.DataFra
         pack_indices_of_step[output_start: output_start + len(output_values), chosen_location] = output_values
         curr_lens[chosen_location] += len(output_values)
 
-    return TODO
+    return [x[x != -1] for x in pack_indices_of_step[:torch.max(curr_lens)]]
 
 
 def _simulate_execution_given_logical_count_of_batch(
