@@ -861,7 +861,7 @@ def match_internvl(model_path: str):
 
 @register_conv_template_matching_function
 def match_llama_3_vision(model_path: str):
-    if re.search(r"llama.*3\\.2.*vision", model_path, re.IGNORECASE):
+    if re.search(r"llama.*3\.2.*vision", model_path, re.IGNORECASE):
         return "llama_3_vision"
 
 
@@ -873,18 +873,18 @@ def match_deepseek_janus_pro(model_path: str):
 
 @register_conv_template_matching_function
 def match_vicuna(model_path: str):
-    if re.search(r"vicuna|llava-v1\\.5|llava-next-video-7b", model_path, re.IGNORECASE):
+    if re.search(r"vicuna|llava-v1\.5|llava-next-video-7b", model_path, re.IGNORECASE):
         return "vicuna_v1.1"
 
 
 @register_conv_template_matching_function
 def match_llama2_chat(model_path: str):
-    if re.search(r"llama-2.*chat", model_path, re.IGNORECASE):
-        return "llama-2"
-    if re.search(r"(mistral|mixtral).*instruct", model_path, re.IGNORECASE):
-        return "llama-2"
-    if re.search(r"codellama.*instruct", model_path, re.IGNORECASE):
-        return "llama-2"
+    if re.search(
+        r"llama-2.*chat|(mistral|mixtral).*instruct|codellama.*instruct",
+        model_path,
+        re.IGNORECASE,
+    ):
+        return "llama-2-chat"
 
 
 @register_conv_template_matching_function
@@ -900,7 +900,7 @@ def match_qwen_chat_ml(model_path: str):
     if re.search(r"qwen.*vl", model_path, re.IGNORECASE):
         return "qwen2-vl"
     if re.search(
-        r"llava-v1\\.6-34b|llava-v1\\.6-yi-34b|llava-next-video-34b|llava-onevision-qwen2",
+        r"llava-v1\.6-34b|llava-v1\.6-yi-34b|llava-next-video-34b|llava-onevision-qwen2",
         model_path,
         re.IGNORECASE,
     ):
@@ -908,12 +908,8 @@ def match_qwen_chat_ml(model_path: str):
 
 
 @register_conv_template_matching_function
-def match_gemma_it(model_path: str):
-    if re.search(r"gemma.*it", model_path, re.IGNORECASE):
-        return "gemma-it"
-    if re.search(r"gemma-3", model_path, re.IGNORECASE) and not re.search(
-        r"1b", model_path, re.IGNORECASE
-    ):
+def match_gemma3_instruct(model_path: str):
+    if re.search(r"gemma-3.*it", model_path, re.IGNORECASE):
         return "gemma-it"
 
 
