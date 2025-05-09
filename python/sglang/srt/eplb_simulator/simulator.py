@@ -41,7 +41,9 @@ def _simulate_scheduled_tokens_given_seq_metadata_prefill(df_metadata: pl.DataFr
 
 
 def _simulate_scheduled_tokens_given_seq_metadata_decode(df_metadata: pl.DataFrame, batch_size: int):
-    num_steps_upper_bound = df_metadata["end_index"].max()
+    # loose bound
+    num_steps_upper_bound = int(df_metadata["end_index"].max() / batch_size * 2.5)
+
     pack_indices_of_step = torch.full((num_steps_upper_bound, batch_size), -1, dtype=torch.int32)
     curr_lens = torch.zeros((batch_size,), dtype=torch.int32)
 
