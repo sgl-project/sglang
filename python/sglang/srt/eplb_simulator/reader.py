@@ -13,7 +13,7 @@ from transformers import AutoTokenizer
 
 @dataclass
 class ExpertDistributionModeDetailPerTokenAndBenchServingPack:
-    topk_ids: torch.Tensor
+    topk_ids: torch.Tensor  # (num_tokens, num_layers, num_topk)
     df_metadata: pl.DataFrame
 
 

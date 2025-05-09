@@ -109,7 +109,6 @@ def _simulate_execution_given_logical_count_of_batch(
 def _simulate_eplb_physical_count_of_batch(
     logical_count_of_batch: torch.Tensor,
     server_args: MyServerArgs,
-    model_config_for_expert_location=MY_MODEL_CONFIG_FOR_EXPERT_LOCATION,
 ):
     num_batches, _, _ = logical_count_of_batch.shape
     num_physical_expert = _compute_num_physical_experts(server_args)
