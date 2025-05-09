@@ -1058,7 +1058,7 @@ class DeepEPMoE(EPMoE):
 
         gateup_output = torch.empty(
             (all_tokens, N),
-            device=hidden_states_fp8.device,
+            device=hidden_states_fp8_device,
             dtype=torch.bfloat16,
         )
         input_tensor[1] = tma_align_input_scale(input_tensor[1])
@@ -1078,7 +1078,7 @@ class DeepEPMoE(EPMoE):
         del gateup_output
         down_output = torch.empty(
             (all_tokens, K),
-            device=hidden_states_fp8.device,
+            device=hidden_states_fp8_device,
             dtype=torch.bfloat16,
         )
         down_input_fp8, down_input_scale = sglang_per_token_group_quant_fp8(
