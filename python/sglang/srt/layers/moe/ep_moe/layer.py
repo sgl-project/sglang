@@ -1014,6 +1014,10 @@ class DeepEPMoE(EPMoE):
         N = self.w13_weight.size(1)
         scale_block_size = 128
 
+        hidden_states_fp8_shape = hidden_states_fp8.shape
+        hidden_states_fp8_device = hidden_states_fp8.device
+        hidden_states_fp8_dtype = hidden_states_fp8.dtype
+
         input_tensor = [
             torch.empty(
                 (all_tokens, K),
