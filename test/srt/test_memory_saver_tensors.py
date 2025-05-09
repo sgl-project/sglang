@@ -14,8 +14,11 @@ class TestPPAccuracy(unittest.TestCase):
     def _common_test(self, x: torch.Tensor):
         self.assertEqual(torch.max(x).item(), 5.0)
         self.assertTrue(torch.allclose(x + torch.tensor([2.0, 2.0, 2.0]), torch.tensor([5.0, 6.0, 7.0])))
-        self.assertTrue(torch.empty_like(x).shape, (3,))
+        self.assertEqual(torch.empty_like(x).shape, (3,))
         self.assertTrue(torch.allclose(torch.full_like(x, 42), torch.tensor([42.0, 42.0, 42.0])))
+        self.assertTrue(x.is_contiguous())
+        self.assertEqual(x.numel(), 3)
+        self.assertEqual(x.shape, (3,))
 
 
 if __name__ == "__main__":
