@@ -132,10 +132,6 @@ class TestOpenAIServer(CustomTestCase):
         token_input,
         return_hidden_states,
     ):
-        print(
-            f"echo={echo}, logprobs={logprobs}, use_list_input={use_list_input}, parallel_sample_num={parallel_sample_num}, token_input={token_input}, return_hidden_states={return_hidden_states}"
-        )
-
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
         prompt = "The capital of France is"
         if token_input:
