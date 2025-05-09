@@ -4,14 +4,14 @@
 
 ## Example launch Command
 
-By default, we will use sglang implementation if it is available. Otherwise, we will fallback to transformers one. However, you can switch the implementation by setting `model_impl` to `transformers`.
+By default, we will use sglang implementation if it is available. Otherwise, we will fallback to transformers one. However, you can switch the implementation by setting `modeling` to `transformers`.
 
 ```shell
 python3 -m sglang.launch_server \
   --model-path meta-llama/Llama-3.2-1B-Instruct \
   --host 0.0.0.0 \
   --port 30000 \
-  --model-impl transformers
+  --modeling transformers
 ```
 
 #### Supported features
