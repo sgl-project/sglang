@@ -228,6 +228,7 @@ class ModelConfig:
             model_override_args=server_args.json_model_override_args,
             is_embedding=server_args.is_embedding,
             enable_multimodal=server_args.enable_multimodal,
+            enable_hybrid_kvcache=server_args.enable_hybrid_kvcache,
             dtype=server_args.dtype,
             quantization=server_args.quantization,
             **kwargs,
