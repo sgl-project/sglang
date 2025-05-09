@@ -35,7 +35,7 @@ def read_expert_distribution_mode_detail_per_token(dir_data):
             topk_ids=topk_ids,
         )
 
-    def _concat_tokens(processed_records):
+    def _concat_records(processed_records):
         return {
             k: torch.concat([r[k] for r in processed_records], dim=0)
             for k in processed_records[0].keys()
@@ -54,7 +54,7 @@ def read_expert_distribution_mode_detail_per_token(dir_data):
         data_pack = torch.load(path, weights_only=True)
         processed_records += [_handle_record(record) for record in data_pack["records"]]
 
-    pack = _concat_tokens(processed_records)
+    pack = _concat_records(processed_records)
     pack = _sort_by_rid(pack)
     pack = _compute_df_metadata(pack)
     return pack
