@@ -1065,6 +1065,7 @@ class DeepEPMoE(EPMoE):
         m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(
             input_tensor, self.w13_weight_fp8, gateup_output, m_indices
         )
+        del input_tensor
         down_input = torch.empty(
             (
                 all_tokens,
@@ -1074,6 +1075,7 @@ class DeepEPMoE(EPMoE):
             dtype=torch.bfloat16,
         )
         silu_and_mul(gateup_output.view(-1, N), down_input)
+        del gateup_output
         down_output = torch.empty(
             (all_tokens, K),
             device=hidden_states_fp8.device,
@@ -1082,6 +1084,7 @@ class DeepEPMoE(EPMoE):
         down_input_fp8, down_input_scale = sglang_per_token_group_quant_fp8(
             down_input, scale_block_size
         )
+        del down_input
         down_input_scale = tma_align_input_scale(down_input_scale)
         m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(
             (down_input_fp8, down_input_scale),
@@ -1089,6 +1092,7 @@ class DeepEPMoE(EPMoE):
             down_output,
             m_indices,
         )
+        del down_input_fp8, down_input_scale
 
         gather_out = torch.empty(
             hidden_states_fp8_shape,
