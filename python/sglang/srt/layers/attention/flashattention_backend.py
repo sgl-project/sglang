@@ -1129,17 +1129,6 @@ class FlashAttentionBackend(AttentionBackend):
         This creates fixed-size tensors that will be reused during CUDA graph replay
         to avoid memory allocations.
         """
-
-        # Estimate maximum sizes for local attention metadata
-        max_seq_len = self.max_context_len
-        attn_chunk_size = self.attention_chunk_size or 1
-        page_size = self.page_size or 1
-        max_virtual_batches = max_bs * (
-            (max_seq_len + attn_chunk_size - 1) // attn_chunk_size
-        )
-        max_blocks_per_seq = (max_seq_len + attn_chunk_size - 1) // attn_chunk_size
-        max_pages_per_block = (attn_chunk_size + page_size - 1) // page_size
-
         # This is being used by normal decode and draft decode when topk == 1
         self.decode_cuda_graph_metadata = {
             "cache_seqlens": torch.zeros(max_bs, dtype=torch.int32, device=self.device),
@@ -1164,20 +1153,35 @@ class FlashAttentionBackend(AttentionBackend):
             "strided_indices": torch.arange(
                 0, self.max_context_len, self.page_size, device=self.device
             ),
-            # Pre-allocate tensors for local attention metadata
-            "local_query_start_loc": torch.zeros(
-                max_virtual_batches + 1, dtype=torch.int32, device=self.device
-            ),
-            "local_seqused_k": torch.zeros(
-                max_virtual_batches, dtype=torch.int32, device=self.device
-            ),
-            "local_block_table": torch.zeros(
-                max_virtual_batches,
-                max_blocks_per_seq * max_pages_per_block,
-                dtype=torch.int32,
-                device=self.device,
-            ),
         }
+
+        # Only allocate local attention buffers if local attention is enabled
+        # This prevents OOM errors when local attention is not being used
+        if self.attention_chunk_size is not None:
+            # Estimate maximum sizes for local attention metadata
+            max_seq_len = self.max_context_len
+            page_size = self.page_size or 1
+            attn_chunk_size = self.attention_chunk_size
+            max_virtual_batches = max_bs * (
+                (max_seq_len + attn_chunk_size - 1) // attn_chunk_size
+            )
+            max_blocks_per_seq = (max_seq_len + attn_chunk_size - 1) // attn_chunk_size
+            max_pages_per_block = (attn_chunk_size + page_size - 1) // page_size
+
+            self.decode_cuda_graph_local_attn_metadata = {
+                "local_query_start_loc": torch.zeros(
+                    max_virtual_batches + 1, dtype=torch.int32, device=self.device
+                ),
+                "local_seqused_k": torch.zeros(
+                    max_virtual_batches, dtype=torch.int32, device=self.device
+                ),
+                "local_block_table": torch.zeros(
+                    max_virtual_batches,
+                    max_blocks_per_seq * max_pages_per_block,
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+            }
 
         # This is used by draft decode's first half of metadata when topk > 1
         if self.topk > 1:
@@ -1431,20 +1435,18 @@ class FlashAttentionBackend(AttentionBackend):
                 self.decode_cuda_graph_metadata[bs] = metadata
 
                 if self.attention_chunk_size is not None:
-                    metadata.local_attn_metadata = (
-                        FlashAttentionMetadata.LocalAttentionMetadata(
-                            local_query_start_loc=self.decode_cuda_graph_metadata[
-                                "local_query_start_loc"
-                            ],
-                            local_seqused_k=self.decode_cuda_graph_metadata[
-                                "local_seqused_k"
-                            ],
-                            local_block_table=self.decode_cuda_graph_metadata[
-                                "local_block_table"
-                            ],
-                            local_max_query_len=1,
-                            local_max_seq_len=1,
-                        )
+                    metadata.local_attn_metadata = FlashAttentionMetadata.LocalAttentionMetadata(
+                        local_query_start_loc=self.decode_cuda_graph_local_attn_metadata[
+                            "local_query_start_loc"
+                        ],
+                        local_seqused_k=self.decode_cuda_graph_local_attn_metadata[
+                            "local_seqused_k"
+                        ],
+                        local_block_table=self.decode_cuda_graph_local_attn_metadata[
+                            "local_block_table"
+                        ],
+                        local_max_query_len=1,
+                        local_max_seq_len=1,
                     )
 
         elif forward_mode.is_target_verify():
@@ -1814,9 +1816,13 @@ class FlashAttentionBackend(AttentionBackend):
             return
 
         # Access preallocated buffers
-        local_q_buf = self.decode_cuda_graph_metadata["local_query_start_loc"]
-        local_k_buf = self.decode_cuda_graph_metadata["local_seqused_k"]
-        local_block_buf = self.decode_cuda_graph_metadata["local_block_table"]
+        local_q_buf = self.decode_cuda_graph_local_attn_metadata[
+            "local_query_start_loc"
+        ]
+        local_k_buf = self.decode_cuda_graph_local_attn_metadata["local_seqused_k"]
+        local_block_buf = self.decode_cuda_graph_local_attn_metadata[
+            "local_block_table"
+        ]
         cu_seqlens_q = self.decode_cuda_graph_metadata["cu_seqlens_q"]
 
         # Create a modified version for local attention that only processes the last token
