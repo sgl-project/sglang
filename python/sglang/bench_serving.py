@@ -1569,6 +1569,7 @@ async def benchmark(
         "prompts": [output.prompt for output in outputs],
         "generated_texts": [output.generated_text for output in outputs],
         "errors": [output.error for output in outputs],
+        "output_metadata": [output.metadata for output in outputs],
     }
 
     # Append results to a JSONL file
