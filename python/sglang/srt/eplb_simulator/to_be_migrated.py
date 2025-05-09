@@ -179,44 +179,6 @@ def simulate_execution(
     )
     print(f"{logical_count_of_batch.shape=}")
 
-    if server_args.enable_expert_location_by_eplb:
-        num_physical_expert = (
-            model_config_for_expert_location.num_logical_experts
-            + server_args.ep_num_redundant_experts
-        )
-
-        if server_args.init_expert_location == "from_variable":
-            print(
-                f"Compute eplb_input_logical_count from override_eplb_input_logical_count"
-            )
-            eplb_input_logical_count = override_eplb_input_logical_count
-        elif (x := server_args.init_expert_location) is not None:
-            print(f"Compute eplb_input_logical_count from {x}")
-            eplb_input_logical_count = torch.tensor(
-                json.loads(Path(x).read_text())["logical_count"]
-            )
-        else:
-            print(f"Compute eplb_input_logical_count from logical_count_of_seq")
-            eplb_input_logical_count = einops.einsum(
-                logical_count_of_seq,
-                "num_seq num_layer num_expert -> num_layer num_expert",
-            )
-
-        expert_location_metadata = MyExpertLocationMetadata.init_by_eplb(
-            server_args,
-            logical_count=eplb_input_logical_count,
-            num_physical_experts=num_physical_expert,
-        )
-        # print(f"hi {expert_location_metadata=}")
-        physical_count_of_batch = simulate_logical_to_physical_by_random_dispatching(
-            logical_count_of_whatever=logical_count_of_batch,
-            logical_to_all_physical_map=expert_location_metadata.logical_to_all_physical_map,
-            num_physical_expert=num_physical_expert,
-        )
-        # print(f"hi {physical_count_of_batch=}")
-    else:
-        physical_count_of_batch = logical_count_of_batch
-
 
 def simulate_batching(
     logical_count_of_seq: torch.Tensor,  # (num_seq, num_layer, num_logical_expert)
