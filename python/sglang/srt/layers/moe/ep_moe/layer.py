@@ -1089,9 +1089,9 @@ class DeepEPMoE(EPMoE):
             m_indices,
         )
 
-        gather_out = torch.empty_like(
-            hidden_states_fp8,
-            device=hidden_states_fp8.device,
+        gather_out = torch.empty(
+            hidden_states_fp8_shape,
+            device=hidden_states_fp8_device,
             dtype=torch.bfloat16,
         )
         ep_gather(down_output, topk_idx, topk_weights, output_index, gather_out)
