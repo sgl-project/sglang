@@ -35,6 +35,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_loader.utils import (
     get_model_architecture,
@@ -60,18 +61,6 @@ from sglang.srt.utils import (
     is_pin_memory_available,
     set_weight_attrs,
 )
-
-# ModelOpt: Define placeholder for quantization config choices
-# Users will need to populate this with actual names of config objects
-# available in modelopt.torch.quantization, e.g., "FP8_DEFAULT_CONFIG"
-# For example: QUANT_CFG_CHOICES = {"fp8": "FP8_CONFIG_NAME_IN_MTQ", "int4_awq": "INT4_AWQ_CONFIG_NAME_IN_MTQ"}
-# This needs to be adapted based on the actual ModelOpt library's provided configs.
-# For demonstration, we'll assume "fp8" maps to a hypothetical "FP8_QUANT_CFG" attribute in mtq.
-QUANT_CFG_CHOICES = {
-    "fp8": "FP8_DEFAULT_CFG",  # Replace "FP8_DEFAULT_CFG" with the actual attribute name in mtq for FP8 config
-    # Add other presets like:
-    # "int4_awq": "INT4_AWQ_DEFAULT_CFG",
-}
 
 
 @contextmanager
