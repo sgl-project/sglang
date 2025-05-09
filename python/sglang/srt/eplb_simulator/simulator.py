@@ -12,7 +12,15 @@ from sglang.srt.managers.expert_distribution import (
 from sglang.srt.managers.expert_location import ExpertLocationMetadata
 
 
-def simulate_execution_given_logical_count_of_batch(
+def _compute_logical_count_of_batch():
+    TODO
+
+
+def _simulate_scheduled_tokens_given_pack():
+    TODO
+
+
+def _simulate_execution_given_logical_count_of_batch(
     logical_count_of_batch: torch.Tensor,
     server_args: MyServerArgs,
 ):

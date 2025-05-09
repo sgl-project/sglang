@@ -1,4 +1,5 @@
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Any
 
@@ -8,6 +9,12 @@ import torch
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
+
+
+@dataclass
+class ExpertDistributionModeDetailPerTokenAndBenchServingPack:
+    topk_ids: torch.Tensor
+    df: pl.DataFrame
 
 
 def read_expert_distribution_mode_detail_per_token_and_bench_serving(dir_data):
@@ -27,7 +34,7 @@ def read_expert_distribution_mode_detail_per_token_and_bench_serving(dir_data):
 
     df = df.sort("dataset_timestamp")
 
-    return dict(
+    return ExpertDistributionModeDetailPerTokenAndBenchServingPack(
         topk_ids=pack_expert_distribution["topk_ids"],
         df=df,
     )
