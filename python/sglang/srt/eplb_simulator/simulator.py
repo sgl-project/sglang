@@ -24,7 +24,10 @@ def _compute_logical_count_of_batch(
         num_tokens_in_batch_overall=server_args.num_tokens_in_batch_overall,
     )
 
-    vanilla_physical_count_of_batch = compute_global_physical_count_from_topk_ids(TODO)
+    vanilla_physical_count_of_batch = compute_global_physical_count_from_topk_ids(
+        topk_ids=topk_ids,
+        num_physical_experts=num_physical_expert,
+    )
 
     assert assert_physical_equal_logical_expert
     logical_count_of_batch = vanilla_physical_count_of_batch
@@ -180,7 +183,7 @@ def _simulate_logical_to_physical_by_random_dispatching(
 
 def compute_global_physical_count_from_topk_ids(
     topk_ids: torch.Tensor,  # (num_tokens, num_layers, num_topk)
-    num_physical_experts: int,
+    num_physical_expert: int,
 ):
     """
     :return: global_physical_count - (num_layers, num_physical_experts)
@@ -188,7 +191,7 @@ def compute_global_physical_count_from_topk_ids(
     topk_ids_flattened = einops.rearrange(topk_ids,
                                           'num_tokens num_layers num_topk -> num_layers (num_tokens num_topk)')
     return torch.stack([
-        torch.bincount(x, minlength=num_physical_experts)
+        torch.bincount(x, minlength=num_physical_expert)
         for x in topk_ids_flattened
     ])
 
