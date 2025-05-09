@@ -437,7 +437,10 @@ class PrefillAdder:
         total_tokens = req.extend_input_len + min(
             req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION
         )
-        input_tokens = req.extend_input_len
+        input_tokens = (
+            -(-req.extend_input_len // self.tree_cache.page_size)
+            * self.tree_cache.page_size
+        )
         prefix_len = len(req.prefix_indices)
 
         if total_tokens >= self.rem_total_tokens:
@@ -459,7 +462,10 @@ class PrefillAdder:
                     req.last_node_global, req.prefix_indices
                 )
                 req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
-                input_tokens = req.extend_input_len
+                input_tokens = (
+                    -(-req.extend_input_len // self.tree_cache.page_size)
+                    * self.tree_cache.page_size
+                )
                 prefix_len = len(req.prefix_indices)
 
             if self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
@@ -475,12 +481,12 @@ class PrefillAdder:
                     ),
                 )
             else:
-                if self.rem_chunk_tokens == 0:
+                # Make sure at least one page is available
+                trunc_len = self.rem_chunk_tokens - self.tree_cache.page_size + 1
+                if trunc_len <= 0:
                     return AddReqResult.OTHER
 
                 # Chunked prefill
-                trunc_len = self.rem_chunk_tokens
-
                 req.extend_input_len = trunc_len
                 req.fill_ids = req.fill_ids[: len(req.prefix_indices) + trunc_len]
 
