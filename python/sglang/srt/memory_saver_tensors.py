@@ -16,6 +16,9 @@ class _WrapperTensor(torch.Tensor):
     def _unwrap(self):
         raise NotImplementedError
 
+    def tolist(self):
+        return self._unwrap().tolist()
+
 
 class DisposableTensor(_WrapperTensor):
     @staticmethod
