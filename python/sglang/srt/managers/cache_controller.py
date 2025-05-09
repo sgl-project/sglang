@@ -23,6 +23,7 @@ from typing import List, Optional
 import torch
 
 from sglang.srt.mem_cache.memory_pool import HostKVCache, TokenToKVPoolAllocator
+from sglang.srt.mem_cache.mooncake_store import MooncakeStore
 
 logger = logging.getLogger(__name__)
 
@@ -150,14 +151,18 @@ class HiCacheController:
         token_to_kv_pool_allocator: TokenToKVPoolAllocator,
         mem_pool_host: HostKVCache,
         page_size: int,
+        enable_mooncake_store_l3_cache: bool,
         load_cache_event: threading.Event = None,
         write_policy: str = "write_through_selective",
+        mooncake_l3_kv_pool: MooncakeStore = None
     ):
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
         self.mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
         self.mem_pool_host = mem_pool_host
         self.write_policy = write_policy
         self.page_size = page_size
+        self.enable_mooncake_store_l3_cache = enable_mooncake_store_l3_cache
+        self.mooncake_l3_kv_pool = mooncake_l3_kv_pool
 
         self.load_cache_event = load_cache_event
         self.layer_done_counter = LayerDoneCounter(self.mem_pool_device.layer_num)

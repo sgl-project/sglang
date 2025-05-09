@@ -509,6 +509,7 @@ class Scheduler(
                     hicache_ratio=server_args.hicache_ratio,
                     hicache_size=server_args.hicache_size,
                     hicache_write_policy=server_args.hicache_write_policy,
+                    enable_mooncake_store_l3_cache=server_args.enable_mooncake_store_l3_cache
                 )
             else:
                 self.tree_cache = RadixCache(

@@ -17,6 +17,8 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode
 
+from sglang.srt.mem_cache.mooncake_store import MooncakeStore
+
 logger = logging.getLogger(__name__)
 
 
@@ -31,6 +33,7 @@ class HiRadixCache(RadixCache):
         hicache_ratio: float,
         hicache_size: int,
         hicache_write_policy: str,
+        enable_mooncake_store_l3_cache: bool
     ):
         self.kv_cache = token_to_kv_pool_allocator.get_kvcache()
         if isinstance(self.kv_cache, MHATokenToKVPool):
@@ -44,6 +47,12 @@ class HiRadixCache(RadixCache):
         else:
             raise ValueError(f"HiRadixCache only supports MHA and MLA yet")
 
+        self.mooncake_l3_kv_pool = None
+        if enable_mooncake_store_l3_cache:
+            # TODO(huangtingwei9988):L3 cache only support write_through_selective and write_through write policy
+            assert hicache_write_policy in ["write_through_selective", "write_through"]
+            self.mooncake_l3_kv_pool = MooncakeStore()
+
         self.tp_group = tp_cache_group
 
         self.load_cache_event = threading.Event()
@@ -51,8 +60,10 @@ class HiRadixCache(RadixCache):
             token_to_kv_pool_allocator,
             self.token_to_kv_pool_host,
             page_size,
+            enable_mooncake_store_l3_cache,
             load_cache_event=self.load_cache_event,
             write_policy=hicache_write_policy,
+            mooncake_l3_kv_pool=self.mooncake_l3_kv_pool
         )
 
         # record the nodes with ongoing write through

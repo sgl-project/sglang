@@ -178,6 +178,7 @@ class ServerArgs:
     enable_custom_logit_processor: bool = False
     tool_call_parser: Optional[str] = None
     enable_hierarchical_cache: bool = False
+    enable_mooncake_store_l3_cache: bool = False
     hicache_ratio: float = 2.0
     hicache_size: int = 0
     hicache_write_policy: str = "write_through_selective"
@@ -1143,6 +1144,11 @@ class ServerArgs:
             "--enable-hierarchical-cache",
             action="store_true",
             help="Enable hierarchical cache",
+        )
+        parser.add_argument(
+            "--enable-mooncake-store-l3-cache",
+            action="store_true",
+            help="Enable mooncake store for hicache L3 cache",
         )
         parser.add_argument(
             "--hicache-ratio",
