@@ -10,17 +10,17 @@ _TRITON_DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
 
 class TestMemorySaverTensors(unittest.TestCase):
-    def test_disposable_tensor(self):
+    def test_disposable_tensor_operations(self):
         x = DisposableTensor(torch.tensor([3.0, 4.0, 5.0], device=_DEVICE))
-        self._common_test(x)
+        self._common_test_operations(x)
 
-    def test_lazy_tensor(self):
+    def test_lazy_tensor_operations(self):
         x = LazyTensor((3,), device=_DEVICE)
         x[0] = 3.0
         x[1:3] = [4.0, 5.0]
-        self._common_test(x)
+        self._common_test_operations(x)
 
-    def _common_test(self, x: torch.Tensor):
+    def _common_test_operations(self, x: torch.Tensor):
         print(f"common_test {type(x)=} {x=}")
         self.assertEqual(torch.max(x).item(), 5.0)
         self.assertTrue(torch.allclose(x + torch.tensor([2.0, 2.0, 2.0], device=_DEVICE),
