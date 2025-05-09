@@ -28,10 +28,13 @@ def simulate_execution_given_pack(
         num_tokens_in_batch_overall=server_args.num_tokens_in_batch_overall,
     )
 
-    vanilla_physical_count_of_batch = compute_global_physical_count_from_topk_ids(
-        topk_ids=pack.topk_ids,
-        num_physical_expert=num_physical_expert,
-    )
+    vanilla_physical_count_of_batch = torch.stack([
+        compute_global_physical_count_from_topk_ids(
+            topk_ids=pack.topk_ids[TODO],
+            num_physical_expert=num_physical_expert,
+        )
+        for TODO in TODO
+    ])
 
     assert assert_physical_equal_logical_expert
     logical_count_of_batch = vanilla_physical_count_of_batch
