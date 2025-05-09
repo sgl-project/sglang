@@ -22,14 +22,16 @@ def _compute_logical_count_of_batch(
 def _simulate_scheduled_tokens_given_seq_metadata(
     df_metadata: pl.DataFrame,
     phase: Union[Literal["prefill", "decode"]],
+    num_tokens_in_batch_overall: int,
 ) -> List[torch.Tensor]:
     """
     :return: `output[i]` denotes all pack indices that will be used in i-th step
     """
     if phase == "prefill":
-        return _simulate_scheduled_tokens_given_seq_metadata_prefill(df_metadata, chunked_prefill_size=TODO)
+        return _simulate_scheduled_tokens_given_seq_metadata_prefill(df_metadata,
+                                                                     chunked_prefill_size=num_tokens_in_batch_overall)
     if phase == "decode":
-        return _simulate_scheduled_tokens_given_seq_metadata_decode(df_metadata, batch_size=TODO)
+        return _simulate_scheduled_tokens_given_seq_metadata_decode(df_metadata, batch_size=num_tokens_in_batch_overall)
     raise NotImplementedError
 
 
