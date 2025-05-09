@@ -584,6 +584,12 @@ class LlamaForCausalLM(nn.Module):
                 # Skip loading kv_scale from ckpts towards new design.
                 if name.endswith(".kv_scale") and name not in params_dict:
                     continue
+                # Skip loading embed_tokens if not first rank in pipeline parallelism
+                if ".embed_tokens" in name and not self.pp_group.is_first_rank:
+                    continue
+                # Skip loading norm if not last rank in pipeline parallelism
+                if ".norm" in name and not self.pp_group.is_last_rank:
+                    continue
                 if name in params_dict.keys():
                     param = params_dict[name]
                     weight_loader = getattr(

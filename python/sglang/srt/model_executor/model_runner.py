@@ -724,8 +724,6 @@ class ModelRunner:
                 if not self.is_draft_worker
                 else self.model_config.hf_config.num_nextn_predict_layers
             )
-            # FIXME: pipeline parallelism is not compatible with mla backend
-            assert self.pp_size == 1
             cell_size = (
                 (self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim)
                 * num_layers
