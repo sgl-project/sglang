@@ -59,10 +59,11 @@ from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.deep_gemm import _ENABLE_JIT_DEEPGEMM
 from sglang.srt.layers.quantization.fp8_kernel import (
-    per_tensor_quant_mla_deep_gemm_masked_fp8,
     per_tensor_quant_mla_fp8,
+    per_token_group_quant_mla_deep_gemm_masked_fp8,
 )
 from sglang.srt.layers.quantization.fp8_utils import (
+    block_quant_dequant,
     block_quant_to_tensor_quant,
     channel_quant_to_tensor_quant,
     normalize_e4m3fn_to_e4m3fnuz,
@@ -88,6 +89,7 @@ from sglang.srt.utils import (
     get_int_env_var,
     is_cuda,
     is_hip,
+    log_info_on_rank0,
 )
 
 _is_hip = is_hip()
@@ -356,6 +358,7 @@ class DeepseekV2MoE(nn.Module):
                 topk_idx,
                 topk_weights,
                 reorder_topk_ids,
+                num_recv_tokens_per_expert,
                 seg_indptr,
                 masked_m,
                 expected_m,
@@ -367,10 +370,13 @@ class DeepseekV2MoE(nn.Module):
             )
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
+            topk_idx=topk_idx,
+            topk_weights=topk_weights,
             reorder_topk_ids=reorder_topk_ids,
             seg_indptr=seg_indptr,
             masked_m=masked_m,
             expected_m=expected_m,
+            num_recv_tokens_per_expert=num_recv_tokens_per_expert,
             forward_mode=forward_mode,
         )
         if self.ep_size > 1:
@@ -738,9 +744,7 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         if self.use_deep_gemm_bmm:
             q_nope_val, q_nope_scale, masked_m, expected_m, aligned_m = (
-                per_tensor_quant_mla_deep_gemm_masked_fp8(
-                    q_nope.transpose(0, 1), dtype=torch.float8_e4m3fn
-                )
+                per_token_group_quant_mla_deep_gemm_masked_fp8(q_nope.transpose(0, 1))
             )
             q_nope_out = q_nope.new_empty(
                 (self.num_local_heads, aligned_m, self.kv_lora_rank)
@@ -785,8 +789,8 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         if self.use_deep_gemm_bmm:
             attn_output_val, attn_output_scale, masked_m, expected_m, aligned_m = (
-                per_tensor_quant_mla_deep_gemm_masked_fp8(
-                    attn_output.transpose(0, 1), dtype=torch.float8_e4m3fn
+                per_token_group_quant_mla_deep_gemm_masked_fp8(
+                    attn_output.transpose(0, 1)
                 )
             )
             attn_bmm_output = attn_output.new_empty(
@@ -1487,8 +1491,9 @@ class DeepseekV2ForCausalLM(nn.Module):
             ):
                 self.n_share_experts_fusion = 0
                 global_server_args_dict["n_share_experts_fusion"] = 0
-                logger.info(
-                    "Only Deepseek V3/R1 can use shared experts fusion optimization. Shared experts fusion optimization is disabled."
+                log_info_on_rank0(
+                    logger,
+                    "Only Deepseek V3/R1 can use shared experts fusion optimization. Shared experts fusion optimization is disabled.",
                 )
             else:
                 assert (
@@ -1503,8 +1508,9 @@ class DeepseekV2ForCausalLM(nn.Module):
             ):
                 self.n_share_experts_fusion = self.tp_size
                 global_server_args_dict["n_share_experts_fusion"] = self.tp_size
-                logger.info(
-                    "Deepseek V3/R1 with fp8 can use shared experts fusion optimization when SM version >=90. Shared experts fusion optimization is enabled."
+                log_info_on_rank0(
+                    logger,
+                    "Deepseek V3/R1 with fp8 can use shared experts fusion optimization when SM version >=90. Shared experts fusion optimization is enabled.",
                 )
 
     def get_input_embeddings(self) -> nn.Embedding:
@@ -1584,13 +1590,22 @@ class DeepseekV2ForCausalLM(nn.Module):
 
                         if (
                             _is_cuda
-                            and _ENABLE_JIT_DEEPGEMM
                             and weight_block_size[0] == 128
                             and weight_block_size[1] == 128
                             and model_dtype == torch.bfloat16
                         ):
-                            block_scale = weight_scale
-                            use_deep_gemm_bmm = True
+                            if _ENABLE_JIT_DEEPGEMM and get_bool_env_var(
+                                "SGL_USE_DEEPGEMM_BMM", "false"
+                            ):
+                                block_scale = weight_scale
+                                use_deep_gemm_bmm = True
+                            else:
+                                w = block_quant_dequant(
+                                    weight,
+                                    weight_scale,
+                                    weight_block_size,
+                                    model_dtype,
+                                )
                         else:
                             w, scale = block_quant_to_tensor_quant(
                                 weight, weight_scale, weight_block_size
