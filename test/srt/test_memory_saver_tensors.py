@@ -1,24 +1,51 @@
 import unittest
 
 import torch
+import triton
+import triton.language as tl
 from python.sglang.srt.memory_saver_tensors import DisposableTensor
 
+_DEVICE = "cuda"
+_TRITON_DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
-class TestPPAccuracy(unittest.TestCase):
+
+class TestMemorySaverTensors(unittest.TestCase):
     def test_disposable_tensor(self):
-        self._common_test(DisposableTensor(torch.tensor([3.0, 4.0, 5.0])))
+        self._common_test(DisposableTensor(torch.tensor([3.0, 4.0, 5.0], device=_DEVICE)))
 
     def test_lazy_tensor(self):
         self._common_test(TODO)
 
     def _common_test(self, x: torch.Tensor):
         self.assertEqual(torch.max(x).item(), 5.0)
-        self.assertTrue(torch.allclose(x + torch.tensor([2.0, 2.0, 2.0]), torch.tensor([5.0, 6.0, 7.0])))
+        self.assertTrue(torch.allclose(x + torch.tensor([2.0, 2.0, 2.0], device=_DEVICE),
+                                       torch.tensor([5.0, 6.0, 7.0], device=_DEVICE)))
         self.assertEqual(torch.empty_like(x).shape, (3,))
-        self.assertTrue(torch.allclose(torch.full_like(x, 42), torch.tensor([42.0, 42.0, 42.0])))
+        self.assertTrue(torch.allclose(torch.full_like(x, 42), torch.tensor([42.0, 42.0, 42.0], device=_DEVICE)))
         self.assertTrue(x.is_contiguous())
         self.assertEqual(x.numel(), 3)
         self.assertEqual(x.shape, (3,))
+
+
+def _add_by_triton(x: torch.Tensor, y: torch.Tensor):
+    output = torch.empty_like(x)
+    assert x.device == _TRITON_DEVICE and y.device == _TRITON_DEVICE and output.device == _TRITON_DEVICE
+    n_elements = output.numel()
+    grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
+    _add_kernel[grid](x, y, output, n_elements, BLOCK_SIZE=1024)
+    return output
+
+
+@triton.jit
+def _add_kernel(x_ptr, y_ptr, output_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    x = tl.load(x_ptr + offsets, mask=mask)
+    y = tl.load(y_ptr + offsets, mask=mask)
+    output = x + y
+    tl.store(output_ptr + offsets, output, mask=mask)
 
 
 if __name__ == "__main__":
