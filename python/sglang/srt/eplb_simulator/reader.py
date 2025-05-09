@@ -23,7 +23,7 @@ def read_expert_distribution_mode_detail_per_token_and_bench_serving(dir_data):
         pack_input_except_history_start_index=pl.col("pack_start_index") + pl.col("history_ids").list.len(),
         pack_output_start_index=pl.col("pack_start_index") + pl.col("input_ids").list.len(),
     )
-   
+
     df = df.sort("dataset_timestamp")
 
     return dict(
@@ -115,6 +115,7 @@ def read_bench_serving(path: Path):
 
     df = pl.DataFrame(dict(
         rid=[_rid_str_to_int64(x["rid"]) for x in data_raw["output_metadata"]],
+        dataset_timestamp=[x["dataset_timestamp"] for x in data_raw["output_metadata"]],
         input_text=data_raw["prompts"],
         output_text=data_raw["generated_texts"],
         history_text=[x["history_text"] for x in data_raw["output_metadata"]],
