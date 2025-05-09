@@ -4,6 +4,8 @@ from pathlib import Path
 import einops
 import polars as pl
 import torch
+from transformers import AutoTokenizer
+
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from tqdm.auto import tqdm
 
@@ -76,12 +78,22 @@ def read_expert_distribution_mode_detail_per_token(dir_data):
 
 def read_bench_serving(path: Path):
     data_raw = json.loads(path.read_text())
-    return pl.DataFrame(dict(
+    tokenizer = AutoTokenizer.from_pretrained(data_raw["tokenizer_id"])
+
+    df = pl.DataFrame(dict(
         rid=[_rid_str_to_int64(x["rid"]) for x in data_raw["output_metadata"]],
         input_text=data_raw["prompts"],
         output_text=data_raw["generated_texts"],
         history_text=[x["history_text"] for x in data_raw["output_metadata"]],
     ))
+
+    df = df.with_columns(
+        input_ids=pl.col("input_text").map_elements(tokenizer.encode, return_dtype=pl.List(pl.Int32)),
+        output_ids=pl.col("output_text").map_elements(tokenizer.encode, return_dtype=pl.List(pl.Int32)),
+        history_ids=pl.col("history_text").map_elements(tokenizer.encode, return_dtype=pl.List(pl.Int32)),
+    )
+
+    return df
 
 
 def unnest_all(df: pl.DataFrame, separator=".") -> pl.DataFrame:
