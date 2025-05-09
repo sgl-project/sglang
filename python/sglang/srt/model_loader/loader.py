@@ -54,6 +54,8 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_loader.utils import (
     get_model_architecture,
     post_load_weights,
