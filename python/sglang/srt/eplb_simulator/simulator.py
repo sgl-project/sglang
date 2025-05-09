@@ -18,6 +18,8 @@ def _compute_logical_count_of_batch(
     server_args: MyServerArgs,
     assert_physical_equal_logical_expert: bool,
 ):
+    num_physical_expert = _compute_num_physical_experts(server_args)
+
     token_indices_of_batch = _simulate_scheduled_pack_indices_given_seq_metadata(
         df_metadata,
         phase=phase,
@@ -26,7 +28,7 @@ def _compute_logical_count_of_batch(
 
     vanilla_physical_count_of_batch = compute_global_physical_count_from_topk_ids(
         topk_ids=topk_ids,
-        num_physical_experts=num_physical_expert,
+        num_physical_expert=num_physical_expert,
     )
 
     assert assert_physical_equal_logical_expert
@@ -108,10 +110,7 @@ def _simulate_eplb_physical_count_of_batch(
     model_config_for_expert_location=MY_MODEL_CONFIG_FOR_EXPERT_LOCATION,
 ):
     num_batches, _, _ = logical_count_of_batch.shape
-    num_physical_expert = (
-        model_config_for_expert_location.num_logical_experts
-        + server_args.ep_num_redundant_experts
-    )
+    num_physical_expert = _compute_num_physical_experts(server_args)
 
     if server_args.enable_expert_location_by_eplb:
         expert_location_metadata_arr = _simulate_expert_location_metadata_arr(
@@ -194,6 +193,16 @@ def compute_global_physical_count_from_topk_ids(
         torch.bincount(x, minlength=num_physical_expert)
         for x in topk_ids_flattened
     ])
+
+
+def _compute_num_physical_experts(
+    server_args: MyServerArgs,
+    model_config_for_expert_location=MY_MODEL_CONFIG_FOR_EXPERT_LOCATION,
+):
+    return (
+        model_config_for_expert_location.num_logical_experts
+        + server_args.ep_num_redundant_experts
+    )
 
 
 @dataclass
