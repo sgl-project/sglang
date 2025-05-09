@@ -26,18 +26,6 @@ _ = compute_utilization_rate, compute_gpu_physical_count
 # ------------------------------------------- TODO refactor below ---------------------------------------------
 
 @dataclass
-class MyServerArgs:
-    # When prefill, this is equivalent to `chunked_prefill_size`
-    num_tokens_in_batch_overall: int
-    ep_num_redundant_experts: int
-    nnodes: int
-    tp_size: int
-    enable_expert_location_by_eplb: bool
-    init_expert_location: Optional[str]
-    deepseek_eplb_hack_shuffle: bool = False
-
-
-@dataclass
 class MyExpertLocationMetadata:
     physical_to_logical_map: torch.Tensor  # (layers, num_physical_experts)
     logical_to_all_physical_map: torch.Tensor  # (layers, num_logical_experts, X)
@@ -66,14 +54,6 @@ class MyExpertLocationMetadata:
             logical_to_all_physical_map=logical_to_all_physical_map,
         )
 
-
-# https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/main/config.json
-_MY_MODEL_CONFIG_FOR_EXPERT_LOCATION = ModelConfigForExpertLocation(
-    num_layers=61,
-    num_logical_experts=256,
-    num_groups=8,
-)
-_MY_MODEL_CONFIG_NUM_EXPERTS_PER_TOK = 8
 
 
 def read_physical_count_of_forward_pass_id_and_rank(dir_data: Path):
