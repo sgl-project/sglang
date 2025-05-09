@@ -5,6 +5,7 @@ import torch
 import triton
 import triton.language as tl
 from sglang.srt.memory_saver_tensors import DisposableTensor, LazyTensor
+from sglang.srt.memory_saver_tensors import WrapperTensor
 
 _DEVICE = torch.device("cuda:0")
 
@@ -62,7 +63,7 @@ def _add_by_triton(x: torch.Tensor, y: torch.Tensor):
     assert x.device == _DEVICE and y.device == _DEVICE and output.device == _DEVICE
     n_elements = output.numel()
     grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
-    _add_kernel[grid](x, y, output, n_elements, BLOCK_SIZE=1024)
+    _add_kernel[grid](WrapperTensor.unwrap(x), WrapperTensor.unwrap(y), output, n_elements, BLOCK_SIZE=1024)
     return output
 
 
