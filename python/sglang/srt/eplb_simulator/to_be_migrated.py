@@ -9,10 +9,6 @@ import einops
 import polars as pl
 import torch
 from sglang.srt.managers import deepseek_eplb
-from sglang.srt.managers.expert_distribution import (
-    compute_gpu_physical_count,
-    compute_utilization_rate,
-)
 from sglang.srt.managers.expert_location import (
     ExpertLocationMetadata,
     ModelConfigForExpertLocation,
@@ -220,25 +216,6 @@ def simulate_execution(
         # print(f"hi {physical_count_of_batch=}")
     else:
         physical_count_of_batch = logical_count_of_batch
-
-    gpu_physical_count_of_batch = compute_gpu_physical_count(
-        physical_count_of_whatever=physical_count_of_batch,
-        num_gpu=server_args.tp_size,
-    )
-    # print(f"hi {gpu_physical_count_of_batch=}")
-
-    utilization_rate = compute_utilization_rate(
-        gpu_physical_count_of_batch=gpu_physical_count_of_batch,
-    )
-    # print(f"hi {utilization_rate=}")
-
-    # NOTE: first 3 layers are MLP, thus those parts are not meaningful
-    mean_utilization_rate = torch.mean(utilization_rate).item()
-
-    return dict(
-        mean_utilization_rate=mean_utilization_rate,
-        num_simulated_batches=logical_count_of_batch.shape[0],
-    )
 
 
 def simulate_batching(
