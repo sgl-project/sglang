@@ -43,6 +43,12 @@ def _simulate_scheduled_tokens_given_seq_metadata_prefill(df_metadata: pl.DataFr
 def _simulate_scheduled_tokens_given_seq_metadata_decode(df_metadata: pl.DataFrame):
     pack_indices_of_step = torch.full((num_steps, batch_size), -1, dtype=torch.int32)
     curr_lens = torch.zeros((batch_size,), dtype=torch.int32)
+    for row in df_metadata.iter_rows(named=True):
+        chosen_location = torch.argmin(curr_lens).item()
+        output_slice = slice(curr_lens[chosen_location], curr_lens[chosen_location] + TODO)
+        pack_indices_of_step[output_slice, chosen_location] = list(
+            range(row["pack_output_start_index"], row["end_index"]))
+        TODO
     return TODO
 
 
