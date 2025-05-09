@@ -4,8 +4,15 @@ from torch.utils._pytree import tree_map
 
 class WrapperTensor(torch.Tensor):
     @classmethod
+    @torch._dynamo.disable
     def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
-        return func(*tree_map(cls.unwrap, args), **tree_map(cls.unwrap, kwargs))
+        def unwrap(x: torch.Tensor):
+            if isinstance(x, cls):
+                return x._unwrap_impl()
+            else:
+                return x
+
+        return func(*tree_map(unwrap, args), **tree_map(unwrap, kwargs))
 
     def __repr__(self, *args, **kwargs):
         return "WrapperTensor:" + self._unwrap_impl().__repr__(*args, **kwargs)
@@ -13,12 +20,8 @@ class WrapperTensor(torch.Tensor):
     def __str__(self):
         return "WrapperTensor:" + str(self._unwrap_impl())
 
-    @classmethod
-    def unwrap(cls, x: torch.Tensor):
-        if isinstance(x, cls):
-            return x._unwrap_impl()
-        else:
-            return x
+    def data_ptr(self):
+        return self._unwrap_impl().data_ptr()
 
     def _unwrap_impl(self):
         raise NotImplementedError
@@ -26,6 +29,7 @@ class WrapperTensor(torch.Tensor):
 
 class DisposableTensor(WrapperTensor):
     @staticmethod
+    @torch._dynamo.disable
     def __new__(cls, inner: torch.Tensor):
         r = torch.Tensor._make_wrapper_subclass(
             cls,
@@ -50,6 +54,7 @@ class DisposableTensor(WrapperTensor):
 
 class LazyTensor(WrapperTensor):
     @staticmethod
+    @torch._dynamo.disable
     def __new__(cls, *args, **kwargs):
         r = torch.Tensor._make_wrapper_subclass(cls, *args, **kwargs)
         r._create_args = args

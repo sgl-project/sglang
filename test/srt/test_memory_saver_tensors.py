@@ -45,17 +45,33 @@ class TestMemorySaverTensors(unittest.TestCase):
         self._common_test_operations(x)
 
     def _common_test_operations(self, x: torch.Tensor):
-        print(f"common_test {type(x)=} {x=}")
-        self.assertEqual(torch.max(x).item(), 5.0)
-        self.assertTrue(torch.allclose(x + torch.tensor([2.0, 2.0, 2.0], device=_DEVICE),
-                                       torch.tensor([5.0, 6.0, 7.0], device=_DEVICE)))
-        self.assertTrue(torch.allclose(_add_by_triton(x, torch.tensor([2.0, 2.0, 2.0], device=_DEVICE)),
-                                       torch.tensor([5.0, 6.0, 7.0], device=_DEVICE)))
-        self.assertEqual(torch.empty_like(x).shape, (3,))
-        self.assertTrue(torch.allclose(torch.full_like(x, 42), torch.tensor([42.0, 42.0, 42.0], device=_DEVICE)))
-        self.assertTrue(x.is_contiguous())
-        self.assertEqual(x.numel(), 3)
-        self.assertEqual(x.shape, (3,))
+        output = self._common_test_operations_execute(x)
+        self._common_test_operations_verify(output)
+
+        output = torch.compile(self._common_test_operations_execute, fullgraph=True)(x)
+        self._common_test_operations_verify(output)
+
+    def _common_test_operations_execute(self, x: torch.Tensor):
+        return dict(
+            max=torch.max(x).item(),
+            sum=x + torch.tensor([2.0, 2.0, 2.0], device=_DEVICE),
+            sum_triton=_add_by_triton(x, torch.tensor([2.0, 2.0, 2.0], device=_DEVICE)),
+            empty_like_shape=torch.empty_like(x).shape,
+            full_like=torch.full_like(x, 42),
+            is_contiguous=x.is_contiguous(),
+            numel=x.numel(),
+            shape=x.shape,
+        )
+
+    def _common_test_operations_verify(self, output):
+        self.assertEqual(output["max"], 5.0)
+        self.assertTrue(torch.allclose(output["sum"], torch.tensor([5.0, 6.0, 7.0], device=_DEVICE)))
+        self.assertTrue(torch.allclose(output["sum_triton"], torch.tensor([5.0, 6.0, 7.0], device=_DEVICE)))
+        self.assertEqual(output["empty_like_shape"], (3,))
+        self.assertTrue(torch.allclose(output["full_like"], torch.tensor([42.0, 42.0, 42.0], device=_DEVICE)))
+        self.assertTrue(output["is_contiguous"])
+        self.assertEqual(output["numel"], 3)
+        self.assertEqual(output["shape"], (3,))
 
 
 def _add_by_triton(x: torch.Tensor, y: torch.Tensor):
@@ -63,7 +79,7 @@ def _add_by_triton(x: torch.Tensor, y: torch.Tensor):
     assert x.device == _DEVICE and y.device == _DEVICE and output.device == _DEVICE
     n_elements = output.numel()
     grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
-    _add_kernel[grid](WrapperTensor.unwrap(x), WrapperTensor.unwrap(y), output, n_elements, BLOCK_SIZE=1024)
+    _add_kernel[grid](x, y, output, n_elements, BLOCK_SIZE=1024)
     return output
 
 
