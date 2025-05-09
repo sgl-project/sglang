@@ -12,11 +12,14 @@ from sglang.srt.managers.expert_distribution import (
 from sglang.srt.managers.expert_location import ExpertLocationMetadata
 
 
-def _compute_logical_count_of_batch():
+def _compute_logical_count_of_batch(
+):
     TODO
 
 
-def _simulate_scheduled_tokens_given_pack():
+def _simulate_scheduled_tokens_given_seq_metadata(
+    df_metadata: pl.DataFrame,
+):
     TODO
 
 

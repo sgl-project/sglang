@@ -19,7 +19,7 @@ class ExpertDistributionModeDetailPerTokenAndBenchServingPack:
 
 def read_expert_distribution_mode_detail_per_token_and_bench_serving(dir_data):
     pack_expert_distribution = read_expert_distribution_mode_detail_per_token(dir_data)
-    df_bench_serving = read_bench_serving(_single(Path(dir_data).glob("*.jsonl")))
+    df_bench_serving = read_bench_serving(_single(list(Path(dir_data).glob("*.jsonl"))))
 
     df = df_bench_serving.join(pack_expert_distribution["df_metadata"], on="rid", how="inner")
 
