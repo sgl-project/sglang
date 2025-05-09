@@ -112,15 +112,14 @@ class TestOpenAIServer(CustomTestCase):
 
         if return_hidden_states:
             hidden_states = response.choices[0].hidden_states
-            assert hidden_states is not None, "hidden_states is not returned"
+            assert hidden_states is not None, "hidden_states was none"
             hidden_states = np.asarray(hidden_states[1:])
             assert (
                 len(hidden_states.shape) == 2
             ), f"hidden_states shape is not correct, was {hidden_states.shape}"
         else:
-            hidden_states = response.choices[0].hidden_states
-            assert (
-                hidden_states is None
+            assert not hasattr(
+                response.choices[0], "hidden_states"
             ), "hidden_states was returned and should not have been"
 
     def run_completion_stream(
@@ -275,9 +274,8 @@ class TestOpenAIServer(CustomTestCase):
                 len(hidden_states.shape) == 2
             ), f"hidden_states shape is not correct, was {hidden_states.shape}"
         else:
-            hidden_states = response.choices[0].hidden_states
-            assert (
-                hidden_states is None
+            assert not hasattr(
+                response.choices[0], "hidden_states"
             ), "hidden_states was returned and should not have been"
 
     def run_chat_completion_stream(
@@ -310,7 +308,7 @@ class TestOpenAIServer(CustomTestCase):
                 assert usage.total_tokens > 0, f"usage.total_tokens was zero"
                 continue
 
-            if response.choices[0].delta.hidden_states is not None:
+            if hasattr(response.choices[0].delta, "hidden_states"):
                 hidden_states = response.choices[0].delta.hidden_states
                 continue
 
