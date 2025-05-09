@@ -1413,7 +1413,6 @@ def v1_chat_generate_response(
                         "total_tokens": ret[i]["meta_info"]["prompt_tokens"]
                         + ret[i]["meta_info"]["completion_tokens"],
                     },
-                    "hidden_states": choice.hidden_states,
                     "system_fingerprint": None,
                 },
             }
