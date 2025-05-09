@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from typing import List, Any
 
 import einops
 import polars as pl
@@ -165,6 +166,6 @@ def _rid_str_to_int64(rid: str):
     return int(rid, 16) & ((1 << 64) - 1)
 
 
-def _single(arr: List):
+def _single(arr: List[Any]):
     assert len(arr) == 1, f"{len(arr)=}"
     return arr[0]
