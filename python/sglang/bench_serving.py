@@ -1272,6 +1272,7 @@ async def benchmark(
     enable_expert_distribution_record: bool = False,
     pd_seperated: bool = False,
     flush_cache: bool = False,
+    tokenizer_id: Optional[str] = None,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -1518,6 +1519,7 @@ async def benchmark(
             "random_input_len": args.random_input_len,
             "random_output_len": args.random_output_len,
             "random_range_ratio": args.random_range_ratio,
+            "tokenizer_id": tokenizer_id,
             # Results
             "duration": benchmark_duration,
             "completed": metrics.completed,
@@ -1732,6 +1734,7 @@ def run_benchmark(args_: argparse.Namespace):
             enable_expert_distribution_record=args.enable_expert_distribution_record,
             pd_seperated=args.pd_seperated,
             flush_cache=args.flush_cache,
+            tokenizer_id=tokenizer_id,
         )
     )
 
