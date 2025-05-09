@@ -13,8 +13,11 @@ class _WrapperTensor(torch.Tensor):
 
         return func(*tree_map(unwrap, args), **tree_map(unwrap, kwargs))
 
-    def tolist(self):
-        return self._unwrap().tolist()
+    def __repr__(self):
+        return "WrapperTensor:" + repr(self._unwrap())
+
+    def __str__(self):
+        return "WrapperTensor:" + str(self._unwrap())
 
     def _unwrap(self):
         raise NotImplementedError
