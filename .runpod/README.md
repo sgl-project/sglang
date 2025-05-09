@@ -2,6 +2,12 @@
 
 🚀 | SGLang is fast serving framework for large language models and vision language models.
 
+---
+
+[![RunPod](https://api.runpod.io/badge/timpietrusky/sglang)](https://www.runpod.io/console/hub/timpietrusky/sglang)
+
+---
+
 ## SGLang Server Configuration
 
 When launching an endpoint, you can configure the SGLang server using environment variables. These variables allow you to customize various aspects of the server's behavior without modifying the code.
