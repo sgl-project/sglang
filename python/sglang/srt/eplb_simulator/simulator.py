@@ -14,7 +14,10 @@ def simulate_execution_given_logical_count_of_batch(
     logical_count_of_batch: torch.Tensor,
     server_args: MyServerArgs,
 ):
-    TODO
+    physical_count_of_batch = simulate_physical_count_of_batch(
+        logical_count_of_batch=logical_count_of_batch,
+        server_args=server_args,
+    )
 
     gpu_physical_count_of_batch = compute_gpu_physical_count(
         physical_count_of_whatever=physical_count_of_batch,
@@ -36,7 +39,7 @@ def simulate_execution_given_logical_count_of_batch(
     )
 
 
-def compute_physical_count_of_batch(
+def simulate_physical_count_of_batch(
     logical_count_of_batch: torch.Tensor,
     server_args: MyServerArgs,
     model_config_for_expert_location=MY_MODEL_CONFIG_FOR_EXPERT_LOCATION,
