@@ -151,7 +151,10 @@ typename T::Fmha::Arguments args_from_options(
        page_size},
       {static_cast<ElementOut*>(out.data_ptr()), stride_O, static_cast<ElementAcc*>(nullptr), stride_LSE},
       hw_info,
-      -1,       // split_kv
+      // TODO(trevor-m): Change split_kv back to -1 when
+      // https://github.com/NVIDIA/cutlass/issues/2274 is fixed. Split_kv=1 will
+      // perform worse with larger context length and smaller batch sizes.
+      1,       // split_kv
       nullptr,  // is_var_split_kv
   };
   // TODO(kaixih@nvidia): When split_kv=-1 and is_var_split_kv=false, we compute
