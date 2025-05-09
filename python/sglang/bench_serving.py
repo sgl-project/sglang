@@ -1198,21 +1198,29 @@ def wrap_multi_round_request_func(request_func: Callable, tokenizer) -> Callable
         gen_prompt: str,
     ):
         assert len(history_user_texts) == len(history_assistant_texts)
-        conversations = []
+        history_conversations = []
         for i in range(len(history_assistant_texts)):
-            conversations += [
+            history_conversations += [
                 {"role": "user", "content": history_user_texts[i]},
                 {"role": "assistant", "content": history_assistant_texts[i]},
             ]
-        conversations.append({"role": "user", "content": gen_prompt})
 
-        output_text = tokenizer.apply_chat_template(
-            conversations,
+        full_conversations = [
+            *history_conversations,
+            {"role": "user", "content": gen_prompt},
+        ]
+
+        history_text = tokenizer.apply_chat_template(
+            history_conversations,
+            add_generation_prompt=False,
+            tokenize=False,
+        ).replace(tokenizer.bos_token, "")
+        full_text = tokenizer.apply_chat_template(
+            history_conversations,
             add_generation_prompt=True,
             tokenize=False,
-        )
-        output_text = output_text.replace(tokenizer.bos_token, "")
-        return output_text
+        ).replace(tokenizer.bos_token, "")
+        return history_text, full_text
 
     async def f(
         request_func_input: RequestFuncInput,
@@ -1221,12 +1229,12 @@ def wrap_multi_round_request_func(request_func: Callable, tokenizer) -> Callable
         prompts: List[str] = request_func_input.prompt
         outputs = []
         for i in range(len(prompts)):
+            history_text, full_prompt = compute_inner_input_prompt(history_user_texts=prompts[:i],
+                                                                   history_assistant_texts=[o.generated_text for o in
+                                                                                            outputs],
+                                                                   gen_prompt=prompts[i], )
             inner_input = RequestFuncInput(
-                prompt=compute_inner_input_prompt(
-                    history_user_texts=prompts[:i],
-                    history_assistant_texts=[o.generated_text for o in outputs],
-                    gen_prompt=prompts[i],
-                ),
+                prompt=full_prompt,
                 model=request_func_input.model,
                 api_url=request_func_input.api_url,
                 prompt_len=request_func_input.prompt_len,
@@ -1239,6 +1247,7 @@ def wrap_multi_round_request_func(request_func: Callable, tokenizer) -> Callable
             )
             output.metadata["multi_round_index"] = i
             output.metadata["multi_round_len"] = len(prompts)
+            output.metadata["history_text"] = history_text
             outputs.append(output)
         return outputs
 
