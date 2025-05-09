@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import List
 
 import torch
 from sglang.srt.eplb_simulator.configs import MyServerArgs, MY_MODEL_CONFIG_FOR_EXPERT_LOCATION
@@ -14,7 +15,7 @@ def simulate_execution_given_logical_count_of_batch(
     logical_count_of_batch: torch.Tensor,
     server_args: MyServerArgs,
 ):
-    physical_count_of_batch = simulate_physical_count_of_batch(
+    physical_count_of_batch = _simulate_physical_count_of_batch(
         logical_count_of_batch=logical_count_of_batch,
         server_args=server_args,
     )
@@ -39,7 +40,7 @@ def simulate_execution_given_logical_count_of_batch(
     )
 
 
-def simulate_physical_count_of_batch(
+def _simulate_physical_count_of_batch(
     logical_count_of_batch: torch.Tensor,
     server_args: MyServerArgs,
     model_config_for_expert_location=MY_MODEL_CONFIG_FOR_EXPERT_LOCATION,
@@ -61,7 +62,7 @@ def simulate_physical_count_of_batch(
             logical_count=eplb_input_logical_count,
             num_physical_experts=num_physical_expert,
         )
-        return simulate_logical_to_physical_by_random_dispatching(
+        return _simulate_logical_to_physical_by_random_dispatching(
             logical_count_of_whatever=logical_count_of_batch,
             logical_to_all_physical_map=expert_location_metadata.logical_to_all_physical_map,
             num_physical_expert=num_physical_expert,
@@ -70,7 +71,11 @@ def simulate_physical_count_of_batch(
         return logical_count_of_batch
 
 
-def simulate_logical_to_physical_by_random_dispatching(
+def _simulate_expert_location_metadata() -> List["MyExpertLocationMetadata"]:
+    return TODO
+
+
+def _simulate_logical_to_physical_by_random_dispatching(
     logical_count_of_whatever: torch.Tensor,  # (..., num_layer, num_logical_expert)
     logical_to_all_physical_map: torch.Tensor,  # (num_layer, num_logical_experts, X)
     num_physical_expert: int,
