@@ -1054,6 +1054,7 @@ class DeepEPMoE(EPMoE):
             m_indices,
             output_index,
         )
+        hidden_states_fp8.set_(torch.empty((0,), device=hidden_states_fp8.device))
 
         gateup_output = torch.empty(
             (all_tokens, N),
