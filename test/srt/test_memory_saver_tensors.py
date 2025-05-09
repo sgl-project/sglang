@@ -6,8 +6,7 @@ import triton
 import triton.language as tl
 from sglang.srt.memory_saver_tensors import DisposableTensor, LazyTensor
 
-_DEVICE = "cuda"
-_TRITON_DEVICE = triton.runtime.driver.active.get_active_torch_device()
+_DEVICE = torch.device("cuda:0")
 
 
 class TestMemorySaverTensors(unittest.TestCase):
@@ -60,7 +59,7 @@ class TestMemorySaverTensors(unittest.TestCase):
 
 def _add_by_triton(x: torch.Tensor, y: torch.Tensor):
     output = torch.empty_like(x)
-    assert x.device == _TRITON_DEVICE and y.device == _TRITON_DEVICE and output.device == _TRITON_DEVICE
+    assert x.device == _DEVICE and y.device == _DEVICE and output.device == _DEVICE
     n_elements = output.numel()
     grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
     _add_kernel[grid](x, y, output, n_elements, BLOCK_SIZE=1024)
