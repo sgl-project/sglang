@@ -12,7 +12,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.python.sglang.srt.layers.moe.fused_moe_triton.fused_moe_int4 import (
+from sglang.srt.layers.moe.fused_moe_triton.fused_moe_int4 import (
     fused_moe_kernel_gptq_awq,
 )
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe_config import (
