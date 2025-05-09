@@ -47,8 +47,14 @@ def read_expert_distribution_mode_detail_per_token(dir_data):
 
     def _compute_df_metadata(pack):
         rids_raw = pack["rids"]
+
         pack_start_index = [0] + (1 + torch.argwhere(rids_raw[1:] != rids_raw[:-1])[:, 0]).tolist()
         pack_end_index = pack_start_index[1:] + [len(rids_raw)]
+        all_ids = [
+            pack["input_ids"][start_index:end_index]
+            for start_index, end_index in zip(pack_start_index, pack_end_index, strict=True)
+        ]
+
         df = pl.DataFrame(dict(
             rid=rid,
             all_ids=all_ids,
