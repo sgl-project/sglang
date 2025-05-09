@@ -378,7 +378,6 @@ class DefaultModelLoader(BaseModelLoader):
             model.load_weights(self._get_all_weights(model_config, model))
             for _, module in model.named_modules():
                 quant_method = getattr(module, "quant_method", None)
-                # print(f"quant_method: {quant_method}")
                 if quant_method is not None:
                     # When quant methods need to process weights after loading
                     # (for repacking, quantizing, etc), they expect parameters
