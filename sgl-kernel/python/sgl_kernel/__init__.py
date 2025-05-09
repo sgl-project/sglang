@@ -62,6 +62,10 @@ from sgl_kernel.speculative import (
     tree_speculative_sampling_target_only,
     verify_tree_greedy,
 )
+from sgl_kernel.flashmla import (
+    flash_mla_with_kvcache,
+    get_mla_metadata,
+)
 from sgl_kernel.version import __version__
 
 build_tree_kernel = (

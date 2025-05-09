@@ -307,6 +307,25 @@ void top_p_sampling_from_probs(
     bool deterministic,
     std::optional<at::Generator> gen);
 
+/*
+ * From FlashMLA
+ */
+std::tuple<at::Tensor, at::Tensor> flash_mla_with_kvcache(
+    at::Tensor q,
+    at::Tensor kv_cache,
+    at::Tensor block_table,
+    at::Tensor cache_seqlens,
+    int dv,
+    at::Tensor tile_scheduler_metadata,
+    at::Tensor num_splits,
+    double softmax_scale,
+    bool causal);
+
+std::tuple<at::Tensor, at::Tensor> get_metadata(
+    at::Tensor cache_seqlens,
+    int q_heads_per_kv_head,
+    int num_kv_heads);
+
 namespace flash {
 /*
  * From fa2 sparse

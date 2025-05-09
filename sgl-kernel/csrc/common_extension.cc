@@ -268,7 +268,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
    */
   m.def(
       "flash_mla_with_kvcache(Tensor q, Tensor kv_cache, Tensor block_table, Tensor cache_seqlens, int dv, "
-      "Tensor tile_scheduler_metadata, Tensor num_splits, bool causal) -> (Tensor, Tensor)");
+      "Tensor tile_scheduler_metadata, Tensor num_splits, float softmax_scale, bool causal) -> (Tensor, Tensor)");
   m.impl("flash_mla_with_kvcache", torch::kCUDA, &flash_mla_with_kvcache);
   
   m.def(
