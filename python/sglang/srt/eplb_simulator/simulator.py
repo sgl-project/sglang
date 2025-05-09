@@ -1,7 +1,8 @@
 from dataclasses import dataclass
-from typing import List
+from typing import List, Union, Literal
 
 import einops
+import polars as pl
 import torch
 from sglang.srt.eplb_simulator.configs import MyServerArgs, MY_MODEL_CONFIG_FOR_EXPERT_LOCATION
 from sglang.srt.managers import deepseek_eplb
@@ -19,6 +20,7 @@ def _compute_logical_count_of_batch(
 
 def _simulate_scheduled_tokens_given_seq_metadata(
     df_metadata: pl.DataFrame,
+    phase: Union[Literal["prefill", "decode"]],
 ):
     TODO
 
