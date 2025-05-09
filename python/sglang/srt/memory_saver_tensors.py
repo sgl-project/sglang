@@ -18,7 +18,7 @@ class _WrapperTensor(torch.Tensor):
 
 
 class DisposableTensor(_WrapperTensor):
-    @classmethod
+    @staticmethod
     def __new__(cls, inner: torch.Tensor):
         r = torch.Tensor._make_wrapper_subclass(
             cls,
@@ -42,7 +42,7 @@ class DisposableTensor(_WrapperTensor):
 
 
 class LazyTensor(_WrapperTensor):
-    @classmethod
+    @staticmethod
     def __new__(cls, *args, **kwargs):
         r = torch.Tensor._make_wrapper_subclass(cls, *args, **kwargs)
         r._create_args = args
