@@ -15,7 +15,7 @@ def read_expert_distribution_mode_detail_per_token(dir_data):
     """
 
     def _handle_record(record):
-        rids_raw = torch.tensor([int(rid, 16) & ((1 << 64) - 1) for rid in record["rids"]])
+        rids_raw = torch.tensor([_rid_str_to_int64(rid) for rid in record["rids"]])
         input_ids = record["input_ids"]
         extend_seq_lens = torch.tensor(record["extend_seq_lens"])
         forward_mode = record["forward_mode"]
@@ -77,7 +77,7 @@ def read_expert_distribution_mode_detail_per_token(dir_data):
 def read_bench_serving(path: Path):
     data_raw = json.loads(path.read_text())
     df = pl.DataFrame(dict(
-        rid=[x["rid"] for x in data_raw["output_metadata"]],
+        rid=[_rid_str_to_int64(x["rid"]) for x in data_raw["output_metadata"]],
         input_text=data_raw["prompts"],
         output_text=data_raw["generated_texts"],
         history_text=[x["history_text"] for x in data_raw["output_metadata"]],
@@ -114,3 +114,7 @@ def _unnest(schema, path):
             yield from _unnest(dtype.to_schema(), path + [name])
         else:
             yield path + [name], dtype
+
+
+def _rid_str_to_int64(rid: str):
+    return int(rid, 16) & ((1 << 64) - 1)
