@@ -74,8 +74,14 @@ def read_expert_distribution_mode_detail_per_token(dir_data):
     return pack
 
 
-def read_bench_serving_output(path: Path):
-    df = pl.DataFrame(json.loads(path.read_text()))
+def read_bench_serving(path: Path):
+    data_raw = json.loads(path.read_text())
+    df = pl.DataFrame(dict(
+        rid=[x["rid"] for x in data_raw["output_metadata"]],
+        input_text=data_raw["prompts"],
+        output_text=data_raw["generated_texts"],
+        history_text=[x["history_text"] for x in data_raw["output_metadata"]],
+    ))
     df = unnest_all(df, separator="/")
     return df
 
