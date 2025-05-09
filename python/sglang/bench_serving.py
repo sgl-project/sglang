@@ -611,6 +611,132 @@ def download_and_cache_file(url: str, filename: Optional[str] = None):
     return filename
 
 
+@dataclass
+class DatasetRow:
+    prompt: str
+    prompt_len: int
+    output_len: int
+
+
+def sample_mmmu_requests(
+    num_requests: int,
+    tokenizer: PreTrainedTokenizerBase,
+    fixed_output_len: Optional[int] = None,
+    random_sample: bool = True,
+) -> List[DatasetRow]:
+    """
+    Sample requests from the MMMU dataset using HuggingFace datasets.
+
+    Args:
+        num_requests: Number of requests to sample.
+        tokenizer: Tokenizer to use for token counting.
+        fixed_output_len: If provided, use this fixed output length for all requests.
+        random_sample: Whether to randomly sample or take the first N.
+
+    Returns:
+        List of tuples (prompt, prompt_token_len, output_token_len).
+    """
+    try:
+        import base64
+        import io
+
+        from datasets import load_dataset
+    except ImportError:
+        raise ImportError("Please install datasets: pip install datasets")
+
+    print("Loading MMMU dataset from HuggingFace...")
+
+    try:
+        print("Attempting to load MMMU Math dataset...")
+        mmmu_dataset = load_dataset("MMMU/MMMU", "Math", split="test")
+        print(
+            f"Successfully loaded MMMU Math dataset from HuggingFace with {len(mmmu_dataset)} examples"
+        )
+    except Exception as e:
+        print(f"Failed to load MMMU Math dataset: {e}")
+        raise ValueError(f"Failed to load MMMU dataset: {e}")
+
+    # Sample from the dataset
+    if len(mmmu_dataset) > num_requests:
+        if random_sample:
+            # Random sample
+            indices = random.sample(range(len(mmmu_dataset)), num_requests)
+            sample_dataset = mmmu_dataset.select(indices)
+        else:
+            # Take first N
+            sample_dataset = mmmu_dataset.select(
+                range(min(num_requests, len(mmmu_dataset)))
+            )
+    else:
+        print(f"Dataset has less than {num_requests} examples, using all examples")
+        sample_dataset = mmmu_dataset
+
+    print(f"Selected {len(sample_dataset)} examples for benchmarking")
+
+    # Create prompts
+    filtered_dataset = []
+
+    for i, example in enumerate(sample_dataset):
+        try:
+            # Extract image_1
+            image = example.get("image_1")
+
+            if image is not None:
+                if hasattr(image, "save"):
+                    # Convert RGBA images to RGB before encoding
+                    if image.mode == "RGBA":
+                        image = image.convert("RGB")
+
+                    # Encode image to base64
+                    buffered = io.BytesIO()
+                    image.save(buffered, format="JPEG")
+                    img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
+                    image_path = f"data:image/jpeg;base64,{img_str}"
+                else:
+                    continue
+
+                # Extract the question
+                question = example.get("question")
+
+                # Create the prompt with image, question
+                prompt = f"Question: {question}\n\nAnswer: "
+                prompt = tokenizer.apply_chat_template(
+                    [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "image_url", "image_url": {"url": image_path}},
+                                {"type": "text", "text": prompt},
+                            ],
+                        }
+                    ],
+                    add_generation_prompt=True,
+                    tokenize=False,
+                )
+                prompt = f"<image>{image_path}</image>{prompt}"
+
+                # Calculate token lengths
+                # Note: This is approximate since we're not rendering the actual image tokens
+                prompt_token_ids = tokenizer.encode(prompt)
+                prompt_len = (
+                    len(prompt_token_ids) + 512
+                )  # Add estimate for image tokens
+
+                output_len = fixed_output_len if fixed_output_len is not None else 256
+
+                filtered_dataset.append(
+                    DatasetRow(
+                        prompt=prompt, prompt_len=prompt_len, output_len=output_len
+                    )
+                )
+
+        except Exception as e:
+            print(f"Error processing example {i}: {e}")
+
+    print(f"\nCreated {len(filtered_dataset)} MMMU prompts")
+    return filtered_dataset
+
+
 def sample_sharegpt_requests(
     dataset_path: str,
     num_requests: int,
@@ -619,7 +745,7 @@ def sample_sharegpt_requests(
     context_len: Optional[int] = None,
     prompt_suffix: Optional[str] = "",
     apply_chat_template=False,
-) -> List[Tuple[str, int, int]]:
+) -> List[DatasetRow]:
     if fixed_output_len is not None and fixed_output_len < 4:
         print("Warn: output_len too small")
 
@@ -650,7 +776,7 @@ def sample_sharegpt_requests(
     random.shuffle(dataset)
 
     # Filter out sequences that are too long or too short
-    filtered_dataset: List[Tuple[str, int, int]] = []
+    filtered_dataset: List[DatasetRow] = []
     for i in range(len(dataset)):
         if len(filtered_dataset) == num_requests:
             break
@@ -688,7 +814,9 @@ def sample_sharegpt_requests(
             # Prune too long sequences.
             continue
 
-        filtered_dataset.append((prompt, prompt_len, output_len))
+        filtered_dataset.append(
+            DatasetRow(prompt=prompt, prompt_len=prompt_len, output_len=output_len)
+        )
 
     print(f"#Input tokens: {np.sum([x[1] for x in filtered_dataset])}")
     print(f"#Output tokens: {np.sum([x[2] for x in filtered_dataset])}")
@@ -704,7 +832,7 @@ def sample_random_requests(
     dataset_path: str,
     random_sample: bool = True,
     return_text: bool = True,
-) -> List[Tuple[str, int, int]]:
+) -> List[DatasetRow]:
     input_lens = np.random.randint(
         max(int(input_len * range_ratio), 1),
         input_len + 1,
@@ -744,7 +872,7 @@ def sample_random_requests(
         random.shuffle(dataset)
 
         # Filter out sequences that are too long or too short
-        input_requests: List[Tuple[str, int, int]] = []
+        input_requests: List[DatasetRow] = []
         for data in dataset:
             i = len(input_requests)
             if i == num_prompts:
@@ -764,25 +892,33 @@ def sample_random_requests(
             else:
                 ratio = (input_lens[i] + prompt_len - 1) // prompt_len
                 input_ids = (prompt_token_ids * ratio)[: input_lens[i]]
-            input_content = input_ids
-            if return_text:
-                input_content = tokenizer.decode(input_content)
+            # TODO return_text is not handled
+            prompt = tokenizer.decode(input_ids)
             input_requests.append(
-                (input_content, int(input_lens[i]), int(output_lens[i]))
+                DatasetRow(
+                    prompt=prompt,
+                    prompt_len=int(input_lens[i]),
+                    output_len=int(output_lens[i]),
+                )
             )
     else:
         # Sample token ids from random integers. This can cause some NaN issues.
         offsets = np.random.randint(0, tokenizer.vocab_size, size=num_prompts)
         input_requests = []
         for i in range(num_prompts):
-            input_content = [
-                (offsets[i] + i + j) % tokenizer.vocab_size
-                for j in range(input_lens[i])
-            ]
-            if return_text:
-                input_content = tokenizer.decode(input_content)
+            # TODO return_text is not handled
+            prompt = tokenizer.decode(
+                [
+                    (offsets[i] + i + j) % tokenizer.vocab_size
+                    for j in range(input_lens[i])
+                ]
+            )
             input_requests.append(
-                (input_content, int(input_lens[i]), int(output_lens[i]))
+                DatasetRow(
+                    prompt=prompt,
+                    prompt_len=int(input_lens[i]),
+                    output_len=int(output_lens[i]),
+                )
             )
 
     print(f"#Input tokens: {np.sum(input_lens)}")
@@ -818,7 +954,7 @@ def sample_generated_shared_prefix_requests(
     output_len: int,
     tokenizer: PreTrainedTokenizerBase,
     args: argparse.Namespace,
-) -> List[Tuple[str, int, int]]:
+) -> List[DatasetRow]:
     """Generate benchmark requests with shared system prompts using random tokens and caching."""
     cache_path = get_gen_prefix_cache_path(args, tokenizer)
 
@@ -856,7 +992,11 @@ def sample_generated_shared_prefix_requests(
             full_prompt = f"{system_prompt}\n\n{question}"
             prompt_len = len(tokenizer.encode(full_prompt))
 
-            input_requests.append((full_prompt, prompt_len, output_len))
+            input_requests.append(
+                DatasetRow(
+                    prompt=full_prompt, prompt_len=prompt_len, output_len=output_len
+                )
+            )
             total_input_tokens += prompt_len
             total_output_tokens += output_len
 
@@ -943,9 +1083,9 @@ def sample_hf_dataset_requests(
 
 
 async def get_request(
-    input_requests: List[Tuple[str, int, int]],
+    input_requests: List[DatasetRow],
     request_rate: float,
-) -> AsyncGenerator[Tuple[str, int, int], None]:
+) -> AsyncGenerator[DatasetRow, None]:
     input_requests = iter(input_requests)
     for request in input_requests:
         yield request
@@ -1100,7 +1240,7 @@ async def benchmark(
     base_url: str,
     model_id: str,
     tokenizer: PreTrainedTokenizerBase,
-    input_requests: List[Tuple[str, int, int]],
+    input_requests: List[DatasetRow],
     request_rate: float,
     max_concurrency: Optional[int],
     disable_tqdm: bool,
@@ -1137,8 +1277,13 @@ async def benchmark(
     print(f"Starting warmup with {args.warmup_requests} sequences...")
 
     # Use the first request for all warmup iterations
-    test_prompt, test_prompt_len, test_output_len = input_requests[0]
-    if lora_names != None and len(lora_names) != 0:
+    test_request = input_requests[0]
+    test_prompt, test_prompt_len, test_output_len = (
+        test_request.prompt,
+        test_request.prompt_len,
+        test_request.output_len,
+    )
+    if lora_names is not None and len(lora_names) != 0:
         lora_name = lora_names[0]
     else:
         lora_name = None
@@ -1203,8 +1348,12 @@ async def benchmark(
     benchmark_start_time = time.perf_counter()
     tasks: List[asyncio.Task] = []
     async for request in get_request(input_requests, request_rate):
-        prompt, prompt_len, output_len = request
-        if lora_names != None and len(lora_names) != 0:
+        prompt, prompt_len, output_len = (
+            request.prompt,
+            request.prompt_len,
+            request.output_len,
+        )
+        if lora_names is not None and len(lora_names) != 0:
             idx = random.randint(0, len(lora_names) - 1)
             lora_name = lora_names[idx]
         else:
