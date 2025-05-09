@@ -3,7 +3,7 @@ import unittest
 import torch
 import triton
 import triton.language as tl
-from python.sglang.srt.memory_saver_tensors import DisposableTensor
+from python.sglang.srt.memory_saver_tensors import DisposableTensor, LazyTensor
 
 _DEVICE = "cuda"
 _TRITON_DEVICE = triton.runtime.driver.active.get_active_torch_device()
@@ -11,12 +11,17 @@ _TRITON_DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
 class TestMemorySaverTensors(unittest.TestCase):
     def test_disposable_tensor(self):
-        self._common_test(DisposableTensor(torch.tensor([3.0, 4.0, 5.0], device=_DEVICE)))
+        x = DisposableTensor(torch.tensor([3.0, 4.0, 5.0], device=_DEVICE))
+        self._common_test(x)
 
     def test_lazy_tensor(self):
-        self._common_test(TODO)
+        x = LazyTensor((3,), device=_DEVICE)
+        x[0] = 3.0
+        x[1:3] = [4.0, 5.0]
+        self._common_test(x)
 
     def _common_test(self, x: torch.Tensor):
+        print(f"common_test {type(x)=} {x=}")
         self.assertEqual(torch.max(x).item(), 5.0)
         self.assertTrue(torch.allclose(x + torch.tensor([2.0, 2.0, 2.0], device=_DEVICE),
                                        torch.tensor([5.0, 6.0, 7.0], device=_DEVICE)))
