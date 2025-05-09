@@ -45,6 +45,7 @@ suites = {
         TestFile("test_input_embeddings.py", 38),
         TestFile("test_json_constrained.py", 98),
         TestFile("test_large_max_new_tokens.py", 41),
+        TestFile("test_memory_saver_tensors.py", 30),
         TestFile("test_metrics.py", 32),
         TestFile("test_mla.py", 242),
         TestFile("test_mla_deepseek_v3.py", 221),
@@ -211,7 +212,7 @@ if __name__ == "__main__":
     if args.auto_partition_size:
         files = auto_partition(files, args.auto_partition_id, args.auto_partition_size)
     else:
-        files = files[args.range_begin : args.range_end]
+        files = files[args.range_begin: args.range_end]
 
     print("The running tests are ", [f.name for f in files])
 
