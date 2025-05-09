@@ -1014,12 +1014,6 @@ class DeepEPMoE(EPMoE):
         N = self.w13_weight.size(1)
         scale_block_size = 128
 
-        gather_out = torch.empty_like(
-            hidden_states_fp8,
-            device=hidden_states_fp8.device,
-            dtype=torch.bfloat16,
-        )
-
         input_tensor = [
             torch.empty(
                 (all_tokens, K),
@@ -1091,6 +1085,11 @@ class DeepEPMoE(EPMoE):
             m_indices,
         )
 
+        gather_out = torch.empty_like(
+            hidden_states_fp8,
+            device=hidden_states_fp8.device,
+            dtype=torch.bfloat16,
+        )
         ep_gather(down_output, topk_idx, topk_weights, output_index, gather_out)
 
         return gather_out
