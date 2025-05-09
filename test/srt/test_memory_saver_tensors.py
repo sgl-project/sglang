@@ -40,7 +40,7 @@ class TestMemorySaverTensors(unittest.TestCase):
     def test_lazy_tensor_operations(self):
         x = LazyTensor((3,), device=_DEVICE)
         x[0] = 3.0
-        x[1:3] = [4.0, 5.0]
+        x[1:3] = torch.tensor([4.0, 5.0], device=_DEVICE)
         self._common_test_operations(x)
 
     def _common_test_operations(self, x: torch.Tensor):
