@@ -387,6 +387,7 @@ async def async_request_sglang_generate(
                             if data["text"]:
                                 timestamp = time.perf_counter()
                                 generated_text = data["text"]
+                                rid = data["meta_info"]["id"]
                                 output_len = data["meta_info"]["completion_tokens"]
 
                                 # First token
@@ -411,6 +412,7 @@ async def async_request_sglang_generate(
                     output.success = True
                     output.latency = latency
                     output.output_len = output_len
+                    output.metadata["rid"] = rid
                 else:
                     output.error = response.reason or ""
                     output.success = False
