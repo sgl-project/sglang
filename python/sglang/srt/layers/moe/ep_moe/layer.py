@@ -882,6 +882,9 @@ class DeepEPMoE(EPMoE):
         reorder_topk_ids: torch.Tensor,
         seg_indptr: torch.Tensor,
     ):
+        hidden_states_dtype = hidden_states.dtype
+        hidden_states_device = hidden_states.device
+
         assert self.quant_method is not None
         assert self.activation == "silu"
         if self.grouped_gemm_runner is None:
@@ -939,14 +942,14 @@ class DeepEPMoE(EPMoE):
             dtype=(
                 self.fp8_dtype
                 if (self.use_fp8_w8a8 and not self.use_block_quant)
-                else hidden_states.dtype
+                else hidden_states_dtype
             ),
         )
         if self.w2_input_scale is None and not self.use_block_quant:
             self.w2_input_scale = torch.ones(
                 self.num_experts_per_partition,
                 dtype=torch.float32,
-                device=hidden_states.device,
+                device=hidden_states_device,
             )
 
         if self.activation == "silu":
@@ -969,8 +972,8 @@ class DeepEPMoE(EPMoE):
         down_output = torch.empty(
             down_input.shape[0],
             self.w2_weight.shape[1],
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
+            device=hidden_states_device,
+            dtype=hidden_states_dtype,
         )
         if down_input.shape[0] > 0:
             down_output = self.grouped_gemm_runner(
