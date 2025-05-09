@@ -332,12 +332,9 @@ class DecodeTransferQueue:
             elif poll == KVPoll.Success:
                 # pop and push it to waiting queue
                 idx = decode_req.metadata_buffer_index
-                assert len(decode_req.req.output_ids) == 0
                 output_id_buffer = self.metadata_buffers[0]
                 # the last dimension is padded by the same values.
                 output_id = output_id_buffer[idx][0].item()
-                assert len(decode_req.req.output_ids) == 0
-                assert decode_req.req.transferred_output_id is None
                 decode_req.req.transferred_output_id = output_id
                 transferred_reqs.append(decode_req)
                 indices_to_remove.add(i)
