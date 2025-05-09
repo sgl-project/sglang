@@ -148,9 +148,7 @@ class DeepEPBuffer:
             # TODO indeed: num_qps_per_rank = max(num_sms // 2, ll_num_experts // num_ranks if test_ll_compatibility else 0)
             num_qps_per_rank = DEEPEP_NUM_SMS // 2
         else:
-            num_qps_per_rank = (
-                num_experts // group.size() if deepep_mode.enable_low_latency() else 1
-            )
+            num_qps_per_rank = max(num_experts // group.size(), Buffer.num_sms // 2)
 
         cls._buffer = Buffer(
             group,
