@@ -43,22 +43,11 @@ def compute_physical_count_of_batch(
             + server_args.ep_num_redundant_experts
         )
 
-        if server_args.init_expert_location == "from_variable":
-            print(
-                f"Compute eplb_input_logical_count from override_eplb_input_logical_count"
-            )
-            eplb_input_logical_count = override_eplb_input_logical_count
-        elif (x := server_args.init_expert_location) is not None:
-            print(f"Compute eplb_input_logical_count from {x}")
-            eplb_input_logical_count = torch.tensor(
-                json.loads(Path(x).read_text())["logical_count"]
-            )
-        else:
-            print(f"Compute eplb_input_logical_count from logical_count_of_seq")
-            eplb_input_logical_count = einops.einsum(
-                logical_count_of_seq,
-                "num_seq num_layer num_expert -> num_layer num_expert",
-            )
+        # TODO
+        eplb_input_logical_count = einops.einsum(
+            logical_count_of_seq,
+            "num_seq num_layer num_expert -> num_layer num_expert",
+        )
 
         expert_location_metadata = MyExpertLocationMetadata.init_by_eplb(
             server_args,
