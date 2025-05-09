@@ -657,6 +657,8 @@ def grouped_gemm_triton(
     if use_fp8_w8a8 and block_shape is None:
         assert scale_a is not None and scale_b is not None
 
+    a_ref = a
+
     if block_shape is not None:
         assert len(block_shape) == 2
         block_n, block_k = block_shape[0], block_shape[1]
@@ -665,6 +667,8 @@ def grouped_gemm_triton(
         assert triton.cdiv(a.shape[-1], block_k) == scale_a.shape[-1]
         assert triton.cdiv(b.shape[-2], block_n) == scale_b.shape[-2]
         assert triton.cdiv(b.shape[-1], block_k) == scale_b.shape[-1]
+
+    a_ref.set_(torch.empty((0,), device=a_ref.device))
 
     # TODO: adjust config or tune kernel
     # Reduce block size to prevent L40 shared memory overflow.
