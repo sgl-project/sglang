@@ -9,6 +9,12 @@ from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 
 
+def read_expert_distribution_mode_detail_per_token_and_bench_serving(dir_data):
+    pack_expert_distribution = read_expert_distribution_mode_detail_per_token(dir_data)
+    df_bench_serving = read_bench_serving(_single(Path(dir_data).glob("*.jsonl")))
+    return TODO
+
+
 def read_expert_distribution_mode_detail_per_token(dir_data):
     """
     Read `expert_distribution_recorder`'s output data when it is in mode `detail_per_token`
@@ -129,3 +135,8 @@ def _unnest(schema, path):
 
 def _rid_str_to_int64(rid: str):
     return int(rid, 16) & ((1 << 64) - 1)
+
+
+def _single(arr: List):
+    assert len(arr) == 1, f"{len(arr)=}"
+    return arr[0]
