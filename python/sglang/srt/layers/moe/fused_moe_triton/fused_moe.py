@@ -39,6 +39,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cuda,
     is_hip,
+    log_info_on_rank0,
 )
 
 _is_hip = is_hip()
