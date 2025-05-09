@@ -14,9 +14,12 @@ from sglang.srt.managers.expert_distribution import (
 )
 from sglang.srt.managers.expert_location import ExpertLocationMetadata
 
+_Phase = Union[Literal["prefill", "decode"]]
+
 
 def simulate_execution_given_pack(
     pack: ExpertDistributionModeDetailPerTokenAndBenchServingPack,
+    phase: str,
     server_args: MyServerArgs,
     assert_physical_equal_logical_expert: bool,
 ):
@@ -45,7 +48,7 @@ def simulate_execution_given_pack(
 
 def _simulate_scheduled_pack_indices_given_seq_metadata(
     df_metadata: pl.DataFrame,
-    phase: Union[Literal["prefill", "decode"]],
+    phase: _Phase,
     num_tokens_in_batch_overall: int,
 ) -> List[torch.Tensor]:
     """
