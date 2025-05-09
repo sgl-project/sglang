@@ -26,7 +26,7 @@ def _simulate_scheduled_tokens_given_seq_metadata(
     if phase == "prefill":
         return _simulate_scheduled_tokens_given_seq_metadata_prefill(df_metadata, chunked_prefill_size=TODO)
     if phase == "decode":
-        return _simulate_scheduled_tokens_given_seq_metadata_decode(df_metadata)
+        return _simulate_scheduled_tokens_given_seq_metadata_decode(df_metadata, batch_size=TODO)
     raise NotImplementedError
 
 
@@ -40,8 +40,9 @@ def _simulate_scheduled_tokens_given_seq_metadata_prefill(df_metadata: pl.DataFr
     return torch.chunk(all_pack_indices, num_chunks)
 
 
-def _simulate_scheduled_tokens_given_seq_metadata_decode(df_metadata: pl.DataFrame):
-    pack_indices_of_step = torch.full((num_steps, batch_size), -1, dtype=torch.int32)
+def _simulate_scheduled_tokens_given_seq_metadata_decode(df_metadata: pl.DataFrame, batch_size: int):
+    num_steps_upper_bound = df_metadata["end_index"].max()
+    pack_indices_of_step = torch.full((num_steps_upper_bound, batch_size), -1, dtype=torch.int32)
     curr_lens = torch.zeros((batch_size,), dtype=torch.int32)
 
     for row in df_metadata.iter_rows(named=True):
