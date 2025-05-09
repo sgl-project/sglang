@@ -125,16 +125,20 @@ class Qwen2_5_VisionBlock(nn.Module):
         self.norm1 = Qwen2RMSNorm(dim, eps=1e-6)
         self.norm2 = Qwen2RMSNorm(dim, eps=1e-6)
         if attn_implementation == "sdpa":
-            use_context_forward = False
             softmax_in_single_precision = False
+            qkv_backend = "sdpa"
             flatten_batch = True
         elif attn_implementation == "flash_attention_2":
             softmax_in_single_precision = False
-            use_context_forward = True
+            qkv_backend = "triton_attn"
             flatten_batch = True
         elif attn_implementation == "eager":
             softmax_in_single_precision = True
-            use_context_forward = False
+            qkv_backend = "sdpa"
+            flatten_batch = True
+        elif attn_implementation == "flash_attention_3":
+            softmax_in_single_precision = False
+            qkv_backend = "fa3"
             flatten_batch = True
 
         self.attn = VisionAttention(
@@ -142,7 +146,7 @@ class Qwen2_5_VisionBlock(nn.Module):
             num_heads=num_heads,
             projection_size=dim,
             use_qkv_parallel=True,
-            use_context_forward=use_context_forward,
+            qkv_backend=qkv_backend,
             softmax_in_single_precision=softmax_in_single_precision,
             flatten_batch=flatten_batch,
             quant_config=quant_config,
