@@ -12,7 +12,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.moe.fused_moe_triton.fused_moe_awq import (
+from sglang.python.sglang.srt.layers.moe.fused_moe_triton.fused_moe_int4 import (
     fused_moe_kernel_gptq_awq,
 )
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe_config import (
@@ -39,7 +39,6 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cuda,
     is_hip,
-    log_info_on_rank0,
 )
 
 _is_hip = is_hip()

@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
-from sglang.srt.utils import get_device_name, is_cuda, is_hip
+from sglang.srt.utils import get_device_name, is_hip, log_info_on_rank0
 
 logger = logging.getLogger(__name__)
 _is_hip = is_hip()
