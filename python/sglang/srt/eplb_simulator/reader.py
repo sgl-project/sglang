@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 import einops
+import polars as pl
 import torch
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from tqdm.auto import tqdm
@@ -55,7 +56,4 @@ def read_mode_detail_per_token(dir_data):
 
 
 def read_bench_serving_output(path: Path):
-    raw = json.loads(path.read_text())
-    return pl.DataFrame(dict(
-
-    ))
+    return pl.DataFrame(json.loads(path.read_text()))
