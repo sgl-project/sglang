@@ -267,7 +267,7 @@ class TokenizerManager:
         self.flush_cache_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
-        self.start_profile_communicator = _Communicator(
+        self.profile_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
         self.get_internal_state_communicator = _Communicator(
@@ -327,7 +327,7 @@ class TokenizerManager:
                 ),
                 (
                     ProfileReqOutput,
-                    self.start_profile_communicator.handle_recv,
+                    self.profile_communicator.handle_recv,
                 ),
                 (
                     GetInternalStateReqOutput,
@@ -745,7 +745,14 @@ class TokenizerManager:
             activities=activities,
             profile_id=str(time.time()),
         )
-        result = (await self.start_profile_communicator(req))[0]
+        return await self._execute_profile(req)
+
+    async def stop_profile(self):
+        req = ProfileReq(type=ProfileReqType.STOP_PROFILE)
+        return await self._execute_profile(req)
+
+    async def _execute_profile(self, req: ProfileReq):
+        result = (await self.profile_communicator(req))[0]
         if not result.success:
             raise RuntimeError(result.message)
         return result
