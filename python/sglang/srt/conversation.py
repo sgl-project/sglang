@@ -884,7 +884,7 @@ def match_llama2_chat(model_path: str):
         model_path,
         re.IGNORECASE,
     ):
-        return "llama-2-chat"
+        return "llama-2"
 
 
 @register_conv_template_matching_function
