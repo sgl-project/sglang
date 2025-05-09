@@ -51,3 +51,7 @@ def read_mode_detail_per_token(dir_data):
     pack = _sort_by_rid(pack)
     pack = _compute_df_metadata(pack)
     return pack
+
+
+def read_bench_serving_output(path: Path):
+    TODO
