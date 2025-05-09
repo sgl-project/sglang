@@ -17,14 +17,15 @@ from sglang.srt.managers.expert_location import ExpertLocationMetadata
 def _compute_logical_count_of_batch(
     server_args: MyServerArgs,
 ):
-    scheduled_tokens_of_batch = _simulate_scheduled_tokens_given_seq_metadata(
+    token_indices_of_batch = _simulate_scheduled_pack_indices_given_seq_metadata(
         df_metadata,
         phase=phase,
         num_tokens_in_batch_overall=server_args.num_tokens_in_batch_overall,
     )
+    logical_count_of_batch = TODO
 
 
-def _simulate_scheduled_tokens_given_seq_metadata(
+def _simulate_scheduled_pack_indices_given_seq_metadata(
     df_metadata: pl.DataFrame,
     phase: Union[Literal["prefill", "decode"]],
     num_tokens_in_batch_overall: int,
@@ -33,40 +34,32 @@ def _simulate_scheduled_tokens_given_seq_metadata(
     :return: `output[i]` denotes all pack indices that will be used in i-th step
     """
     if phase == "prefill":
-        return _simulate_scheduled_tokens_given_seq_metadata_prefill(df_metadata,
-                                                                     num_tokens_in_batch_overall=num_tokens_in_batch_overall)
+        all_pack_indices = torch.tensor([
+            x
+            for row in df_metadata.iter_rows(named=True)
+            for x in range(row["pack_input_except_history_start_index"], row["pack_output_start_index"])
+        ])
+        num_chunks = math.ceil(len(all_pack_indices) / num_tokens_in_batch_overall)
+        return torch.chunk(all_pack_indices, num_chunks)
+
     if phase == "decode":
-        return _simulate_scheduled_tokens_given_seq_metadata_decode(df_metadata,
-                                                                    num_tokens_in_batch_overall=num_tokens_in_batch_overall)
+        # loose bound
+        num_steps_upper_bound = int(df_metadata["end_index"].max() / num_tokens_in_batch_overall * 2.5)
+
+        pack_indices_of_step = torch.full((num_steps_upper_bound, num_tokens_in_batch_overall), -1, dtype=torch.int32)
+        curr_lens = torch.zeros((num_tokens_in_batch_overall,), dtype=torch.int32)
+
+        for row in df_metadata.iter_rows(named=True):
+            chosen_location = torch.argmin(curr_lens).item()
+            output_values = list(range(row["pack_output_start_index"], row["end_index"]))
+            output_start = curr_lens[chosen_location]
+
+            pack_indices_of_step[output_start: output_start + len(output_values), chosen_location] = output_values
+            curr_lens[chosen_location] += len(output_values)
+
+        return [x[x != -1] for x in pack_indices_of_step[:torch.max(curr_lens)]]
+
     raise NotImplementedError
-
-
-def _simulate_scheduled_tokens_given_seq_metadata_prefill(df_metadata: pl.DataFrame, num_tokens_in_batch_overall: int):
-    all_pack_indices = torch.tensor([
-        x
-        for row in df_metadata.iter_rows(named=True)
-        for x in range(row["pack_input_except_history_start_index"], row["pack_output_start_index"])
-    ])
-    num_chunks = math.ceil(len(all_pack_indices) / num_tokens_in_batch_overall)
-    return torch.chunk(all_pack_indices, num_chunks)
-
-
-def _simulate_scheduled_tokens_given_seq_metadata_decode(df_metadata: pl.DataFrame, num_tokens_in_batch_overall: int):
-    # loose bound
-    num_steps_upper_bound = int(df_metadata["end_index"].max() / num_tokens_in_batch_overall * 2.5)
-
-    pack_indices_of_step = torch.full((num_steps_upper_bound, num_tokens_in_batch_overall), -1, dtype=torch.int32)
-    curr_lens = torch.zeros((num_tokens_in_batch_overall,), dtype=torch.int32)
-
-    for row in df_metadata.iter_rows(named=True):
-        chosen_location = torch.argmin(curr_lens).item()
-        output_values = list(range(row["pack_output_start_index"], row["end_index"]))
-        output_start = curr_lens[chosen_location]
-
-        pack_indices_of_step[output_start: output_start + len(output_values), chosen_location] = output_values
-        curr_lens[chosen_location] += len(output_values)
-
-    return [x[x != -1] for x in pack_indices_of_step[:torch.max(curr_lens)]]
 
 
 def _simulate_execution_given_logical_count_of_batch(
