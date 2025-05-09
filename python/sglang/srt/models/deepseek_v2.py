@@ -63,6 +63,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_mla_deep_gemm_masked_fp8,
 )
 from sglang.srt.layers.quantization.fp8_utils import (
+    block_quant_dequant,
     block_quant_to_tensor_quant,
     channel_quant_to_tensor_quant,
     normalize_e4m3fn_to_e4m3fnuz,
@@ -776,7 +777,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         q_nope_out = q_nope_out.transpose(0, 1)
         q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
-        if self.attention_backend == "fa3":
+        if self.attention_backend == "fa3" or self.attention_backend == "flashinfer":
             attn_output = self.attn_mqa(
                 q_nope_out, k_nope, k_nope, forward_batch, q_rope=q_pe, k_rope=k_pe
             )
@@ -1589,13 +1590,22 @@ class DeepseekV2ForCausalLM(nn.Module):
 
                         if (
                             _is_cuda
-                            and _ENABLE_JIT_DEEPGEMM
                             and weight_block_size[0] == 128
                             and weight_block_size[1] == 128
                             and model_dtype == torch.bfloat16
                         ):
-                            block_scale = weight_scale
-                            use_deep_gemm_bmm = True
+                            if _ENABLE_JIT_DEEPGEMM and get_bool_env_var(
+                                "SGL_USE_DEEPGEMM_BMM", "false"
+                            ):
+                                block_scale = weight_scale
+                                use_deep_gemm_bmm = True
+                            else:
+                                w = block_quant_dequant(
+                                    weight,
+                                    weight_scale,
+                                    weight_block_size,
+                                    model_dtype,
+                                )
                         else:
                             w, scale = block_quant_to_tensor_quant(
                                 weight, weight_scale, weight_block_size
