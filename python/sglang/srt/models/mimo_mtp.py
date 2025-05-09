@@ -5,6 +5,7 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
 from torch import nn
+from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
@@ -34,19 +35,22 @@ from sglang.srt.models.qwen2 import (
 )
 from sglang.srt.utils import add_prefix
 
-MiMoConfig = None
-
 
 class MiMoMultiTokenPredictorLayer(nn.Module):
 
     def __init__(
         self,
-        config: MiMoConfig,
+        config: PretrainedConfig,
         prefix: str,
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
 
+        self.embed_tokens = VocabParallelEmbedding(
+            config.vocab_size,
+            config.hidden_size,
+            prefix=add_prefix("embed_tokens", prefix),
+        )
         self.token_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hidden_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.input_proj = nn.Linear(
@@ -59,21 +63,27 @@ class MiMoMultiTokenPredictorLayer(nn.Module):
 
     def forward(
         self,
-        inputs_embeds: torch.Tensor,
+        input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
 
-        assert inputs_embeds is not None
+        if input_embeds is None:
+            hidden_states = self.embed_tokens(input_ids)
+        else:
+            hidden_states = input_embeds
         # masking inputs at position 0, as not needed by MTP
-        inputs_embeds[positions == 0] = 0
-        inputs_embeds = self.token_layernorm(inputs_embeds)
-        previous_hidden_states = self.hidden_layernorm(
-            forward_batch.spec_info.hidden_states
-        )
+        # hidden_states[positions == 0] = 0
 
         hidden_states = self.input_proj(
-            torch.cat([previous_hidden_states, inputs_embeds], dim=-1)
+            torch.cat(
+                (
+                    self.token_layernorm(hidden_states),
+                    self.hidden_layernorm(forward_batch.spec_info.hidden_states),
+                ),
+                dim=-1,
+            )
         )
 
         hidden_states, residual = self.mtp_block(
@@ -82,69 +92,59 @@ class MiMoMultiTokenPredictorLayer(nn.Module):
             forward_batch=forward_batch,
             residual=None,
         )
-        hidden_states = residual + hidden_states
-        return self.final_layernorm(hidden_states)
+        # hidden_states = residual + hidden_states
+        return self.final_layernorm(hidden_states, residual)
 
 
-class MiMoMultiTokenPredictor(nn.Module):
+# class MiMoMultiTokenPredictor(nn.Module):
 
-    def __init__(
-        self,
-        config: MiMoConfig,
-        prefix: str = "",
-        quant_config: Optional[QuantizationConfig] = None,
-    ):
-        super().__init__()
+#     def __init__(
+#         self,
+#         config: MiMoConfig,
+#         prefix: str = "",
+#         quant_config: Optional[QuantizationConfig] = None,
+#     ):
+#         super().__init__()
 
-        self.mtp_start_layer_idx = config.num_hidden_layers
-        self.num_mtp_layers = config.num_nextn_predict_layers
+#         self.mtp_start_layer_idx = config.num_hidden_layers
+#         self.num_mtp_layers = config.num_nextn_predict_layers
 
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-        )
+#         self.mtp_layers = torch.nn.ModuleDict(
+#             {
+#                 str(idx): MiMoMultiTokenPredictorLayer(
+#                     config,
+#                     f"{prefix}.layers.{idx}",
+#                     quant_config=quant_config,
+#                 )
+#                 for idx in range(self.mtp_start_layer_idx,
+#                              self.mtp_start_layer_idx + self.num_mtp_layers)
+#             }
+#         )
 
-        self.mtp_layers = torch.nn.ModuleDict(
-            {
-                str(idx): MiMoMultiTokenPredictorLayer(
-                    config,
-                    f"{prefix}.layers.{idx}",
-                    quant_config=quant_config,
-                )
-                for idx in range(
-                    self.mtp_start_layer_idx,
-                    self.mtp_start_layer_idx + self.num_mtp_layers,
-                )
-            }
-        )
+#         self.logits_processor = LogitsProcessor(config.vocab_size)
 
-        self.logits_processor = LogitsProcessor(config.vocab_size)
+#     def forward(
+#         self,
+#         input_ids: torch.Tensor,
+#         positions: torch.Tensor,
+#         forward_batch: ForwardBatch,
+#         spec_step_idx: int = 0,
+#     ) -> torch.Tensor:
 
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        inputs_embeds: Optional[torch.Tensor] = None,
-        spec_step_idx: int = 0,
-    ) -> torch.Tensor:
-        if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
-
-        hidden_states = self.mtp_layers[str(self.mtp_start_layer_idx + spec_step_idx)](
-            input_ids,
-            positions,
-            forward_batch,
-        )
-        return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch
-        )
+#         hidden_states = self.mtp_layers[str(self.mtp_start_layer_idx + spec_step_idx)](
+#             input_ids,
+#             positions,
+#             forward_batch,
+#         )
+#         return self.logits_processor(
+#             input_ids, hidden_states, self.lm_head, forward_batch
+#         )
 
 
 class MiMoMTP(nn.Module):
     def __init__(
         self,
-        config: MiMoConfig,
+        config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
@@ -153,8 +153,10 @@ class MiMoMTP(nn.Module):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
 
-        self.model = MiMoMultiTokenPredictor(
-            config, add_prefix("model", prefix), quant_config
+        self.model = MiMoMultiTokenPredictorLayer(
+            config,
+            prefix,
+            quant_config,
         )
         self.lm_head = ParallelLMHead(
             config.vocab_size,
@@ -173,7 +175,10 @@ class MiMoMTP(nn.Module):
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
         assert spec_step_idx == 0, "mimo_mtp only support predict one token now"
-        return self.model(input_ids, positions, forward_batch)
+        hidden_states = self.model(input_ids, positions, forward_batch)
+        return self.logits_processor(
+            input_ids, hidden_states, self.lm_head, forward_batch
+        )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
@@ -198,8 +203,8 @@ class MiMoMTP(nn.Module):
                 continue
             if name.startswith("model.vision_tower") and name not in params_dict:
                 continue
+            # print(name, self.map_model_name_to_mtp_param_name(name))
             name = self.map_model_name_to_mtp_param_name(name)
-            name = name.replace("0", "36")
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
@@ -210,6 +215,7 @@ class MiMoMTP(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
+                # print(name)
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -229,20 +235,31 @@ class MiMoMTP(nn.Module):
     def map_model_name_to_mtp_param_name(self, name: str) -> str:
         import re
 
-        name_without_prefix = [
-            "token_layernorm",
-            "hidden_layernorm",
-            "input_proj",
-            "final_layernorm",
-        ]
-        for sub_name in name_without_prefix:
-            if sub_name in name:
-                return name
+        # name_without_prefix = [
+        #     "token_layernorm",
+        #     "hidden_layernorm",
+        #     "input_proj",
+        #     "final_layernorm",
+        # ]
+        # for sub_name in name_without_prefix:
+        #     if sub_name in name:
+        #         return name
         pattern = r"model.mtp_layers.(\d+)."
         group = re.match(pattern, name)
         if group is not None:
-            name = name.replace(group.group(), group.group() + "mtp_block.")
+            name = name.replace(group.group(), "mtp_block.")
         return name
+
+    def get_embed_and_head(self):
+        return self.model.embed_tokens.weight, self.lm_head.weight
+
+    def set_embed_and_head(self, embed, head):
+        del self.model.embed_tokens.weight
+        del self.lm_head.weight
+        self.model.embed_tokens.weight = embed
+        self.lm_head.weight = head
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
 
 
 EntryClass = MiMoMTP
