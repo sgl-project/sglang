@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Union
+from typing import Optional, TYPE_CHECKING, Union
 
 import numpy as np
 import torch
@@ -256,124 +256,6 @@ def make_local_attention_virtual_batches(
         np.arange(actual_batch_size, dtype=np.int32),
         local_blocks * pages_per_local_batch,
     )
-    block_table_local = block_table[batch_indices, block_indices].view(
-        virtual_batches, -1
-    )
-
-    return seqlens_q_local, cu_seqlens_q_local, seqlens_k_local, block_table_local
-
-
-def make_local_attention_virtual_batches_torch(
-    attn_chunk_size: int,
-    query_start_loc: torch.Tensor,  # 1D, int32 or int64
-    seq_lens: torch.Tensor,  # 1D, int32 or int64
-    block_table: torch.Tensor,  # 2D, int32
-    page_size: int = 0,
-):
-    """
-    Fully vectorized PyTorch version of make_local_attention_virtual_batches.
-    All logic is unchanged from the numpy version.
-    """
-    device = query_start_loc.device
-    dtype = torch.int32
-
-    max_seq_len = seq_lens.max()
-    effective_chunk_size = min(attn_chunk_size, max_seq_len)
-    effective_chunk_size = (effective_chunk_size // page_size) * page_size
-    if effective_chunk_size < page_size:
-        effective_chunk_size = page_size
-    attn_chunk_size = effective_chunk_size
-
-    q_seqlens = query_start_loc[1:] - query_start_loc[:-1]
-    actual_batch_size = seq_lens.shape[0]
-
-    q_tokens_in_first_block = torch.minimum(
-        attn_chunk_size - ((seq_lens - q_seqlens) % attn_chunk_size), q_seqlens
-    ).to(dtype)
-    tokens_in_last_block = attn_chunk_size + (seq_lens % -attn_chunk_size)
-    local_blocks = 1 + (
-        (q_seqlens - q_tokens_in_first_block + attn_chunk_size - 1) // attn_chunk_size
-    )
-
-    # --- Vectorized arange logic ---
-    cu_num_blocks = torch.cumsum(local_blocks, dim=0)
-    virtual_batches = cu_num_blocks[-1].item()
-    # block_offsets = np.repeat(cu_num_blocks - local_blocks, local_blocks)
-    block_offsets = torch.repeat_interleave(cu_num_blocks - local_blocks, local_blocks)
-    # arange = np.arange(virtual_batches, dtype=np.int32) - block_offsets
-    arange = torch.arange(virtual_batches, dtype=dtype, device=device) - block_offsets
-    # rarange = np.repeat(local_blocks, local_blocks) - arange - 1
-    repeated_local_blocks = torch.repeat_interleave(local_blocks, local_blocks)
-    rarange = repeated_local_blocks - arange - 1
-
-    # seqlens_q_local = np.repeat(q_seqlens - q_tokens_in_first_block, local_blocks)
-    seqlens_q_local = torch.repeat_interleave(
-        q_seqlens - q_tokens_in_first_block, local_blocks
-    ).to(dtype)
-    # set the first block since this may be a partial block
-    seqlens_q_local[arange == 0] = q_tokens_in_first_block[
-        torch.arange(actual_batch_size, dtype=dtype, device=device).repeat_interleave(
-            local_blocks
-        )[arange == 0]
-    ]
-    # set the remaining blocks
-    mask = arange > 0
-    seqlens_q_local[mask] = torch.minimum(
-        (seqlens_q_local[mask] - attn_chunk_size * (arange[mask] - 1).to(dtype)).to(
-            dtype
-        ),
-        torch.full_like(seqlens_q_local[mask], attn_chunk_size, dtype=dtype),
-    )
-
-    # cu_seqlens_q_local = np.pad(np.cumsum(seqlens_q_local), (1, 0)).astype(np.int32)
-    cu_seqlens_q_local = torch.cat(
-        [
-            torch.zeros(1, dtype=dtype, device=device),
-            torch.cumsum(seqlens_q_local, dim=0).to(dtype),
-        ]
-    ).to(dtype)
-
-    # seqlens_k_local = np.full(cu_num_blocks[-1], attn_chunk_size, dtype=np.int32)
-    seqlens_k_local = torch.full(
-        (virtual_batches,), attn_chunk_size, dtype=dtype, device=device
-    )
-    # seqlens_k_local[cu_num_blocks - 1] = tokens_in_last_block
-    seqlens_k_local[cu_num_blocks - 1] = tokens_in_last_block
-
-    # k_seqstarts_absolute = np.repeat(seq_lens_np, local_blocks) - (
-    #     rarange * attn_chunk_size + np.repeat(tokens_in_last_block, local_blocks)
-    # )
-    seq_lens_repeated = torch.repeat_interleave(seq_lens, local_blocks)
-    tokens_in_last_block_repeated = torch.repeat_interleave(
-        tokens_in_last_block, local_blocks
-    )
-    k_seqstarts_absolute = seq_lens_repeated - (
-        rarange * attn_chunk_size + tokens_in_last_block_repeated
-    )
-    block_starts = k_seqstarts_absolute // page_size
-
-    # block_table_local = np.repeat(block_table, local_blocks, axis=0)
-    # --- Fully vectorized block_table_local computation ---
-    assert attn_chunk_size % page_size == 0, (
-        f"attn_chunk_size {attn_chunk_size} is not "
-        f"divisible by page_size {page_size}"
-    )
-    pages_per_local_batch = attn_chunk_size // page_size
-
-    block_indices = torch.arange(
-        pages_per_local_batch, dtype=dtype, device=device
-    ).unsqueeze(0).expand(
-        virtual_batches, pages_per_local_batch
-    ) + block_starts.unsqueeze(
-        1
-    )
-    block_indices = block_indices.flatten().clamp(max=block_table.shape[1] - 1)
-
-    batch_indices = torch.repeat_interleave(
-        torch.arange(actual_batch_size, dtype=dtype, device=device),
-        local_blocks * pages_per_local_batch,
-    )
-
     block_table_local = block_table[batch_indices, block_indices].view(
         virtual_batches, -1
     )
@@ -1251,23 +1133,13 @@ class FlashAttentionBackend(AttentionBackend):
 
         # Estimate maximum sizes for local attention metadata
         max_seq_len = self.max_context_len
-        attn_chunk_size = self.attention_chunk_size if self.attention_chunk_size else 1
-        max_virtual_batches = (
-            max_bs * (max_seq_len + attn_chunk_size - 1) // attn_chunk_size
-            if attn_chunk_size > 0
-            else max_bs
+        attn_chunk_size = self.attention_chunk_size or 1
+        page_size = self.page_size or 1
+        max_virtual_batches = max_bs * (
+            (max_seq_len + attn_chunk_size - 1) // attn_chunk_size
         )
-        max_blocks_per_seq = (
-            (self.max_context_len + self.attention_chunk_size - 1)
-            // self.attention_chunk_size
-            if self.attention_chunk_size
-            else 1
-        )
-        max_pages_per_block = (
-            (self.attention_chunk_size + self.page_size - 1) // self.page_size
-            if self.page_size
-            else 1
-        )
+        max_blocks_per_seq = (max_seq_len + attn_chunk_size - 1) // attn_chunk_size
+        max_pages_per_block = (attn_chunk_size + page_size - 1) // page_size
 
         # This is being used by normal decode and draft decode when topk == 1
         self.decode_cuda_graph_metadata = {
@@ -1571,8 +1443,8 @@ class FlashAttentionBackend(AttentionBackend):
                             local_block_table=self.decode_cuda_graph_metadata[
                                 "local_block_table"
                             ],
-                            local_max_query_len=0,
-                            local_max_seq_len=0,
+                            local_max_query_len=1,
+                            local_max_seq_len=1,
                         )
                     )
 
@@ -1743,8 +1615,7 @@ class FlashAttentionBackend(AttentionBackend):
                     metadata_expand.page_table[: cache_loc.shape[0]].copy_(
                         cache_loc[:, :decode_length].contiguous().to(torch.int32)
                     )
-                # Local attention metadata will be handled by the CUDA graph
-                # DO NOT call _init_local_attn_metadata_cuda_graph during replay
+                # TODO: Handle local attention metadata for draft decode when llama4 eagle is supported
             else:
                 metadata = self.decode_cuda_graph_metadata[bs]
                 # Normal Decode
@@ -1770,11 +1641,7 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.page_table[:, :max_seq_pages].copy_(page_indices)
                 metadata.page_table[:, max_seq_pages:].fill_(0)
 
-                # Local attention metadata will be handled by the CUDA graph
-                # DO NOT call _init_local_attn_metadata_cuda_graph during replay
-                # self._setup_local_attn_metadata_for_replay(metadata)
-                if self.attention_chunk_size is not None:
-                    self._update_local_attn_metadata_for_replay(metadata, bs)
+                self._update_local_attn_metadata_for_replay(metadata, bs)
         elif forward_mode.is_target_verify():
             if self.topk <= 1:
                 metadata = self.target_verify_metadata[bs]
@@ -1916,24 +1783,29 @@ class FlashAttentionBackend(AttentionBackend):
             metadata.local_attn_metadata = None
             return
 
+        cu_seqlens_q_np = cu_seqlens_q.cpu().numpy()
+        seq_lens_np = cache_seqlens_int32.cpu().numpy()
         (
-            seqlens_q_local,
-            cu_seqlens_q_local,
-            seqlens_k_local,
+            seqlens_q_local_np,
+            cu_seqlens_q_local_np,
+            seqlens_k_local_np,
             block_table_local,
-        ) = make_local_attention_virtual_batches_torch(
+        ) = make_local_attention_virtual_batches(
             self.attention_chunk_size,
-            cu_seqlens_q,
-            cache_seqlens_int32,
+            cu_seqlens_q_np,
+            seq_lens_np,
             page_table,
             self.page_size,
         )
 
-        # Get sizes
-        # q_len = cu_seqlens_q_local.shape[0]
-        # k_len = seqlens_k_local.shape[0]
-        # b0, b1 = block_table_local.shape
-
+        local_metadata = FlashAttentionMetadata.LocalAttentionMetadata(
+            local_query_start_loc=torch.from_numpy(cu_seqlens_q_local_np).to(device),
+            local_seqused_k=torch.from_numpy(seqlens_k_local_np).to(device),
+            local_block_table=block_table_local.to(device),
+            local_max_query_len=int(seqlens_q_local_np.max()),
+            local_max_seq_len=int(seqlens_k_local_np.max()),
+        )
+        metadata.local_attn_metadata = local_metadata
         # Get the current device ID for debug output
         device_id = cu_seqlens_q.device.index
 
@@ -1944,7 +1816,7 @@ class FlashAttentionBackend(AttentionBackend):
             print("=== [No CUDA graph] ===")
             # Print the input parameters for comparison
             print(
-                "=== Parameters to make_local_attention_virtual_batches_torch (No CUDA graph) ==="
+                "=== Parameters to make_local_attention_virtual_batches (No CUDA graph) ==="
             )
             print(f"attn_chunk_size: {self.attention_chunk_size}")
             print(f"query_start_loc: {cu_seqlens_q}")
@@ -1956,101 +1828,84 @@ class FlashAttentionBackend(AttentionBackend):
 
             # Print the output results
             print("=== Results (No CUDA graph) ===")
-            print("local_query_start_loc", cu_seqlens_q_local)
-            print("local_seqused_k", seqlens_k_local)
+            print("local_query_start_loc", cu_seqlens_q_local_np)
+            print("local_seqused_k", seqlens_k_local_np)
             print("local_block_table", block_table_local)
-
-        local_metadata = FlashAttentionMetadata.LocalAttentionMetadata(
-            local_query_start_loc=cu_seqlens_q_local.to(device),
-            local_seqused_k=seqlens_k_local.to(device),
-            local_block_table=block_table_local.to(device),
-            local_max_query_len=int(seqlens_q_local.max().item()),
-            local_max_seq_len=int(seqlens_k_local.max().item()),
-        )
-        metadata.local_attn_metadata = local_metadata
 
     def _update_local_attn_metadata_for_replay(
         self, metadata: FlashAttentionMetadata, bs: int
     ):
         """Update preallocated local attention metadata in-place before CUDA graph replay."""
+        if self.attention_chunk_size is None:
+            return
+        
+        # Debug print
+        # Get the current device ID for debug output
+        device_id = metadata.cache_seqlens_int32.device.index
+
+        # Only print debug info for device 0 to reduce output clutter
+        debug_print = device_id == 0
+
         # Access preallocated buffers
         local_q_buf = self.decode_cuda_graph_metadata["local_query_start_loc"]
         local_k_buf = self.decode_cuda_graph_metadata["local_seqused_k"]
         local_block_buf = self.decode_cuda_graph_metadata["local_block_table"]
         cu_seqlens_q = self.decode_cuda_graph_metadata["cu_seqlens_q"]
-
-        # Step 1: recompute seqlens_q from metadata
-        seqlens_q = metadata.cache_seqlens_int32[:bs]
-        page_table = metadata.page_table[:bs, :]
-
-        # In normal decode mode for a single new token, we see query_start_loc as [0, 1]
-        # But in CUDA graph mode, we're getting [0, full_seq_len]
-        # Create a modified version that mimics the normal decode pattern
-        # for the last token only
-
-        # First update the cumulative sequence lengths as before
-        cu_seqlens_q[0] = 0
-        for i in range(bs):
-            cu_seqlens_q[i + 1] = cu_seqlens_q[i] + seqlens_q[i]
-        if cu_seqlens_q.size(0) > bs + 1:
-            cu_seqlens_q[bs + 1 :].fill_(0)
-
-        # Now create a modified version for local attention that only processes the last token
+        
+        # Create a modified version for local attention that only processes the last token
         # This mimics the normal decode pattern
-        modified_cu_seqlens_q = torch.zeros_like(cu_seqlens_q[: bs + 1])
-        modified_cu_seqlens_q[0] = 0
-        for i in range(bs):
-            modified_cu_seqlens_q[i + 1] = (
-                modified_cu_seqlens_q[i] + 1
-            )  # Only 1 token per sequence
+        cu_seqlens_q = torch.arange(bs + 1, device=cu_seqlens_q.device, dtype=cu_seqlens_q.dtype)
+        seqlens = metadata.cache_seqlens_int32[:bs]
+        # Slice the page_table to match the batch size and actual sequence length
+        # This serves three important purposes:
+        # 1. Ensures we only process the actual batch size (bs) and not the maximum batch size
+        # 2. Limits the sequence length to prevent processing padding tokens or garbage values
+        # 3. Prevents zeros in the block table which can cause garbage output during replay
+        # 
+        # Without this slicing, the pre-allocated page_table may contain zeros or invalid indices
+        # beyond the actual sequence length, leading to incorrect attention calculations
+        max_seq_len = int(seqlens.max().item())
+        sliced_page_table = metadata.page_table[:bs, :max_seq_len]
 
-        # Debug print
-        # Get the current device ID for debug output
-        device_id = seqlens_q.device.index
-
-        # Only print debug info for device 0 to reduce output clutter
-        debug_print = device_id == 0
         if debug_print:
             print(f">>> DEBUG: replay input metadata (bs={bs})")
             print(f"Original cu_seqlens_q: {cu_seqlens_q[:bs+1]}")
-            print(f"Modified cu_seqlens_q: {modified_cu_seqlens_q}")
-            print(f"seqlens_q: {seqlens_q}")
+            print(f"Modified cu_seqlens_q: {cu_seqlens_q}")
+            print(f"seqlens: {seqlens}")
 
-            # Print the full parameters being passed to make_local_attention_virtual_batches_torch
+            # Print the full parameters being passed to make_local_attention_virtual_batches
             print(
-                "=== Parameters to make_local_attention_virtual_batches_torch (CUDA graph) ==="
+                "=== Parameters to make_local_attention_virtual_batches (CUDA graph) ==="
             )
             print(f"attn_chunk_size: {self.attention_chunk_size}")
-            print(f"query_start_loc (modified): {modified_cu_seqlens_q}")
-            print(f"seq_lens: {seqlens_q}")
-            print(f"page_table shape: {page_table.shape}")
+            print(f"query_start_loc (modified): {cu_seqlens_q}")
+            print(f"seq_lens: {seqlens}")
+            print(f"page_table shape: {metadata.page_table.shape}")
             print(f"page_size: {self.page_size}")
-
-        # CRITICAL: Use only the first (bs+1) elements of cu_seqlens_q
-        # This ensures that actual_batch_size in make_local_attention_virtual_batches_torch
-        # will be exactly bs, matching the size of seqlens_q
-
-        # CRITICAL: Slice the page_table to match the actual sequence length
-        # This prevents zeros in the block table due to the pre-allocated page_table being too large
-        max_seq_len = int(seqlens_q.max().item())
-        sliced_page_table = page_table[:, :max_seq_len]
-
-        if debug_print:
-            print(f"Original page_table shape: {page_table.shape}")
+            print(f"Original page_table shape: {metadata.page_table.shape}")
             print(f"Sliced page_table shape: {sliced_page_table.shape}")
+            print(f"Page size: {self.page_size}")
 
+        cu_seqlens_q_np = cu_seqlens_q.cpu().numpy()
+        seqlens_np = seqlens.cpu().numpy()
         (
-            seqlens_q_local,
-            cu_seqlens_q_local,
-            seqlens_k_local,
+            seqlens_q_local_np,
+            cu_seqlens_q_local_np,
+            seqlens_k_local_np,
             block_table_local,
-        ) = make_local_attention_virtual_batches_torch(
+        ) = make_local_attention_virtual_batches(
             self.attention_chunk_size,
-            modified_cu_seqlens_q,  # Use the modified version that mimics normal decode
-            seqlens_q,
+            cu_seqlens_q_np,
+            seqlens_np,
             sliced_page_table,
             self.page_size,
         )
+
+        # Convert back to tensors
+        device = local_q_buf.device
+        cu_seqlens_q_local = torch.from_numpy(cu_seqlens_q_local_np).to(device)
+        seqlens_k_local = torch.from_numpy(seqlens_k_local_np).to(device)
+        block_table_local = block_table_local.to(device)
 
         # Get sizes
         q_len = cu_seqlens_q_local.shape[0]
@@ -2068,26 +1923,14 @@ class FlashAttentionBackend(AttentionBackend):
             local_block_buf.shape[0] >= b0 and local_block_buf.shape[1] >= b1
         ), f"local_block_table too small: {local_block_buf.shape} < {(b0, b1)}"
 
-        # In-place updates into preallocated tensors
+        # In-place updates into preallocated tensors and zero out the unused space
         local_q_buf[:q_len].copy_(cu_seqlens_q_local)
-        # Zero out the rest of the buffer to avoid stale data
-        if q_len < local_q_buf.shape[0]:
-            local_q_buf[q_len:].fill_(0)
-
+        local_q_buf[q_len:].fill_(0)
         local_k_buf[:k_len].copy_(seqlens_k_local)
-        # Zero out the rest of the buffer
-        if k_len < local_k_buf.shape[0]:
-            local_k_buf[k_len:].fill_(0)
-
+        local_k_buf[k_len:].fill_(0)
         local_block_buf[:b0, :b1].copy_(block_table_local)
-        # Zero out the rest of the buffer
-        if b0 < local_block_buf.shape[0] or b1 < local_block_buf.shape[1]:
-            # Zero out unused rows
-            if b0 < local_block_buf.shape[0]:
-                local_block_buf[b0:, :].fill_(0)
-            # Zero out unused columns in used rows
-            if b1 < local_block_buf.shape[1]:
-                local_block_buf[:b0, b1:].fill_(0)
+        local_block_buf[b0:, :].fill_(0)
+        local_block_buf[:b0, b1:].fill_(0)
 
         if debug_print:
             print("=== [Replay] Local Attention Metadata ===")
@@ -2098,8 +1941,8 @@ class FlashAttentionBackend(AttentionBackend):
         # If metadata.local_attn_metadata already exists, just update its fields
         if metadata.local_attn_metadata is not None:
             lam = metadata.local_attn_metadata
-            lam.local_max_query_len = int(seqlens_q_local.max().item())
-            lam.local_max_seq_len = int(seqlens_k_local.max().item())
+            lam.local_max_query_len = int(seqlens_q_local_np.max())
+            lam.local_max_seq_len = int(seqlens_k_local_np.max())
 
         assert id(metadata.local_attn_metadata.local_query_start_loc) == id(
             self.decode_cuda_graph_metadata["local_query_start_loc"]
