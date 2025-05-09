@@ -20,6 +20,8 @@ class TestMemorySaverTensors(unittest.TestCase):
         self.assertEqual(torch.max(x).item(), 5.0)
         self.assertTrue(torch.allclose(x + torch.tensor([2.0, 2.0, 2.0], device=_DEVICE),
                                        torch.tensor([5.0, 6.0, 7.0], device=_DEVICE)))
+        self.assertTrue(torch.allclose(_add_by_triton(x, torch.tensor([2.0, 2.0, 2.0], device=_DEVICE)),
+                                       torch.tensor([5.0, 6.0, 7.0], device=_DEVICE)))
         self.assertEqual(torch.empty_like(x).shape, (3,))
         self.assertTrue(torch.allclose(torch.full_like(x, 42), torch.tensor([42.0, 42.0, 42.0], device=_DEVICE)))
         self.assertTrue(x.is_contiguous())
