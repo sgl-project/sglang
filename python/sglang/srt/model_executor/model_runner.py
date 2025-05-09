@@ -42,6 +42,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
     initialize_dp_attention,
 )
+from sglang.srt.layers.dp_mla import get_dp_mla_wrapper
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.quantization import monkey_patch_isinstance_for_vllm_base_layer
 from sglang.srt.layers.quantization.deep_gemm import (
@@ -162,6 +163,7 @@ class ModelRunner:
                 "disable_radix_cache": server_args.disable_radix_cache,
                 "enable_nan_detection": server_args.enable_nan_detection,
                 "enable_dp_attention": server_args.enable_dp_attention,
+                "enable_dp_mla": server_args.enable_dp_mla,
                 "enable_ep_moe": server_args.enable_ep_moe,
                 "enable_deepep_moe": server_args.enable_deepep_moe,
                 "flashinfer_mla_disable_ragged": server_args.flashinfer_mla_disable_ragged,
@@ -394,6 +396,7 @@ class ModelRunner:
             initialize_model_parallel(
                 tensor_model_parallel_size=self.tp_size,
                 pipeline_model_parallel_size=self.pp_size,
+                enable_dp_mla=self.server_args.enable_dp_mla,
             )
             initialize_dp_attention(
                 enable_dp_attention=self.server_args.enable_dp_attention,
@@ -402,6 +405,7 @@ class ModelRunner:
                 dp_size=self.server_args.dp_size,
                 pp_size=self.server_args.pp_size,
             )
+            get_dp_mla_wrapper().init_gathered_buffer(self)
 
         min_per_gpu_memory = get_available_gpu_memory(
             self.device, self.gpu_id, distributed=self.tp_size > 1
@@ -1183,6 +1187,12 @@ class ModelRunner:
             f"Save sharded model to {path} with pattern {pattern} and max_size {max_size}"
         )
         ShardedStateLoader.save_model(self.model, path, pattern, max_size)
+
+    def get_gathered_buffer_tp2dp(self):
+        return get_dp_mla_wrapper().get_gathered_buffer_tp2dp(self)
+
+    def get_gathered_buffer_dp2tp(self):
+        return get_dp_mla_wrapper().get_gathered_buffer_dp2tp(self)
 
 
 def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):

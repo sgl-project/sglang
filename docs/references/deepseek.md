@@ -125,6 +125,73 @@ With data parallelism attention enabled, we have achieved up to **1.9x** decodin
 
 **Reference**: Check [Blog](https://lmsys.org/blog/2024-12-04-sglang-v0-4/#data-parallelism-attention-for-deepseek-models).
 
+### Data Parallelism MLA
+
+**Description**: This optimization is similar to data parallelism attention, but it applies to MLA core instead of the entire attention. Compared with data parallelism attention, it does not additionally increase the memory occupied by weights. It allows for a significant reduction in the KV cache size and enables larger batch sizes.
+
+On an 8×H20 (96GB) node, with data parallelism MLA enabled, we have achieved up to **1.85x(dp=4)** ~ **2.34x(dp=8)** decoding throughput improvement compared to the previous version. And, the number of kvcaches has been increased by **3.3x(dp=4)** and **6.6x(dp=8)**.
+
+In wgmma computation, the number of rows M is fixed at 64. When TP equals 8 and the head count is 16, both Flash MLA and Flash Infer MLA operate at only 25% of their computing capacity under large batch or long sequence scenarios. If MLA DP = 4 is adopted (in this case, the number of heads is 128 / 2 = 64), low latency can be maintained. If MLA DP = 8 (the number of heads is 128), although the MLA computation time may increase by 50% - 100%, a larger KV Cache capacity can be obtained.
+
+**Memory**:
+
+|                                             | default mem=0.95	 | dp mla, dp-size=4	 | dp mla, dp-size=8 |
+|---------------------------------------------|-------------------|--------------------|-------------------|
+| mem-fraction-static                         | 	0.95	            | 0.94	              | 0.94              |
+| distributed ends. mem usage                 | 	1.81	            | 1.95	              | 1.95              |
+| Load weight end. avail mem/mem usage        | 11.23/81.64       | 	11.08/81.65	      | 11.08/81.65       |
+| Capture cuda graph end. avail mem/mem usage | 	3.65/0.53        | 	3.89/1.20	        | 3.89/1.19         |
+| max_total_num_tokens                        | 98696             | 82258*4            | 82258*8          |
+
+**Performance Comparison**:
+
+| input len | batch size | tp8 latency | output throughput | dp4 latency | output throughput | dp8 latency | output throughput |
+|-----------|------------|-------------|-------------------|-------------|-------------------|-------------|-------------------|
+| 256       | 1          | 14.16       | 72.31             | 16.63       | 61.59             | 16.84       | 60.80             |
+| 256       | 4          | 19.23       | 212.98            | 20.53       | 199.55            | 20.82       | 196.75            |
+| 256       | 8          | 22.81       | 359.21            | 24.72       | 331.33            | 23.74       | 345.02            |
+| 256       | 16         | 27.13       | 603.92            | 29.47       | 555.90            | 28.76       | 569.68            |
+| 256       | 32         | 34.04       | 962.55            | 35.94       | 911.62            | 35.19       | 931.11            |
+| 256       | 48         | 40.10       | 1225.70           | 40.21       | 1222.45           | 39.65       | 1239.79           |
+| 256       | 64         | 67.45       | 971.64            | **43.91**   | **1492.39**       | 44.49       | 1473.02           |
+| 256       | 96         | 79.39       | 1238.24           | **52.35**   | **1877.66**       | 52.69       | 1865.58           |
+| 256       | 128        | 113.39      | 1155.93           | **57.36**   | **2285.00**       | 57.60       | 2275.67           |
+| 1024      | 1          | 14.48       | 70.73             | 16.84       | 60.82             | 17.17       | 59.64             |
+| 1024      | 4          | 18.85       | 217.25            | 20.74       | 197.46            | 21.89       | 187.12            |
+| 1024      | 8          | 23.45       | 349.36            | 25.67       | 319.18            | 25.52       | 320.97            |
+| 1024      | 16         | 28.34       | 578.11            | 29.66       | 552.47            | 30.88       | 530.57            |
+| 1024      | 32         | 37.57       | 872.30            | 38.25       | 856.76            | 38.45       | 852.20            |
+| 1024      | 48         | 46.68       | 1053.04           | **43.97**   | **1117.75**       | 44.24       | 1110.92           |
+| 1024      | 64         | 76.28       | 859.21            | **49.02**   | **1336.82**       | 49.90       | 1313.24           |
+| 1024      | 96         | 93.56       | 1050.74           | **59.77**   | **1644.84**       | 60.78       | 1617.42           |
+| 1024      | 128        | 131.59      | 996.06            | **67.76**   | **1934.37**       | 67.93       | 1929.56           |
+| 4096      | 1          | 15.29       | 66.97             | 18.09       | 56.61             | 19.16       | 53.45             |
+| 4096      | 4          | 21.03       | 194.81            | 22.96       | 178.41            | 24.27       | 168.76            |
+| 4096      | 8          | 28.45       | 287.95            | 29.70       | 275.87            | 28.72       | 285.19            |
+| 4096      | 16         | 39.68       | 412.88            | **36.95**   | **443.44**        | 37.39       | 438.23            |
+| 4096      | 32         | 82.49       | 397.26            | **52.17**   | **628.10**        | 53.22       | 615.65            |
+| 4096      | 48         | 124.72      | 394.11            | **66.07**   | **743.90**        | 67.61       | 727.04            |
+| 4096      | 64         | 167.71      | 390.77            | **79.40**   | **825.36**        | 79.90       | 820.26            |
+| 4096      | 96         | 233.19      | 421.55            | 144.59      | 679.88            | **106.63**  | **921.92**        |
+| 4096      | 128        | 317.57      | 412.73            | 170.99      | 766.54            | **132.86**  | **986.54**        |
+
+**Usage**:
+
+***Restrictions***:
+- The currently implemented custom all-to-all operation is only restricted within a single node. Cross-node is not supported for the time being.
+
+On an 8×H20 (96GB) node, on top of `--attention-backend flashinfer`(less memory occupied) or `--attention-backend fa3`, additional parameters:
+
+```shell
+# dp=4:
+--max-running-requests 128 --mem-fraction-static 0.94 --enable-dp-mla --dp-size 4
+```
+
+```shell
+# dp=8:
+--max-running-requests 128 --mem-fraction-static 0.94 --enable-dp-mla --dp-size 8
+```
+
 ### Multi Node Tensor Parallelism
 
 **Description**: For users with limited memory on a single node, SGLang supports serving DeepSeek Series Models, including DeepSeek V3, across multiple nodes using tensor parallelism. This approach partitions the model parameters across multiple GPUs or nodes to handle models that are too large for one node's memory.
