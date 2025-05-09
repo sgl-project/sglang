@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import einops
@@ -54,4 +55,7 @@ def read_mode_detail_per_token(dir_data):
 
 
 def read_bench_serving_output(path: Path):
-    TODO
+    raw = json.loads(path.read_text())
+    return pl.DataFrame(dict(
+
+    ))
