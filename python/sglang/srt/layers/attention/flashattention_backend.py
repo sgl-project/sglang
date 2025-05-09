@@ -913,8 +913,10 @@ class FlashAttentionBackend(AttentionBackend):
         # Use precomputed metadata across all layers
         metadata = self.forward_metadata
         local_attn_metadata = getattr(metadata, "local_attn_metadata", None)
-        use_local_attention = (
-            self.attention_chunk_size is not None and local_attn_metadata is not None
+        use_local_attn = (
+            self.attention_chunk_size is not None
+            and local_attn_metadata is not None
+            and (hasattr(layer, "use_irope") and layer.use_irope)
         )
         # We do cascade attention for Draft Decode with topk > 1
         use_cascade_attn = self.topk > 1
@@ -970,7 +972,7 @@ class FlashAttentionBackend(AttentionBackend):
                     k_descale=k_descale,
                     v_descale=v_descale,
                 )
-            elif use_local_attention:
+            elif use_local_attn:
                 # Use chunked (local) attention batching for self-attention
                 o = flash_attn_with_kvcache(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
@@ -979,7 +981,7 @@ class FlashAttentionBackend(AttentionBackend):
                     page_table=local_attn_metadata.local_block_table,
                     cache_seqlens=local_attn_metadata.local_seqused_k,
                     cu_seqlens_q=local_attn_metadata.local_query_start_loc,
-                    cu_seqlens_k_new=metadata.cu_seqlens_k,
+                    cu_seqlens_k_new=None,
                     max_seqlen_q=local_attn_metadata.local_max_query_len,
                     softmax_scale=layer.scaling,
                     causal=True,
@@ -1572,8 +1574,6 @@ class FlashAttentionBackend(AttentionBackend):
                     metadata_expand.page_table[: cache_loc.shape[0]].copy_(
                         cache_loc[:, :decode_length].contiguous().to(torch.int32)
                     )
-                # TODO: we need to test this part for llama 4 eagle case
-                self._init_local_attn_metadata(metadata, device)
             else:
                 metadata = self.decode_cuda_graph_metadata[bs]
                 # Normal Decode
@@ -1599,7 +1599,7 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.page_table[:, :max_seq_pages].copy_(page_indices)
                 metadata.page_table[:, max_seq_pages:].fill_(0)
 
-                self._init_local_attn_metadata(metadata, device)
+            self._init_local_attn_metadata(metadata, device)
         elif forward_mode.is_target_verify():
             if self.topk <= 1:
                 metadata = self.target_verify_metadata[bs]
