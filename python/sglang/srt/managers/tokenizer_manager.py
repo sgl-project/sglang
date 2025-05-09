@@ -626,7 +626,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         """Validates that the input token count and the requested token count doesn't exceed the model's context length."""
         # FIXME: unify the length validation logic with the one in the scheduler.
         _max_req_len = self.context_len
-
+        
         input_token_num = len(input_ids) if input_ids is not None else 0
         input_token_num += self.reserve_input_token_num
         if input_token_num >= self.context_len:
@@ -656,17 +656,23 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             max_new_tokens is not None
             and (max_new_tokens + input_token_num) >= _max_req_len
         ):
+            total_tokens = max_new_tokens + input_token_num
             if self.server_args.allow_auto_truncate:
                 logger.warning(
                     f"Requested token count ({input_token_num} input + {max_new_tokens} new) "
                     f"exceeds the model's context length ({self.context_len} tokens). "
-                    "Truncating max_new_tokens."
+                    "Truncating inputs."
+                    # NOTE(hj): SGLang upstream truncate max_new_tokens, but we will truncate the inputs.
                 )
-                obj.sampling_params["max_new_tokens"] = max(
-                    0, _max_req_len - input_token_num
-                )
+                # obj.sampling_params["max_new_tokens"] = max(
+                #     0, _max_req_len - input_token_num
+                # )
+                num_trunc = total_tokens - self.context_len + 1
+                trunc_first = num_trunc // 2
+                for _ in range(num_trunc):
+                    input_ids.pop(input_token_num // 2 + 1 - trunc_first)
+                assert (max_new_tokens + len(input_ids)) < self.context_len, f'({max_new_tokens} + {len(input_ids)}) < {self.context_len}'
             else:
-                total_tokens = max_new_tokens + input_token_num
                 error_msg = (
                     f"Requested token count exceeds the model's maximum context length "
                     f"of {self.context_len} tokens. You requested a total of {total_tokens} "
