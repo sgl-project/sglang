@@ -4,7 +4,7 @@ import unittest
 import torch
 import triton
 import triton.language as tl
-from python.sglang.srt.memory_saver_tensors import DisposableTensor, LazyTensor
+from sglang.srt.memory_saver_tensors import DisposableTensor, LazyTensor
 
 _DEVICE = "cuda"
 _TRITON_DEVICE = triton.runtime.driver.active.get_active_torch_device()
