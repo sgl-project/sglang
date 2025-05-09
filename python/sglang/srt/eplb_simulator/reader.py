@@ -14,8 +14,20 @@ def read_expert_distribution_mode_detail_per_token_and_bench_serving(dir_data):
     df_bench_serving = read_bench_serving(_single(Path(dir_data).glob("*.jsonl")))
 
     df = df_bench_serving.join(pack_expert_distribution["df_metadata"], on="rid", how="inner")
-    
+
+    _check_list_is_prefix(df, "history_ids", "input_ids")
+    _check_list_is_prefix(df, "input_ids", "all_ids")
+
     return TODO
+
+
+def _check_list_is_prefix(df, col_a, col_b):
+    df_violation = df.filter(~_expr_list_is_prefix(col_a, col_b))
+    assert len(df_violation) == 0, f"Expect {col_a} to be prefix of {col_b}. Violation: {df_violation=}"
+
+
+def _expr_list_is_prefix(col_a, col_b):
+    return pl.col(col_b).list.slice(0, pl.col(col_a).list.len()) == pl.col(col_a)
 
 
 def read_expert_distribution_mode_detail_per_token(dir_data):
