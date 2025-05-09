@@ -10,6 +10,12 @@ _TRITON_DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
 
 class TestMemorySaverTensors(unittest.TestCase):
+    def test_disposable_tensor_memory(self):
+        TODO
+
+    def test_lazy_tensor_memory(self):
+        TODO
+
     def test_disposable_tensor_operations(self):
         x = DisposableTensor(torch.tensor([3.0, 4.0, 5.0], device=_DEVICE))
         self._common_test_operations(x)
