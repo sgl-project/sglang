@@ -5,7 +5,7 @@ import torch
 import triton
 
 from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import dispose_tensor, is_cuda
 
 logger = logging.getLogger(__name__)
 
@@ -669,7 +669,7 @@ def grouped_gemm_triton(
         assert triton.cdiv(b.shape[-2], block_n) == scale_b.shape[-2]
         assert triton.cdiv(b.shape[-1], block_k) == scale_b.shape[-1]
 
-    a_ref.set_(torch.empty((0,), device=a_ref.device))
+    dispose_tensor(a_ref)
 
     # TODO: adjust config or tune kernel
     # Reduce block size to prevent L40 shared memory overflow.

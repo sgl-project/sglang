@@ -49,7 +49,7 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.utils import DeepEPMode, is_hip, set_weight_attrs
+from sglang.srt.utils import DeepEPMode, dispose_tensor, is_hip, set_weight_attrs
 
 _is_hip = is_hip()
 
@@ -271,7 +271,7 @@ class EPMoE(torch.nn.Module):
             hidden_states.shape[1],
             BLOCK_SIZE=512,
         )
-        hidden_states.set_(torch.empty((0,), device=hidden_states.device))
+        dispose_tensor(hidden_states)
 
         seg_indptr_cur_rank = seg_indptr[self.start_expert_id : self.end_expert_id + 2]
         weight_indices_cur_rank = torch.arange(
@@ -1060,7 +1060,7 @@ class DeepEPMoE(EPMoE):
             m_indices,
             output_index,
         )
-        hidden_states_fp8.set_(torch.empty((0,), device=hidden_states_fp8.device))
+        dispose_tensor(hidden_states_fp8)
 
         gateup_output = torch.empty(
             (all_tokens, N),
@@ -1128,7 +1128,7 @@ class DeepEPMoE(EPMoE):
         m_grouped_gemm_fp8_fp8_bf16_nt_masked(
             hidden_states_fp8, self.w13_weight_fp8, gateup_output, masked_m, expected_m
         )
-        hidden_states_fp8[0].set_(torch.empty((0,), device=hidden_states_fp8[0].device))
+        dispose_tensor(hidden_states_fp8[0])
 
         # Act
         down_input = torch.empty(
