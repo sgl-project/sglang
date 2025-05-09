@@ -13,11 +13,11 @@ class _WrapperTensor(torch.Tensor):
 
         return func(*tree_map(unwrap, args), **tree_map(unwrap, kwargs))
 
-    def _unwrap(self):
-        raise NotImplementedError
-
     def tolist(self):
         return self._unwrap().tolist()
+
+    def _unwrap(self):
+        raise NotImplementedError
 
 
 class DisposableTensor(_WrapperTensor):
