@@ -218,11 +218,15 @@ class RouterArgs:
             cache_threshold=getattr(args, f"{prefix}cache_threshold"),
             balance_abs_threshold=getattr(args, f"{prefix}balance_abs_threshold"),
             balance_rel_threshold=getattr(args, f"{prefix}balance_rel_threshold"),
-            input_char_length_threshold=getattr(args, f"{prefix}input_char_length_threshold"),
+            input_char_length_threshold=getattr(
+                args, f"{prefix}input_char_length_threshold"
+            ),
             eviction_interval=getattr(args, f"{prefix}eviction_interval"),
             max_tree_size=getattr(args, f"{prefix}max_tree_size"),
             max_payload_size=getattr(args, f"{prefix}max_payload_size"),
-            round_robin_tie_breaking=getattr(args, f"{prefix}round_robin_tie_breaking", False),
+            round_robin_tie_breaking=getattr(
+                args, f"{prefix}round_robin_tie_breaking", False
+            ),
             verbose=getattr(args, f"{prefix}verbose", False),
             log_dir=getattr(args, f"{prefix}log_dir", None),
             service_discovery=getattr(args, f"{prefix}service_discovery", False),
