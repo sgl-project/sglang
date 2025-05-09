@@ -63,6 +63,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_mla_deep_gemm_masked_fp8,
 )
 from sglang.srt.layers.quantization.fp8_utils import (
+    block_quant_dequant,
     block_quant_to_tensor_quant,
     channel_quant_to_tensor_quant,
     normalize_e4m3fn_to_e4m3fnuz,
@@ -357,6 +358,7 @@ class DeepseekV2MoE(nn.Module):
                 topk_idx,
                 topk_weights,
                 reorder_topk_ids,
+                num_recv_tokens_per_expert,
                 seg_indptr,
                 masked_m,
                 expected_m,
@@ -368,10 +370,13 @@ class DeepseekV2MoE(nn.Module):
             )
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
+            topk_idx=topk_idx,
+            topk_weights=topk_weights,
             reorder_topk_ids=reorder_topk_ids,
             seg_indptr=seg_indptr,
             masked_m=masked_m,
             expected_m=expected_m,
+            num_recv_tokens_per_expert=num_recv_tokens_per_expert,
             forward_mode=forward_mode,
         )
         if self.ep_size > 1:
@@ -1585,13 +1590,22 @@ class DeepseekV2ForCausalLM(nn.Module):
 
                         if (
                             _is_cuda
-                            and _ENABLE_JIT_DEEPGEMM
                             and weight_block_size[0] == 128
                             and weight_block_size[1] == 128
                             and model_dtype == torch.bfloat16
                         ):
-                            block_scale = weight_scale
-                            use_deep_gemm_bmm = True
+                            if _ENABLE_JIT_DEEPGEMM and get_bool_env_var(
+                                "SGL_USE_DEEPGEMM_BMM", "false"
+                            ):
+                                block_scale = weight_scale
+                                use_deep_gemm_bmm = True
+                            else:
+                                w = block_quant_dequant(
+                                    weight,
+                                    weight_scale,
+                                    weight_block_size,
+                                    model_dtype,
+                                )
                         else:
                             w, scale = block_quant_to_tensor_quant(
                                 weight, weight_scale, weight_block_size
