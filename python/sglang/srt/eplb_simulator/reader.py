@@ -18,7 +18,18 @@ def read_expert_distribution_mode_detail_per_token_and_bench_serving(dir_data):
     _check_list_is_prefix(df, "history_ids", "input_ids")
     _check_list_is_prefix(df, "input_ids", "all_ids")
 
-    return TODO
+    df = df.with_columns(
+        input_except_history_ids=pl.col("input_ids").list.slice(pl.col("history_ids").list.len(), None),
+        pack_input_except_history_start_index=pl.col("pack_start_index") + pl.col("history_ids").list.len(),
+        pack_output_start_index=pl.col("pack_start_index") + pl.col("input_ids").list.len(),
+    )
+   
+    df = df.sort("dataset_timestamp")
+
+    return dict(
+        topk_ids=pack_expert_distribution["topk_ids"],
+        df=df,
+    )
 
 
 def _check_list_is_prefix(df, col_a, col_b):
