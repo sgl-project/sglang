@@ -208,7 +208,7 @@ def simulate_execution(
             num_physical_experts=num_physical_expert,
         )
         # print(f"hi {expert_location_metadata=}")
-        physical_count_of_batch = simulate_logical_to_physical(
+        physical_count_of_batch = simulate_logical_to_physical_by_random_dispatching(
             logical_count_of_whatever=logical_count_of_batch,
             logical_to_all_physical_map=expert_location_metadata.logical_to_all_physical_map,
             num_physical_expert=num_physical_expert,
