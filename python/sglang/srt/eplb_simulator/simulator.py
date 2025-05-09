@@ -23,6 +23,9 @@ def _simulate_scheduled_tokens_given_seq_metadata(
     df_metadata: pl.DataFrame,
     phase: Union[Literal["prefill", "decode"]],
 ) -> List[torch.Tensor]:
+    """
+    :return: `output[i]` denotes all pack indices that will be used in i-th step
+    """
     if phase == "prefill":
         return _simulate_scheduled_tokens_given_seq_metadata_prefill(df_metadata, chunked_prefill_size=TODO)
     if phase == "decode":
