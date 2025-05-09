@@ -8,7 +8,12 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from tqdm.auto import tqdm
 
 
-def read_mode_detail_per_token(dir_data):
+def read_expert_distribution_mode_detail_per_token(dir_data):
+    """
+    Read `expert_distribution_recorder`'s output data when it is in mode `detail_per_token`
+    :return: DataFrame with - rid, all_ids, pack_start_index, pack_end_index
+    """
+
     def _handle_record(record):
         rids_raw = torch.tensor([int(rid, 16) & ((1 << 64) - 1) for rid in record["rids"]])
         input_ids = record["input_ids"]
