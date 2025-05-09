@@ -3,8 +3,6 @@ from typing import List, Optional
 
 import torch
 import triton
-import triton.language as tl
-
 from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
 from sglang.srt.utils import is_cuda
 
@@ -445,12 +443,12 @@ def gelu_and_mul_triton_kernel(
                 * (
                     1
                     + tanh(
-                        kAlpha
-                        * (
-                            gate_output
-                            + 0.044715 * gate_output * gate_output * gate_output
-                        )
+                    kAlpha
+                    * (
+                        gate_output
+                        + 0.044715 * gate_output * gate_output * gate_output
                     )
+                )
                 )
             )
             gate_output = gate_output.to(InDtype)
@@ -680,6 +678,10 @@ def grouped_gemm_triton(
     compute_m_num_tiles_indptr[(1,)](
         m_num_tiles_indptr, seg_indptr, batch_size, config["BLOCK_SIZE_M"]
     )
+
+    if c is None:
+        assert c_dtype is not None
+        c = torch.empty(a.shape[0], b.shape[1], device=a.device, dtype=c_dtype)
 
     grid = lambda META: (
         triton.cdiv(a.size(0), META["BLOCK_SIZE_M"]) + batch_size,
