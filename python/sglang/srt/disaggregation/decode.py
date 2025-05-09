@@ -545,12 +545,12 @@ class SchedulerDisaggregationDecodeMixin:
 
                     # Triggering the sampling_info_done event.
                     if not self.last_batch_in_queue:
-                        next_batch_sampling_info=self.tp_worker.cur_sampling_info
+                        next_batch_sampling_info = self.tp_worker.cur_sampling_info
                         if next_batch_sampling_info:
                             next_batch_sampling_info.update_regex_vocab_mask()
                             self.current_stream.synchronize()
                             next_batch_sampling_info.sampling_info_done.set()
-                    
+
                     last_batch_in_queue = True
             elif prepare_dp_attn_flag:
                 batch, result = self._prepare_idle_batch_and_run(

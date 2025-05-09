@@ -253,7 +253,7 @@ class SchedulerDisaggregationPrefillMixin:
 
                 # Triggering the sampling_info_done event.
                 if self.last_batch is None:
-                    next_batch_sampling_info=self.tp_worker.cur_sampling_info
+                    next_batch_sampling_info = self.tp_worker.cur_sampling_info
                     if next_batch_sampling_info:
                         next_batch_sampling_info.update_regex_vocab_mask()
                         self.current_stream.synchronize()
@@ -321,7 +321,7 @@ class SchedulerDisaggregationPrefillMixin:
 
                 if self.enable_overlap:
                     self.send_kv_chunk(req, end_idx=req.tmp_end_idx)
-        
+
         if batch.next_batch_sampling_info:
             batch.next_batch_sampling_info.update_regex_vocab_mask()
             self.current_stream.synchronize()
