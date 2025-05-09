@@ -1080,7 +1080,15 @@ def sample_hf_dataset_requests(
     )
     df = df[:num_requests]
 
-    return [(row["prompts"], None, 10000) for row in df.iter_rows(named=True)]
+    return [
+        DatasetRow(
+            prompt=row["prompts"],
+            prompt_len=None,
+            output_len=10000,
+            metadata=dict(id=row["id"], timestamp=row["timestamp"].isoformat()),
+        )
+        for row in df.iter_rows(named=True)
+    ]
 
 
 async def get_request(
