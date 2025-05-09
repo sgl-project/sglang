@@ -1122,6 +1122,7 @@ class DeepEPMoE(EPMoE):
         m_grouped_gemm_fp8_fp8_bf16_nt_masked(
             hidden_states_fp8, self.w13_weight_fp8, gateup_output, masked_m, expected_m
         )
+        hidden_states_fp8[0].set_(torch.empty((0,), device=hidden_states_fp8.device))
 
         # Act
         down_input = torch.empty(
