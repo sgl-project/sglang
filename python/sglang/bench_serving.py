@@ -1122,7 +1122,6 @@ async def benchmark(
         async with semaphore:
             return await request_func(request_func_input=request_func_input, pbar=pbar)
 
-    # Warmup
     print(f"Starting warmup with {warmup_requests} sequences...")
 
     # Use the first request for all warmup iterations
@@ -1170,7 +1169,7 @@ async def benchmark(
         )
     else:
         print(
-            f"Warmup completed with {args.warmup_requests} sequences. Starting main benchmark run..."
+            f"Warmup completed with {warmup_requests} sequences. Starting main benchmark run..."
         )
 
     # Flush cache
@@ -1543,6 +1542,7 @@ def run_benchmark(args_: argparse.Namespace):
             profile=args.profile,
             pd_seperated=args.pd_seperated,
             flush_cache=args.flush_cache,
+            warmup_requests=args.warmup_requests,
         )
     )
 
