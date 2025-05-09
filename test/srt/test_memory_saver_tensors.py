@@ -1,3 +1,4 @@
+import gc
 import unittest
 
 import torch
@@ -11,7 +12,15 @@ _TRITON_DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
 class TestMemorySaverTensors(unittest.TestCase):
     def test_disposable_tensor_memory(self):
-        TODO
+        memory_before = _check_memory()
+
+        x = DisposableTensor(torch.zeros((1_000_000_000,), device=_DEVICE, dtype=torch.float32))
+        assert _check_memory() - memory_before >= 1_000_000_000 * 4
+
+        x.dispose()
+        assert _check_memory() - memory_before <= 1000
+       
+        print(f"{type(x)}")  # ensure there are still ref to it
 
     def test_lazy_tensor_memory(self):
         TODO
@@ -59,6 +68,12 @@ def _add_kernel(x_ptr, y_ptr, output_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
     y = tl.load(y_ptr + offsets, mask=mask)
     output = x + y
     tl.store(output_ptr + offsets, output, mask=mask)
+
+
+def _check_memory():
+    gc.collect()
+    torch.cuda.empty_cache()
+    return torch.cuda.memory_allocated()
 
 
 if __name__ == "__main__":
