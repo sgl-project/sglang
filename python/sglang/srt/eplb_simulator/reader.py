@@ -46,8 +46,8 @@ def read_expert_distribution_mode_detail_per_token(dir_data):
         return {k: v[sort_index, ...] for k, v in pack.items()}
 
     def _compute_df_metadata(pack):
-        df_metadata = TODO
-        return {**pack, "df_metadata": df_metadata}
+        df = pl.DataFrame(dict(rid=rid, all_ids=all_ids, pack_start_index=pack_start_index))
+        return {**pack, "df_metadata": df}
 
     processed_records = []
     for path in tqdm(list(Path(dir_data).glob("*.pt"))):
