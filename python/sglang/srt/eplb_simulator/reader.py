@@ -4,16 +4,14 @@ from pathlib import Path
 import einops
 import polars as pl
 import torch
-from transformers import AutoTokenizer
-
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from tqdm.auto import tqdm
+from transformers import AutoTokenizer
 
 
 def read_expert_distribution_mode_detail_per_token(dir_data):
     """
     Read `expert_distribution_recorder`'s output data when it is in mode `detail_per_token`
-    :return: DataFrame with - rid, all_ids, pack_start_index, pack_end_index
     """
 
     def _handle_record(record):
@@ -77,6 +75,9 @@ def read_expert_distribution_mode_detail_per_token(dir_data):
 
 
 def read_bench_serving(path: Path):
+    """
+    Read `bench_serving.py`'s outputs
+    """
     data_raw = json.loads(path.read_text())
     tokenizer = AutoTokenizer.from_pretrained(data_raw["tokenizer_id"])
 
