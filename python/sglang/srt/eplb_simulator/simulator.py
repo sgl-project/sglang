@@ -16,13 +16,21 @@ from sglang.srt.managers.expert_location import ExpertLocationMetadata
 
 def _compute_logical_count_of_batch(
     server_args: MyServerArgs,
+    assert_physical_equal_logical_expert: bool,
 ):
     token_indices_of_batch = _simulate_scheduled_pack_indices_given_seq_metadata(
         df_metadata,
         phase=phase,
         num_tokens_in_batch_overall=server_args.num_tokens_in_batch_overall,
     )
-    logical_count_of_batch = TODO
+
+    vanilla_physical_count_of_batch = compute_global_physical_count_from_topk_ids(TODO)
+
+    assert assert_physical_equal_logical_expert
+    logical_count_of_batch = vanilla_physical_count_of_batch
+   
+    return _simulate_execution_given_logical_count_of_batch(logical_count_of_batch=logical_count_of_batch,
+                                                            server_args=server_args)
 
 
 def _simulate_scheduled_pack_indices_given_seq_metadata(
@@ -66,7 +74,7 @@ def _simulate_execution_given_logical_count_of_batch(
     logical_count_of_batch: torch.Tensor,
     server_args: MyServerArgs,
 ):
-    physical_count_of_batch = _simulate_physical_count_of_batch(
+    physical_count_of_batch = _simulate_eplb_physical_count_of_batch(
         logical_count_of_batch=logical_count_of_batch,
         server_args=server_args,
     )
@@ -91,7 +99,7 @@ def _simulate_execution_given_logical_count_of_batch(
     )
 
 
-def _simulate_physical_count_of_batch(
+def _simulate_eplb_physical_count_of_batch(
     logical_count_of_batch: torch.Tensor,
     server_args: MyServerArgs,
     model_config_for_expert_location=MY_MODEL_CONFIG_FOR_EXPERT_LOCATION,
