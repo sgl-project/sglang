@@ -653,6 +653,7 @@ def grouped_gemm_triton(
     scale_a: torch.Tensor = None,
     scale_b: torch.Tensor = None,
     block_shape: Optional[List[int]] = None,
+    c_dtype=None,
 ):
     assert weight_column_major == True  # TODO: more
     if use_fp8_w8a8 and block_shape is None:

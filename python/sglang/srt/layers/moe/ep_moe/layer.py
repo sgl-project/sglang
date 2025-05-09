@@ -91,6 +91,7 @@ class GroupedGemmRunner(torch.nn.Module):
         scale_a: torch.Tensor = None,
         scale_b: torch.Tensor = None,
         block_shape: Optional[List[int]] = None,
+        c_dtype=None,
     ):
         if self.use_flashinfer:
             # TODO: flashinfer
@@ -118,6 +119,7 @@ class GroupedGemmRunner(torch.nn.Module):
                 scale_a,
                 scale_b,
                 block_shape=block_shape,
+                c_dtype=c_dtype,
             )
         return c
 
