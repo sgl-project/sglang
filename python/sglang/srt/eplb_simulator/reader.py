@@ -56,7 +56,7 @@ def read_expert_distribution_mode_detail_per_token(dir_data):
         ]
 
         df = pl.DataFrame(dict(
-            rid=rid,
+            rid=rids_raw[pack_start_index].tolist(),
             all_ids=all_ids,
             pack_start_index=pack_start_index,
             pack_end_index=pack_end_index,
