@@ -19,11 +19,20 @@ class TestMemorySaverTensors(unittest.TestCase):
 
         x.dispose()
         assert _check_memory() - memory_before <= 1000
-       
+
         print(f"{type(x)}")  # ensure there are still ref to it
 
     def test_lazy_tensor_memory(self):
-        TODO
+        memory_before = _check_memory()
+
+        x = LazyTensor((1_000_000_000,), device=_DEVICE, dtype=torch.float32)
+        assert _check_memory() - memory_before <= 1000
+
+        x += 1
+        assert _check_memory() - memory_before >= 1_000_000_000 * 4
+
+        del x
+        assert _check_memory() - memory_before <= 1000
 
     def test_disposable_tensor_operations(self):
         x = DisposableTensor(torch.tensor([3.0, 4.0, 5.0], device=_DEVICE))
