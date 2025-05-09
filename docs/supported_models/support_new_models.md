@@ -1,10 +1,15 @@
 # How to Support New Models
 
-This document explains how to add support for new language models and multimodal large language models (mllms) in SGLang. It also covers how to test new models and register external implementations.
+This document explains how to add support for new language models and multimodal large language models (mllms) in
+SGLang. It also covers how to test new models and register external implementations.
 
 ## How to Support a new Language Model
 
-To support a new model in SGLang, you only need to add a single file under the [SGLang Models Directory](https://github.com/sgl-project/sglang/tree/main/python/sglang/srt/models). You can learn from existing model implementations and create a new file for your model. For most models, you should be able to find a similar model to start with (e.g., starting from Llama). Also refer how to [port a Model from vLLM to SGLang](#port-a-model-from-vllm-to-sglang)
+To support a new model in SGLang, you only need to add a single file under
+the [SGLang Models Directory](https://github.com/sgl-project/sglang/tree/main/python/sglang/srt/models). You can learn
+from existing model implementations and create a new file for your model. For most models, you should be able to find a
+similar model to start with (e.g., starting from Llama). Also refer how
+to [port a Model from vLLM to SGLang](#port-a-model-from-vllm-to-sglang)
 
 ## How to Support a new Multimodal Large Language Model
 
@@ -16,18 +21,21 @@ standard LLM support:
    in [model_config.py](https://github.com/sgl-project/sglang/blob/0ab3f437aba729b348a683ab32b35b214456efc7/python/sglang/srt/configs/model_config.py#L561)
    to return `True` for your model.
 
-2. **Multimodal Data Processor**:
+2. **Register a new chat-template**
+   See [conversation.py](https://github.com/sgl-project/sglang/blob/86a779dbe9e815c02f71ea82574608f6eae016b5/python/sglang/srt/conversation.py)
+
+3. **Multimodal Data Processor**:
    Define a new `Processor` class that inherits from `BaseMultimodalProcessor` and register this processor as your
    model’s dedicated processor.
    See [multimodal_processor.py](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/managers/multimodal_processor.py)
    for more details.
 
-3. **Handle Multimodal Tokens**:
+4. **Handle Multimodal Tokens**:
    Implement a `pad_input_ids` function for your new model. In this function, multimodal tokens in the prompt should be
    expanded (if necessary) and padded with multimodal-data-hashes so that SGLang can recognize different multimodal data
    with `RadixAttention`.
 
-4. **Adapt to Vision Attention**:
+5. **Adapt to Vision Attention**:
    Adapt the multi-headed `Attention` of ViT with SGLang’s `VisionAttention`.
 
 You can refer to [Qwen2VL](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/models/qwen2_vl.py) or
@@ -40,7 +48,8 @@ You should test the new MLLM locally against Hugging Face models. See the [
 
 ### Interactive Debugging
 
-For interactive debugging, compare the outputs of Hugging Face/Transformers and SGLang. The following two commands should give the same text output and very similar prefill logits:
+For interactive debugging, compare the outputs of Hugging Face/Transformers and SGLang. The following two commands
+should give the same text output and very similar prefill logits:
 
 - Get the reference output:
   ```bash
@@ -53,7 +62,10 @@ For interactive debugging, compare the outputs of Hugging Face/Transformers and 
 
 ### Add the Model to the Test Suite
 
-To ensure the new model is well maintained, add it to the test suite by including it in the `ALL_OTHER_MODELS` list in the [test_generation_models.py](https://github.com/sgl-project/sglang/blob/main/test/srt/models/test_generation_models.py) file, test the new model on your local machine and report the results on demonstrative benchmarks (GSM8K, MMLU, MMMU, MMMU-Pro, etc.) in your PR.
+To ensure the new model is well maintained, add it to the test suite by including it in the `ALL_OTHER_MODELS` list in
+the [test_generation_models.py](https://github.com/sgl-project/sglang/blob/main/test/srt/models/test_generation_models.py)
+file, test the new model on your local machine and report the results on demonstrative benchmarks (GSM8K, MMLU, MMMU,
+MMMU-Pro, etc.) in your PR.
 
 This is the command to test a new model on your local machine:
 
@@ -63,26 +75,29 @@ ONLY_RUN=Qwen/Qwen2-1.5B python3 -m unittest test_generation_models.TestGenerati
 
 ## Port a Model from vLLM to SGLang
 
-The [vLLM Models Directory](https://github.com/vllm-project/vllm/tree/main/vllm/model_executor/models) is a valuable resource, as vLLM covers many models. SGLang reuses vLLM’s interface and some layers, making it easier to port models from vLLM to SGLang.
+The [vLLM Models Directory](https://github.com/vllm-project/vllm/tree/main/vllm/model_executor/models) is a valuable
+resource, as vLLM covers many models. SGLang reuses vLLM’s interface and some layers, making it easier to port models
+from vLLM to SGLang.
 
 To port a model from vLLM to SGLang:
 
 - Compare these two files for guidance:
-  - [SGLang Llama Implementation](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/models/llama.py)
-  - [vLLM Llama Implementation](https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/llama.py)
+    - [SGLang Llama Implementation](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/models/llama.py)
+    - [vLLM Llama Implementation](https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/llama.py)
 - The major differences include:
-  - **Replace vLLM’s `Attention` with `RadixAttention`** (ensure you pass `layer_id` to `RadixAttention`).
-  - **Replace vLLM’s `LogitsProcessor` with SGLang’s `LogitsProcessor`.**
-  - **Replace the multi-headed `Attention` of ViT with SGLang’s `VisionAttention`.**
-  - **Replace other vLLM layers** (such as `RMSNorm`, `SiluAndMul`) with SGLang layers.
-  - **Remove `Sample`.**
-  - **Change the `forward()` functions** and add a `forward_batch()` method.
-  - **Add `EntryClass`** at the end.
-  - **Ensure that the new implementation uses only SGLang components** and does not rely on any vLLM components.
+    - **Replace vLLM’s `Attention` with `RadixAttention`** (ensure you pass `layer_id` to `RadixAttention`).
+    - **Replace vLLM’s `LogitsProcessor` with SGLang’s `LogitsProcessor`.**
+    - **Replace the multi-headed `Attention` of ViT with SGLang’s `VisionAttention`.**
+    - **Replace other vLLM layers** (such as `RMSNorm`, `SiluAndMul`) with SGLang layers.
+    - **Remove `Sample`.**
+    - **Change the `forward()` functions** and add a `forward_batch()` method.
+    - **Add `EntryClass`** at the end.
+    - **Ensure that the new implementation uses only SGLang components** and does not rely on any vLLM components.
 
 ## Registering an External Model Implementation
 
-In addition to the methods above, you can register your new model with the `ModelRegistry` before launching the server. This allows you to integrate your model without modifying the source code.
+In addition to the methods above, you can register your new model with the `ModelRegistry` before launching the server.
+This allows you to integrate your model without modifying the source code.
 
 For example:
 
@@ -111,4 +126,5 @@ launch_server(server_args)
 
 ---
 
-By following these guidelines, you can add support for new language models and multimodal large language models in SGLang and ensure they are thoroughly tested and easily integrated into the system.
+By following these guidelines, you can add support for new language models and multimodal large language models in
+SGLang and ensure they are thoroughly tested and easily integrated into the system.
