@@ -43,13 +43,8 @@ def simulate_execution_given_logical_count_of_batch(
 def _simulate_physical_count_of_batch(
     logical_count_of_batch: torch.Tensor,
     server_args: MyServerArgs,
-    model_config_for_expert_location=MY_MODEL_CONFIG_FOR_EXPERT_LOCATION,
 ):
     if server_args.enable_expert_location_by_eplb:
-        num_physical_expert = (
-            model_config_for_expert_location.num_logical_experts
-            + server_args.ep_num_redundant_experts
-        )
 
         # TODO
         eplb_input_logical_count = einops.einsum(
@@ -71,8 +66,23 @@ def _simulate_physical_count_of_batch(
         return logical_count_of_batch
 
 
-def _simulate_expert_location_metadata() -> List["MyExpertLocationMetadata"]:
-    return TODO
+def _simulate_expert_location_metadata(
+    server_args: MyServerArgs,
+    model_config_for_expert_location=MY_MODEL_CONFIG_FOR_EXPERT_LOCATION,
+) -> List["MyExpertLocationMetadata"]:
+    num_physical_expert = (
+        model_config_for_expert_location.num_logical_experts
+        + server_args.ep_num_redundant_experts
+    )
+
+    return [
+        MyExpertLocationMetadata.init_by_eplb(
+            server_args,
+            logical_count=eplb_input_logical_count,
+            num_physical_experts=num_physical_expert,
+        )
+        for TODO in TODO
+    ]
 
 
 def _simulate_logical_to_physical_by_random_dispatching(
