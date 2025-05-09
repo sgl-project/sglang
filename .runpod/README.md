@@ -1,53 +1,115 @@
-[**Blog**](https://lmsys.org/blog/2024-07-25-sglang-llama3/)
-| [**Documentation**](https://docs.sglang.ai/)
-| [**Join Slack**](https://slack.sglang.ai/)
-| [**Join Bi-Weekly Development Meeting**](https://meeting.sglang.ai/)
-| [**Roadmap**](https://github.com/sgl-project/sglang/issues/4042)
-| [**Slides**](https://github.com/sgl-project/sgl-learning-materials?tab=readme-ov-file#slides) |
+<h1> SgLang Worker</h1>
 
-## News
-- [2025/03] Supercharge DeepSeek-R1 Inference on AMD Instinct MI300X ([AMD blog](https://rocm.blogs.amd.com/artificial-intelligence/DeepSeekR1-Part2/README.html))
-- [2025/03] SGLang Joins PyTorch Ecosystem: Efficient LLM Serving Engine ([PyTorch blog](https://pytorch.org/blog/sglang-joins-pytorch/))
-- [2025/02] Unlock DeepSeek-R1 Inference Performance on AMD Instinct™ MI300X GPU ([AMD blog](https://rocm.blogs.amd.com/artificial-intelligence/DeepSeekR1_Perf/README.html))
-- [2025/01] 🔥 SGLang provides day one support for DeepSeek V3/R1 models on NVIDIA and AMD GPUs with DeepSeek-specific optimizations. ([instructions](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3), [AMD blog](https://www.amd.com/en/developer/resources/technical-articles/amd-instinct-gpus-power-deepseek-v3-revolutionizing-ai-development-with-sglang.html), [10+ other companies](https://x.com/lmsysorg/status/1887262321636221412))
-- [2024/12] 🔥 v0.4 Release: Zero-Overhead Batch Scheduler, Cache-Aware Load Balancer, Faster Structured Outputs ([blog](https://lmsys.org/blog/2024-12-04-sglang-v0-4/)).
-- [2024/09] v0.3 Release: 7x Faster DeepSeek MLA, 1.5x Faster torch.compile, Multi-Image/Video LLaVA-OneVision ([blog](https://lmsys.org/blog/2024-09-04-sglang-v0-3/)).
-- [2024/07] v0.2 Release: Faster Llama3 Serving with SGLang Runtime (vs. TensorRT-LLM, vLLM) ([blog](https://lmsys.org/blog/2024-07-25-sglang-llama3/)).
-- [2024/10] The First SGLang Online Meetup ([slides](https://github.com/sgl-project/sgl-learning-materials?tab=readme-ov-file#the-first-sglang-online-meetup)).
-- [2024/02] SGLang enables **3x faster JSON decoding** with compressed finite state machine ([blog](https://lmsys.org/blog/2024-02-05-compressed-fsm/)).
-- [2024/01] SGLang provides up to **5x faster inference** with RadixAttention ([blog](https://lmsys.org/blog/2024-01-17-sglang/)).
-- [2024/01] SGLang powers the serving of the official **LLaVA v1.6** release demo ([usage](https://github.com/haotian-liu/LLaVA?tab=readme-ov-file#demo)).
+🚀 | SGLang is fast serving framework for large language models and vision language models.
 
-## About
-SGLang is a fast serving framework for large language models and vision language models.
-It makes your interaction with models faster and more controllable by co-designing the backend runtime and frontend language.
-The core features include:
+## SGLang Server Configuration
 
-- **Fast Backend Runtime**: Provides efficient serving with RadixAttention for prefix caching, zero-overhead CPU scheduler, continuous batching, token attention (paged attention), speculative decoding, tensor parallelism, chunked prefill, structured outputs, and quantization (FP8/INT4/AWQ/GPTQ).
-- **Flexible Frontend Language**: Offers an intuitive interface for programming LLM applications, including chained generation calls, advanced prompting, control flow, multi-modal inputs, parallelism, and external interactions.
-- **Extensive Model Support**: Supports a wide range of generative models (Llama, Gemma, Mistral, QWen, DeepSeek, LLaVA, etc.), embedding models (e5-mistral, gte, mcdse) and reward models (Skywork), with easy extensibility for integrating new models.
-- **Active Community**: SGLang is open-source and backed by an active community with industry adoption.
+When launching an endpoint, you can configure the SGLang server using environment variables. These variables allow you to customize various aspects of the server's behavior without modifying the code.
 
-## Getting Started
-- [Install SGLang](https://docs.sglang.ai/start/install.html)
-- [Quick Start](https://docs.sglang.ai/backend/send_request.html)
-- [Backend Tutorial](https://docs.sglang.ai/backend/openai_api_completions.html)
-- [Frontend Tutorial](https://docs.sglang.ai/frontend/frontend.html)
-- [Contribution Guide](https://docs.sglang.ai/references/contribution_guide.html)
+### How to Use
 
-## Benchmark and Performance
-Learn more in the release blogs: [v0.2 blog](https://lmsys.org/blog/2024-07-25-sglang-llama3/), [v0.3 blog](https://lmsys.org/blog/2024-09-04-sglang-v0-3/), [v0.4 blog](https://lmsys.org/blog/2024-12-04-sglang-v0-4/)
+Define these variables in your endpoint template.
+The SGLang server will read these variables at startup and configure itself accordingly.
+If a variable is not set, the server will use its default value.
 
-## Roadmap
-[Development Roadmap (2025 H1)](https://github.com/sgl-project/sglang/issues/4042)
+### Available Environment Variables
 
-## Adoption and Sponsorship
-The project has been deployed to large-scale production, generating trillions of tokens every day.
-It is supported by the following institutions: AMD, Atlas Cloud, Baseten, Cursor, DataCrunch, Etched, Hyperbolic, Iflytek, Jam & Tea Studios, LinkedIn, LMSYS, Meituan, Nebius, Novita AI, NVIDIA, RunPod, Stanford, UC Berkeley, UCLA, xAI, and 01.AI.
+The following table lists all available environment variables for configuring the SGLang server:
 
-## Contact Us
+| Environment Variable        | Description                              | Default                               | Options                                                                                   |
+| --------------------------- | ---------------------------------------- | ------------------------------------- | ----------------------------------------------------------------------------------------- |
+| `MODEL_PATH`                | Path of the model weights                | "meta-llama/Meta-Llama-3-8B-Instruct" | Local folder or Hugging Face repo ID                                                      |
+| `HOST`                      | Host of the server                       | "0.0.0.0"                             |                                                                                           |
+| `PORT`                      | Port of the server                       | 30000                                 |                                                                                           |
+| `TOKENIZER_PATH`            | Path of the tokenizer                    |                                       |                                                                                           |
+| `ADDITIONAL_PORTS`          | Additional ports for the server          |                                       |                                                                                           |
+| `TOKENIZER_MODE`            | Tokenizer mode                           | "auto"                                | "auto", "slow"                                                                            |
+| `LOAD_FORMAT`               | Format of model weights to load          | "auto"                                | "auto", "pt", "safetensors", "npcache", "dummy"                                           |
+| `DTYPE`                     | Data type for weights and activations    | "auto"                                | "auto", "half", "float16", "bfloat16", "float", "float32"                                 |
+| `CONTEXT_LENGTH`            | Model's maximum context length           |                                       |                                                                                           |
+| `QUANTIZATION`              | Quantization method                      |                                       | "awq", "fp8", "gptq", "marlin", "gptq_marlin", "awq_marlin", "squeezellm", "bitsandbytes" |
+| `SERVED_MODEL_NAME`         | Override model name in API               |                                       |                                                                                           |
+| `CHAT_TEMPLATE`             | Chat template name or path               |                                       |                                                                                           |
+| `MEM_FRACTION_STATIC`       | Fraction of memory for static allocation |                                       |                                                                                           |
+| `MAX_RUNNING_REQUESTS`      | Maximum number of running requests       |                                       |                                                                                           |
+| `MAX_NUM_REQS`              | Maximum requests in memory pool          |                                       |                                                                                           |
+| `MAX_TOTAL_TOKENS`          | Maximum tokens in memory pool            |                                       |                                                                                           |
+| `CHUNKED_PREFILL_SIZE`      | Max tokens in chunk for chunked prefill  |                                       |                                                                                           |
+| `MAX_PREFILL_TOKENS`        | Max tokens in prefill batch              |                                       |                                                                                           |
+| `SCHEDULE_POLICY`           | Request scheduling policy                |                                       | "lpm", "random", "fcfs", "dfs-weight"                                                     |
+| `SCHEDULE_CONSERVATIVENESS` | Conservativeness of schedule policy      |                                       |                                                                                           |
+| `TENSOR_PARALLEL_SIZE`      | Tensor parallelism size                  |                                       |                                                                                           |
+| `STREAM_INTERVAL`           | Streaming interval in token length       |                                       |                                                                                           |
+| `RANDOM_SEED`               | Random seed                              |                                       |                                                                                           |
+| `LOG_LEVEL`                 | Logging level for all loggers            |                                       |                                                                                           |
+| `LOG_LEVEL_HTTP`            | Logging level for HTTP server            |                                       |                                                                                           |
+| `API_KEY`                   | API key for the server                   |                                       |                                                                                           |
+| `FILE_STORAGE_PTH`          | Path of file storage in backend          |                                       |                                                                                           |
+| `DATA_PARALLEL_SIZE`        | Data parallelism size                    |                                       |                                                                                           |
+| `LOAD_BALANCE_METHOD`       | Load balancing strategy                  |                                       | "round_robin", "shortest_queue"                                                           |
+| `NCCL_INIT_ADDR`            | NCCL init address for multi-node         |                                       |                                                                                           |
+| `NNODES`                    | Number of nodes                          |                                       |                                                                                           |
+| `NODE_RANK`                 | Node rank                                |                                       |                                                                                           |
 
-For enterprises interested in adopting or deploying SGLang at scale, including technical consulting, sponsorship opportunities, or partnership inquiries, please contact us at contact@sglang.ai.
+**Boolean Flags** (set to "true", "1", or "yes" to enable):
 
-## Acknowledgment and Citation
-We learned the design and reused code from the following projects: [Guidance](https://github.com/guidance-ai/guidance), [vLLM](https://github.com/vllm-project/vllm), [LightLLM](https://github.com/ModelTC/lightllm), [FlashInfer](https://github.com/flashinfer-ai/flashinfer), [Outlines](https://github.com/outlines-dev/outlines), and [LMQL](https://github.com/eth-sri/lmql). Please cite the paper, [SGLang: Efficient Execution of Structured Language Model Programs](https://arxiv.org/abs/2312.07104), if you find the project useful.
+| Flag                          | Description                               |
+| ----------------------------- | ----------------------------------------- |
+| `SKIP_TOKENIZER_INIT`         | Skip tokenizer init                       |
+| `TRUST_REMOTE_CODE`           | Allow custom models from Hub              |
+| `LOG_REQUESTS`                | Log inputs and outputs of requests        |
+| `SHOW_TIME_COST`              | Show time cost of custom marks            |
+| `DISABLE_FLASHINFER`          | Disable flashinfer attention kernels      |
+| `DISABLE_FLASHINFER_SAMPLING` | Disable flashinfer sampling kernels       |
+| `DISABLE_RADIX_CACHE`         | Disable RadixAttention for prefix caching |
+| `DISABLE_REGEX_JUMP_FORWARD`  | Disable regex jump-forward                |
+| `DISABLE_CUDA_GRAPH`          | Disable cuda graph                        |
+| `DISABLE_DISK_CACHE`          | Disable disk cache                        |
+| `ENABLE_TORCH_COMPILE`        | Optimize model with torch.compile         |
+| `ENABLE_P2P_CHECK`            | Enable P2P check for GPU access           |
+| `ENABLE_MLA`                  | Enable Multi-head Latent Attention        |
+| `ATTENTION_REDUCE_IN_FP32`    | Cast attention results to fp32            |
+| `EFFICIENT_WEIGHT_LOAD`       | Enable memory efficient weight loading    |
+
+## Usage
+
+### OpenAI compatible API
+
+```python
+from openai import OpenAI
+import os
+
+# Initialize the OpenAI Client with your RunPod API Key and Endpoint URL
+client = OpenAI(
+    api_key=os.getenv("RUNPOD_API_KEY"),
+    base_url=f"https://api.runpod.ai/v2/<endpoint_id>/openai/v1",
+)
+```
+
+`Chat Completions (Non-Streaming)`
+
+```python
+response = client.chat.completions.create(
+    model="meta-llama/Meta-Llama-3-8B-Instruct",
+    messages=[{"role": "user", "content": "Give a two lines on Planet Earth ?"}],
+    temperature=0,
+    max_tokens=100,
+
+)
+print(f"Response: {response}")
+```
+
+`Chat Completions (Streaming)`
+
+```python
+response_stream = client.chat.completions.create(
+    model="meta-llama/Meta-Llama-3-8B-Instruct",
+    messages=[{"role": "user", "content": "Give a two lines on Planet Earth ?"}],
+    temperature=0,
+    max_tokens=100,
+    stream=True
+
+)
+for response in response_stream:
+    print(response.choices[0].delta.content or "", end="", flush=True)
+```

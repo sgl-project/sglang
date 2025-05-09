@@ -1,0 +1,25 @@
+services:
+  sglang-worker:
+    image: worker-sglang:dev
+    pull_policy: never
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    environment:
+      - HOST=0.0.0.0
+      - PORT=8000
+      - MODEL_NAME=microsoft/Phi-4-mini-instruct
+      - TRUST_REMOTE_CODE=true
+
+    ports:
+      - "8000:8000"
+
+    volumes:
+      # Model/cache & any other writable data volume the container expects
+      - ./data/runpod-volume:/runpod-volume 
