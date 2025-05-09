@@ -25,6 +25,7 @@ def simulate_execution_given_logical_count_of_batch(
     mean_utilization_rate = torch.mean(utilization_rate).item()
 
     return dict(
+        gpu_physical_count_of_batch=gpu_physical_count_of_batch,
         utilization_rate=utilization_rate,
         mean_utilization_rate=mean_utilization_rate,
         num_simulated_batches=logical_count_of_batch.shape[0],
