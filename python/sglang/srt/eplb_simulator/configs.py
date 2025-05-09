@@ -12,6 +12,7 @@ class MyServerArgs:
     nnodes: int
     tp_size: int
     enable_expert_location_by_eplb: bool
+    eplb_history_num_batch: int
     # init_expert_location: Optional[str]
     deepseek_eplb_hack_shuffle: bool = False
 

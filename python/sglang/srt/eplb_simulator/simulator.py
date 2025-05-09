@@ -60,6 +60,7 @@ def _simulate_expert_location_metadata(
     server_args: MyServerArgs,
     model_config_for_expert_location=MY_MODEL_CONFIG_FOR_EXPERT_LOCATION,
 ) -> List["MyExpertLocationMetadata"]:
+    num_batches, _, _ = logical_count_of_batch.shape
     num_physical_expert = (
         model_config_for_expert_location.num_logical_experts
         + server_args.ep_num_redundant_experts
@@ -69,12 +70,12 @@ def _simulate_expert_location_metadata(
         MyExpertLocationMetadata.init_by_eplb(
             server_args,
             logical_count=einops.einsum(
-                logical_count_of_batch[TODO, :, :],
+                logical_count_of_batch[max(0, batch_index - server_args.eplb_history_num_batch):batch_index, :, :],
                 "num_interest_batches num_layer num_expert -> num_layer num_expert",
             ),
             num_physical_experts=num_physical_expert,
         )
-        for TODO in TODO
+        for batch_index in range(num_batches)
     ]
 
 
