@@ -15,8 +15,13 @@ from sglang.srt.managers.expert_location import ExpertLocationMetadata
 
 
 def _compute_logical_count_of_batch(
+    server_args: MyServerArgs,
 ):
-    TODO
+    scheduled_tokens_of_batch = _simulate_scheduled_tokens_given_seq_metadata(
+        df_metadata,
+        phase=phase,
+        num_tokens_in_batch_overall=server_args.num_tokens_in_batch_overall,
+    )
 
 
 def _simulate_scheduled_tokens_given_seq_metadata(
