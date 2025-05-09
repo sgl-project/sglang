@@ -248,7 +248,5 @@ if __name__ == "__main__":
     args = parser.parse_args()
     server_args = ServerArgs.from_cli_args(args)
     bench_args = BenchArgs.from_cli_args(args)
-    print(f"server_args: {server_args}")
-    print(f"bench_args: {bench_args}")
 
     asyncio.run(run_benchmark(server_args, bench_args))
