@@ -1,10 +1,6 @@
-from typing import Any, Dict, List, Optional, Tuple, Type, TypedDict, Union, cast
+from typing import Any, Dict, List, Optional, Tuple, Type, Union, cast
 
-import numpy as np
-import torch
 import torch.nn as nn
-import transformers.image_utils as image_utils
-from numpy.typing import NDArray
 from PIL.Image import Image
 from torch import Tensor
 from transformers.configuration_utils import PretrainedConfig
@@ -13,11 +9,11 @@ from transformers.image_processing_base import ImageProcessingMixin
 from transformers.image_utils import ImageInput, VideoInput
 from transformers.processing_utils import ProcessingKwargs, ProcessorMixin, Unpack
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase, TextInput
-from transformers.utils.generic import TensorType
 
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.multimodal_processors.base_processor import (
     BaseMultimodalProcessor,
+    MultimodalSpecialTokens,
 )
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.models.vila import VILAForConditionalGeneration
@@ -96,38 +92,28 @@ class VILAProcessor(BaseMultimodalProcessor):
 
     async def process_mm_data_async(
         self,
-        image_data: Optional[
-            Union[
-                List[List[Union[Image, str]]],
-                List[Union[Image, str]],
-                Union[Image, str],
-            ]
-        ],
-        input_text: Optional[
-            Union[
-                List[str],
-                str,
-                List[List[int]],
-                List[int],
-            ]
-        ],
+        image_data: Optional[List[Union[Image, str]]],
+        input_text: Union[str, List[int]],
         request_obj: GenerateReqInput,
         max_req_input_len: int,
         **kwargs,
     ) -> Optional[Dict[str, Any]]:
-        if image_data is None or input_text is None:
+        # Skip multimodal data processing if not provided.
+        if image_data is None or image_data == []:
             return None
 
-        normalized_image_data = self._normalize_image_data(image_data)
-        normalized_input_text = self._normalize_input_text(input_text)
-
-        inputs = self._processor.__call__(
-            images=normalized_image_data,
-            text=normalized_input_text,
+        base_mm_output = self.load_mm_data(
+            prompt=input_text,
+            multimodal_tokens=MultimodalSpecialTokens(
+                image_token=cast(str, self._processor.tokenizer.image_token)
+            ),
+            max_req_input_len=max_req_input_len,
+            image_data=image_data,
         )
 
-        input_ids = reshape_input_ids_like(
-            cast(List[List[int]], inputs.input_ids), input_text
+        inputs = self.process_mm_data(
+            input_text=base_mm_output.input_text,
+            images=base_mm_output.images,
         )
 
         mm_items: List[MultimodalDataItem] = [
@@ -141,73 +127,6 @@ class VILAProcessor(BaseMultimodalProcessor):
         # Checkout python/sglang/srt/managers/schedule_batch.py:MultimodalInputs
         # and python/sglang/srt/managers/tokenizer_manager.py:TokenizerManager._tokenize_one_request()
         return dict(
-            input_ids=input_ids,
+            input_ids=cast(Tensor, inputs.input_ids)[0].tolist(),
             mm_items=mm_items,
         )
-
-    def _normalize_image_data(
-        self,
-        image_data: Union[
-            List[List[Union[Image, str]]],
-            List[Union[Image, str]],
-            Union[Image, str],
-        ],
-    ) -> List[Image]:
-        images = image_utils.load_images(image_data)
-        flat_list: List[Image] = image_utils.make_flat_list_of_images(images)  # type: ignore
-        return flat_list
-
-    def _normalize_input_text(
-        self,
-        input_text: Union[
-            List[str],
-            str,
-            List[List[int]],
-            List[int],
-        ],
-    ) -> List[str]:
-        if is_list_of(input_text, str):
-            return cast(List[str], input_text)
-        elif isinstance(input_text, str):
-            return [input_text]
-        elif is_list_of(input_text, int):
-            return cast(
-                List[str],
-                self._processor.post_process_image_text_to_text(
-                    [input_text], skip_special_tokens=False
-                ),
-            )
-        elif is_list_of_lists_of(input_text, int):
-            return cast(
-                List[str],
-                self._processor.post_process_image_text_to_text(
-                    input_text, skip_special_tokens=False
-                ),
-            )
-
-        assert False, "Argument 'input_text' is not a valid type."
-
-
-def is_list_of(x: Any, t: Type) -> bool:
-    return isinstance(x, list) and all(isinstance(i, t) for i in x)
-
-
-def is_list_of_lists_of(x: Any, t: Type) -> bool:
-    return isinstance(x, list) and all(is_list_of(i, t) for i in x)
-
-
-def reshape_input_ids_like(
-    input_ids: List[List[int]],
-    like: Union[
-        List[str],
-        str,
-        List[List[int]],
-        List[int],
-    ],
-) -> Union[List[int], List[List[int]]]:
-    if is_list_of(like, str) or is_list_of_lists_of(like, int):
-        return input_ids
-    elif isinstance(like, str) or is_list_of(like, int):
-        return input_ids[0]
-
-    assert False, "Argument 'like' is not a valid type."
