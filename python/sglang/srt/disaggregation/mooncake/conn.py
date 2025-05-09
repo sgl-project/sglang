@@ -361,7 +361,8 @@ class MooncakeKVManager(BaseKVManager):
                         else:
                             # Dummy request means the decode instance is not used, so its status can be marked as success directly
                             # Dummy request does not need to sync status to decode endpoint
-                            self.update_status(req.room, KVPoll.Success)
+                            if kv_chunk.is_last:
+                                self.update_status(req.room, KVPoll.Success)
 
                     if self.check_status(kv_chunk.room) == KVPoll.Success:
                         self.transfer_infos.pop(kv_chunk.room)
@@ -408,8 +409,6 @@ class MooncakeKVManager(BaseKVManager):
         self.update_status(bootstrap_room, KVPoll.WaitingForInput)
 
     def check_status(self, bootstrap_room: int):
-        # TOOD: do we really need the poll()?
-
         return self.request_status[bootstrap_room]
 
     def update_status(self, bootstrap_room: int, status: KVPoll):
