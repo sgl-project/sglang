@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from typing import List
 
+import einops
 import torch
 from sglang.srt.eplb_simulator.configs import MyServerArgs, MY_MODEL_CONFIG_FOR_EXPERT_LOCATION
 from sglang.srt.managers import deepseek_eplb
@@ -45,18 +46,6 @@ def _simulate_physical_count_of_batch(
     server_args: MyServerArgs,
 ):
     if server_args.enable_expert_location_by_eplb:
-
-        # TODO
-        eplb_input_logical_count = einops.einsum(
-            logical_count_of_seq,
-            "num_seq num_layer num_expert -> num_layer num_expert",
-        )
-
-        expert_location_metadata = MyExpertLocationMetadata.init_by_eplb(
-            server_args,
-            logical_count=eplb_input_logical_count,
-            num_physical_experts=num_physical_expert,
-        )
         return _simulate_logical_to_physical_by_random_dispatching(
             logical_count_of_whatever=logical_count_of_batch,
             logical_to_all_physical_map=expert_location_metadata.logical_to_all_physical_map,
@@ -67,6 +56,7 @@ def _simulate_physical_count_of_batch(
 
 
 def _simulate_expert_location_metadata(
+    logical_count_of_batch: torch.Tensor,
     server_args: MyServerArgs,
     model_config_for_expert_location=MY_MODEL_CONFIG_FOR_EXPERT_LOCATION,
 ) -> List["MyExpertLocationMetadata"]:
@@ -78,7 +68,10 @@ def _simulate_expert_location_metadata(
     return [
         MyExpertLocationMetadata.init_by_eplb(
             server_args,
-            logical_count=eplb_input_logical_count,
+            logical_count=einops.einsum(
+                logical_count_of_batch[TODO, :, :],
+                "num_interest_batches num_layer num_expert -> num_layer num_expert",
+            ),
             num_physical_experts=num_physical_expert,
         )
         for TODO in TODO
