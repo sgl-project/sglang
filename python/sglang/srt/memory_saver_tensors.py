@@ -48,4 +48,6 @@ class LazyTensor(_WrapperTensor):
         return r
 
     def _unwrap(self):
-        return TODO
+        if self._inner is None:
+            self._inner = torch.empty(*self._create_args, **self._create_kwargs)
+        return self._inner
