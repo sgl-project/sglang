@@ -432,9 +432,11 @@ class FlashAttentionBackend(AttentionBackend):
                     forward_batch.req_pool_indices, : metadata.max_seq_len_k
                 ]
                 if self.is_hybrid is not None:
-                    metadata.page_table_local = forward_batch.req_to_token_pool.req_to_token_local[
-                        forward_batch.req_pool_indices, : metadata.max_seq_len_k
-                    ]
+                    metadata.page_table_local = (
+                        forward_batch.req_to_token_pool.req_to_token_local[
+                            forward_batch.req_pool_indices, : metadata.max_seq_len_k
+                        ]
+                    )
             # TODO: we need to test this part for llama 4 eagle case
             self._init_local_attn_metadata(metadata, device)
         elif forward_batch.forward_mode.is_target_verify():
@@ -571,9 +573,11 @@ class FlashAttentionBackend(AttentionBackend):
                 forward_batch.req_pool_indices, : metadata.max_seq_len_k
             ]
             if self.is_hybrid is not None:
-                metadata.page_table_local = forward_batch.req_to_token_pool.req_to_token_local[
-                forward_batch.req_pool_indices, : metadata.max_seq_len_k
-            ]
+                metadata.page_table_local = (
+                    forward_batch.req_to_token_pool.req_to_token_local[
+                        forward_batch.req_pool_indices, : metadata.max_seq_len_k
+                    ]
+                )
 
             if (
                 any(forward_batch.extend_prefix_lens_cpu)
@@ -639,14 +643,13 @@ class FlashAttentionBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
     ):
-        use_hybrid_loc = (
-            self.is_hybrid is not None 
-            and (hasattr(layer, "use_irope") and layer.use_irope)
+        use_hybrid_loc = self.is_hybrid is not None and (
+            hasattr(layer, "use_irope") and layer.use_irope
         )
         if k is not None:
             assert v is not None
             if save_kv_cache:
-                if not use_hybrid_loc: 
+                if not use_hybrid_loc:
                     cache_loc = (
                         forward_batch.out_cache_loc
                         if not layer.is_cross_attention
@@ -669,7 +672,7 @@ class FlashAttentionBackend(AttentionBackend):
 
         # Use precomputed metadata across all layers
         metadata = self.forward_metadata
-        
+
         # Calculate window size (can be moved to metadata if layer properties don't change)
         # we don't do layer.sliding_window_size - 1 since in model.get_attention_sliding_window_size() we already - 1
         # here is two side inclusive
@@ -687,7 +690,7 @@ class FlashAttentionBackend(AttentionBackend):
             v_descale = layer.v_scale.expand(descale_shape)
             q = q.to(self.kv_cache_dtype)
         causal = not layer.is_cross_attention
-        
+
         # Check if we should use local attention
         use_local_attn = (
             self.attention_chunk_size is not None
@@ -909,12 +912,11 @@ class FlashAttentionBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        
-        use_hybrid_loc = (
-            self.is_hybrid is not None 
-            and (hasattr(layer, "use_irope") and layer.use_irope)
+
+        use_hybrid_loc = self.is_hybrid is not None and (
+            hasattr(layer, "use_irope") and layer.use_irope
         )
-        
+
         if k is not None:
             assert v is not None
             if save_kv_cache:
@@ -926,7 +928,7 @@ class FlashAttentionBackend(AttentionBackend):
                     )
                 else:
                     cache_loc = forward_batch.out_cache_loc_local
-                    # TODO enable cross attention   
+                    # TODO enable cross attention
                 if not self.use_mla:
                     forward_batch.token_to_kv_pool.set_kv_buffer(
                         layer, cache_loc, k, v, layer.k_scale, layer.v_scale
@@ -938,12 +940,13 @@ class FlashAttentionBackend(AttentionBackend):
                         k,
                         k_rope,
                     )
-        
+
         # Use precomputed metadata across all layers
         metadata = self.forward_metadata
         local_attn_metadata = getattr(metadata, "local_attn_metadata", None)
         use_local_attention = (
-            self.attention_chunk_size is not None and local_attn_metadata is not None
+            self.attention_chunk_size is not None
+            and local_attn_metadata is not None
             and (hasattr(layer, "use_irope") and layer.use_irope)
         )
         # We do cascade attention for Draft Decode with topk > 1

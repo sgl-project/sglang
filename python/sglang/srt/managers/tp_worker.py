@@ -177,7 +177,7 @@ class TpModelWorker:
     def get_memory_pool(self):
         return (
             self.model_runner.req_to_token_pool,
-            self.model_runner.token_to_kv_pool_allocator
+            self.model_runner.token_to_kv_pool_allocator,
         )
 
     def forward_batch_generation(

@@ -84,9 +84,10 @@ class EAGLEWorker(TpModelWorker):
         server_args.disable_cuda_graph = True
         # Share the allocator with a target worker.
         # Draft and target worker own their own KV cache pools.
-        self.req_to_token_pool, self.token_to_kv_pool_allocator, = (
-            target_worker.get_memory_pool()
-        )
+        (
+            self.req_to_token_pool,
+            self.token_to_kv_pool_allocator,
+        ) = target_worker.get_memory_pool()
 
         # Load hot token ids
         if self.speculative_algorithm.is_eagle3():

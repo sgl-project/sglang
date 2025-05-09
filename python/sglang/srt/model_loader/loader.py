@@ -333,11 +333,8 @@ class DefaultModelLoader(BaseModelLoader):
             weights_iterator = pt_weights_iterator(hf_weights_files)
 
         # Apply the prefix.
-            
-        return (
-            (source.prefix + name, tensor) 
-            for (name, tensor) in weights_iterator          
-        )
+
+        return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
 
     def _get_all_weights(
         self,

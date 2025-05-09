@@ -96,10 +96,10 @@ class ModelConfig:
 
         # Check model type
         self.is_hybrid = is_hybrid_model(
-            self.hf_config.architectures, 
+            self.hf_config.architectures,
             enable_hybrid_kvcache=enable_hybrid_kvcache,
             context_length=context_length,
-            attention_chunk_size=self.attention_chunk_size
+            attention_chunk_size=self.attention_chunk_size,
         )
         self.is_generation = is_generation_model(
             self.hf_config.architectures, is_embedding
@@ -565,22 +565,25 @@ multimodal_model_archs = [
     "InternVLChatModel",
 ]
 
+
 def is_hybrid_model(
-    model_architectures: List[str], 
-    enable_hybrid_kvcache: Optional[float], 
-    context_length: Optional[int], 
-    attention_chunk_size: Optional[int]
+    model_architectures: List[str],
+    enable_hybrid_kvcache: Optional[float],
+    context_length: Optional[int],
+    attention_chunk_size: Optional[int],
 ):
-    
+
     if enable_hybrid_kvcache is None:
         return None
-    elif(enable_hybrid_kvcache > 0 
-         and model_architectures[0] == "Llama4ForConditionalGeneration"
-         and context_length > attention_chunk_size
+    elif (
+        enable_hybrid_kvcache > 0
+        and model_architectures[0] == "Llama4ForConditionalGeneration"
+        and context_length > attention_chunk_size
     ):
         return enable_hybrid_kvcache
     else:
-        return None 
+        return None
+
 
 def is_multimodal_model(model_architectures: List[str]):
     if any(

@@ -460,22 +460,7 @@ class Scheduler(
     def init_tokenizer(self):
         server_args = self.server_args
 
-<<<<<<< HEAD
-        self.model_config = ModelConfig(
-            server_args.model_path,
-            trust_remote_code=server_args.trust_remote_code,
-            revision=server_args.revision,
-            context_length=server_args.context_length,
-            model_override_args=server_args.json_model_override_args,
-            is_embedding=server_args.is_embedding,
-            enable_multimodal=server_args.enable_multimodal,
-            enable_hybrid_kvcache=server_args.enable_hybrid_kvcache,
-            dtype=server_args.dtype,
-            quantization=server_args.quantization,
-        )
-=======
         self.model_config = ModelConfig.from_server_args(server_args)
->>>>>>> b6cf3532 (Tiny refactor ModelConfig.from_server_args (#5219))
         self.is_generation = self.model_config.is_generation
 
         if server_args.skip_tokenizer_init:
@@ -504,9 +489,11 @@ class Scheduler(
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             self.tp_worker.get_memory_pool()
         )
-        
+
         if self.tp_worker.worker.model_runner.is_hybrid is not None:
-            self.token_to_kv_pool_allocator_local = self.tp_worker.get_memory_pool_local()
+            self.token_to_kv_pool_allocator_local = (
+                self.tp_worker.get_memory_pool_local()
+            )
         else:
             self.token_to_kv_pool_allocator_local = None
         if (
@@ -516,11 +503,8 @@ class Scheduler(
             self.tree_cache = ChunkCache(
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-<<<<<<< HEAD
                 token_to_kv_pool_allocator_local=self.token_to_kv_pool_allocator_local,
-=======
                 page_size=self.page_size,
->>>>>>> f8e46093 (Fix prefill OOM error in the case of large page size (#5081))
             )
         else:
             if self.enable_hierarchical_cache:

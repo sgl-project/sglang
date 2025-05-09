@@ -851,7 +851,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 f"{num_reqs=}, "
             )
         return req_pool_indices
-    
+
     def alloc_token_slots_local(self, num_tokens: int, backup_state: bool = False):
         # TODO backup_state
         out_cache_loc_local = self.token_to_kv_pool_allocator_local.alloc(num_tokens)
@@ -1075,8 +1075,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 )
                 if self.token_to_kv_pool_allocator_local is not None:
                     self.req_to_token_pool.write_local(
-                    (req.req_pool_idx, slice(0, pre_len)), req.prefix_indices
-                )
+                        (req.req_pool_idx, slice(0, pre_len)), req.prefix_indices
+                    )
 
             # If input_embeds are available, store them
             if req.input_embeds is not None:
@@ -1217,7 +1217,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     out_cache_loc_local,
                     self.req_to_token_pool.req_to_token_local.shape[1],
                 )
-                
+
         else:
             pt = 0
             for i in range(bs):
@@ -1227,8 +1227,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 )
                 if self.token_to_kv_pool_allocator_local is not None:
                     self.req_to_token_pool.write_local(
-                    (req_pool_indices[i], slice(prefix_lens[i], seq_lens[i])),
-                    out_cache_loc_local[pt : pt + extend_lens[i]],
+                        (req_pool_indices[i], slice(prefix_lens[i], seq_lens[i])),
+                        out_cache_loc_local[pt : pt + extend_lens[i]],
                     )
                 pt += extend_lens[i]
         if self.model_config.is_encoder_decoder:

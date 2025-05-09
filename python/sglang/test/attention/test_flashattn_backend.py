@@ -182,7 +182,7 @@ class TestFlashAttentionBackend(CustomTestCase):
                 out_cache_loc=torch.arange(
                     out_cache_start, out_cache_end, device=self.device
                 ),
-                out_cache_loc_local = None,
+                out_cache_loc_local=None,
                 seq_lens_sum=self.batch_size * total_len,
                 forward_mode=mode,
                 req_pool_indices=torch.arange(self.batch_size, device=self.device),

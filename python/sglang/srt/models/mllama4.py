@@ -203,7 +203,7 @@ class Llama4ForConditionalGeneration(nn.Module):
                             loaded_weight_list = [loaded_weight]
                         for name, loaded_weight, shard_id in zip(
                             name_list, loaded_weight_list, shard_id_list
-                        ):  
+                        ):
                             if name in params_dict:
                                 param = params_dict[name]
                                 weight_loader = param.weight_loader

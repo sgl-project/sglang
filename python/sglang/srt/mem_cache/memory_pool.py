@@ -54,7 +54,7 @@ class ReqToTokenPool:
         max_context_len: int,
         device: str,
         enable_memory_saver: bool,
-        is_hybrid: float = None
+        is_hybrid: float = None,
     ):
         memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
@@ -77,7 +77,7 @@ class ReqToTokenPool:
 
     def write(self, indices, values):
         self.req_to_token[indices] = values
-    
+
     def write_local(self, indices, values):
         self.req_to_token_local[indices] = values
 
@@ -174,7 +174,7 @@ class TokenToKVPoolAllocator:
     def alloc(self, need_size: int):
         if need_size > len(self.free_slots):
             return None
-        
+
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
         return select_index
@@ -182,7 +182,7 @@ class TokenToKVPoolAllocator:
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
-        
+
         if self.is_not_in_free_group:
             self.free_slots = torch.cat((self.free_slots, free_index))
         else:
@@ -284,7 +284,7 @@ class MHATokenToKVPool(KVCache):
                 self.k_buffer = []
                 self.v_buffer = []
                 for i in range(self.layer_num):
-                    temp_size = self.local_size if int((i+1)%4!=0) else self.size
+                    temp_size = self.local_size if int((i + 1) % 4 != 0) else self.size
                     self.k_buffer.append(
                         torch.zeros(
                             (temp_size + self.page_size, self.head_num, self.head_dim),
@@ -299,7 +299,7 @@ class MHATokenToKVPool(KVCache):
                             device=self.device,
                         )
                     )
-                    
+
     def _clear_buffers(self):
         del self.k_buffer
         del self.v_buffer

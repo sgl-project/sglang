@@ -106,9 +106,9 @@ class TpModelWorkerClient:
     def get_memory_pool(self):
         return (
             self.worker.model_runner.req_to_token_pool,
-            self.worker.model_runner.token_to_kv_pool_allocator
+            self.worker.model_runner.token_to_kv_pool_allocator,
         )
-    
+
     def get_memory_pool_local(self):
         return self.worker.model_runner.token_to_kv_pool_allocator_local
 
