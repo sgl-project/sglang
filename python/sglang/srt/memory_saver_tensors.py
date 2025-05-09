@@ -44,6 +44,7 @@ class LazyTensor(_WrapperTensor):
         r = torch.Tensor._make_wrapper_subclass(cls, *args, **kwargs)
         r._create_args = args
         r._create_kwargs = kwargs
+        r._inner = None
         return r
 
     def _unwrap(self):
