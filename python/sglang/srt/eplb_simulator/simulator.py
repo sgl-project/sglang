@@ -29,28 +29,29 @@ def _simulate_scheduled_tokens_given_seq_metadata(
     """
     if phase == "prefill":
         return _simulate_scheduled_tokens_given_seq_metadata_prefill(df_metadata,
-                                                                     chunked_prefill_size=num_tokens_in_batch_overall)
+                                                                     num_tokens_in_batch_overall=num_tokens_in_batch_overall)
     if phase == "decode":
-        return _simulate_scheduled_tokens_given_seq_metadata_decode(df_metadata, batch_size=num_tokens_in_batch_overall)
+        return _simulate_scheduled_tokens_given_seq_metadata_decode(df_metadata,
+                                                                    num_tokens_in_batch_overall=num_tokens_in_batch_overall)
     raise NotImplementedError
 
 
-def _simulate_scheduled_tokens_given_seq_metadata_prefill(df_metadata: pl.DataFrame, chunked_prefill_size: int):
+def _simulate_scheduled_tokens_given_seq_metadata_prefill(df_metadata: pl.DataFrame, num_tokens_in_batch_overall: int):
     all_pack_indices = torch.tensor([
         x
         for row in df_metadata.iter_rows(named=True)
         for x in range(row["pack_input_except_history_start_index"], row["pack_output_start_index"])
     ])
-    num_chunks = math.ceil(len(all_pack_indices) / chunked_prefill_size)
+    num_chunks = math.ceil(len(all_pack_indices) / num_tokens_in_batch_overall)
     return torch.chunk(all_pack_indices, num_chunks)
 
 
-def _simulate_scheduled_tokens_given_seq_metadata_decode(df_metadata: pl.DataFrame, batch_size: int):
+def _simulate_scheduled_tokens_given_seq_metadata_decode(df_metadata: pl.DataFrame, num_tokens_in_batch_overall: int):
     # loose bound
-    num_steps_upper_bound = int(df_metadata["end_index"].max() / batch_size * 2.5)
+    num_steps_upper_bound = int(df_metadata["end_index"].max() / num_tokens_in_batch_overall * 2.5)
 
-    pack_indices_of_step = torch.full((num_steps_upper_bound, batch_size), -1, dtype=torch.int32)
-    curr_lens = torch.zeros((batch_size,), dtype=torch.int32)
+    pack_indices_of_step = torch.full((num_steps_upper_bound, num_tokens_in_batch_overall), -1, dtype=torch.int32)
+    curr_lens = torch.zeros((num_tokens_in_batch_overall,), dtype=torch.int32)
 
     for row in df_metadata.iter_rows(named=True):
         chosen_location = torch.argmin(curr_lens).item()
