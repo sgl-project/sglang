@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass
 from typing import List, Union, Literal
 
@@ -21,15 +22,22 @@ def _compute_logical_count_of_batch(
 def _simulate_scheduled_tokens_given_seq_metadata(
     df_metadata: pl.DataFrame,
     phase: Union[Literal["prefill", "decode"]],
-):
+) -> List[torch.Tensor]:
     if phase == "prefill":
-        return _simulate_scheduled_tokens_given_seq_metadata_prefill(df_metadata)
+        return _simulate_scheduled_tokens_given_seq_metadata_prefill(df_metadata, chunked_prefill_size=TODO)
     if phase == "decode":
         return _simulate_scheduled_tokens_given_seq_metadata_decode(df_metadata)
+    raise NotImplementedError
 
 
-def _simulate_scheduled_tokens_given_seq_metadata_prefill(df_metadata: pl.DataFrame):
-    return TODO
+def _simulate_scheduled_tokens_given_seq_metadata_prefill(df_metadata: pl.DataFrame, chunked_prefill_size: int):
+    all_pack_indices = torch.tensor([
+        x
+        for row in df_metadata.iter_rows(named=True)
+        for x in range(row["pack_input_except_history_start_index"], row["pack_output_start_index"])
+    ])
+    num_chunks = math.ceil(len(all_pack_indices) / chunked_prefill_size)
+    return torch.chunk(all_pack_indices, num_chunks)
 
 
 def _simulate_scheduled_tokens_given_seq_metadata_decode(df_metadata: pl.DataFrame):
