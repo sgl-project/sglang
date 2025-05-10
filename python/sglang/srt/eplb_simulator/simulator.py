@@ -96,7 +96,7 @@ def _simulate_scheduled_pack_indices_given_seq_metadata(
 
             pack_indices_of_step[
             output_start: output_start + len(output_values), chosen_location
-            ] = output_values
+            ] = torch.tensor(output_values, dtype=torch.int32)
             curr_lens[chosen_location] += len(output_values)
 
         return [x[x != -1] for x in pack_indices_of_step[: torch.max(curr_lens)]]
