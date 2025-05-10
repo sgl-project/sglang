@@ -1133,6 +1133,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         self.enable_dp_attention = global_server_args_dict["enable_dp_attention"]
         self.layer_id = layer_id
+        self.is_nextn = is_nextn
         self.dp_size = get_attention_dp_size()
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
@@ -1271,18 +1272,27 @@ class DeepseekV2DecoderLayer(nn.Module):
                     forward_batch.gathered_buffer,
                     hidden_states,
                 )
-                dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
-                dp_scatter(residual, hidden_states, forward_batch)
+                dp_gather_partial(
+                    hidden_states,
+                    local_hidden_states,
+                    forward_batch,
+                    is_nextn_dp=self.is_nextn,
+                )
+                dp_scatter(
+                    residual, hidden_states, forward_batch, is_nextn_dp=self.is_nextn
+                )
                 hidden_states = self.post_attention_layernorm(hidden_states)
             else:
                 hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                if hidden_states.shape[0] > 0:
+                    hidden_states, residual = self.post_attention_layernorm(
+                        hidden_states, residual
+                    )
+        else:
+            if hidden_states.shape[0] > 0:
                 hidden_states, residual = self.post_attention_layernorm(
                     hidden_states, residual
                 )
-        else:
-            hidden_states, residual = self.post_attention_layernorm(
-                hidden_states, residual
-            )
 
         # Fully Connected
         hidden_states = self.mlp(hidden_states)

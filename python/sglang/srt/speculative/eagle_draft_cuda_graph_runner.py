@@ -36,6 +36,10 @@ class EAGLEDraftCudaGraphRunner:
         self.output_buffers = {}
         self.enable_torch_compile = model_runner.server_args.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
+        self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
+        self.enable_dp_attention = model_runner.server_args.enable_dp_attention
+        self.enable_sp_layernorm = model_runner.server_args.enable_sp_layernorm
+        self.dp_size = self.model_runner.dp_size
         self.tp_size = self.model_runner.tp_size
         self.topk = model_runner.server_args.speculative_eagle_topk
         self.speculative_num_steps = model_runner.server_args.speculative_num_steps
@@ -77,6 +81,19 @@ class EAGLEDraftCudaGraphRunner:
                 dtype=self.model_runner.dtype,
             )
 
+            if self.enable_dp_attention or self.enable_sp_layernorm:
+                # TODO(ch-wan): SP layernorm should use a different logic to manage gathered_buffer
+                self.gathered_buffer = torch.zeros(
+                    (
+                        self.max_num_token,
+                        self.model_runner.model_config.hidden_size,
+                    ),
+                    dtype=self.model_runner.dtype,
+                )
+                self.global_num_tokens_gpu = torch.zeros(
+                    (self.dp_size,), dtype=torch.int32
+                )
+
         # Capture
         try:
             self.capture()
@@ -92,11 +109,25 @@ class EAGLEDraftCudaGraphRunner:
             )
 
     def can_run(self, forward_batch: ForwardBatch):
-        is_bs_supported = (
-            forward_batch.batch_size in self.graphs
-            if self.disable_padding
-            else forward_batch.batch_size <= self.max_bs
-        )
+        if self.enable_dp_attention or self.enable_sp_layernorm:
+            if not forward_batch.can_run_dp_cuda_graph:
+                return False
+            total_batch_size = (
+                sum(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
+                if self.model_runner.spec_algorithm.is_eagle()
+                else sum(forward_batch.global_num_tokens_cpu)
+            )
+            is_bs_supported = (
+                total_batch_size in self.graphs
+                if self.disable_padding
+                else total_batch_size <= self.max_bs
+            )
+        else:
+            is_bs_supported = (
+                forward_batch.batch_size in self.graphs
+                if self.disable_padding
+                else forward_batch.batch_size <= self.max_bs
+            )
         return is_bs_supported
 
     def capture(self):
@@ -115,6 +146,23 @@ class EAGLEDraftCudaGraphRunner:
         topk_p = self.topk_p[:num_seqs]
         topk_index = self.topk_index[:num_seqs]
         hidden_states = self.hidden_states[:num_seqs]
+
+        if self.enable_dp_attention or self.enable_sp_layernorm:
+            self.global_num_tokens_gpu.copy_(
+                torch.tensor(
+                    [
+                        num_tokens // self.dp_size + (i < (num_tokens % self.dp_size))
+                        for i in range(self.dp_size)
+                    ],
+                    dtype=torch.int32,
+                    device=self.input_ids.device,
+                )
+            )
+            global_num_tokens = self.global_num_tokens_gpu
+            gathered_buffer = self.gathered_buffer[:num_tokens]
+        else:
+            global_num_tokens = None
+            gathered_buffer = None
 
         spec_info = EagleDraftInput(
             topk_p=topk_p,
@@ -135,6 +183,8 @@ class EAGLEDraftCudaGraphRunner:
             seq_lens_sum=seq_lens.sum(),
             return_logprob=False,
             positions=positions,
+            global_num_tokens_gpu=global_num_tokens,
+            gathered_buffer=gathered_buffer,
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
             capture_hidden_mode=(
@@ -186,7 +236,15 @@ class EAGLEDraftCudaGraphRunner:
         raw_num_token = raw_bs * self.num_tokens_per_bs
 
         # Pad
-        index = bisect.bisect_left(self.capture_bs, raw_bs)
+        if self.enable_dp_attention or self.enable_sp_layernorm:
+            total_batch_size = (
+                sum(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
+                if self.model_runner.spec_algorithm.is_eagle()
+                else sum(forward_batch.global_num_tokens_cpu)
+            )
+            index = bisect.bisect_left(self.capture_bs, total_batch_size)
+        else:
+            index = bisect.bisect_left(self.capture_bs, raw_bs)
         bs = self.capture_bs[index]
         if bs != raw_bs:
             self.seq_lens.fill_(1)
