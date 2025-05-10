@@ -31,7 +31,6 @@ if _is_cuda:
 if _is_cuda or _is_hip:
     from sgl_kernel import topk_softmax
 
-
 expert_distribution_recorder = ExpertDistributionRecorder()
 
 
@@ -204,6 +203,16 @@ def is_power_of_two(n):
     return n > 0 and math.log2(n).is_integer()
 
 
+# TODO will fuse this into kernel, thus use slow manual operation now
+@torch.compile(dynamic=True, backend=get_compiler_backend())
+def _mask_topk_ids_padded_region(
+    topk_ids: torch.Tensor,
+    num_token_non_padded: Optional[torch.Tensor] = None,
+):
+    indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)
+    topk_ids[indices >= num_token_non_padded, :] = -1
+
+
 def biased_grouped_topk(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -215,6 +224,7 @@ def biased_grouped_topk(
     compiled: bool = True,
     n_share_experts_fusion: int = 0,
     routed_scaling_factor: Optional[float] = None,
+    num_token_non_padded: Optional[torch.Tensor] = None,
 ):
     assert (
         routed_scaling_factor is not None
@@ -226,7 +236,7 @@ def biased_grouped_topk(
         <= 32  # moe_fused_gate kernel ensure that num_experts/num_expert_group does not exceed MAX_VPT=32 now. And when kernel can handle MAX_VPT > 32, we can remove this assertion.
         and is_power_of_two(correction_bias.shape[0])
     ):
-        return moe_fused_gate(
+        topk_weights, topk_ids = moe_fused_gate(
             gating_output,
             correction_bias,
             num_expert_group,
@@ -235,6 +245,8 @@ def biased_grouped_topk(
             n_share_experts_fusion,
             routed_scaling_factor,
         )
+        _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+        return topk_weights, topk_ids
     else:
         biased_grouped_topk_fn = (
             torch.compile(
@@ -268,6 +280,7 @@ def select_experts(
     correction_bias: Optional[torch.Tensor] = None,
     torch_native: bool = False,
     routed_scaling_factor: Optional[float] = None,
+    num_token_non_padded: Optional[torch.Tensor] = None,
 ):
     n_share_experts_fusion = global_server_args_dict["n_share_experts_fusion"]
     # DeekSeek V2/V3/R1 serices models uses grouped_top_k
@@ -296,6 +309,7 @@ def select_experts(
                 topk_group=topk_group,
                 n_share_experts_fusion=n_share_experts_fusion,
                 routed_scaling_factor=routed_scaling_factor,
+                num_token_non_padded=num_token_non_padded,
             )
     elif torch_native and custom_routing_function is None:
         topk_weights, topk_ids = fused_topk_native(
