@@ -1041,7 +1041,7 @@ def sample_chatbot_arena_conversations_requests(
         dataset_name="lmsys/chatbot_arena_conversations",
         column_id="question_id",
         column_conversation="conversation_a",
-        expr_timestamp=(pl.col("tstamp") * 1_000_000).cast(pl.DateTime("us")),
+        expr_timestamp=(pl.col("tstamp") * 1_000_000).cast(pl.Datetime("us")),
         num_requests=num_requests,
     )
 
@@ -1055,9 +1055,7 @@ def sample_wildchat_1m_requests(
         dataset_name="allenai/WildChat-1M",
         column_id="conversation_hash",
         column_conversation="conversation",
-        expr_timestamp=pl.col("timestamp").str.strptime(
-            pl.Datetime, format="%Y-%m-%dT%H:%M:%S"
-        ),
+        expr_timestamp=pl.col("timestamp"),
         num_requests=num_requests,
     )
 
@@ -1087,6 +1085,8 @@ def sample_hf_dataset_requests(
         .list.eval(pl.element().filter(pl.element().struct.field("role") == "user"))
         .list.eval(pl.element().struct.field("content")),
     )
+
+    print(f"sample_hf_dataset_requests {dataset_name=} {df=}")
 
     return [
         DatasetRow(
