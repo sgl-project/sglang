@@ -203,19 +203,18 @@ def _simulate_logical_to_physical_by_random_dispatching(
                                                            "num_layer num_logical_experts X -> num_layer num_logical_experts")
     assert torch.all(num_physical_expert_per_logical_expert >= 1)
     logical_count_amortized = logical_count / num_physical_expert_per_logical_expert
+    logical_count_repeated = einops.repeat(logical_count_amortized, "num_layer num_logical_count -> num_layer num_logical_count x_dim",
+                                           x_dim=x_dim)
 
     physical_count_of_whatever = torch.zeros(
-        (num_layer, num_physical_expert),
+        (num_layer, num_physical_expert + 1),
         dtype=torch.float32,
     )
-    for x_index in range(x_dim):
-        logical_to_all_physical_map_partial = logical_to_all_physical_map[:, :, x_index]
-        mask = logical_to_all_physical_map_partial != -1
-        physical_count_of_whatever.scatter_add_(
-            dim=1,
-            index=logical_to_all_physical_map_partial[mask],
-            src=logical_count_amortized[mask],
-        )
+    physical_count_of_whatever.scatter_add_(
+        dim=1,
+        index=logical_to_all_physical_map,
+        src=logical_count_repeated,
+    )
 
     return physical_count_of_whatever
 
