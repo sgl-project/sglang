@@ -229,6 +229,7 @@ class ForwardBatch:
     # For DP attention
     global_num_tokens_cpu: Optional[List[int]] = None
     global_num_tokens_gpu: Optional[torch.Tensor] = None
+    split_indices_cpu: Optional[torch.Tensor] = None
     # Has to be None when cuda graph is captured.
     global_num_tokens_for_logprob_cpu: Optional[List[int]] = None
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
@@ -295,6 +296,9 @@ class ForwardBatch:
         # For DP attention
         if batch.global_num_tokens is not None:
             ret.global_num_tokens_cpu = batch.global_num_tokens
+            ret.split_indices_cpu = torch.tensor(
+                batch.global_num_tokens, dtype=torch.int64
+            ).cumsum(0)[:-1]
             ret.global_num_tokens_gpu = torch.tensor(
                 batch.global_num_tokens, dtype=torch.int64
             ).to(device, non_blocking=True)
