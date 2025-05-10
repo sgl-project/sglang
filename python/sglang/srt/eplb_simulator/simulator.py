@@ -13,6 +13,7 @@ from sglang.srt.eplb_simulator.reader import (
     ExpertDistributionModeDetailPerTokenAndBenchServingPack,
 )
 from sglang.srt.managers import deepseek_eplb
+from sglang.srt.managers.deepseek_eplb import balanced_packing
 from sglang.srt.managers.expert_distribution import (
     compute_gpu_physical_count,
     compute_utilization_rate,
@@ -118,13 +119,13 @@ def _simulate_execution_given_logical_count_of_batch(
     logical_count_of_batch: torch.Tensor,
     server_args: MyServerArgs,
 ):
-    physical_count_of_batch = _simulate_eplb_physical_count_of_batch(
+    balanced_physical_count_of_batch = _simulate_eplb_physical_count_of_batch(
         logical_count_of_batch=logical_count_of_batch,
         server_args=server_args,
     )
 
     gpu_physical_count_of_batch = compute_gpu_physical_count(
-        physical_count_of_whatever=physical_count_of_batch,
+        physical_count_of_whatever=balanced_physical_count_of_batch,
         num_gpu=server_args.tp_size,
     )
 
@@ -136,6 +137,7 @@ def _simulate_execution_given_logical_count_of_batch(
     mean_utilization_rate = torch.mean(utilization_rate).item()
 
     return dict(
+        balanced_physical_count_of_batch=balanced_physical_count_of_batch,
         gpu_physical_count_of_batch=gpu_physical_count_of_batch,
         utilization_rate=utilization_rate,
         mean_utilization_rate=mean_utilization_rate,
