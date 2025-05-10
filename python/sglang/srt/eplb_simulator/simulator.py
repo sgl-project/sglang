@@ -50,8 +50,13 @@ def simulate_execution_given_pack(
     assert assert_physical_equal_logical_expert
     logical_count_of_batch = vanilla_physical_count_of_batch
 
-    return _simulate_execution_given_logical_count_of_batch(
+    simulation_output = _simulate_execution_given_logical_count_of_batch(
         logical_count_of_batch=logical_count_of_batch, server_args=server_args
+    )
+
+    return dict(
+        num_tokens_of_batch=torch.tensor([len(x) for x in token_indices_of_batch], dtype=torch.int32),
+        **simulation_output,
     )
 
 
