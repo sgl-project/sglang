@@ -58,6 +58,7 @@ class TestSkipTokenizerInit(CustomTestCase):
             self.base_url + "/generate",
             json=self.get_request_json(
                 input_ids=input_ids,
+                max_new_tokens=max_new_tokens,
                 return_logprob=return_logprob,
                 top_logprobs_num=top_logprobs_num,
                 stream=False,
@@ -109,6 +110,7 @@ class TestSkipTokenizerInit(CustomTestCase):
             self.base_url + "/generate",
             json=self.get_request_json(
                 input_ids=input_ids,
+                max_new_tokens=max_new_tokens,
                 return_logprob=return_logprob,
                 top_logprobs_num=top_logprobs_num,
                 stream=False,
@@ -171,9 +173,14 @@ class TestSkipTokenizerInit(CustomTestCase):
         return input_ids
 
     def get_request_json(
-        self, input_ids, return_logprob=False, top_logprobs_num=0, stream=False, n=1
+        self,
+        input_ids,
+        max_new_tokens=32,
+        return_logprob=False,
+        top_logprobs_num=0,
+        stream=False,
+        n=1,
     ):
-        max_new_tokens = 32
         return {
             "input_ids": input_ids,
             "sampling_params": {
