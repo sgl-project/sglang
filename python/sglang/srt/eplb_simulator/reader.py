@@ -96,7 +96,7 @@ def read_expert_distribution_mode_detail_per_token(dir_data):
     def _concat_records(processed_records):
         return {
             k: torch.concat([r[k] for r in processed_records], dim=0)
-            for k in processed_records[0].keys()
+            for k in tqdm(list(processed_records[0].keys()))
         }
 
     def _compute_rid(pack):
