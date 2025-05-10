@@ -1221,9 +1221,9 @@ def wrap_multi_round_request_func(request_func: Callable, tokenizer) -> Callable
             history_conversations,
             add_generation_prompt=False,
             tokenize=False,
-        ).replace(tokenizer.bos_token, "")
+        ).replace(tokenizer.bos_token, "") if len(history_conversations) > 0 else ""
         full_text = tokenizer.apply_chat_template(
-            history_conversations,
+            full_conversations,
             add_generation_prompt=True,
             tokenize=False,
         ).replace(tokenizer.bos_token, "")
