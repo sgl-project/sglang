@@ -86,14 +86,12 @@ def read_expert_distribution_mode_detail_per_token(dir_data):
             if forward_mode == ForwardMode.EXTEND.value
             else torch.full((len(rids_raw),), 1)
         )
-        # forward_mode_repeated = torch.full((len(input_ids),), forward_mode)
 
         return dict(
             rids_raw=rids_raw,
             rids_repeat_num=rids_repeat_num,
             input_ids=input_ids,
             topk_ids=topk_ids,
-            # forward_modes=forward_mode_repeated,
         )
 
     def _concat_records(processed_records):
