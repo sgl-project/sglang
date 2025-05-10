@@ -91,7 +91,6 @@ def read_expert_distribution_mode_detail_per_token(
             rids_raw=rids_raw.cuda(),
             rids_repeat_num=rids_repeat_num.cuda(),
             input_ids=input_ids.cuda(),
-            # topk_ids=topk_ids,
         )
 
     def _concat_records(processed_records):
