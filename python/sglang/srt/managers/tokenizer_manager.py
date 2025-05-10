@@ -732,6 +732,10 @@ class TokenizerManager:
         req = AbortReq(rid)
         self.send_to_scheduler.send_pyobj(req)
 
+    def proactive_abort_request(self, rid: str):
+        req = AbortReq(rid)
+        self.send_to_scheduler.send_pyobj(req)
+
     async def start_profile(
         self,
         output_dir: Optional[str] = None,
