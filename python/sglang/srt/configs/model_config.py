@@ -555,6 +555,7 @@ multimodal_model_archs = [
     "CLIPModel",
     "KimiVLForConditionalGeneration",
     "InternVLChatModel",
+    "VILAForConditionalGeneration",
 ]
 
 
