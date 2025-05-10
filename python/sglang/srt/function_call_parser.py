@@ -268,7 +268,7 @@ class BaseFormatDetector(ABC):
 
                 if cur_arguments:
                     sent = len(self.streamed_args_for_tool[self.current_tool_id])
-                    cur_args_json = json.dumps(cur_arguments)
+                    cur_args_json = json.dumps(cur_arguments, ensure_ascii=False)
                     prev_arguments = self.prev_tool_call_arr[self.current_tool_id].get(
                         "arguments"
                     )
@@ -282,7 +282,7 @@ class BaseFormatDetector(ABC):
                         self.streamed_args_for_tool[self.current_tool_id] = ""
 
                     elif prev_arguments:
-                        prev_args_json = json.dumps(prev_arguments)
+                        prev_args_json = json.dumps(prev_arguments, ensure_ascii=False)
                         if cur_args_json != prev_args_json:
                             prefix = _find_common_prefix(prev_args_json, cur_args_json)
                             argument_diff = prefix[sent:]
