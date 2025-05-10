@@ -1072,7 +1072,7 @@ def sample_hf_dataset_requests(
     import polars as pl
     from datasets import load_dataset
 
-    df = load_dataset(dataset_name).to_polars()
+    df = load_dataset(dataset_name, split="train").to_polars()
 
     df = df[:num_requests]
 
