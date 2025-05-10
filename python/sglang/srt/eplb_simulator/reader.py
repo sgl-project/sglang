@@ -93,6 +93,7 @@ def read_expert_distribution_mode_detail_per_token(dir_data):
         }
 
     def _compute_rid(pack):
+        pack = {**pack}
         rids_raw = pack.pop("rids_raw")
         rids_repeat_num = pack.pop("rids_repeat_num")
         pack["rids"] = torch.repeat_interleave(rids_raw, rids_repeat_num)
