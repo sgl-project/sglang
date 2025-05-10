@@ -181,7 +181,7 @@ def _simulate_expert_location_metadata_arr(
             server_args,
             logical_count=einops.einsum(
                 logical_count_of_batch[
-                chunk_index * chunk_size: (chunk_index + 1) * chunk_size,
+                (chunk_index-1) * chunk_size: chunk_index * chunk_size,
                 :,
                 :,
                 ],
@@ -189,7 +189,7 @@ def _simulate_expert_location_metadata_arr(
             ),
             num_physical_experts=num_physical_expert,
         )
-        for chunk_index in trange(num_chunks)
+        for chunk_index in trange(1, num_chunks)
     ]
 
     return [output_chunks[batch_index // chunk_size] for batch_index in range(num_batches)]
