@@ -3,7 +3,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, List
 
-import einops
 import polars as pl
 import torch
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -83,16 +82,16 @@ def read_expert_distribution_mode_detail_per_token(dir_data):
 
         input_ids = torch.tensor(record["input_ids"], dtype=torch.int32)
 
-        topk_ids = einops.rearrange(
-            record["topk_ids_of_layer"],
-            "num_layer num_token top_k -> num_token num_layer top_k",
-        )
+        # topk_ids = einops.rearrange(
+        #     record["topk_ids_of_layer"],
+        #     "num_layer num_token top_k -> num_token num_layer top_k",
+        # )
 
         return dict(
-            rids_raw=rids_raw,
-            rids_repeat_num=rids_repeat_num,
-            input_ids=input_ids,
-            topk_ids=topk_ids,
+            rids_raw=rids_raw.cuda(),
+            rids_repeat_num=rids_repeat_num.cuda(),
+            input_ids=input_ids.cuda(),
+            # topk_ids=topk_ids,
         )
 
     def _concat_records(processed_records):
@@ -139,7 +138,7 @@ def read_expert_distribution_mode_detail_per_token(dir_data):
     processed_records = []
     for path in list(Path(dir_data).glob("*.pt")):
         print(f"Read {path=}")
-        data_pack = torch.load(path, weights_only=True, map_location=_DEVICE)
+        data_pack = torch.load(path, weights_only=True, map_location="cpu")
         processed_records += [_handle_record(record) for record in tqdm(data_pack["records"])]
 
     pack = _concat_records(processed_records)
