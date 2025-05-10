@@ -26,6 +26,8 @@ suites = {
         TestFile("models/test_reward_models.py", 132),
         TestFile("models/test_vlm_models.py", 317),
         TestFile("test_abort.py", 51),
+        TestFile("test_auto_override_quant_config.py", 5),
+        TestFile("test_awq.py"),
         TestFile("test_block_int8.py", 22),
         TestFile("test_create_kvindices.py", 2),
         TestFile("test_chunked_prefill.py", 285),
