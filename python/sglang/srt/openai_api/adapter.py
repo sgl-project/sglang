@@ -1024,9 +1024,20 @@ def v1_chat_generate_request(
                     assistant_prefix = None
 
                 try:
-                    prompt_ids = tokenizer_manager.tokenizer.apply_chat_template(
+                    tokenized_chat = tokenizer_manager.tokenizer.apply_chat_template(
                         openai_compatible_messages,
-                        tokenize=True,
+                        tokenize=False,
+                        add_generation_prompt=False,
+                        tools=tools,
+                        **(
+                            request.chat_template_kwargs
+                            if request.chat_template_kwargs
+                            else {}
+                        ),
+                    )
+                    tokenized_chat_with_gen = tokenizer_manager.tokenizer.apply_chat_template(
+                        openai_compatible_messages,
+                        tokenize=False,
                         add_generation_prompt=True,
                         tools=tools,
                         **(
@@ -1040,9 +1051,20 @@ def v1_chat_generate_request(
                     #  has a different tools input format that is not compatible
                     #  with openAI's apply_chat_template tool_call format, like Mistral.
                     tools = [t if "function" in t else {"function": t} for t in tools]
-                    prompt_ids = tokenizer_manager.tokenizer.apply_chat_template(
+                    tokenized_chat = tokenizer_manager.tokenizer.apply_chat_template(
                         openai_compatible_messages,
-                        tokenize=True,
+                        tokenize=False,
+                        add_generation_prompt=False,
+                        tools=tools,
+                        **(
+                            request.chat_template_kwargs
+                            if request.chat_template_kwargs
+                            else {}
+                        ),
+                    )
+                    tokenized_chat_with_gen = tokenizer_manager.tokenizer.apply_chat_template(
+                        openai_compatible_messages,
+                        tokenize=False,
                         add_generation_prompt=True,
                         tools=tools,
                         **(
@@ -1052,14 +1074,16 @@ def v1_chat_generate_request(
                         ),
                     )
 
-                if assistant_prefix:
-                    encoded = tokenizer_manager.tokenizer.encode(assistant_prefix)
-                    if (
-                        encoded
-                        and encoded[0] == tokenizer_manager.tokenizer.bos_token_id
-                    ):
-                        encoded = encoded[1:]
-                    prompt_ids += encoded
+                if tokenized_chat_with_gen.startswith(tokenized_chat):
+                    gen_assistant_prefix = tokenized_chat_with_gen[len(tokenized_chat):]
+                else:
+                    gen_assistant_prefix = ""
+
+                assistant_prefix = (gen_assistant_prefix or "") + (assistant_prefix or "")
+
+                prompt_str = tokenized_chat + assistant_prefix
+                prompt_ids = tokenizer_manager.tokenizer.encode(prompt_str)
+
                 if is_multimodal:
                     prompt = tokenizer_manager.tokenizer.decode(prompt_ids)
                 stop = request.stop
