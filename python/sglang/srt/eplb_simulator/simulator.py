@@ -57,6 +57,7 @@ def simulate_execution_given_pack(
         )
 
         return dict(
+            logical_count_of_batch=vanilla_physical_count_of_batch,
             num_tokens_of_batch=torch.tensor([len(x) for x in token_indices_of_batch], dtype=torch.int32),
             **simulation_output,
         )
