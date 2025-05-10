@@ -18,7 +18,7 @@ from sglang.srt.managers.expert_distribution import (
     compute_utilization_rate,
 )
 from sglang.srt.managers.expert_location import ExpertLocationMetadata
-from tqdm.auto import tqdm
+from tqdm.auto import tqdm, trange
 
 _Phase = Union[Literal["prefill", "decode"]]
 
@@ -182,7 +182,7 @@ def _simulate_expert_location_metadata_arr(
             ),
             num_physical_experts=num_physical_expert,
         )
-        for batch_index in range(num_batches)
+        for batch_index in trange(num_batches)
     ]
 
 
