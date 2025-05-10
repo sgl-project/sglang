@@ -148,7 +148,7 @@ def _simulate_eplb_physical_count_of_batch(
         )
         outputs = [
             _simulate_logical_to_physical_by_random_dispatching(
-                logical_count_of_whatever=logical_count_of_batch[batch_index, :, :],
+                logical_count=logical_count_of_batch[batch_index, :, :],
                 logical_to_all_physical_map=expert_location_metadata_arr[
                     batch_index
                 ].logical_to_all_physical_map,
@@ -191,17 +191,19 @@ def _simulate_expert_location_metadata_arr(
 
 
 def _simulate_logical_to_physical_by_random_dispatching(
-    logical_count_of_whatever: torch.Tensor,  # (..., num_layer, num_logical_expert)
+    logical_count: torch.Tensor,  # (num_layer, num_logical_expert)
     logical_to_all_physical_map: torch.Tensor,  # (num_layer, num_logical_experts, X)
     num_physical_expert: int,
 ):
-    """output: (..., num_layer, num_physical_expert)"""
-    *prefix_dims, num_layer, num_logical_expert = logical_count_of_whatever.shape
+    """output: (num_layer, num_physical_expert)"""
+    num_layer, num_logical_expert = logical_count.shape
 
     physical_count_of_whatever = torch.zeros(
         (*prefix_dims, num_layer, num_physical_expert),
         dtype=torch.float32,
     )
+
+    logical_count_amortized = logical_count / TODO
 
     for layer_id in range(num_layer):
         for logical_expert_id in range(num_logical_expert):
@@ -213,7 +215,7 @@ def _simulate_logical_to_physical_by_random_dispatching(
             for physical_expert_id in all_physical_expert_ids:
                 physical_count_of_whatever[
                     ..., layer_id, physical_expert_id
-                ] += logical_count_of_whatever[..., layer_id, logical_expert_id] / len(
+                ] += logical_count[..., layer_id, logical_expert_id] / len(
                     all_physical_expert_ids
                 )
 
