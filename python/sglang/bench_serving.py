@@ -1596,6 +1596,7 @@ async def benchmark(
     }
 
     # Append results to a JSONL file
+    Path(output_file_name).parent.mkdir(parents=True, exist_ok=True)
     with open(output_file_name, "a") as file:
         if args.output_details:
             result_for_dump = result | result_details
