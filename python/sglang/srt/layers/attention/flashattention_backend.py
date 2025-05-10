@@ -16,10 +16,10 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
 
+import torch.distributed as dist
 from sgl_kernel import merge_state_v2
 from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 
-import torch.distributed as dist
 
 @dataclass
 class FlashAttentionMetadata:
@@ -934,7 +934,6 @@ class FlashAttentionBackend(AttentionBackend):
                                 f"cache_loc in forward_decode in flashAtten: {cache_loc}"
                             )
 
-                        
                 else:
                     cache_loc = forward_batch.out_cache_loc_local
                     # TODO enable cross attention
