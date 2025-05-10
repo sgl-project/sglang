@@ -2054,6 +2054,11 @@ class DeepseekV2ForCausalLM(nn.Module):
         self, architecture: str = "DeepseekV3ForCausalLM"
     ):
         self.n_share_experts_fusion = global_server_args_dict["n_share_experts_fusion"]
+
+        print("HACK: force disable shared experts fusion")
+        assert self.n_share_experts_fusion == 0
+        return
+
         if self.n_share_experts_fusion > 0:
             # Only Deepseek V3/R1 can use shared experts fusion optimization now.
             if (
