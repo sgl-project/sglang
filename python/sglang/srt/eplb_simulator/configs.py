@@ -15,6 +15,7 @@ class MyServerArgs:
     eplb_rebalance_num_iterations: Optional[int] = None
     # init_expert_location: Optional[str]
     deepseek_eplb_hack_shuffle: bool = False
+    decode_max_left_padding: int = 500
 
 
 # TODO generalize

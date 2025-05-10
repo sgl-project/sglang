@@ -36,6 +36,7 @@ def simulate_execution_given_pack(
             pack.df_metadata,
             phase=phase,
             num_tokens_in_batch_overall=server_args.num_tokens_in_batch_overall,
+            decode_max_left_padding=server_args.decode_max_left_padding,
         )
 
         vanilla_physical_count_of_batch = torch.stack(
@@ -65,6 +66,7 @@ def _simulate_scheduled_pack_indices_given_seq_metadata(
     df_metadata: pl.DataFrame,
     phase: _Phase,
     num_tokens_in_batch_overall: int,
+    decode_max_left_padding: int,
 ) -> List[torch.Tensor]:
     """
     :return: `output[i]` denotes all pack indices that will be used in i-th step
@@ -91,7 +93,7 @@ def _simulate_scheduled_pack_indices_given_seq_metadata(
         pack_indices_of_step = torch.full(
             (num_steps_upper_bound, num_tokens_in_batch_overall), fill_value=-1, dtype=torch.int32
         )
-        curr_lens = torch.zeros((num_tokens_in_batch_overall,), dtype=torch.int32)
+        curr_lens = torch.randint(0, decode_max_left_padding, (num_tokens_in_batch_overall,), dtype=torch.int32)
 
         for row in tqdm(df_metadata.iter_rows(named=True), total=len(df_metadata)):
             chosen_location = torch.argmin(curr_lens).item()
