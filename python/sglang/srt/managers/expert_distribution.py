@@ -11,7 +11,9 @@ from typing import Any, Dict, List, Optional, Type
 import einops
 import torch
 import torch.distributed
+
 from sglang.srt.managers.expert_location import ExpertLocationMetadata
+from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import Withable, get_bool_env_var
@@ -313,11 +315,13 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
                 self._TOP_K_NUM,
             ),
             dtype=torch.int32,
+            device="cuda",
         )
         self._misc_objects: List[Dict[str, Any]] = []
         assert (
             not server_args.enable_two_batch_overlap
         ), "DetailSinglePassGatherer does not support TBO yet"
+        # TODO assert shared experts fusion is disabled, o/w data is wrong
 
     def on_forward_pass_start(self, forward_batch: ForwardBatch):
         assert self._metadata is None
@@ -330,7 +334,7 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
         )
 
     def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
-        self._topk_ids_of_layer[layer_idx, : topk_ids.shape[0], :] = topk_ids.cpu()
+        self._topk_ids_of_layer[layer_idx, : topk_ids.shape[0], :] = topk_ids
 
     def on_deepep_dispatch_normal(
         self,
@@ -358,7 +362,7 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
         num_tokens = len(self._metadata["input_ids"])
         return dict(
             **self._metadata,
-            topk_ids_of_layer=self._topk_ids_of_layer[:, :num_tokens, :].clone(),
+            topk_ids_of_layer=self._topk_ids_of_layer[:, :num_tokens, :].clone().cpu(),
             misc_objects=self._misc_objects,
         )
 
@@ -399,8 +403,8 @@ class _SelectExpertsSinglePassGatherer(_LayerBasedSinglePassGatherer):
         torch.cuda.synchronize()
 
         global_physical_count = [
-                                    0
-                                ] * self._expert_location_metadata.num_physical_experts
+            0
+        ] * self._expert_location_metadata.num_physical_experts
         for token_record in topk_ids_list:
             for global_physical_expert_idx in token_record:
                 global_physical_count[global_physical_expert_idx] += 1
@@ -483,7 +487,7 @@ def _convert_local_to_global_physical_count(
 
     ans = torch.zeros((num_layers, num_physical_experts), dtype=dtype, device=device)
     ans[
-    :, num_local_physical_experts * rank: num_local_physical_experts * (rank + 1)
+        :, num_local_physical_experts * rank : num_local_physical_experts * (rank + 1)
     ] = local_physical_count
     return ans
 
