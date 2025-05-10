@@ -28,11 +28,10 @@ def simulate_execution_given_pack(
     pack: ExpertDistributionModeDetailPerTokenAndBenchServingPack,
     phase: _Phase,
     server_args: MyServerArgs,
-    assert_physical_equal_logical_expert: bool,
+    assert_vanilla_physical_equal_logical_expert: bool,
+    model_config_for_expert_location=MY_MODEL_CONFIG_FOR_EXPERT_LOCATION,
 ):
     with torch.device("cuda"):
-        num_physical_expert = _compute_num_physical_experts(server_args)
-
         token_indices_of_batch = _simulate_scheduled_pack_indices_given_seq_metadata(
             pack.df_metadata,
             phase=phase,
@@ -40,25 +39,23 @@ def simulate_execution_given_pack(
             decode_max_left_padding=server_args.decode_max_left_padding,
         )
 
-        vanilla_physical_count_of_batch = torch.stack(
+        assert assert_vanilla_physical_equal_logical_expert
+        logical_count_of_batch = torch.stack(
             [
                 compute_global_physical_count_from_topk_ids(
                     topk_ids=pack.topk_ids[token_indices_of_batch[i], :, :],
-                    num_physical_expert=num_physical_expert,
+                    num_physical_expert=model_config_for_expert_location.num_logical_experts,
                 )
                 for i in trange(len(token_indices_of_batch), desc="vanilla_physical_count_of_batch")
             ]
         )
-
-        assert assert_physical_equal_logical_expert
-        logical_count_of_batch = vanilla_physical_count_of_batch
 
         simulation_output = _simulate_execution_given_logical_count_of_batch(
             logical_count_of_batch=logical_count_of_batch, server_args=server_args
         )
 
         return dict(
-            logical_count_of_batch=vanilla_physical_count_of_batch,
+            logical_count_of_batch=logical_count_of_batch,
             num_tokens_of_batch=torch.tensor([len(x) for x in token_indices_of_batch], dtype=torch.int32),
             **simulation_output,
         )
