@@ -526,10 +526,14 @@ def get_dataset(args, tokenizer):
         )
     elif args.dataset_name == "chatbot-arena-conversations":
         input_requests = sample_chatbot_arena_conversations_requests(
-            num_requests=num_prompts
+            num_requests=num_prompts,
+            output_len=args.hf_dataset_output_len,
         )
     elif args.dataset_name == "wildchat-1m":
-        input_requests = sample_wildchat_1m_requests(num_requests=num_prompts)
+        input_requests = sample_wildchat_1m_requests(
+            num_requests=num_prompts,
+            output_len=args.hf_dataset_output_len,
+        )
     else:
         raise ValueError(f"Unknown dataset: {args.dataset_name}")
     input_requests = input_requests[args.skip_num_prompts:]
@@ -1036,6 +1040,7 @@ def sample_generated_shared_prefix_requests(
 
 def sample_chatbot_arena_conversations_requests(
     num_requests: int,
+    output_len: int,
 ):
     import polars as pl
 
@@ -1045,11 +1050,13 @@ def sample_chatbot_arena_conversations_requests(
         column_conversation="conversation_a",
         expr_timestamp=(pl.col("tstamp") * 1_000_000).cast(pl.Datetime("us")),
         num_requests=num_requests,
+        output_len=output_len,
     )
 
 
 def sample_wildchat_1m_requests(
     num_requests: int,
+    output_len: int,
 ):
     import polars as pl
 
@@ -1059,6 +1066,7 @@ def sample_wildchat_1m_requests(
         column_conversation="conversation",
         expr_timestamp=pl.col("timestamp"),
         num_requests=num_requests,
+        output_len=output_len,
     )
 
 
@@ -1068,6 +1076,7 @@ def sample_hf_dataset_requests(
     column_conversation: str,
     expr_timestamp,
     num_requests: int,
+    output_len: int,
 ):
     import polars as pl
     from datasets import load_dataset
@@ -1094,7 +1103,7 @@ def sample_hf_dataset_requests(
         DatasetRow(
             prompt=row["prompts"],
             prompt_len=None,
-            output_len=10000,
+            output_len=output_len,
             metadata=dict(dataset_id=row["id"], dataset_timestamp=row["timestamp"].isoformat()),
         )
         for row in df.iter_rows(named=True)
@@ -1855,6 +1864,12 @@ if __name__ == "__main__":
         default=0.0,
         help="Range of sampled ratio of input/output length, "
              "used only for random dataset.",
+    )
+    parser.add_argument(
+        "--hf-dataset-output-len",
+        default=1024,
+        type=int,
+        help="Number of output tokens per request, used only for hf dataset.",
     )
     parser.add_argument(
         "--request-rate",
