@@ -34,6 +34,7 @@ from typing import List, Optional, Tuple, Union
 import numpy as np
 import psutil
 import torch
+import torch.distributed as dist
 import triton
 import triton.language as tl
 
@@ -54,6 +55,7 @@ class ReqToTokenPool:
         max_context_len: int,
         device: str,
         enable_memory_saver: bool,
+        is_hybrid: float = None,
     ):
         memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
@@ -66,10 +68,28 @@ class ReqToTokenPool:
             self.req_to_token = torch.zeros(
                 (size, max_context_len), dtype=torch.int32, device=device
             )
+            if is_hybrid:
+                self.req_to_token_local = torch.zeros(
+                    (size, max_context_len), dtype=torch.int32, device=device
+                )
+                self.local_start_loc = torch.zeros(
+                    size, dtype=torch.int32, device=device
+                )
+            else:
+                self.req_to_token_local = None
         self.free_slots = list(range(size))
 
     def write(self, indices, values):
         self.req_to_token[indices] = values
+
+    def write_local(self, indices, values):
+        self.req_to_token_local[indices] = values
+
+    def get_local_start_loc(self, idx):
+        return self.local_start_loc[idx]
+
+    def write_local_start_loc(self, start_loc, idx):
+        self.local_start_loc[idx] = start_loc
 
     def available_size(self):
         return len(self.free_slots)
@@ -178,6 +198,13 @@ class TokenToKVPoolAllocator:
         else:
             self.free_group.append(free_index)
 
+        # for debugging
+        rank = dist.get_rank()
+        if rank == 0:
+            with open("log.txt", "a") as f:
+                f.write(f"free_index: {free_index}\n")
+                f.write(f"free_slots: {self.free_slots}\n")
+
     def free_group_begin(self):
         self.is_not_in_free_group = False
         self.free_group = []
@@ -214,10 +241,12 @@ class MHATokenToKVPool(KVCache):
         layer_num: int,
         device: str,
         enable_memory_saver: bool,
+        local_size: int = None,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
     ):
         self.size = size
+        self.local_size = local_size
         self.page_size = page_size
         self.dtype = dtype
         self.device = device
@@ -251,22 +280,42 @@ class MHATokenToKVPool(KVCache):
         with self.memory_saver_adapter.region():
             # [size, head_num, head_dim] for each layer
             # The padded slot 0 is used for writing dummy outputs from padded tokens.
-            self.k_buffer = [
-                torch.zeros(
-                    (self.size + self.page_size, self.head_num, self.head_dim),
-                    dtype=self.store_dtype,
-                    device=self.device,
-                )
-                for _ in range(self.layer_num)
-            ]
-            self.v_buffer = [
-                torch.zeros(
-                    (self.size + self.page_size, self.head_num, self.head_dim),
-                    dtype=self.store_dtype,
-                    device=self.device,
-                )
-                for _ in range(self.layer_num)
-            ]
+            if self.local_size is None:
+                self.k_buffer = [
+                    torch.zeros(
+                        (self.size + self.page_size, self.head_num, self.head_dim),
+                        dtype=self.store_dtype,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+                self.v_buffer = [
+                    torch.zeros(
+                        (self.size + self.page_size, self.head_num, self.head_dim),
+                        dtype=self.store_dtype,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+            else:
+                self.k_buffer = []
+                self.v_buffer = []
+                for i in range(self.layer_num):
+                    temp_size = self.local_size if int((i + 1) % 4 != 0) else self.size
+                    self.k_buffer.append(
+                        torch.zeros(
+                            (temp_size + self.page_size, self.head_num, self.head_dim),
+                            dtype=self.store_dtype,
+                            device=self.device,
+                        )
+                    )
+                    self.v_buffer.append(
+                        torch.zeros(
+                            (temp_size + self.page_size, self.head_num, self.head_dim),
+                            dtype=self.store_dtype,
+                            device=self.device,
+                        )
+                    )
 
     def _clear_buffers(self):
         del self.k_buffer

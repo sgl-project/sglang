@@ -134,6 +134,7 @@ class ModelRunner:
         self.is_draft_worker = is_draft_worker
         self.is_generation = model_config.is_generation
         self.is_multimodal = model_config.is_multimodal
+        self.is_hybrid = model_config.is_hybrid
         self.should_log = tp_rank == 0
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
@@ -141,6 +142,7 @@ class ModelRunner:
         self.page_size = server_args.page_size
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+        self.token_to_kv_pool_allocator_local = None
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
         self.attention_chunk_size = model_config.attention_chunk_size
 
@@ -767,6 +769,7 @@ class ModelRunner:
             )
 
         self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
+        self.local_max_num_tokens = None
 
         if max_num_reqs is None:
             max_num_reqs = min(
@@ -825,12 +828,55 @@ class ModelRunner:
                 "Not enough memory. Please try to increase --mem-fraction-static."
             )
 
+        if self.is_hybrid is not None:
+            if self.is_hybrid < 0 or self.is_hybrid > 1:
+                raise RuntimeError(
+                    "Invalid hybrid ratio. Please set --hybrid-ratio between 0 and 1."
+                )
+            if not self.server_args.disable_cuda_graph:
+                raise RuntimeError(
+                    "Hybrid cache does not support CUDA graph. Please set --disable-cuda-graph"
+                )
+            if not self.server_args.disable_radix_cache:
+                raise RuntimeError(
+                    "Hybrid cache does not support radix cache. Please set --disable-radix-cache"
+                )
+
+            temp_ratio = (
+                (1 - self.is_hybrid)
+                + self.is_hybrid
+                * self.attention_chunk_size
+                / self.model_config.context_len
+            )
+            self.local_max_num_tokens = (
+                4 * self.max_total_num_tokens * temp_ratio // (3 * temp_ratio + 1)
+            )
+            self.max_total_num_tokens = (
+                4 * self.max_total_num_tokens
+                - 12 * self.max_total_num_tokens * temp_ratio // (3 * temp_ratio + 1)
+            )
+            self.local_max_num_tokens = int(
+                self.local_max_num_tokens
+                // self.server_args.page_size
+                * self.server_args.page_size
+            )
+            self.max_total_num_tokens = int(
+                self.max_total_num_tokens
+                // self.server_args.page_size
+                * self.server_args.page_size
+            )
+
+            # for debugging
+            # self.local_max_num_tokens = 200
+            # self.max_total_num_tokens = 1000
+
         if self.req_to_token_pool is None:
             self.req_to_token_pool = ReqToTokenPool(
                 size=max_num_reqs + 1,
                 max_context_len=self.model_config.context_len + 4,
                 device=self.device,
                 enable_memory_saver=self.server_args.enable_memory_saver,
+                is_hybrid=self.is_hybrid,
             )
         else:
             # Draft worker shares req_to_token_pool with the target worker.
@@ -877,6 +923,7 @@ class ModelRunner:
                 layer_num=self.num_effective_layers,
                 device=self.device,
                 enable_memory_saver=self.server_args.enable_memory_saver,
+                local_size=self.local_max_num_tokens,
                 start_layer=self.start_layer,
                 end_layer=self.end_layer,
             )
@@ -889,6 +936,13 @@ class ModelRunner:
                     device=self.device,
                     kvcache=self.token_to_kv_pool,
                 )
+                if self.is_hybrid is not None:
+                    self.token_to_kv_pool_allocator_local = TokenToKVPoolAllocator(
+                        self.local_max_num_tokens,
+                        dtype=self.kv_cache_dtype,
+                        device=self.device,
+                        kvcache=self.token_to_kv_pool,
+                    )
             else:
                 self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
                     self.max_total_num_tokens,
@@ -897,6 +951,7 @@ class ModelRunner:
                     device=self.device,
                     kvcache=self.token_to_kv_pool,
                 )
+                # TODO: hybrid cache for page size > 1
         else:
             assert self.is_draft_worker
 
