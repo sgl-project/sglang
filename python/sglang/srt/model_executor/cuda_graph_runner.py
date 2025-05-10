@@ -237,6 +237,7 @@ class CudaGraphRunner:
             self.out_cache_loc = torch.zeros((self.max_num_token,), dtype=torch.int64)
             self.positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
             self.mrope_positions = torch.zeros((3, self.max_bs), dtype=torch.int64)
+            self.num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
 
             # pipeline parallelism
             if self.pp_size > 1:
@@ -458,7 +459,7 @@ class CudaGraphRunner:
             spec_info=spec_info,
             capture_hidden_mode=self.capture_hidden_mode,
             lora_paths=lora_paths,
-            num_token_unpadded=self.num_token_unpadded,
+            num_token_non_padded=self.num_token_non_padded,
         )
 
         if lora_paths is not None:

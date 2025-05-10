@@ -36,7 +36,6 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Union
 import torch
 import triton
 import triton.language as tl
-
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.utils import flatten_nested_list, get_compiler_backend
 
@@ -247,7 +246,7 @@ class ForwardBatch:
 
     # For padding
     padded_static_len: int = -1  # -1 if not padded
-    num_token_unpadded: torch.Tensor = None # scalar tensor
+    num_token_non_padded: torch.Tensor = None  # scalar tensor
 
     # For Qwen2-VL
     mrope_positions: torch.Tensor = None
@@ -291,7 +290,7 @@ class ForwardBatch:
             capture_hidden_mode=batch.capture_hidden_mode,
             input_embeds=batch.input_embeds,
             extend_input_logprob_token_ids_gpu=extend_input_logprob_token_ids_gpu,
-            num_token_unpadded=torch.tensor(len(batch.input_ids)).to(device, non_blocking=True),
+            num_token_non_padded=torch.tensor(len(batch.input_ids), dtype=torch.int32).to(device, non_blocking=True),
         )
 
         # For DP attention
@@ -445,18 +444,18 @@ class ForwardBatch:
                             [
                                 pos
                                 for pos in range(
-                                    extend_prefix_len,
-                                    extend_prefix_len + extend_seq_len,
-                                )
+                                extend_prefix_len,
+                                extend_prefix_len + extend_seq_len,
+                            )
                             ]
                         ]
                         * 3
                     )
                 else:
                     mrope_positions = mm_input.mrope_positions[
-                        :,
-                        extend_prefix_len : extend_prefix_len + extend_seq_len,
-                    ]
+                                      :,
+                                      extend_prefix_len: extend_prefix_len + extend_seq_len,
+                                      ]
                 mrope_positions_list[batch_idx] = mrope_positions
 
         self.mrope_positions = torch.cat(
@@ -547,8 +546,8 @@ class ForwardBatch:
         self.prefix_chunk_len = chunk_capacity // self.batch_size
 
         self.num_prefix_chunks = (
-            max(self.extend_prefix_lens_cpu) + self.prefix_chunk_len - 1
-        ) // self.prefix_chunk_len
+                                     max(self.extend_prefix_lens_cpu) + self.prefix_chunk_len - 1
+                                 ) // self.prefix_chunk_len
 
         # Here we compute chunk lens twice to avoid stream sync, once on gpu and once on cpu.
         prefix_chunk_starts_cuda, prefix_chunk_seq_lens_cuda = (
