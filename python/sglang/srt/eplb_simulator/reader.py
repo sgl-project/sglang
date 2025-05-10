@@ -176,9 +176,14 @@ def read_bench_serving(path: Path):
     """
     Read `bench_serving.py`'s outputs
     """
+
+    print("[read_bench_serving] load json")
     data_raw = json.loads(path.read_text())
+
+    print("[read_bench_serving] load tokenizer")
     tokenizer = AutoTokenizer.from_pretrained(data_raw["tokenizer_id"])
 
+    print("[read_bench_serving] create data frame")
     df = pl.DataFrame(
         dict(
             rid=[_rid_str_to_int64(x["rid"]) for x in data_raw["output_metadata"]],
@@ -191,6 +196,7 @@ def read_bench_serving(path: Path):
         )
     )
 
+    print("[read_bench_serving] enhance data frame")
     df = df.with_columns(
         input_ids=pl.col("input_text").map_elements(
             tokenizer.encode, return_dtype=pl.List(pl.Int32)
@@ -204,6 +210,7 @@ def read_bench_serving(path: Path):
         dataset_timestamp=pl.col("dataset_timestamp").str.to_datetime(),
     )
 
+    print("[read_bench_serving] end")
     return df
 
 
