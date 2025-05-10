@@ -1150,9 +1150,11 @@ class Scheduler(
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             f += f"#unbootstrapped-req: {len(self.disagg_prefill_bootstrap_queue.queue)}, "
             f += f"#queue-req: {len(self.waiting_queue)}, "
-            f += f"#transferring-req: {len(self.disagg_prefill_inflight_queue)} "
+            f += f"#transferring-req: {len(self.disagg_prefill_inflight_queue)}"
         else:
             f += f"#queue-req: {len(self.waiting_queue)}"
+
+        f += f", timestamp: {time.time()}"
 
         logger.info(f)
 
@@ -1214,7 +1216,8 @@ class Scheduler(
 
         msg += (
             f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
-            f"#queue-req: {len(self.waiting_queue)}"
+            f"#queue-req: {len(self.waiting_queue)}, "
+            f"timestamp: {time.time()}"
         )
 
         logger.info(msg)
