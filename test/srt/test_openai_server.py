@@ -676,6 +676,22 @@ class TestOpenAIEmbedding(CustomTestCase):
         self.assertTrue(len(response.data[0].embedding) > 0)
         self.assertTrue(len(response.data[1].embedding) > 0)
 
+    def test_empty_string_embedding(self):
+        """Test embedding an empty string."""
+
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+
+        # Text embedding example with empty string
+        text = ""
+        # Expect a BadRequestError for empty input
+        with self.assertRaises(openai.BadRequestError) as cm:
+            client.embeddings.create(
+                model=self.model,
+                input=text,
+            )
+        # check the status code
+        self.assertEqual(cm.exception.status_code, 400)
+
 
 class TestOpenAIServerIgnoreEOS(CustomTestCase):
     @classmethod
