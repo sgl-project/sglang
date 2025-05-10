@@ -11,20 +11,27 @@ python3 -m sglang.bench_one_batch_server --model None --base-url http://localhos
 """
 
 import argparse
+import asyncio
 import dataclasses
 import itertools
 import json
 import multiprocessing
 import os
+import sys
 import time
-from typing import Tuple
+import traceback
+from dataclasses import dataclass, field
+from typing import List, Tuple
 
+import aiohttp
 import numpy as np
 import requests
 
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
+
+AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=6 * 60 * 60)
 
 
 @dataclasses.dataclass
@@ -36,6 +43,7 @@ class BenchArgs:
     result_filename: str = "result.jsonl"
     base_url: str = ""
     skip_warmup: bool = False
+    profile: bool = False
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -54,6 +62,12 @@ class BenchArgs:
         )
         parser.add_argument("--base-url", type=str, default=BenchArgs.base_url)
         parser.add_argument("--skip-warmup", action="store_true")
+        parser.add_argument(
+            "--profile",
+            action="store_true",
+            help="Use Torch Profiler. The endpoint must be launched with "
+            "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
@@ -62,6 +76,18 @@ class BenchArgs:
         return cls(
             **{attr: attr_type(getattr(args, attr)) for attr, attr_type in attrs}
         )
+
+
+@dataclass
+class RequestFuncOutput:
+    generated_text: str = ""
+    success: bool = False
+    latency: float = 0.0
+    ttft: float = 0.0  # Time to first token
+    itl: List[float] = field(default_factory=list)  # List of inter-token latencies
+    prompt_len: int = 0
+    error: str = ""
+    output_len: int = 0
 
 
 def launch_server_internal(server_args):
@@ -92,6 +118,24 @@ def launch_server_process(server_args: ServerArgs):
             pass
         time.sleep(10)
     raise TimeoutError("Server failed to start within the timeout period.")
+
+
+async def async_request_profile(api_url: str) -> RequestFuncOutput:
+    async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
+        output = RequestFuncOutput()
+        try:
+            async with session.post(url=api_url) as response:
+                if response.status == 200:
+                    output.success = True
+                else:
+                    output.error = response.reason or ""
+                    output.success = False
+        except Exception:
+            output.success = False
+            exc_info = sys.exc_info()
+            output.error = "".join(traceback.format_exception(*exc_info))
+
+    return output
 
 
 def run_one_case(
@@ -144,7 +188,7 @@ def run_one_case(
             fout.write(json.dumps(res) + "\n")
 
 
-def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
+async def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
     if bench_args.base_url:
         proc, base_url = None, bench_args.base_url
     else:
@@ -160,6 +204,15 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
             run_name="",
             result_filename="",
         )
+
+    # Start profiler
+    if bench_args.profile:
+        print("Starting profiler...")
+        profile_output = await async_request_profile(
+            api_url=base_url + "/start_profile"
+        )
+        if profile_output.success:
+            print("Profiler started")
 
     # benchmark
     try:
@@ -178,6 +231,13 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
         if proc:
             kill_process_tree(proc.pid)
 
+    # Stop profiler
+    if bench_args.profile:
+        print("Stopping profiler...")
+        profile_output = await async_request_profile(api_url=base_url + "/stop_profile")
+        if profile_output.success:
+            print("Profiler stopped")
+
     print(f"\nResults are saved to {bench_args.result_filename}")
 
 
@@ -189,4 +249,4 @@ if __name__ == "__main__":
     server_args = ServerArgs.from_cli_args(args)
     bench_args = BenchArgs.from_cli_args(args)
 
-    run_benchmark(server_args, bench_args)
+    asyncio.run(run_benchmark(server_args, bench_args))
