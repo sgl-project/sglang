@@ -6,7 +6,7 @@ from typing import Any, List
 import einops
 import polars as pl
 import torch
-from sglang.srt.eplb_simulator.configs import MY_MODEL_CONFIG_FOR_EXPERT_LOCATION
+from sglang.srt.eplb_simulator.configs import MY_MODEL_CONFIG_FOR_EXPERT_LOCATION, MY_MODEL_CONFIG_NUM_EXPERTS_PER_TOK
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
@@ -102,8 +102,9 @@ def read_expert_distribution_mode_detail_per_token(
 
     def _compute_topk_ids(pack, raw_data_packs):
         total_num_token, _ = pack["input_ids"].shape
-        topk_ids = torch.empty((total_num_token, model_config_for_expert_location.num_layer, num_top_k),
-                               dtype=torch.int16)
+        topk_ids = torch.empty(
+            (total_num_token, model_config_for_expert_location.num_layer, MY_MODEL_CONFIG_NUM_EXPERTS_PER_TOK),
+            dtype=torch.int16)
 
         for raw_data_pack in raw_data_packs:
             for record in raw_data_pack:
