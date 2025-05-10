@@ -856,7 +856,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def alloc_token_slots_local(self, num_tokens: int, backup_state: bool = False):
         # TODO backup_state
         out_cache_loc_local = self.token_to_kv_pool_allocator_local.alloc(num_tokens)
-        # if out_cache_loc is None:
+        if out_cache_loc_local is None:
+            phase_str = "Prefill" if self.forward_mode.is_extend() else "Decode"
+            error_msg = (
+                f"{phase_str} out of memory. Try to lower your batch size.\n"
+                f"Try to allocate {num_tokens} tokens.\n"
+                f"Avaliable tokens: {self.token_to_kv_pool_allocator.available_size() + self.tree_cache.evictable_size()}\n"
+            )
+            logger.error(error_msg)
+            if self.tree_cache is not None:
+                self.tree_cache.pretty_print()
+            raise RuntimeError(error_msg)
+
         return out_cache_loc_local
 
     def alloc_token_slots(self, num_tokens: int, backup_state: bool = False):
