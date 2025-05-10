@@ -1104,9 +1104,13 @@ def sample_hf_dataset_requests(
             prompt=row["prompts"],
             prompt_len=None,
             output_len=output_len,
-            metadata=dict(dataset_id=row["id"], dataset_timestamp=row["timestamp"].isoformat()),
+            metadata=dict(
+                dataset_index=index,
+                dataset_id=row["id"],
+                dataset_timestamp=row["timestamp"].isoformat(),
+            ),
         )
-        for row in df.iter_rows(named=True)
+        for index, row in enumerate(df.iter_rows(named=True))
     ]
 
 
@@ -1246,11 +1250,11 @@ def wrap_multi_round_request_func(request_func: Callable, tokenizer) -> Callable
     ) -> List[RequestFuncOutput]:
         prompts: List[str] = request_func_input.prompt
         outputs = []
-        for i in range(len(prompts)):
+        for round_index in range(len(prompts)):
             history_text, full_prompt = compute_inner_input_prompt(
-                history_user_texts=prompts[:i],
+                history_user_texts=prompts[:round_index],
                 history_assistant_texts=[o.generated_text for o in outputs],
-                gen_prompt=prompts[i],
+                gen_prompt=prompts[round_index],
             )
             inner_input = RequestFuncInput(
                 prompt=full_prompt,
@@ -1262,10 +1266,11 @@ def wrap_multi_round_request_func(request_func: Callable, tokenizer) -> Callable
                 extra_request_body=request_func_input.extra_request_body,
                 metadata={**request_func_input.metadata},
             )
+            print(f"[{datetime.now().isoformat()}] hi wrap_multi_round_request_func call request start dataset_index={request_func_input.metadata.get('dataset_index')} {round_index=}")
             output = await request_func(
-                inner_input, pbar=pbar if i == len(prompts) - 1 else None
+                inner_input, pbar=pbar if round_index == len(prompts) - 1 else None
             )
-            output.metadata["multi_round_index"] = i
+            output.metadata["multi_round_index"] = round_index
             output.metadata["multi_round_len"] = len(prompts)
             output.metadata["history_text"] = history_text
             outputs.append(output)
