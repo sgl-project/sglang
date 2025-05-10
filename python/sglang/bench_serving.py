@@ -817,8 +817,8 @@ def sample_sharegpt_requests(
             DatasetRow(prompt=prompt, prompt_len=prompt_len, output_len=output_len)
         )
 
-    print(f"#Input tokens: {np.sum([x[1] for x in filtered_dataset])}")
-    print(f"#Output tokens: {np.sum([x[2] for x in filtered_dataset])}")
+    print(f"#Input tokens: {np.sum([x.prompt_len for x in filtered_dataset])}")
+    print(f"#Output tokens: {np.sum([x.output_len for x in filtered_dataset])}")
     return filtered_dataset
 
 
