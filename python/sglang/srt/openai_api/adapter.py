@@ -1268,11 +1268,15 @@ def v1_chat_generate_response(
     cache_report=False,
     tool_call_parser=None,
     reasoning_parser=None,
-    assistant_prefix=None,
+    assistant_prefix_list=None,
 ):
     choices = []
 
-    for idx, (ret_item, assistant_prefix) in enumerate(zip(ret, assistant_prefix)):
+    for idx, ret_item in enumerate(ret):
+        if assistant_prefix_list and idx < len(assistant_prefix_list):
+            assistant_prefix = assistant_prefix_list[idx]
+        else:
+            assistant_prefix = ""
         logprobs = False
         if isinstance(request, list) and request[idx].logprobs:
             logprobs = True
