@@ -1337,6 +1337,8 @@ async def benchmark(
         )
 
     warmup_outputs = await asyncio.gather(*warmup_tasks)
+    if is_multi_round:
+        warmup_outputs = [x for output in warmup_outputs for x in output]
 
     # Check if at least one warmup request succeeded
     if args.warmup_requests > 0 and not any(
@@ -1404,7 +1406,6 @@ async def benchmark(
             )
         )
     outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
-
     if is_multi_round:
         outputs = [x for output in outputs for x in output]
 
