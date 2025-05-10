@@ -101,21 +101,21 @@ def read_expert_distribution_mode_detail_per_token(
         }
 
     def _compute_topk_ids(pack, raw_data_packs):
-        total_num_token, _ = pack["input_ids"].shape
+        total_num_token, = pack["input_ids"].shape
 
         topk_ids = torch.empty(
-            (total_num_token, model_config_for_expert_location.num_layer, MY_MODEL_CONFIG_NUM_EXPERTS_PER_TOK),
+            (total_num_token, model_config_for_expert_location.num_layers, MY_MODEL_CONFIG_NUM_EXPERTS_PER_TOK),
             dtype=torch.int16)
         counter = 0
 
-        for raw_data_pack in raw_data_packs:
-            for record in raw_data_pack:
+        for raw_data_pack in tqdm(raw_data_packs, desc="compute topk ids"):
+            for record in raw_data_pack["records"]:
                 topk_ids_of_record = einops.rearrange(
-                    record["topk_ids_of_layer"],
+                    record["topk_ids_of_layer"].cuda(),
                     "num_layer num_token top_k -> num_token num_layer top_k",
                 )
                 counter_next = counter + topk_ids_of_record.shape[0]
-                topk_ids[counter:counter_next, :, :] = topk_ids_of_record.cuda()
+                topk_ids[counter:counter_next, :, :] = topk_ids_of_record
                 counter = counter_next
 
         assert counter == total_num_token
@@ -158,10 +158,11 @@ def read_expert_distribution_mode_detail_per_token(
 
     raw_data_packs = [
         torch.load(path, weights_only=True, map_location="cpu")
-        for path in tqdm(list(Path(dir_data).glob("*.pt")))
+        for path in tqdm(list(Path(dir_data).glob("*.pt")), desc="read raw data packs")
     ]
 
-    processed_records = [_handle_record(record) for raw_data_pack in raw_data_packs for record in raw_data_pack]
+    processed_records = [_handle_record(record) for raw_data_pack in raw_data_packs for record in
+                         raw_data_pack["records"]]
 
     pack = _concat_records(processed_records)
     pack = _compute_topk_ids(pack, raw_data_packs)
