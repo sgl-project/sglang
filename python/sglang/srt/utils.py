@@ -2033,24 +2033,41 @@ def get_free_port():
             return s.getsockname()[1]
 
 
-def get_local_ip_by_remote() -> str:
-    # try ipv4
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+def get_local_ip() -> str:
+    host_ip = os.getenv("SGLANG_HOST_IP")
+    if host_ip:
+        return host_ip
+
+    # IP is not set, try to get it from the network interface
+
+    # # try ipv4
+    # s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    # try:
+    #     s.connect(("127.0.0.1", 80))  # Doesn't need to be reachable
+    #     return s.getsockname()[0]
+    # except Exception:
+    #     pass
+    #
+    # # try ipv6
+    # try:
+    #     s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+    #     # Google's public DNS server, see
+    #     # https://developers.google.com/speed/public-dns/docs/using#addresses
+    #     s.connect(("127.0.0.1", 80))  # Doesn't need to be reachable
+    #     return s.getsockname()[0]
+    # except Exception:
+    #     pass
     try:
-        s.connect(("8.8.8.8", 80))  # Doesn't need to be reachable
-        return s.getsockname()[0]
+        return socket.gethostbyname(socket.gethostname())
     except Exception:
         pass
 
-    # try ipv6
-    try:
-        s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
-        # Google's public DNS server, see
-        # https://developers.google.com/speed/public-dns/docs/using#addresses
-        s.connect(("2001:4860:4860::8888", 80))  # Doesn't need to be reachable
-        return s.getsockname()[0]
-    except Exception:
-        raise ValueError("Can not get local ip")
+    warnings.warn(
+        "Failed to get the IP address, using 0.0.0.0 by default."
+        "The value can be set by the environment variable"
+        " SGLANG_HOST_IP or HOST_IP."
+    )
+    return "0.0.0.0"
 
 
 def is_page_size_one(server_args):

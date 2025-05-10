@@ -29,7 +29,7 @@ from sglang.srt.disaggregation.base.conn import (
 from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferEngine
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import get_free_port, get_ip, get_local_ip_by_remote
+from sglang.srt.utils import get_free_port, get_ip, get_local_ip
 
 logger = logging.getLogger(__name__)
 
@@ -256,7 +256,7 @@ class MooncakeKVManager(BaseKVManager):
 
     def start_prefill_thread(self):
         self.rank_port = get_free_port()
-        self.server_socket.bind(f"tcp://{get_local_ip_by_remote()}:{self.rank_port}")
+        self.server_socket.bind(f"tcp://{get_local_ip()}:{self.rank_port}")
 
         def bootstrap_thread():
             """This thread recvs pre-alloc notification from the decode engine"""
@@ -329,7 +329,7 @@ class MooncakeKVManager(BaseKVManager):
 
     def start_decode_thread(self):
         self.rank_port = get_free_port()
-        self.server_socket.bind(f"tcp://{get_local_ip_by_remote()}:{self.rank_port}")
+        self.server_socket.bind(f"tcp://{get_local_ip()}:{self.rank_port}")
 
         def decode_thread():
             while True:
@@ -384,7 +384,7 @@ class MooncakeKVManager(BaseKVManager):
         if self.dist_init_addr:
             ip_address = socket.gethostbyname(self.dist_init_addr.split(":")[0])
         else:
-            ip_address = get_ip()
+            ip_address = get_local_ip()
 
         bootstrap_server_url = f"{ip_address}:{self.bootstrap_port}"
         url = f"http://{bootstrap_server_url}/route"
@@ -392,7 +392,7 @@ class MooncakeKVManager(BaseKVManager):
             "role": "Prefill",
             "tp_size": self.tp_size,
             "dp_size": self.dp_size,
-            "rank_ip": get_local_ip_by_remote(),
+            "rank_ip": get_local_ip(),
             "rank_port": self.rank_port,
             "engine_rank": self.kv_args.engine_rank,
         }
@@ -571,7 +571,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
             sock.send_multipart(
                 [
                     "None".encode("ascii"),
-                    get_local_ip_by_remote().encode("ascii"),
+                    get_local_ip().encode("ascii"),
                     str(self.kv_mgr.rank_port).encode("ascii"),
                     self.session_id.encode("ascii"),
                     packed_kv_data_ptrs,
