@@ -3,7 +3,7 @@
 SGLang provides robust support for embedding models by integrating efficient serving mechanisms with its flexible programming interface. This integration allows for streamlined handling of embedding tasks, facilitating faster and more accurate retrieval and semantic search operations. SGLang's architecture enables better resource utilization and reduced latency in embedding model deployment.
 
 ```{important}
-They are executed with `--is-embedding` and some may require `--trust-remote-code` and/or `--chat-template`
+They are executed with `--is-embedding` and some may require `--trust-remote-code`
 ```
 
 ## Example launch Command
@@ -13,7 +13,6 @@ python3 -m sglang.launch_server \
   --model-path Alibaba-NLP/gme-Qwen2-VL-2B-Instruct \  # example HF/local path
   --is-embedding \
   --host 0.0.0.0 \
-  --chat-template gme-qwen2-vl \                     # set chat template
   --port 30000 \
 ```
 
