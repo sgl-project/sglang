@@ -1,4 +1,4 @@
-ARG CUDA_VERSION=12.5.1
+ARG CUDA_VERSION=12.4.1
 
 FROM nvcr.io/nvidia/tritonserver:24.04-py3-min
 
@@ -9,13 +9,9 @@ RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
     && echo 'tzdata tzdata/Zones/America select Los_Angeles' | debconf-set-selections \
     && apt update -y \
     && apt install software-properties-common -y \
-    && add-apt-repository ppa:deadsnakes/ppa -y && apt update \
-    && apt install python3.10 python3.10-dev -y \
-    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1 \
-    && update-alternatives --set python3 /usr/bin/python3.10 && apt install python3.10-distutils -y \
+    && apt install python3 python3-pip -y \
     && apt install curl git sudo libibverbs-dev -y \
-    && apt install -y rdma-core infiniband-diags openssh-server perftest ibverbs-providers libibumad3 libibverbs1 libnl-3-200 libnl-route-3-200 librdmacm1 \
-    && curl https://bootstrap.pypa.io/get-pip.py -o get-pip.py && python3 get-pip.py \
+    && apt install rdma-core infiniband-diags openssh-server perftest -y \
     && python3 --version \
     && python3 -m pip --version \
     && rm -rf /var/lib/apt/lists/* \
@@ -33,7 +29,7 @@ RUN python3 -m pip install --upgrade pip setuptools wheel html5lib six \
          export CUINDEX=121; \
        elif [ "$CUDA_VERSION" = "12.4.1" ]; then \
          export CUINDEX=124; \
-       elif [ "$CUDA_VERSION" = "12.5.1" ]; then \
+       elif [ "$CUDA_VERSION" = "12.8.1" ]; then \
          export CUINDEX=124; \
        elif [ "$CUDA_VERSION" = "11.8.0" ]; then \
          export CUINDEX=118; \
@@ -43,6 +39,9 @@ RUN python3 -m pip install --upgrade pip setuptools wheel html5lib six \
        fi \
     && python3 -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cu${CUINDEX} \
     && cd sglang \
-    && python3 -m pip --no-cache-dir install -e "python[${BUILD_TYPE}]" --find-links https://flashinfer.ai/whl/cu${CUINDEX}/torch2.6/flashinfer-python
+    && python3 -m pip --no-cache-dir install -e "python[${BUILD_TYPE}]" --find-links https://flashinfer.ai/whl/cu${CUINDEX}/torch2.6/flashinfer-python \
+    && if [ "$CUDA_VERSION" = "12.8.1" ]; then \
+         python3 -m pip install nvidia-nccl-cu12==2.26.2.post1 --force-reinstall --no-deps; \
+       fi
 
 ENV DEBIAN_FRONTEND=interactive

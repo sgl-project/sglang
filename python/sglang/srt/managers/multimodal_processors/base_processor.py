@@ -8,6 +8,8 @@ from typing import List, Optional
 
 import numpy as np
 import PIL
+import torch
+from PIL import Image
 from transformers import BaseImageProcessorFast
 
 from sglang.srt.managers.schedule_batch import Modality
@@ -88,11 +90,20 @@ class BaseMultimodalProcessor(ABC):
             return_tensors="pt",
             **kwargs,
         )
+        if "pixel_values" in result and isinstance(
+            result["pixel_values"], torch.Tensor
+        ):
+            result["pixel_values"] = result["pixel_values"].to("cpu")
         return result
 
     @abstractmethod
     async def process_mm_data_async(
-        self, image_data, input_text, max_req_input_len, **kwargs
+        self,
+        image_data,
+        input_text,
+        request_obj,
+        max_req_input_len,
+        **kwargs,
     ):
         pass
 
@@ -104,6 +115,8 @@ class BaseMultimodalProcessor(ABC):
         from decord import VideoReader, cpu
 
         # Before processing inputs
+        if not image_data or len(image_data) == 0:
+            return []
         estimated_frames_list = []
         for image in image_data:
             if isinstance(image, str) and image.startswith("video:"):
@@ -215,6 +228,9 @@ class BaseMultimodalProcessor(ABC):
             discard_alpha_channel: if True, discards the alpha channel in the returned images
 
         """
+
+        if image_data is None:
+            image_data = []
         if isinstance(multimodal_tokens.image_token, int):
             multimodal_tokens.image_token = (
                 self._processor.tokenizer.convert_ids_to_tokens(
@@ -229,6 +245,8 @@ class BaseMultimodalProcessor(ABC):
             prompt = self._processor.tokenizer.decode(prompt)
         else:
             prompt = prompt
+
+        assert isinstance(prompt, str)
         if return_text:
             import re
 

@@ -35,6 +35,7 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 import copy
 import dataclasses
 import logging
+import threading
 from typing import TYPE_CHECKING, List, Optional, Set, Tuple, Union
 
 import numpy as np
@@ -65,23 +66,24 @@ INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 # Put some global args for easy access
 global_server_args_dict = {
     "attention_backend": ServerArgs.attention_backend,
-    "sampling_backend": ServerArgs.sampling_backend,
-    "triton_attention_reduce_in_fp32": ServerArgs.triton_attention_reduce_in_fp32,
-    "torchao_config": ServerArgs.torchao_config,
-    "enable_nan_detection": ServerArgs.enable_nan_detection,
-    "enable_dp_attention": ServerArgs.enable_dp_attention,
-    "enable_ep_moe": ServerArgs.enable_ep_moe,
-    "enable_deepep_moe": ServerArgs.enable_deepep_moe,
+    "chunked_prefill_size": ServerArgs.chunked_prefill_size,
     "deepep_mode": ServerArgs.deepep_mode,
     "device": ServerArgs.device,
-    "speculative_accept_threshold_single": ServerArgs.speculative_accept_threshold_single,
-    "speculative_accept_threshold_acc": ServerArgs.speculative_accept_threshold_acc,
-    "disable_radix_cache": ServerArgs.disable_radix_cache,
-    "flashinfer_mla_disable_ragged": ServerArgs.flashinfer_mla_disable_ragged,
-    "moe_dense_tp_size": ServerArgs.moe_dense_tp_size,
-    "chunked_prefill_size": ServerArgs.chunked_prefill_size,
-    "n_share_experts_fusion": ServerArgs.n_share_experts_fusion,
     "disable_chunked_prefix_cache": ServerArgs.disable_chunked_prefix_cache,
+    "disable_radix_cache": ServerArgs.disable_radix_cache,
+    "enable_deepep_moe": ServerArgs.enable_deepep_moe,
+    "enable_dp_attention": ServerArgs.enable_dp_attention,
+    "enable_ep_moe": ServerArgs.enable_ep_moe,
+    "enable_nan_detection": ServerArgs.enable_nan_detection,
+    "flashinfer_mla_disable_ragged": ServerArgs.flashinfer_mla_disable_ragged,
+    "max_micro_batch_size": ServerArgs.max_micro_batch_size,
+    "moe_dense_tp_size": ServerArgs.moe_dense_tp_size,
+    "n_share_experts_fusion": ServerArgs.n_share_experts_fusion,
+    "sampling_backend": ServerArgs.sampling_backend,
+    "speculative_accept_threshold_acc": ServerArgs.speculative_accept_threshold_acc,
+    "speculative_accept_threshold_single": ServerArgs.speculative_accept_threshold_single,
+    "torchao_config": ServerArgs.torchao_config,
+    "triton_attention_reduce_in_fp32": ServerArgs.triton_attention_reduce_in_fp32,
 }
 
 logger = logging.getLogger(__name__)
@@ -285,6 +287,7 @@ class MultimodalInputs:
     num_image_tokens: Optional[int] = None
 
     # QWen2-VL related
+    mrope_positions: Optional[torch.Tensor] = None
     mrope_position_delta: Optional[torch.Tensor] = None
 
     # image
@@ -310,16 +313,12 @@ class MultimodalInputs:
         assert isinstance(ret.mm_items, list)
         ret.mm_items = [item for item in ret.mm_items if item.is_valid()]
 
-        assert len(ret.mm_items) != 0
-
-        # Use image hash as fake token_ids. We use this as the key for prefix matching in the radix cache.
-        # Please note that if the `input_ids` is later used in the model forward,
-        # you also need to clamp the values within the range of [0, vocab_size) to avoid out-of-bound
-        # errors in cuda kernels. See also llava.py for example.
         for item in ret.mm_items:
             item.set_pad_value()
 
         optional_args = [
+            "mrope_positions",
+            "mrope_position_delta",
             "im_token_id",
             "im_start_id",
             "im_end_id",
@@ -350,11 +349,6 @@ class MultimodalInputs:
         merge image inputs when requests are being merged
         """
 
-        # Use image hash as fake token_ids. We use this as the key for prefix matching in the radix cache.
-        # Please note that if the `input_ids` is later used in the model forward,
-        # you also need to clamp the values within the range of [0, vocab_size) to avoid out-of-bound
-        # errors in cuda kernels. See also llava.py for example.
-
         # args needed to be merged
         optional_args = [
             "mm_items",
@@ -364,6 +358,30 @@ class MultimodalInputs:
             self_arg = getattr(self, arg, None)
             if self_arg is not None:
                 setattr(self, arg, self_arg + getattr(other, arg))
+
+        mrope_positions = self.mrope_positions
+        if mrope_positions is not None:
+            if other.mrope_positions is None:
+                self.mrope_positions = mrope_positions
+            else:
+                self.mrope_positions = torch.cat(
+                    [self.mrope_positions, other.mrope_positions], dim=1
+                )
+
+        mrope_position_delta = self.mrope_position_delta
+        if mrope_position_delta is not None:
+            if other.mrope_position_delta is None:
+                self.mrope_position_delta = mrope_position_delta
+            else:
+                self.mrope_position_delta = torch.cat(
+                    [self.mrope_position_delta, other.mrope_position_delta], dim=0
+                )
+
+        for key, val in other.__dict__.items():
+            if "_id" in key:
+                # set token_ids
+                if getattr(self, key, None) is None:
+                    setattr(self, key, getattr(other, key, None))
         # other args would be kept intact
 
 
@@ -388,6 +406,7 @@ class Req:
         return_hidden_states: bool = False,
         eos_token_ids: Optional[Set[int]] = None,
         bootstrap_host: Optional[str] = None,
+        bootstrap_port: Optional[int] = None,
         bootstrap_room: Optional[int] = None,
     ):
         # Input and output info
@@ -523,6 +542,7 @@ class Req:
 
         # For disaggregation
         self.bootstrap_host: str = bootstrap_host
+        self.bootstrap_port: Optional[int] = bootstrap_port
         self.bootstrap_room: Optional[int] = bootstrap_room
         self.disagg_kv_sender: Optional[BaseKVSender] = None
 
@@ -538,6 +558,11 @@ class Req:
         self.metadata_buffer_index: int = -1
         # The first output_id transferred from prefill instance.
         self.transferred_output_id: Optional[int] = None
+
+        # For overlap schedule, we delay the kv transfer until `process_batch_result_disagg_prefill` rather than `process_prefill_chunk` in non-overlap
+        # This is because kv is not ready in `process_prefill_chunk`.
+        # We use `tmp_end_idx` to store the end index of the kv cache to send.
+        self.tmp_end_idx: int = -1
 
     @property
     def seqlen(self):
@@ -571,6 +596,14 @@ class Req:
                 self.prefix_indices, self.last_node = tree_cache.match_prefix(
                     rid=self.rid, key=self.adjust_max_prefix_ids()
                 )
+        elif enable_hierarchical_cache:
+            # in case last_node is evicted during scheduling, we need to update the prefix_indices
+            while self.last_node.evicted:
+                self.prefix_indices = self.prefix_indices[
+                    : -len(self.last_node.host_value)
+                ]
+                self.last_node = self.last_node.parent
+
         self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
 
     def adjust_max_prefix_ids(self):
@@ -693,6 +726,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # This is an optimization to reduce the overhead of the prefill check.
     batch_is_full: bool = False
 
+    # Events
+    launch_done: Optional[threading.Event] = None
+
+    # For chunked prefill in PP
+    chunked_req: Optional[Req] = None
+
     # Sampling info
     sampling_info: SamplingBatchInfo = None
     next_batch_sampling_info: SamplingBatchInfo = None
@@ -705,6 +744,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # The output locations of the KV cache
     out_cache_loc: torch.Tensor = None  # shape: [b], int64
     output_ids: torch.Tensor = None  # shape: [b], int64
+
+    # For multimodal inputs
+    multimodal_inputs: Optional[List] = None
 
     # The sum of all sequence lengths
     seq_lens_sum: int = None
@@ -726,7 +768,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # For extend and mixed chunekd prefill
     prefix_lens: List[int] = None
     extend_lens: List[int] = None
-    extend_num_tokens: int = None
+    extend_num_tokens: Optional[int] = None
     decoding_reqs: List[Req] = None
     extend_logprob_start_lens: List[int] = None
     # It comes empty list if logprob is not required.
@@ -768,6 +810,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         enable_overlap: bool,
         spec_algorithm: SpeculativeAlgorithm,
         enable_custom_logit_processor: bool,
+        chunked_req: Optional[Req] = None,
     ):
         return_logprob = any(req.return_logprob for req in reqs)
 
@@ -785,6 +828,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             spec_algorithm=spec_algorithm,
             enable_custom_logit_processor=enable_custom_logit_processor,
             return_hidden_states=any(req.return_hidden_states for req in reqs),
+            chunked_req=chunked_req,
         )
 
     def batch_size(self):
@@ -1009,6 +1053,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Copy prefix and do some basic check
         input_embeds = []
         extend_input_logprob_token_ids = []
+        multimodal_inputs = []
 
         for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
             req.req_pool_idx = req_pool_indices[i]
@@ -1023,6 +1068,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if req.input_embeds is not None:
                 # If req.input_embeds is already a list, append its content directly
                 input_embeds.extend(req.input_embeds)  # Use extend to avoid nesting
+
+            multimodal_inputs.append(req.multimodal_inputs)
 
             req.cached_tokens += pre_len - req.already_computed
             req.already_computed = seq_len
@@ -1106,6 +1153,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if input_embeds
             else None
         )
+        for mm_input in multimodal_inputs:
+            if mm_input is None:
+                continue
+            for mm_item in mm_input.mm_items:
+                pixel_values = getattr(mm_item, "pixel_values", None)
+                if isinstance(pixel_values, torch.Tensor):
+                    mm_item.pixel_values = pixel_values.to(
+                        self.device, non_blocking=True
+                    )
+        self.multimodal_inputs = multimodal_inputs
         self.seq_lens_sum = sum(seq_lens)
 
         if self.return_logprob:
@@ -1201,7 +1258,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def retract_decode(self, server_args: ServerArgs):
         """Retract the decoding requests when there is not enough memory."""
-        sorted_indices = [i for i in range(len(self.reqs))]
+        sorted_indices = list(range(len(self.reqs)))
 
         # TODO(lsyin): improve retraction policy for radix cache
         # For spec decoding, filter_batch API can only filter
@@ -1378,15 +1435,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def filter_batch(
         self,
-        chunked_req_to_exclude: Optional[Req] = None,
+        chunked_req_to_exclude: Optional[Union[Req, List[Req]]] = None,
         keep_indices: Optional[List[int]] = None,
     ):
         if keep_indices is None:
+            if isinstance(chunked_req_to_exclude, Req):
+                chunked_req_to_exclude = [chunked_req_to_exclude]
+            elif chunked_req_to_exclude is None:
+                chunked_req_to_exclude = []
             keep_indices = [
                 i
                 for i in range(len(self.reqs))
                 if not self.reqs[i].finished()
-                and self.reqs[i] is not chunked_req_to_exclude
+                and not self.reqs[i] in chunked_req_to_exclude
             ]
 
         if keep_indices is None or len(keep_indices) == 0:
@@ -1407,6 +1468,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.encoder_lens_cpu = [self.encoder_lens_cpu[i] for i in keep_indices]
 
         self.reqs = [self.reqs[i] for i in keep_indices]
+        self.multimodal_inputs = [self.multimodal_inputs[i] for i in keep_indices]
         self.req_pool_indices = self.req_pool_indices[keep_indices_device]
         self.seq_lens = self.seq_lens[keep_indices_device]
         self.out_cache_loc = None
@@ -1437,7 +1499,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.model_config.is_encoder_decoder:
             self.encoder_lens = torch.cat([self.encoder_lens, other.encoder_lens])
             self.encoder_lens_cpu.extend(other.encoder_lens_cpu)
-
         self.req_pool_indices = torch.cat(
             [self.req_pool_indices, other.req_pool_indices]
         )
@@ -1456,6 +1517,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.top_logprobs_nums = [0] * len(self.reqs) + other.top_logprobs_nums
             self.token_ids_logprobs = [None] * len(self.reqs) + other.token_ids_logprobs
         self.reqs.extend(other.reqs)
+        self.multimodal_inputs.extend(other.multimodal_inputs)
 
         self.return_logprob |= other.return_logprob
         self.has_stream |= other.has_stream
@@ -1481,6 +1543,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
             or global_server_args_dict["attention_backend"] == "flashmla"
             or global_server_args_dict["attention_backend"] == "fa3"
+            or global_server_args_dict["attention_backend"] == "cutlass_mla"
         ):
             seq_lens_cpu = self.seq_lens.cpu()
         else:
@@ -1513,7 +1576,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             extend_seq_lens=extend_seq_lens,
             extend_prefix_lens=extend_prefix_lens,
             extend_logprob_start_lens=extend_logprob_start_lens,
-            multimodal_inputs=[r.multimodal_inputs for r in self.reqs],
+            multimodal_inputs=self.multimodal_inputs,
             encoder_cached=self.encoder_cached,
             encoder_lens=self.encoder_lens,
             encoder_lens_cpu=self.encoder_lens_cpu,
@@ -1535,6 +1598,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 )
             ),
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
+            launch_done=self.launch_done,
         )
 
     def copy(self):
@@ -1616,6 +1680,9 @@ class ModelWorkerBatch:
     spec_info: Optional[Union[EagleVerifyInput, EagleDraftInput]] = None
     # If set, the output of the batch contains the hidden states of the run.
     capture_hidden_mode: CaptureHiddenMode = None
+
+    # Overlap event
+    launch_done: Optional[threading.Event] = None
 
 
 @triton.jit

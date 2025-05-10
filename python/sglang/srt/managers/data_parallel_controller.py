@@ -23,11 +23,13 @@ import psutil
 import setproctitle
 import zmq
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import (
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
 )
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -179,44 +181,62 @@ class DataParallelController:
             enable=server_args.enable_memory_saver
         )
 
-        # Launch tensor parallel scheduler processes
         scheduler_pipe_readers = []
-        tp_size_per_node = server_args.tp_size // server_args.nnodes
+
+        nnodes_per_tp_group = max(server_args.nnodes // server_args.pp_size, 1)
+        tp_size_per_node = server_args.tp_size // nnodes_per_tp_group
         tp_rank_range = range(
-            tp_size_per_node * server_args.node_rank,
-            tp_size_per_node * (server_args.node_rank + 1),
+            tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group),
+            tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group + 1),
         )
-        for tp_rank in tp_rank_range:
-            rank_port_args = port_args
 
-            if server_args.enable_dp_attention:
-                # dp attention has different sharding logic
-                _, _, dp_rank = compute_dp_attention_world_info(
-                    server_args.enable_dp_attention,
-                    tp_rank,
-                    server_args.tp_size,
-                    server_args.dp_size,
+        pp_size_per_node = max(server_args.pp_size // server_args.nnodes, 1)
+        pp_rank_range = range(
+            pp_size_per_node * (server_args.node_rank // nnodes_per_tp_group),
+            pp_size_per_node * (server_args.node_rank // nnodes_per_tp_group + 1),
+        )
+
+        for pp_rank in pp_rank_range:
+            for tp_rank in tp_rank_range:
+                rank_port_args = port_args
+
+                if server_args.enable_dp_attention:
+                    # dp attention has different sharding logic
+                    _, _, dp_rank = compute_dp_attention_world_info(
+                        server_args.enable_dp_attention,
+                        tp_rank,
+                        server_args.tp_size,
+                        server_args.dp_size,
+                    )
+                    # compute zmq ports for this dp rank
+                    rank_port_args = PortArgs.init_new(server_args, dp_rank)
+                    # Data parallelism resues the tensor parallelism group,
+                    # so all dp ranks should use the same nccl port.
+                    rank_port_args.nccl_port = port_args.nccl_port
+
+                reader, writer = mp.Pipe(duplex=False)
+                gpu_id = (
+                    server_args.base_gpu_id
+                    + base_gpu_id
+                    + ((pp_rank % pp_size_per_node) * tp_size_per_node)
+                    + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
                 )
-                # compute zmq ports for this dp rank
-                rank_port_args = PortArgs.init_new(server_args, dp_rank)
-                # Data parallelism resues the tensor parallelism group,
-                # so all dp ranks should use the same nccl port.
-                rank_port_args.nccl_port = port_args.nccl_port
-
-            reader, writer = mp.Pipe(duplex=False)
-            gpu_id = (
-                server_args.base_gpu_id
-                + base_gpu_id
-                + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
-            )
-            proc = mp.Process(
-                target=run_scheduler_process,
-                args=(server_args, rank_port_args, gpu_id, tp_rank, dp_rank, writer),
-            )
-            with memory_saver_adapter.configure_subprocess():
-                proc.start()
-            self.scheduler_procs.append(proc)
-            scheduler_pipe_readers.append(reader)
+                proc = mp.Process(
+                    target=run_scheduler_process,
+                    args=(
+                        server_args,
+                        rank_port_args,
+                        gpu_id,
+                        tp_rank,
+                        pp_rank,
+                        dp_rank,
+                        writer,
+                    ),
+                )
+                with memory_saver_adapter.configure_subprocess():
+                    proc.start()
+                self.scheduler_procs.append(proc)
+                scheduler_pipe_readers.append(reader)
 
         # Wait for model to finish loading
         scheduler_info = []
@@ -226,9 +246,14 @@ class DataParallelController:
         self.max_total_num_tokens = scheduler_info[0]["max_total_num_tokens"]
         self.max_req_input_len = scheduler_info[0]["max_req_input_len"]
 
-    def round_robin_scheduler(self, req):
-        self.workers[self.round_robin_counter].send_pyobj(req)
-        self.round_robin_counter = (self.round_robin_counter + 1) % len(self.workers)
+    def round_robin_scheduler(self, req: Req):
+        if self.server_args.disaggregation_mode == "null":
+            self.workers[self.round_robin_counter].send_pyobj(req)
+            self.round_robin_counter = (self.round_robin_counter + 1) % len(
+                self.workers
+            )
+        else:
+            self.workers[req.bootstrap_room % len(self.workers)].send_pyobj(req)
 
     def shortest_queue_scheduler(self, input_requests):
         raise NotImplementedError()
