@@ -154,7 +154,7 @@ def _simulate_eplb_physical_count_of_batch(
                 ].logical_to_all_physical_map,
                 num_physical_expert=num_physical_expert,
             )
-            for batch_index in range(num_batches)
+            for batch_index in trange(num_batches)
         ]
         return torch.stack(outputs)
     else:
