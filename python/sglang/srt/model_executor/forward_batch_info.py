@@ -291,6 +291,7 @@ class ForwardBatch:
             capture_hidden_mode=batch.capture_hidden_mode,
             input_embeds=batch.input_embeds,
             extend_input_logprob_token_ids_gpu=extend_input_logprob_token_ids_gpu,
+            num_token_unpadded=torch.tensor(len(batch.input_ids)).to(device, non_blocking=True),
         )
 
         # For DP attention
