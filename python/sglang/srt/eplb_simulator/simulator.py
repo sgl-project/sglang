@@ -219,8 +219,13 @@ def _simulate_expert_location_metadata_arr(
         return [output_chunks[batch_index // chunk_size] for batch_index in range(num_batches)]
 
     elif expert_location_mode == "global_average":
-        output = TODO
-        return [output for batch_index in range(num_batches)]
+        output = MyExpertLocationMetadata.init_by_eplb(
+            server_args,
+            logical_count=einops.einsum(logical_count_of_batch,
+                                        "num_interest_batches num_layer num_expert -> num_layer num_expert", ),
+            num_physical_experts=num_physical_expert,
+        )
+        return [output for _ in range(num_batches)]
 
     raise NotImplementedError
 
