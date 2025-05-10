@@ -1093,7 +1093,7 @@ def sample_hf_dataset_requests(
             prompt=row["prompts"],
             prompt_len=None,
             output_len=10000,
-            metadata=dict(id=row["id"], dataset_timestamp=row["timestamp"].isoformat()),
+            metadata=dict(dataset_id=row["id"], dataset_timestamp=row["timestamp"].isoformat()),
         )
         for row in df.iter_rows(named=True)
     ]
