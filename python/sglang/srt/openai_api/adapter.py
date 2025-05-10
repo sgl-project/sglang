@@ -934,6 +934,7 @@ def v1_chat_generate_request(
     top_logprobs_nums = []
     modalities_list = []
     lora_paths = []
+    assistant_prefix_list = []
 
     # NOTE: with openai API, the prompt's logprobs are always not computed
 
@@ -1063,7 +1064,7 @@ def v1_chat_generate_request(
                 assistant_prefix = (gen_assistant_prefix or "") + (
                     assistant_prefix or ""
                 )
-
+                assistant_prefix_list.append(assistant_prefix)
                 prompt_str = tokenized_chat + assistant_prefix
                 prompt_ids = tokenizer_manager.tokenizer.encode(prompt_str)
 
@@ -1224,6 +1225,7 @@ def v1_chat_generate_request(
         rid=request_ids,
         modalities=modalities_list,
         lora_path=lora_paths,
+        assistant_prefix=assistant_prefix_list,
         bootstrap_host=all_requests[0].bootstrap_host,
         bootstrap_port=all_requests[0].bootstrap_port,
         bootstrap_room=all_requests[0].bootstrap_room,
@@ -1461,6 +1463,7 @@ async def v1_chat_completions(
                     is_first = is_firsts.get(index, True)
                     stream_buffer = stream_buffers.get(index, "")
                     n_prev_token = n_prev_tokens.get(index, 0)
+                    assistant_prefix = adapted_request.assistant_prefix[index] or ""
 
                     prompt_tokens[index] = content["meta_info"]["prompt_tokens"]
                     completion_tokens[index] = content["meta_info"]["completion_tokens"]
@@ -1518,7 +1521,11 @@ async def v1_chat_completions(
                     if is_first:
                         # First chunk with role
                         is_first = False
-                        delta = DeltaMessage(role="assistant")
+                        delta = (
+                            DeltaMessage(role="assistant", content=assistant_prefix)
+                            if assistant_prefix
+                            else DeltaMessage(role="assistant")
+                        )
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=index,
                             delta=delta,
