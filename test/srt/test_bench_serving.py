@@ -156,8 +156,6 @@ class TestBenchServing(CustomTestCase):
             num_prompts=200,
             request_rate=float("inf"),
             other_server_args=[
-                "--chat-template",
-                DEFAULT_VLM_CHAT_TEMPLATE_FOR_TEST,
                 "--mem-fraction-static",
                 "0.7",
             ],
@@ -181,8 +179,6 @@ class TestBenchServing(CustomTestCase):
             num_prompts=50,
             request_rate=1,
             other_server_args=[
-                "--chat-template",
-                DEFAULT_VLM_CHAT_TEMPLATE_FOR_TEST,
                 "--mem-fraction-static",
                 "0.7",
             ],
