@@ -23,7 +23,6 @@ from typing import TYPE_CHECKING, Callable
 
 import torch
 import tqdm
-
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.parallel_state import GroupCoordinator, graph_capture
@@ -556,6 +555,7 @@ class CudaGraphRunner:
         self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
         self.out_cache_loc[:raw_num_token].copy_(forward_batch.out_cache_loc)
         self.positions[:raw_num_token].copy_(forward_batch.positions)
+        self.num_token_non_padded[...] = len(forward_batch.input_ids)
         if forward_batch.seq_lens_cpu is not None:
             if bs != raw_bs:
                 self.seq_lens_cpu.fill_(1)
