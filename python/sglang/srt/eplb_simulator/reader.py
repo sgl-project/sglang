@@ -102,9 +102,11 @@ def read_expert_distribution_mode_detail_per_token(
 
     def _compute_topk_ids(pack, raw_data_packs):
         total_num_token, _ = pack["input_ids"].shape
+
         topk_ids = torch.empty(
             (total_num_token, model_config_for_expert_location.num_layer, MY_MODEL_CONFIG_NUM_EXPERTS_PER_TOK),
             dtype=torch.int16)
+        counter = 0
 
         for raw_data_pack in raw_data_packs:
             for record in raw_data_pack:
@@ -112,8 +114,11 @@ def read_expert_distribution_mode_detail_per_token(
                     record["topk_ids_of_layer"],
                     "num_layer num_token top_k -> num_token num_layer top_k",
                 )
-                topk_ids[TODO:TODO, :, :] = topk_ids_of_record.cuda()
+                counter_next = counter + topk_ids_of_record.shape[0]
+                topk_ids[counter:counter_next, :, :] = topk_ids_of_record.cuda()
+                counter = counter_next
 
+        assert counter == total_num_token
         return dict(**pack, topk_ids=topk_ids)
 
     def _compute_rid(pack):
