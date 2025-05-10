@@ -275,7 +275,6 @@ def select_experts(
         assert topk_group is not None
         assert num_expert_group is not None
         if correction_bias is None:
-            assert num_token_non_padded is None
             topk_weights, topk_ids = grouped_topk(
                 hidden_states=hidden_states,
                 gating_output=router_logits,
@@ -300,7 +299,6 @@ def select_experts(
                 num_token_non_padded=num_token_non_padded,
             )
     elif torch_native and custom_routing_function is None:
-        assert num_token_non_padded is None
         topk_weights, topk_ids = fused_topk_native(
             hidden_states=hidden_states,
             gating_output=router_logits,
@@ -308,7 +306,6 @@ def select_experts(
             renormalize=renormalize,
         )
     elif custom_routing_function is None:
-        assert num_token_non_padded is None
         topk_weights, topk_ids = fused_topk(
             hidden_states=hidden_states,
             gating_output=router_logits,
@@ -316,7 +313,6 @@ def select_experts(
             renormalize=renormalize,
         )
     else:
-        assert num_token_non_padded is None
         topk_weights, topk_ids = custom_routing_function(
             hidden_states=hidden_states,
             gating_output=router_logits,
