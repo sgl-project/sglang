@@ -458,6 +458,7 @@ class CudaGraphRunner:
             spec_info=spec_info,
             capture_hidden_mode=self.capture_hidden_mode,
             lora_paths=lora_paths,
+            num_token_unpadded=self.num_token_unpadded,
         )
 
         if lora_paths is not None:
