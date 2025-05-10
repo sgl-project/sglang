@@ -41,7 +41,7 @@ def read_expert_distribution_mode_detail_per_token_and_bench_serving(dir_data):
                                     + pl.col("input_ids").list.len(),
         )
 
-        df = df.sort("dataset_timestamp")
+        df = df.sort("dataset_timestamp", maintain_order=True)
 
         return ExpertDistributionModeDetailPerTokenAndBenchServingPack(
             topk_ids=pack_expert_distribution["topk_ids"],
