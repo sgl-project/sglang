@@ -217,20 +217,6 @@ def _simulate_logical_to_physical_by_random_dispatching(
             src=logical_count_amortized[mask],
         )
 
-    for layer_id in range(num_layer):
-        for logical_expert_id in range(num_logical_expert):
-            all_physical_expert_ids = (
-                ExpertLocationMetadata.logical_to_all_physical_raw(
-                    logical_to_all_physical_map, layer_id, logical_expert_id
-                )
-            )
-            for physical_expert_id in all_physical_expert_ids:
-                physical_count_of_whatever[
-                    ..., layer_id, physical_expert_id
-                ] += logical_count[..., layer_id, logical_expert_id] / len(
-                    all_physical_expert_ids
-                )
-
     return physical_count_of_whatever
 
 
