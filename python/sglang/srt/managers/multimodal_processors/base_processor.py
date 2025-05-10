@@ -36,20 +36,28 @@ class BaseMultiModalProcessorOutput:
 
 @dataclasses.dataclass
 class MultimodalSpecialTokens:
-    image_token: Optional[Union[str, re.Pattern]] = None
-    video_token: Optional[Union[str, re.Pattern]] = None
-    audio_token: Optional[Union[str, re.Pattern]] = None
+    image_token: Optional[str] = None
+    video_token: Optional[str] = None
+    audio_token: Optional[str] = None
+
+    image_token_regex: Optional[re.Pattern] = None
+    video_token_regex: Optional[re.Pattern] = None
+    audio_token_regex: Optional[re.Pattern] = None
 
     def __post_init__(self):
-        if isinstance(self.image_token, str):
-            self.image_token = re.compile(re.escape(self.image_token))
-        if isinstance(self.video_token, str):
-            self.video_token = re.compile(re.escape(self.video_token))
-        if isinstance(self.audio_token, str):
-            self.audio_token = re.compile(re.escape(self.audio_token))
+        if self.image_token_regex is None and self.image_token is not None:
+            self.image_token_regex = re.compile(re.escape(self.image_token))
+        if self.video_token_regex is None and self.video_token is not None:
+            self.video_token_regex = re.compile(re.escape(self.video_token))
+        if self.audio_token_regex is None and self.audio_token is not None:
+            self.audio_token_regex = re.compile(re.escape(self.audio_token))
 
     def collect(self) -> re.Pattern:
-        tokens = [self.image_token, self.video_token, self.audio_token]
+        tokens = [
+            self.image_token_regex,
+            self.video_token_regex,
+            self.audio_token_regex,
+        ]
         patterns = []
         flags = 0
         for t in tokens:
@@ -191,8 +199,9 @@ class BaseMultimodalProcessor(ABC):
         image_index, audio_index = 0, 0
 
         for text_part in text_parts:
-            if multimodal_tokens.image_token and multimodal_tokens.image_token.match(
-                text_part
+            if (
+                multimodal_tokens.image_token_regex
+                and multimodal_tokens.image_token_regex.match(text_part)
             ):
                 data = image_data[image_index]
                 is_video = isinstance(data, str) and data.startswith("video:")
@@ -210,8 +219,9 @@ class BaseMultimodalProcessor(ABC):
                 )
                 task_info.append((Modality.IMAGE, data, frame_count_limit))
                 image_index += 1
-            elif multimodal_tokens.audio_token and multimodal_tokens.audio_token.match(
-                text_part
+            elif (
+                multimodal_tokens.audio_token_regex
+                and multimodal_tokens.audio_token_regex.match(text_part)
             ):
                 data = audio_data[audio_index]
                 futures.append(
@@ -294,14 +304,29 @@ class BaseMultimodalProcessor(ABC):
                 task_ptr += 1
 
                 if task_type == Modality.IMAGE:
+                    # If data is already processed it will be a
+                    # dictionary. In this case we want to keep the
+                    # expanded tokens in text_part. Otherwise, we will
+                    # call the processor code, so keep only a single image
+                    # token.
+                    mm_tokens = (
+                        text_part
+                        if isinstance(data, dict)
+                        else multimodal_tokens.image_token
+                    )
                     frames = [result] if not isinstance(result, list) else result
                     if frames:
                         images += frames
-                        new_text += text_part * len(frames)
+                        new_text += mm_tokens * len(frames)
                 elif task_type == Modality.AUDIO:
                     # audio
+                    mm_tokens = (
+                        text_part
+                        if isinstance(data, dict)
+                        else multimodal_tokens.audio_token
+                    )
                     audios.append(result)
-                    new_text += text_part
+                    new_text += mm_tokens
                 # TODO: handle video
             else:
                 new_text += text_part

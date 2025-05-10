@@ -24,7 +24,8 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
 
     def __init__(self, hf_config, server_args, _processor):
         super().__init__(hf_config, server_args, _processor)
-        self.IMAGE_TOKEN = re.compile(
+        self.IMAGE_TOKEN = "<|vision_start|><|image_pad|><|vision_end|>"
+        self.IMAGE_TOKEN_REGEX = re.compile(
             r"<\|vision_start\|>(?:<\|image_pad\|>)+<\|vision_end\|>"
         )
         self.IM_START_TOKEN_ID = hf_config.vision_start_token_id
@@ -51,11 +52,13 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
         if isinstance(image_data, str):
             image_data = [image_data]
 
-        image_token = self.IMAGE_TOKEN
         base_output = self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
-            multimodal_tokens=MultimodalSpecialTokens(image_token=image_token),
+            multimodal_tokens=MultimodalSpecialTokens(
+                image_token=self.IMAGE_TOKEN,
+                image_token_regex=self.IMAGE_TOKEN_REGEX,
+            ),
             max_req_input_len=max_req_input_len,
         )
 
