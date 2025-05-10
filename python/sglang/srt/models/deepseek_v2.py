@@ -35,6 +35,7 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.attention.utils import prepare_qk_for_deepseek_mha_triton
 from sglang.srt.layers.dp_attention import (
     dp_gather_partial,
     dp_scatter,
@@ -669,36 +670,82 @@ class DeepseekV2AttentionMLA(nn.Module):
             q, latent_cache = self.fused_qkv_a_proj_with_mqa(hidden_states)[0].split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
             )
-            q = self.q_a_layernorm(q)
-            q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+            kv_a = latent_cache[..., : self.kv_lora_rank]
+
+            # overlap qk norm/b_proj
+            if self.alt_stream is not None:
+                current_stream = torch.cuda.current_stream()
+                self.alt_stream.wait_stream(current_stream)
+                q = self.q_a_layernorm(q)
+                q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+                with torch.cuda.stream(self.alt_stream):
+                    kv_a = self.kv_a_layernorm(kv_a)
+                    kv = self.kv_b_proj(kv_a)[0].view(
+                        -1,
+                        self.num_local_heads,
+                        self.qk_nope_head_dim + self.v_head_dim,
+                    )
+                current_stream.wait_stream(self.alt_stream)
+            else:
+                q = self.q_a_layernorm(q)
+                kv_a = self.kv_a_layernorm(kv_a)
+                q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+                kv = self.kv_b_proj(kv_a)[0].view(
+                    -1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim
+                )
+
         else:
             q = self.q_proj(hidden_states)[0].view(
                 -1, self.num_local_heads, self.qk_head_dim
             )
             latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
+            kv_a = latent_cache[..., : self.kv_lora_rank]
+            kv_a = self.kv_a_layernorm(kv_a)
+            kv = self.kv_b_proj(kv_a)[0].view(
+                -1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim
+            )
 
+        # Do rotary embedding
+        k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
         _, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-        kv_a, _ = latent_cache.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        latent_cache = latent_cache.unsqueeze(1)
-        kv_a = self.kv_a_layernorm(kv_a.contiguous())
-        kv = self.kv_b_proj(kv_a)[0]
-        kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
-        k_nope = kv[..., : self.qk_nope_head_dim]
-        v = kv[..., self.qk_nope_head_dim :]
-        k_pe = latent_cache[:, :, self.kv_lora_rank :]
         q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
-        q[..., self.qk_nope_head_dim :] = q_pe
-        k = torch.empty_like(q)
-        k[..., : self.qk_nope_head_dim] = k_nope
-        k[..., self.qk_nope_head_dim :] = k_pe
 
-        latent_cache[:, :, : self.kv_lora_rank] = kv_a.unsqueeze(1)
-        latent_cache[:, :, self.kv_lora_rank :] = k_pe
+        # Prepare for attention
+        k_nope, v = kv.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+        k = torch.empty_like(q)
+        prepare_qk_for_deepseek_mha_triton[(q.shape[0],)](
+            q,
+            k,
+            k_nope,
+            q_pe,
+            k_pe,
+            q.stride(0),
+            q.stride(1),
+            k_nope.stride(0),
+            k_nope.stride(1),
+            q_pe.stride(0),
+            q_pe.stride(1),
+            k_pe.stride(0),
+            self.qk_rope_head_dim,
+            self.qk_nope_head_dim,
+            self.num_local_heads,
+        )
 
         # Save latent cache
-        forward_batch.token_to_kv_pool.set_kv_buffer(
-            self.attn_mha, forward_batch.out_cache_loc, latent_cache, None
-        )
+        kv_a = kv_a.unsqueeze(1)
+        if self.attention_backend == "flashinfer" or self.attention_backend == "fa3":
+            forward_batch.token_to_kv_pool.set_mla_kv_buffer(
+                self.attn_mha,
+                forward_batch.out_cache_loc,
+                kv_a,
+                k_pe,
+            )
+        else:
+            saved_latent_cache = torch.cat([kv_a, k_pe], dim=-1)
+            forward_batch.token_to_kv_pool.set_kv_buffer(
+                self.attn_mha, forward_batch.out_cache_loc, saved_latent_cache, None
+            )
+
         attn_output = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
         output, _ = self.o_proj(attn_output)
@@ -718,7 +765,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             k_nope = latent_cache[..., : self.kv_lora_rank]
 
             # overlap qk norm
-            if self.alt_stream is not None and torch.cuda.is_current_stream_capturing():
+            if self.alt_stream is not None:
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
                 q = self.q_a_layernorm(q)
