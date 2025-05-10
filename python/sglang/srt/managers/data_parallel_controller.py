@@ -210,7 +210,7 @@ class DataParallelController:
                     )
                     # compute zmq ports for this dp rank
                     rank_port_args = PortArgs.init_new(server_args, dp_rank)
-                    # Data parallelism resues the tensor parallelism group,
+                    # Data parallelism reuses the tensor parallelism group,
                     # so all dp ranks should use the same nccl port.
                     rank_port_args.nccl_port = port_args.nccl_port
 

@@ -147,3 +147,7 @@ exclude = [
     "scripts*",
     "tests*",
 ]
+
+[tool.codespell]
+ignore-words-list = "ans, hel, boostrap"
+skip = "*.json,*.jsonl,*.patch"
