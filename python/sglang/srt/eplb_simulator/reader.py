@@ -10,6 +10,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 
+_DEVICE = "cuda"
+
 
 @dataclass
 class ExpertDistributionModeDetailPerTokenAndBenchServingPack:
@@ -18,32 +20,33 @@ class ExpertDistributionModeDetailPerTokenAndBenchServingPack:
 
 
 def read_expert_distribution_mode_detail_per_token_and_bench_serving(dir_data):
-    pack_expert_distribution = read_expert_distribution_mode_detail_per_token(dir_data)
-    df_bench_serving = read_bench_serving(_single(list(Path(dir_data).glob("*.jsonl"))))
+    with torch.device("cuda"):
+        pack_expert_distribution = read_expert_distribution_mode_detail_per_token(dir_data)
+        df_bench_serving = read_bench_serving(_single(list(Path(dir_data).glob("*.jsonl"))))
 
-    df = df_bench_serving.join(
-        pack_expert_distribution["df_metadata"], on="rid", how="inner"
-    )
+        df = df_bench_serving.join(
+            pack_expert_distribution["df_metadata"], on="rid", how="inner"
+        )
 
-    _check_list_is_prefix(df, "history_ids", "input_ids")
-    _check_list_is_prefix(df, "input_ids", "all_ids")
+        _check_list_is_prefix(df, "history_ids", "input_ids")
+        _check_list_is_prefix(df, "input_ids", "all_ids")
 
-    df = df.with_columns(
-        input_except_history_ids=pl.col("input_ids").list.slice(
-            pl.col("history_ids").list.len(), None
-        ),
-        pack_input_except_history_start_index=pl.col("pack_start_index")
-                                              + pl.col("history_ids").list.len(),
-        pack_output_start_index=pl.col("pack_start_index")
-                                + pl.col("input_ids").list.len(),
-    )
+        df = df.with_columns(
+            input_except_history_ids=pl.col("input_ids").list.slice(
+                pl.col("history_ids").list.len(), None
+            ),
+            pack_input_except_history_start_index=pl.col("pack_start_index")
+                                                  + pl.col("history_ids").list.len(),
+            pack_output_start_index=pl.col("pack_start_index")
+                                    + pl.col("input_ids").list.len(),
+        )
 
-    df = df.sort("dataset_timestamp")
+        df = df.sort("dataset_timestamp")
 
-    return ExpertDistributionModeDetailPerTokenAndBenchServingPack(
-        topk_ids=pack_expert_distribution["topk_ids"],
-        df_metadata=df,
-    )
+        return ExpertDistributionModeDetailPerTokenAndBenchServingPack(
+            topk_ids=pack_expert_distribution["topk_ids"],
+            df_metadata=df,
+        )
 
 
 def _check_list_is_prefix(df, col_a, col_b):
@@ -137,7 +140,7 @@ def read_expert_distribution_mode_detail_per_token(dir_data):
     processed_records = []
     for path in list(Path(dir_data).glob("*.pt")):
         print(f"Read {path=}")
-        data_pack = torch.load(path, weights_only=True)
+        data_pack = torch.load(path, weights_only=True, map_location=_DEVICE)
         processed_records += [_handle_record(record) for record in tqdm(data_pack["records"])]
 
     pack = _concat_records(processed_records)

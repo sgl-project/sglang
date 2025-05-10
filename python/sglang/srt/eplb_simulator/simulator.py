@@ -29,35 +29,36 @@ def simulate_execution_given_pack(
     server_args: MyServerArgs,
     assert_physical_equal_logical_expert: bool,
 ):
-    num_physical_expert = _compute_num_physical_experts(server_args)
+    with torch.device("cuda"):
+        num_physical_expert = _compute_num_physical_experts(server_args)
 
-    token_indices_of_batch = _simulate_scheduled_pack_indices_given_seq_metadata(
-        pack.df_metadata,
-        phase=phase,
-        num_tokens_in_batch_overall=server_args.num_tokens_in_batch_overall,
-    )
+        token_indices_of_batch = _simulate_scheduled_pack_indices_given_seq_metadata(
+            pack.df_metadata,
+            phase=phase,
+            num_tokens_in_batch_overall=server_args.num_tokens_in_batch_overall,
+        )
 
-    vanilla_physical_count_of_batch = torch.stack(
-        [
-            compute_global_physical_count_from_topk_ids(
-                topk_ids=pack.topk_ids[token_indices_of_batch[i], :, :],
-                num_physical_expert=num_physical_expert,
-            )
-            for i in trange(len(token_indices_of_batch), desc="vanilla_physical_count_of_batch")
-        ]
-    )
+        vanilla_physical_count_of_batch = torch.stack(
+            [
+                compute_global_physical_count_from_topk_ids(
+                    topk_ids=pack.topk_ids[token_indices_of_batch[i], :, :],
+                    num_physical_expert=num_physical_expert,
+                )
+                for i in trange(len(token_indices_of_batch), desc="vanilla_physical_count_of_batch")
+            ]
+        )
 
-    assert assert_physical_equal_logical_expert
-    logical_count_of_batch = vanilla_physical_count_of_batch
+        assert assert_physical_equal_logical_expert
+        logical_count_of_batch = vanilla_physical_count_of_batch
 
-    simulation_output = _simulate_execution_given_logical_count_of_batch(
-        logical_count_of_batch=logical_count_of_batch, server_args=server_args
-    )
+        simulation_output = _simulate_execution_given_logical_count_of_batch(
+            logical_count_of_batch=logical_count_of_batch, server_args=server_args
+        )
 
-    return dict(
-        num_tokens_of_batch=torch.tensor([len(x) for x in token_indices_of_batch], dtype=torch.int32),
-        **simulation_output,
-    )
+        return dict(
+            num_tokens_of_batch=torch.tensor([len(x) for x in token_indices_of_batch], dtype=torch.int32),
+            **simulation_output,
+        )
 
 
 def _simulate_scheduled_pack_indices_given_seq_metadata(
