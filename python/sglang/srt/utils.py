@@ -1263,6 +1263,8 @@ def get_device_memory_capacity(device: str = None):
         gpu_mem = get_amdgpu_memory_capacity()
     elif device == "hpu":
         gpu_mem = get_hpu_memory_capacity()
+    elif device == "cpu":
+        gpu_mem = 0
     else:
         # GPU memory is not known yet or no GPU is available.
         gpu_mem = None

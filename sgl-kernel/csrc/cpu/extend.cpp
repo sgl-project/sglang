@@ -1,6 +1,6 @@
 #include "common.h"
-#include "gemm.h"
 #include "vec.h"
+#include "gemm.h"
 
 namespace {
 
@@ -10,10 +10,73 @@ namespace {
 //   3. computes attention for prefix and extend separately
 //   4. TODO: vectorize `pack_vnni` and `pack_vnni2`
 //
+
 template <typename index_t>
 inline index_t get_index(index_t* ind, int i) {
   return (ind == nullptr) ? (index_t)i : ind[i];
 }
+
+#if defined(CPU_CAPABILITY_AVX512)
+// key: from [N, 32] to [32/2, N, 2]
+template <typename scalar_t, typename index_t>
+inline void pack_vnni_Nx32(
+    scalar_t* __restrict__ dst,
+    const scalar_t* __restrict__ src,
+    const index_t* __restrict__ ind,
+    int N,
+    int ld_src,
+    int ld_dst) {
+
+  __m512i vinputs[16];
+
+  int n = 0;
+  for (; n < N; ++n) {
+    index_t index = get_index(ind, n);
+    vinputs[n] = _mm512_loadu_si512(src + index * ld_src);
+  }
+  // padding with zero to avoid uninitialized vectors
+  for (; n < 16; ++n) {
+    vinputs[n] = _mm512_set1_epi32(0);
+  }
+
+  // pack key
+  transpose_16x16_32bit(vinputs);
+
+  const __mmask16 vmask = (1 << N) - 1;
+  for (int k = 0; k < 16; ++k) {
+    _mm512_mask_storeu_epi32(dst + k * ld_dst * 2, vmask, vinputs[k]);
+  }
+}
+
+// value: from [K, 32] to [K/2, 32, 2]
+template <typename scalar_t, typename index_t>
+inline void pack_vnni_Kx32(
+    scalar_t* __restrict__ dst,
+    const scalar_t* __restrict__ src,
+    const index_t* __restrict__ ind,
+    int K,
+    int ld_src,
+    int ld_dst) {
+
+  __m512i vinputs[2];
+
+  int k = 0;
+  for (; k < K; ++k) {
+    index_t index = get_index(ind, k);
+    vinputs[k] = _mm512_loadu_si512(src + index * ld_src);
+  }
+  // padding with zero to avoid uninitialized vectors
+  for (; k < 2; ++k) {
+    vinputs[k] = _mm512_set1_epi32(0);
+  }
+
+  // pack value
+  __m512i d0, d1;
+  std::tie(d0, d1) = transpose_2x32_16bit(vinputs[0], vinputs[1]);
+  _mm512_storeu_si512(dst + 0 * ld_dst * 2, d0);
+  _mm512_storeu_si512(dst + 0 * ld_dst * 2 + 32, d1);
+}
+#endif
 
 // convert to vnni format
 // from [N, K/2, 2] to [K/2, N, 2] for bfloat16 and float16
@@ -22,18 +85,35 @@ void pack_vnni(
     scalar_t* __restrict__ dst,
     const scalar_t* __restrict__ src,
     const index_t* __restrict__ ind,
-    int N,
-    int K,
-    int ld_src,
-    int ld_dst) {
+    int N, int K, int ld_src, int ld_dst) {
+#if defined(CPU_CAPABILITY_AVX512)
+  const int NB = div_up(N, 16);
+  const int KB = K / 32; // no remainder
+  const bool is_indexed = ind != nullptr;
+
+  for (int nb = 0; nb < NB; ++nb) {
+    for (int kb = 0; kb < KB; ++kb) {
+      // handle 16x512bits each block
+      int nb_size = std::min(N - nb * 16, 16);
+      pack_vnni_Nx32<scalar_t, index_t>(
+          /*    dst */ dst + ((kb * 32) >> 1) * ld_dst * 2 + nb * 16 * 2,
+          /*    src */ src + kb * 32 + (is_indexed ? 0 : nb * 16 * ld_src),
+          /*    ind */ is_indexed ? ind + nb * 16 : nullptr,
+          /*      N */ nb_size,
+          /* ld_src */ ld_src,
+          /* ld_dst */ ld_dst);
+    }
+  }
+#else
   for (int n = 0; n < N; ++n) {
     index_t index = get_index(ind, n);
-    for (int k = 0; k < K / 2; ++k) {
+    for (int k = 0; k < K/2; ++k) {
       for (int d = 0; d < 2; ++d) {
         dst[k * ld_dst * 2 + n * 2 + d] = src[index * ld_src + k * 2 + d];
       }
     }
   }
+#endif
 }
 
 // convert to vnni format
@@ -43,10 +123,26 @@ void pack_vnni2(
     scalar_t* __restrict__ dst,
     const scalar_t* __restrict__ src,
     const index_t* __restrict__ ind,
-    int K,
-    int N,
-    int ld_src,
-    int ld_dst) {
+    int K, int N, int ld_src, int ld_dst) {
+#if defined(CPU_CAPABILITY_AVX512)
+  const int KB = div_up(K, 2);
+  const int NB = N / 32; // no remainder
+  const bool is_indexed = ind != nullptr;
+
+  for (int kb = 0; kb < KB; ++kb) {
+    for (int nb = 0; nb < NB; ++nb) {
+      // handle 2x512bits each block
+      int kb_size = std::min(K - kb * 2, 2);
+      pack_vnni_Kx32<scalar_t, index_t>(
+          /*    dst */ dst + ((kb * 2) >> 1) * ld_dst * 2 + nb * 32 * 2,
+          /*    src */ src + (is_indexed ? 0 : kb * 2 * ld_src) + nb * 32,
+          /*    ind */ is_indexed ? ind + kb * 2 : nullptr,
+          /*      K */ kb_size,
+          /* ld_src */ ld_src,
+          /* ld_dst */ ld_dst);
+    }
+  }
+#else
   int k = 0;
   for (; k < (K >> 1) * 2; k += 2) {
     index_t index0 = get_index(ind, k + 0);
@@ -64,21 +160,17 @@ void pack_vnni2(
     }
     k += 2;
   }
-  // TODO: check whether we can skip this!
-  // const int padded_K = div_up(K, TILE_K) * TILE_K;
-  // for (; k < padded_K; ++k) {
-  //   for (int n = 0; n < N; ++n) {
-  //     dst[k * ld_dst + n] = static_cast<scalar_t>(0);
-  //   }
-  // }
+#endif
 }
 
 template <typename scalar_t>
 inline void fill_stub(scalar_t* __restrict__ out, float val, int size) {
   using Vec = at::vec::Vectorized<scalar_t>;
+  constexpr int kVecSize = Vec::size();
   const Vec data_vec = Vec(static_cast<scalar_t>(val));
   int d = 0;
-  for (; d <= size - Vec::size(); d += Vec::size()) {
+#pragma GCC unroll 4
+  for (; d <= size - kVecSize; d += kVecSize) {
     data_vec.store(out + d);
   }
   if (size - d > 0) {
@@ -110,9 +202,11 @@ template <typename scalar_t>
 inline void copy_stub(scalar_t* __restrict__ out, const float* __restrict__ acc, float s, int size) {
   using bVec = at::vec::Vectorized<scalar_t>;
   using fVec = at::vec::Vectorized<float>;
+  constexpr int kVecSize = bVec::size();
   const fVec s_fvec = fVec(s);
   int d = 0;
-  for (; d <= size - bVec::size(); d += bVec::size()) {
+#pragma GCC unroll 4
+  for (; d <= size - kVecSize; d += kVecSize) {
     fVec a_fvec0 = fVec::loadu(acc + d) * s_fvec;
     fVec a_fvec1 = fVec::loadu(acc + d + fVec::size()) * s_fvec;
     bVec out_bvec = convert_from_float_ext<scalar_t>(a_fvec0, a_fvec1);
@@ -158,6 +252,7 @@ void extend_attention_kernel_impl(
     int max_len_extend,
     int buffer_size_per_thread,
     bool is_prefix_skipped) {
+
   using Vec = at::vec::Vectorized<float>;
 
   // strides
@@ -217,7 +312,8 @@ void extend_attention_kernel_impl(
       TORCH_CHECK(req_pool_id < max_num_reqs, "req_pool_id out of scope!");
 
       if (is_prefix_skipped) {
-        TORCH_CHECK(seq_len_prefix == 0, "extend attention: expect seq_len_prefix to be 0, got ", seq_len_prefix);
+        TORCH_CHECK(seq_len_prefix == 0,
+            "extend attention: expect seq_len_prefix to be 0, got ", seq_len_prefix);
       }
 
       // offset and size in MB
@@ -271,7 +367,10 @@ void extend_attention_kernel_impl(
         for (int row = 0; row < m_size; ++row) {
           // s_i <- s_i * scale
           at::vec::map<float>(
-              [scale_vec](Vec x) { return x * scale_vec; }, s_i + row * BLOCK_N, s_i + row * BLOCK_N, n_size);
+              [scale_vec](Vec x) { return x * scale_vec; },
+              s_i + row * BLOCK_N,
+              s_i + row * BLOCK_N,
+              n_size);
 
           // TODO: `tanh` from torch uses sleef u10, going to be slow
           if (has_logit_cap) {
@@ -284,7 +383,9 @@ void extend_attention_kernel_impl(
 
           // m_i: max value per row
           float m_i = at::vec::reduce_all<float>(
-              [](Vec& x, Vec& y) { return at::vec::maximum(x, y); }, s_i + row * BLOCK_N, n_size);
+              [](Vec& x, Vec& y) { return at::vec::maximum(x, y); },
+              s_i + row * BLOCK_N,
+              n_size);
           m_i = std::max(m_i, m_prime[row]);
 
           // m_delta <- exp(m' - m_i)
@@ -292,12 +393,17 @@ void extend_attention_kernel_impl(
 
           // s_delta <- exp(s_i - m_i)
           at::vec::map<float>(
-              [m_i](Vec x) { return (x - Vec(m_i)).exp_u20(); }, s_delta + row * BLOCK_N, s_i + row * BLOCK_N, n_size);
+              [m_i](Vec x) { return (x - Vec(m_i)).exp_u20(); },
+              s_delta + row * BLOCK_N,
+              s_i + row * BLOCK_N,
+              n_size);
 
           // s' <- s' * m_delta + sum(s_delta)
           s_prime[row] *= m_delta;
-          s_prime[row] +=
-              at::vec::reduce_all<float>([](Vec& x, Vec& y) { return x + y; }, s_delta + row * BLOCK_N, n_size);
+          s_prime[row] += at::vec::reduce_all<float>(
+              [](Vec& x, Vec& y) { return x + y; },
+              s_delta + row * BLOCK_N,
+              n_size);
 
           m_prime[row] = m_i;
 
@@ -327,7 +433,7 @@ void extend_attention_kernel_impl(
         at::native::cpublas::brgemm(
             /* M     */ m_size,
             /* N     */ head_size_v,
-            /* K     */ padded_n_size,  // n_size
+            /* K     */ padded_n_size, //n_size
             /* lda   */ BLOCK_N,
             /* ldb   */ head_size_v,
             /* ldc   */ head_size_v,
@@ -335,7 +441,7 @@ void extend_attention_kernel_impl(
             /* A     */ s_delta2,
             /* B     */ Btmp,
             /* C     */ v_prime);
-      }  // loop with seq_len_prefix
+      } // loop with seq_len_prefix
 
       // stage 2: compute the triangle part
       int num_keys = std::min(seq_len_extend, m + BLOCK_M);
@@ -382,7 +488,10 @@ void extend_attention_kernel_impl(
         for (int row = 0; row < m_size; ++row) {
           // s_i <- s_i * scale
           at::vec::map<float>(
-              [scale_vec](Vec x) { return x * scale_vec; }, s_i + row * BLOCK_N, s_i + row * BLOCK_N, n_size);
+              [scale_vec](Vec x) { return x * scale_vec; },
+              s_i + row * BLOCK_N,
+              s_i + row * BLOCK_N,
+              n_size);
 
           // TODO: `tanh` from torch uses sleef u10, going to be slow
           if (has_logit_cap) {
@@ -395,7 +504,9 @@ void extend_attention_kernel_impl(
 
           // m_i: max value per row
           float m_i = at::vec::reduce_all<float>(
-              [](Vec& x, Vec& y) { return at::vec::maximum(x, y); }, s_i + row * BLOCK_N, n_size);
+              [](Vec& x, Vec& y) { return at::vec::maximum(x, y); },
+              s_i + row * BLOCK_N,
+              n_size);
           m_i = std::max(m_i, m_prime[row]);
 
           // m_delta <- exp(m' - m_i)
@@ -403,12 +514,17 @@ void extend_attention_kernel_impl(
 
           // s_delta <- exp(s_i - m_i)
           at::vec::map<float>(
-              [m_i](Vec x) { return (x - Vec(m_i)).exp_u20(); }, s_delta + row * BLOCK_N, s_i + row * BLOCK_N, n_size);
+              [m_i](Vec x) { return (x - Vec(m_i)).exp_u20(); },
+              s_delta + row * BLOCK_N,
+              s_i + row * BLOCK_N,
+              n_size);
 
           // s' <- s' * m_delta + sum(s_delta)
           s_prime[row] *= m_delta;
-          s_prime[row] +=
-              at::vec::reduce_all<float>([](Vec& x, Vec& y) { return x + y; }, s_delta + row * BLOCK_N, n_size);
+          s_prime[row] += at::vec::reduce_all<float>(
+              [](Vec& x, Vec& y) { return x + y; },
+              s_delta + row * BLOCK_N,
+              n_size);
 
           m_prime[row] = m_i;
 
@@ -438,7 +554,7 @@ void extend_attention_kernel_impl(
         at::native::cpublas::brgemm(
             /* M     */ m_size,
             /* N     */ head_size_v,
-            /* K     */ padded_n_size,  // n_size
+            /* K     */ padded_n_size, //n_size
             /* lda   */ BLOCK_N,
             /* ldb   */ head_size_v,
             /* ldc   */ head_size_v,
@@ -446,12 +562,16 @@ void extend_attention_kernel_impl(
             /* A     */ s_delta2,
             /* B     */ Btmp,
             /* C     */ v_prime);
-      }  // loop with seq_len_extend
+      } // loop with seq_len_extend
 
       scalar_t* __restrict__ out_ptr = o_extend + (seq_extend_start_loc + m) * o_strideM + head_id * o_strideH;
       for (int row = 0; row < m_size; ++row) {
         float s = 1 / s_prime[row];
-        copy_stub<scalar_t>(out_ptr + row * o_strideM, v_prime + row * head_size_v, s, head_size_v);
+        copy_stub<scalar_t>(
+            out_ptr + row * o_strideM,
+            v_prime + row * head_size_v,
+            s,
+            head_size_v);
       }
 
       // move to the next index
@@ -461,7 +581,7 @@ void extend_attention_kernel_impl(
   });
 }
 
-}  // anonymous namespace
+} // anonymous namespace
 
 // q_extend, k_extend, v_extend, o_extend: contiguous tensors
 // k_buffer, v_buffer: (prefix + extend) tensors in mem_manager
@@ -494,19 +614,7 @@ void extend_attention_cpu(
     double sm_scale,
     double logit_cap) {
   RECORD_FUNCTION(
-      "sgl-kernel::extend_attention_cpu",
-      std::vector<c10::IValue>(
-          {q_extend,
-           k_extend,
-           v_extend,
-           o_extend,
-           k_buffer,
-           v_buffer,
-           req_to_token,
-           req_pool_indices,
-           seq_lens,
-           extend_seq_lens,
-           extend_start_loc}));
+    "sgl-kernel::extend_attention_cpu", std::vector<c10::IValue>({q_extend, k_extend, v_extend, o_extend, k_buffer, v_buffer, req_to_token, req_pool_indices, seq_lens, extend_seq_lens, extend_start_loc}));
 
   CHECK_INPUT(q_extend);
   CHECK_INPUT(o_extend);
@@ -549,17 +657,17 @@ void extend_attention_cpu(
 
   // check index data types
   const auto index_dtype = req_to_token.scalar_type();
-  TORCH_CHECK(
-      index_dtype == at::kInt || index_dtype == at::kLong,
+  TORCH_CHECK(index_dtype == at::kInt || index_dtype == at::kLong,
       "extend: expect req_to_token to be int32 or int64, got ",
       index_dtype);
-  TORCH_CHECK(seq_lens.scalar_type() == at::kLong, "extend: expect req_lens to be int64, got ", seq_lens.scalar_type());
-  TORCH_CHECK(
-      req_pool_indices.scalar_type() == at::kLong,
+  TORCH_CHECK(seq_lens.scalar_type() == at::kLong,
+      "extend: expect req_lens to be int64, got ",
+      seq_lens.scalar_type());
+  TORCH_CHECK(req_pool_indices.scalar_type() == at::kLong,
       "extend: expect req_pool_indices to be int64, got ",
       req_pool_indices.scalar_type());
-  TORCH_CHECK(
-      extend_seq_lens.scalar_type() == index_dtype && extend_start_loc.scalar_type() == index_dtype,
+  TORCH_CHECK(extend_seq_lens.scalar_type() == index_dtype &&
+      extend_start_loc.scalar_type() == index_dtype,
       "extend: expect extend_seq_lens and extend_start_loc to have same dtype as req_to_token.");
 
   // D and DV need to be 32x as we transpose by 512-bit

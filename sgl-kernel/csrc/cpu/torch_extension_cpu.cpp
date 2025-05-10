@@ -14,8 +14,8 @@ limitations under the License.
 ==============================================================================*/
 
 #include <ATen/ATen.h>
-#include <torch/extension.h>
 #include <torch/library.h>
+#include <torch/extension.h>
 
 #include "shm.h"
 
@@ -47,33 +47,16 @@ std::tuple<at::Tensor, at::Tensor> biased_grouped_topk_cpu(
     int64_t topk_group);
 
 // attention
-void decode_attention_cpu(
-    at::Tensor& query,
-    at::Tensor& output,
-    at::Tensor& k_cache,
-    at::Tensor& v_cahce,
-    at::Tensor& attn_logits,
-    at::Tensor& req_to_token,
-    at::Tensor& req_pool_indices,
-    at::Tensor& seq_lens,
-    double sm_scale,
-    double logit_cap);
+void decode_attention_cpu(at::Tensor& query, at::Tensor& k_cache, at::Tensor& v_cache, at::Tensor& output,
+    at::Tensor& key, at::Tensor& value, at::Tensor& loc, at::Tensor& attn_logits,
+    at::Tensor& req_to_token, at::Tensor& req_pool_indices, at::Tensor& seq_lens,
+    double sm_scale, double logit_cap);
 
-void extend_attention_cpu(
-    at::Tensor& q_extend,
-    at::Tensor& k_extend,
-    at::Tensor& v_extend,
-    at::Tensor& o_extend,
-    at::Tensor& k_buffer,
-    at::Tensor& v_buffer,
-    at::Tensor& req_to_token,
-    at::Tensor& req_pool_indices,
-    at::Tensor& seq_lens,
-    at::Tensor& extend_seq_lens,
-    at::Tensor& extend_start_loc,
-    int64_t max_len_extend,
-    double sm_scale,
-    double logit_cap);
+void extend_attention_cpu(at::Tensor& q_extend, at::Tensor& k_extend, at::Tensor& v_extend,
+    at::Tensor& o_extend, at::Tensor& k_buffer, at::Tensor& v_buffer,
+    at::Tensor& req_to_token, at::Tensor& req_pool_indices, at::Tensor& seq_lens,
+    at::Tensor& extend_seq_lens, at::Tensor& extend_start_loc,
+    int64_t max_len_extend, double sm_scale, double logit_cap);
 
 // weight prepack
 at::Tensor convert_weight_packed(at::Tensor& weight);
