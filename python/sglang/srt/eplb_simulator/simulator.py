@@ -18,6 +18,7 @@ from sglang.srt.managers.expert_distribution import (
     compute_utilization_rate,
 )
 from sglang.srt.managers.expert_location import ExpertLocationMetadata
+from tqdm.auto import tqdm
 
 _Phase = Union[Literal["prefill", "decode"]]
 
@@ -85,7 +86,7 @@ def _simulate_scheduled_pack_indices_given_seq_metadata(
         )
         curr_lens = torch.zeros((num_tokens_in_batch_overall,), dtype=torch.int32)
 
-        for row in df_metadata.iter_rows(named=True):
+        for row in tqdm(df_metadata.iter_rows(named=True), total=len(df_metadata)):
             chosen_location = torch.argmin(curr_lens).item()
             output_values = list(
                 range(row["pack_output_start_index"], row["pack_end_index"])
