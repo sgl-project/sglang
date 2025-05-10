@@ -1,0 +1,18 @@
+global:
+  client_cmd: python3 ../gsm8k/bench_sglang.py
+  server_cmd: python3 -m sglang.launch_server --attention-backend {attention_backend}
+  benchmark_metric_patterns:
+    - name: Accuracy
+      regex: Accuracy:\s*(.+)
+    - name: Output throughput
+      regex: Output throughput:\s*(.+)
+
+attention_backend:
+  - fa3
+  - flashinfer
+
+models:
+  - name: DeepSeek-V3
+    additional_server_arguments: --tp 8 --model-path /shared/public/elr-models/deepseek-ai/DeepSeek-V3/1d044fd82b15f1cedb197a288e50cc96a2c27205
+  - name: Meta-Llama-3.1-8B-Instruct
+    additional_server_arguments: --model-path /shared/public/models/meta-llama/Meta-Llama-3.1-8B-Instruct
