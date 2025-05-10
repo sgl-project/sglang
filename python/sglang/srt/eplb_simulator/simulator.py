@@ -198,7 +198,7 @@ def _simulate_expert_location_metadata_arr(
                             ),
                             num_physical_experts=num_physical_expert,
                         )
-                        for chunk_index in trange(1, num_chunks)
+                        for chunk_index in trange(1, num_chunks, desc="Expert location init by eplb")
                     ]
 
     return [output_chunks[batch_index // chunk_size] for batch_index in range(num_batches)]
