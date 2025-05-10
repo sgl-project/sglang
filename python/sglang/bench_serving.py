@@ -80,6 +80,7 @@ class RequestFuncOutput:
         output = RequestFuncOutput()
         output.prompt_len = request_func_input.prompt_len
         output.prompt = request_func_input.prompt
+        output.metadata = request_func_input.metadata
         return output
 
 
