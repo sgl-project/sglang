@@ -98,6 +98,7 @@ class ServerArgs:
     show_time_cost: bool = False
     enable_metrics: bool = False
     decode_log_interval: int = 40
+    kv_events_config: Optional[str] = None
 
     # API related
     api_key: Optional[str] = None
@@ -760,6 +761,12 @@ class ServerArgs:
             "--enable-metrics",
             action="store_true",
             help="Enable log prometheus metrics.",
+        )
+        parser.add_argument(
+            "--kv-events-config",
+            type=str,
+            default=None,
+            help="The configurations for event publishing.",
         )
         parser.add_argument(
             "--decode-log-interval",
