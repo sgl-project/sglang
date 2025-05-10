@@ -43,7 +43,7 @@ def simulate_execution_given_pack(
                 topk_ids=pack.topk_ids[token_indices_of_batch[i], :, :],
                 num_physical_expert=num_physical_expert,
             )
-            for i in range(len(token_indices_of_batch))
+            for i in trange(len(token_indices_of_batch), desc="vanilla_physical_count_of_batch")
         ]
     )
 
