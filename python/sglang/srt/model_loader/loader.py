@@ -17,9 +17,11 @@ from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple, cast
 import huggingface_hub
 import numpy as np
 import torch
+from accelerate import infer_auto_device_map, init_empty_weights
+from accelerate.utils import get_max_memory
 from huggingface_hub import HfApi, hf_hub_download
 from torch import nn
-from transformers import AutoModelForCausalLM
+from transformers import AutoConfig, AutoModelForCausalLM
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
 from sglang.srt.configs.device_config import DeviceConfig
@@ -1444,10 +1446,6 @@ class ModelOptModelLoader(DefaultModelLoader):
     ) -> nn.Module:
 
         logger.info("ModelOptModelLoader: Loading base model...")
-
-        from accelerate import infer_auto_device_map, init_empty_weights
-        from accelerate.utils import get_max_memory
-        from transformers import AutoConfig, AutoModelForCausalLM
 
         hf_config = AutoConfig.from_pretrained(
             model_config.model_path, trust_remote_code=True
