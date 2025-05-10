@@ -76,15 +76,14 @@ def read_expert_distribution_mode_detail_per_token(dir_data):
             if forward_mode == ForwardMode.EXTEND.value
             else torch.full((len(rids_raw),), 1)
         )
-        rids_repeated = torch.repeat_interleave(rids_raw, rids_repeat_num)
-
         # forward_mode_repeated = torch.full((len(input_ids),), forward_mode)
 
         return dict(
-            rids=rids_repeated,
-            # forward_modes=forward_mode_repeated,
+            rids_raw=rids_raw,
+            rids_repeat_num=rids_repeat_num,
             input_ids=input_ids,
             topk_ids=topk_ids,
+            # forward_modes=forward_mode_repeated,
         )
 
     def _concat_records(processed_records):
@@ -92,6 +91,12 @@ def read_expert_distribution_mode_detail_per_token(dir_data):
             k: torch.concat([r[k] for r in processed_records], dim=0)
             for k in processed_records[0].keys()
         }
+
+    def _compute_rid(pack):
+        rids_raw = pack.pop("rids_raw")
+        rids_repeat_num = pack.pop("rids_repeat_num")
+        pack["rids"] = torch.repeat_interleave(rids_raw, rids_repeat_num)
+        return pack
 
     def _sort_by_rid(pack):
         sort_index = torch.argsort(pack["rids"], stable=True)
@@ -125,10 +130,10 @@ def read_expert_distribution_mode_detail_per_token(dir_data):
     for path in list(Path(dir_data).glob("*.pt")):
         print(f"Read {path=}")
         data_pack = torch.load(path, weights_only=True)
-        print('hack!!! only pick first several rows')
-        processed_records += [_handle_record(record) for record in tqdm(data_pack["records"][:100])]
+        processed_records += [_handle_record(record) for record in tqdm(data_pack["records"])]
 
     pack = _concat_records(processed_records)
+    pack = _compute_rid(pack)
     pack = _sort_by_rid(pack)
     pack = _compute_df_metadata(pack)
     return pack
