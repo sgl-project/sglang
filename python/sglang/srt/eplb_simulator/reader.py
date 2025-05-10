@@ -97,7 +97,8 @@ def read_expert_distribution_mode_detail_per_token(dir_data):
         }
 
     def _compute_topk_ids(pack, raw_data_packs):
-        topk_ids = torch.empty((TODO,), dtype=torch.int16)
+        total_num_token, _ = pack["input_ids"].shape
+        topk_ids = torch.empty((total_num_token, num_layer, num_top_k), dtype=torch.int16)
 
         for raw_data_pack in raw_data_packs:
             for record in raw_data_pack:
