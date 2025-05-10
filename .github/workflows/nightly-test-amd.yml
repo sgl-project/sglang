@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: nightly-test-${{ github.ref }}
+  group: nightly-test-amd-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
