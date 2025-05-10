@@ -1,0 +1,25 @@
+global:
+  client_cmd: python3 ../gsm8k/bench_sglang.py
+  server_cmd: python3 -m sglang.launch_server \
+    --speculative-num-steps 3 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 4 \
+    --attention-backend {attention_backend} \
+    --trust-remote-code \
+    --mem-fraction-static 0.8 \
+    --cuda-graph-max-bs 2
+  benchmark_metric_patterns:
+    - name: Accuracy
+      regex: Accuracy:\s*(.+)
+    - name: Output throughput
+      regex: Output throughput:\s*(.+)
+
+attention_backend:
+  - fa3
+  - flashinfer
+
+models:
+  - name: DeepSeek-V3
+    additional_server_arguments: --tp 8 --speculative-algo EAGLE --model-path /shared/public/elr-models/deepseek-ai/DeepSeek-V3/1d044fd82b15f1cedb197a288e50cc96a2c27205 --speculative-draft-model-path /shared/user/bhe/bijiang/models--SGLang--DeepSeek-V3-NextN/snapshots/a3b6ab058b5bb3df2bf48afb81312dafd7ea5e60
+  - name: Meta-Llama-3.1-8B-Instruct
+    additional_server_arguments: --dtype float16 --enable-torch-compile --speculative-algo EAGLE3 --model-path /shared/public/models/meta-llama/Meta-Llama-3.1-8B-Instruct --speculative-draft-model-path /shared/public/elr-models/jamesliu1/sglang-EAGLE3-Llama-3.1-Instruct-8B/e5ed08d66f528a95ce89f5d4fd136a28f6def714

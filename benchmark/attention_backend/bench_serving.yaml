@@ -1,0 +1,24 @@
+global:
+  client_cmd: python3 -m sglang.bench_serving --backend sglang --dataset-name random --request-rate 16 --random-input-len {random_input_len} --random-output-len {random_output_len}
+  server_cmd: python3 -m sglang.launch_server --attention-backend {attention_backend}
+  benchmark_metric_patterns:
+    - name: Output token throughput (tok/s)
+      regex: Output token throughput \(tok/s\):\s*(.+)
+
+attention_backend:
+  - fa3
+  - flashinfer
+
+models:
+  - name: DeepSeek-V3
+    additional_server_arguments: --tp 8 --model-path /shared/public/elr-models/deepseek-ai/DeepSeek-V3/1d044fd82b15f1cedb197a288e50cc96a2c27205
+  - name: Meta-Llama-3.1-8B-Instruct
+    additional_server_arguments: --model-path /shared/public/models/meta-llama/Meta-Llama-3.1-8B-Instruct
+
+random_input_output_lens:
+  - random_input_len: 1024
+    random_output_len: 1024
+  - random_input_len: 8192
+    random_output_len: 1024
+  - random_input_len: 8192
+    random_output_len: 8192
