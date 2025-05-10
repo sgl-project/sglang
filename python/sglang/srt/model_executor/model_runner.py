@@ -400,6 +400,7 @@ class ModelRunner:
                 tp_rank=self.tp_rank,
                 tp_size=self.tp_size,
                 dp_size=self.server_args.dp_size,
+                moe_dense_tp_size=self.server_args.moe_dense_tp_size,
                 pp_size=self.server_args.pp_size,
             )
 
@@ -1092,11 +1093,14 @@ class ModelRunner:
             and self.cuda_graph_runner.can_run(forward_batch)
         )
         if can_run_cuda_graph:
+            logger.debug("Cuda graph replay is enabled")
             return self.cuda_graph_runner.replay(
                 forward_batch,
                 skip_attn_backend_init=skip_attn_backend_init,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
+        else:
+            logger.debug("Cuda graph replay is disabled")
 
         if forward_batch.forward_mode.is_decode():
             return self.forward_decode(forward_batch, pp_proxy_tensors=pp_proxy_tensors)
