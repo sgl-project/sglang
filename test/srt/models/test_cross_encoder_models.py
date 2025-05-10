@@ -51,7 +51,7 @@ class TestCrossEncoderModels(CustomTestCase):
             srt_scores = srt_runner.forward(prompts).scores
 
         for i in range(len(srt_scores)):
-            score_difference = hf_scores[i] - srt_scores[i]
+            score_difference = abs(hf_scores[i] - srt_scores[i])
 
             assert (
                 score_difference < score_tolerance
