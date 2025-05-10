@@ -296,6 +296,10 @@ class MyExpertLocationMetadata:
             )
         )
 
+        device = logical_count.device
+        physical_to_logical_map = physical_to_logical_map.to(device)
+        logical_to_all_physical_map = logical_to_all_physical_map.to(device)
+
         return MyExpertLocationMetadata(
             physical_to_logical_map=physical_to_logical_map,
             logical_to_all_physical_map=logical_to_all_physical_map,
