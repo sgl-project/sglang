@@ -64,6 +64,7 @@ def initialize_dp_attention(
     tp_size: int,
     dp_size: int,
     moe_dense_tp_size: int,
+    pp_size: int,
 ):
     global _ATTN_TP_GROUP, _ATTN_TP_RANK, _ATTN_TP_SIZE, _ATTN_DP_RANK, _ATTN_DP_SIZE
     global _LOCAL_ATTN_DP_SIZE, _LOCAL_ATTN_DP_RANK
@@ -78,12 +79,14 @@ def initialize_dp_attention(
     )
 
     if enable_dp_attention:
+        local_rank = tp_rank % (tp_size // dp_size)
         _ATTN_DP_SIZE = dp_size
         if moe_dense_tp_size is None:
             _LOCAL_ATTN_DP_SIZE = _ATTN_DP_SIZE
         else:
             _LOCAL_ATTN_DP_SIZE = max(1, dp_size // (tp_size // moe_dense_tp_size))
     else:
+        local_rank = tp_rank
         _ATTN_DP_SIZE = 1
         _LOCAL_ATTN_DP_SIZE = 1
 
@@ -91,9 +94,9 @@ def initialize_dp_attention(
     _ATTN_TP_GROUP = GroupCoordinator(
         [
             list(range(head, head + _ATTN_TP_SIZE))
-            for head in range(0, tp_size, _ATTN_TP_SIZE)
+            for head in range(0, pp_size * tp_size, _ATTN_TP_SIZE)
         ],
-        tp_group.local_rank,
+        local_rank,
         torch.distributed.get_backend(tp_group.device_group),
         SYNC_TOKEN_IDS_ACROSS_TP,
         False,

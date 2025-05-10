@@ -48,6 +48,9 @@ class DictOutput(object):
     def __getitem__(self, item):
         return self.__dict__[item]
 
+    def __contains__(self, key):
+        return key in self.__dict__
+
     def __setitem__(self, key, value):
         self.__dict__[key] = value
 
@@ -182,7 +185,7 @@ class DeepseekVLV2Processor(ProcessorMixin):
         tokenized_str, images, seq_mask, spatial_crop = self.tokenize_with_images(
             messages,
             pil_images[image_index : image_index + image_token_cnt],
-            bos=False,
+            bos=True,
             eos=True,
             cropping=len(pil_images) <= 2,
             max_req_input_len=max_req_input_len,
