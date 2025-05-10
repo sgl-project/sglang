@@ -136,7 +136,7 @@ Detailed example in [openai compatible api](https://docs.sglang.ai/backend/opena
 Launch a server:
 
 ```bash
-python3 -m sglang.launch_server --model-path lmms-lab/llava-onevision-qwen2-7b-ov --chat-template chatml-llava
+python3 -m sglang.launch_server --model-path lmms-lab/llava-onevision-qwen2-7b-ov
 ```
 
 Download an image:
