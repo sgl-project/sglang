@@ -93,10 +93,11 @@ def _simulate_scheduled_pack_indices_given_seq_metadata(
                 range(row["pack_output_start_index"], row["pack_end_index"])
             )
             output_start = curr_lens[chosen_location]
+            output_end = output_start + len(output_values)
+            assert output_end <= num_steps_upper_bound, f"{num_steps_upper_bound=} {output_end=}"
 
-            pack_indices_of_step[
-            output_start: output_start + len(output_values), chosen_location
-            ] = torch.tensor(output_values, dtype=torch.int32)
+            pack_indices_of_step[output_start: output_end, chosen_location] = torch.tensor(output_values,
+                                                                                           dtype=torch.int32)
             curr_lens[chosen_location] += len(output_values)
 
         return [x[x != -1] for x in pack_indices_of_step[: torch.max(curr_lens)]]
