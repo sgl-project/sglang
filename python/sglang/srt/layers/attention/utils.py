@@ -90,3 +90,49 @@ def create_flashmla_kv_indices_triton(
             data // PAGED_SIZE,
             mask=mask_out,
         )
+
+
+@triton.jit
+def prepare_qk_for_deepseek_mha_triton(
+    q,  # [bs, num_local_heads, qk_nope_head_dim + qk_rope_head_dim]
+    k,  # [bs, num_local_heads, qk_nope_head_dim + qk_rope_head_dim]
+    k_nope,  # [bs, num_local_heads, qk_nope_head_dim]
+    q_pe,  # [bs, num_local_heads, qk_rope_head_dim]
+    k_pe,  # [bs, 1, qk_rope_head_dim]
+    qk_stride_0: tl.constexpr,
+    qk_stride_1: tl.constexpr,
+    k_nope_stride_0: tl.constexpr,
+    k_nope_stride_1: tl.constexpr,
+    q_pe_stride_0: tl.constexpr,
+    q_pe_stride_1: tl.constexpr,
+    k_pe_stride_0: tl.constexpr,
+    qk_rope_head_dim: tl.constexpr,  # 64 for DeepSeek-v3
+    qk_nope_head_dim: tl.constexpr,  # 128 for DeepSeek-v3
+    num_local_heads: tl.constexpr,  # 128 for DeepSeek-v3
+):
+    # Load k_nope to the first qk_nope_head_dim of k
+    # Load q_pe and k_pe to the last qk_rope_head_dim of q and k
+    # q_nope has already been in the first qk_nope_head_dim of q
+    pid = tl.program_id(axis=0)
+    nope_offset = tl.arange(0, qk_nope_head_dim)
+    pe_offset = tl.arange(0, qk_rope_head_dim)
+    q_ptr = q + pid * qk_stride_0
+    k_ptr = k + pid * qk_stride_0
+
+    # k_pe only needs to be loaded once
+    k_pe_data = tl.load(k_pe + pid * k_pe_stride_0 + pe_offset)
+
+    for head_idx in range(num_local_heads):
+        q_pe_data = tl.load(
+            q_pe + pid * q_pe_stride_0 + head_idx * q_pe_stride_1 + pe_offset
+        )
+        k_nope_data = tl.load(
+            k_nope + pid * k_nope_stride_0 + head_idx * k_nope_stride_1 + nope_offset
+        )
+        tl.store(
+            q_ptr + head_idx * qk_stride_1 + qk_nope_head_dim + pe_offset, q_pe_data
+        )
+        tl.store(
+            k_ptr + head_idx * qk_stride_1 + qk_nope_head_dim + pe_offset, k_pe_data
+        )
+        tl.store(k_ptr + head_idx * qk_stride_1 + nope_offset, k_nope_data)
