@@ -125,7 +125,8 @@ def read_expert_distribution_mode_detail_per_token(dir_data):
     for path in list(Path(dir_data).glob("*.pt")):
         print(f"Read {path=}")
         data_pack = torch.load(path, weights_only=True)
-        processed_records += [_handle_record(record) for record in tqdm(data_pack["records"])]
+        print('hack!!! only pick first several rows')
+        processed_records += [_handle_record(record) for record in tqdm(data_pack["records"][:100])]
 
     pack = _concat_records(processed_records)
     pack = _sort_by_rid(pack)
