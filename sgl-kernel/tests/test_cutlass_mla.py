@@ -67,7 +67,7 @@ def test_cutlass_mla_decode(
     pack_factor = 128 // block_size
     block_num = ((block_num + pack_factor - 1) // pack_factor) * pack_factor
 
-    q = torch.randn(bs, h_q, d)
+    q = torch.randn(bs, h_q, d) * 100.0
     block_table = torch.randint(0, bs * block_num, (bs, block_num), dtype=torch.int32)
 
     kv_cache = torch.randn(block_table.numel(), block_size, d)

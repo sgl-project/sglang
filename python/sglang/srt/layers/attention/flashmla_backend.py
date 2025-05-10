@@ -241,6 +241,9 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 seq_lens_cpu,
             )
 
+    def get_cuda_graph_seq_len_fill_value(self):
+        return 1024
+
     def forward_decode(
         self,
         q: torch.Tensor,

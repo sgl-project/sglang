@@ -25,7 +25,21 @@ limitations under the License.
 #include <device/sm100_mla.hpp>
 #include <kernel/sm100_mla_tile_scheduler.hpp>
 
-#if defined CUDA_VERSION && CUDA_VERSION >= 12040
+// clang-format off
+#if !defined(CUDA_VERSION) || CUDA_VERSION < 12040
+void cutlass_mla_decode(
+    torch::Tensor const& out,
+    torch::Tensor const& q_nope_and_q_pe,
+    torch::Tensor const& kv_c_and_k_pe_cache,
+    torch::Tensor const& seq_lens,
+    torch::Tensor const& page_table,
+    torch::Tensor const& workspace) {
+  TORCH_CHECK(false, "CUDA version must be >= 12.4 for cutlass_mla_decode");
+}
+int64_t cutlass_mla_get_workspace_size(int64_t max_seq_len, int64_t num_batches, int64_t sm_count) {
+  TORCH_CHECK(false, "CUDA version must be >= 12.4 for cutlass_mla_get_workspace_size");
+}
+#else
 
 #define CUTLASS_CHECK(status)                                                       \
   {                                                                                 \
@@ -137,7 +151,10 @@ typename T::Fmha::Arguments args_from_options(
        page_size},
       {static_cast<ElementOut*>(out.data_ptr()), stride_O, static_cast<ElementAcc*>(nullptr), stride_LSE},
       hw_info,
-      -1,       // split_kv
+      // TODO(trevor-m): Change split_kv back to -1 when
+      // https://github.com/NVIDIA/cutlass/issues/2274 is fixed. Split_kv=1 will
+      // perform worse with larger context length and smaller batch sizes.
+      1,       // split_kv
       nullptr,  // is_var_split_kv
   };
   // TODO(kaixih@nvidia): When split_kv=-1 and is_var_split_kv=false, we compute
@@ -209,3 +226,4 @@ int64_t cutlass_mla_get_workspace_size(int64_t max_seq_len, int64_t num_batches,
 }
 
 #endif
+// clang-format on

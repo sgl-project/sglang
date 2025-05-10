@@ -32,7 +32,7 @@ class BaseReasoningFormatDetector:
         One-time parsing: Detects and parses reasoning sections in the provided text.
         Returns both reasoning content and normal text separately.
         """
-        text = text.replace(self.think_start_token, "").strip()
+        text = text.replace(self.think_start_token, "")
         if self.think_end_token not in text:
             # Assume reasoning was truncated before `</think>` token
             return StreamingParseResult(reasoning_text=text)
@@ -73,7 +73,7 @@ class BaseReasoningFormatDetector:
             normal_text = current_text[end_idx + len(self.think_end_token) :]
 
             return StreamingParseResult(
-                normal_text=normal_text, reasoning_text=reasoning_text.rstrip()
+                normal_text=normal_text, reasoning_text=reasoning_text
             )
 
         # Continue with reasoning content
@@ -117,6 +117,29 @@ class DeepSeekR1Detector(BaseReasoningFormatDetector):
         # https://github.com/sgl-project/sglang/pull/3202#discussion_r1950153599
 
 
+class Qwen3Detector(BaseReasoningFormatDetector):
+    """
+    Detector for Qwen3 model.
+    Assumes reasoning format:
+      (<think>)*(.*)</think>
+    Returns all the text before the </think> tag as `reasoning_text`
+    and the rest of the text as `normal_text`.
+
+    Args:
+        stream_reasoning (bool): If False, accumulates reasoning content until the end tag.
+            If True, streams reasoning content as it arrives.
+    """
+
+    def __init__(self, stream_reasoning: bool = True):
+        # Qwen3 is assumed to be reasoning until `</think>` token
+        super().__init__(
+            "<think>",
+            "</think>",
+            force_reasoning=True,
+            stream_reasoning=stream_reasoning,
+        )
+
+
 class ReasoningParser:
     """
     Parser that handles both streaming and non-streaming scenarios for extracting
@@ -129,7 +152,8 @@ class ReasoningParser:
     """
 
     DetectorMap: Dict[str, BaseReasoningFormatDetector] = {
-        "deepseek-r1": DeepSeekR1Detector
+        "deepseek-r1": DeepSeekR1Detector,
+        "qwen3": Qwen3Detector,
     }
 
     def __init__(self, model_type: str = None, stream_reasoning: bool = True):
