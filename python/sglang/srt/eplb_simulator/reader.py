@@ -48,9 +48,16 @@ def read_expert_distribution_mode_detail_per_token_and_bench_serving(dir_data):
 
 def _check_list_is_prefix(df, col_a, col_b):
     df_violation = df.filter(~_expr_list_is_prefix(col_a, col_b))
-    assert (
-        len(df_violation) == 0
-    ), f"Expect {col_a} to be prefix of {col_b}. Violation: {df_violation=}"
+    if len(df_violation) > 0:
+        with pl.Config(
+            fmt_str_lengths=10000,
+            tbl_cols=-1,
+            tbl_rows=50,
+            fmt_table_cell_list_len=10000,
+            tbl_width_chars=-1,
+        ):
+            print(f"{df_violation=}")
+        raise AssertionError(f"Expect {col_a} to be prefix of {col_b}")
 
 
 def _expr_list_is_prefix(col_a, col_b):
