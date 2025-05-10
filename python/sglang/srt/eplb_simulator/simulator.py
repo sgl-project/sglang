@@ -102,7 +102,7 @@ def _simulate_scheduled_pack_indices_given_seq_metadata(
         pack_indices_of_step = torch.full(
             (num_steps_upper_bound, num_tokens_in_batch_overall), fill_value=-1, dtype=torch.int32
         )
-        curr_lens = torch.randint(0, decode_max_left_padding, (num_tokens_in_batch_overall,), dtype=torch.int32)
+        curr_lens = torch.randint(0, decode_max_left_padding + 1, (num_tokens_in_batch_overall,), dtype=torch.int32)
 
         for row in tqdm(df_metadata.iter_rows(named=True), total=len(df_metadata)):
             chosen_location = torch.argmin(curr_lens).item()
