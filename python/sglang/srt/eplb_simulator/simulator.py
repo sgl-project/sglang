@@ -85,7 +85,8 @@ def _simulate_scheduled_pack_indices_given_seq_metadata(
 
     if phase == "decode":
         # loose bound
-        num_steps_upper_bound = df_metadata["pack_end_index"].max()
+        num_steps_upper_bound = max(1_000_000,
+                                    int(df_metadata["pack_end_index"].max() // num_tokens_in_batch_overall * 1.5))
 
         pack_indices_of_step = torch.full(
             (num_steps_upper_bound, num_tokens_in_batch_overall), fill_value=-1, dtype=torch.int32
