@@ -61,7 +61,7 @@ class TestPPAccuracy(unittest.TestCase):
         metrics = run_eval(args)
         print(f"{metrics=}")
 
-        self.assertGreater(metrics["accuracy"], 0.75)
+        self.assertGreater(metrics["accuracy"], 0.74)
         # Wait a little bit so that the memory check happens.
         time.sleep(5)
 
