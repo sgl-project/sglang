@@ -210,9 +210,9 @@ def _simulate_logical_to_physical_by_random_dispatching(
     )
     for x_index in range(x_dim):
         physical_count_of_whatever.scatter_add_(
-            dim=TODO,
-            index=TODO,
-            src=TODO,
+            dim=1,
+            index=logical_to_all_physical_map[:, :, x_index],
+            src=logical_count_amortized,
         )
 
     for layer_id in range(num_layer):
