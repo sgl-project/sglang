@@ -189,33 +189,40 @@ def _simulate_expert_location_metadata_arr(
 ) -> List["MyExpertLocationMetadata"]:
     num_batches, num_layer, num_logical_expert = logical_count_of_batch.shape
 
-    chunk_size = server_args.eplb_rebalance_num_iterations
-    num_chunks = math.ceil(num_batches / chunk_size)
+    if expert_location_mode == "previous_chunk":
+        chunk_size = server_args.eplb_rebalance_num_iterations
+        num_chunks = math.ceil(num_batches / chunk_size)
 
-    output_chunks = [
-                        MyExpertLocationMetadata.init_by_eplb(
-                            server_args,
-                            # NOTE first chunk has no statistics
-                            logical_count=torch.zeros((num_layer, num_logical_expert)),
-                            num_physical_experts=num_physical_expert,
-                        )
-                    ] + [
-                        MyExpertLocationMetadata.init_by_eplb(
-                            server_args,
-                            logical_count=einops.einsum(
-                                logical_count_of_batch[
-                                (chunk_index - 1) * chunk_size: chunk_index * chunk_size,
-                                :,
-                                :,
-                                ],
-                                "num_interest_batches num_layer num_expert -> num_layer num_expert",
-                            ),
-                            num_physical_experts=num_physical_expert,
-                        )
-                        for chunk_index in trange(1, num_chunks, desc="Expert location init by eplb")
-                    ]
+        output_chunks = [
+                            MyExpertLocationMetadata.init_by_eplb(
+                                server_args,
+                                # NOTE first chunk has no statistics
+                                logical_count=torch.zeros((num_layer, num_logical_expert)),
+                                num_physical_experts=num_physical_expert,
+                            )
+                        ] + [
+                            MyExpertLocationMetadata.init_by_eplb(
+                                server_args,
+                                logical_count=einops.einsum(
+                                    logical_count_of_batch[
+                                    (chunk_index - 1) * chunk_size: chunk_index * chunk_size,
+                                    :,
+                                    :,
+                                    ],
+                                    "num_interest_batches num_layer num_expert -> num_layer num_expert",
+                                ),
+                                num_physical_experts=num_physical_expert,
+                            )
+                            for chunk_index in trange(1, num_chunks, desc="Expert location init by eplb")
+                        ]
 
-    return [output_chunks[batch_index // chunk_size] for batch_index in range(num_batches)]
+        return [output_chunks[batch_index // chunk_size] for batch_index in range(num_batches)]
+
+    elif expert_location_mode == "global_average":
+        output = TODO
+        return [output for batch_index in range(num_batches)]
+
+    raise NotImplementedError
 
 
 def _simulate_logical_to_physical_by_random_dispatching(

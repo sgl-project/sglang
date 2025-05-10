@@ -11,7 +11,7 @@ class MyServerArgs:
     ep_num_redundant_experts: int
     nnodes: int
     tp_size: int
-    expert_location_mode: Optional[Literal["none"]]
+    expert_location_mode: Optional[Literal["previous_chunk", "global_average"]]
     eplb_rebalance_num_iterations: Optional[int] = None
     # init_expert_location: Optional[str]
     deepseek_eplb_hack_shuffle: bool = False
