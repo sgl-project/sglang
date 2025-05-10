@@ -74,7 +74,11 @@ from sglang.srt.openai_api.protocol import (
     UsageInfo,
 )
 from sglang.srt.reasoning_parser import ReasoningParser
-from sglang.utils import convert_json_schema_to_str, get_exception_traceback
+from sglang.utils import (
+    convert_json_schema_to_str,
+    get_exception_traceback,
+    remove_first_nonblank_token,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -325,6 +329,7 @@ async def process_batch(tokenizer_manager, batch_id: str, batch_request: BatchRe
                     to_file=True,
                     cache_report=tokenizer_manager.server_args.enable_cache_report,
                     tool_call_parser=tokenizer_manager.server_args.tool_call_parser,
+                    assistant_prefix_list=adapted_request.assistant_prefix_list,
                 )
             else:
                 responses = v1_generate_response(
@@ -934,6 +939,7 @@ def v1_chat_generate_request(
     top_logprobs_nums = []
     modalities_list = []
     lora_paths = []
+    assistant_prefix_list = []
 
     # NOTE: with openai API, the prompt's logprobs are always not computed
 
@@ -999,26 +1005,39 @@ def v1_chat_generate_request(
                     assistant_prefix = None
 
                 try:
-                    prompt_ids = tokenizer_manager.tokenizer.apply_chat_template(
+                    tokenized_chat = tokenizer_manager.tokenizer.apply_chat_template(
                         openai_compatible_messages,
                         tokenize=True,
-                        add_generation_prompt=True,
+                        add_generation_prompt=False,
                         tools=tools,
                         **(
                             request.chat_template_kwargs
                             if request.chat_template_kwargs
                             else {}
                         ),
+                    )
+                    tokenized_chat_with_gen = (
+                        tokenizer_manager.tokenizer.apply_chat_template(
+                            openai_compatible_messages,
+                            tokenize=True,
+                            add_generation_prompt=True,
+                            tools=tools,
+                            **(
+                                request.chat_template_kwargs
+                                if request.chat_template_kwargs
+                                else {}
+                            ),
+                        )
                     )
                 except:
                     #  This except branch will be triggered when the chosen model
                     #  has a different tools input format that is not compatible
                     #  with openAI's apply_chat_template tool_call format, like Mistral.
                     tools = [t if "function" in t else {"function": t} for t in tools]
-                    prompt_ids = tokenizer_manager.tokenizer.apply_chat_template(
+                    tokenized_chat = tokenizer_manager.tokenizer.apply_chat_template(
                         openai_compatible_messages,
                         tokenize=True,
-                        add_generation_prompt=True,
+                        add_generation_prompt=False,
                         tools=tools,
                         **(
                             request.chat_template_kwargs
@@ -1026,15 +1045,34 @@ def v1_chat_generate_request(
                             else {}
                         ),
                     )
+                    tokenized_chat_with_gen = (
+                        tokenizer_manager.tokenizer.apply_chat_template(
+                            openai_compatible_messages,
+                            tokenize=True,
+                            add_generation_prompt=True,
+                            tools=tools,
+                            **(
+                                request.chat_template_kwargs
+                                if request.chat_template_kwargs
+                                else {}
+                            ),
+                        )
+                    )
 
-                if assistant_prefix:
-                    encoded = tokenizer_manager.tokenizer.encode(assistant_prefix)
-                    if (
-                        encoded
-                        and encoded[0] == tokenizer_manager.tokenizer.bos_token_id
-                    ):
-                        encoded = encoded[1:]
-                    prompt_ids += encoded
+                if len(tokenized_chat_with_gen) > len(tokenized_chat):
+                    gen_assistant_prefix_ids = tokenized_chat_with_gen[
+                        len(tokenized_chat) :
+                    ]
+                    gen_assistant_prefix = remove_first_nonblank_token(
+                        tokenizer_manager.tokenizer, gen_assistant_prefix_ids
+                    )
+                else:
+                    gen_assistant_prefix = ""
+
+                assistant_prefix = gen_assistant_prefix + (assistant_prefix or "")
+                assistant_prefix_list.append(assistant_prefix)
+                prompt_ids = tokenized_chat_with_gen
+
                 if is_multimodal:
                     prompt = tokenizer_manager.tokenizer.decode(prompt_ids)
                 stop = request.stop
@@ -1192,6 +1230,7 @@ def v1_chat_generate_request(
         rid=request_ids,
         modalities=modalities_list,
         lora_path=lora_paths,
+        assistant_prefix_list=assistant_prefix_list,
         bootstrap_host=all_requests[0].bootstrap_host,
         bootstrap_port=all_requests[0].bootstrap_port,
         bootstrap_room=all_requests[0].bootstrap_room,
@@ -1208,10 +1247,15 @@ def v1_chat_generate_response(
     cache_report=False,
     tool_call_parser=None,
     reasoning_parser=None,
+    assistant_prefix_list=None,
 ):
     choices = []
 
     for idx, ret_item in enumerate(ret):
+        if assistant_prefix_list and idx < len(assistant_prefix_list):
+            assistant_prefix = assistant_prefix_list[idx]
+        else:
+            assistant_prefix = ""
         logprobs = False
         if isinstance(request, list) and request[idx].logprobs:
             logprobs = True
@@ -1258,7 +1302,11 @@ def v1_chat_generate_response(
         finish_reason = ret_item["meta_info"]["finish_reason"]
 
         tool_calls = None
-        text = ret_item["text"]
+        text = (
+            assistant_prefix + ret_item["text"]
+            if assistant_prefix
+            else ret_item["text"]
+        )
 
         if isinstance(request, list):
             tool_choice = request[idx].tool_choice
@@ -1429,6 +1477,9 @@ async def v1_chat_completions(
                     is_first = is_firsts.get(index, True)
                     stream_buffer = stream_buffers.get(index, "")
                     n_prev_token = n_prev_tokens.get(index, 0)
+                    assistant_prefix = (
+                        adapted_request.assistant_prefix_list[index] or ""
+                    )
 
                     prompt_tokens[index] = content["meta_info"]["prompt_tokens"]
                     completion_tokens[index] = content["meta_info"]["completion_tokens"]
@@ -1486,7 +1537,11 @@ async def v1_chat_completions(
                     if is_first:
                         # First chunk with role
                         is_first = False
-                        delta = DeltaMessage(role="assistant")
+                        delta = (
+                            DeltaMessage(role="assistant", content=assistant_prefix)
+                            if assistant_prefix
+                            else DeltaMessage(role="assistant")
+                        )
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=index,
                             delta=delta,
@@ -1743,6 +1798,7 @@ async def v1_chat_completions(
         cache_report=tokenizer_manager.server_args.enable_cache_report,
         tool_call_parser=tokenizer_manager.server_args.tool_call_parser,
         reasoning_parser=tokenizer_manager.server_args.reasoning_parser,
+        assistant_prefix_list=adapted_request.assistant_prefix_list,
     )
 
     return response
