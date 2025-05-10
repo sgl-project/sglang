@@ -401,6 +401,7 @@ class CudaGraphRunner:
         else:
             encoder_lens = None
         mrope_positions = self.mrope_positions[:, :bs]
+        self.num_token_non_padded[...] = num_tokens
 
         # pipeline parallelism
         if self.pp_size > 1:
