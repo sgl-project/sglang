@@ -6,10 +6,9 @@ from typing import Any, List
 import einops
 import polars as pl
 import torch
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
-
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
 
 @dataclass
@@ -34,9 +33,9 @@ def read_expert_distribution_mode_detail_per_token_and_bench_serving(dir_data):
             pl.col("history_ids").list.len(), None
         ),
         pack_input_except_history_start_index=pl.col("pack_start_index")
-        + pl.col("history_ids").list.len(),
+                                              + pl.col("history_ids").list.len(),
         pack_output_start_index=pl.col("pack_start_index")
-        + pl.col("input_ids").list.len(),
+                                + pl.col("input_ids").list.len(),
     )
 
     df = df.sort("dataset_timestamp")
@@ -199,7 +198,10 @@ def _unnest(schema, path):
 
 
 def _rid_str_to_int64(rid: str):
-    return int(rid, 16) & ((1 << 64) - 1)
+    val = int(rid, 16) & ((1 << 64) - 1)
+    if val >= (1 << 63):
+        val -= (1 << 64)
+    return val
 
 
 def _single(arr: List[Any]):
