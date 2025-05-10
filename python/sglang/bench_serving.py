@@ -1462,7 +1462,7 @@ async def benchmark(
     # Compute metrics and print results
     benchmark_duration = time.perf_counter() - benchmark_start_time
     metrics, output_lens = calculate_metrics(
-        input_lens=None if is_multi_round else [x[1] for x in input_requests],
+        input_lens=None if is_multi_round else [x.prompt_len for x in input_requests],
         outputs=outputs,
         dur_s=benchmark_duration,
         tokenizer=tokenizer,
