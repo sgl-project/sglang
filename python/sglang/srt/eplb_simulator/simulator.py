@@ -199,11 +199,14 @@ def _simulate_logical_to_physical_by_random_dispatching(
     num_layer, num_logical_expert = logical_count.shape
 
     physical_count_of_whatever = torch.zeros(
-        (*prefix_dims, num_layer, num_physical_expert),
+        (num_layer, num_physical_expert),
         dtype=torch.float32,
     )
 
-    logical_count_amortized = logical_count / TODO
+    num_physical_expert_per_logical_expert = einops.einsum(logical_to_all_physical_map != -1,
+                                                           "num_layer num_logical_experts X -> num_layer num_logical_experts")
+    assert torch.all(num_physical_expert_per_logical_expert >= 1)
+    logical_count_amortized = logical_count / num_physical_expert_per_logical_expert
 
     for layer_id in range(num_layer):
         for logical_expert_id in range(num_logical_expert):
