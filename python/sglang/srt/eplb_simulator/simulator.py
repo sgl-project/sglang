@@ -171,13 +171,18 @@ def _simulate_expert_location_metadata_arr(
     server_args: MyServerArgs,
     num_physical_expert: int,
 ) -> List["MyExpertLocationMetadata"]:
-    num_batches, _, _ = logical_count_of_batch.shape
+    num_batches, num_layer, num_logical_expert = logical_count_of_batch.shape
 
     chunk_size = server_args.eplb_rebalance_num_iterations
     num_chunks = math.ceil(num_batches / chunk_size)
 
     output_chunks = [
-                        TODO
+                        MyExpertLocationMetadata.init_by_eplb(
+                            server_args,
+                            # NOTE first chunk has no statistics
+                            logical_count=torch.zeros((num_layer, num_logical_expert)),
+                            num_physical_experts=num_physical_expert,
+                        )
                     ] + [
                         MyExpertLocationMetadata.init_by_eplb(
                             server_args,
