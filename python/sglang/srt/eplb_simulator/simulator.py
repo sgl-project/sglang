@@ -248,9 +248,17 @@ def compute_global_physical_count_from_topk_ids(
     topk_ids_flattened = einops.rearrange(
         topk_ids, "num_tokens num_layers num_topk -> num_layers (num_tokens num_topk)"
     )
-    return torch.stack(
-        [torch.bincount(x[x != -1], minlength=num_physical_expert) for x in topk_ids_flattened]
+    num_layers, _ = topk_ids_flattened.shape
+
+    topk_ids_flattened_noneg1 = topk_ids_flattened.masked_fill(topk_ids_flattened == -1, num_physical_expert)
+
+    global_physical_count = torch.zeros((num_layers, num_physical_expert + 1), dtype=torch.int64)
+    global_physical_count.scatter_add_(
+        dim=1,
+        index=topk_ids_flattened_noneg1.long(),
+        src=torch.full_like(topk_ids_flattened, 1, dtype=torch.int64),
     )
+    return global_physical_count[:, :-1]
 
 
 def _compute_num_physical_experts(
