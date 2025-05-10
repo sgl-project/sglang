@@ -1027,7 +1027,7 @@ def v1_chat_generate_request(
                 try:
                     tokenized_chat = tokenizer_manager.tokenizer.apply_chat_template(
                         openai_compatible_messages,
-                        tokenize=False,
+                        tokenize=True,
                         add_generation_prompt=False,
                         tools=tools,
                         **(
@@ -1039,7 +1039,7 @@ def v1_chat_generate_request(
                     tokenized_chat_with_gen = (
                         tokenizer_manager.tokenizer.apply_chat_template(
                             openai_compatible_messages,
-                            tokenize=False,
+                            tokenize=True,
                             add_generation_prompt=True,
                             tools=tools,
                             **(
@@ -1056,7 +1056,7 @@ def v1_chat_generate_request(
                     tools = [t if "function" in t else {"function": t} for t in tools]
                     tokenized_chat = tokenizer_manager.tokenizer.apply_chat_template(
                         openai_compatible_messages,
-                        tokenize=False,
+                        tokenize=True,
                         add_generation_prompt=False,
                         tools=tools,
                         **(
@@ -1068,7 +1068,7 @@ def v1_chat_generate_request(
                     tokenized_chat_with_gen = (
                         tokenizer_manager.tokenizer.apply_chat_template(
                             openai_compatible_messages,
-                            tokenize=False,
+                            tokenize=True,
                             add_generation_prompt=True,
                             tools=tools,
                             **(
@@ -1079,19 +1079,19 @@ def v1_chat_generate_request(
                         )
                     )
 
-                if tokenized_chat_with_gen.startswith(tokenized_chat):
-                    gen_assistant_prefix = tokenized_chat_with_gen[
-                        len(tokenized_chat) :
+                if len(tokenized_chat_with_gen) > len(tokenized_chat):
+                    gen_assistant_prefix_ids = tokenized_chat_with_gen[
+                        len(tokenized_chat) + 1 :
                     ]
-                else:
-                    gen_assistant_prefix = ""
+                    gen_assistant_prefix = tokenizer_manager.tokenizer.decode(
+                        gen_assistant_prefix_ids, skip_special_tokens=True
+                    )
 
                 assistant_prefix = (gen_assistant_prefix or "") + (
                     assistant_prefix or ""
                 )
                 assistant_prefix_list.append(assistant_prefix)
-                prompt_str = tokenized_chat + assistant_prefix
-                prompt_ids = tokenizer_manager.tokenizer.encode(prompt_str)
+                prompt_ids = tokenized_chat_with_gen
 
                 if is_multimodal:
                     prompt = tokenizer_manager.tokenizer.decode(prompt_ids)
@@ -1267,10 +1267,11 @@ def v1_chat_generate_response(
     cache_report=False,
     tool_call_parser=None,
     reasoning_parser=None,
+    assistant_prefix=None,
 ):
     choices = []
 
-    for idx, ret_item in enumerate(ret):
+    for idx, (ret_item, assistant_prefix) in enumerate(zip(ret, assistant_prefix)):
         logprobs = False
         if isinstance(request, list) and request[idx].logprobs:
             logprobs = True
@@ -1317,7 +1318,11 @@ def v1_chat_generate_response(
         finish_reason = ret_item["meta_info"]["finish_reason"]
 
         tool_calls = None
-        text = ret_item["text"]
+        text = (
+            assistant_prefix + ret_item["text"]
+            if assistant_prefix
+            else ret_item["text"]
+        )
 
         if isinstance(request, list):
             tool_choice = request[idx].tool_choice
@@ -1801,6 +1806,7 @@ async def v1_chat_completions(
         return create_error_response(str(e))
     if not isinstance(ret, list):
         ret = [ret]
+    assistant_prefix = adapted_request.assistant_prefix
 
     response = v1_chat_generate_response(
         request,
@@ -1809,6 +1815,7 @@ async def v1_chat_completions(
         cache_report=tokenizer_manager.server_args.enable_cache_report,
         tool_call_parser=tokenizer_manager.server_args.tool_call_parser,
         reasoning_parser=tokenizer_manager.server_args.reasoning_parser,
+        assistant_prefix=assistant_prefix,
     )
 
     return response
