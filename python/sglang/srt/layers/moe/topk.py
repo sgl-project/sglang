@@ -17,7 +17,6 @@ from typing import Callable, Optional
 
 import torch
 import torch.nn.functional as F
-
 from sglang.srt.managers.expert_distribution import ExpertDistributionRecorder
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.utils import get_compiler_backend, is_cuda, is_hip
@@ -201,6 +200,12 @@ def biased_grouped_topk_impl(
 
 def is_power_of_two(n):
     return n > 0 and math.log2(n).is_integer()
+
+
+# TODO fuse this into kernel
+@torch.compile(dynamic=True, backend=get_compiler_backend())
+def _f():
+    TODO
 
 
 def biased_grouped_topk(
