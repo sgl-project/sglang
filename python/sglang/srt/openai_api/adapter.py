@@ -74,7 +74,11 @@ from sglang.srt.openai_api.protocol import (
     UsageInfo,
 )
 from sglang.srt.reasoning_parser import ReasoningParser
-from sglang.utils import convert_json_schema_to_str, get_exception_traceback
+from sglang.utils import (
+    convert_json_schema_to_str,
+    get_exception_traceback,
+    remove_first_nonblank_token,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1081,12 +1085,11 @@ def v1_chat_generate_request(
 
                 if len(tokenized_chat_with_gen) > len(tokenized_chat):
                     gen_assistant_prefix_ids = tokenized_chat_with_gen[
-                        len(tokenized_chat) + 1 :
+                        len(tokenized_chat) :
                     ]
-                    gen_assistant_prefix = tokenizer_manager.tokenizer.decode(
-                        gen_assistant_prefix_ids, skip_special_tokens=True
+                    gen_assistant_prefix = remove_first_nonblank_token(
+                        tokenizer_manager.tokenizer, gen_assistant_prefix_ids
                     )
-                    gen_assistant_prefix = gen_assistant_prefix.strip()
                 else:
                     gen_assistant_prefix = ""
 
