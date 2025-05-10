@@ -167,14 +167,16 @@ def _simulate_expert_location_metadata_arr(
     num_physical_expert: int,
 ) -> List["MyExpertLocationMetadata"]:
     num_batches, _, _ = logical_count_of_batch.shape
-    return [
+
+    chunk_size = server_args.eplb_rebalance_num_iterations
+    num_chunks = math.ceil(num_batches / chunk_size)
+
+    output_chunks = [
         MyExpertLocationMetadata.init_by_eplb(
             server_args,
             logical_count=einops.einsum(
                 logical_count_of_batch[
-                max(
-                    0, batch_index - server_args.eplb_history_num_batch
-                ): batch_index,
+                chunk_index * chunk_size: (chunk_index + 1) * chunk_size,
                 :,
                 :,
                 ],
@@ -182,8 +184,10 @@ def _simulate_expert_location_metadata_arr(
             ),
             num_physical_experts=num_physical_expert,
         )
-        for batch_index in trange(num_batches)
+        for chunk_index in trange(num_chunks)
     ]
+
+    return [output_chunks[batch_index // chunk_size] for batch_index in range(num_batches)]
 
 
 def _simulate_logical_to_physical_by_random_dispatching(
