@@ -208,7 +208,8 @@ def _mask_topk_ids_padded_region(
     topk_ids: torch.Tensor,
     num_token_non_padded: Optional[torch.Tensor] = None,
 ):
-    TODO
+    indices = torch.arange(0, topk_ids.shape[0])
+    topk_ids[indices >= num_token_non_padded, :] = -1
 
 
 def biased_grouped_topk(
