@@ -197,6 +197,7 @@ def _simulate_logical_to_physical_by_random_dispatching(
 ):
     """output: (num_layer, num_physical_expert)"""
     num_layer, num_logical_expert = logical_count.shape
+    _, _, x_dim = logical_to_all_physical_map.shape
 
     num_physical_expert_per_logical_expert = einops.einsum(logical_to_all_physical_map != -1,
                                                            "num_layer num_logical_experts X -> num_layer num_logical_experts")
@@ -207,11 +208,12 @@ def _simulate_logical_to_physical_by_random_dispatching(
         (num_layer, num_physical_expert),
         dtype=torch.float32,
     )
-    physical_count_of_whatever.scatter_add_(
-        dim=TODO,
-        index=TODO,
-        src=TODO,
-    )
+    for x_index in range(x_dim):
+        physical_count_of_whatever.scatter_add_(
+            dim=TODO,
+            index=TODO,
+            src=TODO,
+        )
 
     for layer_id in range(num_layer):
         for logical_expert_id in range(num_logical_expert):
