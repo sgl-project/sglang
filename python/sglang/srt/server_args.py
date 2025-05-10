@@ -199,6 +199,7 @@ class ServerArgs:
     disaggregation_bootstrap_port: int = 8998
     disaggregation_transfer_backend: str = "mooncake"
     disaggregation_ib_device: Optional[str] = None
+    disaggregation_with_mla: bool = True
     pdlb_url: Optional[str] = None
 
     def __post_init__(self):
@@ -1264,6 +1265,12 @@ class ServerArgs:
             type=str,
             default=None,
             help="The URL of the PD disaggregation load balancer. If set, the prefill/decode server will register with the load balancer.",
+        )
+        parser.add_argument(
+            "--disaggregation-with-mla",
+            type=bool,
+            default=ServerArgs.disaggregation_with_mla,
+            help="Enable disaggregation with MLA. Default is True.",
         )
 
         parser.add_argument(
