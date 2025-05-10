@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import dataclasses
 import warnings
 from collections import deque
@@ -124,6 +125,23 @@ def kv_to_page_indices(kv_indices: np.ndarray, page_size: int):
 def kv_to_page_num(num_kv_indices: int, page_size: int):
     # ceil(num_kv_indices / page_size)
     return (num_kv_indices + page_size - 1) // page_size
+
+
+def check_gdr_support():
+    lib = ctypes.CDLL("libcuda.so")
+    if not hasattr(lib, "cuDeviceGetAttribute"):
+        return False
+    CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_SUPPORTED = 116
+    retval = ctypes.c_int()
+    current_device = torch.cuda.current_device()
+    result = lib.cuDeviceGetAttribute(
+        ctypes.byref(retval),
+        CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_SUPPORTED,
+        current_device,
+    )
+    if result != 0:
+        return False
+    return bool(retval.value)
 
 
 @dataclasses.dataclass

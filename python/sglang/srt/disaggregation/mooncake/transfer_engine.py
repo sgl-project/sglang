@@ -70,6 +70,16 @@ class MooncakeTransferEngine:
             raise RuntimeError("Mooncake Transfer Engine Return Error.")
         return ret
 
+    def allocate_managed_buffer(self, length: int) -> int:
+        ret = self.engine.allocate_managed_buffer(length)
+        if ret <= 0:
+            logger.error("Allocation Return Error")
+            raise Exception("Allocation Return Error")
+        return ret
+
+    def free_managed_buffer(self, buffer: int, length: int) -> int:
+        return self.engine.free_managed_buffer(buffer, length)
+
     def get_localhost(self):
         return self.hostname
 
