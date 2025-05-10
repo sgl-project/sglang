@@ -108,6 +108,7 @@ class MooncakeKVManager(BaseKVManager):
         args: KVArgs,
         disaggregation_mode: DisaggregationMode,
         server_args: ServerArgs,
+        launch_kernel_done: Optional[threading.Event] = None,
     ):
         self.kv_args = args
         self.engine = MooncakeTransferEngine(
@@ -130,10 +131,12 @@ class MooncakeKVManager(BaseKVManager):
         self.rank_port = None
         self.server_socket = zmq.Context().socket(zmq.PULL)
         self.register_buffer_to_engine()
+
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.transfer_queue = queue.Queue()
             self.transfer_infos: Dict[int, TransferInfo] = {}
             self.decode_kv_args_table: Dict[str, KVArgsRegisterInfo] = {}
+            self.disagg_launch_done = launch_kernel_done
             self.start_prefill_thread()
             self._register_to_bootstrap()
 
@@ -175,6 +178,10 @@ class MooncakeKVManager(BaseKVManager):
         dst_kv_ptrs: list[int],
         dst_kv_indices: npt.NDArray[np.int64],
     ):
+        # NOTE: When preparing the meatadata, we also need to wait for the kernel launch
+        if self.disagg_launch_done is not None:
+            self.disagg_launch_done.wait()
+
         # Group by indices
         prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
             prefill_kv_indices, dst_kv_indices
@@ -197,6 +204,9 @@ class MooncakeKVManager(BaseKVManager):
                 dst_addr = dst_ptr + int(decode_index[0]) * item_len
                 length = item_len * len(prefill_index)
 
+                # FIXME: remove the GIL in transfer_sync
+                if self.disagg_launch_done is not None:
+                    self.disagg_launch_done.wait()
                 status = self.engine.transfer_sync(
                     mooncake_session_id, src_addr, dst_addr, length
                 )
