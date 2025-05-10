@@ -64,6 +64,7 @@ sources = [
     "csrc/cpu/topk.cpp",
     "csrc/cpu/interface.cpp",
     "csrc/cpu/shm.cpp",
+    "csrc/cpu/rope.cpp",
     "csrc/cpu/torch_extension_cpu.cpp",
 ]
 
