@@ -355,6 +355,7 @@ async def process_batch(tokenizer_manager, batch_id: str, batch_request: BatchRe
                     to_file=True,
                     cache_report=tokenizer_manager.server_args.enable_cache_report,
                     tool_call_parser=tokenizer_manager.server_args.tool_call_parser,
+                    assistant_prefix_list=adapted_request.assistant_prefix_list,
                 )
             else:
                 responses = v1_generate_response(
@@ -1254,7 +1255,7 @@ def v1_chat_generate_request(
         rid=request_ids,
         modalities=modalities_list,
         lora_path=lora_paths,
-        assistant_prefix=assistant_prefix_list,
+        assistant_prefix_list=assistant_prefix_list,
         bootstrap_host=all_requests[0].bootstrap_host,
         bootstrap_port=all_requests[0].bootstrap_port,
         bootstrap_room=all_requests[0].bootstrap_room,
@@ -1503,7 +1504,9 @@ async def v1_chat_completions(
                     is_first = is_firsts.get(index, True)
                     stream_buffer = stream_buffers.get(index, "")
                     n_prev_token = n_prev_tokens.get(index, 0)
-                    assistant_prefix = adapted_request.assistant_prefix[index] or ""
+                    assistant_prefix = (
+                        adapted_request.assistant_prefix_list[index] or ""
+                    )
 
                     prompt_tokens[index] = content["meta_info"]["prompt_tokens"]
                     completion_tokens[index] = content["meta_info"]["completion_tokens"]
@@ -1814,7 +1817,6 @@ async def v1_chat_completions(
         return create_error_response(str(e))
     if not isinstance(ret, list):
         ret = [ret]
-    assistant_prefix = adapted_request.assistant_prefix
 
     response = v1_chat_generate_response(
         request,
@@ -1823,7 +1825,7 @@ async def v1_chat_completions(
         cache_report=tokenizer_manager.server_args.enable_cache_report,
         tool_call_parser=tokenizer_manager.server_args.tool_call_parser,
         reasoning_parser=tokenizer_manager.server_args.reasoning_parser,
-        assistant_prefix=assistant_prefix,
+        assistant_prefix_list=adapted_request.assistant_prefix_list,
     )
 
     return response

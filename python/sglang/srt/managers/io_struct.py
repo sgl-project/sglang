@@ -87,7 +87,7 @@ class GenerateReqInput:
     modalities: Optional[List[str]] = None
     # LoRA related
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
-    assistant_prefix: Optional[Union[List[Optional[str]], Optional[str]]] = None
+    assistant_prefix_list: Optional[Union[List[Optional[str]], Optional[str]]] = None
     # Session info for continual prompting
     session_params: Optional[Union[List[Dict], Dict]] = None
 
