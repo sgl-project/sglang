@@ -487,7 +487,7 @@ def main(args: argparse.Namespace):
             ]
         print(f"Start tuning over {len(search_space)} configurations...")
 
-        start = time.time()
+        start = time.perf_counter()
         configs = _distribute(
             "tune",
             [
@@ -522,7 +522,7 @@ def main(args: argparse.Namespace):
             use_int8_w8a16,
             block_shape,
         )
-        end = time.time()
+        end = time.perf_counter()
         print(f"Tuning took {end - start:.2f} seconds")
     else:
         outputs = _distribute(

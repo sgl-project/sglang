@@ -79,9 +79,9 @@ class TestEncoderEmbeddingModels(CustomTestCase):
             # warm up
             hf_outputs = hf_runner.forward(truncated_prompts)
 
-            st_start_time = time.time()
+            st_start_time = time.perf_counter()
             hf_outputs = hf_runner.forward(truncated_prompts)
-            st_end_time = time.time()
+            st_end_time = time.perf_counter()
 
         with SRTRunner(
             model_path,
@@ -95,9 +95,9 @@ class TestEncoderEmbeddingModels(CustomTestCase):
             # warm up
             srt_outputs = srt_runner.forward(truncated_prompts)
 
-            sgl_start_time = time.time()
+            sgl_start_time = time.perf_counter()
             srt_outputs = srt_runner.forward(truncated_prompts)
-            sgl_end_time = time.time()
+            sgl_end_time = time.perf_counter()
 
         transformer_time = st_end_time - st_start_time
         sgl_time = sgl_end_time - sgl_start_time

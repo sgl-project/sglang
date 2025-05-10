@@ -21,9 +21,9 @@ def test_update_weights_from_tensor(tp_size):
     memory_before = torch.cuda.memory_allocated()
     new_tensor = torch.full((16384, 2048), 1.5, device="cuda")
 
-    time_start = time.time()
+    time_start = time.perf_counter()
     engine.update_weights_from_tensor([(x, new_tensor) for x in param_names])
-    print(f"Time delta: {time.time() - time_start:.03f}")
+    print(f"Time delta: {time.perf_counter() - time_start:.03f}")
 
     for param_name in param_names[:3]:
         _check_param(engine, param_name, [1.5] * 5)
