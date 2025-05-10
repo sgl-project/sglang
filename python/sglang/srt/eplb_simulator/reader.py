@@ -165,7 +165,7 @@ def read_bench_serving(path: Path):
             ],
             input_text=data_raw["prompts"],
             output_text=data_raw["generated_texts"],
-            history_text=[x["history_text"] for x in data_raw["output_metadata"]],
+            history_text=[x.get("history_text", "") for x in data_raw["output_metadata"]],
         )
     )
 
