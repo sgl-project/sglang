@@ -63,6 +63,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_mla_deep_gemm_masked_fp8,
 )
 from sglang.srt.layers.quantization.fp8_utils import (
+    block_quant_dequant,
     block_quant_to_tensor_quant,
     channel_quant_to_tensor_quant,
     normalize_e4m3fn_to_e4m3fnuz,
@@ -357,6 +358,7 @@ class DeepseekV2MoE(nn.Module):
                 topk_idx,
                 topk_weights,
                 reorder_topk_ids,
+                num_recv_tokens_per_expert,
                 seg_indptr,
                 masked_m,
                 expected_m,
@@ -368,10 +370,13 @@ class DeepseekV2MoE(nn.Module):
             )
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
+            topk_idx=topk_idx,
+            topk_weights=topk_weights,
             reorder_topk_ids=reorder_topk_ids,
             seg_indptr=seg_indptr,
             masked_m=masked_m,
             expected_m=expected_m,
+            num_recv_tokens_per_expert=num_recv_tokens_per_expert,
             forward_mode=forward_mode,
         )
         if self.ep_size > 1:
@@ -772,7 +777,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         q_nope_out = q_nope_out.transpose(0, 1)
         q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
-        if self.attention_backend == "fa3":
+        if self.attention_backend == "fa3" or self.attention_backend == "flashinfer":
             attn_output = self.attn_mqa(
                 q_nope_out, k_nope, k_nope, forward_batch, q_rope=q_pe, k_rope=k_pe
             )
@@ -1481,14 +1486,15 @@ class DeepseekV2ForCausalLM(nn.Module):
         if self.n_share_experts_fusion > 0:
             # Only Deepseek V3/R1 can use shared experts fusion optimization now.
             if (
-                self.config.architectures[0] != architecture
+                not _is_cuda
+                or self.config.architectures[0] != architecture
                 or self.config.n_routed_experts != 256
             ):
                 self.n_share_experts_fusion = 0
                 global_server_args_dict["n_share_experts_fusion"] = 0
                 log_info_on_rank0(
                     logger,
-                    "Only Deepseek V3/R1 can use shared experts fusion optimization. Shared experts fusion optimization is disabled.",
+                    "Only Deepseek V3/R1 on NV-platform can use shared experts fusion optimization. Shared experts fusion optimization is disabled.",
                 )
             else:
                 assert (
@@ -1496,7 +1502,8 @@ class DeepseekV2ForCausalLM(nn.Module):
                 ), f"Shared experts fusion optimization is enabled in DeepSeek V3/R1, set it to {self.tp_size} can get best optimized performace."
         elif self.n_share_experts_fusion == 0:
             if (
-                torch.cuda.get_device_capability("cuda") >= (9, 0)
+                _is_cuda
+                and torch.cuda.get_device_capability("cuda") >= (9, 0)
                 and self.config.architectures[0] == architecture
                 and self.config.n_routed_experts == 256
                 and (not global_server_args_dict["enable_deepep_moe"])
@@ -1585,13 +1592,22 @@ class DeepseekV2ForCausalLM(nn.Module):
 
                         if (
                             _is_cuda
-                            and _ENABLE_JIT_DEEPGEMM
                             and weight_block_size[0] == 128
                             and weight_block_size[1] == 128
                             and model_dtype == torch.bfloat16
                         ):
-                            block_scale = weight_scale
-                            use_deep_gemm_bmm = True
+                            if _ENABLE_JIT_DEEPGEMM and get_bool_env_var(
+                                "SGL_USE_DEEPGEMM_BMM", "false"
+                            ):
+                                block_scale = weight_scale
+                                use_deep_gemm_bmm = True
+                            else:
+                                w = block_quant_dequant(
+                                    weight,
+                                    weight_scale,
+                                    weight_block_size,
+                                    model_dtype,
+                                )
                         else:
                             w, scale = block_quant_to_tensor_quant(
                                 weight, weight_scale, weight_block_size

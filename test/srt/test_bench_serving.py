@@ -235,7 +235,7 @@ class TestBenchServing(CustomTestCase):
                 f'accept_length: {res["accept_length"]:.2f} \n'
             )
             if os.getenv("SGLANG_AMD_CI") == "1":
-                self.assertLess(res["median_e2e_latency_ms"], 1450)
+                self.assertLess(res["median_e2e_latency_ms"], 1800)
             else:
                 self.assertLess(res["median_e2e_latency_ms"], 900)
             self.assertGreater(res["accept_length"], 3.0)

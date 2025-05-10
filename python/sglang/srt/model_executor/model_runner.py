@@ -173,6 +173,7 @@ class ModelRunner:
                 "speculative_accept_threshold_single": server_args.speculative_accept_threshold_single,
                 "speculative_accept_threshold_acc": server_args.speculative_accept_threshold_acc,
                 "use_mla_backend": self.use_mla_backend,
+                "mm_attention_backend": server_args.mm_attention_backend,
             }
         )
 
@@ -557,12 +558,7 @@ class ModelRunner:
             return iter
 
         def model_load_weights(model, iter):
-            model.load_weights(iter)
-            for _, module in self.model.named_modules():
-                quant_method = getattr(module, "quant_method", None)
-                if quant_method is not None:
-                    with device_loading_context(module, target_device):
-                        quant_method.process_weights_after_loading(module)
+            DefaultModelLoader.load_weights_and_postprocess(model, iter, target_device)
             return model
 
         with set_default_torch_dtype(self.model_config.dtype):
@@ -1149,7 +1145,9 @@ class ModelRunner:
                 [self.sample(values, forward_batch) for values in logits_output],
                 axis=-1,
             )
-
+        sampling_info = forward_batch.sampling_info
+        if sampling_info.thinking_budgets is not None:
+            sampling_info.apply_thinking_budgets(logits_output.next_token_logits)
         self._preprocess_logits(logits_output, forward_batch.sampling_info)
 
         # Sample the next tokens
@@ -1160,6 +1158,8 @@ class ModelRunner:
             forward_batch.top_logprobs_nums,
             forward_batch.token_ids_logprobs,
         )
+        if sampling_info.thinking_budgets is not None:
+            sampling_info.update_thinking_budgets(next_token_ids)
         return next_token_ids
 
     @property
