@@ -285,6 +285,21 @@ class Engine(EngineBase):
         ret = loop.run_until_complete(generator.__anext__())
         return ret
 
+    async def async_encode(
+        self,
+        prompt: Union[str, List[str], List[Dict], List[List[Dict]]],
+        image_data: Optional[Union[List[str], str]] = None,
+    ) -> Dict:
+        """
+        Asynchronous version of encode method.
+
+        The arguments of this function is the same as `sglang/srt/managers/io_struct.py::EmbeddingReqInput`.
+        Please refer to `EmbeddingReqInput` for the documentation.
+        """
+        obj = EmbeddingReqInput(text=prompt, image_data=image_data)
+        generator = self.tokenizer_manager.generate_request(obj, None)
+        return await generator.__anext__()
+
     def shutdown(self):
         """Shutdown the engine"""
         kill_process_tree(os.getpid(), include_parent=False)
