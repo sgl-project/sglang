@@ -33,28 +33,18 @@ class FakeKVSender(BaseKVSender):
         self,
         kv_indices: list[int],
         aux_index: Optional[int] = None,
-        dest_ranks: Optional[list[int]] = None,
     ):
         logger.info(
-            f"FakeKVSender init with kv_indices: {kv_indices}, aux_index: {aux_index}, dest_ranks: {dest_ranks}"
+            f"FakeKVSender init with kv_indices: {kv_indices}, aux_index: {aux_index}"
         )
         pass
 
     def send(
         self,
         kv_indices: npt.NDArray[np.int64],
-        index_slice: slice,
-        is_last: bool,
     ):
-        logger.info(
-            f"FakeKVSender send with kv_indices: {kv_indices}, index_slice: {index_slice}, is_last: {is_last}"
-        )
-        if is_last:
-            self.has_sent = True
-            logger.info(f"FakeKVSender send success")
-        else:
-            self.has_sent = False
-            logger.info(f"FakeKVSender send fake transfering")
+        self.has_sent = True
+        logger.info(f"FakeKVSender send with kv_indices: {kv_indices}")
 
     def failure_exception(self):
         raise Exception("Fake KVSender Exception")
