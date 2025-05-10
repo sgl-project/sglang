@@ -80,7 +80,7 @@ class RequestFuncOutput:
         output = RequestFuncOutput()
         output.prompt_len = request_func_input.prompt_len
         output.prompt = request_func_input.prompt
-        output.metadata = request_func_input.metadata
+        output.metadata = {**request_func_input.metadata}
         return output
 
 
@@ -1251,7 +1251,7 @@ def wrap_multi_round_request_func(request_func: Callable, tokenizer) -> Callable
                 output_len=request_func_input.output_len,
                 lora_name=request_func_input.lora_name,
                 extra_request_body=request_func_input.extra_request_body,
-                metadata=request_func_input.metadata,
+                metadata={**request_func_input.metadata},
             )
             output = await request_func(
                 inner_input, pbar=pbar if i == len(prompts) - 1 else None
