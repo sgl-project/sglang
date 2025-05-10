@@ -517,29 +517,47 @@ class DefaultModelLoader(BaseModelLoader):
         #                 quant_method.process_weights_after_loading(module)
         # return model.eval()
 
-        target_device = torch.device(device_config.device)
-        with set_default_torch_dtype(model_config.dtype):
-            with target_device:
-                model = _initialize_model(model_config, self.load_config)
-                model.load_weights(self._get_all_weights(model_config, model))
-                for _, module in model.named_modules():
-                    quant_method = getattr(module, "quant_method", None)
-                    # print(f"quant_method: {quant_method}")
-                    if quant_method is not None:
-                        # When quant methods need to process weights after loading
-                        # (for repacking, quantizing, etc), they expect parameters
-                        # to be on the global target device. This scope is for the
-                        # case where cpu offloading is used, where we will move the
-                        # parameters onto device for processing and back off after.
-                        with device_loading_context(module, target_device):
-                            quant_method.process_weights_after_loading(module)
-
-        # print(f"model_config.modelopt_quant: {model_config.modelopt_quant}")
-        # print(f"[PID:{os.getpid()}] Loader: Received ModelConfig(id={id(model_config)}).modelopt_quant = {model_config.modelopt_quant}")
-
-        # self._load_weights(model_config, model)
-        # <<< ModelOpt Quantization Integration Start >>>
         if hasattr(model_config, "modelopt_quant") and model_config.modelopt_quant:
+
+            from accelerate import infer_auto_device_map, init_empty_weights
+            from accelerate.utils import get_max_memory
+            from transformers import AutoConfig, AutoModelForCausalLM
+
+            hf_config = AutoConfig.from_pretrained(
+                model_config.model_path, trust_remote_code=True
+            )
+            with init_empty_weights():
+                torch_dtype = getattr(hf_config, "torch_dtype", torch.float16)
+                model = AutoModelForCausalLM.from_config(
+                    hf_config, torch_dtype=torch_dtype, trust_remote_code=True
+                )
+            max_memory = get_max_memory()
+            inferred_device_map = infer_auto_device_map(model, max_memory=max_memory)
+
+            on_cpu = "cpu" in inferred_device_map.values()
+            gpu_mem_percentage = 0.8
+            model_kwargs = {"torch_dtype": "auto"}
+            device_map = "auto"
+
+            if on_cpu:
+                for device in max_memory.keys():
+                    if isinstance(device, int):
+                        max_memory[device] *= gpu_mem_percentage
+
+                print(
+                    "Model does not fit to the GPU mem. "
+                    f"We apply the following memmory limit for calibration: \n{max_memory}\n"
+                    "If you hit GPU OOM issue, please adjust `gpu_mem_percentage` or "
+                    "reduce the calibration `batch_size` manually."
+                )
+                model_kwargs["max_memory"] = max_memory
+
+            model = AutoModelForCausalLM.from_pretrained(
+                model_config.model_path,
+                device_map=device_map,
+                **model_kwargs,
+                trust_remote_code=True,
+            )
             logger.info(
                 f"ModelOpt quantization requested: {model_config.modelopt_quant}"
             )
