@@ -20,6 +20,7 @@ class MiniCPMMultimodalProcessor(BaseMultimodalProcessor):
         super().__init__(hf_config, server_args, _processor)
         self.image_token = "(<image>./</image>)"
         self.audio_token = "(<audio>./</audio>)"
+        self.video_token = "(<video>./</video>)"
 
     def process_data_task(self, input_text, images=None, audios=None):
 
@@ -70,7 +71,9 @@ class MiniCPMMultimodalProcessor(BaseMultimodalProcessor):
             audio_data=audio_data,
             image_data=image_data,
             multimodal_tokens=MultimodalSpecialTokens(
-                image_token=self.image_token, audio_token=self.audio_token
+                image_token=self.image_token,
+                video_token=self.video_token,
+                audio_token=self.audio_token,
             ),
         )
         if base_output is None:

@@ -230,7 +230,7 @@ class TestMiniCPMVLogits(VisionLLMLogitsBase):
                 ),
                 input_ids=input_ids,
                 input_embedding=model.get_input_embeddings(),
-                image_data_embedding_func=model.get_image_feature,
+                multimodal_model=model,
                 placeholder_tokens={
                     Modality.IMAGE: self.processor.tokenizer.unk_token_id,
                 },

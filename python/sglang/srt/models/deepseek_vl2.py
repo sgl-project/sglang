@@ -227,7 +227,7 @@ class DeepseekVL2ForCausalLM(nn.Module):
             input_ids=input_ids,
             positions=positions,
             forward_batch=forward_batch,
-            image_data_embedding_func=self.get_image_feature,
+            multimodal_model=self,
             language_model=self.language_model,
         )
 
