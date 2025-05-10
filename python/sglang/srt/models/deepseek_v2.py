@@ -344,7 +344,7 @@ class DeepseekV2MoE(nn.Module):
                 num_expert_group=self.num_expert_group,
                 correction_bias=self.correction_bias,
                 routed_scaling_factor=self.routed_scaling_factor,
-                x=dd
+                num_token_non_padded=forward_batch.num_token_non_padded,
             )
         else:
             topk_idx = torch.full(
