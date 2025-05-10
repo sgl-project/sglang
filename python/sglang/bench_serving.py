@@ -1073,17 +1073,20 @@ def sample_hf_dataset_requests(
     from datasets import load_dataset
 
     df = load_dataset(dataset_name).to_polars()
+
+    df = df[:num_requests]
+
     df = df.select(
         id=pl.col(column_id),
         timestamp=expr_timestamp,
         conversation=pl.col(column_conversation),
     )
+
     df = df.with_columns(
         prompts=pl.col("conversation")
         .list.eval(pl.element().filter(pl.element().struct.field("role") == "user"))
         .list.eval(pl.element().struct.field("content")),
     )
-    df = df[:num_requests]
 
     return [
         DatasetRow(
