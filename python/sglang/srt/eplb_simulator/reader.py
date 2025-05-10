@@ -63,7 +63,7 @@ def read_expert_distribution_mode_detail_per_token(dir_data):
     """
 
     def _handle_record(record):
-        rids_raw = torch.tensor([_rid_str_to_int64(rid) for rid in record["rids"]])
+        rids_raw = torch.tensor([_rid_str_to_int64(rid) for rid in record["rids"]], dtype=torch.int64)
         input_ids = torch.tensor(record["input_ids"])
         forward_mode = record["forward_mode"]
         topk_ids = einops.rearrange(
