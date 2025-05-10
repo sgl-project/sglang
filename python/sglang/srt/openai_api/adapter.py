@@ -1061,6 +1061,7 @@ def v1_chat_generate_request(
                     gen_assistant_prefix = tokenizer_manager.tokenizer.decode(
                         gen_assistant_prefix_ids, skip_special_tokens=True
                     )
+                    gen_assistant_prefix = gen_assistant_prefix.strip()
                 else:
                     gen_assistant_prefix = ""
 
