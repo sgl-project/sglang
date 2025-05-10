@@ -34,7 +34,6 @@ from typing import List, Optional, Tuple, Union
 import numpy as np
 import psutil
 import torch
-import torch.distributed as dist
 import triton
 import triton.language as tl
 
@@ -197,13 +196,6 @@ class TokenToKVPoolAllocator:
             self.free_slots = torch.cat((self.free_slots, free_index))
         else:
             self.free_group.append(free_index)
-
-        # for debugging
-        rank = dist.get_rank()
-        if rank == 0:
-            with open("log.txt", "a") as f:
-                f.write(f"free_index: {free_index}\n")
-                f.write(f"free_slots: {self.free_slots}\n")
 
     def free_group_begin(self):
         self.is_not_in_free_group = False

@@ -40,7 +40,6 @@ from typing import TYPE_CHECKING, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
-import torch.distributed as dist
 import triton
 import triton.language as tl
 
@@ -469,6 +468,8 @@ class Req:
         # Prefix info
         # The indices to kv cache for the shared prefix.
         self.prefix_indices = []
+        # The local indices to kv cache for the shared prefix.
+        self.prefix_indices_local = []
         # Number of tokens to run prefill.
         self.extend_input_len = 0
         # The relative logprob_start_len in an extend batch
@@ -1087,8 +1088,25 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 )
                 if self.token_to_kv_pool_allocator_local is not None:
                     self.req_to_token_pool.write_local(
-                        (req.req_pool_idx, slice(0, pre_len)), req.prefix_indices
+                        (req.req_pool_idx, slice(0, pre_len)), req.prefix_indices_local
                     )
+                    start_loc_local = self.req_to_token_pool.get_local_start_loc(
+                        req.req_pool_idx
+                    )
+                    if (
+                        pre_len
+                        > start_loc_local + 2 * self.model_config.attention_chunk_size
+                    ):
+                        last_loc_local = (
+                            prefix_lens - 1 - self.model_config.attention_chunk_size
+                        ).to(torch.int32)
+                        free_slots_local = self.req_to_token_pool.req_to_token_local[
+                            req.req_pool_idx, start_loc_local:last_loc_local
+                        ]
+                        self.token_to_kv_pool_allocator_local.free(free_slots_local)
+                        self.req_to_token_pool.write_local_start_loc(
+                            last_loc_local, req.req_pool_idx
+                        )
 
             # If input_embeds are available, store them
             if req.input_embeds is not None:
@@ -1505,16 +1523,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     self.req_to_token_pool.write_local_start_loc(
                         last_loc_local, self.req_pool_indices[i]
                     )
-                    # for debugging
-                    rank = dist.get_rank()
-                    if rank == 0:
-                        with open("log.txt", "a") as f:
-                            f.write(
-                                f"free_slots_local in prefordeco: {free_slots_local}\n"
-                            )
-                            f.write(f"start_loc_local: {start_loc_local}\n")
-                            f.write(f"last_loc_local: {last_loc_local}\n")
-                            f.write(f"locs[i]: {locs[i]}\n")
 
     def filter_batch(
         self,

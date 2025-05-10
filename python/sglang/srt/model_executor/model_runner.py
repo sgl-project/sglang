@@ -866,10 +866,6 @@ class ModelRunner:
                 * self.server_args.page_size
             )
 
-            # for debugging
-            # self.local_max_num_tokens = 200
-            # self.max_total_num_tokens = 1000
-
         if self.req_to_token_pool is None:
             self.req_to_token_pool = ReqToTokenPool(
                 size=max_num_reqs + 1,

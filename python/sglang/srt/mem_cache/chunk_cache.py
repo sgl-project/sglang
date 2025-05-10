@@ -5,7 +5,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Callable, List, Tuple
 
 import torch
-import torch.distributed as dist
 
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPoolAllocator
@@ -53,12 +52,6 @@ class ChunkCache(BasePrefixCache):
                 req.req_pool_idx,
                 start_loc_local : len(req.origin_input_ids) + len(req.output_ids) - 1,
             ]
-            # for debugging
-            rank = dist.get_rank()
-            if rank == 0:
-                with open("log.txt", "a") as f:
-                    f.write(f"start_loc_local in cache_finished_req: {start_loc_local}")
-                    f.write(f"free indices in cache_finished_req: {kv_indices_local}")
             self.token_to_kv_pool_allocator_local.free(kv_indices_local)
 
     def cache_unfinished_req(self, req: Req):
@@ -69,6 +62,11 @@ class ChunkCache(BasePrefixCache):
 
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
         req.prefix_indices = kv_indices
+        if self.token_to_kv_pool_allocator_local is not None:
+            kv_indices_local = self.req_to_token_pool.req_to_token_local[
+                req.req_pool_idx, : len(req.fill_ids)
+            ]
+            req.prefix_indices_local = kv_indices_local
 
     def insert(self):
         raise NotImplementedError()

@@ -16,7 +16,6 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
 
-import torch.distributed as dist
 from sgl_kernel import merge_state_v2
 from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 
@@ -927,12 +926,6 @@ class FlashAttentionBackend(AttentionBackend):
                         if not layer.is_cross_attention
                         else forward_batch.encoder_out_cache_loc
                     )
-                    rank = dist.get_rank()
-                    if rank == 0 and layer.layer_id == 0:
-                        with open("log.txt", "a") as f:
-                            f.write(
-                                f"cache_loc in forward_decode in flashAtten: {cache_loc}"
-                            )
 
                 else:
                     cache_loc = forward_batch.out_cache_loc_local
