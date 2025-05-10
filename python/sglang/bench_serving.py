@@ -1257,6 +1257,7 @@ def wrap_multi_round_request_func(request_func: Callable, tokenizer) -> Callable
             output.metadata["multi_round_len"] = len(prompts)
             output.metadata["history_text"] = history_text
             outputs.append(output)
+            print(f"hi wrap_multi_round_request_func item {inner_input=} {output=}")
         return outputs
 
     return f
