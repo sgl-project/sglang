@@ -208,8 +208,8 @@ def _simulate_logical_to_physical_by_random_dispatching(
             )
             for physical_expert_id in all_physical_expert_ids:
                 physical_count_of_whatever[
-                :, layer_id, physical_expert_id
-                ] += logical_count_of_whatever[:, layer_id, logical_expert_id] / len(
+                    ..., layer_id, physical_expert_id
+                ] += logical_count_of_whatever[..., layer_id, logical_expert_id] / len(
                     all_physical_expert_ids
                 )
 
