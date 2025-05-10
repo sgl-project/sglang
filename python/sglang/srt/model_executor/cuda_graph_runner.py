@@ -562,7 +562,7 @@ class CudaGraphRunner:
         self.raw_bs = raw_bs
         self.raw_num_token = raw_num_token
         self.bs = bs
-        print(f"hi replay_prepare {raw_bs=} {bs=} {raw_num_token=}")
+        # print(f"hi replay_prepare {raw_bs=} {bs=} {raw_num_token=}")
 
     def replay(
         self, forward_batch: ForwardBatch, skip_attn_backend_init: bool = False
