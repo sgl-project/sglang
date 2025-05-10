@@ -19,6 +19,19 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
 
+def convert_to_cudnn_type(torch_type):
+    if torch_type == torch.float16:
+        return cudnn.data_type.HALF
+    elif torch_type == torch.bfloat16:
+        return cudnn.data_type.BFLOAT16
+    elif torch_type == torch.float32:
+        return cudnn.data_type.FLOAT
+    elif torch_type == torch.int32:
+        return cudnn.data_type.INT32
+    elif torch_type == torch.int64:
+        return cudnn.data_type.INT64
+    else:
+        raise ValueError("Unsupported tensor data type.")
 
 
 class _CuDNNInputParameters:
@@ -110,8 +123,11 @@ class CuDNNBackend(AttentionBackend):
         ragged_query=False,
         causal=True,
     ):
+        
+        cudnn_dtype = convert_to_cudnn_type(self._model_runner.model_config.dtype)
+
         graph = cudnn.pygraph(
-            io_data_type=cudnn.data_type.HALF,
+            io_data_type=cudnn_dtype,
             intermediate_data_type=cudnn.data_type.FLOAT,
             compute_data_type=cudnn.data_type.FLOAT,
         )
@@ -121,7 +137,7 @@ class CuDNNBackend(AttentionBackend):
             name="q",
             dim=query_shape,
             stride=query_strides,
-            data_type=cudnn.data_type.HALF,
+            data_type=cudnn_dtype,
         )
 
         if ragged_query:
@@ -140,13 +156,13 @@ class CuDNNBackend(AttentionBackend):
             name="k_container",
             dim=kv_container_shape,
             stride=self._make_compact_strides(kv_container_shape),
-            data_type=cudnn.data_type.HALF,
+            data_type=cudnn_dtype,
         )
         v_container_cudnn = graph.tensor(
             name="v_container",
             dim=kv_container_shape,
             stride=self._make_compact_strides(kv_container_shape),
-            data_type=cudnn.data_type.HALF,
+            data_type=cudnn_dtype,
         )
 
         # page tables should be int
@@ -500,7 +516,6 @@ class CuDNNBackend(AttentionBackend):
         query = q.view(q.shape[0], layer.tp_q_head_num, layer.qk_head_dim)
         output = q.new_empty(q.shape[0], layer.tp_q_head_num, layer.v_head_dim)
 
-
         seq_lens = forward_batch.seq_lens
         extend_prefix_lens = forward_batch.extend_prefix_lens
         extend_seq_lens = forward_batch.extend_seq_lens
@@ -664,8 +679,6 @@ class CuDNNBackend(AttentionBackend):
                 layer, forward_batch.out_cache_loc, k, v
             )
 
-        # print("decode k shape: ",k.shape)
-        # print("decode v shape: ",v.shape)
 
         query = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
         # batch_size, head, seq_len, head_dim
