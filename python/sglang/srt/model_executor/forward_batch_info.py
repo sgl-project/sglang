@@ -247,6 +247,7 @@ class ForwardBatch:
 
     # For padding
     padded_static_len: int = -1  # -1 if not padded
+    num_token_unpadded: torch.Tensor = None # scalar tensor
 
     # For Qwen2-VL
     mrope_positions: torch.Tensor = None
