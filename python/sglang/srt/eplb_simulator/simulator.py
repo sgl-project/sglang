@@ -54,11 +54,21 @@ def simulate_execution_given_pack(
             logical_count_of_batch=logical_count_of_batch, server_args=server_args
         )
 
-        return dict(
+        simulation_output = dict(
             logical_count_of_batch=logical_count_of_batch,
             num_tokens_of_batch=torch.tensor([len(x) for x in token_indices_of_batch], dtype=torch.int32),
             **simulation_output,
         )
+
+        num_batch, _ = simulation_output['utilization_rate'].shape
+        simulation_output["df_step"] = pl.DataFrame(dict(
+            step=list(range(num_batch)),
+            utilization_rate=einops.reduce(simulation_output['utilization_rate'], 'num_batch num_layer -> num_batch',
+                                           'mean').tolist(),
+            num_tokens_of_batch=simulation_output['num_tokens_of_batch'].tolist(),
+        ))
+
+        return simulation_output
 
 
 def _simulate_scheduled_pack_indices_given_seq_metadata(
