@@ -209,10 +209,12 @@ def _simulate_logical_to_physical_by_random_dispatching(
         dtype=torch.float32,
     )
     for x_index in range(x_dim):
+        logical_to_all_physical_map_partial = logical_to_all_physical_map[:, :, x_index]
+        mask = logical_to_all_physical_map_partial != -1
         physical_count_of_whatever.scatter_add_(
             dim=1,
-            index=logical_to_all_physical_map[:, :, x_index],
-            src=logical_count_amortized,
+            index=logical_to_all_physical_map_partial[mask],
+            src=logical_count_amortized[mask],
         )
 
     for layer_id in range(num_layer):
