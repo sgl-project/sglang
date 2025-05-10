@@ -74,7 +74,6 @@ class ModelConfig:
         self.attention_chunk_size = getattr(
             self.hf_text_config, "attention_chunk_size", None
         )
-
         if enable_multimodal is None:
             mm_disabled_models = [
                 "Gemma3ForConditionalGeneration",

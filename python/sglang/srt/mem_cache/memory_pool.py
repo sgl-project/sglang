@@ -36,6 +36,7 @@ import psutil
 import torch
 import triton
 import triton.language as tl
+import torch.distributed as dist
 
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.utils import debug_timing, get_compiler_backend
@@ -71,6 +72,9 @@ class ReqToTokenPool:
                 self.req_to_token_local = torch.zeros(
                     (size, max_context_len), dtype=torch.int32, device=device
                 )
+                self.local_start_loc = torch.zeros(
+                    size, dtype=torch.int32, device=device
+                )
             else:
                 self.req_to_token_local = None
         self.free_slots = list(range(size))
@@ -80,6 +84,12 @@ class ReqToTokenPool:
 
     def write_local(self, indices, values):
         self.req_to_token_local[indices] = values
+    
+    def get_local_start_loc(self, idx):
+        return self.local_start_loc[idx]
+
+    def write_local_start_loc(self, start_loc, idx):
+        self.local_start_loc[idx] = start_loc        
 
     def available_size(self):
         return len(self.free_slots)
@@ -187,6 +197,13 @@ class TokenToKVPoolAllocator:
             self.free_slots = torch.cat((self.free_slots, free_index))
         else:
             self.free_group.append(free_index)
+        
+        # for debugging
+        rank = dist.get_rank()
+        if rank == 0:
+            with open("log.txt", "a") as f:
+                f.write(f"free_index: {free_index}\n")
+                f.write(f"free_slots: {self.free_slots}\n")
 
     def free_group_begin(self):
         self.is_not_in_free_group = False
