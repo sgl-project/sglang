@@ -64,7 +64,7 @@ def read_expert_distribution_mode_detail_per_token(dir_data):
 
     def _handle_record(record):
         rids_raw = torch.tensor([_rid_str_to_int64(rid) for rid in record["rids"]], dtype=torch.int64)
-        input_ids = torch.tensor(record["input_ids"], dtype=torch.int64)
+        input_ids = torch.tensor(record["input_ids"], dtype=torch.int32)
         forward_mode = record["forward_mode"]
         topk_ids = einops.rearrange(
             record["topk_ids_of_layer"],
@@ -72,7 +72,7 @@ def read_expert_distribution_mode_detail_per_token(dir_data):
         )
 
         rids_repeat_num = (
-            torch.tensor(record["extend_seq_lens"], dtype=torch.int64)
+            torch.tensor(record["extend_seq_lens"], dtype=torch.int32)
             if forward_mode == ForwardMode.EXTEND.value
             else torch.full((len(rids_raw),), 1)
         )
