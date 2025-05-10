@@ -177,20 +177,22 @@ def _simulate_expert_location_metadata_arr(
     num_chunks = math.ceil(num_batches / chunk_size)
 
     output_chunks = [
-        MyExpertLocationMetadata.init_by_eplb(
-            server_args,
-            logical_count=einops.einsum(
-                logical_count_of_batch[
-                (chunk_index-1) * chunk_size: chunk_index * chunk_size,
-                :,
-                :,
-                ],
-                "num_interest_batches num_layer num_expert -> num_layer num_expert",
-            ),
-            num_physical_experts=num_physical_expert,
-        )
-        for chunk_index in trange(1, num_chunks)
-    ]
+                        TODO
+                    ] + [
+                        MyExpertLocationMetadata.init_by_eplb(
+                            server_args,
+                            logical_count=einops.einsum(
+                                logical_count_of_batch[
+                                (chunk_index - 1) * chunk_size: chunk_index * chunk_size,
+                                :,
+                                :,
+                                ],
+                                "num_interest_batches num_layer num_expert -> num_layer num_expert",
+                            ),
+                            num_physical_experts=num_physical_expert,
+                        )
+                        for chunk_index in trange(1, num_chunks)
+                    ]
 
     return [output_chunks[batch_index // chunk_size] for batch_index in range(num_batches)]
 
