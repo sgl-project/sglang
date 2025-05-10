@@ -215,10 +215,12 @@ def _simulate_logical_to_physical_by_random_dispatching(
         (num_layer, num_physical_expert + 1),
         dtype=torch.float32,
     )
+
+    rearrange_expr = "num_layer num_logical_count x_dim -> num_layer (num_logical_count x_dim)"
     physical_count_of_whatever.scatter_add_(
         dim=1,
-        index=logical_to_all_physical_map_noneg1,
-        src=logical_count_repeated,
+        index=einops.rearrange(logical_to_all_physical_map_noneg1, rearrange_expr),
+        src=einops.rearrange(logical_count_repeated, rearrange_expr),
     )
 
     return physical_count_of_whatever[:, :-1]
