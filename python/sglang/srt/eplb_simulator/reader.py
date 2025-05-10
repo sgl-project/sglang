@@ -161,7 +161,7 @@ def read_bench_serving(path: Path):
         dict(
             rid=[_rid_str_to_int64(x["rid"]) for x in data_raw["output_metadata"]],
             dataset_timestamp=[
-                x["dataset_timestamp"] for x in data_raw["output_metadata"]
+                x.get("dataset_timestamp", "2000-01-01T00:00:00") for x in data_raw["output_metadata"]
             ],
             input_text=data_raw["prompts"],
             output_text=data_raw["generated_texts"],
