@@ -159,11 +159,12 @@ def _simulate_eplb_physical_count_of_batch(
     num_batches, _, _ = logical_count_of_batch.shape
     num_physical_expert = _compute_num_physical_experts(server_args)
 
-    if server_args.enable_expert_location_by_eplb:
+    if (expert_location_mode := server_args.expert_location_mode) is not None:
         expert_location_metadata_arr = _simulate_expert_location_metadata_arr(
             logical_count_of_batch=logical_count_of_batch,
             server_args=server_args,
             num_physical_expert=num_physical_expert,
+            expert_location_mode=expert_location_mode,
         )
         outputs = [
             _simulate_logical_to_physical_by_random_dispatching(
@@ -184,6 +185,7 @@ def _simulate_expert_location_metadata_arr(
     logical_count_of_batch: torch.Tensor,
     server_args: MyServerArgs,
     num_physical_expert: int,
+    expert_location_mode: str,
 ) -> List["MyExpertLocationMetadata"]:
     num_batches, num_layer, num_logical_expert = logical_count_of_batch.shape
 

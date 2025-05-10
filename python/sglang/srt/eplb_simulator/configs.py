@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Literal
 
 from sglang.srt.managers.expert_location import ModelConfigForExpertLocation
 
@@ -11,7 +11,7 @@ class MyServerArgs:
     ep_num_redundant_experts: int
     nnodes: int
     tp_size: int
-    enable_expert_location_by_eplb: bool
+    expert_location_mode: Optional[Literal["none"]]
     eplb_rebalance_num_iterations: Optional[int] = None
     # init_expert_location: Optional[str]
     deepseek_eplb_hack_shuffle: bool = False
