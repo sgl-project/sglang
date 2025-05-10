@@ -135,11 +135,12 @@ def read_expert_distribution_mode_detail_per_token(dir_data):
         )
         return {"topk_ids": pack["topk_ids"], "df_metadata": df}
 
-    processed_records = []
-    for path in list(Path(dir_data).glob("*.pt")):
-        print(f"Read {path=}")
-        data_pack = torch.load(path, weights_only=True, map_location="cpu")
-        processed_records += [_handle_record(record) for record in tqdm(data_pack["records"])]
+    data_packs = [
+        torch.load(path, weights_only=True, map_location="cpu")
+        for path in list(Path(dir_data).glob("*.pt"))
+    ]
+
+    processed_records = [_handle_record(record) for data_pack in data_packs for record in tqdm(data_pack)]
 
     pack = _concat_records(processed_records)
     pack = _compute_rid(pack)
