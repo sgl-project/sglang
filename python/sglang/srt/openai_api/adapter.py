@@ -1189,7 +1189,11 @@ def v1_chat_generate_request(
         top_logprobs_num=top_logprobs_nums,
         stream=all_requests[0].stream,
         return_text_in_logprobs=True,
-        rid=request_ids,
+        rid=(
+            request_ids
+            if request_ids is None or len(request_ids) > 1
+            else request_ids[0]
+        ),
         modalities=modalities_list,
         lora_path=lora_paths,
         bootstrap_host=all_requests[0].bootstrap_host,
@@ -1351,28 +1355,52 @@ def v1_chat_generate_response(
     if to_file:
         responses = []
 
-        for i, choice in enumerate(choices):
+        if len(choices) == 1:
             response = {
                 "status_code": 200,
-                "request_id": ret[i]["meta_info"]["id"],
+                "request_id": ret[0]["meta_info"]["id"],
                 "body": {
                     # remain the same but if needed we can change that
-                    "id": ret[i]["meta_info"]["id"],
+                    "id": ret[0]["meta_info"]["id"],
                     "object": "chat.completion",
                     "created": created,
-                    "model": request[i].model,
-                    "choices": choice,
+                    "model": request.model,
+                    "choices": choices[0],
                     "usage": {
-                        "prompt_tokens": ret[i]["meta_info"]["prompt_tokens"],
-                        "completion_tokens": ret[i]["meta_info"]["completion_tokens"],
-                        "total_tokens": ret[i]["meta_info"]["prompt_tokens"]
-                        + ret[i]["meta_info"]["completion_tokens"],
+                        "prompt_tokens": ret[0]["meta_info"]["prompt_tokens"],
+                        "completion_tokens": ret[0]["meta_info"]["completion_tokens"],
+                        "total_tokens": ret[0]["meta_info"]["prompt_tokens"]
+                        + ret[0]["meta_info"]["completion_tokens"],
                     },
                     "system_fingerprint": None,
                 },
             }
             responses.append(response)
-        return responses
+        else:
+            for i, choice in enumerate(choices):
+                response = {
+                    "status_code": 200,
+                    "request_id": ret[i]["meta_info"]["id"],
+                    "body": {
+                        # remain the same but if needed we can change that
+                        "id": ret[i]["meta_info"]["id"],
+                        "object": "chat.completion",
+                        "created": created,
+                        "model": request[i].model,
+                        "choices": choice,
+                        "usage": {
+                            "prompt_tokens": ret[i]["meta_info"]["prompt_tokens"],
+                            "completion_tokens": ret[i]["meta_info"][
+                                "completion_tokens"
+                            ],
+                            "total_tokens": ret[i]["meta_info"]["prompt_tokens"]
+                            + ret[i]["meta_info"]["completion_tokens"],
+                        },
+                        "system_fingerprint": None,
+                    },
+                }
+                responses.append(response)
+            return responses
     else:
         prompt_tokens = sum(
             ret[i]["meta_info"]["prompt_tokens"] for i in range(0, len(ret), request.n)
