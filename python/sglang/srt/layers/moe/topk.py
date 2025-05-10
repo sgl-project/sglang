@@ -34,13 +34,13 @@ expert_distribution_recorder = ExpertDistributionRecorder()
 
 
 def fused_topk_native(
-        hidden_states: torch.Tensor,
-        gating_output: torch.Tensor,
-        topk: int,
-        renormalize: bool,
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    topk: int,
+    renormalize: bool,
 ):
     assert (
-            hidden_states.shape[0] == gating_output.shape[0]
+        hidden_states.shape[0] == gating_output.shape[0]
     ), f"Number of tokens mismatch, {hidden_states.shape=} vs {gating_output.shape=}"
     M, _ = hidden_states.shape
     topk_weights = torch.empty(
@@ -55,10 +55,10 @@ def fused_topk_native(
 
 
 def fused_topk(
-        hidden_states: torch.Tensor,
-        gating_output: torch.Tensor,
-        topk: int,
-        renormalize: bool,
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    topk: int,
+    renormalize: bool,
 ):
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
@@ -89,14 +89,14 @@ def fused_topk(
 # This is used by the Deepseek V2/V3/R1 series models
 @torch.compile(dynamic=True, backend=get_compiler_backend())
 def grouped_topk(
-        hidden_states: torch.Tensor,
-        gating_output: torch.Tensor,
-        topk: int,
-        renormalize: bool,
-        num_expert_group: int = 0,
-        topk_group: int = 0,
-        n_share_experts_fusion: int = 0,
-        routed_scaling_factor: Optional[float] = None,
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    num_expert_group: int = 0,
+    topk_group: int = 0,
+    n_share_experts_fusion: int = 0,
+    routed_scaling_factor: Optional[float] = None,
 ):
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
@@ -140,15 +140,15 @@ def grouped_topk(
 
 
 def biased_grouped_topk_impl(
-        hidden_states: torch.Tensor,
-        gating_output: torch.Tensor,
-        correction_bias: torch.Tensor,
-        topk: int,
-        renormalize: bool,
-        num_expert_group: int = 0,
-        topk_group: int = 0,
-        n_share_experts_fusion: int = 0,
-        routed_scaling_factor: Optional[float] = None,
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    correction_bias: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    num_expert_group: int = 0,
+    topk_group: int = 0,
+    n_share_experts_fusion: int = 0,
+    routed_scaling_factor: Optional[float] = None,
 ):
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
@@ -203,26 +203,27 @@ def is_power_of_two(n):
 
 
 def biased_grouped_topk(
-        hidden_states: torch.Tensor,
-        gating_output: torch.Tensor,
-        correction_bias: torch.Tensor,
-        topk: int,
-        renormalize: bool,
-        num_expert_group: int = 0,
-        topk_group: int = 0,
-        compiled: bool = True,
-        n_share_experts_fusion: int = 0,
-        routed_scaling_factor: Optional[float] = None,
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    correction_bias: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    num_expert_group: int = 0,
+    topk_group: int = 0,
+    compiled: bool = True,
+    n_share_experts_fusion: int = 0,
+    routed_scaling_factor: Optional[float] = None,
+    num_token_non_padded: Optional[torch.Tensor] = None,
 ):
     assert (
-            routed_scaling_factor is not None
+        routed_scaling_factor is not None
     ), "routed_scaling_factor is required for biased_grouped_topk"
     # TODO: moe_fused_gate kernel is not supported for n_share_experts_fusion > 0 now.
     if (
-            _is_cuda
-            and gating_output.shape[1] // num_expert_group
-            <= 32  # moe_fused_gate kernel ensure that num_experts/num_expert_group does not exceed MAX_VPT=32 now. And when kernel can handle MAX_VPT > 32, we can remove this assertion.
-            and is_power_of_two(correction_bias.shape[0])
+        _is_cuda
+        and gating_output.shape[1] // num_expert_group
+        <= 32  # moe_fused_gate kernel ensure that num_experts/num_expert_group does not exceed MAX_VPT=32 now. And when kernel can handle MAX_VPT > 32, we can remove this assertion.
+        and is_power_of_two(correction_bias.shape[0])
     ):
         return moe_fused_gate(
             gating_output,
@@ -255,18 +256,18 @@ def biased_grouped_topk(
 
 
 def select_experts(
-        hidden_states: torch.Tensor,
-        router_logits: torch.Tensor,
-        top_k: int,
-        use_grouped_topk: bool,
-        renormalize: bool,
-        topk_group: Optional[int] = None,
-        num_expert_group: Optional[int] = None,
-        custom_routing_function: Optional[Callable] = None,
-        correction_bias: Optional[torch.Tensor] = None,
-        torch_native: bool = False,
-        routed_scaling_factor: Optional[float] = None,
-        num_token_non_padded: Optional[torch.Tensor] = None,
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    top_k: int,
+    use_grouped_topk: bool,
+    renormalize: bool,
+    topk_group: Optional[int] = None,
+    num_expert_group: Optional[int] = None,
+    custom_routing_function: Optional[Callable] = None,
+    correction_bias: Optional[torch.Tensor] = None,
+    torch_native: bool = False,
+    routed_scaling_factor: Optional[float] = None,
+    num_token_non_padded: Optional[torch.Tensor] = None,
 ):
     n_share_experts_fusion = global_server_args_dict["n_share_experts_fusion"]
     # DeekSeek V2/V3/R1 serices models uses grouped_top_k
@@ -274,6 +275,7 @@ def select_experts(
         assert topk_group is not None
         assert num_expert_group is not None
         if correction_bias is None:
+            assert num_token_non_padded is None
             topk_weights, topk_ids = grouped_topk(
                 hidden_states=hidden_states,
                 gating_output=router_logits,
@@ -295,8 +297,10 @@ def select_experts(
                 topk_group=topk_group,
                 n_share_experts_fusion=n_share_experts_fusion,
                 routed_scaling_factor=routed_scaling_factor,
+                num_token_non_padded=num_token_non_padded,
             )
     elif torch_native and custom_routing_function is None:
+        assert num_token_non_padded is None
         topk_weights, topk_ids = fused_topk_native(
             hidden_states=hidden_states,
             gating_output=router_logits,
@@ -304,6 +308,7 @@ def select_experts(
             renormalize=renormalize,
         )
     elif custom_routing_function is None:
+        assert num_token_non_padded is None
         topk_weights, topk_ids = fused_topk(
             hidden_states=hidden_states,
             gating_output=router_logits,
@@ -311,6 +316,7 @@ def select_experts(
             renormalize=renormalize,
         )
     else:
+        assert num_token_non_padded is None
         topk_weights, topk_ids = custom_routing_function(
             hidden_states=hidden_states,
             gating_output=router_logits,
