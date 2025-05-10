@@ -1287,7 +1287,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         # Fully Connected
         hidden_states = self.mlp(hidden_states)
 
-        # TODO(ch-wan): ues reduce-scatter in MLP to avoid this scatter
+        # TODO(ch-wan): use reduce-scatter in MLP to avoid this scatter
         # Scatter
         if self.dp_size != 1:
             # important: forward batch.gathered_buffer is used both after scatter and after gather.
@@ -1499,7 +1499,7 @@ class DeepseekV2ForCausalLM(nn.Module):
             else:
                 assert (
                     self.n_share_experts_fusion == self.tp_size
-                ), f"Shared experts fusion optimization is enabled in DeepSeek V3/R1, set it to {self.tp_size} can get best optimized performace."
+                ), f"Shared experts fusion optimization is enabled in DeepSeek V3/R1, set it to {self.tp_size} can get best optimized performance."
         elif self.n_share_experts_fusion == 0:
             if (
                 _is_cuda
@@ -1665,7 +1665,7 @@ class DeepseekV2ForCausalLM(nn.Module):
         if is_nextn:
             if hasattr(self.config, "num_nextn_predict_layers"):
                 num_nextn_layers = self.config.num_nextn_predict_layers
-                assert num_nextn_layers == 1, "Only 1 nextn layer is supportted"
+                assert num_nextn_layers == 1, "Only 1 nextn layer is supported"
                 # compatible with old design
                 nextn_layer_id = (
                     0

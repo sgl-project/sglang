@@ -26,7 +26,7 @@ TOOLS_TAG_LIST = [
     "<tool_call>",
     "<|python_tag|>",
     "[TOOL_CALLS]",
-    "<｜tool▁calls▁begin｜>",
+    "<｜tool▁call▁begin｜>",
 ]
 
 
@@ -87,7 +87,7 @@ class StructureInfo:
 _GetInfoFunc = Callable[[str], StructureInfo]
 """
 helper alias of function
-ususally it is a function that takes a name string and returns a StructureInfo object,
+usually it is a function that takes a name string and returns a StructureInfo object,
 which can be used to construct a structural_tag object
 """
 
@@ -483,15 +483,17 @@ class DeepSeekV3Detector(BaseFormatDetector):
     """
     Detector for DeepSeek models.
     Assumes function call format:
-      '<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_current_weather\n```json\n{"location": "Tokyo"}\n```<｜tool▁call▁end｜>\n<｜tool▁call▁begin｜>function<｜tool▁sep｜>get_current_weather\n```json\n{"location": "Paris"}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜><｜end▁of▁sentence｜>
+      '<｜tool▁call▁begin｜>function.get_current_weather\n```json\n{"location": "Tokyo"}\n```<｜tool▁call▁end｜>\n<｜tool▁call▁begin｜>function.get_current_weather\n```json\n{"location": "Paris"}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>
     """
 
     def __init__(self):
         super().__init__()
-        self.bot_token = "<｜tool▁calls▁begin｜>"
+        self.bot_token = "<｜tool▁call▁begin｜>"
         self.eot_token = "<｜tool▁calls▁end｜>"
         self.func_call_regex = r"<｜tool▁call▁begin｜>.*?<｜tool▁call▁end｜>"
-        self.func_detail_regex = r"<｜tool▁call▁begin｜>(.*)<｜tool▁sep｜>(.*)\n```json\n(.*)\n```<｜tool▁call▁end｜>"
+        self.func_detail_regex = (
+            r"<｜tool▁call▁begin｜>(.*) (.*)\n```json\n(.*)\n```<｜tool▁call▁end｜>"
+        )
         self._last_arguments = ""
 
     def has_tool_call(self, text: str) -> bool:
@@ -561,7 +563,7 @@ class DeepSeekV3Detector(BaseFormatDetector):
         calls: list[ToolCallItem] = []
         try:
             partial_match = re.search(
-                pattern=r"<｜tool▁call▁begin｜>(.*)<｜tool▁sep｜>(.*)\n```json\n(.*)",
+                pattern=r"<｜tool▁call▁begin｜>(.*) (.*)\n```json\n(.*)",
                 string=current_text,
                 flags=re.DOTALL,
             )

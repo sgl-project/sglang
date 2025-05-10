@@ -57,7 +57,7 @@ class RobertaEmbedding(nn.Module):
         input_shape = input_ids.size()
         inputs_embeds = self.word_embeddings(input_ids)
 
-        # adpated from vllm: https://github.com/vllm-project/vllm/commit/4a18fd14ba4a349291c798a16bf62fa8a9af0b6b/vllm/model_executor/models/roberta.py
+        # Adapted from vllm: https://github.com/vllm-project/vllm/commit/4a18fd14ba4a349291c798a16bf62fa8a9af0b6b/vllm/model_executor/models/roberta.py
 
         pos_list = []
         token_list = []

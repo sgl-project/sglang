@@ -13,7 +13,7 @@ from sglang.utils import dump_state_text, read_jsonl
 @sgl.function
 def multi_document_qa(s, docs, question):
     s += sgl.user_begin()
-    s += "Pleaes answer a question according to given documents.\n"
+    s += "Please answer a question according to given documents.\n"
     s += "Question:" + question + "Documents begin.\n"
 
     forks = s.fork(len(docs))

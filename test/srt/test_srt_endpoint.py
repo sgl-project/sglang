@@ -295,7 +295,7 @@ class TestSRTEndpoint(CustomTestCase):
         print(f"{output_top_logprobs=}")
 
         # Parse results
-        # This is becaues the grammar constraint allows all prefix tokens
+        # This is because the grammar constraint allows all prefix tokens
         logprobs = [None] * 2
         for i in range(len(output_top_logprobs)):
             try:

@@ -363,7 +363,7 @@ class MooncakeKVManager(BaseKVManager):
         self.request_status[bootstrap_room] = KVPoll.WaitingForInput
 
     def check_status(self, bootstrap_room: int):
-        # TOOD: do we really need the poll()?
+        # TODO: do we really need the poll()?
 
         return self.request_status[bootstrap_room]
 

@@ -590,7 +590,7 @@ def v1_generate_response(
     echo = False
 
     if (not isinstance(request, list)) and request.echo:
-        # TODO: handle the case propmt is token ids
+        # TODO: handle the case prompt is token ids
         if isinstance(request.prompt, list) and isinstance(request.prompt[0], str):
             # for the case of multiple str prompts
             prompts = request.prompt
@@ -646,7 +646,7 @@ def v1_generate_response(
         finish_reason = ret_item["meta_info"]["finish_reason"]
 
         if to_file:
-            # to make the choise data json serializable
+            # to make the choice data json serializable
             choice_data = {
                 "index": 0,
                 "text": text,

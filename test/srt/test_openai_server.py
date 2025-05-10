@@ -433,7 +433,7 @@ class TestOpenAIServer(CustomTestCase):
                             )
 
     def test_completion_stream(self):
-        # parallel sampling adn list input are not supported in streaming mode
+        # parallel sampling and list input are not supported in streaming mode
         for echo in [False, True]:
             for logprobs in [None, 5]:
                 for use_list_input in [True, False]:

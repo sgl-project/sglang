@@ -370,7 +370,7 @@ def test_dtype_gen():
     @sgl.function
     def dtype_gen(s):
         s += "Q: What is the full name of DNS?\n"
-        s += "A: The full nams is " + sgl.gen("str_res", dtype=str, stop="\n") + "\n"
+        s += "A: The full names is " + sgl.gen("str_res", dtype=str, stop="\n") + "\n"
         s += "Q: Which year was DNS invented?\n"
         s += "A: " + sgl.gen("int_res", dtype=int) + "\n"
         s += "Q: What is the value of pi?\n"

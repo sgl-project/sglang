@@ -116,7 +116,7 @@ def deepep_run_moe_deep_preprocess(topk_ids: torch.Tensor, num_experts: int):
     seg_indptr = torch.empty(num_experts + 1, device=topk_ids.device, dtype=torch.int64)
     src2dst = torch.empty(topk_ids.numel(), device=topk_ids.device, dtype=torch.int64)
 
-    # Find offet
+    # Find offset
     expert_ids = torch.arange(
         num_experts + 1, device=topk_ids.device, dtype=reorder_topk_ids.dtype
     )

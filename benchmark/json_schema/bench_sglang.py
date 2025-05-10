@@ -95,7 +95,7 @@ def bench_schema(args):
     latency = time.time() - tic
 
     # Check if the outputs are valid
-    indexs = []
+    indexes = []
     for i, state in enumerate(states):
         try:
             schema = json.loads(arguments[i]["json_schema"])
@@ -103,7 +103,7 @@ def bench_schema(args):
             assert jsonschema.validate(obj, schema) is None
         except Exception as e:
             print(e)
-            indexs.append(i)
+            indexes.append(i)
 
     return states, latency
 

@@ -52,7 +52,7 @@ docker run -itd --shm-size 32g --gpus all -v <volumes-to-mount> --ipc=host --net
 docker exec -it sglang_dev /bin/zsh
 ```
 Some useful volumes to mount are:
-1. **Huggingface model cache**: mounting model cache can avoid re-download everytime docker restarts. Default location on Linux is `~/.cache/huggingface/`.
+1. **Huggingface model cache**: mounting model cache can avoid re-download every time docker restarts. Default location on Linux is `~/.cache/huggingface/`.
 2. **SGLang repository**: code changes in the SGLang local repository will be automatically synced to the .devcontainer.
 
 Example 1: Monting local cache folder `/opt/dlami/nvme/.cache` but not the SGLang repo. Use this when you prefer to manually transfer local code changes to the devcontainer.
