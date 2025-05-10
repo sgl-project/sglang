@@ -5,7 +5,6 @@ from typing import List, Literal, Union
 import einops
 import polars as pl
 import torch
-
 from sglang.srt.eplb_simulator.configs import (
     MY_MODEL_CONFIG_FOR_EXPERT_LOCATION,
     MyServerArgs,
@@ -69,9 +68,9 @@ def _simulate_scheduled_pack_indices_given_seq_metadata(
                 x
                 for row in df_metadata.iter_rows(named=True)
                 for x in range(
-                    row["pack_input_except_history_start_index"],
-                    row["pack_output_start_index"],
-                )
+                row["pack_input_except_history_start_index"],
+                row["pack_output_start_index"],
+            )
             ]
         )
         num_chunks = math.ceil(len(all_pack_indices) / num_tokens_in_batch_overall)
@@ -96,7 +95,7 @@ def _simulate_scheduled_pack_indices_given_seq_metadata(
             output_start = curr_lens[chosen_location]
 
             pack_indices_of_step[
-                output_start : output_start + len(output_values), chosen_location
+            output_start: output_start + len(output_values), chosen_location
             ] = output_values
             curr_lens[chosen_location] += len(output_values)
 
@@ -173,11 +172,11 @@ def _simulate_expert_location_metadata_arr(
             server_args,
             logical_count=einops.einsum(
                 logical_count_of_batch[
-                    max(
-                        0, batch_index - server_args.eplb_history_num_batch
-                    ) : batch_index,
-                    :,
-                    :,
+                max(
+                    0, batch_index - server_args.eplb_history_num_batch
+                ): batch_index,
+                :,
+                :,
                 ],
                 "num_interest_batches num_layer num_expert -> num_layer num_expert",
             ),
@@ -209,7 +208,7 @@ def _simulate_logical_to_physical_by_random_dispatching(
             )
             for physical_expert_id in all_physical_expert_ids:
                 physical_count_of_whatever[
-                    :, layer_id, physical_expert_id
+                :, layer_id, physical_expert_id
                 ] += logical_count_of_whatever[:, layer_id, logical_expert_id] / len(
                     all_physical_expert_ids
                 )
@@ -228,7 +227,7 @@ def compute_global_physical_count_from_topk_ids(
         topk_ids, "num_tokens num_layers num_topk -> num_layers (num_tokens num_topk)"
     )
     return torch.stack(
-        [torch.bincount(x, minlength=num_physical_expert) for x in topk_ids_flattened]
+        [torch.bincount(x[x != -1], minlength=num_physical_expert) for x in topk_ids_flattened]
     )
 
 
