@@ -1035,16 +1035,18 @@ def v1_chat_generate_request(
                             else {}
                         ),
                     )
-                    tokenized_chat_with_gen = tokenizer_manager.tokenizer.apply_chat_template(
-                        openai_compatible_messages,
-                        tokenize=False,
-                        add_generation_prompt=True,
-                        tools=tools,
-                        **(
-                            request.chat_template_kwargs
-                            if request.chat_template_kwargs
-                            else {}
-                        ),
+                    tokenized_chat_with_gen = (
+                        tokenizer_manager.tokenizer.apply_chat_template(
+                            openai_compatible_messages,
+                            tokenize=False,
+                            add_generation_prompt=True,
+                            tools=tools,
+                            **(
+                                request.chat_template_kwargs
+                                if request.chat_template_kwargs
+                                else {}
+                            ),
+                        )
                     )
                 except:
                     #  This except branch will be triggered when the chosen model
@@ -1062,24 +1064,30 @@ def v1_chat_generate_request(
                             else {}
                         ),
                     )
-                    tokenized_chat_with_gen = tokenizer_manager.tokenizer.apply_chat_template(
-                        openai_compatible_messages,
-                        tokenize=False,
-                        add_generation_prompt=True,
-                        tools=tools,
-                        **(
-                            request.chat_template_kwargs
-                            if request.chat_template_kwargs
-                            else {}
-                        ),
+                    tokenized_chat_with_gen = (
+                        tokenizer_manager.tokenizer.apply_chat_template(
+                            openai_compatible_messages,
+                            tokenize=False,
+                            add_generation_prompt=True,
+                            tools=tools,
+                            **(
+                                request.chat_template_kwargs
+                                if request.chat_template_kwargs
+                                else {}
+                            ),
+                        )
                     )
 
                 if tokenized_chat_with_gen.startswith(tokenized_chat):
-                    gen_assistant_prefix = tokenized_chat_with_gen[len(tokenized_chat):]
+                    gen_assistant_prefix = tokenized_chat_with_gen[
+                        len(tokenized_chat) :
+                    ]
                 else:
                     gen_assistant_prefix = ""
 
-                assistant_prefix = (gen_assistant_prefix or "") + (assistant_prefix or "")
+                assistant_prefix = (gen_assistant_prefix or "") + (
+                    assistant_prefix or ""
+                )
 
                 prompt_str = tokenized_chat + assistant_prefix
                 prompt_ids = tokenizer_manager.tokenizer.encode(prompt_str)
