@@ -74,6 +74,7 @@ from sglang.srt.openai_api.protocol import (
     UsageInfo,
 )
 from sglang.srt.reasoning_parser import ReasoningParser
+from sglang.srt.utils import CustomReqError
 from sglang.utils import convert_json_schema_to_str, get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -96,6 +97,15 @@ file_id_storage: Dict[str, str] = {}
 
 # backend storage directory
 storage_dir = None
+
+
+def pack_error_response(e: ValueError, stream: bool):
+    print(str(e))
+    err_func = create_streaming_error_response if stream else create_error_response
+    if isinstance(e, CustomReqError):
+        if stream:
+            return err_func(message=e.message, status_code=e.code)
+    return err_func(str(e))
 
 
 def create_error_response(
@@ -870,7 +880,7 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
                     )
                     yield f"data: {final_usage_data}\n\n"
             except ValueError as e:
-                error = create_streaming_error_response(str(e))
+                error = pack_error_response(e, stream=True)
                 yield f"data: {error}\n\n"
             yield "data: [DONE]\n\n"
 
@@ -886,7 +896,7 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
             adapted_request, raw_request
         ).__anext__()
     except ValueError as e:
-        return create_error_response(str(e))
+        return pack_error_response(e, stream=False)
 
     if not isinstance(ret, list):
         ret = [ret]
@@ -1716,7 +1726,7 @@ async def v1_chat_completions(
                 )
                 yield f"data: {final_usage_chunk.model_dump_json()}\n\n"
             except ValueError as e:
-                error = create_streaming_error_response(str(e))
+                error = pack_error_response(e, stream=True)
                 yield f"data: {error}\n\n"
             yield "data: [DONE]\n\n"
 
@@ -1732,7 +1742,7 @@ async def v1_chat_completions(
             adapted_request, raw_request
         ).__anext__()
     except ValueError as e:
-        return create_error_response(str(e))
+        return pack_error_response(e, stream=False)
     if not isinstance(ret, list):
         ret = [ret]
 
@@ -1843,7 +1853,7 @@ async def v1_embeddings(tokenizer_manager, raw_request: Request):
             adapted_request, raw_request
         ).__anext__()
     except ValueError as e:
-        return create_error_response(str(e))
+        return pack_error_response(e, stream=False)
 
     if not isinstance(ret, list):
         ret = [ret]
