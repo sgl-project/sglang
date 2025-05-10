@@ -1086,10 +1086,10 @@ def v1_chat_generate_request(
                     gen_assistant_prefix = tokenizer_manager.tokenizer.decode(
                         gen_assistant_prefix_ids, skip_special_tokens=True
                     )
+                else:
+                    gen_assistant_prefix = ""
 
-                assistant_prefix = (gen_assistant_prefix or "") + (
-                    assistant_prefix or ""
-                )
+                assistant_prefix = gen_assistant_prefix + (assistant_prefix or "")
                 assistant_prefix_list.append(assistant_prefix)
                 prompt_ids = tokenized_chat_with_gen
 
