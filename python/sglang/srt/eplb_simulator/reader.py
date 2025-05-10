@@ -1,14 +1,15 @@
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Any
+from typing import Any, List
 
 import einops
 import polars as pl
 import torch
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
+
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
 
 @dataclass
@@ -21,15 +22,21 @@ def read_expert_distribution_mode_detail_per_token_and_bench_serving(dir_data):
     pack_expert_distribution = read_expert_distribution_mode_detail_per_token(dir_data)
     df_bench_serving = read_bench_serving(_single(list(Path(dir_data).glob("*.jsonl"))))
 
-    df = df_bench_serving.join(pack_expert_distribution["df_metadata"], on="rid", how="inner")
+    df = df_bench_serving.join(
+        pack_expert_distribution["df_metadata"], on="rid", how="inner"
+    )
 
     _check_list_is_prefix(df, "history_ids", "input_ids")
     _check_list_is_prefix(df, "input_ids", "all_ids")
 
     df = df.with_columns(
-        input_except_history_ids=pl.col("input_ids").list.slice(pl.col("history_ids").list.len(), None),
-        pack_input_except_history_start_index=pl.col("pack_start_index") + pl.col("history_ids").list.len(),
-        pack_output_start_index=pl.col("pack_start_index") + pl.col("input_ids").list.len(),
+        input_except_history_ids=pl.col("input_ids").list.slice(
+            pl.col("history_ids").list.len(), None
+        ),
+        pack_input_except_history_start_index=pl.col("pack_start_index")
+        + pl.col("history_ids").list.len(),
+        pack_output_start_index=pl.col("pack_start_index")
+        + pl.col("input_ids").list.len(),
     )
 
     df = df.sort("dataset_timestamp")
@@ -42,7 +49,9 @@ def read_expert_distribution_mode_detail_per_token_and_bench_serving(dir_data):
 
 def _check_list_is_prefix(df, col_a, col_b):
     df_violation = df.filter(~_expr_list_is_prefix(col_a, col_b))
-    assert len(df_violation) == 0, f"Expect {col_a} to be prefix of {col_b}. Violation: {df_violation=}"
+    assert (
+        len(df_violation) == 0
+    ), f"Expect {col_a} to be prefix of {col_b}. Violation: {df_violation=}"
 
 
 def _expr_list_is_prefix(col_a, col_b):
@@ -59,11 +68,16 @@ def read_expert_distribution_mode_detail_per_token(dir_data):
         input_ids = record["input_ids"]
         extend_seq_lens = torch.tensor(record["extend_seq_lens"])
         forward_mode = record["forward_mode"]
-        topk_ids = einops.rearrange(record["topk_ids_of_layer"],
-                                    "num_layer num_token top_k -> num_token num_layer top_k")
+        topk_ids = einops.rearrange(
+            record["topk_ids_of_layer"],
+            "num_layer num_token top_k -> num_token num_layer top_k",
+        )
 
-        rids_repeat_num = extend_seq_lens if forward_mode == ForwardMode.EXTEND.value else torch.full(
-            (len(rids_raw),), 1)
+        rids_repeat_num = (
+            extend_seq_lens
+            if forward_mode == ForwardMode.EXTEND.value
+            else torch.full((len(rids_raw),), 1)
+        )
         rids_repeated = torch.repeat_interleave(rids_raw, rids_repeat_num)
 
         # forward_mode_repeated = torch.full((len(input_ids),), forward_mode)
@@ -88,19 +102,25 @@ def read_expert_distribution_mode_detail_per_token(dir_data):
     def _compute_df_metadata(pack):
         rids_raw = pack["rids"]
 
-        pack_start_index = [0] + (1 + torch.argwhere(rids_raw[1:] != rids_raw[:-1])[:, 0]).tolist()
+        pack_start_index = [0] + (
+            1 + torch.argwhere(rids_raw[1:] != rids_raw[:-1])[:, 0]
+        ).tolist()
         pack_end_index = pack_start_index[1:] + [len(rids_raw)]
         all_ids = [
             pack["input_ids"][start_index:end_index]
-            for start_index, end_index in zip(pack_start_index, pack_end_index, strict=True)
+            for start_index, end_index in zip(
+                pack_start_index, pack_end_index, strict=True
+            )
         ]
 
-        df = pl.DataFrame(dict(
-            rid=rids_raw[pack_start_index].tolist(),
-            all_ids=all_ids,
-            pack_start_index=pack_start_index,
-            pack_end_index=pack_end_index,
-        ))
+        df = pl.DataFrame(
+            dict(
+                rid=rids_raw[pack_start_index].tolist(),
+                all_ids=all_ids,
+                pack_start_index=pack_start_index,
+                pack_end_index=pack_end_index,
+            )
+        )
         return {"topk_ids": pack["topk_ids"], "df_metadata": df}
 
     processed_records = []
@@ -121,18 +141,28 @@ def read_bench_serving(path: Path):
     data_raw = json.loads(path.read_text())
     tokenizer = AutoTokenizer.from_pretrained(data_raw["tokenizer_id"])
 
-    df = pl.DataFrame(dict(
-        rid=[_rid_str_to_int64(x["rid"]) for x in data_raw["output_metadata"]],
-        dataset_timestamp=[x["dataset_timestamp"] for x in data_raw["output_metadata"]],
-        input_text=data_raw["prompts"],
-        output_text=data_raw["generated_texts"],
-        history_text=[x["history_text"] for x in data_raw["output_metadata"]],
-    ))
+    df = pl.DataFrame(
+        dict(
+            rid=[_rid_str_to_int64(x["rid"]) for x in data_raw["output_metadata"]],
+            dataset_timestamp=[
+                x["dataset_timestamp"] for x in data_raw["output_metadata"]
+            ],
+            input_text=data_raw["prompts"],
+            output_text=data_raw["generated_texts"],
+            history_text=[x["history_text"] for x in data_raw["output_metadata"]],
+        )
+    )
 
     df = df.with_columns(
-        input_ids=pl.col("input_text").map_elements(tokenizer.encode, return_dtype=pl.List(pl.Int32)),
-        output_ids=pl.col("output_text").map_elements(tokenizer.encode, return_dtype=pl.List(pl.Int32)),
-        history_ids=pl.col("history_text").map_elements(tokenizer.encode, return_dtype=pl.List(pl.Int32)),
+        input_ids=pl.col("input_text").map_elements(
+            tokenizer.encode, return_dtype=pl.List(pl.Int32)
+        ),
+        output_ids=pl.col("output_text").map_elements(
+            tokenizer.encode, return_dtype=pl.List(pl.Int32)
+        ),
+        history_ids=pl.col("history_text").map_elements(
+            tokenizer.encode, return_dtype=pl.List(pl.Int32)
+        ),
         dataset_timestamp=pl.col("dataset_timestamp").str.to_datetime(),
     )
 

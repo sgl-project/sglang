@@ -8,19 +8,19 @@ from typing import Optional
 import einops
 import polars as pl
 import torch
+from tqdm.auto import tqdm
+
 from sglang.srt.managers import deepseek_eplb
 from sglang.srt.managers.expert_location import (
     ExpertLocationMetadata,
     ModelConfigForExpertLocation,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from tqdm.auto import tqdm
 
 _ = compute_utilization_rate, compute_gpu_physical_count
 
 
 # ------------------------------------------- TODO refactor below ---------------------------------------------
-
 
 
 def read_physical_count_of_forward_pass_id_and_rank(dir_data: Path):
@@ -74,8 +74,8 @@ def scan_combinations(
         *[
             MyServerArgs(
                 num_tokens_in_batch_overall=num_tokens_in_batch_per_gpu
-                                            * num_gpu_per_node
-                                            * nnodes,
+                * num_gpu_per_node
+                * nnodes,
                 ep_num_redundant_experts=ep_num_redundant_experts,
                 nnodes=nnodes,
                 tp_size=num_gpu_per_node * nnodes,
@@ -164,7 +164,6 @@ def simulate_batching(
     return torch.stack(
         [torch.stack(tensor_chunk).sum(dim=0) for tensor_chunk in tensor_chunks]
     )
-
 
 
 def compute_num_token(whatever_with_num_layer_and_num_expert: torch.Tensor):
