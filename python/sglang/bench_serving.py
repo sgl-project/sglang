@@ -59,6 +59,7 @@ class RequestFuncInput:
     model: str
     lora_name: str
     extra_request_body: Dict[str, Any]
+    metadata: Optional[Dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass
@@ -1249,6 +1250,7 @@ def wrap_multi_round_request_func(request_func: Callable, tokenizer) -> Callable
                 output_len=request_func_input.output_len,
                 lora_name=request_func_input.lora_name,
                 extra_request_body=request_func_input.extra_request_body,
+                metadata=request_func_input.metadata,
             )
             output = await request_func(
                 inner_input, pbar=pbar if i == len(prompts) - 1 else None
@@ -1399,6 +1401,7 @@ async def benchmark(
             output_len=output_len,
             lora_name=lora_name,
             extra_request_body=extra_request_body,
+            metadata=request.metadata,
         )
         tasks.append(
             asyncio.create_task(
