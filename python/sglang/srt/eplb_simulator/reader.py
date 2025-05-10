@@ -97,10 +97,16 @@ def read_expert_distribution_mode_detail_per_token(dir_data):
         }
 
     def _compute_topk_ids(pack, raw_data_packs):
-        topk_ids = einops.rearrange(
-            record["topk_ids_of_layer"],
-            "num_layer num_token top_k -> num_token num_layer top_k",
-        )
+        topk_ids = torch.empty((TODO,), dtype=torch.int16)
+
+        for raw_data_pack in raw_data_packs:
+            for record in raw_data_pack:
+                topk_ids_of_record = einops.rearrange(
+                    record["topk_ids_of_layer"],
+                    "num_layer num_token top_k -> num_token num_layer top_k",
+                )
+                topk_ids[TODO:TODO, :, :] = topk_ids_of_record.cuda()
+
         return dict(**pack, topk_ids=topk_ids)
 
     def _compute_rid(pack):
