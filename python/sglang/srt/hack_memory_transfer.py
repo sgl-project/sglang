@@ -18,7 +18,7 @@ def _thread_entrypoint():
         _log(f"{tensor_cpu_pinned.nbytes=} {tensor_output.nbytes=} {tensor_output.device=}")
 
         while True:
-            output_tensor.copy_(input_tensor, non_blocking=True)
+            tensor_output.copy_(tensor_cpu_pinned, non_blocking=True)
             TODO
 
 
