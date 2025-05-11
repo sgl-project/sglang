@@ -9,11 +9,18 @@ def run_memory_transfer_experiment():
 
 
 def _thread_entrypoint():
-    tensor_size = 1024 ** 3
-    tensor_cpu_pinned = torch.rand((tensor_size,), dtype=torch.uint8, device="cpu", pin_memory=True)
-    print(f"{tensor_cpu_pinned.nbytes=}")
-
     alt_stream = torch.cuda.Stream()
     with torch.cuda.stream(alt_stream):
+        tensor_size = 1024 ** 3
+        tensor_cpu_pinned = torch.rand((tensor_size,), dtype=torch.uint8, device="cpu", pin_memory=True)
+        tensor_output = torch.empty((tensor_size,), dtype=torch.uint8, device="cuda")
+        print(
+            f"[memory_transfer_experiment] {tensor_cpu_pinned.nbytes=} {tensor_output.nbytes=} {tensor_output.device=}")
+
         while True:
+            output_tensor.copy_(input_tensor, non_blocking=True)
             TODO
+
+
+def _log():
+    TODO
