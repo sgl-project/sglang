@@ -130,9 +130,9 @@ class TestGPTQModelDynamic(CustomTestCase):
     def test_throughput(self):
         max_tokens = 256
 
-        tic = time.time()
+        tic = time.perf_counter()
         result = self.run_decode(max_tokens)
-        tok = time.time()
+        tok = time.perf_counter()
 
         print(f"result = `{result}`")
 
@@ -185,9 +185,9 @@ class TestGPTQModelDynamicWithMarlin(CustomTestCase):
     def test_throughput(self):
         max_tokens = 256
 
-        tic = time.time()
+        tic = time.perf_counter()
         result = self.run_decode(max_tokens)
-        tok = time.time()
+        tok = time.perf_counter()
 
         print(f"result = `{result}`")
 
