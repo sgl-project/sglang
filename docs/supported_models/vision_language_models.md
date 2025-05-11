@@ -2,16 +2,11 @@
 
 These models accept multi-modal inputs (e.g., images and text) and generate text output. They augment language models with visual encoders and require a specific chat template for handling vision prompts.
 
-```{important}
-We need to specify `--chat-template` for VLMs because the chat template provided in HuggingFace tokenizer only supports text. If you do not specify a vision model’s `--chat-template`, the server uses HuggingFace’s default template, which only supports text and the images won’t be passed in.
-```
-
 ## Example launch Command
 
 ```shell
 python3 -m sglang.launch_server \
   --model-path meta-llama/Llama-3.2-11B-Vision-Instruct \  # example HF/local path
-  --chat-template llama_3_vision \                        # required chat template
   --host 0.0.0.0 \
   --port 30000 \
 ```

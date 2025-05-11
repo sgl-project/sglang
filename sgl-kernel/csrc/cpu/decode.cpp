@@ -718,7 +718,7 @@ void decode_attention_kernel_impl(
 
         m_prime = m_i;
 
-        // caculate V' <- s_delta @ V + V' * m_delta
+        // calculate V' <- s_delta @ V + V' * m_delta
         index_gemm_kernel_nn<scalar_t, index_t>(
             /* A   */ s_delta,
             /* B   */ v_buffer + head_id * v_strideH,
@@ -925,7 +925,7 @@ void decode_attention_grouped_kernel_impl(
           m_prime[h] = m_i;
         }
 
-        // caculate V' <- s_delta @ V + V' * m_delta
+        // calculate V' <- s_delta @ V + V' * m_delta
         index_gemm_kernel_nn<scalar_t, index_t>(
             /* A   */ s_delta,
             /* B   */ v_buffer + head_kv_id * v_strideH,
