@@ -287,7 +287,7 @@ jobs:
         timeout-minutes: 10
         run: |
           cd test/srt
-          python3 -m unittest test_disaggregation.TestDisaggregationMooncake.test_gsm8k
+          python3 run_suite.py --suite per-commit-pd
 
   finish:
     if: always()

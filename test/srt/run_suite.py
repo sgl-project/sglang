@@ -87,6 +87,7 @@ suites = {
     ],
     "per-commit-pd": [
         TestFile("test_disaggregation.py", 90),
+        TestFile("test_disaggregation_different_tp.py", 90),
     ],
     "per-commit-2-gpu": [
         TestFile("models/lora/test_lora_tp.py", 116),
