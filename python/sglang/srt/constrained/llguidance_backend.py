@@ -130,12 +130,16 @@ class GuidanceBackend(BaseGrammarBackend):
             return None
 
     def dispatch_json(self, key_string: str) -> Optional[GuidanceGrammar]:
-        serialized_grammar = LLMatcher.grammar_from_json_schema(
-            key_string,
-            defaults={
-                "whitespace_pattern": self.whitespace_pattern,
-            },
-        )
+        try:
+            serialized_grammar = LLMatcher.grammar_from_json_schema(
+                key_string,
+                defaults={
+                    "whitespace_pattern": self.whitespace_pattern,
+                },
+            )
+        except Exception as e:
+            logger.warning(f"Skip invalid grammar: {serialized_grammar}, {e=}")
+            return None
         return self._from_serialized(serialized_grammar)
 
     def dispatch_regex(self, key_string: str) -> Optional[GuidanceGrammar]:
