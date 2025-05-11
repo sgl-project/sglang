@@ -20,7 +20,6 @@ import signal
 import sys
 import threading
 import time
-import warnings
 from collections import defaultdict, deque
 from concurrent import futures
 from dataclasses import dataclass
@@ -121,11 +120,7 @@ from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
-from sglang.srt.model_executor.forward_batch_info import (
-    ForwardBatch,
-    ForwardMode,
-    PPProxyTensors,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -135,6 +130,7 @@ from sglang.srt.utils import (
     broadcast_pyobj,
     configure_logger,
     crash_on_warnings,
+    disable_request_logging,
     get_bool_env_var,
     get_zmq_socket,
     kill_itself_when_parent_died,
@@ -907,19 +903,6 @@ class Scheduler(
                 fake_input_ids = [1] * seq_length
                 recv_req.input_ids = fake_input_ids
 
-            # Handle custom logit processor passed to the request
-            custom_logit_processor = recv_req.custom_logit_processor
-            if (
-                not self.server_args.enable_custom_logit_processor
-                and custom_logit_processor is not None
-            ):
-                logger.warning(
-                    "The SGLang server is not configured to enable custom logit processor."
-                    "The custom logit processor passed in will be ignored."
-                    "Please set --enable-custom-logits-processor to enable this feature."
-                )
-                custom_logit_processor = None
-
             if recv_req.bootstrap_port is None:
                 # Use default bootstrap port
                 recv_req.bootstrap_port = self.server_args.disaggregation_bootstrap_port
@@ -935,7 +918,7 @@ class Scheduler(
                 stream=recv_req.stream,
                 lora_path=recv_req.lora_path,
                 input_embeds=recv_req.input_embeds,
-                custom_logit_processor=custom_logit_processor,
+                custom_logit_processor=recv_req.custom_logit_processor,
                 return_hidden_states=recv_req.return_hidden_states,
                 eos_token_ids=self.model_config.hf_eos_token_id,
                 bootstrap_host=recv_req.bootstrap_host,
@@ -1246,9 +1229,7 @@ class Scheduler(
                 f"{self.token_to_kv_pool_allocator.available_size()=}\n"
                 f"{self.tree_cache.evictable_size()=}\n"
             )
-            warnings.warn(msg)
-            if crash_on_warnings():
-                raise ValueError(msg)
+            raise ValueError(msg)
 
         if len(self.req_to_token_pool.free_slots) != self.req_to_token_pool.size:
             msg = (
@@ -1256,9 +1237,7 @@ class Scheduler(
                 f"available_size={len(self.req_to_token_pool.free_slots)}, "
                 f"total_size={self.req_to_token_pool.size}\n"
             )
-            warnings.warn(msg)
-            if crash_on_warnings():
-                raise ValueError(msg)
+            raise ValueError(msg)
 
         if (
             self.enable_metrics
@@ -1774,24 +1753,27 @@ class Scheduler(
             if self.cur_batch is not None:
                 if self.watchdog_last_forward_ct == self.forward_ct:
                     if current > self.watchdog_last_time + self.watchdog_timeout:
-                        logger.error(f"Watchdog timeout ({self.watchdog_timeout=})")
                         break
                 else:
                     self.watchdog_last_forward_ct = self.forward_ct
                     self.watchdog_last_time = current
             time.sleep(self.watchdog_timeout // 2)
 
-        # Print batch size and memory pool info to check whether there are de-sync issues.
-        logger.error(
-            f"{self.cur_batch.batch_size()=}, "
-            f"{self.cur_batch.reqs=}, "
-            f"{self.token_to_kv_pool_allocator.available_size()=}, "
-            f"{self.tree_cache.evictable_size()=}, "
-        )
-        # Wait for some time so that the parent process can print the error.
+        if not disable_request_logging():
+            # Print batch size and memory pool info to check whether there are de-sync issues.
+            logger.error(
+                f"{self.cur_batch.batch_size()=}, "
+                f"{self.cur_batch.reqs=}, "
+                f"{self.token_to_kv_pool_allocator.available_size()=}, "
+                f"{self.tree_cache.evictable_size()=}, "
+            )
+
         pyspy_dump_schedulers()
+        logger.error(f"Watchdog timeout ({self.watchdog_timeout=})")
         print(file=sys.stderr, flush=True)
         print(file=sys.stdout, flush=True)
+
+        # Wait for some time so that the parent process can print the error.
         time.sleep(5)
         self.parent_process.send_signal(signal.SIGQUIT)
 
@@ -1923,25 +1905,30 @@ class Scheduler(
         )
 
     def abort_request(self, recv_req: AbortReq):
+        # TODO(lmzheng): abort the requests in the grammar queue.
+
         # Delete requests in the waiting queue
         to_del = []
         for i, req in enumerate(self.waiting_queue):
             if req.rid.startswith(recv_req.rid):
                 to_del.append(i)
-                break
 
         # Sort in reverse order to avoid index issues when deleting
-        for i in sorted(to_del, reverse=True):
+        for i in reversed(to_del):
             req = self.waiting_queue.pop(i)
+            self.send_to_tokenizer.send_pyobj(AbortReq(req.rid))
             logger.debug(f"Abort queued request. {req.rid=}")
-            return
 
         # Delete requests in the running batch
-        for req in self.running_batch.reqs:
+        if self.cur_batch is self.running_batch or self.cur_batch is None:
+            reqs = self.running_batch.reqs
+        else:
+            reqs = self.running_batch.reqs + self.cur_batch.reqs
+
+        for req in reqs:
             if req.rid.startswith(recv_req.rid) and not req.finished():
                 logger.debug(f"Abort running request. {req.rid=}")
                 req.to_abort = True
-                return
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()
