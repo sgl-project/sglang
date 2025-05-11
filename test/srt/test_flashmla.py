@@ -3,7 +3,6 @@ Usage:
 python3 test/srt/test_flashmla.py
 """
 
-import os
 import unittest
 from types import SimpleNamespace
 
