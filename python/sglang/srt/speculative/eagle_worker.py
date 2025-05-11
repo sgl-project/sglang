@@ -201,7 +201,7 @@ class EAGLEWorker(TpModelWorker):
             self.has_prefill_wrapper_verify = False
         else:
             raise ValueError(
-                f"EAGLE is not supportted in attention backend {self.server_args.attention_backend}"
+                f"EAGLE is not supported in attention backend {self.server_args.attention_backend}"
             )
 
         self.draft_model_runner.draft_attn_backend = self.draft_attn_backend
@@ -597,7 +597,7 @@ class EAGLEWorker(TpModelWorker):
         self.capture_for_decode(logits_output, forward_batch.spec_info)
 
     def forward_draft_extend_after_decode(self, batch: ScheduleBatch):
-        # Backup fileds that will be modified in-place
+        # Backup fields that will be modified in-place
         seq_lens_backup = batch.seq_lens.clone()
         req_pool_indices_backup = batch.req_pool_indices
         accept_length_backup = batch.spec_info.accept_length
