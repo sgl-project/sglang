@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+from transformers import PretrainedConfig
 
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.utils import is_cuda
