@@ -114,7 +114,7 @@ set(SGL_KERNEL_CUDA_FLAGS
     "--expt-extended-lambda"
     "--threads=32"
 
-    # Supress warnings
+    # Suppress warnings
     "-Xcompiler=-Wconversion"
     "-Xcompiler=-fno-strict-aliasing"
 

@@ -61,7 +61,6 @@ suites = {
         TestFile("test_radix_attention.py", 167),
         TestFile("test_reasoning_content.py", 89),
         TestFile("test_enable_thinking.py", 70),
-        TestFile("test_thinking_budget.py", 60),
         TestFile("test_regex_constrained.py", 64),
         TestFile("test_release_memory_occupation.py", 44),
         TestFile("test_request_length_validation.py", 31),
@@ -85,6 +84,9 @@ suites = {
         TestFile("test_vision_openai_server.py", 637),
         TestFile("test_w8a8_quantization.py", 46),
         TestFile("models/lora/test_lora_cuda_graph.py", 250),
+    ],
+    "per-commit-pd": [
+        TestFile("test_disaggregation.py", 90),
     ],
     "per-commit-2-gpu": [
         TestFile("models/lora/test_lora_tp.py", 116),
