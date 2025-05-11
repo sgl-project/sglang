@@ -1475,7 +1475,7 @@ class DeepseekV2ForCausalLM(nn.Module):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=global_server_args_dict["enable_dp_attention"],
+            use_attn_tp_group=global_server_args_dict["enable_dp_lm_head"],
         )
         self.logits_processor = LogitsProcessor(config)
         self.dp_size = get_attention_dp_size()
