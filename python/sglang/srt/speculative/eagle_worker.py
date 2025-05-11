@@ -620,7 +620,7 @@ class EAGLEWorker(TpModelWorker):
         )
 
         # Run
-        logits_output = self.draft_model_runner.forward(forward_batch)
+        logits_output, _ = self.draft_model_runner.forward(forward_batch)
 
         self._detect_nan_if_needed(logits_output)
         self.capture_for_decode(logits_output, forward_batch.spec_info)
