@@ -23,4 +23,5 @@ def _thread_entrypoint():
 
 
 def _log(msg):
-    print(f"[memory_transfer_experiment, {datetime.now().isoformat()}] {msg}")
+    print(
+        f"[memory_transfer_experiment, time={datetime.now().isoformat()}, device={torch.cuda.current_device()}] {msg}")
