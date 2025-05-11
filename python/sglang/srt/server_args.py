@@ -825,7 +825,7 @@ class ServerArgs:
         # Multi-node distributed serving
         parser.add_argument(
             "--dist-init-addr",
-            "--nccl-init-addr",  # For backward compatbility. This will be removed in the future.
+            "--nccl-init-addr",  # For backward compatibility. This will be removed in the future.
             type=str,
             help="The host address for initializing distributed backend (e.g., `192.168.0.2:25000`).",
         )
@@ -1096,7 +1096,7 @@ class ServerArgs:
         parser.add_argument(
             "--triton-attention-reduce-in-fp32",
             action="store_true",
-            help="Cast the intermidiate attention results to fp32 to avoid possible crashes related to fp16."
+            help="Cast the intermediate attention results to fp32 to avoid possible crashes related to fp16."
             "This only affects Triton attention kernels.",
         )
         parser.add_argument(
@@ -1188,7 +1188,7 @@ class ServerArgs:
             type=int,
             default=0,
             help="The number of shared_experts need to be replicated to fuse with normal experts in deepseek v3/r1, "
-            "set it to tp_size can get best optimized performace.",
+            "set it to tp_size can get best optimized performance.",
         )
         parser.add_argument(
             "--disable-chunked-prefix-cache",

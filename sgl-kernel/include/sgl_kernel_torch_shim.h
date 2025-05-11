@@ -20,16 +20,16 @@ limitations under the License.
 #include <torch/library.h>
 
 /**
- * Unforunately, the type signatures of the flash_attn ops are not compatible
+ * Unfortunately, the type signatures of the flash_attn ops are not compatible
  * with the PyTorch library bindings. To get around that we use
- * `make_pytorch_shim` which creates a lambda that exponses the API using
+ * `make_pytorch_shim` which creates a lambda that exposes the API using
  * PyTorch compatible types to the types, then converts them to the types
  * expected by the flash_attn ops. This shims allows us to make minimal changes
  * to `flash_api.cpp` making it easier to synchronize with upstream changes.
  *
  * The `pytorch_library_compatible_type` struct is used to map from the
  * flash_attn ops types to a PyTorch library compatible one. The main issues is
- * that the following types are not support by PyTorch libary bindings:
+ * that the following types are not support by PyTorch library bindings:
  *  - `int`
  *  - `float`
  *  - `std::optional<T> &`
