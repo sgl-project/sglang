@@ -582,12 +582,9 @@ class SRTRunner:
                 return ModelOutput(embed_logits=logits)
             # cross encoder model
             elif self.model_type == "cross_encoder":
-                print("cross encoder model")
-                print(prompts)
                 response = self.engine.rerank(prompts)
                 if not isinstance(response, list):
                     response = [response]
-                print(response)
                 scores = [x["embedding"] for x in response]
                 return ModelOutput(scores=scores)
             # reward model
