@@ -18,7 +18,7 @@ def _thread_entrypoint():
         tensor_size = 1024 ** 3
         tensor_cpu_pinned = torch.rand((tensor_size,), dtype=torch.uint8, device="cpu", pin_memory=True)
         tensor_output = torch.empty((tensor_size,), dtype=torch.uint8, device="cuda")
-        _log(f"{tensor_cpu_pinned.nbytes=} {tensor_output.nbytes=} {tensor_output.device=}")
+        _log(f"startup {tensor_cpu_pinned.nbytes=} {tensor_output.nbytes=} {tensor_output.device=}")
 
         while True:
             torch.cuda.synchronize()
