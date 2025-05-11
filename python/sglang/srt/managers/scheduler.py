@@ -1691,7 +1691,7 @@ class Scheduler(
             local_batch = get_idle_batch()
 
         if local_batch is not None:
-            if moe_dense_tp_size == 1:
+            if moe_dense_tp_size == 1 and global_server_args_dict["enable_dp_lm_head"]:
                 local_batch.global_num_tokens = [num_tokens]
                 local_batch.global_num_tokens_for_logprob = [num_tokens_for_logprob]
             else:
