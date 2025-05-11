@@ -187,6 +187,7 @@ class ServerArgs:
     n_share_experts_fusion: int = 0
     disable_chunked_prefix_cache: bool = False
     disable_fast_image_processor: bool = False
+    mm_attention_backend: Optional[str] = None
 
     # Debug tensor dumps
     debug_tensor_dump_output_folder: Optional[str] = None
@@ -323,6 +324,9 @@ class ServerArgs:
                 assert (
                     not self.enable_dp_attention
                 ), "DeepEP MoE `auto` mode is not supported with DP Attention."
+            if self.deepep_mode == "normal":
+                logger.warning("Cuda graph is disabled because deepep_mode=`normal`")
+                self.disable_cuda_graph = True
             self.ep_size = self.tp_size
             self.enable_sp_layernorm = (
                 self.dp_size < self.tp_size if self.enable_dp_attention else True
@@ -821,7 +825,7 @@ class ServerArgs:
         # Multi-node distributed serving
         parser.add_argument(
             "--dist-init-addr",
-            "--nccl-init-addr",  # For backward compatbility. This will be removed in the future.
+            "--nccl-init-addr",  # For backward compatibility. This will be removed in the future.
             type=str,
             help="The host address for initializing distributed backend (e.g., `192.168.0.2:25000`).",
         )
@@ -1092,7 +1096,7 @@ class ServerArgs:
         parser.add_argument(
             "--triton-attention-reduce-in-fp32",
             action="store_true",
-            help="Cast the intermidiate attention results to fp32 to avoid possible crashes related to fp16."
+            help="Cast the intermediate attention results to fp32 to avoid possible crashes related to fp16."
             "This only affects Triton attention kernels.",
         )
         parser.add_argument(
@@ -1184,7 +1188,7 @@ class ServerArgs:
             type=int,
             default=0,
             help="The number of shared_experts need to be replicated to fuse with normal experts in deepseek v3/r1, "
-            "set it to tp_size can get best optimized performace.",
+            "set it to tp_size can get best optimized performance.",
         )
         parser.add_argument(
             "--disable-chunked-prefix-cache",
@@ -1260,6 +1264,14 @@ class ServerArgs:
             type=str,
             default=None,
             help="The URL of the PD disaggregation load balancer. If set, the prefill/decode server will register with the load balancer.",
+        )
+
+        parser.add_argument(
+            "--mm-attention-backend",
+            type=str,
+            choices=["sdpa", "fa3", "triton_attn"],
+            default=ServerArgs.mm_attention_backend,
+            help="Set multimodal attention backend.",
         )
 
     @classmethod
