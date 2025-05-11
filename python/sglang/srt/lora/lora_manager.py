@@ -100,7 +100,7 @@ class LoRAManager:
             self.configs[name] = LoRAConfig(path)
             self.hf_target_names.update(self.configs[name].target_modules)
 
-        # Target lora weight names for lora_a and lora_b modules repectively.
+        # Target lora weight names for lora_a and lora_b modules respectively.
         # e.g., {("qkv_proj", "q_proj"), ("qkv_proj", "kv_proj")}
         self.lora_weight_names: Set[Tuple[str]] = set(
             [get_stacked_name(module) for module in self.hf_target_names]
