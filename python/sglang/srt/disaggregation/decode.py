@@ -21,6 +21,7 @@ Life cycle of a request in the decode server
 from __future__ import annotations
 
 import logging
+import os
 from collections import deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional, Tuple
@@ -97,7 +98,9 @@ class DecodePreallocQueue:
         self.tp_size = tp_size
         self.bootstrap_port = bootstrap_port
 
-        self.num_reserved_decode_tokens = 512
+        self.num_reserved_decode_tokens = int(
+            os.environ.get("SGLANG_NUM_RESERVED_DECODE_TOKENS", "512")
+        )
 
         # Queue for requests pending pre-allocation
         self.queue: List[DecodeRequest] = []
@@ -506,7 +509,7 @@ class SchedulerDisaggregationDecodeMixin:
     def event_loop_overlap_disagg_decode(self: Scheduler):
         result_queue = deque()
         self.last_batch: Optional[ScheduleBatch] = None
-        self.last_batch_in_queue = False  # last batch is modifed in-place, so we need another variable to track if it's extend
+        self.last_batch_in_queue = False  # last batch is modified in-place, so we need another variable to track if it's extend
 
         while True:
             recv_reqs = self.recv_requests()

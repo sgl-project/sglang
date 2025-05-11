@@ -604,6 +604,21 @@ class TestMinicpmvServer(TestOpenAIVisionServer):
         cls.base_url += "/v1"
 
 
+class TestInternVL2_5Server(TestOpenAIVisionServer):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "OpenGVLab/InternVL2_5-2B"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=["--trust-remote-code"],
+        )
+        cls.base_url += "/v1"
+
+
 class TestMinicpmoServer(TestOpenAIVisionServer):
     @classmethod
     def setUpClass(cls):
@@ -661,8 +676,6 @@ class TestDeepseekVL2TinyServer(TestOpenAIVisionServer):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--trust-remote-code",
-                "--chat-template",
-                "deepseek-vl2",
                 "--context-length",
                 "4096",
             ],
@@ -760,8 +773,6 @@ class TestKimiVLServer(TestOpenAIVisionServer):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--trust-remote-code",
-                "--chat-template",
-                "kimi-vl",
                 "--context-length",
                 "4096",
                 "--dtype",

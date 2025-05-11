@@ -56,11 +56,14 @@ class TpModelWorkerClient:
         server_args: ServerArgs,
         gpu_id: int,
         tp_rank: int,
+        pp_rank: int,
         dp_rank: Optional[int],
         nccl_port: int,
     ):
         # Load the model
-        self.worker = TpModelWorker(server_args, gpu_id, tp_rank, dp_rank, nccl_port)
+        self.worker = TpModelWorker(
+            server_args, gpu_id, tp_rank, pp_rank, dp_rank, nccl_port
+        )
         self.max_running_requests = self.worker.max_running_requests
         self.device = self.worker.device
         self.gpu_id = gpu_id
@@ -91,8 +94,11 @@ class TpModelWorkerClient:
     def get_pad_input_ids_func(self):
         return self.worker.get_pad_input_ids_func()
 
-    def get_tp_cpu_group(self):
-        return self.worker.get_tp_cpu_group()
+    def get_tp_group(self):
+        return self.worker.get_tp_group()
+
+    def get_attention_tp_group(self):
+        return self.worker.get_attention_tp_group()
 
     def get_attention_tp_cpu_group(self):
         return self.worker.get_attention_tp_cpu_group()

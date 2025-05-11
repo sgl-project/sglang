@@ -28,6 +28,11 @@ if is_cuda():
         if get_bool_env_var("SGL_ENABLE_JIT_DEEPGEMM", default="true"):
             _ENABLE_JIT_DEEPGEMM = True
 
+
+def get_enable_jit_deepgemm():
+    return _ENABLE_JIT_DEEPGEMM
+
+
 logger = logging.getLogger(__name__)
 
 _BUILTIN_M_LIST = range(1, 1024 * 16 + 1)
@@ -107,10 +112,10 @@ def _compile_warning_1():
     if not _HAS_WARN_1 and not _IN_PRECOMPILE_STAGE and _IS_FIRST_RANK_ON_NODE:
         _HAS_WARN_1 = True
         logger.warning(
-            "Entering DeepGEMM JIT Pre-Complie session. "
+            "Entering DeepGEMM JIT Pre-Compile session. "
             "And it may takes a long time(Typically 10-20 mins) "
             "if you have not run `sglang.compile_deep_gemm`. "
-            "Recommand to run `sglang.compile_deep_gemm` with same args as `sglang.launch_server`"
+            "It is recommended to run `sglang.compile_deep_gemm` with same args as `sglang.launch_server`"
             " for pre-compilation to reduce the overhead if you have not run it before. "
             "For example: "
             "`python3 -m sglang.compile_deep_gemm --model deepseek-ai/DeepSeek-V3 --tp 8 --trust-remote-code`"
@@ -119,7 +124,7 @@ def _compile_warning_1():
 
 def _compile_warning_2():
     logger.warning(
-        "Entering DeepGEMM JIT Single Kernel Complie session. "
+        "Entering DeepGEMM JIT Single Kernel Compile session. "
         "And it will makes inference throughput becomes flaky. "
         "Please run `sglang.compile_deep_gemm` with same args as `sglang.launch_server`"
         " for pre-compilation to solve this issue. "
