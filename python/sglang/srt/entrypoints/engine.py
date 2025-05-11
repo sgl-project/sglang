@@ -300,7 +300,7 @@ class Engine(EngineBase):
         obj = EmbeddingReqInput(text=prompt, image_data=image_data)
         generator = self.tokenizer_manager.generate_request(obj, None)
         return await generator.__anext__()
-    
+
     def rerank(
         self,
         prompt: Union[List[List[str]]],
