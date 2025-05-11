@@ -197,7 +197,7 @@ class TpModelWorker:
             )
 
         if self.pp_group.is_last_rank:
-            logits_output, cuda_graph_used = self.model_runner.forward(
+            logits_output, can_run_cuda_graph = self.model_runner.forward(
                 forward_batch, pp_proxy_tensors=pp_proxy_tensors
             )
             if model_worker_batch.launch_done is not None:
@@ -210,13 +210,13 @@ class TpModelWorker:
                     logits_output, model_worker_batch
                 )
 
-            return logits_output, next_token_ids, cuda_graph_used
+            return logits_output, next_token_ids, can_run_cuda_graph
         else:
-            pp_proxy_tensors = self.model_runner.forward(
+            pp_proxy_tensors, can_run_cuda_graph = self.model_runner.forward(
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
-            return pp_proxy_tensors.tensors, None, cuda_graph_used
+            return pp_proxy_tensors.tensors, None, can_run_cuda_graph
 
     def forward_batch_embedding(self, model_worker_batch: ModelWorkerBatch):
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
