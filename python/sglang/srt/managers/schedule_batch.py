@@ -534,6 +534,7 @@ class Req:
 
         # Constrained decoding
         self.grammar: Optional[BaseGrammarObject] = None
+        self.grammar_wait_ct = 0
 
         # The number of cached tokens that were already cached in the KV cache
         self.cached_tokens = 0
