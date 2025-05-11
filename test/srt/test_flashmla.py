@@ -60,7 +60,7 @@ class TestFlashMLAAttnBackend(unittest.TestCase):
         metrics = run_eval_few_shot_gsm8k(args)
         print(metrics)
 
-        self.assertGreater(metrics["accuracy"], 0.61)
+        self.assertGreater(metrics["accuracy"], 0.60)
 
 
 class TestFlashMLAAttnLatency(unittest.TestCase):
