@@ -1359,7 +1359,7 @@ def v1_chat_generate_response(
                     "object": "chat.completion",
                     "created": created,
                     "model": request[i].model,
-                    "choices": choice,
+                    "choices": [choice],
                     "usage": {
                         "prompt_tokens": ret[i]["meta_info"]["prompt_tokens"],
                         "completion_tokens": ret[i]["meta_info"]["completion_tokens"],
