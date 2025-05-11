@@ -28,6 +28,8 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather,
+    dp_gather_replicate,
+    dp_scatter,
     get_attention_dp_size,
     get_attention_tp_size,
     get_local_attention_dp_rank,
@@ -198,7 +200,7 @@ class LogitsProcessor(nn.Module):
         super().__init__()
         self.config = config
         self.logit_scale = logit_scale
-        self.use_attn_tp_group = global_server_args_dict["use_attn_tp_group"]
+        self.use_attn_tp_group = global_server_args_dict["enable_dp_lm_head"]
         if self.use_attn_tp_group:
             self.attn_tp_size = get_attention_tp_size()
             self.do_tensor_parallel_all_gather = (
@@ -430,20 +432,21 @@ class LogitsProcessor(nn.Module):
         last position (e.g., extend without input logprobs). The caller should
         guarantee the given hidden_states follow this constraint.
         """
+        if self.use_attn_tp_group:
+            if hasattr(lm_head, "weight"):
+                logits = torch.matmul(
+                    hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
+                )
+            else:
+                # GGUF models
+                logits = lm_head.quant_method.apply(
+                    lm_head, hidden_states, embedding_bias
+                )
 
-        if hasattr(lm_head, "weight"):
-            logits = torch.matmul(
-                hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
-            )
-        else:
-            # GGUF models
-            logits = lm_head.quant_method.apply(lm_head, hidden_states, embedding_bias)
+            if self.logit_scale is not None:
+                logits.mul_(self.logit_scale)
 
-        if self.logit_scale is not None:
-            logits.mul_(self.logit_scale)
-
-        if self.do_tensor_parallel_all_gather:
-            if self.use_attn_tp_group:
+            if self.do_tensor_parallel_all_gather:
                 global_logits = torch.empty(
                     (self.config.vocab_size, logits.shape[0]),
                     device=logits.device,
@@ -454,8 +457,41 @@ class LogitsProcessor(nn.Module):
                     list(global_logits.tensor_split(self.attn_tp_size, dim=-1)), logits
                 )
                 logits = global_logits
+        else:
+            if self.do_tensor_parallel_all_gather_dp_attn:
+                logits_metadata.compute_dp_attention_metadata(hidden_states)
+                hidden_states, local_hidden_states = (
+                    logits_metadata.gathered_buffer,
+                    hidden_states.clone(),
+                )
+                dp_gather_replicate(hidden_states, local_hidden_states, logits_metadata)
+
+            if hasattr(lm_head, "weight"):
+                logits = torch.matmul(
+                    hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
+                )
             else:
+                # GGUF models
+                logits = lm_head.quant_method.apply(
+                    lm_head, hidden_states, embedding_bias
+                )
+
+            if self.logit_scale is not None:
+                logits.mul_(self.logit_scale)
+
+            if self.do_tensor_parallel_all_gather:
                 logits = tensor_model_parallel_all_gather(logits)
+
+            if self.do_tensor_parallel_all_gather_dp_attn:
+                logits, global_logits = (
+                    torch.empty(
+                        (local_hidden_states.shape[0], logits.shape[1]),
+                        device=logits.device,
+                        dtype=logits.dtype,
+                    ),
+                    logits,
+                )
+                dp_scatter(logits, global_logits, logits_metadata)
 
         logits = logits[:, : self.config.vocab_size].float()
 
