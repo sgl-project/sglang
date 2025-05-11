@@ -3,7 +3,7 @@
 SGLang provides robust support for embedding models by integrating efficient serving mechanisms with its flexible programming interface. This integration allows for streamlined handling of embedding tasks, facilitating faster and more accurate retrieval and semantic search operations. SGLang's architecture enables better resource utilization and reduced latency in embedding model deployment.
 
 ```{important}
-They are executed with `--is-embedding` and some may require `--trust-remote-code` and/or `--chat-template`
+They are executed with `--is-embedding` and some may require `--trust-remote-code`
 ```
 
 ## Example Launch Command

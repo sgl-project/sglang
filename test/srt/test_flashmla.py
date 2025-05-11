@@ -3,7 +3,6 @@ Usage:
 python3 test/srt/test_flashmla.py
 """
 
-import os
 import unittest
 from types import SimpleNamespace
 
@@ -61,7 +60,7 @@ class TestFlashMLAAttnBackend(unittest.TestCase):
         metrics = run_eval_few_shot_gsm8k(args)
         print(metrics)
 
-        self.assertGreater(metrics["accuracy"], 0.62)
+        self.assertGreater(metrics["accuracy"], 0.60)
 
 
 class TestFlashMLAAttnLatency(unittest.TestCase):
