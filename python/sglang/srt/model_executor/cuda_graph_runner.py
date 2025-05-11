@@ -19,7 +19,7 @@ import bisect
 import inspect
 import os
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Callable, Optional, Union
 
 import torch
 import tqdm

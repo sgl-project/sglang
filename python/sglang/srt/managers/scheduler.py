@@ -160,6 +160,7 @@ class GenerationBatchResult:
     extend_input_len_per_req: List[int]
     extend_logprob_start_len_per_req: List[int]
     bid: int
+    can_run_cuda_graph: bool
 
 
 @dataclass
@@ -1159,7 +1160,9 @@ class Scheduler(
 
             self.metrics_collector.log_stats(self.stats)
 
-    def log_decode_stats(self, running_batch=None):
+    def log_decode_stats(
+        self, can_run_cuda_graph: bool, running_batch: ScheduleBatch = None
+    ):
         batch = running_batch or self.running_batch
 
         gap_latency = time.time() - self.last_decode_stats_tic
@@ -1199,6 +1202,7 @@ class Scheduler(
             msg += f"pre-allocated usage: {self.num_tokens_pre_allocated / self.max_total_num_tokens:.2f}, "
 
         msg += (
+            f"cuda graph: {can_run_cuda_graph}, "
             f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
             f"#queue-req: {len(self.waiting_queue)}"
         )
@@ -1524,11 +1528,11 @@ class Scheduler(
             if self.spec_algorithm.is_none():
                 model_worker_batch = batch.get_model_worker_batch()
                 if self.pp_group.is_last_rank:
-                    logits_output, next_token_ids = (
+                    logits_output, next_token_ids, can_run_cuda_graph = (
                         self.tp_worker.forward_batch_generation(model_worker_batch)
                     )
                 else:
-                    pp_hidden_states_proxy_tensors, _ = (
+                    pp_hidden_states_proxy_tensors, can_run_cuda_graph = (
                         self.tp_worker.forward_batch_generation(model_worker_batch)
                     )
                 bid = model_worker_batch.bid
@@ -1538,6 +1542,7 @@ class Scheduler(
                     next_token_ids,
                     bid,
                     num_accepted_tokens,
+                    can_run_cuda_graph,
                 ) = self.draft_worker.forward_batch_speculative_generation(batch)
                 self.spec_num_total_accepted_tokens += (
                     num_accepted_tokens + batch.batch_size()
@@ -1571,6 +1576,7 @@ class Scheduler(
                 extend_input_len_per_req=extend_input_len_per_req,
                 extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
                 bid=bid,
+                can_run_cuda_graph=can_run_cuda_graph,
             )
         else:  # embedding or reward model
             model_worker_batch = batch.get_model_worker_batch()

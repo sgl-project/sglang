@@ -14,13 +14,12 @@
 """A tensor parallel worker."""
 
 import logging
-import threading
 from typing import Optional, Tuple, Union
 
 import torch
 
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.distributed import get_pp_group, get_tp_group, get_world_group
+from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -184,7 +183,9 @@ class TpModelWorker:
         self,
         model_worker_batch: ModelWorkerBatch,
         skip_sample: bool = False,
-    ) -> Tuple[Union[LogitsProcessorOutput, torch.Tensor], Optional[torch.Tensor]]:
+    ) -> Tuple[
+        Union[LogitsProcessorOutput, torch.Tensor], Optional[torch.Tensor], bool
+    ]:
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
 
         pp_proxy_tensors = None
@@ -196,7 +197,7 @@ class TpModelWorker:
             )
 
         if self.pp_group.is_last_rank:
-            logits_output = self.model_runner.forward(
+            logits_output, cuda_graph_used = self.model_runner.forward(
                 forward_batch, pp_proxy_tensors=pp_proxy_tensors
             )
             if model_worker_batch.launch_done is not None:
@@ -209,17 +210,17 @@ class TpModelWorker:
                     logits_output, model_worker_batch
                 )
 
-            return logits_output, next_token_ids
+            return logits_output, next_token_ids, cuda_graph_used
         else:
             pp_proxy_tensors = self.model_runner.forward(
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
-            return pp_proxy_tensors.tensors, None
+            return pp_proxy_tensors.tensors, None, cuda_graph_used
 
     def forward_batch_embedding(self, model_worker_batch: ModelWorkerBatch):
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
-        logits_output = self.model_runner.forward(forward_batch)
+        logits_output, _ = self.model_runner.forward(forward_batch)
         embeddings = logits_output.embeddings
         return embeddings
 
