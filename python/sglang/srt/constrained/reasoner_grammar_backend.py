@@ -87,5 +87,4 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
         ret = self.grammar_backend._init_value_dispatch(key)
         if ret is None:
             return None
-        print(f"hehe! {self.think_end_id=}")
         return ReasonerGrammarObject(ret, self.think_end_id)

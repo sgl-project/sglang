@@ -185,7 +185,6 @@ def create_grammar_backend(
         raise ValueError(f"Invalid grammar backend: {server_args.grammar_backend}")
 
     if server_args.reasoning_parser and hasattr(tokenizer, "think_end_id"):
-        print(f"{tokenizer.think_end_id=}")
         from sglang.srt.constrained.reasoner_grammar_backend import (
             ReasonerGrammarBackend,
         )
