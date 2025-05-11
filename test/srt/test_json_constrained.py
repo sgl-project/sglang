@@ -82,7 +82,7 @@ class TestJSONConstrainedOutlinesBackend(CustomTestCase):
         print(json.dumps(ret))
         print("=" * 100)
 
-        if not json_schema:
+        if not json_schema or json_schema == "INVALID":
             return
 
         # Make sure the json output is valid
@@ -97,6 +97,9 @@ class TestJSONConstrainedOutlinesBackend(CustomTestCase):
     def test_json_generate(self):
         self.run_decode(json_schema=self.json_schema)
 
+    def test_json_invalid(self):
+        self.run_decode(json_schema="INVALID")
+
     def test_json_openai(self):
         client = openai.Client(api_key="EMPTY", base_url=f"{self.base_url}/v1")
 
@@ -104,7 +107,10 @@ class TestJSONConstrainedOutlinesBackend(CustomTestCase):
             model=self.model,
             messages=[
                 {"role": "system", "content": "You are a helpful AI assistant"},
-                {"role": "user", "content": "Introduce the capital of France."},
+                {
+                    "role": "user",
+                    "content": "Introduce the capital of France. Return in a JSON format.",
+                },
             ],
             temperature=0,
             max_tokens=128,
