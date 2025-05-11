@@ -138,7 +138,7 @@ class GuidanceBackend(BaseGrammarBackend):
                 },
             )
         except Exception as e:
-            logger.warning(f"Skip invalid grammar: {serialized_grammar}, {e=}")
+            logger.warning(f"Skip invalid grammar: {key_string=}, {e=}")
             return None
         return self._from_serialized(serialized_grammar)
 
