@@ -540,11 +540,11 @@ async def configure_logging(obj: ConfigureLoggingReq, request: Request):
     return Response(status_code=200)
 
 
-@app.post("/abort")
+@app.post("/abort_request")
 async def abort_request(obj: AbortReq, request: Request):
     """Abort a request."""
     try:
-        _global_state.tokenizer_manager.proactive_abort_request(rid=obj.rid)
+        _global_state.tokenizer_manager.abort_request(rid=obj.rid)
         return Response(status_code=200)
     except Exception as e:
         return _create_error_response(e)
