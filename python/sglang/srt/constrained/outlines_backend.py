@@ -171,6 +171,7 @@ class OutlinesGrammarBackend(BaseGrammarBackend):
             )
         except (NotImplementedError, json.decoder.JSONDecodeError) as e:
             logger.warning(f"Skip invalid json_schema: json_schema={key_string}, {e=}")
+            return None
         return self._compile_regex(regex)
 
     def dispatch_regex(self, key_string: str):
