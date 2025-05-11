@@ -54,16 +54,17 @@ class TestSkipTokenizerInit(CustomTestCase):
     ):
         input_ids = self.get_input_ids(prompt_text)
 
+        request = self.get_request_json(
+            input_ids=input_ids,
+            return_logprob=return_logprob,
+            top_logprobs_num=top_logprobs_num,
+            max_new_tokens=max_new_tokens,
+            stream=False,
+            n=n,
+        )
         response = requests.post(
             self.base_url + "/generate",
-            json=self.get_request_json(
-                input_ids=input_ids,
-                max_new_tokens=max_new_tokens,
-                return_logprob=return_logprob,
-                top_logprobs_num=top_logprobs_num,
-                stream=False,
-                n=n,
-            ),
+            json=request,
         )
         ret = response.json()
         print(json.dumps(ret, indent=2))
@@ -82,9 +83,12 @@ class TestSkipTokenizerInit(CustomTestCase):
                 self.assertEqual(item["meta_info"]["prompt_tokens"], len(input_ids))
 
                 if return_logprob:
+                    num_input_logprobs = len(input_ids) - request["logprob_start_len"]
+                    if num_input_logprobs > len(input_ids):
+                        num_input_logprobs -= len(input_ids)
                     self.assertEqual(
                         len(item["meta_info"]["input_token_logprobs"]),
-                        len(input_ids),
+                        num_input_logprobs,
                         f'{len(item["meta_info"]["input_token_logprobs"])} mismatch with {len(input_ids)}',
                     )
                     self.assertEqual(
@@ -228,6 +232,9 @@ class TestSkipTokenizerInitVLM(TestSkipTokenizerInit):
     def get_request_json(self, *args, **kwargs):
         ret = super().get_request_json(*args, **kwargs)
         ret["image_data"] = [self.image_url]
+        ret["logprob_start_len"] = (
+            -1
+        )  # Do not try to calculate logprobs of image embeddings.
         return ret
 
     def test_simple_decode_stream(self):
