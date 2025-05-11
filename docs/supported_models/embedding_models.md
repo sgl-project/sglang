@@ -16,7 +16,7 @@ python3 -m sglang.launch_server \
   --chat-template gme-qwen2-vl \
   --port 30000
 ```
-## Example Client Reuqest
+## Example Client Request
 ```python
 import requests
 
