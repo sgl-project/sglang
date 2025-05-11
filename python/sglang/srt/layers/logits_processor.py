@@ -438,16 +438,14 @@ class LogitsProcessor(nn.Module):
                 hidden_states.clone(),
             )
             dp_gather_replicate(hidden_states, local_hidden_states, logits_metadata)
-    
+
         if hasattr(lm_head, "weight"):
             logits = torch.matmul(
                 hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
             )
         else:
             # GGUF models
-            logits = lm_head.quant_method.apply(
-                lm_head, hidden_states, embedding_bias
-            )
+            logits = lm_head.quant_method.apply(lm_head, hidden_states, embedding_bias)
 
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
