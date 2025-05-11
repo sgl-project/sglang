@@ -1273,7 +1273,7 @@ class TokenizerManager:
             self.model_update_result.set_result(recv_obj)
         else:  # self.server_args.dp_size > 1
             self.model_update_tmp.append(recv_obj)
-            # set future if the all results are recevied
+            # set future if the all results are received
             if len(self.model_update_tmp) == self.server_args.dp_size:
                 self.model_update_result.set_result(self.model_update_tmp)
 
