@@ -1,5 +1,6 @@
 # Code Structures
 
+- `eval`: Llama 3 evaluation and Loogle evaluation.
 - `lang`: The frontend language.
 - `srt`: The backend engine for running local models. (SRT = SGLang Runtime).
 - `test`: The test utilities.
