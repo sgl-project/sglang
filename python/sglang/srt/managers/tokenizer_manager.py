@@ -289,6 +289,7 @@ class TokenizerManager:
                     ),
                     self._handle_batch_output,
                 ),
+                (AbortReq, self._handle_abort_req),
                 (OpenSessionReqOutput, self._handle_open_session_req_output),
                 (
                     UpdateWeightFromDiskReqOutput,
@@ -342,13 +343,14 @@ class TokenizerManager:
             ]
         )
 
+        # For pd disaggregtion
         self.disaggregation_mode = DisaggregationMode(
             self.server_args.disaggregation_mode
         )
         self.transfer_backend = TransferBackend(
             self.server_args.disaggregation_transfer_backend
         )
-        # for disaggregtion, start kv boostrap server on prefill
+        # Start kv boostrap server on prefill
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             # only start bootstrap server on prefill tm
             kv_bootstrap_server_class = get_kv_class(
@@ -483,6 +485,14 @@ class TokenizerManager:
             session_params = (
                 SessionParams(**obj.session_params) if obj.session_params else None
             )
+            if (
+                obj.custom_logit_processor
+                and not self.server_args.enable_custom_logit_processor
+            ):
+                raise ValueError(
+                    "The server is not configured to enable custom logit processor. "
+                    "Please set `--enable-custom-logits-processor` to enable this feature."
+                )
 
         sampling_params = SamplingParams(**obj.sampling_params)
         sampling_params.normalize(self.tokenizer)
@@ -571,9 +581,9 @@ class TokenizerManager:
         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
         created_time: Optional[float] = None,
     ):
+        self.send_to_scheduler.send_pyobj(tokenized_obj)
         state = ReqState([], False, asyncio.Event(), obj, created_time=created_time)
         self.rid_to_state[obj.rid] = state
-        self.send_to_scheduler.send_pyobj(tokenized_obj)
 
     async def _wait_one_response(
         self,
@@ -588,10 +598,11 @@ class TokenizerManager:
                 await asyncio.wait_for(state.event.wait(), timeout=4)
             except asyncio.TimeoutError:
                 if request is not None and await request.is_disconnected():
+                    # Abort the request for disconnected requests (non-streaming, waiting queue)
                     self.abort_request(obj.rid)
+                    # Use exception to kill the whole call stack and asyncio task
                     raise ValueError(
-                        "Request is disconnected from the client side. "
-                        f"Abort request {obj.rid}"
+                        f"Request is disconnected from the client side (type 1). Abort request {obj.rid=}"
                     )
                 continue
 
@@ -606,7 +617,6 @@ class TokenizerManager:
                     else:
                         msg = f"Finish: obj={dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}, out={dataclass_to_string_truncated(out, max_length, skip_names=out_skip_names)}"
                     logger.info(msg)
-                del self.rid_to_state[obj.rid]
 
                 # Check if this was an abort/error created by scheduler
                 if isinstance(out["meta_info"].get("finish_reason"), dict):
@@ -630,10 +640,11 @@ class TokenizerManager:
                 yield out
             else:
                 if request is not None and await request.is_disconnected():
+                    # Abort the request for disconnected requests (non-streaming, running)
                     self.abort_request(obj.rid)
+                    # Use exception to kill the whole call stack and asyncio task
                     raise ValueError(
-                        "Request is disconnected from the client side. "
-                        f"Abort request {obj.rid}"
+                        f"Request is disconnected from the client side (type 3). Abort request {obj.rid=}"
                     )
 
     async def _handle_batch_request(
@@ -733,7 +744,6 @@ class TokenizerManager:
     def abort_request(self, rid: str):
         if rid not in self.rid_to_state:
             return
-        del self.rid_to_state[rid]
         req = AbortReq(rid)
         self.send_to_scheduler.send_pyobj(req)
 
@@ -969,7 +979,7 @@ class TokenizerManager:
     def create_abort_task(self, obj: GenerateReqInput):
         # Abort the request if the client is disconnected.
         async def abort_request():
-            await asyncio.sleep(1)
+            await asyncio.sleep(2)
             if obj.is_single:
                 self.abort_request(obj.rid)
             else:
@@ -1040,6 +1050,9 @@ class TokenizerManager:
         for i, rid in enumerate(recv_obj.rids):
             state = self.rid_to_state.get(rid, None)
             if state is None:
+                logger.error(
+                    f"Received output for {rid=} but the state was deleted in TokenizerManager."
+                )
                 continue
 
             # Build meta_info and return value
@@ -1103,6 +1116,7 @@ class TokenizerManager:
                     meta_info["spec_verify_ct"] = recv_obj.spec_verify_ct[i]
                 state.finished_time = time.time()
                 meta_info["e2e_latency"] = state.finished_time - state.created_time
+                del self.rid_to_state[rid]
 
             state.out_list.append(out_dict)
             state.event.set()
@@ -1251,6 +1265,9 @@ class TokenizerManager:
             # Schedule the task to run in the background without awaiting it
             asyncio.create_task(asyncio.to_thread(background_task))
 
+    def _handle_abort_req(self, recv_obj):
+        self.rid_to_state.pop(recv_obj.rid)
+
     def _handle_open_session_req_output(self, recv_obj):
         self.session_futures[recv_obj.session_id].set_result(
             recv_obj.session_id if recv_obj.success else None
@@ -1261,7 +1278,7 @@ class TokenizerManager:
             self.model_update_result.set_result(recv_obj)
         else:  # self.server_args.dp_size > 1
             self.model_update_tmp.append(recv_obj)
-            # set future if the all results are recevied
+            # set future if the all results are received
             if len(self.model_update_tmp) == self.server_args.dp_size:
                 self.model_update_result.set_result(self.model_update_tmp)
 
@@ -1330,3 +1347,15 @@ class _Communicator(Generic[T]):
         self._result_values.append(recv_obj)
         if len(self._result_values) == self._fan_out:
             self._result_event.set()
+
+
+# Note: request abort handling logic
+# We should handle all of the following cases correctly.
+#
+# | entrypoint | is_streaming | status          | abort engine    | cancel asyncio task   | rid_to_state                |
+# | ---------- | ------------ | --------------- | --------------- | --------------------- | --------------------------- |
+# | http       | yes          | waiting queue   | background task | fast api              | del in _handle_abort_req    |
+# | http       | yes          | running         | background task | fast api              | del in _handle_batch_output |
+# | http       | no           | waiting queue   | type 1          | type 1 exception      | del in _handle_abort_req    |
+# | http       | no           | running         | type 3          | type 3 exception      | del in _handle_batch_output |
+#

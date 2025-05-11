@@ -539,7 +539,6 @@ def v1_generate_request(
                 "temperature": request.temperature,
                 "max_new_tokens": request.max_tokens,
                 "min_new_tokens": request.min_tokens,
-                "thinking_budget": request.thinking_budget,
                 "stop": request.stop,
                 "stop_token_ids": request.stop_token_ids,
                 "top_p": request.top_p,
@@ -601,7 +600,7 @@ def v1_generate_response(
     echo = False
 
     if (not isinstance(request, list)) and request.echo:
-        # TODO: handle the case propmt is token ids
+        # TODO: handle the case prompt is token ids
         if isinstance(request.prompt, list) and isinstance(request.prompt[0], str):
             # for the case of multiple str prompts
             prompts = request.prompt
@@ -657,7 +656,7 @@ def v1_generate_response(
         finish_reason = ret_item["meta_info"]["finish_reason"]
 
         if to_file:
-            # to make the choise data json serializable
+            # to make the choice data json serializable
             choice_data = {
                 "index": 0,
                 "text": text,
@@ -1112,7 +1111,6 @@ def v1_chat_generate_request(
             "temperature": request.temperature,
             "max_new_tokens": request.max_tokens or request.max_completion_tokens,
             "min_new_tokens": request.min_tokens,
-            "thinking_budget": request.thinking_budget,
             "stop": stop,
             "stop_token_ids": request.stop_token_ids,
             "top_p": request.top_p,

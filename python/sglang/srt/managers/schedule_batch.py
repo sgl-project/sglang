@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-import hashlib
-from enum import Enum, auto
-
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -30,12 +27,16 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
   It will be transformed from CPU scheduler to GPU model runner.
 - ForwardBatch is managed by `model_runner.py::ModelRunner`.
   It contains low-level tensor data. Most of the data consists of GPU tensors.
+
+TODO(lmzheng): ModelWorkerBatch seems a bit redundant and we consider removing it in the future.
 """
 
 import copy
 import dataclasses
+import hashlib
 import logging
 import threading
+from enum import Enum, auto
 from typing import TYPE_CHECKING, List, Optional, Set, Tuple, Union
 
 import numpy as np
@@ -135,9 +136,9 @@ class FINISH_LENGTH(BaseFinishReason):
 
 
 class FINISH_ABORT(BaseFinishReason):
-    def __init__(self, message="Unknown error", status_code=None, err_type=None):
+    def __init__(self, message=None, status_code=None, err_type=None):
         super().__init__(is_error=True)
-        self.message = message
+        self.message = message or "Aborted"
         self.status_code = status_code
         self.err_type = err_type
 
@@ -442,11 +443,13 @@ class Req:
         # Check finish
         self.tokenizer = None
         self.finished_reason = None
+        # Whether this request has finished output
+        self.finished_output = None
         # If we want to abort the request in the middle of the event loop, set this to true
         # Note: We should never set finished_reason in the middle, the req will get filtered and never respond
         self.to_abort = False
         # This carries the error message for `.to_abort` and will be attached to the finished_reason at the end of the event loop
-        self.to_abort_message: str = "Unknown error"
+        self.to_abort_message: str = None
         self.stream = stream
         self.eos_token_ids = eos_token_ids
 
@@ -547,18 +550,12 @@ class Req:
         self.bootstrap_room: Optional[int] = bootstrap_room
         self.disagg_kv_sender: Optional[BaseKVSender] = None
 
-        # used for warmup because we don't have a pair yet when init
-        self.skip_kv_transfer: bool = False
         # the start index of the sent kv cache
         # We want to send it chunk by chunk for chunked prefill.
         # After every chunk forward, we do the following:
         # kv_send(req.input_ids[req.start_send_idx:len(req.fill_ids)])
         # start_send_idx = len(req.fill_ids)
         self.start_send_idx: int = 0
-
-        self.metadata_buffer_index: int = -1
-        # The first output_id transferred from prefill instance.
-        self.transferred_output_id: Optional[int] = None
 
         # For overlap schedule, we delay the kv transfer until `process_batch_result_disagg_prefill` rather than `process_prefill_chunk` in non-overlap
         # This is because kv is not ready in `process_prefill_chunk`.
@@ -573,6 +570,9 @@ class Req:
         self.prefill_need_tokens: int = len(self.origin_input_ids) + min(
             max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION
         )
+        self.metadata_buffer_index: int = -1
+        # The first output_id transferred from prefill instance.
+        self.transferred_output_id: Optional[int] = None
 
     @property
     def seqlen(self):
@@ -707,13 +707,29 @@ class Req:
         self.req_pool_idx = None
         self.already_computed = 0
 
+    def offload_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
+        token_indices = req_to_token_pool.req_to_token[
+            self.req_pool_idx, : self.seqlen - 1
+        ]
+        self.kv_cache_cpu = token_to_kv_pool_allocator.get_cpu_copy(token_indices)
+
+    def load_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
+        token_indices = req_to_token_pool.req_to_token[
+            self.req_pool_idx, : self.seqlen - 1
+        ]
+        token_to_kv_pool_allocator.load_cpu_copy(self.kv_cache_cpu, token_indices)
+        del self.kv_cache_cpu
+
     def __repr__(self):
         return (
             f"Req(rid={self.rid}, "
-            f"input_ids={self.origin_input_ids}, output_ids={self.output_ids})"
+            f"input_ids={self.origin_input_ids}, output_ids={self.output_ids}, "
+            f"{self.grammar=}, "
+            f"{self.sampling_params=})"
         )
 
 
+# Batch id
 bid = 0
 
 
@@ -872,7 +888,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             error_msg = (
                 f"{phase_str} out of memory. Try to lower your batch size.\n"
                 f"Try to allocate {num_tokens} tokens.\n"
-                f"Avaliable tokens: {self.token_to_kv_pool_allocator.available_size() + self.tree_cache.evictable_size()}\n"
+                f"Available tokens: {self.token_to_kv_pool_allocator.available_size() + self.tree_cache.evictable_size()}\n"
             )
             logger.error(error_msg)
             if self.tree_cache is not None:
@@ -913,7 +929,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             error_msg = (
                 f"Prefill out of memory. Try to lower your batch size.\n"
                 f"Try to allocate {extend_num_tokens} tokens.\n"
-                f"Avaliable tokens: {self.token_to_kv_pool_allocator.available_size() + self.tree_cache.evictable_size()}\n"
+                f"Available tokens: {self.token_to_kv_pool_allocator.available_size() + self.tree_cache.evictable_size()}\n"
                 f"{self.token_to_kv_pool_allocator.available_size()=}\n"
                 f"{self.tree_cache.evictable_size()=}\n"
             )
@@ -948,7 +964,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             error_msg = (
                 f"Decode out of memory. Try to lower your batch size.\n"
                 f"Try to allocate {len(seq_lens)} tokens.\n"
-                f"Avaliable tokens: {self.token_to_kv_pool_allocator.available_size() + self.tree_cache.evictable_size()}\n"
+                f"Available tokens: {self.token_to_kv_pool_allocator.available_size() + self.tree_cache.evictable_size()}\n"
                 f"{self.token_to_kv_pool_allocator.available_size()=}\n"
                 f"{self.tree_cache.evictable_size()=}\n"
             )
@@ -1473,7 +1489,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 i
                 for i in range(len(self.reqs))
                 if not self.reqs[i].finished()
-                and not self.reqs[i] in chunked_req_to_exclude
+                and self.reqs[i] not in chunked_req_to_exclude
             ]
 
         if keep_indices is None or len(keep_indices) == 0:
