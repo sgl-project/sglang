@@ -355,7 +355,7 @@ async def process_batch(tokenizer_manager, batch_id: str, batch_request: BatchRe
                     to_file=True,
                     cache_report=tokenizer_manager.server_args.enable_cache_report,
                     tool_call_parser=tokenizer_manager.server_args.tool_call_parser,
-                    assistant_prefix_list=adapted_request.assistant_prefix_list,
+                    gen_assistant_prefix_list=adapted_request.gen_assistant_prefix_list,
                 )
             else:
                 responses = v1_generate_response(
@@ -964,7 +964,7 @@ def v1_chat_generate_request(
     top_logprobs_nums = []
     modalities_list = []
     lora_paths = []
-    assistant_prefix_list = []
+    gen_assistant_prefix_list = []
 
     # NOTE: with openai API, the prompt's logprobs are always not computed
 
@@ -1094,8 +1094,7 @@ def v1_chat_generate_request(
                 else:
                     gen_assistant_prefix = ""
 
-                assistant_prefix = gen_assistant_prefix + (assistant_prefix or "")
-                assistant_prefix_list.extend([assistant_prefix] * request.n)
+                gen_assistant_prefix_list.extend([gen_assistant_prefix] * request.n)
                 prompt_ids = tokenized_chat_with_gen
 
                 if is_multimodal:
@@ -1255,7 +1254,7 @@ def v1_chat_generate_request(
         rid=request_ids,
         modalities=modalities_list,
         lora_path=lora_paths,
-        assistant_prefix_list=assistant_prefix_list,
+        gen_assistant_prefix_list=gen_assistant_prefix_list,
         bootstrap_host=all_requests[0].bootstrap_host,
         bootstrap_port=all_requests[0].bootstrap_port,
         bootstrap_room=all_requests[0].bootstrap_room,
@@ -1272,15 +1271,15 @@ def v1_chat_generate_response(
     cache_report=False,
     tool_call_parser=None,
     reasoning_parser=None,
-    assistant_prefix_list=None,
+    gen_assistant_prefix_list=None,
 ):
     choices = []
 
     for idx, ret_item in enumerate(ret):
-        if assistant_prefix_list and idx < len(assistant_prefix_list):
-            assistant_prefix = assistant_prefix_list[idx]
+        if gen_assistant_prefix_list and idx < len(gen_assistant_prefix_list):
+            gen_assistant_prefix = gen_assistant_prefix_list[idx]
         else:
-            assistant_prefix = ""
+            gen_assistant_prefix = ""
         logprobs = False
         if isinstance(request, list) and request[idx].logprobs:
             logprobs = True
@@ -1328,8 +1327,8 @@ def v1_chat_generate_response(
 
         tool_calls = None
         text = (
-            assistant_prefix + ret_item["text"]
-            if assistant_prefix
+            gen_assistant_prefix + ret_item["text"]
+            if gen_assistant_prefix
             else ret_item["text"]
         )
 
@@ -1504,8 +1503,8 @@ async def v1_chat_completions(
                     is_first = is_firsts.get(index, True)
                     stream_buffer = stream_buffers.get(index, "")
                     n_prev_token = n_prev_tokens.get(index, 0)
-                    assistant_prefix = (
-                        adapted_request.assistant_prefix_list[index] or ""
+                    gen_assistant_prefix = (
+                        adapted_request.gen_assistant_prefix_list[index] or ""
                     )
 
                     prompt_tokens[index] = content["meta_info"]["prompt_tokens"]
@@ -1565,8 +1564,8 @@ async def v1_chat_completions(
                         # First chunk with role
                         is_first = False
                         delta = (
-                            DeltaMessage(role="assistant", content=assistant_prefix)
-                            if assistant_prefix
+                            DeltaMessage(role="assistant", content=gen_assistant_prefix)
+                            if gen_assistant_prefix
                             else DeltaMessage(role="assistant")
                         )
                         choice_data = ChatCompletionResponseStreamChoice(
@@ -1825,7 +1824,7 @@ async def v1_chat_completions(
         cache_report=tokenizer_manager.server_args.enable_cache_report,
         tool_call_parser=tokenizer_manager.server_args.tool_call_parser,
         reasoning_parser=tokenizer_manager.server_args.reasoning_parser,
-        assistant_prefix_list=adapted_request.assistant_prefix_list,
+        gen_assistant_prefix_list=adapted_request.gen_assistant_prefix_list,
     )
 
     return response
