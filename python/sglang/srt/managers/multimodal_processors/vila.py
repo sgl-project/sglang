@@ -116,13 +116,16 @@ class VILAProcessor(BaseMultimodalProcessor):
             images=base_mm_output.images,
         )
 
-        mm_items: List[MultimodalDataItem] = [
-            MultimodalDataItem(
-                modality=Modality.IMAGE,
-                pixel_values=single_pixel_values.unsqueeze(0),
-            )
-            for single_pixel_values in cast(Tensor, inputs.pixel_values)
-        ]
+        mm_items: List[MultimodalDataItem] = (
+            [
+                MultimodalDataItem(
+                    modality=Modality.IMAGE,
+                    pixel_values=inputs.pixel_values,
+                )
+            ]
+            if "pixel_values" in inputs
+            else []
+        )
 
         # Checkout python/sglang/srt/managers/schedule_batch.py:MultimodalInputs
         # and python/sglang/srt/managers/tokenizer_manager.py:TokenizerManager._tokenize_one_request()
