@@ -1533,7 +1533,7 @@ class Scheduler(
                         self.tp_worker.forward_batch_generation(model_worker_batch)
                     )
                 else:
-                    pp_hidden_states_proxy_tensors, can_run_cuda_graph = (
+                    pp_hidden_states_proxy_tensors, _, can_run_cuda_graph = (
                         self.tp_worker.forward_batch_generation(model_worker_batch)
                     )
                 bid = model_worker_batch.bid
