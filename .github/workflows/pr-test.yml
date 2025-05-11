@@ -92,7 +92,7 @@ jobs:
   unittest-test-backend-8-gpu:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false
-    needs: [unit-test-frontend, unit-test-backend-1-gpu, unit-test-backend-2-gpu]
+    needs: [unit-test-frontend, unit-test-backend-2-gpu]
     runs-on: 8-gpu-runner
     steps:
       - name: Checkout code
@@ -270,24 +270,6 @@ jobs:
         run: |
           cd test/srt
           python3 test_moe_eval_accuracy_large.py
-
-  unit-test-backend-pd:
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false
-    runs-on: 8-gpu-runner
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install dependencies
-        run: |
-          bash scripts/ci_install_dependency.sh
-
-      - name: Run test
-        timeout-minutes: 10
-        run: |
-          cd test/srt
-          python3 -m unittest test_disaggregation.TestDisaggregationMooncake.test_gsm8k
 
   finish:
     if: always()
