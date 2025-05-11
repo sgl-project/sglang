@@ -1095,7 +1095,7 @@ def v1_chat_generate_request(
                     gen_assistant_prefix = ""
 
                 assistant_prefix = gen_assistant_prefix + (assistant_prefix or "")
-                assistant_prefix_list.append(assistant_prefix)
+                assistant_prefix_list.extend([assistant_prefix] * request.n)
                 prompt_ids = tokenized_chat_with_gen
 
                 if is_multimodal:
