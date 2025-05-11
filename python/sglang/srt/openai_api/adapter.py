@@ -1083,19 +1083,30 @@ def v1_chat_generate_request(
                             ),
                         )
                     )
-
-                if len(tokenized_chat_with_gen) > len(tokenized_chat):
-                    gen_assistant_prefix_ids = tokenized_chat_with_gen[
-                        len(tokenized_chat) :
-                    ]
-                    gen_assistant_prefix = remove_first_nonblank_token(
-                        tokenizer_manager.tokenizer, gen_assistant_prefix_ids
-                    )
-                else:
+                if request.continue_final_message:
                     gen_assistant_prefix = ""
+                else:
+                    if len(tokenized_chat_with_gen) > len(tokenized_chat):
+                        gen_assistant_prefix_ids = tokenized_chat_with_gen[
+                            len(tokenized_chat) :
+                        ]
+                        gen_assistant_prefix = remove_first_nonblank_token(
+                            tokenizer_manager.tokenizer, gen_assistant_prefix_ids
+                        )
+                    else:
+                        gen_assistant_prefix = ""
 
                 gen_assistant_prefix_list.extend([gen_assistant_prefix] * request.n)
                 prompt_ids = tokenized_chat_with_gen
+
+                if assistant_prefix:
+                    encoded = tokenizer_manager.tokenizer.encode(assistant_prefix)
+                    if (
+                        encoded
+                        and encoded[0] == tokenizer_manager.tokenizer.bos_token_id
+                    ):
+                        encoded = encoded[1:]
+                    prompt_ids += encoded
 
                 if is_multimodal:
                     prompt = tokenizer_manager.tokenizer.decode(prompt_ids)
