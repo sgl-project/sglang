@@ -63,8 +63,6 @@ class TestSeparateReasoningExecution(CustomTestCase):
         # wake up all threads
         for ev in self.events:
             ev.set()
-        # let daemon threads clean up
-        time.sleep(0.05)
 
     @patch("sglang.srt.reasoning_parser.ReasoningParser")
     def test_execute_separate_reasoning(self, mock_parser_class):
