@@ -159,7 +159,7 @@ class ServerArgs:
     disable_overlap_schedule: bool = False
     enable_mixed_chunk: bool = False
     enable_dp_attention: bool = False
-    use_attn_tp_group: bool = False
+    enable_dp_lm_head: bool = False
     enable_ep_moe: bool = False
     enable_deepep_moe: bool = False
     deepep_mode: Optional[Literal["auto", "normal", "low_latency"]] = "auto"
@@ -317,6 +317,11 @@ class ServerArgs:
             logger.warning(
                 f"DP attention is enabled. The chunked prefill size is adjusted to {self.chunked_prefill_size} to avoid MoE kernel issues. "
             )
+
+        if self.enable_dp_lm_head:
+            assert (
+                self.enable_dp_attention
+            ), "Please enable dp attention when setting enable_dp_attention. "
 
         # DeepEP MoE
         self.enable_sp_layernorm = False
@@ -1051,7 +1056,7 @@ class ServerArgs:
             help="Enabling data parallelism for attention and tensor parallelism for FFN. The dp size should be equal to the tp size. Currently only DeepSeek-V2 is supported.",
         )
         parser.add_argument(
-            "--use-attn-tp-group",
+            "--enable-dp-lm-head",
             action="store_true",
             help="Enable vocabulary parallel across the attention TP group to avoid all-gather across DP groups, optimizing performance under DP attention.",
         )
