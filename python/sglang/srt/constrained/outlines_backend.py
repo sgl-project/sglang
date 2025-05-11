@@ -170,7 +170,7 @@ class OutlinesGrammarBackend(BaseGrammarBackend):
                 whitespace_pattern=self.whitespace_pattern,
             )
         except (NotImplementedError, json.decoder.JSONDecodeError, ValueError) as e:
-            logger.warning(f"Skip invalid json_schema: json_schema={key_string}, {e=}")
+            logger.warning(f"Skip invalid json_schema: {key_string=}, {e=}")
             return None
         return self._compile_regex(regex)
 
