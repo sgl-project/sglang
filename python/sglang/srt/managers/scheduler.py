@@ -754,6 +754,7 @@ class Scheduler(
                         extend_input_len_per_req=None,
                         extend_logprob_start_len_per_req=None,
                         bid=bids[next_mb_id],
+                        can_run_cuda_graph=result.can_run_cuda_graph,
                     )
                     self.process_batch_result(mbs[next_mb_id], output_result)
                     last_mbs[next_mb_id] = mbs[next_mb_id]

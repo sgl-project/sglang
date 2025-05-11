@@ -183,8 +183,8 @@ def run_one_case(
     overall_throughput = batch_size * (input_len + output_len) / latency
 
     server_info = requests.get(url + "/get_server_info").json()
-    acc_length = server_info["internal_states"][0].get("avg_spec_accept_length", None)
-    last_gen_throughput = server_info["internal_states"][0]["last_gen_throughput"]
+    acc_length = server_info["internal_states"].get("avg_spec_accept_length", None)
+    last_gen_throughput = server_info["internal_states"]["last_gen_throughput"]
 
     print(f"batch size: {batch_size}")
     print(f"input_len: {input_len}")
