@@ -12,7 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 """
-The definition of objects transfered between different
+The definition of objects transferred between different
 processes (TokenizerManager, DetokenizerManager, Controller).
 """
 
@@ -787,6 +787,16 @@ class ResumeMemoryOccupationReqInput:
 
 @dataclass
 class ResumeMemoryOccupationReqOutput:
+    pass
+
+
+@dataclass
+class SlowDownReqInput:
+    forward_sleep_time: Optional[float]
+
+
+@dataclass
+class SlowDownReqOutput:
     pass
 
 

@@ -433,7 +433,7 @@ class TestOpenAIServer(CustomTestCase):
                             )
 
     def test_completion_stream(self):
-        # parallel sampling adn list input are not supported in streaming mode
+        # parallel sampling and list input are not supported in streaming mode
         for echo in [False, True]:
             for logprobs in [None, 5]:
                 for use_list_input in [True, False]:
@@ -688,7 +688,6 @@ class TestOpenAIServerIgnoreEOS(CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             api_key=cls.api_key,
-            other_args=["--chat-template=llama_3_vision"],
         )
         cls.base_url += "/v1"
         cls.tokenizer = get_tokenizer(DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
