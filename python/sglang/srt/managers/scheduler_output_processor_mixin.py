@@ -15,6 +15,8 @@ if TYPE_CHECKING:
         Scheduler,
     )
 
+DEFAULT_FORCE_STREAM_INTERVAL = 50
+
 
 class SchedulerOutputProcessorMixin:
     """
@@ -512,19 +514,26 @@ class SchedulerOutputProcessorMixin:
             if self.model_config.is_multimodal_gen and req.to_abort:
                 continue
 
-            if (
-                req.finished()
-                # If stream, follow the given stream_interval
-                or (req.stream and len(req.output_ids) % self.stream_interval == 0)
-                # If not stream, we still want to output some tokens to get the benefit of incremental decoding.
-                # TODO(lianmin): this is wrong for speculative decoding because len(req.output_ids) does not
-                # always increase one-by-one.
-                or (
-                    not req.stream
-                    and len(req.output_ids) % 50 == 0
-                    and not self.model_config.is_multimodal_gen
-                )
-            ):
+            if req.finished():
+                if req.finished_output:
+                    # With the overlap schedule, a request will try to output twice and hit this line twice
+                    # because of the one additional delayed token. This "continue" prevented the dummy output.
+                    continue
+                req.finished_output = True
+                should_output = True
+            else:
+                if req.stream:
+                    stream_interval = (
+                        req.sampling_params.stream_interval or self.stream_interval
+                    )
+                    should_output = len(req.output_ids) % stream_interval == 0
+                else:
+                    should_output = (
+                        len(req.output_ids) % DEFAULT_FORCE_STREAM_INTERVAL == 0
+                        and not self.model_config.is_multimodal_gen
+                    )
+
+            if should_output:
                 rids.append(req.rid)
                 finished_reasons.append(
                     req.finished_reason.to_json() if req.finished_reason else None
