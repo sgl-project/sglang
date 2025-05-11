@@ -1230,11 +1230,18 @@ class TokenizerManager:
                 state.last_completion_tokens = completion_tokens
 
         if state.finished:
+            has_grammar = (
+                state.obj.sampling_params.get("json_schema", None)
+                or state.obj.sampling_params.get("regex", None)
+                or state.obj.sampling_params.get("ebnf", None)
+                or state.obj.sampling_params.get("structural_tag", None)
+            )
             self.metrics_collector.observe_one_finished_request(
                 recv_obj.prompt_tokens[i],
                 completion_tokens,
                 recv_obj.cached_tokens[i],
                 state.finished_time - state.created_time,
+                has_grammar,
             )
 
     def dump_requests(self, state: ReqState, out_dict: dict):
