@@ -55,7 +55,7 @@ class TestCrossEncoderModels(CustomTestCase):
 
             assert (
                 score_difference < score_tolerance
-            ), "cross encoder socres are not all close"
+            ), "cross encoder scores are not all close"
 
     def preprocess_prompts(self, prompt):
         processed_prompts = []

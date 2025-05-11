@@ -180,7 +180,7 @@ def get_cross_encoder_activation_function(config: PretrainedConfig):
         )
         return resolve_obj_by_qualname(function_name)()
     else:
-        # adapat bge-reranker
+        # adapt bge-reranker
         return nn.Identity()
 
 
