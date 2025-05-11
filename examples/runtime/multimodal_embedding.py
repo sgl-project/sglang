@@ -10,14 +10,7 @@ image_path = "https://huggingface.co/datasets/liuhaotian/llava-bench-in-the-wild
 
 payload = {
     "model": "gme-qwen2-vl",
-    "input": [
-        {
-            "text": text_input
-        },
-        {
-            "image": image_path
-        }
-    ],
+    "input": [{"text": text_input}, {"image": image_path}],
 }
 
 response = requests.post(url + "/v1/embeddings", json=payload).json()
