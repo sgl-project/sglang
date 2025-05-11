@@ -1325,7 +1325,7 @@ class Scheduler(
             return None
 
         running_bs = len(self.running_batch.reqs)
-        # Igore the check if self.chunked_req is not None.
+        # Ignore the check if self.chunked_req is not None.
         # In the non-PP case, when self.chunked_req is not None, num_allocatable_reqs should always be greater than 0,
         # as the space for the chunked request has just been released.
         # In PP case, a chunked req can start in one microbatch and end in another microbatch, so the max_running_requests per microbatch should not be strict.
