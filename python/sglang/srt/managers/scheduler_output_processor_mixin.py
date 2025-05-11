@@ -38,20 +38,16 @@ class SchedulerOutputProcessorMixin:
                 next_token_ids,
                 extend_input_len_per_req,
                 extend_logprob_start_len_per_req,
-                bid,
             ) = (
                 result.logits_output,
                 result.next_token_ids,
                 result.extend_input_len_per_req,
                 result.extend_logprob_start_len_per_req,
-                result.bid,
             )
 
             if self.enable_overlap:
                 logits_output, next_token_ids, _ = (
-                    self.tp_worker.resolve_last_batch_result(
-                        launch_done,
-                    )
+                    self.tp_worker.resolve_last_batch_result(launch_done)
                 )
             else:
                 # Move next_token_ids and logprobs to cpu

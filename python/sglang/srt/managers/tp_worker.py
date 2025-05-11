@@ -14,6 +14,7 @@
 """A tensor parallel worker."""
 
 import logging
+import threading
 from typing import Optional, Tuple, Union
 
 import torch
@@ -182,6 +183,7 @@ class TpModelWorker:
     def forward_batch_generation(
         self,
         model_worker_batch: ModelWorkerBatch,
+        launch_done: Optional[threading.Event] = None,
         skip_sample: bool = False,
     ) -> Tuple[
         Union[LogitsProcessorOutput, torch.Tensor], Optional[torch.Tensor], bool
@@ -200,8 +202,8 @@ class TpModelWorker:
             logits_output, can_run_cuda_graph = self.model_runner.forward(
                 forward_batch, pp_proxy_tensors=pp_proxy_tensors
             )
-            if model_worker_batch.launch_done is not None:
-                model_worker_batch.launch_done.set()
+            if launch_done is not None:
+                launch_done.set()
 
             if skip_sample:
                 next_token_ids = None

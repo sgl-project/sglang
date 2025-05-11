@@ -146,7 +146,9 @@ class TpModelWorkerClient:
 
             # Run forward
             logits_output, next_token_ids, can_run_cuda_graph = (
-                self.worker.forward_batch_generation(model_worker_batch)
+                self.worker.forward_batch_generation(
+                    model_worker_batch, model_worker_batch.launch_done
+                )
             )
 
             # Update the future token ids map
