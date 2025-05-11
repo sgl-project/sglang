@@ -100,7 +100,7 @@ class TestDeepseekV3MTP(CustomTestCase):
         self.assertGreater(metrics["accuracy"], 0.60)
 
         server_info = requests.get(self.base_url + "/get_server_info")
-        avg_spec_accept_length = server_info.json()["internal_states"][
+        avg_spec_accept_length = server_info.json()["internal_states"][0][
             "avg_spec_accept_length"
         ]
         print(f"{avg_spec_accept_length=}")
@@ -161,7 +161,7 @@ class TestDeepseekV3MTPWithDraft(CustomTestCase):
         self.assertGreater(metrics["accuracy"], 0.60)
 
         server_info = requests.get(self.base_url + "/get_server_info")
-        avg_spec_accept_length = server_info.json()["internal_states"][
+        avg_spec_accept_length = server_info.json()["internal_states"][0][
             "avg_spec_accept_length"
         ]
         print(f"{avg_spec_accept_length=}")
