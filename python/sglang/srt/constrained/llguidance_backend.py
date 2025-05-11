@@ -50,21 +50,6 @@ class GuidanceGrammar(BaseGrammarObject):
         self.finished = False
         self.bitmask = None
 
-    def try_jump_forward(self, tokenizer) -> Optional[Tuple[List[int], str]]:
-        ff_tokens = self.ll_matcher.compute_ff_tokens()
-        if ff_tokens:
-            return ff_tokens, ""
-        else:
-            return None
-
-    def jump_forward_str_state(self, helper: Tuple[List[int], str]) -> Tuple[str, int]:
-        return "", -1
-
-    def jump_and_retokenize(
-        self, old_output_ids: List[int], new_output_ids: List[int], next_state: int
-    ):
-        pass
-
     def accept_token(self, token: int):
         if not self.ll_matcher.consume_token(token):
             logger.warning(f"matcher error: {self.ll_matcher.get_error()}")
@@ -103,6 +88,21 @@ class GuidanceGrammar(BaseGrammarObject):
             llguidance_tokenizer=self.llguidance_tokenizer,
             serialized_grammar=self.serialized_grammar,
         )
+
+    def try_jump_forward(self, tokenizer) -> Optional[Tuple[List[int], str]]:
+        ff_tokens = self.ll_matcher.compute_ff_tokens()
+        if ff_tokens:
+            return ff_tokens, ""
+        else:
+            return None
+
+    def jump_forward_str_state(self, helper: Tuple[List[int], str]) -> Tuple[str, int]:
+        return "", -1
+
+    def jump_and_retokenize(
+        self, old_output_ids: List[int], new_output_ids: List[int], next_state: int
+    ):
+        pass
 
 
 class GuidanceBackend(BaseGrammarBackend):
