@@ -34,7 +34,7 @@ rm -rf /usr/local/include/nvshmem*
 pip install --upgrade pip
 
 # Install sgl-kernel
-pip install sgl-kernel==0.1.1 --no-cache-dir
+pip install sgl-kernel==0.1.2.post1 --no-cache-dir
 
 # Install the main package
 pip install -e "python[all]"
