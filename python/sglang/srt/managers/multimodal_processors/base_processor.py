@@ -36,9 +36,21 @@ class BaseMultiModalProcessorOutput:
 
 @dataclasses.dataclass
 class MultimodalSpecialTokens:
-    image_token: Optional[str] = None
-    video_token: Optional[str] = None
-    audio_token: Optional[str] = None
+    image_token: Optional[Union[int, str, List[str]]] = None
+    video_token: Optional[Union[int, str, List[str]]] = None
+    audio_token: Optional[Union[int, str, List[str]]] = None
+
+    def convert_to_str(self, token: Union[str, int], processor) -> str:
+        if token is None:
+            return token
+        if isinstance(token, str):
+            return token
+        return processor.tokenizer.convert_ids_to_tokens([token])[0]
+
+    def convert_to_strs(self, processor):
+        self.image_token = self.convert_to_str(self.image_token, processor)
+        self.video_token = self.convert_to_str(self.video_token, processor)
+        self.audio_token = self.convert_to_str(self.audio_token, processor)
 
     def collect(self) -> list[str]:
         return [
@@ -54,6 +66,7 @@ class BaseMultimodalProcessor(ABC):
     def __init__(self, hf_config, server_args, _processor):
         self.hf_config = hf_config
         self._processor = _processor
+        self.arch = hf_config.architectures[0]
         self.server_args = server_args
         # FIXME: not accurate, model and image specific
         self.NUM_TOKEN_PER_FRAME = 330
@@ -229,16 +242,7 @@ class BaseMultimodalProcessor(ABC):
 
         """
 
-        if image_data is None:
-            image_data = []
-        if isinstance(multimodal_tokens.image_token, int):
-            multimodal_tokens.image_token = (
-                self._processor.tokenizer.convert_ids_to_tokens(
-                    multimodal_tokens.image_token
-                )
-            )
-        else:
-            multimodal_tokens.image_token = multimodal_tokens.image_token
+        multimodal_tokens.convert_to_strs(self._processor)
 
         if isinstance(prompt, list) and return_text:
             assert len(prompt) and isinstance(prompt[0], int)
@@ -266,6 +270,7 @@ class BaseMultimodalProcessor(ABC):
             discard_alpha_channel=discard_alpha_channel,
         )
         # Process results
+        audio_index = 0
         image_sizes, images, audios = [], [], []
         new_text = ""
         task_ptr = 0
@@ -283,17 +288,20 @@ class BaseMultimodalProcessor(ABC):
                         images += frames
                         new_text += multimodal_tokens.image_token * len(frames)
                 elif task_type == Modality.AUDIO:
-                    # audio
-                    audios.append(result)
+                    # load as audio
+                    audio_file = audio_data[audio_index]
+                    audio = load_audio(audio_file)
+                    audios += [audio]
+                    audio_index += 1
                     new_text += multimodal_tokens.audio_token
                 # TODO: handle video
             else:
                 new_text += text_part
 
         out = BaseMultiModalProcessorOutput(
+            input_text=new_text,
             images=images,
             audios=audios,
-            input_text=new_text,
         )
         out.normalize()
         return out

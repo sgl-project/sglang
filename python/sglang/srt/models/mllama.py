@@ -865,7 +865,6 @@ class MllamaForConditionalGeneration(nn.Module):
                 pixel_values = torch.cat(
                     [item.pixel_values for item in mm_input.mm_items], dim=0
                 )
-                # max_num_images = max(max_num_images, sum(1 if item.is_image() else 0 for item in mm_input.items))
                 max_num_images = max(max_num_images, pixel_values.shape[1])
 
                 max_num_tiles = max(max_num_tiles, pixel_values.shape[2])

@@ -1,7 +1,6 @@
 from typing import List, Union
 
 import torch
-from transformers import BaseImageProcessorFast
 
 from sglang.srt.managers.multimodal_processors.base_processor import (
     BaseMultimodalProcessor,
@@ -20,33 +19,6 @@ class MiniCPMMultimodalProcessor(BaseMultimodalProcessor):
         super().__init__(hf_config, server_args, _processor)
         self.image_token = "(<image>./</image>)"
         self.audio_token = "(<audio>./</audio>)"
-
-    def process_data_task(self, input_text, images=None, audios=None):
-
-        if isinstance(images, list) and len(images) == 0:
-            images = None
-        if isinstance(audios, list) and len(audios) == 0:
-            audios = None
-        processor = self._processor
-        args = {}
-        if isinstance(processor, BaseImageProcessorFast):
-            args["device"] = "cuda"
-        result = self._processor.__call__(
-            text=input_text,
-            images=images,
-            audios=audios,
-            return_tensors="pt",
-            chunk_input=True,
-            **args,
-        )
-        return {
-            "input_ids": result.input_ids,
-            "pixel_values": getattr(result, "pixel_values", None),
-            "tgt_sizes": getattr(result, "tgt_sizes", None),
-            "audio_features": getattr(result, "audio_features", None),
-            "audio_feature_lens": getattr(result, "audio_feature_lens", None),
-            "audio_bounds": getattr(result, "audio_bounds", None),
-        }
 
     async def process_mm_data_async(
         self,

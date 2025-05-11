@@ -301,8 +301,9 @@ class MultimodalInputs:
     video_token_id: Optional[int] = None
 
     # audio
-    audio_start_id: Optional[torch.Tensor] = None
-    audio_end_id: Optional[torch.Tensor] = None
+    audio_token_id: Optional[int] = None
+    audio_start_id: Optional[int] = None
+    audio_end_id: Optional[int] = None
 
     @staticmethod
     def from_dict(obj: dict):
@@ -326,6 +327,7 @@ class MultimodalInputs:
             "slice_end_id",
             "audio_start_id",
             "audio_end_id",
+            "audio_token_id",
         ]
         for arg in optional_args:
             if arg in obj:
