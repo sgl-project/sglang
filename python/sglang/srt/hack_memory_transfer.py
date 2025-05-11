@@ -1,4 +1,5 @@
 import threading
+import time
 from datetime import datetime
 
 import torch
@@ -10,6 +11,8 @@ def run_memory_transfer_experiment():
 
 
 def _thread_entrypoint():
+    num_repeat = 100
+
     alt_stream = torch.cuda.Stream()
     with torch.cuda.stream(alt_stream):
         tensor_size = 1024 ** 3
@@ -18,8 +21,17 @@ def _thread_entrypoint():
         _log(f"{tensor_cpu_pinned.nbytes=} {tensor_output.nbytes=} {tensor_output.device=}")
 
         while True:
-            tensor_output.copy_(tensor_cpu_pinned, non_blocking=True)
-            TODO
+            torch.cuda.synchronize()
+            t_start = time.time()
+
+            for _ in range(num_repeat):
+                tensor_output.copy_(tensor_cpu_pinned, non_blocking=True)
+
+            torch.cuda.synchronize()
+            t_end = time.time()
+            t_delta = t_end - t_start
+            bandwidth = tensor_size * num_repeat / t_delta / 1e9
+            _log(f"time={t_delta:.3f} bandwidth={bandwidth}GB/s")
 
 
 def _log(msg):
