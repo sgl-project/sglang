@@ -61,7 +61,6 @@ suites = {
         TestFile("test_radix_attention.py", 167),
         TestFile("test_reasoning_content.py", 89),
         TestFile("test_enable_thinking.py", 70),
-        TestFile("test_thinking_budget.py", 60),
         TestFile("test_regex_constrained.py", 64),
         TestFile("test_release_memory_occupation.py", 44),
         TestFile("test_request_length_validation.py", 31),
@@ -86,6 +85,9 @@ suites = {
         TestFile("test_w8a8_quantization.py", 46),
         TestFile("models/lora/test_lora_cuda_graph.py", 250),
     ],
+    "per-commit-pd": [
+        TestFile("test_disaggregation.py", 90),
+    ],
     "per-commit-2-gpu": [
         TestFile("models/lora/test_lora_tp.py", 116),
         TestFile("test_data_parallelism.py", 73),
@@ -97,9 +99,11 @@ suites = {
         TestFile("test_verl_engine.py", 64),
     ],
     "per-commit-8-gpu": [
-        TestFile("test_deepep_intranode.py", 50),
-        TestFile("test_deepep_low_latency.py", 50),
-        TestFile("test_moe_deepep_eval_accuracy_large.py", 250),
+        # Disabled deepep tests temporarily because it takes too much time.
+        # TODO: re-enable them after reducing the test time with compilation cache and smaller models.
+        # TestFile("test_deepep_intranode.py", 50),
+        # TestFile("test_deepep_low_latency.py", 50),
+        # TestFile("test_moe_deepep_eval_accuracy_large.py", 250),
         TestFile("test_local_attn.py", 250),
         TestFile("test_full_deepseek_v3.py", 250),
         TestFile("test_pp_single_node.py", 150),

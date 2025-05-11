@@ -17,7 +17,7 @@ ASSISTANT_SUFFIX = " </s><s>"
 
 def multi_document_qa(docs, question, generate):
     s = USER_PREFIX
-    s += "Pleaes answer a question according to given documents.\n"
+    s += "Please answer a question according to given documents.\n"
     s += "Question:" + question + "Documents begin.\n"
 
     s += "".join(docs)
