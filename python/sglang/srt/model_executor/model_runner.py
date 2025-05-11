@@ -40,6 +40,7 @@ from sglang.srt.distributed.parallel_state import (
     get_world_group,
     monkey_patch_vllm_parallel_state,
 )
+from sglang.srt.hack_memory_transfer import run_memory_transfer_experiment
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
@@ -224,6 +225,9 @@ class ModelRunner:
             if server_args.expert_location_updater_mode is not None
             else None
         )
+
+        if get_bool_env_var("SGLANG_HACK_ENABLE_MEMORY_TRANSFER_EXPERIMENT"):
+            run_memory_transfer_experiment()
 
     def initialize(self, min_per_gpu_memory: float):
         server_args = self.server_args
