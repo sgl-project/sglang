@@ -324,13 +324,14 @@ class Scheduler(
         set_random_seed(self.random_seed)
 
         # Print debug info
-        logger.info(
-            f"max_total_num_tokens={self.max_total_num_tokens}, "
-            f"chunked_prefill_size={server_args.chunked_prefill_size}, "
-            f"max_prefill_tokens={self.max_prefill_tokens}, "
-            f"max_running_requests={self.max_running_requests}, "
-            f"context_len={self.model_config.context_len}"
-        )
+        if tp_rank == 0:
+            logger.info(
+                f"max_total_num_tokens={self.max_total_num_tokens}, "
+                f"chunked_prefill_size={server_args.chunked_prefill_size}, "
+                f"max_prefill_tokens={self.max_prefill_tokens}, "
+                f"max_running_requests={self.max_running_requests}, "
+                f"context_len={self.model_config.context_len}"
+            )
 
         # Init memory pool and cache
         self.init_memory_pool_and_cache()
