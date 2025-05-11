@@ -89,6 +89,25 @@ jobs:
           cd test/srt
           python3 run_suite.py --suite per-commit-2-gpu
 
+  unittest-test-backend-8-gpu:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+        github.event.pull_request.draft == false
+    needs: [unit-test-frontend, unit-test-backend-1-gpu, unit-test-backend-2-gpu]
+    runs-on: 8-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 20
+        run: |
+          cd test/srt
+          python3 run_suite.py --suite per-commit-8-gpu
+
   performance-test-1-gpu-part-1:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false
@@ -262,7 +281,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci_install_dependency_8_gpu.sh
+          bash scripts/ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 10
@@ -270,35 +289,12 @@ jobs:
           cd test/srt
           python3 -m unittest test_disaggregation.TestDisaggregationMooncake.test_gsm8k
 
-  large-scale-test-8-gpu:
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false
-    needs: [
-      unit-test-frontend, unit-test-backend-1-gpu, unit-test-backend-2-gpu,
-      performance-test-1-gpu-part-1, performance-test-1-gpu-part-2, performance-test-2-gpu,
-      accuracy-test-1-gpu, accuracy-test-2-gpu,
-    ]
-    runs-on: 8-gpu-runner
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install dependencies
-        run: |
-          bash scripts/ci_install_dependency_8_gpu.sh
-
-      - name: Run test
-        timeout-minutes: 25
-        run: |
-          cd test/srt
-          python3 run_suite.py --suite per-commit-8-gpu
-
   finish:
     if: always()
     needs: [
-      unit-test-frontend, unit-test-backend-1-gpu, unit-test-backend-2-gpu,
+      unit-test-frontend, unit-test-backend-1-gpu, unit-test-backend-2-gpu, unittest-test-backend-8-gpu,
       performance-test-1-gpu-part-1, performance-test-1-gpu-part-2, performance-test-2-gpu,
-      accuracy-test-1-gpu, accuracy-test-2-gpu, large-scale-test-8-gpu,
+      accuracy-test-1-gpu, accuracy-test-2-gpu,
     ]
     runs-on: ubuntu-latest
     steps:
