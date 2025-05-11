@@ -1,4 +1,4 @@
-FROM lmsysorg/sglang:latest
+FROM lmsysorg/sglang:dev
 
 # CMake
 RUN apt-get update \
