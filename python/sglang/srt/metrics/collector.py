@@ -37,7 +37,7 @@ class SchedulerMetricsCollector:
         from prometheus_client import Gauge, Histogram
 
         self.labels = labels
-        self.last_log_time = time.time()
+        self.last_log_time = time.perf_counter()
 
         self.num_running_reqs = Gauge(
             name="sglang:num_running_reqs",
@@ -108,7 +108,7 @@ class SchedulerMetricsCollector:
         self._log_gauge(self.cache_hit_rate, stats.cache_hit_rate)
         self._log_gauge(self.spec_accept_length, stats.spec_accept_length)
         self._log_gauge(self.avg_request_queue_latency, stats.avg_request_queue_latency)
-        self.last_log_time = time.time()
+        self.last_log_time = time.perf_counter()
 
 
 class TokenizerMetricsCollector:

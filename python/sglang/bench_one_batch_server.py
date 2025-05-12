@@ -79,8 +79,8 @@ def launch_server_process(server_args: ServerArgs):
     base_url = f"http://{server_args.host}:{server_args.port}"
     timeout = 600
 
-    start_time = time.time()
-    while time.time() - start_time < timeout:
+    start_time = time.perf_counter()
+    while time.perf_counter() - start_time < timeout:
         try:
             headers = {
                 "Content-Type": "application/json; charset=utf-8",
@@ -107,7 +107,7 @@ def run_one_case(
         for _ in range(batch_size)
     ]
 
-    tic = time.time()
+    tic = time.perf_counter()
     response = requests.post(
         url + "/generate",
         json={
@@ -119,7 +119,7 @@ def run_one_case(
             },
         },
     )
-    latency = time.time() - tic
+    latency = time.perf_counter() - tic
 
     _ = response.json()
     output_throughput = batch_size * output_len / latency
