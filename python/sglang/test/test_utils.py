@@ -79,7 +79,8 @@ DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1 = "neuralmagic/Meta-Llama-3.1-8B-Ins
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2 = "neuralmagic/Meta-Llama-3.1-70B-Instruct-FP8,neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8,neuralmagic/Qwen2-72B-Instruct-FP8,neuralmagic/Qwen2-57B-A14B-Instruct-FP8,neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8"
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_QUANT_TP1 = "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4,hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4,hugging-quants/Mixtral-8x7B-Instruct-v0.1-AWQ-INT4"
 DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN = "Qwen/Qwen2.5-1.5B-Instruct"
-DEFAULT_SMALL_VLM_MODEL_NAME = "Qwen/Qwen2-VL-2B"
+DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST = "Qwen/Qwen2.5-VL-3B-Instruct"
+DEFAULT_VLM_CHAT_TEMPLATE_FOR_TEST = "qwen2-vl"
 
 DEFAULT_IMAGE_URL = "https://github.com/sgl-project/sglang/blob/main/test/lang/example_image.png?raw=true"
 DEFAULT_VIDEO_URL = "https://raw.githubusercontent.com/EvolvingLMMs-Lab/sglang/dev/onevision_local/assets/jobs.mp4"
@@ -448,9 +449,9 @@ def popen_launch_server(
     else:
         process = subprocess.Popen(command, stdout=None, stderr=None, env=env)
 
-    start_time = time.time()
+    start_time = time.perf_counter()
     with requests.Session() as session:
-        while time.time() - start_time < timeout:
+        while time.perf_counter() - start_time < timeout:
             try:
                 headers = {
                     "Content-Type": "application/json; charset=utf-8",
@@ -470,6 +471,81 @@ def popen_launch_server(
                 raise Exception(
                     f"Server unexpectedly exits ({return_code=}). Usually there will be error logs describing the cause far above this line."
                 )
+
+            time.sleep(10)
+
+    kill_process_tree(process.pid)
+    raise TimeoutError("Server failed to start within the timeout period.")
+
+
+def popen_launch_pd_server(
+    model: str,
+    base_url: str,
+    timeout: float,
+    api_key: Optional[str] = None,
+    other_args: list[str] = (),
+    env: Optional[dict] = None,
+    return_stdout_stderr: Optional[tuple] = None,
+):
+    _, host, port = base_url.split(":")
+    host = host[2:]
+
+    command = "sglang.launch_server"
+
+    command = [
+        "python3",
+        "-m",
+        command,
+        "--model-path",
+        model,
+        *[str(x) for x in other_args],
+    ]
+
+    command.extend(
+        [
+            "--host",
+            host,
+            "--port",
+            port,
+        ]
+    )
+
+    if api_key:
+        command += ["--api-key", api_key]
+
+    print(f"command={' '.join(command)}")
+
+    if return_stdout_stderr:
+        process = subprocess.Popen(
+            command,
+            stdout=return_stdout_stderr[0],
+            stderr=return_stdout_stderr[1],
+            env=env,
+            text=True,
+        )
+    else:
+        process = subprocess.Popen(command, stdout=None, stderr=None, env=env)
+
+    start_time = time.time()
+    with requests.Session() as session:
+        while time.time() - start_time < timeout:
+            try:
+                headers = {
+                    "Content-Type": "application/json; charset=utf-8",
+                    "Authorization": f"Bearer {api_key}",
+                }
+                response = session.get(
+                    f"{base_url}/health",
+                    headers=headers,
+                )
+                if response.status_code == 200:
+                    return process
+            except requests.RequestException:
+                pass
+
+            return_code = process.poll()
+            if return_code is not None:
+                raise Exception(f"Server unexpectedly exits ({return_code=}).")
 
             time.sleep(10)
 
@@ -508,7 +584,7 @@ class TestFile:
 
 
 def run_unittest_files(files: List[TestFile], timeout_per_file: float):
-    tic = time.time()
+    tic = time.perf_counter()
     success = True
 
     for i, file in enumerate(files):
@@ -523,13 +599,13 @@ def run_unittest_files(files: List[TestFile], timeout_per_file: float):
                 f".\n.\nBegin ({i}/{len(files) - 1}):\npython3 {filename}\n.\n.\n",
                 flush=True,
             )
-            tic = time.time()
+            tic = time.perf_counter()
 
             process = subprocess.Popen(
                 ["python3", filename], stdout=None, stderr=None, env=os.environ
             )
             process.wait()
-            elapsed = time.time() - tic
+            elapsed = time.perf_counter() - tic
 
             print(
                 f".\n.\nEnd ({i}/{len(files) - 1}):\n{filename=}, {elapsed=:.0f}, {estimated_time=}\n.\n.\n",
@@ -555,9 +631,9 @@ def run_unittest_files(files: List[TestFile], timeout_per_file: float):
             break
 
     if success:
-        print(f"Success. Time elapsed: {time.time() - tic:.2f}s", flush=True)
+        print(f"Success. Time elapsed: {time.perf_counter() - tic:.2f}s", flush=True)
     else:
-        print(f"Fail. Time elapsed: {time.time() - tic:.2f}s", flush=True)
+        print(f"Fail. Time elapsed: {time.perf_counter() - tic:.2f}s", flush=True)
 
     return 0 if success else -1
 

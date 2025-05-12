@@ -152,7 +152,7 @@ class BlockInt8LinearMethod(LinearMethodBase):
                     f"{input_size_per_partition} is not divisible by "
                     f"weight quantization block_k = {block_k}."
                 )
-        # Required by collum parallel or enabling merged weights
+        # Required by column parallel or enabling merged weights
         if (tp_size > 1 and output_size // output_size_per_partition == tp_size) or len(
             output_partition_sizes
         ) > 1:
@@ -285,7 +285,7 @@ class BlockInt8MoEMethod:
             self.quant_config.weight_block_size[1],
         )
         # NOTE(HandH1998): To ensure proper alignment of the block-wise quantization scales, the output_size of the weights for both the gate and up layers must be divisible by block_n.
-        # Required by collum parallel or enabling merged weights
+        # Required by column parallel or enabling merged weights
         if intermediate_size % block_n != 0:
             raise ValueError(
                 f"The output_size of gate's and up's weight = "

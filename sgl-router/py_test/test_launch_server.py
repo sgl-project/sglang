@@ -92,9 +92,9 @@ def popen_launch_router(
 
     process = subprocess.Popen(command, stdout=None, stderr=None)
 
-    start_time = time.time()
+    start_time = time.perf_counter()
     with requests.Session() as session:
-        while time.time() - start_time < timeout:
+        while time.perf_counter() - start_time < timeout:
             try:
                 response = session.get(f"{base_url}/health")
                 if response.status_code == 200:
@@ -155,11 +155,11 @@ def terminate_and_wait(process, timeout=300):
         return
 
     process.terminate()
-    start_time = time.time()
+    start_time = time.perf_counter()
 
     while process.poll() is None:
         print(f"Terminating process {process.pid}")
-        if time.time() - start_time > timeout:
+        if time.perf_counter() - start_time > timeout:
             raise TimeoutError(
                 f"Process {process.pid} failed to terminate within {timeout}s"
             )
