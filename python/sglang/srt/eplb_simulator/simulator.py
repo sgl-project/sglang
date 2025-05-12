@@ -360,6 +360,7 @@ class MyExpertLocationMetadata:
                 num_local_physical_experts=num_local_physical_experts,
                 num_groups=model_config_for_expert_location.num_groups,
                 num_nodes=server_args.nnodes,
+                phase=server_args.phase,
             )
         )
 
