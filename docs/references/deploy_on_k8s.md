@@ -330,7 +330,7 @@ This should resolve most NCCL-related issues.
 ## Remaining issues
 
 * In Kubernetes, Docker, or Containerd environments, we use hostNetwork to prevent performance degradation.
-* We utilize privileged mode, which  isn’t secure. Additionally, in containerized environments, full GPU isolation cannot be achieved.
+* We utilize privileged mode, which isn't secure. Additionally, in containerized environments, full GPU isolation cannot be achieved.
 
 ## TODO
 

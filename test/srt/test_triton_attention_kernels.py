@@ -277,7 +277,7 @@ class TestTritonAttention(CustomTestCase):
 
     def test_decode_attention(self):
         # Here we just to ensure there is no error
-        # TODO: correctnesss test
+        # TODO: correctness test
 
         # Test configurations
         configs = [

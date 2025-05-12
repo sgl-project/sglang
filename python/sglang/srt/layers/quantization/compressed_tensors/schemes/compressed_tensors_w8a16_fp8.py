@@ -27,10 +27,10 @@ except ImportError:
     MARLIN_FP8_AVAILABLE = False
 
     def apply_fp8_marlin_linear(*args, **kwargs):
-        raise ImportError("vllm is not installed")
+        raise ImportError("vLLM is not installed")
 
     def prepare_fp8_layer_for_marlin(*args, **kwargs):
-        raise ImportError("vllm is not installed")
+        raise ImportError("vLLM is not installed")
 
 
 __all__ = ["CompressedTensorsW8A16Fp8"]
@@ -45,7 +45,7 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
 
         if not MARLIN_FP8_AVAILABLE:
             raise ImportError(
-                "vllm is not installed. To use CompressedTensorsW8A16Fp8, please install vllm"
+                "vLLM is not installed. To use CompressedTensorsW8A16Fp8, please install vLLM"
             )
 
     @classmethod
