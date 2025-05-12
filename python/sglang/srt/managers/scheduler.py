@@ -20,7 +20,6 @@ import signal
 import sys
 import threading
 import time
-import warnings
 from collections import defaultdict, deque
 from concurrent import futures
 from dataclasses import dataclass
@@ -121,11 +120,7 @@ from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
-from sglang.srt.model_executor.forward_batch_info import (
-    ForwardBatch,
-    ForwardMode,
-    PPProxyTensors,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -135,6 +130,7 @@ from sglang.srt.utils import (
     broadcast_pyobj,
     configure_logger,
     crash_on_warnings,
+    disable_request_logging,
     get_bool_env_var,
     get_zmq_socket,
     kill_itself_when_parent_died,
@@ -153,6 +149,7 @@ logger = logging.getLogger(__name__)
 # Test retract decode for debugging purposes
 TEST_RETRACT = get_bool_env_var("SGLANG_TEST_RETRACT")
 RECORD_STEP_TIME = get_bool_env_var("SGLANG_RECORD_STEP_TIME")
+GRAMMAR_TIMEOUT = float(os.environ.get("SGLANG_GRAMMAR_TIMEOUT", 300))
 
 
 @dataclass
@@ -907,19 +904,6 @@ class Scheduler(
                 fake_input_ids = [1] * seq_length
                 recv_req.input_ids = fake_input_ids
 
-            # Handle custom logit processor passed to the request
-            custom_logit_processor = recv_req.custom_logit_processor
-            if (
-                not self.server_args.enable_custom_logit_processor
-                and custom_logit_processor is not None
-            ):
-                logger.warning(
-                    "The SGLang server is not configured to enable custom logit processor."
-                    "The custom logit processor passed in will be ignored."
-                    "Please set --enable-custom-logits-processor to enable this feature."
-                )
-                custom_logit_processor = None
-
             if recv_req.bootstrap_port is None:
                 # Use default bootstrap port
                 recv_req.bootstrap_port = self.server_args.disaggregation_bootstrap_port
@@ -935,7 +919,7 @@ class Scheduler(
                 stream=recv_req.stream,
                 lora_path=recv_req.lora_path,
                 input_embeds=recv_req.input_embeds,
-                custom_logit_processor=custom_logit_processor,
+                custom_logit_processor=recv_req.custom_logit_processor,
                 return_hidden_states=recv_req.return_hidden_states,
                 eos_token_ids=self.model_config.hf_eos_token_id,
                 bootstrap_host=recv_req.bootstrap_host,
@@ -1041,9 +1025,11 @@ class Scheduler(
             elif req.sampling_params.structural_tag:
                 key = ("structural_tag", req.sampling_params.structural_tag)
 
-            req.grammar = self.grammar_backend.get_cached_value(key)
-            if not req.grammar:
-                req.grammar = self.grammar_backend.get_future_value(key)
+            value, cache_hit = self.grammar_backend.get_cached_or_future_value(key)
+            req.grammar = value
+
+            if not cache_hit:
+                req.grammar_key = key
                 add_to_grammar_queue = True
 
         if add_to_grammar_queue:
@@ -1225,6 +1211,7 @@ class Scheduler(
             self.stats.cache_hit_rate = 0.0
             self.stats.gen_throughput = self.last_gen_throughput
             self.stats.num_queue_reqs = len(self.waiting_queue)
+            self.stats.num_grammar_queue_reqs = len(self.grammar_queue)
             self.stats.spec_accept_length = spec_accept_length
             self.metrics_collector.log_stats(self.stats)
 
@@ -1246,9 +1233,7 @@ class Scheduler(
                 f"{self.token_to_kv_pool_allocator.available_size()=}\n"
                 f"{self.tree_cache.evictable_size()=}\n"
             )
-            warnings.warn(msg)
-            if crash_on_warnings():
-                raise ValueError(msg)
+            raise ValueError(msg)
 
         if len(self.req_to_token_pool.free_slots) != self.req_to_token_pool.size:
             msg = (
@@ -1256,9 +1241,7 @@ class Scheduler(
                 f"available_size={len(self.req_to_token_pool.free_slots)}, "
                 f"total_size={self.req_to_token_pool.size}\n"
             )
-            warnings.warn(msg)
-            if crash_on_warnings():
-                raise ValueError(msg)
+            raise ValueError(msg)
 
         if (
             self.enable_metrics
@@ -1276,6 +1259,7 @@ class Scheduler(
             self.stats.token_usage = num_used / self.max_total_num_tokens
             self.stats.gen_throughput = 0
             self.stats.num_queue_reqs = len(self.waiting_queue)
+            self.stats.num_grammar_queue_reqs = len(self.grammar_queue)
             self.metrics_collector.log_stats(self.stats)
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
@@ -1346,7 +1330,7 @@ class Scheduler(
             return None
 
         running_bs = len(self.running_batch.reqs)
-        # Igore the check if self.chunked_req is not None.
+        # Ignore the check if self.chunked_req is not None.
         # In the non-PP case, when self.chunked_req is not None, num_allocatable_reqs should always be greater than 0,
         # as the space for the chunked request has just been released.
         # In PP case, a chunked req can start in one microbatch and end in another microbatch, so the max_running_requests per microbatch should not be strict.
@@ -1736,11 +1720,17 @@ class Scheduler(
         """Move requests whose grammar objects are ready from grammar_queue to waiting_queue."""
 
         num_ready_reqs = 0
+        num_abort_reqs = 0
         for req in self.grammar_queue:
             try:
-                req.grammar = req.grammar.result(timeout=0.05)
+                req.grammar = req.grammar.result(timeout=0.03)
+                if req.grammar:
+                    self.grammar_backend.set_cache(req.grammar_key, req.grammar.copy())
                 num_ready_reqs += 1
             except futures._base.TimeoutError:
+                req.grammar_wait_ct += 1
+                if req.grammar_wait_ct > GRAMMAR_TIMEOUT / 0.03:
+                    num_abort_reqs = 1
                 break
 
         if self.server_args.enable_dp_attention:
@@ -1752,14 +1742,28 @@ class Scheduler(
 
         if tp_size > 1:
             # Sync across TP ranks to make sure they have the same number of ready requests
-            tensor = torch.tensor(num_ready_reqs, dtype=torch.int32)
+            tensor = torch.tensor([num_ready_reqs, num_abort_reqs], dtype=torch.int32)
             torch.distributed.all_reduce(
                 tensor, op=torch.distributed.ReduceOp.MAX, group=tp_group
             )
-            num_ready_reqs_max = tensor.item()
+            num_ready_reqs_max, num_abort_reqs_max = tensor.tolist()
+
             for i in range(num_ready_reqs, num_ready_reqs_max):
-                self.grammar_queue[i].grammar = self.grammar_queue[i].grammar.result()
-            num_ready_reqs = num_ready_reqs_max
+                req = self.grammar_queue[i]
+                req.grammar = req.grammar.result()
+                if req.grammar:
+                    self.grammar_backend.set_cache(req.grammar_key, req.grammar.copy())
+
+            for i in range(num_ready_reqs, num_ready_reqs + num_abort_reqs_max):
+                req = self.grammar_queue[i]
+                req.grammar.cancel()
+                req.grammar = None
+                error_msg = f"Grammar preprocessing timed out for {req.grammar_key=}"
+                logger.error(error_msg)
+                req.finished_reason = FINISH_ABORT(
+                    error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
+                )
+            num_ready_reqs = num_ready_reqs_max + num_abort_reqs_max
 
         self._extend_requests_to_queue(self.grammar_queue[:num_ready_reqs])
         self.grammar_queue = self.grammar_queue[num_ready_reqs:]
@@ -1774,24 +1778,27 @@ class Scheduler(
             if self.cur_batch is not None:
                 if self.watchdog_last_forward_ct == self.forward_ct:
                     if current > self.watchdog_last_time + self.watchdog_timeout:
-                        logger.error(f"Watchdog timeout ({self.watchdog_timeout=})")
                         break
                 else:
                     self.watchdog_last_forward_ct = self.forward_ct
                     self.watchdog_last_time = current
             time.sleep(self.watchdog_timeout // 2)
 
-        # Print batch size and memory pool info to check whether there are de-sync issues.
-        logger.error(
-            f"{self.cur_batch.batch_size()=}, "
-            f"{self.cur_batch.reqs=}, "
-            f"{self.token_to_kv_pool_allocator.available_size()=}, "
-            f"{self.tree_cache.evictable_size()=}, "
-        )
-        # Wait for some time so that the parent process can print the error.
+        if not disable_request_logging():
+            # Print batch size and memory pool info to check whether there are de-sync issues.
+            logger.error(
+                f"{self.cur_batch.batch_size()=}, "
+                f"{self.cur_batch.reqs=}, "
+                f"{self.token_to_kv_pool_allocator.available_size()=}, "
+                f"{self.tree_cache.evictable_size()=}, "
+            )
+
         pyspy_dump_schedulers()
+        logger.error(f"Watchdog timeout ({self.watchdog_timeout=})")
         print(file=sys.stderr, flush=True)
         print(file=sys.stdout, flush=True)
+
+        # Wait for some time so that the parent process can print the error.
         time.sleep(5)
         self.parent_process.send_signal(signal.SIGQUIT)
 
@@ -1923,25 +1930,30 @@ class Scheduler(
         )
 
     def abort_request(self, recv_req: AbortReq):
+        # TODO(lmzheng): abort the requests in the grammar queue.
+
         # Delete requests in the waiting queue
         to_del = []
         for i, req in enumerate(self.waiting_queue):
             if req.rid.startswith(recv_req.rid):
                 to_del.append(i)
-                break
 
         # Sort in reverse order to avoid index issues when deleting
-        for i in sorted(to_del, reverse=True):
+        for i in reversed(to_del):
             req = self.waiting_queue.pop(i)
+            self.send_to_tokenizer.send_pyobj(AbortReq(req.rid))
             logger.debug(f"Abort queued request. {req.rid=}")
-            return
 
         # Delete requests in the running batch
-        for req in self.running_batch.reqs:
+        if self.cur_batch is self.running_batch or self.cur_batch is None:
+            reqs = self.running_batch.reqs
+        else:
+            reqs = self.running_batch.reqs + self.cur_batch.reqs
+
+        for req in reqs:
             if req.rid.startswith(recv_req.rid) and not req.finished():
                 logger.debug(f"Abort running request. {req.rid=}")
                 req.to_abort = True
-                return
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()

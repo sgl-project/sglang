@@ -49,6 +49,7 @@ from sglang.srt.disaggregation.utils import (
 from sglang.srt.entrypoints.engine import _launch_subprocesses
 from sglang.srt.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
+    AbortReq,
     CloseSessionReqInput,
     ConfigureLoggingReq,
     EmbeddingReqInput,
@@ -537,6 +538,16 @@ async def configure_logging(obj: ConfigureLoggingReq, request: Request):
     """Configure the request logging options."""
     _global_state.tokenizer_manager.configure_logging(obj)
     return Response(status_code=200)
+
+
+@app.post("/abort_request")
+async def abort_request(obj: AbortReq, request: Request):
+    """Abort a request."""
+    try:
+        _global_state.tokenizer_manager.abort_request(rid=obj.rid)
+        return Response(status_code=200)
+    except Exception as e:
+        return _create_error_response(e)
 
 
 @app.post("/parse_function_call")
