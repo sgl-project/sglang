@@ -82,7 +82,7 @@ if is_in_ci():
 
 llm = sgl.Engine(model_path="meta-llama/Meta-Llama-3.1-8B-Instruct")
 
-# Terminalte Engine
+# Terminate Engine
 llm.shutdown()
 ```
 
@@ -94,7 +94,7 @@ llm.shutdown()
 
 ### **Model Selection**
 
-For demonstrations in the docs, **prefer smaller models** to reduce memory consumption and speed up inference. Running larger models in CI can lead to instability due to memory constraints.
+For demonstrations in the docs, we **prefer smaller models** to reduce memory consumption and speed up inference. Running larger models in CI can lead to instability due to memory constraints.
 
 ### **Prompt Alignment Example**
 

@@ -715,7 +715,7 @@ class Scheduler(
                     server_is_idle = False
                     result = self.run_batch(self.cur_batch)
 
-                # send the outputs to the next step
+                # (last rank) send the outputs to the next step
                 if self.pp_group.is_last_rank:
                     if self.cur_batch:
                         next_token_ids, bids[mb_id] = (
@@ -755,18 +755,18 @@ class Scheduler(
                     self.process_batch_result(mbs[next_mb_id], output_result)
                     last_mbs[next_mb_id] = mbs[next_mb_id]
 
-                # carry the outputs to the next stage
+                # (not last rank)
                 if not self.pp_group.is_last_rank:
                     if self.cur_batch:
                         bids[mb_id] = result.bid
+                    # carry the outputs to the next stage
+                    # send the outputs from the last round to let the next stage worker run post processing
                     if pp_outputs:
-                        # send the outputs from the last round to let the next stage worker run post processing
                         self.pp_group.send_tensor_dict(
                             pp_outputs.tensors,
                             all_gather_group=self.attn_tp_group,
                         )
 
-                if not self.pp_group.is_last_rank:
                     # send out reqs to the next stage
                     dp_offset = self.dp_rank * self.attn_tp_size
                     if self.attn_tp_rank == 0:
@@ -1655,7 +1655,7 @@ class Scheduler(
             can_cuda_graph = 0
 
         if not spec_algorithm.is_none():
-            # TODO(sang): Support cuda graph when idle batch is there.
+            # TODO(sang): Support CUDA graph when idle batch is there.
             if local_batch is None or local_batch.forward_mode.is_idle():
                 can_cuda_graph = 0
 
@@ -1692,7 +1692,7 @@ class Scheduler(
             local_batch.global_num_tokens = global_num_tokens
             local_batch.global_num_tokens_for_logprob = global_num_tokens_for_logprob
 
-            # Check forward mode for cuda graph
+            # Check forward mode for CUDA graph
             if not disable_cuda_graph:
                 local_batch.can_run_dp_cuda_graph = can_cuda_graph
 

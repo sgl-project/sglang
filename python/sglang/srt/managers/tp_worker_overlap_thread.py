@@ -215,7 +215,7 @@ class TpModelWorkerClient:
             penalizer_orchestrator=None,
         )
 
-        # A cuda stream sync here to avoid the cuda illegal memory access error.
+        # A cuda stream sync here to avoid the CUDA illegal memory access error.
         sync_event = torch.get_device_module(self.device).Event()
         sync_event.record(self.scheduler_stream)
 

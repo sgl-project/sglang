@@ -67,7 +67,7 @@ class Platform:
     # Real device name of current platform.
     device_name: str
 
-    # For specifying torch device for cuda alike platform's capability.
+    # For specifying torch device for CUDA alike platform's capability.
     device_type: str
 
     #  The torch.distributed backend on current platform
@@ -254,7 +254,7 @@ class Platform:
     @classmethod
     def check_and_update_lora_backend(cls, backend: str) -> str:
         """
-        Check and update the lora backend for the current platform.
+        Check and update the LoRA backend for the current platform.
         """
         raise NotImplementedError
 
