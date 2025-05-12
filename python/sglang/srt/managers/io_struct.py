@@ -12,7 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 """
-The definition of objects transfered between different
+The definition of objects transferred between different
 processes (TokenizerManager, DetokenizerManager, Controller).
 """
 
@@ -836,6 +836,8 @@ class ProfileReqInput:
     # the caller doesn't need to run stop_profile.
     num_steps: Optional[int] = None
     activities: Optional[List[Literal["CPU", "GPU", "MEM", "CUDA_PROFILER"]]] = None
+    with_stack: Optional[bool] = None
+    record_shapes: Optional[bool] = None
 
 
 class ProfileReqType(Enum):

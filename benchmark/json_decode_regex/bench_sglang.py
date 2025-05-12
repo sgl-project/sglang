@@ -63,11 +63,11 @@ def main(args):
     json_warm_up.run().sync()
 
     # Run requests
-    tic = time.time()
+    tic = time.perf_counter()
     states = json_decode.run_batch(
         arguments, temperature=0, num_threads=args.parallel, progress_bar=True
     )
-    latency = time.time() - tic
+    latency = time.perf_counter() - tic
 
     # Compute accuracy
     print(f"Latency: {latency:.3f}")
