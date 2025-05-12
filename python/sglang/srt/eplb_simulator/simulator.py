@@ -356,14 +356,14 @@ class MyExpertLocationMetadata:
     ):
         model_config_for_expert_location = MY_MODEL_CONFIG_FOR_EXPERT_LOCATION
 
+        num_local_physical_experts = num_physical_experts // server_args.tp_size
         physical_to_logical_map, logical_to_all_physical_map, _ = (
             deepseek_eplb.prefill_rebalance_experts(
-                weight=logical_count,
-                num_replicas=num_physical_experts,
+                tokens_per_expert=logical_count,
+                num_physical_experts=num_physical_experts,
+                num_local_physical_experts=num_local_physical_experts,
                 num_groups=model_config_for_expert_location.num_groups,
                 num_nodes=server_args.nnodes,
-                num_gpus=server_args.tp_size,
-                hack_shuffle=server_args.deepseek_eplb_hack_shuffle,
             )
         )
 
