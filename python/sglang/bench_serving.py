@@ -85,7 +85,7 @@ class RequestFuncOutput:
 
 
 def remove_prefix(text: str, prefix: str) -> str:
-    return text[len(prefix):] if text.startswith(prefix) else text
+    return text[len(prefix) :] if text.startswith(prefix) else text
 
 
 def remove_suffix(text: str, suffix: str) -> str:
@@ -403,8 +403,8 @@ async def async_request_sglang_generate(
                                     if num_new_tokens == 0:
                                         continue
                                     adjust_itl = (
-                                                     timestamp - most_recent_timestamp
-                                                 ) / num_new_tokens
+                                        timestamp - most_recent_timestamp
+                                    ) / num_new_tokens
                                     output.itl.extend([adjust_itl] * num_new_tokens)
 
                                 most_recent_timestamp = timestamp
@@ -536,7 +536,7 @@ def get_dataset(args, tokenizer):
         )
     else:
         raise ValueError(f"Unknown dataset: {args.dataset_name}")
-    input_requests = input_requests[args.skip_num_prompts:]
+    input_requests = input_requests[args.skip_num_prompts :]
     return input_requests
 
 
@@ -1185,9 +1185,9 @@ def calculate_metrics(
         output_throughput_retokenized=sum(retokenized_output_lens) / dur_s,
         total_throughput=(total_input + sum(output_lens)) / dur_s,
         total_throughput_retokenized=(total_input + sum(retokenized_output_lens))
-                                     / dur_s,
+        / dur_s,
         mean_ttft_ms=np.mean(ttfts or 0)
-                     * 1000,  # ttfts is empty if streaming is not supported by backend
+        * 1000,  # ttfts is empty if streaming is not supported by backend
         median_ttft_ms=np.median(ttfts or 0) * 1000,
         std_ttft_ms=np.std(ttfts or 0) * 1000,
         p99_ttft_ms=np.percentile(ttfts or 0, 99) * 1000,
@@ -1232,11 +1232,15 @@ def wrap_multi_round_request_func(request_func: Callable, tokenizer) -> Callable
             {"role": "user", "content": gen_prompt},
         ]
 
-        history_text = tokenizer.apply_chat_template(
-            history_conversations,
-            add_generation_prompt=False,
-            tokenize=False,
-        ).replace(tokenizer.bos_token, "") if len(history_conversations) > 0 else ""
+        history_text = (
+            tokenizer.apply_chat_template(
+                history_conversations,
+                add_generation_prompt=False,
+                tokenize=False,
+            ).replace(tokenizer.bos_token, "")
+            if len(history_conversations) > 0
+            else ""
+        )
         full_text = tokenizer.apply_chat_template(
             full_conversations,
             add_generation_prompt=True,
@@ -1267,7 +1271,8 @@ def wrap_multi_round_request_func(request_func: Callable, tokenizer) -> Callable
                 metadata={**(request_func_input.metadata or {})},
             )
             print(
-                f"[{datetime.now().isoformat()}] hi wrap_multi_round_request_func call request start dataset_index={request_func_input.metadata.get('dataset_index')} {round_index=}")
+                f"[{datetime.now().isoformat()}] hi wrap_multi_round_request_func call request start dataset_index={request_func_input.metadata.get('dataset_index')} {round_index=}"
+            )
             output = await request_func(
                 inner_input, pbar=pbar if round_index == len(prompts) - 1 else None
             )
@@ -1812,8 +1817,14 @@ if __name__ == "__main__":
         "--dataset-name",
         type=str,
         default="sharegpt",
-        choices=["sharegpt", "random", "random-ids", "generated-shared-prefix", "chatbot-arena-conversations",
-                 "wildchat-1m"],
+        choices=[
+            "sharegpt",
+            "random",
+            "random-ids",
+            "generated-shared-prefix",
+            "chatbot-arena-conversations",
+            "wildchat-1m",
+        ],
         help="Name of the dataset to benchmark on.",
     )
     parser.add_argument(
@@ -1870,7 +1881,7 @@ if __name__ == "__main__":
         type=float,
         default=0.0,
         help="Range of sampled ratio of input/output length, "
-             "used only for random dataset.",
+        "used only for random dataset.",
     )
     parser.add_argument(
         "--hf-dataset-output-len",
@@ -1883,20 +1894,20 @@ if __name__ == "__main__":
         type=float,
         default=float("inf"),
         help="Number of requests per second. If this is inf, then all the requests are sent at time 0. "
-             "Otherwise, we use Poisson process to synthesize the request arrival times. Default is inf.",
+        "Otherwise, we use Poisson process to synthesize the request arrival times. Default is inf.",
     )
     parser.add_argument(
         "--max-concurrency",
         type=int,
         default=None,
         help="Maximum number of concurrent requests. This can be used "
-             "to help simulate an environment where a higher level component "
-             "is enforcing a maximum number of concurrent requests. While the "
-             "--request-rate argument controls the rate at which requests are "
-             "initiated, this argument will control how many are actually allowed "
-             "to execute at a time. This means that when used in combination, the "
-             "actual request rate may be lower than specified with --request-rate, "
-             "if the server is not processing requests fast enough to keep up.",
+        "to help simulate an environment where a higher level component "
+        "is enforcing a maximum number of concurrent requests. While the "
+        "--request-rate argument controls the rate at which requests are "
+        "initiated, this argument will control how many are actually allowed "
+        "to execute at a time. This means that when used in combination, the "
+        "actual request rate may be lower than specified with --request-rate, "
+        "if the server is not processing requests fast enough to keep up.",
     )
     parser.add_argument("--output-file", type=str, help="Output JSONL file name.")
     parser.add_argument(
@@ -1928,7 +1939,7 @@ if __name__ == "__main__":
         metavar='{"key1": "value1", "key2": "value2"}',
         type=str,
         help="Append given JSON object to the request payload. You can use this to specify"
-             "additional generate params like sampling params.",
+        "additional generate params like sampling params.",
     )
     parser.add_argument(
         "--apply-chat-template",
@@ -1939,7 +1950,7 @@ if __name__ == "__main__":
         "--profile",
         action="store_true",
         help="Use Torch Profiler. The endpoint must be launched with "
-             "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
+        "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
     )
     parser.add_argument(
         "--enable-expert-distribution-record",

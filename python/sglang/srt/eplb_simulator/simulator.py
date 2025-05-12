@@ -5,6 +5,8 @@ from typing import List, Literal, Union
 import einops
 import polars as pl
 import torch
+from tqdm.auto import tqdm, trange
+
 from sglang.srt.eplb_simulator.configs import (
     MY_MODEL_CONFIG_FOR_EXPERT_LOCATION,
     MyServerArgs,
@@ -19,7 +21,6 @@ from sglang.srt.managers.expert_distribution import (
     compute_utilization_rate,
 )
 from sglang.srt.managers.expert_location import ExpertLocationMetadata
-from tqdm.auto import tqdm, trange
 
 _Phase = Union[Literal["prefill", "decode"]]
 
@@ -46,7 +47,9 @@ def simulate_execution_given_pack(
                     topk_ids=pack.topk_ids[token_indices_of_batch[i], :, :],
                     num_physical_expert=model_config_for_expert_location.num_logical_experts,
                 )
-                for i in trange(len(token_indices_of_batch), desc="vanilla_physical_count_of_batch")
+                for i in trange(
+                    len(token_indices_of_batch), desc="vanilla_physical_count_of_batch"
+                )
             ]
         )
 
@@ -56,17 +59,24 @@ def simulate_execution_given_pack(
 
         simulation_output = dict(
             logical_count_of_batch=logical_count_of_batch,
-            num_tokens_of_batch=torch.tensor([len(x) for x in token_indices_of_batch], dtype=torch.int32),
+            num_tokens_of_batch=torch.tensor(
+                [len(x) for x in token_indices_of_batch], dtype=torch.int32
+            ),
             **simulation_output,
         )
 
-        num_batch, _ = simulation_output['utilization_rate'].shape
-        simulation_output["df_step"] = pl.DataFrame(dict(
-            step=list(range(num_batch)),
-            utilization_rate=einops.reduce(simulation_output['utilization_rate'], 'num_batch num_layer -> num_batch',
-                                           'mean').tolist(),
-            num_tokens_of_batch=simulation_output['num_tokens_of_batch'].tolist(),
-        ))
+        num_batch, _ = simulation_output["utilization_rate"].shape
+        simulation_output["df_step"] = pl.DataFrame(
+            dict(
+                step=list(range(num_batch)),
+                utilization_rate=einops.reduce(
+                    simulation_output["utilization_rate"],
+                    "num_batch num_layer -> num_batch",
+                    "mean",
+                ).tolist(),
+                num_tokens_of_batch=simulation_output["num_tokens_of_batch"].tolist(),
+            )
+        )
 
         return simulation_output
 
@@ -86,9 +96,9 @@ def _simulate_scheduled_pack_indices_given_seq_metadata(
                 x
                 for row in df_metadata.iter_rows(named=True)
                 for x in range(
-                row["pack_input_except_history_start_index"],
-                row["pack_output_start_index"],
-            )
+                    row["pack_input_except_history_start_index"],
+                    row["pack_output_start_index"],
+                )
             ]
         )
         num_chunks = math.ceil(len(all_pack_indices) / num_tokens_in_batch_overall)
@@ -96,13 +106,24 @@ def _simulate_scheduled_pack_indices_given_seq_metadata(
 
     if phase == "decode":
         # loose bound
-        num_steps_upper_bound = max(1_000_000,
-                                    int(df_metadata["pack_end_index"].max() // num_tokens_in_batch_overall * 1.5))
+        num_steps_upper_bound = max(
+            1_000_000,
+            int(
+                df_metadata["pack_end_index"].max() // num_tokens_in_batch_overall * 1.5
+            ),
+        )
 
         pack_indices_of_step = torch.full(
-            (num_steps_upper_bound, num_tokens_in_batch_overall), fill_value=-1, dtype=torch.int32
+            (num_steps_upper_bound, num_tokens_in_batch_overall),
+            fill_value=-1,
+            dtype=torch.int32,
         )
-        curr_lens = torch.randint(0, decode_max_left_padding + 1, (num_tokens_in_batch_overall,), dtype=torch.int32)
+        curr_lens = torch.randint(
+            0,
+            decode_max_left_padding + 1,
+            (num_tokens_in_batch_overall,),
+            dtype=torch.int32,
+        )
 
         for row in tqdm(df_metadata.iter_rows(named=True), total=len(df_metadata)):
             chosen_location = torch.argmin(curr_lens).item()
@@ -111,10 +132,13 @@ def _simulate_scheduled_pack_indices_given_seq_metadata(
             )
             output_start = curr_lens[chosen_location]
             output_end = output_start + len(output_values)
-            assert output_end <= num_steps_upper_bound, f"{num_steps_upper_bound=} {output_end=}"
+            assert (
+                output_end <= num_steps_upper_bound
+            ), f"{num_steps_upper_bound=} {output_end=}"
 
-            pack_indices_of_step[output_start: output_end, chosen_location] = torch.tensor(output_values,
-                                                                                           dtype=torch.int32)
+            pack_indices_of_step[output_start:output_end, chosen_location] = (
+                torch.tensor(output_values, dtype=torch.int32)
+            )
             curr_lens[chosen_location] += len(output_values)
 
         return [x[x != -1] for x in pack_indices_of_step[: torch.max(curr_lens)]]
@@ -126,9 +150,11 @@ def _simulate_execution_given_logical_count_of_batch(
     logical_count_of_batch: torch.Tensor,
     server_args: MyServerArgs,
 ):
-    balanced_physical_count_of_batch, expert_location_metadata_arr = _simulate_eplb_physical_count_of_batch(
-        logical_count_of_batch=logical_count_of_batch,
-        server_args=server_args,
+    balanced_physical_count_of_batch, expert_location_metadata_arr = (
+        _simulate_eplb_physical_count_of_batch(
+            logical_count_of_batch=logical_count_of_batch,
+            server_args=server_args,
+        )
     )
 
     gpu_physical_count_of_batch = compute_gpu_physical_count(
@@ -195,35 +221,42 @@ def _simulate_expert_location_metadata_arr(
         num_chunks = math.ceil(num_batches / chunk_size)
 
         output_chunks = [
-                            MyExpertLocationMetadata.init_by_eplb(
-                                server_args,
-                                # NOTE first chunk has no statistics
-                                logical_count=torch.zeros((num_layer, num_logical_expert)),
-                                num_physical_experts=num_physical_expert,
-                            )
-                        ] + [
-                            MyExpertLocationMetadata.init_by_eplb(
-                                server_args,
-                                logical_count=einops.einsum(
-                                    logical_count_of_batch[
-                                    (chunk_index - 1) * chunk_size: chunk_index * chunk_size,
-                                    :,
-                                    :,
-                                    ],
-                                    "num_interest_batches num_layer num_expert -> num_layer num_expert",
-                                ),
-                                num_physical_experts=num_physical_expert,
-                            )
-                            for chunk_index in trange(1, num_chunks, desc="Expert location init by eplb")
-                        ]
+            MyExpertLocationMetadata.init_by_eplb(
+                server_args,
+                # NOTE first chunk has no statistics
+                logical_count=torch.zeros((num_layer, num_logical_expert)),
+                num_physical_experts=num_physical_expert,
+            )
+        ] + [
+            MyExpertLocationMetadata.init_by_eplb(
+                server_args,
+                logical_count=einops.einsum(
+                    logical_count_of_batch[
+                        (chunk_index - 1) * chunk_size : chunk_index * chunk_size,
+                        :,
+                        :,
+                    ],
+                    "num_interest_batches num_layer num_expert -> num_layer num_expert",
+                ),
+                num_physical_experts=num_physical_expert,
+            )
+            for chunk_index in trange(
+                1, num_chunks, desc="Expert location init by eplb"
+            )
+        ]
 
-        return [output_chunks[batch_index // chunk_size] for batch_index in range(num_batches)]
+        return [
+            output_chunks[batch_index // chunk_size]
+            for batch_index in range(num_batches)
+        ]
 
     elif expert_location_mode == "global_average":
         output = MyExpertLocationMetadata.init_by_eplb(
             server_args,
-            logical_count=einops.einsum(logical_count_of_batch,
-                                        "num_interest_batches num_layer num_expert -> num_layer num_expert", ),
+            logical_count=einops.einsum(
+                logical_count_of_batch,
+                "num_interest_batches num_layer num_expert -> num_layer num_expert",
+            ),
             num_physical_experts=num_physical_expert,
         )
         return [output for _ in range(num_batches)]
@@ -240,24 +273,31 @@ def _simulate_logical_to_physical_by_random_dispatching(
     num_layer, num_logical_expert = logical_count.shape
     _, _, x_dim = logical_to_all_physical_map.shape
 
-    num_physical_expert_per_logical_expert = einops.einsum(logical_to_all_physical_map != -1,
-                                                           "num_layer num_logical_experts X -> num_layer num_logical_experts")
+    num_physical_expert_per_logical_expert = einops.einsum(
+        logical_to_all_physical_map != -1,
+        "num_layer num_logical_experts X -> num_layer num_logical_experts",
+    )
     assert torch.all(num_physical_expert_per_logical_expert >= 1)
     logical_count_amortized = logical_count / num_physical_expert_per_logical_expert
-    logical_count_repeated = einops.repeat(logical_count_amortized,
-                                           "num_layer num_logical_count -> num_layer num_logical_count x_dim",
-                                           x_dim=x_dim)
+    logical_count_repeated = einops.repeat(
+        logical_count_amortized,
+        "num_layer num_logical_count -> num_layer num_logical_count x_dim",
+        x_dim=x_dim,
+    )
 
     # change `-1` to `num_physical_expert` (a dummy location that is not used)
-    logical_to_all_physical_map_noneg1 = logical_to_all_physical_map.masked_fill(logical_to_all_physical_map == -1,
-                                                                                 num_physical_expert)
+    logical_to_all_physical_map_noneg1 = logical_to_all_physical_map.masked_fill(
+        logical_to_all_physical_map == -1, num_physical_expert
+    )
 
     physical_count_of_whatever = torch.zeros(
         (num_layer, num_physical_expert + 1),
         dtype=torch.float32,
     )
 
-    rearrange_expr = "num_layer num_logical_count x_dim -> num_layer (num_logical_count x_dim)"
+    rearrange_expr = (
+        "num_layer num_logical_count x_dim -> num_layer (num_logical_count x_dim)"
+    )
     physical_count_of_whatever.scatter_add_(
         dim=1,
         index=einops.rearrange(logical_to_all_physical_map_noneg1, rearrange_expr),
@@ -279,9 +319,13 @@ def compute_global_physical_count_from_topk_ids(
     )
     num_layers, _ = topk_ids_flattened.shape
 
-    topk_ids_flattened_noneg1 = topk_ids_flattened.masked_fill(topk_ids_flattened == -1, num_physical_expert)
+    topk_ids_flattened_noneg1 = topk_ids_flattened.masked_fill(
+        topk_ids_flattened == -1, num_physical_expert
+    )
 
-    global_physical_count = torch.zeros((num_layers, num_physical_expert + 1), dtype=torch.int64)
+    global_physical_count = torch.zeros(
+        (num_layers, num_physical_expert + 1), dtype=torch.int64
+    )
     global_physical_count.scatter_add_(
         dim=1,
         index=topk_ids_flattened_noneg1.long(),

@@ -6,10 +6,14 @@ from typing import Any, List
 import einops
 import polars as pl
 import torch
-from sglang.srt.eplb_simulator.configs import MY_MODEL_CONFIG_FOR_EXPERT_LOCATION, MY_MODEL_CONFIG_NUM_EXPERTS_PER_TOK
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
+
+from sglang.srt.eplb_simulator.configs import (
+    MY_MODEL_CONFIG_FOR_EXPERT_LOCATION,
+    MY_MODEL_CONFIG_NUM_EXPERTS_PER_TOK,
+)
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
 _DEVICE = "cuda"
 
@@ -22,8 +26,12 @@ class ExpertDistributionModeDetailPerTokenAndBenchServingPack:
 
 def read_expert_distribution_mode_detail_per_token_and_bench_serving(dir_data):
     with torch.device("cuda"):
-        pack_expert_distribution = read_expert_distribution_mode_detail_per_token(dir_data)
-        df_bench_serving = read_bench_serving(_single(list(Path(dir_data).glob("*.jsonl"))))
+        pack_expert_distribution = read_expert_distribution_mode_detail_per_token(
+            dir_data
+        )
+        df_bench_serving = read_bench_serving(
+            _single(list(Path(dir_data).glob("*.jsonl")))
+        )
 
         df = df_bench_serving.join(
             pack_expert_distribution["df_metadata"], on="rid", how="inner"
@@ -37,9 +45,9 @@ def read_expert_distribution_mode_detail_per_token_and_bench_serving(dir_data):
                 pl.col("history_ids").list.len(), None
             ),
             pack_input_except_history_start_index=pl.col("pack_start_index")
-                                                  + pl.col("history_ids").list.len(),
+            + pl.col("history_ids").list.len(),
             pack_output_start_index=pl.col("pack_start_index")
-                                    + pl.col("input_ids").list.len(),
+            + pl.col("input_ids").list.len(),
         )
 
         df = df.sort("dataset_timestamp", maintain_order=True)
@@ -77,7 +85,9 @@ def read_expert_distribution_mode_detail_per_token(
     """
 
     def _handle_record(record):
-        rids_raw = torch.tensor([_rid_str_to_int64(rid) for rid in record["rids"]], dtype=torch.int64)
+        rids_raw = torch.tensor(
+            [_rid_str_to_int64(rid) for rid in record["rids"]], dtype=torch.int64
+        )
 
         rids_repeat_num = (
             torch.tensor(record["extend_seq_lens"], dtype=torch.int32)
@@ -100,11 +110,16 @@ def read_expert_distribution_mode_detail_per_token(
         }
 
     def _compute_topk_ids(pack, raw_data_packs):
-        total_num_token, = pack["input_ids"].shape
+        (total_num_token,) = pack["input_ids"].shape
 
         topk_ids = torch.empty(
-            (total_num_token, model_config_for_expert_location.num_layers, MY_MODEL_CONFIG_NUM_EXPERTS_PER_TOK),
-            dtype=torch.int16)
+            (
+                total_num_token,
+                model_config_for_expert_location.num_layers,
+                MY_MODEL_CONFIG_NUM_EXPERTS_PER_TOK,
+            ),
+            dtype=torch.int16,
+        )
         counter = 0
 
         for raw_data_pack in tqdm(raw_data_packs, desc="compute topk ids"):
@@ -160,8 +175,11 @@ def read_expert_distribution_mode_detail_per_token(
         for path in tqdm(list(Path(dir_data).glob("*.pt")), desc="read raw data packs")
     ]
 
-    processed_records = [_handle_record(record) for raw_data_pack in raw_data_packs for record in
-                         raw_data_pack["records"]]
+    processed_records = [
+        _handle_record(record)
+        for raw_data_pack in raw_data_packs
+        for record in raw_data_pack["records"]
+    ]
 
     pack = _concat_records(processed_records)
     pack = _compute_topk_ids(pack, raw_data_packs)
@@ -187,11 +205,14 @@ def read_bench_serving(path: Path):
         dict(
             rid=[_rid_str_to_int64(x["rid"]) for x in data_raw["output_metadata"]],
             dataset_timestamp=[
-                x.get("dataset_timestamp", "2000-01-01T00:00:00") for x in data_raw["output_metadata"]
+                x.get("dataset_timestamp", "2000-01-01T00:00:00")
+                for x in data_raw["output_metadata"]
             ],
             input_text=data_raw["prompts"],
             output_text=data_raw["generated_texts"],
-            history_text=[x.get("history_text", "") for x in data_raw["output_metadata"]],
+            history_text=[
+                x.get("history_text", "") for x in data_raw["output_metadata"]
+            ],
         )
     )
 
@@ -246,7 +267,7 @@ def _unnest(schema, path):
 def _rid_str_to_int64(rid: str):
     val = int(rid, 16) & ((1 << 64) - 1)
     if val >= (1 << 63):
-        val -= (1 << 64)
+        val -= 1 << 64
     return val
 
 

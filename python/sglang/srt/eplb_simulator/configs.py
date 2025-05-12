@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Optional, Literal
+from typing import Literal, Optional
 
 from sglang.srt.managers.expert_location import ModelConfigForExpertLocation
 
