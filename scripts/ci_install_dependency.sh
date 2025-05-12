@@ -19,6 +19,7 @@ rm -rf /usr/local/lib/python3.10/dist-packages/sgl_kernel*
 pip install -e "python[all]"
 
 # Install additional dependencies
+apt install -y libibverbs1 libibverbs-dev
 pip install torch_memory_saver
 pip install transformers==4.51.0 timm torchaudio==2.6.0 sentence_transformers accelerate peft pandas datasets mooncake-transfer-engine==0.3.0
 
