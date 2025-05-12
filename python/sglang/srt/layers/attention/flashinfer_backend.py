@@ -7,6 +7,7 @@ FlashInfer is faster and Triton is easier to customize.
 Each backend supports two operators: extend (i.e. prefill with cached prefix) and decode.
 """
 
+import math
 import os
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -463,22 +464,39 @@ class FlashInferAttnBackend(AttentionBackend):
 
                 # Pad the `head_dim` if it less than `global_fake_head_dim`
                 original_head_dim = layer.head_dim
-                head_dim = max(global_fake_head_dim, original_head_dim)
+                needs_padding = (
+                    hasattr(self.indices_updater_prefill, "fake_head_dim")
+                    and self.indices_updater_prefill.fake_head_dim is not None
+                    and original_head_dim < self.indices_updater_prefill.fake_head_dim
+                )
 
-                q_padded_shape = q.shape[:-1] + (head_dim,)
-                q_padded = torch.zeros(q_padded_shape, dtype=q.dtype, device=q.device)
-                q_padded[..., :original_head_dim] = q
-                q = q_padded
+                if needs_padding:
+                    q_padded_shape = q.shape[:-1] + (
+                        self.indices_updater_prefill.fake_head_dim,
+                    )
+                    q_padded = torch.zeros(
+                        q_padded_shape, dtype=q.dtype, device=q.device
+                    )
+                    q_padded[..., :original_head_dim] = q
+                    q = q_padded
 
-                k_padded_shape = k.shape[:-1] + (head_dim,)
-                k_padded = torch.zeros(k_padded_shape, dtype=k.dtype, device=k.device)
-                k_padded[..., :original_head_dim] = k
-                k = k_padded
+                    k_padded_shape = k.shape[:-1] + (
+                        self.indices_updater_prefill.fake_head_dim,
+                    )
+                    k_padded = torch.zeros(
+                        k_padded_shape, dtype=k.dtype, device=k.device
+                    )
+                    k_padded[..., :original_head_dim] = k
+                    k = k_padded
 
-                v_padded_shape = v.shape[:-1] + (head_dim,)
-                v_padded = torch.zeros(v_padded_shape, dtype=v.dtype, device=v.device)
-                v_padded[..., :original_head_dim] = v
-                v = v_padded
+                    v_padded_shape = v.shape[:-1] + (
+                        self.indices_updater_prefill.fake_head_dim,
+                    )
+                    v_padded = torch.zeros(
+                        v_padded_shape, dtype=v.dtype, device=v.device
+                    )
+                    v_padded[..., :original_head_dim] = v
+                    v = v_padded
 
                 o = self.prefill_wrapper_ragged.forward(
                     q,
@@ -488,7 +506,11 @@ class FlashInferAttnBackend(AttentionBackend):
                     sm_scale=layer.scaling,
                     logits_soft_cap=logits_soft_cap,
                 )
-                o = o[..., :original_head_dim].contiguous()
+
+                if needs_padding:
+                    o = o[..., :original_head_dim]
+
+                o = o.contiguous()
 
             elif self.forward_metadata.extend_no_prefix:
                 o = self.prefill_wrapper_ragged.forward(
@@ -961,6 +983,11 @@ class FlashInferIndicesUpdaterPrefill:
                 )
             )
 
+        # If self.fake_head_dim is not None
+        sm_scale_for_begin_forward = None
+        if self.fake_head_dim is not None:
+            sm_scale_for_begin_forward = 1.0 / math.sqrt(self.head_dim)
+
         # extend part
         if use_ragged:
             wrapper_ragged.begin_forward(
@@ -970,6 +997,7 @@ class FlashInferIndicesUpdaterPrefill:
                 self.num_kv_heads,
                 self.head_dim if self.fake_head_dim is None else self.fake_head_dim,
                 q_data_type=self.q_data_type,
+                sm_scale=sm_scale_for_begin_forward,
             )
 
         # cached part
