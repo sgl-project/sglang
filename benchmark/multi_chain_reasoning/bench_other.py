@@ -113,7 +113,7 @@ def main(args):
             answer = multi_chain_gsm8k(questions[i], args.num_chains, call_generate)
             states[i] = answer
 
-        tic = time.time()
+        tic = time.perf_counter()
         if args.parallel == 1:
             for i in tqdm(range(len(questions))):
                 get_one_answer(i)
@@ -134,7 +134,7 @@ def main(args):
             )
             states[i] = answer
 
-        tic = time.time()
+        tic = time.perf_counter()
         loop = asyncio.get_event_loop()
         batches = [
             list(range(i, min(i + args.parallel, len(questions))))
@@ -144,7 +144,7 @@ def main(args):
             tasks = [get_one_answer_asyncio(k) for k in bt]
             loop.run_until_complete(asyncio.gather(*tasks))
 
-    latency = time.time() - tic
+    latency = time.perf_counter() - tic
 
     preds = []
     for i in range(len(states)):
