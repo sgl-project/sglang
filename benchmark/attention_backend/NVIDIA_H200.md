@@ -164,56 +164,56 @@ python3 -m sglang.bench_serving --backend sglang --dataset-name random --request
 
 ## Experiment - bench_serving_spec_decode | Meta-Llama-3.1-8B-Instruct
 
-| Configuration | FAILED | Input token throughput (tok/s) | Output token throughput (tok/s) |
-|-------------|----------------|----------------|----------------|
-| attn=fa3,random_input_len=1024,random_output_len=1024 |  | 3456.01    | 3536.64    |
-| attn=flashinfer,random_input_len=1024,random_output_len=1024 |  | 3375.78    | 3454.53    |
-| attn=fa3,random_input_len=8192,random_output_len=1024 | Client failed with code 1 |  |  |
-| attn=flashinfer,random_input_len=8192,random_output_len=1024 |  | 10417.88   | 1342.85    |
-| attn=fa3,random_input_len=8192,random_output_len=8192 | Client failed with code 1 |  |  |
-| attn=flashinfer,random_input_len=8192,random_output_len=8192 |  | 1230.00    | 1315.85    |
+| Configuration | Input token throughput (tok/s) | Output token throughput (tok/s) |
+|-------------|----------------|----------------|
+| attn=fa3,random_input_len=1024,random_output_len=1024 | 4500.17    | 4605.15    |
+| attn=flashinfer,random_input_len=1024,random_output_len=1024 | 3506.93    | 3588.74    |
+| attn=fa3,random_input_len=8192,random_output_len=1024 | 11616.10   | 1497.30    |
+| attn=flashinfer,random_input_len=8192,random_output_len=1024 | 6776.90    | 873.53     |
+| attn=fa3,random_input_len=8192,random_output_len=8192 | 1425.65    | 1525.17    |
+| attn=flashinfer,random_input_len=8192,random_output_len=8192 | 626.60     | 670.34     |
 
 ### Commands
 
 #### attn=fa3,random_input_len=1024,random_output_len=1024
 
 ```
-python3 -m sglang.launch_server \ --speculative-num-steps 3 \ --speculative-eagle-topk 1 \ --speculative-num-draft-tokens 4 \ --attention-backend fa3 \ --trust-remote-code \ --mem-fraction-static 0.8 \ --cuda-graph-max-bs 2 --dtype float16 --speculative-algo EAGLE3 --model-path /shared/public/models/meta-llama/Meta-Llama-3.1-8B-Instruct --speculative-draft-model-path /shared/public/elr-models/jamesliu1/sglang-EAGLE3-Llama-3.1-Instruct-8B/e5ed08d66f528a95ce89f5d4fd136a28f6def714
+python3 -m sglang.launch_server \ --speculative-num-steps 3 \ --speculative-eagle-topk 1 \ --speculative-num-draft-tokens 4 \ --attention-backend fa3 \ --trust-remote-code --dtype float16 --speculative-algo EAGLE3 --model-path /shared/public/models/meta-llama/Meta-Llama-3.1-8B-Instruct --speculative-draft-model-path /shared/public/elr-models/jamesliu1/sglang-EAGLE3-Llama-3.1-Instruct-8B/e5ed08d66f528a95ce89f5d4fd136a28f6def714
 python3 -m sglang.bench_serving --backend sglang --dataset-name random --request-rate 16 --num-prompts 200 --random-input-len 1024 --random-output-len 1024
 ```
 
 #### attn=flashinfer,random_input_len=1024,random_output_len=1024
 
 ```
-python3 -m sglang.launch_server \ --speculative-num-steps 3 \ --speculative-eagle-topk 1 \ --speculative-num-draft-tokens 4 \ --attention-backend flashinfer \ --trust-remote-code \ --mem-fraction-static 0.8 \ --cuda-graph-max-bs 2 --dtype float16 --speculative-algo EAGLE3 --model-path /shared/public/models/meta-llama/Meta-Llama-3.1-8B-Instruct --speculative-draft-model-path /shared/public/elr-models/jamesliu1/sglang-EAGLE3-Llama-3.1-Instruct-8B/e5ed08d66f528a95ce89f5d4fd136a28f6def714
+python3 -m sglang.launch_server \ --speculative-num-steps 3 \ --speculative-eagle-topk 1 \ --speculative-num-draft-tokens 4 \ --attention-backend flashinfer \ --trust-remote-code --dtype float16 --speculative-algo EAGLE3 --model-path /shared/public/models/meta-llama/Meta-Llama-3.1-8B-Instruct --speculative-draft-model-path /shared/public/elr-models/jamesliu1/sglang-EAGLE3-Llama-3.1-Instruct-8B/e5ed08d66f528a95ce89f5d4fd136a28f6def714
 python3 -m sglang.bench_serving --backend sglang --dataset-name random --request-rate 16 --num-prompts 200 --random-input-len 1024 --random-output-len 1024
 ```
 
 #### attn=fa3,random_input_len=8192,random_output_len=1024
 
 ```
-python3 -m sglang.launch_server \ --speculative-num-steps 3 \ --speculative-eagle-topk 1 \ --speculative-num-draft-tokens 4 \ --attention-backend fa3 \ --trust-remote-code \ --mem-fraction-static 0.8 \ --cuda-graph-max-bs 2 --dtype float16 --speculative-algo EAGLE3 --model-path /shared/public/models/meta-llama/Meta-Llama-3.1-8B-Instruct --speculative-draft-model-path /shared/public/elr-models/jamesliu1/sglang-EAGLE3-Llama-3.1-Instruct-8B/e5ed08d66f528a95ce89f5d4fd136a28f6def714
+python3 -m sglang.launch_server \ --speculative-num-steps 3 \ --speculative-eagle-topk 1 \ --speculative-num-draft-tokens 4 \ --attention-backend fa3 \ --trust-remote-code --dtype float16 --speculative-algo EAGLE3 --model-path /shared/public/models/meta-llama/Meta-Llama-3.1-8B-Instruct --speculative-draft-model-path /shared/public/elr-models/jamesliu1/sglang-EAGLE3-Llama-3.1-Instruct-8B/e5ed08d66f528a95ce89f5d4fd136a28f6def714
 python3 -m sglang.bench_serving --backend sglang --dataset-name random --request-rate 16 --num-prompts 200 --random-input-len 8192 --random-output-len 1024
 ```
 
 #### attn=flashinfer,random_input_len=8192,random_output_len=1024
 
 ```
-python3 -m sglang.launch_server \ --speculative-num-steps 3 \ --speculative-eagle-topk 1 \ --speculative-num-draft-tokens 4 \ --attention-backend flashinfer \ --trust-remote-code \ --mem-fraction-static 0.8 \ --cuda-graph-max-bs 2 --dtype float16 --speculative-algo EAGLE3 --model-path /shared/public/models/meta-llama/Meta-Llama-3.1-8B-Instruct --speculative-draft-model-path /shared/public/elr-models/jamesliu1/sglang-EAGLE3-Llama-3.1-Instruct-8B/e5ed08d66f528a95ce89f5d4fd136a28f6def714
+python3 -m sglang.launch_server \ --speculative-num-steps 3 \ --speculative-eagle-topk 1 \ --speculative-num-draft-tokens 4 \ --attention-backend flashinfer \ --trust-remote-code --dtype float16 --speculative-algo EAGLE3 --model-path /shared/public/models/meta-llama/Meta-Llama-3.1-8B-Instruct --speculative-draft-model-path /shared/public/elr-models/jamesliu1/sglang-EAGLE3-Llama-3.1-Instruct-8B/e5ed08d66f528a95ce89f5d4fd136a28f6def714
 python3 -m sglang.bench_serving --backend sglang --dataset-name random --request-rate 16 --num-prompts 200 --random-input-len 8192 --random-output-len 1024
 ```
 
 #### attn=fa3,random_input_len=8192,random_output_len=8192
 
 ```
-python3 -m sglang.launch_server \ --speculative-num-steps 3 \ --speculative-eagle-topk 1 \ --speculative-num-draft-tokens 4 \ --attention-backend fa3 \ --trust-remote-code \ --mem-fraction-static 0.8 \ --cuda-graph-max-bs 2 --dtype float16 --speculative-algo EAGLE3 --model-path /shared/public/models/meta-llama/Meta-Llama-3.1-8B-Instruct --speculative-draft-model-path /shared/public/elr-models/jamesliu1/sglang-EAGLE3-Llama-3.1-Instruct-8B/e5ed08d66f528a95ce89f5d4fd136a28f6def714
+python3 -m sglang.launch_server \ --speculative-num-steps 3 \ --speculative-eagle-topk 1 \ --speculative-num-draft-tokens 4 \ --attention-backend fa3 \ --trust-remote-code --dtype float16 --speculative-algo EAGLE3 --model-path /shared/public/models/meta-llama/Meta-Llama-3.1-8B-Instruct --speculative-draft-model-path /shared/public/elr-models/jamesliu1/sglang-EAGLE3-Llama-3.1-Instruct-8B/e5ed08d66f528a95ce89f5d4fd136a28f6def714
 python3 -m sglang.bench_serving --backend sglang --dataset-name random --request-rate 16 --num-prompts 200 --random-input-len 8192 --random-output-len 8192
 ```
 
 #### attn=flashinfer,random_input_len=8192,random_output_len=8192
 
 ```
-python3 -m sglang.launch_server \ --speculative-num-steps 3 \ --speculative-eagle-topk 1 \ --speculative-num-draft-tokens 4 \ --attention-backend flashinfer \ --trust-remote-code \ --mem-fraction-static 0.8 \ --cuda-graph-max-bs 2 --dtype float16 --speculative-algo EAGLE3 --model-path /shared/public/models/meta-llama/Meta-Llama-3.1-8B-Instruct --speculative-draft-model-path /shared/public/elr-models/jamesliu1/sglang-EAGLE3-Llama-3.1-Instruct-8B/e5ed08d66f528a95ce89f5d4fd136a28f6def714
+python3 -m sglang.launch_server \ --speculative-num-steps 3 \ --speculative-eagle-topk 1 \ --speculative-num-draft-tokens 4 \ --attention-backend flashinfer \ --trust-remote-code --dtype float16 --speculative-algo EAGLE3 --model-path /shared/public/models/meta-llama/Meta-Llama-3.1-8B-Instruct --speculative-draft-model-path /shared/public/elr-models/jamesliu1/sglang-EAGLE3-Llama-3.1-Instruct-8B/e5ed08d66f528a95ce89f5d4fd136a28f6def714
 python3 -m sglang.bench_serving --backend sglang --dataset-name random --request-rate 16 --num-prompts 200 --random-input-len 8192 --random-output-len 8192
 ```
 ## Experiment - gsm8k | DeepSeek-V3
@@ -288,21 +288,21 @@ python3 ../gsm8k/bench_sglang.py
 
 | Configuration | Accuracy | Output throughput |
 |-------------|----------------|----------------|
-| attn=fa3 | 0.780 | 2377.701 token/s |
-| attn=flashinfer | 0.775 | 2175.146 token/s |
+| attn=fa3 | 0.775 | 3234.893 token/s |
+| attn=flashinfer | 0.775 | 2689.991 token/s |
 
 ### Commands
 
 #### attn=fa3
 
 ```
-python3 -m sglang.launch_server \ --speculative-num-steps 3 \ --speculative-eagle-topk 1 \ --speculative-num-draft-tokens 4 \ --attention-backend fa3 \ --trust-remote-code \ --mem-fraction-static 0.8 \ --cuda-graph-max-bs 2 --dtype float16 --speculative-algo EAGLE3 --model-path /shared/public/models/meta-llama/Meta-Llama-3.1-8B-Instruct --speculative-draft-model-path /shared/public/elr-models/jamesliu1/sglang-EAGLE3-Llama-3.1-Instruct-8B/e5ed08d66f528a95ce89f5d4fd136a28f6def714
+python3 -m sglang.launch_server \ --speculative-num-steps 3 \ --speculative-eagle-topk 1 \ --speculative-num-draft-tokens 4 \ --attention-backend fa3 \ --trust-remote-code --dtype float16 --speculative-algo EAGLE3 --model-path /shared/public/models/meta-llama/Meta-Llama-3.1-8B-Instruct --speculative-draft-model-path /shared/public/elr-models/jamesliu1/sglang-EAGLE3-Llama-3.1-Instruct-8B/e5ed08d66f528a95ce89f5d4fd136a28f6def714
 python3 ../gsm8k/bench_sglang.py
 ```
 
 #### attn=flashinfer
 
 ```
-python3 -m sglang.launch_server \ --speculative-num-steps 3 \ --speculative-eagle-topk 1 \ --speculative-num-draft-tokens 4 \ --attention-backend flashinfer \ --trust-remote-code \ --mem-fraction-static 0.8 \ --cuda-graph-max-bs 2 --dtype float16 --speculative-algo EAGLE3 --model-path /shared/public/models/meta-llama/Meta-Llama-3.1-8B-Instruct --speculative-draft-model-path /shared/public/elr-models/jamesliu1/sglang-EAGLE3-Llama-3.1-Instruct-8B/e5ed08d66f528a95ce89f5d4fd136a28f6def714
+python3 -m sglang.launch_server \ --speculative-num-steps 3 \ --speculative-eagle-topk 1 \ --speculative-num-draft-tokens 4 \ --attention-backend flashinfer \ --trust-remote-code --dtype float16 --speculative-algo EAGLE3 --model-path /shared/public/models/meta-llama/Meta-Llama-3.1-8B-Instruct --speculative-draft-model-path /shared/public/elr-models/jamesliu1/sglang-EAGLE3-Llama-3.1-Instruct-8B/e5ed08d66f528a95ce89f5d4fd136a28f6def714
 python3 ../gsm8k/bench_sglang.py
 ```
