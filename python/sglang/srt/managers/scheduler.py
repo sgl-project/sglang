@@ -160,6 +160,7 @@ class GenerationBatchResult:
     extend_input_len_per_req: List[int]
     extend_logprob_start_len_per_req: List[int]
     bid: int
+    can_run_cuda_graph: bool
 
 
 @dataclass
@@ -323,13 +324,14 @@ class Scheduler(
         set_random_seed(self.random_seed)
 
         # Print debug info
-        logger.info(
-            f"max_total_num_tokens={self.max_total_num_tokens}, "
-            f"chunked_prefill_size={server_args.chunked_prefill_size}, "
-            f"max_prefill_tokens={self.max_prefill_tokens}, "
-            f"max_running_requests={self.max_running_requests}, "
-            f"context_len={self.model_config.context_len}"
-        )
+        if tp_rank == 0:
+            logger.info(
+                f"max_total_num_tokens={self.max_total_num_tokens}, "
+                f"chunked_prefill_size={server_args.chunked_prefill_size}, "
+                f"max_prefill_tokens={self.max_prefill_tokens}, "
+                f"max_running_requests={self.max_running_requests}, "
+                f"context_len={self.model_config.context_len}"
+            )
 
         # Init memory pool and cache
         self.init_memory_pool_and_cache()
@@ -752,6 +754,7 @@ class Scheduler(
                         extend_input_len_per_req=None,
                         extend_logprob_start_len_per_req=None,
                         bid=bids[next_mb_id],
+                        can_run_cuda_graph=result.can_run_cuda_graph,
                     )
                     self.process_batch_result(mbs[next_mb_id], output_result)
                     last_mbs[next_mb_id] = mbs[next_mb_id]
@@ -1159,7 +1162,9 @@ class Scheduler(
 
             self.metrics_collector.log_stats(self.stats)
 
-    def log_decode_stats(self, running_batch=None):
+    def log_decode_stats(
+        self, can_run_cuda_graph: bool, running_batch: ScheduleBatch = None
+    ):
         batch = running_batch or self.running_batch
 
         gap_latency = time.time() - self.last_decode_stats_tic
@@ -1199,6 +1204,7 @@ class Scheduler(
             msg += f"pre-allocated usage: {self.num_tokens_pre_allocated / self.max_total_num_tokens:.2f}, "
 
         msg += (
+            f"cuda graph: {can_run_cuda_graph}, "
             f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
             f"#queue-req: {len(self.waiting_queue)}"
         )
@@ -1524,11 +1530,11 @@ class Scheduler(
             if self.spec_algorithm.is_none():
                 model_worker_batch = batch.get_model_worker_batch()
                 if self.pp_group.is_last_rank:
-                    logits_output, next_token_ids = (
+                    logits_output, next_token_ids, can_run_cuda_graph = (
                         self.tp_worker.forward_batch_generation(model_worker_batch)
                     )
                 else:
-                    pp_hidden_states_proxy_tensors, _ = (
+                    pp_hidden_states_proxy_tensors, _, can_run_cuda_graph = (
                         self.tp_worker.forward_batch_generation(model_worker_batch)
                     )
                 bid = model_worker_batch.bid
@@ -1538,6 +1544,7 @@ class Scheduler(
                     next_token_ids,
                     bid,
                     num_accepted_tokens,
+                    can_run_cuda_graph,
                 ) = self.draft_worker.forward_batch_speculative_generation(batch)
                 self.spec_num_total_accepted_tokens += (
                     num_accepted_tokens + batch.batch_size()
@@ -1571,6 +1578,7 @@ class Scheduler(
                 extend_input_len_per_req=extend_input_len_per_req,
                 extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
                 bid=bid,
+                can_run_cuda_graph=can_run_cuda_graph,
             )
         else:  # embedding or reward model
             model_worker_batch = batch.get_model_worker_batch()
