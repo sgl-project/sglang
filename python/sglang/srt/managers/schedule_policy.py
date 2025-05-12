@@ -468,9 +468,6 @@ class PrefillAdder:
             return AddReqResult.OTHER
 
         with self._lock_node(req.last_node):
-            if total_tokens > self.rem_total_tokens:
-                return AddReqResult.NO_TOKEN
-
             if (
                 enable_hierarchical_cache
                 and req.last_node_global is not None

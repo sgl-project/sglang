@@ -347,6 +347,12 @@ class ServerArgs:
                 f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
 
+        if self.pp_size > 1:
+            self.disable_overlap_schedule = True
+            logger.warning(
+                "Pipeline parallelism is incompatible with overlap schedule."
+            )
+
         # Speculative Decoding
         if self.speculative_algorithm == "NEXTN":
             # NEXTN shares the same implementation of EAGLE
