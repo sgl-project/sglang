@@ -44,6 +44,7 @@ logger = logging.getLogger(__name__)
 class ServerArgs:
     # Model and tokenizer
     model_path: str
+    hf_config_path: str
     tokenizer_path: Optional[str] = None
     tokenizer_mode: str = "auto"
     skip_tokenizer_init: bool = False
@@ -497,6 +498,12 @@ class ServerArgs:
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
         # Model and port args
+        parser.add_argument(
+            "--hf-config-path",
+            type=nullable_str,
+            default=None,
+            help="Name or path of the huggingface config to use.",
+        )
         parser.add_argument(
             "--model-path",
             type=str,

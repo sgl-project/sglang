@@ -43,6 +43,7 @@ class ModelConfig:
     def __init__(
         self,
         model_path: str,
+        hf_config_path: str,
         trust_remote_code: bool = True,
         revision: Optional[str] = None,
         context_length: Optional[int] = None,
@@ -56,8 +57,10 @@ class ModelConfig:
     ) -> None:
 
         self.model_path = model_path
+        self.hf_config_path = hf_config_path
         self.revision = revision
         self.quantization = quantization
+        self.trust_remote_code = trust_remote_code
 
         # Parse args
         self.maybe_pull_model_tokenizer_from_remote()
@@ -67,8 +70,8 @@ class ModelConfig:
             kwargs["_configuration_file"] = override_config_file.strip()
 
         self.hf_config = get_config(
-            self.model_path,
-            trust_remote_code=trust_remote_code,
+            self.hf_config_path or self.model_path,
+            trust_remote_code=self.trust_remote_code,
             revision=revision,
             model_override_args=self.model_override_args,
             **kwargs,
@@ -248,6 +251,7 @@ class ModelConfig:
     def from_server_args(server_args: ServerArgs, model_path: str = None, **kwargs):
         return ModelConfig(
             model_path=model_path or server_args.model_path,
+            hf_config_path=server_args.hf_config_path,
             trust_remote_code=server_args.trust_remote_code,
             revision=server_args.revision,
             context_length=server_args.context_length,
