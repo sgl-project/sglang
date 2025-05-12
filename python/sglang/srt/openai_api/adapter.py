@@ -1399,6 +1399,7 @@ def v1_chat_generate_response(
                     "system_fingerprint": None,
                 },
             }
+
             responses.append(response)
         else:
             for i, choice in enumerate(choices):
@@ -1424,7 +1425,8 @@ def v1_chat_generate_response(
                     },
                 }
                 responses.append(response)
-            return responses
+
+        return responses
     else:
         prompt_tokens = sum(
             ret[i]["meta_info"]["prompt_tokens"] for i in range(0, len(ret), request.n)
