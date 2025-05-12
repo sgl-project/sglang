@@ -654,8 +654,6 @@ class TestPixtralServer(TestOpenAIVisionServer):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--trust-remote-code",
-                "--chat-template",
-                "mistral",
                 "--mem-fraction-static",
                 "0.73",
             ],
