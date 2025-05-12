@@ -354,7 +354,7 @@ class MyExpertLocationMetadata:
 
         num_local_physical_experts = num_physical_experts // server_args.tp_size
         physical_to_logical_map, logical_to_all_physical_map, _ = (
-            deepseek_eplb.prefill_rebalance_experts(
+            deepseek_eplb.rebalance_experts(
                 tokens_per_expert=logical_count,
                 num_physical_experts=num_physical_experts,
                 num_local_physical_experts=num_local_physical_experts,
