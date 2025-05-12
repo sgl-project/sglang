@@ -277,19 +277,17 @@ class SchedulerDisaggregationPrefillMixin:
             next_token_ids,
             extend_input_len_per_req,
             extend_logprob_start_len_per_req,
-            bid,
         ) = (
             result.logits_output,
             result.next_token_ids,
             result.extend_input_len_per_req,
             result.extend_logprob_start_len_per_req,
-            result.bid,
         )
 
         # Transfer kv for prefill completed requests and add it into disagg_prefill_infight_queue
         if self.enable_overlap:
             # wait
-            _, next_token_ids = self.tp_worker.resolve_last_batch_result(launch_done)
+            _, next_token_ids, _ = self.tp_worker.resolve_last_batch_result(launch_done)
         else:
             next_token_ids = result.next_token_ids.tolist()
 

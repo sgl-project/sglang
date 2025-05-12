@@ -923,12 +923,13 @@ class TokenizerManager:
     ):
         await self.send_to_scheduler.send_pyobj(obj)
 
-    async def get_internal_state(self) -> Dict[Any, Any]:
+    async def get_internal_state(self) -> List[Dict[Any, Any]]:
         req = GetInternalStateReq()
-        res: List[GetInternalStateReqOutput] = (
+        responses: List[GetInternalStateReqOutput] = (
             await self.get_internal_state_communicator(req)
         )
-        return res[0].internal_state
+        # Many DP ranks
+        return [res.internal_state for res in responses]
 
     def get_log_request_metadata(self):
         max_length = None
