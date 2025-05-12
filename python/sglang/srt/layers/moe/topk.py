@@ -97,6 +97,7 @@ def grouped_topk(
     topk_group: int = 0,
     n_share_experts_fusion: int = 0,
     routed_scaling_factor: Optional[float] = None,
+    num_token_non_padded: Optional[torch.Tensor] = None,
 ):
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
@@ -136,7 +137,9 @@ def grouped_topk(
         )
         topk_weights = topk_weights / topk_weights_sum
 
-    return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
+    topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
+    _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+    return topk_weights, topk_ids
 
 
 def biased_grouped_topk_impl(
@@ -301,6 +304,7 @@ def select_experts(
                 topk_group=topk_group,
                 n_share_experts_fusion=n_share_experts_fusion,
                 routed_scaling_factor=routed_scaling_factor,
+                num_token_non_padded=num_token_non_padded,
             )
         else:
             topk_weights, topk_ids = biased_grouped_topk(
