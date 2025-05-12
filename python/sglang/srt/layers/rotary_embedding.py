@@ -186,8 +186,8 @@ class LinearScalingRotaryEmbedding(RotaryEmbedding):
 
     It supports multiple scaling factors. Since multiple LoRA adapters may have
     different scaling factors, we need multiple cos/sin caches. In this way,
-    instead of running rotary embedding kernel per lora, we can run multiple
-    lora in a batched way.
+    instead of running rotary embedding kernel per LoRA adapter, we can run multiple
+    LoRA adapters in a batched way.
 
     In addition to that, we also keep the cos/sin cache for the scaling factor
     of 1 (default) at all times.

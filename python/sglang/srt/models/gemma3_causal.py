@@ -174,7 +174,7 @@ class Gemma3Attention(nn.Module):
             # Local attention. Override the values in config.json.
             self.rope_theta = config.rope_local_base_freq
             self.rope_scaling = {"rope_type": "default"}
-            # FIXME(mick): idk why vllm does this
+            # FIXME(mick): idk why vLLM does this
             # self.sliding_window = config.interleaved_sliding_window
             self.sliding_window = get_attention_sliding_window_size(config)
         else:
@@ -667,7 +667,7 @@ class Gemma3ForCausalLM(PreTrainedModel):
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                # lm_head is not used in vllm as it is tied with embed_token.
+                # lm_head is not used in vLLM as it is tied with embed_token.
                 # To prevent errors, skip loading lm_head.weight.
                 if "lm_head.weight" in name:
                     continue

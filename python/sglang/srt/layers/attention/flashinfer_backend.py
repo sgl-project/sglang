@@ -664,7 +664,7 @@ class FlashInferIndicesUpdaterDecode:
             kv_indptr = kv_indptr[: bs + 1]
 
             if wrapper.is_cuda_graph_enabled:
-                # Directly write to the cuda graph input buffer
+                # Directly write to the CUDA graph input buffer
                 kv_indices = wrapper._paged_kv_indices_buf
             else:
                 kv_indices = torch.empty(
@@ -1173,7 +1173,7 @@ def fast_decode_plan(
     """
     A faster version of BatchDecodeWithPagedKVCacheWrapper::plan used for FlashInferMultiStepDraftBackend.
     Modifications:
-    - Remove unnecessary device-to-device copy for the cuda graph buffers.
+    - Remove unnecessary device-to-device copy for the CUDA graph buffers.
     - Remove unnecessary host-to-device copy for the metadata buffers.
     """
     batch_size = len(last_page_len)

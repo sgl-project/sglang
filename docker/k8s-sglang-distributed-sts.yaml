@@ -22,7 +22,7 @@ spec:
         command:
         - /bin/bash
         - -c
-        # please modify the sglang serving arguments below, as necessary.
+        # please modify the SGLang serving arguments below, as necessary.
         # NOTE: the --expert-parallel-size and --enable-ep-moe are for MoE model like DeepSeek-R1
         args:
         - |

@@ -170,7 +170,7 @@ class GroupCoordinator:
     GroupCoordinator takes charge of all the communication operations among
         the processes in the group. It can route the communication to
         a specific implementation (e.g. switch allreduce implementation
-        based on the tensor size and cuda graph mode).
+        based on the tensor size and CUDA graph mode).
     """
 
     # available attributes:

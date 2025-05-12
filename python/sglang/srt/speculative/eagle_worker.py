@@ -78,7 +78,7 @@ class EAGLEWorker(TpModelWorker):
         # Override context length with target model's context length
         server_args.context_length = target_worker.model_runner.model_config.context_len
 
-        # Do not capture cuda graph in `super().__init__()`
+        # Do not capture CUDA graph in `super().__init__()`
         # It will be captured later.
         backup_disable_cuda_graph = server_args.disable_cuda_graph
         server_args.disable_cuda_graph = True
@@ -136,7 +136,7 @@ class EAGLEWorker(TpModelWorker):
             # Share the embedding and lm_head
             self.draft_model_runner.model.set_embed_and_head(embed, head)
 
-        # Init attention backend and cuda graphs
+        # Init attention backend and CUDA graphs
         self.draft_model_runner.server_args.disable_cuda_graph = (
             backup_disable_cuda_graph
         )
@@ -148,7 +148,7 @@ class EAGLEWorker(TpModelWorker):
             self.init_cuda_graphs()
 
     def init_attention_backend(self):
-        # Create multi-step attn backends and cuda graph runners
+        # Create multi-step attn backends and CUDA graph runners
         if self.server_args.attention_backend == "flashinfer":
             if not global_server_args_dict["use_mla_backend"]:
                 from sglang.srt.layers.attention.flashinfer_backend import (
@@ -207,7 +207,7 @@ class EAGLEWorker(TpModelWorker):
         self.draft_model_runner.draft_attn_backend = self.draft_attn_backend
 
     def init_cuda_graphs(self):
-        """Capture cuda graphs."""
+        """Capture CUDA graphs."""
         self.cuda_graph_runner = None
         self.cuda_graph_runner_for_draft_extend = None
 
@@ -218,12 +218,12 @@ class EAGLEWorker(TpModelWorker):
         tic = time.time()
         before_mem = get_available_gpu_memory(self.device, self.gpu_id)
         logger.info(
-            f"Capture draft cuda graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
+            f"Capture draft CUDA graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
         )
         self.cuda_graph_runner = EAGLEDraftCudaGraphRunner(self)
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         logger.info(
-            f"Capture draft cuda graph end. Time elapsed: {time.time() - tic:.2f} s. avail mem={after_mem:.2f} GB. mem usage={(before_mem - after_mem):.2f} GB."
+            f"Capture draft CUDA graph end. Time elapsed: {time.time() - tic:.2f} s. avail mem={after_mem:.2f} GB. mem usage={(before_mem - after_mem):.2f} GB."
         )
 
         # Capture extend

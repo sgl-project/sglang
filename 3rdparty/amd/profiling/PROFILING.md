@@ -356,7 +356,7 @@ client.sh
 # Start profiling via API
 curl http://localhost:30000/start_profile -H "Content-Type: application/json"
 
-# Benchmark serving using sglang with random dataset and tokenizer
+# Benchmark serving using SGLang with a random dataset and tokenizer
 # Define the log file with a timestamp
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 LOGFILE="sglang_client_log_$TIMESTAMP.json"

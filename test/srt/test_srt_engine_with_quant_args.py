@@ -8,7 +8,7 @@ class TestSRTEngineWithQuantArgs(CustomTestCase):
 
     def test_1_quantization_args(self):
 
-        # we only test fp8 because other methods are currently dependent on vllm. We can add other methods back to test after vllm dependency is resolved.
+        # we only test fp8 because other methods are currently dependent on vLLM. We can add other methods back to test after vLLM dependency is resolved.
         quantization_args_list = [
             # "awq",
             "fp8",
@@ -34,7 +34,7 @@ class TestSRTEngineWithQuantArgs(CustomTestCase):
 
     def test_2_torchao_args(self):
 
-        # we don't test int8dq because currently there is conflict between int8dq and capture cuda graph
+        # we don't test int8dq because currently there is conflict between int8dq and capture CUDA graph
         torchao_args_list = [
             # "int8dq",
             "int8wo",

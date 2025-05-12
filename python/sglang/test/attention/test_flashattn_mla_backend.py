@@ -37,7 +37,7 @@ class MockModelRunner:
             "TokenPool",
             (),
             {
-                # A typical max_bs * max_context_len for cuda graph decode
+                # A typical max_bs * max_context_len for CUDA graph decode
                 "size": batch_size,
                 # Add req_to_token attribute
                 "req_to_token": torch.zeros(

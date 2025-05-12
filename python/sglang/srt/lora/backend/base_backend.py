@@ -41,13 +41,13 @@ class BaseLoRABackend:
     def run_lora_a_sgemm(
         self, x: torch.Tensor, weights: torch.Tensor, *args, **kwargs
     ) -> torch.Tensor:
-        """Run segment Gemm of lora a modules with current backend.
+        """Run segment Gemm of LoRA a modules with current backend.
         The definition of segment Gemm can be referred to https://docs.flashinfer.ai/api/gemm.html.
 
         Args:
              x: input matrix with shape (s, input_dim), here s is the sum of all sequence lengths
-             weights: a set of lora weights with shape (num_lora, c * r, input_dim),
-                      here r is lora rank, c is a multiplier for stacked modules (e.g., c=3 for qkv_proj, c=2 for gate_up_proj)
+             weights: a set of LoRA weights with shape (num_lora, c * r, input_dim),
+                      here r is LoRA rank, c is a multiplier for stacked modules (e.g., c=3 for qkv_proj, c=2 for gate_up_proj)
                       usually input_dim is much larger than r
         Returns:
              result with shape (s, c * r)
@@ -57,12 +57,12 @@ class BaseLoRABackend:
     def run_lora_b_sgemm(
         self, x: torch.Tensor, weights: torch.Tensor, *args, **kwargs
     ) -> torch.Tensor:
-        """Run segment Gemm of lora b modules with current backend.
+        """Run segment Gemm of LoRA b modules with current backend.
         The definition of segment Gemm can be referred to https://docs.flashinfer.ai/api/gemm.html.
 
         Args:
-             x: input matrix with shape (s, r), here s is the sum of all sequence lengths, r is lora rank
-             weights: a set of lora weights with shape (num_lora, output_dim, r)
+             x: input matrix with shape (s, r), here s is the sum of all sequence lengths, r is LoRA rank
+             weights: a set of LoRA weights with shape (num_lora, output_dim, r)
                       usually output_dim is much larger than r
         Returns:
              result with shape (s, output_dim)
@@ -77,7 +77,7 @@ class BaseLoRABackend:
         *args,
         **kwargs,
     ) -> torch.Tensor:
-        """Run the lora pass for QKV Layer.
+        """Run the LoRA pass for QKV Layer.
 
         Args:
             x: input matrix with shape (s, input_dim), here s is the sum of all sequence lengths
@@ -100,7 +100,7 @@ class BaseLoRABackend:
         *args,
         **kwargs,
     ) -> torch.Tensor:
-        """Run the lora pass for gate_up_proj, usually attached to MergedColumnParallelLayer.
+        """Run the LoRA pass for gate_up_proj, usually attached to MergedColumnParallelLayer.
 
         Args:
             x: input matrix with shape (s, input_dim), here s is the sum of all sequence lengths
