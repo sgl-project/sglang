@@ -1115,7 +1115,7 @@ prometheus_multiproc_dir: tempfile.TemporaryDirectory
 
 def set_prometheus_multiproc_dir():
     # Set prometheus multiprocess directory
-    # sglang uses prometheus multiprocess mode
+    # SGLang uses prometheus multiprocess mode
     # we need to set this before importing prometheus_client
     # https://prometheus.github.io/client_python/multiprocess/
     global prometheus_multiproc_dir

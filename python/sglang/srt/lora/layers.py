@@ -198,7 +198,7 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         if self.lora_backend.fuse_stacked_lora_b:
             assert (
                 B_buffer_q.shape[-1] == B_buffer_kv.shape[-1]
-            ), "The lora rank of q and kv should be the same when enabling fusion of qkv lora_b"
+            ), "The LoRA rank of q and kv should be the same when enabling fusion of qkv lora_b"
             output_dim_q, output_dim_kv = B_buffer_q.shape[-2], B_buffer_kv.shape[-2]
 
             # B_buffer_qkv: (num_lora, output_dim_q + 2 * output_dim_kv, r)

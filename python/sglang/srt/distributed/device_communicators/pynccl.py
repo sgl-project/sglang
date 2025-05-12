@@ -104,7 +104,7 @@ class PyNcclCommunicator:
         self.device = device
         # nccl communicator and stream will use this device
         # `torch.cuda.device` is a context manager that changes the
-        # current cuda device to the specified one
+        # current CUDA device to the specified one
         with torch.cuda.device(device):
             self.comm: ncclComm_t = self.nccl.ncclCommInitRank(
                 self.world_size, self.unique_id, self.rank

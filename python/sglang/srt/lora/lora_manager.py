@@ -93,14 +93,14 @@ class LoRAManager:
         # Config of each LoRA adapter
         self.configs: Dict[str, LoRAConfig] = {}
 
-        # Target module names in huggingface lora configs.
+        # Target module names in HuggingFace LoRA configs.
         # e.g., {"k_proj", "q_proj", "v_proj", "o_proj"}
         self.hf_target_names: Set[str] = set()
         for name, path in self.lora_paths.items():
             self.configs[name] = LoRAConfig(path)
             self.hf_target_names.update(self.configs[name].target_modules)
 
-        # Target lora weight names for lora_a and lora_b modules respectively.
+        # Target LoRA weight names for lora_a and lora_b modules respectively.
         # e.g., {("qkv_proj", "q_proj"), ("qkv_proj", "kv_proj")}
         self.lora_weight_names: Set[Tuple[str]] = set(
             [get_stacked_name(module) for module in self.hf_target_names]
@@ -119,11 +119,11 @@ class LoRAManager:
             lora_adapter.initialize_weights()
             self.loras[name] = lora_adapter
 
-        # misc lora configs
+        # misc LoRA configs
         self.max_lora_dim: int = max([x.hf_config["r"] for x in self.configs.values()])
 
         if self.lora_backend == "flashinfer":
-            # FIXME remove the restrictions after supporting multi-rank for flashinfer backend
+            # FIXME: remove the restrictions after supporting multi-rank for flashinfer backend
             max_lora_dim = max([x.hf_config["r"] for x in self.configs.values()])
             scaling = list(self.loras.values())[0].scaling
             assert all(x.hf_config["r"] == max_lora_dim for x in self.configs.values())
@@ -144,16 +144,16 @@ class LoRAManager:
             self.lora_modules,
         )
 
-        # Initialize target lora modules in memory pool
+        # Initialize target LoRA modules in memory pool
         self.memory_pool.init_buffers(self.lora_weight_names, self.base_model)
 
     def prepare_lora_batch(self, forward_batch: ForwardBatch):
-        # load active loras into lora memory pool
+        # load active LoRAs into LoRA memory pool
         cur_uids = set(forward_batch.lora_paths)
         assert len(cur_uids) <= self.max_loras_per_batch
         self.memory_pool.prepare_lora_batch(cur_uids, self.loras)
 
-        # set up batch info shared by all lora modules
+        # set up batch info shared by all LoRA modules
         bs = forward_batch.batch_size
 
         if (
@@ -221,7 +221,7 @@ class LoRAManager:
             )
         self.lora_backend.set_batch_info(batch_info)
 
-        # call set_lora_info for each lora modules
+        # call set_lora_info for each LoRA modules
         for layer_id, modules in self.lora_modules.items():
             for module_name, module in modules:
                 if "qkv_proj" in module_name:
