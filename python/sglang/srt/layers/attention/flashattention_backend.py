@@ -308,7 +308,7 @@ class FlashAttentionBackend(AttentionBackend):
         ), "Sliding window and cross attention are not supported together"
 
         self.forward_metadata: FlashAttentionMetadata = None
-        # extra metdata for handling speculative decoding topk > 1, extended draft decode and verify
+        # extra metadata for handling speculative decoding topk > 1, extended draft decode and verify
         self.forward_metadata_spec_decode_expand: FlashAttentionMetadata = None
         self.max_context_len = model_runner.model_config.context_len
         self.device = model_runner.device

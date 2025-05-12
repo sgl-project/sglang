@@ -129,7 +129,7 @@ def launch_server_process_and_send_one_request(
 
 
 def refine_server_args(server_args: ServerArgs, compile_args: CompileArgs):
-    # Disbale cuda graph and torch compile to save time
+    # Disable cuda graph and torch compile to save time
     server_args.disable_cuda_graph = True
     server_args.enable_torch_compile = False
     print(f"Disable CUDA Graph and Torch Compile to save time...")

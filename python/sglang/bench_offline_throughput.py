@@ -315,7 +315,7 @@ def throughput_test(
     tokenizer_id = server_args.tokenizer_path or server_args.model_path
     tokenizer = get_tokenizer(tokenizer_id)
 
-    # Set global environmnets
+    # Set global environments
     set_ulimit()
     random.seed(bench_args.seed)
     np.random.seed(bench_args.seed)
