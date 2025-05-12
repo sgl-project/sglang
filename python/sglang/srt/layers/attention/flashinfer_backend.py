@@ -25,6 +25,7 @@ from sglang.global_config import global_config
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
 from sglang.srt.utils import is_flashinfer_available, next_power_of_2
@@ -62,6 +63,19 @@ class PrefillMetadata:
 
 # Reuse this workspace buffer across all flashinfer wrappers
 global_workspace_buffer = None
+
+
+# global_fake_head_dim is used as a workaround to bypass FlashInfer's current limitation
+# which does not support head_dim=32 (or other unsupported dimensions). The actual
+# QKV tensors have an effective head dimension of origin, with the remaining padded
+# with zeros.
+#
+# Note: Be sure to set sm_scale = 1.0 / sqrt(actual_dim), based on the real head_dim,
+# even though fake_head_dim is passed to the attention kernel.
+#
+# TODO: Once FlashInfer officially supports head_dim=32, this variable and the
+# associated padding logic should be removed to eliminate the workaround.
+global_fake_head_dim = 64
 
 
 class FlashInferAttnBackend(AttentionBackend):
@@ -438,12 +452,50 @@ class FlashInferAttnBackend(AttentionBackend):
                 v_scale=layer.v_scale,
             )
         else:
-            if self.forward_metadata.extend_no_prefix:
+            causal = True
+            if layer.attn_type == AttentionType.ENCODER_ONLY:
+                save_kv_cache = False
+                causal = False
+
+                q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+                k = k.view(-1, layer.tp_k_head_num, layer.head_dim)
+                v = v.view(-1, layer.tp_v_head_num, layer.head_dim)
+
+                # Pad the `head_dim` if it less than `global_fake_head_dim`
+                original_head_dim = layer.head_dim
+                head_dim = max(global_fake_head_dim, original_head_dim)
+
+                q_padded_shape = q.shape[:-1] + (head_dim,)
+                q_padded = torch.zeros(q_padded_shape, dtype=q.dtype, device=q.device)
+                q_padded[..., :original_head_dim] = q
+                q = q_padded
+
+                k_padded_shape = k.shape[:-1] + (head_dim,)
+                k_padded = torch.zeros(k_padded_shape, dtype=k.dtype, device=k.device)
+                k_padded[..., :original_head_dim] = k
+                k = k_padded
+
+                v_padded_shape = v.shape[:-1] + (head_dim,)
+                v_padded = torch.zeros(v_padded_shape, dtype=v.dtype, device=v.device)
+                v_padded[..., :original_head_dim] = v
+                v = v_padded
+
+                o = self.prefill_wrapper_ragged.forward(
+                    q,
+                    k,
+                    v,
+                    causal=causal,
+                    sm_scale=layer.scaling,
+                    logits_soft_cap=logits_soft_cap,
+                )
+                o = o[..., :original_head_dim].contiguous()
+
+            elif self.forward_metadata.extend_no_prefix:
                 o = self.prefill_wrapper_ragged.forward(
                     q.view(-1, layer.tp_q_head_num, layer.head_dim),
                     k.view(-1, layer.tp_k_head_num, layer.head_dim),
                     v.view(-1, layer.tp_v_head_num, layer.head_dim),
-                    causal=True,
+                    causal=causal,
                     sm_scale=layer.scaling,
                     logits_soft_cap=logits_soft_cap,
                 )
@@ -708,6 +760,9 @@ class FlashInferIndicesUpdaterPrefill:
             get_attention_tp_size()
         )
         self.head_dim = model_runner.model_config.head_dim
+        self.fake_head_dim = (
+            None if self.head_dim >= global_fake_head_dim else global_fake_head_dim
+        )
         self.data_type = model_runner.kv_cache_dtype
         self.q_data_type = model_runner.dtype
         self.sliding_window_size = model_runner.sliding_window_size
@@ -913,7 +968,7 @@ class FlashInferIndicesUpdaterPrefill:
                 qo_indptr,
                 self.num_qo_heads,
                 self.num_kv_heads,
-                self.head_dim,
+                self.head_dim if self.fake_head_dim is None else self.fake_head_dim,
                 q_data_type=self.q_data_type,
             )
 
@@ -925,7 +980,7 @@ class FlashInferIndicesUpdaterPrefill:
             self.kv_last_page_len[:bs],
             self.num_qo_heads,
             self.num_kv_heads,
-            self.head_dim,
+            self.fake_head_dim if self.fake_head_dim else self.head_dim,
             1,
             q_data_type=self.q_data_type,
             kv_data_type=self.data_type,
