@@ -1086,7 +1086,7 @@ class ServerArgs:
             "--cuda-graph-max-bs",
             type=int,
             default=ServerArgs.cuda_graph_max_bs,
-            help="Set the maximum batch size for cuda graph.",
+            help="Set the maximum batch size for cuda graph. It will extend the cuda graph capture batch size to this value.",
         )
         parser.add_argument(
             "--cuda-graph-bs",
