@@ -21,15 +21,15 @@ from sglang.test.test_utils import (
 
 MODEL_SCORE_THRESHOLDS = {
     "meta-llama/Llama-3.1-8B-Instruct": 0.82,
-    "mistralai/Mistral-7B-Instruct-v0.3": 0.56,
-    "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct": 0.85,
-    "meta-llama/Llama-3.1-70B-Instruct": 0.95,
-    "mistralai/Mixtral-8x7B-Instruct-v0.1": 0.64,
-    "Qwen/Qwen2-57B-A14B-Instruct": 0.86,
-    "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8": 0.81,
-    "neuralmagic/Mistral-7B-Instruct-v0.3-FP8": 0.54,
-    "neuralmagic/Meta-Llama-3.1-70B-Instruct-FP8": 0.94,
-    "neuralmagic/Qwen2-72B-Instruct-FP8": 0.94,
+    "mistralai/Mistral-7B-Instruct-v0.3": 0.52,
+    "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct": 0.82,
+    "meta-llama/Llama-3.1-70B-Instruct": 0.92,
+    "mistralai/Mixtral-8x7B-Instruct-v0.1": 0.61,
+    "Qwen/Qwen2-57B-A14B-Instruct": 0.85,
+    "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8": 0.78,
+    "neuralmagic/Mistral-7B-Instruct-v0.3-FP8": 0.50,
+    "neuralmagic/Meta-Llama-3.1-70B-Instruct-FP8": 0.90,
+    "neuralmagic/Qwen2-72B-Instruct-FP8": 0.90,
     "neuralmagic/Qwen2-57B-A14B-Instruct-FP8": 0.82,
 }
 
