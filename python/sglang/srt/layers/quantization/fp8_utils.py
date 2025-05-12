@@ -357,7 +357,7 @@ def apply_fp8_linear(
 
             # Fused GEMM_DQ
             if VLLM_AVAILABLE and use_vllm_cutlass_w8a8_fp8_kernel:
-                # Fall back to vLLM cutlass w8a8 fp8 kernel
+                # Fall back to vllm cutlass w8a8 fp8 kernel
                 output = ops.cutlass_scaled_mm(
                     qinput,
                     weight,
@@ -493,7 +493,7 @@ def apply_fp8_linear(
         if cutlass_fp8_supported:
             try:
                 if VLLM_AVAILABLE and use_vllm_cutlass_w8a8_fp8_kernel:
-                    # Fall back to vLLM cutlass w8a8 fp8 kernel
+                    # Fall back to vllm cutlass w8a8 fp8 kernel
                     output = ops.cutlass_scaled_mm(
                         qinput,
                         weight,

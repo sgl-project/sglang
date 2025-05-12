@@ -874,7 +874,7 @@ def fast_mla_decode_plan(
 ) -> None:
     """A faster version of BatchMLAPagedAttentionWrapper::plan,
     for skipping the stream synchronization in original plan function during
-    CUDA graph replaying.
+    cuda graph replaying.
     """
     self._causal = causal
     self._page_size = page_size

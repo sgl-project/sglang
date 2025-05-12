@@ -25,4 +25,4 @@ docker run --gpus all \
     python3 -m sglang.launch_server --model-path Qwen/Qwen2.5-7B-Instruct --host 0.0.0.0 --port 30000
 ```
 
-Note that ModelScope uses a different cache directory than HuggingFace. You may need to set it manually to avoid running out of disk space.
+Note that modelscope uses a different cache directory than huggingface. You may need to set it manually to avoid running out of disk space.

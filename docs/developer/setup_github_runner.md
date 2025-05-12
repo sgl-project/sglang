@@ -4,7 +4,7 @@
 
 ### Step 1: Start a docker container.
 
-You can mount a folder for the shared HuggingFace model weights cache. The command below uses `/tmp/huggingface` as an example.
+You can mount a folder for the shared huggingface model weights cache. The command below uses `/tmp/huggingface` as an example.
 
 ```
 docker pull nvidia/cuda:12.1.1-devel-ubuntu22.04

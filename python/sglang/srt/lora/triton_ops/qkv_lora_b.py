@@ -39,7 +39,7 @@ def _qkv_lora_b_kernel(
 ):
     # This kernel packs 3 sgemms (q/k/v) into a single kernel.
 
-    # x: (s, 3 * K), s is the sum of sequence lengths, K equals to LoRA rank
+    # x: (s, 3 * K), s is the sum of sequence lengths, K equals to lora rank
     # weights: (num_lora, N_Q + 2 * N_KV, K)
     # output: (s, N_Q + 2 * N_KV)
     # N_Q >> K, N_KV >> K

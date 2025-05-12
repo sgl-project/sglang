@@ -177,7 +177,7 @@ def calculate_diff(num_tokens, num_experts=256, block_size=128, topk=8):
     expert_ids_vllm = torch.zeros_like(expert_ids_cuda)
     num_tokens_post_pad_vllm = torch.empty_like(num_tokens_post_pad_cuda)
 
-    # compare the performance of CUDA, triton and vllm implementation
+    # compare the performance of cuda, triton and vllm implementation
     sgl_moe_align_block_size(
         topk_ids,
         num_experts,
@@ -349,7 +349,7 @@ def benchmark(num_tokens, num_experts, topk, provider):
             ),
             quantiles=quantiles,
         )
-    else:  # vLLM
+    else:  # vllm
         try:
             ms, min_ms, max_ms = triton.testing.do_bench(
                 lambda: ops.moe_align_block_size(
