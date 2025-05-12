@@ -320,6 +320,7 @@ def select_experts(
                 num_token_non_padded=num_token_non_padded,
             )
     elif torch_native and custom_routing_function is None:
+        assert num_token_non_padded is None, "num_token_non_padded is not yet supported in fused_topk_native"
         topk_weights, topk_ids = fused_topk_native(
             hidden_states=hidden_states,
             gating_output=router_logits,
@@ -327,6 +328,7 @@ def select_experts(
             renormalize=renormalize,
         )
     elif custom_routing_function is None:
+        assert num_token_non_padded is None, "num_token_non_padded is not yet supported in fused_topk"
         topk_weights, topk_ids = fused_topk(
             hidden_states=hidden_states,
             gating_output=router_logits,
@@ -334,6 +336,7 @@ def select_experts(
             renormalize=renormalize,
         )
     else:
+        assert num_token_non_padded is None, "num_token_non_padded is not yet supported in custom_routing_function"
         topk_weights, topk_ids = custom_routing_function(
             hidden_states=hidden_states,
             gating_output=router_logits,
