@@ -17,7 +17,7 @@ from utils import (
     convert_weight,
     native_w8a8_per_token_matmul,
     per_token_quant_int8,
-    pres,
+    precision,
 )
 
 from sglang.test.test_utils import CustomTestCase
@@ -63,7 +63,7 @@ class TestGemm(CustomTestCase):
         packed_mat2 = convert_weight_packed(mat2)
         out2 = weight_packed_linear(mat1, packed_mat2, bias if has_bias else None, True)
 
-        atol = rtol = pres[ref.dtype]
+        atol = rtol = precision[ref.dtype]
         self.assertTrue(torch.allclose(ref, out, atol=atol, rtol=rtol))
         self.assertTrue(torch.allclose(ref, out2, atol=atol, rtol=rtol))
 
@@ -98,7 +98,7 @@ class TestGemm(CustomTestCase):
         bias = torch.randn(N) if has_bias else None
         ref_out = native_w8a8_per_token_matmul(Aq, Bq, As, Bs, bias, dtype)
 
-        atol = rtol = pres[ref_out.dtype]
+        atol = rtol = precision[ref_out.dtype]
 
         Aq2, As2 = per_token_quant_int8_cpu(A)
         out = int8_scaled_mm_cpu(
@@ -168,7 +168,7 @@ class TestGemm(CustomTestCase):
             data.dtype,
             prepack,
         )
-        atol = rtol = pres[ref.dtype]
+        atol = rtol = precision[ref.dtype]
         self.assertTrue(torch.allclose(ref, opt, atol=atol, rtol=rtol))
 
     def test_fp8_gemm(self):

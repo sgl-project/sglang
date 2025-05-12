@@ -2,7 +2,7 @@ import math
 
 import torch
 
-pres = {
+precision = {
     torch.bfloat16: 1e-2,
     torch.float16: 1e-3,
     torch.float32: 1e-5,
