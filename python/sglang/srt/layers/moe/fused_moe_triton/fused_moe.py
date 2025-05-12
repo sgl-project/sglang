@@ -1316,7 +1316,7 @@ def fused_experts(
         )
 
 
-@torch.compile
+# @torch.compile
 def compute_sum_scaled(x, out, routed_scaling_factor):
     torch.sum(x, dim=1, out=out)
     out.mul_(routed_scaling_factor)
