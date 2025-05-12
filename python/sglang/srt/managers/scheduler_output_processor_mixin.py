@@ -5,10 +5,10 @@ import threading
 import time
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import BatchEmbeddingOut, BatchTokenIDOut
 from sglang.srt.managers.schedule_batch import BaseFinishReason, Req, ScheduleBatch
-from sglang.srt.server_args import DisaggregationMode
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import (
@@ -549,6 +549,7 @@ class SchedulerOutputProcessorMixin:
                 read_offsets.append(read_offset)
                 if self.skip_tokenizer_init:
                     output_ids.append(req.output_ids[send_token_offset:])
+                req.send_token_offset = len(req.output_ids)
                 skip_special_tokens.append(req.sampling_params.skip_special_tokens)
                 spaces_between_special_tokens.append(
                     req.sampling_params.spaces_between_special_tokens
@@ -634,10 +635,18 @@ class SchedulerOutputProcessorMixin:
                         output_hidden_states = []
                     output_hidden_states.append(req.hidden_states)
 
+            if (
+                req.finished()
+                and self.tp_rank == 0
+                and self.server_args.enable_request_time_stats_logging
+            ):
+                req.log_time_stats()
+
         # Send to detokenizer
         if rids:
             if self.model_config.is_multimodal_gen:
                 return
+
             self.send_to_detokenizer.send_pyobj(
                 BatchTokenIDOut(
                     rids,

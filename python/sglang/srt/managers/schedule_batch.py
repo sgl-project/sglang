@@ -670,6 +670,11 @@ class Req:
             )
             return
 
+        if self.grammar is not None:
+            if self.grammar.is_terminated():
+                self.finished_reason = FINISH_MATCHED_TOKEN(matched=self.output_ids[-1])
+                return
+
         last_token_id = self.output_ids[-1]
 
         if not self.sampling_params.ignore_eos:
@@ -726,6 +731,18 @@ class Req:
         ]
         token_to_kv_pool_allocator.load_cpu_copy(self.kv_cache_cpu, token_indices)
         del self.kv_cache_cpu
+
+    def log_time_stats(self):
+        # If overlap schedule, we schedule one decode batch ahead so this gets called twice.
+        if self.has_log_time_stats is True:
+            return
+
+        if self.bootstrap_room is not None:
+            prefix = f"Req Time Stats(rid={self.rid}, bootstrap_room={self.bootstrap_room}, input len={len(self.origin_input_ids)}, output len={len(self.output_ids)}, type={self.time_stats.get_type().value})"
+        else:
+            prefix = f"Req Time Stats(rid={self.rid}, input len={len(self.origin_input_ids)}, output len={len(self.output_ids)}, type={self.time_stats.get_type().value})"
+        logger.info(f"{prefix}: {self.time_stats}")
+        self.has_log_time_stats = True
 
     def __repr__(self):
         return (

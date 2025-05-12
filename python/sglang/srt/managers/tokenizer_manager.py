@@ -128,7 +128,7 @@ class ReqState:
     out_list: List[Dict[Any, Any]]
     finished: bool
     event: asyncio.Event
-    obj: Any
+    obj: Union[GenerateReqInput, EmbeddingReqInput]
 
     # For metrics
     created_time: float
