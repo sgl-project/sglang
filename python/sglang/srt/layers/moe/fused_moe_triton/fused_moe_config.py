@@ -102,7 +102,7 @@ def get_default_config(
                     "num_stages": 2 if _is_hip else 4,
                 }
         else:
-            # Block-wise quant: BLOCK_SIZE_K must be divisable by block_shape[1]
+            # Block-wise quant: BLOCK_SIZE_K must be divisible by block_shape[1]
             config = {
                 "BLOCK_SIZE_M": 64,
                 "BLOCK_SIZE_N": block_shape[0],
@@ -182,3 +182,5 @@ def get_config_dtype_str(
         # use fp16/bfloat16 configs
         return "float32"
     return None
+
+
