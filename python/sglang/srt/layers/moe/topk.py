@@ -252,7 +252,9 @@ def biased_grouped_topk(
             routed_scaling_factor,
         )
         # TODO will fuse this into kernel, thus use slow manual operation now
-        _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+        torch.compile(
+            _mask_topk_ids_padded_region, dynamic=True, backend=get_compiler_backend()
+        )(topk_ids, num_token_non_padded)
         return topk_weights, topk_ids
     else:
         biased_grouped_topk_fn = (
