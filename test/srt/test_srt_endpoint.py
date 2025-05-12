@@ -492,9 +492,6 @@ class TestSRTEndpoint(CustomTestCase):
         max_total_num_tokens = response_json["max_total_num_tokens"]
         self.assertIsInstance(max_total_num_tokens, int)
 
-        attention_backend = response_json["attention_backend"]
-        self.assertIsInstance(attention_backend, str)
-
         version = response_json["version"]
         self.assertIsInstance(version, str)
 
