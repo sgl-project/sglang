@@ -352,6 +352,7 @@ def fused_moe_kernel(
     use_int8_w8a16: tl.constexpr,
     per_channel_quant: tl.constexpr,
     even_Ks: tl.constexpr,
+    routed_scaling_factor: tl.constexpr,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -509,6 +510,8 @@ def fused_moe_kernel(
             accumulator = (accumulator * a_scale * b_scale).to(compute_type)
     else:
         accumulator = accumulator.to(compute_type)
+
+    accumulator = accumulator * routed_scaling_factor
     # -----------------------------------------------------------
     # Write back the block of the output
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
@@ -755,6 +758,7 @@ def invoke_fused_moe_kernel(
     per_channel_quant: bool,
     block_shape: Optional[List[int]] = None,
     no_combine: bool = False,
+    routed_scaling_factor: Optional[float] = None,
 ) -> None:
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
@@ -805,6 +809,9 @@ def invoke_fused_moe_kernel(
     else:
         assert A_scale is None
         assert B_scale is None
+
+    if routed_scaling_factor is None:
+        routed_scaling_factor = 1.0
 
     grid = lambda META: (
         triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"])
@@ -859,6 +866,7 @@ def invoke_fused_moe_kernel(
             use_int4_w4a16=use_int4_w4a16,
             use_int8_w8a16=use_int8_w8a16,
             even_Ks=even_Ks,
+            routed_scaling_factor=routed_scaling_factor,
             **config,
         )
 
@@ -900,6 +908,7 @@ def invoke_fused_moe_kernel(
             use_int8_w8a16=use_int8_w8a16,
             per_channel_quant=per_channel_quant,
             even_Ks=even_Ks,
+            routed_scaling_factor=routed_scaling_factor,
             **config,
         )
 
@@ -1096,6 +1105,7 @@ def inplace_fused_experts(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
+    routed_scaling_factor: Optional[float] = None,
 ) -> None:
     fused_experts_impl(
         hidden_states,
@@ -1118,6 +1128,7 @@ def inplace_fused_experts(
         a1_scale,
         a2_scale,
         block_shape,
+        routed_scaling_factor,
     )
 
 
@@ -1141,6 +1152,7 @@ def inplace_fused_experts_fake(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
+    routed_scaling_factor: Optional[float] = None,
 ) -> None:
     pass
 
@@ -1174,6 +1186,7 @@ def outplace_fused_experts(
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
     no_combine: bool = False,
+    routed_scaling_factor: Optional[float] = None,
 ) -> torch.Tensor:
     return fused_experts_impl(
         hidden_states,
@@ -1197,6 +1210,7 @@ def outplace_fused_experts(
         a2_scale,
         block_shape,
         no_combine=no_combine,
+        routed_scaling_factor=routed_scaling_factor,
     )
 
 
@@ -1221,6 +1235,7 @@ def outplace_fused_experts_fake(
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
     no_combine: bool = False,
+    routed_scaling_factor: Optional[float] = None,
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states)
 
@@ -1255,6 +1270,7 @@ def fused_experts(
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
     no_combine: bool = False,
+    routed_scaling_factor: Optional[float] = None,
 ):
     if inplace:
         assert not no_combine, "no combine + inplace makes no sense"
@@ -1278,6 +1294,7 @@ def fused_experts(
             a1_scale,
             a2_scale,
             block_shape,
+            routed_scaling_factor,
         )
         return hidden_states
     else:
@@ -1302,6 +1319,7 @@ def fused_experts(
             a2_scale,
             block_shape,
             no_combine=no_combine,
+            routed_scaling_factor=routed_scaling_factor,
         )
 
 
@@ -1327,6 +1345,7 @@ def fused_experts_impl(
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
     no_combine: bool = False,
+    routed_scaling_factor: Optional[float] = None,
 ):
     padded_size = padding_size
     if (
@@ -1457,6 +1476,7 @@ def fused_experts_impl(
             use_int4_w4a16=use_int4_w4a16,
             per_channel_quant=per_channel_quant,
             block_shape=block_shape,
+            routed_scaling_factor=routed_scaling_factor,
         )
         if activation == "silu":
             if _is_cuda:
@@ -1501,6 +1521,7 @@ def fused_experts_impl(
             use_int4_w4a16=use_int4_w4a16,
             per_channel_quant=per_channel_quant,
             block_shape=block_shape,
+            routed_scaling_factor=routed_scaling_factor,
         )
 
         if no_combine:
@@ -1634,4 +1655,5 @@ def fused_moe(
         a2_scale=a2_scale,
         block_shape=block_shape,
         no_combine=no_combine,
+        routed_scaling_factor=routed_scaling_factor,
     )
