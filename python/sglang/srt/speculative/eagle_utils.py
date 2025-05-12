@@ -37,10 +37,6 @@ elif is_hip():
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
 
-import logging
-
-logger = logging.getLogger(__name__)
-
 
 SIMULATE_ACC_LEN = os.environ.get("SIMULATE_ACC_LEN")
 
@@ -69,6 +65,8 @@ class EagleDraftInput:
     all_padding_lens: Optional[torch.Tensor] = None
 
     def prepare_for_extend(self, batch: ScheduleBatch):
+        if batch.forward_mode.is_idle():
+            return
         # Prefill only generate 1 token.
         assert len(self.verified_id) == len(batch.seq_lens)
 
@@ -79,6 +77,17 @@ class EagleDraftInput:
                 (input_ids[1:], self.verified_id[i].reshape(1))
             )
             pt += extend_len
+
+    @classmethod
+    def create_for_idle(cls, device: torch.device, hidden_size: int, topk: int):
+        return cls(
+            verified_id=None,
+            hidden_states=torch.empty(
+                (0, hidden_size), device=device, dtype=torch.float32
+            ),
+            topk_p=torch.empty((0, topk), device=device, dtype=torch.float32),
+            topk_index=torch.empty((0, topk), device=device, dtype=torch.int64),
+        )
 
     def prepare_extend_after_decode(
         self,
@@ -268,7 +277,6 @@ class EagleVerifyInput:
             spec_steps,
             num_verify_tokens,
         )
-
         return cls(
             draft_tokens,
             tree_mask,
@@ -280,6 +288,27 @@ class EagleVerifyInput:
             num_verify_tokens,
             spec_steps,
             CaptureHiddenMode.FULL,
+        )
+
+    @classmethod
+    def create_for_idle(cls, spec_steps: int, num_verify_tokens: int):
+        return cls(
+            draft_token=torch.empty((0,), dtype=torch.long, device="cuda"),
+            custom_mask=torch.full((0,), True, dtype=torch.bool, device="cuda"),
+            positions=torch.empty((0,), dtype=torch.int64, device="cuda"),
+            retrive_index=torch.full(
+                (0, num_verify_tokens), -1, dtype=torch.long, device="cuda"
+            ),
+            retrive_next_token=torch.full(
+                (0, num_verify_tokens), -1, dtype=torch.long, device="cuda"
+            ),
+            retrive_next_sibling=torch.full(
+                (0, num_verify_tokens), -1, dtype=torch.long, device="cuda"
+            ),
+            retrive_cum_len=None,
+            draft_token_num=num_verify_tokens,
+            spec_steps=spec_steps,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
         )
 
     def prepare_for_verify(self, batch: ScheduleBatch, page_size: int):
@@ -599,7 +628,6 @@ class EagleVerifyInput:
                         batch.req_pool_indices
                     )
             batch.out_cache_loc = batch.out_cache_loc[new_accept_index]
-
             return EagleVerifyOutput(
                 draft_input=draft_input,
                 logits_output=logits_output,
@@ -824,10 +852,15 @@ def select_top_k_tokens(
         topk_index = topk_index.reshape(-1, topk**2)
         input_ids = torch.gather(topk_index, index=topk_cs_index, dim=1).flatten()
 
-        selected_input_index = topk_cs_index.flatten() // topk + torch.arange(
-            0, hidden_states.shape[0], step=topk, device="cuda"
-        ).repeat_interleave(topk)
-        hidden_states = hidden_states[selected_input_index, :]
+        if hidden_states.shape[0] > 0:
+            selected_input_index = topk_cs_index.flatten() // topk + torch.arange(
+                0, hidden_states.shape[0], step=topk, device="cuda"
+            ).repeat_interleave(topk)
+            hidden_states = hidden_states[selected_input_index, :]
+        else:
+            hidden_states = torch.empty(
+                [0, hidden_states.shape[1]], dtype=hidden_states.dtype, device="cuda"
+            )
 
         tree_info = (
             expand_scores,  # shape: (b, topk, topk)
