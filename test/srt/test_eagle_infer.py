@@ -97,7 +97,7 @@ class TestEAGLEEngine(CustomTestCase):
 
         print(f"{engine.get_server_info()=}")
 
-        avg_spec_accept_length = engine.get_server_info()[0]["internal_states"][
+        avg_spec_accept_length = engine.get_server_info()["internal_states"][0][
             "avg_spec_accept_length"
         ]
         print(f"{avg_spec_accept_length=}")
