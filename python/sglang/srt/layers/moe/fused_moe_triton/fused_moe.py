@@ -12,7 +12,6 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.moe.fused_moe_triton.moe_sum import sum_dim
 from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
@@ -1317,6 +1316,12 @@ def fused_experts(
         )
 
 
+@torch.compile
+def compute_sum_scaled(x, out, routed_scaling_factor):
+    torch.sum(x, dim=1, out=out)
+    out.mul_(routed_scaling_factor)
+
+
 def fused_experts_impl(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -1527,10 +1532,10 @@ def fused_experts_impl(
                 out_hidden_states[begin_chunk_idx:end_chunk_idx],
             )
         else:
-            out_hidden_states[begin_chunk_idx:end_chunk_idx] = sum_dim(
+            compute_sum_scaled(
                 intermediate_cache3.view(*intermediate_cache3.shape),
-                dim=1,
-                routed_scaling_factor=routed_scaling_factor,
+                out_hidden_states[begin_chunk_idx:end_chunk_idx],
+                routed_scaling_factor,
             )
 
     return out_hidden_states
