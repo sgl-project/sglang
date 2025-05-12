@@ -126,7 +126,7 @@ def _simulate_execution_given_logical_count_of_batch(
     logical_count_of_batch: torch.Tensor,
     server_args: MyServerArgs,
 ):
-    balanced_physical_count_of_batch = _simulate_eplb_physical_count_of_batch(
+    balanced_physical_count_of_batch, expert_location_metadata_arr = _simulate_eplb_physical_count_of_batch(
         logical_count_of_batch=logical_count_of_batch,
         server_args=server_args,
     )
@@ -149,6 +149,7 @@ def _simulate_execution_given_logical_count_of_batch(
         utilization_rate=utilization_rate,
         mean_utilization_rate=mean_utilization_rate,
         num_simulated_batches=logical_count_of_batch.shape[0],
+        expert_location_metadata_arr=expert_location_metadata_arr,
     )
 
 
@@ -176,9 +177,9 @@ def _simulate_eplb_physical_count_of_batch(
             )
             for batch_index in trange(num_batches)
         ]
-        return torch.stack(outputs)
+        return torch.stack(outputs), expert_location_metadata_arr
     else:
-        return logical_count_of_batch
+        return logical_count_of_batch, None
 
 
 def _simulate_expert_location_metadata_arr(
