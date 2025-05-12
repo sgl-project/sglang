@@ -36,13 +36,13 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.dp_attention import (
+    attn_tp_all_gather,
+    attn_tp_reduce_scatter,
     dp_gather_partial,
     dp_scatter,
     get_attention_dp_size,
     get_attention_tp_rank,
     get_attention_tp_size,
-    tp_all_gather,
-    tp_reduce_scatter,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -1287,7 +1287,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         # Fully Connected
         hidden_states = self.mlp(hidden_states)
 
-        # TODO(ch-wan): ues reduce-scatter in MLP to avoid this scatter
+        # TODO(ch-wan): use reduce-scatter in MLP to avoid this scatter
         # Scatter
         if self.dp_size != 1:
             # important: forward batch.gathered_buffer is used both after scatter and after gather.
@@ -1323,7 +1323,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
                 hidden_states,
             )
-            tp_all_gather(
+            attn_tp_all_gather(
                 list(hidden_states.tensor_split(self.attn_tp_size)), local_hidden_states
             )
 
@@ -1339,7 +1339,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             if self.input_is_scattered:
                 tensor_list = list(hidden_states.tensor_split(self.attn_tp_size))
                 hidden_states = tensor_list[self.attn_tp_rank]
-                tp_reduce_scatter(hidden_states, tensor_list)
+                attn_tp_reduce_scatter(hidden_states, tensor_list)
                 if hidden_states.shape[0] != 0:
                     hidden_states, residual = self.post_attention_layernorm(
                         hidden_states, residual
@@ -1349,7 +1349,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                     hidden_states += residual
                 tensor_list = list(hidden_states.tensor_split(self.attn_tp_size))
                 hidden_states = tensor_list[self.attn_tp_rank]
-                tp_reduce_scatter(hidden_states, tensor_list)
+                attn_tp_reduce_scatter(hidden_states, tensor_list)
                 residual = hidden_states
                 if hidden_states.shape[0] != 0:
                     hidden_states = self.post_attention_layernorm(hidden_states)
@@ -1373,7 +1373,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
                 hidden_states,
             )
-            tp_all_gather(
+            attn_tp_all_gather(
                 list(hidden_states.tensor_split(self.attn_tp_size)), local_hidden_states
             )
 
@@ -1475,6 +1475,7 @@ class DeepseekV2ForCausalLM(nn.Module):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
+            use_attn_tp_group=global_server_args_dict["enable_dp_lm_head"],
         )
         self.logits_processor = LogitsProcessor(config)
         self.dp_size = get_attention_dp_size()
@@ -1486,22 +1487,24 @@ class DeepseekV2ForCausalLM(nn.Module):
         if self.n_share_experts_fusion > 0:
             # Only Deepseek V3/R1 can use shared experts fusion optimization now.
             if (
-                self.config.architectures[0] != architecture
+                not _is_cuda
+                or self.config.architectures[0] != architecture
                 or self.config.n_routed_experts != 256
             ):
                 self.n_share_experts_fusion = 0
                 global_server_args_dict["n_share_experts_fusion"] = 0
                 log_info_on_rank0(
                     logger,
-                    "Only Deepseek V3/R1 can use shared experts fusion optimization. Shared experts fusion optimization is disabled.",
+                    "Only Deepseek V3/R1 on NV-platform can use shared experts fusion optimization. Shared experts fusion optimization is disabled.",
                 )
             else:
                 assert (
                     self.n_share_experts_fusion == self.tp_size
-                ), f"Shared experts fusion optimization is enabled in DeepSeek V3/R1, set it to {self.tp_size} can get best optimized performace."
+                ), f"Shared experts fusion optimization is enabled in DeepSeek V3/R1, set it to {self.tp_size} can get best optimized performance."
         elif self.n_share_experts_fusion == 0:
             if (
-                torch.cuda.get_device_capability("cuda") >= (9, 0)
+                _is_cuda
+                and torch.cuda.get_device_capability("cuda") >= (9, 0)
                 and self.config.architectures[0] == architecture
                 and self.config.n_routed_experts == 256
                 and (not global_server_args_dict["enable_deepep_moe"])
@@ -1663,7 +1666,7 @@ class DeepseekV2ForCausalLM(nn.Module):
         if is_nextn:
             if hasattr(self.config, "num_nextn_predict_layers"):
                 num_nextn_layers = self.config.num_nextn_predict_layers
-                assert num_nextn_layers == 1, "Only 1 nextn layer is supportted"
+                assert num_nextn_layers == 1, "Only 1 nextn layer is supported"
                 # compatible with old design
                 nextn_layer_id = (
                     0

@@ -1085,31 +1085,32 @@ class ModelRunner:
         forward_batch: ForwardBatch,
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
-    ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+    ) -> Tuple[Union[LogitsProcessorOutput, PPProxyTensors], bool]:
         can_run_cuda_graph = bool(
             forward_batch.forward_mode.is_cuda_graph()
             and self.cuda_graph_runner
             and self.cuda_graph_runner.can_run(forward_batch)
         )
         if can_run_cuda_graph:
-            return self.cuda_graph_runner.replay(
+            ret = self.cuda_graph_runner.replay(
                 forward_batch,
                 skip_attn_backend_init=skip_attn_backend_init,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
-
-        if forward_batch.forward_mode.is_decode():
-            return self.forward_decode(forward_batch, pp_proxy_tensors=pp_proxy_tensors)
+        elif forward_batch.forward_mode.is_decode():
+            ret = self.forward_decode(forward_batch, pp_proxy_tensors=pp_proxy_tensors)
         elif forward_batch.forward_mode.is_extend():
-            return self.forward_extend(
+            ret = self.forward_extend(
                 forward_batch,
                 skip_attn_backend_init=skip_attn_backend_init,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
         elif forward_batch.forward_mode.is_idle():
-            return self.forward_idle(forward_batch, pp_proxy_tensors=pp_proxy_tensors)
+            ret = self.forward_idle(forward_batch, pp_proxy_tensors=pp_proxy_tensors)
         else:
             raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode}")
+
+        return ret, can_run_cuda_graph
 
     def _preprocess_logits(
         self, logits_output: LogitsProcessorOutput, sampling_info: SamplingBatchInfo
@@ -1145,9 +1146,7 @@ class ModelRunner:
                 [self.sample(values, forward_batch) for values in logits_output],
                 axis=-1,
             )
-        sampling_info = forward_batch.sampling_info
-        if sampling_info.thinking_budgets is not None:
-            sampling_info.apply_thinking_budgets(logits_output.next_token_logits)
+
         self._preprocess_logits(logits_output, forward_batch.sampling_info)
 
         # Sample the next tokens
@@ -1158,8 +1157,6 @@ class ModelRunner:
             forward_batch.top_logprobs_nums,
             forward_batch.token_ids_logprobs,
         )
-        if sampling_info.thinking_budgets is not None:
-            sampling_info.update_thinking_budgets(next_token_ids)
         return next_token_ids
 
     @property
