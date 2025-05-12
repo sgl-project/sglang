@@ -172,7 +172,7 @@ class CustomAllreduce:
 
         if not custom_ar:
             # disable because of missing custom allreduce library
-            # e.g. in a non-CUDA environment
+            # e.g. in a non-cuda environment
             return
 
         self.group = group
@@ -389,11 +389,11 @@ class CustomAllreduce:
         if _is_hip:
             handle, offset = ops.get_graph_buffer_ipc_meta(self._ptr)
             handles, offsets = self._gather_ipc_meta((bytes(handle), offset))
-            logger.info("Registering %d CUDA graph addresses", len(offset))
+            logger.info("Registering %d cuda graph addresses", len(offset))
             ops.register_graph_buffers(self._ptr, handles, offsets)
         else:
             handle, offset = ops.get_graph_buffer_ipc_meta(self._ptr)
-            logger.info("Registering %d CUDA graph addresses", len(offset))
+            logger.info("Registering %d cuda graph addresses", len(offset))
             # We cannot directly use `dist.all_gather_object` here
             # because it is incompatible with `gloo` backend under inference mode.
             # see https://github.com/pytorch/pytorch/issues/126032 for details.
@@ -435,7 +435,7 @@ class CustomAllreduce:
         return False
 
     # all reduce, assuming inp tensor is IPC registered with register_buffer,
-    # or, in the context of CUDA graphs, register_graph_buffers
+    # or, in the context of cuda graphs, register_graph_buffers
     def all_reduce_reg(self, inp: torch.Tensor, out: torch.Tensor = None):
         if out is None:
             out = torch.empty_like(inp)
@@ -473,7 +473,7 @@ class CustomAllreduce:
         return out
 
     def custom_all_reduce(self, input: torch.Tensor) -> Optional[torch.Tensor]:
-        """The main allreduce API that provides support for CUDA graph."""
+        """The main allreduce API that provides support for cuda graph."""
         # When custom allreduce is disabled, this will be None.
         if self.disabled or not self.should_custom_ar(input):
             return None
@@ -489,7 +489,7 @@ class CustomAllreduce:
                 return torch.empty_like(input)
         else:
             if _is_hip:
-                # note: outside of CUDA graph context,
+                # note: outside of cuda graph context,
                 # custom allreduce incurs a cost of cudaMemcpy, which should
                 # be small(<=1% of overall latency) compared to the performance
                 # gains of using custom kernels

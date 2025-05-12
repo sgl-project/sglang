@@ -537,8 +537,8 @@ class MllamaTextCrossAttention(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("o_proj", prefix),
         )
-        # vllm.model_executor.layers.layernorm.RMSNorm has a precision issue,
-        # use HuggingFace's instead
+        # vllm.model_executor.layers.layernorm.RMSNorm has precision issue,
+        # use huggingface's instead
         self.q_norm = MllamaTextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = MllamaTextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.scaling = self.head_dim**-0.5
@@ -979,8 +979,8 @@ class MllamaForConditionalGeneration(nn.Module):
         cross_attention_states = None
 
         if self.capture_mode:
-            # NOTE: when doing CUDA graph capture, we do not want to skip cross attention
-            # Make is a constant value to avoid CUDA graph capture issue
+            # NOTE: when doing cuda graph capture, we do not want to skip cross attention
+            # Make is a constant value to avoid cuda graph capture issue
             skip_cross_attention = False
         else:
             # NOTE: we do not need image_inputs when prefill

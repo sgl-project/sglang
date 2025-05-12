@@ -69,13 +69,13 @@ If you encounter errors when starting the server, ensure the weights have finish
 The DeepSeek series have huge model weights, it takes some time to compile the model with `torch.compile` for the first time if you have added the flag `--enable-torch-compile`. You can refer [here](https://docs.sglang.ai/backend/hyperparameter_tuning.html#try-advanced-options) to optimize the caching of compilation results, so that the cache can be used to speed up the next startup.
 
 ### Launch with one node of 8 x H200
-Please refer to [the example](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#using-docker-recommended). **Note that Deepseek V3 is already in FP8**. So we should not run it with any quantization arguments like `--quantization fp8 --kv-cache-dtype fp8_e5m2`.
+Please refer to [the example](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#using-docker-recommended). **Note that Deepseek V3 is already in FP8. So we should not run it with any quantization arguments like `--quantization fp8 --kv-cache-dtype fp8_e5m2`.
 
 ### Running examples on Multi-node
 
 - [Serving with two H20*8 nodes](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-two-h208-nodes).
 
-- [Serving with two H200*8 nodes and Docker](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-two-h2008-nodes-and-docker).
+- [Serving with two H200*8 nodes and docker](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-two-h2008-nodes-and-docker).
 
 - [Serving with four A100*8 nodes](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-four-a1008-nodes).
 
@@ -89,13 +89,13 @@ Please refer to [the example](https://github.com/sgl-project/sglang/tree/main/be
 
 - **MLA Attention Backends**: Currently SGLang supports different optimized MLA attention backends, including [FlashAttention3](https://github.com/Dao-AILab/flash-attention), [Flashinfer](https://docs.flashinfer.ai/api/mla.html), [FlashMLA](https://github.com/deepseek-ai/FlashMLA), [CutlassMLA](https://github.com/sgl-project/sglang/pull/5390), and [Triton](https://github.com/triton-lang/triton) backends. The default FA3 provides good performance across wide workloads.
 
-- **FP8 Quantization**: W8A8 FP8 and KV Cache FP8 quantization enables efficient FP8 inference. Additionally, we have implemented the Batched Matrix Multiplication (BMM) operator to facilitate FP8 inference in MLA with weight absorption.
+- **FP8 Quantization**: W8A8 FP8 and KV Cache FP8 quantization enables efficient FP8 inference. Additionally, we have implemented Batched Matrix Multiplication (BMM) operator to facilitate FP8 inference in MLA with weight absorption.
 
-- **CUDA Graph & torch.compile**: Both MLA and Mixture of Experts (MoE) are compatible with CUDA Graph and torch.compile, which reduces latency and accelerates decoding speed for small batch sizes.
+- **CUDA Graph & Torch.compile**: Both MLA and Mixture of Experts (MoE) are compatible with CUDA Graph and Torch.compile, which reduces latency and accelerates decoding speed for small batch sizes.
 
-- **Chunked Prefix Cache**: Chunked prefix cache optimization can increase throughput by cutting prefix cache into chunks, processing them with multi-head attention and merging their states. Its improvement can be significant when doing chunked prefill on long sequences. Currently this optimization is only available for the FlashAttention3 backend.
+- **Chunked Prefix Cache**: Chunked prefix cache optimization can increase throughput by cutting prefix cache into chunks, processing them with multi-head attention and merging their states. Its improvement can be significant when doing chunked prefill on long sequences. Currently this optimization is only available for FlashAttention3 backend.
 
-Overall, with these optimizations, we have achieved up to a **7x** acceleration in output throughput compared to the previous version.
+Overall, with these optimizations, we have achieved up to **7x** acceleration in output throughput compared to the previous version.
 
 <p align="center">
   <img src="https://lmsys.org/images/blog/sglang_v0_3/deepseek_mla.svg" alt="Multi-head Latent Attention for DeepSeek Series Models">
@@ -113,7 +113,7 @@ Overall, with these optimizations, we have achieved up to a **7x** acceleration 
   <img src="https://lmsys.org/images/blog/sglang_v0_4/dp_attention.svg" alt="Data Parallelism Attention for DeepSeek Series Models">
 </p>
 
-With data parallelism attention enabled, we have achieved up to a **1.9x** decoding throughput improvement compared to the previous version.
+With data parallelism attention enabled, we have achieved up to **1.9x** decoding throughput improvement compared to the previous version.
 
 <p align="center">
   <img src="https://lmsys.org/images/blog/sglang_v0_4/deepseek_coder_v2.svg" alt="Data Parallelism Attention Performance Comparison">
@@ -150,7 +150,7 @@ python3 -m sglang.compile_deep_gemm --model deepseek-ai/DeepSeek-V3 --tp 8 --tru
 The precompilation process typically takes around 10 minutes to complete.
 
 ### Multi-token Prediction
-**Description**: SGLang implements DeepSeek V3 Multi-Token Prediction (MTP) based on [EAGLE speculative decoding](https://docs.sglang.ai/backend/speculative_decoding.html#EAGLE-Decoding). With this optimization, the decoding speed can be improved by **1.8x** for batch size 1 and **1.5x** for batch size 32 respectively with H200 TP8 setting.
+**Description**: SGLang implements DeepSeek V3 Multi-Token Prediction (MTP) based on [EAGLE speculative decoding](https://docs.sglang.ai/backend/speculative_decoding.html#EAGLE-Decoding). With this optimization, the decoding speed can be improved by **1.8x** for batch size 1 and **1.5x** for batch size 32 respectively on H200 TP8 setting.
 
 **Usage**:
 Add arguments `--speculative-algorithm`, `--speculative-num-steps`, `--speculative-eagle-topk` and `--speculative-num-draft-tokens` to enable this feature. For example:
@@ -161,7 +161,7 @@ python3 -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3-0324 --spec
 - FlashAttention3 and Triton backend fully supports MTP usage. For FlashInfer backend (`--attention-backend flashinfer`) with speculative decoding,`--speculative-eagle-topk` parameter should be set to `1`. MTP support for the FlashMLA backend and CutlassMLA backend is still under development.
 - To enable DeepSeek MTP for large batch sizes (>32), there are some parameters should be changed (Reference [this discussion](https://github.com/sgl-project/sglang/issues/4543#issuecomment-2737413756)):
   - Adjust `--max-running-requests` to a larger number. The default value is `32` for MTP. For larger batch sizes, you should increase this value beyond the default value.
-  - Set `--cuda-graph-bs`. It is a list of batch sizes for CUDA graph capture. The default captured batch sizes for speculative decoding is set [here](https://github.com/sgl-project/sglang/blob/49420741746c8f3e80e0eb17e7d012bfaf25793a/python/sglang/srt/model_executor/cuda_graph_runner.py#L126). You can include more batch sizes into it.
+  - Set `--cuda-graph-bs`. It's a list of batch sizes for cuda graph capture. The default captured batch sizes for speculative decoding is set [here](https://github.com/sgl-project/sglang/blob/49420741746c8f3e80e0eb17e7d012bfaf25793a/python/sglang/srt/model_executor/cuda_graph_runner.py#L126). You can include more batch sizes into it.
 
 
 ### Reasoning Content for DeepSeek R1
@@ -209,7 +209,7 @@ data: {"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"\"}"}}]}}]}
 data: {"choices":[{"delta":{"tool_calls":null}}], "finish_reason": "tool_calls"}
 data: [DONE]
 ```
-The client needs to concatenate all fragments of the tool call arguments to reconstruct the complete tool call:
+The client needs to concatenate all arguments fragments to reconstruct the complete tool call:
 ```
 {"city": "Qingdao"}
 ```
@@ -223,4 +223,4 @@ Important Notes:
 
 1. **Question**: What should I do if model loading takes too long and NCCL timeout occurs?
 
-    **Answer**: You can try to add `--dist-timeout 3600` when launching the model, this allows for a 1-hour timeout.
+    **Answer**: You can try to add `--dist-timeout 3600` when launching the model, this allows for 1-hour timeout.

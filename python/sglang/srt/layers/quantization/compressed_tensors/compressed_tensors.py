@@ -363,7 +363,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         if self._is_wNa16_group_channel(weight_quant, input_quant):
             if not VLLM_AVAILABLE:
                 raise ImportError(
-                    "vLLM is not installed, to use CompressedTensorsW4A16Sparse24 and CompressedTensorsWNA16, please install vLLM"
+                    "vllm is not installed, to use CompressedTensorsW4A16Sparse24 and CompressedTensorsWNA16, please install vllm"
                 )
             if (
                 self.quant_format == CompressionFormat.marlin_24.value
@@ -409,7 +409,7 @@ class CompressedTensorsConfig(QuantizationConfig):
             if self._is_fp8_w8a16(weight_quant, input_quant):
                 if not VLLM_AVAILABLE:
                     raise ImportError(
-                        "vLLM is not installed, to use CompressedTensorsW8A16Fp8, please install vLLM"
+                        "vllm is not installed, to use CompressedTensorsW8A16Fp8, please install vllm"
                     )
                 is_static_input_scheme = input_quant and not input_quant.dynamic
                 return CompressedTensorsW8A16Fp8(
@@ -491,7 +491,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         ):
             if not VLLM_AVAILABLE:
                 raise ImportError(
-                    "vLLM is not installed, to use CompressedTensors24, please install vLLM"
+                    "vllm is not installed, to use CompressedTensors24, please install vllm"
                 )
             # Have a valid sparsity scheme
             # Validate layer is supported by Cutlass 2:4 Kernel

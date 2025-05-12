@@ -35,7 +35,7 @@ SGLang uses Python's built-in [unittest](https://docs.python.org/3/library/unitt
 
 ## Writing Documentation & Running Docs CI
 
-We recommend new contributors start from writing documentation, which helps you quickly understand the SGLang codebase. For more details, please refer to [docs/README.md](https://github.com/sgl-project/sglang/tree/main/docs/README.md).
+We recommend new contributors start from writing documentation, which helps you quickly understand SGLang codebase. For more details, please refer to [docs/README.md](https://github.com/sgl-project/sglang/tree/main/docs/README.md).
 
 ## Tips for Newcomers
 
