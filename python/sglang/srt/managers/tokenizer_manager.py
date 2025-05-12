@@ -747,12 +747,16 @@ class TokenizerManager:
         output_dir: Optional[str] = None,
         num_steps: Optional[int] = None,
         activities: Optional[List[str]] = None,
+        with_stack: Optional[bool] = None,
+        record_shapes: Optional[bool] = None,
     ):
         req = ProfileReq(
             type=ProfileReqType.START_PROFILE,
             output_dir=output_dir,
             num_steps=num_steps,
             activities=activities,
+            with_stack=with_stack,
+            record_shapes=record_shapes,
             profile_id=str(time.time()),
         )
         result = (await self.start_profile_communicator(req))[0]
