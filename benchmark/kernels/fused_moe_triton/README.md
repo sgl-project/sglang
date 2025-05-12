@@ -4,7 +4,7 @@ This directory contains benchmarking tools for MoE (Mixture of Experts) kernels.
 
 ### Tuning Tool
 
-- `tuning_fused_moe_triton.py`: A tool for tuning the `fused_moe_triton` kernel. Adapted from [vllm's benchmark_moe.py](https://github.com/vllm-project/vllm/blob/main/benchmarks/kernels/benchmark_moe.py), with added support for various model architectures.
+- `tuning_fused_moe_triton.py`: A tool for tuning the `fused_moe_triton` kernel. Adapted from [vLLM's benchmark_moe.py](https://github.com/vllm-project/vllm/blob/main/benchmarks/kernels/benchmark_moe.py), with added support for various model architectures.
 
 Example usage:
 ```bash
@@ -48,7 +48,7 @@ After tuning, a configuration file (e.g., `E=64,N=640,device_name=NVIDIA_GeForce
 
 ### Performance Comparison Tool
 
-- `benchmark_vllm_vs_sglang_fused_moe_triton.py`: A tool for comparing the performance of fused MoE kernels between vllm and sglang implementations. Supports various model architectures and data types.
+- `benchmark_vllm_vs_sglang_fused_moe_triton.py`: A tool for comparing the performance of fused MoE kernels between vLLM and SGLang implementations. Supports various model architectures and data types.
 
 Example usage:
 ```bash

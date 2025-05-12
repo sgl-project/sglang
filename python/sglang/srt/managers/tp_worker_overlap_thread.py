@@ -205,7 +205,7 @@ class TpModelWorkerClient:
             penalizer_orchestrator=None,
         )
 
-        # A cuda stream sync here to avoid the cuda illegal memory access error.
+        # A CUDA stream sync here to avoid the CUDA illegal memory access error.
         self.scheduler_stream.synchronize()
 
         # Push a new batch to the queue

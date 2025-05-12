@@ -92,7 +92,7 @@ class TritonAttnBackend(AttentionBackend):
         skip_prefill: bool = False,
         kv_indptr_buf: Optional[torch.Tensor] = None,
     ):
-        # Lazy import to avoid the initialization of cuda context
+        # Lazy import to avoid the initialization of CUDA context
         from sglang.srt.layers.attention.triton_ops.decode_attention import (
             decode_attention_fwd,
         )

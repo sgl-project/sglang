@@ -83,11 +83,11 @@ Third-party libraries:
 
 ### FlashAttention FYI
 
-  FA3 can fail without a enough shared memory for a some shapes, such as higher hidden_dim or some special cases. Right now, fa3 is supported for sm80/sm87 and sm86/sm89.
+  FA3 can fail without a enough shared memory for some shapes, such as higher hidden_dim or some special cases. Right now, FA3 is supported for sm80/sm87 and sm86/sm89.
 
   The main different Between sm80/sm87 and sm86/sm89 is the shared memory size. you can follow the link below for more information https://docs.nvidia.com/cuda/cuda-c-programming-guide/#shared-memory-8-x.
 
-  And for sgl-kernel right now, we can build fa3 on sm80/sm86/sm89/sm90a. That means if you use **A100(tested)**/A*0/**L20(tested)**/L40/L40s/**3090(tested)** you can use fa3.
+  And for sgl-kernel right now, we can build FA3 on sm80/sm86/sm89/sm90a. That means if you use **A100(tested)**/A*0/**L20(tested)**/L40/L40s/**3090(tested)** you can use FA3.
 
 ### Kernel Development
 
@@ -164,7 +164,7 @@ template <>
 struct pytorch_library_compatible_type<int> {
   using type = int64_t;
   static int convert_from_type(int64_t arg) {
-    TORCH_CHECK(arg <= std::numeric_limits<int>::max(), "int64_t value is too large to be converted  to int");
+    TORCH_CHECK(arg <= std::numeric_limits<int>::max(), "int64_t value is too large to be converted to int");
     TORCH_CHECK(arg >= std::numeric_limits<int>::min(), "int64_t value is too small to be converted to int");
     return arg;
   }

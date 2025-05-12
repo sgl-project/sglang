@@ -1,6 +1,6 @@
 ## How to reproduce the benchmark results for SGLang v0.3.0 compared to vLLM v0.6.0
 
-In short, with multi step enabled, in online scenarios that we benchmarked, the Median TTFT of vLLM is **3 times** that of SGLang, and the Median ITL is **10 times** that of SGLang. Lower Median TTFT and ITL are better. vLLM's multi-step optimization did not improve throughput while ensuring lower Median TTFT and ITL. Also, under maximum throughput benchmark, if vLLM does not set gpu util to 0.95 separately and uses the default configuration instead, its maximum throughput is **lower** than that of SGLang.
+In short, with multi step enabled, in online scenarios that we benchmarked, the Median TTFT of vLLM is **3 times** that of SGLang, and the Median ITL is **10 times** that of SGLang. Lower Median TTFT and ITL are better. vLLM's multi-step optimization did not improve throughput while ensuring lower Median TTFT and ITL. Also, under maximum throughput benchmark, if vLLM does not set GPU utilization to 0.95 separately and uses the default configuration instead, its maximum throughput is **lower** than that of SGLang.
 
 ## Online benchmark results
 
@@ -41,12 +41,12 @@ In short, with multi step enabled, in online scenarios that we benchmarked, the 
 ## Installation
 
 ```bash
-# install sglang v0.3.0
+# install SGLang v0.3.0
 pip install --upgrade pip
 pip install "sglang[all]"==0.3.0
 pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/
 
-# install vllm v0.6.0
+# install vLLM v0.6.0
 pip install vllm==0.6.0
 ```
 

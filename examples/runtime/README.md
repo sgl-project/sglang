@@ -28,7 +28,7 @@ The `engine` folder contains that examples that show how to use [Offline Engine 
 
 ## Hidden States
 
-The `hidden_states` folder contains examples on how to extract hidden states using SGLang. Please note that this might degrade throughput due to cuda graph rebuilding.
+The `hidden_states` folder contains examples on how to extract hidden states using SGLang. Please note that this might degrade throughput due to CUDA graph rebuilding.
 
 * `hidden_states_engine.py`: An example how to extract hidden states using the Engine API.
 * `hidden_states_server.py`: An example how to extract hidden states using the Server API.

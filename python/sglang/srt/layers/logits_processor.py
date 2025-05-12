@@ -165,7 +165,7 @@ class LogitsMetadata:
 
     def compute_dp_attention_metadata(self, hidden_states: torch.Tensor):
         if self.global_num_tokens_for_logprob_cpu is None:
-            # we are capturing cuda graph
+            # we are capturing CUDA graph
             return
 
         cumtokens = torch.cumsum(self.global_num_tokens_for_logprob_gpu, dim=0)
