@@ -234,6 +234,7 @@ class Qwen2MoeAttention(nn.Module):
             quant_config=quant_config,
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
+            reduce_results=not global_server_args_dict["enable_dp_attention"],
             prefix=add_prefix("o_proj", prefix),
         )
 
