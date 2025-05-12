@@ -189,7 +189,7 @@ def init_process_hf(
     print(f"[hf] {rank=} {broadcast_time=:.3f}s")
     param_queue.put(("broadcast_time", broadcast_time))
 
-    # Delete the huggingface models to free up memory.
+    # Delete the HuggingFace models to free up memory.
     del hf_instruct_model
     del hf_base_model
     gc.collect()
