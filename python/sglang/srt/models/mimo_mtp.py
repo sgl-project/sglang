@@ -93,7 +93,8 @@ class MiMoMultiTokenPredictorLayer(nn.Module):
             residual=None,
         )
         # hidden_states = residual + hidden_states
-        return self.final_layernorm(hidden_states, residual)
+        hidden_states, _ = self.final_layernorm(hidden_states, residual)
+        return hidden_states
 
 
 # class MiMoMultiTokenPredictor(nn.Module):
@@ -235,15 +236,6 @@ class MiMoMTP(nn.Module):
     def map_model_name_to_mtp_param_name(self, name: str) -> str:
         import re
 
-        # name_without_prefix = [
-        #     "token_layernorm",
-        #     "hidden_layernorm",
-        #     "input_proj",
-        #     "final_layernorm",
-        # ]
-        # for sub_name in name_without_prefix:
-        #     if sub_name in name:
-        #         return name
         pattern = r"model.mtp_layers.(\d+)."
         group = re.match(pattern, name)
         if group is not None:
