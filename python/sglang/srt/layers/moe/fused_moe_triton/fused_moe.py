@@ -1130,6 +1130,7 @@ def inplace_fused_experts(
         a1_scale,
         a2_scale,
         block_shape,
+        False,
         routed_scaling_factor,
     )
 
@@ -1274,6 +1275,7 @@ def fused_experts(
     no_combine: bool = False,
     routed_scaling_factor: Optional[float] = None,
 ):
+
     if inplace:
         assert not no_combine, "no combine + inplace makes no sense"
         torch.ops.sglang.inplace_fused_experts(
