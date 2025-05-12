@@ -25,10 +25,12 @@ class ChunkCache(BasePrefixCache):
         req_to_token_pool: ReqToTokenPool,
         token_to_kv_pool_allocator: TokenToKVPoolAllocator,
         page_size: int,
+        token_to_kv_pool_allocator_local: TokenToKVPoolAllocator = None,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.page_size = page_size
+        self.token_to_kv_pool_allocator_local = token_to_kv_pool_allocator_local
 
     def reset(self):
         pass
@@ -42,14 +44,29 @@ class ChunkCache(BasePrefixCache):
         ]
         self.req_to_token_pool.free(req.req_pool_idx)
         self.token_to_kv_pool_allocator.free(kv_indices)
+        if self.token_to_kv_pool_allocator_local is not None:
+            start_loc_local = self.req_to_token_pool.get_local_start_loc(
+                req.req_pool_idx
+            )
+            kv_indices_local = self.req_to_token_pool.req_to_token_local[
+                req.req_pool_idx,
+                start_loc_local : len(req.origin_input_ids) + len(req.output_ids) - 1,
+            ]
+            self.token_to_kv_pool_allocator_local.free(kv_indices_local)
 
     def cache_unfinished_req(self, req: Req):
+        # TODO: for hybrid cache
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(req.fill_ids)
         ]
 
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
         req.prefix_indices = kv_indices
+        if self.token_to_kv_pool_allocator_local is not None:
+            kv_indices_local = self.req_to_token_pool.req_to_token_local[
+                req.req_pool_idx, : len(req.fill_ids)
+            ]
+            req.prefix_indices_local = kv_indices_local
 
     def insert(self):
         raise NotImplementedError()

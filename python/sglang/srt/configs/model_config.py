@@ -45,6 +45,7 @@ class ModelConfig:
         model_override_args: Optional[str] = None,
         is_embedding: Optional[bool] = None,
         enable_multimodal: Optional[bool] = None,
+        enable_hybrid_kvcache: Optional[float] = None,
         dtype: str = "auto",
         quantization: Optional[str] = None,
         override_config_file: Optional[str] = None,
@@ -73,7 +74,6 @@ class ModelConfig:
         self.attention_chunk_size = getattr(
             self.hf_text_config, "attention_chunk_size", None
         )
-
         if enable_multimodal is None:
             mm_disabled_models = [
                 "Gemma3ForConditionalGeneration",
@@ -94,6 +94,12 @@ class ModelConfig:
             self.hf_config.architectures[0] = "DeepseekV3ForCausalLMNextN"
 
         # Check model type
+        self.is_hybrid = is_hybrid_model(
+            self.hf_config.architectures,
+            enable_hybrid_kvcache=enable_hybrid_kvcache,
+            context_length=context_length,
+            attention_chunk_size=self.attention_chunk_size,
+        )
         self.is_generation = is_generation_model(
             self.hf_config.architectures, is_embedding
         )
@@ -221,6 +227,7 @@ class ModelConfig:
             model_override_args=server_args.json_model_override_args,
             is_embedding=server_args.is_embedding,
             enable_multimodal=server_args.enable_multimodal,
+            enable_hybrid_kvcache=server_args.enable_hybrid_kvcache,
             dtype=server_args.dtype,
             quantization=server_args.quantization,
             **kwargs,
@@ -556,6 +563,25 @@ multimodal_model_archs = [
     "KimiVLForConditionalGeneration",
     "InternVLChatModel",
 ]
+
+
+def is_hybrid_model(
+    model_architectures: List[str],
+    enable_hybrid_kvcache: Optional[float],
+    context_length: Optional[int],
+    attention_chunk_size: Optional[int],
+):
+
+    if enable_hybrid_kvcache is None:
+        return None
+    elif (
+        enable_hybrid_kvcache > 0
+        and model_architectures[0] == "Llama4ForConditionalGeneration"
+        and context_length > attention_chunk_size
+    ):
+        return enable_hybrid_kvcache
+    else:
+        return None
 
 
 def is_multimodal_model(model_architectures: List[str]):

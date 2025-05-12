@@ -588,6 +588,13 @@ def match_internvl_chat(model_path: str):
         return "internvl-2-5"
 
 
+@register_chat_template_matching_function
+def match_internvl_chat(model_path: str):
+    model_path = model_path.lower()
+    if "internvl" in model_path:
+        return get_chat_template("internvl-2-5")
+
+
 if __name__ == "__main__":
     messages = [
         {"role": "system", "content": None},  # None means default

@@ -489,6 +489,12 @@ class Scheduler(
             self.tp_worker.get_memory_pool()
         )
 
+        if self.tp_worker.worker.model_runner.is_hybrid is not None:
+            self.token_to_kv_pool_allocator_local = (
+                self.tp_worker.get_memory_pool_local()
+            )
+        else:
+            self.token_to_kv_pool_allocator_local = None
         if (
             server_args.chunked_prefill_size is not None
             and server_args.disable_radix_cache
@@ -496,6 +502,7 @@ class Scheduler(
             self.tree_cache = ChunkCache(
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                token_to_kv_pool_allocator_local=self.token_to_kv_pool_allocator_local,
                 page_size=self.page_size,
             )
         else:
@@ -1447,6 +1454,7 @@ class Scheduler(
             self.enable_overlap,
             self.spec_algorithm,
             self.server_args.enable_custom_logit_processor,
+            self.token_to_kv_pool_allocator_local,
             chunked_req=self.chunked_req,
         )
         new_batch.prepare_for_extend()

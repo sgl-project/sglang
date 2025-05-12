@@ -42,6 +42,8 @@ class FlashAttentionMetadata:
     window_size: tuple = (-1, -1)
     # Page table, the index of KV Cache Tables/Blocks
     page_table: torch.Tensor = None
+    # Page table, the index of KV Cache Tables/Blocks for local attention
+    page_table_local: torch.Tensor = None
 
     # Encoder metadata
     # Cumulative sequence lengths for encoder key
@@ -315,6 +317,8 @@ class FlashAttentionBackend(AttentionBackend):
         self.decode_cuda_graph_metadata = {}
         self.target_verify_metadata = {}
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self.req_to_token_local = model_runner.req_to_token_pool.req_to_token_local
+        self.is_hybrid = model_runner.is_hybrid
         self.kv_cache_dtype = model_runner.kv_cache_dtype
         self.kv_cache_dtype_str = model_runner.server_args.kv_cache_dtype
         self.page_size = model_runner.page_size
@@ -427,6 +431,12 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
                     forward_batch.req_pool_indices, : metadata.max_seq_len_k
                 ]
+                if self.is_hybrid is not None:
+                    metadata.page_table_local = (
+                        forward_batch.req_to_token_pool.req_to_token_local[
+                            forward_batch.req_pool_indices, : metadata.max_seq_len_k
+                        ]
+                    )
             # TODO: we need to test this part for llama 4 eagle case
             self._init_local_attn_metadata(metadata, device)
         elif forward_batch.forward_mode.is_target_verify():
@@ -562,6 +572,12 @@ class FlashAttentionBackend(AttentionBackend):
             metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
                 forward_batch.req_pool_indices, : metadata.max_seq_len_k
             ]
+            if self.is_hybrid is not None:
+                metadata.page_table_local = (
+                    forward_batch.req_to_token_pool.req_to_token_local[
+                        forward_batch.req_pool_indices, : metadata.max_seq_len_k
+                    ]
+                )
 
             if (
                 any(forward_batch.extend_prefix_lens_cpu)
@@ -627,14 +643,21 @@ class FlashAttentionBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
     ):
+        use_hybrid_loc = self.is_hybrid is not None and (
+            hasattr(layer, "use_irope") and layer.use_irope
+        )
         if k is not None:
             assert v is not None
             if save_kv_cache:
-                cache_loc = (
-                    forward_batch.out_cache_loc
-                    if not layer.is_cross_attention
-                    else forward_batch.encoder_out_cache_loc
-                )
+                if not use_hybrid_loc:
+                    cache_loc = (
+                        forward_batch.out_cache_loc
+                        if not layer.is_cross_attention
+                        else forward_batch.encoder_out_cache_loc
+                    )
+                else:
+                    cache_loc = forward_batch.out_cache_loc_local
+                    # TODO enable cross attention
                 if not self.use_mla:
                     forward_batch.token_to_kv_pool.set_kv_buffer(
                         layer, cache_loc, k, v, layer.k_scale, layer.v_scale
@@ -674,7 +697,6 @@ class FlashAttentionBackend(AttentionBackend):
             and metadata.local_attn_metadata is not None
             and (hasattr(layer, "use_irope") and layer.use_irope)
         )
-
         # We do cascade attention for Target Verify with topk > 1
         use_cascade_attn = (
             forward_batch.forward_mode.is_target_verify() and self.topk > 1
@@ -890,14 +912,24 @@ class FlashAttentionBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+
+        use_hybrid_loc = self.is_hybrid is not None and (
+            hasattr(layer, "use_irope") and layer.use_irope
+        )
+
         if k is not None:
             assert v is not None
             if save_kv_cache:
-                cache_loc = (
-                    forward_batch.out_cache_loc
-                    if not layer.is_cross_attention
-                    else forward_batch.encoder_out_cache_loc
-                )
+                if not use_hybrid_loc:
+                    cache_loc = (
+                        forward_batch.out_cache_loc
+                        if not layer.is_cross_attention
+                        else forward_batch.encoder_out_cache_loc
+                    )
+
+                else:
+                    cache_loc = forward_batch.out_cache_loc_local
+                    # TODO enable cross attention
                 if not self.use_mla:
                     forward_batch.token_to_kv_pool.set_kv_buffer(
                         layer, cache_loc, k, v, layer.k_scale, layer.v_scale
@@ -913,7 +945,7 @@ class FlashAttentionBackend(AttentionBackend):
         # Use precomputed metadata across all layers
         metadata = self.forward_metadata
         local_attn_metadata = getattr(metadata, "local_attn_metadata", None)
-        use_local_attn = (
+        use_local_attention = (
             self.attention_chunk_size is not None
             and local_attn_metadata is not None
             and (hasattr(layer, "use_irope") and layer.use_irope)
@@ -972,7 +1004,7 @@ class FlashAttentionBackend(AttentionBackend):
                     k_descale=k_descale,
                     v_descale=v_descale,
                 )
-            elif use_local_attn:
+            elif use_local_attention:
                 # Use chunked (local) attention batching for self-attention
                 o = flash_attn_with_kvcache(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
@@ -1779,7 +1811,10 @@ class FlashAttentionBackend(AttentionBackend):
 
         cu_seqlens_q = metadata.cu_seqlens_q
         cache_seqlens_int32 = metadata.cache_seqlens_int32
-        page_table = metadata.page_table
+        if self.is_hybrid:
+            page_table = metadata.page_table_local
+        else:
+            page_table = metadata.page_table
         if cu_seqlens_q is None or cache_seqlens_int32 is None or page_table is None:
             metadata.local_attn_metadata = None
             return
