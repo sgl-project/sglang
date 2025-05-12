@@ -97,51 +97,6 @@ class MiMoMultiTokenPredictorLayer(nn.Module):
         return hidden_states
 
 
-# class MiMoMultiTokenPredictor(nn.Module):
-
-#     def __init__(
-#         self,
-#         config: MiMoConfig,
-#         prefix: str = "",
-#         quant_config: Optional[QuantizationConfig] = None,
-#     ):
-#         super().__init__()
-
-#         self.mtp_start_layer_idx = config.num_hidden_layers
-#         self.num_mtp_layers = config.num_nextn_predict_layers
-
-#         self.mtp_layers = torch.nn.ModuleDict(
-#             {
-#                 str(idx): MiMoMultiTokenPredictorLayer(
-#                     config,
-#                     f"{prefix}.layers.{idx}",
-#                     quant_config=quant_config,
-#                 )
-#                 for idx in range(self.mtp_start_layer_idx,
-#                              self.mtp_start_layer_idx + self.num_mtp_layers)
-#             }
-#         )
-
-#         self.logits_processor = LogitsProcessor(config.vocab_size)
-
-#     def forward(
-#         self,
-#         input_ids: torch.Tensor,
-#         positions: torch.Tensor,
-#         forward_batch: ForwardBatch,
-#         spec_step_idx: int = 0,
-#     ) -> torch.Tensor:
-
-#         hidden_states = self.mtp_layers[str(self.mtp_start_layer_idx + spec_step_idx)](
-#             input_ids,
-#             positions,
-#             forward_batch,
-#         )
-#         return self.logits_processor(
-#             input_ids, hidden_states, self.lm_head, forward_batch
-#         )
-
-
 class MiMoMTP(nn.Module):
     def __init__(
         self,
