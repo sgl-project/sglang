@@ -38,20 +38,16 @@ class SchedulerOutputProcessorMixin:
                 next_token_ids,
                 extend_input_len_per_req,
                 extend_logprob_start_len_per_req,
-                bid,
             ) = (
                 result.logits_output,
                 result.next_token_ids,
                 result.extend_input_len_per_req,
                 result.extend_logprob_start_len_per_req,
-                result.bid,
             )
 
             if self.enable_overlap:
-                logits_output, next_token_ids = (
-                    self.tp_worker.resolve_last_batch_result(
-                        launch_done,
-                    )
+                logits_output, next_token_ids, _ = (
+                    self.tp_worker.resolve_last_batch_result(launch_done)
                 )
             else:
                 # Move next_token_ids and logprobs to cpu
@@ -189,16 +185,16 @@ class SchedulerOutputProcessorMixin:
         result: GenerationBatchResult,
         launch_done: Optional[threading.Event] = None,
     ):
-        logits_output, next_token_ids, bid = (
+        logits_output, next_token_ids, can_run_cuda_graph = (
             result.logits_output,
             result.next_token_ids,
-            result.bid,
+            result.can_run_cuda_graph,
         )
         self.num_generated_tokens += len(batch.reqs)
 
         if self.enable_overlap:
-            logits_output, next_token_ids = self.tp_worker.resolve_last_batch_result(
-                launch_done
+            logits_output, next_token_ids, can_run_cuda_graph = (
+                self.tp_worker.resolve_last_batch_result(launch_done)
             )
             next_token_logprobs = logits_output.next_token_logprobs
         elif batch.spec_algorithm.is_none():
@@ -280,7 +276,7 @@ class SchedulerOutputProcessorMixin:
             self.attn_tp_rank == 0
             and self.forward_ct_decode % self.server_args.decode_log_interval == 0
         ):
-            self.log_decode_stats(running_batch=batch)
+            self.log_decode_stats(can_run_cuda_graph, running_batch=batch)
 
     def add_input_logprob_return_values(
         self: Scheduler,

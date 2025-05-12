@@ -35,7 +35,7 @@ def main(args):
     def get_one_answer(i):
         states[i] = multi_turns(generate=call_generate, **multi_qas[i])
 
-    tic = time.time()
+    tic = time.perf_counter()
     if args.parallel == 1:
         for i in tqdm(range(len(multi_qas))):
             get_one_answer(i)
@@ -50,7 +50,7 @@ def main(args):
             for _ in rets:
                 pass
 
-    latency = time.time() - tic
+    latency = time.perf_counter() - tic
 
     # Compute accuracy
     print(f"Latency: {latency:.3f}")

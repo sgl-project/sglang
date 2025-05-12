@@ -75,6 +75,7 @@ global_server_args_dict = {
     "disable_radix_cache": ServerArgs.disable_radix_cache,
     "enable_deepep_moe": ServerArgs.enable_deepep_moe,
     "enable_dp_attention": ServerArgs.enable_dp_attention,
+    "enable_dp_lm_head": ServerArgs.enable_dp_lm_head,
     "enable_ep_moe": ServerArgs.enable_ep_moe,
     "enable_nan_detection": ServerArgs.enable_nan_detection,
     "flashinfer_mla_disable_ragged": ServerArgs.flashinfer_mla_disable_ragged,
@@ -534,6 +535,7 @@ class Req:
 
         # Constrained decoding
         self.grammar: Optional[BaseGrammarObject] = None
+        self.grammar_wait_ct = 0
 
         # The number of cached tokens that were already cached in the KV cache
         self.cached_tokens = 0

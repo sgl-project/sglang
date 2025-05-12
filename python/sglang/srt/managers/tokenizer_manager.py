@@ -752,12 +752,16 @@ class TokenizerManager:
         output_dir: Optional[str] = None,
         num_steps: Optional[int] = None,
         activities: Optional[List[str]] = None,
+        with_stack: Optional[bool] = None,
+        record_shapes: Optional[bool] = None,
     ):
         req = ProfileReq(
             type=ProfileReqType.START_PROFILE,
             output_dir=output_dir,
             num_steps=num_steps,
             activities=activities,
+            with_stack=with_stack,
+            record_shapes=record_shapes,
             profile_id=str(time.time()),
         )
         result = (await self.start_profile_communicator(req))[0]
@@ -924,12 +928,13 @@ class TokenizerManager:
     ):
         await self.send_to_scheduler.send_pyobj(obj)
 
-    async def get_internal_state(self) -> Dict[Any, Any]:
+    async def get_internal_state(self) -> List[Dict[Any, Any]]:
         req = GetInternalStateReq()
-        res: List[GetInternalStateReqOutput] = (
+        responses: List[GetInternalStateReqOutput] = (
             await self.get_internal_state_communicator(req)
         )
-        return res[0].internal_state
+        # Many DP ranks
+        return [res.internal_state for res in responses]
 
     def get_log_request_metadata(self):
         max_length = None
@@ -1235,11 +1240,18 @@ class TokenizerManager:
                 state.last_completion_tokens = completion_tokens
 
         if state.finished:
+            has_grammar = (
+                state.obj.sampling_params.get("json_schema", None)
+                or state.obj.sampling_params.get("regex", None)
+                or state.obj.sampling_params.get("ebnf", None)
+                or state.obj.sampling_params.get("structural_tag", None)
+            )
             self.metrics_collector.observe_one_finished_request(
                 recv_obj.prompt_tokens[i],
                 completion_tokens,
                 recv_obj.cached_tokens[i],
                 state.finished_time - state.created_time,
+                has_grammar,
             )
 
     def dump_requests(self, state: ReqState, out_dict: dict):
