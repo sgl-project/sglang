@@ -76,7 +76,7 @@ def _per_token_group_quant_int8(
     y_s_ptr,
     # Stride of input
     y_stride,
-    # Collums of input
+    # Columns of input
     N,
     # Avoid to divide zero
     eps,
@@ -370,7 +370,7 @@ def w8a8_block_int8_matmul(
         config = configs[min(configs.keys(), key=lambda x: abs(x - M))]
     else:
         # Default config
-        # Block-wise quant: BLOCK_SIZE_K must be divisable by block_size[1]
+        # Block-wise quant: BLOCK_SIZE_K must be divisible by block_size[1]
         config = {
             "BLOCK_SIZE_M": 64,
             "BLOCK_SIZE_N": block_size[0],

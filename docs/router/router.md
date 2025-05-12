@@ -32,7 +32,7 @@ python -m sglang_router.launch_server --model-path meta-llama/Meta-Llama-3.1-8B-
 
 After the server is ready, you can directly send requests to the router as the same way as sending requests to each single worker.
 
-Please adjust the batchsize accordingly to archieve maximum throughput.
+Please adjust the batchsize accordingly to achieve maximum throughput.
 
 ```python
 import requests

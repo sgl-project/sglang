@@ -76,7 +76,7 @@ class RMSNorm(CustomOp):
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if not x.is_contiguous():
-            # NOTE: Romove this if aiter kernel supports discontinuous input
+            # NOTE: Remove this if aiter kernel supports discontinuous input
             x = x.contiguous()
         if residual is not None:
             fused_add_rms_norm(x, residual, self.weight.data, self.variance_epsilon)

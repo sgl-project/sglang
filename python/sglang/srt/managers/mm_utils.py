@@ -51,7 +51,7 @@ class MultiModalityDataPaddingPatternTokenPairs(MultiModalityDataPaddingPattern)
         self, input_ids: List[int], mm_inputs: MultimodalInputs
     ) -> List[int]:
         """
-        This function will replace the data-tokens inbetween with pad_values accordingly
+        This function will replace the data-tokens in between with pad_values accordingly
         """
         pad_values = [item.pad_value for item in mm_inputs.mm_items]
         data_token_pairs = self.data_token_id_pairs

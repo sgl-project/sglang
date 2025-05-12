@@ -259,7 +259,9 @@ def throughput_test_once(
         measurement_results["total_input_tokens"]
         + measurement_results["total_output_tokens"]
     ) / latency
-    measurement_results["last_gen_throughput"] = server_info["last_gen_throughput"]
+    measurement_results["last_gen_throughput"] = server_info["internal_states"][0][
+        "last_gen_throughput"
+    ]
 
     return measurement_results
 
@@ -315,7 +317,7 @@ def throughput_test(
     tokenizer_id = server_args.tokenizer_path or server_args.model_path
     tokenizer = get_tokenizer(tokenizer_id)
 
-    # Set global environmnets
+    # Set global environments
     set_ulimit()
     random.seed(bench_args.seed)
     np.random.seed(bench_args.seed)

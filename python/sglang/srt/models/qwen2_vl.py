@@ -139,21 +139,21 @@ class Qwen2VisionBlock(nn.Module):
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
         if attn_implementation == "sdpa":
-            use_context_forward = False
+            qkv_backend = "sdpa"
             softmax_in_single_precision = False
         elif attn_implementation == "flash_attention_2":
+            qkv_backend = "triton_attn"
             softmax_in_single_precision = False
-            use_context_forward = True
         elif attn_implementation == "eager":
+            qkv_backend = "sdpa"
             softmax_in_single_precision = True
-            use_context_forward = False
 
         self.attn = VisionAttention(
             embed_dim=dim,
             num_heads=num_heads,
             projection_size=dim,
             use_qkv_parallel=True,
-            use_context_forward=use_context_forward,
+            qkv_backend=qkv_backend,
             softmax_in_single_precision=softmax_in_single_precision,
             flatten_batch=True,
             quant_config=quant_config,

@@ -164,7 +164,7 @@ def init_process_hf(
     )
     dist.barrier(group=group, device_ids=[rank])
     torch.cuda.synchronize()
-    time_begin_broadcast = time.time()
+    time_begin_broadcast = time.perf_counter()
 
     # The last parameter is lm_head.weight, which is tied
     # with embed_tokens.weight. Actually, we only need
@@ -182,7 +182,7 @@ def init_process_hf(
             group=group,
         )
     torch.cuda.synchronize()
-    time_end_broadcast = time.time()
+    time_end_broadcast = time.perf_counter()
 
     # Measure the latency of broadcasting/weights update.
     broadcast_time = time_end_broadcast - time_begin_broadcast
@@ -282,7 +282,7 @@ def init_process_sgl(
         )
 
     torch.cuda.synchronize()
-    time_begin_update = time.time()
+    time_begin_update = time.perf_counter()
 
     # The last parameter is lm_head.weight, which is tied
     # with embed_tokens.weight. Actually, we only need
@@ -312,7 +312,7 @@ def init_process_sgl(
                 },
             )
     torch.cuda.synchronize()
-    time_end_update = time.time()
+    time_end_update = time.perf_counter()
 
     # Measure the latency of broadcast/weights update.
     update_time = time_end_update - time_begin_update

@@ -295,7 +295,7 @@ class TestSRTEndpoint(CustomTestCase):
         print(f"{output_top_logprobs=}")
 
         # Parse results
-        # This is becaues the grammar constraint allows all prefix tokens
+        # This is because the grammar constraint allows all prefix tokens
         logprobs = [None] * 2
         for i in range(len(output_top_logprobs)):
             try:
@@ -491,9 +491,6 @@ class TestSRTEndpoint(CustomTestCase):
 
         max_total_num_tokens = response_json["max_total_num_tokens"]
         self.assertIsInstance(max_total_num_tokens, int)
-
-        attention_backend = response_json["attention_backend"]
-        self.assertIsInstance(attention_backend, str)
 
         version = response_json["version"]
         self.assertIsInstance(version, str)

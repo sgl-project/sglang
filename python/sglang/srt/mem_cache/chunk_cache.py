@@ -24,9 +24,11 @@ class ChunkCache(BasePrefixCache):
         self,
         req_to_token_pool: ReqToTokenPool,
         token_to_kv_pool_allocator: TokenToKVPoolAllocator,
+        page_size: int,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+        self.page_size = page_size
 
     def reset(self):
         pass

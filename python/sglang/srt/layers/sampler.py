@@ -239,10 +239,6 @@ def top_p_normalize_probs_torch(
 
 
 def get_top_logprobs(logprobs: torch.Tensor, top_logprobs_nums: List[int]):
-    assert len(top_logprobs_nums) == logprobs.shape[0], (
-        len(top_logprobs_nums),
-        logprobs.shape[0],
-    )
     max_k = max(top_logprobs_nums)
     ret = logprobs.topk(max_k, dim=1)
     values = ret.values.tolist()

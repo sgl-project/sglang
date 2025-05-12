@@ -35,6 +35,7 @@ class EvalArgs:
     extra_request_body: Optional[str] = None
     profile: bool = False
     profile_number: int = 5
+    concurrency: int = 1
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -73,6 +74,7 @@ class EvalArgs:
         parser.add_argument(
             "--profile-number", type=int, default=EvalArgs.profile_number
         )
+        parser.add_argument("--concurrency", type=int, default=EvalArgs.concurrency)
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):

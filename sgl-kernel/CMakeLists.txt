@@ -22,7 +22,9 @@ find_package(CUDAToolkit REQUIRED)
 set_property(GLOBAL PROPERTY CUDA_SEPARABLE_COMPILATION ON)
 
 message(STATUS "Detected CUDA_VERSION=${CUDA_VERSION}")
-if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8")
+if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "13.0")
+    message("CUDA_VERSION ${CUDA_VERSION} >= 13.0")
+elseif ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8")
     message("CUDA_VERSION ${CUDA_VERSION} >= 12.8")
 elseif ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4")
     message("CUDA_VERSION ${CUDA_VERSION} >= 12.4")
@@ -43,7 +45,7 @@ include(FetchContent)
 FetchContent_Declare(
     repo-cutlass
     GIT_REPOSITORY https://github.com/NVIDIA/cutlass
-    GIT_TAG        e94e888df3551224738bfa505787b515eae8352f
+    GIT_TAG        ad7b2f5e84fcfa124cb02b91d5bd26d238c0459e
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-cutlass)
@@ -51,7 +53,7 @@ FetchContent_Populate(repo-cutlass)
 FetchContent_Declare(
     repo-deepgemm
     GIT_REPOSITORY https://github.com/deepseek-ai/DeepGEMM
-    GIT_TAG        4499c4ccbb5d3958b1a069f29ef666156a121278
+    GIT_TAG        d75b218b7b8f4a5dd5406ac87905039ead3ae42f
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-deepgemm)
@@ -112,7 +114,7 @@ set(SGL_KERNEL_CUDA_FLAGS
     "--expt-extended-lambda"
     "--threads=32"
 
-    # Supress warnings
+    # Suppress warnings
     "-Xcompiler=-Wconversion"
     "-Xcompiler=-fno-strict-aliasing"
 
@@ -128,9 +130,16 @@ option(SGL_KERNEL_ENABLE_FP8              "Enable FP8"              ON)
 option(SGL_KERNEL_ENABLE_FP4              "Enable FP4"              OFF)
 option(SGL_KERNEL_ENABLE_FA3              "Enable FA3"              OFF)
 
-if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
+if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "13.0" OR SGL_KERNEL_ENABLE_SM100A)
+    list(APPEND SGL_KERNEL_CUDA_FLAGS
+        "-gencode=arch=compute_100,code=sm_110"
+        "-gencode=arch=compute_100a,code=sm_110a"
+    )
+elseif ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-gencode=arch=compute_100,code=sm_100"
+        "-gencode=arch=compute_100,code=sm_101"
+        "-gencode=arch=compute_100,code=sm_101a"
         "-gencode=arch=compute_100a,code=sm_100a"
         "-gencode=arch=compute_120,code=sm_120"
     )
