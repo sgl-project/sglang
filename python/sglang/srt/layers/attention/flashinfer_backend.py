@@ -783,7 +783,11 @@ class FlashInferIndicesUpdaterPrefill:
         )
         self.head_dim = model_runner.model_config.head_dim
         self.fake_head_dim = (
-            None if self.head_dim >= global_fake_head_dim else global_fake_head_dim
+            global_fake_head_dim
+            if self.head_dim < global_fake_head_dim
+            and not model_runner.model_config.is_generation
+            and not model_runner.model_config.is_encoder_decoder
+            else None
         )
         self.data_type = model_runner.kv_cache_dtype
         self.q_data_type = model_runner.dtype
