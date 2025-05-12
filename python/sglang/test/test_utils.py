@@ -300,13 +300,35 @@ def add_common_other_args_and_parse(parser: argparse.ArgumentParser):
     return args
 
 
+def auto_detect_device() -> str:
+    """Auto-detect available device platform"""
+    import torch
+
+    if torch.cuda.is_available():
+        return "cuda"
+    elif hasattr(torch.version, "hip") and torch.version.hip:
+        return "rocm"
+    elif hasattr(torch, "xpu") and torch.xpu.is_available():  # Check for Intel XPU
+        return "xpu"
+    else:
+        return "cpu"
+
+
 def add_common_sglang_args_and_parse(parser: argparse.ArgumentParser):
     parser.add_argument("--parallel", type=int, default=64)
     parser.add_argument("--host", type=str, default="http://127.0.0.1")
     parser.add_argument("--port", type=int, default=30000)
     parser.add_argument("--backend", type=str, default="srt")
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        choices=["auto", "cuda", "rocm", "cpu"],
+        help="Device type (auto/cuda/rocm/cpu). Auto will detect available platforms",
+    )
     parser.add_argument("--result-file", type=str, default="result.jsonl")
     args = parser.parse_args()
+
     return args
 
 
@@ -392,11 +414,25 @@ def popen_launch_server(
     base_url: str,
     timeout: float,
     api_key: Optional[str] = None,
-    other_args: list[str] = (),
+    other_args: list[str] = [],
     env: Optional[dict] = None,
     return_stdout_stderr: Optional[tuple] = None,
     pd_seperated: bool = False,
+    device: str = "auto",
 ):
+    """Launch a server process with automatic device detection.
+
+    Args:
+        device: Device type ("auto", "cuda", "rocm" or "cpu").
+                If "auto", will detect available platforms automatically.
+    """
+    # Auto-detect device if needed
+    if device == "auto":
+        device = auto_detect_device()
+        print(f"Auto-detected device: {device}", flush=True)
+        other_args = list(other_args)
+        other_args += ["--device", str(device)]
+
     _, host, port = base_url.split(":")
     host = host[2:]
 
@@ -529,6 +565,16 @@ def popen_launch_pd_server(
     start_time = time.time()
     with requests.Session() as session:
         while time.time() - start_time < timeout:
+
+            # check if server process has crashe/exited
+            return_code = process.poll()
+            if return_code is not None:
+                # Server failed to start (non-zero exit code) or crashed
+                raise Exception(
+                    f"Server process exited with code {return_code}. "
+                    "Check server logs for errors."
+                )
+
             try:
                 headers = {
                     "Content-Type": "application/json; charset=utf-8",
@@ -657,6 +703,7 @@ def get_benchmark_args(
     disable_ignore_eos=False,
     seed: int = 0,
     pd_seperated: bool = False,
+    device="auto",
 ):
     return SimpleNamespace(
         backend="sglang",
@@ -687,6 +734,7 @@ def get_benchmark_args(
         lora_name=None,
         prompt_suffix="",
         pd_seperated=pd_seperated,
+        device=device,
     )
 
 
@@ -705,7 +753,10 @@ def run_bench_serving(
     disable_ignore_eos=False,
     need_warmup=False,
     seed: int = 0,
+    device="auto",
 ):
+    if device == "auto":
+        device = auto_detect_device()
     # Launch the server
     base_url = DEFAULT_URL_FOR_TEST
     process = popen_launch_server(
@@ -729,6 +780,7 @@ def run_bench_serving(
         disable_stream=disable_stream,
         disable_ignore_eos=disable_ignore_eos,
         seed=seed,
+        device=device,
     )
 
     try:
@@ -779,6 +831,18 @@ def run_bench_serving_multi(
 
 
 def run_bench_one_batch(model, other_args):
+    """Launch a offline process with automatic device detection.
+
+    Args:
+        device: Device type ("auto", "cuda", "rocm" or "cpu").
+                If "auto", will detect available platforms automatically.
+    """
+    # Auto-detect device if needed
+
+    device = auto_detect_device()
+    print(f"Auto-detected device: {device}", flush=True)
+    other_args += ["--device", str(device)]
+
     command = [
         "python3",
         "-m",
