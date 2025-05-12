@@ -80,6 +80,7 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "disable_chunked_prefix_cache",
     "disable_radix_cache",
     "enable_dp_attention",
+    "enable_dp_mla",
     "enable_two_batch_overlap",
     "enable_dp_lm_head",
     "enable_deepep_moe",

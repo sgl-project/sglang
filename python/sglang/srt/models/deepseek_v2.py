@@ -28,6 +28,7 @@ from tqdm import tqdm
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     parallel_state,
     tensor_model_parallel_all_reduce,
@@ -43,6 +44,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
     get_local_attention_dp_size,
 )
+from sglang.srt.layers.dp_mla import get_dp_mla_wrapper
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -596,8 +598,16 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.v_head_dim = v_head_dim
         self.q_lora_rank = q_lora_rank
         self.kv_lora_rank = kv_lora_rank
-        attn_tp_rank = get_attention_tp_rank()
-        attn_tp_size = get_attention_tp_size()
+        self.enable_dp_mla = global_server_args_dict["enable_dp_mla"]
+
+        self.dp_mla_wrapper = get_dp_mla_wrapper()
+        if self.enable_dp_mla:
+            # for DP<->TP all to all
+            attn_tp_rank = get_tensor_model_parallel_rank()  # only mla dp
+            attn_tp_size = get_tensor_model_parallel_world_size()  # only mla dp
+        else:
+            attn_tp_rank = get_attention_tp_rank()
+            attn_tp_size = get_attention_tp_size()
 
         self.num_heads = num_heads
         assert num_heads % attn_tp_size == 0
@@ -605,6 +615,13 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.scaling = self.qk_head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
+
+        if self.enable_dp_mla:
+            dp_mla_tp_size = get_attention_tp_size()
+            assert num_heads % dp_mla_tp_size == 0
+            self.num_local_attn_heads = num_heads // dp_mla_tp_size
+        else:
+            self.num_local_attn_heads = self.num_local_heads
 
         # For tensor parallel attention
         if self.q_lora_rank is not None:
@@ -686,7 +703,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             self.rotary_emb.forward = self.rotary_emb.forward_native
 
         self.attn_mqa = RadixAttention(
-            self.num_local_heads,
+            self.num_local_attn_heads,
             self.kv_lora_rank + self.qk_rope_head_dim,
             self.scaling,
             num_kv_heads=1,
@@ -697,10 +714,10 @@ class DeepseekV2AttentionMLA(nn.Module):
         )
 
         self.attn_mha = RadixAttention(
-            self.num_local_heads,
+            self.num_local_attn_heads,
             self.qk_nope_head_dim + self.qk_rope_head_dim,
             self.scaling,
-            num_kv_heads=self.num_local_heads,
+            num_kv_heads=self.num_local_attn_heads,
             layer_id=layer_id,
             v_head_dim=self.v_head_dim,
             quant_config=quant_config,
@@ -752,7 +769,8 @@ class DeepseekV2AttentionMLA(nn.Module):
         if self.attention_backend == "flashinfer":
             # Flashinfer MLA: Do not absorb when enabling ragged prefill
             if (
-                not self.flashinfer_mla_disable_ragged
+                not self.enable_dp_mla
+                and not self.flashinfer_mla_disable_ragged
                 and forward_batch.forward_mode.is_extend()
                 and not forward_batch.forward_mode.is_target_verify()
                 and not forward_batch.forward_mode.is_draft_extend()
@@ -766,7 +784,8 @@ class DeepseekV2AttentionMLA(nn.Module):
             if forward_batch.extend_prefix_lens_cpu is not None:
                 sum_extend_prefix_lens = sum(forward_batch.extend_prefix_lens_cpu)
             if (
-                forward_batch.forward_mode.is_extend()
+                not self.enable_dp_mla
+                and forward_batch.forward_mode.is_extend()
                 and not self.disable_chunked_prefix_cache
                 and not forward_batch.forward_mode.is_target_verify()
                 and not forward_batch.forward_mode.is_draft_extend()
@@ -946,21 +965,24 @@ class DeepseekV2AttentionMLA(nn.Module):
             q, latent_cache = self.fused_qkv_a_proj_with_mqa(hidden_states)[0].split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
             )
-            k_nope = latent_cache[..., : self.kv_lora_rank]
+            if not self.enable_dp_mla:
+                k_nope = latent_cache[..., : self.kv_lora_rank]
 
-            # overlap qk norm
-            if self.alt_stream is not None and get_is_capture_mode():
-                current_stream = torch.cuda.current_stream()
-                self.alt_stream.wait_stream(current_stream)
-                q = self.q_a_layernorm(q)
-                with torch.cuda.stream(self.alt_stream):
+                # overlap qk norm
+                if self.alt_stream is not None and get_is_capture_mode():
+                    current_stream = torch.cuda.current_stream()
+                    self.alt_stream.wait_stream(current_stream)
+                    q = self.q_a_layernorm(q)
+                    with torch.cuda.stream(self.alt_stream):
+                        k_nope = self.kv_a_layernorm(k_nope)
+                    current_stream.wait_stream(self.alt_stream)
+                else:
+                    q = self.q_a_layernorm(q)
                     k_nope = self.kv_a_layernorm(k_nope)
-                current_stream.wait_stream(self.alt_stream)
+
+                k_nope = k_nope.unsqueeze(1)
             else:
                 q = self.q_a_layernorm(q)
-                k_nope = self.kv_a_layernorm(k_nope)
-
-            k_nope = k_nope.unsqueeze(1)
             q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
         else:
             q = self.q_proj(hidden_states)[0].view(
@@ -971,7 +993,6 @@ class DeepseekV2AttentionMLA(nn.Module):
             k_nope = self.kv_a_layernorm(k_nope).unsqueeze(1)
 
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-        k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
 
         if self.use_deep_gemm_bmm:
             q_nope_val, q_nope_scale, masked_m, expected_m, aligned_m = (
@@ -1006,23 +1027,50 @@ class DeepseekV2AttentionMLA(nn.Module):
             q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
 
         q_nope_out = q_nope_out.transpose(0, 1)
-        q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+        q_nope_out, q_pe, latent_cache = self.dp_mla_wrapper.mla_inputs_tp_to_dp(
+            q_nope_out,
+            q_pe,
+            latent_cache,
+            forward_batch,
+        )
+        if not forward_batch.forward_mode.is_idle():
+            if self.enable_dp_mla:
+                k_nope = latent_cache[..., : self.kv_lora_rank]
+                k_nope = self.kv_a_layernorm(k_nope).unsqueeze(1)
+                k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
+            q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+        else:
+            k_nope, k_pe = None, None
 
         return q_pe, k_pe, q_nope_out, k_nope, forward_batch, zero_allocator
 
     def forward_absorb_core(
         self, q_pe, k_pe, q_nope_out, k_nope, forward_batch, zero_allocator
     ):
-        if self.attention_backend == "fa3" or self.attention_backend == "flashinfer":
-            attn_output = self.attn_mqa(
-                q_nope_out, k_nope, k_nope, forward_batch, q_rope=q_pe, k_rope=k_pe
+        if k_nope is not None:
+            if (
+                self.attention_backend == "fa3"
+                or self.attention_backend == "flashinfer"
+            ):
+                attn_output = self.attn_mqa(
+                    q_nope_out, k_nope, k_nope, forward_batch, q_rope=q_pe, k_rope=k_pe
+                )
+            else:
+                q = torch.cat([q_nope_out, q_pe], dim=-1)
+                k = torch.cat([k_nope, k_pe], dim=-1)
+                attn_output = self.attn_mqa(q, k, k_nope, forward_batch)
+            attn_output = attn_output.view(
+                -1, self.num_local_attn_heads, self.kv_lora_rank
             )
         else:
-            q = torch.cat([q_nope_out, q_pe], dim=-1)
-            k = torch.cat([k_nope, k_pe], dim=-1)
-            attn_output = self.attn_mqa(q, k, k_nope, forward_batch)
-        attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
-
+            attn_output = q_nope_out.new_zeros(
+                q_nope_out.shape[0],
+                self.num_local_attn_heads,
+                self.kv_lora_rank,
+            )
+        attn_output = self.dp_mla_wrapper.mla_outputs_dp_to_tp(
+            attn_output, forward_batch
+        )
         if self.use_deep_gemm_bmm:
             attn_output_val, attn_output_scale, masked_m, expected_m, aligned_m = (
                 per_token_group_quant_mla_deep_gemm_masked_fp8(
@@ -1398,6 +1446,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         self.enable_dp_attention = global_server_args_dict["enable_dp_attention"]
+        self.enable_dp_mla = global_server_args_dict["enable_dp_mla"]
         self.layer_id = layer_id
         self.self_attn = DeepseekV2AttentionMLA(
             config=config,
@@ -1585,11 +1634,13 @@ class DeepseekV2Model(nn.Module):
         self.padding_id = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.first_k_dense_replace = config.first_k_dense_replace
+        self.dp_mla_wrapper = get_dp_mla_wrapper()
 
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
-            enable_tp=not global_server_args_dict["enable_dp_attention"],
+            enable_tp=global_server_args_dict["enable_dp_mla"]
+            or not global_server_args_dict["enable_dp_attention"],
         )
         self.alt_stream = torch.cuda.Stream() if _is_cuda else None
         self.layers = nn.ModuleList(
@@ -1625,6 +1676,7 @@ class DeepseekV2Model(nn.Module):
             dtype=torch.float32,
             device=device,
         )
+        input_ids = self.dp_mla_wrapper.model_inputs_dp_to_tp(input_ids, forward_batch)
 
         if input_embeds is None:
             hidden_states = self.embed_tokens(input_ids)
@@ -1664,6 +1716,10 @@ class DeepseekV2Model(nn.Module):
                 hidden_states = self.norm(hidden_states)
             else:
                 hidden_states, _ = self.norm(hidden_states, residual)
+        hidden_states = self.dp_mla_wrapper.model_outputs_tp_to_dp(
+            hidden_states,
+            forward_batch,
+        )
         return hidden_states
 
 

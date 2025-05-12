@@ -20,6 +20,7 @@ from typing import Dict, Optional
 import torch.distributed
 
 from sglang.srt.distributed import (
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
@@ -237,9 +238,14 @@ class CommunicateContext:
 
     @classmethod
     def init_new(cls):
-        attn_tp_rank = get_attention_tp_rank()
-        attn_tp_size = get_attention_tp_size()
-        local_attn_dp_size = get_local_attention_dp_size()
+        if global_server_args_dict["enable_dp_mla"]:
+            attn_tp_rank = get_tensor_model_parallel_rank()
+            attn_tp_size = get_tensor_model_parallel_world_size()
+            local_attn_dp_size = 1
+        else:
+            attn_tp_rank = get_attention_tp_rank()
+            attn_tp_size = get_attention_tp_size()
+            local_attn_dp_size = get_local_attention_dp_size()
         tp_size = get_tensor_model_parallel_world_size()
         process_group_sizes = {
             ScatterMode.SCATTERED: 1,

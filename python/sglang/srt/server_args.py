@@ -114,7 +114,7 @@ class ServerArgs:
     tool_call_parser: Optional[str] = None
 
     # Data parallelism
-    dp_size: int = 1
+    dp_size: Optional[int] = None
     load_balance_method: str = "round_robin"
 
     # Multi-node distributed serving
@@ -192,6 +192,7 @@ class ServerArgs:
     enable_mixed_chunk: bool = False
     enable_dp_attention: bool = False
     enable_dp_lm_head: bool = False
+    enable_dp_mla: bool = False
     enable_two_batch_overlap: bool = False
     enable_torch_compile: bool = False
     torch_compile_max_bs: int = 32
@@ -361,6 +362,20 @@ class ServerArgs:
         # Choose grammar backend
         if self.grammar_backend is None:
             self.grammar_backend = "xgrammar"
+
+        if self.enable_dp_mla:
+            self.enable_dp_attention = True
+            if self.dp_size is None:
+                default_mla_tp_size = 2
+                self.dp_size = self.tp_size // default_mla_tp_size
+            logger.info(f"dp_size  {self.dp_size}, mla dp is enabled.")
+            # more likely to cause kvcache nan
+            self.flashinfer_mla_disable_ragged = True
+            logger.info(
+                f"mla dp is enabled, and flashinfer_mla_disable_ragged is set to True."
+            )
+        elif self.dp_size is None:
+            self.dp_size = 1
 
         # Data parallelism attention
         if self.enable_dp_attention:
@@ -1330,6 +1345,11 @@ class ServerArgs:
             "--enable-dp-lm-head",
             action="store_true",
             help="Enable vocabulary parallel across the attention TP group to avoid all-gather across DP groups, optimizing performance under DP attention.",
+        )
+        parser.add_argument(
+            "--enable-dp-mla",
+            action="store_true",
+            help="Enabling data and tensor parallelism for mla and tensor parallelism for FFN. Currently only DeepSeek-V2 is supported.",
         )
         parser.add_argument(
             "--enable-two-batch-overlap",
