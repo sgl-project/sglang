@@ -1425,6 +1425,9 @@ def run_benchmark(args_: argparse.Namespace):
     if not hasattr(args, "warmup_requests"):
         args.warmup_requests = 1
 
+    if not hasattr(args, "output_details"):
+        args.output_details = False
+
     print(f"benchmark_args={args}")
 
     # Set global environments
