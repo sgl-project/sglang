@@ -1,11 +1,10 @@
+import os
 import subprocess
-import threading
 import time
 import unittest
 from types import SimpleNamespace
 
 import requests
-import torch
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
@@ -22,6 +21,10 @@ from sglang.test.test_utils import (
 class TestDisaggregationMooncakeDifferentTP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
+        # Temporarily disable JIT DeepGEMM
+        cls.original_jit_deepgemm = os.environ.get("SGL_ENABLE_JIT_DEEPGEMM")
+        os.environ["SGL_ENABLE_JIT_DEEPGEMM"] = "false"
+
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
         cls.base_host = "127.0.0.1"
         cls.base_port = int(DEFAULT_URL_FOR_TEST.split(":")[-1])
@@ -115,6 +118,12 @@ class TestDisaggregationMooncakeDifferentTP(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
+        # Restore JIT DeepGEMM environment variable
+        if cls.original_jit_deepgemm is not None:
+            os.environ["SGL_ENABLE_JIT_DEEPGEMM"] = cls.original_jit_deepgemm
+        else:
+            os.environ.pop("SGL_ENABLE_JIT_DEEPGEMM", None)
+
         for process in [cls.process_lb, cls.process_decode, cls.process_prefill]:
             if process:
                 try:
