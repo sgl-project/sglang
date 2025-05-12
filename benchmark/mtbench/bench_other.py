@@ -66,7 +66,7 @@ def main(args):
         answers[i] = cur_answers
 
     # Run requests
-    tic = time.time()
+    tic = time.perf_counter()
     if args.parallel == 1:
         for i in tqdm(range(len(questions))):
             get_answer(i)
@@ -79,7 +79,7 @@ def main(args):
                 )
             )
 
-    latency = time.time() - tic
+    latency = time.perf_counter() - tic
 
     print(f"#questions: {len(questions)}, Latency: {latency:.2f}")
 

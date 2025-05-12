@@ -229,7 +229,7 @@ def apply_rope_with_cos_sin_cache_inplace(
         Whether to use Neox style RoPE, default: ``True``.
 
         * If ``True``, the last dimension of the query/key tensor is not interleaved, i.e.,
-          we rorate the first half dimensions ``([..., :head_dim//2])`` and the second half
+          we rotate the first half dimensions ``([..., :head_dim//2])`` and the second half
           dimensions ``([..., head_dim//2:])``.
 
         * If ``False``, the last dimension of the query/key tensor is interleaved, i.e.,

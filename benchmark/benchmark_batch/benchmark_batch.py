@@ -81,7 +81,7 @@ def send_batch_request(endpoint, prompts, gen_tokens, request_id):
     }
     data = {"text": prompts, "sampling_params": sampling_params}
 
-    start_time = time.time()
+    start_time = time.perf_counter()
     try:
         response = requests.post(
             endpoint.base_url + "/generate", json=data, timeout=3600
@@ -90,7 +90,7 @@ def send_batch_request(endpoint, prompts, gen_tokens, request_id):
             error = response.json()
             raise RuntimeError(f"Request {request_id} failed: {error}")
         result = response.json()
-        elapsed_time = (time.time() - start_time) * 1000  # Convert to ms
+        elapsed_time = (time.perf_counter() - start_time) * 1000  # Convert to ms
         avg_per_prompt = elapsed_time / len(prompts) if prompts else 0
         return request_id, elapsed_time, avg_per_prompt, True, len(prompts)
     except Exception as e:
@@ -104,7 +104,7 @@ def run_benchmark(endpoint, batched_prompts, batch_size, gen_tokens):
     num_requests = len(batched_prompts)
 
     # Record start time for total latency
-    benchmark_start_time = time.time()
+    benchmark_start_time = time.perf_counter()
 
     for i, batch_prompts in enumerate(batched_prompts):
         request_id = i + 1
@@ -119,7 +119,7 @@ def run_benchmark(endpoint, batched_prompts, batch_size, gen_tokens):
         results.append(result)
 
     # Calculate total latency
-    total_latency = (time.time() - benchmark_start_time) * 1000  # Convert to ms
+    total_latency = (time.perf_counter() - benchmark_start_time) * 1000  # Convert to ms
 
     return results, total_latency
 
