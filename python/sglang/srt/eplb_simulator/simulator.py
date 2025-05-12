@@ -15,7 +15,6 @@ from sglang.srt.eplb_simulator.reader import (
     ExpertDistributionModeDetailPerTokenAndBenchServingPack,
 )
 from sglang.srt.managers import deepseek_eplb
-from sglang.srt.managers.deepseek_eplb import balanced_packing
 from sglang.srt.managers.expert_distribution import (
     compute_gpu_physical_count,
     compute_utilization_rate,
