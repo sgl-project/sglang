@@ -1543,7 +1543,7 @@ def run_benchmark(args_: argparse.Namespace):
             lora_names=args.lora_name,
             extra_request_body=extra_request_body,
             profile=args.profile,
-            pd_separated=args.pd_separated,
+            pd_separated=args.pd_seperated,
             flush_cache=args.flush_cache,
         )
     )
