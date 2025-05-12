@@ -17,7 +17,6 @@ from typing import Callable, Optional
 
 import torch
 import torch.nn.functional as F
-
 from sglang.srt.managers.expert_distribution import ExpertDistributionRecorder
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.utils import get_compiler_backend, is_cuda, is_hip
@@ -150,6 +149,7 @@ def biased_grouped_topk_impl(
     topk_group: int = 0,
     n_share_experts_fusion: int = 0,
     routed_scaling_factor: Optional[float] = None,
+    num_token_non_padded: Optional[torch.Tensor] = None,
 ):
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
@@ -196,14 +196,15 @@ def biased_grouped_topk_impl(
         )
         topk_weights = topk_weights / topk_weights_sum
 
-    return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
+    topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
+    _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+    return topk_weights, topk_ids
 
 
 def is_power_of_two(n):
     return n > 0 and math.log2(n).is_integer()
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend())
 def _mask_topk_ids_padded_region(
     topk_ids: torch.Tensor,
     num_token_non_padded: Optional[torch.Tensor] = None,
@@ -267,6 +268,7 @@ def biased_grouped_topk(
             topk_group,
             n_share_experts_fusion=n_share_experts_fusion,
             routed_scaling_factor=routed_scaling_factor,
+            num_token_non_padded=num_token_non_padded,
         )
 
 
