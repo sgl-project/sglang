@@ -172,7 +172,7 @@ def read_expert_distribution_mode_detail_per_token(
 
     raw_data_packs = [
         torch.load(path, weights_only=True, map_location="cpu")
-        for path in tqdm(list(Path(dir_data).glob("*.pt")), desc="read raw data packs")
+        for path in tqdm(sorted(list(Path(dir_data).glob("*.pt"))), desc="read raw data packs")
     ]
 
     processed_records = [
@@ -198,7 +198,9 @@ def read_bench_serving(path: Path):
     data_raw = json.loads(path.read_text())
 
     print("[read_bench_serving] load tokenizer")
-    tokenizer = AutoTokenizer.from_pretrained(data_raw["tokenizer_id"])
+    # TODO temp
+    tokenizer = AutoTokenizer.from_pretrained(data_raw["tokenizer_id"].replace("/dev/shm/", "deepseek-ai/"))
+    # tokenizer = AutoTokenizer.from_pretrained(data_raw["tokenizer_id"])
 
     print("[read_bench_serving] create data frame")
     df = pl.DataFrame(
