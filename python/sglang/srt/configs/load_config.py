@@ -29,7 +29,7 @@ class LoadFormat(str, enum.Enum):
 class LoadConfig:
     """
     download_dir: Directory to download and load the weights, default to the
-        default cache directory of HuggingFace.
+        default cache directory of huggingface.
     load_format: The format of the model weights to load:
         "auto" will try to load the weights in the safetensors format and
             fall back to the pytorch bin format if safetensors format is

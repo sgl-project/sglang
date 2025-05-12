@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Run the model with CUDA graph and torch.compile."""
+"""Run the model with cuda graph and torch.compile."""
 
 from __future__ import annotations
 
@@ -127,7 +127,7 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
             else:
                 capture_bs = [1, 2, 4, 8] + list(range(16, 161, 8))
         else:
-            # Since speculative decoding requires more CUDA graph memory, we
+            # Since speculative decoding requires more cuda graph memory, we
             # capture less.
             capture_bs = (
                 list(range(1, 9)) + list(range(10, 33, 2)) + list(range(40, 161, 16))
@@ -161,7 +161,7 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
     return capture_bs, compile_bs
 
 
-# Reuse this memory pool across all CUDA graph runners.
+# Reuse this memory pool across all cuda graph runners.
 global_graph_memory_pool = None
 
 
@@ -175,7 +175,7 @@ def set_global_graph_memory_pool(val):
 
 
 class CudaGraphRunner:
-    """A CudaGraphRunner runs the forward pass of a model with CUDA graph and torch.compile."""
+    """A CudaGraphRunner runs the forward pass of a model with cuda graph and torch.compile."""
 
     def __init__(self, model_runner: ModelRunner):
         # Parse args
@@ -194,7 +194,7 @@ class CudaGraphRunner:
 
         # Batch sizes to capture
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
-        rank0_log(f"Capture CUDA graph bs {self.capture_bs}")
+        rank0_log(f"Capture cuda graph bs {self.capture_bs}")
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.NULL
         self.num_tokens_per_bs = 1
@@ -334,8 +334,8 @@ class CudaGraphRunner:
                 else forward_batch.batch_size <= self.max_bs
             )
 
-        # NOTE: CUDA graph cannot handle mixed batch (encoder_len = 0)
-        # If mixed batch cannot be supported, then encoder_lens can be removed in CUDA graph
+        # NOTE: cuda graph cannot handle mixed batch (encoder_len = 0)
+        # If mixed batch cannot be supported, then encoder_lens can be removed in cuda graph
         # because the full_text_row_masked_out_mask tensor will always be ones
         is_encoder_lens_supported = (
             torch.all(forward_batch.encoder_lens > 0)
@@ -350,7 +350,7 @@ class CudaGraphRunner:
             avail_mem = get_available_gpu_memory(
                 self.model_runner.device, self.model_runner.gpu_id, empty_cache=False
             )
-            # Reverse the order to enable better memory sharing across CUDA graphs.
+            # Reverse the order to enable better memory sharing across cuda graphs.
             capture_range = (
                 tqdm.tqdm(list(reversed(self.capture_bs)))
                 if get_tensor_model_parallel_rank() == 0
@@ -429,9 +429,9 @@ class CudaGraphRunner:
                 spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
             )
         if self.model_runner.server_args.lora_paths is not None:
-            # Currently, if the lora_path in `lora_paths` is None, the LoRA backend will use a
-            # different logic to handle LoRA, so we need to set `lora_paths` to a list of non-None
-            # values if LoRA is enabled.
+            # Currently, if the lora_path in `lora_paths` is None, the lora backend will use a
+            # different logic to handle lora, so we need to set `lora_paths` to a list of non-None
+            # values if lora is enabled.
             lora_paths = [next(iter(self.model_runner.server_args.lora_paths))] * bs
         else:
             lora_paths = None

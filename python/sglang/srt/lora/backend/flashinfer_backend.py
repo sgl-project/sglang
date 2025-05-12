@@ -117,7 +117,7 @@ class FlashInferLoRABackend(BaseLoRABackend):
             dtype=x.dtype,
         )
 
-        # Compute LoRA for gate and up proj respectively
+        # Compute lora for gate and up proj respectively
         lora_output[:, :output_dim] = self.run_lora_b_sgemm(
             x=lora_a_output[:, :lora_rank].contiguous(),
             weights=gate_up_lora_b[0],

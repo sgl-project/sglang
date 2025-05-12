@@ -1190,7 +1190,7 @@ class CLIPVisionTower(nn.Module):
             # vision_tower = create_sam_vit(**vision_tower_params)
             forward_kwargs = dict()
 
-        else:  # HuggingFace
+        else:  # huggingface
             from transformers import CLIPVisionModel
 
             vision_tower = CLIPVisionModel.from_pretrained(**vision_tower_params)

@@ -237,7 +237,7 @@ def dp_scatter(
     forward_batch: ForwardBatch,
 ):
     # local_num_tokens is not necessarily the same as local_tokens.shape[0],
-    # since local_tokens may be padded for CUDA graph
+    # since local_tokens may be padded for cuda graph
     local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
 
     local_tokens.fill_(0)
