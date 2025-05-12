@@ -1216,6 +1216,8 @@ class GGUFModelLoader(BaseModelLoader):
         # hack: ggufs have a different name than transformers
         if model_type == "cohere":
             model_type = "command-r"
+        if model_type == "deepseek_v3":
+            model_type = "deepseek2"
         arch = None
         for key, value in gguf.MODEL_ARCH_NAMES.items():
             if value == model_type:
@@ -1225,8 +1227,9 @@ class GGUFModelLoader(BaseModelLoader):
             raise RuntimeError(f"Unknown gguf model_type: {model_type}")
         num_layers = config.num_hidden_layers
         name_map = gguf.get_tensor_name_map(arch, num_layers)
-        with torch.device("meta"):
-            dummy_model = AutoModelForCausalLM.from_config(config)
+        from accelerate import init_empty_weights
+        with  init_empty_weights():
+            dummy_model = AutoModelForCausalLM.from_config(config, trust_remote_code=model_config.trust_remote_code)
         state_dict = dummy_model.state_dict()
 
         gguf_to_hf_name_map = {}

@@ -1558,6 +1558,7 @@ class DeepseekV2Model(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
+            quant_config=quant_config,
             enable_tp=not global_server_args_dict["enable_dp_attention"],
         )
         self.alt_stream = torch.cuda.Stream() if _is_cuda else None
@@ -2088,7 +2089,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                         continue
 
                     if fuse_qkv_a_proj and (
-                        "q_a_proj" in name or "kv_a_proj_with_mqa" in name
+                        ("q_a_proj" in name or "kv_a_proj_with_mqa" in name) and 'type' not in name
                     ):
                         cached_a_proj[name] = loaded_weight
                         q_a_proj_name = (
