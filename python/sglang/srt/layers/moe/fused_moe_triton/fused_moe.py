@@ -1365,7 +1365,7 @@ def _moe_sum_reduce_kernel(
         )
 
 
-def moe_sum_reduce(
+def moe_sum_reduce_triton(
     input: torch.Tensor, output: torch.Tensor, routed_scaling_factor: float
 ):
     assert input.is_contiguous()
@@ -1402,7 +1402,7 @@ def moe_sum_reduce(
 
 
 @torch.compile
-def compute_sum_scaled(x, out, routed_scaling_factor):
+def moe_sum_reduce_torch_compile(x, out, routed_scaling_factor):
     torch.sum(x, dim=1, out=out)
     out.mul_(routed_scaling_factor)
 
@@ -1619,13 +1619,13 @@ def fused_experts_impl(
         else:
             # According to micro benchmark results, torch.compile can get better performance for small token.
             if tokens_in_chunk <= 32:
-                compute_sum_scaled(
+                moe_sum_reduce_torch_compile(
                     intermediate_cache3.view(*intermediate_cache3.shape),
                     out_hidden_states[begin_chunk_idx:end_chunk_idx],
                     routed_scaling_factor,
                 )
             else:
-                moe_sum_reduce(
+                moe_sum_reduce_triton(
                     intermediate_cache3.view(*intermediate_cache3.shape),
                     out_hidden_states[begin_chunk_idx:end_chunk_idx],
                     routed_scaling_factor,
