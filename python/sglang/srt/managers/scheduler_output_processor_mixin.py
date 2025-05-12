@@ -15,6 +15,8 @@ if TYPE_CHECKING:
         Scheduler,
     )
 
+DEFAULT_FORCE_STREAM_INTERVAL = 50
+
 
 class SchedulerOutputProcessorMixin:
     """
@@ -36,20 +38,16 @@ class SchedulerOutputProcessorMixin:
                 next_token_ids,
                 extend_input_len_per_req,
                 extend_logprob_start_len_per_req,
-                bid,
             ) = (
                 result.logits_output,
                 result.next_token_ids,
                 result.extend_input_len_per_req,
                 result.extend_logprob_start_len_per_req,
-                result.bid,
             )
 
             if self.enable_overlap:
-                logits_output, next_token_ids = (
-                    self.tp_worker.resolve_last_batch_result(
-                        launch_done,
-                    )
+                logits_output, next_token_ids, _ = (
+                    self.tp_worker.resolve_last_batch_result(launch_done)
                 )
             else:
                 # Move next_token_ids and logprobs to cpu
@@ -187,16 +185,16 @@ class SchedulerOutputProcessorMixin:
         result: GenerationBatchResult,
         launch_done: Optional[threading.Event] = None,
     ):
-        logits_output, next_token_ids, bid = (
+        logits_output, next_token_ids, can_run_cuda_graph = (
             result.logits_output,
             result.next_token_ids,
-            result.bid,
+            result.can_run_cuda_graph,
         )
         self.num_generated_tokens += len(batch.reqs)
 
         if self.enable_overlap:
-            logits_output, next_token_ids = self.tp_worker.resolve_last_batch_result(
-                launch_done
+            logits_output, next_token_ids, can_run_cuda_graph = (
+                self.tp_worker.resolve_last_batch_result(launch_done)
             )
             next_token_logprobs = logits_output.next_token_logprobs
         elif batch.spec_algorithm.is_none():
@@ -278,7 +276,7 @@ class SchedulerOutputProcessorMixin:
             self.attn_tp_rank == 0
             and self.forward_ct_decode % self.server_args.decode_log_interval == 0
         ):
-            self.log_decode_stats(running_batch=batch)
+            self.log_decode_stats(can_run_cuda_graph, running_batch=batch)
 
     def add_input_logprob_return_values(
         self: Scheduler,
@@ -512,19 +510,26 @@ class SchedulerOutputProcessorMixin:
             if self.model_config.is_multimodal_gen and req.to_abort:
                 continue
 
-            if (
-                req.finished()
-                # If stream, follow the given stream_interval
-                or (req.stream and len(req.output_ids) % self.stream_interval == 0)
-                # If not stream, we still want to output some tokens to get the benefit of incremental decoding.
-                # TODO(lianmin): this is wrong for speculative decoding because len(req.output_ids) does not
-                # always increase one-by-one.
-                or (
-                    not req.stream
-                    and len(req.output_ids) % 50 == 0
-                    and not self.model_config.is_multimodal_gen
-                )
-            ):
+            if req.finished():
+                if req.finished_output:
+                    # With the overlap schedule, a request will try to output twice and hit this line twice
+                    # because of the one additional delayed token. This "continue" prevented the dummy output.
+                    continue
+                req.finished_output = True
+                should_output = True
+            else:
+                if req.stream:
+                    stream_interval = (
+                        req.sampling_params.stream_interval or self.stream_interval
+                    )
+                    should_output = len(req.output_ids) % stream_interval == 0
+                else:
+                    should_output = (
+                        len(req.output_ids) % DEFAULT_FORCE_STREAM_INTERVAL == 0
+                        and not self.model_config.is_multimodal_gen
+                    )
+
+            if should_output:
                 rids.append(req.rid)
                 finished_reasons.append(
                     req.finished_reason.to_json() if req.finished_reason else None
