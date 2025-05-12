@@ -203,7 +203,6 @@ def is_power_of_two(n):
     return n > 0 and math.log2(n).is_integer()
 
 
-# TODO will fuse this into kernel, thus use slow manual operation now
 @torch.compile(dynamic=True, backend=get_compiler_backend())
 def _mask_topk_ids_padded_region(
     topk_ids: torch.Tensor,
@@ -247,6 +246,7 @@ def biased_grouped_topk(
             n_share_experts_fusion,
             routed_scaling_factor,
         )
+        # TODO will fuse this into kernel, thus use slow manual operation now
         _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
         return topk_weights, topk_ids
     else:
