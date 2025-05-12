@@ -27,7 +27,7 @@ completion_template_name = None
 
 
 class FimPosition:
-    """Postion of fim middle token."""
+    """Position of fim middle token."""
 
     MIDDLE = auto()
     END = auto()
