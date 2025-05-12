@@ -418,7 +418,7 @@ class MoonVitEncoderLayer(nn.Module):
         hidden_dim: int,
         mlp_dim: int,
         *,
-        attn_implementation: str = "flash_attention_2",  # use fa2 in SGLang by default
+        attn_implementation: str = "flash_attention_2",  # use fa2 in sglang by default
         activation=F.gelu,
         attn_bias: bool = False,
     ):

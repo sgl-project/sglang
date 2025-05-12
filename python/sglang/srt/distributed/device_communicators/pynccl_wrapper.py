@@ -6,7 +6,7 @@
 # 1. We tried to use `cupy`, it calls NCCL correctly, but `cupy` itself
 #  often gets stuck when initializing the NCCL communicator.
 # 2. We tried to use `torch.distributed`, but `torch.distributed.all_reduce`
-#  contains many other potential CUDA APIs, that are not allowed during
+#  contains many other potential cuda APIs, that are not allowed during
 #  capturing the CUDA graph. For further details, please check
 # https://discuss.pytorch.org/t/pytorch-cudagraph-with-nccl-operation-failed/ .
 #

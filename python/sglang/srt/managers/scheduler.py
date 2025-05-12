@@ -1655,7 +1655,7 @@ class Scheduler(
             can_cuda_graph = 0
 
         if not spec_algorithm.is_none():
-            # TODO(sang): Support CUDA graph when idle batch is there.
+            # TODO(sang): Support cuda graph when idle batch is there.
             if local_batch is None or local_batch.forward_mode.is_idle():
                 can_cuda_graph = 0
 
@@ -1692,7 +1692,7 @@ class Scheduler(
             local_batch.global_num_tokens = global_num_tokens
             local_batch.global_num_tokens_for_logprob = global_num_tokens_for_logprob
 
-            # Check forward mode for CUDA graph
+            # Check forward mode for cuda graph
             if not disable_cuda_graph:
                 local_batch.can_run_dp_cuda_graph = can_cuda_graph
 

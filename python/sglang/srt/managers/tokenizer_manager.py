@@ -253,7 +253,7 @@ class TokenizerManager:
             self.metrics_collector = TokenizerMetricsCollector(
                 labels={
                     "model_name": self.server_args.served_model_name,
-                    # TODO: Add LoRA name/path in the future,
+                    # TODO: Add lora name/path in the future,
                 },
             )
 

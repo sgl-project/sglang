@@ -197,7 +197,7 @@ def test_merge_attn_states(
     if not torch.cuda.is_available():
         pytest.skip(
             "Currently only support compare triton merge_attn_states "
-            "with custom CUDA merge_attn_states kernel"
+            "with custom cuda merge_attn_states kernel"
         )
 
     NUM_TOKENS = num_tokens
