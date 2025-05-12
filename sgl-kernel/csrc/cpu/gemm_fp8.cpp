@@ -1,6 +1,6 @@
 #include "common.h"
-#include "vec.h"
 #include "gemm.h"
+#include "vec.h"
 
 namespace {
 
@@ -11,7 +11,7 @@ inline void copy_stub(scalar_t* __restrict__ out, const float* __restrict__ inpu
   constexpr int kVecSize = bVec::size();
 
   int64_t d;
-  #pragma GCC unroll 4
+#pragma GCC unroll 4
   for (d = 0; d <= size - kVecSize; d += kVecSize) {
     fVec data0 = fVec::loadu(input + d);
     fVec data1 = fVec::loadu(input + d + fVec::size());
@@ -24,13 +24,14 @@ inline void copy_stub(scalar_t* __restrict__ out, const float* __restrict__ inpu
 }
 
 template <typename scalar_t>
-inline void copy_add_stub(scalar_t* __restrict__ out, const float* __restrict__ input, const float* __restrict__ bias, int64_t size) {
+inline void copy_add_stub(
+    scalar_t* __restrict__ out, const float* __restrict__ input, const float* __restrict__ bias, int64_t size) {
   using bVec = at::vec::Vectorized<scalar_t>;
   using fVec = at::vec::Vectorized<float>;
   constexpr int kVecSize = bVec::size();
 
   int64_t d;
-  #pragma GCC unroll 4
+#pragma GCC unroll 4
   for (d = 0; d <= size - kVecSize; d += kVecSize) {
     fVec data0 = fVec::loadu(input + d) + fVec::loadu(bias + d);
     fVec data1 = fVec::loadu(input + d + fVec::size()) + fVec::loadu(bias + d + fVec::size());
@@ -52,7 +53,7 @@ inline void unpack_B(
     float scale) {
   // [K/2, N, 2]
   const int K2 = K >> 1;
-  const int ldb2 = ldb; // ldb * 2 >> 1;
+  const int ldb2 = ldb;  // ldb * 2 >> 1;
   const uint16_t* b_ptr = reinterpret_cast<const uint16_t*>(packed_B);
   const __m512 vd = _mm512_set1_ps(scale);
 
@@ -60,31 +61,31 @@ inline void unpack_B(
   static_assert(BLOCK_N == 32);
 
   for (int k = 0; k < K2; ++k) {
-    for (int n = 0; n < N; n += 64) { // BLOCK_N = 32
-        __m512i b8 = _mm512_loadu_si512(b_ptr + k * ldb2 + n);
+    for (int n = 0; n < N; n += 64) {  // BLOCK_N = 32
+      __m512i b8 = _mm512_loadu_si512(b_ptr + k * ldb2 + n);
 
-        __m256i b8_0 = _mm512_extracti32x8_epi32(b8, 0);
-        __m256i b8_1 = _mm512_extracti32x8_epi32(b8, 1);
+      __m256i b8_0 = _mm512_extracti32x8_epi32(b8, 0);
+      __m256i b8_1 = _mm512_extracti32x8_epi32(b8, 1);
 
-        __m512bh bf16_0 = CVT_FP8_TO_BF16(b8_0);
-        __m512bh bf16_1 = CVT_FP8_TO_BF16(b8_1);
+      __m512bh bf16_0 = CVT_FP8_TO_BF16(b8_0);
+      __m512bh bf16_1 = CVT_FP8_TO_BF16(b8_1);
 
-        // Apply scale
-        __m512 f0_lo = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32((__m512i)bf16_0, 0));
-        __m512 f0_hi = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32((__m512i)bf16_0, 1));
-        __m512 f1_lo = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32((__m512i)bf16_1, 0));
-        __m512 f1_hi = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32((__m512i)bf16_1, 1));
+      // Apply scale
+      __m512 f0_lo = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32((__m512i)bf16_0, 0));
+      __m512 f0_hi = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32((__m512i)bf16_0, 1));
+      __m512 f1_lo = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32((__m512i)bf16_1, 0));
+      __m512 f1_hi = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32((__m512i)bf16_1, 1));
 
-        f0_lo = _mm512_mul_ps(f0_lo, vd);
-        f0_hi = _mm512_mul_ps(f0_hi, vd);
-        f1_lo = _mm512_mul_ps(f1_lo, vd);
-        f1_hi = _mm512_mul_ps(f1_hi, vd);
+      f0_lo = _mm512_mul_ps(f0_lo, vd);
+      f0_hi = _mm512_mul_ps(f0_hi, vd);
+      f1_lo = _mm512_mul_ps(f1_lo, vd);
+      f1_hi = _mm512_mul_ps(f1_hi, vd);
 
-        bf16_0 = _mm512_cvtne2ps_pbh(f0_hi, f0_lo);
-        bf16_1 = _mm512_cvtne2ps_pbh(f1_hi, f1_lo);
+      bf16_0 = _mm512_cvtne2ps_pbh(f0_hi, f0_lo);
+      bf16_1 = _mm512_cvtne2ps_pbh(f1_hi, f1_lo);
 
-        _mm512_storeu_si512(Btmp + k * ldb_tmp * 2 + n * 2 + 0, (__m512i)bf16_0);
-        _mm512_storeu_si512(Btmp + k * ldb_tmp * 2 + n * 2 + 32, (__m512i)bf16_1);
+      _mm512_storeu_si512(Btmp + k * ldb_tmp * 2 + n * 2 + 0, (__m512i)bf16_0);
+      _mm512_storeu_si512(Btmp + k * ldb_tmp * 2 + n * 2 + 32, (__m512i)bf16_1);
     }
   }
 }
@@ -128,8 +129,7 @@ struct brgemm<scalar_t, scalar_t, has_bias> {
     UNUSED(scale);
 
     constexpr int BLOCK_N = block_size_n();
-    at::native::cpublas::brgemm(
-        M, N, K, lda, ldb, BLOCK_N, /* add_C */ false, A, B, Ctmp);
+    at::native::cpublas::brgemm(M, N, K, lda, ldb, BLOCK_N, /* add_C */ false, A, B, Ctmp);
 
     // copy from Ctmp to C
     for (int m = 0; m < M; ++m) {
@@ -169,12 +169,11 @@ struct brgemm<at::BFloat16, at::Float8_e4m3fn, has_bias> {
     for (int k = 0; k < K; k += BLOCK_K) {
       int kb_size = std::min(BLOCK_K, K - k);
 
-      int idx = k >> 7; // k / BLOCK_K where BLOCK_K = 128
+      int idx = k >> 7;  // k / BLOCK_K where BLOCK_K = 128
       unpack_B(Btmp, B + k * ldb, N, kb_size, ldb, ldb_tmp, scale[idx]);
 
       const bool add_C = (k != 0);
-      at::native::cpublas::brgemm(
-          M, N, kb_size, lda, ldb_tmp, BLOCK_N, add_C, A + k, Btmp, Ctmp);
+      at::native::cpublas::brgemm(M, N, kb_size, lda, ldb_tmp, BLOCK_N, add_C, A + k, Btmp, Ctmp);
     }
 
     // copy from Ctmp to C
@@ -205,10 +204,8 @@ void tinygemm_kernel(
     int64_t ldc,
     bool brg,
     int64_t block_size_K) {
-
   if (brg) {
-    brgemm<scalar_t, at::Float8_e4m3fn, has_bias>::apply(
-        A, B, C, Btmp, Ctmp, bias, scale, M, N, K, lda, ldb, ldc);
+    brgemm<scalar_t, at::Float8_e4m3fn, has_bias>::apply(A, B, C, Btmp, Ctmp, bias, scale, M, N, K, lda, ldb, ldc);
     return;
   }
 
@@ -230,7 +227,6 @@ void fp8_scaled_mm_kernel_impl(
     int64_t out_strideM,
     int64_t block_size_N,
     int64_t block_size_K) {
-
   constexpr int64_t BLOCK_M = block_size_m();
   constexpr int64_t BLOCK_N = block_size_n();
   const int64_t MB = div_up(M, BLOCK_M);
@@ -267,7 +263,7 @@ void fp8_scaled_mm_kernel_impl(
 
         tinygemm_kernel<scalar_t, has_bias>(
             /*   A            */ mat1 + mb_start * mat1_strideM,
-            /*   B            */ mat2 + nb_start * K, // nb * BLOCK_N * K
+            /*   B            */ mat2 + nb_start * K,  // nb * BLOCK_N * K
             /*   C            */ out + mb_start * out_strideM + nb_start,
             /*   Btmp         */ Btmp,
             /*   Ctmp         */ Ctmp,
@@ -291,14 +287,18 @@ void fp8_scaled_mm_kernel_impl(
       }
     });
   });
-
 }
 
-} // anonymous namespace
+}  // anonymous namespace
 
-at::Tensor fp8_scaled_mm_cpu(at::Tensor& mat1, at::Tensor& mat2, at::Tensor& scales2,
-    std::vector<int64_t> block_size, std::optional<at::Tensor>& bias,
-    at::ScalarType out_dtype, bool is_vnni) {
+at::Tensor fp8_scaled_mm_cpu(
+    at::Tensor& mat1,
+    at::Tensor& mat2,
+    at::Tensor& scales2,
+    std::vector<int64_t> block_size,
+    std::optional<at::Tensor>& bias,
+    at::ScalarType out_dtype,
+    bool is_vnni) {
   RECORD_FUNCTION("sgl-kernel::fp8_scaled_mm_cpu", std::vector<c10::IValue>({mat1, mat2, scales2, block_size, bias}));
 
   auto packed_w = is_vnni ? mat2 : convert_weight_packed(mat2);
@@ -306,8 +306,7 @@ at::Tensor fp8_scaled_mm_cpu(at::Tensor& mat1, at::Tensor& mat2, at::Tensor& sca
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(mat1);
   CHECK_INPUT(mat2);
   CHECK_INPUT(scales2);
-  TORCH_CHECK(scales2.scalar_type() == at::kFloat,
-      "fp8_scaled_mm_cpu: expect scales2 to be float32.");
+  TORCH_CHECK(scales2.scalar_type() == at::kFloat, "fp8_scaled_mm_cpu: expect scales2 to be float32.");
 
   int64_t M = mat1.size(0);
   int64_t N = mat2.size(0);
@@ -317,8 +316,7 @@ at::Tensor fp8_scaled_mm_cpu(at::Tensor& mat1, at::Tensor& mat2, at::Tensor& sca
   CHECK_DIM(2, mat1);
   CHECK_DIM(2, mat2);
 
-  TORCH_CHECK(block_size.size() == 2,
-      "fp8_scaled_mm_cpu: expect block_size.size() to be 2.");
+  TORCH_CHECK(block_size.size() == 2, "fp8_scaled_mm_cpu: expect block_size.size() to be 2.");
 
   int64_t block_size_N = block_size[0];
   int64_t block_size_K = block_size[1];
@@ -330,14 +328,10 @@ at::Tensor fp8_scaled_mm_cpu(at::Tensor& mat1, at::Tensor& mat2, at::Tensor& sca
   CHECK_EQ(scales2.size(1), div_up(K, block_size_K));
 
   const auto st = mat1.scalar_type();
-  TORCH_CHECK(st == at::kBFloat16 || st == at::kHalf,
-      "fp8_scaled_mm_cpu: expect A to be bfloat16 or half.");
-  TORCH_CHECK(st == out_dtype,
-      "fp8_scaled_mm_cpu: expect A has same dtype with out_dtype.");
-  TORCH_CHECK(mat2.scalar_type() == at::kFloat8_e4m3fn,
-      "fp8_scaled_mm_cpu: expect mat2 to be fp8_e4m3.");
-  TORCH_CHECK(scales2.scalar_type() == at::kFloat,
-      "fp8_scaled_mm_cpu: expect scales to be float32.");
+  TORCH_CHECK(st == at::kBFloat16 || st == at::kHalf, "fp8_scaled_mm_cpu: expect A to be bfloat16 or half.");
+  TORCH_CHECK(st == out_dtype, "fp8_scaled_mm_cpu: expect A has same dtype with out_dtype.");
+  TORCH_CHECK(mat2.scalar_type() == at::kFloat8_e4m3fn, "fp8_scaled_mm_cpu: expect mat2 to be fp8_e4m3.");
+  TORCH_CHECK(scales2.scalar_type() == at::kFloat, "fp8_scaled_mm_cpu: expect scales to be float32.");
   auto out = at::empty({M, N}, mat1.options().dtype(out_dtype));
 
   // strides
