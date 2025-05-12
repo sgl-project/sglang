@@ -33,7 +33,7 @@ try:
     from vllm.model_executor.layers.quantization.marlin import MarlinConfig
     from vllm.model_executor.layers.quantization.qqq import QQQConfig
     from vllm.model_executor.layers.quantization.tpu_int8 import Int8TpuConfig
-
+    # from vllm.model_executor.layers.quantization.auto_round import AutoRoundConfig
     VLLM_AVAILABLE = True
 except ImportError:
     VLLM_AVAILABLE = False
@@ -43,7 +43,7 @@ except ImportError:
         def override_quantization_method(self, *args, **kwargs):
             return None
 
-    AQLMConfig = AWQMarlinConfig = BitsAndBytesConfig = CompressedTensorsConfig = (
+    AQLMConfig = AWQMarlinConfig = AutoRoundConfig = BitsAndBytesConfig = CompressedTensorsConfig = (
         DeepSpeedFPConfig
     ) = ExpertsInt8Config = FBGEMMFp8Config = GGUFConfig = GPTQMarlin24Config = (
         MarlinConfig
@@ -59,6 +59,7 @@ from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.gptq import GPTQConfig, GPTQMarlinConfig
+from sglang.srt.layers.quantization.auto_round import AutoRoundConfig
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp8Config,
@@ -95,6 +96,7 @@ VLLM_QUANTIZATION_METHODS = {
     "experts_int8": ExpertsInt8Config,
     "gptq_marlin": GPTQMarlinConfig,
     "gptq": GPTQConfig,
+    "auto-round": AutoRoundConfig,
 }
 
 QUANTIZATION_METHODS = {**BASE_QUANTIZATION_METHODS, **VLLM_QUANTIZATION_METHODS}
