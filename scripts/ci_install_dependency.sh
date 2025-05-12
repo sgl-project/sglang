@@ -31,3 +31,6 @@ pip install -e lmms-eval/
 
 # Install FlashMLA for attention backend tests
 pip install git+https://github.com/deepseek-ai/FlashMLA.git
+
+# Install hf_xet
+pip install huggingface_hub[hf_xet]
