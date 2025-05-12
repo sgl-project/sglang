@@ -5,6 +5,7 @@ import torch
 import triton
 import triton.language as tl
 
+
 def dim_compress(inp, dims):
     if isinstance(dims, int):
         dims = [dims]
@@ -24,7 +25,7 @@ def sum_kernel(
     N,
     routed_scaling_factor: tl.constexpr,
     BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr
+    BLOCK_N: tl.constexpr,
 ):
     if tl.constexpr(inp.dtype.element_ty == tl.float16) or tl.constexpr(
         inp.dtype.element_ty == tl.bfloat16
@@ -57,6 +58,8 @@ def sum_dim(inp, dim=None, routed_scaling_factor=1.0, keepdim=False, *, dtype=No
         if dtype is torch.bool:
             dtype = torch.int64
 
+    if isinstance(dim, int):
+        dim = [dim]
     shape = list(inp.shape)
     dim = [d % inp.ndim for d in dim]
     inp = dim_compress(inp, dim)
@@ -69,7 +72,7 @@ def sum_dim(inp, dim=None, routed_scaling_factor=1.0, keepdim=False, *, dtype=No
     out = torch.empty(shape, dtype=dtype, device=inp.device)
 
     grid = lambda meta: (triton.cdiv(M, meta["BLOCK_M"]),)
-    sum_kernel[grid](inp, out, M, N, routed_scaling_factor)
+    sum_kernel[grid](inp, out, M, N, routed_scaling_factor, 64, 128)
     if not keepdim:
         out = out.squeeze(dim=dim)
     return out

@@ -12,8 +12,8 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.moe.fused_moe_triton.moe_sum import sum_dim
+from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
     scaled_fp8_quant,
@@ -807,7 +807,6 @@ def invoke_fused_moe_kernel(
         assert A_scale is None
         assert B_scale is None
 
-
     grid = lambda META: (
         triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"])
         * triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"]),
@@ -1317,39 +1316,6 @@ def fused_experts(
             routed_scaling_factor=routed_scaling_factor,
         )
 
-@triton.jit
-def sum_kernel(
-    in_ptr,
-    out_ptr,
-    M,
-    N,
-    routed_scaling_factor,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    STAGE: tl.constexpr,
-):
-    if tl.constexpr(in_ptr.dtype.element_ty == tl.float16) or tl.constexpr(
-        in_ptr.dtype.element_ty == tl.bfloat16
-    ):
-        cdtype = tl.float32
-    else:
-        cdtype = in_ptr.dtype.element_ty
-
-    # Map the program id to the row of inp it should compute.
-    row_ids = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
-    row_mask = row_ids < M
-
-    acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=cdtype)
-    for off in tl.range(0, N, BLOCK_N, STAGE):
-        col_ids = off + tl.arange(0, BLOCK_N)
-        col_mask = col_ids < N
-        mask = row_mask[:, None] & col_mask[None, :]
-
-        a = tl.load(in_ptr + row_ids[:, None] * N + col_ids, mask, other=0).to(cdtype)
-        acc += a * routed_scaling_factor
-    out = tl.sum(acc, axis=1)
-    tl.store(out_ptr + row_ids, out, row_mask)
-
 
 def fused_experts_impl(
     hidden_states: torch.Tensor,
@@ -1561,7 +1527,11 @@ def fused_experts_impl(
                 out_hidden_states[begin_chunk_idx:end_chunk_idx],
             )
         else:
-            out_hidden_states[begin_chunk_idx:end_chunk_idx] = sum_dim(intermediate_cache3.view(*intermediate_cache3.shape),  dim=1, routed_scaling_factor=routed_scaling_factor)
+            out_hidden_states[begin_chunk_idx:end_chunk_idx] = sum_dim(
+                intermediate_cache3.view(*intermediate_cache3.shape),
+                dim=1,
+                routed_scaling_factor=routed_scaling_factor,
+            )
 
     return out_hidden_states
 
