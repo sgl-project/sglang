@@ -65,5 +65,5 @@ from sgl_kernel.speculative import (
 from sgl_kernel.version import __version__
 
 build_tree_kernel = (
-    None  # TODO(ying): remove this after updating the sglang python code.
+    None  # TODO(ying): remove this after updating the SGLang python code.
 )

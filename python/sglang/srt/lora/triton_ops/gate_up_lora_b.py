@@ -37,7 +37,7 @@ def _gate_up_lora_b_kernel(
 ):
     # This kernel packs 2 sgemms (gate/up) into a single kernel.
 
-    # x: (s, 2 * K), s is the sum of sequence lengths, K equals to lora rank
+    # x: (s, 2 * K), s is the sum of sequence lengths, K equals to LoRA rank
     # weights: (num_lora, 2 * output_dim, K)
     # output: (s, 2 * output_dim)
     # output_dim >> K
