@@ -13,6 +13,7 @@
 # ==============================================================================
 """A scheduler that manages a tensor parallel GPU worker."""
 
+import datetime
 import faulthandler
 import logging
 import os
@@ -1166,7 +1167,7 @@ class Scheduler(
         else:
             f += f"#queue-req: {len(self.waiting_queue)}, "
 
-        f += f"timestamp: {time.time()}"
+        f += f"timestamp: {datetime.datetime.now().isoformat()}"
 
         logger.info(f)
 
@@ -1233,7 +1234,7 @@ class Scheduler(
             f"cuda graph: {can_run_cuda_graph}, "
             f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
             f"#queue-req: {len(self.waiting_queue)}, "
-            f"timestamp: {time.time()}"
+            f"timestamp: {datetime.datetime.now().isoformat()}"
         )
 
         logger.info(msg)
