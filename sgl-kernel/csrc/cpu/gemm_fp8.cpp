@@ -93,8 +93,16 @@ inline void unpack_B(
 template <typename scalar_t, typename packed_t, bool has_bias, int BLOCK_M, int BLOCK_N>
 struct tinygemm_kernel_nn {
   static inline void apply(
-      const scalar_t* __restrict__ A, const packed_t* __restrict__ B, scalar_t* __restrict__ C,
-      const float* __restrict__ bias, const float* __restrict__ scale, int K, int lda, int ldb, int ldc, int64_t block_size_K) {
+      const scalar_t* __restrict__ A,
+      const packed_t* __restrict__ B,
+      scalar_t* __restrict__ C,
+      const float* __restrict__ bias,
+      const float* __restrict__ scale,
+      int K,
+      int lda,
+      int ldb,
+      int ldc,
+      int64_t block_size_K) {
     TORCH_CHECK(false, "tinygemm_kernel_nn: scalar path not implemented!");
   }
 };
@@ -103,9 +111,16 @@ struct tinygemm_kernel_nn {
 template <bool has_bias, int BLOCK_M, int BLOCK_N>
 struct tinygemm_kernel_nn<at::BFloat16, at::Float8_e4m3fn, has_bias, BLOCK_M, BLOCK_N> {
   static inline void apply(
-      const at::BFloat16* __restrict__ A, const at::Float8_e4m3fn* __restrict__ B, at::BFloat16* __restrict__ C,
-      const float* __restrict__ bias, const float* __restrict__ scale, int K, int lda, int ldb, int ldc, int64_t block_size_K) {
-
+      const at::BFloat16* __restrict__ A,
+      const at::Float8_e4m3fn* __restrict__ B,
+      at::BFloat16* __restrict__ C,
+      const float* __restrict__ bias,
+      const float* __restrict__ scale,
+      int K,
+      int lda,
+      int ldb,
+      int ldc,
+      int64_t block_size_K) {
     constexpr int ROWS = BLOCK_M;
     constexpr int COLS = BLOCK_N / 16;
 
@@ -128,7 +143,7 @@ struct tinygemm_kernel_nn<at::BFloat16, at::Float8_e4m3fn, has_bias, BLOCK_M, BL
 
     const int K2 = K >> 1;
     const int lda2 = lda >> 1;
-    const int ldb2 = ldb; // ldb * 2 >> 1;
+    const int ldb2 = ldb;  // ldb * 2 >> 1;
     const float* a_ptr = reinterpret_cast<const float*>(A);
     const uint16_t* b_ptr = reinterpret_cast<const uint16_t*>(B);
 
@@ -143,7 +158,6 @@ struct tinygemm_kernel_nn<at::BFloat16, at::Float8_e4m3fn, has_bias, BLOCK_M, BL
         va = (__m512bh)(_mm512_set1_ps(a_ptr[row * lda2 + k]));
       }
       if constexpr (row == 0) {
-
         if constexpr (col % 2 == 0) {
           __m512i b8 = _mm512_loadu_si512(b_ptr + k * ldb2 + col * 16);
           if constexpr (PREFETCH_SIZE_K > 0) {
@@ -189,9 +203,7 @@ struct tinygemm_kernel_nn<at::BFloat16, at::Float8_e4m3fn, has_bias, BLOCK_M, BL
               (__m512i)(_mm512_cvtne2ps_pbh(vc[row * COLS + col + 1], vc[row * COLS + col])));
         }
       } else {
-        _mm256_storeu_si256(
-            reinterpret_cast<__m256i*>(C + row * ldc + col * 16),
-            (__m256i)(_mm512_cvtneps_pbh(vc[i])));
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(C + row * ldc + col * 16), (__m256i)(_mm512_cvtneps_pbh(vc[i])));
       }
     };
     Unroll<ROWS * COLS>{}(storec);
@@ -199,10 +211,18 @@ struct tinygemm_kernel_nn<at::BFloat16, at::Float8_e4m3fn, has_bias, BLOCK_M, BL
 };
 #endif
 
-#define LAUNCH_TINYGEMM_KERNEL_NN(MB_SIZE, NB_SIZE)                          \
-    tinygemm_kernel_nn<scalar_t, at::Float8_e4m3fn, has_bias, MB_SIZE, NB_SIZE>::apply(         \
-        A + mb_start * lda, B + nb_start * 2, C + mb_start * ldc + nb_start, \
-        has_bias ? bias + nb_start : nullptr, scale, K, lda, ldb, ldc, block_size_K);
+#define LAUNCH_TINYGEMM_KERNEL_NN(MB_SIZE, NB_SIZE)                                   \
+  tinygemm_kernel_nn<scalar_t, at::Float8_e4m3fn, has_bias, MB_SIZE, NB_SIZE>::apply( \
+      A + mb_start * lda,                                                             \
+      B + nb_start * 2,                                                               \
+      C + mb_start * ldc + nb_start,                                                  \
+      has_bias ? bias + nb_start : nullptr,                                           \
+      scale,                                                                          \
+      K,                                                                              \
+      lda,                                                                            \
+      ldb,                                                                            \
+      ldc,                                                                            \
+      block_size_K);
 
 template <typename scalar_t, typename packed_t, bool has_bias>
 struct brgemm {
@@ -335,20 +355,37 @@ void tinygemm_kernel(
       int64_t nb_start = nb * BLOCK_N;
       int64_t nb_size = std::min(BLOCK_N, N - nb_start);
 
-      switch(mb_size << 4 | nb_size >> 4) {
+      switch (mb_size << 4 | nb_size >> 4) {
         // mb_size = 1
-        case 0x12: LAUNCH_TINYGEMM_KERNEL_NN(1, 32); break;
-        case 0x14: LAUNCH_TINYGEMM_KERNEL_NN(1, 64); break;
+        case 0x12:
+          LAUNCH_TINYGEMM_KERNEL_NN(1, 32);
+          break;
+        case 0x14:
+          LAUNCH_TINYGEMM_KERNEL_NN(1, 64);
+          break;
         // mb_size = 2
-        case 0x22: LAUNCH_TINYGEMM_KERNEL_NN(2, 32); break;
-        case 0x24: LAUNCH_TINYGEMM_KERNEL_NN(2, 64); break;
+        case 0x22:
+          LAUNCH_TINYGEMM_KERNEL_NN(2, 32);
+          break;
+        case 0x24:
+          LAUNCH_TINYGEMM_KERNEL_NN(2, 64);
+          break;
         // mb_size = 3
-        case 0x32: LAUNCH_TINYGEMM_KERNEL_NN(3, 32); break;
-        case 0x34: LAUNCH_TINYGEMM_KERNEL_NN(3, 64); break;
+        case 0x32:
+          LAUNCH_TINYGEMM_KERNEL_NN(3, 32);
+          break;
+        case 0x34:
+          LAUNCH_TINYGEMM_KERNEL_NN(3, 64);
+          break;
         // mb_size = 4
-        case 0x42: LAUNCH_TINYGEMM_KERNEL_NN(4, 32); break;
-        case 0x44: LAUNCH_TINYGEMM_KERNEL_NN(4, 64); break;
-        default: TORCH_CHECK(false, "Unexpected block size, ", mb_size, "x", "nb_size");
+        case 0x42:
+          LAUNCH_TINYGEMM_KERNEL_NN(4, 32);
+          break;
+        case 0x44:
+          LAUNCH_TINYGEMM_KERNEL_NN(4, 64);
+          break;
+        default:
+          TORCH_CHECK(false, "Unexpected block size, ", mb_size, "x", "nb_size");
       }
     }
   }
