@@ -1,6 +1,6 @@
 # This file is copied from https://github.com/deepseek-ai/EPLB/blob/main/eplb.py since that one is not a pypi package
 
-from typing import Tuple
+from typing import Tuple, Literal
 
 import torch
 
@@ -251,3 +251,28 @@ def prefill_rebalance_experts(
     # log_count[i][j] = mlog_count[i][log2mlog[i][j]]
     log_count = mlog_count.gather(1, log2mlog)
     return phy2log, log2phy, log_count
+
+
+def rebalance_experts(
+    tokens_per_expert: torch.Tensor,
+    num_physical_experts: int,
+    num_local_physical_experts: int,
+    num_groups: int,
+    num_nodes: int,
+    phase: Literal["prefill", "decode"],
+):
+    if phase == "prefill":
+        return prefill_rebalance_experts(
+            tokens_per_expert=tokens_per_expert,
+            num_physical_experts=num_physical_experts,
+            num_local_physical_experts=num_local_physical_experts,
+            num_groups=num_groups,
+            num_nodes=num_nodes,
+        )
+    if phase == "decode":
+        return decode_rebalance_experts(
+            tokens_per_expert=tokens_per_expert,
+            num_physical_experts=num_physical_experts,
+            num_local_physical_experts=num_local_physical_experts,
+        )
+    raise NotImplementedError

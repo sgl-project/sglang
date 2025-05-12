@@ -27,7 +27,6 @@ _Phase = Union[Literal["prefill", "decode"]]
 
 def simulate_execution_given_pack(
     pack: ExpertDistributionModeDetailPerTokenAndBenchServingPack,
-    phase: _Phase,
     server_args: MyServerArgs,
     assert_vanilla_physical_equal_logical_expert: bool,
     model_config_for_expert_location=MY_MODEL_CONFIG_FOR_EXPERT_LOCATION,
@@ -35,7 +34,7 @@ def simulate_execution_given_pack(
     with torch.device("cuda"):
         token_indices_of_batch = _simulate_scheduled_pack_indices_given_seq_metadata(
             pack.df_metadata,
-            phase=phase,
+            phase=server_args.phase,
             num_tokens_in_batch_overall=server_args.num_tokens_in_batch_overall,
             decode_max_left_padding=server_args.decode_max_left_padding,
         )
@@ -54,7 +53,7 @@ def simulate_execution_given_pack(
         )
 
         simulation_output = _simulate_execution_given_logical_count_of_batch(
-            logical_count_of_batch=logical_count_of_batch, server_args=server_args
+            logical_count_of_batch=logical_count_of_batch, server_args=server_args,
         )
 
         simulation_output = dict(
@@ -358,7 +357,7 @@ class MyExpertLocationMetadata:
         model_config_for_expert_location = MY_MODEL_CONFIG_FOR_EXPERT_LOCATION
 
         physical_to_logical_map, logical_to_all_physical_map, _ = (
-            deepseek_eplb.rebalance_experts(
+            deepseek_eplb.prefill_rebalance_experts(
                 weight=logical_count,
                 num_replicas=num_physical_experts,
                 num_groups=model_config_for_expert_location.num_groups,
