@@ -1,7 +1,9 @@
 global:
-  client_cmd: python3 -m sglang.bench_serving --backend sglang --dataset-name random --request-rate 16 --random-input-len {random_input_len} --random-output-len {random_output_len}
+  client_cmd: python3 -m sglang.bench_serving --backend sglang --dataset-name random --request-rate 16 --num-prompts 200 --random-input-len {random_input_len} --random-output-len {random_output_len}
   server_cmd: python3 -m sglang.launch_server --attention-backend {attention_backend}
   benchmark_metric_patterns:
+    - name: Input token throughput (tok/s)
+      regex: Input token throughput \(tok/s\):\s*(.+)
     - name: Output token throughput (tok/s)
       regex: Output token throughput \(tok/s\):\s*(.+)
 
