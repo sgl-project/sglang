@@ -97,7 +97,9 @@ class TestEAGLEEngine(CustomTestCase):
 
         print(f"{engine.get_server_info()=}")
 
-        avg_spec_accept_length = engine.get_server_info()["avg_spec_accept_length"]
+        avg_spec_accept_length = engine.get_server_info()["internal_states"][0][
+            "avg_spec_accept_length"
+        ]
         print(f"{avg_spec_accept_length=}")
         self.assertGreater(avg_spec_accept_length, 1.9)
 
@@ -296,7 +298,9 @@ class TestEAGLEServer(CustomTestCase):
         self.assertGreater(metrics["accuracy"], 0.20)
 
         server_info = requests.get(self.base_url + "/get_server_info").json()
-        avg_spec_accept_length = server_info["avg_spec_accept_length"]
+        avg_spec_accept_length = server_info["internal_states"][0][
+            "avg_spec_accept_length"
+        ]
         print(f"{avg_spec_accept_length=}")
 
         speculative_eagle_topk = server_info["speculative_eagle_topk"]
