@@ -293,7 +293,9 @@ def _simulate_logical_to_physical_by_random_dispatching(
     )
     physical_count_of_whatever.scatter_add_(
         dim=1,
-        index=einops.rearrange(logical_to_all_physical_map_noneg1, rearrange_expr),
+        index=einops.rearrange(
+            logical_to_all_physical_map_noneg1, rearrange_expr
+        ).long(),
         src=einops.rearrange(logical_count_repeated, rearrange_expr),
     )
 

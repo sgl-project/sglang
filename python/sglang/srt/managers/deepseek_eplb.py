@@ -207,7 +207,7 @@ def prefill_rebalance_experts(
     num_steps, _, num_logical_experts = tokens_per_expert.shape
     assert num_logical_experts % num_groups == 0
     group_size = num_logical_experts // num_groups
-    assert num_groups % num_nodes == 0
+    assert num_groups % num_nodes == 0, f"{num_groups=} {num_nodes=}"
 
     tokens_per_group = tokens_per_expert.sum(0).unflatten(-1, (num_groups, -1)).sum(-1)
     group_perm = pack_groups(
