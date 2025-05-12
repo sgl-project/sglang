@@ -305,6 +305,12 @@ class ServerArgs:
         if self.grammar_backend is None:
             self.grammar_backend = "xgrammar"
 
+        if self.pp_size > 1:
+            self.disable_overlap_schedule = True
+            logger.warning(
+                "Overlap scheduler is disabled because of using pipeline parallelism."
+            )
+
         # Data parallelism attention
         if self.enable_dp_attention:
             self.schedule_conservativeness = self.schedule_conservativeness * 0.3
