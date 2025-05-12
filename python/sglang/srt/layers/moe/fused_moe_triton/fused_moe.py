@@ -13,6 +13,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.moe.topk import select_experts
+from sglang.srt.layers.moe.fused_moe_triton.moe_sum import sum_dim
 from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
     scaled_fp8_quant,
@@ -119,7 +120,6 @@ def fused_moe_kernel_gptq_awq(
     use_int4_w4a16: tl.constexpr,
     use_int8_w8a16: tl.constexpr,
     even_Ks: tl.constexpr,
-    routed_scaling_factor: tl.constexpr,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -296,7 +296,6 @@ def fused_moe_kernel_gptq_awq(
         accumulator = accumulator * moe_weight[:, None]
 
     accumulator = accumulator.to(compute_type)
-    accumulator = accumulator * routed_scaling_factor
     # -----------------------------------------------------------
     # Write back the block of the output
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
@@ -354,7 +353,6 @@ def fused_moe_kernel(
     use_int8_w8a16: tl.constexpr,
     per_channel_quant: tl.constexpr,
     even_Ks: tl.constexpr,
-    routed_scaling_factor: tl.constexpr,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -512,8 +510,6 @@ def fused_moe_kernel(
             accumulator = (accumulator * a_scale * b_scale).to(compute_type)
     else:
         accumulator = accumulator.to(compute_type)
-
-    accumulator = accumulator * routed_scaling_factor
     # -----------------------------------------------------------
     # Write back the block of the output
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
@@ -760,7 +756,6 @@ def invoke_fused_moe_kernel(
     per_channel_quant: bool,
     block_shape: Optional[List[int]] = None,
     no_combine: bool = False,
-    routed_scaling_factor: Optional[float] = None,
 ) -> None:
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
@@ -812,8 +807,6 @@ def invoke_fused_moe_kernel(
         assert A_scale is None
         assert B_scale is None
 
-    if routed_scaling_factor is None:
-        routed_scaling_factor = 1.0
 
     grid = lambda META: (
         triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"])
@@ -868,7 +861,6 @@ def invoke_fused_moe_kernel(
             use_int4_w4a16=use_int4_w4a16,
             use_int8_w8a16=use_int8_w8a16,
             even_Ks=even_Ks,
-            routed_scaling_factor=routed_scaling_factor,
             **config,
         )
 
@@ -910,7 +902,6 @@ def invoke_fused_moe_kernel(
             use_int8_w8a16=use_int8_w8a16,
             per_channel_quant=per_channel_quant,
             even_Ks=even_Ks,
-            routed_scaling_factor=routed_scaling_factor,
             **config,
         )
 
@@ -1326,6 +1317,39 @@ def fused_experts(
             routed_scaling_factor=routed_scaling_factor,
         )
 
+@triton.jit
+def sum_kernel(
+    in_ptr,
+    out_ptr,
+    M,
+    N,
+    routed_scaling_factor,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    STAGE: tl.constexpr,
+):
+    if tl.constexpr(in_ptr.dtype.element_ty == tl.float16) or tl.constexpr(
+        in_ptr.dtype.element_ty == tl.bfloat16
+    ):
+        cdtype = tl.float32
+    else:
+        cdtype = in_ptr.dtype.element_ty
+
+    # Map the program id to the row of inp it should compute.
+    row_ids = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    row_mask = row_ids < M
+
+    acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=cdtype)
+    for off in tl.range(0, N, BLOCK_N, STAGE):
+        col_ids = off + tl.arange(0, BLOCK_N)
+        col_mask = col_ids < N
+        mask = row_mask[:, None] & col_mask[None, :]
+
+        a = tl.load(in_ptr + row_ids[:, None] * N + col_ids, mask, other=0).to(cdtype)
+        acc += a * routed_scaling_factor
+    out = tl.sum(acc, axis=1)
+    tl.store(out_ptr + row_ids, out, row_mask)
+
 
 def fused_experts_impl(
     hidden_states: torch.Tensor,
@@ -1480,7 +1504,6 @@ def fused_experts_impl(
             use_int4_w4a16=use_int4_w4a16,
             per_channel_quant=per_channel_quant,
             block_shape=block_shape,
-            routed_scaling_factor=1.0,
         )
         if activation == "silu":
             if _is_cuda:
@@ -1525,8 +1548,10 @@ def fused_experts_impl(
             use_int4_w4a16=use_int4_w4a16,
             per_channel_quant=per_channel_quant,
             block_shape=block_shape,
-            routed_scaling_factor=routed_scaling_factor,
         )
+
+        if routed_scaling_factor is None:
+            routed_scaling_factor = 1.0
 
         if no_combine:
             pass
@@ -1536,20 +1561,7 @@ def fused_experts_impl(
                 out_hidden_states[begin_chunk_idx:end_chunk_idx],
             )
         else:
-            if topk_ids.shape[1] == 1:
-                pass  # we write directly into out_hidden_states
-            elif topk_ids.shape[1] == 2:
-                torch.add(
-                    intermediate_cache3[:, 0],
-                    intermediate_cache3[:, 1],
-                    out=out_hidden_states[begin_chunk_idx:end_chunk_idx],
-                ).squeeze(dim=1)
-            elif topk_ids.shape[1] > 2:
-                torch.sum(
-                    intermediate_cache3.view(*intermediate_cache3.shape),
-                    dim=1,
-                    out=out_hidden_states[begin_chunk_idx:end_chunk_idx],
-                )
+            out_hidden_states[begin_chunk_idx:end_chunk_idx] = sum_dim(intermediate_cache3.view(*intermediate_cache3.shape),  dim=1, routed_scaling_factor=routed_scaling_factor)
 
     return out_hidden_states
 
