@@ -22,11 +22,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.9'
-
       - name: Install dependencies
         run: |
           bash scripts/ci_install_dependency.sh
@@ -34,6 +29,8 @@ jobs:
           apt-get update
           apt-get install -y pandoc
           apt-get update && apt-get install -y parallel retry
+
+          ln -sf "$(which python3)" /usr/bin/python
 
       - name: Setup Jupyter Kernel
         run: |
