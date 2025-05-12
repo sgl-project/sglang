@@ -182,5 +182,3 @@ def get_config_dtype_str(
         # use fp16/bfloat16 configs
         return "float32"
     return None
-
-
