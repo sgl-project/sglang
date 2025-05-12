@@ -16,7 +16,7 @@ from typing import Any, List, Optional
 
 import torch
 
-from sglang import ServerArgs
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.managers.io_struct import BlockReqInput, BlockReqType
 from sglang.srt.poll_based_barrier import PollBasedBarrier
 
