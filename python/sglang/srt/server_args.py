@@ -235,6 +235,7 @@ class ServerArgs:
     disaggregation_ib_device: Optional[str] = None
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
     pdlb_url: Optional[str] = None
+    disaggregation_with_mla: bool = True
 
     # For model weight update
     custom_weight_loader: Optional[List[str]] = None
@@ -1614,6 +1615,12 @@ class ServerArgs:
             action="store_true",
             help="Disable mmap while loading weight using safetensors.",
         )
+        parser.add_argument(
+            "--disaggregation-with-mla",
+            type=bool,
+            default=ServerArgs.disaggregation_with_mla,
+            help="Enable disaggregation with MLA. Default is True.",
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
@@ -1694,7 +1701,8 @@ class PortArgs:
     scheduler_input_ipc_name: str
     # The ipc filename for detokenizer to receive inputs from scheduler (zmq)
     detokenizer_ipc_name: str
-
+    # The ipc filename for scheduler to receive workload status from worker (zmq)
+    worker_workload_status_ipc_name: str
     # The port for nccl initialization (torch.dist)
     nccl_port: int
 
@@ -1718,6 +1726,7 @@ class PortArgs:
                 tokenizer_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 scheduler_input_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 detokenizer_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
+                worker_workload_status_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 nccl_port=port,
                 rpc_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
             )
@@ -1747,6 +1756,8 @@ class PortArgs:
                 tokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base}",
                 scheduler_input_ipc_name=f"tcp://{dist_init_host}:{scheduler_input_port}",
                 detokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base + 1}",
+                # we have to use a fixed port to support multi-nodes inference
+                worker_workload_status_ipc_name=f"tcp://{dist_init_host}:{port_base + 100}",
                 nccl_port=port,
                 rpc_ipc_name=f"tcp://{dist_init_host}:{port_base + 2}",
             )
