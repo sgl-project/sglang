@@ -509,7 +509,7 @@ class SchedulerDisaggregationDecodeMixin:
     def event_loop_overlap_disagg_decode(self: Scheduler):
         result_queue = deque()
         self.last_batch: Optional[ScheduleBatch] = None
-        self.last_batch_in_queue = False  # last batch is modifed in-place, so we need another variable to track if it's extend
+        self.last_batch_in_queue = False  # last batch is modified in-place, so we need another variable to track if it's extend
 
         while True:
             recv_reqs = self.recv_requests()

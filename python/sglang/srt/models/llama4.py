@@ -428,7 +428,7 @@ class Llama4DecoderLayer(nn.Module):
         # Fully Connected
         hidden_states = self.feed_forward(hidden_states, forward_batch)
 
-        # TODO(ch-wan): ues reduce-scatter in MLP to avoid this scatter
+        # TODO(ch-wan): use reduce-scatter in MLP to avoid this scatter
         # Scatter
         if self.dp_size != 1:
             # important: forward batch.gathered_buffer is used both after scatter and after gather.
