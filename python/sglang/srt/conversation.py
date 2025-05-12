@@ -894,11 +894,17 @@ def match_vicuna(model_path: str):
 @register_conv_template_matching_function
 def match_llama2_chat(model_path: str):
     if re.search(
-        r"llama-2.*chat|(mistral|mixtral).*instruct|codellama.*instruct",
+        r"llama-2.*chat|codellama.*instruct",
         model_path,
         re.IGNORECASE,
     ):
         return "llama-2"
+
+
+@register_conv_template_matching_function
+def match_mistral(model_path: str):
+    if re.search(r"pixtral|(mistral|mixtral).*instruct", model_path, re.IGNORECASE):
+        return "mistral"
 
 
 @register_conv_template_matching_function
