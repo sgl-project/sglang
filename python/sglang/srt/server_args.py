@@ -1194,7 +1194,7 @@ class ServerArgs:
             type=int,
             default=0,
             help="The number of shared_experts need to be replicated to fuse with normal experts in deepseek v3/r1, "
-            "set it to tp_size can get best optimized performance.",
+            "set it to tp_size can get best optimized performance. Note that for architectures with SM==90, we have enabled the shared experts fusion optimization by default for DeepSeek V3/R1, with n_share_experts_fusion automatically set to the TP size.",
         )
         parser.add_argument(
             "--disable-chunked-prefix-cache",
