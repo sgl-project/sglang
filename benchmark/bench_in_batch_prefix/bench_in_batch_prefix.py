@@ -64,11 +64,11 @@ def test_batch_by_batch(all_prompts, gen_len):
 
     tot_time = 0
     for i in range(len(all_prompts)):
-        tic = time.time()
+        tic = time.perf_counter()
         text_qa.run_batch(
             list(zip(all_prompts[i], [gen_len] * len(all_prompts[i]))),
         )
-        tot_time += time.time() - tic
+        tot_time += time.perf_counter() - tic
 
     return tot_time
 
@@ -78,13 +78,13 @@ def test_batch_by_batch_with_hint(all_prompts, gen_len):
 
     tot_time = 0
     for i in range(len(all_prompts)):
-        tic = time.time()
+        tic = time.perf_counter()
         # Send a hint to cache the prefix
         text_qa.run_batch(list(zip(all_prompts[i][:1], [gen_len])))
         # Send the batch
         text_qa.run_batch(list(zip(all_prompts[i], [gen_len] * len(all_prompts[i]))))
 
-        tot_time += time.time() - tic
+        tot_time += time.perf_counter() - tic
 
     return tot_time
 
@@ -94,11 +94,11 @@ def test_send_all(all_prompts, gen_len):
 
     all_prompts = [x for prompt_list in all_prompts for x in prompt_list]
 
-    tic = time.time()
+    tic = time.perf_counter()
     text_qa.run_batch(
         list(zip(all_prompts, [gen_len] * len(all_prompts))),
     )
-    tot_time = time.time() - tic
+    tot_time = time.perf_counter() - tic
 
     return tot_time
 

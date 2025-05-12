@@ -85,14 +85,14 @@ def bench_schema(args):
     sgl.set_default_backend(backend)
 
     # Run requests
-    tic = time.time()
+    tic = time.perf_counter()
     states = schema_gen.run_batch(
         arguments,
         temperature=0,
         num_threads=args.parallel,
         progress_bar=True,
     )
-    latency = time.time() - tic
+    latency = time.perf_counter() - tic
 
     # Check if the outputs are valid
     indexes = []
