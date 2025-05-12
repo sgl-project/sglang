@@ -55,13 +55,13 @@ class ModelConfig:
         quantization: Optional[str] = None,
         override_config_file: Optional[str] = None,
         is_draft_model: bool = False,
-        modeling: Union[str, ModelImpl] = ModelImpl.AUTO,
+        impl: Union[str, ModelImpl] = ModelImpl.AUTO,
     ) -> None:
 
         self.model_path = model_path
         self.revision = revision
         self.quantization = quantization
-        self.modeling = modeling
+        self.impl = impl
 
         # Parse args
         self.maybe_pull_model_tokenizer_from_remote()
@@ -231,7 +231,7 @@ class ModelConfig:
             enable_multimodal=server_args.enable_multimodal,
             dtype=server_args.dtype,
             quantization=server_args.quantization,
-            modeling=server_args.modeling,
+            impl=server_args.impl,
             **kwargs,
         )
 

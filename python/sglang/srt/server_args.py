@@ -60,7 +60,7 @@ class ServerArgs:
     completion_template: Optional[str] = None
     is_embedding: bool = False
     revision: Optional[str] = None
-    modeling: str = "auto"
+    impl: str = "auto"
 
     # Port for the HTTP server
     host: str = "127.0.0.1"
@@ -652,9 +652,9 @@ class ServerArgs:
             help="The number of tokens in a page.",
         )
         parser.add_argument(
-            "--modeling",
+            "--impl",
             type=str,
-            default=ServerArgs.modeling,
+            default=ServerArgs.impl,
             help="Which implementation of the model to use.\n\n"
             '* "auto" will try to use the SGLang implementation if it exists '
             "and fallback to the Transformers implementation if no SGLang "

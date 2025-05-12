@@ -57,7 +57,16 @@ def batch():
 
 
 if __name__ == "__main__":
-    runtime = sgl.Runtime(model_path="meta-llama/Llama-2-7b-chat-hf")
+    # runtime = sgl.Runtime(model_path="unsloth/Llama-3.2-1B-bnb-4bit", tp_size=1, max_total_tokens=100)
+    # runtime = sgl.Runtime(model_path="hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4", tp_size=1, max_total_tokens=100)
+    runtime = sgl.Runtime(
+        model_path="meta-llama/Llama-3.2-1B-Instruct",
+        modeling="transformers",
+        torchao_config="int4wo-128",
+        tp_size=2,
+        max_total_tokens=100,
+    )
+
     sgl.set_default_backend(runtime)
 
     # Run a single request
