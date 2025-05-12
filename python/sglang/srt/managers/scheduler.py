@@ -773,7 +773,7 @@ class Scheduler(
 
                 if not self.pp_group.is_last_rank:
                     # send out reqs to the next stage
-                    dp_offset = self.dp_rank * self.attn_tp_size
+                    dp_offset = self.attn_dp_rank * self.attn_tp_size
                     if self.attn_tp_rank == 0:
                         point_to_point_pyobj(
                             recv_reqs,
@@ -820,7 +820,7 @@ class Scheduler(
                 recv_reqs = None
         else:
             if self.attn_tp_rank == 0:
-                dp_offset = self.dp_rank * self.attn_tp_size
+                dp_offset = self.attn_dp_rank * self.attn_tp_size
                 recv_reqs = point_to_point_pyobj(
                     [],
                     self.pp_rank * self.tp_size + dp_offset,
@@ -2192,8 +2192,8 @@ class Scheduler(
 
     def get_print_prefix(self):
         prefix = ""
-        if self.dp_rank is not None:
-            prefix += f" DP{self.dp_rank}"
+        if self.attn_dp_rank is not None:
+            prefix += f" DP{self.attn_dp_rank}"
         if self.server_args.tp_size > 1:
             prefix += f" TP{self.tp_rank}"
         if self.pp_size > 1:
