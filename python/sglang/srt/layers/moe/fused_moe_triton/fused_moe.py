@@ -1316,7 +1316,92 @@ def fused_experts(
         )
 
 
-# @torch.compile
+@triton.jit
+def _moe_sum_reduce_kernel(
+    input_ptr,
+    input_stride_0,
+    input_stride_1,
+    input_stride_2,
+    output_ptr,
+    output_stride_0,
+    output_stride_1,
+    token_num: int,
+    topk_num: int,
+    hidden_dim: int,
+    routed_scaling_factor: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_DIM: tl.constexpr,
+    NUM_STAGE: tl.constexpr,
+):
+    input_stride_0 = tl.cast(input_stride_0, dtype=tl.int64)
+    input_stride_1 = tl.cast(input_stride_1, dtype=tl.int64)
+    output_stride_0 = tl.cast(output_stride_0, dtype=tl.int64)
+
+    token_block_id = tl.program_id(0)
+    dim_block_id = tl.program_id(1)
+
+    token_start = token_block_id * BLOCK_M
+    token_end = min((token_block_id + 1) * BLOCK_M, token_num)
+
+    dim_start = dim_block_id * BLOCK_DIM
+    dim_end = min((dim_block_id + 1) * BLOCK_DIM, hidden_dim)
+
+    offs_dim = dim_start + tl.arange(0, BLOCK_DIM)
+
+    for token_index in range(token_start, token_end):
+        accumulator = tl.zeros((BLOCK_DIM,), dtype=tl.float32)
+        input_t_ptr = input_ptr + token_index * input_stride_0 + offs_dim
+        for i in tl.range(0, topk_num, num_stages=NUM_STAGE):
+            tmp = tl.load(
+                input_t_ptr + i * input_stride_1, mask=offs_dim < dim_end, other=0.0
+            )
+            accumulator += tmp
+        accumulator = accumulator * routed_scaling_factor
+        store_t_ptr = output_ptr + token_index * output_stride_0 + offs_dim
+        tl.store(
+            store_t_ptr,
+            accumulator.to(input_ptr.dtype.element_ty),
+            mask=offs_dim < dim_end,
+        )
+
+
+def moe_sum_reduce(
+    input: torch.Tensor, output: torch.Tensor, routed_scaling_factor: float
+):
+    assert input.is_contiguous()
+    assert output.is_contiguous()
+
+    token_num, topk_num, hidden_dim = input.shape
+    assert output.shape[0] == token_num and output.shape[1] == hidden_dim
+
+    BLOCK_M = 1
+    BLOCK_DIM = 2048
+    NUM_STAGE = 1
+    num_warps = 8
+
+    grid = (
+        triton.cdiv(token_num, BLOCK_M),
+        triton.cdiv(hidden_dim, BLOCK_DIM),
+    )
+
+    _moe_sum_reduce_kernel[grid](
+        input,
+        *input.stride(),
+        output,
+        *output.stride(),
+        token_num=token_num,
+        topk_num=topk_num,
+        hidden_dim=hidden_dim,
+        routed_scaling_factor=routed_scaling_factor,
+        BLOCK_M=BLOCK_M,
+        BLOCK_DIM=BLOCK_DIM,
+        NUM_STAGE=NUM_STAGE,
+        num_warps=num_warps,
+    )
+    return
+
+
+@torch.compile
 def compute_sum_scaled(x, out, routed_scaling_factor):
     torch.sum(x, dim=1, out=out)
     out.mul_(routed_scaling_factor)
@@ -1532,11 +1617,19 @@ def fused_experts_impl(
                 out_hidden_states[begin_chunk_idx:end_chunk_idx],
             )
         else:
-            compute_sum_scaled(
-                intermediate_cache3.view(*intermediate_cache3.shape),
-                out_hidden_states[begin_chunk_idx:end_chunk_idx],
-                routed_scaling_factor,
-            )
+            # According to micro benchmark results, torch.compile can get better performance for small token.
+            if tokens_in_chunk <= 32:
+                compute_sum_scaled(
+                    intermediate_cache3.view(*intermediate_cache3.shape),
+                    out_hidden_states[begin_chunk_idx:end_chunk_idx],
+                    routed_scaling_factor,
+                )
+            else:
+                moe_sum_reduce(
+                    intermediate_cache3.view(*intermediate_cache3.shape),
+                    out_hidden_states[begin_chunk_idx:end_chunk_idx],
+                    routed_scaling_factor,
+                )
 
     return out_hidden_states
 
