@@ -201,7 +201,7 @@ def _dp_gather(
             global_tokens, local_tokens, 0, local_start_pos, local_num_tokens, False
         )
 
-    # Input IDs are in int 32. We should use inplace_all_reduce for local case becaues of custom all reduce.
+    # Input IDs are in int 32. We should use inplace_all_reduce for local case because of custom all reduce.
     NUM_GPUS_PER_NODE = 8
     if (
         not local_tokens.dtype.is_floating_point
@@ -252,12 +252,12 @@ def dp_scatter(
         )
 
 
-def tp_reduce_scatter(
+def attn_tp_reduce_scatter(
     output: torch.Tensor,
     input_list: List[torch.Tensor],
 ):
     return get_attention_tp_group().reduce_scatter(output, input_list)
 
 
-def tp_all_gather(output_list: List[torch.Tensor], input_: torch.Tensor):
+def attn_tp_all_gather(output_list: List[torch.Tensor], input_: torch.Tensor):
     return get_attention_tp_group().all_gather(input_, tensor_list=output_list)
