@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Run the model with cuda graph and torch.compile."""
+"""Run the model with CUDA graph and torch.compile."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ import bisect
 import inspect
 import os
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Callable, Optional, Union
 
 import torch
 import tqdm
@@ -40,14 +40,11 @@ from sglang.srt.patch_torch import monkey_patch_torch_compile
 from sglang.srt.utils import (
     get_available_gpu_memory,
     get_device_memory_capacity,
-    is_hip,
     rank0_log,
 )
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
-
-_is_hip = is_hip()
 
 
 def _to_torch(model: torch.nn.Module, reverse: bool, num_tokens: int):
@@ -130,14 +127,13 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
             else:
                 capture_bs = [1, 2, 4, 8] + list(range(16, 161, 8))
         else:
-            # Since speculative decoding requires more cuda graph memory, we
+            # Since speculative decoding requires more CUDA graph memory, we
             # capture less.
             capture_bs = (
                 list(range(1, 9)) + list(range(10, 33, 2)) + list(range(40, 161, 16))
             )
 
         gpu_mem = get_device_memory_capacity()
-        # Batch size of each rank will not become so large when DP is on
         if gpu_mem is not None and gpu_mem > 96 * 1024:
             capture_bs += list(range(160, 257, 8))
 
@@ -148,12 +144,15 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
             model_runner.req_to_token_pool.size
         ]
 
-    capture_bs = list(sorted(set(capture_bs)))
-
-    assert len(capture_bs) > 0 and capture_bs[0] > 0
-    capture_bs = [bs for bs in capture_bs if bs <= model_runner.req_to_token_pool.size]
     if server_args.cuda_graph_max_bs:
         capture_bs = [bs for bs in capture_bs if bs <= server_args.cuda_graph_max_bs]
+        if max(capture_bs) < server_args.cuda_graph_max_bs:
+            capture_bs += list(
+                range(max(capture_bs), server_args.cuda_graph_max_bs + 1, 16)
+            )
+    capture_bs = [bs for bs in capture_bs if bs <= model_runner.req_to_token_pool.size]
+    capture_bs = list(sorted(set(capture_bs)))
+    assert len(capture_bs) > 0 and capture_bs[0] > 0
     compile_bs = (
         [bs for bs in capture_bs if bs <= server_args.torch_compile_max_bs]
         if server_args.enable_torch_compile
@@ -162,7 +161,7 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
     return capture_bs, compile_bs
 
 
-# Reuse this memory pool across all cuda graph runners.
+# Reuse this memory pool across all CUDA graph runners.
 global_graph_memory_pool = None
 
 
@@ -176,7 +175,7 @@ def set_global_graph_memory_pool(val):
 
 
 class CudaGraphRunner:
-    """A CudaGraphRunner runs the forward pass of a model with cuda graph and torch.compile."""
+    """A CudaGraphRunner runs the forward pass of a model with CUDA graph and torch.compile."""
 
     def __init__(self, model_runner: ModelRunner):
         # Parse args
@@ -195,7 +194,7 @@ class CudaGraphRunner:
 
         # Batch sizes to capture
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
-        rank0_log(f"Capture cuda graph bs {self.capture_bs}")
+        rank0_log(f"Capture CUDA graph bs {self.capture_bs}")
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.NULL
         self.num_tokens_per_bs = 1
@@ -296,12 +295,12 @@ class CudaGraphRunner:
                 self.capture()
         except RuntimeError as e:
             raise Exception(
-                f"Capture cuda graph failed: {e}\n"
+                f"Capture CUDA graph failed: {e}\n"
                 "Possible solutions:\n"
                 "1. set --mem-fraction-static to a smaller value (e.g., 0.8 or 0.7)\n"
                 "2. set --cuda-graph-max-bs to a smaller value (e.g., 16)\n"
                 "3. disable torch compile by not using --enable-torch-compile\n"
-                "4. disable cuda graph by --disable-cuda-graph. (Not recommonded. Huge perf loss)\n"
+                "4. disable CUDA graph by --disable-cuda-graph. (Not recommended. Huge performance loss)\n"
                 "Open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose \n"
             )
 
@@ -335,8 +334,8 @@ class CudaGraphRunner:
                 else forward_batch.batch_size <= self.max_bs
             )
 
-        # NOTE: cuda graph cannot handle mixed batch (encoder_len = 0)
-        # If mixed batch cannot be supported, then encoder_lens can be removed in cuda graph
+        # NOTE: CUDA graph cannot handle mixed batch (encoder_len = 0)
+        # If mixed batch cannot be supported, then encoder_lens can be removed in CUDA graph
         # because the full_text_row_masked_out_mask tensor will always be ones
         is_encoder_lens_supported = (
             torch.all(forward_batch.encoder_lens > 0)
@@ -351,7 +350,7 @@ class CudaGraphRunner:
             avail_mem = get_available_gpu_memory(
                 self.model_runner.device, self.model_runner.gpu_id, empty_cache=False
             )
-            # Reverse the order to enable better memory sharing across cuda graphs.
+            # Reverse the order to enable better memory sharing across CUDA graphs.
             capture_range = (
                 tqdm.tqdm(list(reversed(self.capture_bs)))
                 if get_tensor_model_parallel_rank() == 0
@@ -430,9 +429,9 @@ class CudaGraphRunner:
                 spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
             )
         if self.model_runner.server_args.lora_paths is not None:
-            # Currently, if the lora_path in `lora_paths` is None, the lora backend will use a
-            # different logic to handle lora, so we need to set `lora_paths` to a list of non-None
-            # values if lora is enabled.
+            # Currently, if the lora_path in `lora_paths` is None, the LoRA backend will use a
+            # different logic to handle LoRA, so we need to set `lora_paths` to a list of non-None
+            # values if LoRA is enabled.
             lora_paths = [next(iter(self.model_runner.server_args.lora_paths))] * bs
         else:
             lora_paths = None

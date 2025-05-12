@@ -285,6 +285,21 @@ class Engine(EngineBase):
         ret = loop.run_until_complete(generator.__anext__())
         return ret
 
+    async def async_encode(
+        self,
+        prompt: Union[str, List[str], List[Dict], List[List[Dict]]],
+        image_data: Optional[Union[List[str], str]] = None,
+    ) -> Dict:
+        """
+        Asynchronous version of encode method.
+
+        The arguments of this function is the same as `sglang/srt/managers/io_struct.py::EmbeddingReqInput`.
+        Please refer to `EmbeddingReqInput` for the documentation.
+        """
+        obj = EmbeddingReqInput(text=prompt, image_data=image_data)
+        generator = self.tokenizer_manager.generate_request(obj, None)
+        return await generator.__anext__()
+
     def shutdown(self):
         """Shutdown the engine"""
         kill_process_tree(os.getpid(), include_parent=False)
@@ -315,7 +330,7 @@ class Engine(EngineBase):
         return {
             **dataclasses.asdict(self.tokenizer_manager.server_args),
             **self.scheduler_info,
-            **internal_states,
+            "internal_states": internal_states,
             "version": __version__,
         }
 
@@ -471,7 +486,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     if _is_cuda:
         assert_pkg_version(
             "sgl-kernel",
-            "0.1.1",
+            "0.1.2.post1",
             "Please reinstall the latest version with `pip install sgl-kernel --force-reinstall`",
         )
 

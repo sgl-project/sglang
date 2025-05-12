@@ -16,7 +16,7 @@ from sglang.srt.lora.utils import (
 
 
 class LoRAMemoryPool:
-    """Class for memory pool management of lora modules"""
+    """Class for memory pool management of LoRA modules"""
 
     def __init__(
         self,
@@ -38,7 +38,7 @@ class LoRAMemoryPool:
         self.tp_rank: int = tp_rank
         self.lora_modules: Dict[int, List[Tuple[str, BaseLayerWithLoRA]]] = lora_modules
 
-        # Both A_buffer and B_buffer maps lora weight names to its buffer space.
+        # Both A_buffer and B_buffer maps LoRA weight names to its buffer space.
         # A_buffer contains num_layer number of row-major tensors with shape
         #   (max_loras_per_batch, stacked_num * max_lora_dim, input_dim)
         # B_buffer contains num_layer number of column-major tensors with shape
@@ -46,19 +46,19 @@ class LoRAMemoryPool:
         self.A_buffer: Dict[str, List[torch.Tensor]] = {}
         self.B_buffer: Dict[str, List[torch.Tensor]] = {}
 
-        # Lora uid -> buffer idx in memory pool
+        # LoRA uid -> buffer idx in memory pool
         self.uid_to_buffer_id: Dict[Optional[str], int] = {}
 
-        # Buffer idx -> lora uid in memory pool
-        # All uids are initalized as empty strings for empty buffer slots
-        # Here we don't initalize to None since None is a valid uid
+        # Buffer idx -> LoRA uid in memory pool
+        # All uids are initialized as empty strings for empty buffer slots
+        # Here we don't initialize to None since None is a valid uid
         self.buffer_id_to_uid: List[Optional[str]] = [""] * self.max_loras_per_batch
 
     def get_lora_A_shape(
         self, module_name: str, base_model: torch.nn.Module
     ) -> Tuple[int]:
         """
-        Given a module_name (might be a stacked name), return the hidden dims of modules's input and output.
+        Given a module_name (might be a stacked name), return the hidden dims of modules' input and output.
         """
         input_dim, _ = get_hidden_dim(module_name, self.base_hf_config, base_model)
         c = get_stacked_multiply(module_name)
@@ -75,7 +75,7 @@ class LoRAMemoryPool:
         self, module_name: str, base_model: torch.nn.Module
     ) -> Tuple[int]:
         """
-        Given a module_name (might be a stacked name), return the hidden dims of modules's input and output.
+        Given a module_name (might be a stacked name), return the hidden dims of modules' input and output.
         """
         _, output_dim = get_hidden_dim(module_name, self.base_hf_config, base_model)
         c = get_stacked_multiply(module_name)
@@ -95,7 +95,7 @@ class LoRAMemoryPool:
         base_model: torch.nn.Module,
     ):
 
-        # lora_weight_names is a set of name pairs indicating each pair of lora modules to load
+        # lora_weight_names is a set of name pairs indicating each pair of LoRA modules to load
         #   e.g., {("qkv_proj", "q_proj"), ("qkv_proj", "kv_proj"), ("o_proj", "o_proj")}
         self.lora_weight_names: Set[Tuple[str]] = lora_weight_names
         device = next(base_model.parameters()).device
@@ -137,7 +137,7 @@ class LoRAMemoryPool:
                     return buffer_id, ""
 
             for buffer_id in range(self.max_loras_per_batch):
-                # Evict unneeded lora
+                # Evict unneeded LoRA
                 if self.buffer_id_to_uid[buffer_id] not in cur_uids:
                     return buffer_id, self.buffer_id_to_uid[buffer_id]
 

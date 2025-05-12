@@ -37,7 +37,7 @@ def _gate_up_lora_b_kernel(
 ):
     # This kernel packs 2 sgemms (gate/up) into a single kernel.
 
-    # x: (s, 2 * K), s is the sum of sequence lengths, K equals to lora rank
+    # x: (s, 2 * K), s is the sum of sequence lengths, K equals to LoRA rank
     # weights: (num_lora, 2 * output_dim, K)
     # output: (s, 2 * output_dim)
     # output_dim >> K
@@ -77,7 +77,7 @@ def _gate_up_lora_b_kernel(
         k_offset[:, None] * w_stride_2 + n_offset[None, :] * w_stride_1
     )
 
-    # Iteate to compute the block in output matrix
+    # Iterate to compute the block in output matrix
     partial_sum = tl.zeros((BLOCK_S, BLOCK_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_K)):
         x_tile = tl.load(

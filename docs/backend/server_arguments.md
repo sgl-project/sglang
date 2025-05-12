@@ -38,7 +38,7 @@ memory management, and optimization techniques.
 - To enable fp8 weight quantization, add `--quantization fp8` on a fp16 checkpoint or directly load a fp8 checkpoint without specifying any arguments.
 - To enable fp8 kv cache quantization, add `--kv-cache-dtype fp8_e5m2`.
 - If the model does not have a chat template in the Hugging Face tokenizer, you can specify a [custom chat template](custom_chat_template.md).
-- To run tensor parallelism on multiple nodes, add `--nnodes 2`. If you have two nodes with two GPUs on each node and want to run TP=4, let `sgl-dev-0` be the hostname of the first node and `50000` be an available port, you can use the following commands. If you meet deadlock, please try to add `--disable-cuda-graph`
+- To run tensor parallelism on multiple nodes, add `--nnodes 2`. If you have two nodes with two GPUs on each node and want to run TP=4, let `sgl-dev-0` be the hostname of the first node and `50000` be an available port, so you can use the following commands. If you encounter deadlocks, please try to add `--disable-cuda-graph`.
 
   ```bash
   # Node 0
@@ -62,7 +62,6 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `dtype` | Dtype used for the model. | `auto` |
 | `kv_cache_dtype` | Dtype of the kv cache. | `auto` |
 | `context_length` | The model's maximum context length. Defaults to None (will use the value from the model's config.json instead). Note that extending the default might lead to strange behavior. | None |
-| `device` | The device we put the model. | None |
 | `device` | The device we put the model. | None |
 | `served_model_name` | Override the model name returned by the v1/models endpoint in OpenAI API server.| None |
 | `is_embedding` | Set to `true` to perform [embedding](./openai_api_embeddings.ipynb) / [encode](https://docs.sglang.ai/backend/native_api#Encode-(embedding-model)) and [reward](https://docs.sglang.ai/backend/native_api#Classify-(reward-model)) tasks. | `False` |
@@ -222,3 +221,4 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `triton_attention_num_kv_splits` | Use to adjust the number of KV splits in triton kernels. | `8` |
 | `flashinfer_mla_disable_ragged` | Disable the use of the [ragged prefill](https://github.com/flashinfer-ai/flashinfer/blob/5751fc68f109877f6e0fc54f674cdcdef361af56/docs/tutorials/kv_layout.rst#L26) wrapper for the FlashInfer MLA attention backend. Ragged prefill increases throughput by computing MHA instead of paged MLA when there is no prefix match. Only use it when FlashInfer is being used as the MLA backend. | `False` |
 | `disable_chunked_prefix_cache` | Disable the use of chunked prefix cache for DeepSeek models. Only use it when FA3 is attention backend. | `False` |
+| `enable_dp_lm_head` | Enable vocabulary parallel across the attention TP group to avoid all-gather across DP groups, optimizing performance under DP attention. | `False` |

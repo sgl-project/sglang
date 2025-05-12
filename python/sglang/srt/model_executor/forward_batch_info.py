@@ -58,7 +58,7 @@ class ForwardMode(IntEnum):
     DECODE = auto()
     # Contains both EXTEND and DECODE when doing chunked prefill.
     MIXED = auto()
-    # No sequence to forward. For data parallel attention, some workers wil be IDLE if no sequence are allocated.
+    # No sequence to forward. For data parallel attention, some workers will be IDLE if no sequence are allocated.
     IDLE = auto()
 
     # Used in speculative decoding: verify a batch in the target model.
@@ -229,7 +229,7 @@ class ForwardBatch:
     # For DP attention
     global_num_tokens_cpu: Optional[List[int]] = None
     global_num_tokens_gpu: Optional[torch.Tensor] = None
-    # Has to be None when cuda graph is captured.
+    # Has to be None when CUDA graph is captured.
     global_num_tokens_for_logprob_cpu: Optional[List[int]] = None
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
     # for extend, local start pos and num tokens is different in logits processor
@@ -356,7 +356,7 @@ class ForwardBatch:
         if model_runner.model_is_mrope:
             ret._compute_mrope_positions(model_runner, batch)
 
-        # Init lora information
+        # Init LoRA information
         if model_runner.server_args.lora_paths is not None:
             model_runner.lora_manager.prepare_lora_batch(ret)
 

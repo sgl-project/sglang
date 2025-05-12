@@ -39,7 +39,7 @@ def _qkv_lora_b_kernel(
 ):
     # This kernel packs 3 sgemms (q/k/v) into a single kernel.
 
-    # x: (s, 3 * K), s is the sum of sequence lengths, K equals to lora rank
+    # x: (s, 3 * K), s is the sum of sequence lengths, K equals to LoRA rank
     # weights: (num_lora, N_Q + 2 * N_KV, K)
     # output: (s, N_Q + 2 * N_KV)
     # N_Q >> K, N_KV >> K
@@ -79,7 +79,7 @@ def _qkv_lora_b_kernel(
         k_offset[:, None] * w_stride_2 + n_offset[None, :] * w_stride_1
     )
 
-    # Iteate to compute the block in output matrix
+    # Iterate to compute the block in output matrix
     partial_sum = tl.zeros((BLOCK_S, BLOCK_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_K)):
         x_tile = tl.load(

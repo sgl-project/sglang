@@ -159,6 +159,7 @@ class ServerArgs:
     disable_overlap_schedule: bool = False
     enable_mixed_chunk: bool = False
     enable_dp_attention: bool = False
+    enable_dp_lm_head: bool = False
     enable_ep_moe: bool = False
     enable_deepep_moe: bool = False
     deepep_mode: Optional[Literal["auto", "normal", "low_latency"]] = "auto"
@@ -245,7 +246,7 @@ class ServerArgs:
                 self.mem_fraction_static = min(
                     mem_fraction + 48 * 1024 * (1 - mem_fraction) / gpu_mem,
                     (gpu_mem - 1024 * 18)
-                    / gpu_mem,  # 15 GB + additional 3GB for cuda graph
+                    / gpu_mem,  # 15 GB + additional 3GB for CUDA graph
                 )
 
         # Set chunked prefill size, which depends on the gpu memory capacity
@@ -275,9 +276,9 @@ class ServerArgs:
             )
             self.page_size = 128
 
-        # Set cuda graph max batch size
+        # Set CUDA graph max batch size
         if self.cuda_graph_max_bs is None:
-            # Based on detailed statistics, when serving TP1/TP2 models on lower-end GPUs with HBM<25G, you can either disable cuda graph or set `cuda_graph_max_bs` to a very small value to reduce the memory overhead of creating cuda graphs, with almost no impact on performance. However, when serving models with TP4 or TP8, we need to enable cuda graph to maintain high performance. In this case, we can set `cuda_graph_max_bs` to 80 (half of the default value 160) to reduce the memory overhead of creating cuda graphs. Looking at the logs from TP4 serving of qwen2-72b, a value of 80 is sufficient and can reduce the memory overhead of creating cuda graphs on lower-end GPUs compared to the original 160, avoiding OOM issues.
+            # Based on detailed statistics, when serving TP1/TP2 models on lower-end GPUs with HBM<25G, you can either disable CUDA graph or set `cuda_graph_max_bs` to a very small value to reduce the memory overhead of creating CUDA graphs, with almost no impact on performance. However, when serving models with TP4 or TP8, we need to enable CUDA graph to maintain high performance. In this case, we can set `cuda_graph_max_bs` to 80 (half of the default value 160) to reduce the memory overhead of creating CUDA graphs. Looking at the logs from TP4 serving of qwen2-72b, a value of 80 is sufficient and can reduce the memory overhead of creating CUDA graphs on lower-end GPUs compared to the original 160, avoiding OOM issues.
             if gpu_mem is not None and gpu_mem < 25_000:
                 if self.tp_size < 4:
                     self.cuda_graph_max_bs = 8
@@ -305,6 +306,12 @@ class ServerArgs:
         if self.grammar_backend is None:
             self.grammar_backend = "xgrammar"
 
+        if self.pp_size > 1:
+            self.disable_overlap_schedule = True
+            logger.warning(
+                "Overlap scheduler is disabled because of using pipeline parallelism."
+            )
+
         # Data parallelism attention
         if self.enable_dp_attention:
             self.schedule_conservativeness = self.schedule_conservativeness * 0.3
@@ -316,6 +323,11 @@ class ServerArgs:
             logger.warning(
                 f"DP attention is enabled. The chunked prefill size is adjusted to {self.chunked_prefill_size} to avoid MoE kernel issues. "
             )
+
+        if self.enable_dp_lm_head:
+            assert (
+                self.enable_dp_attention
+            ), "Please enable dp attention when setting enable_dp_attention. "
 
         # DeepEP MoE
         self.enable_sp_layernorm = False
@@ -711,7 +723,7 @@ class ServerArgs:
             "--download-dir",
             type=str,
             default=ServerArgs.download_dir,
-            help="Model download directory for huggingface.",
+            help="Model download directory for HuggingFace.",
         )
         parser.add_argument(
             "--base-gpu-id",
@@ -825,7 +837,7 @@ class ServerArgs:
         # Multi-node distributed serving
         parser.add_argument(
             "--dist-init-addr",
-            "--nccl-init-addr",  # For backward compatbility. This will be removed in the future.
+            "--nccl-init-addr",  # For backward compatibility. This will be removed in the future.
             type=str,
             help="The host address for initializing distributed backend (e.g., `192.168.0.2:25000`).",
         )
@@ -1006,12 +1018,12 @@ class ServerArgs:
         parser.add_argument(
             "--disable-cuda-graph",
             action="store_true",
-            help="Disable cuda graph.",
+            help="Disable CUDA graph.",
         )
         parser.add_argument(
             "--disable-cuda-graph-padding",
             action="store_true",
-            help="Disable cuda graph when padding is needed. Still uses cuda graph when padding is not needed.",
+            help="Disable CUDA graph when padding is needed. Still uses CUDA graph when padding is not needed.",
         )
         parser.add_argument(
             "--enable-nccl-nvls",
@@ -1050,9 +1062,14 @@ class ServerArgs:
             help="Enabling data parallelism for attention and tensor parallelism for FFN. The dp size should be equal to the tp size. Currently only DeepSeek-V2 is supported.",
         )
         parser.add_argument(
+            "--enable-dp-lm-head",
+            action="store_true",
+            help="Enable vocabulary parallel across the attention TP group to avoid all-gather across DP groups, optimizing performance under DP attention.",
+        )
+        parser.add_argument(
             "--enable-ep-moe",
             action="store_true",
-            help="Enabling expert parallelism for moe. The ep size is equal to the tp size.",
+            help="Enabling expert parallelism for MoE. The ep size is equal to the tp size.",
         )
         parser.add_argument(
             "--enable-torch-compile",
@@ -1069,13 +1086,13 @@ class ServerArgs:
             "--cuda-graph-max-bs",
             type=int,
             default=ServerArgs.cuda_graph_max_bs,
-            help="Set the maximum batch size for cuda graph.",
+            help="Set the maximum batch size for CUDA graph. It will extend the CUDA graph capture batch size to this value.",
         )
         parser.add_argument(
             "--cuda-graph-bs",
             type=int,
             nargs="+",
-            help="Set the list of batch sizes for cuda graph.",
+            help="Set the list of batch sizes for CUDA graph.",
         )
         parser.add_argument(
             "--torchao-config",
@@ -1096,7 +1113,7 @@ class ServerArgs:
         parser.add_argument(
             "--triton-attention-reduce-in-fp32",
             action="store_true",
-            help="Cast the intermidiate attention results to fp32 to avoid possible crashes related to fp16."
+            help="Cast the intermediate attention results to fp32 to avoid possible crashes related to fp16."
             "This only affects Triton attention kernels.",
         )
         parser.add_argument(
@@ -1188,7 +1205,7 @@ class ServerArgs:
             type=int,
             default=0,
             help="The number of shared_experts need to be replicated to fuse with normal experts in deepseek v3/r1, "
-            "set it to tp_size can get best optimized performace.",
+            "set it to tp_size can get best optimized performance. Note that for architectures with SM==90, we have enabled the shared experts fusion optimization by default for DeepSeek V3/R1, with n_share_experts_fusion automatically set to the TP size.",
         )
         parser.add_argument(
             "--disable-chunked-prefix-cache",
@@ -1311,7 +1328,7 @@ class ServerArgs:
             self.max_loras_per_batch > 0
             # FIXME
             and (self.lora_paths is None or self.disable_radix_cache)
-        ), "compatibility of lora and cuda graph and radix attention is in progress"
+        ), "compatibility of LoRA and CUDA graph and RadixAttention is in progress"
         assert self.base_gpu_id >= 0, "base_gpu_id must be non-negative"
         assert self.gpu_id_step >= 1, "gpu_id_step must be positive"
 

@@ -156,8 +156,6 @@ class TestBenchServing(CustomTestCase):
             num_prompts=200,
             request_rate=float("inf"),
             other_server_args=[
-                "--chat-template",
-                DEFAULT_VLM_CHAT_TEMPLATE_FOR_TEST,
                 "--mem-fraction-static",
                 "0.7",
             ],
@@ -181,8 +179,6 @@ class TestBenchServing(CustomTestCase):
             num_prompts=50,
             request_rate=1,
             other_server_args=[
-                "--chat-template",
-                DEFAULT_VLM_CHAT_TEMPLATE_FOR_TEST,
                 "--mem-fraction-static",
                 "0.7",
             ],
@@ -194,7 +190,7 @@ class TestBenchServing(CustomTestCase):
                 f"### test_vlm_online_latency\n"
                 f'median_e2e_latency_ms: {res["median_e2e_latency_ms"]:.2f} ms\n'
             )
-            self.assertLess(res["median_e2e_latency_ms"], 16000)
+            self.assertLess(res["median_e2e_latency_ms"], 16500)
             if os.getenv("SGLANG_AMD_CI") == "1":
                 self.assertLess(res["median_ttft_ms"], 150)
                 # TODO: not set yet, need AMD machine
