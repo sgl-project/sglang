@@ -384,11 +384,7 @@ class DeepseekV2MoE(nn.Module):
             return None
 
     def _forward_select_experts(self, forward_mode, hidden_states, router_logits):
-        if (
-            forward_mode is not None
-            and not forward_mode.is_idle()
-            and hidden_states.shape[0] > 0
-        ):
+        if router_logits is not None:
             topk_weights, topk_idx = select_experts(
                 hidden_states=hidden_states,
                 router_logits=router_logits,
