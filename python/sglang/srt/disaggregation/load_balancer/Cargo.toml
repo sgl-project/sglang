@@ -1,0 +1,21 @@
+[package]
+name = "sglang-load-balancer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+log = "0.4"
+log4rs = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+parking_lot = {version = "0.12"}
+tokio = { version = "1", features = ["full"] }
+hyper = { version = "1", features = ["client", "http1"] }
+axum = { version = "0.8" }
+url = { version = "2", features = ["serde"] }
+http-body-util = "0.1"
+hyper-util = { version = "0.1", features = ["tokio"] }
+reqwest = { version = "0.12", default-features = false, features = ["json"]}
+stream-guard = "1"
