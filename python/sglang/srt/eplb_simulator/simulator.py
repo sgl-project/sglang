@@ -53,7 +53,8 @@ def simulate_execution_given_pack(
         )
 
         simulation_output = _simulate_execution_given_logical_count_of_batch(
-            logical_count_of_batch=logical_count_of_batch, server_args=server_args,
+            logical_count_of_batch=logical_count_of_batch,
+            server_args=server_args,
         )
 
         simulation_output = dict(
@@ -223,20 +224,17 @@ def _simulate_expert_location_metadata_arr(
             MyExpertLocationMetadata.init_by_eplb(
                 server_args,
                 # NOTE first chunk has no statistics
-                logical_count=torch.zeros((num_layer, num_logical_expert)),
+                logical_count=torch.zeros((1, num_layer, num_logical_expert)),
                 num_physical_experts=num_physical_expert,
             )
         ] + [
             MyExpertLocationMetadata.init_by_eplb(
                 server_args,
-                logical_count=einops.einsum(
-                    logical_count_of_batch[
-                        (chunk_index - 1) * chunk_size : chunk_index * chunk_size,
-                        :,
-                        :,
-                    ],
-                    "num_interest_batches num_layer num_expert -> num_layer num_expert",
-                ),
+                logical_count=logical_count_of_batch[
+                    (chunk_index - 1) * chunk_size : chunk_index * chunk_size,
+                    :,
+                    :,
+                ],
                 num_physical_experts=num_physical_expert,
             )
             for chunk_index in trange(
@@ -252,10 +250,7 @@ def _simulate_expert_location_metadata_arr(
     elif expert_location_mode == "global_average":
         output = MyExpertLocationMetadata.init_by_eplb(
             server_args,
-            logical_count=einops.einsum(
-                logical_count_of_batch,
-                "num_interest_batches num_layer num_expert -> num_layer num_expert",
-            ),
+            logical_count=logical_count_of_batch,
             num_physical_experts=num_physical_expert,
         )
         return [output for _ in range(num_batches)]

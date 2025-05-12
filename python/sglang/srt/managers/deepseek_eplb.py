@@ -1,6 +1,6 @@
 # This file is copied from https://github.com/deepseek-ai/EPLB/blob/main/eplb.py since that one is not a pypi package
 
-from typing import Tuple, Literal
+from typing import Literal, Tuple
 
 import torch
 
