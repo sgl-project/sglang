@@ -119,6 +119,7 @@ def fused_moe_kernel_gptq_awq(
     use_int4_w4a16: tl.constexpr,
     use_int8_w8a16: tl.constexpr,
     even_Ks: tl.constexpr,
+    routed_scaling_factor: tl.constexpr,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -295,6 +296,7 @@ def fused_moe_kernel_gptq_awq(
         accumulator = accumulator * moe_weight[:, None]
 
     accumulator = accumulator.to(compute_type)
+    accumulator = accumulator * routed_scaling_factor
     # -----------------------------------------------------------
     # Write back the block of the output
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
