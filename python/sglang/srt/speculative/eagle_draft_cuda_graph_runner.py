@@ -100,9 +100,6 @@ class EAGLEDraftCudaGraphRunner:
                 self.global_num_tokens_gpu = torch.zeros(
                     (self.dp_size,), dtype=torch.int32
                 )
-                self.global_num_tokens_for_logprob_gpu = torch.zeros(
-                    (self.dp_size,), dtype=torch.int32
-                )
 
         # Capture
         try:
@@ -114,8 +111,7 @@ class EAGLEDraftCudaGraphRunner:
             )
 
     def can_run(self, forward_batch: ForwardBatch):
-        if self.enable_dp_attention:
-            # TODO(ch-wan): check --moe-dense-tp-size and --enable-dp-lm-head
+        if self.enable_dp_attention or self.enable_sp_layernorm:
             if not forward_batch.can_run_dp_cuda_graph:
                 return False
             total_batch_size = (
@@ -164,23 +160,11 @@ class EAGLEDraftCudaGraphRunner:
                     device=self.input_ids.device,
                 )
             )
-            self.global_num_tokens_for_logprob_gpu.copy_(
-                torch.tensor(
-                    [
-                        num_tokens // self.dp_size + (i < (num_tokens % self.dp_size))
-                        for i in range(self.dp_size)
-                    ],
-                    dtype=torch.int32,
-                    device=self.input_ids.device,
-                )
-            )
             global_num_tokens = self.global_num_tokens_gpu
             gathered_buffer = self.gathered_buffer[:num_tokens]
-            global_num_tokens_for_logprob = self.global_num_tokens_for_logprob_gpu
         else:
             global_num_tokens = None
             gathered_buffer = None
-            global_num_tokens_for_logprob = None
 
         spec_info = EagleDraftInput(
             topk_p=topk_p,
@@ -299,19 +283,15 @@ class EAGLEDraftCudaGraphRunner:
             forward_batch.seq_lens = self.seq_lens[:bs]
             forward_batch.req_pool_indices = self.req_pool_indices[:bs]
             forward_batch.positions = self.positions[:num_tokens]
-
         # Special handle for seq_len_cpu used when flashinfer mla is used
         if forward_batch.seq_lens_cpu is not None:
             if bs != raw_bs:
                 self.seq_lens_cpu.fill_(self.seq_len_fill_value)
             self.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
             forward_batch.seq_lens_cpu = self.seq_lens_cpu[:bs]
-
         self.model_runner.draft_attn_backend.init_forward_metadata_replay_cuda_graph(
             forward_batch, bs
         )
-        # TODO: The forward_batch.seq_len_sum might need to be updated to reflect the padding in the cuda graph
-
         # Replay
         self.graphs[bs].replay()
         out = self.output_buffers[bs]

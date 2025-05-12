@@ -1453,8 +1453,6 @@ class Scheduler(
                     self.running_batch.merge_batch(self.last_batch)
 
         new_batch = self.get_new_batch_prefill()
-
-        # TODO(ch-wan): minor refactor is needed here to improve readability
         any_new_batch = (
             self.server_args.enable_dp_attention
             and not self.spec_algorithm.is_none()
@@ -1887,7 +1885,7 @@ class Scheduler(
                 local_batch.global_num_tokens_for_logprob = (
                     global_num_tokens_for_logprob
                 )
-            local_batch.is_extend_in_batch = any(is_extend_in_batch)
+            local_batch.global_is_extend_in_batch = any(is_extend_in_batch)
             local_batch.tbo_split_seq_index = tbo_split_seq_index
             local_batch.global_forward_mode = global_forward_mode
 
