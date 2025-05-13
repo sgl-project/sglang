@@ -160,6 +160,7 @@ class GenerationBatchResult:
     extend_input_len_per_req: List[int]
     extend_logprob_start_len_per_req: List[int]
     bid: int
+    can_run_cuda_graph: bool
 
 
 @dataclass
@@ -323,13 +324,14 @@ class Scheduler(
         set_random_seed(self.random_seed)
 
         # Print debug info
-        logger.info(
-            f"max_total_num_tokens={self.max_total_num_tokens}, "
-            f"chunked_prefill_size={server_args.chunked_prefill_size}, "
-            f"max_prefill_tokens={self.max_prefill_tokens}, "
-            f"max_running_requests={self.max_running_requests}, "
-            f"context_len={self.model_config.context_len}"
-        )
+        if tp_rank == 0:
+            logger.info(
+                f"max_total_num_tokens={self.max_total_num_tokens}, "
+                f"chunked_prefill_size={server_args.chunked_prefill_size}, "
+                f"max_prefill_tokens={self.max_prefill_tokens}, "
+                f"max_running_requests={self.max_running_requests}, "
+                f"context_len={self.model_config.context_len}"
+            )
 
         # Init memory pool and cache
         self.init_memory_pool_and_cache()
@@ -528,10 +530,6 @@ class Scheduler(
         )
 
     def init_metrics(self):
-        # The largest prefill length of a single request
-        self._largest_prefill_len: int = 0
-        # The largest context length (prefill + generation) of a single request
-        self._largest_prefill_decode_len: int = 0
         self.last_gen_throughput: float = 0.0
         self.last_input_throughput: float = 0.0
         self.step_time_dict = defaultdict(list)  # Dict[batch size -> step time]
@@ -717,7 +715,7 @@ class Scheduler(
                     server_is_idle = False
                     result = self.run_batch(self.cur_batch)
 
-                # send the outputs to the next step
+                # (last rank) send the outputs to the next step
                 if self.pp_group.is_last_rank:
                     if self.cur_batch:
                         next_token_ids, bids[mb_id] = (
@@ -752,22 +750,23 @@ class Scheduler(
                         extend_input_len_per_req=None,
                         extend_logprob_start_len_per_req=None,
                         bid=bids[next_mb_id],
+                        can_run_cuda_graph=result.can_run_cuda_graph,
                     )
                     self.process_batch_result(mbs[next_mb_id], output_result)
                     last_mbs[next_mb_id] = mbs[next_mb_id]
 
-                # carry the outputs to the next stage
+                # (not last rank)
                 if not self.pp_group.is_last_rank:
                     if self.cur_batch:
                         bids[mb_id] = result.bid
+                    # carry the outputs to the next stage
+                    # send the outputs from the last round to let the next stage worker run post processing
                     if pp_outputs:
-                        # send the outputs from the last round to let the next stage worker run post processing
                         self.pp_group.send_tensor_dict(
                             pp_outputs.tensors,
                             all_gather_group=self.attn_tp_group,
                         )
 
-                if not self.pp_group.is_last_rank:
                     # send out reqs to the next stage
                     dp_offset = self.dp_rank * self.attn_tp_size
                     if self.attn_tp_rank == 0:
@@ -1119,9 +1118,6 @@ class Scheduler(
             self.token_to_kv_pool_allocator.available_size()
             + self.tree_cache.evictable_size()
         )
-        self._largest_prefill_len = max(
-            self._largest_prefill_len, adder.log_input_tokens
-        )
 
         num_new_seq = len(can_run_list)
         f = (
@@ -1159,7 +1155,9 @@ class Scheduler(
 
             self.metrics_collector.log_stats(self.stats)
 
-    def log_decode_stats(self, running_batch=None):
+    def log_decode_stats(
+        self, can_run_cuda_graph: bool, running_batch: ScheduleBatch = None
+    ):
         batch = running_batch or self.running_batch
 
         gap_latency = time.perf_counter() - self.last_decode_stats_tic
@@ -1199,6 +1197,7 @@ class Scheduler(
             msg += f"pre-allocated usage: {self.num_tokens_pre_allocated / self.max_total_num_tokens:.2f}, "
 
         msg += (
+            f"cuda graph: {can_run_cuda_graph}, "
             f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
             f"#queue-req: {len(self.waiting_queue)}"
         )
@@ -1524,11 +1523,11 @@ class Scheduler(
             if self.spec_algorithm.is_none():
                 model_worker_batch = batch.get_model_worker_batch()
                 if self.pp_group.is_last_rank:
-                    logits_output, next_token_ids = (
+                    logits_output, next_token_ids, can_run_cuda_graph = (
                         self.tp_worker.forward_batch_generation(model_worker_batch)
                     )
                 else:
-                    pp_hidden_states_proxy_tensors, _ = (
+                    pp_hidden_states_proxy_tensors, _, can_run_cuda_graph = (
                         self.tp_worker.forward_batch_generation(model_worker_batch)
                     )
                 bid = model_worker_batch.bid
@@ -1538,6 +1537,7 @@ class Scheduler(
                     next_token_ids,
                     bid,
                     num_accepted_tokens,
+                    can_run_cuda_graph,
                 ) = self.draft_worker.forward_batch_speculative_generation(batch)
                 self.spec_num_total_accepted_tokens += (
                     num_accepted_tokens + batch.batch_size()
@@ -1571,6 +1571,7 @@ class Scheduler(
                 extend_input_len_per_req=extend_input_len_per_req,
                 extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
                 bid=bid,
+                can_run_cuda_graph=can_run_cuda_graph,
             )
         else:  # embedding or reward model
             model_worker_batch = batch.get_model_worker_batch()
@@ -1593,14 +1594,9 @@ class Scheduler(
         elif batch.forward_mode.is_idle():
             if self.enable_overlap:
                 self.tp_worker.resolve_last_batch_result(launch_done)
-                if batch.next_batch_sampling_info:
-                    batch.next_batch_sampling_info.update_regex_vocab_mask()
-                    self.current_stream.synchronize()
-                    batch.next_batch_sampling_info.sampling_info_done.set()
+                self.set_next_batch_sampling_info_done(batch)
         elif batch.forward_mode.is_dummy_first():
-            batch.next_batch_sampling_info.update_regex_vocab_mask()
-            self.current_stream.synchronize()
-            batch.next_batch_sampling_info.sampling_info_done.set()
+            self.set_next_batch_sampling_info_done(batch)
 
         if self.return_health_check_ct:
             # Return some signal for the health check.
@@ -1767,6 +1763,13 @@ class Scheduler(
 
         self._extend_requests_to_queue(self.grammar_queue[:num_ready_reqs])
         self.grammar_queue = self.grammar_queue[num_ready_reqs:]
+
+    def set_next_batch_sampling_info_done(self, batch: ScheduleBatch):
+        if batch.next_batch_sampling_info:
+            if batch.next_batch_sampling_info.grammars is not None:
+                batch.next_batch_sampling_info.update_regex_vocab_mask()
+                self.current_stream.synchronize()
+            batch.next_batch_sampling_info.sampling_info_done.set()
 
     def watchdog_thread(self):
         """A watch dog thread that will try to kill the server itself if one forward batch takes too long."""
