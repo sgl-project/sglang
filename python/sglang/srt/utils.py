@@ -434,23 +434,16 @@ def make_layers(
     pp_rank: Optional[int] = None,
     pp_size: Optional[int] = None,
     prefix: str = "",
-    return_tuple: bool = False,
+    return_tuple: bool = True,
 ) -> Tuple[int, int, torch.nn.ModuleList]:
     """Make a list of layers with the given layer function"""
     # circula imports
-    from sglang.srt.distributed import get_pp_indices
+    from sglang.srt.distributed import get_pp_group
     from sglang.srt.layers.utils import PPMissingLayer
 
     assert not pp_size or num_hidden_layers >= pp_size
-    start_layer, end_layer = (
-        get_pp_indices(
-            num_hidden_layers,
-            pp_rank,
-            pp_size,
-        )
-        if pp_rank is not None and pp_size is not None
-        else (0, num_hidden_layers)
-    )
+    start_layer, end_layer = get_pp_group().pp_start_layer, get_pp_group().pp_end_layer
+    
     modules = torch.nn.ModuleList(
         [PPMissingLayer(return_tuple=return_tuple) for _ in range(start_layer)]
         + [

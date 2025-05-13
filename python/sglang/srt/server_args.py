@@ -62,7 +62,7 @@ class ServerArgs:
     revision: Optional[str] = None
 
     # Port for the HTTP server
-    host: str = "127.0.0.1"
+    host: str = "localhost"
     port: int = 30000
 
     # Memory and scheduling
@@ -79,6 +79,8 @@ class ServerArgs:
     # Other runtime options
     tp_size: int = 1
     pp_size: int = 1
+    pp_start_layer: int = 0
+    pp_end_layer: int = 0
     max_micro_batch_size: Optional[int] = None
     stream_interval: int = 1
     stream_output: bool = False
@@ -684,6 +686,18 @@ class ServerArgs:
             type=int,
             default=ServerArgs.pp_size,
             help="The pipeline parallelism size.",
+        )
+        parser.add_argument(
+            "--pp-start-layer",
+            type=int,
+            required=True,
+            help="The start layer of the pipeline parallelism.",
+        )
+        parser.add_argument(
+            "--pp-end-layer",
+            type=int,
+            required=True,
+            help="The end layer of the pipeline parallelism.",
         )
         parser.add_argument(
             "--max-micro-batch-size",

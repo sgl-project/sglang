@@ -238,7 +238,7 @@ class CudaGraphRunner:
             self.mrope_positions = torch.zeros((3, self.max_bs), dtype=torch.int64)
 
             # pipeline parallelism
-            if self.pp_size > 1:
+            if self.pp_size > 0:
                 self.pp_proxy_tensors = {
                     "hidden_states": torch.zeros(
                         (self.max_bs, self.model_runner.model_config.hidden_size),
@@ -401,7 +401,7 @@ class CudaGraphRunner:
         mrope_positions = self.mrope_positions[:, :bs]
 
         # pipeline parallelism
-        if self.pp_size > 1:
+        if self.pp_size > 0:
             pp_proxy_tensors = PPProxyTensors(
                 {k: v[:num_tokens] for k, v in self.pp_proxy_tensors.items()}
             )
@@ -480,7 +480,7 @@ class CudaGraphRunner:
 
             kwargs = {}
             if (
-                self.pp_size > 1
+                self.pp_size > 0
                 and "pp_proxy_tensors" in inspect.signature(forward).parameters
             ):
                 kwargs["pp_proxy_tensors"] = pp_proxy_tensors

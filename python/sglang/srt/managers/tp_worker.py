@@ -83,6 +83,8 @@ class TpModelWorker:
             tp_size=server_args.tp_size,
             pp_rank=pp_rank,
             pp_size=server_args.pp_size,
+            pp_start_layer=server_args.pp_start_layer,
+            pp_end_layer=server_args.pp_end_layer,
             nccl_port=nccl_port,
             server_args=server_args,
             is_draft_worker=is_draft_worker,

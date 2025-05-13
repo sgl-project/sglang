@@ -413,6 +413,7 @@ class LlamaForCausalLM(nn.Module):
         self.model = self._init_model(config, quant_config, add_prefix("model", prefix))
         # Llama 3.2 1B Instruct set tie_word_embeddings to True
         # Llama 3.1 8B Instruct set tie_word_embeddings to False
+        self.config.tie_word_embeddings = False
         if self.config.tie_word_embeddings:
             self.lm_head = self.model.embed_tokens
         else:

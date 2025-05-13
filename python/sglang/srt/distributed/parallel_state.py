@@ -210,6 +210,9 @@ class GroupCoordinator:
         use_npu_communicator: bool,
         use_message_queue_broadcaster: bool = False,
         group_name: Optional[str] = None,
+        pp_start_layer: int = 0,
+        pp_end_layer: int = 0,
+        hidden_layers: int = 0,
     ):
         group_name = group_name or "anonymous"
         self.unique_name = _get_unique_name(group_name)
@@ -217,6 +220,9 @@ class GroupCoordinator:
 
         self.rank = torch.distributed.get_rank()
         self.local_rank = local_rank
+        self.pp_start_layer = pp_start_layer
+        self.pp_end_layer = pp_end_layer
+        self.hidden_layers = hidden_layers
         self.device_group = None
         self.cpu_group = None
 
@@ -325,12 +331,12 @@ class GroupCoordinator:
     @property
     def is_first_rank(self):
         """Return whether the caller is the first process in the group"""
-        return self.rank == self.first_rank
+        return self.pp_start_layer == 0
 
     @property
     def is_last_rank(self):
         """Return whether the caller is the last process in the group"""
-        return self.rank == self.last_rank
+        return self.pp_end_layer == self.hidden_layers
 
     @property
     def next_rank(self):
@@ -972,6 +978,9 @@ def init_model_parallel_group(
     use_custom_allreduce: Optional[bool] = None,
     use_message_queue_broadcaster: bool = False,
     group_name: Optional[str] = None,
+    pp_start_layer: int = 0,
+    pp_end_layer: int = 0,
+    hidden_layers: int = 0,
 ) -> GroupCoordinator:
     if use_custom_allreduce is None:
         use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
@@ -986,6 +995,9 @@ def init_model_parallel_group(
         use_npu_communicator=True,
         use_message_queue_broadcaster=use_message_queue_broadcaster,
         group_name=group_name,
+        pp_start_layer=pp_start_layer,
+        pp_end_layer=pp_end_layer,
+        hidden_layers=hidden_layers,
     )
 
 
@@ -1101,6 +1113,9 @@ def init_distributed_environment(
 def initialize_model_parallel(
     tensor_model_parallel_size: int = 1,
     pipeline_model_parallel_size: int = 1,
+    pp_start_layer: int = 0,
+    pp_end_layer: int = 0,
+    hidden_layers: int = 0,
     backend: Optional[str] = None,
 ) -> None:
     """
@@ -1172,6 +1187,9 @@ def initialize_model_parallel(
         backend,
         use_custom_allreduce=False,
         group_name="pp",
+        pp_start_layer=pp_start_layer,
+        pp_end_layer=pp_end_layer,
+        hidden_layers=hidden_layers,
     )
 
 

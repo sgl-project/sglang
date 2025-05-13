@@ -49,7 +49,6 @@ import json
 import logging
 import multiprocessing
 import os
-import pickle
 import time
 from typing import Tuple
 
@@ -57,7 +56,6 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed.parallel_state import destroy_distributed_environment
 from sglang.srt.entrypoints.engine import _set_envs_and_config
@@ -235,7 +233,7 @@ def prepare_synthetic_inputs_for_latency_test(batch_size, input_len):
 
 
 @torch.no_grad
-def extend(reqs, model_runner: ModelRunner):
+def extend(reqs, model_runner, model_runner2=None):
     batch = ScheduleBatch.init_new(
         reqs=reqs,
         req_to_token_pool=model_runner.req_to_token_pool,
@@ -250,91 +248,29 @@ def extend(reqs, model_runner: ModelRunner):
     _maybe_prepare_dp_attn_batch(batch, model_runner)
     model_worker_batch = batch.get_model_worker_batch()
     forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
-<<<<<<< HEAD
-    logits_output, _ = model_runner.forward(forward_batch)
+    logits_output = model_runner.forward(forward_batch)
+
+    if model_runner2 is not None:
+        forward_batch2 = ForwardBatch.init_new(model_worker_batch, model_runner2)
+        logits_output = model_runner2.forward(forward_batch2, pp_proxy_tensors=logits_output)
+
     next_token_ids = model_runner.sample(logits_output, forward_batch)
     return next_token_ids, logits_output.next_token_logits, batch
-=======
-    if model_runner.pp_start_layer != 0:
-        pp_proxy_tensors = None
-        try:
-            # 尝试从之前保存的pickle文件中加载数据
-            if os.path.exists(f'output/logits_output_layer_{model_runner.pp_start_layer}.pkl'):
-                with open(f'output/logits_output_layer_{model_runner.pp_start_layer}.pkl', 'rb') as f:
-                    pp_proxy_tensors = pickle.load(f)
-                    for key, tensor in pp_proxy_tensors.tensors.items():
-                        print(key, tensor.shape)
-        except Exception as e:
-            print(f"加载pickle文件时出错: {e}")
-        
-        # 如果加载失败，使用默认值
-        if pp_proxy_tensors is None:
-            pp_proxy_tensors = PPProxyTensors({
-                "hidden_states": torch.ones(
-                    (forward_batch.input_ids.shape[0], model_runner.model_config.hidden_size),
-                    dtype=torch.bfloat16,
-                ).cuda(),
-                "residual": torch.ones(
-                    (forward_batch.input_ids.shape[0], model_runner.model_config.hidden_size),
-                    dtype=torch.bfloat16,
-                ).cuda(),
-            })
-        logits_output = model_runner.forward(forward_batch, pp_proxy_tensors=pp_proxy_tensors)
-    else:
-        logits_output = model_runner.forward(forward_batch)
-    
-
-    if model_runner.pp_end_layer != model_runner.model_config.num_hidden_layers:
-        assert isinstance(logits_output, PPProxyTensors)
-        # 使用pickle序列化logits_output并保存到本地文件
-        with open(f'output/logits_output_layer_{model_runner.pp_end_layer}.pkl', 'wb') as f:
-            pickle.dump(logits_output, f)
-        return logits_output
-    else:
-        assert isinstance(logits_output, LogitsProcessorOutput)
-        next_token_ids = model_runner.sample(logits_output, forward_batch)
-        return next_token_ids, logits_output.next_token_logits, batch
->>>>>>> ae829c7d (customize pp_start_layer and pp_end_layer)
 
 
 @torch.no_grad
-def decode(input_token_ids, batch: ScheduleBatch, model_runner):
+def decode(input_token_ids, batch, model_runner, model_runner2=None):
     batch.output_ids = input_token_ids
     batch.prepare_for_decode()
     _maybe_prepare_dp_attn_batch(batch, model_runner)
     model_worker_batch = batch.get_model_worker_batch()
     forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
-<<<<<<< HEAD
-    logits_output, _ = model_runner.forward(forward_batch)
-=======
-    if model_runner.pp_start_layer != 0:
-        pp_proxy_tensors = None
-        try:
-            # 尝试从之前保存的pickle文件中加载数据
-            if os.path.exists(f'output/logits_output_layer_{model_runner.pp_start_layer}.pkl'):
-                with open(f'output/logits_output_layer_{model_runner.pp_start_layer}.pkl', 'rb') as f:
-                    pp_proxy_tensors = pickle.load(f)
-                    for key, tensor in pp_proxy_tensors.tensors.items():
-                        pp_proxy_tensors[key] = tensor[0:1,:]
+    logits_output = model_runner.forward(forward_batch)
+    
+    if model_runner2 is not None:
+        forward_batch2 = ForwardBatch.init_new(model_worker_batch, model_runner2)
+        logits_output = model_runner2.forward(forward_batch2, pp_proxy_tensors=logits_output)
 
-        except Exception as e:
-            print(f"加载pickle文件时出错: {e}")
-        
-        # 如果加载失败，使用默认值
-        if pp_proxy_tensors is None:
-            pp_proxy_tensors = PPProxyTensors({
-                "hidden_states": torch.ones(
-                    (1, model_runner.model_config.hidden_size),
-                    dtype=torch.bfloat16,
-                ).cuda(),
-                "residual": torch.ones(
-                    (1, model_runner.model_config.hidden_size),
-                    dtype=torch.bfloat16,
-                ).cuda(),
-            })
-
-    logits_output = model_runner.forward(forward_batch, pp_proxy_tensors=pp_proxy_tensors)
->>>>>>> ae829c7d (customize pp_start_layer and pp_end_layer)
     next_token_ids = model_runner.sample(logits_output, forward_batch)
     return next_token_ids, logits_output.next_token_logits
 
@@ -353,6 +289,14 @@ def _maybe_prepare_dp_attn_batch(batch: ScheduleBatch, model_runner):
         )
 
 
+def create_model_runner_subprocess(server_args, port_args, tp_rank, result_queue):
+    try:
+        model_runner, tokenizer = load_model(server_args, port_args, tp_rank)
+        result_queue.put((True, model_runner, tokenizer))
+    except Exception as e:
+        result_queue.put((False, str(e), None))
+
+
 def correctness_test(
     server_args,
     port_args,
@@ -364,7 +308,25 @@ def correctness_test(
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
 
     # Load the model
+    server_args.pp_start_layer = 0
+    server_args.pp_end_layer = 8
     model_runner, tokenizer = load_model(server_args, port_args, tp_rank)
+    server_args.pp_start_layer = 8
+    server_args.pp_end_layer = 16
+
+    port_args.nccl_port = port_args.nccl_port + 1
+    result_queue = multiprocessing.Queue()
+    subprocess = multiprocessing.Process(
+        target=create_model_runner_subprocess,
+        args=(server_args, port_args, tp_rank, result_queue)
+    )
+    subprocess.start()
+    success, result1, result2 = result_queue.get()
+    if success:
+        model_runner2, _ = result1, result2 
+    else:
+        raise RuntimeError(f"创建model_runner2失败: {result1}")
+    subprocess.join()
 
     # Prepare inputs
     input_ids, reqs = prepare_inputs_for_correctness_test(bench_args, tokenizer)
@@ -372,7 +334,7 @@ def correctness_test(
 
     if bench_args.cut_len > 0:
         # Prefill
-        next_token_ids, next_token_logits, batch = extend(reqs, model_runner)
+        next_token_ids, next_token_logits, batch = extend(reqs, model_runner, model_runner2)
         rank_print(f"prefill logits (first half): {next_token_logits} \n")
 
     # Prepare extend inputs
@@ -381,13 +343,13 @@ def correctness_test(
     )
 
     # Extend (prefill w/ KV cache)
-    next_token_ids, next_token_logits, batch = extend(reqs, model_runner)
+    next_token_ids, next_token_logits, batch = extend(reqs, model_runner, model_runner2)
     rank_print(f"prefill logits (final): {next_token_logits} \n")
 
     # Decode
     output_ids = [input_ids[i] + [next_token_ids[i]] for i in range(len(input_ids))]
     for _ in range(bench_args.output_len[0] - 1):
-        next_token_ids, _ = decode(next_token_ids, batch, model_runner)
+        next_token_ids, _ = decode(next_token_ids, batch, model_runner, model_runner2)
         next_token_ids_list = next_token_ids.tolist()
         for i in range(len(reqs)):
             output_ids[i].append(next_token_ids_list[i])
