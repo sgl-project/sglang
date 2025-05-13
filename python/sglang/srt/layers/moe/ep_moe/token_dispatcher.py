@@ -119,7 +119,8 @@ class _DeepEPConfig:
     def __init__(self):
         deepep_config = global_server_args_dict["deepep_config"]
         if deepep_config:
-            TODO
+            self.normal_dispatch_config = TODO
+            self.normal_combine_config = TODO
         else:
             self.normal_dispatch_config = None
             self.normal_combine_config = None
