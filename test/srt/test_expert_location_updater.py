@@ -1,6 +1,7 @@
 import traceback
 import unittest
 
+import torch
 import torch.multiprocessing as mp
 from sglang.srt.model_executor import expert_location_updater
 from sglang.test.test_utils import CustomTestCase
@@ -76,7 +77,8 @@ def _run_subprocess(
                 old_physical_to_logical_map=old_physical_to_logical_map,
                 new_physical_to_logical_map=new_physical_to_logical_map,
             )
-            assert all(torch.all(x == y) for x, y in zip(TODO, TODO, strict=True))
+            expect_new_weights = _create_routed_experts_weights(new_physical_to_logical_map)
+            assert all(torch.all(x == y) for x, y in zip(routed_experts_weights, expect_new_weights, strict=True))
 
         execution_ok = True
     except Exception as e:
