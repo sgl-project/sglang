@@ -123,7 +123,6 @@ class ModelRunner:
     def __init__(
         self,
         model_config: ModelConfig,
-        expert_location_metadata: Optional[ExpertLocationMetadata],
         mem_fraction_static: float,
         gpu_id: int,
         tp_rank: int,
@@ -203,11 +202,6 @@ class ModelRunner:
         if _ENABLE_JIT_DEEPGEMM:
             update_deep_gemm_config(gpu_id, server_args)
 
-        [expert_location_metadata] = broadcast_pyobj(
-            data=[expert_location_metadata],
-            rank=torch.distributed.get_rank(),
-            dist_group=get_world_group().cpu_group,
-        )
         expert_location_metadata.to(server_args.device)
         set_global_expert_location_metadata(expert_location_metadata)
         if self.tp_rank == 0 and get_bool_env_var(

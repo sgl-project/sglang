@@ -55,7 +55,6 @@ class TpModelWorkerClient:
     def __init__(
         self,
         server_args: ServerArgs,
-        expert_location_metadata: Optional[ExpertLocationMetadata],
         gpu_id: int,
         tp_rank: int,
         dp_rank: Optional[int],
@@ -63,7 +62,7 @@ class TpModelWorkerClient:
     ):
         # Load the model
         self.worker = TpModelWorker(
-            server_args, expert_location_metadata, gpu_id, tp_rank, dp_rank, nccl_port
+            server_args, gpu_id, tp_rank, dp_rank, nccl_port
         )
         self.max_running_requests = self.worker.max_running_requests
         self.device = self.worker.device
