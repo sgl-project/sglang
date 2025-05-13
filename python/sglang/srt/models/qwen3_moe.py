@@ -283,6 +283,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 class Qwen3MoeAttention(nn.Module):
     def __init__(
         self,
+        config: Qwen3MoeConfig,
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
@@ -363,6 +364,10 @@ class Qwen3MoeAttention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
             prefix=add_prefix("attn", prefix),
+            orig_context_len=getattr(
+                config, "orig_context_len", max_position_embeddings
+            ),
+            rope=self.rotary_emb,
         )
 
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
@@ -414,7 +419,11 @@ class Qwen3MoeAttention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self._apply_qk_norm(q, k)
-        q, k = self.rotary_emb(positions, q, k)
+        # RoPE is applied inside the attention kernel in HiP Attention
+        if (forward_batch.hip_metadata_cache_pool is None) or (
+            not forward_batch.hip_metadata_cache_pool.hip_config.using_extend
+        ):
+            q, k = self.rotary_emb(positions, q, k)
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
 
@@ -464,6 +473,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
             config, "dual_chunk_attention_config", None
         )
         self.self_attn = Qwen3MoeAttention(
+            config=config,
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
@@ -631,6 +641,8 @@ class Qwen3MoeModel(Qwen2MoeModel):
 
 class Qwen3MoeForCausalLM(nn.Module):
     fall_back_to_pt_during_load = False
+
+    hip_attention_supported = True
 
     def __init__(
         self,
