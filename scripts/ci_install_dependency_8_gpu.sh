@@ -7,6 +7,7 @@ export NVSHMEM_DIR=/opt/nvshmem/install
 export LD_LIBRARY_PATH="${NVSHMEM_DIR}/lib:$LD_LIBRARY_PATH"
 export PATH="${NVSHMEM_DIR}/bin:$PATH"
 export CUDA_HOME=/usr/local/cuda
+export NCCL_IB_DISABLE=1
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 bash "${SCRIPT_DIR}/killall_sglang.sh"
