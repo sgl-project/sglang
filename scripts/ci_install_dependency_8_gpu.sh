@@ -123,3 +123,6 @@ gdrcopy_copybw
 echo "=== Verify NVSHMEM ==="
 nvshmem-info -a
 # /opt/nvshmem/bin/perftest/device/pt-to-pt/shmem_put_bw
+
+# Install hf_xet
+pip install huggingface_hub[hf_xet]

@@ -104,6 +104,7 @@ suites = {
         # TestFile("test_moe_deepep_eval_accuracy_large.py", 250),
         TestFile("test_disaggregation.py", 210),
         TestFile("test_local_attn.py", 250),
+        TestFile("test_disaggregation_different_tp.py", 210),
         TestFile("test_full_deepseek_v3.py", 250),
         TestFile("test_pp_single_node.py", 150),
     ],
