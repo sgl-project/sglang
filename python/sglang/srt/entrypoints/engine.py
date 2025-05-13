@@ -20,14 +20,11 @@ This file implements python APIs for the inference engine.
 import asyncio
 import atexit
 import dataclasses
-import json
 import logging
 import multiprocessing as mp
 import os
 import signal
 import threading
-from json import JSONDecodeError
-from pathlib import Path
 from typing import AsyncIterator, Dict, Iterator, List, Optional, Tuple, Union
 
 import zmq
@@ -621,42 +618,3 @@ def _launch_subprocesses(
     scheduler_info = scheduler_infos[0]
     tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
     return tokenizer_manager, scheduler_info
-
-
-def _compute_initial_expert_location_metadata(
-    server_args: ServerArgs, eplb_manager: EPLBManager
-) -> ExpertLocationMetadata:
-    TODO_move
-    if (data := server_args.init_expert_location) is not None:
-        if data == "trivial":
-            logger.info("init_expert_location from init_expert_location=trivial")
-            return ExpertLocationMetadata.init_trivial(server_args)
-        if data == "padding":
-            logger.info("init_expert_location from init_expert_location=padding")
-            return ExpertLocationMetadata.init_padding(server_args)
-
-        try:
-            data_dict = json.loads(data)
-        except JSONDecodeError:
-            data_dict = json.loads(Path(data).read_text())
-
-        if "physical_to_logical_map" in data_dict:
-            logger.info(
-                "init_expert_location from init_by_mapping using ServerArgs.init_expert_location"
-            )
-            return ExpertLocationMetadata.init_by_mapping(server_args, **data_dict)
-        elif "logical_count" in data_dict:
-            logger.info(
-                "init_expert_location from init_by_eplb using ServerArgs.init_expert_location"
-            )
-            return ExpertLocationMetadata.init_by_eplb(server_args, **data_dict)
-        else:
-            raise NotImplementedError(
-                f"Unknown init_expert_location format ({list(data_dict.keys())=})"
-            )
-
-    if server_args.enable_eplb:
-        logger.info("init_expert_location from EPLBManager")
-        return eplb_manager.compute_expert_location_metadata()
-
-    return ExpertLocationMetadata.init_trivial(server_args)
