@@ -593,7 +593,7 @@ class _DequeCollection:
         return {d.maxlen: sum(d) / len(d) for d in self._dequeues}
 
 
-class _DetailAccumulator(_Accumulator):
+class _DetailAccumulator(_UtilizationRateAccumulatorMixin):
     def __init__(self, expert_location_metadata: "ExpertLocationMetadata", rank: int):
         super().__init__(expert_location_metadata, rank)
         self._records = []
@@ -618,6 +618,8 @@ class _DetailAccumulator(_Accumulator):
         gatherer_key: str,
         single_pass_data: Dict,
     ):
+        super().append(forward_pass_id, gatherer_key, single_pass_data)
+
         def _process_object(obj):
             if isinstance(obj, torch.Tensor):
                 return obj.cpu().clone()
@@ -637,6 +639,7 @@ class _DetailAccumulator(_Accumulator):
         )
 
     def reset(self):
+        super().reset()
         self._records.clear()
 
     def dump(self):
@@ -650,7 +653,7 @@ class _DetailAccumulator(_Accumulator):
         torch.save(output, str(path_output))
 
 
-class _StatAccumulator(_Accumulator):
+class _StatAccumulator(_UtilizationRateAccumulatorMixin):
     def __init__(self, expert_location_metadata: "ExpertLocationMetadata", rank: int):
         super().__init__(expert_location_metadata, rank)
         self._buffer_global_physical_count = torch.zeros(
@@ -672,12 +675,14 @@ class _StatAccumulator(_Accumulator):
         gatherer_key: str,
         single_pass_data: Dict,
     ):
+        super().append(forward_pass_id, gatherer_key, single_pass_data)
         # Can optimize if overhead here is large
         self._buffer_global_physical_count += single_pass_data[
             "global_physical_count"
         ].cpu()
 
     def reset(self):
+        super().reset()
         self._buffer_global_physical_count[...] = 0
         self._logical_count[...] = 0
 
