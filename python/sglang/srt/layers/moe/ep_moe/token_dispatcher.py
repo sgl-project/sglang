@@ -126,7 +126,8 @@ class _DeepEPConfig:
         config_str = global_server_args_dict["deepep_config"]
         if config_str:
             config_parsed = load_json_config(config_str)
-            logger.info(f"Use DeepEP Config: {config_parsed}")
+            if torch.distributed.get_rank() == 0:
+                logger.info(f"Use DeepEP Config: {config_parsed}")
             self.normal_dispatch_config = Config(**config_parsed["normal_dispatch"])
             self.normal_combine_config = Config(**config_parsed["normal_combine"])
         else:
@@ -458,9 +459,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         buffer = self._get_buffer()
         topk_idx = topk_idx.to(torch.int64)
         expected_m = (
-            hidden_states.shape[0] * buffer.group_size * topk_idx.shape[1]
-            + self.num_experts
-        ) // self.num_experts
+                         hidden_states.shape[0] * buffer.group_size * topk_idx.shape[1]
+                         + self.num_experts
+                     ) // self.num_experts
         hidden_states, masked_m, event, hook = self._dispatch_core(
             hidden_states,
             topk_idx,
