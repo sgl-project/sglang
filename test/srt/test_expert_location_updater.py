@@ -86,6 +86,7 @@ def _run_subprocess(
                 torch.arange(0, num_logical_experts),
                 torch.randint(0, num_logical_experts, (num_physical_experts - num_logical_experts,)),
             ])
+            ans = ans[torch.randperm(ans.shape[0])]
             return ans
 
         physical_to_logical_map = _create_physical_to_logical_map()
