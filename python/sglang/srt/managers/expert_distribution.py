@@ -686,21 +686,18 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             physical_to_logical_map=self._expert_location_metadata.physical_to_logical_map,
         )
         torch.distributed.all_reduce(logical_count_of_buffered_step, op=torch.distributed.ReduceOp.SUM)
+        output = dict(
+            rank=self._rank,
+            logical_count=logical_count_of_buffered_step,
+        )
 
         if output_mode == "file":
             if self._rank == 0:
-                _dump_to_file(f"expert_distribution_recorder_{time.time()}.pt", TODO)
-
+                _dump_to_file(f"expert_distribution_recorder_{time.time()}.pt", output)
         elif output_mode == "object":
-            TODO
-
+            return output
         else:
             raise NotImplementedError
-
-        return dict(
-            rank=self._rank,
-            logical_count=self._logical_count.tolist(),
-        )
 
 
 def _dump_to_file(name, data):
