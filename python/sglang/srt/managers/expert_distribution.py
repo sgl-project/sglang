@@ -5,7 +5,7 @@ from abc import ABC
 from collections import deque
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Type
+from typing import Any, Dict, List, Optional, Type, Literal
 
 import einops
 import torch
@@ -18,8 +18,9 @@ from sglang.srt.utils import Withable, get_bool_env_var
 
 logger = logging.getLogger(__name__)
 
-
 # --------------------------------------- Entrypoint -----------------------------------------
+
+_OutputMode = Literal["file", "object"]
 
 
 class ExpertDistributionRecorder:
@@ -73,7 +74,7 @@ class ExpertDistributionRecorder:
     def stop_record(self):
         self._on_not_implemented()
 
-    def dump_record(self):
+    def dump_record(self, output_mode: _OutputMode):
         self._on_not_implemented()
 
     def _on_not_implemented(self):
@@ -203,9 +204,9 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             )
         self._recording = False
 
-    def dump_record(self):
+    def dump_record(self, output_mode: _OutputMode):
         """Dump the expert distribution record and reset the recorder after dumping."""
-        output = self._accumulator.dump()
+        output = self._accumulator.dump(output_mode=output_mode)
         self._reset()
         return output
 
@@ -522,7 +523,7 @@ class _Accumulator(ABC):
     def reset(self):
         raise NotImplementedError
 
-    def dump(self):
+    def dump(self, output_mode: _OutputMode):
         raise NotImplementedError
 
 
@@ -648,7 +649,8 @@ class _DetailAccumulator(_UtilizationRateAccumulatorMixin):
         super().reset()
         self._records.clear()
 
-    def dump(self):
+    def dump(self, output_mode: _OutputMode):
+        assert output_mode == "file"
         path_output = Path(self._save_dir) / f"{time.time()}-{self._rank}.pt"
         logger.info(f"Write expert distribution to {path_output}")
         output = dict(
@@ -692,7 +694,14 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
         self._buffer_global_physical_count[...] = 0
         self._logical_count[...] = 0
 
-    def dump(self):
+    def dump(self, output_mode: _OutputMode):
+        if output_mode == "file":
+            TODO
+        elif output_mode == "object":
+            TODO
+        else:
+            raise NotImplementedError
+
         self._logical_count += _convert_global_physical_count_to_logical_count(
             self._buffer_global_physical_count,
             num_layers=self._expert_location_metadata.num_layers,
