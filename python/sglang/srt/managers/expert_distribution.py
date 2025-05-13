@@ -696,9 +696,12 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
 
     def dump(self, output_mode: _OutputMode):
         if output_mode == "file":
-            TODO
+            if rank == 0:
+                TODO
+
         elif output_mode == "object":
             TODO
+
         else:
             raise NotImplementedError
 
