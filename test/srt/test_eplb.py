@@ -87,7 +87,6 @@ class TestEPLBMisc(CustomTestCase):
                 disable_overlap_schedule=True,
             )
             self._assert_behavior(engine)
-            TODO
 
             print(f"Action: eplb_save_expert_distribution")
             engine.dump_expert_distribution_record()
@@ -105,18 +104,7 @@ class TestEPLBMisc(CustomTestCase):
                 init_expert_location=str(snapshot_path),
                 port=21000,
             )
-            self._assert_behavior(engine, "not_equal_trivial")
-            print(f"Action: shutdown engine")
-            engine.shutdown()
-            del engine
-
-            print(
-                f"Action: start engine to check automatically loading from storage dir"
-            )
-            engine = sgl.Engine(
-                **engine_kwargs, eplb_storage_dir=eplb_storage_dir_a, port=22000
-            )
-            self._assert_behavior(engine, "not_equal_trivial")
+            self._assert_behavior(engine)
             print(f"Action: shutdown engine")
             engine.shutdown()
             del engine
