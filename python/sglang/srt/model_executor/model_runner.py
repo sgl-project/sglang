@@ -683,16 +683,30 @@ class ModelRunner:
             monkey_patch_vllm_gguf_config()
 
         if self.server_args.enable_hip_attention:
-            orig_context_length = get_context_length(self.model_config.hf_config)
-            new_context_length = (
-                max(orig_context_length, self.server_args.context_length)
-                if self.server_args.context_length is not None
-                else orig_context_length
-            )
-            if self.server_args.context_length is None:
-                new_context_length = orig_context_length
-            update_context_length(self.model_config.hf_config, new_context_length)
-            self.model_config.hf_config.orig_context_len = orig_context_length
+            if hasattr(self.model_config.hf_config, 'text_config'):
+                orig_context_length = get_context_length(self.model_config.hf_config.text_config)
+                new_context_length = (
+                    max(orig_context_length, self.server_args.context_length)
+                    if self.server_args.context_length is not None
+                    else orig_context_length
+                )
+                if self.server_args.context_length is None:
+                    new_context_length = orig_context_length
+                update_context_length(self.model_config.hf_config, new_context_length)
+                update_context_length(self.model_config.hf_config.text_config, new_context_length)
+                self.model_config.hf_config.orig_context_len = orig_context_length
+                self.model_config.hf_config.text_config.orig_context_len = orig_context_length
+            else:
+                orig_context_length = get_context_length(self.model_config.hf_config)
+                new_context_length = (
+                    max(orig_context_length, self.server_args.context_length)
+                    if self.server_args.context_length is not None
+                    else orig_context_length
+                )
+                if self.server_args.context_length is None:
+                    new_context_length = orig_context_length
+                update_context_length(self.model_config.hf_config, new_context_length)
+                self.model_config.hf_config.orig_context_len = orig_context_length
             logger.info(
                 f"Update model config for HiP context extension "
                 f"{orig_context_length} -> {new_context_length}."
