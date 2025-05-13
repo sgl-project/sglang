@@ -526,7 +526,7 @@ class _Accumulator(ABC):
         raise NotImplementedError
 
 
-class _UtilizationRateAccumulatorMixin(_StatAccumulator):
+class _UtilizationRateAccumulatorMixin(_Accumulator):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         window_sizes = [10, 100, 1000]
