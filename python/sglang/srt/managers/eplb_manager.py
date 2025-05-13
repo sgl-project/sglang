@@ -35,6 +35,9 @@ class EPLBManager:
         if forward_pass_id % self._server_args.eplb_rebalance_num_iterations == 0:
             self.rebalance()
 
+    async def rebalance(self):
+        TODO
+
 
 class _TODO_REMOVE_EPLBManager:
     def bind(self, tokenizer_manager: "TokenizerManager"):
