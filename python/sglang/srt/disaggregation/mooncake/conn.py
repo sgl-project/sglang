@@ -551,11 +551,10 @@ class MooncakeKVReceiver(BaseKVReceiver):
         prefill_tp_size_per_dp_rank = exact_int_div(
             self.prefill_tp_size, self.prefill_dp_size
         )
+        local_tp_rank = self.kv_mgr.kv_args.engine_rank % local_tp_size_per_dp_rank
 
         if local_tp_size_per_dp_rank == prefill_tp_size_per_dp_rank:
-            self.target_prefill_tp_rank = (
-                self.kv_mgr.kv_args.engine_rank % local_tp_size_per_dp_rank
-            )
+            self.target_prefill_tp_rank = local_tp_rank
             self.required_dst_info_num = 1
             self.target_prefill_tp_ranks = [self.target_prefill_tp_rank]
         elif local_tp_size_per_dp_rank > prefill_tp_size_per_dp_rank:
@@ -566,9 +565,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
                 local_tp_size_per_dp_rank, prefill_tp_size_per_dp_rank
             )
             # Each prefill TP rank will send to replicated_decode_per_prefill decode workers
-            self.target_prefill_tp_rank = (
-                self.kv_mgr.kv_args.engine_rank % local_tp_size_per_dp_rank
-            ) // replicated_decode_per_prefill
+            self.target_prefill_tp_rank = local_tp_rank // replicated_decode_per_prefill
             self.required_dst_info_num = replicated_decode_per_prefill
             self.target_prefill_tp_ranks = [self.target_prefill_tp_rank]
         else:
@@ -580,7 +577,6 @@ class MooncakeKVReceiver(BaseKVReceiver):
             replicated_prefill_per_decode = exact_int_div(
                 prefill_tp_size_per_dp_rank, local_tp_size_per_dp_rank
             )
-            local_tp_rank = self.kv_mgr.kv_args.engine_rank % local_tp_size_per_dp_rank
             self.target_prefill_tp_ranks = [
                 rank
                 for rank in range(
