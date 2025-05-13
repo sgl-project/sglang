@@ -2,9 +2,11 @@ import heapq
 import logging
 import threading
 import time
+import hashlib
 from typing import List, Optional
 
 import torch
+import numpy as np
 
 from sglang.srt.managers.cache_controller import HiCacheController
 from sglang.srt.mem_cache.memory_pool import (
@@ -21,6 +23,55 @@ from sglang.srt.mem_cache.mooncake_store import MooncakeStore
 
 logger = logging.getLogger(__name__)
 
+
+
+def token_ids_to_key(
+    token_ids: List,
+    local_rank: int
+):
+    token_ids_bytes = np.array(token_ids).tobytes()
+    hash_object = hashlib.blake2b(token_ids_bytes)
+    hash_hex = hash_object.hexdigest()
+    return f"{int(hash_hex[:16], 16)}_{local_rank}"
+
+
+def page_token_ids_to_key(
+    prefix_page_ids: List,
+    current_page_ids: List,
+    local_rank: int
+):
+    prefix_str = ""
+    if len(prefix_page_ids) > 0:
+        prefix_page_ids_bytes = np.array(prefix_page_ids).tobytes()
+        prefix_hash_object = hashlib.blake2b(prefix_page_ids_bytes)
+        prefix_hash_hex = prefix_hash_object.hexdigest()
+        prefix_str = f"{int(prefix_hash_hex[:16], 16)}"
+
+    current_token_ids_bytes = np.array(current_page_ids).tobytes()
+    current_hash_object = hashlib.blake2b(current_token_ids_bytes)
+    current_hash_hex = current_hash_object.hexdigest()
+
+    return f"{prefix_str}_{int(current_hash_hex[:16], 16)}_{local_rank}"
+
+def get_node_l3_keys(
+    token_ids: List,
+    token_len: int,
+    local_rank: int = 0,
+    page_size: int = 1,
+):
+    l3_keys = []
+    if page_size == 1:
+        # 每个token的key构建需要加上完整的前缀
+        for i in range(token_len):
+            l3_keys.append(token_ids_to_key(token_ids[:i - token_len + 1], local_rank))
+    else:
+        num_key = token_len // page_size
+        for i in range(num_key):
+            prefix_page_ids = token_ids[: -(num_key - i) * page_size]
+            current_page_ids = token_ids[-(num_key - i) * page_size: -(num_key - i + 1) * page_size]
+            l3_keys.append(page_token_ids_to_key(prefix_page_ids, current_page_ids, local_rank))
+
+    return l3_keys
 
 class HiRadixCache(RadixCache):
 
@@ -48,12 +99,14 @@ class HiRadixCache(RadixCache):
             raise ValueError(f"HiRadixCache only supports MHA and MLA yet")
 
         self.mooncake_l3_kv_pool = None
+        self.enable_mooncake_store_l3_cache = enable_mooncake_store_l3_cache
         if enable_mooncake_store_l3_cache:
             # TODO(huangtingwei9988):L3 cache only support write_through_selective and write_through write policy
             assert hicache_write_policy in ["write_through_selective", "write_through"]
             self.mooncake_l3_kv_pool = MooncakeStore()
 
         self.tp_group = tp_cache_group
+        self.page_size = page_size
 
         self.load_cache_event = threading.Event()
         self.cache_controller = HiCacheController(
@@ -92,16 +145,23 @@ class HiRadixCache(RadixCache):
             height += 1
         return height
 
-    def write_backup(self, node: TreeNode, write_back=False):
+    def write_backup(self, node: TreeNode, write_back=False, token_ids: Optional[List]=None):
+        l3_keys = []
+        if self.enable_mooncake_store_l3_cache:
+            l3_keys = get_node_l3_keys(token_ids, len(node.value),
+                                       torch.cuda.current_device(), self.page_size)
+
         host_indices = self.cache_controller.write(
             device_indices=node.value,
             node_id=node.id,
+            l3_keys=l3_keys if self.enable_mooncake_store_l3_cache else None
         )
         if host_indices is None:
             self.evict_host(len(node.value))
             host_indices = self.cache_controller.write(
                 device_indices=node.value,
                 node_id=node.id,
+                l3_keys=l3_keys if self.enable_mooncake_store_l3_cache else None
             )
         if host_indices is not None:
             node.host_value = host_indices
@@ -112,14 +172,17 @@ class HiRadixCache(RadixCache):
         else:
             return 0
 
+        if len(l3_keys) > 0:
+            node.l3_keys = l3_keys
+
         return len(host_indices)
 
-    def inc_hit_count(self, node: TreeNode):
+    def inc_hit_count(self, node: TreeNode, token_ids: Optional[List]=None):
         if node.backuped or self.cache_controller.write_policy == "write_back":
             return
         node.hit_count += 1
         if node.hit_count >= self.write_through_threshold:
-            self.write_backup(node)
+            self.write_backup(node, token_ids=token_ids)
             node.hit_count = 0
 
     def writing_check(self, write_back=False):
@@ -243,12 +306,18 @@ class HiRadixCache(RadixCache):
         # todo: more loading policies
 
         last_hit_node = node
-        nodes_to_load = []
+        l2_nodes_to_load = []
+        l3_nodes_to_load = []
+
         while node.evicted:
             assert (
-                node.backuped
+                node.backuped or node.l3_backuped
             ), "No backup available on evicted nodes, should not happen"
-            nodes_to_load.insert(0, node)
+            if node.backuped:
+                l2_nodes_to_load.insert(0, node)
+            if self.enable_mooncake_store_l3_cache:
+                if not node.backuped and node.l3_backuped:
+                    l3_nodes_to_load.insert(0, node)
             node = node.parent
         else:
             ancester_node = node
@@ -257,21 +326,25 @@ class HiRadixCache(RadixCache):
         delta = self.inc_lock_ref(ancester_node)
 
         # load it all or not at all
-        host_indices = torch.cat([n.host_value for n in nodes_to_load])
-        if len(host_indices) < self.load_back_threshold or (
-            len(host_indices) > mem_quota + delta if mem_quota is not None else False
+        host_indices = torch.cat([n.host_value for n in l2_nodes_to_load])
+        l3_keys = [key for n in l3_nodes_to_load for key in n.l3_keys]
+
+        total_load_back_size = len(host_indices) + len(l3_keys) * self.page_size
+
+        if total_load_back_size < self.load_back_threshold or (
+            total_load_back_size > mem_quota + delta if mem_quota is not None else False
         ):
             # skip loading back if the total size is too small or exceeding the memory quota
             self.dec_lock_ref(ancester_node)
             return None
 
         device_indices = self.cache_controller.load(
-            host_indices=host_indices, node_id=last_hit_node.id
+            host_indices=host_indices, node_id=last_hit_node.id, l3_keys=l3_keys
         )
         if device_indices is None:
             self.evict(len(host_indices))
             device_indices = self.cache_controller.load(
-                host_indices=host_indices, node_id=last_hit_node.id
+                host_indices=host_indices, node_id=last_hit_node.id, l3_keys=l3_keys
             )
         self.dec_lock_ref(ancester_node)
         if device_indices is None:
@@ -280,11 +353,15 @@ class HiRadixCache(RadixCache):
 
         self.ongoing_load_back[last_hit_node.id] = (ancester_node, last_hit_node)
         offset = 0
-        for node in nodes_to_load:
+        for node in l2_nodes_to_load:
             node.value = device_indices[offset : offset + len(node.host_value)]
             offset += len(node.host_value)
             node.loading = True
-        self.evictable_size_ += len(device_indices)
+        for node in l3_nodes_to_load:
+            node.value = device_indices[offset: offset + len(node.l3_keys) * self.page_size]
+            offset += len(node.l3_keys) * self.page_size
+            node.loading = True
+        self.evictable_size_ += total_load_back_size
         self.inc_lock_ref(last_hit_node)
 
         return device_indices
@@ -346,23 +423,26 @@ class HiRadixCache(RadixCache):
             return value, last_node
 
     def _match_prefix_helper(self, node: TreeNode, key: List):
+        total_key = key
         node.last_access_time = time.time()
         child_key = self.get_child_key_fn(key)
         value = []
+        total_prefix_length = 0
 
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
             child.last_access_time = time.time()
             prefix_len = self.key_match_fn(child.key, key)
+            total_prefix_length += prefix_len
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
-                self.inc_hit_count(new_node)
+                self.inc_hit_count(new_node, token_ids=total_key[:total_prefix_length])
                 if not new_node.evicted:
                     value.append(new_node.value)
                 node = new_node
                 break
             else:
-                self.inc_hit_count(child)
+                self.inc_hit_count(child, token_ids=total_key[:total_prefix_length])
                 if not child.evicted:
                     value.append(child.value)
                 node = child
@@ -370,6 +450,28 @@ class HiRadixCache(RadixCache):
 
                 if len(key):
                     child_key = self.get_child_key_fn(key)
+
+        if self.enable_mooncake_store_l3_cache:
+            # try to get the cross instance shared kv cache
+            if len(key) and (not node.evicted or node.l3_backuped):
+                l3_keys = get_node_l3_keys(total_key, len(key),
+                                           torch.cuda.current_device(), self.page_size)
+                l3_exist_keys = []
+                for item in l3_keys:
+                    if self.mooncake_l3_kv_pool.is_exist(item):
+                        l3_exist_keys.append(item)
+                    else:
+                        break
+
+                if len(l3_exist_keys) > 0:
+                    child_key = self.get_child_key_fn(key)
+                    new_node = TreeNode()
+                    new_node.parent = node
+                    new_node.key = key[len(l3_exist_keys) * self.page_size]
+                    node.children[child_key] = new_node
+                    new_node.l3_keys = l3_exist_keys
+                    new_node.evicted = True
+                    node = new_node
 
         return value, node
 
@@ -391,12 +493,16 @@ class HiRadixCache(RadixCache):
         if child.backuped:
             new_node.host_value = child.host_value[:split_len]
             child.host_value = child.host_value[split_len:]
+        if child.l3_backuped:
+            new_node.l3_keys = child.l3_keys[:split_len // self.page_size]
+            child.l3_keys = child.l3_keys[split_len // self.page_size:]
         child.parent = new_node
         child.key = child.key[split_len:]
         new_node.parent.children[self.get_child_key_fn(key)] = new_node
         return new_node
 
     def _insert_helper(self, node: TreeNode, key: List, value):
+        total_key = key
         node.last_access_time = time.time()
         if len(key) == 0:
             return 0
@@ -417,8 +523,8 @@ class HiRadixCache(RadixCache):
                     self.token_to_kv_pool_host.update_synced(node.host_value)
                     self.evictable_size_ += len(node.value)
                 else:
-                    self.inc_hit_count(node)
                     total_prefix_length += prefix_len
+                    self.inc_hit_count(node, token_ids=total_key[:total_prefix_length])
             else:
                 # partial match, split the node
                 new_node = self._split_node(node.key, node, prefix_len)
@@ -427,8 +533,8 @@ class HiRadixCache(RadixCache):
                     self.token_to_kv_pool_host.update_synced(new_node.host_value)
                     self.evictable_size_ += len(new_node.value)
                 else:
-                    self.inc_hit_count(new_node)
                     total_prefix_length += prefix_len
+                    self.inc_hit_count(new_node, token_ids=total_key[:total_prefix_length])
                 node = new_node
 
             key = key[prefix_len:]
@@ -446,7 +552,7 @@ class HiRadixCache(RadixCache):
             self.evictable_size_ += len(value)
 
             if self.cache_controller.write_policy != "write_back":
-                self.inc_hit_count(new_node)
+                self.inc_hit_count(new_node, token_ids=total_key)
         return total_prefix_length
 
     def _collect_leaves_device(self):

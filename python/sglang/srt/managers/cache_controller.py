@@ -47,6 +47,28 @@ class LayerDoneCounter:
         with self.condition:
             self.counter = 0
 
+class MooncakeStoreCacheOperation:
+    counter = 0
+
+    def __init__(
+        self,
+        device_indices: torch.Tensor,
+        mooncake_keys: List,
+        node_id: int,
+        priority: Optional[int] = None,
+    ):
+        self.device_indices = device_indices
+        self.node_ids = [node_id]
+        self.mooncake_keys = mooncake_keys
+
+        self.id = CacheOperation.counter
+        CacheOperation.counter += 1
+        # default priority is the order of creation
+        self.priority = priority if priority is not None else self.id
+
+    def __lt__(self, other: "MooncakeStoreCacheOperation"):
+        return self.priority < other.priority
+
 
 class CacheOperation:
 
@@ -161,8 +183,6 @@ class HiCacheController:
         self.mem_pool_host = mem_pool_host
         self.write_policy = write_policy
         self.page_size = page_size
-        self.enable_mooncake_store_l3_cache = enable_mooncake_store_l3_cache
-        self.mooncake_l3_kv_pool = mooncake_l3_kv_pool
 
         self.load_cache_event = load_cache_event
         self.layer_done_counter = LayerDoneCounter(self.mem_pool_device.layer_num)
@@ -201,8 +221,36 @@ class HiCacheController:
         self.load_thread = threading.Thread(
             target=self.load_thread_func_layer_by_layer, daemon=True
         )
+
+        self.enable_mooncake_store_l3_cache = enable_mooncake_store_l3_cache
+        if self.enable_mooncake_store_l3_cache:
+            # 异步读写相关必要的组件
+            self.mooncake_l3_kv_pool = mooncake_l3_kv_pool
+
+            self.mooncake_l3_write_queue = PriorityQueue()
+            self.mooncake_l3_load_queue = PriorityQueue()
+
+            self.mooncake_l3_ack_write_queue = Queue()
+            self.mooncake_l3_ack_load_queue = Queue()
+
+            self.mooncake_l3_stop_event = threading.Event()
+
+            self.mooncake_l3_write_stream = torch.cuda.Stream()
+            self.mooncake_l3_load_stream = torch.cuda.Stream()
+
+            self.mooncake_l3_write_thread = threading.Thread(
+                target=self.mooncake_l3_write_thread_func_direct, daemon=True,
+            )
+            self.mooncake_l3_load_thread = threading.Thread(
+                target=self.mooncake_l3_load_thread_func_direct, daemon=True
+            )
+
         self.write_thread.start()
         self.load_thread.start()
+
+        if self.enable_mooncake_store_l3_cache:
+            self.mooncake_l3_write_thread.start()
+            self.mooncake_l3_load_thread.start()
 
     def reset(self):
         self.stop_event.set()
@@ -235,8 +283,9 @@ class HiCacheController:
         self,
         device_indices: torch.Tensor,
         priority: Optional[int] = None,
+        l3_keys: Optional[List] = None,
         node_id: int = 0,
-    ) -> Optional[torch.Tensor]:
+    ):
         """
         Back up KV caches from device memory to host memory.
         """
@@ -247,26 +296,37 @@ class HiCacheController:
         self.write_queue.put(
             CacheOperation(host_indices, device_indices, node_id, priority)
         )
+
+        if self.enable_mooncake_store_l3_cache:
+            self.mooncake_l3_write_queue.put(
+                MooncakeStoreCacheOperation(device_indices, l3_keys,node_id, priority))
         return host_indices
 
-    def load(
+    def  load(
         self,
         host_indices: torch.Tensor,
         priority: Optional[int] = None,
         node_id: int = 0,
+        l3_keys: Optional[List[str]] = None,
     ) -> Optional[torch.Tensor]:
         """
         Load KV caches from host memory to device memory.
         """
-        device_indices = self.mem_pool_device_allocator.alloc(len(host_indices))
+        total_load_back_size = len(host_indices) + len(l3_keys) * self.page_size
+        device_indices = self.mem_pool_device_allocator.alloc(total_load_back_size)
         if device_indices is None:
             return None
         self.mem_pool_host.protect_load(host_indices)
         # to ensure the device indices are ready before accessed by another CUDA stream
         torch.cuda.current_stream().synchronize()
         self.load_queue.put(
-            CacheOperation(host_indices, device_indices, node_id, priority)
+            CacheOperation(host_indices, device_indices[:len(host_indices)], node_id, priority)
         )
+
+        if self.enable_mooncake_store_l3_cache:
+            self.mooncake_l3_load_queue.put(MooncakeStoreCacheOperation(device_indices,
+                                                                        l3_keys, node_id, priority))
+
         return device_indices
 
     def write_thread_func_direct(self):
@@ -292,6 +352,32 @@ class HiCacheController:
                 except Exception as e:
                     logger.error(e)
 
+    def mooncake_l3_write_thread_func_direct(self):
+        with torch.cuda.stream(self.mooncake_l3_write_stream):
+            while not self.mooncake_l3_stop_event.is_set():
+                try:
+                    operation = self.mooncake_l3_write_queue.get(block=True, timeout=1)
+                    keys = operation.mooncake_keys
+                    values = self.mem_pool_device.get_flat_data(operation.device_indices)
+
+                    for i in range(len(keys)):
+                        # 并发相同的key并发写
+                        if not self.mooncake_l3_kv_pool.is_exist(keys[i]):
+                            if self.page_size == 1:
+                                self.mooncake_l3_kv_pool.put(keys[i], values[i])
+                            else:
+                                self.mooncake_l3_kv_pool.put(keys[i], values[i * self.page_size:(i + 1) * self.page_size])
+
+                    self.mooncake_l3_write_stream.synchronize()
+                    for node_id in operation.node_ids:
+                        if node_id != 0:
+                            self.mooncake_l3_ack_write_queue.put(node_id)
+                except Empty:
+                    continue
+                except Exception as e:
+                    logger.error(e)
+
+
     def load_thread_func_direct(self):
         """
         Directly load KV caches from host memory to device memory without buffering.
@@ -308,6 +394,22 @@ class HiCacheController:
                         operation.device_indices, operation.data
                     )
                     self.mem_pool_host.complete_io(operation.host_indices)
+                    for node_id in operation.node_ids:
+                        if node_id != 0:
+                            self.ack_load_queue.put(node_id)
+                except Empty:
+                    continue
+                except Exception as e:
+                    logger.error(e)
+
+    def mooncake_l3_load_thread_func_direct(self):
+        with torch.cuda.stream(self.mooncake_l3_load_stream):
+            while not self.mooncake_l3_stop_event.is_set():
+                try:
+                    operation = self.mooncake_l3_load_queue.get(block=True, timeout=1)
+                    keys = operation.mooncake_keys
+                    data = [self.mooncake_l3_kv_pool.get(key) for key in keys]
+                    self.mem_pool_device.transfer(operation.device_indices, data)
                     for node_id in operation.node_ids:
                         if node_id != 0:
                             self.ack_load_queue.put(node_id)
