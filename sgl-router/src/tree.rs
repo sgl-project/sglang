@@ -306,7 +306,7 @@ impl Tree {
                 .map(|kv| kv.key().to_owned())
                 .unwrap_or("empty".to_string())
         };
-        if curr.tenant_last_access_time.contains_key(&tenant) {
+        if !tenant.eq("empty") && curr.tenant_last_access_time.contains_key(&tenant) {
             let timestamp_ms = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
