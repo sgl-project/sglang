@@ -98,6 +98,7 @@ class ServerArgs:
     show_time_cost: bool = False
     enable_metrics: bool = False
     decode_log_interval: int = 40
+    enable_request_time_stats_logging: bool = False
 
     # API related
     api_key: Optional[str] = None
@@ -345,6 +346,12 @@ class ServerArgs:
             )
             logger.warning(
                 f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
+            )
+
+        if self.pp_size > 1:
+            self.disable_overlap_schedule = True
+            logger.warning(
+                "Pipeline parallelism is incompatible with overlap schedule."
             )
 
         # Speculative Decoding
@@ -778,6 +785,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.decode_log_interval,
             help="The log interval of decode batch.",
+        )
+        parser.add_argument(
+            "--enable-request-time-stats-logging",
+            action="store_true",
+            default=ServerArgs.enable_request_time_stats_logging,
+            help="Enable per request time stats logging",
         )
 
         # API related

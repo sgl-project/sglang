@@ -530,10 +530,6 @@ class Scheduler(
         )
 
     def init_metrics(self):
-        # The largest prefill length of a single request
-        self._largest_prefill_len: int = 0
-        # The largest context length (prefill + generation) of a single request
-        self._largest_prefill_decode_len: int = 0
         self.last_gen_throughput: float = 0.0
         self.last_input_throughput: float = 0.0
         self.step_time_dict = defaultdict(list)  # Dict[batch size -> step time]
@@ -719,7 +715,7 @@ class Scheduler(
                     server_is_idle = False
                     result = self.run_batch(self.cur_batch)
 
-                # send the outputs to the next step
+                # (last rank) send the outputs to the next step
                 if self.pp_group.is_last_rank:
                     if self.cur_batch:
                         next_token_ids, bids[mb_id] = (
@@ -759,18 +755,18 @@ class Scheduler(
                     self.process_batch_result(mbs[next_mb_id], output_result)
                     last_mbs[next_mb_id] = mbs[next_mb_id]
 
-                # carry the outputs to the next stage
+                # (not last rank)
                 if not self.pp_group.is_last_rank:
                     if self.cur_batch:
                         bids[mb_id] = result.bid
+                    # carry the outputs to the next stage
+                    # send the outputs from the last round to let the next stage worker run post processing
                     if pp_outputs:
-                        # send the outputs from the last round to let the next stage worker run post processing
                         self.pp_group.send_tensor_dict(
                             pp_outputs.tensors,
                             all_gather_group=self.attn_tp_group,
                         )
 
-                if not self.pp_group.is_last_rank:
                     # send out reqs to the next stage
                     dp_offset = self.dp_rank * self.attn_tp_size
                     if self.attn_tp_rank == 0:
@@ -1121,9 +1117,6 @@ class Scheduler(
         num_used = self.max_total_num_tokens - (
             self.token_to_kv_pool_allocator.available_size()
             + self.tree_cache.evictable_size()
-        )
-        self._largest_prefill_len = max(
-            self._largest_prefill_len, adder.log_input_tokens
         )
 
         num_new_seq = len(can_run_list)
@@ -1601,14 +1594,9 @@ class Scheduler(
         elif batch.forward_mode.is_idle():
             if self.enable_overlap:
                 self.tp_worker.resolve_last_batch_result(launch_done)
-                if batch.next_batch_sampling_info:
-                    batch.next_batch_sampling_info.update_regex_vocab_mask()
-                    self.current_stream.synchronize()
-                    batch.next_batch_sampling_info.sampling_info_done.set()
+                self.set_next_batch_sampling_info_done(batch)
         elif batch.forward_mode.is_dummy_first():
-            batch.next_batch_sampling_info.update_regex_vocab_mask()
-            self.current_stream.synchronize()
-            batch.next_batch_sampling_info.sampling_info_done.set()
+            self.set_next_batch_sampling_info_done(batch)
 
         if self.return_health_check_ct:
             # Return some signal for the health check.
@@ -1775,6 +1763,13 @@ class Scheduler(
 
         self._extend_requests_to_queue(self.grammar_queue[:num_ready_reqs])
         self.grammar_queue = self.grammar_queue[num_ready_reqs:]
+
+    def set_next_batch_sampling_info_done(self, batch: ScheduleBatch):
+        if batch.next_batch_sampling_info:
+            if batch.next_batch_sampling_info.grammars is not None:
+                batch.next_batch_sampling_info.update_regex_vocab_mask()
+                self.current_stream.synchronize()
+            batch.next_batch_sampling_info.sampling_info_done.set()
 
     def watchdog_thread(self):
         """A watch dog thread that will try to kill the server itself if one forward batch takes too long."""
