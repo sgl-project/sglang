@@ -19,7 +19,7 @@ jobs:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
     strategy:
       matrix:
-        runner: [linux-mi300-gpu-2, linux-mi325-gpu-2]
+        runner: [linux-mi300-gpu-2, linux-mi325-gpu-2-nightly]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
