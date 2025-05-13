@@ -22,11 +22,6 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-# DeepSeek-Coder-V2-Lite-Instruct
-_NUM_ROUTED_EXPERTS = 64
-_NUM_HIDDEN_LAYERS = 27
-_REF_OUTPUT = [", 4+4=8,", ", four plus four is eight, eight"]
-
 
 class TestEPLBEndToEnd(CustomTestCase):
     @classmethod
