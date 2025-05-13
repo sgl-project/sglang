@@ -1385,8 +1385,11 @@ class ModelRunner:
                 sa_factors = []
                 sa_sizes = []
 
+                irope_offset = 1
+                irope_interval = 4
+
                 for layer_id in range(num_layers):
-                    use_rope = (layer_id + 1) % 4 != 0
+                    use_rope = (layer_id + irope_offset) % irope_interval != 0
                     if use_rope:
                         # Chunked attention
                         mask_factors.append(None)
@@ -1412,6 +1415,9 @@ class ModelRunner:
                     layer_num=self.model_config.num_hidden_layers,
                     device=torch.device(self.gpu_id),
                     hip_config=self.server_args.hip_attention_config,
+                    chunked_attention_size=attention_chunk_size,
+                    irope_offset=irope_offset,
+                    irope_interval=irope_interval,
                 )
             else:
                 self.token_to_kv_pool = MHATokenToHiPOffloadKVPool(
