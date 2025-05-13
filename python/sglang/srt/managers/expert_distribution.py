@@ -766,7 +766,8 @@ class _InfiniteBuffer(_Buffer):
         return self._buffer[:self._size]
 
     def reset(self):
-        TODO
+        self._buffer[...] = 0
+        self._size = 0
 
 
 def _convert_global_physical_count_to_logical_count(
