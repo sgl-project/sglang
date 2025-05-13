@@ -1070,7 +1070,7 @@ mod tests {
 
     #[test]
     fn test_utf8_split_seq() {
-        // The string should be indexed and splitted by a utf-8 value basis instead of byte basis
+        // The string should be indexed and split by a utf-8 value basis instead of byte basis
         // use .chars() to get the iterator of the utf-8 value
         let tree = Arc::new(Tree::new());
 
