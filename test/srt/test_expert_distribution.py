@@ -1,6 +1,7 @@
 import os
 import tempfile
 import unittest
+from pathlib import Path
 
 import requests
 import torch
@@ -82,7 +83,7 @@ class TestExpertDistribution(CustomTestCase):
                 self.assertEqual(response.status_code, 200)
 
                 # Check data rows
-                data = response.json()
+                data = torch.load(list(Path(tmp_dir).glob("*.pt"))[0], weights_only=True)
                 print(f"{data=}")
 
                 if mode_detail:
