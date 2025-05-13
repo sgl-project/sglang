@@ -102,11 +102,15 @@ def create_causal_mask_from_page_triton(
     mask_ptr,  # [qo_len, kv_len]
     cu_qo_indptr,  # [bs + 1], cumulative ranges for each req
     cu_kv_lens_ptr,  # [bs + 1]
-    prefix_lens_ptr,  # [bs + 1]
+    prefix_lens_ptr,  # [bs + 1], indicates shared prefix by all qo in a request
     stride_mask_qo,
     max_kv_len_per_req: tl.constexpr,  # must be static
 ):
-    """Each program handles a row of qo"""
+    """
+    Creates causal mask from paged indices to filter out kv for each request.
+    Each program handles a row of qo,
+    with the prefix kv attended by all queries in a request.
+    """
     pid_qo = tl.program_id(axis=0)
     req_id = tl.program_id(axis=1)
 
@@ -116,15 +120,15 @@ def create_causal_mask_from_page_triton(
     if qo_start <= pid_qo and pid_qo < qo_end:
         kv_start = tl.load(cu_kv_lens_ptr + req_id).to(tl.int32)
         kv_end = tl.load(cu_kv_lens_ptr + req_id + 1).to(tl.int32)
-        kv_len = kv_end - kv_start
+        kv_len_local = kv_end - kv_start
         # mask_offset = pid_qo * stride_mask_qo + kv_start + tl.arange(0, max_kv_len)
 
-        kv_indices = tl.arange(0, max_kv_len_per_req)
-        is_valid_kv = kv_indices < kv_len
-        kv_pos = kv_indices
-        qo_index_local = (pid_qo - qo_start) + tl.load(prefix_lens_ptr + req_id).to(
+        kv_indices_local = tl.arange(0, max_kv_len_per_req)
+        is_valid_kv = kv_indices_local < kv_len_local
+        kv_pos = kv_indices_local
+        qo_idx_local = (pid_qo - qo_start) + tl.load(prefix_lens_ptr + req_id + 1).to(
             tl.int32
         )
-        mask = (kv_pos <= qo_index_local) & is_valid_kv
+        mask = (kv_pos <= qo_idx_local) & is_valid_kv
         mask_offsets = pid_qo * stride_mask_qo + kv_pos + kv_start
         tl.store(mask_ptr + mask_offsets, mask, mask=is_valid_kv)
