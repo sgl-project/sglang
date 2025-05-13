@@ -554,11 +554,7 @@ class _DetailAccumulator(_Accumulator):
         def _process_object(obj):
             if not isinstance(obj, torch.Tensor):
                 return obj
-
-            obj = obj.cpu().clone()
-            if self._save_dir is None:
-                obj = obj.tolist()
-            return obj
+            return obj.cpu().clone()
 
         single_pass_data_processed = {
             k: _process_object(v) for k, v in single_pass_data.items()
