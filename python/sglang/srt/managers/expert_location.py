@@ -110,6 +110,9 @@ class ExpertLocationMetadata:
     def init_by_eplb(server_args: ServerArgs, logical_count: torch.Tensor):
         if not isinstance(logical_count, torch.Tensor):
             logical_count = torch.tensor(logical_count)
+        if len(logical_count.shape) == 2:
+            logical_count = logical_count.unsqueeze(0)
+
         common = ExpertLocationMetadata._init_common(server_args)
         model_config_for_expert_location = common["model_config_for_expert_location"]
 
