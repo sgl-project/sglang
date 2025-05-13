@@ -61,7 +61,7 @@ class TestEPLBEndToEnd(CustomTestCase):
         self.assertGreater(metrics["score"], 0.5)
 
 
-class TestEPLB(CustomTestCase):
+class TestEPLBMisc(CustomTestCase):
     TODO
 
 
