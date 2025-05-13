@@ -27,16 +27,16 @@ def _update_expert_weights(
         update_expert_weights_single_layer(
             routed_experts_weights=routed_experts_weights_of_layer[layer_id],
             temp_buffers=temp_buffers,
-            old_expert_location_metadata=old_expert_location_metadata,
-            new_expert_location_metadata=new_expert_location_metadata,
+            old_physical_to_logical_map=old_expert_location_metadata.physical_to_logical_map,
+            new_physical_to_logical_map=new_expert_location_metadata.physical_to_logical_map,
         )
 
 
 def update_expert_weights_single_layer(
     routed_experts_weights: List[torch.Tensor],
     temp_buffers: List[torch.Tensor],
-    old_expert_location_metadata: ExpertLocationMetadata,
-    new_expert_location_metadata: ExpertLocationMetadata,
+    old_physical_to_logical_map: torch.Tensor,
+    new_physical_to_logical_map: torch.Tensor,
 ):
     assert all(tensor.shape[0] == num_local_physical_experts for tensor in routed_experts_weights)
     TODO
