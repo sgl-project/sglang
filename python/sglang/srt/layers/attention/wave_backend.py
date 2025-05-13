@@ -326,12 +326,14 @@ class WaveAttnBackend(AttentionBackend):
         self, max_bs: int, kv_indices_buf: Optional[torch.Tensor] = None
     ):
         self.cuda_graph_attn_logits = torch.zeros(
-            (max_bs, self.num_head, self.max_kv_splits, self.v_head_dim),
+            (self.max_kv_splits, max_bs, self.v_head_dim, self.num_head),
+            # (max_bs, self.num_head, self.max_kv_splits, self.v_head_dim),
             dtype=torch.float32,
             device=self.device,
         )
         self.cuda_graph_attn_lse = torch.zeros(
-            (max_bs, self.num_head, self.max_kv_splits),
+            (self.max_kv_splits, max_bs, self.num_head),
+            # (max_bs, self.num_head, self.max_kv_splits),
             dtype=torch.float32,
             device=self.device,
         )
