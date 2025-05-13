@@ -300,11 +300,12 @@ impl Tree {
             (curr.tenant_last_access_time.contains_key(t), t.to_string())
         } else {
             // Select the first tenant (key in the map)
-            let tenant = curr.tenant_last_access_time
-                    .iter()
-                    .next()
-                    .map(|kv| kv.key().to_owned())
-                    .unwrap_or_else(|| "empty".to_string());
+            let tenant = curr
+                .tenant_last_access_time
+                .iter()
+                .next()
+                .map(|kv| kv.key().to_owned())
+                .unwrap_or_else(|| "empty".to_string());
             (!tenant.eq("empty"), tenant)
         };
         if perform_update {
