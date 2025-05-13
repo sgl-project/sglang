@@ -11,18 +11,12 @@ from sglang.srt.managers.expert_location import (
     ExpertLocationMetadata,
     ModelConfigForExpertLocation,
 )
-from sglang.srt.managers.io_struct import (
-    EplbRebalanceReqInput,
-    UpdateExpertLocationReqInput,
-)
 from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
 logger = logging.getLogger(__name__)
-
-TODO_rm
 
 
 class EPLBManager:
