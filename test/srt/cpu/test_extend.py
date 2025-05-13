@@ -33,8 +33,6 @@ class TestExtendAttention(CustomTestCase):
 
         start_q, start_kv = 0, 0
         for seq_idx in range(seq_lens.shape[0]):
-            # TODO: this loop process a sequence per iter, this is inefficient.
-            # Need optimize the performance later.
 
             extend_seq_len_q = extend_seq_lens[seq_idx]
             prefill_seq_len_q = extend_prefix_lens[seq_idx]
@@ -122,6 +120,12 @@ class TestExtendAttention(CustomTestCase):
             q_extend[extend_start:extend_end] = torch.randn(
                 (b_seq_len_extend[i], H_Q, D), dtype=dtype
             )
+
+        # k_extend, v_extend, k_buffer and v_buffer supports non-contiguous tensors
+        k_extend = k_extend.transpose(0, 1).contiguous().transpose(0, 1)
+        v_extend = v_extend.transpose(0, 1).contiguous().transpose(0, 1)
+        k_buffer = k_buffer.transpose(0, 1).contiguous().transpose(0, 1)
+        v_buffer = v_buffer.transpose(0, 1).contiguous().transpose(0, 1)
 
         b_seq_len_extend = b_seq_len - b_seq_len_prefix
         b_start_loc_extend = torch.zeros_like(b_seq_len)
