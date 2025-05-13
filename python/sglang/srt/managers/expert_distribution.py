@@ -607,9 +607,6 @@ class _DetailAccumulator(_UtilizationRateAccumulatorMixin):
         super().__init__(*args, **kwargs)
         self._records = []
 
-        if not _SAVE_DIR.exists():
-            _SAVE_DIR.mkdir(parents=True, exist_ok=True)
-
     def get_single_pass_gatherer_keys(self):
         if False:  # TODO `server_args.enable_two_batch_overlap`
             return [_SINGLE_PASS_GATHERER_KEY_PRIMARY, "child_a", "child_b"]
@@ -659,6 +656,8 @@ class _DetailAccumulator(_UtilizationRateAccumulatorMixin):
             # NOTE: This may change during recording, so here we say it is the "last" one
             last_physical_to_logical_map=self._expert_location_metadata.physical_to_logical_map,
         )
+        if not _SAVE_DIR.exists():
+            _SAVE_DIR.mkdir(parents=True, exist_ok=True)
         torch.save(output, str(path_output))
 
 
