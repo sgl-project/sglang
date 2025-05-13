@@ -1,4 +1,5 @@
 from sglang.srt.layers.quantization.deep_gemm import _ENABLE_JIT_DEEPGEMM
+from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.utils import DeepEPMode
 
 try:
@@ -116,6 +117,7 @@ class _DeepEPConfig:
     _instance = None
 
     def __init__(self):
+        deepep_config = global_server_args_dict["deepep_config"]
         TODO
 
     @classmethod
