@@ -19,6 +19,11 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class EPLBManager:
+    def __init__(self):
+        TODO
+
+
 class _TODO_REMOVE_EPLBManager:
     def __init__(self, server_args: ServerArgs):
         super().__init__()
