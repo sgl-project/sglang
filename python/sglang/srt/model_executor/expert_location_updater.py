@@ -37,4 +37,5 @@ def update_expert_weights_single_layer(
     old_expert_location_metadata: ExpertLocationMetadata,
     new_expert_location_metadata: ExpertLocationMetadata,
 ):
+    assert all(tensor.shape[0] == num_local_physical_experts for tensor in routed_experts_weights)
     TODO
