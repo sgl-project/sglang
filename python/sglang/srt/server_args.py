@@ -347,6 +347,8 @@ class ServerArgs:
             logger.info(
                 f"EPLB is enabled or init_expert_location is provided. ep_dispatch_algorithm is configured."
             )
+        if self.enable_expert_distribution_metrics and (self.expert_distribution_recorder_mode is None):
+            self.expert_distribution_recorder_mode = "stat"
 
         if self.ep_num_redundant_experts > 0:
             assert (
