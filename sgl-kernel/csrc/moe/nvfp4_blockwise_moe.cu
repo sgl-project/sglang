@@ -351,14 +351,6 @@ constexpr auto SF_DTYPE = at::ScalarType::Float8_e4m3fn;
   CHECK_CONTIGUOUS(x, m);     \
   CHECK_TYPE(x, st, m)
 
-static int getSMVersion() {
-  int device;
-  cudaGetDevice(&device);
-  cudaDeviceProp deviceProp;
-  cudaGetDeviceProperties(&deviceProp, device);
-  return deviceProp.major * 10 + deviceProp.minor;
-}
-
 void cutlass_fp4_group_mm(
     torch::Tensor& output, const torch::Tensor& a, const torch::Tensor& b,
     const torch::Tensor& a_blockscale, const torch::Tensor& b_blockscales,
