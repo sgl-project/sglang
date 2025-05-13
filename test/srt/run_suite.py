@@ -73,6 +73,7 @@ suites = {
         TestFile("test_torch_compile_moe.py", 172),
         TestFile("test_torch_native_attention_backend.py", 123),
         TestFile("test_torchao.py", 70),
+        TestFile("test_transformers_models.py", 300),
         TestFile("test_triton_attention_kernels.py", 4),
         TestFile("test_triton_attention_backend.py", 134),
         TestFile("test_triton_moe_channel_fp8_kernel.py", 25),
