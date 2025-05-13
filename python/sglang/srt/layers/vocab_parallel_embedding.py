@@ -13,6 +13,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.layers.parameter import BasevLLMParameter
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
@@ -214,12 +215,14 @@ class VocabParallelEmbedding(torch.nn.Module):
         self,
         num_embeddings: int,
         embedding_dim: int,
+        *,
         params_dtype: Optional[torch.dtype] = None,
         org_num_embeddings: Optional[int] = None,
         padding_size: int = DEFAULT_VOCAB_PADDING_SIZE,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         enable_tp: bool = True,
+        use_attn_tp_group: bool = False,
         use_presharded_weights: bool = False,
     ):
         super().__init__()
@@ -227,9 +230,14 @@ class VocabParallelEmbedding(torch.nn.Module):
 
         self.enable_tp = enable_tp
         if self.enable_tp:
-            tp_rank = get_tensor_model_parallel_rank()
-            self.tp_size = get_tensor_model_parallel_world_size()
+            if use_attn_tp_group:
+                tp_rank = get_attention_tp_rank()
+                self.tp_size = get_attention_tp_size()
+            else:
+                tp_rank = get_tensor_model_parallel_rank()
+                self.tp_size = get_tensor_model_parallel_world_size()
         else:
+            assert use_attn_tp_group is False
             tp_rank = 0
             self.tp_size = 1
 
@@ -519,22 +527,25 @@ class ParallelLMHead(VocabParallelEmbedding):
         self,
         num_embeddings: int,
         embedding_dim: int,
+        *,
         bias: bool = False,
         params_dtype: Optional[torch.dtype] = None,
         org_num_embeddings: Optional[int] = None,
         padding_size: int = DEFAULT_VOCAB_PADDING_SIZE,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        use_attn_tp_group: bool = False,
         use_presharded_weights: bool = False,
     ):
         super().__init__(
             num_embeddings,
             embedding_dim,
-            params_dtype,
-            org_num_embeddings,
-            padding_size,
-            quant_config,
-            prefix,
+            params_dtype=params_dtype,
+            org_num_embeddings=org_num_embeddings,
+            padding_size=padding_size,
+            quant_config=quant_config,
+            prefix=prefix,
+            use_attn_tp_group=use_attn_tp_group,
             use_presharded_weights=use_presharded_weights,
         )
         self.quant_config = quant_config
