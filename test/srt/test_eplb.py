@@ -86,7 +86,7 @@ class TestEPLBMisc(CustomTestCase):
                 **engine_kwargs,
                 disable_overlap_schedule=True,
             )
-            self._assert_behavior(engine)
+            self._assert_engine_generate_correct(engine)
 
             print(f"Action: eplb_save_expert_distribution")
             engine.dump_expert_distribution_record()
@@ -104,12 +104,12 @@ class TestEPLBMisc(CustomTestCase):
                 init_expert_location=str(snapshot_path),
                 port=21000,
             )
-            self._assert_behavior(engine)
+            self._assert_engine_generate_correct(engine)
             print(f"Action: shutdown engine")
             engine.shutdown()
             del engine
 
-    def _assert_behavior(self, engine: sgl.Engine):
+    def _assert_engine_generate_correct(self, engine: sgl.Engine):
         output = engine.generate(
             prompt=["1+1=2, 2+2=4", "One plus one is two, two plus two is four"],
             sampling_params=dict(max_new_tokens=8, temperature=0.0),
