@@ -26,6 +26,7 @@ from sglang.lang.backend.openai import OpenAI
 from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
 from sglang.srt.utils import (
     get_bool_env_var,
+    get_device,
     is_port_available,
     kill_process_tree,
     retry,
@@ -300,18 +301,16 @@ def add_common_other_args_and_parse(parser: argparse.ArgumentParser):
     return args
 
 
-def auto_detect_device() -> str:
-    """Auto-detect available device platform"""
-    import torch
+def auto_config_device() -> str:
+    """Auto-config available device platform"""
 
-    if torch.cuda.is_available():
-        return "cuda"
-    elif hasattr(torch.version, "hip") and torch.version.hip:
-        return "rocm"
-    elif hasattr(torch, "xpu") and torch.xpu.is_available():  # Check for Intel XPU
-        return "xpu"
-    else:
-        return "cpu"
+    try:
+        device = get_device()
+    except (RuntimeError, ImportError) as e:
+        print(f"Warning: {e} - Falling back to CPU")
+        device = "cpu"
+
+    return device
 
 
 def add_common_sglang_args_and_parse(parser: argparse.ArgumentParser):
@@ -428,8 +427,8 @@ def popen_launch_server(
     """
     # Auto-detect device if needed
     if device == "auto":
-        device = auto_detect_device()
-        print(f"Auto-detected device: {device}", flush=True)
+        device = auto_config_device()
+        print(f"Auto-configed device: {device}", flush=True)
         other_args = list(other_args)
         other_args += ["--device", str(device)]
 
@@ -756,7 +755,7 @@ def run_bench_serving(
     device="auto",
 ):
     if device == "auto":
-        device = auto_detect_device()
+        device = auto_config_device()
     # Launch the server
     base_url = DEFAULT_URL_FOR_TEST
     process = popen_launch_server(
@@ -839,8 +838,8 @@ def run_bench_one_batch(model, other_args):
     """
     # Auto-detect device if needed
 
-    device = auto_detect_device()
-    print(f"Auto-detected device: {device}", flush=True)
+    device = auto_config_device()
+    print(f"Auto-configed device: {device}", flush=True)
     other_args += ["--device", str(device)]
 
     command = [
