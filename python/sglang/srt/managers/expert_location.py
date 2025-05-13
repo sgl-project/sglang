@@ -390,6 +390,7 @@ def compute_initial_expert_location_metadata(server_args: ServerArgs) -> ExpertL
             logger.info("init_expert_location from init_expert_location=trivial")
             return ExpertLocationMetadata.init_trivial(server_args)
 
+        # TODO unify with the utils function
         if data.endswith(".pt"):
             data_dict = torch.load(data, weights_only=True)
         elif data.endswith(".json"):
