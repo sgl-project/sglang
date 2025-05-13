@@ -1,5 +1,7 @@
 import logging
+from typing import Dict, List
 
+import torch
 from sglang.srt.managers.expert_location import ExpertLocationMetadata
 from sglang.srt.managers.schedule_batch import get_global_expert_location_metadata
 
@@ -15,6 +17,7 @@ def update_expert_location(
 
 
 def _update_expert_weights(
+    routed_experts_weights_of_layer: Dict[int, List[torch.Tensor]],
     old_expert_location_metadata: ExpertLocationMetadata,
     new_expert_location_metadata: ExpertLocationMetadata,
 ):
