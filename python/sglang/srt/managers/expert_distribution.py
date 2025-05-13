@@ -679,13 +679,14 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
         self._global_physical_count_of_buffered_step.reset()
 
     def dump(self, output_mode: _OutputMode):
-        logical_count_of_step = _convert_global_physical_count_to_logical_count(
+        logical_count_of_buffered_step = _convert_global_physical_count_to_logical_count(
             self._global_physical_count_of_buffered_step.get_all(),
             num_layers=self._expert_location_metadata.num_layers,
             num_logical_experts=self._expert_location_metadata.num_logical_experts,
             physical_to_logical_map=self._expert_location_metadata.physical_to_logical_map,
         )
-       
+        torch.distributed.all_reduce(logical_count_of_buffered_step, op=torch.distributed.ReduceOp.SUM)
+
         if output_mode == "file":
             if self._rank == 0:
                 _dump_to_file(f"expert_distribution_recorder_{time.time()}.pt", TODO)
