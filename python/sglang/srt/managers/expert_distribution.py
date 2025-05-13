@@ -526,6 +526,73 @@ class _Accumulator(ABC):
         raise NotImplementedError
 
 
+class _UtilizationRateAccumulatorMixin(_StatAccumulator):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        window_sizes = [10, 100, 1000]
+        self._history = _DequeCollection(maxlens=window_sizes)
+        self._rank = torch.distributed.get_rank()
+
+    def append(
+        self,
+        forward_pass_id: int,
+        gatherer_key: str,
+        single_pass_data: Dict,
+    ):
+        super().append(forward_pass_id, gatherer_key, single_pass_data)
+        self._append_utilization_rate(
+            forward_pass_id, single_pass_data["global_physical_count"]
+        )
+
+    def reset(self):
+        super().reset()
+        self._history.clear()
+
+    def _append_utilization_rate(
+        self, forward_pass_id: int, single_pass_global_physical_count: torch.Tensor
+    ):
+        gpu_physical_count = compute_gpu_physical_count(
+            single_pass_global_physical_count,
+            num_gpu=self._expert_location_metadata.ep_size,
+        )
+        gpu_physical_count = gpu_physical_count.to("cuda")
+        torch.distributed.reduce(
+            gpu_physical_count, dst=0, op=torch.distributed.ReduceOp.SUM
+        )
+
+        if self._rank == 0:
+            utilization_rate_tensor = compute_utilization_rate(gpu_physical_count)
+            utilization_rate = torch.mean(utilization_rate_tensor).item()
+            self._history.append(utilization_rate)
+
+            gpu_physical_count_sum = gpu_physical_count.sum().item()
+
+            logger.info(
+                f"[Expert Utilization Rate] "
+                f"forward_pass_id={forward_pass_id} "
+                f"current_pass_value={utilization_rate:.03f} "
+                f"{''.join(f'last_{size}_value={value:.03f} ' for size, value in self._history.mean().items())} "
+                f"gpu_physical_count_sum={gpu_physical_count_sum} "
+                f"current_pass_per_layer={[round(x, 2) for x in utilization_rate_tensor.cpu().tolist()]}"
+            )
+
+
+class _DequeCollection:
+    def __init__(self, maxlens: List[int]):
+        self._dequeues = [deque(maxlen=maxlen) for maxlen in maxlens]
+
+    def append(self, value):
+        for d in self._dequeues:
+            d.append(value)
+
+    def clear(self):
+        for d in self._dequeues:
+            d.clear()
+
+    def mean(self) -> Dict[int, float]:
+        return {d.maxlen: sum(d) / len(d) for d in self._dequeues}
+
+
 class _DetailAccumulator(_Accumulator):
     def __init__(self, expert_location_metadata: "ExpertLocationMetadata", rank: int):
         super().__init__(expert_location_metadata, rank)
@@ -642,74 +709,6 @@ def _convert_global_physical_count_to_logical_count(
         src=global_physical_count,
     )
     return logical_count
-
-
-# TODO use composition instead of inheritance later
-class _StatAndUtilizationRateAccumulator(_StatAccumulator):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        window_sizes = [10, 100, 1000]
-        self._history = _DequeCollection(maxlens=window_sizes)
-        self._rank = torch.distributed.get_rank()
-
-    def append(
-        self,
-        forward_pass_id: int,
-        gatherer_key: str,
-        single_pass_data: Dict,
-    ):
-        super().append(forward_pass_id, gatherer_key, single_pass_data)
-        self._append_utilization_rate(
-            forward_pass_id, single_pass_data["global_physical_count"]
-        )
-
-    def reset(self):
-        super().reset()
-        self._history.clear()
-
-    def _append_utilization_rate(
-        self, forward_pass_id: int, single_pass_global_physical_count: torch.Tensor
-    ):
-        gpu_physical_count = compute_gpu_physical_count(
-            single_pass_global_physical_count,
-            num_gpu=self._expert_location_metadata.ep_size,
-        )
-        gpu_physical_count = gpu_physical_count.to("cuda")
-        torch.distributed.reduce(
-            gpu_physical_count, dst=0, op=torch.distributed.ReduceOp.SUM
-        )
-
-        if self._rank == 0:
-            utilization_rate_tensor = compute_utilization_rate(gpu_physical_count)
-            utilization_rate = torch.mean(utilization_rate_tensor).item()
-            self._history.append(utilization_rate)
-
-            gpu_physical_count_sum = gpu_physical_count.sum().item()
-
-            logger.info(
-                f"[Expert Utilization Rate] "
-                f"forward_pass_id={forward_pass_id} "
-                f"current_pass_value={utilization_rate:.03f} "
-                f"{''.join(f'last_{size}_value={value:.03f} ' for size, value in self._history.mean().items())} "
-                f"gpu_physical_count_sum={gpu_physical_count_sum} "
-                f"current_pass_per_layer={[round(x, 2) for x in utilization_rate_tensor.cpu().tolist()]}"
-            )
-
-
-class _DequeCollection:
-    def __init__(self, maxlens: List[int]):
-        self._dequeues = [deque(maxlen=maxlen) for maxlen in maxlens]
-
-    def append(self, value):
-        for d in self._dequeues:
-            d.append(value)
-
-    def clear(self):
-        for d in self._dequeues:
-            d.clear()
-
-    def mean(self) -> Dict[int, float]:
-        return {d.maxlen: sum(d) / len(d) for d in self._dequeues}
 
 
 def compute_gpu_physical_count(
