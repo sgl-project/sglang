@@ -406,8 +406,4 @@ def compute_initial_expert_location_metadata(server_args: ServerArgs) -> ExpertL
                 f"Unknown init_expert_location format ({list(data_dict.keys())=})"
             )
 
-    if server_args.enable_eplb:
-        logger.info("init_expert_location from EPLBManager")
-        return eplb_manager.compute_expert_location_metadata()
-
     return ExpertLocationMetadata.init_trivial(server_args)
