@@ -416,8 +416,8 @@ def popen_launch_server(
     other_args: list[str] = [],
     env: Optional[dict] = None,
     return_stdout_stderr: Optional[tuple] = None,
-    pd_seperated: bool = False,
     device: str = "auto",
+    pd_separated: bool = False,
 ):
     """Launch a server process with automatic device detection.
 
@@ -435,7 +435,7 @@ def popen_launch_server(
     _, host, port = base_url.split(":")
     host = host[2:]
 
-    if pd_seperated:
+    if pd_separated:
         command = "sglang.launch_pd_server"
     else:
         command = "sglang.launch_server"
@@ -449,7 +449,7 @@ def popen_launch_server(
         *[str(x) for x in other_args],
     ]
 
-    if pd_seperated:
+    if pd_separated:
         command.extend(
             [
                 "--lb-host",
@@ -701,8 +701,8 @@ def get_benchmark_args(
     disable_stream=False,
     disable_ignore_eos=False,
     seed: int = 0,
-    pd_seperated: bool = False,
     device="auto",
+    pd_separated: bool = False,
 ):
     return SimpleNamespace(
         backend="sglang",
@@ -732,8 +732,8 @@ def get_benchmark_args(
         profile=None,
         lora_name=None,
         prompt_suffix="",
-        pd_seperated=pd_seperated,
         device=device,
+        pd_separated=pd_separated,
     )
 
 
@@ -801,7 +801,7 @@ def run_bench_serving_multi(
     other_server_args,
     benchmark_args,
     need_warmup=False,
-    pd_seperated=False,
+    pd_separated=False,
 ):
     # Launch the server
     process = popen_launch_server(
@@ -809,7 +809,7 @@ def run_bench_serving_multi(
         base_url,
         timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
         other_args=other_server_args,
-        pd_seperated=pd_seperated,
+        pd_separated=pd_separated,
     )
 
     # run benchmark for all
