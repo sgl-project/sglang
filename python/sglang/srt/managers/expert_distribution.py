@@ -22,6 +22,8 @@ logger = logging.getLogger(__name__)
 
 _OutputMode = Literal["file", "object"]
 
+_SAVE_DIR = os.environ.get("SGLANG_EXPERT_DISTRIBUTION_RECORDER_SAVE_DIR", "/tmp")
+
 
 class ExpertDistributionRecorder:
     """Global expert distribution recording"""
@@ -605,7 +607,7 @@ class _DetailAccumulator(_UtilizationRateAccumulatorMixin):
         super().__init__(*args, **kwargs)
         self._records = []
 
-        self._save_dir = os.environ.get("SGLANG_EXPERT_DISTRIBUTION_RECORDER_SAVE_DIR")
+        self._save_dir = _SAVE_DIR
         if self._save_dir is not None and not Path(self._save_dir).exists():
             Path(self._save_dir).mkdir(parents=True, exist_ok=True)
 
