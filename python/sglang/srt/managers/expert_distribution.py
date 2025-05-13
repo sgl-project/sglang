@@ -22,8 +22,6 @@ logger = logging.getLogger(__name__)
 
 _OutputMode = Literal["file", "object"]
 
-_SAVE_DIR = Path(os.environ.get("SGLANG_EXPERT_DISTRIBUTION_RECORDER_SAVE_DIR", "/tmp"))
-
 
 class ExpertDistributionRecorder:
     """Global expert distribution recording"""
@@ -659,6 +657,10 @@ class _DetailAccumulator(_UtilizationRateAccumulatorMixin):
         if not _SAVE_DIR.exists():
             _SAVE_DIR.mkdir(parents=True, exist_ok=True)
         torch.save(output, str(path_output))
+
+
+def _dump_to_file():
+    _SAVE_DIR = Path(os.environ.get("SGLANG_EXPERT_DISTRIBUTION_RECORDER_SAVE_DIR", "/tmp"))
 
 
 class _StatAccumulator(_UtilizationRateAccumulatorMixin):
