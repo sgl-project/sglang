@@ -32,7 +32,6 @@ class DeepEPDispatchMode(IntEnum):
 
 
 class DeepEPBuffer:
-
     _buffer = None
     _dispatch_mode: Optional[DeepEPDispatchMode] = None
     _hidden_size: Optional[int] = None
@@ -112,9 +111,19 @@ class DeepEPBuffer:
             cls.clean_buffer()
         cls._dispatch_mode = DeepEPDispatchMode.LOW_LATENCY
 
+
 class _DeepEPConfig:
+    _instance = None
+
     def __init__(self):
         TODO
+
+    @classmethod
+    def get_instance(cls):
+        if cls._instance is None:
+            cls._instance = _DeepEPConfig()
+        return cls._instance
+
 
 class _DeepEPDispatcherImplBase:
     def __init__(
@@ -432,9 +441,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         buffer = self._get_buffer()
         topk_idx = topk_idx.to(torch.int64)
         expected_m = (
-            hidden_states.shape[0] * buffer.group_size * topk_idx.shape[1]
-            + self.num_experts
-        ) // self.num_experts
+                         hidden_states.shape[0] * buffer.group_size * topk_idx.shape[1]
+                         + self.num_experts
+                     ) // self.num_experts
         hidden_states, masked_m, event, hook = self._dispatch_core(
             hidden_states,
             topk_idx,
