@@ -64,12 +64,12 @@ def _run_subprocess(
     device: str,
 ):
     try:
-        temp_buffers = expert_location_updater.create_temp_buffers()
+        routed_experts_weights = TODO
         for _ in range(5000):
             TODO_prepare
             expert_location_updater.update_expert_weights_single_layer(
                 routed_experts_weights=routed_experts_weights,
-                temp_buffers=TODO,
+                temp_buffers=expert_location_updater.create_temp_buffers(),
                 old_physical_to_logical_map=old_physical_to_logical_map,
                 new_physical_to_logical_map=new_physical_to_logical_map,
             )
