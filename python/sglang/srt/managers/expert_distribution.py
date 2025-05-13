@@ -679,6 +679,13 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
         self._global_physical_count_of_buffered_step.reset()
 
     def dump(self, output_mode: _OutputMode):
+        logical_count_of_step = _convert_global_physical_count_to_logical_count(
+            self._global_physical_count_of_buffered_step.get_all(),
+            num_layers=self._expert_location_metadata.num_layers,
+            num_logical_experts=self._expert_location_metadata.num_logical_experts,
+            physical_to_logical_map=self._expert_location_metadata.physical_to_logical_map,
+        )
+       
         if output_mode == "file":
             if self._rank == 0:
                 _dump_to_file(f"expert_distribution_recorder_{time.time()}.pt", TODO)
@@ -688,14 +695,6 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
 
         else:
             raise NotImplementedError
-
-        self._logical_count += _convert_global_physical_count_to_logical_count(
-            self._buffer_global_physical_count,
-            num_layers=self._expert_location_metadata.num_layers,
-            num_logical_experts=self._expert_location_metadata.num_logical_experts,
-            physical_to_logical_map=self._expert_location_metadata.physical_to_logical_map,
-        )
-        self._buffer_global_physical_count[...] = 0
 
         return dict(
             rank=self._rank,
