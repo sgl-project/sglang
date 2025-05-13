@@ -561,12 +561,12 @@ class MooncakeKVReceiver(BaseKVReceiver):
             assert (
                 self.kv_mgr.is_mla_backend
             ), "PD with different TP sizes per DP rank is not yet supported for non-MLA models"
-            replicated_decode_per_prefill = exact_int_div(
+            n_decode_per_prefill = exact_int_div(
                 local_tp_size_per_dp_rank, prefill_tp_size_per_dp_rank
             )
-            # Each prefill TP rank will send to replicated_decode_per_prefill decode workers
-            self.target_prefill_tp_rank = local_tp_rank // replicated_decode_per_prefill
-            self.required_dst_info_num = replicated_decode_per_prefill
+            # Each prefill TP rank will send to n_decode_per_prefill decode workers
+            self.target_prefill_tp_rank = local_tp_rank // n_decode_per_prefill
+            self.required_dst_info_num = n_decode_per_prefill
             self.target_prefill_tp_ranks = [self.target_prefill_tp_rank]
         else:
             assert (
@@ -574,14 +574,14 @@ class MooncakeKVReceiver(BaseKVReceiver):
             ), "PD with different TP sizes per DP rank is not yet supported for non-MLA models"
 
             # For non-MLA models, one decode rank may need to retrieve KVCache from multiple prefill ranks
-            replicated_prefill_per_decode = exact_int_div(
+            n_prefill_per_decode = exact_int_div(
                 prefill_tp_size_per_dp_rank, local_tp_size_per_dp_rank
             )
             self.target_prefill_tp_ranks = [
                 rank
                 for rank in range(
-                    local_tp_rank * replicated_prefill_per_decode,
-                    (local_tp_rank + 1) * replicated_prefill_per_decode,
+                    local_tp_rank * n_prefill_per_decode,
+                    (local_tp_rank + 1) * n_prefill_per_decode,
                 )
             ]
 
