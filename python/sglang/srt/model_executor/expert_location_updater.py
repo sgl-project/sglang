@@ -21,4 +21,5 @@ def _update_expert_weights(
     old_expert_location_metadata: ExpertLocationMetadata,
     new_expert_location_metadata: ExpertLocationMetadata,
 ):
+    temp_buffers = [torch.empty_like(tensor) for tensor in routed_experts_weights_of_layer[0]]
     TODO
