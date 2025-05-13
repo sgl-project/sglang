@@ -2104,3 +2104,9 @@ def log_info_on_rank0(logger, msg):
 
     if get_tensor_model_parallel_rank() == 0:
         logger.info(msg)
+
+
+def exact_int_div(num: int, denom: int) -> int:
+    """Requires numerator to be integer multiple of denominator"""
+    assert num % denom == 0, "%d is not divisible by %d" % (num, denom)
+    return num // denom

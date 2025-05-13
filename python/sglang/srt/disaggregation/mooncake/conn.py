@@ -29,7 +29,7 @@ from sglang.srt.disaggregation.base.conn import (
 from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferEngine
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import get_free_port, get_ip, get_local_ip_by_remote
+from sglang.srt.utils import get_free_port, get_ip, get_local_ip_by_remote, exact_int_div
 
 logger = logging.getLogger(__name__)
 
@@ -538,57 +538,64 @@ class MooncakeKVReceiver(BaseKVReceiver):
 
         # Currently, we don't allow prefill instance and decode instance to
         # have different TP sizes per DP rank, except for models using MLA.
-        local_tp_size_per_dp_rank = self.kv_mgr.tp_size // self.kv_mgr.dp_size
-        prefill_tp_size_per_dp_rank = self.prefill_tp_size // self.prefill_dp_size
+
+        # If not exactly divisible, we will miscalculate the local TP sizes
+        local_tp_size_per_dp_rank = exact_int_div(self.kv_mgr.tp_size, self.kv_mgr.dp_size)
+        prefill_tp_size_per_dp_rank = exact_int_div(self.prefill_tp_size, self.prefill_dp_size)
+
         if local_tp_size_per_dp_rank == prefill_tp_size_per_dp_rank:
-            self.target_tp_rank = (
+            self.target_prefill_tp_rank = (
                 self.kv_mgr.kv_args.engine_rank % local_tp_size_per_dp_rank
             )
             self.required_dst_info_num = 1
-            self.target_tp_ranks = [self.target_tp_rank]
+            self.target_prefill_tp_ranks = [self.target_prefill_tp_rank]
         elif local_tp_size_per_dp_rank > prefill_tp_size_per_dp_rank:
             assert (
                 self.kv_mgr.is_mla_backend
             ), "PD with different TP sizes per DP rank is not yet supported for non-MLA models"
-            self.target_tp_rank = (
-                self.kv_mgr.kv_args.engine_rank % local_tp_size_per_dp_rank
-            ) // (local_tp_size_per_dp_rank // prefill_tp_size_per_dp_rank)
-            self.required_dst_info_num = (
-                local_tp_size_per_dp_rank // prefill_tp_size_per_dp_rank
+            replicated_decode_per_prefill = exact_int_div(
+                local_tp_size_per_dp_rank, prefill_tp_size_per_dp_rank
             )
-            self.target_tp_ranks = [self.target_tp_rank]
+            # Each prefill TP rank will send to replicated_decode_per_prefill decode workers
+            self.target_prefill_tp_rank = (
+                self.kv_mgr.kv_args.engine_rank % local_tp_size_per_dp_rank
+            ) // replicated_decode_per_prefill
+            self.required_dst_info_num = replicated_decode_per_prefill
+            self.target_prefill_tp_ranks = [self.target_prefill_tp_rank]
         else:
             assert (
                 self.kv_mgr.is_mla_backend
             ), "PD with different TP sizes per DP rank is not yet supported for non-MLA models"
 
-            # For non-MLA models, one decode rank needs to retrieve KVCache from multiple prefill ranks for non MLA models;
-            self.target_tp_ranks = [
+            # For non-MLA models, one decode rank may need to retrieve KVCache from multiple prefill ranks
+            replicated_prefill_per_decode = exact_int_div(
+                prefill_tp_size_per_dp_rank, local_tp_size_per_dp_rank
+            )
+            local_tp_rank = self.kv_mgr.kv_args.engine_rank % local_tp_size_per_dp_rank
+            self.target_prefill_tp_ranks = [
                 rank
                 for rank in range(
-                    (self.kv_mgr.kv_args.engine_rank % local_tp_size_per_dp_rank)
-                    * (prefill_tp_size_per_dp_rank // local_tp_size_per_dp_rank),
-                    (self.kv_mgr.kv_args.engine_rank % local_tp_size_per_dp_rank + 1)
-                    * (prefill_tp_size_per_dp_rank // local_tp_size_per_dp_rank),
+                    local_tp_rank * replicated_prefill_per_decode,
+                    (local_tp_rank + 1) * replicated_prefill_per_decode,
                 )
             ]
 
             # For MLA models, we can retrieve KVCache from only one prefill rank, but we still need to maintain
             # multiple connections in the connection pool and have to send dummy requests to other prefill ranks,
             # or the KVPoll will never be set correctly
-            self.target_tp_rank = self.target_tp_ranks[0]
+            self.target_prefill_tp_rank = self.target_prefill_tp_ranks[0]
             self.required_dst_info_num = 1
 
         self.target_dp_group = bootstrap_room % self.prefill_dp_size
 
         # NOTE: key distinguished by bootstrap_addr, target_dp_group, and target_tp_rank
         bootstrap_key = (
-            f"{self.bootstrap_addr}_{self.target_dp_group}_{self.target_tp_rank}"
+            f"{self.bootstrap_addr}_{self.target_dp_group}_{self.target_prefill_tp_rank}"
         )
 
         if bootstrap_key not in self.kv_mgr.connection_pool:
             bootstrap_infos = []
-            for target_tp_rank in self.target_tp_ranks:
+            for target_tp_rank in self.target_prefill_tp_ranks:
                 bootstrap_info = self._get_bootstrap_info_from_server(
                     target_tp_rank,
                     self.target_dp_group,
@@ -596,8 +603,8 @@ class MooncakeKVReceiver(BaseKVReceiver):
                 if bootstrap_info is not None:
                     # NOTE: only support MLA for now: select one prefill rank as real rank
                     bootstrap_info["is_dummy"] = not bool(
-                        target_tp_rank == self.target_tp_rank
-                        or self.target_tp_rank is None
+                        target_tp_rank == self.target_prefill_tp_rank
+                        or self.target_prefill_tp_rank is None
                     )
                     bootstrap_infos.append(bootstrap_info)
                 else:
