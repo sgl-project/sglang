@@ -766,7 +766,7 @@ class _InfiniteBuffer(_Buffer):
         self._size += 1
 
     def get_all(self) -> torch.Tensor:
-        TODO
+        return self._buffer[:self._size]
 
 
 def _convert_global_physical_count_to_logical_count(
