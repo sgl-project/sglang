@@ -25,7 +25,7 @@ class TestExpertDistribution(CustomTestCase):
                 self._execute_core(**info)
 
     def _execute_core(
-            self, model_path: str, mode: str, tp_size: int = 1
+        self, model_path: str, mode: str = "stat", tp_size: int = 1
     ):
         """Test expert distribution record endpoints"""
         process = popen_launch_server(
