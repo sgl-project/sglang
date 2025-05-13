@@ -759,6 +759,8 @@ class _InfiniteBuffer(_Buffer):
 
         if self._size == curr_buffer_size:
             new_buffer = torch.zeros((2 * curr_buffer_size, *self._item_shape), device=device)
+            new_buffer[:curr_buffer_size, ...] = self._buffer
+            self._buffer = new_buffer
 
         TODO
 
