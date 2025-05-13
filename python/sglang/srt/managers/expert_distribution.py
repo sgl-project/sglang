@@ -652,7 +652,7 @@ class _DetailAccumulator(_UtilizationRateAccumulatorMixin):
             # NOTE: This may change during recording, so here we say it is the "last" one
             last_physical_to_logical_map=self._expert_location_metadata.physical_to_logical_map,
         )
-        _dump_to_file(f"{time.time()}-{self._rank}.pt", output)
+        _dump_to_file(f"expert_distribution_recorder_{time.time()}_{self._rank}.pt", output)
 
 
 class _StatAccumulator(_UtilizationRateAccumulatorMixin):
@@ -680,8 +680,8 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
 
     def dump(self, output_mode: _OutputMode):
         if output_mode == "file":
-            if rank == 0:
-                TODO
+            if self._rank == 0:
+                _dump_to_file(f"expert_distribution_recorder_{time.time()}.pt", TODO)
 
         elif output_mode == "object":
             TODO
