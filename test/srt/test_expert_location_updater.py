@@ -1,4 +1,3 @@
-import random
 import traceback
 import unittest
 
@@ -66,7 +65,7 @@ def _run_subprocess(
     device: str,
 ):
     try:
-        r = random.Random(42)
+        torch.random.manual_seed(42)
         num_local_physical_experts = num_physical_experts // num_gpus
 
         def _create_routed_experts_weights(physical_to_logical_map):
