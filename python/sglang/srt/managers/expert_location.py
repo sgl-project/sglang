@@ -3,13 +3,11 @@ import json
 import logging
 import random
 from dataclasses import dataclass
-from json import JSONDecodeError
 from pathlib import Path
 from typing import List, Optional
 
 import torch
 import torch.nn.functional as F
-
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.managers import deepseek_eplb
 from sglang.srt.model_loader import get_model_architecture
@@ -91,7 +89,6 @@ class ExpertLocationMetadata:
     def init_by_mapping(
         server_args: ServerArgs,
         physical_to_logical_map,
-        hack_logical_to_all_physical_map_pick_first_only=False,
     ):
         if not isinstance(physical_to_logical_map, torch.Tensor):
             physical_to_logical_map = torch.tensor(physical_to_logical_map)
@@ -102,12 +99,6 @@ class ExpertLocationMetadata:
             physical_to_logical_map,
             num_logical_experts=model_config_for_expert_location.num_logical_experts,
         )
-
-        if hack_logical_to_all_physical_map_pick_first_only:
-            logical_to_all_physical_map = logical_to_all_physical_map[:, :, :1]
-            print(
-                f"hack since hack_logical_to_all_physical_map_pick_first_only! {logical_to_all_physical_map.tolist()=}"
-            )
 
         return ExpertLocationMetadata._init_raw(
             ep_size=common["ep_size"],
@@ -325,8 +316,8 @@ def compute_logical_to_rank_dispatch_physical_map(
                 )
             )
             output_partial = logical_to_rank_dispatch_physical_map[
-                :, layer_id, logical_expert_id
-            ]
+                             :, layer_id, logical_expert_id
+                             ]
 
             for gpu_id in range(num_gpus):
                 same_gpu_physical_expert_ids = [
@@ -335,7 +326,7 @@ def compute_logical_to_rank_dispatch_physical_map(
                     if _compute_gpu_id_of_physical_expert(
                         physical_expert_id, num_local_physical_experts
                     )
-                    == gpu_id
+                       == gpu_id
                 ]
                 if len(same_gpu_physical_expert_ids) > 0:
                     output_partial[gpu_id] = same_gpu_physical_expert_ids[0]
