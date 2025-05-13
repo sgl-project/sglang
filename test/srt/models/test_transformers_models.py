@@ -174,7 +174,7 @@ class TestTransformersFallbackEngine(CustomTestCase):
                 prompts = [p for p in DEFAULT_PROMPTS if len(p) < 1000]
 
             # Assert the logits and output strs are close
-            self.assert_close_logits_and_output_strs(prompts, model_case, torch.float16)
+            self.assert_close_logits_and_output_strs(prompts, model_case)
 
 
 if __name__ == "__main__":
