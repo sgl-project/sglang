@@ -4,7 +4,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import torch
-
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.managers import deepseek_eplb
 from sglang.srt.managers.expert_distribution_storage import ExpertDistributionStorage
@@ -31,7 +30,7 @@ class EPLBManager:
         TODO_remove_eplb_storage_dir
         self._expert_distribution_storage = ExpertDistributionStorage(
             dir_data=Path(self._server_args.eplb_storage_dir)
-            / "expert_distribution_storage"
+                     / "expert_distribution_storage"
         )
 
     def bind(self, tokenizer_manager: "TokenizerManager"):
@@ -40,6 +39,7 @@ class EPLBManager:
 
     async def handle_loop(self):
         await self._expert_distribution_storage.start()
+        TODO_remove_eplb_rebalance_period
         while True:
             sleep_time = self._server_args.eplb_rebalance_period or 1000000000
             logger.info(
