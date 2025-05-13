@@ -824,14 +824,17 @@ class TokenizerManager:
         )
 
     async def eplb_rebalance(self, obj: EplbRebalanceReqInput):
+        TODO_rm
         self.auto_create_handle_loop()
         await self.eplb_manager.rebalance(obj)
 
     async def eplb_save_expert_distribution(self):
+        TODO_rm
         self.auto_create_handle_loop()
         await self.eplb_manager.save_expert_distribution()
 
     async def update_expert_location(self, obj: UpdateExpertLocationReqInput):
+        TODO_rm
         self.auto_create_handle_loop()
         assert (
             self.server_args.ep_dispatch_algorithm is not None

@@ -691,21 +691,6 @@ class FlushCacheReqOutput:
 
 
 @dataclass
-class EplbRebalanceReqInput:
-    debug_use_random_stat: bool = False
-
-
-@dataclass
-class UpdateExpertLocationReqInput:
-    expert_location_metadata: "ExpertLocationMetadata"
-
-
-@dataclass
-class UpdateExpertLocationReqOutput:
-    pass
-
-
-@dataclass
 class UpdateWeightFromDiskReqInput:
     # The model path with the new weights
     model_path: str
