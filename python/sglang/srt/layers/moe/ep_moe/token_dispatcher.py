@@ -3,7 +3,7 @@ from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.utils import DeepEPMode, load_json_config
 
 try:
-    from deep_ep import Buffer
+    from deep_ep import Buffer, Config
 
     from sglang.srt.layers.quantization.fp8_kernel import (
         sglang_per_token_group_quant_fp8,
@@ -120,8 +120,8 @@ class _DeepEPConfig:
         config_str = global_server_args_dict["deepep_config"]
         if config_str:
             config_parsed = load_json_config(config_str)
-            self.normal_dispatch_config = TODO
-            self.normal_combine_config = TODO
+            self.normal_dispatch_config = Config(**config_parsed["normal_dispatch"])
+            self.normal_combine_config = Config(**config_parsed["normal_combine"])
         else:
             self.normal_dispatch_config = None
             self.normal_combine_config = None
