@@ -109,6 +109,14 @@ class TestEPLBMisc(CustomTestCase):
             engine.shutdown()
             del engine
 
+    def _assert_behavior(self, engine: sgl.Engine):
+        output = engine.generate(
+            prompt=["1+1=2, 2+2=4", "One plus one is two, two plus two is four"],
+            sampling_params=dict(max_new_tokens=8, temperature=0.0),
+        )
+        print(f"engine.generate {output=}")
+        self.assertEqual([x["text"] for x in output], [", 4+4=8,", ", four plus four is eight, eight"])
+
 
 if __name__ == "__main__":
     unittest.main()
