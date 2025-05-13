@@ -112,6 +112,9 @@ class DeepEPBuffer:
             cls.clean_buffer()
         cls._dispatch_mode = DeepEPDispatchMode.LOW_LATENCY
 
+class _DeepEPConfig:
+    def __init__(self):
+        TODO
 
 class _DeepEPDispatcherImplBase:
     def __init__(
