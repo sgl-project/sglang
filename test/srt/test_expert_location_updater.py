@@ -1,5 +1,7 @@
 import unittest
 
+from sglang.test.test_utils import CustomTestCase
+
 
 class TestExpertLocationUpdater(CustomTestCase):
     TODO
