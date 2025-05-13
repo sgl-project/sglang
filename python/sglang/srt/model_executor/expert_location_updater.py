@@ -11,4 +11,4 @@ def update_expert_location(
 ):
     old_expert_location_metadata = get_global_expert_location_metadata()
     TODO
-   
+    old_expert_location_metadata.update(new_expert_location_metadata)
