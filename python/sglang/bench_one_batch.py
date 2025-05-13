@@ -250,11 +250,6 @@ def extend(reqs, model_runner: ModelRunner):
     _maybe_prepare_dp_attn_batch(batch, model_runner)
     model_worker_batch = batch.get_model_worker_batch()
     forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
-<<<<<<< HEAD
-    logits_output, _ = model_runner.forward(forward_batch)
-    next_token_ids = model_runner.sample(logits_output, forward_batch)
-    return next_token_ids, logits_output.next_token_logits, batch
-=======
     if model_runner.pp_start_layer != 0:
         pp_proxy_tensors = None
         try:
@@ -294,7 +289,6 @@ def extend(reqs, model_runner: ModelRunner):
         assert isinstance(logits_output, LogitsProcessorOutput)
         next_token_ids = model_runner.sample(logits_output, forward_batch)
         return next_token_ids, logits_output.next_token_logits, batch
->>>>>>> ae829c7d (customize pp_start_layer and pp_end_layer)
 
 
 @torch.no_grad
@@ -304,9 +298,6 @@ def decode(input_token_ids, batch: ScheduleBatch, model_runner):
     _maybe_prepare_dp_attn_batch(batch, model_runner)
     model_worker_batch = batch.get_model_worker_batch()
     forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
-<<<<<<< HEAD
-    logits_output, _ = model_runner.forward(forward_batch)
-=======
     if model_runner.pp_start_layer != 0:
         pp_proxy_tensors = None
         try:
@@ -334,7 +325,6 @@ def decode(input_token_ids, batch: ScheduleBatch, model_runner):
             })
 
     logits_output = model_runner.forward(forward_batch, pp_proxy_tensors=pp_proxy_tensors)
->>>>>>> ae829c7d (customize pp_start_layer and pp_end_layer)
     next_token_ids = model_runner.sample(logits_output, forward_batch)
     return next_token_ids, logits_output.next_token_logits
 
