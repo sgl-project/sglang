@@ -22,6 +22,7 @@ class EPLBManager:
     def __init__(self, model_runner: ModelRunner):
         super().__init__()
         self._model_runner = model_runner
+        model_runner.server_args.eplb_rebalance_num_iterations
 
 
 class _TODO_REMOVE_EPLBManager:

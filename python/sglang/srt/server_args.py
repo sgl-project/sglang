@@ -168,11 +168,12 @@ class ServerArgs:
         None
     )
     enable_eplb: bool = False
-    eplb_rebalance_num_iterations: Optional[int] = None
+    eplb_rebalance_num_iterations: int = 1000
     deepseek_eplb_hack_shuffle: bool = False
     expert_distribution_recorder_mode: Optional[
         Literal["stat", "stat_ut", "stat_per_pass", "detail_per_token"]
     ] = None
+    expert_distribution_recorder_buffer_size: int = 1000
     enable_torch_compile: bool = False
     torch_compile_max_bs: int = 32
     cuda_graph_max_bs: Optional[int] = None
