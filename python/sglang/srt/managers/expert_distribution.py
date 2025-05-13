@@ -4,14 +4,12 @@ import time
 from abc import ABC
 from collections import deque
 from contextlib import contextmanager
-from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Type
 
 import einops
 import torch
 import torch.distributed
-
 from sglang.srt.managers.expert_location import ExpertLocationMetadata
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -225,7 +223,6 @@ def set_global_expert_distribution_recorder(value):
     _global_expert_distribution_recorder = value
 
 
-
 # --------------------------------------- SinglePassGatherer -----------------------------------------
 
 
@@ -392,8 +389,8 @@ class _SelectExpertsSinglePassGatherer(_LayerBasedSinglePassGatherer):
         torch.cuda.synchronize()
 
         global_physical_count = [
-            0
-        ] * self._expert_location_metadata.num_physical_experts
+                                    0
+                                ] * self._expert_location_metadata.num_physical_experts
         for token_record in topk_ids_list:
             for global_physical_expert_idx in token_record:
                 global_physical_count[global_physical_expert_idx] += 1
@@ -476,7 +473,7 @@ def _convert_local_to_global_physical_count(
 
     ans = torch.zeros((num_layers, num_physical_experts), dtype=dtype, device=device)
     ans[
-        :, num_local_physical_experts * rank : num_local_physical_experts * (rank + 1)
+    :, num_local_physical_experts * rank: num_local_physical_experts * (rank + 1)
     ] = local_physical_count
     return ans
 
@@ -580,19 +577,15 @@ class _DetailAccumulator(_Accumulator):
         self._records.clear()
 
     def dump(self):
-        if self._save_dir is None:
-            # TODO make it unified with the other branch
-            return deepcopy(self._records)
-        else:
-            path_output = Path(self._save_dir) / f"{time.time()}-{self._rank}.pt"
-            logger.info(f"Write expert distribution to {path_output}")
-            output = dict(
-                records=self._records,
-                # NOTE: This may change during recording, so here we say it is the "last" one
-                last_physical_to_logical_map=self._expert_location_metadata.physical_to_logical_map,
-            )
-            torch.save(output, str(path_output))
-            return [dict(path_output=str(path_output))]
+        path_output = Path(self._save_dir) / f"{time.time()}-{self._rank}.pt"
+        logger.info(f"Write expert distribution to {path_output}")
+        output = dict(
+            records=self._records,
+            # NOTE: This may change during recording, so here we say it is the "last" one
+            last_physical_to_logical_map=self._expert_location_metadata.physical_to_logical_map,
+        )
+        torch.save(output, str(path_output))
+        return [dict(path_output=str(path_output))]
 
 
 class _StatAccumulator(_Accumulator):
@@ -639,7 +632,6 @@ class _StatAccumulator(_Accumulator):
             rank=self._rank,
             logical_count=self._logical_count.tolist(),
         )
-
 
 
 def _convert_global_physical_count_to_logical_count(
