@@ -1057,7 +1057,7 @@ class ServerArgs:
             "--expert-distribution-recorder-buffer-size",
             type=int,
             default=ServerArgs.expert_distribution_recorder_buffer_size,
-            help="Circular buffer size of expert distribution recorder",
+            help="Circular buffer size of expert distribution recorder. Set to -1 to denote infinite buffer.",
         )
         parser.add_argument(
             "--enable-torch-compile",
