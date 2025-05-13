@@ -52,6 +52,7 @@ from sglang.srt.disaggregation.utils import (
 from sglang.srt.entrypoints.engine import _launch_subprocesses
 from sglang.srt.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
+    AbortReq,
     CloseSessionReqInput,
     ConfigureLoggingReq,
     EmbeddingReqInput,
@@ -224,7 +225,7 @@ async def get_server_info():
     return {
         **dataclasses.asdict(_global_state.tokenizer_manager.server_args),
         **_global_state.scheduler_info,
-        **internal_states,
+        "internal_states": internal_states,
         "version": __version__,
     }
 
@@ -340,7 +341,11 @@ async def start_profile_async(obj: Optional[ProfileReqInput] = None):
         obj = ProfileReqInput()
 
     await _global_state.tokenizer_manager.start_profile(
-        obj.output_dir, obj.num_steps, obj.activities
+        output_dir=obj.output_dir,
+        num_steps=obj.num_steps,
+        activities=obj.activities,
+        with_stack=obj.with_stack,
+        record_shapes=obj.record_shapes,
     )
     return Response(
         content="Start profiling.\n",
@@ -540,6 +545,16 @@ async def configure_logging(obj: ConfigureLoggingReq, request: Request):
     """Configure the request logging options."""
     _global_state.tokenizer_manager.configure_logging(obj)
     return Response(status_code=200)
+
+
+@app.post("/abort_request")
+async def abort_request(obj: AbortReq, request: Request):
+    """Abort a request."""
+    try:
+        _global_state.tokenizer_manager.abort_request(rid=obj.rid)
+        return Response(status_code=200)
+    except Exception as e:
+        return _create_error_response(e)
 
 
 @app.post("/parse_function_call")

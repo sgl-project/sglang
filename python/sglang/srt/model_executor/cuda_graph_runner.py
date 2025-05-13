@@ -19,7 +19,7 @@ import bisect
 import inspect
 import os
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Callable, Optional, Union
 
 import torch
 import tqdm
@@ -40,14 +40,11 @@ from sglang.srt.patch_torch import monkey_patch_torch_compile
 from sglang.srt.utils import (
     get_available_gpu_memory,
     get_device_memory_capacity,
-    is_hip,
     rank0_log,
 )
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
-
-_is_hip = is_hip()
 
 
 def _to_torch(model: torch.nn.Module, reverse: bool, num_tokens: int):
@@ -137,7 +134,6 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
             )
 
         gpu_mem = get_device_memory_capacity()
-        # Batch size of each rank will not become so large when DP is on
         if gpu_mem is not None and gpu_mem > 96 * 1024:
             capture_bs += list(range(160, 257, 8))
 
@@ -148,12 +144,15 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
             model_runner.req_to_token_pool.size
         ]
 
-    capture_bs = list(sorted(set(capture_bs)))
-
-    assert len(capture_bs) > 0 and capture_bs[0] > 0
-    capture_bs = [bs for bs in capture_bs if bs <= model_runner.req_to_token_pool.size]
     if server_args.cuda_graph_max_bs:
         capture_bs = [bs for bs in capture_bs if bs <= server_args.cuda_graph_max_bs]
+        if max(capture_bs) < server_args.cuda_graph_max_bs:
+            capture_bs += list(
+                range(max(capture_bs), server_args.cuda_graph_max_bs + 1, 16)
+            )
+    capture_bs = [bs for bs in capture_bs if bs <= model_runner.req_to_token_pool.size]
+    capture_bs = list(sorted(set(capture_bs)))
+    assert len(capture_bs) > 0 and capture_bs[0] > 0
     compile_bs = (
         [bs for bs in capture_bs if bs <= server_args.torch_compile_max_bs]
         if server_args.enable_torch_compile
@@ -296,12 +295,12 @@ class CudaGraphRunner:
                 self.capture()
         except RuntimeError as e:
             raise Exception(
-                f"Capture cuda graph failed: {e}\n"
+                f"Capture CUDA graph failed: {e}\n"
                 "Possible solutions:\n"
                 "1. set --mem-fraction-static to a smaller value (e.g., 0.8 or 0.7)\n"
                 "2. set --cuda-graph-max-bs to a smaller value (e.g., 16)\n"
                 "3. disable torch compile by not using --enable-torch-compile\n"
-                "4. disable cuda graph by --disable-cuda-graph. (Not recommonded. Huge perf loss)\n"
+                "4. disable CUDA graph by --disable-cuda-graph. (Not recommended. Huge performance loss)\n"
                 "Open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose \n"
             )
 

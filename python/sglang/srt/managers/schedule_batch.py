@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-import hashlib
-from enum import Enum, auto
-
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -30,12 +27,16 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
   It will be transformed from CPU scheduler to GPU model runner.
 - ForwardBatch is managed by `model_runner.py::ModelRunner`.
   It contains low-level tensor data. Most of the data consists of GPU tensors.
+
+TODO(lmzheng): ModelWorkerBatch seems a bit redundant and we consider removing it in the future.
 """
 
 import copy
 import dataclasses
+import hashlib
 import logging
 import threading
+from enum import Enum, auto
 from typing import TYPE_CHECKING, List, Optional, Set, Tuple, Union
 
 import numpy as np
@@ -51,6 +52,7 @@ from sglang.srt.disaggregation.decode import ScheduleBatchDisaggregationDecodeMi
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPoolAllocator
+from sglang.srt.metrics.collector import TimeStats
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -73,6 +75,7 @@ global_server_args_dict = {
     "disable_radix_cache": ServerArgs.disable_radix_cache,
     "enable_deepep_moe": ServerArgs.enable_deepep_moe,
     "enable_dp_attention": ServerArgs.enable_dp_attention,
+    "enable_dp_lm_head": ServerArgs.enable_dp_lm_head,
     "enable_ep_moe": ServerArgs.enable_ep_moe,
     "enable_nan_detection": ServerArgs.enable_nan_detection,
     "flashinfer_mla_disable_ragged": ServerArgs.flashinfer_mla_disable_ragged,
@@ -134,9 +137,9 @@ class FINISH_LENGTH(BaseFinishReason):
 
 
 class FINISH_ABORT(BaseFinishReason):
-    def __init__(self, message="Unknown error", status_code=None, err_type=None):
+    def __init__(self, message=None, status_code=None, err_type=None):
         super().__init__(is_error=True)
-        self.message = message
+        self.message = message or "Aborted"
         self.status_code = status_code
         self.err_type = err_type
 
@@ -434,6 +437,7 @@ class Req:
         self.sampling_params = sampling_params
         self.custom_logit_processor = custom_logit_processor
         self.return_hidden_states = return_hidden_states
+        self.lora_path = lora_path
 
         # Memory pool info
         self.req_pool_idx: Optional[int] = None
@@ -441,11 +445,13 @@ class Req:
         # Check finish
         self.tokenizer = None
         self.finished_reason = None
+        # Whether this request has finished output
+        self.finished_output = None
         # If we want to abort the request in the middle of the event loop, set this to true
         # Note: We should never set finished_reason in the middle, the req will get filtered and never respond
         self.to_abort = False
         # This carries the error message for `.to_abort` and will be attached to the finished_reason at the end of the event loop
-        self.to_abort_message: str = "Unknown error"
+        self.to_abort_message: str = None
         self.stream = stream
         self.eos_token_ids = eos_token_ids
 
@@ -483,6 +489,13 @@ class Req:
         # For retraction
         self.is_retracted = False
 
+        # Incremental streamining
+        self.send_token_offset: int = 0
+        self.send_decode_id_offset: int = 0
+        # TODO (Byron): send_output_token_logprobs_offset and send_decode_id_offset can be different in disaggregation mode
+        # because the decode server does not have the first output token logprobs
+        self.send_output_token_logprobs_offset: int = 0
+
         # Logprobs (arguments)
         self.return_logprob = return_logprob
         # Start index to compute logprob from.
@@ -492,11 +505,9 @@ class Req:
         self.temp_scaled_logprobs = False
         self.top_p_normalized_logprobs = False
 
-        # Latency Breakdown
-        self.queue_time_start = None
-        self.queue_time_end = None
-
         # Logprobs (return values)
+        # True means the input logprob has been already sent to detokenizer.
+        self.input_logprob_sent: bool = False
         self.input_token_logprobs_val: Optional[List[float]] = None
         self.input_token_logprobs_idx: Optional[List[int]] = None
         self.input_top_logprobs_val: Optional[List[float]] = None
@@ -511,8 +522,10 @@ class Req:
         self.temp_input_token_ids_logprobs_idx: Optional[List[int]] = None
 
         if return_logprob:
+            # shape: (bs, 1)
             self.output_token_logprobs_val = []
             self.output_token_logprobs_idx = []
+            # shape: (bs, k)
             self.output_top_logprobs_val = []
             self.output_top_logprobs_idx = []
             self.output_token_ids_logprobs_val = []
@@ -530,6 +543,7 @@ class Req:
 
         # Constrained decoding
         self.grammar: Optional[BaseGrammarObject] = None
+        self.grammar_wait_ct = 0
 
         # The number of cached tokens that were already cached in the KV cache
         self.cached_tokens = 0
@@ -538,7 +552,12 @@ class Req:
         # The number of verification forward passes in the speculative decoding.
         # This is used to compute the average acceptance length per request.
         self.spec_verify_ct = 0
-        self.lora_path = lora_path
+
+        # For metrics
+        self.time_stats: TimeStats = TimeStats()
+        self.has_log_time_stats: bool = False
+        self.queue_time_start = None
+        self.queue_time_end = None
 
         # For disaggregation
         self.bootstrap_host: str = bootstrap_host
@@ -546,8 +565,6 @@ class Req:
         self.bootstrap_room: Optional[int] = bootstrap_room
         self.disagg_kv_sender: Optional[BaseKVSender] = None
 
-        # used for warmup because we don't have a pair yet when init
-        self.skip_kv_transfer: bool = False
         # the start index of the sent kv cache
         # We want to send it chunk by chunk for chunked prefill.
         # After every chunk forward, we do the following:
@@ -555,14 +572,14 @@ class Req:
         # start_send_idx = len(req.fill_ids)
         self.start_send_idx: int = 0
 
-        self.metadata_buffer_index: int = -1
-        # The first output_id transferred from prefill instance.
-        self.transferred_output_id: Optional[int] = None
-
         # For overlap schedule, we delay the kv transfer until `process_batch_result_disagg_prefill` rather than `process_prefill_chunk` in non-overlap
         # This is because kv is not ready in `process_prefill_chunk`.
         # We use `tmp_end_idx` to store the end index of the kv cache to send.
         self.tmp_end_idx: int = -1
+        self.metadata_buffer_index: int = -1
+
+        # The first output_id transferred from prefill instance.
+        self.transferred_output_id: Optional[int] = None
 
     @property
     def seqlen(self):
@@ -653,6 +670,11 @@ class Req:
             )
             return
 
+        if self.grammar is not None:
+            if self.grammar.is_terminated():
+                self.finished_reason = FINISH_MATCHED_TOKEN(matched=self.output_ids[-1])
+                return
+
         last_token_id = self.output_ids[-1]
 
         if not self.sampling_params.ignore_eos:
@@ -697,13 +719,41 @@ class Req:
         self.req_pool_idx = None
         self.already_computed = 0
 
+    def offload_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
+        token_indices = req_to_token_pool.req_to_token[
+            self.req_pool_idx, : self.seqlen - 1
+        ]
+        self.kv_cache_cpu = token_to_kv_pool_allocator.get_cpu_copy(token_indices)
+
+    def load_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
+        token_indices = req_to_token_pool.req_to_token[
+            self.req_pool_idx, : self.seqlen - 1
+        ]
+        token_to_kv_pool_allocator.load_cpu_copy(self.kv_cache_cpu, token_indices)
+        del self.kv_cache_cpu
+
+    def log_time_stats(self):
+        # If overlap schedule, we schedule one decode batch ahead so this gets called twice.
+        if self.has_log_time_stats is True:
+            return
+
+        if self.bootstrap_room is not None:
+            prefix = f"Req Time Stats(rid={self.rid}, bootstrap_room={self.bootstrap_room}, input len={len(self.origin_input_ids)}, output len={len(self.output_ids)}, type={self.time_stats.get_type().value})"
+        else:
+            prefix = f"Req Time Stats(rid={self.rid}, input len={len(self.origin_input_ids)}, output len={len(self.output_ids)}, type={self.time_stats.get_type().value})"
+        logger.info(f"{prefix}: {self.time_stats}")
+        self.has_log_time_stats = True
+
     def __repr__(self):
         return (
             f"Req(rid={self.rid}, "
-            f"input_ids={self.origin_input_ids}, output_ids={self.output_ids})"
+            f"input_ids={self.origin_input_ids}, output_ids={self.output_ids}, "
+            f"{self.grammar=}, "
+            f"{self.sampling_params=})"
         )
 
 
+# Batch id
 bid = 0
 
 
@@ -862,7 +912,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             error_msg = (
                 f"{phase_str} out of memory. Try to lower your batch size.\n"
                 f"Try to allocate {num_tokens} tokens.\n"
-                f"Avaliable tokens: {self.token_to_kv_pool_allocator.available_size() + self.tree_cache.evictable_size()}\n"
+                f"Available tokens: {self.token_to_kv_pool_allocator.available_size() + self.tree_cache.evictable_size()}\n"
             )
             logger.error(error_msg)
             if self.tree_cache is not None:
@@ -903,7 +953,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             error_msg = (
                 f"Prefill out of memory. Try to lower your batch size.\n"
                 f"Try to allocate {extend_num_tokens} tokens.\n"
-                f"Avaliable tokens: {self.token_to_kv_pool_allocator.available_size() + self.tree_cache.evictable_size()}\n"
+                f"Available tokens: {self.token_to_kv_pool_allocator.available_size() + self.tree_cache.evictable_size()}\n"
                 f"{self.token_to_kv_pool_allocator.available_size()=}\n"
                 f"{self.tree_cache.evictable_size()=}\n"
             )
@@ -938,7 +988,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             error_msg = (
                 f"Decode out of memory. Try to lower your batch size.\n"
                 f"Try to allocate {len(seq_lens)} tokens.\n"
-                f"Avaliable tokens: {self.token_to_kv_pool_allocator.available_size() + self.tree_cache.evictable_size()}\n"
+                f"Available tokens: {self.token_to_kv_pool_allocator.available_size() + self.tree_cache.evictable_size()}\n"
                 f"{self.token_to_kv_pool_allocator.available_size()=}\n"
                 f"{self.tree_cache.evictable_size()=}\n"
             )
@@ -1447,7 +1497,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 i
                 for i in range(len(self.reqs))
                 if not self.reqs[i].finished()
-                and not self.reqs[i] in chunked_req_to_exclude
+                and self.reqs[i] not in chunked_req_to_exclude
             ]
 
         if keep_indices is None or len(keep_indices) == 0:
@@ -1468,7 +1518,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.encoder_lens_cpu = [self.encoder_lens_cpu[i] for i in keep_indices]
 
         self.reqs = [self.reqs[i] for i in keep_indices]
-        self.multimodal_inputs = [self.multimodal_inputs[i] for i in keep_indices]
+        if self.multimodal_inputs is not None:
+            self.multimodal_inputs = [self.multimodal_inputs[i] for i in keep_indices]
         self.req_pool_indices = self.req_pool_indices[keep_indices_device]
         self.seq_lens = self.seq_lens[keep_indices_device]
         self.out_cache_loc = None
@@ -1517,7 +1568,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.top_logprobs_nums = [0] * len(self.reqs) + other.top_logprobs_nums
             self.token_ids_logprobs = [None] * len(self.reqs) + other.token_ids_logprobs
         self.reqs.extend(other.reqs)
-        self.multimodal_inputs.extend(other.multimodal_inputs)
+        if self.multimodal_inputs is not None:
+            self.multimodal_inputs.extend(other.multimodal_inputs)
 
         self.return_logprob |= other.return_logprob
         self.has_stream |= other.has_stream

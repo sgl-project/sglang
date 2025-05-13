@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sglang"
-version = "0.4.6.post3"
+version = "0.4.6.post4"
 description = "SGLang is yet another fast serving framework for large language models and vision language models."
 readme = "README.md"
 requires-python = ">=3.8"
@@ -48,7 +48,7 @@ runtime_common = [
 
 srt = [
     "sglang[runtime_common]",
-    "sgl-kernel==0.1.1",
+    "sgl-kernel==0.1.2.post1",
     "flashinfer_python==0.2.5",
     "torch==2.6.0",
     "torchvision==0.21.0",
@@ -103,7 +103,7 @@ test = [
     "accelerate",
     "peft",
 ]
-all = ["sglang[srt]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]"]
+all = ["sglang[srt]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]", "sglang[torch_memory_saver]"]
 all_hip = ["sglang[srt_hip]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]"]
 all_xpu = ["sglang[srt_xpu]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]"]
 all_hpu = ["sglang[srt_hpu]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]"]
@@ -147,3 +147,7 @@ exclude = [
     "scripts*",
     "tests*",
 ]
+
+[tool.codespell]
+ignore-words-list = "ans, als, hel, boostrap, childs, te, vas, hsa, ment"
+skip = "*.json,*.jsonl,*.patch,*.txt"
