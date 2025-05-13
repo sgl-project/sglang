@@ -175,7 +175,7 @@ def run_one_case(
                 or data["meta_info"]["finish_reason"]["type"] == "length"
             )
             if data["meta_info"]["completion_tokens"] == 1:
-                ttft = time.time() - tic
+                ttft = time.perf_counter() - tic
 
     latency = time.perf_counter() - tic
     input_throughput = batch_size * input_len / ttft
