@@ -37,6 +37,7 @@ class EPLBManager:
 
     async def rebalance(self):
         logical_count = get_global_expert_distribution_recorder().dump_record()["logical_count"]
+        expert_location_metadata = ExpertLocationMetadata.init_by_eplb(self._server_args, logical_count)
         TODO
 
 
