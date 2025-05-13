@@ -2,16 +2,11 @@
 
 These models accept multi-modal inputs (e.g., images and text) and generate text output. They augment language models with visual encoders and require a specific chat template for handling vision prompts.
 
-```{important}
-We need to specify `--chat-template` for VLMs because the chat template provided in HuggingFace tokenizer only supports text. If you do not specify a vision model’s `--chat-template`, the server uses HuggingFace’s default template, which only supports text and the images won’t be passed in.
-```
-
 ## Example launch Command
 
 ```shell
 python3 -m sglang.launch_server \
   --model-path meta-llama/Llama-3.2-11B-Vision-Instruct \  # example HF/local path
-  --chat-template llama_3_vision \                        # required chat template
   --host 0.0.0.0 \
   --port 30000 \
 ```
@@ -29,3 +24,4 @@ python3 -m sglang.launch_server \
 | **LLaVA-NeXT** (8B, 72B)       | `lmms-lab/llava-next-72b`                        | `chatml-llava`       | Improved LLaVA models (with an 8B Llama3 version and a 72B version) offering enhanced visual instruction-following and accuracy on multimodal benchmarks. |
 | **LLaVA-OneVision**            | `lmms-lab/llava-onevision-qwen2-7b-ov`           | `chatml-llava`       | Enhanced LLaVA variant integrating Qwen as the backbone; supports multiple images (and even video frames) as inputs via an OpenAI Vision API-compatible format. |
 | **Gemma 3 (Multimodal)**       | `google/gemma-3-4b-it`                           | `gemma-it`           | Gemma 3’s larger models (4B, 12B, 27B) accept images (each image encoded as 256 tokens) alongside text in a combined 128K-token context. |
+| **Kimi-VL** (A3B)              | `moonshotai/Kimi-VL-A3B-Instruct`                | `kimi-vl`            | Kimi-VL is a multimodal model that can understand and generate text from images. |
