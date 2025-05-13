@@ -678,6 +678,11 @@ def v1_generate_response(
             hidden_states = ret_item["meta_info"].get("hidden_states", None)
         elif (not isinstance(request, list)) and request.return_hidden_states:
             hidden_states = ret_item["meta_info"].get("hidden_states", None)
+        if hidden_states is not None:
+            hidden_states = hidden_states[1:]  # trim off the prefill
+            hidden_states = (
+                hidden_states[-1] if len(hidden_states) > 0 else []
+            )  # slice out the last token
 
         finish_reason = ret_item["meta_info"]["finish_reason"]
 
@@ -899,6 +904,10 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
                         prompt_tokens_details=prompt_tokens_details,
                     )
                     if request.return_hidden_states and hidden_states:
+                        hidden_states = hidden_states[1:]  # trim off the prefill
+                        hidden_states = (
+                            hidden_states[-1] if len(hidden_states) > 0 else []
+                        )  # slice out the last token
                         hidden_states_chunk = CompletionStreamResponse(
                             id=content["meta_info"]["id"],
                             created=created,
@@ -1320,7 +1329,11 @@ def v1_chat_generate_response(
         else:
             include_hidden_states = False
         if include_hidden_states and ret_item["meta_info"].get("hidden_states", None):
-            hidden_states = ret_item["meta_info"]["hidden_states"]  # Last token only.
+            hidden_states = ret_item["meta_info"]["hidden_states"]
+            hidden_states = hidden_states[1:]  # trim off the prefill
+            hidden_states = (
+                hidden_states[-1] if len(hidden_states) > 0 else []
+            )  # slice out the last token
         else:
             hidden_states = None
 
@@ -1781,6 +1794,10 @@ async def v1_chat_completions(
                 else:
                     usage = None
                 if request.return_hidden_states and hidden_states:
+                    hidden_states = hidden_states[1:]  # trim off the prefill
+                    hidden_states = (
+                        hidden_states[-1] if len(hidden_states) > 0 else []
+                    )  # slice out the last token
                     hidden_states_chunk = ChatCompletionStreamResponse(
                         id=content["meta_info"]["id"],
                         created=created,

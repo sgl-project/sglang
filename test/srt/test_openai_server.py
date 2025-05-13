@@ -113,9 +113,9 @@ class TestOpenAIServer(CustomTestCase):
         if return_hidden_states:
             hidden_states = response.choices[0].hidden_states
             assert hidden_states is not None, "hidden_states was none"
-            hidden_states = np.asarray(hidden_states[1:])
+            hidden_states = np.asarray(hidden_states)
             assert (
-                len(hidden_states.shape) == 2
+                len(hidden_states.shape) == 1
             ), f"hidden_states shape is not correct, was {hidden_states.shape}"
         else:
             assert not hasattr(
@@ -213,14 +213,12 @@ class TestOpenAIServer(CustomTestCase):
 
         if return_hidden_states:
             assert hidden_states is not None, "hidden_states is not returned"
-            if len(hidden_states) > 1:
-                hidden_states = hidden_states[1:]
             try:
                 hidden_states = np.asarray(hidden_states)
             except Exception as e:
                 raise Exception(f"Failed to convert hidden states to numpy array: {e}")
             assert (
-                len(hidden_states.shape) == 2
+                len(hidden_states.shape) == 1
             ), f"hidden_states shape is not correct, was {hidden_states.shape}"
         else:
             assert (
@@ -269,9 +267,9 @@ class TestOpenAIServer(CustomTestCase):
         if return_hidden_states:
             hidden_states = response.choices[0].hidden_states
             assert hidden_states is not None, "hidden_states is not returned"
-            hidden_states = np.asarray(hidden_states[1:])
+            hidden_states = np.asarray(hidden_states)
             assert (
-                len(hidden_states.shape) == 2
+                len(hidden_states.shape) == 1
             ), f"hidden_states shape is not correct, was {hidden_states.shape}"
         else:
             assert not hasattr(
@@ -359,14 +357,12 @@ class TestOpenAIServer(CustomTestCase):
 
         if return_hidden_states:
             assert hidden_states is not None, "hidden_states is not returned"
-            if len(hidden_states) > 1:
-                hidden_states = hidden_states[1:]
             try:
                 hidden_states = np.asarray(hidden_states)
             except Exception as e:
                 raise Exception(f"Failed to convert hidden states to numpy array: {e}")
             assert (
-                len(hidden_states.shape) == 2
+                len(hidden_states.shape) == 1
             ), f"hidden_states shape is not correct, was {hidden_states.shape}"
         else:
             assert (
