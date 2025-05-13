@@ -719,6 +719,18 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
         )
 
 
+class _Buffer:
+    TODO
+
+
+class _CircularBuffer:
+    TODO
+
+
+class _InfiniteBuffer:
+    TODO
+
+
 def _convert_global_physical_count_to_logical_count(
     global_physical_count: torch.Tensor,
     num_layers: int,
