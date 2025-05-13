@@ -31,6 +31,9 @@ class EPLBManager:
 
         get_global_expert_distribution_recorder().start_record()
 
+    def on_forward_pass_end(self, forward_pass_id: int):
+        TODO
+
 
 class _TODO_REMOVE_EPLBManager:
     def bind(self, tokenizer_manager: "TokenizerManager"):
