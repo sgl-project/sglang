@@ -139,9 +139,6 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             single_pass_data = gatherer.collect()
             self._accumulator.append(forward_pass_id, gatherer_key, single_pass_data)
 
-    def flush_buffer_depending_on_expert_location_metadata(self):
-        self._accumulator.flush_buffer_depending_on_expert_location_metadata()
-
     def on_select_experts(self, topk_ids: torch.Tensor):
         self._on_hook("on_select_experts", topk_ids=topk_ids)
 
@@ -531,9 +528,6 @@ class _Accumulator(ABC):
     def dump(self):
         raise NotImplementedError
 
-    def flush_buffer_depending_on_expert_location_metadata(self):
-        raise NotImplementedError
-
 
 class _DetailAccumulator(_Accumulator):
     def __init__(self, expert_location_metadata: "ExpertLocationMetadata", rank: int):
@@ -600,9 +594,6 @@ class _DetailAccumulator(_Accumulator):
             torch.save(output, str(path_output))
             return [dict(path_output=str(path_output))]
 
-    def flush_buffer_depending_on_expert_location_metadata(self):
-        pass
-
 
 class _StatAccumulator(_Accumulator):
     def __init__(self, expert_location_metadata: "ExpertLocationMetadata", rank: int):
@@ -636,14 +627,6 @@ class _StatAccumulator(_Accumulator):
         self._logical_count[...] = 0
 
     def dump(self):
-        self.flush_buffer_depending_on_expert_location_metadata()
-
-        return dict(
-            rank=self._rank,
-            logical_count=self._logical_count.tolist(),
-        )
-
-    def flush_buffer_depending_on_expert_location_metadata(self):
         self._logical_count += _convert_global_physical_count_to_logical_count(
             self._buffer_global_physical_count,
             num_layers=self._expert_location_metadata.num_layers,
@@ -651,6 +634,12 @@ class _StatAccumulator(_Accumulator):
             physical_to_logical_map=self._expert_location_metadata.physical_to_logical_map,
         )
         self._buffer_global_physical_count[...] = 0
+
+        return dict(
+            rank=self._rank,
+            logical_count=self._logical_count.tolist(),
+        )
+
 
 
 def _convert_global_physical_count_to_logical_count(
