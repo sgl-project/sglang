@@ -31,6 +31,9 @@ class MHATokenToHiPOffloadKVPool(KVCache):
         layer_num: int,
         device: torch.device,
         hip_config: HiPAttentionConfig,
+        chunked_attention_size: int = 0,
+        irope_offset: int = 0,
+        irope_interval: int = 0,
     ):
         super().__init__()
         self.size = max_token_size
@@ -54,6 +57,9 @@ class MHATokenToHiPOffloadKVPool(KVCache):
             layer_num=layer_num,
             device=device,
             hip_config=hip_config,
+            chunked_attention_size=chunked_attention_size,
+            irope_offset=irope_offset,
+            irope_interval=irope_interval,
         )
 
     def get_key_buffer(self, layer_id: int):
