@@ -13,15 +13,15 @@ from sglang.srt.managers.expert_location import (
 from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.tokenizer_manager import TokenizerManager
+    from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
 
 
 class EPLBManager:
-    def __init__(self, server_args: ServerArgs):
+    def __init__(self, model_runner: ModelRunner):
         super().__init__()
-        self._server_args = server_args
+        self._model_runner = model_runner
 
 
 class _TODO_REMOVE_EPLBManager:
