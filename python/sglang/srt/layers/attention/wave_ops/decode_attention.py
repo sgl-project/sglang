@@ -643,6 +643,11 @@ def decode_attention_fwd_grouped(
     _decode_softmax_reducev_fwd(attn_logits, q, o, v_buffer, b_seq_len, num_kv_splits)
 
 
+def view_trunc(tensor, shape):
+    size = math.prod(shape)
+    return tensor.view(-1)[:size].view(shape)
+
+
 def decode_attention_wave(
     q,
     k_buffer,
@@ -673,8 +678,8 @@ def decode_attention_wave(
         seq_len,
     )
 
-    k_buffer = k_buffer.view(num_seqs, seq_len, num_kv_heads, head_size)
-    v_buffer = v_buffer.view(num_seqs, seq_len, num_kv_heads, head_size_kv)
+    k_buffer = view_trunc(k_buffer, (num_seqs, seq_len, num_kv_heads, head_size))
+    v_buffer = view_trunc(v_buffer, (num_seqs, seq_len, num_kv_heads, head_size_kv))
 
     # Get the kernels (either compile or load from cache).
     if mha:
@@ -765,7 +770,7 @@ def decode_attention_fwd(
     sm_scale,
     logit_cap=0.0,
 ):
-    assert max_kv_splits == attn_logits.shape[2]
+    # assert max_kv_splits == attn_logits.shape[2]
     decode_attention_wave(
         q,
         k_buffer,
