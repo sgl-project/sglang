@@ -95,7 +95,7 @@ class ExpertLocationMetadata:
 
         common = ExpertLocationMetadata._init_common(server_args)
         model_config_for_expert_location = common["model_config_for_expert_location"]
-        logical_to_all_physical_map = _compute_logical_to_all_physical_map(
+        logical_to_all_physical_map = compute_logical_to_all_physical_map(
             physical_to_logical_map,
             num_logical_experts=model_config_for_expert_location.num_logical_experts,
         )
@@ -242,7 +242,7 @@ class ExpertLocationMetadata:
         )
 
 
-def _compute_logical_to_all_physical_map(
+def compute_logical_to_all_physical_map(
     physical_to_logical_map: torch.Tensor, num_logical_experts: int
 ):
     # This is rarely called, so we use for loops for maximum clarity
