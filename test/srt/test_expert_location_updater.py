@@ -70,9 +70,7 @@ def _run_subprocess(
                 routed_experts_weights=TODO,
                 temp_buffers=TODO,
                 old_physical_to_logical_map=old_physical_to_logical_map,
-                old_logical_to_all_physical_map=TODO,
                 new_physical_to_logical_map=new_physical_to_logical_map,
-                new_logical_to_all_physical_map=TODO,
             )
             TODO_assert
 
