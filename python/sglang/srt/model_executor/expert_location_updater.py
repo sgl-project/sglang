@@ -9,10 +9,11 @@ logger = logging.getLogger(__name__)
 
 
 def update_expert_location(
+    routed_experts_weights_of_layer: Dict[int, List[torch.Tensor]],
     new_expert_location_metadata: ExpertLocationMetadata,
 ):
     old_expert_location_metadata = get_global_expert_location_metadata()
-    _update_expert_weights(old_expert_location_metadata, new_expert_location_metadata)
+    _update_expert_weights(old_expert_location_metadata, new_expert_location_metadata, routed_experts_weights_of_layer)
     old_expert_location_metadata.update(new_expert_location_metadata)
 
 
