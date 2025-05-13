@@ -601,8 +601,8 @@ class _DequeCollection:
 
 
 class _DetailAccumulator(_UtilizationRateAccumulatorMixin):
-    def __init__(self, expert_location_metadata: "ExpertLocationMetadata", rank: int):
-        super().__init__(expert_location_metadata, rank)
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
         self._records = []
 
         self._save_dir = os.environ.get("SGLANG_EXPERT_DISTRIBUTION_RECORDER_SAVE_DIR")
@@ -662,8 +662,8 @@ class _DetailAccumulator(_UtilizationRateAccumulatorMixin):
 
 
 class _StatAccumulator(_UtilizationRateAccumulatorMixin):
-    def __init__(self, expert_location_metadata: "ExpertLocationMetadata", rank: int):
-        super().__init__(expert_location_metadata, rank)
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
         self._buffer_global_physical_count = _Buffer.init_new(item_shape=(
             self._expert_location_metadata.num_layers,
             self._expert_location_metadata.num_physical_experts,
