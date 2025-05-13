@@ -49,7 +49,6 @@ class MiMoMultiTokenPredictorLayer(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
-            prefix=add_prefix("embed_tokens", prefix),
         )
         self.token_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hidden_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -149,6 +148,10 @@ class MiMoMTP(nn.Module):
         params_dict = dict(self.named_parameters())
         print(params_dict.keys())
         for name, loaded_weight in weights:
+            # if not ("mtp_layers" not in name and (
+            #         "embed_tokens" not in name and "lm_head" not in name
+            #     )):
+            #     print(name)
             if "rotary_emb.inv_freq" in name or "projector" in name:
                 continue
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
@@ -159,7 +162,7 @@ class MiMoMTP(nn.Module):
                 continue
             if name.startswith("model.vision_tower") and name not in params_dict:
                 continue
-            # print(name, self.map_model_name_to_mtp_param_name(name))
+            print(name, self.map_model_name_to_mtp_param_name(name))
             name = self.map_model_name_to_mtp_param_name(name)
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
@@ -191,10 +194,20 @@ class MiMoMTP(nn.Module):
     def map_model_name_to_mtp_param_name(self, name: str) -> str:
         import re
 
+        name_without_prefix = [
+            "token_layernorm",
+            "hidden_layernorm",
+            "input_proj",
+            "final_layernorm",
+        ]
         pattern = r"model.mtp_layers.(\d+)."
         group = re.match(pattern, name)
         if group is not None:
-            name = name.replace(group.group(), "mtp_block.")
+            for sub_name in name_without_prefix:
+                if sub_name in name:
+                    name = name.replace(group.group(), "model.")
+                    return name
+            name = name.replace(group.group(), "model.mtp_block.")
         return name
 
     def get_embed_and_head(self):
