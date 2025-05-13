@@ -11,7 +11,7 @@ from sglang.utils import is_in_ci
 class TestExpertLocationUpdater(CustomTestCase):
     def test_cpu(self):
         self._test_core(num_gpus=TODO)
-       
+
     def test_gpu(self):
         if is_in_ci():
             return
@@ -20,6 +20,7 @@ class TestExpertLocationUpdater(CustomTestCase):
     def _test_core(
         self,
         num_gpus: int,
+        **kwargs,
     ):
         processes = []
         output_reader, output_writer = mp.Pipe(duplex=False)
@@ -28,7 +29,9 @@ class TestExpertLocationUpdater(CustomTestCase):
                 target=_run_subprocess,
                 kwargs=dict(
                     rank=rank,
+                    num_gpus=num_gpus,
                     output_writer=output_writer,
+                    **kwargs,
                 ),
             )
             p.start()
@@ -43,6 +46,7 @@ class TestExpertLocationUpdater(CustomTestCase):
 
 def _run_subprocess(
     rank: int,
+    num_gpus: int,
     output_writer,
 ):
     try:
