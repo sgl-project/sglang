@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 _OutputMode = Literal["file", "object"]
 
-_SAVE_DIR = os.environ.get("SGLANG_EXPERT_DISTRIBUTION_RECORDER_SAVE_DIR", "/tmp")
+_SAVE_DIR = Path(os.environ.get("SGLANG_EXPERT_DISTRIBUTION_RECORDER_SAVE_DIR", "/tmp"))
 
 
 class ExpertDistributionRecorder:
