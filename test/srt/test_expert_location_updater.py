@@ -2,6 +2,7 @@ import traceback
 import unittest
 
 import torch.multiprocessing as mp
+from sglang.srt.model_executor import expert_location_updater
 from sglang.test.test_utils import CustomTestCase
 from torch.multiprocessing import Process
 
@@ -36,7 +37,8 @@ def _run_subprocess(
     output_writer,
 ):
     try:
-        TODO
+        for _ in range(5000):
+            expert_location_updater.update_expert_weights_single_layer()
 
         execution_ok = True
     except Exception as e:
