@@ -311,12 +311,12 @@ class HiRadixCache(RadixCache):
 
         while node.evicted:
             assert (
-                node.backuped or node.l3_backuped
+                node.backuped
             ), "No backup available on evicted nodes, should not happen"
-            if node.backuped:
+            if node.l2_backuped:
                 l2_nodes_to_load.insert(0, node)
             if self.enable_mooncake_store_l3_cache:
-                if not node.backuped and node.l3_backuped:
+                if not node.l2_backuped and node.l3_backuped:
                     l3_nodes_to_load.insert(0, node)
             node = node.parent
         else:
@@ -490,7 +490,7 @@ class HiRadixCache(RadixCache):
         else:
             new_node.value = child.value[:split_len]
             child.value = child.value[split_len:]
-        if child.backuped:
+        if child.l2_backuped:
             new_node.host_value = child.host_value[:split_len]
             child.host_value = child.host_value[split_len:]
         if child.l3_backuped:

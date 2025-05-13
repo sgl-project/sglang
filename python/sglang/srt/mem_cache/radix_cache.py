@@ -65,6 +65,10 @@ class TreeNode:
 
     @property
     def backuped(self):
+        return self.host_value is not None or len(self.l3_keys) > 0
+
+    @property
+    def l2_backuped(self):
         return self.host_value is not None
 
     @property
