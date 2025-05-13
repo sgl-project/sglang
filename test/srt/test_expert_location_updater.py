@@ -12,16 +12,20 @@ class TestExpertLocationUpdater(CustomTestCase):
     def test_cpu(self):
         self._test_core(num_gpus=32, nnodes=4, num_logical_experts=256, num_physical_experts=288)
         self._test_core(num_gpus=144, nnodes=18, num_logical_experts=256, num_physical_experts=288)
+        self._test_common()
 
     def test_gpu(self):
         if is_in_ci():
             return
+        self._test_common(device="cuda")
+
+    def _test_common(self, device="cpu"):
         for nnodes in [1, 2, 4]:
             for num_logical_experts in [2, 5, 20, 200]:
                 for num_physical_experts in [4, 16, 220]:
                     if num_logical_experts > num_physical_experts: continue
                     self._test_core(num_gpus=8, nnodes=nnodes, num_logical_experts=num_logical_experts,
-                                    num_physical_experts=num_physical_experts)
+                                    num_physical_experts=num_physical_experts, device=device)
 
     def _test_core(
         self,
@@ -53,7 +57,11 @@ class TestExpertLocationUpdater(CustomTestCase):
 def _run_subprocess(
     rank: int,
     num_gpus: int,
+    nnodes: int,
+    num_logical_experts: int,
+    num_physical_experts: int,
     output_writer,
+    device: str,
 ):
     try:
         for _ in range(5000):
