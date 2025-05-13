@@ -80,17 +80,18 @@ def _run_subprocess(
                 ], device=device),
             ]
 
+        physical_to_logical_map = TODO
         routed_experts_weights = _create_routed_experts_weights(TODO)
         for _ in range(5000):
-            TODO_prepare
             expert_location_updater.update_expert_weights_single_layer(
                 routed_experts_weights=routed_experts_weights,
                 temp_buffers=expert_location_updater.create_temp_buffers(routed_experts_weights),
-                old_physical_to_logical_map=old_physical_to_logical_map,
+                old_physical_to_logical_map=physical_to_logical_map,
                 new_physical_to_logical_map=new_physical_to_logical_map,
             )
             expect_new_weights = _create_routed_experts_weights(new_physical_to_logical_map)
             assert all(torch.all(x == y) for x, y in zip(routed_experts_weights, expect_new_weights, strict=True))
+            physical_to_logical_map = new_physical_to_logical_map
 
         execution_ok = True
     except Exception as e:
