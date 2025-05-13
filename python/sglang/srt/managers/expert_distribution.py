@@ -736,11 +736,24 @@ class _Buffer:
 
 class _CircularBuffer(_Buffer):
     def __init__(self, item_shape: Tuple, buffer_size: int):
-        self._buffer = torch.zeros(item_shape, device=TODO)
+        self._buffer = torch.zeros((buffer_size, *item_shape), device=TODO)
+        self._curr_index = 0
+
+    def append(self, value: torch.Tensor):
+        TODO
+
+    def get_all(self) -> torch.Tensor:
+        TODO
 
 
 class _InfiniteBuffer(_Buffer):
     def __init__(self, item_shape: Tuple):
+        TODO
+
+    def append(self, value: torch.Tensor):
+        TODO
+
+    def get_all(self) -> torch.Tensor:
         TODO
 
 
