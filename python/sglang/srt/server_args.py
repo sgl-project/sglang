@@ -170,6 +170,7 @@ class ServerArgs:
     enable_eplb: bool = False
     eplb_rebalance_num_iterations: int = 1000
     deepseek_eplb_hack_shuffle: bool = False
+    enable_expert_distribution_metrics: bool = False
     expert_distribution_recorder_mode: Optional[
         Literal["stat", "stat_ut", "stat_per_pass", "detail_per_token"]
     ] = None
@@ -1207,6 +1208,11 @@ class ServerArgs:
             "--deepseek-eplb-hack-shuffle",
             action="store_true",
             help="",
+        )
+        parser.add_argument(
+            "--enable-expert-distribution-metrics",
+            action="store_true",
+            help="Enable logging metrics for expert balancedness",
         )
         parser.add_argument(
             "--eplb-rebalance-num-iterations",
