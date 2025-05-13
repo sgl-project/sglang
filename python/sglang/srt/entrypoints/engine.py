@@ -511,14 +511,6 @@ def _launch_subprocesses(
         server_args.model_path, server_args.tokenizer_path
     )
 
-    if server_args.node_rank == 0:
-        eplb_manager = EPLBManager(server_args) if server_args.enable_eplb else None
-        expert_location_metadata = _compute_initial_expert_location_metadata(
-            server_args, eplb_manager
-        )
-    else:
-        eplb_manager = expert_location_metadata = None
-
     scheduler_procs = []
     if server_args.dp_size == 1:
         # Launch tensor parallel scheduler processes
@@ -543,7 +535,6 @@ def _launch_subprocesses(
                 args=(
                     server_args,
                     port_args,
-                    expert_location_metadata,
                     gpu_id,
                     tp_rank,
                     None,
@@ -560,7 +551,7 @@ def _launch_subprocesses(
         scheduler_pipe_readers = [reader]
         proc = mp.Process(
             target=run_data_parallel_controller_process,
-            args=(server_args, port_args, expert_location_metadata, writer),
+            args=(server_args, port_args, writer),
         )
         proc.start()
         scheduler_procs.append(proc)
@@ -598,7 +589,7 @@ def _launch_subprocesses(
 
     # Launch tokenizer process
     tokenizer_manager = TokenizerManager(
-        server_args, port_args, expert_location_metadata, eplb_manager
+        server_args, port_args
     )
     if server_args.chat_template:
         load_chat_template_for_openai_api(
