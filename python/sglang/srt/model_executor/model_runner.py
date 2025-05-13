@@ -62,7 +62,6 @@ from sglang.srt.managers.expert_distribution import (
     set_global_expert_distribution_recorder,
 )
 from sglang.srt.managers.expert_location import ExpertLocationMetadata, compute_initial_expert_location_metadata
-from sglang.srt.managers.io_struct import UpdateExpertLocationReqInput
 from sglang.srt.managers.schedule_batch import (
     get_global_expert_location_metadata,
     global_server_args_dict,
@@ -76,6 +75,7 @@ from sglang.srt.mem_cache.memory_pool import (
     TokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.paged_allocator import PagedTokenToKVPoolAllocator
+from sglang.srt.model_executor import expert_location_updater
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.expert_location_updater import ExpertLocationUpdater
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -544,7 +544,7 @@ class ModelRunner:
             ) from None
 
     def update_expert_location(self, new_expert_location_metadata: ExpertLocationMetadata):
-        TODO
+        expert_location_updater.update_expert_location(new_expert_location_metadata)
 
     def update_weights_from_disk(
         self, model_path: str, load_format: str, param_categories: Optional[List[str]]
