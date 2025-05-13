@@ -185,7 +185,6 @@ class SchedulerDisaggregationPrefillMixin:
         while True:
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
-            self.model_runner_event_loop_step()
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
