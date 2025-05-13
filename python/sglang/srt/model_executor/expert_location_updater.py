@@ -10,5 +10,12 @@ def update_expert_location(
     new_expert_location_metadata: ExpertLocationMetadata,
 ):
     old_expert_location_metadata = get_global_expert_location_metadata()
-    TODO
+    _update_expert_weights(old_expert_location_metadata, new_expert_location_metadata)
     old_expert_location_metadata.update(new_expert_location_metadata)
+
+
+def _update_expert_weights(
+    old_expert_location_metadata: ExpertLocationMetadata,
+    new_expert_location_metadata: ExpertLocationMetadata,
+):
+    TODO
