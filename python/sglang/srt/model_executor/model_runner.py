@@ -1112,7 +1112,11 @@ class ModelRunner:
                     f"{'-tbo' if forward_batch.can_run_tbo else ''}"
                 )
                 with torch.autograd.profiler.record_function(debug_name):
-                    return self._forward_raw(forward_batch, skip_attn_backend_init)
+                    output = self._forward_raw(forward_batch, skip_attn_backend_init)
+
+        self.eplb_manager.on_forward_pass_end(self.forward_pass_id)
+       
+        return output
 
     def _forward_raw(
         self, forward_batch: ForwardBatch, skip_attn_backend_init: bool
