@@ -507,7 +507,7 @@ class UnquantizedEPMoEMethod(FusedMoEMethodBase, CustomOp):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        # Fused gate_up_proj (column parallel)
+        # Fused gate_up_proj
         w13_weight = torch.nn.Parameter(
             torch.empty(
                 num_experts_per_partition,
@@ -520,7 +520,7 @@ class UnquantizedEPMoEMethod(FusedMoEMethodBase, CustomOp):
         layer.register_parameter("w13_weight", w13_weight)
         set_weight_attrs(w13_weight, extra_weight_attrs)
 
-        # down_proj (row parallel)
+        # down_proj
         w2_weight = torch.nn.Parameter(
             torch.empty(
                 num_experts_per_partition,
