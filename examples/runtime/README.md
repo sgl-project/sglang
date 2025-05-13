@@ -11,7 +11,7 @@ The below examples will mostly need you to start a server in a separate terminal
 * `openai_chat_with_response_prefill.py`:
   An example that demonstrates how to [prefill a response](https://eugeneyan.com/writing/prompting/#prefill-claudes-responses) using the OpenAI API by enabling the `continue_final_message` parameter.
   When enabled, the final (partial) assistant message is removed and its content is used as a prefill so that the model continues that message rather  than starting a new turn. See [Anthropic's prefill example](https://docs.anthropic.com/en/docs/build-with-claude/prompt-engineering/prefill-claudes-response#example-structured-data-extraction-with-prefilling) for more context.
-* `openai_chat_with_reasoning_parser.py`: An example how to use the [reasoning parser](https://docs.sglang.ai/backend/separate_reasoning.html) to seperate reasoning from non reasoning content in a models answer.
+* `openai_chat_with_reasoning_parser.py`: An example how to use the [reasoning parser](https://docs.sglang.ai/backend/separate_reasoning.html) to separate reasoning from non reasoning content in a models answer.
 * `reward_model.py`: An example how to extract scores from a reward model.
 * `vertex_predict.py`: An example how to deploy a model to [Vertex AI](https://cloud.google.com/vertex-ai?hl=en).
 
