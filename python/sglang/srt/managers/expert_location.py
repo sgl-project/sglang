@@ -206,13 +206,9 @@ class ExpertLocationMetadata:
             ("logical_to_all_physical_map_num_valid", 0),
             ("logical_to_rank_dispatch_physical_map", 1),
         ]:
-            def _get(obj):
-                ans = getattr(obj, field)
-                return ans
-
             # Cannot update address to avoid breaking CUDA graph
-            dst = _get(self)
-            dst[...] = _get(other)
+            dst = getattr(self, field)
+            dst[...] = getattr(other, field)
 
     def to(self, device):
         for field in [
