@@ -497,8 +497,8 @@ class _Accumulator(ABC):
     def get_class(server_args: ServerArgs) -> Type["_Accumulator"]:
         return {
             "stat": _StatAccumulator,
-            "stat_per_pass": _DetailAccumulator,
-            "detail_per_token": _DetailAccumulator,
+            "per_pass": _DetailAccumulator,
+            "per_token": _DetailAccumulator,
         }[server_args.expert_distribution_recorder_mode]
 
     def __init__(self, server_args: ServerArgs, expert_location_metadata: "ExpertLocationMetadata", rank: int):

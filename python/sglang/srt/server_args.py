@@ -172,7 +172,7 @@ class ServerArgs:
     deepseek_eplb_hack_shuffle: bool = False
     enable_expert_distribution_metrics: bool = False
     expert_distribution_recorder_mode: Optional[
-        Literal["stat", "stat_per_pass", "detail_per_token"]
+        Literal["stat", "per_pass", "per_token"]
     ] = None
     expert_distribution_recorder_buffer_size: int = 1000
     enable_torch_compile: bool = False
