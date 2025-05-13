@@ -706,7 +706,7 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
 
 
 def _dump_to_file(name, data):
-    save_dir = Path(os.environ.get("SGLANG_EXPERT_DISTRIBUTION_RECORDER_SAVE_DIR", "/tmp"))
+    save_dir = Path(os.environ.get("SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR", "/tmp"))
     path_output = save_dir / name
     logger.info(f"Write expert distribution to {path_output}")
     if not save_dir.exists():
