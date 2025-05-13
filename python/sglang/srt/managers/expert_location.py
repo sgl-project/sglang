@@ -206,7 +206,6 @@ class ExpertLocationMetadata:
             ("logical_to_all_physical_map_num_valid", 0),
             ("logical_to_rank_dispatch_physical_map", 1),
         ]:
-            # Cannot update address to avoid breaking CUDA graph
             dst = getattr(self, field)
             dst[...] = getattr(other, field)
 
