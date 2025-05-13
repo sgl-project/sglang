@@ -22,7 +22,11 @@ class EPLBManager:
     def __init__(self, model_runner: ModelRunner):
         super().__init__()
         self._model_runner = model_runner
-        model_runner.server_args.eplb_rebalance_num_iterations
+
+        server_args = model_runner.server_args
+        # Otherwise, the circular buffer will contain stale data. If the case is needed, it can be implemented.
+        assert server_args.eplb_rebalance_num_iterations <= server_args.expert_distribution_recorder_buffer_size, \
+            "eplb_rebalance_num_iterations must be less than expert_distribution_recorder_buffer_size"
 
 
 class _TODO_REMOVE_EPLBManager:
