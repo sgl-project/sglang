@@ -86,10 +86,10 @@ class TestExpertDistribution(CustomTestCase):
                 data = torch.load(list(Path(tmp_dir).glob("*.pt"))[0], weights_only=True)
                 print(f"{data=}")
 
-                if mode_detail:
+                if mode in ["per_pass", "per_token"]:
                     self.assertGreater(len(data), 0, "Should contain data rows")
                 else:
-                    logical_count = torch.tensor(data["logical_count"])
+                    logical_count = data["logical_count"]
                     print(f"{logical_count=}")
                     self.assertTrue(logical_count.sum() > 0)
 
