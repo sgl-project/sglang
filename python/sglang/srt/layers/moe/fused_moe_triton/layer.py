@@ -195,7 +195,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                     topk == 1
                 ), "Only support topk=1 when `apply_router_weight_on_input` is True"
                 x = x * topk_weights.to(x.dtype)
-                topk_ids = topk_ids.to(torch.int32)
                 topk_weights = torch.ones_like(
                     topk_weights, dtype=torch.float32
                 )  # topk_weights must be FP32 (float32)
