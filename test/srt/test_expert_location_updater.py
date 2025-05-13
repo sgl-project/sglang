@@ -1,3 +1,4 @@
+import traceback
 import unittest
 
 import torch.multiprocessing as mp
@@ -17,6 +18,7 @@ class TestExpertLocationUpdater(CustomTestCase):
                 target=_run_subprocess,
                 kwargs=dict(
                     rank=rank,
+                    output_writer=output_writer,
                 ),
             )
             p.start()
@@ -27,6 +29,23 @@ class TestExpertLocationUpdater(CustomTestCase):
 
         for p in processes:
             p.join()
+
+
+def _run_subprocess(
+    rank: int,
+    output_writer,
+):
+    try:
+        TODO
+
+        execution_ok = True
+    except Exception as e:
+        print(f"subprocess[{rank=}] has error: {e}", flush=True)
+        traceback.print_exc()
+        execution_ok = False
+
+    output_writer.send(execution_ok)
+    output_writer.close()
 
 
 if __name__ == "__main__":
