@@ -222,16 +222,16 @@ class HiCacheController:
             target=self.load_thread_func_layer_by_layer, daemon=True
         )
 
+        self.write_thread.start()
+        self.load_thread.start()
+
         self.enable_mooncake_store_l3_cache = enable_mooncake_store_l3_cache
         if self.enable_mooncake_store_l3_cache:
-            # 异步读写相关必要的组件
+
             self.mooncake_l3_kv_pool = mooncake_l3_kv_pool
 
             self.mooncake_l3_write_queue = PriorityQueue()
             self.mooncake_l3_load_queue = PriorityQueue()
-
-            self.mooncake_l3_ack_write_queue = Queue()
-            self.mooncake_l3_ack_load_queue = Queue()
 
             self.mooncake_l3_stop_event = threading.Event()
 
@@ -245,10 +245,6 @@ class HiCacheController:
                 target=self.mooncake_l3_load_thread_func_direct, daemon=True
             )
 
-        self.write_thread.start()
-        self.load_thread.start()
-
-        if self.enable_mooncake_store_l3_cache:
             self.mooncake_l3_write_thread.start()
             self.mooncake_l3_load_thread.start()
 
@@ -278,6 +274,26 @@ class HiCacheController:
         self.stop_event.clear()
         self.write_thread.start()
         self.load_thread.start()
+
+        if self.enable_mooncake_store_l3_cache:
+            self.mooncake_l3_stop_event.set()
+            self.mooncake_l3_write_thread.join()
+            self.mooncake_l3_load_thread.join()
+
+            self.mooncake_l3_write_queue.queue.clear()
+            self.mooncake_l3_load_queue.queue.clear()
+
+            self.mooncake_l3_write_thread = threading.Thread(
+                target=self.mooncake_l3_write_thread_func_direct, daemon=True,
+            )
+            self.mooncake_l3_load_thread = threading.Thread(
+                target=self.mooncake_l3_load_thread_func_direct, daemon=True
+            )
+
+            self.mooncake_l3_stop_event.clear()
+
+            self.mooncake_l3_write_thread.start()
+            self.mooncake_l3_load_thread.start()
 
     def write(
         self,
@@ -371,7 +387,7 @@ class HiCacheController:
                     self.mooncake_l3_write_stream.synchronize()
                     for node_id in operation.node_ids:
                         if node_id != 0:
-                            self.mooncake_l3_ack_write_queue.put(node_id)
+                            self.ack_write_queue.put(node_id)
                 except Empty:
                     continue
                 except Exception as e:
@@ -409,6 +425,7 @@ class HiCacheController:
                     operation = self.mooncake_l3_load_queue.get(block=True, timeout=1)
                     keys = operation.mooncake_keys
                     data = [self.mooncake_l3_kv_pool.get(key) for key in keys]
+                    data = torch.concat(data)
                     self.mem_pool_device.transfer(operation.device_indices, data)
                     for node_id in operation.node_ids:
                         if node_id != 0:
