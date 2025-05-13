@@ -662,7 +662,10 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             self._expert_location_metadata.num_layers,
             # Cannot use local_physical_count to support select_experts
             self._expert_location_metadata.num_physical_experts,
-        ), buffer_size=self._server_args.expert_distribution_recorder_buffer_size)
+        ), buffer_size=self._server_args.expert_distribution_recorder_buffer_size,
+            dtype=TODO,
+            device=TODO,
+        )
 
     def append(
         self,
