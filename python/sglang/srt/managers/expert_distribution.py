@@ -664,18 +664,10 @@ class _DetailAccumulator(_UtilizationRateAccumulatorMixin):
 class _StatAccumulator(_UtilizationRateAccumulatorMixin):
     def __init__(self, expert_location_metadata: "ExpertLocationMetadata", rank: int):
         super().__init__(expert_location_metadata, rank)
-        self._buffer_global_physical_count = torch.zeros(
-            (
-                self._expert_location_metadata.num_layers,
-                self._expert_location_metadata.num_physical_experts,
-            )
-        )
-        self._logical_count = torch.zeros(
-            (
-                self._expert_location_metadata.num_layers,
-                self._expert_location_metadata.num_logical_experts,
-            )
-        )
+        self._buffer_global_physical_count = _Buffer.init_new(item_shape=(
+            self._expert_location_metadata.num_layers,
+            self._expert_location_metadata.num_physical_experts,
+        ), buffer_size=TODO)
 
     def append(
         self,
