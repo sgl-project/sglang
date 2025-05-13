@@ -774,15 +774,17 @@ class _InfiniteBuffer(_Buffer):
 
 
 def _convert_global_physical_count_to_logical_count(
+    # (whatever, num_layers, num_physical_experts)
     global_physical_count: torch.Tensor,
     num_layers: int,
     num_logical_experts: int,
     physical_to_logical_map: torch.Tensor,
 ):
-    logical_count = torch.zeros((num_layers, num_logical_experts))
+    dim_extra, _, _ = global_physical_count.shape
+    logical_count = torch.zeros((dim_extra, num_layers, num_logical_experts))
     logical_count.scatter_add_(
-        dim=1,
-        index=physical_to_logical_map,
+        dim=2,
+        index=physical_to_logical_map.unsqueeze(0).expand(dim_extra, -1, -1),
         src=global_physical_count,
     )
     return logical_count
