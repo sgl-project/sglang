@@ -2230,6 +2230,8 @@ class DeepseekV2ForCausalLM(nn.Module):
                     self_attn.w_vc = w_vc.contiguous()
                     self_attn.use_deep_gemm_bmm = True
 
+        self.routed_experts_weights_of_layer = TODO
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
