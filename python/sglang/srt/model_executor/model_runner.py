@@ -1256,15 +1256,15 @@ class ModelRunner:
                 self.server_args.max_num_reqs = max_num_reqs
 
         if max_total_tokens is not None:
-            if max_total_tokens > self.max_total_num_tokens:
-                logging.warning(
-                    f"max_total_tokens={max_total_tokens} is larger than the profiled value "
-                    f"{self.max_total_num_tokens}. "
-                    f"Use the profiled value instead."
-                )
             if self.server_args.enable_hip_kv_cache_offload:
                 self.max_total_num_tokens = max_total_tokens
             else:
+                if max_total_tokens > self.max_total_num_tokens:
+                    logging.warning(
+                        f"max_total_tokens={max_total_tokens} is larger than the profiled value "
+                        f"{self.max_total_num_tokens}. "
+                        f"Use the profiled value instead."
+                    )
                 self.max_total_num_tokens = min(
                     self.max_total_num_tokens, max_total_tokens
                 )
