@@ -17,7 +17,7 @@ concurrency:
 jobs:
   nightly-test:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
-    runs-on: linux-mi300-gpu-2
+    runs-on: linux-mi325-gpu-2
     steps:
       - name: Checkout code
         uses: actions/checkout@v4

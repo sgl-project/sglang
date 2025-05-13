@@ -25,7 +25,7 @@ jobs:
   accuracy-test-1-gpu-amd:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
       github.event.pull_request.draft == false
-    runs-on: linux-mi300-gpu-1
+    runs-on: linux-mi325-gpu-1
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -65,7 +65,7 @@ jobs:
   accuracy-test-2-gpu-amd:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false
-    runs-on: linux-mi300-gpu-2
+    runs-on: linux-mi325-gpu-2
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -103,7 +103,7 @@ jobs:
   mla-test-1-gpu-amd:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
       github.event.pull_request.draft == false
-    runs-on: linux-mi300-gpu-1
+    runs-on: linux-mi325-gpu-1
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -141,7 +141,7 @@ jobs:
   performance-test-1-gpu-part-1-amd:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false
-    runs-on: linux-mi300-gpu-1
+    runs-on: linux-mi325-gpu-1
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -200,7 +200,7 @@ jobs:
   performance-test-1-gpu-part-2-amd:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false
-    runs-on: linux-mi300-gpu-1
+    runs-on: linux-mi325-gpu-1
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -248,7 +248,7 @@ jobs:
   bench-test-2-gpu-amd:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
       github.event.pull_request.draft == false
-    runs-on: linux-mi300-gpu-2
+    runs-on: linux-mi325-gpu-2
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
