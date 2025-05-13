@@ -1744,6 +1744,10 @@ class Scheduler(
             )
             num_ready_reqs_max, num_abort_reqs_max = tensor.tolist()
 
+            total_needed = num_ready_reqs_max + num_abort_reqs_max
+            if len(self.grammar_queue) < total_needed:
+                return
+            
             for i in range(num_ready_reqs, num_ready_reqs_max):
                 req = self.grammar_queue[i]
                 req.grammar = req.grammar.result()
