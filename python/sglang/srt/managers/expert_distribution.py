@@ -228,15 +228,6 @@ def set_global_expert_distribution_recorder(value):
     _global_expert_distribution_recorder = value
 
 
-def postprocess_dumps(
-    dumps: List[Any],
-    server_args: ServerArgs,
-    expert_location_metadata: "ExpertLocationMetadata",
-):
-    return _Accumulator.get_class(server_args).postprocess_dumps(
-        dumps, expert_location_metadata
-    )
-
 
 # --------------------------------------- SinglePassGatherer -----------------------------------------
 
@@ -526,14 +517,6 @@ class _Accumulator(ABC):
     def get_single_pass_gatherer_key(self, debug_name: Optional[str]):
         return _SINGLE_PASS_GATHERER_KEY_PRIMARY
 
-    @classmethod
-    def postprocess_dumps(
-        cls,
-        dumps: List[Any],
-        expert_location_metadata: "ExpertLocationMetadata",
-    ):
-        raise NotImplementedError
-
     def append(
         self,
         forward_pass_id: int,
@@ -553,15 +536,6 @@ class _Accumulator(ABC):
 
 
 class _DetailAccumulator(_Accumulator):
-    @classmethod
-    def postprocess_dumps(
-        cls,
-        dumps: List[Any],
-        expert_location_metadata: "ExpertLocationMetadata",
-    ):
-        # Do not convert to logical since we want all details
-        return [record for dump in dumps for record in dump]
-
     def __init__(self, expert_location_metadata: "ExpertLocationMetadata", rank: int):
         super().__init__(expert_location_metadata, rank)
         self._records = []
@@ -631,17 +605,6 @@ class _DetailAccumulator(_Accumulator):
 
 
 class _StatAccumulator(_Accumulator):
-    @classmethod
-    def postprocess_dumps(
-        cls,
-        dumps: List[Any],
-        expert_location_metadata: "ExpertLocationMetadata",
-    ):
-        logical_count = torch.tensor([item["logical_count"] for item in dumps]).sum(
-            dim=0
-        )
-        return dict(logical_count=logical_count.tolist())
-
     def __init__(self, expert_location_metadata: "ExpertLocationMetadata", rank: int):
         super().__init__(expert_location_metadata, rank)
         self._buffer_global_physical_count = torch.zeros(
