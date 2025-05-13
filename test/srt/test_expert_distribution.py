@@ -1,3 +1,5 @@
+import os
+import tempfile
 import unittest
 
 import requests
@@ -29,66 +31,69 @@ class TestExpertDistribution(CustomTestCase):
         self, model_path: str, mode: str = "stat", tp_size: int = 1
     ):
         """Test expert distribution record endpoints"""
-        process = popen_launch_server(
-            model_path,
-            DEFAULT_URL_FOR_TEST,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--trust-remote-code",
-                "--tp-size",
-                str(tp_size),
-                "--expert-distribution-recorder-mode",
-                mode,
-                "--disable-cuda-graph",
-                "--disable-overlap-schedule",
-            ],
-        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            os.environ["SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR"] = tmp_dir
 
-        try:
-            # Start recording
-            response = requests.post(
-                f"{DEFAULT_URL_FOR_TEST}/start_expert_distribution_record"
+            process = popen_launch_server(
+                model_path,
+                DEFAULT_URL_FOR_TEST,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=[
+                    "--trust-remote-code",
+                    "--tp-size",
+                    str(tp_size),
+                    "--expert-distribution-recorder-mode",
+                    mode,
+                    "--disable-cuda-graph",
+                    "--disable-overlap-schedule",
+                ],
             )
-            self.assertEqual(response.status_code, 200)
 
-            # Make some requests to generate expert distribution data
-            response = requests.post(
-                f"{DEFAULT_URL_FOR_TEST}/generate",
-                json={
-                    "text": "The capital of France is",
-                    "sampling_params": {
-                        "temperature": 0,
-                        "max_new_tokens": 32,
+            try:
+                # Start recording
+                response = requests.post(
+                    f"{DEFAULT_URL_FOR_TEST}/start_expert_distribution_record"
+                )
+                self.assertEqual(response.status_code, 200)
+
+                # Make some requests to generate expert distribution data
+                response = requests.post(
+                    f"{DEFAULT_URL_FOR_TEST}/generate",
+                    json={
+                        "text": "The capital of France is",
+                        "sampling_params": {
+                            "temperature": 0,
+                            "max_new_tokens": 32,
+                        },
                     },
-                },
-            )
-            self.assertEqual(response.status_code, 200)
+                )
+                self.assertEqual(response.status_code, 200)
 
-            # Stop recording
-            response = requests.post(
-                f"{DEFAULT_URL_FOR_TEST}/stop_expert_distribution_record"
-            )
-            self.assertEqual(response.status_code, 200)
+                # Stop recording
+                response = requests.post(
+                    f"{DEFAULT_URL_FOR_TEST}/stop_expert_distribution_record"
+                )
+                self.assertEqual(response.status_code, 200)
 
-            # Dump the recorded data
-            response = requests.post(
-                f"{DEFAULT_URL_FOR_TEST}/dump_expert_distribution_record"
-            )
-            self.assertEqual(response.status_code, 200)
+                # Dump the recorded data
+                response = requests.post(
+                    f"{DEFAULT_URL_FOR_TEST}/dump_expert_distribution_record"
+                )
+                self.assertEqual(response.status_code, 200)
 
-            # Check data rows
-            data = response.json()
-            print(f"{data=}")
+                # Check data rows
+                data = response.json()
+                print(f"{data=}")
 
-            if mode_detail:
-                self.assertGreater(len(data), 0, "Should contain data rows")
-            else:
-                logical_count = torch.tensor(data["logical_count"])
-                print(f"{logical_count=}")
-                self.assertTrue(logical_count.sum() > 0)
+                if mode_detail:
+                    self.assertGreater(len(data), 0, "Should contain data rows")
+                else:
+                    logical_count = torch.tensor(data["logical_count"])
+                    print(f"{logical_count=}")
+                    self.assertTrue(logical_count.sum() > 0)
 
-        finally:
-            kill_process_tree(process.pid)
+            finally:
+                kill_process_tree(process.pid)
 
 
 if __name__ == "__main__":
