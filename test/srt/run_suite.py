@@ -34,6 +34,7 @@ suites = {
         TestFile("test_fp8_kernel.py", 8),
         TestFile("test_embedding_openai_server.py", 36),
         TestFile("test_expert_location.py", 10),
+        TestFile("test_expert_location_updater.py", 60),
         TestFile("test_hidden_states.py", 55),
         TestFile("test_int8_kernel.py", 8),
         TestFile("test_input_embeddings.py", 38),
@@ -200,7 +201,7 @@ if __name__ == "__main__":
     if args.auto_partition_size:
         files = auto_partition(files, args.auto_partition_id, args.auto_partition_size)
     else:
-        files = files[args.range_begin : args.range_end]
+        files = files[args.range_begin: args.range_end]
 
     print("The running tests are ", [f.name for f in files])
 
