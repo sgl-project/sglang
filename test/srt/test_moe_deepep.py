@@ -1,3 +1,4 @@
+import json
 import unittest
 from types import SimpleNamespace
 
@@ -65,6 +66,12 @@ class TestDPAttn(unittest.TestCase):
                 "--enable-dp-attention",
                 "--enable-deepep-moe",
                 "--disable-cuda-graph",
+                # Test custom config
+                "--deepep-config",
+                json.dumps({
+                    "normal_dispatch": TODO,
+                    "normal_combine": TODO,
+                }),
             ],
         )
 
