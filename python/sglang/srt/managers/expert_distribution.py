@@ -490,18 +490,18 @@ class _Accumulator(ABC):
         expert_location_metadata: "ExpertLocationMetadata",
         rank: int,
     ) -> "_Accumulator":
-        return _Accumulator.get_class(server_args)(expert_location_metadata, rank)
+        return _Accumulator.get_class(server_args)(server_args, expert_location_metadata, rank)
 
     @staticmethod
     def get_class(server_args: ServerArgs) -> Type["_Accumulator"]:
         return {
             "stat": _StatAccumulator,
-            "stat_ut": _StatAndUtilizationRateAccumulator,
             "stat_per_pass": _DetailAccumulator,
             "detail_per_token": _DetailAccumulator,
         }[server_args.expert_distribution_recorder_mode]
 
-    def __init__(self, expert_location_metadata: "ExpertLocationMetadata", rank: int):
+    def __init__(self, server_args: ServerArgs, expert_location_metadata: "ExpertLocationMetadata", rank: int):
+        self._server_args = server_args
         self._expert_location_metadata = expert_location_metadata
         self._rank = rank
 
@@ -529,9 +529,13 @@ class _Accumulator(ABC):
 class _UtilizationRateAccumulatorMixin(_Accumulator):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        window_sizes = [10, 100, 1000]
-        self._history = _DequeCollection(maxlens=window_sizes)
-        self._rank = torch.distributed.get_rank()
+
+        self._enable = self._server_args.enable_expert_distribution_metrics
+
+        if self._enable:
+            window_sizes = [10, 100, 1000]
+            self._history = _DequeCollection(maxlens=window_sizes)
+            self._rank = torch.distributed.get_rank()
 
     def append(
         self,
@@ -540,13 +544,15 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
         single_pass_data: Dict,
     ):
         super().append(forward_pass_id, gatherer_key, single_pass_data)
-        self._append_utilization_rate(
-            forward_pass_id, single_pass_data["global_physical_count"]
-        )
+        if self._enable:
+            self._append_utilization_rate(
+                forward_pass_id, single_pass_data["global_physical_count"]
+            )
 
     def reset(self):
         super().reset()
-        self._history.clear()
+        if self._enable:
+            self._history.clear()
 
     def _append_utilization_rate(
         self, forward_pass_id: int, single_pass_global_physical_count: torch.Tensor
