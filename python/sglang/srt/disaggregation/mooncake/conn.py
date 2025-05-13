@@ -29,7 +29,12 @@ from sglang.srt.disaggregation.base.conn import (
 from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferEngine
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import get_free_port, get_ip, get_local_ip_by_remote, exact_int_div
+from sglang.srt.utils import (
+    exact_int_div,
+    get_free_port,
+    get_ip,
+    get_local_ip_by_remote,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -540,8 +545,12 @@ class MooncakeKVReceiver(BaseKVReceiver):
         # have different TP sizes per DP rank, except for models using MLA.
 
         # If not exactly divisible, we will miscalculate the local TP sizes
-        local_tp_size_per_dp_rank = exact_int_div(self.kv_mgr.tp_size, self.kv_mgr.dp_size)
-        prefill_tp_size_per_dp_rank = exact_int_div(self.prefill_tp_size, self.prefill_dp_size)
+        local_tp_size_per_dp_rank = exact_int_div(
+            self.kv_mgr.tp_size, self.kv_mgr.dp_size
+        )
+        prefill_tp_size_per_dp_rank = exact_int_div(
+            self.prefill_tp_size, self.prefill_dp_size
+        )
 
         if local_tp_size_per_dp_rank == prefill_tp_size_per_dp_rank:
             self.target_prefill_tp_rank = (
@@ -589,9 +598,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
         self.target_dp_group = bootstrap_room % self.prefill_dp_size
 
         # NOTE: key distinguished by bootstrap_addr, target_dp_group, and target_tp_rank
-        bootstrap_key = (
-            f"{self.bootstrap_addr}_{self.target_dp_group}_{self.target_prefill_tp_rank}"
-        )
+        bootstrap_key = f"{self.bootstrap_addr}_{self.target_dp_group}_{self.target_prefill_tp_rank}"
 
         if bootstrap_key not in self.kv_mgr.connection_pool:
             bootstrap_infos = []
