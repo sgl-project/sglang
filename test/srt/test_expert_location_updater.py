@@ -4,8 +4,8 @@ import unittest
 import torch.multiprocessing as mp
 from sglang.srt.model_executor import expert_location_updater
 from sglang.test.test_utils import CustomTestCase
-from torch.multiprocessing import Process
 from sglang.utils import is_in_ci
+from torch.multiprocessing import Process
 
 
 class TestExpertLocationUpdater(CustomTestCase):
@@ -15,7 +15,9 @@ class TestExpertLocationUpdater(CustomTestCase):
     def test_gpu(self):
         if is_in_ci():
             return
-        self._test_core(num_gpus=8)
+        for nnodes in [1, 2, 4]:
+            for num_logical_experts in [2, 5, 20, 200]:
+                self._test_core(num_gpus=8, nnodes=nnodes, num_logical_experts=num_logical_experts)
 
     def _test_core(
         self,
