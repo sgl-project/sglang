@@ -723,6 +723,9 @@ class _Buffer:
     def get_all(self) -> torch.Tensor:
         raise NotImplementedError
 
+    def reset(self):
+        raise NotImplementedError
+
 
 class _CircularBuffer(_Buffer):
     def __init__(self, item_shape: Tuple, buffer_size: int):
@@ -735,6 +738,9 @@ class _CircularBuffer(_Buffer):
 
     def get_all(self) -> torch.Tensor:
         return self._buffer
+
+    def reset(self):
+        TODO
 
 
 class _InfiniteBuffer(_Buffer):
@@ -757,6 +763,9 @@ class _InfiniteBuffer(_Buffer):
 
     def get_all(self) -> torch.Tensor:
         return self._buffer[:self._size]
+
+    def reset(self):
+        TODO
 
 
 def _convert_global_physical_count_to_logical_count(
