@@ -40,10 +40,7 @@ inline void add_mul_stub(
 
 template <typename scalar_t>
 inline void silu_and_mul_stub(
-    scalar_t* __restrict__ out,
-    const scalar_t* __restrict__ input,
-    const scalar_t* __restrict__ input2,
-    int64_t size) {
+    scalar_t* __restrict__ out, const scalar_t* __restrict__ input, const scalar_t* __restrict__ input2, int64_t size) {
   using bVec = at::vec::Vectorized<scalar_t>;
   using fVec = at::vec::Vectorized<float>;
   const fVec one = fVec(1.f);
@@ -66,7 +63,7 @@ inline void silu_and_mul_stub(
   }
 }
 
-} // anonymous namespace
+}  // anonymous namespace
 
 template <typename scalar_t>
 void shared_expert_fp8_kernel_impl(
@@ -131,11 +128,7 @@ void shared_expert_fp8_kernel_impl(
   // stage 1.5: intermediate_cache1 = silu(intermediate_cache0)
   at::parallel_for(0, M, 0, [&](int64_t begin, int64_t end) {
     for (int64_t m = begin; m < end; ++m) {
-      silu_and_mul_stub(
-          ic1 + m * N,
-          ic0 + m * 2 * N,
-          ic0 + m * 2 * N + N,
-          N);
+      silu_and_mul_stub(ic1 + m * N, ic0 + m * 2 * N, ic0 + m * 2 * N + N, N);
     }
   });
 
