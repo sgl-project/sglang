@@ -4,12 +4,12 @@ Usage:
 # Installing latest sglang.
 
 # Endpoint Service CLI:
-python -m sglang.launch_server --model-path lmms-lab/llama3-llava-next-8b --port=30000
+python -m sglang.launch_server --model-path lmms-lab/llava-next-72b --port=30000 --tp-size=8
 
-python3 http_llama3_llava_test.py
+python3 qwen_llava_server.py
 
 Output:
-"Friends posing for a fun photo with a life-sized teddy bear, creating a playful and memorable moment."
+"Two children pose with a large teddy bear, one holding a smaller stuffed bear, in a room with an American flag and potted plants."
 """
 
 import argparse
@@ -19,7 +19,7 @@ import json
 
 import aiohttp
 import requests
-from llava.conversation import conv_llava_llama_3
+from llava.conversation import conv_qwen
 
 
 async def send_request(url, data, delay=0):
@@ -34,7 +34,7 @@ async def test_concurrent(args):
     url = f"{args.host}:{args.port}"
 
     prompt = "<image>\nPlease generate caption towards this image."
-    conv_template = copy.deepcopy(conv_llava_llama_3)
+    conv_template = copy.deepcopy(conv_qwen)
     conv_template.append_message(role=conv_template.roles[0], message=prompt)
     conv_template.append_message(role=conv_template.roles[1], message=None)
     prompt_with_template = conv_template.get_prompt()
@@ -52,7 +52,7 @@ async def test_concurrent(args):
                         "top_p": 1.0,
                         "presence_penalty": 2,
                         "frequency_penalty": 2,
-                        "stop": "<|eot_id|>",
+                        "stop": "<|im_end|>",
                     },
                 },
             )
@@ -66,7 +66,7 @@ async def test_concurrent(args):
 def test_streaming(args):
     url = f"{args.host}:{args.port}"
     prompt = "<image>\nPlease generate caption towards this image."
-    conv_template = copy.deepcopy(conv_llava_llama_3)
+    conv_template = copy.deepcopy(conv_qwen)
     conv_template.append_message(role=conv_template.roles[0], message=prompt)
     conv_template.append_message(role=conv_template.roles[1], message=None)
     prompt_with_template = conv_template.get_prompt()
@@ -78,7 +78,7 @@ def test_streaming(args):
             "top_p": 1.0,
             "presence_penalty": 2,
             "frequency_penalty": 2,
-            "stop": "<|eot_id|>",
+            "stop": "<|im_end|>",
         },
         "image_data": "https://farm4.staticflickr.com/3175/2653711032_804ff86d81_z.jpg",
         "stream": True,
