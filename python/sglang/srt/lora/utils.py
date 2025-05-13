@@ -79,7 +79,7 @@ def get_hidden_dim(
     module_name: str, config: AutoConfig, base_model: torch.nn.Module
 ) -> Tuple[int]:
     """
-    Given a module_name (might be a stacked name), return the hidden dims of modules's input and output.
+    Given a module_name (might be a stacked name), return the hidden dims of modules' input and output.
     """
 
     if hasattr(base_model, "get_hidden_dim"):

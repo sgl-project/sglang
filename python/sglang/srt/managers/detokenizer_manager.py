@@ -28,6 +28,7 @@ from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.managers.io_struct import (
     BatchEmbeddingOut,
     BatchMultimodalDecodeReq,
+    BatchMultimodalOut,
     BatchStrOut,
     BatchTokenIDOut,
 )
@@ -60,6 +61,8 @@ class DecodeStatus:
     decode_ids: List[int]
     surr_offset: int
     read_offset: int
+    # Offset that's sent to tokenizer for incremental update.
+    sent_offset: int = 0
 
 
 class DetokenizerManager:
@@ -151,7 +154,7 @@ class DetokenizerManager:
                 self.decode_status[rid] = s
             else:
                 s = self.decode_status[rid]
-                s.decode_ids = recv_obj.decode_ids[i]
+                s.decode_ids.extend(recv_obj.decode_ids[i])
 
             read_ids.append(
                 self.trim_matched_stop(
@@ -199,13 +202,15 @@ class DetokenizerManager:
                 else:
                     new_text = find_printable_text(new_text)
 
-            output_strs.append(
-                self.trim_matched_stop(
-                    s.decoded_text + new_text,
-                    recv_obj.finished_reasons[i],
-                    recv_obj.no_stop_trim[i],
-                )
+            output_str = self.trim_matched_stop(
+                s.decoded_text + new_text,
+                recv_obj.finished_reasons[i],
+                recv_obj.no_stop_trim[i],
             )
+            # Incrementally send text.
+            incremental_output = output_str[s.sent_offset :]
+            s.sent_offset = len(output_str)
+            output_strs.append(incremental_output)
 
         return BatchStrOut(
             rids=recv_obj.rids,
@@ -232,7 +237,15 @@ class DetokenizerManager:
         )
 
     def handle_multimodal_decode_req(self, recv_obj: BatchMultimodalDecodeReq):
-        raise NotImplementedError()
+        outputs = self.tokenizer.detokenize(recv_obj)
+        return BatchMultimodalOut(
+            rids=recv_obj.rids,
+            finished_reasons=recv_obj.finished_reasons,
+            outputs=outputs,
+            prompt_tokens=recv_obj.prompt_tokens,
+            completion_tokens=recv_obj.completion_tokens,
+            cached_tokens=recv_obj.cached_tokens,
+        )
 
 
 class LimitedCapacityDict(OrderedDict):

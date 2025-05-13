@@ -1,9 +1,9 @@
 """
 Usage:
 
-python3 -m sglang.launch_server --model-path lmms-lab/llava-onevision-qwen2-72b-ov --port=30000 --tp-size=8 --chat-template=chatml-llava
+python3 -m sglang.launch_server --model-path lmms-lab/llava-onevision-qwen2-72b-ov --port=30000 --tp-size=8
 
-python3 http_llava_onevision_test.py
+python3 llava_onevision_server.py
 """
 
 import base64
