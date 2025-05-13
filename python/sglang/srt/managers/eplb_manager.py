@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 import torch
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.managers import deepseek_eplb
+from sglang.srt.managers.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.managers.expert_distribution_storage import ExpertDistributionStorage
 from sglang.srt.managers.expert_location import (
     ExpertLocationMetadata,
@@ -27,6 +28,8 @@ class EPLBManager:
         # Otherwise, the circular buffer will contain stale data. If the case is needed, it can be implemented.
         assert server_args.eplb_rebalance_num_iterations <= server_args.expert_distribution_recorder_buffer_size, \
             "eplb_rebalance_num_iterations must be less than expert_distribution_recorder_buffer_size"
+
+        get_global_expert_distribution_recorder().start_record()
 
 
 class _TODO_REMOVE_EPLBManager:
