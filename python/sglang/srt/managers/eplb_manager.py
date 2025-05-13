@@ -28,6 +28,7 @@ class EPLBManager:
     def __init__(self, server_args: ServerArgs):
         super().__init__()
         self._server_args = server_args
+        TODO_remove_eplb_storage_dir
         self._expert_distribution_storage = ExpertDistributionStorage(
             dir_data=Path(self._server_args.eplb_storage_dir)
             / "expert_distribution_storage"
