@@ -64,7 +64,11 @@ def _run_subprocess(
     device: str,
 ):
     try:
-        routed_experts_weights = TODO
+
+        def _create_routed_experts_weights(physical_to_logical_map):
+            return TODO
+       
+        routed_experts_weights = _create_routed_experts_weights(TODO)
         for _ in range(5000):
             TODO_prepare
             expert_location_updater.update_expert_weights_single_layer(
