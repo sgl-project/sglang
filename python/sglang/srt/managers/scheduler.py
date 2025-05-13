@@ -89,8 +89,6 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
-    UpdateExpertLocationReqInput,
-    UpdateExpertLocationReqOutput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
     UpdateWeightsFromDistributedReqInput,
@@ -452,7 +450,6 @@ class Scheduler(
                 (AbortReq, self.abort_request),
                 (OpenSessionReqInput, self.open_session),
                 (CloseSessionReqInput, self.close_session),
-                (UpdateExpertLocationReqInput, self.update_expert_location),
                 (UpdateWeightFromDiskReqInput, self.update_weights_from_disk),
                 (InitWeightsUpdateGroupReqInput, self.init_weights_update_group),
                 (
@@ -1900,9 +1897,6 @@ class Scheduler(
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()
-
-    def update_expert_location(self, recv_req: UpdateExpertLocationReqInput):
-        self.tp_worker.worker.model_runner.update_expert_location_start(recv_req)
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         """In-place update of the weights from disk."""
