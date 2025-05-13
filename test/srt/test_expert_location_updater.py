@@ -66,6 +66,7 @@ def _run_subprocess(
 ):
     try:
         def _create_routed_experts_weights(physical_to_logical_map):
+            local_logical_expert_ids = physical_to_logical_map[TODO:TODO]
             return TODO
 
         routed_experts_weights = _create_routed_experts_weights(TODO)
