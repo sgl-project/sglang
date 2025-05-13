@@ -1,3 +1,4 @@
+import random
 import traceback
 import unittest
 
@@ -65,6 +66,7 @@ def _run_subprocess(
     device: str,
 ):
     try:
+        r = random.Random(42)
         num_local_physical_experts = num_physical_experts // num_gpus
 
         def _create_routed_experts_weights(physical_to_logical_map):
@@ -81,10 +83,15 @@ def _run_subprocess(
             ]
 
         def _create_physical_to_logical_map():
-            return TODO
+            ans = torch.concat([
+                torch.arange(0, num_logical_experts),
+                torch.randint(0, num_logical_experts, (num_physical_experts - num_logical_experts,)),
+            ])
+            return ans
 
         physical_to_logical_map = _create_physical_to_logical_map()
         routed_experts_weights = _create_routed_experts_weights(physical_to_logical_map)
+
         for _ in range(5000):
             new_physical_to_logical_map = _create_physical_to_logical_map()
             expect_new_weights = _create_routed_experts_weights(new_physical_to_logical_map)
