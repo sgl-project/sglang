@@ -552,9 +552,9 @@ class _DetailAccumulator(_Accumulator):
         single_pass_data: Dict,
     ):
         def _process_object(obj):
-            if not isinstance(obj, torch.Tensor):
-                return obj
-            return obj.cpu().clone()
+            if isinstance(obj, torch.Tensor):
+                return obj.cpu().clone()
+            return obj
 
         single_pass_data_processed = {
             k: _process_object(v) for k, v in single_pass_data.items()
