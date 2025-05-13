@@ -64,6 +64,7 @@ def _run_subprocess(
     device: str,
 ):
     try:
+        temp_buffers = expert_location_updater.create_temp_buffers()
         for _ in range(5000):
             TODO_prepare
             expert_location_updater.update_expert_weights_single_layer(
