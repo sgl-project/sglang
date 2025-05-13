@@ -607,9 +607,8 @@ class _DetailAccumulator(_UtilizationRateAccumulatorMixin):
         super().__init__(*args, **kwargs)
         self._records = []
 
-        self._save_dir = _SAVE_DIR
-        if not Path(self._save_dir).exists():
-            Path(self._save_dir).mkdir(parents=True, exist_ok=True)
+        if not _SAVE_DIR.exists():
+            _SAVE_DIR.mkdir(parents=True, exist_ok=True)
 
     def get_single_pass_gatherer_keys(self):
         if False:  # TODO `server_args.enable_two_batch_overlap`
@@ -653,7 +652,7 @@ class _DetailAccumulator(_UtilizationRateAccumulatorMixin):
 
     def dump(self, output_mode: _OutputMode):
         assert output_mode == "file"
-        path_output = Path(self._save_dir) / f"{time.time()}-{self._rank}.pt"
+        path_output = _SAVE_DIR / f"{time.time()}-{self._rank}.pt"
         logger.info(f"Write expert distribution to {path_output}")
         output = dict(
             records=self._records,
