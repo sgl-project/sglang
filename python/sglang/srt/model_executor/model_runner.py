@@ -543,7 +543,7 @@ class ModelRunner:
                 f"TP rank {self.tp_rank} could finish the model loading, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
             ) from None
 
-    def update_expert_location(self):
+    def update_expert_location(self, new_expert_location_metadata: ExpertLocationMetadata):
         TODO
 
     def update_expert_location_start(self, recv_req: UpdateExpertLocationReqInput):
