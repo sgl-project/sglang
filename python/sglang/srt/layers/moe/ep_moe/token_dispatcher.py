@@ -1,3 +1,5 @@
+import logging
+
 from sglang.srt.layers.quantization.deep_gemm import _ENABLE_JIT_DEEPGEMM
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.utils import DeepEPMode, load_json_config
@@ -25,6 +27,8 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     deepep_run_moe_deep_preprocess,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+logger = logging.getLogger(__name__)
 
 
 class DeepEPDispatchMode(IntEnum):
@@ -120,6 +124,7 @@ class _DeepEPConfig:
         config_str = global_server_args_dict["deepep_config"]
         if config_str:
             config_parsed = load_json_config(config_str)
+            logger.info(f"Use DeepEP Config: {config_parsed}")
             self.normal_dispatch_config = Config(**config_parsed["normal_dispatch"])
             self.normal_combine_config = Config(**config_parsed["normal_combine"])
         else:
