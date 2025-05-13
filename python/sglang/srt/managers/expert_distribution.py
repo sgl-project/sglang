@@ -608,7 +608,7 @@ class _DetailAccumulator(_UtilizationRateAccumulatorMixin):
         self._records = []
 
         self._save_dir = _SAVE_DIR
-        if self._save_dir is not None and not Path(self._save_dir).exists():
+        if not Path(self._save_dir).exists():
             Path(self._save_dir).mkdir(parents=True, exist_ok=True)
 
     def get_single_pass_gatherer_keys(self):
