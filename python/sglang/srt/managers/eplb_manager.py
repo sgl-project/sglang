@@ -36,6 +36,7 @@ class EPLBManager:
             self.rebalance()
 
     async def rebalance(self):
+        logical_count = get_global_expert_distribution_recorder().dump_record()["logical_count"]
         TODO
 
 
