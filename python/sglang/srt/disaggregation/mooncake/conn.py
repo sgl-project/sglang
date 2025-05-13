@@ -654,7 +654,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
     def _get_prefill_dp_size_from_server(self) -> int:
         """Fetch the prefill parallel info from the bootstrap server."""
         try:
-            url = f"http://{self.bootstrap_addr}/route?engine_rank={-1}&target_prefill_dp_group={-1}"
+            url = f"http://{self.bootstrap_addr}/route?engine_rank=-1&target_prefill_dp_group=-1"
             response = requests.get(url)
             if response.status_code == 200:
                 prefill_parallel_info = response.json()
