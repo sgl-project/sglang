@@ -711,11 +711,11 @@ def _dump_to_file(name, data):
 
 class _Buffer:
     @staticmethod
-    def init_new(item_shape: Tuple, buffer_size: int):
+    def init_new(item_shape: Tuple, buffer_size: int, dtype, device):
         if buffer_size < 0:
-            return _InfiniteBuffer(item_shape)
+            return _InfiniteBuffer(item_shape, dtype=dtype, device=device)
         else:
-            return _CircularBuffer(item_shape, buffer_size)
+            return _CircularBuffer(item_shape, buffer_size, dtype=dtype, device=device)
 
     def append(self, value: torch.Tensor):
         raise NotImplementedError
@@ -728,8 +728,8 @@ class _Buffer:
 
 
 class _CircularBuffer(_Buffer):
-    def __init__(self, item_shape: Tuple, buffer_size: int):
-        self._buffer = torch.zeros((buffer_size, *item_shape), dtype=TODO, device=TODO)
+    def __init__(self, item_shape: Tuple, buffer_size: int, dtype, device):
+        self._buffer = torch.zeros((buffer_size, *item_shape), dtype=dtype, device=device)
         self._curr_index = 0
 
     def append(self, value: torch.Tensor):
@@ -744,9 +744,9 @@ class _CircularBuffer(_Buffer):
 
 
 class _InfiniteBuffer(_Buffer):
-    def __init__(self, item_shape: Tuple):
+    def __init__(self, item_shape: Tuple, dtype, device):
         self._item_shape = item_shape
-        self._buffer = torch.zeros((128, *item_shape), dtype=TODO, device=TODO)
+        self._buffer = torch.zeros((128, *item_shape), dtype=dtype, device=device)
         self._size = 0
 
     def append(self, value: torch.Tensor):
