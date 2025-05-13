@@ -678,14 +678,11 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
     ):
         super().append(forward_pass_id, gatherer_key, single_pass_data)
         # Can optimize if overhead here is large
-        self._buffer_global_physical_count += single_pass_data[
-            "global_physical_count"
-        ].cpu()
+        self._global_physical_count_of_buffered_step.append(single_pass_data["global_physical_count"])
 
     def reset(self):
         super().reset()
-        self._buffer_global_physical_count[...] = 0
-        self._logical_count[...] = 0
+        self._global_physical_count_of_buffered_step.reset()
 
     def dump(self, output_mode: _OutputMode):
         if output_mode == "file":
