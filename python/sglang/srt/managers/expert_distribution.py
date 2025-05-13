@@ -585,7 +585,6 @@ class _DetailAccumulator(_Accumulator):
             last_physical_to_logical_map=self._expert_location_metadata.physical_to_logical_map,
         )
         torch.save(output, str(path_output))
-        return [dict(path_output=str(path_output))]
 
 
 class _StatAccumulator(_Accumulator):
