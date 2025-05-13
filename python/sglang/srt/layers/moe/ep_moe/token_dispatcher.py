@@ -1,6 +1,6 @@
 from sglang.srt.layers.quantization.deep_gemm import _ENABLE_JIT_DEEPGEMM
 from sglang.srt.managers.schedule_batch import global_server_args_dict
-from sglang.srt.utils import DeepEPMode
+from sglang.srt.utils import DeepEPMode, load_json_config
 
 try:
     from deep_ep import Buffer
@@ -117,8 +117,9 @@ class _DeepEPConfig:
     _instance = None
 
     def __init__(self):
-        deepep_config = global_server_args_dict["deepep_config"]
-        if deepep_config:
+        config_str = global_server_args_dict["deepep_config"]
+        if config_str:
+            config_parsed = load_json_config(config_str)
             self.normal_dispatch_config = TODO
             self.normal_combine_config = TODO
         else:
