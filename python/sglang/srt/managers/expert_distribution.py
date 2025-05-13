@@ -666,7 +666,7 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             ),
             buffer_size=self._server_args.expert_distribution_recorder_buffer_size,
             dtype=torch.int32,
-            device=TODO,
+            device=self._server_args.device,
         )
 
     def append(
