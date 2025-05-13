@@ -19,7 +19,6 @@ rm -rf /usr/local/lib/python3.10/dist-packages/sgl_kernel*
 pip install -e "python[all]"
 
 # Install additional dependencies
-pip install torch_memory_saver
 pip install transformers==4.51.0 timm torchaudio==2.6.0 sentence_transformers accelerate peft pandas datasets mooncake-transfer-engine==0.3.0
 
 # For compiling xgrammar kernels
@@ -31,3 +30,6 @@ pip install -e lmms-eval/
 
 # Install FlashMLA for attention backend tests
 pip install git+https://github.com/deepseek-ai/FlashMLA.git
+
+# Install hf_xet
+pip install huggingface_hub[hf_xet]
