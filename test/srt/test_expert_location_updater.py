@@ -38,7 +38,12 @@ def _run_subprocess(
 ):
     try:
         for _ in range(5000):
-            expert_location_updater.update_expert_weights_single_layer()
+            expert_location_updater.update_expert_weights_single_layer(
+                routed_experts_weights=TODO,
+                temp_buffers=TODO,
+                old_expert_location_metadata=TODO,
+                new_expert_location_metadata=TODO,
+            )
 
         execution_ok = True
     except Exception as e:
