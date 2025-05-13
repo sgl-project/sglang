@@ -727,6 +727,12 @@ class _Buffer:
         else:
             return _CircularBuffer(item_shape, buffer_size)
 
+    def append(self, value: torch.Tensor):
+        raise NotImplementedError
+
+    def get_all(self) -> torch.Tensor:
+        raise NotImplementedError
+
 
 class _CircularBuffer(_Buffer):
     def __init__(self, item_shape: Tuple, buffer_size: int):
