@@ -1,6 +1,5 @@
 import asyncio
 import logging
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 import torch
@@ -20,20 +19,12 @@ logger = logging.getLogger(__name__)
 
 
 class EPLBManager:
-    def __init__(self):
-        TODO
-
-
-class _TODO_REMOVE_EPLBManager:
     def __init__(self, server_args: ServerArgs):
         super().__init__()
         self._server_args = server_args
-        TODO_remove_eplb_storage_dir
-        self._expert_distribution_storage = ExpertDistributionStorage(
-            dir_data=Path(self._server_args.eplb_storage_dir)
-                     / "expert_distribution_storage"
-        )
 
+
+class _TODO_REMOVE_EPLBManager:
     def bind(self, tokenizer_manager: "TokenizerManager"):
         self._tokenizer_manager = tokenizer_manager
         self._expert_distribution_storage.bind(tokenizer_manager)
