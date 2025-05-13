@@ -1,4 +1,7 @@
+import os
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 
 import sglang as sgl
@@ -62,7 +65,61 @@ class TestEPLBEndToEnd(CustomTestCase):
 
 
 class TestEPLBMisc(CustomTestCase):
-    TODO
+    def test_save_expert_distribution_and_init_expert_location(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            engine_kwargs = dict(
+                model_path=DEFAULT_MLA_MODEL_NAME_FOR_TEST,
+                trust_remote_code=True,
+                ep_num_redundant_experts=4,
+                enable_dp_attention=True,
+                enable_deepep_moe=True,
+                deepep_mode="normal",
+                disable_cuda_graph=True,
+                tp_size=2,
+                dp_size=2,
+                log_level="info",
+            )
+
+            print(f"Action: start engine")
+            os.environ["SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR"] = tmp_dir
+            engine = sgl.Engine(
+                **engine_kwargs,
+                disable_overlap_schedule=True,
+            )
+            self._assert_behavior(engine)
+            TODO
+
+            print(f"Action: eplb_save_expert_distribution")
+            engine.dump_expert_distribution_record()
+            snapshot_path = list(Path(tmp_dir).glob("*.pt"))[0]
+            assert snapshot_path is not None
+            print(f"{snapshot_path=}")
+
+            print(f"Action: shutdown engine")
+            engine.shutdown()
+            del engine
+
+            print(f"Action: start engine with init_expert_location")
+            engine = sgl.Engine(
+                **engine_kwargs,
+                init_expert_location=str(snapshot_path),
+                port=21000,
+            )
+            self._assert_behavior(engine, "not_equal_trivial")
+            print(f"Action: shutdown engine")
+            engine.shutdown()
+            del engine
+
+            print(
+                f"Action: start engine to check automatically loading from storage dir"
+            )
+            engine = sgl.Engine(
+                **engine_kwargs, eplb_storage_dir=eplb_storage_dir_a, port=22000
+            )
+            self._assert_behavior(engine, "not_equal_trivial")
+            print(f"Action: shutdown engine")
+            engine.shutdown()
+            del engine
 
 
 if __name__ == "__main__":
