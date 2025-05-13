@@ -67,7 +67,7 @@ def _run_subprocess(
         for _ in range(5000):
             TODO_prepare
             expert_location_updater.update_expert_weights_single_layer(
-                routed_experts_weights=TODO,
+                routed_experts_weights=routed_experts_weights,
                 temp_buffers=TODO,
                 old_physical_to_logical_map=old_physical_to_logical_map,
                 new_physical_to_logical_map=new_physical_to_logical_map,
