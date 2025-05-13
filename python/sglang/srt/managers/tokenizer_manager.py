@@ -802,14 +802,6 @@ class TokenizerManager:
         await self.expert_distribution_communicator(
             ExpertDistributionReq.DUMP_RECORD
         )
-        TODO_change
-        raw_outputs: List[ExpertDistributionReqOutput] = (
-        )
-        return expert_distribution.postprocess_dumps(
-            [output.dump_output for output in raw_outputs],
-            server_args=self.server_args,
-            expert_location_metadata=self.expert_location_metadata,
-        )
 
     async def update_weights_from_disk(
         self,
