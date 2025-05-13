@@ -647,20 +647,12 @@ class _DetailAccumulator(_UtilizationRateAccumulatorMixin):
 
     def dump(self, output_mode: _OutputMode):
         assert output_mode == "file"
-        path_output = _SAVE_DIR / f"{time.time()}-{self._rank}.pt"
-        logger.info(f"Write expert distribution to {path_output}")
         output = dict(
             records=self._records,
             # NOTE: This may change during recording, so here we say it is the "last" one
             last_physical_to_logical_map=self._expert_location_metadata.physical_to_logical_map,
         )
-        if not _SAVE_DIR.exists():
-            _SAVE_DIR.mkdir(parents=True, exist_ok=True)
-        torch.save(output, str(path_output))
-
-
-def _dump_to_file():
-    _SAVE_DIR = Path(os.environ.get("SGLANG_EXPERT_DISTRIBUTION_RECORDER_SAVE_DIR", "/tmp"))
+        _dump_to_file(f"{time.time()}-{self._rank}.pt", output)
 
 
 class _StatAccumulator(_UtilizationRateAccumulatorMixin):
@@ -709,6 +701,15 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             rank=self._rank,
             logical_count=self._logical_count.tolist(),
         )
+
+
+def _dump_to_file(name, data):
+    save_dir = Path(os.environ.get("SGLANG_EXPERT_DISTRIBUTION_RECORDER_SAVE_DIR", "/tmp"))
+    path_output = save_dir / name
+    logger.info(f"Write expert distribution to {path_output}")
+    if not save_dir.exists():
+        save_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(data, str(path_output))
 
 
 class _Buffer:
