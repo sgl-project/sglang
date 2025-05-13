@@ -168,7 +168,7 @@ class ServerArgs:
         None
     )
     enable_eplb: bool = False
-    eplb_rebalance_period: Optional[int] = None
+    eplb_rebalance_num_iterations: Optional[int] = None
     deepseek_eplb_hack_shuffle: bool = False
     expert_distribution_recorder_mode: Optional[
         Literal["stat", "stat_ut", "stat_per_pass", "detail_per_token"]
@@ -1202,10 +1202,10 @@ class ServerArgs:
             help="",
         )
         parser.add_argument(
-            "--eplb-rebalance-period",
+            "--eplb-rebalance-num-iterations",
             type=int,
-            default=ServerArgs.eplb_rebalance_period,
-            help="Time (inm seconds) to automatically trigger a EPLB re-balance.",
+            default=ServerArgs.eplb_rebalance_num_iterations,
+            help="Number of iterations to automatically trigger a EPLB re-balance.",
         )
         parser.add_argument(
             "--moe-dense-tp-size",
