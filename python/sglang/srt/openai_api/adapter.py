@@ -555,7 +555,6 @@ def v1_generate_request(
                 "temperature": request.temperature,
                 "max_new_tokens": request.max_tokens,
                 "min_new_tokens": request.min_tokens,
-                "thinking_budget": request.thinking_budget,
                 "stop": request.stop,
                 "stop_token_ids": request.stop_token_ids,
                 "top_p": request.top_p,
