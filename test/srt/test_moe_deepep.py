@@ -1,4 +1,5 @@
 import json
+import os
 import unittest
 from types import SimpleNamespace
 
@@ -65,6 +66,8 @@ class TestDPAttn(unittest.TestCase):
                 "2",
                 "--enable-dp-attention",
                 "--enable-deepep-moe",
+                "--deepep-mode",
+                "normal",
                 "--disable-cuda-graph",
                 # Test custom config
                 "--deepep-config",
@@ -85,6 +88,10 @@ class TestDPAttn(unittest.TestCase):
                     },
                 }),
             ],
+            env={
+                "SGL_ENABLE_JIT_DEEPGEMM": "0",
+                **os.environ,
+            },
         )
 
     @classmethod
