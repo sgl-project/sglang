@@ -748,7 +748,8 @@ class _CircularBuffer(_Buffer):
 
 class _InfiniteBuffer(_Buffer):
     def __init__(self, item_shape: Tuple):
-        TODO
+        self._buffer = torch.zeros((128, *item_shape), device=TODO)
+        self._size = 0
 
     def append(self, value: torch.Tensor):
         TODO
