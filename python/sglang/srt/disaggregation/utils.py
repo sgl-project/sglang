@@ -112,7 +112,7 @@ def get_kv_class(transfer_backend: TransferBackend, class_type: KVClassType):
 
 
 def kv_to_page_indices(kv_indices: np.ndarray, page_size: int):
-    # 1. The page is guaruanteed to be full except the last page.
+    # 1. The page is guaranteed to be full except the last page.
     # 2. page index = kv_index // page_size
     # The return vector is kv_indices[::page_size] // page_size
     if page_size == 1:  # shortcut
@@ -162,3 +162,9 @@ def register_disaggregation_server(
         warnings.warn(
             f"Failed to register disaggregation server: {res.status_code} {res.text}"
         )
+
+
+def is_mla_backend(target_kv_pool) -> bool:
+    from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+
+    return isinstance(target_kv_pool, MLATokenToKVPool)

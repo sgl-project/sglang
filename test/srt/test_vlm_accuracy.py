@@ -116,7 +116,7 @@ class VisionLLMLogitsBase(unittest.IsolatedAsyncioTestCase):
         }},
         {{
           "type": "text",
-          "text": "Whats in this picture?"
+          "text": "What's in this picture?"
         }}
       ]
     }}

@@ -36,13 +36,13 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.dp_attention import (
+    attn_tp_all_gather,
+    attn_tp_reduce_scatter,
     dp_gather_partial,
     dp_scatter,
-    get_attention_dp_size,
     get_attention_tp_rank,
     get_attention_tp_size,
-    tp_all_gather,
-    tp_reduce_scatter,
+    get_local_attention_dp_size,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -438,7 +438,6 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.v_head_dim = v_head_dim
         self.q_lora_rank = q_lora_rank
         self.kv_lora_rank = kv_lora_rank
-        self.dp_size = get_attention_dp_size()
         attn_tp_rank = get_attention_tp_rank()
         attn_tp_size = get_attention_tp_size()
 
@@ -1133,7 +1132,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         self.enable_dp_attention = global_server_args_dict["enable_dp_attention"]
         self.layer_id = layer_id
-        self.dp_size = get_attention_dp_size()
+        self.local_dp_size = get_local_attention_dp_size()
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
         self.self_attn = DeepseekV2AttentionMLA(
@@ -1184,7 +1183,8 @@ class DeepseekV2DecoderLayer(nn.Module):
             )
 
         self.input_is_scattered = (
-            previous_layer_info.ffn_input_mode == _FFNInputMode.SCATTERED
+            layer_id > 0
+            and previous_layer_info.ffn_input_mode == _FFNInputMode.SCATTERED
         )
         self.is_last_layer = self.layer_id == config.num_hidden_layers - 1
 
@@ -1264,7 +1264,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         # Gather
         if get_tensor_model_parallel_world_size() > 1:
             # all gather and all reduce
-            if self.dp_size != 1:
+            if self.local_dp_size != 1:
                 if self.attn_tp_rank == 0:
                     hidden_states += residual
                 hidden_states, local_hidden_states = (
@@ -1287,9 +1287,9 @@ class DeepseekV2DecoderLayer(nn.Module):
         # Fully Connected
         hidden_states = self.mlp(hidden_states)
 
-        # TODO(ch-wan): ues reduce-scatter in MLP to avoid this scatter
+        # TODO(ch-wan): use reduce-scatter in MLP to avoid this scatter
         # Scatter
-        if self.dp_size != 1:
+        if self.local_dp_size != 1:
             # important: forward batch.gathered_buffer is used both after scatter and after gather.
             # be careful about this!
             hidden_states, global_hidden_states = (
@@ -1323,7 +1323,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
                 hidden_states,
             )
-            tp_all_gather(
+            attn_tp_all_gather(
                 list(hidden_states.tensor_split(self.attn_tp_size)), local_hidden_states
             )
 
@@ -1339,7 +1339,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             if self.input_is_scattered:
                 tensor_list = list(hidden_states.tensor_split(self.attn_tp_size))
                 hidden_states = tensor_list[self.attn_tp_rank]
-                tp_reduce_scatter(hidden_states, tensor_list)
+                attn_tp_reduce_scatter(hidden_states, tensor_list)
                 if hidden_states.shape[0] != 0:
                     hidden_states, residual = self.post_attention_layernorm(
                         hidden_states, residual
@@ -1349,7 +1349,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                     hidden_states += residual
                 tensor_list = list(hidden_states.tensor_split(self.attn_tp_size))
                 hidden_states = tensor_list[self.attn_tp_rank]
-                tp_reduce_scatter(hidden_states, tensor_list)
+                attn_tp_reduce_scatter(hidden_states, tensor_list)
                 residual = hidden_states
                 if hidden_states.shape[0] != 0:
                     hidden_states = self.post_attention_layernorm(hidden_states)
@@ -1373,7 +1373,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
                 hidden_states,
             )
-            tp_all_gather(
+            attn_tp_all_gather(
                 list(hidden_states.tensor_split(self.attn_tp_size)), local_hidden_states
             )
 
@@ -1413,7 +1413,7 @@ class DeepseekV2Model(nn.Module):
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        self.dp_size = get_attention_dp_size()
+        self.dp_size = get_local_attention_dp_size()
 
     def get_input_embeddings(self) -> torch.Tensor:
         return self.embed_tokens
@@ -1475,9 +1475,10 @@ class DeepseekV2ForCausalLM(nn.Module):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
+            use_attn_tp_group=global_server_args_dict["enable_dp_lm_head"],
         )
         self.logits_processor = LogitsProcessor(config)
-        self.dp_size = get_attention_dp_size()
+        self.dp_size = get_local_attention_dp_size()
 
     def determine_n_share_experts_fusion(
         self, architecture: str = "DeepseekV3ForCausalLM"
@@ -1499,7 +1500,7 @@ class DeepseekV2ForCausalLM(nn.Module):
             else:
                 assert (
                     self.n_share_experts_fusion == self.tp_size
-                ), f"Shared experts fusion optimization is enabled in DeepSeek V3/R1, set it to {self.tp_size} can get best optimized performace."
+                ), f"Shared experts fusion optimization is enabled in DeepSeek V3/R1, set it to {self.tp_size} can get best optimized performance."
         elif self.n_share_experts_fusion == 0:
             if (
                 _is_cuda
@@ -1665,7 +1666,7 @@ class DeepseekV2ForCausalLM(nn.Module):
         if is_nextn:
             if hasattr(self.config, "num_nextn_predict_layers"):
                 num_nextn_layers = self.config.num_nextn_predict_layers
-                assert num_nextn_layers == 1, "Only 1 nextn layer is supportted"
+                assert num_nextn_layers == 1, "Only 1 nextn layer is supported"
                 # compatible with old design
                 nextn_layer_id = (
                     0
