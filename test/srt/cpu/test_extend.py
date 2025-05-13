@@ -1,8 +1,11 @@
-import torch
 import unittest
-from torch.nn.functional import scaled_dot_product_attention
+
+import torch
 from sgl_kernel.cpu import extend_attention
+from torch.nn.functional import scaled_dot_product_attention
+
 from sglang.test.test_utils import CustomTestCase
+
 
 class TestExtendAttention(CustomTestCase):
 
@@ -72,7 +75,6 @@ class TestExtendAttention(CustomTestCase):
             start_q, start_kv = end_q, end_kv
         return output
 
-
     def _test_extend_attention_once(self, B, N_CTX, H_Q, H_KV, D, DV, mla=False):
         dtype = torch.bfloat16
 
@@ -80,7 +82,7 @@ class TestExtendAttention(CustomTestCase):
         if mla:
             b_seq_len_prefix.zero_()
         b_seq_len_extend = torch.randint(1, N_CTX // 2, (B,), dtype=torch.int32)
-        b_seq_len = (b_seq_len_prefix + b_seq_len_extend)
+        b_seq_len = b_seq_len_prefix + b_seq_len_extend
         max_len_in_batch = torch.max(b_seq_len, 0)[0].item()
 
         b_req_idx = torch.arange(B, dtype=torch.int32)
@@ -111,9 +113,15 @@ class TestExtendAttention(CustomTestCase):
             extend_end_in_buffer = b_start_loc[i] + b_seq_len[i]
             extend_start = b_start_loc_extend[i]
             extend_end = b_start_loc_extend[i] + b_seq_len_extend[i]
-            k_extend[extend_start:extend_end] = k_buffer[extend_start_in_buffer:extend_end_in_buffer]
-            v_extend[extend_start:extend_end] = v_buffer[extend_start_in_buffer:extend_end_in_buffer]
-            q_extend[extend_start:extend_end] = torch.randn((b_seq_len_extend[i], H_Q, D), dtype=dtype)
+            k_extend[extend_start:extend_end] = k_buffer[
+                extend_start_in_buffer:extend_end_in_buffer
+            ]
+            v_extend[extend_start:extend_end] = v_buffer[
+                extend_start_in_buffer:extend_end_in_buffer
+            ]
+            q_extend[extend_start:extend_end] = torch.randn(
+                (b_seq_len_extend[i], H_Q, D), dtype=dtype
+            )
 
         b_seq_len_extend = b_seq_len - b_seq_len_prefix
         b_start_loc_extend = torch.zeros_like(b_seq_len)
@@ -130,18 +138,18 @@ class TestExtendAttention(CustomTestCase):
         enable_gqa = H_Q != H_KV
         o_ref = torch.empty((extend_token_num, H_Q, DV), dtype=dtype)
         self._run_sdpa_forward_extend(
-        q_extend,
-        o_ref,
-        k_buffer,
-        v_buffer,
-        req_to_tokens,
-        b_req_idx,
-        b_seq_len,
-        b_seq_len_prefix,
-        b_seq_len_extend,
-        scaling = sm_scale,
-        enable_gqa = enable_gqa,
-        causal = True
+            q_extend,
+            o_ref,
+            k_buffer,
+            v_buffer,
+            req_to_tokens,
+            b_req_idx,
+            b_seq_len,
+            b_seq_len_prefix,
+            b_seq_len_extend,
+            scaling=sm_scale,
+            enable_gqa=enable_gqa,
+            causal=True,
         )
 
         o_extend = torch.empty((extend_token_num, H_Q, DV), dtype=dtype)
@@ -159,7 +167,8 @@ class TestExtendAttention(CustomTestCase):
             b_start_loc_extend,
             max_len_extend,
             sm_scale,
-            logit_cap)
+            logit_cap,
+        )
 
         torch.testing.assert_close(o_ref, o_extend, atol=1e-2, rtol=1e-2)
 
@@ -168,6 +177,7 @@ class TestExtendAttention(CustomTestCase):
             self._test_extend_attention_once(1, 123, 1, 1, 128, 96, is_mla)
             self._test_extend_attention_once(1, 123, 16, 1, 128, 96, is_mla)
             self._test_extend_attention_once(4, 1230, 16, 4, 128, 96, is_mla)
+
 
 if __name__ == "__main__":
     unittest.main()

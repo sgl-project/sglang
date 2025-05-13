@@ -303,7 +303,9 @@ class ModelRunner:
                     )
             else:
                 if server_args.attention_backend != "intel_amx":
-                    raise ValueError("MLA optimization not supported on CPU except for intel_amx backend.")
+                    raise ValueError(
+                        "MLA optimization not supported on CPU except for intel_amx backend."
+                    )
 
         if (
             server_args.attention_backend == "fa3"
@@ -988,7 +990,10 @@ class ModelRunner:
 
             self.attn_backend = CutlassMLABackend(self)
         elif self.server_args.attention_backend == "intel_amx":
-            from sglang.srt.layers.attention.intel_amx_backend import IntelAMXAttnBackend
+            from sglang.srt.layers.attention.intel_amx_backend import (
+                IntelAMXAttnBackend,
+            )
+
             self.attn_backend = IntelAMXAttnBackend(self)
         else:
             raise ValueError(

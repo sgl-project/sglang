@@ -1,7 +1,9 @@
-import torch
 import unittest
-from torch.nn.functional import scaled_dot_product_attention
+
+import torch
 from sgl_kernel.cpu import decode_attention
+from torch.nn.functional import scaled_dot_product_attention
+
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -84,7 +86,11 @@ class TestDecodeAttention(CustomTestCase):
         o = torch.zeros(B, H_Q, D_V, dtype=dtype, device=device)
         o_grouped = torch.zeros(B, H_Q, D_V, dtype=dtype, device=device)
 
-        req_to_token = torch.arange(total_tokens, device=device).reshape(B, seq_len).to(torch.int32)
+        req_to_token = (
+            torch.arange(total_tokens, device=device)
+            .reshape(B, seq_len)
+            .to(torch.int32)
+        )
         b_req_idx = torch.arange(B, device=device).to(torch.int64)
         b_seq_len = torch.full((B,), seq_len, device=device).to(torch.int64)
 
@@ -107,7 +113,8 @@ class TestDecodeAttention(CustomTestCase):
             b_seq_len,
             attn_logits,
             sm_scale,
-            logit_cap)
+            logit_cap,
+        )
 
         self._run_sdpa_forward_decode(
             q,
@@ -118,7 +125,7 @@ class TestDecodeAttention(CustomTestCase):
             b_req_idx,
             b_seq_len,
             scaling=sm_scale,
-            enable_gqa=enable_gqa
+            enable_gqa=enable_gqa,
         )
 
         cos_sim = torch.nn.functional.cosine_similarity(
@@ -126,7 +133,6 @@ class TestDecodeAttention(CustomTestCase):
         )
         self.assertGreater(cos_sim.item(), 0.99)
         torch.testing.assert_close(o, o_grouped, atol=3e-2, rtol=1e-6)
-
 
     def _test_grouped_decode_attention(self, device="cuda"):
         configs = [
@@ -144,10 +150,13 @@ class TestDecodeAttention(CustomTestCase):
         ]
 
         for B, H_Q, H_KV, D, D_V in configs:
-            self._test_grouped_decode_attention_once(B, H_Q, H_KV, D, D_V, device=device)
+            self._test_grouped_decode_attention_once(
+                B, H_Q, H_KV, D, D_V, device=device
+            )
 
     def test_grouped_decode_attention(self):
         self._test_grouped_decode_attention("cpu")
+
 
 if __name__ == "__main__":
     unittest.main()
