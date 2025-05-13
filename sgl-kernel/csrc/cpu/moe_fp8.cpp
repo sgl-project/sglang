@@ -7,8 +7,8 @@ namespace {
 template <typename scalar_t>
 inline void copy_stub(scalar_t* __restrict__ out, const scalar_t* __restrict__ input, int64_t size) {
   using Vec = at::vec::Vectorized<scalar_t>;
-  // no remainder
-  #pragma GCC unroll 4
+// no remainder
+#pragma GCC unroll 4
   for (int64_t d = 0; d < size; d += Vec::size()) {
     Vec data = Vec::loadu(input + d);
     data.store(out + d);
@@ -22,7 +22,7 @@ inline void copy_mul_stub(scalar_t* __restrict__ out, const scalar_t* __restrict
   constexpr int kVecSize = bVec::size();
   const fVec weight_vec = fVec(weight);
   int64_t d;
-  #pragma GCC unroll 4
+#pragma GCC unroll 4
   for (d = 0; d <= size - kVecSize; d += kVecSize) {
     bVec x = bVec::loadu(input + d);
     fVec x0, x1;
@@ -49,7 +49,7 @@ inline void sum_stub(scalar_t* __restrict__ out, const scalar_t* __restrict__ in
   } else {
     // do sum for topk != 1
     int64_t d;
-    #pragma GCC unroll 4
+#pragma GCC unroll 4
     for (d = 0; d <= K - kVecSize; d += kVecSize) {
       fVec sum_fvec0 = fVec(0.f);
       fVec sum_fvec1 = fVec(0.f);
@@ -159,7 +159,6 @@ void fused_experts_fp8_kernel_impl(
     int64_t E,
     int64_t topk,
     int64_t num_tokens_post_pad) {
-
   constexpr int64_t BLOCK_M = block_size_m();
   constexpr int64_t BLOCK_N = block_size_n();
 
@@ -193,7 +192,8 @@ void fused_experts_fp8_kernel_impl(
       // B shape [K, n_size] in vnni format
       int32_t expert_id = expert_ids[mb];
       const at::Float8_e4m3fn* __restrict__ B = packed_w1 + expert_id * stride_e + nb * BLOCK_N * stride_n;
-      const float* __restrict__ Bs = w1s + expert_id * scale_size_N * scale_size_K + (nb / blocks_n_per_group) * scale_size_K;
+      const float* __restrict__ Bs =
+          w1s + expert_id * scale_size_N * scale_size_K + (nb / blocks_n_per_group) * scale_size_K;
 
       // 1.a load A
       const int32_t* A_ids = sorted_ids + mb * BLOCK_M;
@@ -233,11 +233,7 @@ void fused_experts_fp8_kernel_impl(
   // stage 1.5: intermediate_cache1 = silu(intermediate_cache0)
   at::parallel_for(0, M * topk, 0, [&](int64_t begin, int64_t end) {
     for (int64_t m = begin; m < end; ++m) {
-      silu_and_mul_stub(
-          ic1 + m * N,
-          ic0 + m * 2 * N,
-          ic0 + m * 2 * N + N,
-          N);
+      silu_and_mul_stub(ic1 + m * N, ic0 + m * 2 * N, ic0 + m * 2 * N + N, N);
     }
   });
 
@@ -278,7 +274,8 @@ void fused_experts_fp8_kernel_impl(
       // B shape [IC, n_size] in vnni format
       int32_t expert_id = expert_ids[mb];
       const at::Float8_e4m3fn* __restrict__ B = packed_w2 + expert_id * stride_e2 + nb * BLOCK_N * stride_oc;
-      const float* __restrict__ Bs = w2s + expert_id * scale_size_N * scale_size_K + (nb / blocks_n_per_group) * scale_size_K;
+      const float* __restrict__ Bs =
+          w2s + expert_id * scale_size_N * scale_size_K + (nb / blocks_n_per_group) * scale_size_K;
 
       tinygemm_kernel<scalar_t>(
           /*   A            */ A,
@@ -364,7 +361,6 @@ void shared_expert_fp8_kernel_impl(
     int64_t M,
     int64_t N,
     int64_t K) {
-
   constexpr int64_t BLOCK_M = block_size_m();
   constexpr int64_t BLOCK_N = block_size_n();
 
