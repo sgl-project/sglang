@@ -35,6 +35,36 @@ logger = logging.getLogger(__name__)
 NixlEngineInfo: TypeAlias = Dict[str, Union[str, int]]
 
 
+# From Mooncake backend.
+def group_concurrent_contiguous(
+    src_indices: npt.NDArray[np.int64], dst_indices: npt.NDArray[np.int64]
+) -> Tuple[List[npt.NDArray[np.int64]], List[npt.NDArray[np.int64]]]:
+    src_groups = []
+    dst_groups = []
+    current_src = [src_indices[0]]
+    current_dst = [dst_indices[0]]
+
+    for i in range(1, len(src_indices)):
+        src_contiguous = src_indices[i] == src_indices[i - 1] + 1
+        dst_contiguous = dst_indices[i] == dst_indices[i - 1] + 1
+        if src_contiguous and dst_contiguous:
+            current_src.append(src_indices[i])
+            current_dst.append(dst_indices[i])
+        else:
+            src_groups.append(current_src)
+            dst_groups.append(current_dst)
+            current_src = [src_indices[i]]
+            current_dst = [dst_indices[i]]
+
+    src_groups.append(current_src)
+    dst_groups.append(current_dst)
+
+    return src_groups, dst_groups
+
+
+GUARD = "NixlMsgGuard".encode("ascii")
+
+
 @dataclasses.dataclass
 class TransferInfo:
     room: int
@@ -102,6 +132,7 @@ class NixlKVManager(BaseKVManager):
         args: KVArgs,
         disaggregation_mode: DisaggregationMode,
         server_args: ServerArgs,
+        is_mla_backend: Optional[bool] = False,
     ):
         try:
             from nixl._api import nixl_agent
@@ -142,10 +173,8 @@ class NixlKVManager(BaseKVManager):
             self._start_bootstrap_thread()
             self._register_to_bootstrap()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            # bootstrap key -> (engine_rank - >real source remote, engine_rank -> dummy remote)
-            self.prefill_peer_infos: Dict[
-                str, Tuple[Dict[int, NixlEngineInfo], Dict[int, NixlEngineInfo]]
-            ] = {}
+            # bootstrap key -> (remote_engine_rank -> possible remote source info)
+            self.prefill_peer_infos: Dict[str, list[Dict[int, NixlEngineInfo]]] = {}
             self.transfer_statuses: Dict[int, TransferStatus] = defaultdict(
                 TransferStatus
             )
@@ -161,6 +190,7 @@ class NixlKVManager(BaseKVManager):
         ):
             kv_addrs.append((kv_data_ptr, kv_data_len, self.kv_args.gpu_id, ""))
         self.kv_descs = self.agent.register_memory(kv_addrs, "VRAM", is_sorted=True)
+        logger.debug(f"Register kv tensors, len(kv_addr)= {len(kv_addrs)}")
         if not self.kv_descs:
             raise Exception("NIXL memory registration failed for kv tensors")
         aux_addrs = []
@@ -169,6 +199,7 @@ class NixlKVManager(BaseKVManager):
         ):
             aux_addrs.append((aux_data_ptr, aux_data_len, 0, ""))
         self.aux_descs = self.agent.register_memory(aux_addrs, "DRAM", is_sorted=True)
+        logger.debug(f"Register aux tensors, len(aux_addrs)= {len(aux_addrs)}")
         if not self.aux_descs:
             raise Exception("NIXL memory registration failed for aux tensors")
 
@@ -192,6 +223,12 @@ class NixlKVManager(BaseKVManager):
         dst_gpu_id: int,
         notif: str,
     ):
+        # group by indices
+        prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
+            prefill_kv_indices, dst_kv_indices
+        )
+
+        logger.debug(f"sending kvcache to {peer_name} with notif {notif}")
         # Make descs
         num_layers = len(self.kv_args.kv_data_ptrs)
         src_addrs = []
@@ -201,12 +238,16 @@ class NixlKVManager(BaseKVManager):
             dst_ptr = dst_kv_ptrs[layer_id]
             item_len = self.kv_args.kv_item_lens[layer_id]
 
-            for prefill_index, decode_index in zip(prefill_kv_indices, dst_kv_indices):
-                src_addr = src_ptr + int(prefill_index) * item_len
-                dst_addr = dst_ptr + int(decode_index) * item_len
-                length = item_len
+            for prefill_index, decode_index in zip(prefill_kv_blocks, dst_kv_blocks):
+                src_addr = src_ptr + int(prefill_index[0]) * item_len
+                dst_addr = dst_ptr + int(decode_index[0]) * item_len
+                length = item_len * len(prefill_index)
                 src_addrs.append((src_addr, length, self.kv_args.gpu_id))
                 dst_addrs.append((dst_addr, length, dst_gpu_id))
+
+        logger.debug(
+            f"len(src_addrs): before group: {len(prefill_kv_indices)}, after group: {len(src_addrs)}"
+        )
         src_descs = self.agent.get_xfer_descs(src_addrs, "VRAM", is_sorted=True)
         dst_descs = self.agent.get_xfer_descs(dst_addrs, "VRAM", is_sorted=True)
         # Transfer data
@@ -364,6 +405,13 @@ class NixlKVManager(BaseKVManager):
             """This thread recvs transfer info from the decode engine"""
             while True:
                 waiting_req_bytes = self.server_socket.recv_multipart()
+                logger.debug(
+                    f"Received multipart with total byte size {sum(len(x) for x in waiting_req_bytes)}"
+                )
+                assert (
+                    waiting_req_bytes[0] == GUARD
+                ), f"First message should be {GUARD}. Foreign traffic?"
+                waiting_req_bytes = waiting_req_bytes[1:]
                 room = waiting_req_bytes[0].decode("ascii")
                 if room == "None":
                     continue
@@ -453,10 +501,12 @@ class NixlKVReceiver(BaseKVReceiver):
             self.bootstrap_info = self.kv_mgr.prefill_peer_infos[bootstrap_key]
         assert self.bootstrap_info is not None
 
-    # return: (real source remotes, others dummy remotes)
+    # return a list of remotes in a dict, [(remote_engine_rank -> NixlEngineInfo), ...]
+    # In each dict, there are multiple possible remotes named "equal sources".
+    # We only need to select one to split the traffic. i.e. we totally select len(list) remotes.
     def _get_bootstrap_info_from_server(
         self, engine_rank
-    ) -> Optional[Tuple[Dict[int, NixlEngineInfo], Dict[int, NixlEngineInfo]]]:
+    ) -> Optional[List[Dict[int, NixlEngineInfo]]]:
         """Fetch the bootstrap info from the bootstrap server."""
         try:
             if self.kv_mgr.enable_dp_attention:
@@ -494,25 +544,26 @@ class NixlKVReceiver(BaseKVReceiver):
                     for i in range(0, prefill_tp_size, self.kv_mgr.tp_size_of_dp)
                 ]
                 managed_ranks = remote_tp_ranks_grouped[self.kv_mgr.attn_tp_rank]
-                picked_rank = managed_ranks[0]
 
                 assert len(managed_ranks) == num_remote_tp_rank_we_managed
 
                 logger.debug(
-                    f"Rank {self.kv_mgr.kv_args.engine_rank} managed {managed_ranks}, picked {picked_rank} as real source"
+                    f"Rank {self.kv_mgr.kv_args.engine_rank} source can be {managed_ranks}"
                 )
 
-                return {picked_rank: bootstrap_info[picked_rank]}, {
-                    rk: bootstrap_info[rk]
-                    for rk in bootstrap_info.keys()
-                    if rk in managed_ranks and rk != picked_rank
-                }
+                return [
+                    {
+                        rk: bootstrap_info[rk]
+                        for rk in bootstrap_info.keys()
+                        if rk in managed_ranks
+                    }
+                ]
             else:
                 url = f"http://{self.bootstrap_addr}/route?engine_rank={engine_rank}"
                 response = requests.get(url)
                 if response.status_code == 200:
                     bootstrap_info = response.json()
-                    return {engine_rank: bootstrap_info}, {}
+                    return [{engine_rank: bootstrap_info}]
                 else:
                     logger.error(
                         f"Failed to get prefill server info: {response.status_code}, {response.text}"
@@ -531,47 +582,53 @@ class NixlKVReceiver(BaseKVReceiver):
     def init(self, kv_indices: npt.NDArray[np.int64], aux_index: Optional[int] = None):
 
         assert self.bootstrap_info is not None
+        assert self.bootstrap_room is not None
 
-        sources = self.bootstrap_info[0]
-        dummy = self.bootstrap_info[1]
-
-        assert len(sources) == 1, "Only support one source now"
-
-        remote_rank = list(self.bootstrap_info[0].keys())[0]
-
-        self.prefill_server_url = f"{self.bootstrap_info[0][remote_rank]['rank_ip']}:{self.bootstrap_info[0][remote_rank]['rank_port']}"
-
-        logger.debug(
-            f"Fetched bootstrap info for engine rank: {self.kv_mgr.kv_args.engine_rank}, source: {self.bootstrap_info[0].keys()}, dummy: {self.bootstrap_info[1].keys()} "
-        )
-
-        packed_kv_data_ptrs = b"".join(
-            struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
-        )
-        packed_aux_data_ptrs = b"".join(
-            struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.aux_data_ptrs
-        )
-        self._connect("tcp://" + self.prefill_server_url).send_multipart(
-            [
-                str(self.bootstrap_room).encode("ascii"),
-                get_local_ip_by_remote().encode("ascii"),
-                str(self.kv_mgr.rank_port).encode("ascii"),
-                self.kv_mgr.agent.get_agent_metadata(),
-                packed_kv_data_ptrs,
-                kv_indices.tobytes(),
-                packed_aux_data_ptrs,
-                str(aux_index).encode("ascii"),
-                str(self.kv_mgr.kv_args.gpu_id).encode("ascii"),
+        for equal_sources in self.bootstrap_info:
+            remote_rank = list(equal_sources.keys())[
+                self.bootstrap_room % len(equal_sources)
             ]
-        )
+            self.prefill_server_url = f"{equal_sources[remote_rank]['rank_ip']}:{equal_sources[remote_rank]['rank_port']}"
+            logger.debug(
+                f"Fetched bootstrap info for engine rank: {self.kv_mgr.kv_args.engine_rank}, source: {remote_rank}, all: {list(equal_sources.keys())}"
+            )
 
-        for dummy_rank, dummy_info in dummy.items():
-            dummy_url = f"{dummy_info['rank_ip']}:{dummy_info['rank_port']}"
-            self._connect("tcp://" + dummy_url).send_multipart(
+            packed_kv_data_ptrs = b"".join(
+                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
+            )
+            packed_aux_data_ptrs = b"".join(
+                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.aux_data_ptrs
+            )
+
+            logger.debug(
+                f"Sending to {self.prefill_server_url} with bootstrap room {self.bootstrap_room}"
+            )
+            self._connect("tcp://" + self.prefill_server_url).send_multipart(
                 [
+                    GUARD,
                     str(self.bootstrap_room).encode("ascii"),
+                    get_local_ip_by_remote().encode("ascii"),
+                    str(self.kv_mgr.rank_port).encode("ascii"),
+                    self.kv_mgr.agent.get_agent_metadata(),
+                    packed_kv_data_ptrs,
+                    kv_indices.tobytes(),
+                    packed_aux_data_ptrs,
+                    str(aux_index).encode("ascii"),
+                    str(self.kv_mgr.kv_args.gpu_id).encode("ascii"),
                 ]
             )
+
+            for dummy_rank in equal_sources.keys():
+                if dummy_rank == remote_rank:
+                    continue
+                dummy_info = equal_sources[dummy_rank]
+                dummy_url = f"{dummy_info['rank_ip']}:{dummy_info['rank_port']}"
+                self._connect("tcp://" + dummy_url).send_multipart(
+                    [
+                        GUARD,
+                        str(self.bootstrap_room).encode("ascii"),
+                    ]
+                )
 
         self.started_transfer = True
 
@@ -591,6 +648,7 @@ class NixlKVReceiver(BaseKVReceiver):
 
 class NixlKVBootstrapServer(BaseKVBootstrapServer):
     def __init__(self, port: int):
+        logger.debug(f"NixlKVBootstrapServer started on port {port}")
         self.port = port
         self.app = web.Application()
         self.store = dict()

@@ -24,6 +24,7 @@ from transformers import PretrainedConfig
 
 from sglang.srt.hf_transformers_utils import get_config, get_context_length
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_bool_env_var, is_hip
 
 logger = logging.getLogger(__name__)
@@ -47,6 +48,7 @@ class ModelConfig:
         dtype: str = "auto",
         quantization: Optional[str] = None,
         override_config_file: Optional[str] = None,
+        is_draft_model: bool = False,
     ) -> None:
 
         self.model_path = model_path
@@ -84,6 +86,12 @@ class ModelConfig:
                 )
             else:
                 enable_multimodal = True
+
+        if (
+            is_draft_model
+            and self.hf_config.architectures[0] == "DeepseekV3ForCausalLM"
+        ):
+            self.hf_config.architectures[0] = "DeepseekV3ForCausalLMNextN"
 
         # Check model type
         self.is_generation = is_generation_model(
@@ -169,6 +177,13 @@ class ModelConfig:
             self.attention_arch = AttentionArch.MLA
             self.kv_lora_rank = self.hf_text_config.kv_lora_rank
             self.qk_rope_head_dim = self.hf_text_config.qk_rope_head_dim
+        elif "KimiVLForConditionalGeneration" in self.hf_config.architectures:
+            self.head_dim = 256
+            self.attention_arch = AttentionArch.MLA
+            self.kv_lora_rank = self.hf_text_config.kv_lora_rank
+            self.qk_rope_head_dim = self.hf_text_config.qk_rope_head_dim
+            self.v_head_dim = self.hf_text_config.v_head_dim
+            self.qk_nope_head_dim = self.hf_text_config.qk_nope_head_dim
         else:
             self.attention_arch = AttentionArch.MHA
 
@@ -195,6 +210,21 @@ class ModelConfig:
         # Cache attributes
         self.hf_eos_token_id = self.get_hf_eos_token_id()
         self.image_token_id = getattr(self.hf_config, "image_token_id", None)
+
+    @staticmethod
+    def from_server_args(server_args: ServerArgs, model_path: str = None, **kwargs):
+        return ModelConfig(
+            model_path=model_path or server_args.model_path,
+            trust_remote_code=server_args.trust_remote_code,
+            revision=server_args.revision,
+            context_length=server_args.context_length,
+            model_override_args=server_args.json_model_override_args,
+            is_embedding=server_args.is_embedding,
+            enable_multimodal=server_args.enable_multimodal,
+            dtype=server_args.dtype,
+            quantization=server_args.quantization,
+            **kwargs,
+        )
 
     # adapted from https://github.com/vllm-project/vllm/blob/main/vllm/config.py#L289
     def get_total_num_kv_heads(self) -> int:
@@ -515,6 +545,7 @@ multimodal_model_archs = [
     "Llama4ForConditionalGeneration",
     "LlavaMistralForCausalLM",
     "LlavaQwenForCausalLM",
+    "LlavaForConditionalGeneration",
     "LlavaVidForCausalLM",
     "MiniCPMO",
     "MiniCPMV",
@@ -523,6 +554,8 @@ multimodal_model_archs = [
     "Qwen2VLForConditionalGeneration",
     "Qwen2_5_VLForConditionalGeneration",
     "CLIPModel",
+    "KimiVLForConditionalGeneration",
+    "InternVLChatModel",
 ]
 
 

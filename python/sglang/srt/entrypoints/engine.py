@@ -126,7 +126,6 @@ class Engine(EngineBase):
             server_args=server_args,
             port_args=port_args,
         )
-
         self.server_args = server_args
         self.tokenizer_manager = tokenizer_manager
         self.scheduler_info = scheduler_info
@@ -164,6 +163,9 @@ class Engine(EngineBase):
         custom_logit_processor: Optional[Union[List[str], str]] = None,
         return_hidden_states: bool = False,
         stream: bool = False,
+        bootstrap_host: Optional[Union[List[str], str]] = None,
+        bootstrap_port: Optional[Union[List[int], int]] = None,
+        bootstrap_room: Optional[Union[List[int], int]] = None,
     ) -> Union[Dict, Iterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -182,6 +184,9 @@ class Engine(EngineBase):
             custom_logit_processor=custom_logit_processor,
             return_hidden_states=return_hidden_states,
             stream=stream,
+            bootstrap_host=bootstrap_host,
+            bootstrap_port=bootstrap_port,
+            bootstrap_room=bootstrap_room,
         )
         loop = asyncio.get_event_loop()
         generator = self.tokenizer_manager.generate_request(obj, None)
@@ -228,6 +233,9 @@ class Engine(EngineBase):
         lora_path: Optional[List[Optional[str]]] = None,
         custom_logit_processor: Optional[Union[List[str], str]] = None,
         stream: bool = False,
+        bootstrap_host: Optional[Union[List[str], str]] = None,
+        bootstrap_port: Optional[Union[List[int], int]] = None,
+        bootstrap_room: Optional[Union[List[int], int]] = None,
     ) -> Union[Dict, AsyncIterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -245,6 +253,9 @@ class Engine(EngineBase):
             lora_path=lora_path,
             stream=stream,
             custom_logit_processor=custom_logit_processor,
+            bootstrap_host=bootstrap_host,
+            bootstrap_port=bootstrap_port,
+            bootstrap_room=bootstrap_room,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
 
@@ -274,6 +285,21 @@ class Engine(EngineBase):
         ret = loop.run_until_complete(generator.__anext__())
         return ret
 
+    async def async_encode(
+        self,
+        prompt: Union[str, List[str], List[Dict], List[List[Dict]]],
+        image_data: Optional[Union[List[str], str]] = None,
+    ) -> Dict:
+        """
+        Asynchronous version of encode method.
+
+        The arguments of this function is the same as `sglang/srt/managers/io_struct.py::EmbeddingReqInput`.
+        Please refer to `EmbeddingReqInput` for the documentation.
+        """
+        obj = EmbeddingReqInput(text=prompt, image_data=image_data)
+        generator = self.tokenizer_manager.generate_request(obj, None)
+        return await generator.__anext__()
+
     def shutdown(self):
         """Shutdown the engine"""
         kill_process_tree(os.getpid(), include_parent=False)
@@ -301,11 +327,10 @@ class Engine(EngineBase):
         internal_states = loop.run_until_complete(
             self.tokenizer_manager.get_internal_state()
         )
-
         return {
             **dataclasses.asdict(self.tokenizer_manager.server_args),
             **self.scheduler_info,
-            **internal_states,
+            "internal_states": internal_states,
             "version": __version__,
         }
 
@@ -350,8 +375,8 @@ class Engine(EngineBase):
         load_format: Optional[str] = None,
         flush_cache: bool = True,
     ):
-        """Update weights from distributed source. If there are going to be more updates, set `flush_cache` to be true
-        to avoid duplicated operations such as clearing cache."""
+        """Update weights from distributed source. If there are going to be more updates, set `flush_cache` to be false
+        to avoid duplicated cache cleaning operation."""
         obj = UpdateWeightsFromTensorReqInput(
             serialized_named_tensors=[
                 MultiprocessingSerializer.serialize(named_tensors)
@@ -453,7 +478,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     if server_args.attention_backend == "flashinfer":
         assert_pkg_version(
             "flashinfer_python",
-            "0.2.3",
+            "0.2.5",
             "Please uninstall the old version and "
             "reinstall the latest version by following the instructions "
             "at https://docs.flashinfer.ai/installation.html.",
@@ -461,7 +486,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     if _is_cuda:
         assert_pkg_version(
             "sgl-kernel",
-            "0.1.0",
+            "0.1.2.post1",
             "Please reinstall the latest version with `pip install sgl-kernel --force-reinstall`",
         )
 
@@ -520,25 +545,44 @@ def _launch_subprocesses(
         )
 
         scheduler_pipe_readers = []
-        tp_size_per_node = server_args.tp_size // server_args.nnodes
+
+        nnodes_per_tp_group = max(server_args.nnodes // server_args.pp_size, 1)
+        tp_size_per_node = server_args.tp_size // nnodes_per_tp_group
         tp_rank_range = range(
-            tp_size_per_node * server_args.node_rank,
-            tp_size_per_node * (server_args.node_rank + 1),
+            tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group),
+            tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group + 1),
         )
-        for tp_rank in tp_rank_range:
-            reader, writer = mp.Pipe(duplex=False)
-            gpu_id = (
-                server_args.base_gpu_id
-                + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
-            )
-            proc = mp.Process(
-                target=run_scheduler_process,
-                args=(server_args, port_args, gpu_id, tp_rank, None, writer),
-            )
-            with memory_saver_adapter.configure_subprocess():
-                proc.start()
-            scheduler_procs.append(proc)
-            scheduler_pipe_readers.append(reader)
+
+        pp_size_per_node = max(server_args.pp_size // server_args.nnodes, 1)
+        pp_rank_range = range(
+            pp_size_per_node * (server_args.node_rank // nnodes_per_tp_group),
+            pp_size_per_node * (server_args.node_rank // nnodes_per_tp_group + 1),
+        )
+
+        for pp_rank in pp_rank_range:
+            for tp_rank in tp_rank_range:
+                reader, writer = mp.Pipe(duplex=False)
+                gpu_id = (
+                    server_args.base_gpu_id
+                    + ((pp_rank % pp_size_per_node) * tp_size_per_node)
+                    + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
+                )
+                proc = mp.Process(
+                    target=run_scheduler_process,
+                    args=(
+                        server_args,
+                        port_args,
+                        gpu_id,
+                        tp_rank,
+                        pp_rank,
+                        None,
+                        writer,
+                    ),
+                )
+                with memory_saver_adapter.configure_subprocess():
+                    proc.start()
+                scheduler_procs.append(proc)
+                scheduler_pipe_readers.append(reader)
     else:
         # Launch the data parallel controller
         reader, writer = mp.Pipe(duplex=False)

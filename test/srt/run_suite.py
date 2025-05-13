@@ -36,6 +36,7 @@ suites = {
         TestFile("test_fa3.py", 376),
         TestFile("test_fim_completion.py", 40),
         TestFile("test_fp8_kernel.py", 8),
+        TestFile("test_function_calling.py", 60),
         TestFile("test_fused_moe.py", 30),
         TestFile("test_hicache.py", 116),
         TestFile("test_hicache_mla.py", 254),
@@ -50,6 +51,7 @@ suites = {
         TestFile("test_mla_int8_deepseek_v3.py", 389),
         TestFile("test_mla_flashinfer.py", 395),
         TestFile("test_mla_fp8.py", 153),
+        TestFile("test_flashmla.py", 300),
         TestFile("test_no_chunked_prefill.py", 108),
         TestFile("test_no_overlap_scheduler.py", 216),
         TestFile("test_openai_server.py", 149),
@@ -58,6 +60,7 @@ suites = {
         TestFile("test_pytorch_sampling_backend.py", 66),
         TestFile("test_radix_attention.py", 167),
         TestFile("test_reasoning_content.py", 89),
+        TestFile("test_enable_thinking.py", 70),
         TestFile("test_regex_constrained.py", 64),
         TestFile("test_release_memory_occupation.py", 44),
         TestFile("test_request_length_validation.py", 31),
@@ -93,11 +96,22 @@ suites = {
         TestFile("test_verl_engine.py", 64),
     ],
     "per-commit-8-gpu": [
+        # Disabled deepep tests temporarily because it takes too much time.
+        # TODO: re-enable them after reducing the test time with compilation cache and smaller models.
+        # TestFile("test_deepep_intranode.py", 50),
+        # TestFile("test_deepep_low_latency.py", 50),
+        # TestFile("test_moe_deepep_eval_accuracy_large.py", 250),
+        TestFile("test_disaggregation.py", 210),
         TestFile("test_local_attn.py", 250),
+        TestFile("test_disaggregation_different_tp.py", 210),
         TestFile("test_full_deepseek_v3.py", 250),
+        TestFile("test_pp_single_node.py", 150),
     ],
     "nightly": [
         TestFile("test_nightly_gsm8k_eval.py"),
+    ],
+    "nightly-amd": [
+        TestFile("test_nightly_gsm8k_eval_amd.py"),
     ],
     "vllm_dependency_test": [
         TestFile("test_vllm_dependency.py"),

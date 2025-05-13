@@ -7,12 +7,14 @@ on:
       - "python/**"
       - "scripts/**"
       - "test/**"
+      - ".github/workflows/pr-test.yml"
   pull_request:
     branches: [ main ]
     paths:
       - "python/**"
       - "scripts/**"
       - "test/**"
+      - ".github/workflows/pr-test.yml"
   workflow_dispatch:
     inputs:
       version:
@@ -54,7 +56,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [0, 1, 2, 3, 4, 5, 6, 7]
+        part: [0, 1, 2, 3, 4, 5, 6, 7, 8]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -67,7 +69,7 @@ jobs:
         timeout-minutes: 30
         run: |
           cd test/srt
-          python3 run_suite.py --suite per-commit --auto-partition-id ${{ matrix.part }} --auto-partition-size 8
+          python3 run_suite.py --suite per-commit --auto-partition-id ${{ matrix.part }} --auto-partition-size 9
 
   unit-test-backend-2-gpu:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
@@ -87,22 +89,21 @@ jobs:
           cd test/srt
           python3 run_suite.py --suite per-commit-2-gpu
 
-  unit-test-backend-8-gpu:
+  unittest-test-backend-8-gpu:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false
+    needs: [unit-test-frontend, unit-test-backend-2-gpu]
     runs-on: 8-gpu-runner
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Install dependencies
-        env:
-          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.5/flashinfer-python' || 'https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python' }}
         run: |
           bash scripts/ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 40
+        timeout-minutes: 20
         run: |
           cd test/srt
           python3 run_suite.py --suite per-commit-8-gpu
@@ -180,6 +181,18 @@ jobs:
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_default_fp8
 
+      - name: Benchmark VLM offline throughput
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_serving.TestBenchServing.test_vlm_offline_throughput
+
+      - name: Benchmark VLM online latency
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_serving.TestBenchServing.test_vlm_online_latency
+
   performance-test-2-gpu:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false
@@ -215,6 +228,18 @@ jobs:
         run: |
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_moe_offline_throughput_without_radix_cache
+
+      - name: Benchmark offline decode throughput (PP=2)
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_serving.TestBenchServing.test_pp_offline_throughput_default_decode
+
+      - name: Benchmark offline prefill throughput (PP=2)
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_serving.TestBenchServing.test_pp_long_context_prefill
 
   accuracy-test-1-gpu:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
@@ -261,9 +286,9 @@ jobs:
   finish:
     if: always()
     needs: [
-      unit-test-frontend, unit-test-backend-1-gpu, unit-test-backend-2-gpu,
+      unit-test-frontend, unit-test-backend-1-gpu, unit-test-backend-2-gpu, unittest-test-backend-8-gpu,
       performance-test-1-gpu-part-1, performance-test-1-gpu-part-2, performance-test-2-gpu,
-      accuracy-test-1-gpu, accuracy-test-2-gpu
+      accuracy-test-1-gpu, accuracy-test-2-gpu,
     ]
     runs-on: ubuntu-latest
     steps:

@@ -15,12 +15,17 @@
 
 import logging
 import threading
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import torch
 
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
+from sglang.srt.distributed import get_pp_group, get_world_group
+from sglang.srt.hf_transformers_utils import (
+    get_processor,
+    get_tokenizer,
+    get_tokenizer_from_processor,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqInput,
@@ -31,7 +36,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, global_server_args_dict
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPoolAllocator
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
@@ -47,6 +52,7 @@ class TpModelWorker:
         server_args: ServerArgs,
         gpu_id: int,
         tp_rank: int,
+        pp_rank: int,
         dp_rank: Optional[int],
         nccl_port: int,
         is_draft_worker: bool = False,
@@ -54,30 +60,29 @@ class TpModelWorker:
         token_to_kv_pool_allocator: Optional[TokenToKVPoolAllocator] = None,
     ):
         # Parse args
+        self.tp_size = server_args.tp_size
         self.tp_rank = tp_rank
+        self.pp_rank = pp_rank
 
         # Init model and tokenizer
-        self.model_config = ModelConfig(
-            (
+        self.model_config = ModelConfig.from_server_args(
+            server_args,
+            model_path=(
                 server_args.model_path
                 if not is_draft_worker
                 else server_args.speculative_draft_model_path
             ),
-            trust_remote_code=server_args.trust_remote_code,
-            revision=server_args.revision,
-            context_length=server_args.context_length,
-            model_override_args=server_args.json_model_override_args,
-            is_embedding=server_args.is_embedding,
-            enable_multimodal=server_args.enable_multimodal,
-            dtype=server_args.dtype,
-            quantization=server_args.quantization,
+            is_draft_model=is_draft_worker,
         )
+
         self.model_runner = ModelRunner(
             model_config=self.model_config,
             mem_fraction_static=server_args.mem_fraction_static,
             gpu_id=gpu_id,
             tp_rank=tp_rank,
             tp_size=server_args.tp_size,
+            pp_rank=pp_rank,
+            pp_size=server_args.pp_size,
             nccl_port=nccl_port,
             server_args=server_args,
             is_draft_worker=is_draft_worker,
@@ -94,7 +99,7 @@ class TpModelWorker:
                     trust_remote_code=server_args.trust_remote_code,
                     revision=server_args.revision,
                 )
-                self.tokenizer = self.processor.tokenizer
+                self.tokenizer = get_tokenizer_from_processor(self.processor)
             else:
                 self.tokenizer = get_tokenizer(
                     server_args.tokenizer_path,
@@ -103,6 +108,10 @@ class TpModelWorker:
                     revision=server_args.revision,
                 )
         self.device = self.model_runner.device
+
+        # Init nccl groups
+        self.pp_group = get_pp_group()
+        self.world_group = get_world_group()
 
         # Profile number of tokens
         self.max_total_num_tokens = self.model_runner.max_total_num_tokens
@@ -129,8 +138,9 @@ class TpModelWorker:
         # Sync random seed across TP workers
         self.random_seed = broadcast_pyobj(
             [server_args.random_seed],
-            self.tp_rank,
-            self.model_runner.tp_group.cpu_group,
+            self.tp_size * self.pp_rank + tp_rank,
+            self.world_group.cpu_group,
+            src=self.world_group.ranks[0],
         )[0]
         set_random_seed(self.random_seed)
 
@@ -155,11 +165,14 @@ class TpModelWorker:
     def get_pad_input_ids_func(self):
         return getattr(self.model_runner.model, "pad_input_ids", None)
 
-    def get_tp_cpu_group(self):
-        return self.model_runner.tp_group.cpu_group
+    def get_tp_group(self):
+        return self.model_runner.tp_group
+
+    def get_attention_tp_group(self):
+        return self.model_runner.attention_tp_group
 
     def get_attention_tp_cpu_group(self):
-        return self.model_runner.attention_tp_group.cpu_group
+        return getattr(self.model_runner.attention_tp_group, "cpu_group", None)
 
     def get_memory_pool(self):
         return (
@@ -170,24 +183,46 @@ class TpModelWorker:
     def forward_batch_generation(
         self,
         model_worker_batch: ModelWorkerBatch,
+        launch_done: Optional[threading.Event] = None,
         skip_sample: bool = False,
-    ) -> Tuple[LogitsProcessorOutput, Optional[torch.Tensor]]:
+    ) -> Tuple[
+        Union[LogitsProcessorOutput, torch.Tensor], Optional[torch.Tensor], bool
+    ]:
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
-        logits_output = self.model_runner.forward(forward_batch)
 
-        if model_worker_batch.launch_done is not None:
-            model_worker_batch.launch_done.set()
+        pp_proxy_tensors = None
+        if not self.pp_group.is_first_rank:
+            pp_proxy_tensors = PPProxyTensors(
+                self.pp_group.recv_tensor_dict(
+                    all_gather_group=self.get_attention_tp_group()
+                )
+            )
 
-        if skip_sample:
-            next_token_ids = None
+        if self.pp_group.is_last_rank:
+            logits_output, can_run_cuda_graph = self.model_runner.forward(
+                forward_batch, pp_proxy_tensors=pp_proxy_tensors
+            )
+            if launch_done is not None:
+                launch_done.set()
+
+            if skip_sample:
+                next_token_ids = None
+            else:
+                next_token_ids = self.model_runner.sample(
+                    logits_output, model_worker_batch
+                )
+
+            return logits_output, next_token_ids, can_run_cuda_graph
         else:
-            next_token_ids = self.model_runner.sample(logits_output, model_worker_batch)
-
-        return logits_output, next_token_ids
+            pp_proxy_tensors, can_run_cuda_graph = self.model_runner.forward(
+                forward_batch,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
+            return pp_proxy_tensors.tensors, None, can_run_cuda_graph
 
     def forward_batch_embedding(self, model_worker_batch: ModelWorkerBatch):
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
-        logits_output = self.model_runner.forward(forward_batch)
+        logits_output, _ = self.model_runner.forward(forward_batch)
         embeddings = logits_output.embeddings
         return embeddings
 
