@@ -3,7 +3,7 @@ Usage:
 python hidden_states.py
 
 Note that each time you change the `return_hidden_states` parameter,
-the CUDA graph will be recaptured, which might lead to a performance hit.
+the cuda graph will be recaptured, which might lead to a performance hit.
 So avoid getting hidden states and completions alternately.
 """
 

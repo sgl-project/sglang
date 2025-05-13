@@ -20,7 +20,7 @@ class AttentionBackend(ABC):
         raise NotImplementedError()
 
     def init_cuda_graph_state(self, max_bs: int):
-        """Init the global shared states for CUDA graph."""
+        """Init the global shared states for cuda graph."""
         raise NotImplementedError()
 
     def init_forward_metadata_capture_cuda_graph(
@@ -33,7 +33,7 @@ class AttentionBackend(ABC):
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     ):
-        """Init the metadata for a forward pass for capturing a CUDA graph."""
+        """Init the metadata for a forward pass for capturing a cuda graph."""
         raise NotImplementedError()
 
     def init_forward_metadata_replay_cuda_graph(
@@ -47,7 +47,7 @@ class AttentionBackend(ABC):
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
         seq_lens_cpu: Optional[torch.Tensor],
     ):
-        """Init the metadata for a forward pass for replaying a CUDA graph."""
+        """Init the metadata for a forward pass for replaying a cuda graph."""
         raise NotImplementedError()
 
     def get_cuda_graph_seq_len_fill_value(self):

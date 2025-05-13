@@ -32,6 +32,7 @@ from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
 from sglang.srt.distributed import (
     get_tp_group,
+    get_world_group,
     init_distributed_environment,
     initialize_model_parallel,
     set_custom_all_reduce,
@@ -224,7 +225,7 @@ class ModelRunner:
         if self.tp_size > 1 and supports_torch_tp:
             self.apply_torch_tp()
 
-        # Init LoRA
+        # Init lora
         if server_args.lora_paths is not None:
             self.init_lora_manager()
 
@@ -400,11 +401,15 @@ class ModelRunner:
                 tp_rank=self.tp_rank,
                 tp_size=self.tp_size,
                 dp_size=self.server_args.dp_size,
+                moe_dense_tp_size=self.server_args.moe_dense_tp_size,
                 pp_size=self.server_args.pp_size,
             )
 
         min_per_gpu_memory = get_available_gpu_memory(
-            self.device, self.gpu_id, distributed=self.tp_size > 1
+            self.device,
+            self.gpu_id,
+            distributed=get_world_group().world_size > 1,
+            cpu_group=get_world_group().cpu_group,
         )
         self.tp_group = get_tp_group()
         self.attention_tp_group = get_attention_tp_group()
@@ -716,7 +721,10 @@ class ModelRunner:
 
     def profile_max_num_token(self, total_gpu_memory: int):
         available_gpu_memory = get_available_gpu_memory(
-            self.device, self.gpu_id, distributed=self.tp_size > 1
+            self.device,
+            self.gpu_id,
+            distributed=get_world_group().world_size > 1,
+            cpu_group=get_world_group().cpu_group,
         )
         if self.use_mla_backend:
             num_layers = (
@@ -1002,11 +1010,11 @@ class ModelRunner:
             )
 
     def init_cuda_graphs(self):
-        """Capture CUDA graphs."""
+        """Capture cuda graphs."""
         self.cuda_graph_runner = None
 
         if not self.is_generation:
-            # TODO: Currently, CUDA graph only captures decode steps, which only exists for generation models
+            # TODO: Currently, cuda graph only captures decode steps, which only exists for generation models
             return
 
         if self.server_args.disable_cuda_graph:
@@ -1015,12 +1023,12 @@ class ModelRunner:
         tic = time.time()
         before_mem = get_available_gpu_memory(self.device, self.gpu_id)
         logger.info(
-            f"Capture CUDA graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
+            f"Capture cuda graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
         )
         self.cuda_graph_runner = CudaGraphRunner(self)
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         logger.info(
-            f"Capture CUDA graph end. Time elapsed: {time.time() - tic:.2f} s. "
+            f"Capture cuda graph end. Time elapsed: {time.time() - tic:.2f} s. "
             f"mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
         )
 

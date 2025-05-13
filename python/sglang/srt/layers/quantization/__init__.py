@@ -38,7 +38,7 @@ try:
 except ImportError:
     VLLM_AVAILABLE = False
 
-    # Define empty classes as placeholders when vLLM is not available
+    # Define empty classes as placeholders when vllm is not available
     class DummyConfig:
         def override_quantization_method(self, *args, **kwargs):
             return None
@@ -109,7 +109,7 @@ def get_quantization_config(quantization: str) -> Type[QuantizationConfig]:
     if quantization in VLLM_QUANTIZATION_METHODS and not VLLM_AVAILABLE:
         raise ValueError(
             f"{quantization} quantization requires some operators from vllm. "
-            "Please install vLLM by `pip install vllm==0.8.4`"
+            "Please install vllm by `pip install vllm==0.8.4`"
         )
 
     return QUANTIZATION_METHODS[quantization]
@@ -231,7 +231,7 @@ original_isinstance = builtins.isinstance
 def monkey_patch_isinstance_for_vllm_base_layer(reverse: bool = False):
     """
     Patch isinstance so that the `get_quant_method` in vllm's QuantizationConfig
-    can recognize SGLang layers
+    can recognize sglang layers
     """
     if not VLLM_AVAILABLE:
         return
@@ -267,7 +267,7 @@ def monkey_patch_isinstance_for_vllm_base_layer(reverse: bool = False):
 def monkey_patch_moe_apply(class_obj: "FusedMoEMethodBase"):
     """
     Monkey patch the apply function of vllm's FusedMoEMethodBase.
-    Convert SGLang arguments to vLLM arguments.
+    Convert sglang arguments to vllm arguments.
     """
     original_apply = class_obj.apply
     sig = inspect.signature(original_apply)
@@ -329,6 +329,6 @@ def monkey_patch_quant_configs():
     monkey_patch_moe_apply(CompressedTensorsWNA16MoEMethod)
 
 
-# Only apply monkey patches if vLLM is available
+# Only apply monkey patches if vllm is available
 if VLLM_AVAILABLE:
     monkey_patch_quant_configs()

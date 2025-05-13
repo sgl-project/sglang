@@ -280,8 +280,8 @@ class CustomAllreduce {
   std::unordered_map<void*, RankData*> buffers_;
   Signal* self_sg_;
 
-  // Stores rank data from all ranks. This is mainly for CUDA graph purposes.
-  // For CUDA graph to work, all kernel arguments must be fixed during graph
+  // Stores rank data from all ranks. This is mainly for cuda graph purposes.
+  // For cuda graph to work, all kernel arguments must be fixed during graph
   // capture time. However, the peer pointers are not known during graph capture
   // time. Therefore, during capture, we increment the rank data pointer and use
   // that as the argument to the kernel. The kernel arguments are stored in
@@ -291,7 +291,7 @@ class CustomAllreduce {
   //
   // The overall process looks like this:
   // 1. Graph capture.
-  // 2. Each rank obtains the IPC handles for each addresses used during CUDA
+  // 2. Each rank obtains the IPC handles for each addresses used during cuda
   // graph capture using get_graph_buffer_ipc_meta.
   // 3. (In Python) all gather the IPC handles.
   // 4. Obtain the peer pointers by opening the IPC handles, and store them in

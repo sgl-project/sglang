@@ -12,7 +12,7 @@ use_vllm_custom_allreduce = get_bool_env_var(
 )
 
 if not is_hpu():
-    # ROCm does not use vLLM custom allreduce
+    # ROCm does not use vllm custom allreduce
     if use_vllm_custom_allreduce and not is_hip():
         try:
             import vllm._C

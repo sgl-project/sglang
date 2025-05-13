@@ -121,14 +121,14 @@ def can_actually_p2p(
     Therefore, we have to perform a real P2P access to check if it is actually
     possible.
 
-    Note on p2p and CUDA IPC:
+    Note on p2p and cuda IPC:
     Usually, one process uses one GPU:
-    GPU src --> CUDA context src --> tensor src --> process src
+    GPU src --> cuda context src --> tensor src --> process src
 
-    We need to combine p2p and CUDA IPC, so that:
-    GPU src --> CUDA context src --> tensor src --> process src
+    We need to combine p2p and cuda IPC, so that:
+    GPU src --> cuda context src --> tensor src --> process src
                                       |shared|
-    GPU tgt --> CUDA context tgt --> tensor tgt --> process tgt
+    GPU tgt --> cuda context tgt --> tensor tgt --> process tgt
     That is to say, process src creates a tensor in GPU src, passes IPC handle to
     process tgt, and process tgt accesses the tensor in GPU tgt. Any operation on the
     tensor in process tgt will be reflected in the tensor in process src, because
@@ -201,9 +201,9 @@ def can_actually_p2p(
 # then all the processes can read the cache file to check the p2p access status.
 # Note that the cache file is suffixed by the CUDA_VISIBLE_DEVICES, so that we
 #  can have different cache files for different CUDA_VISIBLE_DEVICES settings,
-#  e.g. used by different vLLM engines. The device id in the cache file is a
+#  e.g. used by different vllm engines. The device id in the cache file is a
 #  **local** device id, i.e. from 0 to num_dev-1, where num_dev is the number
-#  of visible devices in the vLLM engine.
+#  of visible devices in the vllm engine.
 _gpu_p2p_access_cache: Optional[Dict[str, bool]] = None
 
 

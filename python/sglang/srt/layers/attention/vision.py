@@ -257,7 +257,7 @@ class VisionFlash3Attention(nn.Module):
         **kwargs,
     ):
         if not _is_cuda:
-            raise Exception("VisionFlash3Attention is only available for CUDA")
+            raise Exception("VisionFlash3Attention is only available for cuda")
         super().__init__()
 
     def forward(
