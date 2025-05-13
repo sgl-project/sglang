@@ -664,7 +664,7 @@ class _DetailAccumulator(_UtilizationRateAccumulatorMixin):
 class _StatAccumulator(_UtilizationRateAccumulatorMixin):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._buffer_global_physical_count = _Buffer.init_new(item_shape=(
+        self._global_physical_count_of_buffered_step = _Buffer.init_new(item_shape=(
             self._expert_location_metadata.num_layers,
             self._expert_location_metadata.num_physical_experts,
         ), buffer_size=self._server_args.expert_distribution_recorder_buffer_size)
