@@ -69,7 +69,7 @@ def _run_subprocess(
             TODO_prepare
             expert_location_updater.update_expert_weights_single_layer(
                 routed_experts_weights=routed_experts_weights,
-                temp_buffers=expert_location_updater.create_temp_buffers(),
+                temp_buffers=expert_location_updater.create_temp_buffers(routed_experts_weights),
                 old_physical_to_logical_map=old_physical_to_logical_map,
                 new_physical_to_logical_map=new_physical_to_logical_map,
             )

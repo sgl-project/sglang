@@ -22,7 +22,7 @@ def _update_expert_weights(
     old_expert_location_metadata: ExpertLocationMetadata,
     new_expert_location_metadata: ExpertLocationMetadata,
 ):
-    temp_buffers = create_temp_buffers()
+    temp_buffers = create_temp_buffers(next(iter(routed_experts_weights_of_layer.values())))
     for layer_id in sorted(routed_experts_weights_of_layer.keys()):
         update_expert_weights_single_layer(
             routed_experts_weights=routed_experts_weights_of_layer[layer_id],
@@ -32,8 +32,8 @@ def _update_expert_weights(
         )
 
 
-def create_temp_buffers():
-    return [torch.empty_like(tensor) for tensor in next(iter(routed_experts_weights_of_layer.values()))]
+def create_temp_buffers(sample_tensors):
+    return [torch.empty_like(tensor) for tensor in sample_tensors]
 
 
 def update_expert_weights_single_layer(
