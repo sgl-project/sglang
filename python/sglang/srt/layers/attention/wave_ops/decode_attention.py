@@ -709,6 +709,7 @@ def decode_attention_wave(
         run_bench=False,
         use_buffer_load_ops=False,
         use_buffer_store_ops=False,
+        waves_per_eu=2,
         dynamic_symbols=dynamic_symbols,
         dynamic_symbols_map=dynamic_symbols_map,
     )
@@ -736,6 +737,7 @@ def decode_attention_wave(
         run_bench=False,
         use_buffer_load_ops=False,
         use_buffer_store_ops=False,
+        waves_per_eu=4,
         dynamic_symbols=dynamic_symbols,
         dynamic_symbols_map=dynamic_symbols_map,
     )
