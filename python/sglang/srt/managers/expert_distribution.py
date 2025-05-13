@@ -5,7 +5,7 @@ from abc import ABC
 from collections import deque
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Type, Literal
+from typing import Any, Dict, List, Optional, Type, Literal, Tuple
 
 import einops
 import torch
@@ -720,15 +720,22 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
 
 
 class _Buffer:
-    TODO
+    @staticmethod
+    def init_new(item_shape: Tuple, buffer_size: int):
+        if buffer_size < 0:
+            return _InfiniteBuffer(item_shape)
+        else:
+            return _CircularBuffer(item_shape, buffer_size)
 
 
 class _CircularBuffer:
-    TODO
+    def __init__(self, item_shape: Tuple, buffer_size: int):
+        TODO
 
 
 class _InfiniteBuffer:
-    TODO
+    def __init__(self, item_shape: Tuple):
+        TODO
 
 
 def _convert_global_physical_count_to_logical_count(
