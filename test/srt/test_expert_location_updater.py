@@ -64,10 +64,9 @@ def _run_subprocess(
     device: str,
 ):
     try:
-
         def _create_routed_experts_weights(physical_to_logical_map):
             return TODO
-       
+
         routed_experts_weights = _create_routed_experts_weights(TODO)
         for _ in range(5000):
             TODO_prepare
@@ -77,7 +76,7 @@ def _run_subprocess(
                 old_physical_to_logical_map=old_physical_to_logical_map,
                 new_physical_to_logical_map=new_physical_to_logical_map,
             )
-            TODO_assert
+            assert all(torch.all(x == y) for x, y in zip(TODO, TODO, strict=True))
 
         execution_ok = True
     except Exception as e:
