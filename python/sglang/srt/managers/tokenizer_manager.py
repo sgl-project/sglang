@@ -17,7 +17,6 @@ import asyncio
 import copy
 import dataclasses
 import logging
-import math
 import os
 import pickle
 import signal
@@ -57,7 +56,6 @@ from sglang.srt.disaggregation.utils import (
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.managers import expert_distribution
-from sglang.srt.managers.expert_location import ExpertLocationMetadata
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOut,
@@ -96,8 +94,6 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
-    UpdateExpertLocationReqInput,
-    UpdateExpertLocationReqOutput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
     UpdateWeightsFromDistributedReqInput,
@@ -814,55 +810,6 @@ class TokenizerManager:
             server_args=self.server_args,
             expert_location_metadata=self.expert_location_metadata,
         )
-
-    async def eplb_rebalance(self, obj: EplbRebalanceReqInput):
-        TODO_rm
-        self.auto_create_handle_loop()
-        await self.eplb_manager.rebalance(obj)
-
-    async def eplb_save_expert_distribution(self):
-        TODO_rm
-        self.auto_create_handle_loop()
-        await self.eplb_manager.save_expert_distribution()
-
-    async def update_expert_location(self, obj: UpdateExpertLocationReqInput):
-        TODO_rm
-        self.auto_create_handle_loop()
-        assert (
-            self.server_args.ep_dispatch_algorithm is not None
-        ), f"update_expert_location requires ep_dispatch_algorithm"
-
-        old_expert_location_metadata = copy.deepcopy(self.expert_location_metadata)
-        num_layers = old_expert_location_metadata.num_layers
-
-        # pretty arbitrary choice; can optimize if bottleneck
-        step = math.ceil(num_layers / 5)
-        layer_id_lens = list(range(step, num_layers, step)) + [num_layers]
-
-        for layer_id_end in layer_id_lens:
-            logger.info(f"update_expert_location handling up to {layer_id_end}th layer")
-            partial_expert_location_metadata = copy.deepcopy(
-                old_expert_location_metadata
-            )
-            partial_expert_location_metadata.update(
-                obj.expert_location_metadata,
-                layer_id_start=0,
-                layer_id_len=layer_id_end,
-            )
-            await self._update_expert_location_raw(
-                expert_location_metadata=partial_expert_location_metadata,
-            )
-
-    async def _update_expert_location_raw(
-        self, expert_location_metadata: ExpertLocationMetadata
-    ):
-        self.expert_location_metadata = None
-        await self.update_expert_location_communicator(
-            UpdateExpertLocationReqInput(
-                expert_location_metadata=expert_location_metadata,
-            )
-        )
-        self.expert_location_metadata = expert_location_metadata
 
     async def update_weights_from_disk(
         self,
