@@ -64,7 +64,6 @@ class DataParallelController:
         self,
         server_args: ServerArgs,
         port_args: PortArgs,
-        expert_location_metadata: Optional[ExpertLocationMetadata],
     ) -> None:
         # Parse args
         self.max_total_num_tokens = None
@@ -95,12 +94,12 @@ class DataParallelController:
 
         if server_args.enable_dp_attention:
             dp_port_args = self.launch_dp_attention_schedulers(
-                server_args, port_args, expert_location_metadata
+                server_args, port_args,
             )
             self.control_message_step = server_args.tp_size
         else:
             dp_port_args = self.launch_dp_schedulers(
-                server_args, port_args, expert_location_metadata
+                server_args, port_args,
             )
             self.control_message_step = 1
 
@@ -116,7 +115,7 @@ class DataParallelController:
 
         self.max_req_input_len = None
 
-    def launch_dp_schedulers(self, server_args, port_args, expert_location_metadata):
+    def launch_dp_schedulers(self, server_args, port_args):
         base_gpu_id = 0
 
         threads = []
@@ -142,7 +141,6 @@ class DataParallelController:
                 args=(
                     server_args,
                     tmp_port_args,
-                    expert_location_metadata,
                     base_gpu_id,
                     dp_rank,
                     ready_event,
@@ -167,13 +165,12 @@ class DataParallelController:
         self,
         server_args: ServerArgs,
         port_args: PortArgs,
-        expert_location_metadata: Optional[ExpertLocationMetadata],
         base_gpu_id: int,
         dp_rank: int,
         ready_event: threading.Event,
     ):
         self.launch_tensor_parallel_group(
-            server_args, port_args, expert_location_metadata, base_gpu_id, dp_rank
+            server_args, port_args, base_gpu_id, dp_rank
         )
         ready_event.set()
 
@@ -183,10 +180,10 @@ class DataParallelController:
             pass
 
     def launch_dp_attention_schedulers(
-        self, server_args, port_args, expert_location_metadata
+        self, server_args, port_args,
     ):
         self.launch_tensor_parallel_group(
-            server_args, port_args, expert_location_metadata, 0, None
+            server_args, port_args, 0, None
         )
         dp_port_args = []
         for dp_rank in range(server_args.dp_size):
@@ -197,7 +194,6 @@ class DataParallelController:
         self,
         server_args: ServerArgs,
         port_args: PortArgs,
-        expert_location_metadata: Optional[ExpertLocationMetadata],
         base_gpu_id: int,
         dp_rank: int,
     ):
@@ -243,7 +239,6 @@ class DataParallelController:
                 args=(
                     server_args,
                     rank_port_args,
-                    expert_location_metadata,
                     gpu_id,
                     tp_rank,
                     dp_rank,
@@ -303,7 +298,6 @@ class DataParallelController:
 def run_data_parallel_controller_process(
     server_args: ServerArgs,
     port_args: PortArgs,
-    expert_location_metadata: Optional[ExpertLocationMetadata],
     pipe_writer,
 ):
     setproctitle.setproctitle("sglang::data_parallel_controller")
@@ -312,7 +306,7 @@ def run_data_parallel_controller_process(
 
     try:
         controller = DataParallelController(
-            server_args, port_args, expert_location_metadata
+            server_args, port_args,
         )
         pipe_writer.send(
             {
