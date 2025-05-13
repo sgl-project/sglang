@@ -69,8 +69,20 @@ class TestDPAttn(unittest.TestCase):
                 # Test custom config
                 "--deepep-config",
                 json.dumps({
-                    "normal_dispatch": TODO,
-                    "normal_combine": TODO,
+                    "normal_dispatch": {
+                        "num_sms": TODO,
+                        "num_max_nvl_chunked_send_tokens": TODO,
+                        "num_max_nvl_chunked_recv_tokens": TODO,
+                        "num_max_rdma_chunked_send_tokens": TODO,
+                        "num_max_rdma_chunked_recv_tokens": TODO,
+                    },
+                    "normal_combine": {
+                        "num_sms": TODO,
+                        "num_max_nvl_chunked_send_tokens": TODO,
+                        "num_max_nvl_chunked_recv_tokens": TODO,
+                        "num_max_rdma_chunked_send_tokens": TODO,
+                        "num_max_rdma_chunked_recv_tokens": TODO,
+                    },
                 }),
             ],
         )
