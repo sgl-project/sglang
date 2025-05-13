@@ -427,3 +427,39 @@ class ModelConfigForExpertLocation:
             )
         else:
             return ModelConfigForExpertLocation.init_dummy()
+
+
+def compute_initial_expert_location_metadata(server_args: ServerArgs) -> ExpertLocationMetadata:
+    if (data := server_args.init_expert_location) is not None:
+        if data == "trivial":
+            logger.info("init_expert_location from init_expert_location=trivial")
+            return ExpertLocationMetadata.init_trivial(server_args)
+        if data == "padding":
+            logger.info("init_expert_location from init_expert_location=padding")
+            return ExpertLocationMetadata.init_padding(server_args)
+
+        try:
+            data_dict = json.loads(data)
+        except JSONDecodeError:
+            data_dict = json.loads(Path(data).read_text())
+
+        if "physical_to_logical_map" in data_dict:
+            logger.info(
+                "init_expert_location from init_by_mapping using ServerArgs.init_expert_location"
+            )
+            return ExpertLocationMetadata.init_by_mapping(server_args, **data_dict)
+        elif "logical_count" in data_dict:
+            logger.info(
+                "init_expert_location from init_by_eplb using ServerArgs.init_expert_location"
+            )
+            return ExpertLocationMetadata.init_by_eplb(server_args, **data_dict)
+        else:
+            raise NotImplementedError(
+                f"Unknown init_expert_location format ({list(data_dict.keys())=})"
+            )
+
+    if server_args.enable_eplb:
+        logger.info("init_expert_location from EPLBManager")
+        return eplb_manager.compute_expert_location_metadata()
+
+    return ExpertLocationMetadata.init_trivial(server_args)
