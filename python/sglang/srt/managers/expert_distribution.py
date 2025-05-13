@@ -667,7 +667,7 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
         self._buffer_global_physical_count = _Buffer.init_new(item_shape=(
             self._expert_location_metadata.num_layers,
             self._expert_location_metadata.num_physical_experts,
-        ), buffer_size=TODO)
+        ), buffer_size=self._server_args.expert_distribution_recorder_buffer_size)
 
     def append(
         self,
