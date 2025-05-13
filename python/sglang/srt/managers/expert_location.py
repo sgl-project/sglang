@@ -390,11 +390,12 @@ def compute_initial_expert_location_metadata(server_args: ServerArgs) -> ExpertL
             logger.info("init_expert_location from init_expert_location=trivial")
             return ExpertLocationMetadata.init_trivial(server_args)
 
-        # TODO use the new function in utils.py
-        try:
-            data_dict = json.loads(data)
-        except JSONDecodeError:
+        if data.endswith(".pt"):
+            data_dict = torch.load(data, weights_only=True)
+        elif data.endswith(".json"):
             data_dict = json.loads(Path(data).read_text())
+        else:
+            data_dict = json.loads(data)
 
         if "physical_to_logical_map" in data_dict:
             logger.info(
