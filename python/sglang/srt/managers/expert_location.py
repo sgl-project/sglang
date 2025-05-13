@@ -385,6 +385,7 @@ def compute_initial_expert_location_metadata(server_args: ServerArgs) -> ExpertL
             logger.info("init_expert_location from init_expert_location=trivial")
             return ExpertLocationMetadata.init_trivial(server_args)
 
+        # TODO use the new function in utils.py
         try:
             data_dict = json.loads(data)
         except JSONDecodeError:
