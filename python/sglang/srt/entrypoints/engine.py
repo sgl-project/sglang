@@ -330,7 +330,7 @@ class Engine(EngineBase):
         return {
             **dataclasses.asdict(self.tokenizer_manager.server_args),
             **self.scheduler_info,
-            **internal_states,
+            "internal_states": internal_states,
             "version": __version__,
         }
 
