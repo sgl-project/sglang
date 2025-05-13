@@ -31,6 +31,8 @@ if TYPE_CHECKING:
 # FlashMLA only supports pagesize=64
 PAGE_SIZE = 64
 
+# FlashMLA FP8 issue: https://github.com/deepseek-ai/FlashMLA/issues/56
+
 
 @dataclass
 class FlashMLADecodeMetadata:
@@ -354,7 +356,6 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
 
         reshape_q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
-
         if self.data_type == torch.float8_e4m3fn:
             reshape_q_fp8 = reshape_q.to(torch.float8_e4m3fn)
             o, _ = flash_mla_with_kvcache(
