@@ -295,18 +295,19 @@ impl Tree {
 
         curr = prev.clone();
 
-        // Only update timestamp if we found a match for the specified tenant
-        let tenant = if let Some(t) = tenant {
-            t.to_string()
+        let (perform_update, tenant) = if let Some(t) = tenant {
+            // Only update timestamp if we found a match for the specified tenant
+            (curr.tenant_last_access_time.contains_key(t), t.to_string())
         } else {
             // Select the first tenant (key in the map)
-            curr.tenant_last_access_time
-                .iter()
-                .next()
-                .map(|kv| kv.key().to_owned())
-                .unwrap_or("empty".to_string())
+            let tenant = curr.tenant_last_access_time
+                    .iter()
+                    .next()
+                    .map(|kv| kv.key().to_owned())
+                    .unwrap_or_else(|| "empty".to_string());
+            (!tenant.eq("empty"), tenant)
         };
-        if !tenant.eq("empty") && curr.tenant_last_access_time.contains_key(&tenant) {
+        if perform_update {
             let timestamp_ms = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
