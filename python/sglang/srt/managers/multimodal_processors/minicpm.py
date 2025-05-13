@@ -97,6 +97,8 @@ class MiniCPMMultimodalProcessor(BaseMultimodalProcessor):
             audio_start_id = tokenizer.audio_start_id
             audio_end_id = tokenizer.audio_end_id
 
+        im_start_id = tokenizer.im_start_id
+        im_end_id = tokenizer.im_end_id
         im_token_id = tokenizer.unk_id
         pixel_values = res["pixel_values"]
         tgt_sizes = res["tgt_sizes"]
@@ -132,9 +134,23 @@ class MiniCPMMultimodalProcessor(BaseMultimodalProcessor):
         pixel_values = pixel_values_flat
 
         items = []
+        input_ids = res["input_ids"].flatten()
+        image_offsets = self.get_mm_items_offset_by_pair(
+            input_ids=input_ids, mm_start_id=im_start_id, mm_end_id=im_end_id
+        )
+        slice_offsets = self.get_mm_items_offset_by_pair(
+            input_ids=input_ids, mm_start_id=slice_start_id, mm_end_id=slice_end_id
+        )
+        image_offsets.extend(slice_offsets)
+        image_offsets = sorted(image_offsets)
+        audio_offsets = self.get_mm_items_offset_by_pair(
+            input_ids=input_ids, mm_start_id=audio_start_id, mm_end_id=audio_end_id
+        )
+
         if len(pixel_values) != 0:
             item = MultimodalDataItem(
                 pixel_values=pixel_values,
+                image_offsets=image_offsets,
                 tgt_size=tgt_sizes_flat,
                 modality=Modality.IMAGE,
             )
@@ -148,18 +164,19 @@ class MiniCPMMultimodalProcessor(BaseMultimodalProcessor):
             item = MultimodalDataItem(
                 audio_features=[res["audio_features"]],
                 audio_feature_lens=res["audio_feature_lens"],
+                audio_offsets=audio_offsets,
                 modality=Modality.AUDIO,
             )
             items += [item]
 
         return {
             "mm_items": items,
-            "input_ids": res["input_ids"].flatten().tolist(),
+            "input_ids": input_ids.tolist(),
             "audio_start_id": audio_start_id,
             "audio_end_id": audio_end_id,
             "im_token_id": im_token_id,
-            "im_start_id": tokenizer.im_start_id,
-            "im_end_id": tokenizer.im_end_id,
+            "im_start_id": im_start_id,
+            "im_end_id": im_end_id,
             "slice_start_id": slice_start_id,
             "slice_end_id": slice_end_id,
         }

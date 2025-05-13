@@ -212,7 +212,9 @@ def get_embedding_chunk(
             end_index += extend_end_index - start + 1
         elif extend_end_index > end:
             end_index += end - start + 1
-    embedding_chunk = embedding[start_index:end_index]
+    # some models embedding is 3-dim, reshape it to 2-dim
+    embedding = embedding.reshape(-1, embedding.shape[-1])
+    embedding_chunk = embedding[start_index : end_index]
     return embedding_chunk, start_index, end_index
 
 
@@ -258,12 +260,7 @@ def get_embedding_and_mask(
         embedding_list.append(embedding_per_req_chunk)
     embedding = torch.concat(embedding_list, dim=0)
     # 2. Check the embedding
-    if embedding.dim() == 2:
-        num_mm_tokens_in_embedding = embedding.shape[0]
-    else:
-        num_mm_tokens_in_embedding = embedding.shape[0] * embedding.shape[1]
-
-    # the mask of multimodal tokens from input_ids
+    num_mm_tokens_in_embedding = embedding.shape[0]
     special_multimodal_mask = torch.isin(
         input_ids,
         placeholder_tensor,
@@ -314,8 +311,6 @@ def embed_mm_inputs(
         item.pad_value for item in item_flatten_list
     ]
 
-    placeholder_tensor = torch.tensor(placeholder_token_ids, device=input_ids.device)
-
     embeddings, masks = [], []
 
     # 2. Get multimodal embedding separately
@@ -326,6 +321,10 @@ def embed_mm_inputs(
         and image_data_embedding_func
     ):
         items = [item for item in item_flatten_list if item.is_image()]
+        placeholder_tensor = torch.tensor(
+            [item.pad_value for item in items],
+            device=input_ids.device,
+        )
         # calculate per request items length offset
         items_size = torch.zeros(len(mm_inputs_list) + 1, dtype=int)
         items_offsets = []
@@ -362,9 +361,13 @@ def embed_mm_inputs(
         and audio_data_embedding_func
     ):
         items = [item for item in item_flatten_list if item.is_audio()]
+        placeholder_tensor = torch.tensor(
+            [item.pad_value for item in items],
+            device=input_ids.device,
+        )
         items_offsets = []
         # calculate per request items length offset
-        items_size = torch.zeros(len(mm_inputs_list + 1))
+        items_size = torch.zeros(len(mm_inputs_list) + 1, dtype=int)
         for i, mm_inputs in enumerate(mm_inputs_list):
             audio_items = [item for item in mm_inputs.mm_items if item.is_audio()]
             items_size[i + 1] = len(audio_items)

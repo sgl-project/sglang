@@ -314,3 +314,12 @@ class BaseMultimodalProcessor(ABC):
         end_positions = (mask & ~torch.roll(mask, -1)).nonzero(as_tuple=True)[0]
 
         return list(zip(start_positions.tolist(), end_positions.tolist()))
+
+    @staticmethod
+    def get_mm_items_offset_by_pair(
+         input_ids: torch.Tensor, mm_start_id: int, mm_end_id: int
+    ) -> List[Tuple[int, int]]:
+        indices_start = (input_ids == mm_start_id).nonzero(as_tuple=True)[0] + 1
+        indices_end = (input_ids == mm_end_id).nonzero(as_tuple=True)[0] - 1
+
+        return list(zip(indices_start.tolist(), indices_end.tolist()))
