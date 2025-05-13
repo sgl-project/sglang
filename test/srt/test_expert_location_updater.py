@@ -69,8 +69,10 @@ def _run_subprocess(
             expert_location_updater.update_expert_weights_single_layer(
                 routed_experts_weights=TODO,
                 temp_buffers=TODO,
-                old_expert_location_metadata=TODO,
-                new_expert_location_metadata=TODO,
+                old_physical_to_logical_map=old_physical_to_logical_map,
+                old_logical_to_all_physical_map=TODO,
+                new_physical_to_logical_map=new_physical_to_logical_map,
+                new_logical_to_all_physical_map=TODO,
             )
             TODO_assert
 
