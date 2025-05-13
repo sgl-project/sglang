@@ -740,7 +740,8 @@ class _CircularBuffer(_Buffer):
         self._curr_index = 0
 
     def append(self, value: torch.Tensor):
-        TODO
+        self._buffer[self._curr_index, ...] = value
+        self._curr_index = (self._curr_index + 1) % len(self._buffer)
 
     def get_all(self) -> torch.Tensor:
         TODO
