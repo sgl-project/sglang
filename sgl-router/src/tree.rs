@@ -81,12 +81,6 @@ fn slice_by_chars(s: &str, start: usize, end: usize) -> String {
     s.chars().skip(start).take(end - start).collect()
 }
 
-impl Default for Tree {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Tree {
     /*
     Thread-safe multi tenant radix tree
