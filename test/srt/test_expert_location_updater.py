@@ -5,9 +5,18 @@ import torch.multiprocessing as mp
 from sglang.srt.model_executor import expert_location_updater
 from sglang.test.test_utils import CustomTestCase
 from torch.multiprocessing import Process
+from sglang.utils import is_in_ci
 
 
 class TestExpertLocationUpdater(CustomTestCase):
+    def test_cpu(self):
+        self._test_core(num_gpus=TODO)
+       
+    def test_gpu(self):
+        if is_in_ci():
+            return
+        self._test_core(num_gpus=8)
+
     def _test_core(
         self,
         num_gpus: int,
