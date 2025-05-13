@@ -728,12 +728,12 @@ class _Buffer:
             return _CircularBuffer(item_shape, buffer_size)
 
 
-class _CircularBuffer:
+class _CircularBuffer(_Buffer):
     def __init__(self, item_shape: Tuple, buffer_size: int):
         TODO
 
 
-class _InfiniteBuffer:
+class _InfiniteBuffer(_Buffer):
     def __init__(self, item_shape: Tuple):
         TODO
 
