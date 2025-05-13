@@ -799,11 +799,11 @@ class TokenizerManager:
 
     async def dump_expert_distribution_record(self):
         print("hi tokenizer_manager dump_expert_distribution_record", flush=True)
+        await self.expert_distribution_communicator(
+            ExpertDistributionReq.DUMP_RECORD
+        )
         TODO_change
         raw_outputs: List[ExpertDistributionReqOutput] = (
-            await self.expert_distribution_communicator(
-                ExpertDistributionReq.DUMP_RECORD
-            )
         )
         return expert_distribution.postprocess_dumps(
             [output.dump_output for output in raw_outputs],

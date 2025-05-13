@@ -2098,16 +2098,15 @@ class Scheduler(
 
     def expert_distribution_handle(self, recv_req: ExpertDistributionReq):
         print(f"hi expert_distribution_handle {recv_req=}", flush=True)
-        dump_output = None
         if recv_req == ExpertDistributionReq.START_RECORD:
             get_global_expert_distribution_recorder().start_record()
         elif recv_req == ExpertDistributionReq.STOP_RECORD:
             get_global_expert_distribution_recorder().stop_record()
         elif recv_req == ExpertDistributionReq.DUMP_RECORD:
-            dump_output = get_global_expert_distribution_recorder().dump_record()
+            get_global_expert_distribution_recorder().dump_record()
         else:
             raise ValueError("Unrecognized ExpertDistributionReq value")
-        return ExpertDistributionReqOutput(dump_output=dump_output)
+        return ExpertDistributionReqOutput()
 
     def open_session(self, recv_req: OpenSessionReqInput):
         # handle error
