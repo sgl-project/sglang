@@ -176,8 +176,10 @@ def update_expert_weights_single_layer(
             req.wait()
 
     def _execute_buffer2weight_copies(buffer2weight_copy_infos):
-        for info in buffer2weight_copy_infos:
-            TODO
+        for src_expert_location, dst_expert_location in buffer2weight_copy_infos:
+            for i in range(num_tensors):
+                routed_experts_weights[i][to_local(dst_expert_location)].copy_(
+                    temp_buffers[i][to_local(src_expert_location)])
 
     _entrypoint()
 
