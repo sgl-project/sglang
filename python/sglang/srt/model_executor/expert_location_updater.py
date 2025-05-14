@@ -49,41 +49,43 @@ def update_expert_weights_single_layer(
     old_physical_to_logical_map = old_physical_to_logical_map.tolist()
     new_physical_to_logical_map = new_physical_to_logical_map.tolist()
 
-    for dst_expert_location in range(
-        rank * num_local_physical_experts,
-        (rank + 1) * num_local_physical_experts,
-    ):
-        _handle_dst_expert_location(dst_expert_location=dst_expert_location)
-        TODO
+    def _handle_dst_expert_location(dst_expert_location: int):
+        logical_expert_id = new_physical_to_logical_map[dst_expert_location]
 
-    for src_expert_location in range(
-        rank * num_local_physical_experts,
-        (rank + 1) * num_local_physical_experts,
-    ):
-        logical_expert_id = old_physical_to_logical_map[src_expert_location]
-        TODO
+        # case 1: unchanged
+        if old_physical_to_logical_map[dst_expert_location] == logical_expert_id:
+            return
 
-    reqs = torch.distributed.batch_isend_irecv(TODO)
-    for req in reqs:
-        req.wait()
+        # case 2: same-gpu
+        for src_expert_location in range(
+            rank * num_local_physical_experts,
+            (rank + 1) * num_local_physical_experts,
+        ):
+            if old_physical_to_logical_map[src_expert_location] == logical_expert_id:
+                TODO
+                break
+        TODO_early_return
 
-    for copy_back_info in TODO:
-        TODO
-
-
-def _handle_dst_expert_location(dst_expert_location: int):
-    logical_expert_id = new_physical_to_logical_map[dst_expert_location]
-
-    # case 1: unchanged
-    if old_physical_to_logical_map[dst_expert_location] == logical_expert_id:
-        return
-
-    # case 2: same-gpu
-    for src_expert_location in range(
-        rank * num_local_physical_experts,
-        (rank + 1) * num_local_physical_experts,
-    ):
-        if old_physical_to_logical_map[src_expert_location] == logical_expert_id:
+    def _entrypoint():
+        for dst_expert_location in range(
+            rank * num_local_physical_experts,
+            (rank + 1) * num_local_physical_experts,
+        ):
+            _handle_dst_expert_location(dst_expert_location=dst_expert_location)
             TODO
-            break
-    TODO_early_return
+
+        for src_expert_location in range(
+            rank * num_local_physical_experts,
+            (rank + 1) * num_local_physical_experts,
+        ):
+            logical_expert_id = old_physical_to_logical_map[src_expert_location]
+            TODO
+
+        reqs = torch.distributed.batch_isend_irecv(TODO)
+        for req in reqs:
+            req.wait()
+
+        for copy_back_info in TODO:
+            TODO
+
+    _entrypoint()
