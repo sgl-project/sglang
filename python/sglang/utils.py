@@ -514,14 +514,20 @@ async def async_stream_and_merge(llm, prompt, sampling_params):
         yield cleaned_chunk  # yield the non-overlapping portion
 
 
-def remove_first_nonblank_token(tokenizer, token_ids):
+def remove_first_nonblank_token(tokenizer, token_ids, tokenized_chat):
     idx = 0
+    removed_tokens = []
+    
     while idx < len(token_ids):
         token_str = tokenizer.decode([token_ids[idx]], skip_special_tokens=True)
         if token_str.strip() == "":
+            removed_tokens.append(token_ids[idx])
             idx += 1
         else:
+            removed_tokens.append(token_ids[idx])  # 包括第一个非空白token
             idx += 1
             break
-    text = tokenizer.decode(token_ids[idx:], skip_special_tokens=True)
-    return text.strip()
+    
+    updated_tokenized_chat = tokenized_chat + removed_tokens
+    
+    return updated_tokenized_chat, token_ids[idx:]
