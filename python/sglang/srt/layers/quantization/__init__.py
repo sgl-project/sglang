@@ -109,7 +109,7 @@ def get_quantization_config(quantization: str) -> Type[QuantizationConfig]:
     if quantization in VLLM_QUANTIZATION_METHODS and not VLLM_AVAILABLE:
         raise ValueError(
             f"{quantization} quantization requires some operators from vllm. "
-            "Pleaes install vllm by `pip install vllm==0.7.2`"
+            "Please install vllm by `pip install vllm==0.8.4`"
         )
 
     return QUANTIZATION_METHODS[quantization]
@@ -290,6 +290,7 @@ def monkey_patch_moe_apply(class_obj: "FusedMoEMethodBase"):
         apply_router_weight_on_input: bool = False,
         inplace: bool = True,
         no_combine: bool = False,
+        routed_scaling_factor: Optional[float] = None,
     ):
         assert activation == "silu"
         assert inplace and not no_combine
@@ -309,7 +310,7 @@ def monkey_patch_moe_apply(class_obj: "FusedMoEMethodBase"):
         if correction_bias is not None:
             if not has_correction_bias:
                 raise ValueError(
-                    "Please increase the version of your vllm. Try `pip install vllm==0.7.2`"
+                    "Please increase the version of your vllm. Try `pip install vllm==0.8.4`"
                 )
             kwargs["e_score_correction_bias"] = correction_bias
         return original_apply(**kwargs)

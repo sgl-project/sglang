@@ -58,6 +58,7 @@ class RequestFuncInput:
     output_len: int
     model: str
     lora_name: str
+    image_data: str
     extra_request_body: Dict[str, Any]
 
 
@@ -295,7 +296,7 @@ async def async_request_truss(
                             # NOTE: Some completion API might have a last
                             # usage summary response without a token so we
                             # want to check a token was generated
-                            if data["choices"][0]["delta"]["content"]:
+                            if data["choices"][0]["text"]:
                                 timestamp = time.perf_counter()
                                 # First token
                                 if ttft == 0.0:
@@ -307,7 +308,7 @@ async def async_request_truss(
                                     output.itl.append(timestamp - most_recent_timestamp)
 
                                 most_recent_timestamp = timestamp
-                                generated_text += data["choices"][0]["delta"]["content"]
+                                generated_text += data["choices"][0]["text"]
 
                     output.generated_text = generated_text
                     output.success = True
@@ -347,6 +348,11 @@ async def async_request_sglang_generate(
             "logprob_start_len": -1,
             **request_func_input.extra_request_body,
         }
+
+        # Add image data if available
+        if request_func_input.image_data:
+            payload["image_data"] = request_func_input.image_data
+
         headers = get_auth_headers()
 
         output = RequestFuncOutput()
@@ -490,7 +496,7 @@ def get_dataset(args, tokenizer):
             prompt_suffix=args.prompt_suffix,
             apply_chat_template=args.apply_chat_template,
         )
-    elif args.dataset_name == "random":
+    elif args.dataset_name.startswith("random"):
         input_requests = sample_random_requests(
             input_len=args.random_input_len,
             output_len=args.random_output_len,
@@ -498,6 +504,7 @@ def get_dataset(args, tokenizer):
             range_ratio=args.random_range_ratio,
             tokenizer=tokenizer,
             dataset_path=args.dataset_path,
+            random_sample=args.dataset_name == "random",
         )
     elif args.dataset_name == "generated-shared-prefix":
         input_requests = sample_generated_shared_prefix_requests(
@@ -508,6 +515,13 @@ def get_dataset(args, tokenizer):
             output_len=args.gsp_output_len,
             tokenizer=tokenizer,
             args=args,
+        )
+    elif args.dataset_name == "mmmu":
+        input_requests = sample_mmmu_requests(
+            num_requests=args.num_prompts,
+            tokenizer=tokenizer,
+            fixed_output_len=args.random_output_len,
+            random_sample=True,
         )
     else:
         raise ValueError(f"Unknown dataset: {args.dataset_name}")
@@ -594,6 +608,121 @@ def download_and_cache_file(url: str, filename: Optional[str] = None):
             bar.update(len(chunk))
 
     return filename
+
+
+def sample_mmmu_requests(
+    num_requests: int,
+    tokenizer: PreTrainedTokenizerBase,
+    fixed_output_len: Optional[int] = None,
+    random_sample: bool = True,
+) -> List[Tuple[str, int, int]]:
+    """
+    Sample requests from the MMMU dataset using HuggingFace datasets.
+
+    Args:
+        num_requests: Number of requests to sample.
+        tokenizer: Tokenizer to use for token counting.
+        fixed_output_len: If provided, use this fixed output length for all requests.
+        random_sample: Whether to randomly sample or take the first N.
+
+    Returns:
+        List of tuples (prompt, prompt_token_len, output_token_len).
+    """
+    try:
+        import base64
+        import io
+
+        from datasets import load_dataset
+    except ImportError:
+        raise ImportError("Please install datasets: pip install datasets")
+
+    print("Loading MMMU dataset from HuggingFace...")
+
+    try:
+        print("Attempting to load MMMU Math dataset...")
+        mmmu_dataset = load_dataset("MMMU/MMMU", "Math", split="test")
+        print(
+            f"Successfully loaded MMMU Math dataset from HuggingFace with {len(mmmu_dataset)} examples"
+        )
+    except Exception as e:
+        print(f"Failed to load MMMU Math dataset: {e}")
+        raise ValueError(f"Failed to load MMMU dataset: {e}")
+
+    # Sample from the dataset
+    if len(mmmu_dataset) > num_requests:
+        if random_sample:
+            # Random sample
+            indices = random.sample(range(len(mmmu_dataset)), num_requests)
+            sample_dataset = mmmu_dataset.select(indices)
+        else:
+            # Take first N
+            sample_dataset = mmmu_dataset.select(
+                range(min(num_requests, len(mmmu_dataset)))
+            )
+    else:
+        print(f"Dataset has less than {num_requests} examples, using all examples")
+        sample_dataset = mmmu_dataset
+
+    print(f"Selected {len(sample_dataset)} examples for benchmarking")
+
+    # Create prompts
+    filtered_dataset = []
+
+    for i, example in enumerate(sample_dataset):
+        try:
+            # Extract image_1
+            image = example.get("image_1")
+
+            if image is not None:
+                if hasattr(image, "save"):
+                    # Convert RGBA images to RGB before encoding
+                    if image.mode == "RGBA":
+                        image = image.convert("RGB")
+
+                    # Encode image to base64
+                    buffered = io.BytesIO()
+                    image.save(buffered, format="JPEG")
+                    img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
+                    image_path = f"data:image/jpeg;base64,{img_str}"
+                else:
+                    continue
+
+                # Extract the question
+                question = example.get("question")
+
+                # Create the prompt with image, question
+                prompt = f"Question: {question}\n\nAnswer: "
+                prompt = tokenizer.apply_chat_template(
+                    [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "image_url", "image_url": {"url": image_path}},
+                                {"type": "text", "text": prompt},
+                            ],
+                        }
+                    ],
+                    add_generation_prompt=True,
+                    tokenize=False,
+                )
+                prompt = f"<image>{image_path}</image>{prompt}"
+
+                # Calculate token lengths
+                # Note: This is approximate since we're not rendering the actual image tokens
+                prompt_token_ids = tokenizer.encode(prompt)
+                prompt_len = (
+                    len(prompt_token_ids) + 512
+                )  # Add estimate for image tokens
+
+                output_len = fixed_output_len if fixed_output_len is not None else 256
+
+                filtered_dataset.append((prompt, prompt_len, output_len))
+
+        except Exception as e:
+            print(f"Error processing example {i}: {e}")
+
+    print(f"\nCreated {len(filtered_dataset)} MMMU prompts")
+    return filtered_dataset
 
 
 def sample_sharegpt_requests(
@@ -687,8 +816,8 @@ def sample_random_requests(
     range_ratio: float,
     tokenizer: PreTrainedTokenizerBase,
     dataset_path: str,
+    random_sample: bool = True,
 ) -> List[Tuple[str, int, int]]:
-
     input_lens = np.random.randint(
         max(int(input_len * range_ratio), 1),
         input_len + 1,
@@ -700,7 +829,7 @@ def sample_random_requests(
         size=num_prompts,
     )
 
-    if True:
+    if random_sample:
         # Sample token ids from ShareGPT and repeat/truncate them to satisfy the input_lens
 
         # Download sharegpt if necessary
@@ -974,8 +1103,9 @@ async def benchmark(
     lora_names: List[str],
     extra_request_body: Dict[str, Any],
     profile: bool,
-    pd_seperated: bool = False,
+    pd_separated: bool = False,
     flush_cache: bool = False,
+    warmup_requests: int = 1,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -993,14 +1123,23 @@ async def benchmark(
             return await request_func(request_func_input=request_func_input, pbar=pbar)
 
     # Warmup
-    print(f"Starting warmup with {args.warmup_requests} sequences...")
+    print(f"Starting warmup with {warmup_requests} sequences...")
 
     # Use the first request for all warmup iterations
     test_prompt, test_prompt_len, test_output_len = input_requests[0]
-    if lora_names != None and len(lora_names) != 0:
+    if lora_names is not None and len(lora_names) != 0:
         lora_name = lora_names[0]
     else:
         lora_name = None
+
+    if "<image>" in test_prompt:
+        import re
+
+        image_match = re.search(r"<image>(.*?)</image>(.*)", test_prompt)
+        image_data = image_match.group(1) if image_match else None
+        test_prompt = image_match.group(2) if image_match else test_prompt
+    else:
+        image_data = None
 
     # Create the test input once
     test_input = RequestFuncInput(
@@ -1010,12 +1149,13 @@ async def benchmark(
         prompt_len=test_prompt_len,
         output_len=min(test_output_len, 32),
         lora_name=lora_name,
+        image_data=image_data,
         extra_request_body=extra_request_body,
     )
 
     # Run warmup requests
     warmup_tasks = []
-    for _ in range(args.warmup_requests):
+    for _ in range(warmup_requests):
         warmup_tasks.append(
             asyncio.create_task(request_func(request_func_input=test_input))
         )
@@ -1023,7 +1163,7 @@ async def benchmark(
     warmup_outputs = await asyncio.gather(*warmup_tasks)
 
     # Check if at least one warmup request succeeded
-    if not any(output.success for output in warmup_outputs):
+    if warmup_requests > 0 and not any(output.success for output in warmup_outputs):
         raise ValueError(
             "Warmup failed - Please make sure benchmark arguments "
             f"are correctly specified. Error: {warmup_outputs[0].error}"
@@ -1055,11 +1195,20 @@ async def benchmark(
     tasks: List[asyncio.Task] = []
     async for request in get_request(input_requests, request_rate):
         prompt, prompt_len, output_len = request
-        if lora_names != None and len(lora_names) != 0:
+        if lora_names is not None and len(lora_names) != 0:
             idx = random.randint(0, len(lora_names) - 1)
             lora_name = lora_names[idx]
         else:
             lora_name = None
+
+        if "<image>" in prompt:
+            import re
+
+            image_match = re.search(r"<image>(.*?)</image>(.*)", prompt)
+            image_data = image_match.group(1) if image_match else None
+            prompt = image_match.group(2) if image_match else prompt
+        else:
+            image_data = None
 
         request_func_input = RequestFuncInput(
             model=model_id,
@@ -1068,6 +1217,7 @@ async def benchmark(
             prompt_len=prompt_len,
             output_len=output_len,
             lora_name=lora_name,
+            image_data=image_data,
             extra_request_body=extra_request_body,
         )
         tasks.append(
@@ -1089,12 +1239,14 @@ async def benchmark(
 
     if "sglang" in backend:
         server_info = requests.get(base_url + "/get_server_info")
-        if pd_seperated:
-            accept_length = server_info.json()["decode"][0].get(
+        if pd_separated:
+            accept_length = server_info.json()["decode"][0]["internal_states"][0].get(
                 "avg_spec_accept_length", None
             )
         else:
-            accept_length = server_info.json().get("avg_spec_accept_length", None)
+            accept_length = server_info.json()["internal_states"][0].get(
+                "avg_spec_accept_length", None
+            )
     else:
         accept_length = None
 
@@ -1113,7 +1265,7 @@ async def benchmark(
     print("{:<40} {:<10}".format("Traffic request rate:", request_rate))
     print(
         "{:<40} {:<10}".format(
-            "Max reqeuest concurrency:",
+            "Max request concurrency:",
             max_concurrency if max_concurrency else "not set",
         )
     )
@@ -1223,7 +1375,7 @@ async def benchmark(
         output_file_name = args.output_file
     else:
         now = datetime.now().strftime("%m%d")
-        if args.dataset_name == "random":
+        if args.dataset_name.startswith("random"):
             output_file_name = f"{args.backend}_{now}_{args.num_prompts}_{args.random_input_len}_{args.random_output_len}.jsonl"
         else:
             output_file_name = f"{args.backend}_{now}_{args.num_prompts}_sharegpt.jsonl"
@@ -1391,7 +1543,7 @@ def run_benchmark(args_: argparse.Namespace):
             lora_names=args.lora_name,
             extra_request_body=extra_request_body,
             profile=args.profile,
-            pd_seperated=args.pd_seperated,
+            pd_separated=args.pd_separated,
             flush_cache=args.flush_cache,
         )
     )
@@ -1442,7 +1594,7 @@ if __name__ == "__main__":
         "--dataset-name",
         type=str,
         default="sharegpt",
-        choices=["sharegpt", "random", "generated-shared-prefix"],
+        choices=["sharegpt", "random", "random-ids", "generated-shared-prefix", "mmmu"],
         help="Name of the dataset to benchmark on.",
     )
     parser.add_argument(
@@ -1570,7 +1722,7 @@ if __name__ == "__main__":
         help="Suffix applied to the end of all user prompts, followed by assistant prompt suffix.",
     )
     parser.add_argument(
-        "--pd-seperated",
+        "--pd-separated",
         action="store_true",
         help="Benchmark PD disaggregation server",
     )

@@ -20,7 +20,7 @@ from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
 )
 from sglang.srt.utils import is_hip
 
-_is_hip_ = is_hip()
+_is_hip = is_hip()
 
 
 class BenchmarkConfig(TypedDict):
@@ -112,8 +112,8 @@ def benchmark_config(
             )
 
     if use_fp8_w8a8:
-        w1 = w1.to(torch.float8_e4m3fnuz if _is_hip_ else torch.float8_e4m3fn)
-        w2 = w2.to(torch.float8_e4m3fnuz if _is_hip_ else torch.float8_e4m3fn)
+        w1 = w1.to(torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn)
+        w2 = w2.to(torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn)
 
     input_gating = torch.empty(num_tokens, num_experts, dtype=torch.float32)
 
@@ -204,7 +204,7 @@ def get_configs_compute_bound() -> List[Dict[str, int]]:
     # TODO(woosuk): Increase the search space and use a performance model to
     # prune the search space.
     configs: List[BenchmarkConfig] = []
-    if _is_hip_:
+    if _is_hip:
         configs = get_rocm_configs_compute_bound()
     else:
         for num_stages in [2, 3, 4, 5]:
@@ -393,7 +393,7 @@ def main(args: argparse.Namespace):
         topk = config.num_experts_per_tok
         intermediate_size = config.intermediate_size
         shard_intermediate_size = 2 * intermediate_size // args.tp_size
-    elif config.architectures[0] == "Qwen2MoeForCausalLM":
+    elif config.architectures[0] in ["Qwen2MoeForCausalLM", "Qwen3MoeForCausalLM"]:
         E = config.num_experts
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
@@ -407,6 +407,12 @@ def main(args: argparse.Namespace):
         )
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
+        shard_intermediate_size = 2 * intermediate_size // args.tp_size
+    elif config.architectures[0] == "Llama4ForConditionalGeneration":
+        n_share_fusion_experts = args.n_share_experts_fusion
+        E = config.text_config.num_local_experts + n_share_fusion_experts
+        topk = config.text_config.num_experts_per_tok
+        intermediate_size = config.text_config.intermediate_size
         shard_intermediate_size = 2 * intermediate_size // args.tp_size
     elif config.architectures[0] in [
         "Grok1ForCausalLM",
@@ -424,7 +430,7 @@ def main(args: argparse.Namespace):
         intermediate_size = config.intermediate_size
         shard_intermediate_size = 2 * intermediate_size // args.tp_size
 
-    hidden_size = config.hidden_size
+    hidden_size = getattr(config, "hidden_size", None) or config.text_config.hidden_size
     dtype = config.torch_dtype
     use_fp8_w8a8 = args.dtype == "fp8_w8a8"
     use_int8_w8a8 = args.dtype == "int8_w8a8"
@@ -487,7 +493,7 @@ def main(args: argparse.Namespace):
             ]
         print(f"Start tuning over {len(search_space)} configurations...")
 
-        start = time.time()
+        start = time.perf_counter()
         configs = _distribute(
             "tune",
             [
@@ -522,7 +528,7 @@ def main(args: argparse.Namespace):
             use_int8_w8a16,
             block_shape,
         )
-        end = time.time()
+        end = time.perf_counter()
         print(f"Tuning took {end - start:.2f} seconds")
     else:
         outputs = _distribute(

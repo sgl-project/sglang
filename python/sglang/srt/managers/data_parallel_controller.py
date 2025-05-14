@@ -17,6 +17,7 @@ import logging
 import multiprocessing as mp
 import signal
 import threading
+import time
 from enum import Enum, auto
 
 import psutil
@@ -24,13 +25,14 @@ import setproctitle
 import zmq
 
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
-from sglang.srt.managers.expert_location import ExpertLocationMetadata
 from sglang.srt.managers.io_struct import (
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
 )
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import bind_port, configure_logger, get_zmq_socket
 from sglang.utils import get_exception_traceback
 
@@ -55,12 +57,7 @@ class LoadBalanceMethod(Enum):
 class DataParallelController:
     """A controller that dispatches requests to multiple data parallel workers."""
 
-    def __init__(
-        self,
-        server_args: ServerArgs,
-        port_args: PortArgs,
-        expert_location_metadata: ExpertLocationMetadata,
-    ) -> None:
+    def __init__(self, server_args: ServerArgs, port_args: PortArgs) -> None:
         # Parse args
         self.max_total_num_tokens = None
         self.server_args = server_args
@@ -89,14 +86,10 @@ class DataParallelController:
         self.workers = [None] * server_args.dp_size
 
         if server_args.enable_dp_attention:
-            dp_port_args = self.launch_dp_attention_schedulers(
-                server_args, port_args, expert_location_metadata
-            )
+            dp_port_args = self.launch_dp_attention_schedulers(server_args, port_args)
             self.control_message_step = server_args.tp_size
         else:
-            dp_port_args = self.launch_dp_schedulers(
-                server_args, port_args, expert_location_metadata
-            )
+            dp_port_args = self.launch_dp_schedulers(server_args, port_args)
             self.control_message_step = 1
 
         # Only node rank 0 runs the real data parallel controller that dispatches the requests.
@@ -111,7 +104,7 @@ class DataParallelController:
 
         self.max_req_input_len = None
 
-    def launch_dp_schedulers(self, server_args, port_args, expert_location_metadata):
+    def launch_dp_schedulers(self, server_args, port_args):
         base_gpu_id = 0
 
         threads = []
@@ -134,14 +127,7 @@ class DataParallelController:
             # Create a thread for each worker
             thread = threading.Thread(
                 target=self.launch_tensor_parallel_group_thread,
-                args=(
-                    server_args,
-                    tmp_port_args,
-                    expert_location_metadata,
-                    base_gpu_id,
-                    dp_rank,
-                    ready_event,
-                ),
+                args=(server_args, tmp_port_args, base_gpu_id, dp_rank, ready_event),
             )
             threads.append(thread)
             base_gpu_id += server_args.tp_size * server_args.gpu_id_step
@@ -162,27 +148,20 @@ class DataParallelController:
         self,
         server_args: ServerArgs,
         port_args: PortArgs,
-        expert_location_metadata: ExpertLocationMetadata,
         base_gpu_id: int,
         dp_rank: int,
         ready_event: threading.Event,
     ):
-        self.launch_tensor_parallel_group(
-            server_args, port_args, expert_location_metadata, base_gpu_id, dp_rank
-        )
+        self.launch_tensor_parallel_group(server_args, port_args, base_gpu_id, dp_rank)
         ready_event.set()
 
         # This thread cannot be closed because otherwise the `kill_itself_when_parent_died`
         # function in scheduler.py will kill the scheduler.
         while True:
-            pass
+            time.sleep(30 * 24 * 3600)
 
-    def launch_dp_attention_schedulers(
-        self, server_args, port_args, expert_location_metadata
-    ):
-        self.launch_tensor_parallel_group(
-            server_args, port_args, expert_location_metadata, 0, None
-        )
+    def launch_dp_attention_schedulers(self, server_args, port_args):
+        self.launch_tensor_parallel_group(server_args, port_args, 0, None)
         dp_port_args = []
         for dp_rank in range(server_args.dp_size):
             dp_port_args.append(PortArgs.init_new(server_args, dp_rank))
@@ -192,58 +171,72 @@ class DataParallelController:
         self,
         server_args: ServerArgs,
         port_args: PortArgs,
-        expert_location_metadata: ExpertLocationMetadata,
         base_gpu_id: int,
         dp_rank: int,
     ):
         if not server_args.enable_dp_attention:
             logger.info(f"Launch DP{dp_rank} starting at GPU #{base_gpu_id}.")
 
-        # Launch tensor parallel scheduler processes
-        scheduler_pipe_readers = []
-        tp_size_per_node = server_args.tp_size // server_args.nnodes
-        tp_rank_range = range(
-            tp_size_per_node * server_args.node_rank,
-            tp_size_per_node * (server_args.node_rank + 1),
+        memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=server_args.enable_memory_saver
         )
-        for tp_rank in tp_rank_range:
-            rank_port_args = port_args
 
-            if server_args.enable_dp_attention:
-                # dp attention has different sharding logic
-                _, _, dp_rank = compute_dp_attention_world_info(
-                    server_args.enable_dp_attention,
-                    tp_rank,
-                    server_args.tp_size,
-                    server_args.dp_size,
+        scheduler_pipe_readers = []
+
+        nnodes_per_tp_group = max(server_args.nnodes // server_args.pp_size, 1)
+        tp_size_per_node = server_args.tp_size // nnodes_per_tp_group
+        tp_rank_range = range(
+            tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group),
+            tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group + 1),
+        )
+
+        pp_size_per_node = max(server_args.pp_size // server_args.nnodes, 1)
+        pp_rank_range = range(
+            pp_size_per_node * (server_args.node_rank // nnodes_per_tp_group),
+            pp_size_per_node * (server_args.node_rank // nnodes_per_tp_group + 1),
+        )
+
+        for pp_rank in pp_rank_range:
+            for tp_rank in tp_rank_range:
+                rank_port_args = port_args
+
+                if server_args.enable_dp_attention:
+                    # dp attention has different sharding logic
+                    _, _, dp_rank = compute_dp_attention_world_info(
+                        server_args.enable_dp_attention,
+                        tp_rank,
+                        server_args.tp_size,
+                        server_args.dp_size,
+                    )
+                    # compute zmq ports for this dp rank
+                    rank_port_args = PortArgs.init_new(server_args, dp_rank)
+                    # Data parallelism reuses the tensor parallelism group,
+                    # so all dp ranks should use the same nccl port.
+                    rank_port_args.nccl_port = port_args.nccl_port
+
+                reader, writer = mp.Pipe(duplex=False)
+                gpu_id = (
+                    server_args.base_gpu_id
+                    + base_gpu_id
+                    + ((pp_rank % pp_size_per_node) * tp_size_per_node)
+                    + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
                 )
-                # compute zmq ports for this dp rank
-                rank_port_args = PortArgs.init_new(server_args, dp_rank)
-                # Data parallelism resues the tensor parallelism group,
-                # so all dp ranks should use the same nccl port.
-                rank_port_args.nccl_port = port_args.nccl_port
-
-            reader, writer = mp.Pipe(duplex=False)
-            gpu_id = (
-                server_args.base_gpu_id
-                + base_gpu_id
-                + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
-            )
-            proc = mp.Process(
-                target=run_scheduler_process,
-                args=(
-                    server_args,
-                    rank_port_args,
-                    expert_location_metadata,
-                    gpu_id,
-                    tp_rank,
-                    dp_rank,
-                    writer,
-                ),
-            )
-            proc.start()
-            self.scheduler_procs.append(proc)
-            scheduler_pipe_readers.append(reader)
+                proc = mp.Process(
+                    target=run_scheduler_process,
+                    args=(
+                        server_args,
+                        rank_port_args,
+                        gpu_id,
+                        tp_rank,
+                        pp_rank,
+                        dp_rank,
+                        writer,
+                    ),
+                )
+                with memory_saver_adapter.configure_subprocess():
+                    proc.start()
+                self.scheduler_procs.append(proc)
+                scheduler_pipe_readers.append(reader)
 
         # Wait for model to finish loading
         scheduler_info = []
@@ -253,9 +246,14 @@ class DataParallelController:
         self.max_total_num_tokens = scheduler_info[0]["max_total_num_tokens"]
         self.max_req_input_len = scheduler_info[0]["max_req_input_len"]
 
-    def round_robin_scheduler(self, req):
-        self.workers[self.round_robin_counter].send_pyobj(req)
-        self.round_robin_counter = (self.round_robin_counter + 1) % len(self.workers)
+    def round_robin_scheduler(self, req: Req):
+        if self.server_args.disaggregation_mode == "null":
+            self.workers[self.round_robin_counter].send_pyobj(req)
+            self.round_robin_counter = (self.round_robin_counter + 1) % len(
+                self.workers
+            )
+        else:
+            self.workers[req.bootstrap_room % len(self.workers)].send_pyobj(req)
 
     def shortest_queue_scheduler(self, input_requests):
         raise NotImplementedError()
@@ -285,7 +283,6 @@ class DataParallelController:
 def run_data_parallel_controller_process(
     server_args: ServerArgs,
     port_args: PortArgs,
-    expert_location_metadata: ExpertLocationMetadata,
     pipe_writer,
 ):
     setproctitle.setproctitle("sglang::data_parallel_controller")
@@ -293,9 +290,7 @@ def run_data_parallel_controller_process(
     parent_process = psutil.Process().parent()
 
     try:
-        controller = DataParallelController(
-            server_args, port_args, expert_location_metadata
-        )
+        controller = DataParallelController(server_args, port_args)
         pipe_writer.send(
             {
                 "status": "ready",

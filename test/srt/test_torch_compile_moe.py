@@ -24,7 +24,7 @@ class TestTorchCompileMoe(CustomTestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--enable-torch-compile", "--torch-compile-max-bs", "8"],
+            other_args=["--enable-torch-compile", "--torch-compile-max-bs", "4"],
         )
 
     @classmethod
@@ -62,9 +62,9 @@ class TestTorchCompileMoe(CustomTestCase):
         res = self.run_decode(16)
 
         max_tokens = 256
-        tic = time.time()
+        tic = time.perf_counter()
         res = self.run_decode(max_tokens)
-        tok = time.time()
+        tok = time.perf_counter()
         print(f"{res=}")
         throughput = max_tokens / (tok - tic)
         self.assertGreaterEqual(throughput, 285)
