@@ -69,11 +69,9 @@ def update_expert_weights_single_layer(
 
         for dst_expert_location in range(*local_expert_location_range):
             _handle_dst_expert_location(dst_expert_location, buffer2weight_copy_infos, p2p_op_infos)
-            TODO
 
         for src_expert_location in range(*local_expert_location_range):
-            logical_expert_id = old_physical_to_logical_map[src_expert_location]
-            TODO
+            _handle_isend(src_expert_location, p2p_op_infos)
 
         reqs = torch.distributed.batch_isend_irecv(TODO)
         for req in reqs:
@@ -130,6 +128,9 @@ def update_expert_weights_single_layer(
         buffer2weight_copy_infos.append((TODO, TODO))
         return
 
+    def _handle_isend(src_expert_location: int, p2p_op_infos):
+        logical_expert_id = old_physical_to_logical_map[src_expert_location]
+       
     def _compute_comm_info(logical_expert_id: int):
         all_src_ranks = _deduplicate_ordered([
             x // num_local_physical_experts
