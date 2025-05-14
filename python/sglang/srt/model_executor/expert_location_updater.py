@@ -86,4 +86,10 @@ def update_expert_weights_single_layer(
                 TODO_add_to_copy_back_info
                 return
 
+        # case 3: free-rider
+        for src_expert_location in range(rank * num_local_physical_experts, dst_expert_location):
+            if new_physical_to_logical_map[src_expert_location] == logical_expert_id:
+                TODO_add_to_copy_back_info
+                return
+
     _entrypoint()
