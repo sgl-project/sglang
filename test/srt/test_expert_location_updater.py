@@ -36,12 +36,17 @@ class TestExpertLocationUpdater(CustomTestCase):
         self._test_common(device="cuda")
 
     def _test_common(self, device):
+        infos = []
         for nnodes in [1, 2, 4]:
             for num_logical_experts in [2, 5, 20, 200]:
                 for num_physical_experts in [4, 16, 220]:
                     if num_logical_experts > num_physical_experts: continue
-                    self._test_core(num_gpus=8, nnodes=nnodes, num_logical_experts=num_logical_experts,
-                                    num_physical_experts=num_physical_experts, device=device)
+                    infos.append(_TestInfo(
+                        nnodes=nnodes,
+                        num_logical_experts=num_logical_experts,
+                        num_physical_experts=num_physical_experts,
+                    ))
+        self._test_core(num_gpus=8, device=device, infos=infos)
 
     def _test_core(
         self,
