@@ -173,6 +173,7 @@ def _execute_test(info: _TestInfo, rank: int, num_gpus: int, device: str):
             if not torch.all(x == y):
                 output_logs_str = "\n".join(output_logs)
                 raise AssertionError(
+                    f"{rank=} {num_gpus=} {info=}\n"
                     f"routed_experts_weights[i]={x.tolist()}\n"
                     f"expect_new_weights[i]={y.tolist()}\n"
                     f"old_physical_to_logical_map={physical_to_logical_map.tolist()}\n"
