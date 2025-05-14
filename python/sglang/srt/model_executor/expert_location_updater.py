@@ -119,6 +119,11 @@ def update_expert_weights_single_layer(
 
         # case 4: same-node
         if rank in need_comm_self_node_dst_ranks:
+            chosen_src_rank = _ChunkUtils.chunk_value_from_element_value(
+                chunk_values=self_node_src_ranks,
+                element_values=need_comm_self_node_dst_ranks,
+                element_value=rank,
+            )
             TODO
 
         # case 5: cross-node
