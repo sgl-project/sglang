@@ -302,7 +302,7 @@ def compute_logical_to_rank_dispatch_physical_map(
     )
     logical_to_rank_dispatch_physical_map = logical_to_all_physical_map[chosen_index]
 
-    for index in range(logical_to_all_physical_map_num_valid.max()):
+    for index in range(logical_to_all_physical_map_num_valid.max() + 1):
         partial_logical_to_all_physical_map = logical_to_all_physical_map[:, :, index]
         is_valid = partial_logical_to_all_physical_map != -1
         is_same_gpu = partial_logical_to_all_physical_map // num_local_physical_experts == self_gpu_id
