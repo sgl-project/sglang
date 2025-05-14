@@ -144,14 +144,10 @@ def update_expert_weights_single_layer(
         same_node_mapping, cross_node_mapping, need_comm_self_node_dst_ranks = _compute_comm_info(
             logical_expert_id=logical_expert_id)
 
-        # a. same-node
-        chosen_dst_ranks = same_node_mapping.element_values_from_chunk_value(chunk_value=rank)
-        p2p_op_infos.append((TODO, [
-            TODO for i in range(num_tensors)
-        ]))
+        same_node_dst_ranks = same_node_mapping.element_values_from_chunk_value(chunk_value=rank)
+        cross_node_dst_ranks = cross_node_mapping.element_values_from_chunk_value(chunk_value=rank)
+        all_dst_ranks = same_node_dst_ranks + cross_node_dst_ranks
 
-        # b. cross-node
-        chosen_dst_ranks = cross_node_mapping.element_values_from_chunk_value(chunk_value=rank)
         p2p_op_infos.append((TODO, [
             TODO for i in range(num_tensors)
         ]))
