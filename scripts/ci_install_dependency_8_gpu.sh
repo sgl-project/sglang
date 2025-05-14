@@ -34,7 +34,7 @@ rm -rf /usr/local/include/nvshmem*
 pip install --upgrade pip
 
 # Install sgl-kernel
-pip install sgl-kernel==0.1.1 --no-cache-dir
+pip install sgl-kernel==0.1.2.post1 --no-cache-dir
 
 # Install the main package
 pip install -e "python[all]"
@@ -43,7 +43,7 @@ pip install -e "python[all]"
 pip install torch_memory_saver
 pip install transformers==4.51.0 sentence_transformers accelerate peft pandas datasets timm torchaudio==2.6.0
 
-# For compling xgrammar kernels
+# For compiling xgrammar kernels
 pip install cuda-python nvidia-cuda-nvrtc-cu12
 
 # For lmms_evals evaluating MMMU
@@ -52,6 +52,9 @@ pip install -e lmms-eval/
 
 # Install FlashMLA for attention backend tests
 pip install git+https://github.com/deepseek-ai/FlashMLA.git
+
+# Install mooncake-transfer-engine
+pip install mooncake-transfer-engine
 
 # Install system dependencies
 # apt-get update && apt-get install -y libibverbs-dev infiniband-diags libmlx5-1 rdma-core openssh-server perftest ibverbs-providers libibumad3 libibverbs1 libnl-3-200 libnl-route-3-200 librdmacm1 rdma-core-dev infiniband-diags-dev libibverbs-dev libibverbs-utils librdmacm-dev librdmacm-utils ibverbs-utils rdma-core-utils
@@ -120,3 +123,6 @@ gdrcopy_copybw
 echo "=== Verify NVSHMEM ==="
 nvshmem-info -a
 # /opt/nvshmem/bin/perftest/device/pt-to-pt/shmem_put_bw
+
+# Install hf_xet
+pip install huggingface_hub[hf_xet]
