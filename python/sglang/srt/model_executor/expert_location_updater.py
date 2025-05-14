@@ -50,6 +50,7 @@ def update_expert_weights_single_layer(
 
     num_physical_experts, = old_physical_to_logical_map.shape
     num_gpu_per_node = TODO
+    num_tensors = len(routed_experts_weights)
 
     self_node_id = rank // num_gpu_per_node
 
@@ -88,7 +89,7 @@ def update_expert_weights_single_layer(
         # case 2: same-gpu
         for src_expert_location in range(*local_expert_location_range):
             if old_physical_to_logical_map[src_expert_location] == logical_expert_id:
-                for i in range(len(routed_experts_weights)):
+                for i in range(num_tensors):
                     temp_buffers[i][to_local(dst_expert_location)].copy_(
                         routed_experts_weights[i][to_local(src_expert_location)])
                 buffer2weight_copy_infos.append((dst_expert_location, dst_expert_location))
@@ -106,14 +107,14 @@ def update_expert_weights_single_layer(
         # case 4: same-node
         if rank in need_comm_self_node_dst_ranks:
             chosen_src_rank = same_node_mapping.chunk_value_from_element_value(element_value=rank)
-            for i in range(len(routed_experts_weights)):
+            for i in range(num_tensors):
                 p2p_op_infos.append((TODO, TODO))
             buffer2weight_copy_infos.append((TODO, TODO))
             return
 
         # case 5: cross-node
         chosen_src_rank = cross_node_mapping.chunk_value_from_element_value(element_value=rank)
-        for i in range(len(routed_experts_weights)):
+        for i in range(num_tensors):
             p2p_op_infos.append((TODO, TODO))
         buffer2weight_copy_infos.append((TODO, TODO))
         return
@@ -175,7 +176,8 @@ def update_expert_weights_single_layer(
             req.wait()
 
     def _execute_buffer2weight_copies(buffer2weight_copy_infos):
-        TODO
+        for info in buffer2weight_copy_infos:
+            TODO
 
     _entrypoint()
 
