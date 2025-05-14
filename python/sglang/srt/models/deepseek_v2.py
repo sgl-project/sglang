@@ -345,6 +345,9 @@ class DeepseekV2MoE(nn.Module):
             return_recv_hook=True,
         )
 
+    def get_moe_weights(self):
+        return [x.data for x in self.experts.parameters()]
+
     def forward(
         self, hidden_states: torch.Tensor, forward_mode: Optional[ForwardMode] = None
     ) -> torch.Tensor:
@@ -2230,7 +2233,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                     self_attn.use_deep_gemm_bmm = True
 
         self.routed_experts_weights_of_layer = {
-            layer_id: [x.data for x in layer.mlp.experts.parameters()]
+            layer_id: layer.mlp.get_moe_weights()
             for layer_id, layer in enumerate(self.model.layers)
             if isinstance(layer.mlp, DeepseekV2MoE)
         }
