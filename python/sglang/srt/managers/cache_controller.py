@@ -332,16 +332,21 @@ class HiCacheController:
         device_indices = self.mem_pool_device_allocator.alloc(total_load_back_size)
         if device_indices is None:
             return None
-        self.mem_pool_host.protect_load(host_indices)
         # to ensure the device indices are ready before accessed by another CUDA stream
         torch.cuda.current_stream().synchronize()
-        self.load_queue.put(
-            CacheOperation(host_indices, device_indices[:len(host_indices)], node_id, priority)
-        )
 
+        #load  L2 cache
+        if len(host_indices) > 0:
+            self.mem_pool_host.protect_load(host_indices)
+            self.load_queue.put(
+                CacheOperation(host_indices, device_indices[:len(host_indices)], node_id, priority)
+            )
+
+        #load L3 cache
         if self.enable_mooncake_store_l3_cache:
-            self.mooncake_l3_load_queue.put(MooncakeStoreCacheOperation(device_indices,
-                                                                        l3_keys, node_id, priority))
+            if len(l3_keys) > 0:
+                self.mooncake_l3_load_queue.put(MooncakeStoreCacheOperation(device_indices,
+                                                                            l3_keys, node_id, priority))
 
         return device_indices
 

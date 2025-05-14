@@ -327,7 +327,9 @@ class HiRadixCache(RadixCache):
         delta = self.inc_lock_ref(ancester_node)
 
         # load it all or not at all
-        host_indices = torch.cat([n.host_value for n in l2_nodes_to_load])
+        host_indices = []
+        if len(l2_nodes_to_load) > 0:
+            host_indices = torch.cat([n.host_value for n in l2_nodes_to_load])
         l3_keys = [key for n in l3_nodes_to_load for key in n.l3_keys]
 
         total_load_back_size = len(host_indices) + len(l3_keys) * self.page_size
@@ -471,7 +473,6 @@ class HiRadixCache(RadixCache):
                     new_node.key = key[len(l3_exist_keys) * self.page_size:]
                     node.children[child_key] = new_node
                     new_node.l3_keys = l3_exist_keys
-                    new_node.evicted = True
                     node = new_node
 
         return value, node

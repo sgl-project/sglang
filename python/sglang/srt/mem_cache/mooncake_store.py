@@ -83,6 +83,7 @@ class MooncakeStore:
                              self.config.protocol,
                              self.config.device_name,
                              self.config.master_server_address)
+            logger.info("Connect to Mooncake store successfully.")
 
         except ValueError as e:
             logger.error("Configuration loading failed: %s", e)
@@ -118,7 +119,7 @@ class MooncakeStore:
                  key: str
     ) -> bool:
         if key is not None:
-            return self.store.is_exist(key) == 0
+            return self.store.is_exist(key) == 1
         return False
 
     def _put_impl(
