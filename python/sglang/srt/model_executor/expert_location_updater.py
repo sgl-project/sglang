@@ -55,6 +55,8 @@ def update_expert_weights_single_layer(
     )
 
     def _entrypoint():
+        copy_back_infos = []
+
         for dst_expert_location in range(*local_expert_location_range):
             _handle_dst_expert_location(dst_expert_location=dst_expert_location)
             TODO
@@ -80,7 +82,8 @@ def update_expert_weights_single_layer(
         # case 2: same-gpu
         for src_expert_location in range(*local_expert_location_range):
             if old_physical_to_logical_map[src_expert_location] == logical_expert_id:
-                TODO
+                TODO_do_copy
+                TODO_add_to_copy_back_info
                 return
 
     _entrypoint()
