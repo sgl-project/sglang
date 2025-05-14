@@ -338,3 +338,16 @@ class BaseMultimodalProcessor(ABC):
         )
         out.normalize()
         return out
+
+    def mm_inputs_are_preprocessed(self, mm_inputs: Optional[list]):
+        """Returns true if all images are preprocessed, false if all are not, and error otherwise."""
+        if not mm_inputs:
+            return True
+        ret = any(isinstance(mm_input, MultimodalDataItem) for mm_input in mm_inputs)
+        if ret and not all(
+            isinstance(mm_input, MultimodalDataItem) for mm_input in mm_inputs
+        ):
+            raise ValueError(
+                "Unsupported: mixture of multimodal inputs where some but not all are preprocessed."
+            )
+        return ret

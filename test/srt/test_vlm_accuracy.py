@@ -247,7 +247,7 @@ class TestMiniCPMVLogits(VisionLLMLogitsBase):
         self.compare_outputs(sglang_output, hf_output)
 
 
-class TestQwenVLSeesImage(VisionLLMLogitsBase):
+class TestQwenVLUnderstandsImage(VisionLLMLogitsBase):
 
     @classmethod
     def setUpClass(cls):
@@ -276,7 +276,7 @@ class TestQwenVLSeesImage(VisionLLMLogitsBase):
     def tearDown(self):
         self.engine.shutdown()
 
-    async def test_qwen_vl_sees_image(self):
+    async def test_qwen_vl_understands_image(self):
         req = self.get_completion_request()
         conv = generate_chat_conv(req, template_name=self.chat_template)
         text = conv.get_prompt()
@@ -287,7 +287,7 @@ class TestQwenVLSeesImage(VisionLLMLogitsBase):
         )
         self.assertIn("taxi", output["text"].lower())
 
-    async def test_qwen_vl_sees_precomputed_features(self):
+    async def test_qwen_vl_understands_precomputed_features(self):
         req = self.get_completion_request()
         processor_output = self.get_processor_output(req=req)
         with torch.inference_mode():

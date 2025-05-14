@@ -24,7 +24,9 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
 
     def __init__(self, hf_config, server_args, _processor):
         super().__init__(hf_config, server_args, _processor)
+        # The single, pre-expanded image token.
         self.IMAGE_TOKEN = "<|vision_start|><|image_pad|><|vision_end|>"
+        # The regex that matches expanded image tokens.
         self.IMAGE_TOKEN_REGEX = re.compile(
             r"<\|vision_start\|>(?:<\|image_pad\|>)+<\|vision_end\|>"
         )
@@ -123,22 +125,14 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
         async def resize_image_async(image):
             return resize_image(image)
 
-        using_precomputed_features = base_output.images and any(
-            isinstance(image, MultimodalDataItem) for image in base_output.images
-        )
-
-        if using_precomputed_features and not all(
-            isinstance(image, MultimodalDataItem) for image in base_output.images
-        ):
-            raise ValueError("Unsupported mixture of images and precomputed MM data.")
-
-        if base_output.images and not using_precomputed_features:
+        images_are_preprocessed = self.mm_inputs_are_preprocessed(base_output.images)
+        if base_output.images and not images_are_preprocessed:
             resize_tasks = [resize_image_async(image) for image in base_output.images]
             base_output.images = await asyncio.gather(*resize_tasks)
 
         ret = self.process_mm_data(
             input_text=base_output.input_text,
-            images=None if using_precomputed_features else base_output.images,
+            images=None if images_are_preprocessed else base_output.images,
         )
         input_ids = ret["input_ids"].flatten().tolist()
         image_grid_thw = None
@@ -146,23 +140,34 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
         items = []
 
         if base_output.images:
-            if using_precomputed_features:
-                pixel_values = None
+            if images_are_preprocessed:
                 image_grid_thw = torch.concat(
                     [
                         torch.as_tensor(item.image_grid_thws)
                         for item in base_output.images
                     ]
                 )
-                precomputed_features = torch.concat(
-                    [
-                        torch.as_tensor(item.precomputed_features)
-                        for item in base_output.images
-                    ]
+                all_pixel_values = [
+                    item.pixel_values
+                    for item in base_output.images
+                    if item.pixel_values is not None
+                ]
+                all_precomputed_features = [
+                    item.precomputed_features
+                    for item in base_output.images
+                    if item.precomputed_features is not None
+                ]
+                pixel_values = (
+                    torch.concat(all_pixel_values) if all_pixel_values else None
+                )
+                precomputed_features = (
+                    torch.concat(all_precomputed_features)
+                    if all_precomputed_features
+                    else None
                 )
             else:
-                pixel_values = ret["pixel_values"]
                 image_grid_thw = ret["image_grid_thw"]
+                pixel_values = ret["pixel_values"]
                 precomputed_features = None
             items += [
                 MultimodalDataItem(
