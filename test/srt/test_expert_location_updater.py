@@ -46,7 +46,8 @@ class TestExpertLocationUpdater(CustomTestCase):
     def _test_core(
         self,
         num_gpus: int,
-        **kwargs,
+        device: str,
+        infos: List[_TestInfo],
     ):
         master_port = find_available_port(23456)
 
@@ -60,7 +61,8 @@ class TestExpertLocationUpdater(CustomTestCase):
                     num_gpus=num_gpus,
                     output_writer=output_writer,
                     master_port=master_port,
-                    **kwargs,
+                    device=device,
+                    infos=infos,
                 ),
             )
             p.start()
@@ -78,7 +80,7 @@ def _run_subprocess(
     num_gpus: int,
     master_port: int,
     device: str,
-    test_infos: List[_TestInfo],
+    infos: List[_TestInfo],
     output_writer,
 ):
     try:
@@ -91,7 +93,7 @@ def _run_subprocess(
         if device == "cuda":
             torch.cuda.set_device(f"cuda:{rank}")
 
-        for info in test_infos:
+        for info in infos:
             _execute_test(info, rank=rank, num_gpus=num_gpus, device=device)
 
         execution_ok = True
