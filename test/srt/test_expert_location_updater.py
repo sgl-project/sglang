@@ -177,6 +177,10 @@ def _execute_test(info: _TestInfo, rank: int, num_gpus: int, device: str):
         global_has_error = torch.tensor(local_has_error)
         torch.distributed.all_reduce(global_has_error, op=torch.distributed.ReduceOp.MAX)
 
+        if global_has_error:
+            global_output_logs = [None] * num_gpus
+            torch.distributed.gather_object(output_logs, global_output_logs, dst=0)
+
         # output_logs_str = "\n".join(output_logs)
         # raise AssertionError(
         #     f"{rank=} {num_gpus=} {info=}\n"
