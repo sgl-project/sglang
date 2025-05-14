@@ -5,6 +5,7 @@ import torch
 import torch.distributed
 from sglang.srt.managers.expert_location import ExpertLocationMetadata
 from sglang.srt.managers.schedule_batch import get_global_expert_location_metadata
+from torch.distributed import P2POp
 
 logger = logging.getLogger(__name__)
 
@@ -63,9 +64,11 @@ def update_expert_weights_single_layer(
     def _entrypoint():
         # List[Tuple[src_temp_buffers_expert_location, dst_routed_experts_weights_expert_location]]
         buffer2weight_copy_infos: List[Tuple[int, int]] = []
+        # List[Tuple[logical_expert_id, P2POp]]
+        p2p_op_infos: List[Tuple[int, P2POp]] = []
 
         for dst_expert_location in range(*local_expert_location_range):
-            _handle_dst_expert_location(dst_expert_location, buffer2weight_copy_infos)
+            _handle_dst_expert_location(dst_expert_location, buffer2weight_copy_infos, p2p_op_infos)
             TODO
 
         for src_expert_location in range(*local_expert_location_range):
@@ -79,7 +82,7 @@ def update_expert_weights_single_layer(
         for copy_back_info in TODO:
             TODO
 
-    def _handle_dst_expert_location(dst_expert_location: int, buffer2weight_copy_infos):
+    def _handle_dst_expert_location(dst_expert_location: int, buffer2weight_copy_infos, p2p_op_infos):
         logical_expert_id = new_physical_to_logical_map[dst_expert_location]
 
         # case 1: unchanged
@@ -124,7 +127,8 @@ def update_expert_weights_single_layer(
                 element_values=need_comm_self_node_dst_ranks,
                 element_value=rank,
             )
-            TODO
+            for i in range(len(routed_experts_weights)):
+                p2p_op_infos.append((TODO, TODO))
 
         # case 5: cross-node
         TODO
