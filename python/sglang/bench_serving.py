@@ -904,8 +904,10 @@ def sample_random_requests(
             else:
                 ratio = (input_lens[i] + prompt_len - 1) // prompt_len
                 input_ids = (prompt_token_ids * ratio)[: input_lens[i]]
-            # TODO return_text is not handled
-            prompt = tokenizer.decode(input_ids)
+            if return_text:
+                prompt = tokenizer.decode(input_ids)
+            else:
+                prompt = input_ids
             input_requests.append(
                 DatasetRow(
                     prompt=prompt,
@@ -918,13 +920,14 @@ def sample_random_requests(
         offsets = np.random.randint(0, tokenizer.vocab_size, size=num_prompts)
         input_requests = []
         for i in range(num_prompts):
-            # TODO return_text is not handled
-            prompt = tokenizer.decode(
-                [
-                    (offsets[i] + i + j) % tokenizer.vocab_size
-                    for j in range(input_lens[i])
-                ]
-            )
+            input_ids = [
+                (offsets[i] + i + j) % tokenizer.vocab_size
+                for j in range(input_lens[i])
+            ]
+            if return_text:
+                prompt = tokenizer.decode(input_ids)
+            else:
+                prompt = input_ids
             input_requests.append(
                 DatasetRow(
                     prompt=prompt,
