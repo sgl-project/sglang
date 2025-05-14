@@ -88,8 +88,8 @@ def update_expert_weights_single_layer(
         for src_expert_location in range(*local_expert_location_range):
             if old_physical_to_logical_map[src_expert_location] == logical_expert_id:
                 for i in range(num_tensors):
-                    temp_buffers[i][_to_local(dst_expert_location)].copy_(
-                        routed_experts_weights[i][_to_local(src_expert_location)])
+                    _get_tensor(temp_buffers, i, dst_expert_location).copy_(
+                        _get_tensor(routed_experts_weights, i, src_expert_location))
                 buffer2weight_copy_infos.append((dst_expert_location, dst_expert_location))
                 return
 
