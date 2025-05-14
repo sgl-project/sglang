@@ -1,6 +1,7 @@
 #pragma once
-
 #include <ATen/native/CPUBlas.h>
+
+#include "common.h"
 
 // amx-bf16
 #define TILE_M 16
