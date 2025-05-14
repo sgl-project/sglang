@@ -104,22 +104,6 @@ def update_expert_weights_single_layer(
                 buffer2weight_copy_infos.append((src_expert_location, dst_expert_location))
                 return
 
-        all_src_ranks = _deduplicate_ordered([
-            x // num_local_physical_experts
-            for x in range(num_physical_experts) if old_physical_to_logical_map[x] == logical_expert_id
-        ])
-        all_src_nodes = [x // num_gpu_per_node for x in all_src_ranks]
-        self_node_src_ranks = [x for x in all_src_ranks if x // num_gpu_per_node == self_node_id]
-
-        need_comm_dst_ranks = _deduplicate_ordered([
-            x // num_local_physical_experts
-            for x in range(num_physical_experts) if new_physical_to_logical_map[x] == logical_expert_id
-            and x // num_local_physical_experts not in all_src_ranks
-        ])
-        need_comm_self_node_dst_ranks = [x for x in need_comm_dst_ranks if x // num_gpu_per_node == self_node_id]
-        need_comm_cross_node_dst_ranks = [x for x in need_comm_dst_ranks if
-                                          (x // num_gpu_per_node) not in all_src_nodes]
-
         # case 4: same-node
         if rank in need_comm_self_node_dst_ranks:
             chosen_src_rank = _ChunkUtils.chunk_value_from_element_value(
@@ -141,6 +125,25 @@ def update_expert_weights_single_layer(
             p2p_op_infos.append((TODO, TODO))
         buffer2weight_copy_infos.append((TODO, TODO))
 
+    def _compute_comm_info(logical_expert_id: int):
+        all_src_ranks = _deduplicate_ordered([
+            x // num_local_physical_experts
+            for x in range(num_physical_experts) if old_physical_to_logical_map[x] == logical_expert_id
+        ])
+        all_src_nodes = [x // num_gpu_per_node for x in all_src_ranks]
+        self_node_src_ranks = [x for x in all_src_ranks if x // num_gpu_per_node == self_node_id]
+
+        need_comm_dst_ranks = _deduplicate_ordered([
+            x // num_local_physical_experts
+            for x in range(num_physical_experts) if new_physical_to_logical_map[x] == logical_expert_id
+            and x // num_local_physical_experts not in all_src_ranks
+        ])
+        need_comm_self_node_dst_ranks = [x for x in need_comm_dst_ranks if x // num_gpu_per_node == self_node_id]
+        need_comm_cross_node_dst_ranks = [x for x in need_comm_dst_ranks if
+                                          (x // num_gpu_per_node) not in all_src_nodes]
+
+        return all_src_ranks, self_node_src_ranks, need_comm_self_node_dst_ranks, need_comm_cross_node_dst_ranks
+    
     _entrypoint()
 
 
