@@ -130,7 +130,21 @@ def update_expert_weights_single_layer(
 
     def _handle_isend(src_expert_location: int, p2p_op_infos):
         logical_expert_id = old_physical_to_logical_map[src_expert_location]
-       
+
+        all_src_ranks, self_node_src_ranks, need_comm_self_node_dst_ranks, need_comm_cross_node_dst_ranks = _compute_comm_info(
+            logical_expert_id=logical_expert_id)
+
+        # a. same-node
+        chosen_dst_ranks = _ChunkUtils.element_values_from_chunk_value(
+            chunk_values=self_node_src_ranks,
+            element_values=need_comm_self_node_dst_ranks,
+            chunk_value=rank,
+        )
+        TODO
+
+        # b. cross-node
+        TODO
+
     def _compute_comm_info(logical_expert_id: int):
         all_src_ranks = _deduplicate_ordered([
             x // num_local_physical_experts
@@ -156,6 +170,10 @@ def update_expert_weights_single_layer(
 class _ChunkUtils:
     @staticmethod
     def chunk_value_from_element_value(chunk_values: List, element_values: List, element_value):
+        return TODO
+
+    @staticmethod
+    def element_values_from_chunk_value(chunk_values: List, element_values: List, chunk_value) -> List:
         return TODO
 
 
