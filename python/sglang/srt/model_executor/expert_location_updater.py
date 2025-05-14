@@ -114,12 +114,12 @@ def update_expert_weights_single_layer(
         _create_p2p_recv_and_buffer2weight_copy(buffer2weight_copy_infos, p2p_op_infos, src_rank=chosen_src_rank)
         return
 
-    def _create_p2p_recv_and_buffer2weight_copy(buffer2weight_copy_infos, p2p_op_infos):
+    def _create_p2p_recv_and_buffer2weight_copy(buffer2weight_copy_infos, p2p_op_infos, *, src_rank: int):
         p2p_op_infos.append((TODO, [
             P2POp(
                 op=TODO,
-                tensor=TODO,
-                peer=TODO,
+                tensor=routed_experts_weights[i][to_local(TODO)],
+                peer=src_rank,
             )
             for i in range(num_tensors)
         ]))
