@@ -1103,7 +1103,7 @@ async def benchmark(
     lora_names: List[str],
     extra_request_body: Dict[str, Any],
     profile: bool,
-    pd_seperated: bool = False,
+    pd_separated: bool = False,
     flush_cache: bool = False,
     warmup_requests: int = 1,
 ):
@@ -1239,12 +1239,14 @@ async def benchmark(
 
     if "sglang" in backend:
         server_info = requests.get(base_url + "/get_server_info")
-        if pd_seperated:
-            accept_length = server_info.json()["decode"][0].get(
+        if pd_separated:
+            accept_length = server_info.json()["decode"][0]["internal_states"][0].get(
                 "avg_spec_accept_length", None
             )
         else:
-            accept_length = server_info.json().get("avg_spec_accept_length", None)
+            accept_length = server_info.json()["internal_states"][0].get(
+                "avg_spec_accept_length", None
+            )
     else:
         accept_length = None
 
@@ -1263,7 +1265,7 @@ async def benchmark(
     print("{:<40} {:<10}".format("Traffic request rate:", request_rate))
     print(
         "{:<40} {:<10}".format(
-            "Max reqeuest concurrency:",
+            "Max request concurrency:",
             max_concurrency if max_concurrency else "not set",
         )
     )
@@ -1541,7 +1543,7 @@ def run_benchmark(args_: argparse.Namespace):
             lora_names=args.lora_name,
             extra_request_body=extra_request_body,
             profile=args.profile,
-            pd_seperated=args.pd_seperated,
+            pd_separated=args.pd_separated,
             flush_cache=args.flush_cache,
         )
     )
@@ -1720,7 +1722,7 @@ if __name__ == "__main__":
         help="Suffix applied to the end of all user prompts, followed by assistant prompt suffix.",
     )
     parser.add_argument(
-        "--pd-seperated",
+        "--pd-separated",
         action="store_true",
         help="Benchmark PD disaggregation server",
     )

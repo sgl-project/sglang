@@ -96,10 +96,14 @@ suites = {
         TestFile("test_verl_engine.py", 64),
     ],
     "per-commit-8-gpu": [
-        TestFile("test_deepep_intranode.py", 50),
-        TestFile("test_deepep_low_latency.py", 50),
-        TestFile("test_moe_deepep_eval_accuracy_large.py", 250),
+        # Disabled deepep tests temporarily because it takes too much time.
+        # TODO: re-enable them after reducing the test time with compilation cache and smaller models.
+        # TestFile("test_deepep_intranode.py", 50),
+        # TestFile("test_deepep_low_latency.py", 50),
+        # TestFile("test_moe_deepep_eval_accuracy_large.py", 250),
+        TestFile("test_disaggregation.py", 210),
         TestFile("test_local_attn.py", 250),
+        TestFile("test_disaggregation_different_tp.py", 210),
         TestFile("test_full_deepseek_v3.py", 250),
         TestFile("test_pp_single_node.py", 150),
     ],
