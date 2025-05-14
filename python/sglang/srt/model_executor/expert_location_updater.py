@@ -132,7 +132,14 @@ def update_expert_weights_single_layer(
             buffer2weight_copy_infos.append((TODO, TODO))
 
         # case 5: cross-node
-        TODO
+        chosen_src_rank = _ChunkUtils.chunk_value_from_element_value(
+            chunk_values=all_src_ranks,
+            element_values=need_comm_cross_node_dst_ranks,
+            element_value=rank,
+        )
+        for i in range(len(routed_experts_weights)):
+            p2p_op_infos.append((TODO, TODO))
+        buffer2weight_copy_infos.append((TODO, TODO))
 
     _entrypoint()
 
