@@ -75,6 +75,7 @@ class TestEPLBMisc(CustomTestCase):
                 enable_deepep_moe=True,
                 deepep_mode="normal",
                 disable_cuda_graph=True,
+                expert_distribution_recorder_mode="stat",
                 tp_size=2,
                 dp_size=2,
                 log_level="info",
@@ -88,7 +89,7 @@ class TestEPLBMisc(CustomTestCase):
             )
             self._assert_engine_generate_correct(engine)
 
-            print(f"Action: eplb_save_expert_distribution")
+            print(f"Action: dump_expert_distribution_record")
             engine.dump_expert_distribution_record()
             snapshot_path = list(Path(tmp_dir).glob("*.pt"))[0]
             assert snapshot_path is not None
