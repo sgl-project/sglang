@@ -1,11 +1,12 @@
+import os
 import traceback
 import unittest
 
 import torch
 import torch.multiprocessing as mp
-from python.sglang.test.test_utils import find_available_port
 from sglang.srt.model_executor import expert_location_updater
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import find_available_port
 from sglang.utils import is_in_ci
 from torch.multiprocessing import Process
 
