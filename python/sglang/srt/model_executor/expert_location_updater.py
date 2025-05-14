@@ -59,6 +59,15 @@ def update_expert_weights_single_layer(
         if old_physical_to_logical_map[dst_expert_location] == logical_expert_id:
             continue
 
+        # case 2: same-gpu
+        for src_expert_location in range(
+            rank * num_local_physical_experts,
+            (rank + 1) * num_local_physical_experts,
+        ):
+            if old_physical_to_logical_map[src_expert_location] == logical_expert_id:
+                TODO
+                break
+
         TODO
 
     for src_expert_location in range(
