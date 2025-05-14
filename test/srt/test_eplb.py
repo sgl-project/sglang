@@ -87,6 +87,7 @@ class TestEPLBMisc(CustomTestCase):
                 **engine_kwargs,
                 disable_overlap_schedule=True,
             )
+            engine.start_expert_distribution_record()
             self._assert_engine_generate_correct(engine)
 
             print(f"Action: dump_expert_distribution_record")
