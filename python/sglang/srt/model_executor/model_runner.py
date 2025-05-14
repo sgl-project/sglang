@@ -545,7 +545,7 @@ class ModelRunner:
 
     def update_expert_location(self, new_expert_location_metadata: ExpertLocationMetadata):
         expert_location_updater.update_expert_location(self.model.routed_experts_weights_of_layer,
-                                                       new_expert_location_metadata)
+                                                       new_expert_location_metadata, self.tp_rank)
 
     def update_weights_from_disk(
         self, model_path: str, load_format: str, param_categories: Optional[List[str]]
