@@ -32,6 +32,8 @@ def _update_expert_weights(
     temp_buffers = create_temp_buffers(next(iter(routed_experts_weights_of_layer.values())))
 
     world_size = torch.distributed.get_world_size()
+    num_local_physical_experts = old_expert_location_metadata.num_local_physical_experts
+    num_gpu_per_node = world_size // nnodes
 
     for layer_id in sorted(routed_experts_weights_of_layer.keys()):
         update_expert_weights_single_layer(
@@ -39,8 +41,8 @@ def _update_expert_weights(
             temp_buffers=temp_buffers,
             old_physical_to_logical_map=old_expert_location_metadata.physical_to_logical_map[layer_id],
             new_physical_to_logical_map=new_expert_location_metadata.physical_to_logical_map[layer_id],
-            num_local_physical_experts=old_expert_location_metadata.num_local_physical_experts,
-            num_gpu_per_node=world_size // nnodes,
+            num_local_physical_experts=num_local_physical_experts,
+            num_gpu_per_node=num_gpu_per_node,
             rank=rank,
         )
 
