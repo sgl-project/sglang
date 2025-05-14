@@ -148,8 +148,14 @@ def update_expert_weights_single_layer(
         cross_node_dst_ranks = cross_node_mapping.element_values_from_chunk_value(chunk_value=rank)
         all_dst_ranks = same_node_dst_ranks + cross_node_dst_ranks
 
-        p2p_op_infos.append((TODO, [
-            TODO for i in range(num_tensors)
+        p2p_op_infos.append((logical_expert_id, [
+            P2POp(
+                op=torch.distributed.isend,
+                tensor=routed_experts_weights[i][to_local(TODO)],
+                peer=dst_rank,
+            )
+            for dst_rank in all_dst_ranks
+            for i in range(num_tensors)
         ]))
 
     def _compute_comm_info(logical_expert_id: int):
