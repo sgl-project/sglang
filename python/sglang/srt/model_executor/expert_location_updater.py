@@ -113,8 +113,9 @@ def update_expert_weights_single_layer(
             for x in range(num_physical_experts) if new_physical_to_logical_map[x] == logical_expert_id
             and x // num_local_physical_experts not in all_src_ranks
         ])
-
         need_comm_self_node_dst_ranks = [x for x in need_comm_dst_ranks if x // num_gpu_per_node == self_node_id]
+        need_comm_cross_node_dst_ranks = [x for x in need_comm_dst_ranks if
+                                          (x // num_gpu_per_node) not in all_src_nodes]
 
         # case 4: same-node
         TODO
