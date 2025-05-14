@@ -305,7 +305,7 @@ def compute_logical_to_rank_dispatch_physical_map(
     )
     logical_to_rank_dispatch_physical_map = torch.gather(logical_to_all_physical_map, dim=2,
                                                          index=chosen_index.unsqueeze(-1)).squeeze(-1)
-    print(f"hi {logical_to_rank_dispatch_physical_map.shape=}")
+    assert logical_to_rank_dispatch_physical_map.shape == output_shape
 
     for index in range(logical_to_all_physical_map_num_valid.max() + 1):
         partial_logical_to_all_physical_map = logical_to_all_physical_map[:, :, index]
