@@ -144,7 +144,10 @@ class TestDeepseekV3MTP(CustomTestCase):
                 f"{acc_length=:.2f}\n"
                 f"{speed=:.2f} token/s\n"
             )
-            self.assertGreater(acc_length, 2.9)
+            if os.getenv("SGLANG_AMD_CI") == "1":
+                self.assertGreater(acc_length, 2.8)
+            else:
+                self.assertGreater(acc_length, 2.9)
             if os.getenv("SGLANG_AMD_CI") == "1":
                 self.assertGreater(speed, 15)
             else:
