@@ -50,6 +50,8 @@ def update_expert_weights_single_layer(
     num_physical_experts, = old_physical_to_logical_map.shape
     num_gpu_per_node = TODO
 
+    self_node_id = rank // num_gpu_per_node
+
     old_physical_to_logical_map = old_physical_to_logical_map.tolist()
     new_physical_to_logical_map = new_physical_to_logical_map.tolist()
 
@@ -105,6 +107,7 @@ def update_expert_weights_single_layer(
             if old_physical_to_logical_map[x] == logical_expert_id
         ])
         all_src_nodes = [x // num_gpu_per_node for x in all_src_ranks]
+        self_node_src_ranks = [x for x in all_src_ranks if x // num_gpu_per_node == self_node_id]
 
         # case 4: same-node
         TODO
