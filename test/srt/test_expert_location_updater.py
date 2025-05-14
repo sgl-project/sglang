@@ -141,6 +141,7 @@ def _execute_test(info: _TestInfo, rank: int, num_gpus: int, device: str):
     if rank == 0:
         print(f"Test: {num_gpus=} {info=}", flush=True)
 
+    assert info.num_physical_experts % num_gpus == 0
     num_local_physical_experts = info.num_physical_experts // num_gpus
     assert num_gpus % info.nnodes == 0
     num_gpu_per_node = num_gpus // info.nnodes
