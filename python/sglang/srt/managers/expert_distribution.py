@@ -74,7 +74,7 @@ class ExpertDistributionRecorder:
     def stop_record(self):
         self._on_not_implemented()
 
-    def dump_record(self, output_mode: _OutputMode):
+    def dump_record(self, output_mode: _OutputMode = "file"):
         self._on_not_implemented()
 
     def _on_not_implemented(self):
