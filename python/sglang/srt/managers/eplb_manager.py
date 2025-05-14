@@ -1,6 +1,8 @@
 import logging
+import time
 from typing import TYPE_CHECKING
 
+import torch.cuda
 from sglang.srt.managers.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.managers.expert_location import (
     ExpertLocationMetadata,
@@ -29,8 +31,14 @@ class EPLBManager:
             self.rebalance()
 
     async def rebalance(self):
-        logger.info("rebalance start")
+        logger.info("[EPLBManager] rebalance start")
+        torch.cuda.synchronize()
+        time_start = time.time()
+
         logical_count = get_global_expert_distribution_recorder().dump_record(output_mode="object")["logical_count"]
         expert_location_metadata = ExpertLocationMetadata.init_by_eplb(self._server_args, logical_count)
         self._model_runner.update_expert_location(expert_location_metadata)
-        logger.info("rebalance end")
+
+        torch.cuda.synchronize()
+        time_end = time.time()
+        logger.info(f"[EPLBManager] rebalance end time={time_end - time_start:.3f}s")
