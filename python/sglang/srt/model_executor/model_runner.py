@@ -211,23 +211,24 @@ class ModelRunner:
             enable=self.server_args.enable_memory_saver
         )
 
-        set_global_expert_location_metadata(
-            compute_initial_expert_location_metadata(server_args, self.model_config)
-        )
-        if self.tp_rank == 0 and get_bool_env_var(
-            "SGLANG_LOG_EXPERT_LOCATION_METADATA"
-        ):
-            logger.info(
-                f"Initial expert_location_metadata: {get_global_expert_location_metadata().debug_str()}"
+        if not self.is_draft_worker:
+            set_global_expert_location_metadata(
+                compute_initial_expert_location_metadata(server_args, self.model_config)
             )
+            if self.tp_rank == 0 and get_bool_env_var(
+                "SGLANG_LOG_EXPERT_LOCATION_METADATA"
+            ):
+                logger.info(
+                    f"Initial expert_location_metadata: {get_global_expert_location_metadata().debug_str()}"
+                )
 
-        set_global_expert_distribution_recorder(
-            ExpertDistributionRecorder.init_new(
-                server_args,
-                get_global_expert_location_metadata(),
-                rank=self.tp_rank,
+            set_global_expert_distribution_recorder(
+                ExpertDistributionRecorder.init_new(
+                    server_args,
+                    get_global_expert_location_metadata(),
+                    rank=self.tp_rank,
+                )
             )
-        )
 
         # Load the model
         self.sampler = Sampler()
