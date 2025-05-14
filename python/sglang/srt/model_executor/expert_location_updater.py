@@ -95,6 +95,9 @@ def update_expert_weights_single_layer(
                 buffer2weight_copy_infos.append((src_expert_location, dst_expert_location))
                 return
 
+        all_src_ranks = _deduplicate_ordered(
+            [x // num_expert_per_gpu for x in old_log2phy_all[logical_expert_id] if x != -1])
+
         # case 4: same-node
         TODO
 
@@ -102,3 +105,10 @@ def update_expert_weights_single_layer(
         TODO
 
     _entrypoint()
+
+
+def _deduplicate_ordered(arr: List[int]):
+    output = []
+    for item in arr:
+        TODO
+    return output
