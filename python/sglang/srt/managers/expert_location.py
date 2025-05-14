@@ -267,7 +267,7 @@ def _compute_logical_to_all_physical_map(
         logical_to_all_physical_map, pad_value=-1
     )
 
-    return torch.tensor(logical_to_all_physical_map)
+    return torch.tensor(logical_to_all_physical_map, device=physical_to_logical_map.device)
 
 
 def _pad_nested_array(arr, pad_value):
