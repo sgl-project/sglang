@@ -4,7 +4,6 @@ from typing import List, Optional
 
 import torch
 import triton
-
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
 from sglang.srt.utils import (
@@ -32,14 +31,14 @@ import triton.language as tl
 
 @triton.jit
 def deepep_permute_triton_kernel(
-    input_ptr,
-    gateup_input_ptr,
-    src2dst_ptr,
-    topk_ids_ptr,
-    a1_scales_ptr,
-    topk,
-    hidden_size,
-    BLOCK_SIZE: tl.constexpr,
+        input_ptr,
+        gateup_input_ptr,
+        src2dst_ptr,
+        topk_ids_ptr,
+        a1_scales_ptr,
+        topk,
+        hidden_size,
+        BLOCK_SIZE: tl.constexpr,
 ):
     OutDtype = gateup_input_ptr.dtype.element_ty
 
@@ -63,14 +62,14 @@ def deepep_permute_triton_kernel(
 
 @triton.jit
 def deepep_post_reorder_triton_kernel(
-    down_output_ptr,
-    output_ptr,
-    src2dst_ptr,
-    topk_ids_ptr,
-    topk_weights_ptr,
-    topk,
-    hidden_size,
-    BLOCK_SIZE: tl.constexpr,
+        down_output_ptr,
+        output_ptr,
+        src2dst_ptr,
+        topk_ids_ptr,
+        topk_weights_ptr,
+        topk,
+        hidden_size,
+        BLOCK_SIZE: tl.constexpr,
 ):
     InDtype = down_output_ptr.dtype.element_ty
 
@@ -96,7 +95,7 @@ def deepep_post_reorder_triton_kernel(
 
 @triton.jit
 def compute_src2dst_triton_kernel(
-    reorder_ids, src2dst, num_toks, BLOCK_SIZE: tl.constexpr
+        reorder_ids, src2dst, num_toks, BLOCK_SIZE: tl.constexpr
 ):
     pid = tl.program_id(axis=0)
     dst_id = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -107,7 +106,7 @@ def compute_src2dst_triton_kernel(
 
 @triton.jit
 def deepep_compute_src2dst_triton_kernel(
-    reorder_ids, src2dst, num_toks, num_minus_one, BLOCK_SIZE: tl.constexpr
+        reorder_ids, src2dst, num_toks, num_minus_one, BLOCK_SIZE: tl.constexpr
 ):
     pid = tl.program_id(axis=0)
     dst_id = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -175,16 +174,16 @@ def run_moe_ep_preproess(topk_ids: torch.Tensor, num_experts: int):
 
 @triton.jit
 def pre_reorder_triton_kernel(
-    input_ptr,
-    gateup_input_ptr,
-    src2dst_ptr,
-    topk_ids_ptr,
-    a1_scales_ptr,
-    start_expert_id,
-    end_expert_id,
-    topk,
-    hidden_size,
-    BLOCK_SIZE: tl.constexpr,
+        input_ptr,
+        gateup_input_ptr,
+        src2dst_ptr,
+        topk_ids_ptr,
+        a1_scales_ptr,
+        start_expert_id,
+        end_expert_id,
+        topk,
+        hidden_size,
+        BLOCK_SIZE: tl.constexpr,
 ):
     OutDtype = gateup_input_ptr.dtype.element_ty
 
@@ -213,14 +212,14 @@ def pre_reorder_triton_kernel(
 
 @triton.jit
 def silu_and_mul_triton_kernel(
-    gateup_output,
-    down_input,
-    hidden_size,
-    reorder_topk_ids,
-    scales,
-    start_expert_id,
-    end_expert_id,
-    BLOCK_SIZE: tl.constexpr,
+        gateup_output,
+        down_input,
+        hidden_size,
+        reorder_topk_ids,
+        scales,
+        start_expert_id,
+        end_expert_id,
+        BLOCK_SIZE: tl.constexpr,
 ):
     InDtype = gateup_output.dtype.element_ty
     OutDtype = down_input.dtype.element_ty
@@ -260,24 +259,24 @@ def silu_and_mul_triton_kernel(
 # copy from https://github.com/ModelTC/lightllm/blob/a000ab69098654df4731f5b12587dd4e7f0a4f41/lightllm/common/fused_moe/moe_silu_and_mul_mix_quant_ep.py
 @triton.jit
 def _silu_and_mul_post_quant_kernel(
-    input_ptr,
-    stride_input_0,
-    stride_input_1,
-    stride_input_2,
-    output_ptr,
-    stride_output_0,
-    stride_output_1,
-    stride_output_2,
-    output_scale_ptr,
-    stride_output_scale_0,
-    stride_output_scale_1,
-    stride_output_scale_2,
-    masked_m_ptr,
-    size_n,
-    fp8_max,
-    fp8_min,
-    BLOCK_N: tl.constexpr,
-    NUM_STAGE: tl.constexpr,
+        input_ptr,
+        stride_input_0,
+        stride_input_1,
+        stride_input_2,
+        output_ptr,
+        stride_output_0,
+        stride_output_1,
+        stride_output_2,
+        output_scale_ptr,
+        stride_output_scale_0,
+        stride_output_scale_1,
+        stride_output_scale_2,
+        masked_m_ptr,
+        size_n,
+        fp8_max,
+        fp8_min,
+        BLOCK_N: tl.constexpr,
+        NUM_STAGE: tl.constexpr,
 ):
     expert_id = tl.program_id(2)
     token_id = tl.program_id(1)
@@ -296,13 +295,13 @@ def _silu_and_mul_post_quant_kernel(
     input_ptr_offs = input_ptr + expert_id * stride_input_0 + offs_in_d
     output_ptr_offs = output_ptr + expert_id * stride_output_0 + offs_in_d
     output_scale_offs = (
-        output_scale_ptr
-        + expert_id * stride_output_scale_0
-        + hidden_dim_block_index * stride_output_scale_2
+            output_scale_ptr
+            + expert_id * stride_output_scale_0
+            + hidden_dim_block_index * stride_output_scale_2
     )
 
     for token_index in tl.range(
-        token_id, token_num_cur_expert, block_num_per_expert, num_stages=NUM_STAGE
+            token_id, token_num_cur_expert, block_num_per_expert, num_stages=NUM_STAGE
     ):
         gate = tl.load(
             input_ptr_offs + token_index * stride_input_1,
@@ -334,11 +333,11 @@ def _silu_and_mul_post_quant_kernel(
 
 
 def silu_and_mul_masked_post_quant_fwd(
-    input: torch.Tensor,
-    output: torch.Tensor,
-    output_scale: torch.Tensor,
-    quant_group_size: int,
-    masked_m: torch.Tensor,
+        input: torch.Tensor,
+        output: torch.Tensor,
+        output_scale: torch.Tensor,
+        quant_group_size: int,
+        masked_m: torch.Tensor,
 ):
     """
     input shape [expert_num, token_num_padded, hidden_dim]
@@ -406,14 +405,14 @@ def tanh(x):
 
 @triton.jit
 def gelu_and_mul_triton_kernel(
-    gateup_output,
-    down_input,
-    hidden_size,
-    reorder_topk_ids,
-    scales,
-    start_expert_id,
-    end_expert_id,
-    BLOCK_SIZE: tl.constexpr,
+        gateup_output,
+        down_input,
+        hidden_size,
+        reorder_topk_ids,
+        scales,
+        start_expert_id,
+        end_expert_id,
+        BLOCK_SIZE: tl.constexpr,
 ):
     InDtype = gateup_output.dtype.element_ty
     OutDtype = down_input.dtype.element_ty
@@ -446,18 +445,18 @@ def gelu_and_mul_triton_kernel(
             # sqrt(2/pi)
             kAlpha = 0.7978845608028654
             gate_output = (
-                0.5
-                * gate_output
-                * (
-                    1
-                    + tanh(
+                    0.5
+                    * gate_output
+                    * (
+                            1
+                            + tanh(
                         kAlpha
                         * (
-                            gate_output
-                            + 0.044715 * gate_output * gate_output * gate_output
+                                gate_output
+                                + 0.044715 * gate_output * gate_output * gate_output
                         )
                     )
-                )
+                    )
             )
             gate_output = gate_output.to(InDtype)
 
@@ -468,16 +467,16 @@ def gelu_and_mul_triton_kernel(
 
 @triton.jit
 def post_reorder_triton_kernel(
-    down_output_ptr,
-    output_ptr,
-    src2dst_ptr,
-    topk_ids_ptr,
-    topk_weights_ptr,
-    start_expert_id,
-    end_expert_id,
-    topk,
-    hidden_size,
-    BLOCK_SIZE: tl.constexpr,
+        down_output_ptr,
+        output_ptr,
+        src2dst_ptr,
+        topk_ids_ptr,
+        topk_weights_ptr,
+        start_expert_id,
+        end_expert_id,
+        topk,
+        hidden_size,
+        BLOCK_SIZE: tl.constexpr,
 ):
     InDtype = down_output_ptr.dtype.element_ty
 
@@ -515,12 +514,12 @@ def post_reorder_triton_kernel(
 
 @triton.jit
 def compute_m_range(
-    pid,
-    batch_size,
-    seg_indptr,
-    weight_indices,
-    m_num_tiles_indptr,
-    BLOCK_SIZE_M: tl.constexpr,
+        pid,
+        batch_size,
+        seg_indptr,
+        weight_indices,
+        m_num_tiles_indptr,
+        BLOCK_SIZE_M: tl.constexpr,
 ):
     idx = 0
     for bs in range(batch_size):
@@ -538,31 +537,31 @@ def compute_m_range(
 
 @triton.jit
 def grouped_gemm_triton_kernel(
-    a,
-    b,
-    c,
-    batch_size,
-    N,
-    K,
-    seg_indptr,
-    weight_indices,
-    m_num_tiles_indptr,
-    scale_a,
-    scale_b,
-    use_fp8_w8a8: tl.constexpr,
-    group_n: tl.constexpr,
-    group_k: tl.constexpr,
-    a_stride_0: tl.constexpr,
-    b_stride_0: tl.constexpr,
-    b_stride_1: tl.constexpr,
-    as_stride_0: tl.constexpr,
-    as_stride_1: tl.constexpr,
-    bs_stride_0: tl.constexpr,
-    bs_stride_2: tl.constexpr,
-    bs_stride_1: tl.constexpr,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
+        a,
+        b,
+        c,
+        batch_size,
+        N,
+        K,
+        seg_indptr,
+        weight_indices,
+        m_num_tiles_indptr,
+        scale_a,
+        scale_b,
+        use_fp8_w8a8: tl.constexpr,
+        group_n: tl.constexpr,
+        group_k: tl.constexpr,
+        a_stride_0: tl.constexpr,
+        b_stride_0: tl.constexpr,
+        b_stride_1: tl.constexpr,
+        as_stride_0: tl.constexpr,
+        as_stride_1: tl.constexpr,
+        bs_stride_0: tl.constexpr,
+        bs_stride_2: tl.constexpr,
+        bs_stride_1: tl.constexpr,
+        BLOCK_SIZE_M: tl.constexpr,
+        BLOCK_SIZE_N: tl.constexpr,
+        BLOCK_SIZE_K: tl.constexpr,
 ):
     c_dtype = c.dtype.element_ty
 
@@ -592,9 +591,9 @@ def grouped_gemm_triton_kernel(
 
     a_ptr = a + (m_range_start + offs_am[:, None]) * a_stride_0 + offs_k[None, :]
     b_ptr = b + (
-        (expert_id * b_stride_0)
-        + (n_range_start + offs_bn[:, None]) * b_stride_1
-        + offs_k[None, :]
+            (expert_id * b_stride_0)
+            + (n_range_start + offs_bn[:, None]) * b_stride_1
+            + offs_k[None, :]
     )
 
     if group_k > 0 and group_n > 0:
@@ -638,7 +637,7 @@ def grouped_gemm_triton_kernel(
 
 @triton.jit
 def compute_m_num_tiles_indptr(
-    m_num_tiles_indptr, seg_indptr, batch_size: tl.constexpr, BLOCK_SIZE_M: tl.constexpr
+        m_num_tiles_indptr, seg_indptr, batch_size: tl.constexpr, BLOCK_SIZE_M: tl.constexpr
 ):
     for bs in range(batch_size):
         m = tl.load(seg_indptr + bs + 1) - tl.load(seg_indptr + bs)
@@ -648,17 +647,17 @@ def compute_m_num_tiles_indptr(
 
 
 def grouped_gemm_triton(
-    a: MaybeDisposibleTensor,
-    b: torch.Tensor,
-    c: MaybeTensorCreator,
-    batch_size: int,
-    weight_column_major: bool,
-    seg_indptr: Optional[torch.Tensor] = None,
-    weight_indices: Optional[torch.Tensor] = None,
-    use_fp8_w8a8: bool = False,
-    scale_a: torch.Tensor = None,
-    scale_b: torch.Tensor = None,
-    block_shape: Optional[List[int]] = None,
+        a: MaybeDisposibleTensor,
+        b: torch.Tensor,
+        c: MaybeTensorCreator,
+        batch_size: int,
+        weight_column_major: bool,
+        seg_indptr: Optional[torch.Tensor] = None,
+        weight_indices: Optional[torch.Tensor] = None,
+        use_fp8_w8a8: bool = False,
+        scale_a: torch.Tensor = None,
+        scale_b: torch.Tensor = None,
+        block_shape: Optional[List[int]] = None,
 ):
     assert weight_column_major == True  # TODO: more
     if use_fp8_w8a8 and block_shape is None:
@@ -681,9 +680,8 @@ def grouped_gemm_triton(
         assert triton.cdiv(a.shape[-1], block_k) == scale_a.shape[-1]
         assert triton.cdiv(b.shape[-2], block_n) == scale_b.shape[-2]
         assert triton.cdiv(b.shape[-1], block_k) == scale_b.shape[-1]
-    else:
-        # TODO temp, will refactor
-        a = DisposibleTensor.maybe_unwrap(a)
+
+    a = DisposibleTensor.maybe_unwrap(a)
 
     # TODO: adjust config or tune kernel
     # Reduce block size to prevent L40 shared memory overflow.
@@ -735,12 +733,12 @@ def grouped_gemm_triton(
 
 @triton.jit
 def _fwd_kernel_ep_scatter_1(
-    num_recv_tokens_per_expert,
-    expert_start_loc,
-    m_indices,
-    num_experts: tl.constexpr,
-    BLOCK_E: tl.constexpr,
-    BLOCK_EXPERT_NUM: tl.constexpr,
+        num_recv_tokens_per_expert,
+        expert_start_loc,
+        m_indices,
+        num_experts: tl.constexpr,
+        BLOCK_E: tl.constexpr,
+        BLOCK_EXPERT_NUM: tl.constexpr,
 ):
     cur_expert = tl.program_id(0)
 
@@ -768,31 +766,31 @@ def _fwd_kernel_ep_scatter_1(
 
 @triton.jit
 def _fwd_kernel_ep_scatter_2(
-    total_token_num,
-    expert_start_loc,
-    recv_x,
-    recv_x_stride0,
-    recv_x_stride1,
-    recv_x_scale,
-    recv_x_scale_stride0,
-    recv_x_scale_stride1,
-    recv_topk,
-    recv_topk_stride0,
-    recv_topk_stride1,
-    output_tensor,
-    output_tensor_stride0,
-    output_tensor_stride1,
-    output_tensor_scale,
-    output_tensor_scale_stride0,
-    output_tensor_scale_stride1,
-    output_index,
-    output_index_stride0,
-    output_index_stride1,
-    topk_num: tl.constexpr,
-    HIDDEN_SIZE: tl.constexpr,
-    HIDDEN_SIZE_PAD: tl.constexpr,
-    SCALE_HIDDEN_SIZE: tl.constexpr,
-    SCALE_HIDDEN_SIZE_PAD: tl.constexpr,
+        total_token_num,
+        expert_start_loc,
+        recv_x,
+        recv_x_stride0,
+        recv_x_stride1,
+        recv_x_scale,
+        recv_x_scale_stride0,
+        recv_x_scale_stride1,
+        recv_topk,
+        recv_topk_stride0,
+        recv_topk_stride1,
+        output_tensor,
+        output_tensor_stride0,
+        output_tensor_stride1,
+        output_tensor_scale,
+        output_tensor_scale_stride0,
+        output_tensor_scale_stride1,
+        output_index,
+        output_index_stride0,
+        output_index_stride1,
+        topk_num: tl.constexpr,
+        HIDDEN_SIZE: tl.constexpr,
+        HIDDEN_SIZE_PAD: tl.constexpr,
+        SCALE_HIDDEN_SIZE: tl.constexpr,
+        SCALE_HIDDEN_SIZE_PAD: tl.constexpr,
 ):
     start_token_id = tl.program_id(0)
     grid_num = tl.num_programs(0)
@@ -818,10 +816,10 @@ def _fwd_kernel_ep_scatter_2(
                     dest_token_index,
                 )
                 output_tensor_ptr = (
-                    output_tensor + dest_token_index * output_tensor_stride0
+                        output_tensor + dest_token_index * output_tensor_stride0
                 )
                 output_tensor_scale_ptr = (
-                    output_tensor_scale + dest_token_index * output_tensor_scale_stride0
+                        output_tensor_scale + dest_token_index * output_tensor_scale_stride0
                 )
                 tl.store(output_tensor_ptr + offset_in, to_copy, mask=mask)
                 tl.store(output_tensor_scale_ptr + offset_in_s, to_copy_s, mask=mask_s)
@@ -830,15 +828,15 @@ def _fwd_kernel_ep_scatter_2(
 # copy from https://github.com/ModelTC/lightllm/blob/main/lightllm/common/fused_moe/deepep_scatter_gather.py
 @torch.no_grad()
 def ep_scatter(
-    recv_x: torch.Tensor,
-    recv_x_scale: torch.Tensor,
-    recv_topk: torch.Tensor,
-    num_recv_tokens_per_expert: torch.Tensor,
-    expert_start_loc: torch.Tensor,
-    output_tensor: torch.Tensor,
-    output_tensor_scale: torch.Tensor,
-    m_indices: torch.Tensor,
-    output_index: torch.Tensor,
+        recv_x: torch.Tensor,
+        recv_x_scale: torch.Tensor,
+        recv_topk: torch.Tensor,
+        num_recv_tokens_per_expert: torch.Tensor,
+        expert_start_loc: torch.Tensor,
+        output_tensor: torch.Tensor,
+        output_tensor_scale: torch.Tensor,
+        m_indices: torch.Tensor,
+        output_index: torch.Tensor,
 ):
     BLOCK_E = 128  # token num of per expert is aligned to 128
     BLOCK_D = 128  # block size of quantization
@@ -947,24 +945,24 @@ def ep_scatter(
 
 @triton.jit
 def _fwd_kernel_ep_gather(
-    total_token_num,
-    input_tensor,
-    input_tensor_stride0,
-    input_tensor_stride1,
-    recv_topk_ids,
-    recv_topk_ids_stride0,
-    recv_topk_ids_stride1,
-    recv_topk_weight,
-    recv_topk_weight_stride0,
-    recv_topk_weight_stride1,
-    input_index,
-    input_index_stride0,
-    input_index_stride1,
-    output_tensor,
-    output_tensor_stride0,
-    output_tensor_stride1,
-    topk_num: tl.constexpr,
-    BLOCK_D: tl.constexpr,
+        total_token_num,
+        input_tensor,
+        input_tensor_stride0,
+        input_tensor_stride1,
+        recv_topk_ids,
+        recv_topk_ids_stride0,
+        recv_topk_ids_stride1,
+        recv_topk_weight,
+        recv_topk_weight_stride0,
+        recv_topk_weight_stride1,
+        input_index,
+        input_index_stride0,
+        input_index_stride1,
+        output_tensor,
+        output_tensor_stride0,
+        output_tensor_stride1,
+        topk_num: tl.constexpr,
+        BLOCK_D: tl.constexpr,
 ):
     cur_block = tl.program_id(0)
     start_cur_token = tl.program_id(1)
@@ -1003,11 +1001,11 @@ def _fwd_kernel_ep_gather(
 
 @torch.no_grad()
 def ep_gather(
-    input_tensor: torch.Tensor,
-    recv_topk_ids: torch.Tensor,
-    recv_topk_weight: torch.Tensor,
-    input_index: torch.Tensor,
-    output_tensor: torch.Tensor,
+        input_tensor: torch.Tensor,
+        recv_topk_ids: torch.Tensor,
+        recv_topk_weight: torch.Tensor,
+        input_index: torch.Tensor,
+        output_tensor: torch.Tensor,
 ):
     BLOCK_D = 1024  # block size of quantization
     num_warps = 2
@@ -1062,15 +1060,15 @@ def get_tma_aligned_size(x: int, element_size: int) -> int:
 
 @triton.jit
 def _tma_align_input_scale_kernel(
-    input_scale_ptr,
-    output_ptr,
-    m,
-    k_div_block_size,
-    input_scale_stride_m,
-    input_scale_stride_k,
-    output_stride_m,
-    output_stride_k,
-    BLOCK_SIZE_K: tl.constexpr,
+        input_scale_ptr,
+        output_ptr,
+        m,
+        k_div_block_size,
+        input_scale_stride_m,
+        input_scale_stride_k,
+        output_stride_m,
+        output_stride_k,
+        BLOCK_SIZE_K: tl.constexpr,
 ):
     pid_m = tl.program_id(axis=0)
     grid_m = tl.num_programs(0)
@@ -1078,14 +1076,14 @@ def _tma_align_input_scale_kernel(
 
     for m_base in range(pid_m, m, grid_m):
         input_offset = (
-            input_scale_ptr
-            + m_base * input_scale_stride_m
-            + k_offsets * input_scale_stride_k
+                input_scale_ptr
+                + m_base * input_scale_stride_m
+                + k_offsets * input_scale_stride_k
         )
         input_data = tl.load(input_offset, mask=k_offsets < k_div_block_size)
 
         output_offset = (
-            output_ptr + k_offsets * output_stride_k + m_base * output_stride_m
+                output_ptr + k_offsets * output_stride_k + m_base * output_stride_m
         )
         tl.store(output_offset, input_data, mask=k_offsets < k_div_block_size)
 
