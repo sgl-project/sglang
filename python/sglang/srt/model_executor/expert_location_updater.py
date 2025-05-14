@@ -208,7 +208,12 @@ class _ChunkUtils:
 
     @staticmethod
     def _chunk_index_from_element_index(num_elements: int, num_chunks: int, element_index: int) -> int:
-        return TODO
+        short_chunk_size, num_long_chunks = divmod(num_elements, num_chunks)
+        num_elements_for_long_chunks = num_long_chunks * (short_chunk_size + 1)
+        if element_index < num_elements_for_long_chunks:
+            return element_index // (short_chunk_size + 1)
+        else:
+            return num_long_chunks + (element_index - num_elements_for_long_chunks) // short_chunk_size
 
     @staticmethod
     def _element_slice_from_chunk_index(num_elements: int, num_chunks: int, chunk_index: int) -> slice:
