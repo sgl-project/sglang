@@ -309,7 +309,7 @@ def _maybe_compile_deep_gemm_one_type_all(
         logger.info(
             f"DeepGEMM Loading/Compiling libs for "
             f"<{kernel_helper.name}> N={n}, K={k}, num_groups={num_groups}, num_sms={num_sms}."
-            f"{' It only takes a litte time (typically 1 sec) if you have run `python3 -m sglang.compile_deep_gemm`. ' if not _IN_PRECOMPILE_STAGE else ''}"
+            f"{' It only takes a little time (typically 1 sec) if you have run `python3 -m sglang.compile_deep_gemm`. ' if not _IN_PRECOMPILE_STAGE else ''}"
         )
 
         collected_configs = set()
