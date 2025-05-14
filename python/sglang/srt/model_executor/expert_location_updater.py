@@ -55,7 +55,10 @@ def update_expert_weights_single_layer(
     ):
         TODO
 
-    for src_expert_location in range(TODO, TODO):
+    for src_expert_location in range(
+        rank * num_local_physical_experts,
+        (rank + 1) * num_local_physical_experts,
+    ):
         TODO
 
     reqs = torch.distributed.batch_isend_irecv(TODO)
