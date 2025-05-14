@@ -197,15 +197,30 @@ def get_embedding_chunk(
     extend_prefix_len: int,
     extend_seq_len: int,
     items_offset: List[Tuple[int, int]],
-) -> torch.Tensor:
+) -> Tuple[torch.Tensor, int, int]:
     """
-    Extract embedding chunk according to [extend_prefix_len, extend_prefix_len + extend_seq_len - 1]
-    and items_offset, items_offset records list of each items [start, end] offset in origin_input_ids in a request
-    it is used for chunk prefill for multimodal items
+    Extract a chunk of embeddings based on the specified prefix length, sequence length, and offset ranges.
+
+    Args:
+        embedding: The full embedding tensor to extract a chunk from
+        extend_prefix_len: The starting position (prefix length) for extraction
+        extend_seq_len: The number of tokens to extract
+        items_offset: List of [start, end] offset ranges for multimodal items in the input sequence
+
+    Returns:
+        A tuple containing:
+        - The extracted embedding chunk as a tensor
+        - The start index used for extraction
+        - The end index used for extraction
+
+    Note:
+        If there's no overlap between the requested range and the offset ranges,
+        an empty tensor is returned with zeros for start and end indices.
     """
     start_index, end_index = 0, 0
     extend_start_index = extend_prefix_len
     extend_end_index = extend_prefix_len + extend_seq_len - 1
+
     for start, end in items_offset:
         if extend_start_index >= start and extend_start_index <= end:
             start_index += extend_start_index - start
@@ -231,12 +246,28 @@ def get_embedding_and_mask(
     prefix_length: List[int],
     extend_length: List[int],
     items_offset_list: List[List[Tuple[int, int]]],
-):
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Get the multimodal embedding and its mask from input_ids
-        Args:
-            items_size: the number of items for each request
-            items_offset_list: list of [start, end] offset for each item in a request
+    Generate multimodal embeddings and create a mask for identifying their positions in the input sequence.
+
+    Args:
+        data_embedding_func: Function that generates embeddings for multimodal items
+        embedding_items: List of multimodal items to embed
+        placeholder_tensor: Tensor containing token IDs that serve as placeholders for multimodal content
+        input_ids: The input token IDs tensor
+        items_size: Cumulative sizes of multimodal items per request
+        prefix_length: Prefix lengths for each request
+        extend_length: Sequence lengths for each request
+        items_offset_list: List of offset ranges for multimodal items in each request
+
+    Returns:
+        A tuple containing:
+        - The generated embeddings tensor
+        - A boolean mask tensor indicating where these embeddings should be placed
+
+    Raises:
+        AssertionError: If the number of multimodal tokens in input_ids doesn't match
+                        the number of tokens in the generated embeddings
     """
     # 1. Get the embedding
     #    Calculate embedding for each request, try to get it from cache to avoid repeated calculation
@@ -250,7 +281,11 @@ def get_embedding_and_mask(
         embedding_per_req = embedding_cache.get(embedding_items_hash)
         if embedding_per_req is None:
             embedding_per_req = data_embedding_func(embedding_items_per_req)
-            embedding_cache.put(embedding_items_hash, embedding_per_req)
+            if not embedding_cache.put(embedding_items_hash, embedding_per_req):
+                print_warning_once(
+                    "Multimodal embedding cache is full. Consider increasing the "
+                    "`SGLANG_VLM_CACHE_SIZE_MB` environment variable."
+                )
 
         embedding_per_req_chunk, _, end_index = get_embedding_chunk(
             embedding=embedding_per_req,
@@ -271,6 +306,7 @@ def get_embedding_and_mask(
     ).unsqueeze(-1)
 
     num_mm_tokens_in_input_ids = special_multimodal_mask.sum()
+
     assert (
         num_mm_tokens_in_input_ids == num_mm_tokens_in_embedding
     ), f"expected {num_mm_tokens_in_input_ids}, got {num_mm_tokens_in_embedding}"
@@ -292,14 +328,20 @@ def embed_mm_inputs(
     placeholder_tokens: dict[Modality, List[int]] = None,
 ) -> Optional[torch.Tensor]:
     """
-    Calculate the multimodal embeddings if necessary, then scatter the result with the help of a boolean mask denoting the embed locations
+    Embed multimodal inputs and integrate them with text token embeddings.
 
-        Args:
-            placeholder_tokens: denoting the token of multimodal data in input_ids.
-                If none, the pad_values of multimodal items are used
+    Args:
+        mm_inputs_list: List of multimodal inputs to process
+        extend_prefix_lens: Prefix lengths for each request
+        extend_seq_lens: Sequence lengths for each request
+        input_ids: Input token IDs tensor
+        input_embedding: Embedding layer for text tokens
+        image_data_embedding_func: Function to embed image data
+        audio_data_embedding_func: Function to embed audio data
+        placeholder_tokens: Token IDs for multimodal placeholders (uses pad_values if None)
 
-        Returns:
-            final embedding: Optional[torch.Tensor]
+    Returns:
+        Combined embedding tensor with multimodal content integrated
     """
 
     if mm_inputs_list is None:
@@ -428,16 +470,19 @@ def general_mm_embed_routine(
     **kwargs,
 ) -> torch.Tensor:
     """
-    A general wrapper function to get final input embeds from multimodal models with a language model as causal model
+    Process multimodal inputs and forward through language model.
 
-        Args:
-            placeholder_token_ids (List[int]): the ids of mm data placeholder tokens
-            image_data_embedding_func : the function returning the image embedding
-            audio_data_embedding_func : the function returning the image embedding
+    Args:
+        input_ids: Input token IDs tensor
+        forward_batch: Batch information for model forward pass
+        language_model: Base language model to use
+        image_data_embedding_func: Function to embed image data
+        audio_data_embedding_func: Function to embed audio data
+        placeholder_tokens: Token IDs for multimodal placeholders
+        **kwargs: Additional arguments passed to language model
 
-        Returns:
-            forwarded hidden states
-
+    Returns:
+        Hidden states from language model forward pass
     """
 
     assert hasattr(language_model, "get_input_embeddings")
