@@ -245,6 +245,8 @@ class _ChunkUtils:
         return self.chunk_values[chunk_index]
 
     def element_values_from_chunk_value(self, chunk_value) -> List:
+        if len(self.element_values) == 0:
+            return []
         element_slice = self._element_slice_from_chunk_index(
             num_elements=len(self.element_values),
             num_chunks=len(self.chunk_values),
