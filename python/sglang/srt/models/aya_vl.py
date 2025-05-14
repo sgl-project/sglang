@@ -476,4 +476,4 @@ class AyaVisionCohereForCausalLM(AyaVisionBaseForCausalLM):
         logger.info("Weight loading complete.")
 
 
-EntryClass = AyaVisionCohereForCausalLM 
+EntryClass = AyaVisionCohereForCausalLM
