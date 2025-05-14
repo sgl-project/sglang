@@ -44,6 +44,7 @@ class TestEPLBEndToEnd(CustomTestCase):
                 "50",
                 "--expert-distribution-recorder-buffer-size",
                 "50",
+                "--enable-expert-distribution-metrics",
             ],
         )
 
@@ -79,6 +80,7 @@ class TestEPLBMisc(CustomTestCase):
                 tp_size=2,
                 dp_size=2,
                 log_level="info",
+                enable_expert_distribution_metrics=True,
             )
 
             print(f"Action: start engine")
