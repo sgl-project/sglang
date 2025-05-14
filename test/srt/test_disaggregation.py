@@ -63,8 +63,10 @@ class TestDisaggregationMooncake(CustomTestCase):
             cls.base_host,
             "--port",
             str(cls.base_port + 100),
-            "--tp",
+            "--base-gpu-id",
             "4",
+            "--tp",
+            "2",
         ]
         cls.process_prefill = popen_launch_pd_server(
             cls.model,
@@ -83,10 +85,10 @@ class TestDisaggregationMooncake(CustomTestCase):
             cls.base_host,
             "--port",
             str(cls.base_port + 200),
-            "--tp",
-            "4",
             "--base-gpu-id",
-            "4",
+            "6",
+            "--tp",
+            "2",
         ]
         cls.process_decode = popen_launch_pd_server(
             cls.model,
@@ -113,13 +115,12 @@ class TestDisaggregationMooncake(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        import torch
-
-        for device in range(8):
-            torch.cuda.set_device(device)
-            torch.cuda.empty_cache()
-
-        subprocess.run(["pkill -9 -f 'sglang|python.*launch_server'"], shell=True)
+        for process in [cls.process_lb, cls.process_decode, cls.process_prefill]:
+            if process:
+                try:
+                    kill_process_tree(process.pid)
+                except Exception as e:
+                    print(f"Error killing process {process.pid}: {e}")
 
     def test_gsm8k(self):
         args = SimpleNamespace(
