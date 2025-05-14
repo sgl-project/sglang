@@ -181,16 +181,18 @@ def _execute_test(info: _TestInfo, rank: int, num_gpus: int, device: str):
             global_output_logs = [None] * num_gpus
             torch.distributed.gather_object(output_logs, global_output_logs, dst=0)
 
-        # output_logs_str = "\n".join(output_logs)
-        # raise AssertionError(
-        #     f"{rank=} {num_gpus=} {info=}\n"
-        #     f"routed_experts_weights[i]={x.tolist()}\n"
-        #     f"expect_new_weights[i]={y.tolist()}\n"
-        #     f"old_physical_to_logical_map={physical_to_logical_map.tolist()}\n"
-        #     f"new_physical_to_logical_map={new_physical_to_logical_map.tolist()}\n"
-        #     f"===logs===\n"
-        #     f"{output_logs_str}"
-        # )
+            output_logs_str = "\n".join(output_logs)
+            msg = (
+                f"{rank=} {num_gpus=} {info=}\n"
+                f"routed_experts_weights[i]={x.tolist()}\n"
+                f"expect_new_weights[i]={y.tolist()}\n"
+                f"old_physical_to_logical_map={physical_to_logical_map.tolist()}\n"
+                f"new_physical_to_logical_map={new_physical_to_logical_map.tolist()}\n"
+                f"===logs===\n"
+                f"{output_logs_str}"
+            )
+
+            raise AssertionError("Error happens. See logs above.")
 
         physical_to_logical_map = new_physical_to_logical_map
 
