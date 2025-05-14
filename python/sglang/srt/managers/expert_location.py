@@ -189,6 +189,7 @@ class ExpertLocationMetadata:
                 logical_to_all_physical_map_num_valid=logical_to_all_physical_map_num_valid,
                 num_gpus=ep_size,
                 num_physical_experts=num_physical_experts,
+                rank=rank,
             ),
         )
 
@@ -286,6 +287,7 @@ def compute_logical_to_rank_dispatch_physical_map(
     logical_to_all_physical_map_num_valid: torch.Tensor,
     num_gpus: int,
     num_physical_experts: int,
+    rank: int,
     seed: int = 42,
 ):
     g = torch.Generator()
@@ -305,7 +307,7 @@ def compute_logical_to_rank_dispatch_physical_map(
     for index in range(logical_to_all_physical_map_num_valid.max() + 1):
         partial_logical_to_all_physical_map = logical_to_all_physical_map[:, :, index]
         is_valid = partial_logical_to_all_physical_map != -1
-        is_same_gpu = partial_logical_to_all_physical_map // num_local_physical_experts == self_gpu_id
+        is_same_gpu = partial_logical_to_all_physical_map // num_local_physical_experts == rank
         logical_to_rank_dispatch_physical_map.masked_fill_(is_valid & is_same_gpu, partial_logical_to_all_physical_map)
 
     assert torch.all(logical_to_rank_dispatch_physical_map != -1)
