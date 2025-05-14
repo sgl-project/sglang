@@ -7,6 +7,7 @@ from sglang.srt.model_executor import expert_location_updater
 from sglang.test.test_utils import CustomTestCase
 from sglang.utils import is_in_ci
 from torch.multiprocessing import Process
+from tqdm import tqdm
 
 
 class TestExpertLocationUpdater(CustomTestCase):
@@ -90,7 +91,7 @@ def _run_subprocess(
         physical_to_logical_map = _create_physical_to_logical_map()
         routed_experts_weights = _create_routed_experts_weights(physical_to_logical_map)
 
-        for _ in range(5000):
+        for _ in tqdm(range(5000)):
             new_physical_to_logical_map = _create_physical_to_logical_map()
             expect_new_weights = _create_routed_experts_weights(new_physical_to_logical_map)
 
@@ -99,6 +100,9 @@ def _run_subprocess(
                 temp_buffers=expert_location_updater.create_temp_buffers(routed_experts_weights),
                 old_physical_to_logical_map=physical_to_logical_map,
                 new_physical_to_logical_map=new_physical_to_logical_map,
+                num_local_physical_experts=TDOO,
+                num_gpu_per_node=TDOO,
+                rank=TDOO,
             )
             assert all(torch.all(x == y) for x, y in zip(routed_experts_weights, expect_new_weights, strict=True))
 
