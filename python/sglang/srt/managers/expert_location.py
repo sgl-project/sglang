@@ -185,7 +185,8 @@ class ExpertLocationMetadata:
             logical_to_all_physical_map=logical_to_all_physical_map_padded,
             logical_to_all_physical_map_num_valid=logical_to_all_physical_map_num_valid,
             logical_to_rank_dispatch_physical_map=compute_logical_to_rank_dispatch_physical_map(
-                logical_to_all_physical_map,
+                logical_to_all_physical_map=logical_to_all_physical_map,
+                logical_to_all_physical_map_num_valid=logical_to_all_physical_map_num_valid,
                 num_gpus=ep_size,
                 num_physical_experts=num_physical_experts,
             ),
@@ -279,19 +280,30 @@ def _pad_nested_array(arr, pad_value):
     return padded
 
 
-# This is rarely called, so we use for loops for maximum clarity
+# TODO use more sophisticated approaches
 def compute_logical_to_rank_dispatch_physical_map(
     logical_to_all_physical_map: torch.Tensor,
+    logical_to_all_physical_map_num_valid: torch.Tensor,
     num_gpus: int,
     num_physical_experts: int,
     seed: int = 42,
 ):
-    r = random.Random(seed)
+    g = torch.Generator()
+    g.manual_seed(seed)
+
     device = logical_to_all_physical_map.device
 
     num_local_physical_experts = num_physical_experts // num_gpus
     num_layers, num_logical_experts, _ = logical_to_all_physical_map.shape
     dtype = logical_to_all_physical_map.dtype
+
+    chosen_index = (
+        torch.randint(0, 65536, (num_layers, num_logical_experts), dtype=torch.int32, device=device, generator=g)
+        % logical_to_all_physical_map_num_valid
+    )
+    logical_to_rank_dispatch_physical_map = logical_to_all_physical_map[chosen_index]
+
+    #################################################################
 
     logical_to_rank_dispatch_physical_map = torch.full(
         size=(num_gpus, num_layers, num_logical_experts),
