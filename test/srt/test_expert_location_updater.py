@@ -180,7 +180,7 @@ def _execute_test(info: _TestInfo, rank: int, num_gpus: int, device: str):
         if global_has_error.cpu().item():
             output_logs_str = "\n".join(output_logs)
             local_message = (
-                f"===================== rank {rank} ============================"
+                f"===================== rank {rank} ============================\n"
                 f"{num_gpus=} {info=}\n"
                 f"{routed_experts_weights[0].tolist()=}\n"
                 f"{expect_new_weights[0].tolist()=}\n"
@@ -188,14 +188,15 @@ def _execute_test(info: _TestInfo, rank: int, num_gpus: int, device: str):
                 f"{new_physical_to_logical_map.tolist()=}\n"
                 f"===logs===\n"
                 f"{output_logs_str}\n"
-                f"=============================================================="
+                f"==============================================================\n"
             )
 
             global_messages = ([None] * num_gpus) if rank == 0 else None
             torch.distributed.gather_object(local_message, global_messages, dst=0)
 
-            msg = "\n\n".join(global_messages) if rank == 0 else "(see rank 0)"
-            raise AssertionError(f"Error happens:\n{msg}")
+            if rank == 0:
+                print("\n\n".join(global_messages), flush=True)
+            raise AssertionError(f"Error happens, see logs above")
 
         physical_to_logical_map = new_physical_to_logical_map
 
