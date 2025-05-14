@@ -1204,6 +1204,7 @@ class GGUFModelLoader(BaseModelLoader):
         # only load the gguf module when needed
         try:
             import gguf
+
             from sglang.srt.model_loader.utils import check_gguf_version
 
             check_gguf_version(version=getattr(gguf, "__version__", None))
