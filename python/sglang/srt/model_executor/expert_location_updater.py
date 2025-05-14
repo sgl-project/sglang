@@ -49,18 +49,17 @@ def update_expert_weights_single_layer(
     old_physical_to_logical_map = old_physical_to_logical_map.tolist()
     new_physical_to_logical_map = new_physical_to_logical_map.tolist()
 
+    local_expert_location_range = (
+        rank * num_local_physical_experts,
+        (rank + 1) * num_local_physical_experts,
+    )
+
     def _entrypoint():
-        for dst_expert_location in range(
-            rank * num_local_physical_experts,
-            (rank + 1) * num_local_physical_experts,
-        ):
+        for dst_expert_location in range(*local_expert_location_range):
             _handle_dst_expert_location(dst_expert_location=dst_expert_location)
             TODO
 
-        for src_expert_location in range(
-            rank * num_local_physical_experts,
-            (rank + 1) * num_local_physical_experts,
-        ):
+        for src_expert_location in range(*local_expert_location_range):
             logical_expert_id = old_physical_to_logical_map[src_expert_location]
             TODO
 
@@ -79,10 +78,7 @@ def update_expert_weights_single_layer(
             return
 
         # case 2: same-gpu
-        for src_expert_location in range(
-            rank * num_local_physical_experts,
-            (rank + 1) * num_local_physical_experts,
-        ):
+        for src_expert_location in range(*local_expert_location_range):
             if old_physical_to_logical_map[src_expert_location] == logical_expert_id:
                 TODO
                 return
