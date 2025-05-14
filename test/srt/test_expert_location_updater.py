@@ -35,6 +35,10 @@ class TestExpertLocationUpdater(CustomTestCase):
             infos=[_TestInfo(nnodes=4, num_logical_experts=256, num_physical_experts=288, num_repeat=10000)],
 
         )
+
+    def test_cpu_slow(self):
+        if is_in_ci():
+            return
         self._test_core(
             num_gpus=144,
             device="cpu",
