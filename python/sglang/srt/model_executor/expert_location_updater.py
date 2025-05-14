@@ -83,7 +83,8 @@ def update_expert_weights_single_layer(
         # case 2: same-gpu
         for src_expert_location in range(*local_expert_location_range):
             if old_physical_to_logical_map[src_expert_location] == logical_expert_id:
-                TODO_do_copy
+                for i in range(len(routed_experts_weights)):
+                    temp_buffers[i][TODO].copy_(routed_experts_weights[i][TODO])
                 copy_back_infos.append((dst_expert_location, dst_expert_location))
                 return
 
