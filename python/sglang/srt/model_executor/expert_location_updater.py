@@ -163,7 +163,7 @@ def update_expert_weights_single_layer(
         p2p_op_infos.append((logical_expert_id, [
             P2POp(
                 op=torch.distributed.irecv,
-                tensor=_get_tensor(routed_experts_weights, i, dst_expert_location),
+                tensor=_get_tensor(temp_buffers, i, dst_expert_location),
                 peer=src_rank,
             )
             for i in range(num_tensors)
