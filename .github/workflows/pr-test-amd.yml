@@ -25,7 +25,10 @@ jobs:
   accuracy-test-1-gpu-amd:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
       github.event.pull_request.draft == false
-    runs-on: linux-mi300-gpu-1
+    strategy:
+      matrix:
+        runner: [linux-mi300-gpu-1, linux-mi325-gpu-1]
+    runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -38,12 +41,12 @@ jobs:
           else
             DEVICE_FLAG="--device /dev/dri"
           fi
-          docker pull ghcr.io/saienduri/sglang-aiter-v0.1.1:428
+          docker pull lmsysorg/sglang:v0.4.6.post3-rocm630
           docker run -dt --user root --device=/dev/kfd $DEVICE_FLAG \
             -v ${{ github.workspace }}:/sglang-checkout --ipc=host --group-add video \
             --cap-add=SYS_PTRACE -e HF_TOKEN=${HF_TOKEN} --security-opt seccomp=unconfined \
             -w /sglang-checkout --name ci_sglang \
-            ghcr.io/saienduri/sglang-aiter-v0.1.1:428
+            lmsysorg/sglang:v0.4.6.post3-rocm630
 
       - name: Install dependencies
         run: |
@@ -65,7 +68,10 @@ jobs:
   accuracy-test-2-gpu-amd:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false
-    runs-on: linux-mi300-gpu-2
+    strategy:
+      matrix:
+        runner: [linux-mi300-gpu-2, linux-mi325-gpu-2]
+    runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -78,12 +84,12 @@ jobs:
           else
             DEVICE_FLAG="--device /dev/dri"
           fi
-          docker pull ghcr.io/saienduri/sglang-aiter-v0.1.1:428
+          docker pull lmsysorg/sglang:v0.4.6.post3-rocm630
           docker run -dt --user root --device=/dev/kfd $DEVICE_FLAG \
             -v ${{ github.workspace }}:/sglang-checkout --ipc=host --group-add video \
             --cap-add=SYS_PTRACE -e HF_TOKEN=${HF_TOKEN} --security-opt seccomp=unconfined \
             -w /sglang-checkout --name ci_sglang \
-            ghcr.io/saienduri/sglang-aiter-v0.1.1:428
+            lmsysorg/sglang:v0.4.6.post3-rocm630
 
       - name: Install dependencies
         run: |
@@ -103,7 +109,10 @@ jobs:
   mla-test-1-gpu-amd:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
       github.event.pull_request.draft == false
-    runs-on: linux-mi300-gpu-1
+    strategy:
+      matrix:
+        runner: [linux-mi300-gpu-1, linux-mi325-gpu-1]
+    runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -116,12 +125,12 @@ jobs:
           else
             DEVICE_FLAG="--device /dev/dri"
           fi
-          docker pull ghcr.io/saienduri/sglang-aiter-v0.1.1:428
+          docker pull lmsysorg/sglang:v0.4.6.post3-rocm630
           docker run -dt --user root --device=/dev/kfd $DEVICE_FLAG \
             -v ${{ github.workspace }}:/sglang-checkout --ipc=host --group-add video \
             --cap-add=SYS_PTRACE -e HF_TOKEN=${{ secrets.AMD_HF_TOKEN }} --security-opt seccomp=unconfined \
             -w /sglang-checkout --name ci_sglang \
-            ghcr.io/saienduri/sglang-aiter-v0.1.1:428
+            lmsysorg/sglang:v0.4.6.post3-rocm630
 
       - name: Install dependencies
         run: |
@@ -141,7 +150,10 @@ jobs:
   performance-test-1-gpu-part-1-amd:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false
-    runs-on: linux-mi300-gpu-1
+    strategy:
+      matrix:
+        runner: [linux-mi300-gpu-1, linux-mi325-gpu-1]
+    runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -154,12 +166,12 @@ jobs:
           else
             DEVICE_FLAG="--device /dev/dri"
           fi
-          docker pull ghcr.io/saienduri/sglang-aiter-v0.1.1:428
+          docker pull lmsysorg/sglang:v0.4.6.post3-rocm630
           docker run -dt --user root --device=/dev/kfd $DEVICE_FLAG \
             -v ${{ github.workspace }}:/sglang-checkout --ipc=host --group-add video \
             --cap-add=SYS_PTRACE -e HF_TOKEN=${HF_TOKEN} --security-opt seccomp=unconfined \
             -w /sglang-checkout --name ci_sglang \
-            ghcr.io/saienduri/sglang-aiter-v0.1.1:428
+            lmsysorg/sglang:v0.4.6.post3-rocm630
 
       - name: Install dependencies
         run: |
@@ -200,7 +212,10 @@ jobs:
   performance-test-1-gpu-part-2-amd:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false
-    runs-on: linux-mi300-gpu-1
+    strategy:
+      matrix:
+        runner: [linux-mi300-gpu-1, linux-mi325-gpu-1]
+    runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -213,12 +228,12 @@ jobs:
           else
             DEVICE_FLAG="--device /dev/dri"
           fi
-          docker pull ghcr.io/saienduri/sglang-aiter-v0.1.1:428
+          docker pull lmsysorg/sglang:v0.4.6.post3-rocm630
           docker run -dt --user root --device=/dev/kfd $DEVICE_FLAG \
             -v ${{ github.workspace }}:/sglang-checkout --ipc=host --group-add video \
             --cap-add=SYS_PTRACE -e HF_TOKEN=${HF_TOKEN} --security-opt seccomp=unconfined \
             -w /sglang-checkout --name ci_sglang \
-            ghcr.io/saienduri/sglang-aiter-v0.1.1:428
+            lmsysorg/sglang:v0.4.6.post3-rocm630
 
       - name: Install dependencies
         run: |
@@ -248,7 +263,10 @@ jobs:
   bench-test-2-gpu-amd:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
       github.event.pull_request.draft == false
-    runs-on: linux-mi300-gpu-2
+    strategy:
+      matrix:
+        runner: [linux-mi300-gpu-2, linux-mi325-gpu-2]
+    runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -261,12 +279,12 @@ jobs:
           else
             DEVICE_FLAG="--device /dev/dri"
           fi
-          docker pull ghcr.io/saienduri/sglang-aiter-v0.1.1:428
+          docker pull lmsysorg/sglang:v0.4.6.post3-rocm630
           docker run -dt --user root --device=/dev/kfd $DEVICE_FLAG \
             -v ${{ github.workspace }}:/sglang-checkout --ipc=host --group-add video \
             --cap-add=SYS_PTRACE -e HF_TOKEN=${HF_TOKEN} --security-opt seccomp=unconfined \
             -w /sglang-checkout --name ci_sglang \
-            ghcr.io/saienduri/sglang-aiter-v0.1.1:428
+            lmsysorg/sglang:v0.4.6.post3-rocm630
 
       - name: Install dependencies
         run: |

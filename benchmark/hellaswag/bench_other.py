@@ -57,7 +57,7 @@ def main(args):
                 context=few_shot_examples + questions[i], choices=choices[i]
             )
 
-        tic = time.time()
+        tic = time.perf_counter()
         if args.parallel == 1:
             for i in tqdm(range(len(questions))):
                 get_one_answer(i)
@@ -82,10 +82,10 @@ def main(args):
                 for j in range(len(rets)):
                     preds[i + j] = rets[j]
 
-        tic = time.time()
+        tic = time.perf_counter()
         asyncio.run(batched_call(batch_size=args.parallel))
 
-    latency = time.time() - tic
+    latency = time.perf_counter() - tic
 
     # Compute accuracy
     acc = np.mean(np.array(preds) == np.array(labels))
