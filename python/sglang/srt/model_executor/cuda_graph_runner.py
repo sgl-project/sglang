@@ -46,6 +46,9 @@ from sglang.srt.utils import (
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
+# Detect whether the current forward pass is in capture mode
+is_capture_mode = False
+
 
 def _to_torch(model: torch.nn.Module, reverse: bool, num_tokens: int):
     for sub in model._modules.values():
@@ -306,17 +309,13 @@ class CudaGraphRunner:
 
     @contextmanager
     def model_capture_mode(self):
-        if hasattr(self.model_runner.model, "capture_mode"):
-            self.model_runner.model.capture_mode = True
-        if hasattr(self.model_runner.token_to_kv_pool, "capture_mode"):
-            self.model_runner.token_to_kv_pool.capture_mode = True
+        global is_capture_mode
+        is_capture_mode = True
 
         yield
 
-        if hasattr(self.model_runner.model, "capture_mode"):
-            self.model_runner.model.capture_mode = False
-        if hasattr(self.model_runner.token_to_kv_pool, "capture_mode"):
-            self.model_runner.token_to_kv_pool.capture_mode = False
+        global is_capture_mode
+        is_capture_mode = False
 
     def can_run(self, forward_batch: ForwardBatch):
         if self.enable_dp_attention or self.enable_sp_layernorm:

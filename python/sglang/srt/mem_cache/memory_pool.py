@@ -38,6 +38,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.model_executor.cuda_graph_runner import is_capture_mode
 from sglang.srt.utils import debug_timing, get_compiler_backend
 
 logger = logging.getLogger(__name__)
@@ -238,7 +239,6 @@ class MHATokenToKVPool(KVCache):
         self.end_layer = end_layer or layer_num - 1
 
         self.layer_transfer_counter = None
-        self.capture_mode = False
         self.device_module = torch.get_device_module(self.device)
         self.alt_stream = self.device_module.Stream()
 
@@ -370,7 +370,7 @@ class MHATokenToKVPool(KVCache):
             cache_k = cache_k.view(self.store_dtype)
             cache_v = cache_v.view(self.store_dtype)
 
-        if self.capture_mode and cache_k.shape[0] < 4:
+        if is_capture_mode and cache_k.shape[0] < 4:
             # Overlap the copy of K and V cache for small batch size
             current_stream = self.device_module.current_stream()
             self.alt_stream.wait_stream(current_stream)

@@ -79,6 +79,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.managers.expert_distribution import ExpertDistributionRecorder
 from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.model_executor.cuda_graph_runner import is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import (
@@ -717,7 +718,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             k_nope = latent_cache[..., : self.kv_lora_rank]
 
             # overlap qk norm
-            if self.alt_stream is not None:
+            if self.alt_stream is not None and is_capture_mode:
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
                 q = self.q_a_layernorm(q)

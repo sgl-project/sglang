@@ -34,6 +34,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.managers.schedule_batch import MultimodalInputs
+from sglang.srt.model_executor.cuda_graph_runner import is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaDecoderLayer, LlamaMLP
@@ -836,7 +837,6 @@ class MllamaForConditionalGeneration(nn.Module):
             prefix="multi_modal_projector",
         )
         self.logits_processor = LogitsProcessor(config.text_config)
-        self.capture_mode = False
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         pixel_values = torch.cat(
@@ -978,7 +978,7 @@ class MllamaForConditionalGeneration(nn.Module):
         cross_attention_mask = None
         cross_attention_states = None
 
-        if self.capture_mode:
+        if is_capture_mode:
             # NOTE: when doing cuda graph capture, we do not want to skip cross attention
             # Make is a constant value to avoid cuda graph capture issue
             skip_cross_attention = False
