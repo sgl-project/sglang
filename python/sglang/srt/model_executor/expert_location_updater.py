@@ -59,6 +59,7 @@ def update_expert_weights_single_layer(
     num_local_physical_experts: int,
     num_gpu_per_node: int,
     rank: int,
+    debug: bool = False,
 ):
     assert all(tensor.shape[0] == num_local_physical_experts for tensor in routed_experts_weights)
 
