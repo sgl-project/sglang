@@ -36,7 +36,7 @@ class TestExpertLocationUpdater(CustomTestCase):
         self._test_core(
             num_gpus=144,
             device="cpu",
-            infos=[_TestInfo(nnodes=18, num_logical_experts=256, num_physical_experts=288, )],
+            infos=[_TestInfo(nnodes=18, num_logical_experts=256, num_physical_experts=288)],
         )
 
     def test_gpu(self):
