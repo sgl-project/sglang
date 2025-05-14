@@ -105,20 +105,20 @@ def update_expert_weights_single_layer(
         # case 4: same-node
         if rank in need_comm_self_node_dst_ranks:
             chosen_src_rank = same_node_mapping.chunk_value_from_element_value(element_value=rank)
-            p2p_op_infos.append((TODO, [
-                TODO for i in range(num_tensors)
-            ]))
-            buffer2weight_copy_infos.append((TODO, TODO))
+            _create_p2p_recv_and_buffer2weight_copy(buffer2weight_copy_infos, p2p_op_infos)
             return
 
         # case 5: cross-node
         # Future work: can optimize when there are multiple ranks in the same dst node that uses the same logical expert
         chosen_src_rank = cross_node_mapping.chunk_value_from_element_value(element_value=rank)
+        _create_p2p_recv_and_buffer2weight_copy(buffer2weight_copy_infos, p2p_op_infos)
+        return
+
+    def _create_p2p_recv_and_buffer2weight_copy(buffer2weight_copy_infos, p2p_op_infos):
         p2p_op_infos.append((TODO, [
             TODO for i in range(num_tensors)
         ]))
         buffer2weight_copy_infos.append((TODO, TODO))
-        return
 
     def _create_isend_ops(p2p_op_infos):
         logical_expert_ids = sorted(set(
