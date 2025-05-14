@@ -72,9 +72,7 @@ def update_expert_weights_single_layer(
 
         _create_isend_ops(p2p_op_infos)
 
-        reqs = torch.distributed.batch_isend_irecv(TODO)
-        for req in reqs:
-            req.wait()
+        _execute_p2p_ops(p2p_op_infos)
 
         for copy_back_info in TODO:
             TODO
@@ -167,6 +165,11 @@ def update_expert_weights_single_layer(
         )
 
         return same_node_mapping, cross_node_mapping, need_comm_self_node_dst_ranks
+
+    def _execute_p2p_ops(p2p_op_infos):
+        reqs = torch.distributed.batch_isend_irecv(TODO)
+        for req in reqs:
+            req.wait()
 
     _entrypoint()
 
