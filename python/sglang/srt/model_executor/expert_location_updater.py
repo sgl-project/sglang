@@ -40,12 +40,13 @@ def create_temp_buffers(sample_tensors):
 def update_expert_weights_single_layer(
     routed_experts_weights: List[torch.Tensor],
     temp_buffers: List[torch.Tensor],
-    old_physical_to_logical_map: torch.Tensor,  # (num_global_physical_Experts,)
-    new_physical_to_logical_map: torch.Tensor,  # (num_global_physical_Experts,)
+    old_physical_to_logical_map: torch.Tensor,  # (num_physical_Experts,)
+    new_physical_to_logical_map: torch.Tensor,  # (num_physical_Experts,)
     num_local_physical_experts: int,
     rank: int,
 ):
     assert all(tensor.shape[0] == num_local_physical_experts for tensor in routed_experts_weights)
+    num_physical_experts, = old_physical_to_logical_map.shape
     old_physical_to_logical_map = old_physical_to_logical_map.tolist()
     new_physical_to_logical_map = new_physical_to_logical_map.tolist()
 
@@ -95,8 +96,10 @@ def update_expert_weights_single_layer(
                 buffer2weight_copy_infos.append((src_expert_location, dst_expert_location))
                 return
 
-        all_src_ranks = _deduplicate_ordered(
-            [x // num_local_physical_experts for x in old_log2phy_all[logical_expert_id] if x != -1])
+        all_src_ranks = _deduplicate_ordered([
+            x // num_local_physical_experts
+            for x in range(num_physical_experts) if old_physical_to_logical_map[x] == logical_expert_id
+        ])
 
         # case 4: same-node
         TODO
