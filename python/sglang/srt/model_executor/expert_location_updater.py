@@ -65,7 +65,7 @@ def update_expert_weights_single_layer(
     def _entrypoint():
         # List[Tuple[logical_expert_id, List[P2POp]]]
         p2p_op_infos: List[Tuple[int, List[P2POp]]] = []
-        # List[Tuple[src_temp_buffers_expert_location, dst_routed_experts_weights_expert_location]]
+        # List[Tuple[temp_buffers_expert_location, routed_experts_weights_expert_location]]
         buffer2weight_copy_infos: List[Tuple[int, int]] = []
 
         _handle_recv(buffer2weight_copy_infos, p2p_op_infos)
@@ -193,10 +193,10 @@ def update_expert_weights_single_layer(
             req.wait()
 
     def _execute_buffer2weight_copies(buffer2weight_copy_infos):
-        for src_expert_location, dst_expert_location in buffer2weight_copy_infos:
+        for temp_buffers_expert_location, routed_experts_weights_expert_location in buffer2weight_copy_infos:
             for i in range(num_tensors):
-                routed_experts_weights[i][to_local(dst_expert_location)].copy_(
-                    temp_buffers[i][to_local(src_expert_location)])
+                routed_experts_weights[i][to_local(temp_buffers_expert_location)].copy_(
+                    temp_buffers[i][to_local(routed_experts_weights_expert_location)])
 
     _entrypoint()
 
