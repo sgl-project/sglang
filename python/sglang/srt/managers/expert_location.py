@@ -7,7 +7,6 @@ from typing import Optional
 import torch
 import torch.distributed
 import torch.nn.functional as F
-
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.managers import deepseek_eplb
 from sglang.srt.model_loader import get_model_architecture
@@ -112,7 +111,8 @@ class ExpertLocationMetadata:
 
         num_physical_experts = (
             model_config_for_expert_location.num_logical_experts
-            + server_args.ep_num_redundant_experts
+            # TODO pr-chain: enable this later
+            # + server_args.ep_num_redundant_experts
         )
         ep_size = server_args.ep_size
         assert num_physical_experts % ep_size == 0
