@@ -45,6 +45,8 @@ class HiPAttentionBackend(AttentionBackend):
 
         self.tp_rank = model_runner.tp_rank
 
+        self.attention_chunk_size = model_runner.attention_chunk_size
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         pass
 
@@ -132,6 +134,12 @@ class HiPAttentionBackend(AttentionBackend):
 
         q_reshaped = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
 
+        using_chunked_sw = False
+        sw_size = layer.sliding_window_size
+        if layer.use_irope:
+            using_chunked_sw = True
+            sw_size = self.attention_chunk_size
+
         o, _ = self.forward_paged_hip(
             query=q_reshaped,
             sm_scale=layer.scaling,
@@ -164,6 +172,8 @@ class HiPAttentionBackend(AttentionBackend):
             ),
             is_decode=False,
             offloading_metadata=offloading_metadata,
+            sliding_window_size=sw_size,
+            using_chunked_sliding_window=using_chunked_sw,
         )
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
@@ -220,6 +230,12 @@ class HiPAttentionBackend(AttentionBackend):
         k_reshaped = k.reshape(-1, layer.tp_k_head_num, layer.head_dim)
         v_reshaped = v.reshape(-1, layer.tp_v_head_num, layer.v_head_dim)
 
+        using_chunked_sw = False
+        sw_size = layer.sliding_window_size
+        if layer.use_irope:
+            using_chunked_sw = True
+            sw_size = self.attention_chunk_size
+
         o, metadata = self.forward_paged_hip(
             query=q_reshaped,
             sm_scale=layer.scaling,
@@ -251,16 +267,19 @@ class HiPAttentionBackend(AttentionBackend):
             ),
             is_decode=True,
             offloading_metadata=offloading_metadata,
+            sliding_window_size=sw_size,
+            using_chunked_sliding_window=using_chunked_sw,
         )
 
-        forward_batch.hip_metadata_cache_pool.set_hip_metadata_cache(
-            layer_id=layer.layer_id,
-            size=q.shape[0],
-            batch_size=forward_batch.batch_size,
-            metadata=metadata,
-        )
+        if metadata is not None:
+            forward_batch.hip_metadata_cache_pool.set_hip_metadata_cache(
+                layer_id=layer.layer_id,
+                size=q.shape[0],
+                batch_size=forward_batch.batch_size,
+                metadata=metadata,
+            )
 
-        if self.is_kv_cache_offload_enabled:
-            offload_cache.handle_cache_miss(metadata)
+            if self.is_kv_cache_offload_enabled:
+                offload_cache.handle_cache_miss(metadata)
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
