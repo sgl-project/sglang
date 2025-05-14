@@ -300,9 +300,10 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
             device=server_args.device,
         )
         self._misc_objects: List[Dict[str, Any]] = []
-        assert (
-            not server_args.enable_two_batch_overlap
-        ), "DetailSinglePassGatherer does not support TBO yet"
+        # TODO pr-chain: enable this later
+        # assert (
+        #     not server_args.enable_two_batch_overlap
+        # ), "DetailSinglePassGatherer does not support TBO yet"
         # TODO assert shared experts fusion is disabled, o/w data is wrong
 
     def on_forward_pass_start(self, forward_batch: ForwardBatch):
