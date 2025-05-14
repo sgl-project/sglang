@@ -63,7 +63,6 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `kv_cache_dtype` | Dtype of the kv cache. | `auto` |
 | `context_length` | The model's maximum context length. Defaults to None (will use the value from the model's config.json instead). Note that extending the default might lead to strange behavior. | None |
 | `device` | The device we put the model. | None |
-| `device` | The device we put the model. | None |
 | `served_model_name` | Override the model name returned by the v1/models endpoint in OpenAI API server.| None |
 | `is_embedding` | Set to `true` to perform [embedding](./openai_api_embeddings.ipynb) / [encode](https://docs.sglang.ai/backend/native_api#Encode-(embedding-model)) and [reward](https://docs.sglang.ai/backend/native_api#Classify-(reward-model)) tasks. | `False` |
 | `revision` | Adjust if a specific version of the model should be used. | None |
@@ -100,7 +99,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 
 | Arguments | Description | Defaults |
 |-----------|-------------|---------|
-| `dp_size` | Will be deprecated. The number of data-parallel copies of the model. [SGLang router](../router/router.md) is recommended instead of the current naive data parallel. | `1` |
+| `dp_size` | For non-DeepSeek models, this is the the number of data-parallel copies of the model. For DeepSeek models, this is the group size of [data parallel attention](https://docs.sglang.ai/references/deepseek.html#data-parallelism-attention) on DeepSeek models. | `1` |
 | `load_balance_method` | Will be deprecated. Load balancing strategy for data parallel requests. | `"round_robin"` |
 
 ### Expert parallelism
@@ -166,10 +165,11 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 
 ## Kernel backend
 
-| Arguments | Description | Defaults |
-|----------|-------------|---------|
-| `attention_backend` | This argument specifies the backend for attention computation and KV cache management, which can be `fa3`, `flashinfer`, `triton`, `cutlass_mla`, or `torch_native`. When deploying DeepSeek models, use this argument to specify the MLA backend. | None |
-| `sampling_backend` | Specifies the backend used for sampling. | None |
+| Arguments              | Description | Defaults |
+|------------------------|-------------|---------|
+| `attention_backend`    | This argument specifies the backend for attention computation and KV cache management, which can be `fa3`, `flashinfer`, `triton`, `cutlass_mla`, or `torch_native`. When deploying DeepSeek models, use this argument to specify the MLA backend. | None |
+| `sampling_backend`     | Specifies the backend used for sampling. | None |
+| `mm_attention_backend` | Set multimodal attention backend.
 
 ## Constrained Decoding
 
@@ -221,3 +221,4 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `triton_attention_num_kv_splits` | Use to adjust the number of KV splits in triton kernels. | `8` |
 | `flashinfer_mla_disable_ragged` | Disable the use of the [ragged prefill](https://github.com/flashinfer-ai/flashinfer/blob/5751fc68f109877f6e0fc54f674cdcdef361af56/docs/tutorials/kv_layout.rst#L26) wrapper for the FlashInfer MLA attention backend. Ragged prefill increases throughput by computing MHA instead of paged MLA when there is no prefix match. Only use it when FlashInfer is being used as the MLA backend. | `False` |
 | `disable_chunked_prefix_cache` | Disable the use of chunked prefix cache for DeepSeek models. Only use it when FA3 is attention backend. | `False` |
+| `enable_dp_lm_head` | Enable vocabulary parallel across the attention TP group to avoid all-gather across DP groups, optimizing performance under DP attention. | `False` |

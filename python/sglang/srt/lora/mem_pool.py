@@ -50,15 +50,15 @@ class LoRAMemoryPool:
         self.uid_to_buffer_id: Dict[Optional[str], int] = {}
 
         # Buffer idx -> lora uid in memory pool
-        # All uids are initalized as empty strings for empty buffer slots
-        # Here we don't initalize to None since None is a valid uid
+        # All uids are initialized as empty strings for empty buffer slots
+        # Here we don't initialize to None since None is a valid uid
         self.buffer_id_to_uid: List[Optional[str]] = [""] * self.max_loras_per_batch
 
     def get_lora_A_shape(
         self, module_name: str, base_model: torch.nn.Module
     ) -> Tuple[int]:
         """
-        Given a module_name (might be a stacked name), return the hidden dims of modules's input and output.
+        Given a module_name (might be a stacked name), return the hidden dims of modules' input and output.
         """
         input_dim, _ = get_hidden_dim(module_name, self.base_hf_config, base_model)
         c = get_stacked_multiply(module_name)
@@ -75,7 +75,7 @@ class LoRAMemoryPool:
         self, module_name: str, base_model: torch.nn.Module
     ) -> Tuple[int]:
         """
-        Given a module_name (might be a stacked name), return the hidden dims of modules's input and output.
+        Given a module_name (might be a stacked name), return the hidden dims of modules' input and output.
         """
         _, output_dim = get_hidden_dim(module_name, self.base_hf_config, base_model)
         c = get_stacked_multiply(module_name)
