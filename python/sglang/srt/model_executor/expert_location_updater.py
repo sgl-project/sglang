@@ -118,7 +118,8 @@ def update_expert_weights_single_layer(
                                           (x // num_gpu_per_node) not in all_src_nodes]
 
         # case 4: same-node
-        TODO
+        if rank in need_comm_self_node_dst_ranks:
+            TODO
 
         # case 5: cross-node
         TODO
