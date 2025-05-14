@@ -18,7 +18,6 @@ class _TestInfo:
     nnodes: int
     num_logical_experts: int
     num_physical_experts: int
-    device: str
 
 
 class TestExpertLocationUpdater(CustomTestCase):
@@ -78,6 +77,7 @@ def _run_subprocess(
     rank: int,
     num_gpus: int,
     master_port: int,
+    device: str,
     test_infos: List[_TestInfo],
     output_writer,
 ):
@@ -92,7 +92,7 @@ def _run_subprocess(
             torch.cuda.set_device(f"cuda:{rank}")
 
         for info in test_infos:
-            _execute_test(info)
+            _execute_test(info, rank=rank, num_gpus=num_gpus, device=device)
 
         execution_ok = True
     except Exception as e:
@@ -104,13 +104,13 @@ def _run_subprocess(
     output_writer.close()
 
 
-def _execute_test(test_info: _TestInfo):
+def _execute_test(info: _TestInfo, rank: int, num_gpus: int, device: str):
     if rank == 0:
-        print(f"Test: {num_gpus=} {nnodes=} {num_logical_experts=} {num_physical_experts=} {device=}", flush=True)
+        print(f"Test: {num_gpus=} {info=}", flush=True)
 
-    num_local_physical_experts = num_physical_experts // num_gpus
-    assert num_gpus % nnodes == 0
-    num_gpu_per_node = num_gpus // nnodes
+    num_local_physical_experts = info.num_physical_experts // num_gpus
+    assert num_gpus % info.nnodes == 0
+    num_gpu_per_node = num_gpus // info.nnodes
 
     def _create_routed_experts_weights(physical_to_logical_map):
         local_logical_expert_ids = physical_to_logical_map[
@@ -125,8 +125,8 @@ def _execute_test(test_info: _TestInfo):
 
     def _create_physical_to_logical_map():
         ans = torch.concat([
-            torch.arange(0, num_logical_experts),
-            torch.randint(0, num_logical_experts, (num_physical_experts - num_logical_experts,)),
+            torch.arange(0, info.num_logical_experts),
+            torch.randint(0, info.num_logical_experts, (info.num_physical_experts - info.num_logical_experts,)),
         ])
         ans = ans[torch.randperm(ans.shape[0])]
         return ans
