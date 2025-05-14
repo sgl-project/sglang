@@ -359,6 +359,15 @@ class ServerArgs:
                 "Pipeline parallelism is incompatible with overlap schedule."
             )
 
+        if self.expert_distribution_recorder_buffer_size is None:
+            # TODO pr-chain: enable this later
+            # if (x := self.eplb_rebalance_num_iterations) is not None:
+            #     self.expert_distribution_recorder_buffer_size = x
+            if False:
+                pass
+            elif self.expert_distribution_recorder_mode is not None:
+                self.expert_distribution_recorder_buffer_size = 1000
+
         # Speculative Decoding
         if self.speculative_algorithm == "NEXTN":
             # NEXTN shares the same implementation of EAGLE
