@@ -68,12 +68,14 @@ def update_expert_weights_single_layer(
         # List[Tuple[logical_expert_id, P2POp]]
         p2p_op_infos: List[Tuple[int, P2POp]] = []
 
-        for dst_expert_location in range(*local_expert_location_range):
-            _handle_recv_dst_expert_location(dst_expert_location, buffer2weight_copy_infos, p2p_op_infos)
-
+        _handle_recv(buffer2weight_copy_infos, p2p_op_infos)
         _create_isend_ops(p2p_op_infos)
         _execute_p2p_ops(p2p_op_infos)
         _execute_buffer2weight_copies(buffer2weight_copy_infos)
+
+    def _handle_recv(buffer2weight_copy_infos, p2p_op_infos):
+        for dst_expert_location in range(*local_expert_location_range):
+            _handle_recv_dst_expert_location(dst_expert_location, buffer2weight_copy_infos, p2p_op_infos)
 
     def _handle_recv_dst_expert_location(dst_expert_location: int, buffer2weight_copy_infos, p2p_op_infos):
         logical_expert_id = new_physical_to_logical_map[dst_expert_location]
