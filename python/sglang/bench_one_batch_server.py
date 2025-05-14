@@ -25,7 +25,6 @@ import numpy as np
 import requests
 import torch
 import torch.multiprocessing as mp
-
 from sglang.bench_serving import get_tokenizer, sample_random_requests
 from sglang.srt import fine_grained_benchmark
 from sglang.srt.entrypoints.http_server import launch_server
@@ -72,7 +71,7 @@ class BenchArgs:
             "--profile",
             action="store_true",
             help="Use Torch Profiler. The endpoint must be launched with "
-            "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
+                 "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
         )
         parser.add_argument(
             "--profile-activities",
@@ -166,7 +165,7 @@ def run_one_case(
     response = requests.post(
         url + "/generate",
         json={
-            "input_ids": [input_ids for input_ids, _, _ in input_requests],
+            "input_ids": [x.prompt for x in input_requests],
             "sampling_params": {
                 "temperature": 0,
                 "max_new_tokens": output_len,
