@@ -191,10 +191,20 @@ class _ChunkUtils:
         self.element_values = element_values
 
     def chunk_value_from_element_value(self, element_value):
-        return TODO
+        chunk_index = self._chunk_index_from_element_index(
+            num_elements=len(self.element_values),
+            num_chunks=len(self.chunk_values),
+            element_index=self.element_values.index(element_value),
+        )
+        return self.chunk_values[chunk_index]
 
     def element_values_from_chunk_value(self, chunk_value) -> List:
-        return TODO
+        element_slice = self._element_slice_from_chunk_index(
+            num_elements=len(self.element_values),
+            num_chunks=len(self.chunk_values),
+            chunk_index=self.chunk_values.index(chunk_value),
+        )
+        return self.element_values[element_slice]
 
     @staticmethod
     def _chunk_index_from_element_index(num_elements: int, num_chunks: int, element_index: int) -> int:
