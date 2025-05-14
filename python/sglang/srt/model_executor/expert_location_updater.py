@@ -56,8 +56,8 @@ def update_expert_weights_single_layer(
         logical_expert_id = new_physical_to_logical_map[dst_expert_location]
 
         # case 1: unchanged
-        if old_physical_to_logical_map[dst_expert_location] == new_physical_to_logical_map[dst_expert_location]:
-            TODO
+        if old_physical_to_logical_map[dst_expert_location] == logical_expert_id:
+            continue
 
         TODO
 
