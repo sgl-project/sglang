@@ -399,6 +399,10 @@ class ChatCompletionRequest(BaseModel):
     bootstrap_host: Optional[str] = None
     bootstrap_port: Optional[int] = None
     bootstrap_room: Optional[int] = None
+    logprob_start_len: int = -1
+    # TODO: The following two fields are deprecated. Remove them in the future.
+    # max_output_token_logprobs: int = 0
+    # max_input_token_logprobs: int = 0
 
 
 class ChatMessage(BaseModel):

@@ -1098,6 +1098,16 @@ def v1_chat_generate_request(
                 gen_assistant_prefix_ids_list.extend(
                     [gen_assistant_prefix_ids] * request.n
                 )
+                if request.logprob_start_len:
+                    request.logprob_start_len = max(
+                        request.logprob_start_len, len(gen_assistant_prefix_ids)
+                    )
+                    logprob_start_lens.append(request.logprob_start_len)
+                elif len(gen_assistant_prefix_ids) > 0:
+                    logprob_start_lens.append(len(gen_assistant_prefix_ids))
+                else:
+                    logprob_start_lens.append(-1)
+
                 prompt_ids = prompt_with_role_ids + gen_assistant_prefix_ids
 
                 if assistant_prefix:
@@ -1167,7 +1177,6 @@ def v1_chat_generate_request(
             prompt = request.messages
         input_ids.append(prompt_ids)
         return_logprobs.append(request.logprobs)
-        logprob_start_lens.append(-1)
         top_logprobs_nums.append(request.top_logprobs or 0)
         lora_paths.append(request.lora_path)
         prompts.append(prompt)
