@@ -56,10 +56,10 @@ def update_expert_weights_single_layer(
 
     def _entrypoint():
         # List[Tuple[src_temp_buffers_expert_location, dst_routed_experts_weights_expert_location]]
-        copy_back_infos: List[Tuple[int, int]] = []
+        buffer2weight_copy_infos: List[Tuple[int, int]] = []
 
         for dst_expert_location in range(*local_expert_location_range):
-            _handle_dst_expert_location(dst_expert_location, copy_back_infos)
+            _handle_dst_expert_location(dst_expert_location, buffer2weight_copy_infos)
             TODO
 
         for src_expert_location in range(*local_expert_location_range):
@@ -73,7 +73,7 @@ def update_expert_weights_single_layer(
         for copy_back_info in TODO:
             TODO
 
-    def _handle_dst_expert_location(dst_expert_location: int, copy_back_infos):
+    def _handle_dst_expert_location(dst_expert_location: int, buffer2weight_copy_infos):
         logical_expert_id = new_physical_to_logical_map[dst_expert_location]
 
         # case 1: unchanged
@@ -86,13 +86,13 @@ def update_expert_weights_single_layer(
                 for i in range(len(routed_experts_weights)):
                     temp_buffers[i][to_local(dst_expert_location)].copy_(
                         routed_experts_weights[i][to_local(src_expert_location)])
-                copy_back_infos.append((dst_expert_location, dst_expert_location))
+                buffer2weight_copy_infos.append((dst_expert_location, dst_expert_location))
                 return
 
         # case 3: free-rider
         for src_expert_location in range(rank * num_local_physical_experts, dst_expert_location):
             if new_physical_to_logical_map[src_expert_location] == logical_expert_id:
-                copy_back_infos.append((src_expert_location, dst_expert_location))
+                buffer2weight_copy_infos.append((src_expert_location, dst_expert_location))
                 return
 
         # case 4: same-node
