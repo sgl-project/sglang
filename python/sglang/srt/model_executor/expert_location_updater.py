@@ -43,4 +43,7 @@ def update_expert_weights_single_layer(
     new_physical_to_logical_map: torch.Tensor,  # (num_global_physical_Experts,)
 ):
     assert all(tensor.shape[0] == num_local_physical_experts for tensor in routed_experts_weights)
+    old_physical_to_logical_map = old_physical_to_logical_map.tolist()
+    new_physical_to_logical_map = new_physical_to_logical_map.tolist()
+
     TODO
