@@ -71,6 +71,7 @@ def update_expert_weights_single_layer(
             _handle_dst_expert_location(dst_expert_location, buffer2weight_copy_infos, p2p_op_infos)
 
         for src_expert_location in range(*local_expert_location_range):
+            TODO_only_call_once_per_logical_expert
             _handle_isend(src_expert_location, p2p_op_infos)
 
         reqs = torch.distributed.batch_isend_irecv(TODO)
