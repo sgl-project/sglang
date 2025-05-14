@@ -1,5 +1,7 @@
 from sglang.srt.layers.quantization.deep_gemm import _ENABLE_JIT_DEEPGEMM
-from sglang.srt.managers.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.managers.expert_distribution import (
+    get_global_expert_distribution_recorder,
+)
 from sglang.srt.utils import DeepEPMode
 
 try:

@@ -1908,6 +1908,7 @@ class DeepseekV2ForCausalLM(nn.Module):
             num_groups=config.n_group,
         )
 
+
 class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):
     pass
 
