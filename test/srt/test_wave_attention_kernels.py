@@ -124,6 +124,8 @@ class TestWaveAttention(unittest.TestCase):
             max_len_in_batch,
         )
 
+        is_causal = True
+
         o_extend = torch.empty((extend_token_num, H_Q, D), dtype=dtype, device="cuda")
         extend_attention_fwd(
             q_extend,
@@ -136,6 +138,7 @@ class TestWaveAttention(unittest.TestCase):
             kv_indptr,
             kv_indices,
             custom_mask,
+            is_causal,
             mask_indptr,
             max_len_extend,
         )
@@ -154,7 +157,7 @@ class TestWaveAttention(unittest.TestCase):
             mask_indptr,
             max_len_extend,
             o_wave,
-            is_causal=True,
+            is_causal=is_causal,
         )
 
         self.assertTrue(torch.allclose(o_extend, o_redundant, rtol=1e-2))
