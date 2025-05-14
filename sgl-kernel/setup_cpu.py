@@ -64,7 +64,6 @@ sources = [
     "csrc/cpu/moe_int8.cpp",
     "csrc/cpu/norm.cpp",
     "csrc/cpu/qkv_proj.cpp",
-    "csrc/cpu/rope.cpp",
     "csrc/cpu/topk.cpp",
     "csrc/cpu/interface.cpp",
     "csrc/cpu/shm.cpp",
