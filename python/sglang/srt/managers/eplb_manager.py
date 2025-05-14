@@ -33,7 +33,7 @@ class EPLBManager:
         if forward_pass_id % self._server_args.eplb_rebalance_num_iterations == 0:
             self.rebalance()
 
-    async def rebalance(self):
+    def rebalance(self):
         logger.info("[EPLBManager] rebalance start")
         torch.cuda.synchronize()
         time_start = time.time()
