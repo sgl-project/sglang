@@ -27,7 +27,7 @@ from sglang.srt.models.qwen2 import Qwen2ForCausalLM
 logger = logging.getLogger(__name__)
 
 
-##### Copy from remote code. #####
+##### BEGIN COPY configuration.py #####
 
 
 class VILAConfig(PretrainedConfig):
@@ -38,10 +38,17 @@ class VILAConfig(PretrainedConfig):
     # Model configuration.
     hidden_size: int
     image_token_id: int
+    image_end_token_id: int
     mm_hidden_size: int
     mm_projector_type: str
     mm_vision_select_feature: str
     mm_vision_select_layer: int
+    video_token_id: int
+
+
+##### END COPY configuration.py #####
+
+##### BEGIN COPY modeling_vila.py #####
 
 
 class DownSampleBlock(nn.Module):
@@ -169,7 +176,7 @@ class MultimodalProjector(nn.Module):
         return self.layers(x)
 
 
-##### End of copy. #####
+##### END COPY modeling_vila.py #####
 
 
 class VILAForConditionalGenerationHF(PreTrainedModel, GenerationMixin):
@@ -262,7 +269,7 @@ class VILAForConditionalGeneration(nn.Module):
     def _embed_image_data(self, mm_input: List[MultimodalDataItem]) -> Tensor:
         pixel_values = torch.cat([mm_item.pixel_values for mm_item in mm_input], dim=0)
 
-        ##### Copy from remote code. #####
+        ##### BEGIN COPY AND MODIFY modeling_vila.py #####
 
         image_features: BaseModelOutputWithPooling = self.vision_tower.__call__(
             pixel_values.to(
@@ -294,7 +301,26 @@ class VILAForConditionalGeneration(nn.Module):
             )
         )
 
-        ##### End of copy. #####
+        # Append image end token to every image embedding.
+        image_end_token_embedding: Tensor = self.llm.get_input_embeddings().__call__(
+            torch.tensor(
+                self.config.image_end_token_id,
+                device=next(self.llm.get_input_embeddings().parameters()).device,
+                dtype=torch.long,
+            ).view(1, -1)
+        )  # Shape: (1, 1, dim_feature)
+        image_end_token_embedding = image_end_token_embedding.expand(
+            image_embedding.shape[0], 1, -1
+        )  # Shape: (n_images, 1, dim_feature)
+        image_embedding = torch.concat(
+            [
+                image_embedding,
+                image_end_token_embedding.to(device=image_embedding.device),
+            ],
+            dim=1,
+        )
+
+        ##### END COPY AND MODIFY modeling_vila.py #####
 
         return image_embedding
 
