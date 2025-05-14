@@ -53,7 +53,9 @@ from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.managers.expert_distribution import set_global_expert_distribution_recorder, ExpertDistributionRecorder
-from sglang.srt.managers.schedule_batch import global_server_args_dict, get_global_expert_location_metadata
+from sglang.srt.managers.expert_location import compute_initial_expert_location_metadata
+from sglang.srt.managers.schedule_batch import global_server_args_dict, get_global_expert_location_metadata, \
+    set_global_expert_location_metadata
 from sglang.srt.mem_cache.memory_pool import (
     DoubleSparseTokenToKVPool,
     MHATokenToKVPool,
@@ -202,6 +204,14 @@ class ModelRunner:
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=self.server_args.enable_memory_saver
         )
+
+        set_global_expert_location_metadata(compute_initial_expert_location_metadata(server_args, self.model_config))
+        if self.tp_rank == 0 and get_bool_env_var(
+            "SGLANG_LOG_EXPERT_LOCATION_METADATA"
+        ):
+            logger.info(
+                f"Initial expert_location_metadata: {get_global_expert_location_metadata().debug_str()}"
+            )
 
         set_global_expert_distribution_recorder(
             ExpertDistributionRecorder.init_new(
