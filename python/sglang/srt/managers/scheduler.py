@@ -1977,8 +1977,8 @@ class Scheduler(
                 recv_req.num_steps,
                 recv_req.activities,
                 # NOTE fix
-                # recv_req.with_stack,
-                False,
+                recv_req.with_stack,
+                # False,
                 recv_req.record_shapes,
                 recv_req.profile_id,
             )
