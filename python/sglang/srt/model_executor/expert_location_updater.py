@@ -172,7 +172,7 @@ def update_expert_weights_single_layer(
 
 
 class _ChunkUtils:
-    def __init__(self, chunk_values: List, element_values: List):
+    def __init__(self, *, chunk_values: List, element_values: List):
         self.chunk_values = chunk_values
         self.element_values = element_values
 
