@@ -307,10 +307,6 @@ def embed_mm_inputs(
     for mm_inputs in mm_inputs_list:
         item_flatten_list += [item for item in mm_inputs.mm_items if item is not None]
 
-    placeholder_token_ids = placeholder_token_ids or [
-        item.pad_value for item in item_flatten_list
-    ]
-
     embeddings, masks = [], []
 
     # 2. Get multimodal embedding separately
