@@ -120,16 +120,17 @@ def update_expert_weights_single_layer(
         *,
         logical_expert_id: int,
         src_rank: int,
+        dst_expert_location: int,
     ):
         p2p_op_infos.append((logical_expert_id, [
             P2POp(
-                op=TODO,
-                tensor=routed_experts_weights[i][to_local(TODO)],
+                op=torch.distributed.irecv,
+                tensor=routed_experts_weights[i][to_local(dst_expert_location)],
                 peer=src_rank,
             )
             for i in range(num_tensors)
         ]))
-        buffer2weight_copy_infos.append((TODO, TODO))
+        buffer2weight_copy_infos.append((dst_expert_location, dst_expert_location))
 
     def _create_isend_ops(p2p_op_infos):
         logical_expert_ids = sorted(set(
