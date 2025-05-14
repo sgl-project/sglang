@@ -17,14 +17,10 @@ from enum import Enum
 from typing import Optional
 
 from torch import nn
-import logging
 from sglang.srt.layers.linear import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-
-
 from sglang.srt.utils import print_warning_once
-logger = logging.getLogger(__name__)
 
 class AttentionType(Enum):
     """

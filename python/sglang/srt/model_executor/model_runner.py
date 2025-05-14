@@ -994,9 +994,6 @@ class ModelRunner:
                 f"Invalid attention backend: {self.server_args.attention_backend}"
             )
 
-
-        print("using self.attn_backend:", self.attn_backend)
-
     def init_double_sparsity_channel_config(self, selected_channel):
         selected_channel = "." + selected_channel + "_proj"
         self.sorted_channels = []
