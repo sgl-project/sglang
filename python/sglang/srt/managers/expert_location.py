@@ -69,7 +69,7 @@ class ExpertLocationMetadata:
     @staticmethod
     def init_trivial(server_args: ServerArgs, model_config: ModelConfig):
         """Trivial location - logical expert i corresponds to physical expert i"""
-        common = ExpertLocationMetadata._init_common(server_args)
+        common = ExpertLocationMetadata._init_common(server_args, model_config)
         num_physical_experts = common["num_physical_experts"]
         model_config_for_expert_location = common["model_config_for_expert_location"]
         num_layers = model_config_for_expert_location.num_layers
@@ -95,7 +95,7 @@ class ExpertLocationMetadata:
             physical_to_logical_map = torch.tensor(physical_to_logical_map)
         physical_to_logical_map = physical_to_logical_map.to(server_args.device)
 
-        common = ExpertLocationMetadata._init_common(server_args)
+        common = ExpertLocationMetadata._init_common(server_args, model_config)
         model_config_for_expert_location = common["model_config_for_expert_location"]
         logical_to_all_physical_map = _compute_logical_to_all_physical_map(
             physical_to_logical_map,
@@ -116,7 +116,7 @@ class ExpertLocationMetadata:
             logical_count = logical_count.unsqueeze(0)
         logical_count = logical_count.to(server_args.device)
 
-        common = ExpertLocationMetadata._init_common(server_args)
+        common = ExpertLocationMetadata._init_common(server_args, model_config)
         model_config_for_expert_location = common["model_config_for_expert_location"]
         num_physical_experts = common["num_physical_experts"]
 
