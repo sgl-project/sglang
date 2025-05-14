@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from sglang.srt.managers.expert_location import ExpertLocationMetadata
+
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -88,6 +90,19 @@ global_server_args_dict = {
     "torchao_config": ServerArgs.torchao_config,
     "triton_attention_reduce_in_fp32": ServerArgs.triton_attention_reduce_in_fp32,
 }
+
+_global_expert_location_metadata: Optional[ExpertLocationMetadata] = None
+
+
+def get_global_expert_location_metadata():
+    return _global_expert_location_metadata
+
+
+def set_global_expert_location_metadata(value):
+    global _global_expert_location_metadata
+    assert _global_expert_location_metadata is None
+    _global_expert_location_metadata = value
+
 
 logger = logging.getLogger(__name__)
 
@@ -617,8 +632,8 @@ class Req:
             # in case last_node is evicted during scheduling, we need to update the prefix_indices
             while self.last_node.evicted:
                 self.prefix_indices = self.prefix_indices[
-                    : -len(self.last_node.host_value)
-                ]
+                                      : -len(self.last_node.host_value)
+                                      ]
                 self.last_node = self.last_node.parent
 
         self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
@@ -652,7 +667,7 @@ class Req:
             )
 
         all_ids = self.origin_input_ids_unpadded + self.output_ids
-        return all_ids[self.surr_offset :], self.read_offset - self.surr_offset
+        return all_ids[self.surr_offset:], self.read_offset - self.surr_offset
 
     def check_finished(self):
         if self.finished():
@@ -698,7 +713,7 @@ class Req:
         # Check stop strings
         if len(self.sampling_params.stop_strs) > 0:
             tail_str = self.tokenizer.decode(
-                self.output_ids[-(self.sampling_params.stop_str_max_len + 1) :]
+                self.output_ids[-(self.sampling_params.stop_str_max_len + 1):]
             )
 
             for stop_str in self.sampling_params.stop_strs:
@@ -721,14 +736,14 @@ class Req:
 
     def offload_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
         token_indices = req_to_token_pool.req_to_token[
-            self.req_pool_idx, : self.seqlen - 1
-        ]
+                        self.req_pool_idx, : self.seqlen - 1
+                        ]
         self.kv_cache_cpu = token_to_kv_pool_allocator.get_cpu_copy(token_indices)
 
     def load_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
         token_indices = req_to_token_pool.req_to_token[
-            self.req_pool_idx, : self.seqlen - 1
-        ]
+                        self.req_pool_idx, : self.seqlen - 1
+                        ]
         token_to_kv_pool_allocator.load_cpu_copy(self.kv_cache_cpu, token_indices)
         del self.kv_cache_cpu
 
@@ -1033,15 +1048,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # NOTE: the encoder part should be considered as a whole
                 assert len(req.prefix_indices) == 0
                 input_ids[i] = input_ids[i][encoder_len:]
-                encoder_out_cache_loc.append(self.out_cache_loc[pt : pt + encoder_len])
+                encoder_out_cache_loc.append(self.out_cache_loc[pt: pt + encoder_len])
                 decoder_out_cache_loc.append(
-                    self.out_cache_loc[pt + encoder_len : pt + req.extend_input_len]
+                    self.out_cache_loc[pt + encoder_len: pt + req.extend_input_len]
                 )
                 self.extend_lens[i] -= encoder_len
                 self.extend_num_tokens -= encoder_len
             else:
                 decoder_out_cache_loc.append(
-                    self.out_cache_loc[pt : pt + req.extend_input_len]
+                    self.out_cache_loc[pt: pt + req.extend_input_len]
                 )
                 self.prefix_lens[i] -= encoder_len
 
@@ -1080,7 +1095,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Init tensors
         reqs = self.reqs
-        input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
+        input_ids = [r.fill_ids[len(r.prefix_indices):] for r in reqs]
         extend_num_tokens = sum(len(ids) for ids in input_ids)
         seq_lens = [len(r.fill_ids) for r in reqs]
         prefix_lens = [len(r.prefix_indices) for r in reqs]
@@ -1158,8 +1173,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     global_start_idx = req.logprob_start_len
 
                 logprob_token_ids = req.origin_input_ids[
-                    global_start_idx + 1 : global_end_idx + 1
-                ]
+                                    global_start_idx + 1: global_end_idx + 1
+                                    ]
                 extend_input_logprob_token_ids.extend(logprob_token_ids)
 
                 # We will need req.extend_input_len - req.extend_logprob_start_len number of
@@ -1243,7 +1258,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             for i in range(bs):
                 self.req_to_token_pool.write(
                     (req_pool_indices[i], slice(prefix_lens[i], seq_lens[i])),
-                    out_cache_loc[pt : pt + extend_lens[i]],
+                    out_cache_loc[pt: pt + extend_lens[i]],
                 )
                 pt += extend_lens[i]
 
@@ -1360,18 +1375,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if isinstance(self.tree_cache, ChunkCache):
                 # ChunkCache does not have eviction
                 token_indices = self.req_to_token_pool.req_to_token[
-                    req.req_pool_idx, : seq_lens_cpu[idx]
-                ]
+                                req.req_pool_idx, : seq_lens_cpu[idx]
+                                ]
                 self.token_to_kv_pool_allocator.free(token_indices)
                 self.req_to_token_pool.free(req.req_pool_idx)
             else:
                 # TODO: apply more fine-grained retraction
                 last_uncached_pos = (
-                    len(req.prefix_indices) // server_args.page_size
-                ) * server_args.page_size
+                                        len(req.prefix_indices) // server_args.page_size
+                                    ) * server_args.page_size
                 token_indices = self.req_to_token_pool.req_to_token[
-                    req.req_pool_idx, last_uncached_pos : seq_lens_cpu[idx]
-                ]
+                                req.req_pool_idx, last_uncached_pos: seq_lens_cpu[idx]
+                                ]
                 self.token_to_kv_pool_allocator.free(token_indices)
                 self.req_to_token_pool.free(req.req_pool_idx)
 
@@ -1395,8 +1410,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         total_max_new_tokens = sum(r.sampling_params.max_new_tokens for r in self.reqs)
 
         new_estimate_ratio = (
-            total_decoded_tokens + global_config.retract_decode_steps * len(self.reqs)
-        ) / total_max_new_tokens
+                                 total_decoded_tokens + global_config.retract_decode_steps * len(self.reqs)
+                             ) / total_max_new_tokens
         new_estimate_ratio = min(1.0, new_estimate_ratio)
 
         return retracted_reqs, new_estimate_ratio
@@ -1497,7 +1512,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 i
                 for i in range(len(self.reqs))
                 if not self.reqs[i].finished()
-                and self.reqs[i] not in chunked_req_to_exclude
+                   and self.reqs[i] not in chunked_req_to_exclude
             ]
 
         if keep_indices is None or len(keep_indices) == 0:
