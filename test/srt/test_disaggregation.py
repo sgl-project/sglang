@@ -114,6 +114,7 @@ class TestDisaggregationMooncake(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         import torch
+
         for device in range(8):
             torch.cuda.set_device(device)
             torch.cuda.empty_cache()
