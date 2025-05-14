@@ -304,7 +304,10 @@ def compute_logical_to_rank_dispatch_physical_map(
     logical_to_rank_dispatch_physical_map = logical_to_all_physical_map[chosen_index]
 
     for index in range(logical_to_all_physical_map_num_valid.max()):
+        logical_to_all_physical_map[:, :, index]
         TODO
+
+    return logical_to_rank_dispatch_physical_map
 
     #################################################################
 
