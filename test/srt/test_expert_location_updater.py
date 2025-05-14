@@ -142,11 +142,17 @@ def _execute_test(info: _TestInfo, rank: int, num_gpus: int, device: str):
         ]
 
     def _create_physical_to_logical_map():
-        ans = torch.concat([
-            torch.arange(0, info.num_logical_experts),
-            torch.randint(0, info.num_logical_experts, (info.num_physical_experts - info.num_logical_experts,)),
-        ])
-        ans = ans[torch.randperm(ans.shape[0])]
+        if rank == 0:
+            ans = torch.concat([
+                torch.arange(0, info.num_logical_experts),
+                torch.randint(0, info.num_logical_experts, (info.num_physical_experts - info.num_logical_experts,)),
+            ])
+            ans = ans[torch.randperm(ans.shape[0])]
+        else:
+            ans = torch.empty((info.num_physical_experts,), dtype=torch.int64)
+
+        torch.distributed.broadcast(ans, src=0)
+
         return ans
 
     physical_to_logical_map = _create_physical_to_logical_map()
