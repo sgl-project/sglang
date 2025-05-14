@@ -41,9 +41,9 @@ class TestEPLBEndToEnd(CustomTestCase):
                 "--ep-num-redundant-experts",
                 "4",
                 "--eplb-rebalance-num-iterations",
-                "5",
+                "50",
                 "--expert-distribution-recorder-buffer-size",
-                "5",
+                "50",
             ],
         )
 
