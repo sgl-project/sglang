@@ -171,8 +171,10 @@ def _execute_test(info: _TestInfo, rank: int, num_gpus: int, device: str):
         for x, y in zip(routed_experts_weights, expect_new_weights, strict=True):
             if not torch.all(x == y):
                 raise AssertionError(
-                    f"routed_experts_weights[i]={x.tolist()} "
-                    f"expect_new_weights[i]={y.tolist()}",
+                    f"routed_experts_weights[i]={x.tolist()}\n"
+                    f"expect_new_weights[i]={y.tolist()}\n"
+                    f"old_physical_to_logical_map={physical_to_logical_map.tolist()}\n"
+                    f"new_physical_to_logical_map={new_physical_to_logical_map.tolist()}\n"
                 )
 
         physical_to_logical_map = new_physical_to_logical_map
