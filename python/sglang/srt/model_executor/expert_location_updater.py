@@ -44,12 +44,12 @@ def update_expert_weights_single_layer(
     old_physical_to_logical_map: torch.Tensor,  # (num_physical_Experts,)
     new_physical_to_logical_map: torch.Tensor,  # (num_physical_Experts,)
     num_local_physical_experts: int,
+    num_gpu_per_node: int,
     rank: int,
 ):
     assert all(tensor.shape[0] == num_local_physical_experts for tensor in routed_experts_weights)
 
     num_physical_experts, = old_physical_to_logical_map.shape
-    num_gpu_per_node = TODO
     num_tensors = len(routed_experts_weights)
 
     self_node_id = rank // num_gpu_per_node
@@ -72,12 +72,8 @@ def update_expert_weights_single_layer(
             _handle_recv_dst_expert_location(dst_expert_location, buffer2weight_copy_infos, p2p_op_infos)
 
         _create_isend_ops(p2p_op_infos)
-
         _execute_p2p_ops(p2p_op_infos)
         _execute_buffer2weight_copies(buffer2weight_copy_infos)
-
-        for copy_back_info in TODO:
-            TODO
 
     def _handle_recv_dst_expert_location(dst_expert_location: int, buffer2weight_copy_infos, p2p_op_infos):
         logical_expert_id = new_physical_to_logical_map[dst_expert_location]
