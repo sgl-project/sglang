@@ -138,9 +138,9 @@ def update_expert_weights_single_layer(
             for src_expert_location in range(*local_expert_location_range)
         ))
         for logical_expert_id in logical_expert_ids:
-            _create_isend_ops_of_logical_expert_id(logical_expert_id, p2p_op_infos)
+            _create_isend_ops_of_logical_expert_id(logical_expert_id, TODO, p2p_op_infos)
 
-    def _create_isend_ops_of_logical_expert_id(logical_expert_id, p2p_op_infos):
+    def _create_isend_ops_of_logical_expert_id(logical_expert_id, src_expert_location, p2p_op_infos):
         same_node_mapping, cross_node_mapping, need_comm_self_node_dst_ranks = _compute_comm_info(
             logical_expert_id=logical_expert_id)
 
@@ -151,7 +151,7 @@ def update_expert_weights_single_layer(
         p2p_op_infos.append((logical_expert_id, [
             P2POp(
                 op=torch.distributed.isend,
-                tensor=routed_experts_weights[i][to_local(TODO)],
+                tensor=routed_experts_weights[i][to_local(src_expert_location)],
                 peer=dst_rank,
             )
             for dst_rank in all_dst_ranks
