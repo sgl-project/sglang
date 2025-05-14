@@ -196,6 +196,14 @@ class _ChunkUtils:
     def element_values_from_chunk_value(self, chunk_value) -> List:
         return TODO
 
+    @staticmethod
+    def _chunk_index_from_element_index(num_elements: int, num_chunks: int, element_index: int) -> int:
+        return TODO
+
+    @staticmethod
+    def _element_slice_from_chunk_index(num_elements: int, num_chunks: int, chunk_index: int) -> slice:
+        return TODO
+
 
 def _deduplicate_ordered(arr: List[int]):
     output = []
