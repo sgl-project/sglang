@@ -2230,7 +2230,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                     self_attn.use_deep_gemm_bmm = True
 
         self.routed_experts_weights_of_layer = {
-            layer_id: [x.data for x in layer.mlp.parameters()]
+            layer_id: [x.data for x in layer.mlp.experts.parameters()]
             for layer_id, layer in enumerate(self.model.layers)
             if isinstance(layer.mlp, DeepseekV2MoE)
         }
