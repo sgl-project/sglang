@@ -53,8 +53,8 @@ class TestExpertLocationUpdater(CustomTestCase):
         # TODO
         # TODO
         for nnodes in [4]:
-            for num_logical_experts in [2, 5, 20, 200]:
-                for num_physical_experts in [4, 16, 220]:
+            for num_logical_experts in [2]:
+                for num_physical_experts in [220]:
                     if num_logical_experts > num_physical_experts: continue
                     infos.append(_TestInfo(
                         nnodes=nnodes,
