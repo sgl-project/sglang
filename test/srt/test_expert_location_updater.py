@@ -107,7 +107,7 @@ def _run_subprocess(
 
         torch.random.manual_seed(42)
         torch.distributed.init_process_group(rank=rank, world_size=num_gpus,
-                                             backend={"cpu": "gloo", "cuda": "nccl"}[device])
+                                             backend={"cpu": "gloo", "cuda": None}[device])
         if device == "cuda":
             torch.cuda.set_device(f"cuda:{rank}")
 
