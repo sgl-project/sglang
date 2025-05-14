@@ -769,6 +769,8 @@ class ModelRunner:
         elif self.server_args.kv_cache_dtype == "fp8_e4m3":
             if is_cuda():
                 self.kv_cache_dtype = torch.float8_e4m3fn
+            else:
+                raise ValueError("fp8_e4m3 kv cache dtype is not supported on non-CUDA plateforms.")
         else:
             raise ValueError(
                 f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
@@ -991,6 +993,9 @@ class ModelRunner:
             raise ValueError(
                 f"Invalid attention backend: {self.server_args.attention_backend}"
             )
+
+
+        print("using self.attn_backend:", self.attn_backend)
 
     def init_double_sparsity_channel_config(self, selected_channel):
         selected_channel = "." + selected_channel + "_proj"

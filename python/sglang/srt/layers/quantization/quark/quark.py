@@ -12,7 +12,12 @@ from sglang.srt.layers.quantization.base_config import (  # noqa: E501
     QuantizationConfig, QuantizeMethodBase)
 from sglang.srt.layers.quantization.quark.schemes import QuarkScheme, QuarkW4A4MXFP4
 from sglang.srt.layers.quantization.quark.utils import deep_compare, should_ignore_layer
-from vllm.platforms import current_platform
+from sglang.srt.utils import get_device_capability
+from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
+
+from sglang.srt.layers.radix_attention import RadixAttention
+
+from typing import List
 
 __all__ = ["QuarkLinearMethod"]
 
@@ -23,9 +28,15 @@ class QuarkConfig(QuantizationConfig):
 
     def __init__(self,
                  quant_config: dict[str, Any],
+                 kv_cache_group: Optional[list[str]] = None,
+                 kv_cache_config: Optional[dict[str, Any]] = None,
                  pack_method: str = "reorder"):
         super().__init__()
+        if kv_cache_group is None:
+            kv_cache_group = []
         self.quant_config = quant_config
+        self.kv_cache_group = kv_cache_group
+        self.kv_cache_config = kv_cache_config
         self.pack_method = pack_method
 
     def get_linear_method(self) -> "QuarkLinearMethod":
@@ -54,6 +65,9 @@ class QuarkConfig(QuantizationConfig):
             scheme = self.get_scheme(layer=layer, layer_name=prefix)
             layer.scheme = scheme
             return QuarkLinearMethod(self)
+        
+        if isinstance(layer, RadixAttention):
+            return QuarkKVCacheMethod(self)
 
         return None
 
@@ -63,9 +77,63 @@ class QuarkConfig(QuantizationConfig):
         if export_config is None:
             raise ValueError("The export key should be included in "
                              "the configurations of Quark quantized model")
+        
+        kv_cache_group = cast(list[str], export_config.get("kv_cache_group"))
         pack_method = cast(str, export_config.get("pack_method"))
 
+        # In the export model of quark, the quantization configuration
+        # of kv_cache is stored in layer_quant_config. First, it is
+        # judged whether kv_cache_group exists, and then it is judged
+        # whether layer_quant_config has a quantization configuration
+        # that matches kv_cache.
+        if len(kv_cache_group) == 0:
+            kv_cache_config = None
+        else:
+            kv_cache_set = set(kv_cache_group)
+            layer_quant_config = cast(dict[str, Any],
+                                      config.get("layer_quant_config"))
+            layer_quant_names = list(layer_quant_config.keys())
+            layer_quant_set = set(layer_quant_names)
+
+            if not kv_cache_set.issubset(layer_quant_set):
+                raise ValueError("The Quark quantized model has the "
+                                 "kv_cache_group parameter setting, "
+                                 "but no kv_cache quantization settings "
+                                 "were found in the quantization "
+                                 "configuration.")
+
+            q_configs = [
+                cast(dict[str, Any], layer_quant_config.get(name))
+                for name in kv_cache_group
+            ]
+            if not all(
+                    deep_compare(q_config, q_configs[0])
+                    for q_config in q_configs):
+                raise ValueError(
+                    "The quantization method used for kv_cache should "
+                    "be the same, but the quantization method for the "
+                    "kv_cache layer in the config is different.")
+            kv_cache_config = q_configs[0].get("output_tensors")
+            if kv_cache_config is None:
+                raise ValueError(
+                    "The kv_cache quantization configuration is empty.")
+
+            # Since we have already set kv_cache quantization configurations,
+            # we will remove the quantization configuration for the
+            # output_tensors corresponding to the kv_cache layer.
+            for q_config in q_configs:
+                q_config["output_tensors"] = None
+
+            # In case q_proj output is also quantized, remove the configuration
+            # to keep qkv consistency.
+            q_proj_q_config = cast(dict[str, Any],
+                                   layer_quant_config.get("*q_proj"))
+            if q_proj_q_config is not None:
+                q_proj_q_config["output_tensors"] = None
+
         return cls(quant_config=config,
+                   kv_cache_group=kv_cache_group,
+                   kv_cache_config=kv_cache_config,
                    pack_method=pack_method)
 
     @classmethod
@@ -75,10 +143,12 @@ class QuarkConfig(QuantizationConfig):
     def _check_scheme_supported(self,
                                 min_capability: int,
                                 error: bool = True) -> bool:
-        capability_tuple = current_platform.get_device_capability()
+        capability_tuple = get_device_capability()
 
         if capability_tuple is not None:
-            capability = capability_tuple.to_int()
+            assert 0 <= capability_tuple[1] < 10
+            capability = capability_tuple[0] * 10 + capability_tuple[1]
+
             supported = capability >= min_capability
             if error and not supported:
                 raise RuntimeError(
@@ -207,6 +277,10 @@ class QuarkConfig(QuantizationConfig):
 
         return scheme
 
+    def get_scaled_act_names(self) -> List[str]:
+        return []
+
+
 class QuarkLinearMethod(LinearMethodBase):
 
     def __init__(self, quantization_config: QuarkConfig):
@@ -249,3 +323,36 @@ class QuarkLinearMethod(LinearMethodBase):
         if scheme is None:
             raise ValueError("A scheme must be defined for each layer")
         return scheme.apply_weights(layer, x, bias=bias)
+
+
+class QuarkKVCacheMethod(BaseKVCacheMethod):
+    """
+    Supports loading kv-cache scaling factors from quark checkpoints.
+    """
+
+    def __init__(self, quant_config: QuarkConfig):
+        self.validate_kv_cache_config(quant_config.kv_cache_config)
+        super().__init__(quant_config)
+
+    @staticmethod
+    def validate_kv_cache_config(kv_cache_config: Optional[dict[str, Any]]):
+        """
+        Validator for the kv cache configuration. Useful for controlling the
+        kv cache quantization schemes, that are being supported in vLLM
+        :param kv_cache_config: the quark kv cache scheme
+        """
+        if kv_cache_config is None:
+            return
+
+        dtype = kv_cache_config.get("dtype")
+        if dtype != "fp8_e4m3":
+            raise NotImplementedError(
+                "Currently supported kv cache quantization is "
+                f"dtype=fp8_e4m3, however received {dtype}")
+
+        qscheme = kv_cache_config.get("qscheme")
+        if qscheme != "per_tensor":
+            raise NotImplementedError(
+                "Only support per-tensor scaling factor "
+                "for quark KV cache. "
+                f"Expected qscheme: per_tensor, found qscheme: {qscheme}")

@@ -12,7 +12,7 @@ from sglang.srt.layers.quantization.mxfp4_utils import (
     dequant_mxfp4,
 )
 from sglang.srt.layers.parameter import GroupQuantScaleParameter, PackedvLLMParameter
-from vllm.platforms import current_platform
+from sglang.srt.platforms.interface import Platform
 from sglang.srt.utils import get_bool_env_var
 
 __all__ = ["QuarkW4A4MXFP4"]
@@ -26,7 +26,7 @@ class QuarkW4A4MXFP4(QuarkScheme):
         self.qscheme = "per_group"
         self.weight_quant_spec = weight_quant_spec
         self.input_quant_spec = input_quant_spec
-        self.emulate = not current_platform.supports_mx()
+        self.emulate = not Platform.supports_mx()
 
         if get_bool_env_var("VLLM_QUARK_EMU_MEM_OPT"):
             self.emulate_memory = True

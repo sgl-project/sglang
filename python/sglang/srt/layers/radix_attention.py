@@ -17,11 +17,14 @@ from enum import Enum
 from typing import Optional
 
 from torch import nn
-
+import logging
 from sglang.srt.layers.linear import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
+
+from sglang.srt.utils import print_warning_once
+logger = logging.getLogger(__name__)
 
 class AttentionType(Enum):
     """
@@ -56,6 +59,8 @@ class RadixAttention(nn.Module):
         prefix: str = "",
         use_irope: bool = False,
     ):
+        from sglang.srt.managers.schedule_batch import global_server_args_dict
+
         super().__init__()
         self.tp_q_head_num = num_heads
         self.tp_k_head_num = num_kv_heads
@@ -79,6 +84,11 @@ class RadixAttention(nn.Module):
         if self.quant_method is not None:
             self.quant_method.create_weights(self)
         self.attn_type = attn_type
+
+        # Only fa3 and flashinfer attention backends implement FP8 KV cache.
+        use_fp8_cache = self.k_scale is not None or self.v_scale is not None
+        if global_server_args_dict["attention_backend"] not in ["fa3", "flashinfer"] and use_fp8_cache:
+            print_warning_once(f"The attention backend {global_server_args_dict['attention_backend']} does not support KV cache quantization, but RadixAttention has registered key/value scales. The KV cache will not be quantized.")
 
     def forward(
         self,
