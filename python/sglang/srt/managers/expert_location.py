@@ -67,7 +67,7 @@ class ExpertLocationMetadata:
     # -------------------------------- construction ------------------------------------
 
     @staticmethod
-    def init_trivial(server_args: ServerArgs):
+    def init_trivial(server_args: ServerArgs, model_config: ModelConfig):
         """Trivial location - logical expert i corresponds to physical expert i"""
         common = ExpertLocationMetadata._init_common(server_args)
         num_physical_experts = common["num_physical_experts"]
@@ -82,12 +82,13 @@ class ExpertLocationMetadata:
 
         return ExpertLocationMetadata.init_by_mapping(
             server_args,
+            model_config,
             physical_to_logical_map=physical_to_logical_map,
         )
 
     @staticmethod
     def init_by_mapping(
-        server_args: ServerArgs,
+        server_args: ServerArgs, model_config: ModelConfig,
         physical_to_logical_map,
     ):
         if not isinstance(physical_to_logical_map, torch.Tensor):
@@ -108,7 +109,7 @@ class ExpertLocationMetadata:
         )
 
     @staticmethod
-    def init_by_eplb(server_args: ServerArgs, logical_count: torch.Tensor):
+    def init_by_eplb(server_args: ServerArgs, model_config: ModelConfig, logical_count: torch.Tensor):
         if not isinstance(logical_count, torch.Tensor):
             logical_count = torch.tensor(logical_count)
         if len(logical_count.shape) == 2:
@@ -141,8 +142,7 @@ class ExpertLocationMetadata:
         )
 
     @staticmethod
-    def _init_common(server_args: ServerArgs):
-        model_config = ModelConfig.from_server_args(server_args)
+    def _init_common(server_args: ServerArgs, model_config: ModelConfig):
         model_config_for_expert_location = (
             ModelConfigForExpertLocation.from_model_config(model_config)
         )
