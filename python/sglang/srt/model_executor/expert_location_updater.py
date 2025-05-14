@@ -35,7 +35,7 @@ def _update_expert_weights(
             old_physical_to_logical_map=old_expert_location_metadata.physical_to_logical_map[layer_id],
             new_physical_to_logical_map=new_expert_location_metadata.physical_to_logical_map[layer_id],
             num_local_physical_experts=old_expert_location_metadata.num_local_physical_experts,
-            num_gpu_per_node=TODO,
+            num_gpu_per_node=world_size // nnodes,
             rank=rank,
         )
 
