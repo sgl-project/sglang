@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 
 class EPLBManager:
-    def __init__(self, model_runner: ModelRunner):
+    def __init__(self, model_runner: "ModelRunner"):
         super().__init__()
         self._model_runner = model_runner
         self._server_args = model_runner.server_args
