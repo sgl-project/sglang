@@ -101,7 +101,7 @@ def update_expert_weights_single_layer(
                 buffer2weight_copy_infos.append((src_expert_location, dst_expert_location))
                 return
 
-        all_src_ranks, self_node_src_ranks, need_comm_self_node_dst_ranks, need_comm_cross_node_dst_ranks = _compute_comm_info(
+        same_node_mapping, cross_node_mapping, need_comm_self_node_dst_ranks = _compute_comm_info(
             logical_expert_id=logical_expert_id)
 
         # case 4: same-node
@@ -132,7 +132,7 @@ def update_expert_weights_single_layer(
             _handle_isend_of_logical_expert_id(logical_expert_id, p2p_op_infos)
 
     def _handle_isend_of_logical_expert_id(logical_expert_id, p2p_op_infos):
-        all_src_ranks, self_node_src_ranks, need_comm_self_node_dst_ranks, need_comm_cross_node_dst_ranks = _compute_comm_info(
+        same_node_mapping, cross_node_mapping, need_comm_self_node_dst_ranks = _compute_comm_info(
             logical_expert_id=logical_expert_id)
 
         # a. same-node
@@ -173,6 +173,8 @@ def update_expert_weights_single_layer(
             chunk_values=all_src_ranks,
             element_values=need_comm_cross_node_dst_ranks,
         )
+
+        return same_node_mapping, cross_node_mapping, need_comm_self_node_dst_ranks
 
     _entrypoint()
 
