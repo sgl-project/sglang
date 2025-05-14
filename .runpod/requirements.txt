@@ -9,3 +9,5 @@ pydantic
 pydantic-settings
 hf-transfer
 transformers
+setuptools
+wheel

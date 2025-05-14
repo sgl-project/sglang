@@ -14,12 +14,29 @@ services:
     environment:
       - HOST=0.0.0.0
       - PORT=8000
-      - MODEL_NAME=microsoft/Phi-4-mini-instruct
+      - MODEL_NAME=HuggingFaceTB/SmolLM2-1.7B-Instruct
       - TRUST_REMOTE_CODE=true
+      - ATTENTION_BACKEND=flashinfer
+      - SAMPLING_BACKEND=flashinfer
+
+      # keep plenty of free space for the kernel builds
+      - MEM_FRACTION_STATIC=0.5 # reserve only 50 % of VRAM for the token pool
+      - CHUNKED_PREFILL_SIZE=512 # default 8192
+      - MAX_PREFILL_TOKENS=2048 # default 16384
+      - MAX_TOTAL_TOKENS=2048
+      - DISABLE_CUDA_GRAPH=true # graphs double the memory FlashInfer needs
+      - CONTEXT_LENGTH=2048
+
+      # working on small card
+      # - DISABLE_CUDA_GRAPH=true
+      # - ATTENTION_BACKEND=torch_native
+      # - SAMPLING_BACKEND=pytorch
+      # - TORCH_COMPILE=0
+      # - TORCH_COMPILE_DISABLE=1
+      # - TORCH_DISABLE_DYNAMO=1
 
     ports:
       - "8000:8000"
 
     volumes:
-      # Model/cache & any other writable data volume the container expects
-      - ./data/runpod-volume:/runpod-volume 
+      - ../var/runpod-volume:/runpod-volume

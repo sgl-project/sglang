@@ -1,9 +1,9 @@
 {
   "tests": [
     {
-      "name": "Query Phi 3",
+      "name": "basic_test",
       "input": {
-        "model": "microsoft/Phi-4-mini-instruct",
+        "model": "HuggingFaceTB/SmolLM2-1.7B-Instruct",
         "messages": [
           { "role": "user", "content": "What is the capital of France?" }
         ]
@@ -21,7 +21,7 @@
       },
       {
         "key": "MODEL_NAME",
-        "value": "microsoft/Phi-4-mini-instruct"
+        "value": "HuggingFaceTB/SmolLM2-1.7B-Instruct"
       }
     ],
     "allowedCudaVersions": [
