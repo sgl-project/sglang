@@ -67,9 +67,9 @@ def get_node_l3_keys(
     else:
         num_key = token_len // page_size
         for i in range(num_key):
-            prefix_page_ids = token_ids[: -(num_key - i) * page_size]
-            current_page_ids = token_ids[-(num_key - i) * page_size: -(num_key - i + 1) * page_size]
-            l3_keys.append(page_token_ids_to_key(prefix_page_ids, current_page_ids, local_rank))
+            prefix_block_token_ids = token_ids[: -(num_key - i) * page_size]
+            current_block_token_ids = token_ids[-(num_key - i) * page_size: -(num_key - i + 1) * page_size]
+            l3_keys.append(page_token_ids_to_key(prefix_block_token_ids, current_block_token_ids, local_rank))
 
     return l3_keys
 
@@ -468,7 +468,7 @@ class HiRadixCache(RadixCache):
                     child_key = self.get_child_key_fn(key)
                     new_node = TreeNode()
                     new_node.parent = node
-                    new_node.key = key[len(l3_exist_keys) * self.page_size]
+                    new_node.key = key[len(l3_exist_keys) * self.page_size:]
                     node.children[child_key] = new_node
                     new_node.l3_keys = l3_exist_keys
                     new_node.evicted = True
