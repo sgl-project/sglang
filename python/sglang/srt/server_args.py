@@ -164,9 +164,6 @@ class ServerArgs:
     ep_num_redundant_experts: int = 0
     ep_dispatch_algorithm: Optional[Literal["static", "random"]] = None
     init_expert_location: Optional[str] = None
-    expert_location_updater_mode: Optional[Literal["pin_memory", "pageable_memory"]] = (
-        None
-    )
     enable_eplb: bool = False
     eplb_rebalance_num_iterations: int = 1000
     deepseek_eplb_hack_shuffle: bool = False
@@ -331,15 +328,8 @@ class ServerArgs:
         if self.enable_eplb:
             if self.expert_distribution_recorder_mode is None:
                 self.expert_distribution_recorder_mode = "stat"
-            if self.expert_location_updater_mode is None:
-                self.expert_location_updater_mode = "pageable_memory"
             logger.info(
-                f"EPLB is enabled. The expert_distribution_recorder_mode and expert_location_updater_mode are automatically set."
-            )
-        if self.expert_location_updater_mode is not None:
-            self.disable_overlap_schedule = True
-            logger.info(
-                f"ExpertLocationUpdater is enabled. The disable_overlap_schedule is set."
+                f"EPLB is enabled. The expert_distribution_recorder_mode is automatically set."
             )
         if self.enable_eplb or (self.init_expert_location is not None):
             if self.ep_dispatch_algorithm is None:
@@ -1194,12 +1184,6 @@ class ServerArgs:
             type=str,
             default=ServerArgs.init_expert_location,
             help="Initial location of EP experts.",
-        )
-        parser.add_argument(
-            "--expert-location-updater-mode",
-            type=str,
-            default=ServerArgs.expert_location_updater_mode,
-            help="Mode of ExpertLocationUpdater, can be `pin_memory` (put weights in pinned memory at startup, thus faster but takes more host memory) or `pageable_memory` (put weights on pageable memory, thus slower but takes less host memory)",
         )
         parser.add_argument(
             "--enable-eplb",
