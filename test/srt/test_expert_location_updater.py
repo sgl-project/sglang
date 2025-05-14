@@ -134,7 +134,7 @@ def _execute_test(info: _TestInfo, rank: int, num_gpus: int, device: str):
         local_logical_expert_ids = physical_to_logical_map[
                                    rank * num_local_physical_experts: (rank + 1) * num_local_physical_experts].cpu()
         return [
-            local_logical_expert_ids.to(device),
+            local_logical_expert_ids.to(device).clone(),
             torch.tensor([
                 [local_logical_expert_id * 10, local_logical_expert_id * 100]
                 for local_logical_expert_id in local_logical_expert_ids.tolist()
