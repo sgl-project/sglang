@@ -71,11 +71,11 @@ WEIGHT_SHAPES = {
         x_vals=[1, 16, 32, 64, 128, 256, 512, 1024, 2048],
         x_log=False,
         line_arg="provider",
-        line_vals=["W8A8", "Qserve_W4A8_Per_Channel", "Qserve_W4A8_Per_Group"],
-        line_names=["W8A8", "Qserve_W4A8_Per_Channel", "Qserve_W4A8_Per_Group"],
-        styles=[("blue", "-"), ("orange", "-"), ("green", "-")],
+        line_vals=["FP16", "W8A8", "Qserve_W4A8_Per_Channel", "Qserve_W4A8_Per_Group"],
+        line_names=["FP16", "W8A8", "Qserve_W4A8_Per_Channel", "Qserve_W4A8_Per_Group"],
+        styles=[("blue", "-"), ("orange", "-"), ("green", "-"), ("red", "-")],
         ylabel="ms",
-        plot_name="W8A8_vs_Qserve_W4A8_GEMM",
+        plot_name="FP16_vs_W8A8_vs_Qserve_W4A8_GEMM",
         args={},
     )
 )
@@ -84,6 +84,8 @@ def benchmark(batch_size, provider, N, K):
     # For W8A8
     a = to_int8(torch.randn((M, K), device="cuda") * 5)
     b = to_int8(torch.randn((N, K), device="cuda").t() * 5)
+    a_fp16 = a.to(torch.float16)
+    b_fp16 = b.to(torch.float16)
     scale_a = torch.randn((M,), device="cuda", dtype=torch.float32)
     scale_b = torch.randn((N,), device="cuda", dtype=torch.float32)
 
@@ -114,6 +116,11 @@ def benchmark(batch_size, provider, N, K):
     )
 
     quantiles = [0.5, 0.2, 0.8]
+    if provider == "FP16":
+        ms, min_ms, max_ms = triton.testing.do_bench(
+            lambda: torch.matmul(a_fp16, b_fp16),
+            quantiles=quantiles,
+        )
     if provider == "W8A8":
         ms, min_ms, max_ms = triton.testing.do_bench(
             lambda: int8_scaled_mm(a, b, scale_a, scale_b, torch.float16),
