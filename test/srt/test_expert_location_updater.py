@@ -178,20 +178,23 @@ def _execute_test(info: _TestInfo, rank: int, num_gpus: int, device: str):
         torch.distributed.all_reduce(global_has_error, op=torch.distributed.ReduceOp.MAX)
 
         if global_has_error:
-            global_output_logs = [None] * num_gpus
-            torch.distributed.gather_object(output_logs, global_output_logs, dst=0)
-
             output_logs_str = "\n".join(output_logs)
-            msg = (
-                f"{rank=} {num_gpus=} {info=}\n"
-                f"routed_experts_weights[i]={x.tolist()}\n"
-                f"expect_new_weights[i]={y.tolist()}\n"
-                f"old_physical_to_logical_map={physical_to_logical_map.tolist()}\n"
-                f"new_physical_to_logical_map={new_physical_to_logical_map.tolist()}\n"
+            local_message = (
+                f"===================== rank {rank} ============================"
+                f"{num_gpus=} {info=}\n"
+                f"{routed_experts_weights[0].tolist()=}\n"
+                f"{expect_new_weights[0].tolist()=}\n"
+                f"{physical_to_logical_map.tolist()=}\n"
+                f"{new_physical_to_logical_map.tolist()=}\n"
                 f"===logs===\n"
-                f"{output_logs_str}"
+                f"{output_logs_str}\n"
+                f"=============================================================="
             )
 
+            global_messages = [None] * num_gpus
+            torch.distributed.gather_object(local_message, global_messages, dst=0)
+
+            msg = "\n\n".join(global_messages)
             raise AssertionError(f"Error happens:\n{msg}")
 
         physical_to_logical_map = new_physical_to_logical_map
