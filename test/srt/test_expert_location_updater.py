@@ -1,6 +1,8 @@
 import os
 import traceback
 import unittest
+from dataclasses import dataclass
+from typing import List
 
 import torch
 import torch.multiprocessing as mp
@@ -9,6 +11,14 @@ from sglang.test.test_utils import CustomTestCase
 from sglang.test.test_utils import find_available_port
 from sglang.utils import is_in_ci
 from torch.multiprocessing import Process
+
+
+@dataclass
+class _TestInfo:
+    nnodes: int
+    num_logical_experts: int
+    num_physical_experts: int
+    device: str
 
 
 class TestExpertLocationUpdater(CustomTestCase):
@@ -67,17 +77,11 @@ class TestExpertLocationUpdater(CustomTestCase):
 def _run_subprocess(
     rank: int,
     num_gpus: int,
-    nnodes: int,
-    num_logical_experts: int,
-    num_physical_experts: int,
-    device: str,
     master_port: int,
+    test_infos: List[_TestInfo],
     output_writer,
 ):
     try:
-        if rank == 0:
-            print(f"Test: {num_gpus=} {nnodes=} {num_logical_experts=} {num_physical_experts=} {device=}", flush=True)
-
         os.environ["MASTER_ADDR"] = "localhost"
         os.environ["MASTER_PORT"] = str(master_port)
 
@@ -87,52 +91,8 @@ def _run_subprocess(
         if device == "cuda":
             torch.cuda.set_device(f"cuda:{rank}")
 
-        num_local_physical_experts = num_physical_experts // num_gpus
-        assert num_gpus % nnodes == 0
-        num_gpu_per_node = num_gpus // nnodes
-
-        def _create_routed_experts_weights(physical_to_logical_map):
-            local_logical_expert_ids = physical_to_logical_map[
-                                       rank * num_local_physical_experts: (rank + 1) * num_local_physical_experts].cpu()
-            return [
-                local_logical_expert_ids.to(device),
-                torch.tensor([
-                    [local_logical_expert_id * 10, local_logical_expert_id * 100]
-                    for local_logical_expert_id in local_logical_expert_ids.tolist()
-                ], device=device),
-            ]
-
-        def _create_physical_to_logical_map():
-            ans = torch.concat([
-                torch.arange(0, num_logical_experts),
-                torch.randint(0, num_logical_experts, (num_physical_experts - num_logical_experts,)),
-            ])
-            ans = ans[torch.randperm(ans.shape[0])]
-            return ans
-
-        physical_to_logical_map = _create_physical_to_logical_map()
-        routed_experts_weights = _create_routed_experts_weights(physical_to_logical_map)
-
-        num_repeats = 5000
-        for i in range(num_repeats):
-            if rank == 0 and i % 500 == 0:
-                print(f"Step {i}/{num_repeats}", flush=True)
-
-            new_physical_to_logical_map = _create_physical_to_logical_map()
-            expect_new_weights = _create_routed_experts_weights(new_physical_to_logical_map)
-
-            expert_location_updater.update_expert_weights_single_layer(
-                routed_experts_weights=routed_experts_weights,
-                temp_buffers=expert_location_updater.create_temp_buffers(routed_experts_weights),
-                old_physical_to_logical_map=physical_to_logical_map,
-                new_physical_to_logical_map=new_physical_to_logical_map,
-                num_local_physical_experts=num_local_physical_experts,
-                num_gpu_per_node=num_gpu_per_node,
-                rank=rank,
-            )
-            assert all(torch.all(x == y) for x, y in zip(routed_experts_weights, expect_new_weights, strict=True))
-
-            physical_to_logical_map = new_physical_to_logical_map
+        for info in test_infos:
+            _execute_test(info)
 
         execution_ok = True
     except Exception as e:
@@ -142,6 +102,58 @@ def _run_subprocess(
 
     output_writer.send(execution_ok)
     output_writer.close()
+
+
+def _execute_test(test_info: _TestInfo):
+    if rank == 0:
+        print(f"Test: {num_gpus=} {nnodes=} {num_logical_experts=} {num_physical_experts=} {device=}", flush=True)
+
+    num_local_physical_experts = num_physical_experts // num_gpus
+    assert num_gpus % nnodes == 0
+    num_gpu_per_node = num_gpus // nnodes
+
+    def _create_routed_experts_weights(physical_to_logical_map):
+        local_logical_expert_ids = physical_to_logical_map[
+                                   rank * num_local_physical_experts: (rank + 1) * num_local_physical_experts].cpu()
+        return [
+            local_logical_expert_ids.to(device),
+            torch.tensor([
+                [local_logical_expert_id * 10, local_logical_expert_id * 100]
+                for local_logical_expert_id in local_logical_expert_ids.tolist()
+            ], device=device),
+        ]
+
+    def _create_physical_to_logical_map():
+        ans = torch.concat([
+            torch.arange(0, num_logical_experts),
+            torch.randint(0, num_logical_experts, (num_physical_experts - num_logical_experts,)),
+        ])
+        ans = ans[torch.randperm(ans.shape[0])]
+        return ans
+
+    physical_to_logical_map = _create_physical_to_logical_map()
+    routed_experts_weights = _create_routed_experts_weights(physical_to_logical_map)
+
+    num_repeats = 5000
+    for i in range(num_repeats):
+        if rank == 0 and i % 500 == 0:
+            print(f"Step {i}/{num_repeats}", flush=True)
+
+        new_physical_to_logical_map = _create_physical_to_logical_map()
+        expect_new_weights = _create_routed_experts_weights(new_physical_to_logical_map)
+
+        expert_location_updater.update_expert_weights_single_layer(
+            routed_experts_weights=routed_experts_weights,
+            temp_buffers=expert_location_updater.create_temp_buffers(routed_experts_weights),
+            old_physical_to_logical_map=physical_to_logical_map,
+            new_physical_to_logical_map=new_physical_to_logical_map,
+            num_local_physical_experts=num_local_physical_experts,
+            num_gpu_per_node=num_gpu_per_node,
+            rank=rank,
+        )
+        assert all(torch.all(x == y) for x, y in zip(routed_experts_weights, expect_new_weights, strict=True))
+
+        physical_to_logical_map = new_physical_to_logical_map
 
 
 if __name__ == "__main__":
