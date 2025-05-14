@@ -88,8 +88,8 @@ def update_expert_weights_single_layer(
         for src_expert_location in range(*local_expert_location_range):
             if old_physical_to_logical_map[src_expert_location] == logical_expert_id:
                 for i in range(num_tensors):
-                    temp_buffers[i][to_local(dst_expert_location)].copy_(
-                        routed_experts_weights[i][to_local(src_expert_location)])
+                    temp_buffers[i][_to_local(dst_expert_location)].copy_(
+                        routed_experts_weights[i][_to_local(src_expert_location)])
                 buffer2weight_copy_infos.append((dst_expert_location, dst_expert_location))
                 return
 
@@ -125,7 +125,7 @@ def update_expert_weights_single_layer(
         p2p_op_infos.append((logical_expert_id, [
             P2POp(
                 op=torch.distributed.irecv,
-                tensor=routed_experts_weights[i][to_local(dst_expert_location)],
+                tensor=routed_experts_weights[i][_to_local(dst_expert_location)],
                 peer=src_rank,
             )
             for i in range(num_tensors)
@@ -154,7 +154,7 @@ def update_expert_weights_single_layer(
         p2p_op_infos.append((logical_expert_id, [
             P2POp(
                 op=torch.distributed.isend,
-                tensor=routed_experts_weights[i][to_local(src_expert_location)],
+                tensor=routed_experts_weights[i][_to_local(src_expert_location)],
                 peer=dst_rank,
             )
             for dst_rank in all_dst_ranks
@@ -200,8 +200,13 @@ def update_expert_weights_single_layer(
     def _execute_buffer2weight_copies(buffer2weight_copy_infos):
         for temp_buffers_expert_location, routed_experts_weights_expert_location in buffer2weight_copy_infos:
             for i in range(num_tensors):
-                routed_experts_weights[i][to_local(temp_buffers_expert_location)].copy_(
-                    temp_buffers[i][to_local(routed_experts_weights_expert_location)])
+                routed_experts_weights[i][_to_local(temp_buffers_expert_location)].copy_(
+                    temp_buffers[i][_to_local(routed_experts_weights_expert_location)])
+
+    def _to_local(expert_location: int) -> int:
+        """Returns expert location in local array"""
+        assert TODO <= expert_location < TODO
+        return expert_location % num_local_physical_experts
 
     _entrypoint()
 
