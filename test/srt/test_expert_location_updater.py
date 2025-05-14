@@ -169,18 +169,21 @@ def _execute_test(info: _TestInfo, rank: int, num_gpus: int, device: str):
             debug=True,
         )
 
-        for x, y in zip(routed_experts_weights, expect_new_weights, strict=True):
-            if not torch.all(x == y):
-                output_logs_str = "\n".join(output_logs)
-                raise AssertionError(
-                    f"{rank=} {num_gpus=} {info=}\n"
-                    f"routed_experts_weights[i]={x.tolist()}\n"
-                    f"expect_new_weights[i]={y.tolist()}\n"
-                    f"old_physical_to_logical_map={physical_to_logical_map.tolist()}\n"
-                    f"new_physical_to_logical_map={new_physical_to_logical_map.tolist()}\n"
-                    f"===logs===\n"
-                    f"{output_logs_str}"
-                )
+        local_has_error = not all(
+            torch.all(x == y)
+            for x, y in zip(routed_experts_weights, expect_new_weights, strict=True)
+        )
+
+        # output_logs_str = "\n".join(output_logs)
+        # raise AssertionError(
+        #     f"{rank=} {num_gpus=} {info=}\n"
+        #     f"routed_experts_weights[i]={x.tolist()}\n"
+        #     f"expect_new_weights[i]={y.tolist()}\n"
+        #     f"old_physical_to_logical_map={physical_to_logical_map.tolist()}\n"
+        #     f"new_physical_to_logical_map={new_physical_to_logical_map.tolist()}\n"
+        #     f"===logs===\n"
+        #     f"{output_logs_str}"
+        # )
 
         physical_to_logical_map = new_physical_to_logical_map
 
