@@ -68,7 +68,8 @@ def _run_subprocess(
     try:
         torch.random.manual_seed(42)
         num_local_physical_experts = num_physical_experts // num_gpus
-        num_gpu_per_node = TODO
+        assert num_gpus % nnodes == 0
+        num_gpu_per_node = num_gpus // nnodes
 
         def _create_routed_experts_weights(physical_to_logical_map):
             local_logical_expert_ids = physical_to_logical_map[
