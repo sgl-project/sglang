@@ -53,12 +53,14 @@ def update_expert_weights_single_layer(
         rank * num_local_physical_experts,
         (rank + 1) * num_local_physical_experts,
     ):
+        logical_expert_id = new_physical_to_logical_map[dst_expert_location]
         TODO
 
     for src_expert_location in range(
         rank * num_local_physical_experts,
         (rank + 1) * num_local_physical_experts,
     ):
+        logical_expert_id = old_physical_to_logical_map[src_expert_location]
         TODO
 
     reqs = torch.distributed.batch_isend_irecv(TODO)
