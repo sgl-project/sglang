@@ -178,12 +178,14 @@ def update_expert_weights_single_layer(
 
 
 class _ChunkUtils:
-    @staticmethod
-    def chunk_value_from_element_value(chunk_values: List, element_values: List, element_value):
+    def __init__(self, chunk_values: List, element_values: List):
+        self.chunk_values = chunk_values
+        self.element_values = element_values
+
+    def chunk_value_from_element_value(self, element_value):
         return TODO
 
-    @staticmethod
-    def element_values_from_chunk_value(chunk_values: List, element_values: List, chunk_value) -> List:
+    def element_values_from_chunk_value(self, chunk_value) -> List:
         return TODO
 
 
