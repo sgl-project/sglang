@@ -1272,6 +1272,7 @@ def v1_chat_generate_response(
     request,
     ret,
     created,
+    tokenizer_manager,
     to_file=False,
     cache_report=False,
     tool_call_parser=None,
@@ -1283,6 +1284,7 @@ def v1_chat_generate_response(
     for idx, ret_item in enumerate(ret):
         if gen_assistant_prefix_ids_list and idx < len(gen_assistant_prefix_ids_list):
             gen_assistant_prefix_id = gen_assistant_prefix_ids_list[idx]
+            gen_assistant_prefix = tokenizer_manager.tokenizer.decode(gen_assistant_prefix_id, skip_special_tokens=False)
         else:
             gen_assistant_prefix_id = []
         logprobs = False
@@ -1343,8 +1345,8 @@ def v1_chat_generate_response(
 
         tool_calls = None
         text = (
-            gen_assistant_prefix_id + ret_item["text"]
-            if gen_assistant_prefix_id
+            gen_assistant_prefix + ret_item["text"]
+            if gen_assistant_prefix
             else ret_item["text"]
         )
 
@@ -1862,6 +1864,7 @@ async def v1_chat_completions(
         request,
         ret,
         created,
+        tokenizer_manager,
         cache_report=tokenizer_manager.server_args.enable_cache_report,
         tool_call_parser=tokenizer_manager.server_args.tool_call_parser,
         reasoning_parser=tokenizer_manager.server_args.reasoning_parser,
