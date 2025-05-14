@@ -56,3 +56,6 @@ def update_expert_weights_single_layer(
     reqs = torch.distributed.batch_isend_irecv(TODO)
     for req in reqs:
         req.wait()
+
+    for copy_back_info in TODO:
+        TODO
