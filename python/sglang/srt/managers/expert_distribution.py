@@ -6,7 +6,6 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Type, Literal, Tuple
 
-import einops
 import torch
 import torch.distributed
 from sglang.srt.managers.expert_location import ExpertLocationMetadata
@@ -660,34 +659,3 @@ def _convert_global_physical_count_to_logical_count(
         src=global_physical_count,
     )
     return logical_count
-
-
-def compute_gpu_physical_count(
-    physical_count_of_whatever: torch.Tensor,  # (..., num_layer, num_physical_expert)
-    num_gpu: int,
-):
-    """output: gpu_physical_count_of_batch (..., num_layer, num_gpu)"""
-    return einops.reduce(
-        physical_count_of_whatever,
-        "... num_layer (num_gpu num_expert_per_gpu) -> ... num_layer num_gpu",
-        "sum",
-        num_gpu=num_gpu,
-    )
-
-
-def compute_utilization_rate(
-    gpu_physical_count_of_batch: torch.Tensor,  # (..., num_layer, num_gpu)
-):
-    """output: utilization_rate (..., num_layer)"""
-    gpu_physical_count_of_batch = gpu_physical_count_of_batch.float()
-    max_gpu_physical_count = einops.reduce(
-        gpu_physical_count_of_batch,
-        "... num_layer num_gpu -> ... num_layer",
-        "max",
-    )
-    avg_gpu_physical_count = einops.reduce(
-        gpu_physical_count_of_batch,
-        "... num_layer num_gpu -> ... num_layer",
-        "mean",
-    )
-    return (avg_gpu_physical_count + 1e-5) / (max_gpu_physical_count + 1e-5)
