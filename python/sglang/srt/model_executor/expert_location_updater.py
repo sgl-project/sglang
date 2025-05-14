@@ -209,8 +209,12 @@ def update_expert_weights_single_layer(
         return same_node_mapping, cross_node_mapping, need_comm_self_node_dst_ranks
 
     def _execute_p2p_ops(p2p_op_infos):
+        if len(p2p_op_infos) == 0:
+            return
+
         sorted_infos = sorted(p2p_op_infos, key=lambda info: info[0])
         p2p_ops = [op for _, ops in sorted_infos for op in ops]
+       
         reqs = torch.distributed.batch_isend_irecv(p2p_ops)
         for req in reqs:
             req.wait()
