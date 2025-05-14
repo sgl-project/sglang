@@ -18,6 +18,7 @@ class _TestInfo:
     nnodes: int
     num_logical_experts: int
     num_physical_experts: int
+    num_repeat: int = 20000
 
 
 class TestExpertLocationUpdater(CustomTestCase):
@@ -141,10 +142,9 @@ def _execute_test(info: _TestInfo, rank: int, num_gpus: int, device: str):
     physical_to_logical_map = _create_physical_to_logical_map()
     routed_experts_weights = _create_routed_experts_weights(physical_to_logical_map)
 
-    num_repeats = 5000
-    for i in range(num_repeats):
-        if rank == 0 and i % 500 == 0:
-            print(f"Step {i}/{num_repeats}", flush=True)
+    for i in range(info.num_repeat):
+        if rank == 0 and ((i % 500 == 0) or (i == info.num_repeat - 1)):
+            print(f"Step {i}/{info.num_repeat}", flush=True)
 
         new_physical_to_logical_map = _create_physical_to_logical_map()
         expect_new_weights = _create_routed_experts_weights(new_physical_to_logical_map)
