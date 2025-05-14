@@ -1,5 +1,5 @@
 import logging
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import torch
 import torch.distributed
@@ -56,10 +56,10 @@ def update_expert_weights_single_layer(
 
     def _entrypoint():
         # List[Tuple[src_expert_location, dst_expert_location]]
-        copy_back_infos = []
+        copy_back_infos: List[Tuple[int, int]] = []
 
         for dst_expert_location in range(*local_expert_location_range):
-            _handle_dst_expert_location(dst_expert_location=dst_expert_location)
+            _handle_dst_expert_location(dst_expert_location, copy_back_infos)
             TODO
 
         for src_expert_location in range(*local_expert_location_range):
@@ -73,7 +73,7 @@ def update_expert_weights_single_layer(
         for copy_back_info in TODO:
             TODO
 
-    def _handle_dst_expert_location(dst_expert_location: int):
+    def _handle_dst_expert_location(dst_expert_location: int, copy_back_infos):
         logical_expert_id = new_physical_to_logical_map[dst_expert_location]
 
         # case 1: unchanged
@@ -84,13 +84,13 @@ def update_expert_weights_single_layer(
         for src_expert_location in range(*local_expert_location_range):
             if old_physical_to_logical_map[src_expert_location] == logical_expert_id:
                 TODO_do_copy
-                TODO_add_to_copy_back_info
+                copy_back_infos.append((TODO, TODO))
                 return
 
         # case 3: free-rider
         for src_expert_location in range(rank * num_local_physical_experts, dst_expert_location):
             if new_physical_to_logical_map[src_expert_location] == logical_expert_id:
-                TODO_add_to_copy_back_info
+                copy_back_infos.append((TODO, TODO))
                 return
 
     _entrypoint()
