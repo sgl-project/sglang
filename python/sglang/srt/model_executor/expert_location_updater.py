@@ -246,8 +246,8 @@ def update_expert_weights_single_layer(
     def _execute_buffer2weight_copies(buffer2weight_copy_infos):
         for temp_buffers_expert_location, routed_experts_weights_expert_location in buffer2weight_copy_infos:
             for i in range(num_tensors):
-                _get_tensor(routed_experts_weights, i, temp_buffers_expert_location).copy_(
-                    _get_tensor(temp_buffers, i, routed_experts_weights_expert_location))
+                _get_tensor(routed_experts_weights, i, routed_experts_weights_expert_location).copy_(
+                    _get_tensor(temp_buffers, i, temp_buffers_expert_location))
 
     def _get_tensor(tensors, tensor_index: int, expert_location: int) -> torch.Tensor:
         return tensors[tensor_index][_get_local_expert_location(expert_location)]
