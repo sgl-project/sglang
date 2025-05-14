@@ -107,8 +107,6 @@ def update_expert_weights_single_layer(
         # case 4: same-node
         if rank in need_comm_self_node_dst_ranks:
             chosen_src_rank = _ChunkUtils.chunk_value_from_element_value(
-                chunk_values=self_node_src_ranks,
-                element_values=need_comm_self_node_dst_ranks,
                 element_value=rank,
             )
             for i in range(len(routed_experts_weights)):
@@ -118,8 +116,6 @@ def update_expert_weights_single_layer(
 
         # case 5: cross-node
         chosen_src_rank = _ChunkUtils.chunk_value_from_element_value(
-            chunk_values=all_src_ranks,
-            element_values=need_comm_cross_node_dst_ranks,
             element_value=rank,
         )
         for i in range(len(routed_experts_weights)):
@@ -141,16 +137,12 @@ def update_expert_weights_single_layer(
 
         # a. same-node
         chosen_dst_ranks = _ChunkUtils.element_values_from_chunk_value(
-            chunk_values=self_node_src_ranks,
-            element_values=need_comm_self_node_dst_ranks,
             chunk_value=rank,
         )
         p2p_op_infos.append((TODO, TODO))
 
         # b. cross-node
         chosen_dst_ranks = _ChunkUtils.element_values_from_chunk_value(
-            chunk_values=all_src_ranks,
-            element_values=need_comm_cross_node_dst_ranks,
             chunk_value=rank,
         )
         p2p_op_infos.append((TODO, TODO))
@@ -172,7 +164,15 @@ def update_expert_weights_single_layer(
         need_comm_cross_node_dst_ranks = [x for x in need_comm_dst_ranks if
                                           (x // num_gpu_per_node) not in all_src_nodes]
 
-        return all_src_ranks, self_node_src_ranks, need_comm_self_node_dst_ranks, need_comm_cross_node_dst_ranks
+        same_node_mapping = _ChunkUtils(
+            chunk_values=self_node_src_ranks,
+            element_values=need_comm_self_node_dst_ranks,
+        )
+
+        cross_node_mapping = _ChunkUtils(
+            chunk_values=all_src_ranks,
+            element_values=need_comm_cross_node_dst_ranks,
+        )
 
     _entrypoint()
 
