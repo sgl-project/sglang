@@ -129,6 +129,7 @@ def update_expert_weights_single_layer(
             )
             for i in range(len(routed_experts_weights)):
                 p2p_op_infos.append((TODO, TODO))
+            buffer2weight_copy_infos.append((TODO, TODO))
 
         # case 5: cross-node
         TODO
