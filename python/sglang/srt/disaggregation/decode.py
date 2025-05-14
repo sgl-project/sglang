@@ -308,7 +308,7 @@ class DecodeTransferQueue:
         self,
         gloo_group: ProcessGroup,
         req_to_metadata_buffer_idx_allocator: ReqToMetadataIdxAllocator,
-        metadata_buffers: torch.Tensor,
+        metadata_buffers: List[torch.Tensor],
     ):
         self.queue: List[DecodeRequest] = []
         self.gloo_group = gloo_group
