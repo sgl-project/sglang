@@ -39,8 +39,8 @@ def create_temp_buffers(sample_tensors):
 def update_expert_weights_single_layer(
     routed_experts_weights: List[torch.Tensor],
     temp_buffers: List[torch.Tensor],
-    old_physical_to_logical_map: torch.Tensor,
-    new_physical_to_logical_map: torch.Tensor,
+    old_physical_to_logical_map: torch.Tensor,  # (num_global_physical_Experts,)
+    new_physical_to_logical_map: torch.Tensor,  # (num_global_physical_Experts,)
 ):
     assert all(tensor.shape[0] == num_local_physical_experts for tensor in routed_experts_weights)
     TODO
