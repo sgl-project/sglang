@@ -63,7 +63,7 @@ def update_expert_weights_single_layer(
 ):
     assert all(tensor.shape[0] == num_local_physical_experts for tensor in routed_experts_weights)
 
-    output_logs = []
+    output_logs = [] if debug else None
 
     num_physical_experts, = old_physical_to_logical_map.shape
     num_tensors = len(routed_experts_weights)
@@ -88,6 +88,10 @@ def update_expert_weights_single_layer(
         _create_isend_ops(p2p_op_infos)
         _execute_p2p_ops(p2p_op_infos)
         _execute_buffer2weight_copies(buffer2weight_copy_infos)
+
+        if debug:
+            output_logs.append(f"{p2p_op_infos=}")
+            output_logs.append(f"{buffer2weight_copy_infos=}")
 
     def _handle_recv(buffer2weight_copy_infos, p2p_op_infos):
         for dst_expert_location in range(*local_expert_location_range):
@@ -245,6 +249,8 @@ def update_expert_weights_single_layer(
         return expert_location % num_local_physical_experts
 
     _entrypoint()
+
+    return output_logs
 
 
 class _ChunkUtils:
