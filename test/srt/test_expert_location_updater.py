@@ -191,7 +191,7 @@ def _execute_test(info: _TestInfo, rank: int, num_gpus: int, device: str):
                 f"=============================================================="
             )
 
-            global_messages = [None] * num_gpus
+            global_messages = ([None] * num_gpus) if rank == 0 else None
             torch.distributed.gather_object(local_message, global_messages, dst=0)
 
             msg = "\n\n".join(global_messages) if rank == 0 else "(see rank 0)"
