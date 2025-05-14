@@ -105,7 +105,7 @@ def _run_subprocess(
 
         torch.random.manual_seed(42)
         torch.distributed.init_process_group(rank=rank, world_size=num_gpus,
-                                             backend={"cpu": "gloo", "cuda": "gloo,nccl"}[device])
+                                             backend={"cpu": "gloo", "cuda": "nccl"}[device])
         if device == "cuda":
             torch.cuda.set_device(f"cuda:{rank}")
 
@@ -174,10 +174,10 @@ def _execute_test(info: _TestInfo, rank: int, num_gpus: int, device: str):
             torch.all(x == y)
             for x, y in zip(routed_experts_weights, expect_new_weights, strict=True)
         )
-        global_has_error = torch.tensor(local_has_error)
+        global_has_error = torch.tensor(local_has_error, device=device)
         torch.distributed.all_reduce(global_has_error, op=torch.distributed.ReduceOp.MAX)
 
-        if global_has_error:
+        if global_has_error.cpu().item():
             output_logs_str = "\n".join(output_logs)
             local_message = (
                 f"===================== rank {rank} ============================"
