@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Literal, Optional, Tuple, Type
 
 import torch
 import torch.distributed
+
 from sglang.srt.managers.expert_location import ExpertLocationMetadata
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -386,8 +387,8 @@ class _SelectExpertsSinglePassGatherer(_LayerBasedSinglePassGatherer):
         torch.cuda.synchronize()
 
         global_physical_count = [
-                                    0
-                                ] * self._expert_location_metadata.num_physical_experts
+            0
+        ] * self._expert_location_metadata.num_physical_experts
         for token_record in topk_ids_list:
             for global_physical_expert_idx in token_record:
                 global_physical_count[global_physical_expert_idx] += 1
@@ -470,7 +471,7 @@ def _convert_local_to_global_physical_count(
 
     ans = torch.zeros((num_layers, num_physical_experts), dtype=dtype, device=device)
     ans[
-    :, num_local_physical_experts * rank: num_local_physical_experts * (rank + 1)
+        :, num_local_physical_experts * rank : num_local_physical_experts * (rank + 1)
     ] = local_physical_count
     return ans
 
