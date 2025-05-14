@@ -297,16 +297,21 @@ def compute_logical_to_rank_dispatch_physical_map(
 
     g = torch.Generator(device=device)
     g.manual_seed(base_seed + ep_rank)
+
+    output_shape = (num_layers, num_logical_experts)
     chosen_index = (
-        torch.randint(0, 65536, (num_layers, num_logical_experts), dtype=torch.int32, device=device, generator=g)
+        torch.randint(0, 65536, output_shape, dtype=torch.int32, device=device, generator=g)
         % logical_to_all_physical_map_num_valid
     )
-    logical_to_rank_dispatch_physical_map = logical_to_all_physical_map[chosen_index]
+    assert logical_to_all_physical_map.shape == chosen_index.shape
+    logical_to_rank_dispatch_physical_map = logical_to_all_physical_map.flatten()[chosen_index.flatten()].view(
+        output_shape)
+    print(f"hi {logical_to_rank_dispatch_physical_map.shape=}")
 
     for index in range(logical_to_all_physical_map_num_valid.max() + 1):
         partial_logical_to_all_physical_map = logical_to_all_physical_map[:, :, index]
         is_valid = partial_logical_to_all_physical_map != -1
-        is_same_gpu = partial_logical_to_all_physical_map // num_local_physical_experts == ep_rank
+        is_same_gpu = (partial_logical_to_all_physical_map // num_local_physical_experts) == ep_rank
         logical_to_rank_dispatch_physical_map = torch.where(is_valid & is_same_gpu, partial_logical_to_all_physical_map,
                                                             logical_to_rank_dispatch_physical_map)
 
