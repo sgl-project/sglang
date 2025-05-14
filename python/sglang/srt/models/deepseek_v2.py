@@ -1694,7 +1694,10 @@ class DeepseekV2ForCausalLM(nn.Module):
                         "up_proj.weight",
                         "up_proj.weight_scale",
                     ]
-                elif self.quant_config.get_name() == "fp8" or self.quant_config.get_name() == "blockwise_int8":
+                elif (
+                    self.quant_config.get_name() == "fp8"
+                    or self.quant_config.get_name() == "blockwise_int8"
+                ):
                     suffix_list = [
                         "down_proj.weight",
                         "down_proj.weight_scale_inv",
