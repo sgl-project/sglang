@@ -11,16 +11,16 @@ from torch.multiprocessing import Process
 
 class TestExpertLocationUpdater(CustomTestCase):
     def test_cpu(self):
-        self._test_core(num_gpus=32, nnodes=4, num_logical_experts=256, num_physical_experts=288)
-        self._test_core(num_gpus=144, nnodes=18, num_logical_experts=256, num_physical_experts=288)
-        self._test_common()
+        self._test_core(num_gpus=32, nnodes=4, num_logical_experts=256, num_physical_experts=288, device="cpu")
+        self._test_core(num_gpus=144, nnodes=18, num_logical_experts=256, num_physical_experts=288, device="cpu")
+        self._test_common(device="cpu")
 
     def test_gpu(self):
         if is_in_ci():
             return
         self._test_common(device="cuda")
 
-    def _test_common(self, device="cpu"):
+    def _test_common(self, device):
         for nnodes in [1, 2, 4]:
             for num_logical_experts in [2, 5, 20, 200]:
                 for num_physical_experts in [4, 16, 220]:
