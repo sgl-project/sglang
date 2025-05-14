@@ -90,7 +90,7 @@ class TestExpertDistribution(CustomTestCase):
                     self.assertGreater(len(data), 0, "Should contain data rows")
                 else:
                     logical_count = data["logical_count"]
-                    print(f"{logical_count=}")
+                    print(f"{logical_count.sum()=} {logical_count=}")
                     self.assertTrue(logical_count.sum() > 0)
 
             finally:
