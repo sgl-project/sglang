@@ -155,9 +155,10 @@ def _execute_test(info: _TestInfo, rank: int, num_gpus: int, device: str):
             ans = torch.empty((info.num_physical_experts,), dtype=torch.int64)
 
         assert ans.dtype == torch.int64 and ans.shape == (info.num_physical_experts,)
+        ans = ans.to(device)
         torch.distributed.broadcast(ans, src=0)
 
-        return ans
+        return ans.cpu()
 
     physical_to_logical_map = _create_physical_to_logical_map()
     routed_experts_weights = _create_routed_experts_weights(physical_to_logical_map)
