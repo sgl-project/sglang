@@ -13,11 +13,12 @@ logger = logging.getLogger(__name__)
 def update_expert_location(
     routed_experts_weights_of_layer: Dict[int, List[torch.Tensor]],
     new_expert_location_metadata: ExpertLocationMetadata,
+    nnodes: int,
     rank: int,
 ):
     old_expert_location_metadata = get_global_expert_location_metadata()
     _update_expert_weights(routed_experts_weights_of_layer, old_expert_location_metadata, new_expert_location_metadata,
-                           rank)
+                           nnodes, rank)
     old_expert_location_metadata.update(new_expert_location_metadata)
 
 
@@ -25,9 +26,13 @@ def _update_expert_weights(
     routed_experts_weights_of_layer: Dict[int, List[torch.Tensor]],
     old_expert_location_metadata: ExpertLocationMetadata,
     new_expert_location_metadata: ExpertLocationMetadata,
+    nnodes: int,
     rank: int,
 ):
     temp_buffers = create_temp_buffers(next(iter(routed_experts_weights_of_layer.values())))
+
+    world_size = torch.distributed.get_world_size()
+
     for layer_id in sorted(routed_experts_weights_of_layer.keys()):
         update_expert_weights_single_layer(
             routed_experts_weights=routed_experts_weights_of_layer[layer_id],
