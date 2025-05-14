@@ -518,13 +518,13 @@ class _Accumulator(ABC):
         gatherer_key: str,
         single_pass_data: Dict,
     ):
-        raise NotImplementedError
+        pass
 
     def reset(self):
-        raise NotImplementedError
+        pass
 
     def dump(self, output_mode: _OutputMode):
-        raise NotImplementedError
+        pass
 
 
 class _UtilizationRateAccumulatorMixin(_Accumulator):
