@@ -276,6 +276,16 @@ class ReplicatedLinear(LinearBase):
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
         # If the weight on disk does not have a shape, give it one
         # (such scales for AutoFp8).
+
+        is_gguf_weight = getattr(param, "is_gguf_weight", False)
+        is_gguf_weight_type = getattr(param, "is_gguf_weight_type", False)
+        if is_gguf_weight_type:
+            param.weight_type = loaded_weight.item()
+
+        # Materialize GGUF UninitializedParameter
+        if is_gguf_weight and isinstance(param, UninitializedParameter):
+            param.materialize(loaded_weight.shape, dtype=loaded_weight.dtype)
+
         if len(loaded_weight.shape) == 0:
             loaded_weight = loaded_weight.reshape(1)
 
