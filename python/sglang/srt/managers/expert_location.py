@@ -290,14 +290,13 @@ def compute_logical_to_rank_dispatch_physical_map(
     rank: int,
     base_seed: int = 42,
 ):
-    g = torch.Generator()
-    g.manual_seed(base_seed + rank)
-
     device = logical_to_all_physical_map.device
 
     num_local_physical_experts = num_physical_experts // num_gpus
     num_layers, num_logical_experts, _ = logical_to_all_physical_map.shape
 
+    g = torch.Generator()
+    g.manual_seed(base_seed + rank)
     chosen_index = (
         torch.randint(0, 65536, (num_layers, num_logical_experts), dtype=torch.int32, device=device, generator=g)
         % logical_to_all_physical_map_num_valid
