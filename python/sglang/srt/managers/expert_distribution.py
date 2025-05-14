@@ -201,7 +201,7 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             )
         self._recording = False
 
-    def dump_record(self, output_mode: _OutputMode):
+    def dump_record(self, output_mode: _OutputMode = "file"):
         """Dump the expert distribution record and reset the recorder after dumping."""
         output = self._accumulator.dump(output_mode=output_mode)
         self._reset()
