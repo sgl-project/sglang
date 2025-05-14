@@ -111,7 +111,7 @@ def get_int_env_var(name: str, default: int = 0) -> int:
 
 # https://pytorch.org/docs/stable/notes/hip.html#checking-for-hip
 def is_hip() -> bool:
-    return torch.version.hip is not None
+    return torch.cuda.is_available() and torch.version.hip
 
 
 if is_hip():
@@ -123,10 +123,6 @@ FP8_E4M3_MIN = -FP8_E4M3_MAX
 
 builtins.FP8_E4M3_MAX = FP8_E4M3_MAX
 builtins.FP8_E4M3_MIN = FP8_E4M3_MIN
-
-
-def is_rocm() -> bool:
-    return torch.cuda.is_available() and torch.version.hip
 
 
 def is_cuda():
