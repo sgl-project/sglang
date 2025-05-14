@@ -95,4 +95,10 @@ def update_expert_weights_single_layer(
                 copy_back_infos.append((src_expert_location, dst_expert_location))
                 return
 
+        # case 4: same-node
+        TODO
+
+        # case 5: cross-node
+        TODO
+
     _entrypoint()
