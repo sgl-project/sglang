@@ -171,7 +171,7 @@ class ServerArgs:
     expert_distribution_recorder_mode: Optional[
         Literal["stat", "per_pass", "per_token"]
     ] = None
-    expert_distribution_recorder_buffer_size: int = 1000
+    expert_distribution_recorder_buffer_size: Optional[int] = None
     enable_torch_compile: bool = False
     torch_compile_max_bs: int = 32
     cuda_graph_max_bs: Optional[int] = None
@@ -339,6 +339,11 @@ class ServerArgs:
             )
         if self.enable_expert_distribution_metrics and (self.expert_distribution_recorder_mode is None):
             self.expert_distribution_recorder_mode = "stat"
+        if self.expert_distribution_recorder_buffer_size is None:
+            if (x := self.eplb_rebalance_num_iterations) is not None:
+                self.expert_distribution_recorder_buffer_size = x
+            elif self.expert_distribution_recorder_mode is not None:
+                self.expert_distribution_recorder_buffer_size = 1000
 
         if self.ep_num_redundant_experts > 0:
             assert (
