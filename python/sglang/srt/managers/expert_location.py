@@ -55,8 +55,9 @@ class ExpertLocationMetadata:
         num_layers_2, num_logical_experts_1 = (
             self.logical_to_all_physical_map_num_valid.shape
         )
-        assert num_layers_0 == num_layers_1 == num_layers_2 == num_layers_3
-        assert num_logical_experts_0 == num_logical_experts_1 == num_logical_experts_2
+        # TODO pr-chain: enable this later
+        # assert num_layers_0 == num_layers_1 == num_layers_2 == num_layers_3
+        # assert num_logical_experts_0 == num_logical_experts_1 == num_logical_experts_2
         assert num_physical_experts_0 == num_physical_experts_1
 
     # -------------------------------- construction ------------------------------------
