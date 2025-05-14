@@ -151,6 +151,7 @@ def _execute_test(info: _TestInfo, rank: int, num_gpus: int, device: str):
         else:
             ans = torch.empty((info.num_physical_experts,), dtype=torch.int64)
 
+        assert ans.dtype == torch.int64 and ans.shape == (info.num_physical_experts,)
         torch.distributed.broadcast(ans, src=0)
 
         return ans
