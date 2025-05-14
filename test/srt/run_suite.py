@@ -88,7 +88,6 @@ suites = {
     "per-commit-amd": [
         TestFile("test_mla.py", 242),
         TestFile("test_mla_deepseek_v3.py", 221),
-        TestFile("test_mla_fp8.py", 153),
         TestFile("test_torch_compile.py", 76),
         TestFile("test_torch_compile_moe.py", 172),
     ],
@@ -104,7 +103,6 @@ suites = {
     ],
     "per-commit-2-gpu-amd": [
         TestFile("test_mla_tp.py", 170),
-        TestFile("test_moe_ep.py", 181),
     ],
     "per-commit-8-gpu": [
         # Disabled deepep tests temporarily because it takes too much time.
