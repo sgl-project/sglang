@@ -18,8 +18,12 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.mem_cache.multimodal_cache import MultiModalCache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import flatten_nested_list, print_warning_once
+from sglang.utils import logger
 
-logger = logging.getLogger(__name__)
+# NOTE: Using the shared logger from sglang.utils instead of creating a module-specific logger
+# to ensure consistent logging behavior across the codebase. This prevents issues with log
+# propagation that can cause some log messages (like 'server is fired up') to not appear
+# in the console when multimodal support is enabled.
 
 
 class MultiModalityDataPaddingPattern:
@@ -214,7 +218,7 @@ def get_embedding_chunk(
             end_index += end - start + 1
     # some models embedding is 3-dim, reshape it to 2-dim
     embedding = embedding.reshape(-1, embedding.shape[-1])
-    embedding_chunk = embedding[start_index : end_index]
+    embedding_chunk = embedding[start_index:end_index]
     return embedding_chunk, start_index, end_index
 
 

@@ -317,7 +317,7 @@ class BaseMultimodalProcessor(ABC):
 
     @staticmethod
     def get_mm_items_offset_by_pair(
-         input_ids: torch.Tensor, mm_start_id: int, mm_end_id: int
+        input_ids: torch.Tensor, mm_start_id: int, mm_end_id: int
     ) -> List[Tuple[int, int]]:
         indices_start = (input_ids == mm_start_id).nonzero(as_tuple=True)[0] + 1
         indices_end = (input_ids == mm_end_id).nonzero(as_tuple=True)[0] - 1

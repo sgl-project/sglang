@@ -127,7 +127,7 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
         )
 
         items = []
-        
+
         input_ids = ret["input_ids"].flatten().tolist()
         image_offsets = self.get_mm_items_offset(
             input_ids=ret["input_ids"].flatten(), mm_token_id=self.image_token_id

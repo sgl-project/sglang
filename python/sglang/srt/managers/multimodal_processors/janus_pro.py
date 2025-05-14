@@ -47,7 +47,9 @@ class JanusProImageProcessor(BaseMultimodalProcessor):
         )
 
         input_ids = res["input_ids"].flatten()
-        image_offsets = self.get_mm_items_offset(input_ids=input_ids, mm_token_id=processor.image_id)
+        image_offsets = self.get_mm_items_offset(
+            input_ids=input_ids, mm_token_id=processor.image_id
+        )
         return {
             "mm_items": [
                 MultimodalDataItem(
