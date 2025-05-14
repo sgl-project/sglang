@@ -780,7 +780,8 @@ def _convert_global_physical_count_to_logical_count(
     physical_to_logical_map: torch.Tensor,
 ):
     dim_extra, _, _ = global_physical_count.shape
-    logical_count = torch.zeros((dim_extra, num_layers, num_logical_experts))
+    device = global_physical_count.device
+    logical_count = torch.zeros((dim_extra, num_layers, num_logical_experts), device=device)
     logical_count.scatter_add_(
         dim=2,
         index=physical_to_logical_map.unsqueeze(0).expand(dim_extra, -1, -1),
