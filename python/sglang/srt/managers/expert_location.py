@@ -46,7 +46,7 @@ class ExpertLocationMetadata:
 
     @property
     def ep_size(self):
-        return self.logical_to_rank_dispatch_physical_map.shape[0]
+        return TODO
 
     def __post_init__(self):
         num_layers_0, num_physical_experts_0 = self.physical_to_logical_map.shape
@@ -56,7 +56,7 @@ class ExpertLocationMetadata:
         num_layers_2, num_logical_experts_1 = (
             self.logical_to_all_physical_map_num_valid.shape
         )
-        ep_size_0, num_layers_3, num_logical_experts_2 = (
+        num_layers_3, num_logical_experts_2 = (
             self.logical_to_rank_dispatch_physical_map.shape
         )
         assert num_layers_0 == num_layers_1 == num_layers_2 == num_layers_3
@@ -203,11 +203,11 @@ class ExpertLocationMetadata:
         ]:
             assert getattr(self, field) == getattr(other, field)
 
-        for field, layer_id_dim in [
-            ("physical_to_logical_map", 0),
-            ("logical_to_all_physical_map", 0),
-            ("logical_to_all_physical_map_num_valid", 0),
-            ("logical_to_rank_dispatch_physical_map", 1),
+        for field in [
+            "physical_to_logical_map",
+            "logical_to_all_physical_map",
+            "logical_to_all_physical_map_num_valid",
+            "logical_to_rank_dispatch_physical_map",
         ]:
             dst = getattr(self, field)
             dst[...] = getattr(other, field)

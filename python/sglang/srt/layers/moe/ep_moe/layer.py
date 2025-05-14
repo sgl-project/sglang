@@ -247,7 +247,6 @@ class EPMoE(torch.nn.Module):
             custom_routing_function=self.custom_routing_function,
             routed_scaling_factor=self.routed_scaling_factor,
             expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                ep_rank=self.tp_rank,
                 layer_id=self.layer_id,
             ),
         )

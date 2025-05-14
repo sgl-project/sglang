@@ -19,7 +19,7 @@ class ExpertLocationDispatchInfo:
     num_physical_experts: int
 
     @classmethod
-    def init_new(cls,  layer_id: int):
+    def init_new(cls, layer_id: int):
         ep_dispatch_algorithm = global_server_args_dict["ep_dispatch_algorithm"]
         expert_location_metadata = get_global_expert_location_metadata()
 
@@ -41,7 +41,7 @@ class ExpertLocationDispatchInfo:
 
 
 def topk_ids_logical_to_physical(
-        topk_ids: torch.Tensor, info: Optional[ExpertLocationDispatchInfo]
+    topk_ids: torch.Tensor, info: Optional[ExpertLocationDispatchInfo]
 ) -> torch.Tensor:
     if info is None:
         return topk_ids
@@ -58,21 +58,21 @@ def topk_ids_logical_to_physical(
 
 
 def _topk_ids_logical_to_physical_static(
-        topk_ids: torch.Tensor, info: Optional[ExpertLocationDispatchInfo]
+    topk_ids: torch.Tensor, info: Optional[ExpertLocationDispatchInfo]
 ) -> torch.Tensor:
     return info.partial_logical_to_rank_dispatch_physical_map[topk_ids]
 
 
 def _topk_ids_logical_to_physical_random(
-        topk_ids: torch.Tensor, info: Optional[ExpertLocationDispatchInfo]
+    topk_ids: torch.Tensor, info: Optional[ExpertLocationDispatchInfo]
 ) -> torch.Tensor:
     topk_ids_original_shape = topk_ids.shape
     device = topk_ids.device
     topk_ids = topk_ids.flatten()
 
     chosen_dispatch_index = (
-            torch.randint(0, 65536, topk_ids.shape, dtype=torch.int32, device=device)
-            % info.partial_logical_to_all_physical_map_num_valid[topk_ids]
+        torch.randint(0, 65536, topk_ids.shape, dtype=torch.int32, device=device)
+        % info.partial_logical_to_all_physical_map_num_valid[topk_ids]
     )
     topk_ids = info.partial_logical_to_all_physical_map[topk_ids, chosen_dispatch_index]
 
@@ -81,7 +81,7 @@ def _topk_ids_logical_to_physical_random(
 
 
 def _topk_ids_logical_to_physical_fake_uniform(
-        topk_ids: torch.Tensor, info: Optional[ExpertLocationDispatchInfo]
+    topk_ids: torch.Tensor, info: Optional[ExpertLocationDispatchInfo]
 ) -> torch.Tensor:
     # NOTE it will have probability to send one token to one expert multiple times
     return torch.randint(
@@ -95,7 +95,7 @@ def _topk_ids_logical_to_physical_fake_uniform(
 
 @torch.compile(dynamic=True, backend=get_compiler_backend())
 def _topk_ids_logical_to_physical_fake_grouped_uniform(
-        topk_ids: torch.Tensor, info: Optional[ExpertLocationDispatchInfo]
+    topk_ids: torch.Tensor, info: Optional[ExpertLocationDispatchInfo]
 ) -> torch.Tensor:
     # NOTE it will have probability to send one token to one expert multiple times
     # NOTE it will make each group have exactly two experts chosen
