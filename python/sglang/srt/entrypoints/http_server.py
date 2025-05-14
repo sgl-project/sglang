@@ -108,21 +108,12 @@ class _GlobalState:
     tokenizer_manager: TokenizerManager
     scheduler_info: Dict
 
-
-_global_state: Optional[_GlobalState] = None
-
-
-def set_global_state(global_state: _GlobalState):
-    global _global_state
-    _global_state = global_state
-
-
 @asynccontextmanager
 async def lifespan(fast_api_app: FastAPI):
     server_args: ServerArgs = fast_api_app.server_args
     if server_args.warmups is not None:
         await execute_warmups(
-            server_args.warmups.split(","), _global_state.tokenizer_manager
+            server_args.warmups.split(","), fast_api_app.state.tokenizer_manager
         )
         logger.info("Warmup ended")
 
@@ -164,9 +155,9 @@ async def health_generate(request: Request) -> Response:
     sampling_params = {"max_new_tokens": 1, "temperature": 0.0}
     rid = f"HEALTH_CHECK_{time.time()}"
 
-    if _global_state.tokenizer_manager.is_image_gen:
+    if request.app.state.tokenizer_manager.is_image_gen:
         raise NotImplementedError()
-    elif _global_state.tokenizer_manager.is_generation:
+    elif request.app.state.tokenizer_manager.is_generation:
         gri = GenerateReqInput(
             rid=rid,
             input_ids=[0],
@@ -179,49 +170,49 @@ async def health_generate(request: Request) -> Response:
         )
 
     async def gen():
-        async for _ in _global_state.tokenizer_manager.generate_request(gri, request):
+        async for _ in request.app.state.tokenizer_manager.generate_request(gri, request):
             break
 
     tic = time.time()
     task = asyncio.create_task(gen())
     while time.time() < tic + HEALTH_CHECK_TIMEOUT:
         await asyncio.sleep(1)
-        if _global_state.tokenizer_manager.last_receive_tstamp > tic:
+        if request.app.state.tokenizer_manager.last_receive_tstamp > tic:
             task.cancel()
-            _global_state.tokenizer_manager.rid_to_state.pop(rid, None)
+            request.app.state.tokenizer_manager.rid_to_state.pop(rid, None)
             return Response(status_code=200)
 
     task.cancel()
     tic_time = time.strftime("%H:%M:%S", time.localtime(tic))
     last_receive_time = time.strftime(
-        "%H:%M:%S", time.localtime(_global_state.tokenizer_manager.last_receive_tstamp)
+        "%H:%M:%S", time.localtime(request.app.state.tokenizer_manager.last_receive_tstamp)
     )
     logger.error(
         f"Health check failed. Server couldn't get a response from detokenizer for last "
         f"{HEALTH_CHECK_TIMEOUT} seconds. tic start time: {tic_time}. "
         f"last_heartbeat time: {last_receive_time}"
     )
-    _global_state.tokenizer_manager.rid_to_state.pop(rid, None)
+    request.app.state.tokenizer_manager.rid_to_state.pop(rid, None)
     return Response(status_code=503)
 
 
 @app.get("/get_model_info")
-async def get_model_info():
+async def get_model_info(request: Request):
     """Get the model information."""
     result = {
-        "model_path": _global_state.tokenizer_manager.model_path,
-        "tokenizer_path": _global_state.tokenizer_manager.server_args.tokenizer_path,
-        "is_generation": _global_state.tokenizer_manager.is_generation,
+        "model_path": request.app.state.tokenizer_manager.model_path,
+        "tokenizer_path": request.app.state.tokenizer_manager.server_args.tokenizer_path,
+        "is_generation": request.app.state.tokenizer_manager.is_generation,
     }
     return result
 
 
 @app.get("/get_server_info")
-async def get_server_info():
-    internal_states = await _global_state.tokenizer_manager.get_internal_state()
+async def get_server_info(request: Request):
+    internal_states = await request.app.state.tokenizer_manager.get_internal_state()
     return {
-        **dataclasses.asdict(_global_state.tokenizer_manager.server_args),
-        **_global_state.scheduler_info,
+        **dataclasses.asdict(request.app.state.tokenizer_manager.server_args),
+        **request.app.state.scheduler_info,
         "internal_states": internal_states,
         "version": __version__,
     }
@@ -229,7 +220,7 @@ async def get_server_info():
 
 @app.api_route("/set_internal_state", methods=["POST", "PUT"])
 async def set_internal_state(obj: SetInternalStateReq, request: Request):
-    res = await _global_state.tokenizer_manager.set_internal_state(obj)
+    res = await request.app.state.tokenizer_manager.set_internal_state(obj)
     return res
 
 
@@ -241,7 +232,7 @@ async def generate_request(obj: GenerateReqInput, request: Request):
 
         async def stream_results() -> AsyncIterator[bytes]:
             try:
-                async for out in _global_state.tokenizer_manager.generate_request(
+                async for out in request.app.state.tokenizer_manager.generate_request(
                     obj, request
                 ):
                     yield b"data: " + orjson.dumps(
@@ -258,11 +249,11 @@ async def generate_request(obj: GenerateReqInput, request: Request):
         return StreamingResponse(
             stream_results(),
             media_type="text/event-stream",
-            background=_global_state.tokenizer_manager.create_abort_task(obj),
+            background=request.app.state.tokenizer_manager.create_abort_task(obj),
         )
     else:
         try:
-            ret = await _global_state.tokenizer_manager.generate_request(
+            ret = await request.app.state.tokenizer_manager.generate_request(
                 obj, request
             ).__anext__()
             return ret
@@ -287,7 +278,7 @@ async def generate_from_file_request(file: UploadFile, request: Request):
     )
 
     try:
-        ret = await _global_state.tokenizer_manager.generate_request(
+        ret = await request.app.state.tokenizer_manager.generate_request(
             obj, request
         ).__anext__()
         return ret
@@ -300,7 +291,7 @@ async def generate_from_file_request(file: UploadFile, request: Request):
 async def encode_request(obj: EmbeddingReqInput, request: Request):
     """Handle an embedding request."""
     try:
-        ret = await _global_state.tokenizer_manager.generate_request(
+        ret = await request.app.state.tokenizer_manager.generate_request(
             obj, request
         ).__anext__()
         return ret
@@ -312,7 +303,7 @@ async def encode_request(obj: EmbeddingReqInput, request: Request):
 async def classify_request(obj: EmbeddingReqInput, request: Request):
     """Handle a reward model request. Now the arguments and return values are the same as embedding models."""
     try:
-        ret = await _global_state.tokenizer_manager.generate_request(
+        ret = await request.app.state.tokenizer_manager.generate_request(
             obj, request
         ).__anext__()
         return ret
@@ -321,9 +312,9 @@ async def classify_request(obj: EmbeddingReqInput, request: Request):
 
 
 @app.api_route("/flush_cache", methods=["GET", "POST"])
-async def flush_cache():
+async def flush_cache(request: Request):
     """Flush the radix cache."""
-    ret = await _global_state.tokenizer_manager.flush_cache()
+    ret = await request.app.state.tokenizer_manager.flush_cache()
     return Response(
         content="Cache flushed.\nPlease check backend logs for more details. "
         "(When there are running or waiting requests, the operation will not be performed.)\n",
@@ -332,12 +323,12 @@ async def flush_cache():
 
 
 @app.api_route("/start_profile", methods=["GET", "POST"])
-async def start_profile_async(obj: Optional[ProfileReqInput] = None):
+async def start_profile_async(request: Request, obj: Optional[ProfileReqInput] = None):
     """Start profiling."""
     if obj is None:
         obj = ProfileReqInput()
 
-    await _global_state.tokenizer_manager.start_profile(
+    await request.app.state.tokenizer_manager.start_profile(
         output_dir=obj.output_dir,
         num_steps=obj.num_steps,
         activities=obj.activities,
@@ -351,9 +342,9 @@ async def start_profile_async(obj: Optional[ProfileReqInput] = None):
 
 
 @app.api_route("/stop_profile", methods=["GET", "POST"])
-async def stop_profile_async():
+async def stop_profile_async(request: Request):
     """Stop profiling."""
-    _global_state.tokenizer_manager.stop_profile()
+    request.app.state.tokenizer_manager.stop_profile()
     return Response(
         content="Stop profiling. This will take some time.\n",
         status_code=200,
@@ -361,9 +352,9 @@ async def stop_profile_async():
 
 
 @app.api_route("/start_expert_distribution_record", methods=["GET", "POST"])
-async def start_expert_distribution_record_async():
+async def start_expert_distribution_record_async(request: Request):
     """Start recording the expert distribution. Clear the previous record if any."""
-    await _global_state.tokenizer_manager.start_expert_distribution_record()
+    await request.app.state.tokenizer_manager.start_expert_distribution_record()
     return Response(
         content="Start recording the expert distribution.\n",
         status_code=200,
@@ -371,9 +362,9 @@ async def start_expert_distribution_record_async():
 
 
 @app.api_route("/stop_expert_distribution_record", methods=["GET", "POST"])
-async def stop_expert_distribution_record_async():
+async def stop_expert_distribution_record_async(request: Request):
     """Stop recording the expert distribution."""
-    await _global_state.tokenizer_manager.stop_expert_distribution_record()
+    await request.app.state.tokenizer_manager.stop_expert_distribution_record()
     return Response(
         content="Stop recording the expert distribution.\n",
         status_code=200,
@@ -381,9 +372,9 @@ async def stop_expert_distribution_record_async():
 
 
 @app.api_route("/dump_expert_distribution_record", methods=["GET", "POST"])
-async def dump_expert_distribution_record_async():
+async def dump_expert_distribution_record_async(request: Request):
     """Dump expert distribution record."""
-    await _global_state.tokenizer_manager.dump_expert_distribution_record()
+    await request.app.state.tokenizer_manager.dump_expert_distribution_record()
     return Response(
         content="Dump expert distribution record.\n",
         status_code=200,
@@ -394,7 +385,7 @@ async def dump_expert_distribution_record_async():
 async def update_weights_from_disk(obj: UpdateWeightFromDiskReqInput, request: Request):
     """Update the weights from disk inplace without re-launching the server."""
     success, message, num_paused_requests = (
-        await _global_state.tokenizer_manager.update_weights_from_disk(obj, request)
+        await request.app.state.tokenizer_manager.update_weights_from_disk(obj, request)
     )
     content = {
         "success": success,
@@ -418,7 +409,7 @@ async def init_weights_update_group(
     obj: InitWeightsUpdateGroupReqInput, request: Request
 ):
     """Initialize the parameter update group."""
-    success, message = await _global_state.tokenizer_manager.init_weights_update_group(
+    success, message = await request.app.state.tokenizer_manager.init_weights_update_group(
         obj, request
     )
     content = {"success": success, "message": message}
@@ -439,7 +430,7 @@ async def update_weights_from_tensor(
     3. Any binary data in the named tensors should be base64 encoded.
     """
 
-    success, message = await _global_state.tokenizer_manager.update_weights_from_tensor(
+    success, message = await request.app.state.tokenizer_manager.update_weights_from_tensor(
         obj, request
     )
     content = {"success": success, "message": message}
@@ -454,7 +445,7 @@ async def update_weights_from_distributed(
 ):
     """Update model parameter from distributed online."""
     success, message = (
-        await _global_state.tokenizer_manager.update_weights_from_distributed(
+        await request.app.state.tokenizer_manager.update_weights_from_distributed(
             obj, request
         )
     )
@@ -469,7 +460,7 @@ async def update_weights_from_distributed(
 async def get_weights_by_name(obj: GetWeightsByNameReqInput, request: Request):
     """Get model parameter by name."""
     try:
-        ret = await _global_state.tokenizer_manager.get_weights_by_name(obj, request)
+        ret = await request.app.state.tokenizer_manager.get_weights_by_name(obj, request)
         if ret is None:
             return _create_error_response("Get parameter by name failed")
         else:
@@ -484,7 +475,7 @@ async def release_memory_occupation(
 ):
     """Release GPU memory occupation temporarily."""
     try:
-        await _global_state.tokenizer_manager.release_memory_occupation(obj, request)
+        await request.app.state.tokenizer_manager.release_memory_occupation(obj, request)
     except Exception as e:
         return _create_error_response(e)
 
@@ -495,7 +486,7 @@ async def resume_memory_occupation(
 ):
     """Resume GPU memory occupation."""
     try:
-        await _global_state.tokenizer_manager.resume_memory_occupation(obj, request)
+        await request.app.state.tokenizer_manager.resume_memory_occupation(obj, request)
     except Exception as e:
         return _create_error_response(e)
 
@@ -508,7 +499,7 @@ async def slow_down(obj: SlowDownReqInput, request: Request):
     to let it run in full batch size.
     """
     try:
-        await _global_state.tokenizer_manager.slow_down(obj, request)
+        await request.app.state.tokenizer_manager.slow_down(obj, request)
     except Exception as e:
         return _create_error_response(e)
 
@@ -517,7 +508,7 @@ async def slow_down(obj: SlowDownReqInput, request: Request):
 async def open_session(obj: OpenSessionReqInput, request: Request):
     """Open a session, and return its unique session id."""
     try:
-        session_id = await _global_state.tokenizer_manager.open_session(obj, request)
+        session_id = await request.app.state.tokenizer_manager.open_session(obj, request)
         if session_id is None:
             raise Exception(
                 "Failed to open the session. Check if a session with the same id is still open."
@@ -531,7 +522,7 @@ async def open_session(obj: OpenSessionReqInput, request: Request):
 async def close_session(obj: CloseSessionReqInput, request: Request):
     """Close the session."""
     try:
-        await _global_state.tokenizer_manager.close_session(obj, request)
+        await request.app.state.tokenizer_manager.close_session(obj, request)
         return Response(status_code=200)
     except Exception as e:
         return _create_error_response(e)
@@ -540,7 +531,7 @@ async def close_session(obj: CloseSessionReqInput, request: Request):
 @app.api_route("/configure_logging", methods=["GET", "POST"])
 async def configure_logging(obj: ConfigureLoggingReq, request: Request):
     """Configure the request logging options."""
-    _global_state.tokenizer_manager.configure_logging(obj)
+    request.app.state.tokenizer_manager.configure_logging(obj)
     return Response(status_code=200)
 
 
@@ -548,7 +539,7 @@ async def configure_logging(obj: ConfigureLoggingReq, request: Request):
 async def abort_request(obj: AbortReq, request: Request):
     """Abort a request."""
     try:
-        _global_state.tokenizer_manager.abort_request(rid=obj.rid)
+        request.app.state.tokenizer_manager.abort_request(rid=obj.rid)
         return Response(status_code=200)
     except Exception as e:
         return _create_error_response(e)
@@ -601,40 +592,40 @@ async def separate_reasoning_request(obj: SeparateReasoningReqInput, request: Re
 
 @app.post("/v1/completions")
 async def openai_v1_completions(raw_request: Request):
-    return await v1_completions(_global_state.tokenizer_manager, raw_request)
+    return await v1_completions(raw_request.app.state.tokenizer_manager, raw_request)
 
 
 @app.post("/v1/chat/completions")
 async def openai_v1_chat_completions(raw_request: Request):
-    return await v1_chat_completions(_global_state.tokenizer_manager, raw_request)
+    return await v1_chat_completions(raw_request.app.state.tokenizer_manager, raw_request)
 
 
 @app.post("/v1/embeddings", response_class=ORJSONResponse)
 async def openai_v1_embeddings(raw_request: Request):
-    response = await v1_embeddings(_global_state.tokenizer_manager, raw_request)
+    response = await v1_embeddings(raw_request.app.state.tokenizer_manager, raw_request)
     return response
 
 
 @app.get("/v1/models", response_class=ORJSONResponse)
-def available_models():
+def available_models(raw_request: Request):
     """Show available models."""
-    served_model_names = [_global_state.tokenizer_manager.served_model_name]
+    served_model_names = [raw_request.app.state.tokenizer_manager.served_model_name]
     model_cards = []
     for served_model_name in served_model_names:
         model_cards.append(
             ModelCard(
                 id=served_model_name,
                 root=served_model_name,
-                max_model_len=_global_state.tokenizer_manager.model_config.context_len,
+                max_model_len=raw_request.app.state.tokenizer_manager.model_config.context_len,
             )
         )
     return ModelList(data=model_cards)
 
 
 @app.post("/v1/files")
-async def openai_v1_files(file: UploadFile = File(...), purpose: str = Form("batch")):
+async def openai_v1_files(raw_request: Request, file: UploadFile = File(...), purpose: str = Form("batch")):
     return await v1_files_create(
-        file, purpose, _global_state.tokenizer_manager.server_args.file_storage_path
+        file, purpose, raw_request.app.state.tokenizer_manager.server_args.file_storage_path
     )
 
 
@@ -646,13 +637,13 @@ async def delete_file(file_id: str):
 
 @app.post("/v1/batches")
 async def openai_v1_batches(raw_request: Request):
-    return await v1_batches(_global_state.tokenizer_manager, raw_request)
+    return await v1_batches(raw_request.app.state.tokenizer_manager, raw_request)
 
 
 @app.post("/v1/batches/{batch_id}/cancel")
-async def cancel_batches(batch_id: str):
+async def cancel_batches(raw_request: Request, batch_id: str):
     # https://platform.openai.com/docs/api-reference/batch/cancel
-    return await v1_cancel_batch(_global_state.tokenizer_manager, batch_id)
+    return await v1_cancel_batch(raw_request.app.state.tokenizer_manager, batch_id)
 
 
 @app.get("/v1/batches/{batch_id}")
@@ -681,7 +672,7 @@ async def sagemaker_health() -> Response:
 
 @app.post("/invocations")
 async def sagemaker_chat_completions(raw_request: Request):
-    return await v1_chat_completions(_global_state.tokenizer_manager, raw_request)
+    return await v1_chat_completions(raw_request.app.state.tokenizer_manager, raw_request)
 
 
 ## Vertex AI API
@@ -739,11 +730,9 @@ def launch_server(
     2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
     """
     tokenizer_manager, scheduler_info = _launch_subprocesses(server_args=server_args)
-    set_global_state(
-        _GlobalState(
-            tokenizer_manager=tokenizer_manager,
-            scheduler_info=scheduler_info,
-        )
+    app.state = _GlobalState(
+        tokenizer_manager=tokenizer_manager,
+        scheduler_info=scheduler_info,
     )
 
     # Add api key authorization
@@ -762,7 +751,7 @@ def launch_server(
         args=(
             server_args,
             pipe_finish_writer,
-            _global_state.tokenizer_manager.image_token_id,
+            app.state.tokenizer_manager.image_token_id,
             launch_callback,
         ),
     )
