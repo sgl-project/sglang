@@ -63,8 +63,8 @@ def update_expert_weights_single_layer(
     )
 
     def _entrypoint():
-        # List[Tuple[logical_expert_id, P2POp]]
-        p2p_op_infos: List[Tuple[int, P2POp]] = []
+        # List[Tuple[logical_expert_id, List[P2POp]]]
+        p2p_op_infos: List[Tuple[int, List[P2POp]]] = []
         # List[Tuple[src_temp_buffers_expert_location, dst_routed_experts_weights_expert_location]]
         buffer2weight_copy_infos: List[Tuple[int, int]] = []
 
@@ -169,7 +169,7 @@ def update_expert_weights_single_layer(
 
     def _execute_p2p_ops(p2p_op_infos):
         sorted_infos = sorted(p2p_op_infos, key=lambda info: info[0])
-        p2p_ops = [op for _, op in sorted_infos]
+        p2p_ops = [op for _, ops in sorted_infos for op in ops]
         reqs = torch.distributed.batch_isend_irecv(p2p_ops)
         for req in reqs:
             req.wait()
