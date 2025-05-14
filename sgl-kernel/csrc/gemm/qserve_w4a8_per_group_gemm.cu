@@ -12,6 +12,7 @@
 
 // Adapted from https://github.com/mit-han-lab/omniserve/blob/main/kernels/csrc/qgemm/w4a8_per_group/gemm_cuda.cu
 
+#include <ATen/cuda/CUDAContext.h>
 #include <cuda_fp16.h>
 #include <cuda_pipeline_primitives.h>
 #include <torch/all.h>
@@ -55,7 +56,7 @@
   dim3 threads_per_block(WARP_SIZE, NUM_WARPS);                                                              \
   auto kernel_func = dense_kernel0<CTA_M, CTA_N, CTA_K, WARP_M, WARP_N, WARP_K, STAGES, G>;                  \
   cudaFuncSetAttribute(kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemByteSize);             \
-  kernel_func<<<num_blocks, threads_per_block, kSmemByteSize>>>(                                             \
+  kernel_func<<<num_blocks, threads_per_block, kSmemByteSize, stream>>>(                                     \
       in_feats,                                                                                              \
       kernel,                                                                                                \
       zeros,                                                                                                 \
@@ -742,6 +743,7 @@ void qserve_w4a8_per_group_gemm(
   // auto options =
   //     torch::TensorOptions().dtype(torch::kHalf).device(_in_feats.device());
   auto out_feats = reinterpret_cast<half*>(_out_feats.data_ptr<at::Half>());
+  auto stream = at::cuda::getCurrentCUDAStream(_in_feats.get_device());
   auto sm_version = getSMVersion();
   if (sm_version >= 80) {
     constexpr int G = 128;
