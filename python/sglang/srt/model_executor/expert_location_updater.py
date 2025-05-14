@@ -46,4 +46,5 @@ def update_expert_weights_single_layer(
     old_physical_to_logical_map = old_physical_to_logical_map.tolist()
     new_physical_to_logical_map = new_physical_to_logical_map.tolist()
 
-    TODO
+    for dst_expert_location in range(TODO, TODO):
+        TODO
