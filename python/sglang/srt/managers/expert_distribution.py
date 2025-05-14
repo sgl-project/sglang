@@ -315,7 +315,6 @@ class _SelectExpertsSinglePassGatherer(_LayerBasedSinglePassGatherer):
         global_physical_count = [
                                     0
                                 ] * self._expert_location_metadata.num_physical_experts
-        print(f"hi {self._expert_location_metadata.num_physical_experts=} {topk_ids_list=}")
         for token_record in topk_ids_list:
             for global_physical_expert_idx in token_record:
                 global_physical_count[global_physical_expert_idx] += 1
