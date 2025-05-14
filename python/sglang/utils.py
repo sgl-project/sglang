@@ -516,18 +516,18 @@ async def async_stream_and_merge(llm, prompt, sampling_params):
 
 def remove_first_nonblank_token(tokenizer, token_ids, tokenized_chat):
     idx = 0
-    removed_tokens = []
+    prefix_ids = []
     
     while idx < len(token_ids):
         token_str = tokenizer.decode([token_ids[idx]], skip_special_tokens=True)
-        if token_str.strip() == "":
-            removed_tokens.append(token_ids[idx])
+        if token_str.isspace() or token_str == "":
+            prefix_ids.append(token_ids[idx])
             idx += 1
         else:
-            removed_tokens.append(token_ids[idx])  # 包括第一个非空白token
+            prefix_ids.append(token_ids[idx])
             idx += 1
             break
     
-    updated_tokenized_chat = tokenized_chat + removed_tokens
+    updated_tokenized_chat = tokenized_chat + prefix_ids
     
     return updated_tokenized_chat, token_ids[idx:]
