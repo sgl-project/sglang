@@ -106,18 +106,14 @@ def update_expert_weights_single_layer(
 
         # case 4: same-node
         if rank in need_comm_self_node_dst_ranks:
-            chosen_src_rank = _ChunkUtils.chunk_value_from_element_value(
-                element_value=rank,
-            )
+            chosen_src_rank = same_node_mapping.chunk_value_from_element_value(element_value=rank)
             for i in range(len(routed_experts_weights)):
                 p2p_op_infos.append((TODO, TODO))
             buffer2weight_copy_infos.append((TODO, TODO))
             return
 
         # case 5: cross-node
-        chosen_src_rank = _ChunkUtils.chunk_value_from_element_value(
-            element_value=rank,
-        )
+        chosen_src_rank = cross_node_mapping.chunk_value_from_element_value(element_value=rank)
         for i in range(len(routed_experts_weights)):
             p2p_op_infos.append((TODO, TODO))
         buffer2weight_copy_infos.append((TODO, TODO))
@@ -136,15 +132,11 @@ def update_expert_weights_single_layer(
             logical_expert_id=logical_expert_id)
 
         # a. same-node
-        chosen_dst_ranks = _ChunkUtils.element_values_from_chunk_value(
-            chunk_value=rank,
-        )
+        chosen_dst_ranks = same_node_mapping.element_values_from_chunk_value(chunk_value=rank)
         p2p_op_infos.append((TODO, TODO))
 
         # b. cross-node
-        chosen_dst_ranks = _ChunkUtils.element_values_from_chunk_value(
-            chunk_value=rank,
-        )
+        chosen_dst_ranks = cross_node_mapping.element_values_from_chunk_value(chunk_value=rank)
         p2p_op_infos.append((TODO, TODO))
 
     def _compute_comm_info(logical_expert_id: int):
