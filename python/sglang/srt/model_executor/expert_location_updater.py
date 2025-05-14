@@ -110,5 +110,6 @@ def update_expert_weights_single_layer(
 def _deduplicate_ordered(arr: List[int]):
     output = []
     for item in arr:
-        TODO
+        if len(output) == 0 or item != output[-1]:
+            output.append(item)
     return output
