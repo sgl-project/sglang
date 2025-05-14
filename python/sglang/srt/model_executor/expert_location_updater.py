@@ -63,6 +63,8 @@ def update_expert_weights_single_layer(
 ):
     assert all(tensor.shape[0] == num_local_physical_experts for tensor in routed_experts_weights)
 
+    output_logs = []
+
     num_physical_experts, = old_physical_to_logical_map.shape
     num_tensors = len(routed_experts_weights)
 
@@ -96,6 +98,8 @@ def update_expert_weights_single_layer(
 
         # case 1: unchanged
         if old_physical_to_logical_map[dst_expert_location] == logical_expert_id:
+            if debug:
+                output_logs.append(f"{dst_expert_location=} case=unchanged")
             return
 
         # case 2: same-gpu
@@ -105,12 +109,16 @@ def update_expert_weights_single_layer(
                     _get_tensor(temp_buffers, i, dst_expert_location).copy_(
                         _get_tensor(routed_experts_weights, i, src_expert_location))
                 buffer2weight_copy_infos.append((dst_expert_location, dst_expert_location))
+                if debug:
+                    output_logs.append(f"{dst_expert_location=} case=same-gpu")
                 return
 
         # case 3: free-rider
         for src_expert_location in range(rank * num_local_physical_experts, dst_expert_location):
             if new_physical_to_logical_map[src_expert_location] == logical_expert_id:
                 buffer2weight_copy_infos.append((src_expert_location, dst_expert_location))
+                if debug:
+                    output_logs.append(f"{dst_expert_location=} case=free-rider")
                 return
 
         same_node_mapping, cross_node_mapping, need_comm_self_node_dst_ranks = _compute_comm_info(
@@ -122,6 +130,8 @@ def update_expert_weights_single_layer(
             _create_p2p_recv_and_buffer2weight_copy(buffer2weight_copy_infos, p2p_op_infos, src_rank=chosen_src_rank,
                                                     logical_expert_id=logical_expert_id,
                                                     dst_expert_location=dst_expert_location)
+            if debug:
+                output_logs.append(f"{dst_expert_location=} case=same-node")
             return
 
         # case 5: cross-node
@@ -130,6 +140,8 @@ def update_expert_weights_single_layer(
         _create_p2p_recv_and_buffer2weight_copy(buffer2weight_copy_infos, p2p_op_infos, src_rank=chosen_src_rank,
                                                 logical_expert_id=logical_expert_id,
                                                 dst_expert_location=dst_expert_location)
+        if debug:
+            output_logs.append(f"{dst_expert_location=} case=cross-node")
         return
 
     def _create_p2p_recv_and_buffer2weight_copy(
