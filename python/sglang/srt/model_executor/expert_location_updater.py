@@ -133,12 +133,15 @@ def update_expert_weights_single_layer(
         buffer2weight_copy_infos.append((dst_expert_location, dst_expert_location))
 
     def _create_isend_ops(p2p_op_infos):
-        logical_expert_ids = sorted(set(
-            old_physical_to_logical_map[src_expert_location]
-            for src_expert_location in range(*local_expert_location_range)
-        ))
-        for logical_expert_id in logical_expert_ids:
-            _create_isend_ops_of_logical_expert_id(logical_expert_id, TODO, p2p_op_infos)
+        handled_logical_expert_ids = set()
+        for src_expert_location in range(*local_expert_location_range):
+            logical_expert_id = old_physical_to_logical_map[src_expert_location]
+
+            if logical_expert_id in handled_logical_expert_ids:
+                continue
+            handled_logical_expert_ids.add(logical_expert_id)
+
+            _create_isend_ops_of_logical_expert_id(logical_expert_id, src_expert_location, p2p_op_infos)
 
     def _create_isend_ops_of_logical_expert_id(logical_expert_id, src_expert_location, p2p_op_infos):
         same_node_mapping, cross_node_mapping, need_comm_self_node_dst_ranks = _compute_comm_info(
