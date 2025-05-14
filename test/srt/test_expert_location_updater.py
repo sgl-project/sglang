@@ -71,6 +71,9 @@ def _run_subprocess(
 ):
     try:
         torch.random.manual_seed(42)
+        if device == "cuda":
+            torch.cuda.set_device(f"cuda:{rank}")
+
         num_local_physical_experts = num_physical_experts // num_gpus
         assert num_gpus % nnodes == 0
         num_gpu_per_node = num_gpus // nnodes
