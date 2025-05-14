@@ -103,8 +103,8 @@ def get_auth_headers() -> Dict[str, str]:
 # trt llm does not support ignore_eos
 # https://github.com/triton-inference-server/tensorrtllm_backend/issues/505
 async def async_request_trt_llm(
-        request_func_input: RequestFuncInput,
-        pbar: Optional[tqdm] = None,
+    request_func_input: RequestFuncInput,
+    pbar: Optional[tqdm] = None,
 ) -> RequestFuncOutput:
     api_url = request_func_input.api_url
     assert api_url.endswith("generate_stream")
@@ -172,8 +172,8 @@ async def async_request_trt_llm(
 
 # set ignore_eos True by default
 async def async_request_openai_completions(
-        request_func_input: RequestFuncInput,
-        pbar: Optional[tqdm] = None,
+    request_func_input: RequestFuncInput,
+    pbar: Optional[tqdm] = None,
 ) -> RequestFuncOutput:
     api_url = request_func_input.api_url
     assert api_url.endswith(
@@ -204,7 +204,7 @@ async def async_request_openai_completions(
         most_recent_timestamp = st
         try:
             async with session.post(
-                    url=api_url, json=payload, headers=headers
+                url=api_url, json=payload, headers=headers
             ) as response:
                 if response.status == 200:
                     async for chunk_bytes in response.content:
@@ -257,8 +257,8 @@ async def async_request_openai_completions(
 
 
 async def async_request_truss(
-        request_func_input: RequestFuncInput,
-        pbar: Optional[tqdm] = None,
+    request_func_input: RequestFuncInput,
+    pbar: Optional[tqdm] = None,
 ) -> RequestFuncOutput:
     api_url = request_func_input.api_url
 
@@ -285,7 +285,7 @@ async def async_request_truss(
         most_recent_timestamp = st
         try:
             async with session.post(
-                    url=api_url, json=payload, headers=headers
+                url=api_url, json=payload, headers=headers
             ) as response:
                 if response.status == 200:
                     async for chunk_bytes in response.content:
@@ -335,8 +335,8 @@ async def async_request_truss(
 
 
 async def async_request_sglang_generate(
-        request_func_input: RequestFuncInput,
-        pbar: Optional[tqdm] = None,
+    request_func_input: RequestFuncInput,
+    pbar: Optional[tqdm] = None,
 ) -> RequestFuncOutput:
     api_url = request_func_input.api_url
     prompt = request_func_input.prompt
@@ -367,7 +367,7 @@ async def async_request_sglang_generate(
         last_output_len = 0
         try:
             async with session.post(
-                    url=api_url, json=payload, headers=headers
+                url=api_url, json=payload, headers=headers
             ) as response:
                 if response.status == 200:
                     async for chunk_bytes in response.content:
@@ -403,7 +403,7 @@ async def async_request_sglang_generate(
                                     if num_new_tokens == 0:
                                         continue
                                     adjust_itl = (
-                                                         timestamp - most_recent_timestamp
+                                                     timestamp - most_recent_timestamp
                                                  ) / num_new_tokens
                                     output.itl.extend([adjust_itl] * num_new_tokens)
 
@@ -430,8 +430,8 @@ async def async_request_sglang_generate(
 
 
 async def async_request_gserver(
-        request_func_input: RequestFuncInput,
-        pbar: Optional[tqdm] = None,
+    request_func_input: RequestFuncInput,
+    pbar: Optional[tqdm] = None,
 ) -> RequestFuncOutput:
     raise NotImplementedError()
 
@@ -470,21 +470,21 @@ def get_model(pretrained_model_name_or_path: str) -> str:
 
 
 def get_tokenizer(
-        pretrained_model_name_or_path: str,
+    pretrained_model_name_or_path: str,
 ) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
     assert (
-            pretrained_model_name_or_path is not None
-            and pretrained_model_name_or_path != ""
+        pretrained_model_name_or_path is not None
+        and pretrained_model_name_or_path != ""
     )
     if pretrained_model_name_or_path.endswith(
-            ".json"
+        ".json"
     ) or pretrained_model_name_or_path.endswith(".model"):
         from sglang.srt.hf_transformers_utils import get_tokenizer
 
         return get_tokenizer(pretrained_model_name_or_path)
 
     if pretrained_model_name_or_path is not None and not os.path.exists(
-            pretrained_model_name_or_path
+        pretrained_model_name_or_path
     ):
         pretrained_model_name_or_path = get_model(pretrained_model_name_or_path)
     return AutoTokenizer.from_pretrained(
@@ -609,11 +609,11 @@ def download_and_cache_file(url: str, filename: Optional[str] = None):
 
     # Use tqdm to display the progress bar
     with open(filename, "wb") as f, tqdm(
-            desc=filename,
-            total=total_size,
-            unit="B",
-            unit_scale=True,
-            unit_divisor=1024,
+        desc=filename,
+        total=total_size,
+        unit="B",
+        unit_scale=True,
+        unit_divisor=1024,
     ) as bar:
         for chunk in response.iter_content(chunk_size=chunk_size):
             f.write(chunk)
@@ -631,10 +631,10 @@ class DatasetRow:
 
 
 def sample_mmmu_requests(
-        num_requests: int,
-        tokenizer: PreTrainedTokenizerBase,
-        fixed_output_len: Optional[int] = None,
-        random_sample: bool = True,
+    num_requests: int,
+    tokenizer: PreTrainedTokenizerBase,
+    fixed_output_len: Optional[int] = None,
+    random_sample: bool = True,
 ) -> List[DatasetRow]:
     """
     Sample requests from the MMMU dataset using HuggingFace datasets.
@@ -731,7 +731,7 @@ def sample_mmmu_requests(
                 # Note: This is approximate since we're not rendering the actual image tokens
                 prompt_token_ids = tokenizer.encode(prompt)
                 prompt_len = (
-                        len(prompt_token_ids) + 512
+                    len(prompt_token_ids) + 512
                 )  # Add estimate for image tokens
 
                 output_len = fixed_output_len if fixed_output_len is not None else 256
@@ -750,13 +750,13 @@ def sample_mmmu_requests(
 
 
 def sample_sharegpt_requests(
-        dataset_path: str,
-        num_requests: int,
-        tokenizer: PreTrainedTokenizerBase,
-        fixed_output_len: Optional[int] = None,
-        context_len: Optional[int] = None,
-        prompt_suffix: Optional[str] = "",
-        apply_chat_template=False,
+    dataset_path: str,
+    num_requests: int,
+    tokenizer: PreTrainedTokenizerBase,
+    fixed_output_len: Optional[int] = None,
+    context_len: Optional[int] = None,
+    prompt_suffix: Optional[str] = "",
+    apply_chat_template=False,
 ) -> List[DatasetRow]:
     if fixed_output_len is not None and fixed_output_len < 4:
         print("Warn: output_len too small")
@@ -797,9 +797,9 @@ def sample_sharegpt_requests(
         prompt = dataset[i][0]
         if prompt_suffix:
             prompt = (
-                    remove_suffix(prompt, ASSISTANT_SUFFIX)
-                    + prompt_suffix
-                    + ASSISTANT_SUFFIX
+                remove_suffix(prompt, ASSISTANT_SUFFIX)
+                + prompt_suffix
+                + ASSISTANT_SUFFIX
             )
 
         if apply_chat_template:
@@ -836,14 +836,14 @@ def sample_sharegpt_requests(
 
 
 def sample_random_requests(
-        input_len: int,
-        output_len: int,
-        num_prompts: int,
-        range_ratio: float,
-        tokenizer: PreTrainedTokenizerBase,
-        dataset_path: str,
-        random_sample: bool = True,
-        return_text: bool = True,
+    input_len: int,
+    output_len: int,
+    num_prompts: int,
+    range_ratio: float,
+    tokenizer: PreTrainedTokenizerBase,
+    dataset_path: str,
+    random_sample: bool = True,
+    return_text: bool = True,
 ) -> List[DatasetRow]:
     input_lens = np.random.randint(
         max(int(input_len * range_ratio), 1),
@@ -964,13 +964,13 @@ def get_gen_prefix_cache_path(args, tokenizer):
 
 
 def sample_generated_shared_prefix_requests(
-        num_groups: int,
-        prompts_per_group: int,
-        system_prompt_len: int,
-        question_len: int,
-        output_len: int,
-        tokenizer: PreTrainedTokenizerBase,
-        args: argparse.Namespace,
+    num_groups: int,
+    prompts_per_group: int,
+    system_prompt_len: int,
+    question_len: int,
+    output_len: int,
+    tokenizer: PreTrainedTokenizerBase,
+    args: argparse.Namespace,
 ) -> List[DatasetRow]:
     """Generate benchmark requests with shared system prompts using random tokens and caching."""
     cache_path = get_gen_prefix_cache_path(args, tokenizer)
@@ -1003,7 +1003,7 @@ def sample_generated_shared_prefix_requests(
     for group_idx in tqdm(range(num_groups), desc="Generating system prompt"):
         system_prompt = system_prompts[group_idx]
         for prompt_idx in tqdm(
-                range(prompts_per_group), desc="Generating questions", leave=False
+            range(prompts_per_group), desc="Generating questions", leave=False
         ):
             question = questions[group_idx * prompts_per_group + prompt_idx]
             full_prompt = f"{system_prompt}\n\n{question}"
@@ -1044,8 +1044,8 @@ def sample_generated_shared_prefix_requests(
 
 
 def sample_chatbot_arena_conversations_requests(
-        num_requests: int,
-        output_len: int,
+    num_requests: int,
+    output_len: int,
 ):
     import polars as pl
 
@@ -1060,8 +1060,8 @@ def sample_chatbot_arena_conversations_requests(
 
 
 def sample_wildchat_1m_requests(
-        num_requests: int,
-        output_len: int,
+    num_requests: int,
+    output_len: int,
 ):
     import polars as pl
 
@@ -1076,12 +1076,12 @@ def sample_wildchat_1m_requests(
 
 
 def sample_hf_dataset_requests(
-        dataset_name: str,
-        column_id: str,
-        column_conversation: str,
-        expr_timestamp,
-        num_requests: int,
-        output_len: int,
+    dataset_name: str,
+    column_id: str,
+    column_conversation: str,
+    expr_timestamp,
+    num_requests: int,
+    output_len: int,
 ):
     import polars as pl
     from datasets import load_dataset
@@ -1120,8 +1120,8 @@ def sample_hf_dataset_requests(
 
 
 async def get_request(
-        input_requests: List[DatasetRow],
-        request_rate: float,
+    input_requests: List[DatasetRow],
+    request_rate: float,
 ) -> AsyncGenerator[DatasetRow, None]:
     input_requests = iter(input_requests)
     for request in input_requests:
@@ -1138,11 +1138,11 @@ async def get_request(
 
 
 def calculate_metrics(
-        input_lens: Optional[List[int]],
-        outputs: List[RequestFuncOutput],
-        dur_s: float,
-        tokenizer: PreTrainedTokenizerBase,
-        backend: str,
+    input_lens: Optional[List[int]],
+    outputs: List[RequestFuncOutput],
+    dur_s: float,
+    tokenizer: PreTrainedTokenizerBase,
+    backend: str,
 ) -> Tuple[BenchmarkMetrics, List[int]]:
     output_lens: List[int] = []
     retokenized_output_lens: List[int] = []
@@ -1220,9 +1220,9 @@ def wrap_multi_round_request_func(request_func: Callable, tokenizer) -> Callable
     print("Enable multi-round request function")
 
     def compute_inner_input_prompt(
-            history_user_texts: List[str],
-            history_assistant_texts: List[str],
-            gen_prompt: str,
+        history_user_texts: List[str],
+        history_assistant_texts: List[str],
+        gen_prompt: str,
     ):
         assert len(history_user_texts) == len(history_assistant_texts)
         history_conversations = []
@@ -1254,8 +1254,8 @@ def wrap_multi_round_request_func(request_func: Callable, tokenizer) -> Callable
         return history_text, full_text
 
     async def f(
-            request_func_input: RequestFuncInput,
-            pbar: Optional[tqdm] = None,
+        request_func_input: RequestFuncInput,
+        pbar: Optional[tqdm] = None,
     ) -> List[RequestFuncOutput]:
         prompts: List[str] = request_func_input.prompt
         outputs = []
@@ -1292,22 +1292,22 @@ def wrap_multi_round_request_func(request_func: Callable, tokenizer) -> Callable
 
 
 async def benchmark(
-        backend: str,
-        api_url: str,
-        base_url: str,
-        model_id: str,
-        tokenizer: PreTrainedTokenizerBase,
-        input_requests: List[DatasetRow],
-        request_rate: float,
-        max_concurrency: Optional[int],
-        disable_tqdm: bool,
-        lora_names: List[str],
-        extra_request_body: Dict[str, Any],
-        profile: bool,
-        enable_expert_distribution_record: bool = False,
-        pd_seperated: bool = False,
-        flush_cache: bool = False,
-        tokenizer_id: Optional[str] = None,
+    backend: str,
+    api_url: str,
+    base_url: str,
+    model_id: str,
+    tokenizer: PreTrainedTokenizerBase,
+    input_requests: List[DatasetRow],
+    request_rate: float,
+    max_concurrency: Optional[int],
+    disable_tqdm: bool,
+    lora_names: List[str],
+    extra_request_body: Dict[str, Any],
+    profile: bool,
+    enable_expert_distribution_record: bool = False,
+    pd_seperated: bool = False,
+    flush_cache: bool = False,
+    tokenizer_id: Optional[str] = None,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -1370,7 +1370,7 @@ async def benchmark(
 
     # Check if at least one warmup request succeeded
     if args.warmup_requests > 0 and not any(
-            output.success for output in warmup_outputs
+        output.success for output in warmup_outputs
     ):
         raise ValueError(
             "Warmup failed - Please make sure benchmark arguments "
@@ -1542,9 +1542,9 @@ async def benchmark(
     print("=" * 50)
 
     if (
-            metrics.median_ttft_ms is not None
-            and metrics.mean_itl_ms is not None
-            and metrics.output_throughput is not None
+        metrics.median_ttft_ms is not None
+        and metrics.mean_itl_ms is not None
+        and metrics.output_throughput is not None
     ):
         result = {
             # Arguments
