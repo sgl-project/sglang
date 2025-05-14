@@ -7,7 +7,6 @@ from sglang.srt.model_executor import expert_location_updater
 from sglang.test.test_utils import CustomTestCase
 from sglang.utils import is_in_ci
 from torch.multiprocessing import Process
-from tqdm.auto import trange
 
 
 class TestExpertLocationUpdater(CustomTestCase):
@@ -66,10 +65,13 @@ def _run_subprocess(
     nnodes: int,
     num_logical_experts: int,
     num_physical_experts: int,
-    output_writer,
     device: str,
+    output_writer,
 ):
     try:
+        if rank == 0:
+            print(f"Test: {num_gpus=} {nnodes=} {num_logical_experts=} {num_physical_experts=} {device=}")
+
         torch.random.manual_seed(42)
         torch.distributed.init_process_group(rank=rank, world_size=num_gpus,
                                              backend={"cpu": "gloo", "gpu": "nccl"}[device])
@@ -102,9 +104,11 @@ def _run_subprocess(
         physical_to_logical_map = _create_physical_to_logical_map()
         routed_experts_weights = _create_routed_experts_weights(physical_to_logical_map)
 
-        chosen_range = trange if rank == 0 else range
+        num_repeats = 5000
+        for i in range(num_repeats):
+            if rank == 0 and i % 500 == 0:
+                print(f"Step {i}/{num_repeats}")
 
-        for _ in chosen_range(5000):
             new_physical_to_logical_map = _create_physical_to_logical_map()
             expect_new_weights = _create_routed_experts_weights(new_physical_to_logical_map)
 
