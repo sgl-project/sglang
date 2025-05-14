@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import List, Optional
 
 import torch
+import torch.distributed
 import torch.nn.functional as F
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.managers import deepseek_eplb
@@ -46,7 +47,7 @@ class ExpertLocationMetadata:
 
     @property
     def ep_size(self):
-        return TODO
+        return torch.distributed.get_world_size()
 
     def __post_init__(self):
         num_layers_0, num_physical_experts_0 = self.physical_to_logical_map.shape
@@ -188,7 +189,7 @@ class ExpertLocationMetadata:
                 logical_to_all_physical_map_num_valid=logical_to_all_physical_map_num_valid,
                 num_gpus=ep_size,
                 num_physical_experts=num_physical_experts,
-                rank=rank,
+                ep_rank=torch.distributed.get_rank(),
             ),
         )
 
@@ -286,7 +287,7 @@ def compute_logical_to_rank_dispatch_physical_map(
     logical_to_all_physical_map_num_valid: torch.Tensor,
     num_gpus: int,
     num_physical_experts: int,
-    rank: int,
+    ep_rank: int,
     base_seed: int = 42,
 ):
     device = logical_to_all_physical_map.device
@@ -295,7 +296,7 @@ def compute_logical_to_rank_dispatch_physical_map(
     num_layers, num_logical_experts, _ = logical_to_all_physical_map.shape
 
     g = torch.Generator(device=device)
-    g.manual_seed(base_seed + rank)
+    g.manual_seed(base_seed + ep_rank)
     chosen_index = (
         torch.randint(0, 65536, (num_layers, num_logical_experts), dtype=torch.int32, device=device, generator=g)
         % logical_to_all_physical_map_num_valid
@@ -305,7 +306,7 @@ def compute_logical_to_rank_dispatch_physical_map(
     for index in range(logical_to_all_physical_map_num_valid.max() + 1):
         partial_logical_to_all_physical_map = logical_to_all_physical_map[:, :, index]
         is_valid = partial_logical_to_all_physical_map != -1
-        is_same_gpu = partial_logical_to_all_physical_map // num_local_physical_experts == rank
+        is_same_gpu = partial_logical_to_all_physical_map // num_local_physical_experts == ep_rank
         logical_to_rank_dispatch_physical_map.masked_fill_(is_valid & is_same_gpu, partial_logical_to_all_physical_map)
 
     assert torch.all(logical_to_rank_dispatch_physical_map != -1)
