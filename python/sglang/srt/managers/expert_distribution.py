@@ -190,9 +190,6 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             logger.warning(
                 "SGLang server is already recording expert ids. Did you forget to dump the expert ids recorded so far by sending requests to the `/stop_expert_distribution_record` and `/dump_expert_distribution_record` endpoints?"
             )
-        assert (
-            self._server_args.disable_overlap_schedule
-        ), "ExpertDistributionRecorder needs disable_overlap_schedule currently (will implement this later)"
         self._reset()
         self._recording = True
 
