@@ -39,7 +39,8 @@ class EPLBManager:
         time_start = time.time()
 
         logical_count = get_global_expert_distribution_recorder().dump_record(output_mode="object")["logical_count"]
-        expert_location_metadata = ExpertLocationMetadata.init_by_eplb(self._server_args, logical_count)
+        expert_location_metadata = ExpertLocationMetadata.init_by_eplb(self._server_args,
+                                                                       self._model_runner.model_config, logical_count)
         self._model_runner.update_expert_location(expert_location_metadata)
 
         torch.cuda.synchronize()

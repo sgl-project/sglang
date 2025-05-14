@@ -201,7 +201,7 @@ class ModelRunner:
         if _ENABLE_JIT_DEEPGEMM:
             update_deep_gemm_config(gpu_id, server_args)
 
-        set_global_expert_location_metadata(compute_initial_expert_location_metadata(server_args))
+        set_global_expert_location_metadata(compute_initial_expert_location_metadata(server_args, model_config))
         if self.tp_rank == 0 and get_bool_env_var(
             "SGLANG_LOG_EXPERT_LOCATION_METADATA"
         ):

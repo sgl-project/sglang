@@ -366,11 +366,12 @@ class ModelConfigForExpertLocation:
             return ModelConfigForExpertLocation.init_dummy()
 
 
-def compute_initial_expert_location_metadata(server_args: ServerArgs) -> ExpertLocationMetadata:
+def compute_initial_expert_location_metadata(server_args: ServerArgs,
+                                             model_config: ModelConfig) -> ExpertLocationMetadata:
     if (data := server_args.init_expert_location) is not None:
         if data == "trivial":
             logger.info("init_expert_location from init_expert_location=trivial")
-            return ExpertLocationMetadata.init_trivial(server_args)
+            return ExpertLocationMetadata.init_trivial(server_args, model_config)
 
         # TODO unify with the utils function
         if data.endswith(".pt"):
@@ -384,15 +385,15 @@ def compute_initial_expert_location_metadata(server_args: ServerArgs) -> ExpertL
             logger.info(
                 "init_expert_location from init_by_mapping using ServerArgs.init_expert_location"
             )
-            return ExpertLocationMetadata.init_by_mapping(server_args, **data_dict)
+            return ExpertLocationMetadata.init_by_mapping(server_args, model_config, **data_dict)
         elif "logical_count" in data_dict:
             logger.info(
                 "init_expert_location from init_by_eplb using ServerArgs.init_expert_location"
             )
-            return ExpertLocationMetadata.init_by_eplb(server_args, **data_dict)
+            return ExpertLocationMetadata.init_by_eplb(server_args, model_config, **data_dict)
         else:
             raise NotImplementedError(
                 f"Unknown init_expert_location format ({list(data_dict.keys())=})"
             )
 
-    return ExpertLocationMetadata.init_trivial(server_args)
+    return ExpertLocationMetadata.init_trivial(server_args, model_config)
