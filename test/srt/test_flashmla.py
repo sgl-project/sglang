@@ -103,11 +103,11 @@ class TestFlashMLAMTP(CustomTestCase):
                     "--speculative-draft",
                     "lmsys/sglang-ci-dsv3-test-NextN",
                     "--speculative-num-steps",
-                    "3",
+                    "1",
                     "--speculative-eagle-topk",
                     "1",
                     "--speculative-num-draft-tokens",
-                    "4",
+                    "2",
                     "--attention-backend",
                     "flashmla",
                 ]
