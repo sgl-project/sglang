@@ -117,6 +117,7 @@ def update_expert_weights_single_layer(
             for i in range(len(routed_experts_weights)):
                 p2p_op_infos.append((TODO, TODO))
             buffer2weight_copy_infos.append((TODO, TODO))
+            return
 
         # case 5: cross-node
         chosen_src_rank = _ChunkUtils.chunk_value_from_element_value(
@@ -127,6 +128,7 @@ def update_expert_weights_single_layer(
         for i in range(len(routed_experts_weights)):
             p2p_op_infos.append((TODO, TODO))
         buffer2weight_copy_infos.append((TODO, TODO))
+        return
 
     def _compute_comm_info(logical_expert_id: int):
         all_src_ranks = _deduplicate_ordered([
