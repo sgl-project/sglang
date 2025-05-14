@@ -38,7 +38,6 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.model_executor.cuda_graph_runner import is_capture_mode
 from sglang.srt.utils import debug_timing, get_compiler_backend
 
 logger = logging.getLogger(__name__)
@@ -357,6 +356,8 @@ class MHATokenToKVPool(KVCache):
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
     ):
+        from sglang.srt.model_executor.cuda_graph_runner import is_capture_mode
+
         layer_id = layer.layer_id
         if cache_k.dtype != self.dtype:
             if k_scale is not None:
