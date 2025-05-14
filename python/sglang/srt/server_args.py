@@ -1478,6 +1478,14 @@ class ServerArgs:
             help="The path of the draft model weights. This can be a local folder or a Hugging Face repo ID.",
         )
         parser.add_argument(
+            "--speculative-draft-model-revision",
+            type=str,
+            default=None,
+            help="The specific draft model version to use. It can be a branch "
+            "name, a tag name, or a commit id. If unspecified, will use "
+            "the default version.",
+        )
+        parser.add_argument(
             "--speculative-num-steps",
             type=int,
             help="The number of steps sampled from draft model in Speculative Decoding.",
