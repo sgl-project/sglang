@@ -663,6 +663,7 @@ class TestPixtralServer(TestOpenAIVisionServer):
     def test_video_chat_completion(self):
         pass
 
+
 class TestMistral3_1Server(TestOpenAIVisionServer):
     @classmethod
     def setUpClass(cls):
