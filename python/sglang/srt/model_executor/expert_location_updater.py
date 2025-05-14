@@ -144,6 +144,12 @@ def update_expert_weights_single_layer(
     _entrypoint()
 
 
+class _ChunkUtils:
+    @staticmethod
+    def chunk_value_from_element_value(chunk_values: List, element_values: List, element_value):
+        return TODO
+
+
 def _deduplicate_ordered(arr: List[int]):
     output = []
     for item in arr:
