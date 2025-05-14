@@ -113,12 +113,12 @@ class TestDisaggregationMooncake(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        for process in [cls.process_lb, cls.process_decode, cls.process_prefill]:
-            if process:
-                try:
-                    kill_process_tree(process.pid)
-                except Exception as e:
-                    print(f"Error killing process {process.pid}: {e}")
+        import torch
+        for device in range(8):
+            torch.cuda.set_device(device)
+            torch.cuda.empty_cache()
+
+        subprocess.run(["pkill -9 -f 'sglang|python.*launch_server'"], shell=True)
 
     def test_gsm8k(self):
         args = SimpleNamespace(
