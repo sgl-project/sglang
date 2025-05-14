@@ -317,6 +317,7 @@ class ModelConfig:
             "compressed-tensors",
             "fbgemm_fp8",
             "w8a8_fp8",
+            "quark",
         ]
         optimized_quantization_methods = [
             "fp8",
