@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import List
 
 import torch
+import torch.distributed
 import torch.multiprocessing as mp
 from sglang.srt.model_executor import expert_location_updater
 from sglang.test.test_utils import CustomTestCase
@@ -104,7 +105,7 @@ def _run_subprocess(
 
         torch.random.manual_seed(42)
         torch.distributed.init_process_group(rank=rank, world_size=num_gpus,
-                                             backend={"cpu": "gloo", "cuda": "nccl"}[device])
+                                             backend={"cpu": "gloo", "cuda": "gloo,nccl"}[device])
         if device == "cuda":
             torch.cuda.set_device(f"cuda:{rank}")
 
@@ -173,6 +174,8 @@ def _execute_test(info: _TestInfo, rank: int, num_gpus: int, device: str):
             torch.all(x == y)
             for x, y in zip(routed_experts_weights, expect_new_weights, strict=True)
         )
+        global_has_error = torch.tensor(local_has_error)
+        torch.distributed.all_reduce(global_has_error, op=torch.distributed.ReduceOp.MAX)
 
         # output_logs_str = "\n".join(output_logs)
         # raise AssertionError(
