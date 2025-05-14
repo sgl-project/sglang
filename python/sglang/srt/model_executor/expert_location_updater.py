@@ -2,6 +2,7 @@ import logging
 from typing import Dict, List
 
 import torch
+import torch.distributed
 from sglang.srt.managers.expert_location import ExpertLocationMetadata
 from sglang.srt.managers.schedule_batch import get_global_expert_location_metadata
 
@@ -48,3 +49,10 @@ def update_expert_weights_single_layer(
 
     for dst_expert_location in range(TODO, TODO):
         TODO
+
+    for src_expert_location in range(TODO, TODO):
+        TODO
+
+    reqs = torch.distributed.batch_isend_irecv(TODO)
+    for req in reqs:
+        req.wait()
