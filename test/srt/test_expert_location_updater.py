@@ -19,7 +19,7 @@ class _TestInfo:
     nnodes: int
     num_logical_experts: int
     num_physical_experts: int
-    num_repeat: int = 20000
+    num_repeat: int = 5000
 
 
 class TestExpertLocationUpdater(CustomTestCase):
@@ -32,13 +32,13 @@ class TestExpertLocationUpdater(CustomTestCase):
         self._test_core(
             num_gpus=32,
             device="cpu",
-            infos=[_TestInfo(nnodes=4, num_logical_experts=256, num_physical_experts=288, num_repeat=200000)],
+            infos=[_TestInfo(nnodes=4, num_logical_experts=256, num_physical_experts=288, num_repeat=100000)],
 
         )
         self._test_core(
             num_gpus=144,
             device="cpu",
-            infos=[_TestInfo(nnodes=18, num_logical_experts=256, num_physical_experts=288, num_repeat=200000)],
+            infos=[_TestInfo(nnodes=18, num_logical_experts=256, num_physical_experts=288, num_repeat=100000)],
         )
 
     def test_gpu(self):
@@ -48,30 +48,15 @@ class TestExpertLocationUpdater(CustomTestCase):
 
     def _test_common(self, device):
         infos = []
-
-        # TODO
-        # TODO
-        # TODO
-        for nnodes in [1]:
-            for num_logical_experts in [2]:
-                for num_physical_experts in [16]:
+        for nnodes in [1, 2, 4]:
+            for num_logical_experts in [2, 5, 20, 200]:
+                for num_physical_experts in [4, 16, 220]:
                     if num_logical_experts > num_physical_experts: continue
                     infos.append(_TestInfo(
                         nnodes=nnodes,
                         num_logical_experts=num_logical_experts,
                         num_physical_experts=num_physical_experts,
                     ))
-
-        # for nnodes in [1, 2, 4]:
-        #     for num_logical_experts in [2, 5, 20, 200]:
-        #         for num_physical_experts in [4, 16, 220]:
-        #             if num_logical_experts > num_physical_experts: continue
-        #             infos.append(_TestInfo(
-        #                 nnodes=nnodes,
-        #                 num_logical_experts=num_logical_experts,
-        #                 num_physical_experts=num_physical_experts,
-        #             ))
-
         self._test_core(num_gpus=8, device=device, infos=infos)
 
     def _test_core(
