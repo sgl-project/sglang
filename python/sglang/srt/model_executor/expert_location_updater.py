@@ -84,7 +84,8 @@ def update_expert_weights_single_layer(
         for src_expert_location in range(*local_expert_location_range):
             if old_physical_to_logical_map[src_expert_location] == logical_expert_id:
                 for i in range(len(routed_experts_weights)):
-                    temp_buffers[i][TODO].copy_(routed_experts_weights[i][TODO])
+                    temp_buffers[i][to_local(dst_expert_location)].copy_(
+                        routed_experts_weights[i][to_local(src_expert_location)])
                 copy_back_infos.append((dst_expert_location, dst_expert_location))
                 return
 
