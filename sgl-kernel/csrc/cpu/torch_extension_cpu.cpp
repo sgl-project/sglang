@@ -34,6 +34,8 @@ void fused_add_rmsnorm_cpu(at::Tensor& input, at::Tensor& residual, at::Tensor& 
 
 std::tuple<at::Tensor, at::Tensor> topk_sigmoid_cpu(at::Tensor& hidden_states, at::Tensor& gating_output,
     int64_t topk);
+std::tuple<at::Tensor, at::Tensor> topk_softmax_cpu(at::Tensor& hidden_states, at::Tensor& gating_output,
+    int64_t topk, bool renormalize);
 // topk
 std::tuple<at::Tensor, at::Tensor> grouped_topk_cpu(
     at::Tensor& hidden_states,
@@ -195,6 +197,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   
   // topk
   m.def("topk_sigmoid_cpu", &topk_sigmoid_cpu, "TopK-Sigmoid fusion for CPU");
+  m.def("topk_softmax_cpu", &topk_softmax_cpu, "TopK-Softmax fusion for CPU");
   m.def("grouped_topk_cpu", &grouped_topk_cpu, "Grouped TopK for CPU");
 
   // biased group topk
