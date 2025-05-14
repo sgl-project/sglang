@@ -68,6 +68,7 @@ def _run_subprocess(
     try:
         torch.random.manual_seed(42)
         num_local_physical_experts = num_physical_experts // num_gpus
+        num_gpu_per_node = TODO
 
         def _create_routed_experts_weights(physical_to_logical_map):
             local_logical_expert_ids = physical_to_logical_map[
@@ -100,9 +101,9 @@ def _run_subprocess(
                 temp_buffers=expert_location_updater.create_temp_buffers(routed_experts_weights),
                 old_physical_to_logical_map=physical_to_logical_map,
                 new_physical_to_logical_map=new_physical_to_logical_map,
-                num_local_physical_experts=TDOO,
-                num_gpu_per_node=TDOO,
-                rank=TDOO,
+                num_local_physical_experts=num_local_physical_experts,
+                num_gpu_per_node=num_gpu_per_node,
+                rank=rank,
             )
             assert all(torch.all(x == y) for x, y in zip(routed_experts_weights, expect_new_weights, strict=True))
 
