@@ -55,6 +55,7 @@ def update_expert_weights_single_layer(
     )
 
     def _entrypoint():
+        # List[Tuple[src_expert_location, dst_expert_location]]
         copy_back_infos = []
 
         for dst_expert_location in range(*local_expert_location_range):
