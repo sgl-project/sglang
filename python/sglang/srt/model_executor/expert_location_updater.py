@@ -42,12 +42,17 @@ def update_expert_weights_single_layer(
     temp_buffers: List[torch.Tensor],
     old_physical_to_logical_map: torch.Tensor,  # (num_global_physical_Experts,)
     new_physical_to_logical_map: torch.Tensor,  # (num_global_physical_Experts,)
+    num_local_physical_experts: int,
+    rank: int,
 ):
     assert all(tensor.shape[0] == num_local_physical_experts for tensor in routed_experts_weights)
     old_physical_to_logical_map = old_physical_to_logical_map.tolist()
     new_physical_to_logical_map = new_physical_to_logical_map.tolist()
 
-    for dst_expert_location in range(TODO, TODO):
+    for dst_expert_location in range(
+        rank * num_local_physical_experts,
+        (rank + 1) * num_local_physical_experts,
+    ):
         TODO
 
     for src_expert_location in range(TODO, TODO):
