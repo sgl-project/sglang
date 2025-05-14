@@ -1035,11 +1035,6 @@ class TokenizerManager:
             loop.create_task(print_exception_wrapper(self.sigterm_watchdog))
         )
 
-        if self.eplb_manager is not None:
-            self.asyncio_tasks.add(
-                loop.create_task(print_exception_wrapper(self.eplb_manager.handle_loop))
-            )
-
     async def sigterm_watchdog(self):
         while not self.gracefully_exit:
             await asyncio.sleep(5)
