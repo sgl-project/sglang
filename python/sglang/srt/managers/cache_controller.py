@@ -424,9 +424,11 @@ class HiCacheController:
                 try:
                     operation = self.mooncake_l3_load_queue.get(block=True, timeout=1)
                     keys = operation.mooncake_keys
-                    data = [self.mooncake_l3_kv_pool.get(key) for key in keys]
-                    data = torch.concat(data)
-                    self.mem_pool_device.transfer(operation.device_indices, data)
+                    offset = 0
+                    for key in keys:
+                        data = self.mooncake_l3_kv_pool.get(key)
+                        self.mem_pool_device.transfer(operation.device_indices[offset: offset + self.page_size], data)
+                        offset += self.page_size
                     for node_id in operation.node_ids:
                         if node_id != 0:
                             self.ack_load_queue.put(node_id)

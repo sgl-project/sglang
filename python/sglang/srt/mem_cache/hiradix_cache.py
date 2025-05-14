@@ -454,7 +454,7 @@ class HiRadixCache(RadixCache):
 
         if self.enable_mooncake_store_l3_cache:
             # try to get the cross instance shared kv cache
-            if len(key) and (not node.evicted or node.l3_backuped):
+            if len(key) and (not node.evicted or node.backuped):
                 l3_keys = get_node_l3_keys(total_key, len(key),
                                            torch.cuda.current_device(), self.page_size)
                 l3_exist_keys = []
