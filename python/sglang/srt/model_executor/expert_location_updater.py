@@ -35,12 +35,15 @@ def _update_expert_weights(
     num_local_physical_experts = old_expert_location_metadata.num_local_physical_experts
     num_gpu_per_node = world_size // nnodes
 
+    old_physical_to_logical_map = old_expert_location_metadata.physical_to_logical_map.tolist()
+    new_physical_to_logical_map = new_expert_location_metadata.physical_to_logical_map.tolist()
+
     for layer_id in sorted(routed_experts_weights_of_layer.keys()):
         update_expert_weights_single_layer(
             routed_experts_weights=routed_experts_weights_of_layer[layer_id],
             temp_buffers=temp_buffers,
-            old_physical_to_logical_map=old_expert_location_metadata.physical_to_logical_map[layer_id],
-            new_physical_to_logical_map=new_expert_location_metadata.physical_to_logical_map[layer_id],
+            old_physical_to_logical_map=old_physical_to_logical_map[layer_id],
+            new_physical_to_logical_map=new_physical_to_logical_map[layer_id],
             num_local_physical_experts=num_local_physical_experts,
             num_gpu_per_node=num_gpu_per_node,
             rank=rank,
@@ -54,25 +57,22 @@ def create_temp_buffers(sample_tensors):
 def update_expert_weights_single_layer(
     routed_experts_weights: List[torch.Tensor],
     temp_buffers: List[torch.Tensor],
-    old_physical_to_logical_map: torch.Tensor,  # (num_physical_Experts,)
-    new_physical_to_logical_map: torch.Tensor,  # (num_physical_Experts,)
+    old_physical_to_logical_map: List[int],  # (num_physical_Experts,)
+    new_physical_to_logical_map: List[int],  # (num_physical_Experts,)
     num_local_physical_experts: int,
     num_gpu_per_node: int,
     rank: int,
     debug: bool = False,
 ):
     assert all(tensor.shape[0] == num_local_physical_experts for tensor in routed_experts_weights), \
-    f"{num_local_physical_experts=} {[x.shape for x in routed_experts_weights]=}"
+        f"{num_local_physical_experts=} {[x.shape for x in routed_experts_weights]=}"
 
     output_logs = [] if debug else None
 
-    num_physical_experts, = old_physical_to_logical_map.shape
+    num_physical_experts = len(old_physical_to_logical_map)
     num_tensors = len(routed_experts_weights)
 
     self_node_id = rank // num_gpu_per_node
-
-    old_physical_to_logical_map = old_physical_to_logical_map.tolist()
-    new_physical_to_logical_map = new_physical_to_logical_map.tolist()
 
     local_expert_location_range = (
         rank * num_local_physical_experts,
