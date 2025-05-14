@@ -70,9 +70,7 @@ def _run_subprocess(
 
         def _create_routed_experts_weights(physical_to_logical_map):
             local_logical_expert_ids = physical_to_logical_map[
-                                       rank * num_local_physical_experts:
-                                       (rank + 1) * num_local_physical_experts,
-                                       ].cpu()
+                                       rank * num_local_physical_experts: (rank + 1) * num_local_physical_experts].cpu()
             return [
                 local_logical_expert_ids.to(device),
                 torch.tensor([
