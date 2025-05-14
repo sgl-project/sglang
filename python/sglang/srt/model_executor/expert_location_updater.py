@@ -85,7 +85,6 @@ def update_expert_weights_single_layer(
         ):
             if old_physical_to_logical_map[src_expert_location] == logical_expert_id:
                 TODO
-                break
-        TODO_early_return
+                return
 
     _entrypoint()
