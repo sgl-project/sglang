@@ -4,10 +4,11 @@ import time
 from abc import ABC
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Type, Literal, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple, Type
 
 import torch
 import torch.distributed
+
 from sglang.srt.managers.expert_location import ExpertLocationMetadata
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -385,8 +386,8 @@ class _SelectExpertsSinglePassGatherer(_LayerBasedSinglePassGatherer):
         torch.cuda.synchronize()
 
         global_physical_count = [
-                                    0
-                                ] * self._expert_location_metadata.num_physical_experts
+            0
+        ] * self._expert_location_metadata.num_physical_experts
         for token_record in topk_ids_list:
             for global_physical_expert_idx in token_record:
                 global_physical_count[global_physical_expert_idx] += 1
@@ -469,7 +470,7 @@ def _convert_local_to_global_physical_count(
 
     ans = torch.zeros((num_layers, num_physical_experts), dtype=dtype, device=device)
     ans[
-    :, num_local_physical_experts * rank: num_local_physical_experts * (rank + 1)
+        :, num_local_physical_experts * rank : num_local_physical_experts * (rank + 1)
     ] = local_physical_count
     return ans
 
@@ -486,7 +487,9 @@ class _Accumulator(ABC):
         expert_location_metadata: "ExpertLocationMetadata",
         rank: int,
     ) -> "_Accumulator":
-        return _Accumulator.get_class(server_args)(server_args, expert_location_metadata, rank)
+        return _Accumulator.get_class(server_args)(
+            server_args, expert_location_metadata, rank
+        )
 
     @staticmethod
     def get_class(server_args: ServerArgs) -> Type["_Accumulator"]:
@@ -496,7 +499,12 @@ class _Accumulator(ABC):
             "per_token": _DetailAccumulator,
         }[server_args.expert_distribution_recorder_mode]
 
-    def __init__(self, server_args: ServerArgs, expert_location_metadata: "ExpertLocationMetadata", rank: int):
+    def __init__(
+        self,
+        server_args: ServerArgs,
+        expert_location_metadata: "ExpertLocationMetadata",
+        rank: int,
+    ):
         self._server_args = server_args
         self._expert_location_metadata = expert_location_metadata
         self._rank = rank
@@ -544,7 +552,9 @@ class _StatAccumulator(_Accumulator):
     ):
         super().append(forward_pass_id, gatherer_key, single_pass_data)
         # Can optimize if overhead here is large
-        self._global_physical_count_of_buffered_step.append(single_pass_data["global_physical_count"])
+        self._global_physical_count_of_buffered_step.append(
+            single_pass_data["global_physical_count"]
+        )
 
     def reset(self):
         super().reset()
@@ -557,7 +567,9 @@ class _StatAccumulator(_Accumulator):
             num_logical_experts=self._expert_location_metadata.num_logical_experts,
             physical_to_logical_map=self._expert_location_metadata.physical_to_logical_map,
         )
-        torch.distributed.all_reduce(logical_count_of_buffered_step, op=torch.distributed.ReduceOp.SUM)
+        torch.distributed.all_reduce(
+            logical_count_of_buffered_step, op=torch.distributed.ReduceOp.SUM
+        )
         output = dict(
             rank=self._rank,
             logical_count=logical_count_of_buffered_step,
@@ -601,7 +613,9 @@ class _Buffer:
 
 class _CircularBuffer(_Buffer):
     def __init__(self, item_shape: Tuple, buffer_size: int, dtype, device):
-        self._buffer = torch.zeros((buffer_size, *item_shape), dtype=dtype, device=device)
+        self._buffer = torch.zeros(
+            (buffer_size, *item_shape), dtype=dtype, device=device
+        )
         self._curr_index = 0
 
     def append(self, value: torch.Tensor):
@@ -627,7 +641,9 @@ class _InfiniteBuffer(_Buffer):
         device = self._buffer.device
 
         if self._size == curr_buffer_size:
-            new_buffer = torch.zeros((2 * curr_buffer_size, *self._item_shape), dtype=dtype, device=device)
+            new_buffer = torch.zeros(
+                (2 * curr_buffer_size, *self._item_shape), dtype=dtype, device=device
+            )
             new_buffer[:curr_buffer_size] = self._buffer
             self._buffer = new_buffer
 
@@ -635,7 +651,7 @@ class _InfiniteBuffer(_Buffer):
         self._size += 1
 
     def get_all(self) -> torch.Tensor:
-        return self._buffer[:self._size]
+        return self._buffer[: self._size]
 
     def reset(self):
         self._buffer[...] = 0
@@ -652,7 +668,9 @@ def _convert_global_physical_count_to_logical_count(
     dim_extra, _, _ = global_physical_count.shape
     dtype = global_physical_count.dtype
     device = global_physical_count.device
-    logical_count = torch.zeros((dim_extra, num_layers, num_logical_experts), dtype=dtype, device=device)
+    logical_count = torch.zeros(
+        (dim_extra, num_layers, num_logical_experts), dtype=dtype, device=device
+    )
     logical_count.scatter_add_(
         dim=2,
         index=physical_to_logical_map.unsqueeze(0).expand(dim_extra, -1, -1),

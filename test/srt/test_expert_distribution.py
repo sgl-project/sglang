@@ -5,6 +5,7 @@ from pathlib import Path
 
 import requests
 import torch
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST,
@@ -28,9 +29,7 @@ class TestExpertDistribution(CustomTestCase):
             with self.subTest(info=info):
                 self._execute_core(**info)
 
-    def _execute_core(
-        self, model_path: str, mode: str = "stat", tp_size: int = 1
-    ):
+    def _execute_core(self, model_path: str, mode: str = "stat", tp_size: int = 1):
         """Test expert distribution record endpoints"""
         with tempfile.TemporaryDirectory() as tmp_dir:
             os.environ["SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR"] = tmp_dir
@@ -83,7 +82,9 @@ class TestExpertDistribution(CustomTestCase):
                 self.assertEqual(response.status_code, 200)
 
                 # Check data rows
-                data = torch.load(list(Path(tmp_dir).glob("*.pt"))[0], weights_only=True)
+                data = torch.load(
+                    list(Path(tmp_dir).glob("*.pt"))[0], weights_only=True
+                )
                 print(f"{data=}")
 
                 if mode in ["per_pass", "per_token"]:

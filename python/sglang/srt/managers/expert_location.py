@@ -7,6 +7,7 @@ from typing import Optional
 import torch
 import torch.distributed
 import torch.nn.functional as F
+
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.managers import deepseek_eplb
 from sglang.srt.model_loader import get_model_architecture
@@ -82,7 +83,8 @@ class ExpertLocationMetadata:
 
     @staticmethod
     def init_by_mapping(
-        server_args: ServerArgs, model_config: ModelConfig,
+        server_args: ServerArgs,
+        model_config: ModelConfig,
         physical_to_logical_map,
     ):
         if not isinstance(physical_to_logical_map, torch.Tensor):
@@ -171,7 +173,9 @@ def _compute_logical_to_all_physical_map(
         logical_to_all_physical_map, pad_value=-1
     )
 
-    return torch.tensor(logical_to_all_physical_map, device=physical_to_logical_map.device)
+    return torch.tensor(
+        logical_to_all_physical_map, device=physical_to_logical_map.device
+    )
 
 
 def _pad_nested_array(arr, pad_value):
@@ -204,8 +208,9 @@ class ModelConfigForExpertLocation:
             return ModelConfigForExpertLocation.init_dummy()
 
 
-def compute_initial_expert_location_metadata(server_args: ServerArgs,
-                                             model_config: ModelConfig) -> ExpertLocationMetadata:
+def compute_initial_expert_location_metadata(
+    server_args: ServerArgs, model_config: ModelConfig
+) -> ExpertLocationMetadata:
     if (data := server_args.init_expert_location) is not None:
         if data == "trivial":
             logger.info("init_expert_location from init_expert_location=trivial")
@@ -223,13 +228,16 @@ def compute_initial_expert_location_metadata(server_args: ServerArgs,
             logger.info(
                 "init_expert_location from init_by_mapping using ServerArgs.init_expert_location"
             )
-            return ExpertLocationMetadata.init_by_mapping(server_args, model_config, **data_dict)
+            return ExpertLocationMetadata.init_by_mapping(
+                server_args, model_config, **data_dict
+            )
         elif "logical_count" in data_dict:
             logger.info(
                 "init_expert_location from init_by_eplb using ServerArgs.init_expert_location"
             )
-            return ExpertLocationMetadata.init_by_eplb(server_args, model_config,
-                                                       logical_count=data_dict["logical_count"])
+            return ExpertLocationMetadata.init_by_eplb(
+                server_args, model_config, logical_count=data_dict["logical_count"]
+            )
         else:
             raise NotImplementedError(
                 f"Unknown init_expert_location format ({list(data_dict.keys())=})"
