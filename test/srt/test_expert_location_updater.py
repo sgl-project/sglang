@@ -167,7 +167,9 @@ def _execute_test(info: _TestInfo, rank: int, num_gpus: int, device: str):
             num_gpu_per_node=num_gpu_per_node,
             rank=rank,
         )
-        assert all(torch.all(x == y) for x, y in zip(routed_experts_weights, expect_new_weights, strict=True))
+
+        for x, y in zip(routed_experts_weights, expect_new_weights, strict=True):
+            assert torch.all(x == y), f"{x.tolist()=} != {y.tolist()=}"
 
         physical_to_logical_map = new_physical_to_logical_map
 
