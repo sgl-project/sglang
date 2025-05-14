@@ -299,7 +299,7 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
                 self._TOP_K_NUM,
             ),
             dtype=torch.int32,
-            device="cuda",
+            device=server_args.device,
         )
         self._misc_objects: List[Dict[str, Any]] = []
         assert (
@@ -559,7 +559,7 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
             single_pass_global_physical_count,
             num_gpu=self._expert_location_metadata.ep_size,
         )
-        gpu_physical_count = gpu_physical_count.to("cuda")
+        gpu_physical_count = gpu_physical_count.to(self._server_args.device)
         torch.distributed.reduce(
             gpu_physical_count, dst=0, op=torch.distributed.ReduceOp.SUM
         )
