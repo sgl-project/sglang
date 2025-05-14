@@ -228,7 +228,8 @@ class ModelRunner:
                 rank=self.tp_rank,
             )
         )
-        self.eplb_manager = EPLBManager(self)
+        if self.server_args.enable_eplb:
+            self.eplb_manager = EPLBManager(self)
 
         # Load the model
         self.sampler = Sampler()
@@ -1107,7 +1108,8 @@ class ModelRunner:
                 with torch.autograd.profiler.record_function(debug_name):
                     output = self._forward_raw(forward_batch, skip_attn_backend_init)
 
-        self.eplb_manager.on_forward_pass_end(self.forward_pass_id)
+        if self.eplb_manager is not None:
+            self.eplb_manager.on_forward_pass_end(self.forward_pass_id)
 
         return output
 
