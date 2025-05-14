@@ -761,6 +761,7 @@ class TokenizerManager:
         num_steps: Optional[int] = None,
         activities: Optional[List[str]] = None,
     ):
+        self.auto_create_handle_loop()
         req = ProfileReq(
             type=ProfileReqType.START_PROFILE,
             output_dir=output_dir,
@@ -771,6 +772,7 @@ class TokenizerManager:
         return await self._execute_profile(req)
 
     async def stop_profile(self):
+        self.auto_create_handle_loop()
         req = ProfileReq(type=ProfileReqType.STOP_PROFILE)
         return await self._execute_profile(req)
 
@@ -783,14 +785,17 @@ class TokenizerManager:
 
     async def start_expert_distribution_record(self):
         print("hi tokenizer_manager start_expert_distribution_record", flush=True)
+        self.auto_create_handle_loop()
         await self.expert_distribution_communicator(ExpertDistributionReq.START_RECORD)
 
     async def stop_expert_distribution_record(self):
         print("hi tokenizer_manager stop_expert_distribution_record", flush=True)
+        self.auto_create_handle_loop()
         await self.expert_distribution_communicator(ExpertDistributionReq.STOP_RECORD)
 
     async def dump_expert_distribution_record(self):
         print("hi tokenizer_manager dump_expert_distribution_record", flush=True)
+        self.auto_create_handle_loop()
         await self.expert_distribution_communicator(
             ExpertDistributionReq.DUMP_RECORD
         )
