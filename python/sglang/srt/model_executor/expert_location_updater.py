@@ -73,6 +73,7 @@ def update_expert_weights_single_layer(
         _create_isend_ops(p2p_op_infos)
 
         _execute_p2p_ops(p2p_op_infos)
+        _execute_buffer2weight_copies(buffer2weight_copy_infos)
 
         for copy_back_info in TODO:
             TODO
@@ -172,6 +173,9 @@ def update_expert_weights_single_layer(
         reqs = torch.distributed.batch_isend_irecv(p2p_ops)
         for req in reqs:
             req.wait()
+
+    def _execute_buffer2weight_copies(buffer2weight_copy_infos):
+        TODO
 
     _entrypoint()
 
