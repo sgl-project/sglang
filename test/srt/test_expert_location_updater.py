@@ -158,7 +158,7 @@ def _execute_test(info: _TestInfo, rank: int, num_gpus: int, device: str):
         new_physical_to_logical_map = _create_physical_to_logical_map()
         expect_new_weights = _create_routed_experts_weights(new_physical_to_logical_map)
 
-        expert_location_updater.update_expert_weights_single_layer(
+        output_logs = expert_location_updater.update_expert_weights_single_layer(
             routed_experts_weights=routed_experts_weights,
             temp_buffers=expert_location_updater.create_temp_buffers(routed_experts_weights),
             old_physical_to_logical_map=physical_to_logical_map,
@@ -166,15 +166,19 @@ def _execute_test(info: _TestInfo, rank: int, num_gpus: int, device: str):
             num_local_physical_experts=num_local_physical_experts,
             num_gpu_per_node=num_gpu_per_node,
             rank=rank,
+            debug=True,
         )
 
         for x, y in zip(routed_experts_weights, expect_new_weights, strict=True):
             if not torch.all(x == y):
+                output_logs_str = "\n".join(output_logs)
                 raise AssertionError(
                     f"routed_experts_weights[i]={x.tolist()}\n"
                     f"expect_new_weights[i]={y.tolist()}\n"
                     f"old_physical_to_logical_map={physical_to_logical_map.tolist()}\n"
                     f"new_physical_to_logical_map={new_physical_to_logical_map.tolist()}\n"
+                    f"===logs===\n"
+                    f"{output_logs_str}"
                 )
 
         physical_to_logical_map = new_physical_to_logical_map
