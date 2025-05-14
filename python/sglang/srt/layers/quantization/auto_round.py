@@ -11,7 +11,6 @@ try:
     )
     from vllm.scalar_type import scalar_types
     from vllm.platforms import current_platform
-    from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
     from vllm.logger import init_logger
     logger = init_logger(__name__)
     VLLM_AVAILABLE = True
@@ -35,7 +34,7 @@ from sglang.srt.layers.linear import (
 )
 # from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-
+from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 
 class AutoRoundConfig(QuantizationConfig):
     """Config class for AutoRound.
@@ -317,12 +316,12 @@ class AutoRoundConfig(QuantizationConfig):
             else:
                 raise ValueError(
                     f"ipex backend only supports awq "
-                    f"and gtpq format,but got {self.packing_format}")
+                    f"and gptq format, but got {self.packing_format}")
         else:
             return None
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
-        if (current_platform.is_cpu() or current_platform.is_xpu()
+        if current_platform is not None and (current_platform.is_cpu() or current_platform.is_xpu()
                 or self.backend == "ipex"):
             return self.apply_ipex_quant_layer(layer, prefix)
         if "gptq" in self.packing_format or "gptq" in self.backend:
