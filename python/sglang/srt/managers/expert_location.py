@@ -303,8 +303,7 @@ def compute_logical_to_rank_dispatch_physical_map(
         torch.randint(0, 65536, output_shape, dtype=torch.int32, device=device, generator=g)
         % logical_to_all_physical_map_num_valid
     )
-    assert logical_to_all_physical_map.shape == chosen_index.shape
-    logical_to_rank_dispatch_physical_map = logical_to_all_physical_map.flatten()[chosen_index.flatten()].view(
+    logical_to_rank_dispatch_physical_map = logical_to_all_physical_map[TODO, TODO, chosen_index.flatten()].view(
         output_shape)
     print(f"hi {logical_to_rank_dispatch_physical_map.shape=}")
 
