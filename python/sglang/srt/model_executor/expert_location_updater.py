@@ -205,7 +205,7 @@ def update_expert_weights_single_layer(
 
     def _to_local(expert_location: int) -> int:
         """Returns expert location in local array"""
-        assert TODO <= expert_location < TODO
+        assert local_expert_location_range[0] <= expert_location < local_expert_location_range[1]
         return expert_location % num_local_physical_experts
 
     _entrypoint()
