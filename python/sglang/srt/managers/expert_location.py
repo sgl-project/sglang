@@ -287,6 +287,7 @@ def compute_logical_to_rank_dispatch_physical_map(
     seed: int = 42,
 ):
     r = random.Random(seed)
+    device = logical_to_all_physical_map.device
 
     num_local_physical_experts = num_physical_experts // num_gpus
     num_layers, num_logical_experts, _ = logical_to_all_physical_map.shape
@@ -328,7 +329,7 @@ def compute_logical_to_rank_dispatch_physical_map(
             )
 
     assert torch.all(logical_to_rank_dispatch_physical_map != -1)
-    return logical_to_rank_dispatch_physical_map
+    return logical_to_rank_dispatch_physical_map.to(device)
 
 
 def _compute_gpu_id_of_physical_expert(
