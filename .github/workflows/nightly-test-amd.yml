@@ -1,0 +1,58 @@
+name: Nightly Test (AMD)
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  push:
+    branches:
+      - main
+    paths:
+      - "python/sglang/version.py"
+  workflow_dispatch:
+
+concurrency:
+  group: nightly-test-amd-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  nightly-test:
+    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    strategy:
+      matrix:
+        runner: [linux-mi300-gpu-2, linux-mi325-gpu-2-nightly]
+    runs-on: ${{matrix.runner}}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup docker
+        run: |
+          # Ensure GPU isolation if pod is part of kubernetes setup with DEVICE_FLAG.
+          if [ -f "/etc/podinfo/gha-render-devices" ]; then
+            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+          else
+            DEVICE_FLAG="--device /dev/dri"
+          fi
+          touch github_summary.md
+          docker pull lmsysorg/sglang:v0.4.6.post3-rocm630
+          docker run -dt --user root --device=/dev/kfd $DEVICE_FLAG \
+            -v ${{ github.workspace }}:/sglang-checkout --ipc=host --group-add video \
+            --cap-add=SYS_PTRACE -e HF_TOKEN=${HF_TOKEN} --security-opt seccomp=unconfined \
+            -w /sglang-checkout --name ci_sglang \
+            lmsysorg/sglang:v0.4.6.post3-rocm630
+
+      - name: Install dependencies
+        run: |
+          docker exec ci_sglang pip install --upgrade pip
+          docker exec ci_sglang pip uninstall sgl-kernel -y || true
+          docker exec -w /sglang-checkout/sgl-kernel ci_sglang bash -c "rm -f pyproject.toml && mv pyproject_rocm.toml pyproject.toml && python3 setup_rocm.py install"
+          docker exec ci_sglang pip install -e "python[dev_hip]"
+
+          docker exec -w / ci_sglang git clone https://github.com/merrymercy/human-eval.git
+          docker exec -w /human-eval ci_sglang pip install -e .
+          docker exec ci_sglang pip install huggingface_hub[hf_xet]
+
+      - name: Nightly Test
+        run: |
+          docker exec -w /sglang-checkout/test/srt -e SGLANG_IS_IN_CI=1 -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" ci_sglang python3 run_suite.py --suite nightly-amd --timeout-per-file 7200
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY

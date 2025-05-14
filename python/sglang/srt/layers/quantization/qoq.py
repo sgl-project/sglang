@@ -1,17 +1,9 @@
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
-
-from sglang.srt.utils import is_cuda_available, set_weight_attrs
-
-is_cuda = is_cuda_available()
-if is_cuda:
-    from sgl_kernel import int8_scaled_mm
-
 from sgl_kernel import qserve_w4a8_per_chn_gemm, qserve_w4a8_per_group_gemm
 from torch.nn.parameter import Parameter
 
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.linear import LinearMethodBase
 from sglang.srt.layers.parameter import (
     ChannelQuantScaleParameter,
