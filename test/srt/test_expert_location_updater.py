@@ -3,6 +3,7 @@ import unittest
 
 import torch
 import torch.multiprocessing as mp
+from python.sglang.test.test_utils import find_available_port
 from sglang.srt.model_executor import expert_location_updater
 from sglang.test.test_utils import CustomTestCase
 from sglang.utils import is_in_ci
@@ -37,6 +38,8 @@ class TestExpertLocationUpdater(CustomTestCase):
         num_gpus: int,
         **kwargs,
     ):
+        master_port = find_available_port(23456)
+
         processes = []
         output_reader, output_writer = mp.Pipe(duplex=False)
         for rank in range(num_gpus):
@@ -46,6 +49,7 @@ class TestExpertLocationUpdater(CustomTestCase):
                     rank=rank,
                     num_gpus=num_gpus,
                     output_writer=output_writer,
+                    master_port=master_port,
                     **kwargs,
                 ),
             )
@@ -66,11 +70,15 @@ def _run_subprocess(
     num_logical_experts: int,
     num_physical_experts: int,
     device: str,
+    master_port: int,
     output_writer,
 ):
     try:
         if rank == 0:
             print(f"Test: {num_gpus=} {nnodes=} {num_logical_experts=} {num_physical_experts=} {device=}", flush=True)
+
+        os.environ["MASTER_ADDR"] = "localhost"
+        os.environ["MASTER_PORT"] = str(master_port)
 
         torch.random.manual_seed(42)
         torch.distributed.init_process_group(rank=rank, world_size=num_gpus,
