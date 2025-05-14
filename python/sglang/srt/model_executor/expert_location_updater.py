@@ -61,7 +61,8 @@ def update_expert_weights_single_layer(
     rank: int,
     debug: bool = False,
 ):
-    assert all(tensor.shape[0] == num_local_physical_experts for tensor in routed_experts_weights)
+    assert all(tensor.shape[0] == num_local_physical_experts for tensor in routed_experts_weights), \
+    f"{num_local_physical_experts=} {[x.shape for x in routed_experts_weights]=}"
 
     output_logs = [] if debug else None
 
