@@ -113,6 +113,7 @@ def update_expert_weights_single_layer(
             return
 
         # case 5: cross-node
+        # Future work: can optimize when there are multiple ranks in the same dst node that uses the same logical expert
         chosen_src_rank = cross_node_mapping.chunk_value_from_element_value(element_value=rank)
         for i in range(num_tensors):
             p2p_op_infos.append((TODO, TODO))
