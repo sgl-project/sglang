@@ -145,10 +145,15 @@ def update_expert_weights_single_layer(
             element_values=need_comm_self_node_dst_ranks,
             chunk_value=rank,
         )
-        TODO
+        p2p_op_infos.append((TODO, TODO))
 
         # b. cross-node
-        TODO
+        chosen_dst_ranks = _ChunkUtils.element_values_from_chunk_value(
+            chunk_values=all_src_ranks,
+            element_values=need_comm_cross_node_dst_ranks,
+            chunk_value=rank,
+        )
+        p2p_op_infos.append((TODO, TODO))
 
     def _compute_comm_info(logical_expert_id: int):
         all_src_ranks = _deduplicate_ordered([
