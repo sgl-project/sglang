@@ -217,7 +217,10 @@ class _ChunkUtils:
 
     @staticmethod
     def _element_slice_from_chunk_index(num_elements: int, num_chunks: int, chunk_index: int) -> slice:
-        return TODO
+        short_chunk_size, num_long_chunks = divmod(num_elements, num_chunks)
+        start = chunk_index * short_chunk_size + min(chunk_index, num_long_chunks)
+        end = start + short_chunk_size + int(chunk_index < num_long_chunks)
+        return slice(start, end)
 
 
 def _deduplicate_ordered(arr: List[int]):
