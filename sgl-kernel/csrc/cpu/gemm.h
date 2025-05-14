@@ -1,5 +1,4 @@
 #pragma once
-
 #include <ATen/native/CPUBlas.h>
 
 #include "common.h"
