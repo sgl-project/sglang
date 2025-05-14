@@ -70,7 +70,7 @@ def _run_subprocess(
 ):
     try:
         if rank == 0:
-            print(f"Test: {num_gpus=} {nnodes=} {num_logical_experts=} {num_physical_experts=} {device=}")
+            print(f"Test: {num_gpus=} {nnodes=} {num_logical_experts=} {num_physical_experts=} {device=}", flush=True)
 
         torch.random.manual_seed(42)
         torch.distributed.init_process_group(rank=rank, world_size=num_gpus,
@@ -107,7 +107,7 @@ def _run_subprocess(
         num_repeats = 5000
         for i in range(num_repeats):
             if rank == 0 and i % 500 == 0:
-                print(f"Step {i}/{num_repeats}")
+                print(f"Step {i}/{num_repeats}", flush=True)
 
             new_physical_to_logical_map = _create_physical_to_logical_map()
             expect_new_weights = _create_routed_experts_weights(new_physical_to_logical_map)
