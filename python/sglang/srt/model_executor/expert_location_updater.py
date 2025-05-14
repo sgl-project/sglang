@@ -104,6 +104,9 @@ def update_expert_weights_single_layer(
                 buffer2weight_copy_infos.append((src_expert_location, dst_expert_location))
                 return
 
+        all_src_ranks, self_node_src_ranks, need_comm_self_node_dst_ranks, need_comm_cross_node_dst_ranks = _compute_comm_info(
+            logical_expert_id=logical_expert_id)
+
         # case 4: same-node
         if rank in need_comm_self_node_dst_ranks:
             chosen_src_rank = _ChunkUtils.chunk_value_from_element_value(
@@ -143,7 +146,7 @@ def update_expert_weights_single_layer(
                                           (x // num_gpu_per_node) not in all_src_nodes]
 
         return all_src_ranks, self_node_src_ranks, need_comm_self_node_dst_ranks, need_comm_cross_node_dst_ranks
-    
+
     _entrypoint()
 
 
