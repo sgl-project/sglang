@@ -307,10 +307,12 @@ def compute_logical_to_rank_dispatch_physical_map(
                                                          index=chosen_index.unsqueeze(-1)).squeeze(-1)
     assert logical_to_rank_dispatch_physical_map.shape == output_shape
 
-    for index in range(logical_to_all_physical_map_num_valid.max() + 1):
+    for index in range(logical_to_all_physical_map_num_valid.max().item() + 1):
         partial_logical_to_all_physical_map = logical_to_all_physical_map[:, :, index]
         is_valid = partial_logical_to_all_physical_map != -1
         is_same_gpu = (partial_logical_to_all_physical_map // num_local_physical_experts) == ep_rank
+        print(
+            f"{is_valid.shape=} {is_same_gpu.shape=} {partial_logical_to_all_physical_map.shape=} {logical_to_rank_dispatch_physical_map.shape=}")
         logical_to_rank_dispatch_physical_map = torch.where(is_valid & is_same_gpu, partial_logical_to_all_physical_map,
                                                             logical_to_rank_dispatch_physical_map)
 
