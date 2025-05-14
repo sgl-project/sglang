@@ -98,7 +98,8 @@ def update_expert_weights_single_layer(
 
         all_src_ranks = _deduplicate_ordered([
             x // num_local_physical_experts
-            for x in range(num_physical_experts) if old_physical_to_logical_map[x] == logical_expert_id
+            for x in range(num_physical_experts)
+            if old_physical_to_logical_map[x] == logical_expert_id
         ])
 
         # case 4: same-node
