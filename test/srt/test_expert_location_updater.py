@@ -192,7 +192,7 @@ def _execute_test(info: _TestInfo, rank: int, num_gpus: int, device: str):
                 f"{output_logs_str}"
             )
 
-            raise AssertionError("Error happens. See logs above.")
+            raise AssertionError(f"Error happens:\n{msg}")
 
         physical_to_logical_map = new_physical_to_logical_map
 
