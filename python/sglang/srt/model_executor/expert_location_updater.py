@@ -96,7 +96,7 @@ def update_expert_weights_single_layer(
                 return
 
         all_src_ranks = _deduplicate_ordered(
-            [x // num_expert_per_gpu for x in old_log2phy_all[logical_expert_id] if x != -1])
+            [x // num_local_physical_experts for x in old_log2phy_all[logical_expert_id] if x != -1])
 
         # case 4: same-node
         TODO
