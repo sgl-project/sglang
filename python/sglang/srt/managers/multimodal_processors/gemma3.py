@@ -1,5 +1,7 @@
 from typing import List, Union
 
+import torch
+
 from sglang.srt.managers.multimodal_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
@@ -53,7 +55,7 @@ class Gemma3SGLangImageProcessor(SGLangBaseProcessor):
         input_ids = ret["input_ids"].flatten()
         image_offsets = self.get_mm_items_offset(
             input_ids=input_ids,
-            mm_token_id=self.IMAGE_TOKEN,
+            mm_token_id=self.hf_config.image_token_index,
         )
         for i, image in enumerate(base_output.images):
             item = MultimodalDataItem(
