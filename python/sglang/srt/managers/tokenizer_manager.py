@@ -114,7 +114,6 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     dataclass_to_string_truncated,
-    disable_request_logging,
     get_zmq_socket,
     kill_process_tree,
 )
@@ -689,7 +688,6 @@ class TokenizerManager:
 
         generators = []
         rids = []
-
         if getattr(obj, "parallel_sample_num", 1) == 1:
             if self.server_args.enable_tokenizer_batch_encode:
                 # Validate batch tokenization constraints
@@ -879,7 +877,7 @@ class TokenizerManager:
         self.auto_create_handle_loop()
         assert (
             self.server_args.dp_size == 1
-        ), "dp_size must be for update weights from distributed"
+        ), "dp_size must be 1 for update weights from distributed"
 
         # This means that weight sync
         # cannot run while requests are in progress.
@@ -1165,7 +1163,16 @@ class TokenizerManager:
                     "meta_info": meta_info,
                 }
             elif isinstance(recv_obj, BatchMultimodalOut):
-                raise NotImplementedError()
+                if isinstance(recv_obj.outputs[i], str):
+                    out_dict = {
+                        "text": recv_obj.outputs[i],
+                        "meta_info": meta_info,
+                    }
+                else:
+                    out_dict = {
+                        "outputs": json.dumps(recv_obj.outputs[i]),
+                        "meta_info": meta_info,
+                    }
             else:
                 assert isinstance(recv_obj, BatchEmbeddingOut)
                 out_dict = {
