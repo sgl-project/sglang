@@ -163,8 +163,8 @@ class LayerCommunicator:
 
     def _compute_context(self):
         return _Context(
-            process_group_sizes=self.process_group_sizes,
             num_tokens_of_mode=TODO,
+            process_group_sizes=self.process_group_sizes,
             attn_tp_rank=self.attn_tp_rank,
             attn_tp_size=self.attn_tp_size,
             tp_size=self.tp_size,
@@ -173,8 +173,8 @@ class LayerCommunicator:
 
 @dataclass
 class _Context:
-    process_group_sizes: Dict["ScatterMode", int]
     num_tokens_of_mode: Dict["ScatterMode", int]
+    process_group_sizes: Dict["ScatterMode", int]
     attn_tp_rank: int
     attn_tp_size: int
     tp_size: int
