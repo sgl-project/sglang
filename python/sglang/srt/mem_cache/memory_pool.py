@@ -94,6 +94,33 @@ class ReqToTokenPool:
 
 
 class KVCache(abc.ABC):
+    @abc.abstractmethod
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        dtype: torch.dtype,
+        layer_num: int,
+        device: str,
+        enable_memory_saver: bool,
+        start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
+    ):
+        self.size = size
+        self.page_size = page_size
+        self.dtype = dtype
+        self.device = device
+        if dtype in (torch.float8_e5m2, torch.float8_e4m3fn):
+            # NOTE: Store as torch.uint8 because Tensor.index_put is not implemented for torch.float8_e5m2
+            self.store_dtype = torch.uint8
+        else:
+            self.store_dtype = dtype
+        self.layer_num = layer_num
+        self.start_layer = start_layer or 0
+        self.end_layer = end_layer or layer_num - 1
+        self.memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=enable_memory_saver
+        )
 
     @abc.abstractmethod
     def get_key_buffer(self, layer_id: int) -> torch.Tensor:
@@ -217,20 +244,15 @@ class MHATokenToKVPool(KVCache):
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
     ):
-        self.size = size
-        self.page_size = page_size
-        self.dtype = dtype
-        self.device = device
-        if dtype in (torch.float8_e5m2, torch.float8_e4m3fn):
-            # NOTE: Store as torch.uint8 because Tensor.index_put is not implemented for torch.float8_e5m2
-            self.store_dtype = torch.uint8
-        else:
-            self.store_dtype = dtype
-        self.layer_num = layer_num
-        self.start_layer = start_layer or 0
-        self.end_layer = end_layer or layer_num - 1
-        self.memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=enable_memory_saver
+        super().__init__(
+            size,
+            page_size,
+            dtype,
+            layer_num,
+            device,
+            enable_memory_saver,
+            start_layer,
+            end_layer,
         )
 
         self.head_num = head_num
@@ -493,20 +515,15 @@ class MLATokenToKVPool(KVCache):
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
     ):
-        self.size = size
-        self.page_size = page_size
-        self.dtype = dtype
-        self.device = device
-        if dtype in (torch.float8_e5m2, torch.float8_e4m3fn):
-            # NOTE: Store as torch.uint8 because Tensor.index_put is not implemented for torch.float8_e5m2
-            self.store_dtype = torch.uint8
-        else:
-            self.store_dtype = dtype
-        self.layer_num = layer_num
-        self.start_layer = start_layer or 0
-        self.end_layer = end_layer or layer_num - 1
-        self.memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=enable_memory_saver
+        super().__init__(
+            size,
+            page_size,
+            dtype,
+            layer_num,
+            device,
+            enable_memory_saver,
+            start_layer,
+            end_layer,
         )
 
         self.kv_lora_rank = kv_lora_rank
@@ -637,19 +654,15 @@ class DoubleSparseTokenToKVPool(KVCache):
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
     ):
-        self.size = size
-        self.page_size = page_size
-        self.dtype = dtype
-        self.device = device
-        if dtype in (torch.float8_e5m2, torch.float8_e4m3fn):
-            # NOTE: Store as torch.uint8 because Tensor.index_put is not implemented for torch.float8_e5m2
-            self.store_dtype = torch.uint8
-        else:
-            self.store_dtype = dtype
-        self.start_layer = start_layer or 0
-        self.end_layer = end_layer or layer_num - 1
-        self.memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=enable_memory_saver
+        super().__init__(
+            size,
+            page_size,
+            dtype,
+            layer_num,
+            device,
+            enable_memory_saver,
+            start_layer,
+            end_layer,
         )
 
         with self.memory_saver_adapter.region():
