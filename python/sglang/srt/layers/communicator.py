@@ -208,7 +208,8 @@ def _communicate_summable_tensor_pair(
     local_dp_size: int,
     attn_tp_size: int,
 ):
-    """It is allowed to sum hidden_states and residual if needed."""
+    """It is allowed to make (hidden_states, residual) := (hidden_states + residual, None) if needed."""
+
     if hidden_states_input_mode == ScatterMode.FULL:
         TODO_add_more_guards
         # TODO(ch-wan): use reduce-scatter in MLP to avoid this scatter
