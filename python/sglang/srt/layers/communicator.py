@@ -297,8 +297,7 @@ def _communicate_with_all_reduce_and_layer_norm(
         if context.is_same_group_size(
             hidden_states_input_mode, hidden_states_output_mode
         ) and context.is_same_group_size(residual_input_mode, residual_output_mode):
-            if context.tp_size > 1:
-                hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+            assert context.attn_tp_size == 1
             if hidden_states.shape[0] != 0:
                 hidden_states, residual = layernorm(hidden_states, residual)
             return hidden_states, residual
