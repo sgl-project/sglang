@@ -1132,6 +1132,7 @@ class DeepseekV2DecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
+        self.n_routed_experts = config.n_routed_experts
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
@@ -1201,7 +1202,7 @@ class DeepseekV2DecoderLayer(nn.Module):
 
     def _is_layer_sparse(self, layer_id: int, is_nextn: bool) -> bool:
         return is_nextn or (
-            self.config.n_routed_experts is not None
+            self.n_routed_experts is not None
             and layer_id >= self.config.first_k_dense_replace
             and layer_id % self.config.moe_layer_freq == 0
         )
