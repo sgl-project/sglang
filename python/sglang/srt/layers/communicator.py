@@ -218,6 +218,15 @@ def _communicate_simple(
     raise NotImplementedError(f"{input_mode=} {output_mode=}")
 
 
+def _communicate_with_all_reduce_and_layer_norm(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    forward_batch: ForwardBatch,
+    context: _Context,
+):
+    TODO
+
+
 def _communicate_summable_tensor_pair(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
