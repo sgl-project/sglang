@@ -210,7 +210,6 @@ def _communicate_with_all_reduce_and_layer_norm(
         and (hidden_states_output_mode == ScatterMode.FULL)
         and (residual_output_mode == ScatterMode.TP_ATTN_FULL)
     ):
-        # all gather and all reduce
         if context.local_attn_dp_size != 1:
             if context.attn_tp_rank == 0:
                 hidden_states += residual
