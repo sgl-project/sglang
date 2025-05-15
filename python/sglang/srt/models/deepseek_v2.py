@@ -1143,12 +1143,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             alt_stream=alt_stream,
         )
 
-        self.info = self._compute_info(config, layer_id=layer_id, is_nextn=is_nextn)
-        previous_layer_info = self._compute_info(
-            config, layer_id=layer_id - 1, is_nextn=False
-        )
-
-        if self.info.is_sparse:
+        if TODO_info.is_sparse:
             self.mlp = DeepseekV2MoE(
                 config=config,
                 quant_config=quant_config,
@@ -1222,7 +1217,7 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         if mode_is_forward_ffn_with_full_input or (not (
             enable_moe_dense_fully_dp()
-            and (not self.info.is_sparse)
+            and (not TODO_info.is_sparse)
             and hidden_states.shape[0] == 0
         )):
             hidden_states = self.mlp(hidden_states, forward_batch.forward_mode)
