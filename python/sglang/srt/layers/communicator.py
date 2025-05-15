@@ -15,6 +15,7 @@ from sglang.srt.layers.dp_attention import (
     dp_scatter,
     get_attention_tp_rank,
     get_attention_tp_size,
+    get_local_attention_dp_size,
 )
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -121,6 +122,7 @@ class LayerCommunicator:
 
         self.attn_tp_rank = get_attention_tp_rank()
         self.attn_tp_size = get_attention_tp_size()
+        self.local_attn_dp_size = get_local_attention_dp_size()
         self.tp_size = get_tensor_model_parallel_world_size()
         self.process_group_sizes = {
             ScatterMode.SCATTERED: 1,
@@ -185,6 +187,7 @@ class LayerCommunicator:
             process_group_sizes=self.process_group_sizes,
             attn_tp_rank=self.attn_tp_rank,
             attn_tp_size=self.attn_tp_size,
+            local_attn_dp_size=self.local_attn_dp_size,
             tp_size=self.tp_size,
         )
 
@@ -219,6 +222,7 @@ class _Context:
     process_group_sizes: Dict["ScatterMode", int]
     attn_tp_rank: int
     attn_tp_size: int
+    local_attn_dp_size: int
     tp_size: int
 
     def is_same_group_size(self, a: "ScatterMode", b: "ScatterMode"):
@@ -294,10 +298,13 @@ def _communicate_with_all_reduce_and_layer_norm(
     def _inner():
         nonlocal hidden_states, residual
 
-        if context.is_same_group_size(
-            hidden_states_input_mode, hidden_states_output_mode
-        ) and context.is_same_group_size(residual_input_mode, residual_output_mode):
-            assert context.attn_tp_size == 1
+        if (
+            context.is_same_group_size(
+                hidden_states_input_mode, hidden_states_output_mode
+            )
+            and context.is_same_group_size(residual_input_mode, residual_output_mode)
+            and context.attn_tp_size == 1
+        ):
             if hidden_states.shape[0] != 0:
                 hidden_states, residual = layernorm(hidden_states, residual)
             return hidden_states, residual
@@ -308,16 +315,20 @@ def _communicate_with_all_reduce_and_layer_norm(
             and (hidden_states_output_mode == ScatterMode.FULL)
             and (residual_output_mode == ScatterMode.TP_ATTN_FULL)
         ):
-            if context.attn_tp_rank == 0:
-                hidden_states += residual
-            hidden_states, local_hidden_states = (
-                forward_batch.gathered_buffer,
-                hidden_states,
-            )
-            dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
-            dp_scatter(residual, hidden_states, forward_batch)
-            if hidden_states.shape[0] != 0:
-                hidden_states = layernorm(hidden_states)
+            if context.local_attn_dp_size != 1:
+                if context.attn_tp_rank == 0:
+                    hidden_states += residual
+                hidden_states, local_hidden_states = (
+                    forward_batch.gathered_buffer,
+                    hidden_states,
+                )
+                dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
+                dp_scatter(residual, hidden_states, forward_batch)
+                if hidden_states.shape[0] != 0:
+                    hidden_states = layernorm(hidden_states)
+            else:
+                hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                hidden_states, residual = layernorm(hidden_states, residual)
             return hidden_states, residual
 
         if (
