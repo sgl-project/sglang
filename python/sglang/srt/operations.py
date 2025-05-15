@@ -1,10 +1,11 @@
+import os
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Generator, List, Sequence, Union
 
 import torch
 
-_ENABLE_PROFILE = bool(int(os.environ.get("SGLANG_TBO_ENABLE_PROFILE", "0")))
+_ENABLE_PROFILE = bool(int(os.environ.get("SGLANG_OPERATIONS_ENABLE_PROFILE", "0")))
 
 if _ENABLE_PROFILE:
     import nvtx
