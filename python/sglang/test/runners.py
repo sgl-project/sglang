@@ -19,7 +19,9 @@ from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
+import transformers
 from transformers import (
+    AutoConfig,
     AutoModel,
     AutoModelForCausalLM,
     AutoModelForVision2Seq,
@@ -211,7 +213,12 @@ class HFRunner:
 
         # Load the model and tokenizer
         if self.model_type == "generation":
-            self.base_model = AutoModelForCausalLM.from_pretrained(
+            config = AutoConfig.from_pretrained(model_path)
+            if model_archs := getattr(config, "architectures"):
+                model_cls = getattr(transformers, model_archs[0])
+            else:
+                model_cls = AutoModelForCausalLM
+            self.base_model = model_cls.from_pretrained(
                 model_path,
                 torch_dtype=torch_dtype,
                 trust_remote_code=self.trust_remote_code,
@@ -423,9 +430,9 @@ class HFRunner:
                     )
                 del input_logits
 
-        if lora_paths is not None and lora_paths[i] is not None:
-            # Unload the LoRA adapter if it is used
-            model.unload()
+            if lora_paths is not None and lora_paths[i] is not None:
+                # Unload the LoRA adapter if it is used
+                model.unload()
 
         return ModelOutput(
             output_strs=output_strs,

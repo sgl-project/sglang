@@ -270,7 +270,7 @@ def select_experts(
     routed_scaling_factor: Optional[float] = None,
 ):
     n_share_experts_fusion = global_server_args_dict["n_share_experts_fusion"]
-    # DeekSeek V2/V3/R1 serices models uses grouped_top_k
+    # DeepSeek V2/V3/R1 series models use grouped_top_k
     if use_grouped_topk:
         assert topk_group is not None
         assert num_expert_group is not None

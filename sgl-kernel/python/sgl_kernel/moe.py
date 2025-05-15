@@ -45,10 +45,10 @@ def moe_fused_gate(
 ):
     # This fused kernel function is used to select topk expert in a hierarchical 2-layer fashion
     # it split group of expert into num_expert_group, and use top2 expert weight sum in each group
-    # as the group weight to select exerpt groups and then select topk experts within the selected groups
+    # as the group weight to select expert groups and then select topk experts within the selected groups
     # the #experts is decided by the input tensor shape and we currently only support power of 2 #experts
-    # and #experts should be divisible by num_expert_group. #expert/num_expert_group <= 32 is limitted for now.
-    # for non-supported case, we suggestion to use the biased_grouped_topk func in sglang.srt.layers.moe.topk
+    # and #experts should be divisible by num_expert_group. #expert/num_expert_group <= 32 is limited for now.
+    # for non-supported case, we suggest to use the biased_grouped_topk func in sglang.srt.layers.moe.topk
     # n_share_experts_fusion: if > 0, the last expert will be replaced with a round-robin shared expert
     # routed_scaling_factor: if > 0, the last expert will be scaled by this factor
     return torch.ops.sgl_kernel.moe_fused_gate.default(
