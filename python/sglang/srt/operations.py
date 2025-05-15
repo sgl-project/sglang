@@ -10,11 +10,6 @@ if _ENABLE_PROFILE:
     import nvtx
 
 
-# TODO move?
-def compute_layer_operations():
-    return TODO
-
-
 def execute_operations(inputs, operations):
     stages = _convert_operations_to_stages(operations)
     executor = _StageExecutor("primary", stages, inputs=inputs)
