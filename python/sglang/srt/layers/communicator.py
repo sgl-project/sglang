@@ -20,11 +20,23 @@ class LayerScatterModes:
     ffn_mode: ScatterMode
     layer_output_mode: ScatterMode
 
-    @staticmethod
-    def init_new(layer_id: int, is_layer_sparse: _IsLayerSparseCallable):
-        return LayerScatterModes(
+    @classmethod
+    def init_new(cls, layer_id: int, is_layer_sparse: _IsLayerSparseCallable):
+        return cls(
             layer_input_mode=TODO,
             attn_mode=ScatterMode.TP_ATTN_FULL,
             ffn_mode=TODO,
             layer_output_mode=TODO,
         )
+
+    @classmethod
+    def _compute_layer_input_mode(cls, layer_id: int, is_layer_sparse: _IsLayerSparseCallable):
+        return TODO
+
+    @classmethod
+    def _compute_ffn_mode(cls, layer_id: int, is_layer_sparse: _IsLayerSparseCallable):
+        return TODO
+
+    @classmethod
+    def _compute_layer_output_mode(cls, layer_id: int, is_layer_sparse: _IsLayerSparseCallable):
+        return TODO
