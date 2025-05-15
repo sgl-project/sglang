@@ -224,7 +224,9 @@ def _communicate_with_all_reduce_and_layer_norm(
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual
             )
-    elif self.layer_scatter_modes.mlp_mode == ScatterMode.SCATTERED:
+        return hidden_states, residual
+
+    if self.layer_scatter_modes.mlp_mode == ScatterMode.SCATTERED:
         if self.attn_tp_size != 1:
             if self.layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED:
                 tensor_list = list(hidden_states.tensor_split(self.attn_tp_size))
@@ -239,9 +241,10 @@ def _communicate_with_all_reduce_and_layer_norm(
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual
             )
-    else:
-        raise NotImplementedError
-    return hidden_states, residual
+        return hidden_states, residual
+
+    raise NotImplementedError(
+        f"{hidden_states_input_mode=} {residual_input_mode=} {residual_output_mode=} {residual_output_mode=}")
 
 
 def _communicate_summable_tensor_pair(
