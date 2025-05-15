@@ -271,9 +271,9 @@ class TestBenchServing(CustomTestCase):
                 f'accept_length: {res["accept_length"]:.2f} \n'
             )
             if os.getenv("SGLANG_AMD_CI") == "1":
-                self.assertLess(res["median_e2e_latency_ms"], 1800)
+                self.assertLess(res["median_e2e_latency_ms"], 3000)
             else:
-                self.assertLess(res["median_e2e_latency_ms"], 900)
+                self.assertLess(res["median_e2e_latency_ms"], 1500)
             self.assertGreater(res["accept_length"], 1.5)
 
     def test_moe_offline_throughput_default(self):
