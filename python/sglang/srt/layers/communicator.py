@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Optional, Dict
+from typing import Optional, Dict, Tuple
 
 import torch
 from sglang.srt.distributed import get_tensor_model_parallel_world_size, tensor_model_parallel_all_reduce
@@ -166,6 +166,10 @@ class _Context:
         actual_num_tokens = x.shape[0]
         expect_num_tokens = self.num_tokens_of_mode[mode]
         assert actual_num_tokens == expect_num_tokens, f"{actual_num_tokens=} {expect_num_tokens=} {mode=} {x.shape=}"
+        return x
+
+    def check_shapes(self, xs: Tuple[torch.Tensor], modes: Tuple[ScatterMode]) -> Tuple[torch.Tensor]:
+        return tuple([self.check_shape(x, mode) for x, mode in zip(xs, modes, strict=True)])
 
 
 def _communicate_simple(
@@ -175,20 +179,25 @@ def _communicate_simple(
     output_mode: ScatterMode,
     context: _Context,
 ) -> torch.Tensor:
-    if context.is_same_group_size(input_mode, output_mode):
-        return hidden_states
+    def _inner():
+        if context.is_same_group_size(input_mode, output_mode):
+            return hidden_states
 
-    if input_mode == ScatterMode.SCATTERED and output_mode == ScatterMode.TP_ATTN_FULL:
-        hidden_states, local_hidden_states = (
-            forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
-            hidden_states,
-        )
-        attn_tp_all_gather(
-            list(hidden_states.tensor_split(context.attn_tp_size)), local_hidden_states
-        )
-        return hidden_states
+        if input_mode == ScatterMode.SCATTERED and output_mode == ScatterMode.TP_ATTN_FULL:
+            hidden_states, local_hidden_states = (
+                forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
+                hidden_states,
+            )
+            attn_tp_all_gather(
+                list(hidden_states.tensor_split(context.attn_tp_size)), local_hidden_states
+            )
+            return hidden_states
 
-    raise NotImplementedError(f"{input_mode=} {output_mode=}")
+        raise NotImplementedError(f"{input_mode=} {output_mode=}")
+
+    hidden_states = _inner()
+    context.check_shape(hidden_states, output_mode)
+    return hidden_states
 
 
 def _communicate_with_all_reduce_and_layer_norm(
