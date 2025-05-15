@@ -1176,12 +1176,6 @@ class DeepseekV2DecoderLayer(nn.Module):
                 tp_size=mlp_tp_size,
             )
 
-        self.input_is_scattered = (
-            layer_id > 0
-            and previous_layer_info.ffn_input_mode == _FFNInputMode.SCATTERED
-        )
-        self.is_last_layer = self.layer_id == config.num_hidden_layers - 1
-
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps

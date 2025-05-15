@@ -90,6 +90,13 @@ class LayerCommunicator:
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
 
+        # TODO
+        self.input_is_scattered = (
+            layer_id > 0
+            and previous_layer_info.ffn_input_mode == _FFNInputMode.SCATTERED
+        )
+        self.is_last_layer = self.layer_id == config.num_hidden_layers - 1
+
     def forward_pre_attn(
         self,
         hidden_states: torch.Tensor,
