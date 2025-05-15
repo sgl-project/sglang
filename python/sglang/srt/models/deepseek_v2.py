@@ -352,17 +352,20 @@ class DeepseekV2MoE(nn.Module):
                 forward_mode=forward_mode,
             )
 
-        final_hidden_states = self.experts(
-            hidden_states=hidden_states,
-            topk_idx=topk_idx,
-            topk_weights=topk_weights,
-            reorder_topk_ids=reorder_topk_ids,
-            seg_indptr=seg_indptr,
-            masked_m=masked_m,
-            expected_m=expected_m,
-            num_recv_tokens_per_expert=num_recv_tokens_per_expert,
-            forward_mode=forward_mode,
-        )
+        if enable_deepep_moe:
+            final_hidden_states = self.experts(
+                hidden_states=hidden_states,
+                topk_idx=topk_idx,
+                topk_weights=topk_weights,
+                reorder_topk_ids=reorder_topk_ids,
+                seg_indptr=seg_indptr,
+                masked_m=masked_m,
+                expected_m=expected_m,
+                num_recv_tokens_per_expert=num_recv_tokens_per_expert,
+                forward_mode=forward_mode,
+            )
+        else:
+            final_hidden_states = self.experts(hidden_states=hidden_states, router_logits=router_logits)
 
         if enable_deepep_moe and (self.ep_size > 1):
             final_hidden_states = self.deepep_dispatcher.combine(
@@ -382,7 +385,7 @@ class DeepseekV2MoE(nn.Module):
     def forward_normal(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # router_logits = self.gate(hidden_states)
         # shared_output = self._forward_shared_experts(hidden_states)
-        final_hidden_states = self.experts(hidden_states=hidden_states, router_logits=router_logits)
+        # final_hidden_states = self.experts(hidden_states=hidden_states, router_logits=router_logits)
         final_hidden_states *= self.routed_scaling_factor
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
