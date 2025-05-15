@@ -96,9 +96,14 @@ class LayerScatterModes:
 
     @classmethod
     def _compute_layer_output_mode(cls, context: _LayerModeComputationContext):
+        mlp_mode = cls._compute_mlp_mode(context)
         if context.layer_id == context.num_layers - 1:
             return ScatterMode.TP_ATTN_FULL
-        return cls._compute_mlp_mode(context)
+        if mlp_mode == ScatterMode.SCATTERED:
+            return ScatterMode.SCATTERED
+        if mlp_mode == ScatterMode.FULL:
+            return ScatterMode.TP_ATTN_FULL
+        raise NotImplementedError
 
 
 def enable_moe_dense_fully_dp():
