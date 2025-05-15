@@ -768,6 +768,8 @@ class ModelRunner:
         elif self.server_args.kv_cache_dtype == "fp8_e4m3":
             if is_cuda():
                 self.kv_cache_dtype = torch.float8_e4m3fn
+            else:
+                raise ValueError("fp8_e4m3 kv cache dtype is not supported on non-CUDA plateforms.")
         else:
             raise ValueError(
                 f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."

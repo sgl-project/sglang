@@ -210,7 +210,7 @@ class Platform:
             torch.manual_seed(seed)
 
     @classmethod
-    def check_and_update_server_args(cls, server_args: ServerArgs) -> None:
+    def check_and_update_server_args(cls, server_args: "ServerArgs") -> None:
         """
         Check and update the server arguments for the current platform.
 
@@ -223,7 +223,7 @@ class Platform:
         pass
 
     @classmethod
-    def check_and_update_model_dtype(cls, model_config: ModelConfig, dtype: str) -> str:
+    def check_and_update_model_dtype(cls, model_config: "ModelConfig", dtype: str) -> str:
         """
         Check and update the model's dtype for the current platform.
         """
@@ -237,7 +237,7 @@ class Platform:
 
     @classmethod
     def check_and_update_attntion_backend(
-        cls, model_config: ModelConfig, backend: str
+        cls, model_config: "ModelConfig", backend: str
     ) -> str:
         """
         Check and update the attntion backend for the current platform.
@@ -335,6 +335,18 @@ class Platform:
     @classmethod
     def supports_fp8(cls) -> bool:
         return False
+
+    @classmethod
+    def supports_mx(cls) -> bool:
+        """
+        Returns whether the current platform supports MX types.
+        """
+        if torch.version.hip:
+            gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
+            return any(gfx in gcn_arch for gfx in ["gfx95"])
+        else:
+            return False
+
 
     @classmethod
     def fp8_dtype(cls) -> torch.dtype:
