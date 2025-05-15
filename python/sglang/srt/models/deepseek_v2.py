@@ -302,7 +302,8 @@ class DeepseekV2MoE(nn.Module):
     def forward(
         self, hidden_states: torch.Tensor, forward_mode: Optional[ForwardMode] = None
     ) -> torch.Tensor:
-        if not global_server_args_dict["enable_deepep_moe"]:
+        enable_deepep_moe = global_server_args_dict["enable_deepep_moe"]
+        if not enable_deepep_moe:
             return self.forward_normal(hidden_states)
         else:
             return self.forward_deepep(hidden_states, forward_mode)
