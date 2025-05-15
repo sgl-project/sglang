@@ -717,6 +717,7 @@ def decode_attention_wave(
         waves_per_eu=2,
         dynamic_symbols=dynamic_symbols,
         dynamic_symbols_map=dynamic_symbols_map,
+        wave_runtime=True,
     )
     options = set_default_run_config(options)
     phase_0 = wave_compile(options, phase_0)
@@ -745,6 +746,7 @@ def decode_attention_wave(
         waves_per_eu=4,
         dynamic_symbols=dynamic_symbols,
         dynamic_symbols_map=dynamic_symbols_map,
+        wave_runtime=True,
     )
     options = set_default_run_config(options)
     phase_1 = wave_compile(options, phase_1)
