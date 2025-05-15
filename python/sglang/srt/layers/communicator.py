@@ -44,13 +44,13 @@ class LayerScatterModes:
 
     @classmethod
     def _compute_layer_input_mode(cls, context: _LayerModeComputationContext):
-        if layer_id == 0:
+        if context.layer_id == 0:
             return ScatterMode.TP_ATTN_FULL
         return cls._compute_layer_output_mode(layer_id=layer_id - 1, context=context)
 
     @classmethod
     def _compute_ffn_mode(cls, context: _LayerModeComputationContext):
-        if context.is_layer_sparse(layer_id):
+        if context.is_layer_sparse:
             return (
                 ScatterMode.SCATTERED
                 if global_server_args_dict["enable_deepep_moe"]
@@ -65,9 +65,9 @@ class LayerScatterModes:
 
     @classmethod
     def _compute_layer_output_mode(cls, context: _LayerModeComputationContext):
-        if layer_id == context.num_layers - 1:
+        if context.layer_id == context.num_layers - 1:
             return ScatterMode.TP_ATTN_FULL
-        return cls._compute_ffn_mode(layer_id, context)
+        return cls._compute_ffn_mode(context)
 
 
 def enable_moe_dense_fully_dp():
