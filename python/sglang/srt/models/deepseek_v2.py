@@ -1129,9 +1129,6 @@ class DeepseekV2DecoderLayer(nn.Module):
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         self.enable_dp_attention = global_server_args_dict["enable_dp_attention"]
         self.layer_id = layer_id
-        self.local_dp_size = get_local_attention_dp_size()
-        self.attn_tp_size = get_attention_tp_size()
-        self.attn_tp_rank = get_attention_tp_rank()
         self.self_attn = DeepseekV2AttentionMLA(
             config=config,
             hidden_size=self.hidden_size,
