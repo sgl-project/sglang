@@ -272,11 +272,12 @@ class DeepseekV2MoE(nn.Module):
                     tp_size=1,
                 )
 
+        self.top_k = config.num_experts_per_tok
+
         if global_server_args_dict["enable_deepep_moe"]:
             # TODO: we will support tp < ep in the future
             self.ep_size = get_tensor_model_parallel_world_size()
             self.num_experts = config.n_routed_experts
-            self.top_k = config.num_experts_per_tok
             self.renormalize = config.norm_topk_prob
             self.topk_group = config.topk_group
             self.num_expert_group = config.n_group
