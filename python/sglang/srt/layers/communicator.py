@@ -237,16 +237,17 @@ def _communicate_summable_tensor_pair(
 
     if hidden_states_input_mode == ScatterMode.SCATTERED:
         TODO_add_more_guards
-        if output_mode == ScatterMode.TP_ATTN_FULL and context.attn_tp_size != 1:
-            hidden_states += residual
-            residual = None
-            hidden_states, local_hidden_states = (
-                forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
-                hidden_states,
-            )
-            attn_tp_all_gather(
-                list(hidden_states.tensor_split(context.attn_tp_size)), local_hidden_states
-            )
+        if output_mode == ScatterMode.TP_ATTN_FULL:
+            if context.attn_tp_size != 1:
+                hidden_states += residual
+                residual = None
+                hidden_states, local_hidden_states = (
+                    forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
+                    hidden_states,
+                )
+                attn_tp_all_gather(
+                    list(hidden_states.tensor_split(context.attn_tp_size)), local_hidden_states
+                )
         return hidden_states, residual
 
     raise NotImplementedError
