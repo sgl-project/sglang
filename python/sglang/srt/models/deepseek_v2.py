@@ -244,26 +244,19 @@ class DeepseekV2MoE(nn.Module):
         if config.n_shared_experts is not None and self.n_share_experts_fusion == 0:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
             # disable tp for shared experts when enable deepep moe
-            if not global_server_args_dict["enable_deepep_moe"]:
-                self.shared_experts = DeepseekV2MLP(
-                    hidden_size=config.hidden_size,
-                    intermediate_size=intermediate_size,
-                    hidden_act=config.hidden_act,
-                    quant_config=quant_config,
-                    reduce_results=False,
-                    prefix=add_prefix("shared_experts", prefix),
-                )
-            else:
-                self.shared_experts = DeepseekV2MLP(
-                    hidden_size=config.hidden_size,
-                    intermediate_size=intermediate_size,
-                    hidden_act=config.hidden_act,
-                    quant_config=quant_config,
-                    reduce_results=False,
-                    prefix=add_prefix("shared_experts", prefix),
-                    tp_rank=0,
-                    tp_size=1,
-                )
+            self.shared_experts = DeepseekV2MLP(
+                hidden_size=config.hidden_size,
+                intermediate_size=intermediate_size,
+                hidden_act=config.hidden_act,
+                quant_config=quant_config,
+                reduce_results=False,
+                prefix=add_prefix("shared_experts", prefix),
+                **(
+                    dict(tp_rank=0, tp_size=1)
+                    if global_server_args_dict["enable_deepep_moe"]
+                    else {}
+                ),
+            )
 
         if global_server_args_dict["enable_deepep_moe"]:
             # TODO: we will support tp < ep in the future
