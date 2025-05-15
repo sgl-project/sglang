@@ -236,6 +236,44 @@ class TestBenchServing(CustomTestCase):
                 self.assertLess(res["median_e2e_latency_ms"], 900)
             self.assertGreater(res["accept_length"], 3.0)
 
+    def test_offline_throughput_mtp_eagle(self):
+        res = run_bench_serving(
+            model=DEFAULT_MTP_MODEL_FOR_TEST,
+            num_prompts=300,
+            request_rate=8,
+            sharegpt_context_len=3072,
+            disable_ignore_eos=True,
+            dataset_name="sharegpt",
+            other_server_args=[
+                "--speculative-algorithm",
+                "EAGLE",
+                "--speculative-draft-model-path",
+                DEFAULT_MTP_MODEL_FOR_TEST,
+                "--speculative-num-steps",
+                "1",
+                "--speculative-eagle-topk",
+                "1",
+                "--speculative-num-draft-tokens",
+                "2",
+                "--mem-fraction-static",
+                "0.5",
+            ],
+            need_warmup=True,
+            seed=42,
+        )
+
+        if is_in_ci():
+            write_github_step_summary(
+                f"### test_offline_throughput_mtp_eagle\n"
+                f'median_e2e_latency_ms: {res["median_e2e_latency_ms"]:.2f} ms\n'
+                f'accept_length: {res["accept_length"]:.2f} \n'
+            )
+            if os.getenv("SGLANG_AMD_CI") == "1":
+                self.assertLess(res["median_e2e_latency_ms"], 1800)
+            else:
+                self.assertLess(res["median_e2e_latency_ms"], 900)
+            self.assertGreater(res["accept_length"], 1.5)
+
     def test_moe_offline_throughput_default(self):
         res = run_bench_serving(
             model=DEFAULT_MOE_MODEL_NAME_FOR_TEST,
