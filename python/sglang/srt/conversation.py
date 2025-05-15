@@ -781,7 +781,7 @@ register_conv_template(
     Conversation(
         name="gemma-it",
         system_message="You are a helpful assistant.",
-        system_template="<start_of_turn>user{system_message}\n\n",
+        system_template="<start_of_turn>user\n{system_message}\n\n",
         roles=("<start_of_turn>user\n", "<start_of_turn>model\n"),
         sep="<end_of_turn>\n",
         sep_style=SeparatorStyle.GEMMA3,
