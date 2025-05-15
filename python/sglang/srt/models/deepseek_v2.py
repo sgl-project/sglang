@@ -18,7 +18,7 @@
 
 import logging
 import os
-from enum import Enum, IntEnum, auto
+from enum import IntEnum, auto
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
@@ -1102,13 +1102,6 @@ class DeepseekV2AttentionMLA(nn.Module):
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
         output, _ = self.o_proj(attn_output)
         return output
-
-
-class _FFNInputMode(Enum):
-    # The MLP sublayer requires 1/tp_size tokens as input
-    SCATTERED = auto()
-    # The MLP sublayer requires all tokens as input
-    FULL = auto()
 
 
 class DeepseekV2DecoderLayer(nn.Module):
