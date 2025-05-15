@@ -49,17 +49,17 @@ class LayerScatterModes:
         if context.is_layer_sparse(layer_id):
             return ScatterMode.SCATTERED if global_server_args_dict["enable_deepep_moe"] else ScatterMode.FULL
         else:
-            return (
-                ScatterMode.SCATTERED
-                if DeepseekV2DecoderLayer._enable_moe_dense_fully_dp()
-                else ScatterMode.FULL
-            )
+            return ScatterMode.SCATTERED if enable_moe_dense_fully_dp() else ScatterMode.FULL
 
     @classmethod
     def _compute_layer_output_mode(cls, layer_id: int, context: _LayerModeComputationContext):
         if layer_id == context.num_layers - 1:
             return ScatterMode.TP_ATTN_FULL
         return cls._compute_ffn_mode(layer_id, context)
+
+
+def enable_moe_dense_fully_dp():
+    return global_server_args_dict["moe_dense_tp_size"] == 1
 
 
 class LayerCommunicator:

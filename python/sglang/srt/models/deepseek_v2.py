@@ -31,6 +31,7 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.communicator import enable_moe_dense_fully_dp
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather,
     attn_tp_reduce_scatter,
@@ -1167,7 +1168,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 prefix=add_prefix("mlp", prefix),
             )
         else:
-            if self._enable_moe_dense_fully_dp():
+            if enable_moe_dense_fully_dp():
                 mlp_tp_rank, mlp_tp_size = 0, 1
             else:
                 mlp_tp_rank, mlp_tp_size = None, None
@@ -1191,10 +1192,6 @@ class DeepseekV2DecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-
-    @staticmethod
-    def _enable_moe_dense_fully_dp():
-        return global_server_args_dict["moe_dense_tp_size"] == 1
 
     @staticmethod
     def _compute_info(config: PretrainedConfig, layer_id: int, is_nextn: bool):
@@ -1346,7 +1343,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             )
 
         if not (
-            self._enable_moe_dense_fully_dp()
+            enable_moe_dense_fully_dp()
             and (not self.info.is_sparse)
             and hidden_states.shape[0] == 0
         ):
