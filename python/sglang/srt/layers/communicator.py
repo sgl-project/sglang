@@ -3,6 +3,7 @@ from enum import Enum, auto
 from typing import Optional, Dict, Tuple
 
 import torch
+import torch.distributed
 from sglang.srt.distributed import get_tensor_model_parallel_world_size, tensor_model_parallel_all_reduce
 from sglang.srt.layers.dp_attention import attn_tp_all_gather, dp_gather_partial, dp_scatter, attn_tp_reduce_scatter, \
     get_local_attention_dp_size, get_attention_tp_size, get_attention_tp_rank
@@ -111,7 +112,7 @@ class LayerCommunicator:
         self.process_group_sizes = {
             ScatterMode.SCATTERED: 1,
             ScatterMode.TP_ATTN_FULL: TODO,
-            ScatterMode.FULL: TODO,
+            ScatterMode.FULL: torch.distributed.get_world_size(),
         }
 
     def forward_pre_attn(
