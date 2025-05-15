@@ -51,9 +51,11 @@ NUM_TOP_LOGPROBS = 5
 
 
 def get_dtype_str(torch_dtype):
-    if torch_dtype is torch.float16:
+    if torch_dtype == "auto":
+        return "auto"
+    elif torch_dtype is torch.float16:
         return "float16"
-    if torch_dtype is torch.float32:
+    elif torch_dtype is torch.float32:
         return "float32"
     else:
         raise NotImplementedError()
@@ -447,7 +449,7 @@ class SRTRunner:
     def __init__(
         self,
         model_path: str,
-        torch_dtype: torch.dtype,
+        torch_dtype: Union[torch.dtype, str],
         model_type: str,
         tp_size: int = 1,
         port: int = DEFAULT_PORT_FOR_SRT_TEST_RUNNER,

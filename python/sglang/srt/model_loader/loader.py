@@ -146,6 +146,7 @@ def _initialize_model(
 ) -> nn.Module:
     """Initialize a model with the given configurations."""
     model_class, _ = get_model_architecture(model_config)
+
     packed_modules_mapping = getattr(model_class, "packed_modules_mapping", {})
     quant_config = _get_quantization_config(
         model_config, load_config, packed_modules_mapping

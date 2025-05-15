@@ -122,7 +122,7 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         float_dtype = torch.get_default_dtype()
 
-        if self.emulate and not get_bool_env_var("VLLM_QUARK_EMU_MEM_OPT"):
+        if self.emulate and not get_bool_env_var("SGLANG_QUARK_EMU_MEM_OPT"):
             # Unpack and dequantize the weights, the operators are in
             # high-precision, with simulated quantization).
             layer.w13_weight = torch.nn.Parameter(
@@ -179,7 +179,6 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
             routed_scaling_factor=routed_scaling_factor
         )
 
-        print("call fused_experts in quark moe apply")
         out = fused_experts(
             x,
             layer.w13_weight,

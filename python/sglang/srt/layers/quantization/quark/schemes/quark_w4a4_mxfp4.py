@@ -28,7 +28,7 @@ class QuarkW4A4MXFP4(QuarkScheme):
         self.input_quant_spec = input_quant_spec
         self.emulate = not Platform.supports_mx()
 
-        if get_bool_env_var("VLLM_QUARK_EMU_MEM_OPT"):
+        if get_bool_env_var("SGLANG_QUARK_EMU_MEM_OPT"):
             self.emulate_memory = True
         else:
             self.emulate_memory = False

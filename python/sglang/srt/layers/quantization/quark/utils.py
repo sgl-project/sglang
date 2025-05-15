@@ -67,6 +67,7 @@ def should_ignore_layer(
                                                          targets=ignore)
 
     assert should_ignore_layer is not None
+
     return should_ignore_layer
 
 

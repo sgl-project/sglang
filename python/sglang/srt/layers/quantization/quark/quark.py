@@ -42,6 +42,8 @@ class QuarkConfig(QuantizationConfig):
         self.kv_cache_config = kv_cache_config
         self.pack_method = pack_method
 
+        self.packed_modules_mapping = self.quant_config["packed_modules_mapping"]
+
     def get_linear_method(self) -> "QuarkLinearMethod":
         return QuarkLinearMethod(self)
 

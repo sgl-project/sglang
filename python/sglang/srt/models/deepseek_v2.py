@@ -1455,6 +1455,7 @@ class DeepseekV2Model(nn.Module):
 
 
 class DeepseekV2ForCausalLM(nn.Module):
+    packed_modules_mapping = {}
 
     def __init__(
         self,
@@ -1463,6 +1464,11 @@ class DeepseekV2ForCausalLM(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+
+        fuse_qkv_a_proj = hasattr(config, "q_lora_rank") and config.q_lora_rank is not None
+        if fuse_qkv_a_proj:
+            self.packed_modules_mapping["fused_qkv_a_proj_with_mqa"] = ["q_a_proj", "kv_a_proj_with_mqa"]
+
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
@@ -1755,7 +1761,7 @@ class DeepseekV2ForCausalLM(nn.Module):
             self.config.q_lora_rank is not None
         )
         cached_a_proj = {} if fuse_qkv_a_proj else None
-
+    
         if is_nextn:
             nextn_layer_prefix = f"model.layers.{nextn_layer_id}"
             nextn_spec_weight_names = [
