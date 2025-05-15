@@ -47,7 +47,11 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 # Detect whether the current forward pass is in capture mode
-is_capture_mode = None
+is_capture_mode = False
+
+
+def get_is_capture_mode():
+    return is_capture_mode
 
 
 def _to_torch(model: torch.nn.Module, reverse: bool, num_tokens: int):
@@ -601,8 +605,7 @@ class CudaGraphRunner:
             self.positions[: self.raw_num_token].copy_(forward_batch.positions)
 
         # Replay
-        with self.model_capture_mode():
-            self.graphs[self.bs].replay()
+        self.graphs[self.bs].replay()
 
         output = self.output_buffers[self.bs]
         if isinstance(output, LogitsProcessorOutput):

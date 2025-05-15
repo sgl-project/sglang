@@ -34,7 +34,6 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.managers.schedule_batch import MultimodalInputs
-from sglang.srt.model_executor.cuda_graph_runner import is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaDecoderLayer, LlamaMLP
@@ -970,6 +969,8 @@ class MllamaForConditionalGeneration(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
+        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+
         batched_images, batched_ar_ids, batched_ar_mask, encoder_lens_need = (
             self._batch_image_inputs(forward_batch)
         )
@@ -978,7 +979,7 @@ class MllamaForConditionalGeneration(nn.Module):
         cross_attention_mask = None
         cross_attention_states = None
 
-        if is_capture_mode:
+        if get_is_capture_mode():
             # NOTE: when doing cuda graph capture, we do not want to skip cross attention
             # Make is a constant value to avoid cuda graph capture issue
             skip_cross_attention = False

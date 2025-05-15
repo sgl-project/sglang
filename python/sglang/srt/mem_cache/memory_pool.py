@@ -356,7 +356,7 @@ class MHATokenToKVPool(KVCache):
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
     ):
-        from sglang.srt.model_executor.cuda_graph_runner import is_capture_mode
+        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
         layer_id = layer.layer_id
         if cache_k.dtype != self.dtype:
@@ -371,7 +371,7 @@ class MHATokenToKVPool(KVCache):
             cache_k = cache_k.view(self.store_dtype)
             cache_v = cache_v.view(self.store_dtype)
 
-        if is_capture_mode and cache_k.shape[0] < 4:
+        if get_is_capture_mode() and cache_k.shape[0] < 4:
             # Overlap the copy of K and V cache for small batch size
             current_stream = self.device_module.current_stream()
             self.alt_stream.wait_stream(current_stream)
