@@ -1873,6 +1873,7 @@ def launch_dummy_health_check_server(host, port):
         host=host,
         port=port,
         timeout_keep_alive=5,
+        loop="auto",
         log_config=None,
         log_level="warning",
     )
