@@ -314,7 +314,7 @@ class DeepseekV2MoE(nn.Module):
         else:
             router_logits = shared_output = None
 
-        if router_logits is not None:
+        if enable_deepep_moe and (router_logits is not None):
             topk_weights, topk_idx = select_experts(
                 hidden_states=hidden_states,
                 router_logits=router_logits,
@@ -334,7 +334,7 @@ class DeepseekV2MoE(nn.Module):
                 (0, self.top_k), dtype=torch.float32, device=hidden_states.device
             )
 
-        if self.ep_size > 1:
+        if enable_deepep_moe and (self.ep_size > 1):
             # TODO(ch-wan): allow users to set num_max_dispatch_tokens_per_rank value
             (
                 hidden_states,
@@ -351,6 +351,7 @@ class DeepseekV2MoE(nn.Module):
                 topk_weights,
                 forward_mode=forward_mode,
             )
+
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
             topk_idx=topk_idx,
@@ -362,13 +363,15 @@ class DeepseekV2MoE(nn.Module):
             num_recv_tokens_per_expert=num_recv_tokens_per_expert,
             forward_mode=forward_mode,
         )
-        if self.ep_size > 1:
+
+        if enable_deepep_moe and (self.ep_size > 1):
             final_hidden_states = self.deepep_dispatcher.combine(
                 final_hidden_states,
                 topk_idx,
                 topk_weights,
                 forward_mode,
             )
+
         final_hidden_states *= self.routed_scaling_factor
 
         if shared_output is not None:
