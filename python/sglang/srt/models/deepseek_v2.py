@@ -298,8 +298,8 @@ class DeepseekV2MoE(nn.Module):
 
     def op_gate(self, state):
         if (
-            forward_mode is not None
-            and not forward_mode.is_idle()
+            state.forward_mode is not None
+            and not state.forward_mode.is_idle()
             and hidden_states.shape[0] > 0
         ):
             # router_logits: (num_tokens, n_experts)
@@ -310,8 +310,8 @@ class DeepseekV2MoE(nn.Module):
     def op_shared_experts(self, state):
         if (
             (self.n_share_experts_fusion == 0)
-            and (forward_mode is not None)
-            and not forward_mode.is_idle()
+            and (state.forward_mode is not None)
+            and not state.forward_mode.is_idle()
             and hidden_states.shape[0] > 0
         ):
             shared_output = self.self.shared_experts(hidden_states)
@@ -346,7 +346,7 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states,
                 topk_idx,
                 topk_weights,
-                forward_mode=forward_mode,
+                forward_mode=state.forward_mode,
             )
 
     def op_dispatch_b(self, state):
@@ -373,7 +373,7 @@ class DeepseekV2MoE(nn.Module):
                 masked_m=masked_m,
                 expected_m=expected_m,
                 num_recv_tokens_per_expert=num_recv_tokens_per_expert,
-                forward_mode=forward_mode,
+                forward_mode=state.forward_mode,
             )
         else:
             final_hidden_states = self.experts(
@@ -386,7 +386,7 @@ class DeepseekV2MoE(nn.Module):
                 final_hidden_states,
                 topk_idx,
                 topk_weights,
-                forward_mode,
+                state.forward_mode,
             )
 
     def op_combine_b(self, state):
