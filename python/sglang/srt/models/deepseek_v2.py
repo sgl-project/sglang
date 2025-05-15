@@ -1216,6 +1216,16 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         hidden_states = self.layer_communicator.forward_pre_attn(hidden_states, forward_batch)
 
+        if hidden_states.shape[0] != 0:
+            # Self Attention
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+                zero_allocator=zero_allocator,
+            )
+
+
         ##################################################################
 
         if self.info.ffn_input_mode == _FFNInputMode.SCATTERED:
@@ -1237,15 +1247,6 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
-        if hidden_states.shape[0] != 0:
-            # Self Attention
-            hidden_states = self.self_attn(
-                positions=positions,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
-                zero_allocator=zero_allocator,
-            )
-
         hidden_states, residual = self.layer_communicator.forward_pre_mlp(hidden_states, residual, forward_batch)
 
         # Fully Connected
@@ -1263,14 +1264,6 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
-
-        # Self Attention
-        hidden_states = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-            forward_batch=forward_batch,
-            zero_allocator=zero_allocator,
-        )
 
         hidden_states, residual = self.layer_communicator.forward_pre_mlp(hidden_states, residual, forward_batch)
 
