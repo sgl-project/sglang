@@ -1225,20 +1225,14 @@ class DeepseekV2DecoderLayer(nn.Module):
                 zero_allocator=zero_allocator,
             )
 
+        hidden_states, residual = self.layer_communicator.forward_pre_mlp(hidden_states, residual, forward_batch)
 
-        ##################################################################
+        TODO_mlp
 
-        if self.info.ffn_input_mode == _FFNInputMode.SCATTERED:
-            return self.forward_ffn_with_scattered_input(
-                positions, hidden_states, forward_batch, residual, zero_allocator
-            )
-        elif self.info.ffn_input_mode == _FFNInputMode.FULL:
-            return self.forward_ffn_with_full_input(
-                positions, hidden_states, forward_batch, residual, zero_allocator
-            )
-        else:
-            raise NotImplementedError
+        hidden_states, residual = self.layer_communicator.forward_layer_end(hidden_states, residual, forward_batch)
 
+        return hidden_states, residual
+    
     def forward_ffn_with_full_input(
         self,
         positions: torch.Tensor,
@@ -1247,14 +1241,9 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
-        hidden_states, residual = self.layer_communicator.forward_pre_mlp(hidden_states, residual, forward_batch)
 
         # Fully Connected
         hidden_states = self.mlp(hidden_states)
-
-        hidden_states, residual = self.layer_communicator.forward_layer_end(hidden_states, residual, forward_batch)
-
-        return hidden_states, residual
 
     def forward_ffn_with_scattered_input(
         self,
@@ -1264,19 +1253,12 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
-
-        hidden_states, residual = self.layer_communicator.forward_pre_mlp(hidden_states, residual, forward_batch)
-
         if not (
             enable_moe_dense_fully_dp()
             and (not self.info.is_sparse)
             and hidden_states.shape[0] == 0
         ):
             hidden_states = self.mlp(hidden_states, forward_batch.forward_mode)
-
-        hidden_states, residual = self.layer_communicator.forward_layer_end(hidden_states, residual, forward_batch)
-
-        return hidden_states, residual
 
 
 class DeepseekV2Model(nn.Module):
