@@ -300,10 +300,10 @@ class DeepseekV2MoE(nn.Module):
         if (
             state.forward_mode is not None
             and not state.forward_mode.is_idle()
-            and hidden_states.shape[0] > 0
+            and state.hidden_states_for_mlp.shape[0] > 0
         ):
             # router_logits: (num_tokens, n_experts)
-            state.router_logits = self.gate(hidden_states)
+            state.router_logits = self.gate(state.hidden_states_for_mlp)
         else:
             state.router_logits = None
 
@@ -312,15 +312,15 @@ class DeepseekV2MoE(nn.Module):
             (self.n_share_experts_fusion == 0)
             and (state.forward_mode is not None)
             and not state.forward_mode.is_idle()
-            and hidden_states.shape[0] > 0
+            and state.hidden_states_for_mlp.shape[0] > 0
         ):
-            state.shared_output = self.self.shared_experts(hidden_states)
+            state.shared_output = self.self.shared_experts(state.hidden_states_for_mlp)
         else:
             state.shared_output = None
 
     def op_select_experts(self, state):
         router_logits = state.pop("router_logits")
-        hidden_states = TODO_state_get
+        hidden_states = state.hidden_states_for_mlp
 
         if self._enable_deepep_moe and (router_logits is not None):
             state.topk_weights_local, state.topk_idx_local = select_experts(
@@ -346,7 +346,7 @@ class DeepseekV2MoE(nn.Module):
         if self._enable_deepep_moe and (self.ep_size > 1):
             # TODO(ch-wan): allow users to set num_max_dispatch_tokens_per_rank value
             self.deepep_dispatcher.dispatch_a(
-                hidden_states=hidden_states,
+                hidden_states=state.pop("hidden_states_for_mlp"),
                 topk_idx=state.pop("topk_idx_local"),
                 topk_weights=state.pop("topk_weights_local"),
                 forward_mode=state.forward_mode,
@@ -1261,7 +1261,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
 
     def op_comm_pre_mlp(self, state):
-        state.hidden_states_after_comm_pre_mlp, state.residual_after_comm_pre_mlp = (
+        state.hidden_states_for_mlp, state.residual_after_comm_pre_mlp = (
             self.layer_communicator.forward_pre_mlp(
                 state.pop("hidden_states_after_attn"),
                 state.pop("residual_after_input_ln"),
@@ -1270,7 +1270,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
 
     def op_mlp(self, state):
-        hidden_states = state.pop("hidden_states_after_comm_pre_mlp")
+        hidden_states = state.pop("hidden_states_for_mlp")
         if not (
             enable_moe_dense_fully_dp()
             and (not self.is_layer_sparse)
