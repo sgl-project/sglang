@@ -834,7 +834,7 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
                         )
                         n_prev_token = len(
                             content["meta_info"]["output_token_logprobs"]
-                        )
+                        ) 
                     else:
                         logprobs = None
 
@@ -1349,7 +1349,7 @@ def v1_chat_generate_response(
                     ChatCompletionTokenLogprob(
                         token=token,
                         bytes=token_bytes,
-                        logprob=logprob if logprob else 0.0,
+                        logprob=logprob
                         top_logprobs=top_logprobs,
                     )
                 )
@@ -1608,7 +1608,7 @@ async def v1_chat_completions(
                                 if finish_reason and "matched" in finish_reason
                                 else None
                             ),
-                            logprobs=choice_logprobs,
+                            logprobs=None,
                         )
                         chunk = ChatCompletionStreamResponse(
                             id=content["meta_info"]["id"],
@@ -1662,8 +1662,11 @@ async def v1_chat_completions(
                                 yield f"data: {chunk.model_dump_json(exclude_none=False)}\n\n"
 
                     text = content["text"]
+                    print(f"text: {text}")
                     delta = text[len(stream_buffer) :]
+                    print(f"delta: {delta}")
                     new_stream_buffer = stream_buffer + delta
+                    print(f"new_stream_buffer: {new_stream_buffer}")
 
                     enable_thinking = _get_enable_thinking_from_request(request)
 
