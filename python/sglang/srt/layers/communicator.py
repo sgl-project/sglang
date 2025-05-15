@@ -276,39 +276,44 @@ def _communicate_summable_tensor_pair(
 ):
     """It is allowed to make (hidden_states, residual) := (hidden_states + residual, None) if needed."""
 
-    if context.is_same_group_size(hidden_states_input_mode, output_mode) \
-        and context.is_same_group_size(residual_input_mode, output_mode):
-        return hidden_states, residual
+    def _inner():
+        nonlocal hidden_states, residual
 
-    if (
-        (hidden_states_input_mode == ScatterMode.FULL)
-        and (residual_input_mode == ScatterMode.TP_ATTN_FULL)
-        and (output_mode == ScatterMode.TP_ATTN_FULL)
-    ):
-        # TODO(ch-wan): use reduce-scatter in MLP to avoid this scatter
-        # important: forward batch.gathered_buffer is used both after scatter and after gather.
-        # be careful about this!
-        hidden_states, global_hidden_states = (
-            forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
-            hidden_states,
-        )
-        dp_scatter(hidden_states, global_hidden_states, forward_batch)
-        return hidden_states, residual
+        if context.is_same_group_size(hidden_states_input_mode, output_mode) \
+            and context.is_same_group_size(residual_input_mode, output_mode):
+            return hidden_states, residual
 
-    if (
-        (hidden_states_input_mode == ScatterMode.SCATTERED)
-        and (residual_input_mode == ScatterMode.SCATTERED)
-        and (output_mode == ScatterMode.TP_ATTN_FULL)
-    ):
-        hidden_states += residual
-        residual = None
-        hidden_states, local_hidden_states = (
-            forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
-            hidden_states,
-        )
-        attn_tp_all_gather(
-            list(hidden_states.tensor_split(context.attn_tp_size)), local_hidden_states
-        )
-        return hidden_states, residual
+        if (
+            (hidden_states_input_mode == ScatterMode.FULL)
+            and (residual_input_mode == ScatterMode.TP_ATTN_FULL)
+            and (output_mode == ScatterMode.TP_ATTN_FULL)
+        ):
+            # TODO(ch-wan): use reduce-scatter in MLP to avoid this scatter
+            # important: forward batch.gathered_buffer is used both after scatter and after gather.
+            # be careful about this!
+            hidden_states, global_hidden_states = (
+                forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
+                hidden_states,
+            )
+            dp_scatter(hidden_states, global_hidden_states, forward_batch)
+            return hidden_states, residual
 
-    raise NotImplementedError(f"{hidden_states_input_mode=} {residual_input_mode=} {output_mode=}")
+        if (
+            (hidden_states_input_mode == ScatterMode.SCATTERED)
+            and (residual_input_mode == ScatterMode.SCATTERED)
+            and (output_mode == ScatterMode.TP_ATTN_FULL)
+        ):
+            hidden_states += residual
+            residual = None
+            hidden_states, local_hidden_states = (
+                forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
+                hidden_states,
+            )
+            attn_tp_all_gather(
+                list(hidden_states.tensor_split(context.attn_tp_size)), local_hidden_states
+            )
+            return hidden_states, residual
+
+        raise NotImplementedError(f"{hidden_states_input_mode=} {residual_input_mode=} {output_mode=}")
+
+    return context.check_shapes(_inner(), (output_mode, output_mode))
