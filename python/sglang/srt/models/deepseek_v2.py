@@ -297,9 +297,7 @@ class DeepseekV2MoE(nn.Module):
     def _enable_deepep_moe(self):
         return global_server_args_dict["enable_deepep_moe"]
 
-    def forward(
-        self, hidden_states: torch.Tensor, forward_mode: Optional[ForwardMode] = None
-    ) -> torch.Tensor:
+    def op_gate(self, state):
         if (
             forward_mode is not None
             and not forward_mode.is_idle()
@@ -310,6 +308,7 @@ class DeepseekV2MoE(nn.Module):
         else:
             router_logits = None
 
+    def op_shared_experts(self, state):
         if (
             (self.n_share_experts_fusion == 0)
             and (forward_mode is not None)
@@ -320,6 +319,7 @@ class DeepseekV2MoE(nn.Module):
         else:
             shared_output = None
 
+    def op_select_experts(self, state):
         if self._enable_deepep_moe and (router_logits is not None):
             topk_weights, topk_idx = select_experts(
                 hidden_states=hidden_states,
@@ -340,6 +340,7 @@ class DeepseekV2MoE(nn.Module):
                 (0, self.top_k), dtype=torch.float32, device=hidden_states.device
             )
 
+    def op_dispatch(self, state):
         if self._enable_deepep_moe and (self.ep_size > 1):
             # TODO(ch-wan): allow users to set num_max_dispatch_tokens_per_rank value
             (
@@ -358,6 +359,7 @@ class DeepseekV2MoE(nn.Module):
                 forward_mode=forward_mode,
             )
 
+    def op_experts(self, state):
         if self._enable_deepep_moe:
             final_hidden_states = self.experts(
                 hidden_states=hidden_states,
@@ -375,6 +377,7 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states=hidden_states, router_logits=router_logits
             )
 
+    def op_combine(self, state):
         if self._enable_deepep_moe and (self.ep_size > 1):
             final_hidden_states = self.deepep_dispatcher.combine(
                 final_hidden_states,
@@ -383,6 +386,7 @@ class DeepseekV2MoE(nn.Module):
                 forward_mode,
             )
 
+    def op_output(self, state):
         final_hidden_states *= self.routed_scaling_factor
 
         if shared_output is not None:
