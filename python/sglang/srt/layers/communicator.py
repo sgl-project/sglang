@@ -33,12 +33,8 @@ class LayerScatterModes:
     layer_output_mode: ScatterMode
 
     @classmethod
-    def init_new(
-        cls, layer_id: int, num_layers: int, is_layer_sparse: _IsLayerSparseCallable
-    ):
-        context = _LayerModeComputationContext(
-            num_layers=num_layers, is_layer_sparse=is_layer_sparse
-        )
+    def init_new(cls, **kwargs):
+        context = _LayerModeComputationContext(**kwargs)
         return cls(
             layer_input_mode=cls._compute_layer_input_mode(layer_id, context),
             attn_mode=ScatterMode.TP_ATTN_FULL,
