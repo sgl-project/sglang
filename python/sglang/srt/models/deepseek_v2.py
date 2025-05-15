@@ -1234,7 +1234,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             else:
                 hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-        self.layer_communicator.forward_pre_attn()
+        hidden_states = self.layer_communicator.forward_pre_attn(hidden_states, forward_batch)
 
         if hidden_states.shape[0] != 0:
             # Self Attention
@@ -1245,12 +1245,12 @@ class DeepseekV2DecoderLayer(nn.Module):
                 zero_allocator=zero_allocator,
             )
 
-        self.layer_communicator.forward_pre_mlp()
+        hidden_states, residual = self.layer_communicator.forward_pre_mlp(hidden_states, residual, forward_batch)
 
         # Fully Connected
         hidden_states = self.mlp(hidden_states)
 
-        self.layer_communicator.forward_layer_end()
+        hidden_states, residual = self.layer_communicator.forward_layer_end(hidden_states, residual, forward_batch)
 
         return hidden_states, residual
 
