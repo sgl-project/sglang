@@ -18,8 +18,7 @@
 
 import logging
 import os
-from dataclasses import dataclass
-from enum import Enum, IntEnum, auto
+from enum import IntEnum, auto
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
@@ -35,6 +34,12 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.communicator import (
+    LayerCommunicator,
+    LayerScatterModes,
+    ScatterMode,
+    enable_moe_dense_fully_dp,
+)
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather,
     attn_tp_reduce_scatter,
@@ -1101,19 +1106,6 @@ class DeepseekV2AttentionMLA(nn.Module):
         return output
 
 
-class _FFNInputMode(Enum):
-    # The MLP sublayer requires 1/tp_size tokens as input
-    SCATTERED = auto()
-    # The MLP sublayer requires all tokens as input
-    FULL = auto()
-
-
-@dataclass
-class _DecoderLayerInfo:
-    is_sparse: bool
-    ffn_input_mode: _FFNInputMode
-
-
 class DeepseekV2DecoderLayer(nn.Module):
 
     def __init__(
@@ -1132,9 +1124,6 @@ class DeepseekV2DecoderLayer(nn.Module):
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         self.enable_dp_attention = global_server_args_dict["enable_dp_attention"]
         self.layer_id = layer_id
-        self.local_dp_size = get_local_attention_dp_size()
-        self.attn_tp_size = get_attention_tp_size()
-        self.attn_tp_rank = get_attention_tp_rank()
         self.self_attn = DeepseekV2AttentionMLA(
             config=config,
             hidden_size=self.hidden_size,
@@ -1156,19 +1145,24 @@ class DeepseekV2DecoderLayer(nn.Module):
             alt_stream=alt_stream,
         )
 
-        self.info = self._compute_info(config, layer_id=layer_id, is_nextn=is_nextn)
-        previous_layer_info = self._compute_info(
-            config, layer_id=layer_id - 1, is_nextn=False
+        self.is_layer_sparse = self._is_layer_sparse(layer_id, is_nextn=is_nextn)
+        is_previous_layer_sparse = self._is_layer_sparse(layer_id - 1, is_nextn=False)
+
+        self.layer_scatter_modes = LayerScatterModes.init_new(
+            layer_id=layer_id,
+            num_layers=config.num_hidden_layers,
+            is_layer_sparse=self.is_layer_sparse,
+            is_previous_layer_sparse=is_previous_layer_sparse,
         )
 
-        if self.info.is_sparse:
+        if self.is_layer_sparse:
             self.mlp = DeepseekV2MoE(
                 config=config,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
             )
         else:
-            if self._enable_moe_dense_fully_dp():
+            if enable_moe_dense_fully_dp():
                 mlp_tp_rank, mlp_tp_size = 0, 1
             else:
                 mlp_tp_rank, mlp_tp_size = None, None
@@ -1182,35 +1176,22 @@ class DeepseekV2DecoderLayer(nn.Module):
                 tp_size=mlp_tp_size,
             )
 
-        self.input_is_scattered = (
-            layer_id > 0
-            and previous_layer_info.ffn_input_mode == _FFNInputMode.SCATTERED
-        )
-        self.is_last_layer = self.layer_id == config.num_hidden_layers - 1
-
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
 
-    @staticmethod
-    def _enable_moe_dense_fully_dp():
-        return global_server_args_dict["moe_dense_tp_size"] == 1
+        self.layer_communicator = LayerCommunicator(
+            layer_scatter_modes=self.layer_scatter_modes,
+            post_attention_layernorm=self.post_attention_layernorm,
+        )
 
-    @staticmethod
-    def _compute_info(config: PretrainedConfig, layer_id: int, is_nextn: bool):
-        is_sparse = is_nextn or (
-            config.n_routed_experts is not None
-            and layer_id >= config.first_k_dense_replace
-            and layer_id % config.moe_layer_freq == 0
+    def _is_layer_sparse(self, layer_id: int, is_nextn: bool) -> bool:
+        return is_nextn or (
+            self.config.n_routed_experts is not None
+            and layer_id >= self.config.first_k_dense_replace
+            and layer_id % self.config.moe_layer_freq == 0
         )
-        ffn_input_mode = (
-            _FFNInputMode.SCATTERED
-            if (global_server_args_dict["enable_deepep_moe"] and is_sparse)
-            or (DeepseekV2DecoderLayer._enable_moe_dense_fully_dp() and not is_sparse)
-            else _FFNInputMode.FULL
-        )
-        return _DecoderLayerInfo(is_sparse=is_sparse, ffn_input_mode=ffn_input_mode)
 
     def forward(
         self,
@@ -1220,26 +1201,6 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
-        if self.info.ffn_input_mode == _FFNInputMode.SCATTERED:
-            return self.forward_ffn_with_scattered_input(
-                positions, hidden_states, forward_batch, residual, zero_allocator
-            )
-        elif self.info.ffn_input_mode == _FFNInputMode.FULL:
-            return self.forward_ffn_with_full_input(
-                positions, hidden_states, forward_batch, residual, zero_allocator
-            )
-        else:
-            raise NotImplementedError
-
-    def forward_ffn_with_full_input(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor],
-        zero_allocator: BumpAllocator,
-    ) -> torch.Tensor:
-
         if hidden_states.shape[0] == 0:
             residual = hidden_states
         else:
@@ -1249,10 +1210,11 @@ class DeepseekV2DecoderLayer(nn.Module):
             else:
                 hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-            assert not (
-                self.attn_tp_size != 1 and self.input_is_scattered
-            ), "moe_layer_freq > 1 is not supported when attn_tp_size > 1"
+        hidden_states = self.layer_communicator.forward_pre_attn(
+            hidden_states, forward_batch
+        )
 
+        if hidden_states.shape[0] != 0:
             # Self Attention
             hidden_states = self.self_attn(
                 positions=positions,
@@ -1261,121 +1223,20 @@ class DeepseekV2DecoderLayer(nn.Module):
                 zero_allocator=zero_allocator,
             )
 
-        # Gather
-        if get_tensor_model_parallel_world_size() > 1:
-            # all gather and all reduce
-            if self.local_dp_size != 1:
-                if self.attn_tp_rank == 0:
-                    hidden_states += residual
-                hidden_states, local_hidden_states = (
-                    forward_batch.gathered_buffer,
-                    hidden_states,
-                )
-                dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
-                dp_scatter(residual, hidden_states, forward_batch)
-                hidden_states = self.post_attention_layernorm(hidden_states)
-            else:
-                hidden_states = tensor_model_parallel_all_reduce(hidden_states)
-                hidden_states, residual = self.post_attention_layernorm(
-                    hidden_states, residual
-                )
-        else:
-            hidden_states, residual = self.post_attention_layernorm(
-                hidden_states, residual
-            )
-
-        # Fully Connected
-        hidden_states = self.mlp(hidden_states)
-
-        # TODO(ch-wan): use reduce-scatter in MLP to avoid this scatter
-        # Scatter
-        if self.local_dp_size != 1:
-            # important: forward batch.gathered_buffer is used both after scatter and after gather.
-            # be careful about this!
-            hidden_states, global_hidden_states = (
-                forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
-                hidden_states,
-            )
-            dp_scatter(hidden_states, global_hidden_states, forward_batch)
-
-        return hidden_states, residual
-
-    def forward_ffn_with_scattered_input(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor],
-        zero_allocator: BumpAllocator,
-    ) -> torch.Tensor:
-
-        if hidden_states.shape[0] == 0:
-            residual = hidden_states
-        else:
-            if residual is None:
-                residual = hidden_states
-                hidden_states = self.input_layernorm(hidden_states)
-            else:
-                hidden_states, residual = self.input_layernorm(hidden_states, residual)
-
-        if self.attn_tp_size != 1 and self.input_is_scattered:
-            hidden_states, local_hidden_states = (
-                forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
-                hidden_states,
-            )
-            attn_tp_all_gather(
-                list(hidden_states.tensor_split(self.attn_tp_size)), local_hidden_states
-            )
-
-        # Self Attention
-        hidden_states = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-            forward_batch=forward_batch,
-            zero_allocator=zero_allocator,
+        hidden_states, residual = self.layer_communicator.forward_pre_mlp(
+            hidden_states, residual, forward_batch
         )
 
-        if self.attn_tp_size != 1:
-            if self.input_is_scattered:
-                tensor_list = list(hidden_states.tensor_split(self.attn_tp_size))
-                hidden_states = tensor_list[self.attn_tp_rank]
-                attn_tp_reduce_scatter(hidden_states, tensor_list)
-                if hidden_states.shape[0] != 0:
-                    hidden_states, residual = self.post_attention_layernorm(
-                        hidden_states, residual
-                    )
-            else:
-                if self.attn_tp_rank == 0:
-                    hidden_states += residual
-                tensor_list = list(hidden_states.tensor_split(self.attn_tp_size))
-                hidden_states = tensor_list[self.attn_tp_rank]
-                attn_tp_reduce_scatter(hidden_states, tensor_list)
-                residual = hidden_states
-                if hidden_states.shape[0] != 0:
-                    hidden_states = self.post_attention_layernorm(hidden_states)
-        else:
-            if hidden_states.shape[0] != 0:
-                hidden_states, residual = self.post_attention_layernorm(
-                    hidden_states, residual
-                )
-
         if not (
-            self._enable_moe_dense_fully_dp()
-            and (not self.info.is_sparse)
+            enable_moe_dense_fully_dp()
+            and (not self.is_layer_sparse)
             and hidden_states.shape[0] == 0
         ):
             hidden_states = self.mlp(hidden_states, forward_batch.forward_mode)
 
-        if self.is_last_layer and self.attn_tp_size != 1:
-            hidden_states += residual
-            residual = None
-            hidden_states, local_hidden_states = (
-                forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
-                hidden_states,
-            )
-            attn_tp_all_gather(
-                list(hidden_states.tensor_split(self.attn_tp_size)), local_hidden_states
-            )
+        hidden_states, residual = self.layer_communicator.forward_layer_end(
+            hidden_states, residual, forward_batch
+        )
 
         return hidden_states, residual
 
@@ -1859,7 +1720,6 @@ class DeepseekV2ForCausalLM(nn.Module):
                             q_a_proj_name in cached_a_proj
                             and kv_a_proj_name in cached_a_proj
                         ):
-
                             q_a_proj_weight = cached_a_proj[q_a_proj_name]
                             kv_a_proj_weight = cached_a_proj[kv_a_proj_name]
                             fused_weight = torch.cat(
