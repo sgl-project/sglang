@@ -18,10 +18,8 @@ def compute_layer_operations():
 def execute_operations(inputs, operations):
     stages = _convert_operations_to_stages(operations)
     executor = _StageExecutor("primary", stages, inputs=inputs)
-
     for _ in range(executor.num_stages):
         executor.next()
-
     assert executor.done
     return executor.output
 
