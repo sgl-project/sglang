@@ -36,22 +36,20 @@ class LayerScatterModes:
     def init_new(cls, **kwargs):
         context = _LayerModeComputationContext(**kwargs)
         return cls(
-            layer_input_mode=cls._compute_layer_input_mode(layer_id, context),
+            layer_input_mode=cls._compute_layer_input_mode(context),
             attn_mode=ScatterMode.TP_ATTN_FULL,
-            ffn_mode=cls._compute_ffn_mode(layer_id, context),
-            layer_output_mode=cls._compute_layer_output_mode(layer_id, context),
+            ffn_mode=cls._compute_ffn_mode(context),
+            layer_output_mode=cls._compute_layer_output_mode(context),
         )
 
     @classmethod
-    def _compute_layer_input_mode(
-        cls, layer_id: int, context: _LayerModeComputationContext
-    ):
+    def _compute_layer_input_mode(cls, context: _LayerModeComputationContext):
         if layer_id == 0:
             return ScatterMode.TP_ATTN_FULL
         return cls._compute_layer_output_mode(layer_id=layer_id - 1, context=context)
 
     @classmethod
-    def _compute_ffn_mode(cls, layer_id: int, context: _LayerModeComputationContext):
+    def _compute_ffn_mode(cls, context: _LayerModeComputationContext):
         if context.is_layer_sparse(layer_id):
             return (
                 ScatterMode.SCATTERED
@@ -66,9 +64,7 @@ class LayerScatterModes:
             )
 
     @classmethod
-    def _compute_layer_output_mode(
-        cls, layer_id: int, context: _LayerModeComputationContext
-    ):
+    def _compute_layer_output_mode(cls, context: _LayerModeComputationContext):
         if layer_id == context.num_layers - 1:
             return ScatterMode.TP_ATTN_FULL
         return cls._compute_ffn_mode(layer_id, context)
