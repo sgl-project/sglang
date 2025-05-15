@@ -56,3 +56,12 @@ class LayerScatterModes:
 class LayerCommunicator:
     def __init__(self, layer_scatter_modes: LayerScatterModes):
         self.layer_scatter_modes = layer_scatter_modes
+
+    def forward_pre_attn(self):
+        TODO
+
+    def forward_pre_mlp(self):
+        TODO
+
+    def forward_layer_end(self):
+        TODO
