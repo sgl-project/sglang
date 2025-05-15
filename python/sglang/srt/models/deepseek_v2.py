@@ -320,6 +320,8 @@ class DeepseekV2MoE(nn.Module):
 
     def op_select_experts(self, state):
         router_logits = state.pop("router_logits")
+        hidden_states = TODO_state_get
+        
         if self._enable_deepep_moe and (router_logits is not None):
             state.topk_weights_local, state.topk_idx_local = select_experts(
                 hidden_states=hidden_states,
