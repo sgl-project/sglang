@@ -172,7 +172,7 @@ class SamplingBatchInfo:
     def apply_thinking_budgets(self, next_token_logits: torch.Tensor):
         if self.thinking_budgets is None:
             return
-        has_budget = self.thinking_budgets > 0
+        has_budget = self.thinking_budgets >= 0
         if not has_budget.any():
             return
         torch.where(
@@ -191,7 +191,7 @@ class SamplingBatchInfo:
             next_token_logits[batch_indices, end_token_indices] = 0.0
 
     def update_thinking_budgets(self, next_token_ids: torch.Tensor):
-        if self.thinking_budgets is None or not torch.any(self.thinking_budgets > 0):
+        if self.thinking_budgets is None or not torch.any(self.thinking_budgets >= 0):
             return
         torch.where(
             next_token_ids == self.think_end_ids,
