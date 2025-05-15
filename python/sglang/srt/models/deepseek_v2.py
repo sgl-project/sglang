@@ -1192,9 +1192,10 @@ class DeepseekV2DecoderLayer(nn.Module):
                 residual=residual,
                 zero_allocator=zero_allocator,
             ),
-            operations=compute_layer_operations(self)
+            operations=compute_layer_operations(self),
         )
 
+    def op_input_layernorm(self, state):
         if hidden_states.shape[0] == 0:
             residual = hidden_states
         else:
@@ -1204,10 +1205,12 @@ class DeepseekV2DecoderLayer(nn.Module):
             else:
                 hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
+    def op_comm_pre_attn(self, state):
         hidden_states = self.layer_communicator.forward_pre_attn(
             hidden_states, forward_batch
         )
 
+    def op_attn(self, state):
         if hidden_states.shape[0] != 0:
             # Self Attention
             hidden_states = self.self_attn(
@@ -1217,10 +1220,12 @@ class DeepseekV2DecoderLayer(nn.Module):
                 zero_allocator=zero_allocator,
             )
 
+    def op_comm_pre_mlp(self, state):
         hidden_states, residual = self.layer_communicator.forward_pre_mlp(
             hidden_states, residual, forward_batch
         )
 
+    def op_mlp(self, state):
         if not (
             enable_moe_dense_fully_dp()
             and (not self.is_layer_sparse)
@@ -1228,6 +1233,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         ):
             hidden_states = self.mlp(hidden_states, forward_batch.forward_mode)
 
+    def op_comm_layer_end(self, state):
         hidden_states, residual = self.layer_communicator.forward_layer_end(
             hidden_states, residual, forward_batch
         )
