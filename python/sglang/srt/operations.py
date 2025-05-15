@@ -15,26 +15,15 @@ def compute_layer_operations():
     return TODO
 
 
-def execute_operations(
-    inputs_a, inputs_b, operations_a, operations_b, delta_stages: int
-):
-    stages_a = _convert_operations_to_stages(operations_a)
-    stages_b = _convert_operations_to_stages(operations_b)
-    executor_a = _StageExecutor("a", stages_a, inputs=inputs_a)
-    executor_b = _StageExecutor("b", stages_b, inputs=inputs_b)
+def execute_operations(inputs, operations):
+    stages = _convert_operations_to_stages(operations)
+    executor = _StageExecutor("primary", stages, inputs=inputs)
 
-    for _ in range(delta_stages):
-        executor_a.next()
+    for _ in range(executor.num_stages):
+        executor.next()
 
-    for _ in range(executor_a.num_stages - delta_stages):
-        executor_a.next()
-        executor_b.next()
-
-    for _ in range(delta_stages):
-        executor_b.next()
-
-    assert executor_a.done and executor_b.done
-    return executor_a.output, executor_b.output
+    assert executor.done
+    return executor.output
 
 
 class YieldOperation:
