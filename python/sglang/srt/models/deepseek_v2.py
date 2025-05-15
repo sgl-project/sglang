@@ -373,8 +373,8 @@ class DeepseekV2MoE(nn.Module):
         return final_hidden_states
 
     def forward_normal(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        shared_output = self._forward_shared_experts(hidden_states)
         router_logits = self.gate(hidden_states)
+        shared_output = self._forward_shared_experts(hidden_states)
         final_hidden_states = (
             self.experts(hidden_states=hidden_states, router_logits=router_logits)
             * self.routed_scaling_factor
