@@ -1213,6 +1213,16 @@ class DeepseekV2DecoderLayer(nn.Module):
             else:
                 hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
+        state.update(
+            dict(
+                hidden_states_after_input_ln=hidden_states,
+                residual_after_input_ln=residual,
+                forward_batch=forward_batch,
+                positions=positions,
+                zero_allocator=zero_allocator,
+            )
+        )
+
     def op_comm_pre_attn(self, state):
         hidden_states = self.layer_communicator.forward_pre_attn(
             hidden_states, forward_batch
