@@ -1184,7 +1184,16 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
-        return execute_operations(compute_layer_operations(self))
+        return execute_operations(
+            inputs=dict(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+                residual=residual,
+                zero_allocator=zero_allocator,
+            ),
+            operations=compute_layer_operations(self)
+        )
 
         if hidden_states.shape[0] == 0:
             residual = hidden_states
