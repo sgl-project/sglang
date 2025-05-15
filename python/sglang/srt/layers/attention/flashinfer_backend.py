@@ -7,7 +7,6 @@ FlashInfer is faster and Triton is easier to customize.
 Each backend supports two operators: extend (i.e. prefill with cached prefix) and decode.
 """
 
-import math
 import os
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -64,19 +63,6 @@ class PrefillMetadata:
 
 # Reuse this workspace buffer across all flashinfer wrappers
 global_workspace_buffer = None
-
-
-# global_fake_head_dim is used as a workaround to bypass FlashInfer's current limitation
-# which does not support head_dim=32 (or other unsupported dimensions). The actual
-# QKV tensors have an effective head dimension of origin, with the remaining padded
-# with zeros.
-#
-# Note: Be sure to set sm_scale = 1.0 / sqrt(actual_dim), based on the real head_dim,
-# even though fake_head_dim is passed to the attention kernel.
-#
-# TODO: Once FlashInfer officially supports head_dim=32, this variable and the
-# associated padding logic should be removed to eliminate the workaround.
-global_fake_head_dim = 64
 
 
 class FlashInferAttnBackend(AttentionBackend):
@@ -458,61 +444,10 @@ class FlashInferAttnBackend(AttentionBackend):
                 save_kv_cache = False
                 causal = False
 
-                q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
-                k = k.view(-1, layer.tp_k_head_num, layer.head_dim)
-                v = v.view(-1, layer.tp_v_head_num, layer.head_dim)
-
-                # Pad the `head_dim` if it less than `global_fake_head_dim`
-                original_head_dim = layer.head_dim
-                needs_padding = (
-                    hasattr(self.indices_updater_prefill, "fake_head_dim")
-                    and self.indices_updater_prefill.fake_head_dim is not None
-                    and original_head_dim < self.indices_updater_prefill.fake_head_dim
-                )
-
-                if needs_padding:
-                    q_padded_shape = q.shape[:-1] + (
-                        self.indices_updater_prefill.fake_head_dim,
-                    )
-                    q_padded = torch.zeros(
-                        q_padded_shape, dtype=q.dtype, device=q.device
-                    )
-                    q_padded[..., :original_head_dim] = q
-                    q = q_padded
-
-                    k_padded_shape = k.shape[:-1] + (
-                        self.indices_updater_prefill.fake_head_dim,
-                    )
-                    k_padded = torch.zeros(
-                        k_padded_shape, dtype=k.dtype, device=k.device
-                    )
-                    k_padded[..., :original_head_dim] = k
-                    k = k_padded
-
-                    v_padded_shape = v.shape[:-1] + (
-                        self.indices_updater_prefill.fake_head_dim,
-                    )
-                    v_padded = torch.zeros(
-                        v_padded_shape, dtype=v.dtype, device=v.device
-                    )
-                    v_padded[..., :original_head_dim] = v
-                    v = v_padded
-
-                o = self.prefill_wrapper_ragged.forward(
-                    q,
-                    k,
-                    v,
-                    causal=causal,
-                    sm_scale=layer.scaling,
-                    logits_soft_cap=logits_soft_cap,
-                )
-
-                if needs_padding:
-                    o = o[..., :original_head_dim]
-
-                o = o.contiguous()
-
-            elif self.forward_metadata.extend_no_prefix:
+            if self.forward_metadata.extend_no_prefix:
+                # NOTE: FlashInfer currently has limitations with head_dim = 32 or other dimensions
+                # The FlashInfer head_dim limitation itself is tracked here:
+                # https://github.com/flashinfer-ai/flashinfer/issues/1048
                 o = self.prefill_wrapper_ragged.forward(
                     q.view(-1, layer.tp_q_head_num, layer.head_dim),
                     k.view(-1, layer.tp_k_head_num, layer.head_dim),
@@ -782,13 +717,6 @@ class FlashInferIndicesUpdaterPrefill:
             get_attention_tp_size()
         )
         self.head_dim = model_runner.model_config.head_dim
-        self.fake_head_dim = (
-            global_fake_head_dim
-            if self.head_dim < global_fake_head_dim
-            and not model_runner.model_config.is_generation
-            and not model_runner.model_config.is_encoder_decoder
-            else None
-        )
         self.data_type = model_runner.kv_cache_dtype
         self.q_data_type = model_runner.dtype
         self.sliding_window_size = model_runner.sliding_window_size
@@ -987,11 +915,6 @@ class FlashInferIndicesUpdaterPrefill:
                 )
             )
 
-        # If self.fake_head_dim is not None
-        sm_scale_for_begin_forward = None
-        if self.fake_head_dim is not None:
-            sm_scale_for_begin_forward = 1.0 / math.sqrt(self.head_dim)
-
         # extend part
         if use_ragged:
             wrapper_ragged.begin_forward(
@@ -999,9 +922,8 @@ class FlashInferIndicesUpdaterPrefill:
                 qo_indptr,
                 self.num_qo_heads,
                 self.num_kv_heads,
-                self.head_dim if self.fake_head_dim is None else self.fake_head_dim,
+                self.head_dim,
                 q_data_type=self.q_data_type,
-                sm_scale=sm_scale_for_begin_forward,
             )
 
         # cached part
@@ -1012,7 +934,7 @@ class FlashInferIndicesUpdaterPrefill:
             self.kv_last_page_len[:bs],
             self.num_qo_heads,
             self.num_kv_heads,
-            self.fake_head_dim if self.fake_head_dim else self.head_dim,
+            self.head_dim,
             1,
             q_data_type=self.q_data_type,
             kv_data_type=self.data_type,
