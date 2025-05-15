@@ -1887,9 +1887,7 @@ def launch_dummy_health_check_server(host, port):
         loop.create_task(server.serve())
 
     except RuntimeError:
-        logger.info(
-            f"Starting dummy health check server at {host}:{port}"
-        )
+        logger.info(f"Starting dummy health check server at {host}:{port}")
         server.run()
 
 
