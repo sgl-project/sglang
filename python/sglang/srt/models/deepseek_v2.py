@@ -367,7 +367,7 @@ class DeepseekV2MoE(nn.Module):
 
     def op_experts(self, state):
         if self._enable_deepep_moe:
-            final_hidden_states = self.experts(
+            state.hidden_states_experts_output = self.experts(
                 hidden_states=state.pop("hidden_states_experts_input"),
                 topk_idx=state.topk_idx_dispatched,
                 topk_weights=state.topk_weights_dispatched,
@@ -379,15 +379,15 @@ class DeepseekV2MoE(nn.Module):
                 forward_mode=state.forward_mode,
             )
         else:
-            final_hidden_states = self.experts(
+            state.hidden_states_experts_output = self.experts(
                 hidden_states=state.pop("hidden_states_mlp_input"),
                 router_logits=state.pop("router_logits")
             )
 
     def op_combine_a(self, state):
         if self._enable_deepep_moe and (self.ep_size > 1):
-            self.deepep_dispatcher.combine(
-                final_hidden_states,
+            self.deepep_dispatcher.combine_a(
+                state.pop("hidden_states_experts_output"),
                 topk_idx=state.pop("topk_idx_dispatched"),
                 topk_weights=state.pop("topk_weights_dispatched"),
                 forward_mode=state.forward_mode,
