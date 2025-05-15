@@ -395,10 +395,14 @@ class DeepseekV2MoE(nn.Module):
 
     def op_combine_b(self, state):
         if self._enable_deepep_moe and (self.ep_size > 1):
-            final_hidden_states = self.deepep_dispatcher.combine_b()
+            state.hidden_states_after_combine = self.deepep_dispatcher.combine_b()
 
     def op_output(self, state):
-        final_hidden_states = state.pop(TODO)
+        final_hidden_states = (
+            state.pop("hidden_states_after_combine")
+            if self._enable_deepep_moe else
+            state.pop("hidden_states_experts_output")
+        )
 
         final_hidden_states *= self.routed_scaling_factor
 
