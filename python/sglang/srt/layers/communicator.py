@@ -210,6 +210,9 @@ def _communicate_summable_tensor_pair(
 ):
     """It is allowed to make (hidden_states, residual) := (hidden_states + residual, None) if needed."""
 
+    if hidden_states_input_mode == residual_input_mode == output_mode:
+        return hidden_states, residual
+
     if hidden_states_input_mode == ScatterMode.FULL:
         TODO_add_more_guards
         # TODO(ch-wan): use reduce-scatter in MLP to avoid this scatter
