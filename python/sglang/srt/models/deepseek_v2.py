@@ -416,7 +416,7 @@ class DeepseekV2MoE(nn.Module):
         if (not self._enable_deepep_moe) and (self.tp_size > 1):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
-        state.hidden_states_after_mlp = final_hidden_states
+        state.hidden_states_mlp_output = final_hidden_states
 
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
@@ -1290,13 +1290,15 @@ class DeepseekV2DecoderLayer(nn.Module):
             and (not self.is_layer_sparse)
             and hidden_states.shape[0] == 0
         ):
-            state.hidden_states_after_mlp = self.mlp(
+            state.hidden_states_mlp_output = self.mlp(
                 hidden_states, state.forward_batch.forward_mode
             )
+        else:
+            state.hidden_states_mlp_output = hidden_states
 
     def op_comm_layer_end(self, state):
         hidden_states, residual = self.layer_communicator.forward_layer_end(
-            state.pop("hidden_states_after_mlp"),
+            state.pop("hidden_states_mlp_output"),
             state.pop("residual_after_comm_pre_mlp"),
             state.forward_batch,
         )
