@@ -17,8 +17,9 @@ class ScatterMode(Enum):
     TP_ATTN_FULL = auto()
     FULL = auto()
 
+    # TODO move?
     @staticmethod
-    def is_equivalent(a: "ScatterMode", b: "ScatterMode", group_sizes: _GroupSizes):
+    def is_same_group_size(a: "ScatterMode", b: "ScatterMode", group_sizes: _GroupSizes):
         return group_sizes[a] == group_sizes[b]
 
 
@@ -187,7 +188,7 @@ def _communicate_simple(
     output_mode: ScatterMode,
     attn_tp_size: int,
 ) -> torch.Tensor:
-    if input_mode == output_mode:
+    if ScatterMode.is_same_group_size(input_mode, output_mode, group_sizes):
         return hidden_states
 
     if input_mode == ScatterMode.SCATTERED and output_mode == ScatterMode.TP_ATTN_FULL:
@@ -216,7 +217,8 @@ def _communicate_summable_tensor_pair(
 ):
     """It is allowed to make (hidden_states, residual) := (hidden_states + residual, None) if needed."""
 
-    if hidden_states_input_mode == residual_input_mode == output_mode:
+    if ScatterMode.is_same_group_size(hidden_states_input_mode, output_mode, group_sizes)
+        and ScatterMode.is_same_group_size(residual_input_mode, output_mode, group_sizes):
         return hidden_states, residual
 
     if hidden_states_input_mode == ScatterMode.FULL:
