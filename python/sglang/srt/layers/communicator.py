@@ -153,13 +153,17 @@ class LayerCommunicator:
 # TODO rename?
 @dataclass
 class _Context:
-    group_sizes: Dict["ScatterMode", int]
+    process_group_sizes: Dict["ScatterMode", int]
+    num_tokens_of_mode: Dict["ScatterMode", int]
     attn_tp_rank: int
     attn_tp_size: int
     tp_size: int
 
     def is_same_group_size(self, a: "ScatterMode", b: "ScatterMode"):
-        return self.group_sizes[a] == self.group_sizes[b]
+        return self.process_group_sizes[a] == self.process_group_sizes[b]
+
+    def assert_shape(self, x: torch.Tensor, mode: ScatterMode):
+        assert x.shape[0] == self.num_tokens_of_mode[mode]
 
 
 def _communicate_simple(
