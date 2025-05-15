@@ -99,9 +99,8 @@ def enable_moe_dense_fully_dp():
 class LayerCommunicator:
     def __init__(self, layer_scatter_modes: LayerScatterModes):
         self.layer_scatter_modes = layer_scatter_modes
-        self.local_attn_dp_size = get_local_attention_dp_size()
-        self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
+        self.attn_tp_size = get_attention_tp_size()
         self.tp_size = get_tensor_model_parallel_world_size()
 
     def forward_pre_attn(
@@ -155,7 +154,6 @@ class LayerCommunicator:
 @dataclass
 class _Context:
     group_sizes: Dict["ScatterMode", int]
-    local_attn_dp_size: int
     attn_tp_rank: int
     attn_tp_size: int
     tp_size: int
