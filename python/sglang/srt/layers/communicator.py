@@ -2,7 +2,10 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Callable
 
+import torch
+from sglang.srt.layers.dp_attention import attn_tp_all_gather
 from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 class ScatterMode(Enum):
@@ -82,7 +85,11 @@ class LayerCommunicator:
     def __init__(self, layer_scatter_modes: LayerScatterModes):
         self.layer_scatter_modes = layer_scatter_modes
 
-    def forward_pre_attn(self):
+    def forward_pre_attn(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
         if self.layer_scatter_modes.ffn_mode == ScatterMode.FULL:
             assert not (
                 self.attn_tp_size != 1 and self.input_is_scattered
@@ -98,8 +105,14 @@ class LayerCommunicator:
                 )
         else:
             raise NotImplementedError
+        return hidden_states
 
-    def forward_pre_mlp(self):
+    def forward_pre_mlp(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
         if self.layer_scatter_modes.ffn_mode == ScatterMode.FULL:
             if get_tensor_model_parallel_world_size() > 1:
                 # all gather and all reduce
@@ -139,8 +152,14 @@ class LayerCommunicator:
                 )
         else:
             raise NotImplementedError
+        return hidden_states, residual
 
-    def forward_layer_end(self):
+    def forward_layer_end(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
         if self.layer_scatter_modes.ffn_mode == ScatterMode.FULL:
             # TODO(ch-wan): use reduce-scatter in MLP to avoid this scatter
             # Scatter
@@ -165,3 +184,4 @@ class LayerCommunicator:
                 )
         else:
             raise NotImplementedError
+        return hidden_states, residual
