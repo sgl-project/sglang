@@ -52,10 +52,10 @@ class LayerScatterModes:
             return TODO
 
         return (
-            _FFNInputMode.SCATTERED
+            ScatterMode.SCATTERED
             if (global_server_args_dict["enable_deepep_moe"] and is_sparse)
                or (DeepseekV2DecoderLayer._enable_moe_dense_fully_dp() and not is_sparse)
-            else _FFNInputMode.FULL
+            else ScatterMode.FULL
         )
 
     @classmethod
