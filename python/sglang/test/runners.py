@@ -240,6 +240,14 @@ class HFRunner:
                 self.model = _get_sentence_transformer_embedding_model(
                     model_path, torch_dtype
                 )
+        elif self.model_type == "sequence_classification":
+            from transformers import AutoModelForSequenceClassification
+
+            self.model = AutoModelForSequenceClassification.from_pretrained(
+                model_path,
+                torch_dtype=torch_dtype,
+                trust_remote_code=self.needs_trust_remote_code(model_path),
+            ).cuda()
         elif self.model_type == "reward":
             from transformers import AutoModelForSequenceClassification
 
@@ -302,7 +310,12 @@ class HFRunner:
                     else:
                         logits = self.model.encode(prompts).tolist()
                     out_queue.put(ModelOutput(embed_logits=logits))
-
+                elif self.model_type == "sequence_classification":
+                    inputs = self.tokenizer(
+                        prompts, padding=True, return_tensors="pt"
+                    ).to("cuda")
+                    scores = self.model(**inputs).logits.tolist()
+                    out_queue.put(ModelOutput(scores=scores))
                 elif self.model_type == "reward":
                     scores = []
                     for conv in prompts:
@@ -543,6 +556,13 @@ class SRTRunner:
                 else:
                     logits = [response["embedding"]]
                 return ModelOutput(embed_logits=logits)
+            elif self.model_type == "sequence_classification":
+                response = self.engine.encode(prompt=prompts)
+                if isinstance(response, list):
+                    scores = [x["embedding"] for x in response]
+                else:
+                    scores = [response["embedding"]]
+                return ModelOutput(scores=scores)
             # reward model
             else:
                 response = self.engine.encode(prompts)
