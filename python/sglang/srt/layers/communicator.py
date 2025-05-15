@@ -78,7 +78,12 @@ class LayerScatterModes:
 
     @classmethod
     def _compute_middle_residual_mode(cls, context: _LayerModeComputationContext):
-        return TODO
+        mlp_mode = cls._compute_mlp_mode(context)
+        if mlp_mode == ScatterMode.SCATTERED:
+            return TODO
+        if mlp_mode == ScatterMode.FULL:
+            return TODO
+        raise NotImplementedError
 
     @classmethod
     def _compute_layer_output_mode(cls, context: _LayerModeComputationContext):
