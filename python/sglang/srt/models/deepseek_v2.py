@@ -324,25 +324,26 @@ class DeepseekV2MoE(nn.Module):
         router_logits = state.router_logits
         hidden_states = state.hidden_states_mlp_input
 
-        if self._enable_deepep_moe and (router_logits is not None):
-            state.topk_weights_local, state.topk_idx_local = select_experts(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-                top_k=self.top_k,
-                use_grouped_topk=True,
-                renormalize=self.renormalize,
-                topk_group=self.topk_group,
-                num_expert_group=self.num_expert_group,
-                correction_bias=self.correction_bias,
-                routed_scaling_factor=self.routed_scaling_factor,
-            )
-        else:
-            state.topk_idx_local = torch.full(
-                (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device
-            )
-            state.topk_weights_local = torch.empty(
-                (0, self.top_k), dtype=torch.float32, device=hidden_states.device
-            )
+        if self._enable_deepep_moe:
+            if router_logits is not None:
+                state.topk_weights_local, state.topk_idx_local = select_experts(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                    top_k=self.top_k,
+                    use_grouped_topk=True,
+                    renormalize=self.renormalize,
+                    topk_group=self.topk_group,
+                    num_expert_group=self.num_expert_group,
+                    correction_bias=self.correction_bias,
+                    routed_scaling_factor=self.routed_scaling_factor,
+                )
+            else:
+                state.topk_idx_local = torch.full(
+                    (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device
+                )
+                state.topk_weights_local = torch.empty(
+                    (0, self.top_k), dtype=torch.float32, device=hidden_states.device
+                )
 
     def op_dispatch_a(self, state):
         if self._enable_deepep_moe and (self.ep_size > 1):
