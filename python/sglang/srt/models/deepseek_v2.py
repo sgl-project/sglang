@@ -321,7 +321,7 @@ class DeepseekV2MoE(nn.Module):
     def op_select_experts(self, state):
         router_logits = state.pop("router_logits")
         if self._enable_deepep_moe and (router_logits is not None):
-            topk_weights, topk_idx = select_experts(
+            state.topk_weights, state.topk_idx = select_experts(
                 hidden_states=hidden_states,
                 router_logits=router_logits,
                 top_k=self.top_k,
@@ -333,10 +333,10 @@ class DeepseekV2MoE(nn.Module):
                 routed_scaling_factor=self.routed_scaling_factor,
             )
         else:
-            topk_idx = torch.full(
+            state.topk_idx = torch.full(
                 (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device
             )
-            topk_weights = torch.empty(
+            state.topk_weights = torch.empty(
                 (0, self.top_k), dtype=torch.float32, device=hidden_states.device
             )
 
