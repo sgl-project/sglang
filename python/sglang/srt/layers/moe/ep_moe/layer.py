@@ -1150,3 +1150,10 @@ class DeepEPMoE(EPMoE):
         )
 
         return down_output
+
+def get_moe_impl_class():
+    return (
+        DeepEPMoE
+        if global_server_args_dict["enable_deepep_moe"]
+        else (EPMoE if global_server_args_dict["enable_ep_moe"] else FusedMoE)
+    )
