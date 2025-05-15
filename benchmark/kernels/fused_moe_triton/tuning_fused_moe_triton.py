@@ -408,6 +408,12 @@ def main(args: argparse.Namespace):
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
         shard_intermediate_size = 2 * intermediate_size // args.tp_size
+    elif config.architectures[0] == "Llama4ForConditionalGeneration":
+        n_share_fusion_experts = args.n_share_experts_fusion
+        E = config.text_config.num_local_experts + n_share_fusion_experts
+        topk = config.text_config.num_experts_per_tok
+        intermediate_size = config.text_config.intermediate_size
+        shard_intermediate_size = 2 * intermediate_size // args.tp_size
     elif config.architectures[0] in [
         "Grok1ForCausalLM",
         "Grok1ImgGen",
@@ -424,7 +430,7 @@ def main(args: argparse.Namespace):
         intermediate_size = config.intermediate_size
         shard_intermediate_size = 2 * intermediate_size // args.tp_size
 
-    hidden_size = config.hidden_size
+    hidden_size = getattr(config, "hidden_size", None) or config.text_config.hidden_size
     dtype = config.torch_dtype
     use_fp8_w8a8 = args.dtype == "fp8_w8a8"
     use_int8_w8a8 = args.dtype == "int8_w8a8"
@@ -487,7 +493,7 @@ def main(args: argparse.Namespace):
             ]
         print(f"Start tuning over {len(search_space)} configurations...")
 
-        start = time.time()
+        start = time.perf_counter()
         configs = _distribute(
             "tune",
             [
@@ -522,7 +528,7 @@ def main(args: argparse.Namespace):
             use_int8_w8a16,
             block_shape,
         )
-        end = time.time()
+        end = time.perf_counter()
         print(f"Tuning took {end - start:.2f} seconds")
     else:
         outputs = _distribute(

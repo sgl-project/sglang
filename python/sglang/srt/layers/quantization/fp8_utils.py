@@ -14,6 +14,9 @@ except ImportError:
 
 from sglang.srt.layers.quantization.deep_gemm import _ENABLE_JIT_DEEPGEMM
 from sglang.srt.layers.quantization.fp8_kernel import (
+    fp8_dtype,
+    fp8_max,
+    is_fp8_fnuz,
     per_token_group_quant_fp8,
     scaled_fp8_quant,
     sglang_per_token_quant_fp8,
@@ -30,8 +33,11 @@ from sglang.srt.utils import (
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
+_is_fp8_fnuz = is_fp8_fnuz()
 
-if _is_hip and get_bool_env_var("SGLANG_AITER_MOE"):
+use_aiter_moe = get_bool_env_var("SGLANG_AITER_MOE")
+
+if _is_hip and use_aiter_moe:
     from aiter import gemm_a8w8_blockscale
 
 if _is_cuda:
@@ -43,19 +49,23 @@ use_vllm_cutlass_w8a8_fp8_kernel = get_bool_env_var("USE_VLLM_CUTLASS_W8A8_FP8_K
 # from pytorch 2.5. Allocating a dummy tensor to pass as input_scale
 TORCH_DEVICE_IDENTITY = None
 
-_TORCH_VERSION = torch.__version__.split("+")[0]
-try:
-    _TORCH_VERSION_TUPLE = tuple(map(int, _TORCH_VERSION.split(".")[:3]))
-except ValueError:
-    _TORCH_VERSION_TUPLE = (0, 0, 0)
 
-# The condition to determine if it is on a platform that supports
-# torch._scaled_mm rowwise feature.
-# The condition is determined once as the operations
-# are time consuming.
-USE_ROWWISE_TORCH_SCALED_MM = (
-    _is_hip and get_device_capability() >= (9, 4) and _TORCH_VERSION_TUPLE >= (2, 7, 0)
-)
+def use_rowwise_torch_scaled_mm():
+    _TORCH_VERSION = torch.__version__.split("+")[0]
+    try:
+        _TORCH_VERSION_TUPLE = tuple(map(int, _TORCH_VERSION.split(".")[:3]))
+    except ValueError:
+        _TORCH_VERSION_TUPLE = (0, 0, 0)
+    if _is_hip:
+        # The condition to determine if it is on a platform that supports
+        # torch._scaled_mm rowwise feature.
+        # The condition is determined once as the operations
+        # are time consuming.
+        return get_device_capability() >= (9, 4) and _TORCH_VERSION_TUPLE >= (2, 7, 0)
+    return False
+
+
+USE_ROWWISE_TORCH_SCALED_MM = use_rowwise_torch_scaled_mm()
 
 
 def cutlass_fp8_supported():
@@ -132,7 +142,7 @@ def apply_w8a8_block_fp8_linear(
         output = fp8_blockwise_scaled_mm(
             q_input, weight.T, x_scale, weight_scale.T, out_dtype=input.dtype
         )
-    elif _is_hip and get_bool_env_var("SGLANG_AITER_MOE"):
+    elif _is_hip and use_aiter_moe:
         q_input, x_scale = per_token_group_quant_fp8(
             input_2d, block_size[1], column_major_scales=False
         )
@@ -164,18 +174,21 @@ def apply_w8a8_block_fp8_linear(
 
 
 def input_to_float8(
-    x: torch.Tensor, dtype: torch.dtype = torch.float8_e4m3fn
+    x: torch.Tensor, dtype: torch.dtype = fp8_dtype
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """This function quantizes input values to float8 values with tensor-wise quantization."""
-    finfo = torch.finfo(dtype)
     min_val, max_val = x.aminmax()
     amax = torch.maximum(min_val.abs(), max_val.abs()).float().clamp(min=1e-12)
-    fp8_max = finfo.max
-    if _is_hip:
-        dtype = torch.float8_e4m3fnuz
-        fp8_max = 224.0
-    scale = fp8_max / amax
-    x_scl_sat = (x.float() * scale).clamp(min=-fp8_max, max=fp8_max)
+
+    if _is_fp8_fnuz:
+        dtype = fp8_dtype
+        fp_max = fp8_max
+    else:
+        finfo = torch.finfo(dtype)
+        fp_max = finfo.max
+
+    scale = fp_max / amax
+    x_scl_sat = (x.float() * scale).clamp(min=-fp_max, max=fp_max)
     return x_scl_sat.to(dtype).contiguous(), scale.float().reciprocal()
 
 
@@ -220,6 +233,41 @@ def block_quant_to_tensor_quant(
         else input_to_float8(x_dq_block, dtype=x_q_block.dtype)
     )
     return x_q_tensor, scale
+
+
+def block_quant_dequant(
+    x_q_block: torch.Tensor,
+    x_s: torch.Tensor,
+    block_size: List[int],
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """This function converts block-wise quantization to unquantized.
+    The inputs are block-wise quantization tensor `x_q_block`, block-wise quantization scale
+    and the block size.
+    The output is an unquantized tensor with dtype.
+    """
+    block_n, block_k = block_size[0], block_size[1]
+    n, k = x_q_block.shape
+    n_tiles = (n + block_n - 1) // block_n
+    k_tiles = (k + block_k - 1) // block_k
+    assert n_tiles == x_s.shape[0]
+    assert k_tiles == x_s.shape[1]
+
+    x_dq_block = torch.empty_like(x_q_block, dtype=dtype)
+
+    for j in range(n_tiles):
+        for i in range(k_tiles):
+            x_q_block_tile = x_q_block[
+                j * block_n : min((j + 1) * block_n, n),
+                i * block_k : min((i + 1) * block_k, k),
+            ]
+            x_dq_block_tile = x_dq_block[
+                j * block_n : min((j + 1) * block_n, n),
+                i * block_k : min((i + 1) * block_k, k),
+            ]
+            x_dq_block_tile[:, :] = x_q_block_tile.to(torch.float32) * x_s[j][i]
+
+    return x_dq_block
 
 
 def channel_quant_to_tensor_quant(

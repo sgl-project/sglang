@@ -8,7 +8,7 @@ class TestSRTEngineWithQuantArgs(CustomTestCase):
 
     def test_1_quantization_args(self):
 
-        # we only test fp8 because other methods are currenly depend on vllm. We can add other methods back to test after vllm depency is resolved.
+        # we only test fp8 because other methods are currently dependent on vllm. We can add other methods back to test after vllm dependency is resolved.
         quantization_args_list = [
             # "awq",
             "fp8",
