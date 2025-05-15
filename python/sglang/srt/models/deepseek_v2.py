@@ -1219,11 +1219,11 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         hidden_states, residual = self.layer_communicator.forward_pre_mlp(hidden_states, residual, forward_batch)
 
-        if (self.layer_scatter_modes.ffn_mode == ScatterMode.FULL) or (not (
+        if not (
             enable_moe_dense_fully_dp()
             and (not self.is_layer_sparse)
             and hidden_states.shape[0] == 0
-        )):
+        ):
             hidden_states = self.mlp(hidden_states, forward_batch.forward_mode)
 
         hidden_states, residual = self.layer_communicator.forward_layer_end(hidden_states, residual, forward_batch)
