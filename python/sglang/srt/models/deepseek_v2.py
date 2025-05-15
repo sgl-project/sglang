@@ -1143,7 +1143,10 @@ class DeepseekV2DecoderLayer(nn.Module):
             alt_stream=alt_stream,
         )
 
-        if TODO_info.is_sparse:
+        is_layer_sparse=self._is_layer_sparse(layer_id, is_nextn=is_nextn)
+        is_previous_layer_sparse=self._is_layer_sparse(layer_id - 1, is_nextn=False)
+
+        if is_layer_sparse:
             self.mlp = DeepseekV2MoE(
                 config=config,
                 quant_config=quant_config,
@@ -1173,8 +1176,8 @@ class DeepseekV2DecoderLayer(nn.Module):
             layer_scatter_modes=LayerScatterModes.init_new(
                 layer_id=layer_id,
                 num_layers=config.num_hidden_layers,
-                is_layer_sparse=self._is_layer_sparse(layer_id, is_nextn=is_nextn),
-                is_previous_layer_sparse=self._is_layer_sparse(layer_id - 1, is_nextn=False),
+                is_layer_sparse=is_layer_sparse,
+                is_previous_layer_sparse=is_previous_layer_sparse,
             ),
         )
 
