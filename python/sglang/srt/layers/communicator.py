@@ -201,7 +201,7 @@ def _communicate_with_all_reduce_and_layer_norm(
         return hidden_states, residual
 
     if (
-        (hidden_states_input_mode == TODO)
+        (hidden_states_input_mode == ScatterMode.TP_ATTN_FULL)
         and (residual_input_mode == TODO)
         and (hidden_states_output_mode == ScatterMode.FULL)
         and (residual_output_mode == ScatterMode.TP_ATTN_FULL)
@@ -233,7 +233,7 @@ def _communicate_with_all_reduce_and_layer_norm(
         return hidden_states, residual
 
     if (
-        (hidden_states_input_mode == TODO)
+        (hidden_states_input_mode == ScatterMode.TP_ATTN_FULL)
         and (residual_input_mode == TODO)
         and (hidden_states_output_mode == ScatterMode.SCATTERED)
         and (residual_output_mode == ScatterMode.SCATTERED)
