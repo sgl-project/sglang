@@ -531,7 +531,7 @@ class WaveAttnBackend(AttentionBackend):
                 layer, forward_batch.out_cache_loc, k, v
             )
 
-        _, max_extend_len = self.forward_metadata
+        max_extend_len = self.forward_metadata.max_extend_len
         # TODO: We ran into situtations where q_extend.shape[0] was
         # not equal to the value in extend_seq_lens which was max_extend_len.
         # This should not be required and is probably a bug in sglang.
