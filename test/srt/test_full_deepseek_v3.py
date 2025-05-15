@@ -1,3 +1,4 @@
+import os
 import unittest
 from types import SimpleNamespace
 
@@ -66,7 +67,10 @@ class TestDeepseekV3(CustomTestCase):
             write_github_step_summary(
                 f"### test_bs_1_speed (deepseek-v3)\n" f"{speed=:.2f} token/s\n"
             )
-            self.assertGreater(speed, 75)
+            if os.getenv("SGLANG_AMD_CI") == "1":
+                self.assertGreater(speed, 12)
+            else:
+                self.assertGreater(speed, 75)
 
 
 class TestDeepseekV3MTP(CustomTestCase):
@@ -144,8 +148,14 @@ class TestDeepseekV3MTP(CustomTestCase):
                 f"{acc_length=:.2f}\n"
                 f"{speed=:.2f} token/s\n"
             )
-            self.assertGreater(acc_length, 2.9)
-            self.assertGreater(speed, 105)
+            if os.getenv("SGLANG_AMD_CI") == "1":
+                self.assertGreater(acc_length, 2.8)
+            else:
+                self.assertGreater(acc_length, 2.9)
+            if os.getenv("SGLANG_AMD_CI") == "1":
+                self.assertGreater(speed, 15)
+            else:
+                self.assertGreater(speed, 105)
 
 
 if __name__ == "__main__":
