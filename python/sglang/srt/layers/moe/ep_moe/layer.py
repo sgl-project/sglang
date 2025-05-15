@@ -2,9 +2,10 @@ import logging
 from typing import Callable, List, Optional, Tuple
 
 import torch
+from torch.nn import Module
+
 from sglang.srt.layers.quantization.deep_gemm import _ENABLE_JIT_DEEPGEMM
 from sglang.srt.managers.schedule_batch import global_server_args_dict
-from torch.nn import Module
 
 try:
     from deep_gemm import (
@@ -40,7 +41,7 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     tma_align_input_scale,
 )
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
-from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoEMethodBase, FusedMoE
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE, FusedMoEMethodBase
 from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
@@ -266,7 +267,7 @@ class EPMoE(torch.nn.Module):
             BLOCK_SIZE=512,
         )
 
-        seg_indptr_cur_rank = seg_indptr[self.start_expert_id: self.end_expert_id + 2]
+        seg_indptr_cur_rank = seg_indptr[self.start_expert_id : self.end_expert_id + 2]
         weight_indices_cur_rank = torch.arange(
             0,
             self.num_experts_per_partition,
@@ -443,7 +444,7 @@ class EPMoE(torch.nn.Module):
         elif shard_id == "w1":
             param.data[expert_id][: self.intermediate_size, :] = loaded_weight
         elif shard_id == "w3":
-            param.data[expert_id][self.intermediate_size:, :] = loaded_weight
+            param.data[expert_id][self.intermediate_size :, :] = loaded_weight
         else:
             raise ValueError(f"Expected shard_id w1,w2 or w3 but got {shard_id}")
 
@@ -475,11 +476,11 @@ class EPMoE(torch.nn.Module):
                 block_n, block_k = self.block_shape[0], self.block_shape[1]
                 if shard_id == "w1":
                     param_data[expert_id][
-                    : (self.intermediate_size + block_n - 1) // block_n, :
+                        : (self.intermediate_size + block_n - 1) // block_n, :
                     ] = loaded_weight
                 elif shard_id == "w3":
                     param_data[expert_id][
-                    (self.intermediate_size + block_n - 1) // block_n:, :
+                        (self.intermediate_size + block_n - 1) // block_n :, :
                     ] = loaded_weight
                 else:  # w2
                     param_data[expert_id] = loaded_weight
