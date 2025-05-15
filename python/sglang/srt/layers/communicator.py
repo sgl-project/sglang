@@ -185,7 +185,10 @@ def _communicate_simple(
         if context.is_same_group_size(input_mode, output_mode):
             return hidden_states
 
-        if input_mode == ScatterMode.SCATTERED and output_mode == ScatterMode.TP_ATTN_FULL:
+        if (
+            (input_mode == ScatterMode.SCATTERED)
+            and (output_mode == ScatterMode.TP_ATTN_FULL)
+        ):
             hidden_states, local_hidden_states = (
                 forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
                 hidden_states,
