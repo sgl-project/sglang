@@ -266,11 +266,12 @@ class DeepseekV2MoE(nn.Module):
                 ),
             )
 
+        self.top_k = config.num_experts_per_tok
+
         if global_server_args_dict["enable_deepep_moe"]:
             # TODO: we will support tp < ep in the future
             self.ep_size = get_tensor_model_parallel_world_size()
             self.num_experts = config.n_routed_experts
-            self.top_k = config.num_experts_per_tok
             self.renormalize = config.norm_topk_prob
             self.topk_group = config.topk_group
             self.num_expert_group = config.n_group
@@ -1197,6 +1198,9 @@ class DeepseekV2DecoderLayer(nn.Module):
             layer_scatter_modes=self.layer_scatter_modes,
             post_attention_layernorm=self.post_attention_layernorm,
         )
+        print(
+            f"hi {self.layer_id=} {self.layer_scatter_modes=} {self.is_layer_sparse=}"
+        )
 
     def _is_layer_sparse(self, layer_id: int, is_nextn: bool) -> bool:
         return is_nextn or (
@@ -1233,6 +1237,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
     ):
+        print(f"hi op_input_layernorm {self.layer_id=} {hidden_states.shape=}")
         if hidden_states.shape[0] == 0:
             residual = hidden_states
         else:
@@ -1293,6 +1298,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             state.pop("residual_after_comm_pre_mlp"),
             state.forward_batch,
         )
+        print(f"hi op_comm_layer_end {self.layer_id=} {hidden_states.shape=}")
 
         state.clear(expect_keys={"positions", "forward_batch", "zero_allocator"})
         return hidden_states, residual
