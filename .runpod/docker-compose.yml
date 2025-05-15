@@ -13,7 +13,7 @@ services:
 
     environment:
       - HOST=0.0.0.0
-      - PORT=8000
+      - PORT=30000
       - MODEL_NAME=HuggingFaceTB/SmolLM2-1.7B-Instruct
       - TRUST_REMOTE_CODE=true
       - ATTENTION_BACKEND=flashinfer

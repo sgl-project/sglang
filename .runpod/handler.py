@@ -29,6 +29,7 @@ async def async_handler(job):
     """Handle the requests asynchronously."""
     job_input = job["input"]
 
+    # Case 1: full OpenAI style payload where caller already specifies the route.
     if job_input.get("openai_route"):
         openai_route, openai_input = job_input.get("openai_route"), job_input.get(
             "openai_input"
@@ -47,6 +48,27 @@ async def async_handler(job):
                 if chunk:
                     decoded_chunk = chunk.decode("utf-8")
                     yield decoded_chunk
+
+    # Case 2: payload looks like OpenAI chat/completions but omits the wrapper.
+    elif "messages" in job_input:
+        openai_url = f"{engine.base_url}/v1/chat/completions"
+        headers = {"Content-Type": "application/json"}
+
+        # Make sure model is set; fall back to default.
+        if "model" not in job_input:
+            job_input["model"] = engine.model or "default"
+
+        response = requests.post(openai_url, headers=headers, json=job_input)
+
+        if job_input.get("stream", False):
+            for formated_chunk in process_response(response):
+                yield formated_chunk
+        else:
+            for chunk in response.iter_lines():
+                if chunk:
+                    yield chunk.decode("utf-8")
+
+    # Case 3: assume user meant the native /generate endpoint.
     else:
         generate_url = f"{engine.base_url}/generate"
         headers = {"Content-Type": "application/json"}

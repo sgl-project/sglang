@@ -8,12 +8,13 @@ ENV PATH="/root/.local/bin:${PATH}"
 # Set working directory to the one already used by the base image
 WORKDIR /sgl-workspace
 
-# Copy RunPod specific files into the working directory
-COPY .runpod/ ./
-
 # install dependencies
+COPY .runpod/requirements.txt ./
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --system -r requirements.txt
+
+# copy source files
+COPY .runpod/ ./
 
 # Setup for Option 2: Building the Image with the Model included
 ARG MODEL_NAME=""
@@ -34,9 +35,6 @@ ENV MODEL_NAME=$MODEL_NAME \
     HF_HOME="${BASE_PATH}/huggingface-cache/hub" \
     HF_HUB_ENABLE_HF_TRANSFER=1
 
-# Expose the runpod files to Python
-ENV PYTHONPATH="/:${PYTHONPATH}"
-
 # Model download script execution
 # Ensure this script uses python3 and handles paths correctly relative to /app if needed
 RUN --mount=type=secret,id=HF_TOKEN,required=false \
@@ -47,5 +45,4 @@ RUN --mount=type=secret,id=HF_TOKEN,required=false \
         python3 download_model.py; \
     fi
 
-# Start the handler
 CMD ["python3", "handler.py"]
