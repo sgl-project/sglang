@@ -156,7 +156,9 @@ class LayerCommunicator:
 class _Context:
     group_sizes: Dict["ScatterMode", int]
     local_attn_dp_size: int
+    attn_tp_rank: int
     attn_tp_size: int
+    tp_size: int
 
     def is_same_group_size(self, a: "ScatterMode", b: "ScatterMode"):
         return self.group_sizes[a] == self.group_sizes[b]
@@ -206,13 +208,13 @@ def _communicate_with_all_reduce_and_layer_norm(
         and (hidden_states_output_mode == ScatterMode.FULL)
         and (residual_output_mode == ScatterMode.TP_ATTN_FULL)
     ):
-        if self.attn_tp_size != 1 and self.layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED:
+        if context.attn_tp_size != 1 and self.layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED:
             raise AssertionError("moe_layer_freq > 1 is not supported when attn_tp_size > 1")
 
-        if self.tp_size > 1:
+        if context.tp_size > 1:
             # all gather and all reduce
-            if self.local_attn_dp_size != 1:
-                if self.attn_tp_rank == 0:
+            if context.local_attn_dp_size != 1:
+                if context.attn_tp_rank == 0:
                     hidden_states += residual
                 hidden_states, local_hidden_states = (
                     forward_batch.gathered_buffer,
@@ -237,16 +239,16 @@ def _communicate_with_all_reduce_and_layer_norm(
         and (hidden_states_output_mode == ScatterMode.SCATTERED)
         and (residual_output_mode == ScatterMode.SCATTERED)
     ):
-        if self.attn_tp_size != 1:
+        if context.attn_tp_size != 1:
             if residual_input_mode == ScatterMode.SCATTERED:
-                tensor_list = list(hidden_states.tensor_split(self.attn_tp_size))
-                hidden_states = tensor_list[self.attn_tp_rank]
+                tensor_list = list(hidden_states.tensor_split(context.attn_tp_size))
+                hidden_states = tensor_list[context.attn_tp_rank]
                 attn_tp_reduce_scatter(hidden_states, tensor_list)
             elif residual_input_mode == ScatterMode.TP_ATTN_FULL:
-                tensor_list = list(hidden_states.tensor_split(self.attn_tp_size))
-                hidden_states = tensor_list[self.attn_tp_rank]
+                tensor_list = list(hidden_states.tensor_split(context.attn_tp_size))
+                hidden_states = tensor_list[context.attn_tp_rank]
                 attn_tp_reduce_scatter(hidden_states, tensor_list)
-                residual = residual.tensor_split(self.attn_tp_size)[self.attn_tp_rank]
+                residual = residual.tensor_split(context.attn_tp_size)[context.attn_tp_rank]
             else:
                 raise NotImplementedError
         if hidden_states.shape[0] != 0:
