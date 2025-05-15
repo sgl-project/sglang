@@ -175,7 +175,7 @@ def _compute_num_tokens_of_mode(forward_batch: ForwardBatch):
     return {
         ScatterMode.SCATTERED: TODO,
         ScatterMode.TP_ATTN_FULL: forward_batch.input_ids.shape[0],
-        ScatterMode.FULL: TODO,
+        ScatterMode.FULL: forward_batch.gathered_buffer.shape[0],
     }
 
 
