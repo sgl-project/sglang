@@ -23,6 +23,17 @@ class _LayerModeComputationContext:
     is_layer_sparse: bool
     is_previous_layer_sparse: Optional[bool]
 
+    def previous_layer(self):
+        assert self.is_previous_layer_sparse is not None
+        return _LayerModeComputationContext(
+            layer_id=self.layer_id,
+            is_layer_sparse=self.is_previous_layer_sparse,
+            is_previous_layer_sparse=None,
+
+            # unchanged
+            num_layers=self.num_layers,
+        )
+
 
 @dataclass
 class LayerScatterModes:
@@ -46,7 +57,7 @@ class LayerScatterModes:
     def _compute_layer_input_mode(cls, context: _LayerModeComputationContext):
         if context.layer_id == 0:
             return ScatterMode.TP_ATTN_FULL
-        return cls._compute_layer_output_mode(layer_id=layer_id - 1, context=context)
+        return cls._compute_layer_output_mode(context.previous_layer())
 
     @classmethod
     def _compute_ffn_mode(cls, context: _LayerModeComputationContext):
