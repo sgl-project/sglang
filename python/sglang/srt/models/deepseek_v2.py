@@ -380,14 +380,18 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states=hidden_states, router_logits=router_logits
             )
 
-    def op_combine(self, state):
+    def op_combine_a(self, state):
         if self._enable_deepep_moe and (self.ep_size > 1):
-            final_hidden_states = self.deepep_dispatcher.combine(
+            self.deepep_dispatcher.combine(
                 final_hidden_states,
                 topk_idx,
                 topk_weights,
                 forward_mode,
             )
+
+    def op_combine_b(self, state):
+        if self._enable_deepep_moe and (self.ep_size > 1):
+            final_hidden_states = self.deepep_dispatcher.combine_b()
 
     def op_output(self, state):
         final_hidden_states *= self.routed_scaling_factor
