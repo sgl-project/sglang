@@ -204,6 +204,8 @@ def _communicate_with_all_reduce_and_layer_norm(
     """
     if context.is_same_group_size(hidden_states_input_mode, hidden_states_output_mode) \
         and context.is_same_group_size(residual_input_mode, residual_output_mode):
+        if TODO_if_tp_size_gt_1:
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
         if hidden_states.shape[0] != 0:
             hidden_states, residual = layernorm(hidden_states, residual)
         return hidden_states, residual
@@ -214,19 +216,15 @@ def _communicate_with_all_reduce_and_layer_norm(
         and (hidden_states_output_mode == ScatterMode.FULL)
         and (residual_output_mode == ScatterMode.TP_ATTN_FULL)
     ):
-        if context.local_attn_dp_size != 1:
-            if context.attn_tp_rank == 0:
-                hidden_states += residual
-            hidden_states, local_hidden_states = (
-                forward_batch.gathered_buffer,
-                hidden_states,
-            )
-            dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
-            dp_scatter(residual, hidden_states, forward_batch)
-            hidden_states = layernorm(hidden_states)
-        else:
-            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
-            hidden_states, residual = layernorm(hidden_states, residual)
+        if context.attn_tp_rank == 0:
+            hidden_states += residual
+        hidden_states, local_hidden_states = (
+            forward_batch.gathered_buffer,
+            hidden_states,
+        )
+        dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
+        dp_scatter(residual, hidden_states, forward_batch)
+        hidden_states = layernorm(hidden_states)
         return hidden_states, residual
 
     if (
