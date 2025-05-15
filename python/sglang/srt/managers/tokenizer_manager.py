@@ -404,10 +404,10 @@ class TokenizerManager:
                 self._send_one_request(obj, tokenized_obj, created_time)
                 length = 0
                 async for response in self._wait_one_response(obj, request):
-                    if len(response['text']) == length:
+                    if len(response["text"]) == length:
                         pass
                     else:
-                        length = len(response['text'])
+                        length = len(response["text"])
                         yield response
             else:
                 async for response in self._handle_batch_request(
