@@ -140,3 +140,6 @@ class HttpServerEngineAdapter(EngineBase):
 
     def resume_memory_occupation(self):
         return self._make_request("resume_memory_occupation")
+
+    def flush_cache(self):
+        return self._make_request("flush_cache")
