@@ -1238,7 +1238,7 @@ class DeepseekV2DecoderLayer(nn.Module):
 
     def op_comm_pre_mlp(self, state):
         hidden_states, residual = self.layer_communicator.forward_pre_mlp(
-            hidden_states, residual, forward_batch
+            state.pop("hidden_states_after_attn"), state.pop("residual_after_input_ln"), state.forward_batch
         )
 
     def op_mlp(self, state):
