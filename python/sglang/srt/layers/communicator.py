@@ -12,6 +12,7 @@ class ScatterMode(Enum):
 class LayerScatterModes:
     layer_input_mode: ScatterMode
     attn_mode: ScatterMode
+    # Can be further split into e.g. ffn_input_mode and ffn_output_mode if needed
     ffn_mode: ScatterMode
     layer_output_mode: ScatterMode
 
