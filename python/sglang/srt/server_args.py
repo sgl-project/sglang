@@ -59,6 +59,7 @@ class ServerArgs:
     chat_template: Optional[str] = None
     completion_template: Optional[str] = None
     is_embedding: bool = False
+    enable_multimodal: Optional[bool] = None
     revision: Optional[str] = None
 
     # Port for the HTTP server
@@ -97,6 +98,10 @@ class ServerArgs:
     log_requests_level: int = 0
     show_time_cost: bool = False
     enable_metrics: bool = False
+    bucket_time_to_first_token: Optional[List[float]] = None
+    bucket_e2e_request_latency: Optional[List[float]] = None
+    bucket_inter_token_latency: Optional[List[float]] = None
+    collect_tokens_histogram: bool = False
     decode_log_interval: int = 40
     enable_request_time_stats_logging: bool = False
 
@@ -156,7 +161,6 @@ class ServerArgs:
     enable_nccl_nvls: bool = False
     disable_outlines_disk_cache: bool = False
     disable_custom_all_reduce: bool = False
-    enable_multimodal: Optional[bool] = None
     disable_overlap_schedule: bool = False
     enable_mixed_chunk: bool = False
     enable_dp_attention: bool = False
@@ -604,6 +608,12 @@ class ServerArgs:
             help="Whether to use a CausalLM as an embedding model.",
         )
         parser.add_argument(
+            "--enable-multimodal",
+            default=ServerArgs.enable_multimodal,
+            action="store_true",
+            help="Enable the multimodal functionality for the served model. If the model being served is not multimodal, nothing will happen",
+        )
+        parser.add_argument(
             "--revision",
             type=str,
             default=None,
@@ -779,6 +789,33 @@ class ServerArgs:
             "--enable-metrics",
             action="store_true",
             help="Enable log prometheus metrics.",
+        )
+        parser.add_argument(
+            "--bucket-time-to-first-token",
+            type=float,
+            nargs="+",
+            default=ServerArgs.bucket_time_to_first_token,
+            help="The buckets of time to first token, specified as a list of floats.",
+        )
+        parser.add_argument(
+            "--bucket-inter-token-latency",
+            type=float,
+            nargs="+",
+            default=ServerArgs.bucket_inter_token_latency,
+            help="The buckets of inter-token latency, specified as a list of floats.",
+        )
+        parser.add_argument(
+            "--bucket-e2e-request-latency",
+            type=float,
+            nargs="+",
+            default=ServerArgs.bucket_e2e_request_latency,
+            help="The buckets of end-to-end request latency, specified as a list of floats.",
+        )
+        parser.add_argument(
+            "--collect-tokens-histogram",
+            action="store_true",
+            default=ServerArgs.collect_tokens_histogram,
+            help="Collect prompt/generation tokens histogram.",
         )
         parser.add_argument(
             "--decode-log-interval",
@@ -1052,12 +1089,6 @@ class ServerArgs:
             "--disable-custom-all-reduce",
             action="store_true",
             help="Disable the custom all-reduce kernel and fall back to NCCL.",
-        )
-        parser.add_argument(
-            "--enable-multimodal",
-            default=ServerArgs.enable_multimodal,
-            action="store_true",
-            help="Enable the multimodal functionality for the served model. If the model being served is not multimodal, nothing will happen",
         )
         parser.add_argument(
             "--disable-overlap-schedule",

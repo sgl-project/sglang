@@ -16,6 +16,7 @@
 import asyncio
 import copy
 import dataclasses
+import json
 import logging
 import os
 import pickle
@@ -90,6 +91,8 @@ from sglang.srt.managers.io_struct import (
     ResumeMemoryOccupationReqInput,
     ResumeMemoryOccupationReqOutput,
     SessionParams,
+    SetInternalStateReq,
+    SetInternalStateReqOutput,
     SlowDownReqInput,
     SlowDownReqOutput,
     TokenizedEmbeddingReqInput,
@@ -111,6 +114,7 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     dataclass_to_string_truncated,
+    disable_request_logging,
     get_zmq_socket,
     kill_process_tree,
 )
@@ -228,6 +232,7 @@ class TokenizerManager:
         # Store states
         self.no_create_loop = False
         self.rid_to_state: Dict[str, ReqState] = {}
+        self.health_check_failed = False
         self.gracefully_exit = False
         self.last_receive_tstamp = 0
         self.dump_requests_folder = ""  # By default do not dump
@@ -255,6 +260,10 @@ class TokenizerManager:
                     "model_name": self.server_args.served_model_name,
                     # TODO: Add lora name/path in the future,
                 },
+                bucket_time_to_first_token=self.server_args.bucket_time_to_first_token,
+                bucket_e2e_request_latency=self.server_args.bucket_e2e_request_latency,
+                bucket_inter_token_latency=self.server_args.bucket_inter_token_latency,
+                collect_tokens_histogram=self.server_args.collect_tokens_histogram,
             )
 
         # Communicators
@@ -285,7 +294,11 @@ class TokenizerManager:
         self.start_profile_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.health_check_communitcator = _Communicator(self.send_to_scheduler, 1)
         self.get_internal_state_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.set_internal_state_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
         self.expert_distribution_communicator = _Communicator(
@@ -348,6 +361,10 @@ class TokenizerManager:
                 (
                     GetInternalStateReqOutput,
                     self.get_internal_state_communicator.handle_recv,
+                ),
+                (
+                    SetInternalStateReqOutput,
+                    self.set_internal_state_communicator.handle_recv,
                 ),
                 (
                     ExpertDistributionReqOutput,
@@ -946,6 +963,14 @@ class TokenizerManager:
         # Many DP ranks
         return [res.internal_state for res in responses]
 
+    async def set_internal_state(
+        self, obj: SetInternalStateReq
+    ) -> SetInternalStateReqOutput:
+        responses: List[SetInternalStateReqOutput] = (
+            await self.set_internal_state_communicator(obj)
+        )
+        return [res.internal_state for res in responses]
+
     def get_log_request_metadata(self):
         max_length = None
         skip_names = None
@@ -1015,11 +1040,17 @@ class TokenizerManager:
             loop.create_task(print_exception_wrapper(self.handle_loop))
         )
 
+        self.event_loop = loop
+
         # We cannot add signal handler when the tokenizer manager is not in
         # the main thread due to the CPython limitation.
         if threading.current_thread() is threading.main_thread():
             signal_handler = SignalHandler(self)
-            loop.add_signal_handler(signal.SIGTERM, signal_handler.signal_handler)
+            loop.add_signal_handler(signal.SIGTERM, signal_handler.sigterm_handler)
+            # Update the signal handler for the process. It overrides the sigquit handler in the launch phase.
+            loop.add_signal_handler(
+                signal.SIGQUIT, signal_handler.running_phase_sigquit_handler
+            )
         else:
             logger.warning(
                 "Signal handler is not added because the tokenizer manager is "
@@ -1037,6 +1068,15 @@ class TokenizerManager:
         # Drain requests
         while True:
             remain_num_req = len(self.rid_to_state)
+
+            if self.health_check_failed:
+                # if health check failed, we should exit immediately
+                logger.error(
+                    "Signal SIGTERM received while health check failed. Exiting... remaining number of requests: %d",
+                    remain_num_req,
+                )
+                break
+
             logger.info(
                 f"Gracefully exiting... remaining number of requests {remain_num_req}"
             )
@@ -1366,11 +1406,17 @@ class SignalHandler:
     def __init__(self, tokenizer_manager: TokenizerManager):
         self.tokenizer_manager = tokenizer_manager
 
-    def signal_handler(self, signum=None, frame=None):
+    def sigterm_handler(self, signum=None, frame=None):
         logger.warning(
             f"SIGTERM received. {signum=} {frame=}. Draining requests and shutting down..."
         )
         self.tokenizer_manager.gracefully_exit = True
+
+    def running_phase_sigquit_handler(self, signum=None, frame=None):
+        logger.error(
+            "Received sigquit from a child process. It usually means the child failed."
+        )
+        kill_process_tree(os.getpid())
 
 
 T = TypeVar("T")
