@@ -198,6 +198,10 @@ def _communicate_with_all_reduce_and_layer_norm(
     layernorm: torch.nn.Module,
     context: _Context,
 ):
+    """Besides communication, needs to
+    1. All reduce in tp_attn_group on hidden_states
+    2. Apply layer norm
+    """
     if context.is_same_group_size(hidden_states_input_mode, hidden_states_output_mode) \
         and context.is_same_group_size(residual_input_mode, residual_output_mode):
         if hidden_states.shape[0] != 0:
