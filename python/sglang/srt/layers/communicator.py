@@ -163,12 +163,20 @@ class LayerCommunicator:
 
     def _compute_context(self, forward_batch: ForwardBatch):
         return _Context(
-            num_tokens_of_mode=TODO,
+            num_tokens_of_mode=_compute_num_tokens_of_mode(forward_batch),
             process_group_sizes=self.process_group_sizes,
             attn_tp_rank=self.attn_tp_rank,
             attn_tp_size=self.attn_tp_size,
             tp_size=self.tp_size,
         )
+
+
+def _compute_num_tokens_of_mode(forward_batch: ForwardBatch):
+    return {
+        ScatterMode.SCATTERED: TODO,
+        ScatterMode.TP_ATTN_FULL: TODO,
+        ScatterMode.FULL: TODO,
+    }
 
 
 @dataclass
