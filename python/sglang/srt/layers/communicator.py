@@ -103,7 +103,7 @@ class LayerCommunicator:
             forward_batch=forward_batch,
             input_mode=self.layer_scatter_modes.layer_input_mode,
             output_mode=self.layer_scatter_modes.attn_mode,
-            attn_tp_size=self.attn_tp_size,
+            context=TODO,
         )
 
     def forward_pre_mlp(
@@ -169,8 +169,7 @@ class LayerCommunicator:
             hidden_states_input_mode=self.layer_scatter_modes.mlp_mode,
             residual_input_mode=TODO,
             output_mode=self.layer_scatter_modes.layer_output_mode,
-            local_dp_size=self.local_dp_size,
-            attn_tp_size=self.attn_tp_size,
+            context=TODO,
         )
 
 
