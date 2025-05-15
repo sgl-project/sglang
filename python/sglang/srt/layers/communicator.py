@@ -90,11 +90,6 @@ class LayerCommunicator:
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
 
-        # TODO
-        self.input_is_scattered = (
-            layer_id > 0
-            and previous_layer_info.ffn_input_mode == _FFNInputMode.SCATTERED
-        )
         self.is_last_layer = self.layer_id == config.num_hidden_layers - 1
 
     def forward_pre_attn(
@@ -104,10 +99,10 @@ class LayerCommunicator:
     ):
         if self.layer_scatter_modes.ffn_mode == ScatterMode.FULL:
             assert not (
-                self.attn_tp_size != 1 and self.input_is_scattered
+                self.attn_tp_size != 1 and self.layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED
             ), "moe_layer_freq > 1 is not supported when attn_tp_size > 1"
         elif self.layer_scatter_modes.ffn_mode == ScatterMode.SCATTERED:
-            if self.attn_tp_size != 1 and self.input_is_scattered:
+            if self.attn_tp_size != 1 and self.layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED:
                 hidden_states, local_hidden_states = (
                     forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
                     hidden_states,
@@ -149,7 +144,7 @@ class LayerCommunicator:
                 )
         elif self.layer_scatter_modes.ffn_mode == ScatterMode.SCATTERED:
             if self.attn_tp_size != 1:
-                if self.input_is_scattered:
+                if self.layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED:
                     tensor_list = list(hidden_states.tensor_split(self.attn_tp_size))
                     hidden_states = tensor_list[self.attn_tp_rank]
                     attn_tp_reduce_scatter(hidden_states, tensor_list)
