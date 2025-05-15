@@ -264,4 +264,4 @@ def _communicate_summable_tensor_pair(
         )
         return hidden_states, residual
 
-    raise NotImplementedError
+    raise NotImplementedError(f"{hidden_states_input_mode=} {residual_input_mode=} {output_mode=}")
