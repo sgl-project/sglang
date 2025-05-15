@@ -193,6 +193,7 @@ def _communicate_with_all_reduce_and_layer_norm(
     hidden_states_output_mode: ScatterMode,
     residual_output_mode: ScatterMode,
     forward_batch: ForwardBatch,
+    layernorm: torch.nn.Module,
     context: _Context,
 ):
     if context.is_same_group_size(hidden_states_input_mode, hidden_states_output_mode) \
@@ -214,14 +215,14 @@ def _communicate_with_all_reduce_and_layer_norm(
                 )
                 dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
                 dp_scatter(residual, hidden_states, forward_batch)
-                hidden_states = self.post_attention_layernorm(hidden_states)
+                hidden_states = layernorm(hidden_states)
             else:
                 hidden_states = tensor_model_parallel_all_reduce(hidden_states)
-                hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual = layernorm(
                     hidden_states, residual
                 )
         else:
-            hidden_states, residual = self.post_attention_layernorm(
+            hidden_states, residual = layernorm(
                 hidden_states, residual
             )
         return hidden_states, residual
@@ -238,7 +239,7 @@ def _communicate_with_all_reduce_and_layer_norm(
                 attn_tp_reduce_scatter(hidden_states, tensor_list)
                 residual = residual.tensor_split(self.attn_tp_size)[self.attn_tp_rank]
         if hidden_states.shape[0] != 0:
-            hidden_states, residual = self.post_attention_layernorm(
+            hidden_states, residual = layernorm(
                 hidden_states, residual
             )
         return hidden_states, residual
