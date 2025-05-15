@@ -202,10 +202,25 @@ class HiRadixCache(RadixCache):
                 op=torch.distributed.ReduceOp.MIN,
                 group=self.tp_group,
             )
-        for _ in range(queue_size.item()):
-            ack_id = self.cache_controller.ack_write_queue.get()
-            self.dec_lock_ref(self.ongoing_write_through[ack_id])
-            del self.ongoing_write_through[ack_id]
+
+        if self.enable_mooncake_store_l3_cache:
+            # l2 and l3 are offloaded at the same time, so ack_id needs to be received twice
+            ack_id_count = {}
+            for _ in range(queue_size.item()):
+                ack_id = self.cache_controller.ack_write_queue.get()
+                if ack_id in ack_id_count.keys():
+                    self.dec_lock_ref(self.ongoing_write_through[ack_id])
+                    del self.ongoing_write_through[ack_id]
+                    ack_id_count[ack_id] += 1
+                    if ack_id_count[ack_id] > 2:
+                        raise ValueError("ack_id error in hiRadixCache write check")
+                else:
+                    ack_id_count[ack_id] = 1
+        else:
+            for _ in range(queue_size.item()):
+                ack_id = self.cache_controller.ack_write_queue.get()
+                self.dec_lock_ref(self.ongoing_write_through[ack_id])
+                del self.ongoing_write_through[ack_id]
 
     def loading_check(self):
         while not self.cache_controller.ack_load_queue.empty():
@@ -467,10 +482,10 @@ class HiRadixCache(RadixCache):
                         break
 
                 if len(l3_exist_keys) > 0:
-                    child_key = self.get_child_key_fn(key[len(l3_exist_keys) * self.page_size:])
+                    child_key = self.get_child_key_fn(key[:len(l3_exist_keys) * self.page_size])
                     new_node = TreeNode()
                     new_node.parent = node
-                    new_node.key = key[len(l3_exist_keys) * self.page_size:]
+                    new_node.key = key[:len(l3_exist_keys) * self.page_size]
                     node.children[child_key] = new_node
                     new_node.l3_keys = l3_exist_keys
                     node = new_node
