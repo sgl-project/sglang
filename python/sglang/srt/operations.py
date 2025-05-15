@@ -129,17 +129,3 @@ def _chunk_by_separator(
             pending_items.append(item)
     if len(pending_items) > 0:
         yield pending_items
-
-
-def decorate_operations(operations: List[Operation], debug_name_prefix: str):
-    return [_decorate_operation(op, debug_name_prefix) for op in operations]
-
-
-def _decorate_operation(operation: Operation, debug_name_prefix: str):
-    if isinstance(operation, YieldOperation):
-        return operation
-    return ExecutionOperation(
-        debug_name=debug_name_prefix
-                   + getattr(operation, "__name__", "unknown").replace("_forward_tbo_op_", ""),
-        fn=operation,
-    )
