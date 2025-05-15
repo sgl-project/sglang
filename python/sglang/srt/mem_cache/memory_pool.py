@@ -505,14 +505,14 @@ class MLATokenToKVPool(KVCache):
         self.layer_num = layer_num
         self.start_layer = start_layer or 0
         self.end_layer = end_layer or layer_num - 1
-        memory_saver_adapter = TorchMemorySaverAdapter.create(
+        self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
         )
 
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
 
-        with memory_saver_adapter.region():
+        with self.memory_saver_adapter.region():
             # The padded slot 0 is used for writing dummy outputs from padded tokens.
             self.kv_buffer = [
                 torch.zeros(
@@ -648,11 +648,11 @@ class DoubleSparseTokenToKVPool(KVCache):
             self.store_dtype = dtype
         self.start_layer = start_layer or 0
         self.end_layer = end_layer or layer_num - 1
-        memory_saver_adapter = TorchMemorySaverAdapter.create(
+        self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
         )
 
-        with memory_saver_adapter.region():
+        with self.memory_saver_adapter.region():
             # [size, head_num, head_dim] for each layer
             self.k_buffer = [
                 torch.zeros(
