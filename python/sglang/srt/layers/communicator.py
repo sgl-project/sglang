@@ -211,3 +211,12 @@ def _communicate_simple(
         return hidden_states
 
     raise NotImplementedError(f"{input_mode=} {output_mode=}")
+
+
+def _communicate_summable_tensor_pair(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    forward_batch: ForwardBatch,
+):
+    """It is allowed to sum hidden_states and residual if needed."""
+    TODO
