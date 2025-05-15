@@ -1251,6 +1251,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 zero_allocator=zero_allocator,
             )
 
+        self.layer_communicator.forward_pre_mlp()
         # Gather
         if get_tensor_model_parallel_world_size() > 1:
             # all gather and all reduce
@@ -1277,6 +1278,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         # Fully Connected
         hidden_states = self.mlp(hidden_states)
 
+        self.layer_communicator.forward_layer_end()
         # TODO(ch-wan): use reduce-scatter in MLP to avoid this scatter
         # Scatter
         if self.local_dp_size != 1:
