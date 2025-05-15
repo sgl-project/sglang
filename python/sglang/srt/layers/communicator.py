@@ -217,7 +217,7 @@ def _communicate_summable_tensor_pair(
 ):
     """It is allowed to make (hidden_states, residual) := (hidden_states + residual, None) if needed."""
 
-    if ScatterMode.is_same_group_size(hidden_states_input_mode, output_mode, group_sizes)
+    if ScatterMode.is_same_group_size(hidden_states_input_mode, output_mode, group_sizes) \
         and ScatterMode.is_same_group_size(residual_input_mode, output_mode, group_sizes):
         return hidden_states, residual
 
