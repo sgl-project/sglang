@@ -221,6 +221,9 @@ class _Context:
         return self.process_group_sizes[a] == self.process_group_sizes[b]
 
     def check_shape(self, x: torch.Tensor, mode: ScatterMode):
+        if x is None:
+            return
+
         actual_num_tokens = x.shape[0]
         expect_num_tokens = self.num_tokens_of_mode[mode]
         assert (
