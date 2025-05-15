@@ -321,7 +321,7 @@ class DeepseekV2MoE(nn.Module):
             state.shared_output = None
 
     def op_select_experts(self, state):
-        router_logits = state.pop("router_logits")
+        router_logits = state.router_logits
         hidden_states = state.hidden_states_mlp_input
 
         if self._enable_deepep_moe and (router_logits is not None):
@@ -369,6 +369,7 @@ class DeepseekV2MoE(nn.Module):
 
     def op_experts(self, state):
         if self._enable_deepep_moe:
+            state.pop("router_logits")
             state.hidden_states_experts_output = self.experts(
                 hidden_states=state.pop("hidden_states_experts_input"),
                 topk_idx=state.topk_idx_dispatched,
