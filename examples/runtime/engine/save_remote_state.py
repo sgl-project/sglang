@@ -34,6 +34,11 @@ parser.add_argument(
     type=str,
     help="remote address to store model weights",
 )
+parser.add_argument(
+    "--remote-draft-model-save-url",
+    default=None,
+    type=str,
+)
 
 
 def main(args):
@@ -43,7 +48,10 @@ def main(args):
         raise ValueError("model path must be a local directory")
     # Create LLM instance from arguments
     llm = Engine(**dataclasses.asdict(engine_args))
-    llm.save_remote_model(url=args.remote_model_save_url)
+    llm.save_remote_model(
+        url=args.remote_model_save_url, draft_url=args.remote_draft_model_save_url
+    )
+    print("save remote model successfully")
 
 
 if __name__ == "__main__":
