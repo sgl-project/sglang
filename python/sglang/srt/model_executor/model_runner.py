@@ -729,16 +729,11 @@ class ModelRunner:
             num_layers = getattr(
                 self.model_config.hf_config,
                 "num_nextn_predict_layers",
-                self.model_config.num_hidden_layers,
+                self.num_effective_layers,
             )
         else:
-            num_layers = self.model_config.num_hidden_layers
+            num_layers = self.num_effective_layers
         if self.use_mla_backend:
-            num_layers = (
-                self.num_effective_layers
-                if not self.is_draft_worker
-                else self.model_config.hf_config.num_nextn_predict_layers
-            )
             # FIXME: pipeline parallelism is not compatible with mla backend
             assert self.pp_size == 1
             cell_size = (
