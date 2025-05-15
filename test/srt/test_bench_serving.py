@@ -245,6 +245,7 @@ class TestBenchServing(CustomTestCase):
             disable_ignore_eos=True,
             dataset_name="sharegpt",
             other_server_args=[
+                "--trust-remote-code",
                 "--speculative-algorithm",
                 "EAGLE",
                 "--speculative-draft-model-path",

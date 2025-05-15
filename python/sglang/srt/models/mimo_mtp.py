@@ -143,7 +143,6 @@ class MiMoMTP(nn.Module):
         ]
 
         params_dict = dict(self.named_parameters())
-        print(params_dict.keys())
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name or "projector" in name:
                 continue
