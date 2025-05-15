@@ -225,7 +225,7 @@ class _Context:
         expect_num_tokens = self.num_tokens_of_mode[mode]
         assert (
             actual_num_tokens == expect_num_tokens
-        ), f"{actual_num_tokens=} {expect_num_tokens=} {mode=} {x.shape=}"
+        ), f"{actual_num_tokens=} {expect_num_tokens=} {mode=} {x.shape=} {self.num_tokens_of_mode=} {self.process_group_sizes=}"
         return x
 
     def check_shapes(
