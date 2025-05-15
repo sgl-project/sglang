@@ -188,7 +188,7 @@ class LayerCommunicator:
 @dataclass
 class _Context:
     group_sizes: Dict["ScatterMode", int]
-    local_dp_size: int
+    local_attn_dp_size: int
     attn_tp_size: int
 
     def is_same_group_size(self, a: "ScatterMode", b: "ScatterMode"):
@@ -239,7 +239,7 @@ def _communicate_summable_tensor_pair(
         and (output_mode == ScatterMode.TP_ATTN_FULL)
     ):
         # TODO(ch-wan): use reduce-scatter in MLP to avoid this scatter
-        if local_dp_size != 1:
+        if local_attn_dp_size != 1:
             # important: forward batch.gathered_buffer is used both after scatter and after gather.
             # be careful about this!
             hidden_states, global_hidden_states = (
