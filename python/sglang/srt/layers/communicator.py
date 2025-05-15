@@ -51,3 +51,7 @@ class LayerScatterModes:
         if layer_id == context.num_layers - 1:
             return ScatterMode.TP_ATTN_FULL
         return cls._compute_ffn_mode(layer_id, context)
+
+
+class LayerCommunicator:
+    TODO
