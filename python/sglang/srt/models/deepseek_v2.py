@@ -1255,7 +1255,10 @@ class DeepseekV2DecoderLayer(nn.Module):
             state.pop("hidden_states_after_mlp"), state.pop("residual_after_comm_pre_mlp"), state.forward_batch
         )
 
-        return hidden_states, residual
+        TODO_for_tbo_should_consider_next_layer
+        output = hidden_states, residual
+        state.clear(expect_keys={"positions", "forward_batch", "zero_allocator"})
+        return output
 
 
 class DeepseekV2Model(nn.Module):
