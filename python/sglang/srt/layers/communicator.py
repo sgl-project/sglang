@@ -103,6 +103,7 @@ class LayerCommunicator:
             forward_batch=forward_batch,
             input_mode=self.layer_scatter_modes.layer_input_mode,
             output_mode=self.layer_scatter_modes.attn_mode,
+            attn_tp_size=self.attn_tp_size,
         )
 
     def forward_pre_mlp(
@@ -193,18 +194,19 @@ def _communicate_simple(
     forward_batch: ForwardBatch,
     input_mode: ScatterMode,
     output_mode: ScatterMode,
+    attn_tp_size: int,
 ) -> torch.Tensor:
     if input_mode == output_mode:
         return hidden_states
 
     if input_mode == ScatterMode.SCATTERED and output_mode == ScatterMode.TP_ATTN_FULL:
-        if self.attn_tp_size != 1:
+        if attn_tp_size != 1:
             hidden_states, local_hidden_states = (
                 forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
                 hidden_states,
             )
             attn_tp_all_gather(
-                list(hidden_states.tensor_split(self.attn_tp_size)), local_hidden_states
+                list(hidden_states.tensor_split(attn_tp_size)), local_hidden_states
             )
         return hidden_states
 
