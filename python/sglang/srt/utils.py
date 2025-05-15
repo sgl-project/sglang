@@ -1887,7 +1887,7 @@ def launch_dummy_health_check_server(host, port):
 
     except RuntimeError:
         logger.info(
-            f"No existing event loop, starting dummy health check server at {host}:{port}"
+            f"Starting dummy health check server at {host}:{port}"
         )
         server.run()
 
