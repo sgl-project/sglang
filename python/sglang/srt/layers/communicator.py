@@ -198,7 +198,11 @@ def _compute_num_tokens_of_mode(
             tp_attn_full_num_tokens, attn_tp_size, attn_tp_rank
         ),
         ScatterMode.TP_ATTN_FULL: tp_attn_full_num_tokens,
-        ScatterMode.FULL: forward_batch.gathered_buffer.shape[0],
+        ScatterMode.FULL: (
+            forward_batch.gathered_buffer.shape[0]
+            if forward_batch.gathered_buffer is not None
+            else None
+        ),
     }
 
 
