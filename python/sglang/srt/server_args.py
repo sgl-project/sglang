@@ -125,6 +125,7 @@ class ServerArgs:
 
     # Model override args in JSON
     json_model_override_args: str = "{}"
+    preferred_sampling_params: Optional[str] = None
 
     # LoRA
     lora_paths: Optional[List[str]] = None
@@ -904,6 +905,11 @@ class ServerArgs:
             type=str,
             help="A dictionary in JSON string format used to override default model configurations.",
             default=ServerArgs.json_model_override_args,
+        )
+        parser.add_argument(
+            "--preferred-sampling-params",
+            type=str,
+            help="json-formatted sampling settings that will be returned in /get_model_info",
         )
 
         # LoRA

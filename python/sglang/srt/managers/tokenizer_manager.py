@@ -525,7 +525,12 @@ class TokenizerManager:
                     "Please set `--enable-custom-logits-processor` to enable this feature."
                 )
 
-        sampling_params = SamplingParams(**obj.sampling_params)
+        # Parse sampling parameters
+        # Note: if there are preferred sampling params, we use them if they are not
+        # explicitly passed in sampling_params
+        sampling_params = SamplingParams(
+            **{**self.server_args.preferred_sampling_params, **obj.sampling_params}
+        )
         sampling_params.normalize(self.tokenizer)
         sampling_params.verify()
 
