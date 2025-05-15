@@ -315,9 +315,7 @@ class DeepseekV2MoE(nn.Module):
             and not state.forward_batch.forward_mode.is_idle()
             and state.hidden_states_mlp_input.shape[0] > 0
         ):
-            state.shared_output = self.self.shared_experts(
-                state.hidden_states_mlp_input
-            )
+            state.shared_output = self.shared_experts(state.hidden_states_mlp_input)
         else:
             state.shared_output = None
 
