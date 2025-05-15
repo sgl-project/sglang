@@ -317,7 +317,8 @@ def _communicate_with_all_reduce_and_layer_norm(
             )
             dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
             dp_scatter(residual, hidden_states, forward_batch)
-            hidden_states = layernorm(hidden_states)
+            if hidden_states.shape[0] != 0:
+                hidden_states = layernorm(hidden_states)
             return hidden_states, residual
 
         if (
