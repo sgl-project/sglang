@@ -49,7 +49,7 @@ class LayerScatterModes:
         return cls(
             layer_input_mode=cls._compute_layer_input_mode(context),
             attn_mode=ScatterMode.TP_ATTN_FULL,
-            mlp_mode=cls._compute_ffn_mode(context),
+            mlp_mode=cls._compute_mlp_mode(context),
             layer_output_mode=cls._compute_layer_output_mode(context),
         )
 
@@ -60,7 +60,7 @@ class LayerScatterModes:
         return cls._compute_layer_output_mode(context.previous_layer())
 
     @classmethod
-    def _compute_ffn_mode(cls, context: _LayerModeComputationContext):
+    def _compute_mlp_mode(cls, context: _LayerModeComputationContext):
         if context.is_layer_sparse:
             return (
                 ScatterMode.SCATTERED
@@ -78,7 +78,7 @@ class LayerScatterModes:
     def _compute_layer_output_mode(cls, context: _LayerModeComputationContext):
         if context.layer_id == context.num_layers - 1:
             return ScatterMode.TP_ATTN_FULL
-        return cls._compute_ffn_mode(context)
+        return cls._compute_mlp_mode(context)
 
 
 def enable_moe_dense_fully_dp():
