@@ -234,7 +234,7 @@ def _communicate_summable_tensor_pair(
         return hidden_states, residual
 
     if hidden_states_input_mode == ScatterMode.FULL:
-        assert residual_input_mode == WHAT
+        assert residual_input_mode == ScatterMode.TP_ATTN_FULL
         assert output_mode == ScatterMode.TP_ATTN_FULL
         TODO_add_more_guards
         # TODO(ch-wan): use reduce-scatter in MLP to avoid this scatter
@@ -249,7 +249,7 @@ def _communicate_summable_tensor_pair(
         return hidden_states, residual
 
     if hidden_states_input_mode == ScatterMode.SCATTERED:
-        assert residual_input_mode == WHAT
+        assert residual_input_mode == ScatterMode.SCATTERED
         TODO_add_more_guards
         if output_mode == ScatterMode.TP_ATTN_FULL:
             if context.attn_tp_size != 1:
