@@ -166,7 +166,7 @@ class LayerCommunicator:
             hidden_states=hidden_states,
             residual=residual,
             forward_batch=forward_batch,
-            hidden_states_input_mode=TODO,
+            hidden_states_input_mode=self.layer_scatter_modes.ffn_mode,
             residual_input_mode=TODO,
             output_mode=self.layer_scatter_modes.layer_output_mode,
         )
