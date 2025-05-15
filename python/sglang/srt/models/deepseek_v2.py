@@ -385,9 +385,9 @@ class DeepseekV2MoE(nn.Module):
         if self._enable_deepep_moe and (self.ep_size > 1):
             self.deepep_dispatcher.combine(
                 final_hidden_states,
-                state.pop("topk_idx_dispatched"),
-                state.pop("topk_weights_dispatched"),
-                state.forward_mode,
+                topk_idx=state.pop("topk_idx_dispatched"),
+                topk_weights=state.pop("topk_weights_dispatched"),
+                forward_mode=state.forward_mode,
             )
 
     def op_combine_b(self, state):
