@@ -467,7 +467,7 @@ class HiRadixCache(RadixCache):
                         break
 
                 if len(l3_exist_keys) > 0:
-                    child_key = self.get_child_key_fn(key)
+                    child_key = self.get_child_key_fn(key[len(l3_exist_keys) * self.page_size:])
                     new_node = TreeNode()
                     new_node.parent = node
                     new_node.key = key[len(l3_exist_keys) * self.page_size:]

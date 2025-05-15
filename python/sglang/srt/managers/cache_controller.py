@@ -379,15 +379,17 @@ class HiCacheController:
                 try:
                     operation = self.mooncake_l3_write_queue.get(block=True, timeout=1)
                     keys = operation.mooncake_keys
-                    values = self.mem_pool_device.get_flat_data(operation.device_indices)
 
                     for i in range(len(keys)):
                         # 并发相同的key并发写
                         if not self.mooncake_l3_kv_pool.is_exist(keys[i]):
                             if self.page_size == 1:
-                                self.mooncake_l3_kv_pool.put(keys[i], values[i])
+                                value = self.mem_pool_device.get_flat_data(operation.device_indices[i])
+                                self.mooncake_l3_kv_pool.put(keys[i], value)
                             else:
-                                self.mooncake_l3_kv_pool.put(keys[i], values[i * self.page_size:(i + 1) * self.page_size])
+                                value = self.mem_pool_device.get_flat_data(
+                                    operation.device_indices[i * self.page_size:(i + 1) * self.page_size])
+                                self.mooncake_l3_kv_pool.put(keys[i], value)
 
                     self.mooncake_l3_write_stream.synchronize()
                     for node_id in operation.node_ids:
