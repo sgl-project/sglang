@@ -206,13 +206,10 @@ def _communicate_with_all_reduce_and_layer_norm(
 
     if (
         (hidden_states_input_mode == ScatterMode.TP_ATTN_FULL)
-        and (residual_input_mode == TODO)
+        and (residual_input_mode == ScatterMode.TP_ATTN_FULL)
         and (hidden_states_output_mode == ScatterMode.FULL)
         and (residual_output_mode == ScatterMode.TP_ATTN_FULL)
     ):
-        if context.attn_tp_size != 1 and self.layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED:
-            raise AssertionError("moe_layer_freq > 1 is not supported when attn_tp_size > 1")
-
         # all gather and all reduce
         if context.local_attn_dp_size != 1:
             if context.attn_tp_rank == 0:
