@@ -50,16 +50,22 @@ class Gemma3SGLangImageProcessor(SGLangBaseProcessor):
         )
 
         items = []
+        input_ids = ret["input_ids"].flatten()
+        image_offsets = self.get_mm_items_offset(
+            input_ids=input_ids,
+            mm_token_id=self.IMAGE_TOKEN,
+        )
         for i, image in enumerate(base_output.images):
             item = MultimodalDataItem(
                 pixel_values=ret["pixel_values"][i],
                 modality=Modality.IMAGE,
+                image_offsets=image_offsets[i],
             )
             items += [item]
 
         return {
             "mm_items": items,
-            "input_ids": ret["input_ids"].flatten().tolist(),
+            "input_ids": input_ids.tolist(),
             "im_start_id": self.IM_START_TOKEN_ID,
             "im_end_id": self.IM_END_TOKEN_ID,
         }

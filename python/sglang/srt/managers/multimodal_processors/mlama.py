@@ -1,5 +1,7 @@
 from typing import List, Union
 
+import torch
+
 from sglang.srt.managers.multimodal_processors.base_processor import (
     BaseMultimodalProcessor,
 )
@@ -34,12 +36,17 @@ class MllamaImageProcessor(BaseMultimodalProcessor):
 
         image_inputs = self.process_mm_data(input_text=input_text, images=images)
         image_inputs["input_ids"] = image_inputs["input_ids"].tolist()[0]
+        image_offsets = self.get_mm_items_offset(
+            input_ids=torch.tensor(image_inputs["input_ids"]),
+            mm_token_id=self.hf_config.image_token_index,
+        )
         image_inputs["mm_items"] = [
             MultimodalDataItem(
                 pixel_values=image_inputs["pixel_values"],
                 aspect_ratio_id=image_inputs["aspect_ratio_ids"],
                 aspect_ratio_mask=image_inputs["aspect_ratio_mask"],
                 modality=Modality.IMAGE,
+                image_offsets=image_offsets,
             )
         ]
 

@@ -108,15 +108,21 @@ class PixtralProcessor(BaseMultimodalProcessor):
         )
 
         if "pixel_values" in processor_output:
+            input_ids = processor_output["input_ids"].view(-1)
+            image_offsets = self.get_mm_items_offset(
+                input_ids=input_ids,
+                mm_token_id=self.image_token_id,
+            )
             mm_items = [
                 MultimodalDataItem(
                     pixel_values=processor_output["pixel_values"],
                     image_sizes=processor_output["image_sizes"],
                     modality=Modality.IMAGE,
+                    image_offsets=image_offsets,
                 )
             ]
 
-            input_ids = processor_output["input_ids"].view(-1).tolist()
+            input_ids = input_ids.tolist()
             processor_output.update(
                 input_ids=input_ids,
                 mm_items=mm_items,
