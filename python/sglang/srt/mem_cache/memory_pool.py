@@ -755,7 +755,7 @@ class HostKVCache(abc.ABC):
 
     def __init__(
         self,
-        device_pool: MHATokenToKVPool,
+        device_pool: KVCache,
         host_to_device_ratio: float,
         host_size: int,
         pin_memory: bool,
@@ -927,6 +927,8 @@ class HostKVCache(abc.ABC):
 
 
 class MHATokenToKVPoolHost(HostKVCache):
+    device_pool: MHATokenToKVPool
+
     def __init__(
         self,
         device_pool: MHATokenToKVPool,
@@ -1010,6 +1012,8 @@ class MHATokenToKVPoolHost(HostKVCache):
 
 
 class MLATokenToKVPoolHost(HostKVCache):
+    device_pool: MLATokenToKVPool
+
     def __init__(
         self,
         device_pool: MLATokenToKVPool,
