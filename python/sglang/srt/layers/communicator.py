@@ -181,8 +181,11 @@ def _compute_num_tokens_of_mode(forward_batch: ForwardBatch, attn_tp_rank: int, 
     }
 
 
-def _torch_tensor_split_len(tensor_len: int, sections: int, output_index: int):
-    return TODO
+def _torch_tensor_split_len(tensor_len: int, n: int, output_index: int):
+    if output_index < int(tensor_len % n):
+        return int(tensor_len / n) + 1
+    else:
+        return int(tensor_len / n)
 
 
 @dataclass
