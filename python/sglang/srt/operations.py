@@ -1,6 +1,6 @@
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import List, Sequence, Dict, Any, Callable, Union, Generator
+from typing import Any, Callable, Dict, Generator, List, Sequence, Union
 
 import torch
 
