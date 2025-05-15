@@ -83,10 +83,25 @@ class LayerCommunicator:
         self.layer_scatter_modes = layer_scatter_modes
 
     def forward_pre_attn(self):
-        TODO
+        if self.layer_scatter_modes.ffn_mode == ScatterMode.FULL:
+            TODO
+        elif self.layer_scatter_modes.ffn_mode == ScatterMode.SCATTERED:
+            TODO
+        else:
+            raise NotImplementedError
 
     def forward_pre_mlp(self):
-        TODO
+        if self.layer_scatter_modes.ffn_mode == ScatterMode.FULL:
+            TODO
+        elif self.layer_scatter_modes.ffn_mode == ScatterMode.SCATTERED:
+            TODO
+        else:
+            raise NotImplementedError
 
     def forward_layer_end(self):
-        TODO
+        if self.layer_scatter_modes.ffn_mode == ScatterMode.FULL:
+            TODO
+        elif self.layer_scatter_modes.ffn_mode == ScatterMode.SCATTERED:
+            TODO
+        else:
+            raise NotImplementedError
