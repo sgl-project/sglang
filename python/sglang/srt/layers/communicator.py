@@ -162,8 +162,10 @@ class _Context:
     def is_same_group_size(self, a: "ScatterMode", b: "ScatterMode"):
         return self.process_group_sizes[a] == self.process_group_sizes[b]
 
-    def assert_shape(self, x: torch.Tensor, mode: ScatterMode):
-        assert x.shape[0] == self.num_tokens_of_mode[mode]
+    def check_shape(self, x: torch.Tensor, mode: ScatterMode):
+        actual_num_tokens = x.shape[0]
+        expect_num_tokens = self.num_tokens_of_mode[mode]
+        assert actual_num_tokens == expect_num_tokens, f"{actual_num_tokens=} {expect_num_tokens=} {mode=} {x.shape=}"
 
 
 def _communicate_simple(
