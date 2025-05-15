@@ -169,6 +169,8 @@ class LayerCommunicator:
             hidden_states_input_mode=self.layer_scatter_modes.mlp_mode,
             residual_input_mode=TODO,
             output_mode=self.layer_scatter_modes.layer_output_mode,
+            local_dp_size=self.local_dp_size,
+            attn_tp_size=self.attn_tp_size,
         )
 
 
@@ -203,12 +205,14 @@ def _communicate_summable_tensor_pair(
     hidden_states_input_mode: ScatterMode,
     residual_input_mode: ScatterMode,
     output_mode: ScatterMode,
+    local_dp_size: int,
+    attn_tp_size: int,
 ):
     """It is allowed to sum hidden_states and residual if needed."""
     if hidden_states_input_mode == ScatterMode.FULL:
         # TODO(ch-wan): use reduce-scatter in MLP to avoid this scatter
         # Scatter
-        if self.local_dp_size != 1:
+        if local_dp_size != 1:
             # important: forward batch.gathered_buffer is used both after scatter and after gather.
             # be careful about this!
             hidden_states, global_hidden_states = (
@@ -219,7 +223,7 @@ def _communicate_summable_tensor_pair(
         return hidden_states, residual
 
     if hidden_states_input_mode == ScatterMode.SCATTERED:
-        if output_mode == ScatterMode.TP_ATTN_FULL and self.attn_tp_size != 1:
+        if output_mode == ScatterMode.TP_ATTN_FULL and attn_tp_size != 1:
             hidden_states += residual
             residual = None
             hidden_states, local_hidden_states = (
@@ -227,7 +231,7 @@ def _communicate_summable_tensor_pair(
                 hidden_states,
             )
             attn_tp_all_gather(
-                list(hidden_states.tensor_split(self.attn_tp_size)), local_hidden_states
+                list(hidden_states.tensor_split(attn_tp_size)), local_hidden_states
             )
         return hidden_states, residual
 
