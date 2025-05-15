@@ -135,9 +135,9 @@ class Mllama4ImageProcessor(BaseMultimodalProcessor):
         processor_output["im_end_id"] = self.eoi_token_index
         processor_output["im_token_id"] = self.image_token_index
 
-        # input_ids = processor_output["input_ids"].flatten()
         image_offsets = self.get_mm_items_offset(
-            input_ids=input_ids, mm_token_id=self.image_token_index
+            input_ids=torch.tensor(processor_output["input_ids"]),
+            mm_token_id=self.image_token_index,
         )
 
         # Add metadata for image processing
