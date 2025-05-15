@@ -47,17 +47,11 @@ class LayerScatterModes:
     @classmethod
     def _compute_ffn_mode(cls, layer_id: int, context: _LayerModeComputationContext):
         if context.is_layer_sparse(layer_id):
-            return (
-                ScatterMode.SCATTERED
-                if (global_server_args_dict["enable_deepep_moe"] and is_sparse)
-                   or (DeepseekV2DecoderLayer._enable_moe_dense_fully_dp() and not is_sparse)
-                else ScatterMode.FULL
-            )
+            return ScatterMode.SCATTERED if global_server_args_dict["enable_deepep_moe"] else ScatterMode.FULL
         else:
             return (
                 ScatterMode.SCATTERED
-                if (global_server_args_dict["enable_deepep_moe"] and is_sparse)
-                   or (DeepseekV2DecoderLayer._enable_moe_dense_fully_dp() and not is_sparse)
+                if DeepseekV2DecoderLayer._enable_moe_dense_fully_dp()
                 else ScatterMode.FULL
             )
 
