@@ -1345,14 +1345,14 @@ class DeepseekV2DecoderLayer(nn.Module):
                         hidden_states, residual
                     )
             else:
-                if self.attn_tp_rank == 0:
-                    hidden_states += residual
                 tensor_list = list(hidden_states.tensor_split(self.attn_tp_size))
                 hidden_states = tensor_list[self.attn_tp_rank]
                 attn_tp_reduce_scatter(hidden_states, tensor_list)
-                residual = hidden_states
+                residual = residual.tensor_split(self.attn_tp_size)[self.attn_tp_rank]
                 if hidden_states.shape[0] != 0:
-                    hidden_states = self.post_attention_layernorm(hidden_states)
+                    hidden_states, residual = self.post_attention_layernorm(
+                        hidden_states, residual
+                    )
         else:
             if hidden_states.shape[0] != 0:
                 hidden_states, residual = self.post_attention_layernorm(
