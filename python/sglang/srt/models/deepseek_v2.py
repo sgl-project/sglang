@@ -23,10 +23,6 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
-from torch import nn
-from tqdm import tqdm
-from transformers import PretrainedConfig
-
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -87,6 +83,7 @@ from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.operations import execute_operations
+from sglang.srt.operations_strategy import compute_layer_operations
 from sglang.srt.utils import (
     BumpAllocator,
     DeepEPMode,
@@ -97,6 +94,9 @@ from sglang.srt.utils import (
     is_hip,
     log_info_on_rank0,
 )
+from torch import nn
+from tqdm import tqdm
+from transformers import PretrainedConfig
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -1184,7 +1184,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
-        return execute_operations(TODO)
+        return execute_operations(compute_layer_operations(self))
 
         if hidden_states.shape[0] == 0:
             residual = hidden_states
