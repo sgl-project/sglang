@@ -2100,3 +2100,10 @@ def log_info_on_rank0(logger, msg):
 
     if get_tensor_model_parallel_rank() == 0:
         logger.info(msg)
+
+
+def load_json_config(data: str):
+    try:
+        return json.loads(data)
+    except JSONDecodeError:
+        return json.loads(Path(data).read_text())
