@@ -1229,13 +1229,12 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
 
     def op_attn(self, state):
-        if hidden_states.shape[0] != 0:
-            state.hidden_states_after_attn = self.self_attn(
-                positions=state.positions,
-                hidden_states=state.pop("hidden_states_after_comm_pre_attn"),
-                forward_batch=state.forward_batch,
-                zero_allocator=state.zero_allocator,
-            )
+        state.hidden_states_after_attn = self.self_attn(
+            positions=state.positions,
+            hidden_states=state.pop("hidden_states_after_comm_pre_attn"),
+            forward_batch=state.forward_batch,
+            zero_allocator=state.zero_allocator,
+        )
 
     def op_comm_pre_mlp(self, state):
         hidden_states, residual = self.layer_communicator.forward_pre_mlp(
