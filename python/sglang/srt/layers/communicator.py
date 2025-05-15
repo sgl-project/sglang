@@ -54,4 +54,5 @@ class LayerScatterModes:
 
 
 class LayerCommunicator:
-    TODO
+    def __init__(self, layer_scatter_modes: LayerScatterModes):
+        self.layer_scatter_modes = layer_scatter_modes
