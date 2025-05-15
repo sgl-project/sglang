@@ -395,6 +395,8 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states = self.deepep_dispatcher.combine_b()
 
     def op_output(self, state):
+        final_hidden_states = state.pop(TODO)
+
         final_hidden_states *= self.routed_scaling_factor
 
         if (s := state.pop("shared_output")) is not None:
