@@ -198,18 +198,19 @@ Key fields under `input` you can provide:
 
 > [!IMPORTANT]
 >
-> SGLang will **not** auto-wrap your prompt when you call `/run`, `/runsync` or `/generate` directly. \
-> **You have three options:** \
+> SGLang will **not** auto-wrap your prompt when you call `/run`, `/runsync` or `/generate` directly.
+> **You have three options:**
 >
-> 1. **Use the OpenAI-compatible endpoints** (`/v1/chat/completions`, etc.). The server adds the template for you. \
-> 2. **Wrap the prompt yourself.** Embed the appropriate chat-template tokens (see example above). \
-> 3. **Let the server apply a template automatically** by setting: \
->    ````bash
+> 1. **Use the OpenAI-compatible endpoints** (`/v1/chat/completions`, etc.). The server adds the template for you.
+> 2. **Wrap the prompt yourself.** Embed the appropriate chat-template tokens (see example above).
+> 3. **Let the server apply a template automatically** by setting:
+>
+>    ```bash
 >    CHAT_TEMPLATE=llama3   # or qwen, openchat, mistral-instruct, …
->    ```  \
->    This becomes `--chat-template llama3` for `sglang.launch_server`.  \
+>    ```
+>
+>    This becomes `--chat-template llama3` for `sglang.launch_server`.
 >    Full list: <https://docs.sglang.ai/backend/server_arguments.html#model-processor-and-tokenizer>
->    ````
 
 ## Compatibility
 
