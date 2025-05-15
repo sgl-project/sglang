@@ -354,26 +354,26 @@ class DeepseekV2MoE(nn.Module):
         if self._enable_deepep_moe and (self.ep_size > 1):
             (
                 hidden_states,
-                topk_idx_dispatched,
-                topk_weights_dispatched,
-                reorder_topk_ids,
-                num_recv_tokens_per_expert,
-                seg_indptr,
-                masked_m,
-                expected_m,
+                state.topk_idx_dispatched,
+                state.topk_weights_dispatched,
+                state.reorder_topk_ids,
+                state.num_recv_tokens_per_expert,
+                state.seg_indptr,
+                state.masked_m,
+                state.expected_m,
             ) = self.deepep_dispatcher.dispatch_b()
 
     def op_experts(self, state):
         if self._enable_deepep_moe:
             final_hidden_states = self.experts(
                 hidden_states=hidden_states,
-                topk_idx=topk_idx_dispatched,
-                topk_weights=topk_weights_dispatched,
-                reorder_topk_ids=reorder_topk_ids,
-                seg_indptr=seg_indptr,
-                masked_m=masked_m,
-                expected_m=expected_m,
-                num_recv_tokens_per_expert=num_recv_tokens_per_expert,
+                topk_idx=state.topk_idx_dispatched,
+                topk_weights=state.topk_weights_dispatched,
+                reorder_topk_ids=state.reorder_topk_ids,
+                seg_indptr=state.seg_indptr,
+                masked_m=state.masked_m,
+                expected_m=state.expected_m,
+                num_recv_tokens_per_expert=state.num_recv_tokens_per_expert,
                 forward_mode=state.forward_mode,
             )
         else:
