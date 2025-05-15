@@ -36,7 +36,7 @@ class _LayerModeComputationContext:
     def previous_layer(self):
         assert self.is_previous_layer_sparse is not None
         return _LayerModeComputationContext(
-            layer_id=self.layer_id,
+            layer_id=self.layer_id - 1,
             is_layer_sparse=self.is_previous_layer_sparse,
             is_previous_layer_sparse=None,
             # unchanged
