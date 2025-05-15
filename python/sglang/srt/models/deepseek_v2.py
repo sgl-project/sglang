@@ -303,9 +303,9 @@ class DeepseekV2MoE(nn.Module):
             and hidden_states.shape[0] > 0
         ):
             # router_logits: (num_tokens, n_experts)
-            router_logits = self.gate(hidden_states)
+            state.router_logits = self.gate(hidden_states)
         else:
-            router_logits = None
+            state.router_logits = None
 
     def op_shared_experts(self, state):
         if (
@@ -314,15 +314,15 @@ class DeepseekV2MoE(nn.Module):
             and not state.forward_mode.is_idle()
             and hidden_states.shape[0] > 0
         ):
-            shared_output = self.self.shared_experts(hidden_states)
+            state.shared_output = self.self.shared_experts(hidden_states)
         else:
-            shared_output = None
+            state.shared_output = None
 
     def op_select_experts(self, state):
         if self._enable_deepep_moe and (router_logits is not None):
             topk_weights, topk_idx = select_experts(
                 hidden_states=hidden_states,
-                router_logits=router_logits,
+                router_logits=state.pop("router_logits"),
                 top_k=self.top_k,
                 use_grouped_topk=True,
                 renormalize=self.renormalize,
@@ -396,8 +396,8 @@ class DeepseekV2MoE(nn.Module):
     def op_output(self, state):
         final_hidden_states *= self.routed_scaling_factor
 
-        if shared_output is not None:
-            final_hidden_states = final_hidden_states + shared_output
+        if (s := state.pop("shared_output") is not None:
+            final_hidden_states = final_hidden_states + s
 
         if (not self._enable_deepep_moe) and (self.tp_size > 1):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
