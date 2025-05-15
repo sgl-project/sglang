@@ -402,8 +402,13 @@ class TokenizerManager:
             if is_single:
                 tokenized_obj = await self._tokenize_one_request(obj)
                 self._send_one_request(obj, tokenized_obj, created_time)
+                length = 0
                 async for response in self._wait_one_response(obj, request):
-                    yield response
+                    if len(response['text']) == length:
+                        pass
+                    else:
+                        length = len(response['text'])
+                        yield response
             else:
                 async for response in self._handle_batch_request(
                     obj, request, created_time
