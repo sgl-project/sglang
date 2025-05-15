@@ -105,9 +105,8 @@ class LayerCommunicator:
         )
 
         if self.layer_scatter_modes.ffn_mode == ScatterMode.FULL:
-            assert not (
-                self.attn_tp_size != 1 and self.layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED
-            ), "moe_layer_freq > 1 is not supported when attn_tp_size > 1"
+            if self.attn_tp_size != 1 and self.layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED:
+                raise AssertionError("moe_layer_freq > 1 is not supported when attn_tp_size > 1")
         elif self.layer_scatter_modes.ffn_mode == ScatterMode.SCATTERED:
             if self.attn_tp_size != 1 and self.layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED:
                 hidden_states, local_hidden_states = (
