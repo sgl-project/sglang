@@ -171,32 +171,6 @@ class LayerCommunicator:
             output_mode=self.layer_scatter_modes.layer_output_mode,
         )
 
-        if hidden_states_input_mode == ScatterMode.FULL:
-            # TODO(ch-wan): use reduce-scatter in MLP to avoid this scatter
-            # Scatter
-            if self.local_dp_size != 1:
-                # important: forward batch.gathered_buffer is used both after scatter and after gather.
-                # be careful about this!
-                hidden_states, global_hidden_states = (
-                    forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
-                    hidden_states,
-                )
-                dp_scatter(hidden_states, global_hidden_states, forward_batch)
-        elif hidden_states_input_mode == ScatterMode.SCATTERED:
-            if self.layer_scatter_modes.layer_output_mode == ScatterMode.TP_ATTN_FULL and self.attn_tp_size != 1:
-                hidden_states += residual
-                residual = None
-                hidden_states, local_hidden_states = (
-                    forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
-                    hidden_states,
-                )
-                attn_tp_all_gather(
-                    list(hidden_states.tensor_split(self.attn_tp_size)), local_hidden_states
-                )
-        else:
-            raise NotImplementedError
-        return hidden_states, residual
-
 
 def _communicate_simple(
     hidden_states: torch.Tensor,
@@ -231,4 +205,28 @@ def _communicate_summable_tensor_pair(
     output_mode: ScatterMode,
 ):
     """It is allowed to sum hidden_states and residual if needed."""
-    TODO
+    if hidden_states_input_mode == ScatterMode.FULL:
+        # TODO(ch-wan): use reduce-scatter in MLP to avoid this scatter
+        # Scatter
+        if self.local_dp_size != 1:
+            # important: forward batch.gathered_buffer is used both after scatter and after gather.
+            # be careful about this!
+            hidden_states, global_hidden_states = (
+                forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
+                hidden_states,
+            )
+            dp_scatter(hidden_states, global_hidden_states, forward_batch)
+    elif hidden_states_input_mode == ScatterMode.SCATTERED:
+        if self.layer_scatter_modes.layer_output_mode == ScatterMode.TP_ATTN_FULL and self.attn_tp_size != 1:
+            hidden_states += residual
+            residual = None
+            hidden_states, local_hidden_states = (
+                forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
+                hidden_states,
+            )
+            attn_tp_all_gather(
+                list(hidden_states.tensor_split(self.attn_tp_size)), local_hidden_states
+            )
+    else:
+        raise NotImplementedError
+    return hidden_states, residual
