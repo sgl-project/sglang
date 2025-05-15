@@ -37,10 +37,10 @@ class LayerScatterModes:
 
     @classmethod
     def _compute_ffn_mode(cls, layer_id: int, is_layer_sparse: _IsLayerSparseCallable):
-        if layer_id == num_layers - 1:
-            return ScatterMode.TP_ATTN_FULL
         return TODO
 
     @classmethod
     def _compute_layer_output_mode(cls, layer_id: int, is_layer_sparse: _IsLayerSparseCallable):
-        return TODO
+        if layer_id == num_layers - 1:
+            return ScatterMode.TP_ATTN_FULL
+        return cls._compute_ffn_mode(layer_id, is_layer_sparse)
