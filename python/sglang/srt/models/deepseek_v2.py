@@ -31,7 +31,7 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.communicator import enable_moe_dense_fully_dp
+from sglang.srt.layers.communicator import enable_moe_dense_fully_dp, LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather,
     attn_tp_reduce_scatter,
@@ -1193,13 +1193,24 @@ class DeepseekV2DecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
+        self.layer_communicator = LayerCommunicator(
+            layer_scatter_modes=LayerScatterModes.init_new(
+                layer_id=layer_id,
+                num_layers=config.num_hidden_layers,
+                is_layer_sparse=self._is_layer_sparse,
+            ),
+        )
+
+    def _is_layer_sparse(self, layer_id: int) -> bool:
+        return is_nextn or (
+            self.config.n_routed_experts is not None
+            and layer_id >= self.config.first_k_dense_replace
+            and layer_id % self.config.moe_layer_freq == 0
+        )
+
     @staticmethod
     def _compute_info(config: PretrainedConfig, layer_id: int, is_nextn: bool):
-        is_sparse = is_nextn or (
-            config.n_routed_experts is not None
-            and layer_id >= config.first_k_dense_replace
-            and layer_id % config.moe_layer_freq == 0
-        )
+        is_sparse = MOVED
         ffn_input_mode = MOVED
         return _DecoderLayerInfo(is_sparse=is_sparse, ffn_input_mode=ffn_input_mode)
 
