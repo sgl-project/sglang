@@ -1,11 +1,15 @@
 from dataclasses import dataclass
 from enum import Enum, auto
+from typing import Callable
 
 
 class ScatterMode(Enum):
     SCATTERED = auto()
     TP_ATTN_FULL = auto()
     FULL = auto()
+
+
+_IsLayerSparseCallable = Callable[[int], bool]
 
 
 @dataclass
@@ -17,7 +21,7 @@ class LayerScatterModes:
     layer_output_mode: ScatterMode
 
     @staticmethod
-    def init_new():
+    def init_new(layer_id: int, is_layer_sparse: _IsLayerSparseCallable):
         return LayerScatterModes(
             layer_input_mode=TODO,
             attn_mode=ScatterMode.TP_ATTN_FULL,
