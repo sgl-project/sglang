@@ -73,13 +73,13 @@ class MiMoMultiTokenPredictorLayer(nn.Module):
         else:
             hidden_states = input_embeds
         # masking inputs at position 0, as not needed by MTP
-        # hidden_states[positions == 0] = 0
+        hidden_states[positions == 0] = 0
 
         hidden_states = self.input_proj(
             torch.cat(
                 (
-                    self.token_layernorm(hidden_states),
                     self.hidden_layernorm(forward_batch.spec_info.hidden_states),
+                    self.token_layernorm(hidden_states),
                 ),
                 dim=-1,
             )
@@ -91,8 +91,8 @@ class MiMoMultiTokenPredictorLayer(nn.Module):
             forward_batch=forward_batch,
             residual=None,
         )
-        # hidden_states = residual + hidden_states
-        hidden_states, _ = self.final_layernorm(hidden_states, residual)
+        hidden_states = residual + hidden_states
+        hidden_states = self.final_layernorm(hidden_states)
         return hidden_states
 
 
@@ -117,7 +117,6 @@ class MiMoMTP(nn.Module):
             config.vocab_size,
             config.hidden_size,
             quant_config=quant_config,
-            # prefix=add_prefix("model.shared_head.head", prefix),
         )
         self.logits_processor = LogitsProcessor(config)
 
@@ -127,9 +126,7 @@ class MiMoMTP(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        spec_step_idx: int = 0,
     ) -> torch.Tensor:
-        assert spec_step_idx == 0, "mimo_mtp only support predict one token now"
         hidden_states = self.model(input_ids, positions, forward_batch)
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
@@ -148,10 +145,6 @@ class MiMoMTP(nn.Module):
         params_dict = dict(self.named_parameters())
         print(params_dict.keys())
         for name, loaded_weight in weights:
-            # if not ("mtp_layers" not in name and (
-            #         "embed_tokens" not in name and "lm_head" not in name
-            #     )):
-            #     print(name)
             if "rotary_emb.inv_freq" in name or "projector" in name:
                 continue
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
@@ -162,19 +155,17 @@ class MiMoMTP(nn.Module):
                 continue
             if name.startswith("model.vision_tower") and name not in params_dict:
                 continue
-            print(name, self.map_model_name_to_mtp_param_name(name))
             name = self.map_model_name_to_mtp_param_name(name)
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
-                if "mtp_layers" not in name:
+                if "mtp_block" not in name:
                     break
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
-                # print(name)
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -183,8 +174,13 @@ class MiMoMTP(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
-                if "mtp_layers" not in name and (
-                    "embed_tokens" not in name and "lm_head" not in name
+                if "mtp_block" not in name and (
+                    "embed_tokens" not in name
+                    and "lm_head" not in name
+                    and "token_layernorm" not in name
+                    and "hidden_layernorm" not in name
+                    and "input_proj" not in name
+                    and "final_layernorm" not in name
                 ):
                     continue
                 param = params_dict[name]
