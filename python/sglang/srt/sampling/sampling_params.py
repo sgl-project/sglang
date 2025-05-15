@@ -50,6 +50,7 @@ class SamplingParams:
         spaces_between_special_tokens: bool = True,
         no_stop_trim: bool = False,
         custom_params: Optional[Dict[str, Any]] = None,
+        stream_interval: Optional[int] = None,
     ) -> None:
         self.max_new_tokens = max_new_tokens
         self.stop_strs = stop
@@ -75,6 +76,7 @@ class SamplingParams:
         self.spaces_between_special_tokens = spaces_between_special_tokens
         self.no_stop_trim = no_stop_trim
         self.custom_params = custom_params
+        self.stream_interval = stream_interval
 
         # Process some special cases
         if 0 <= self.temperature < _SAMPLING_EPS:

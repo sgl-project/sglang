@@ -99,6 +99,7 @@ class ServerArgs:
     show_time_cost: bool = False
     enable_metrics: bool = False
     decode_log_interval: int = 40
+    enable_request_time_stats_logging: bool = False
 
     # API related
     api_key: Optional[str] = None
@@ -160,6 +161,7 @@ class ServerArgs:
     disable_overlap_schedule: bool = False
     enable_mixed_chunk: bool = False
     enable_dp_attention: bool = False
+    enable_dp_lm_head: bool = False
     enable_ep_moe: bool = False
     enable_deepep_moe: bool = False
     deepep_mode: Optional[Literal["auto", "normal", "low_latency"]] = "auto"
@@ -188,6 +190,7 @@ class ServerArgs:
     n_share_experts_fusion: int = 0
     disable_chunked_prefix_cache: bool = False
     disable_fast_image_processor: bool = False
+    mm_attention_backend: Optional[str] = None
 
     # Debug tensor dumps
     debug_tensor_dump_output_folder: Optional[str] = None
@@ -199,6 +202,7 @@ class ServerArgs:
     disaggregation_bootstrap_port: int = 8998
     disaggregation_transfer_backend: str = "mooncake"
     disaggregation_ib_device: Optional[str] = None
+    pdlb_url: Optional[str] = None
 
     def __post_init__(self):
         # Expert parallelism
@@ -226,7 +230,7 @@ class ServerArgs:
         # Set mem fraction static, which depends on the tensor parallelism size
         if self.mem_fraction_static is None:
             parallel_size = self.tp_size * self.pp_size
-            if gpu_mem <= 81920:
+            if gpu_mem is not None and gpu_mem <= 81920:
                 if parallel_size >= 16:
                     self.mem_fraction_static = 0.79
                 elif parallel_size >= 8:
@@ -239,7 +243,7 @@ class ServerArgs:
                     self.mem_fraction_static = 0.88
             else:
                 self.mem_fraction_static = 0.88
-            if gpu_mem > 96 * 1024:
+            if gpu_mem is not None and gpu_mem > 96 * 1024:
                 mem_fraction = self.mem_fraction_static
                 self.mem_fraction_static = min(
                     mem_fraction + 48 * 1024 * (1 - mem_fraction) / gpu_mem,
@@ -304,6 +308,12 @@ class ServerArgs:
         if self.grammar_backend is None:
             self.grammar_backend = "xgrammar"
 
+        if self.pp_size > 1:
+            self.disable_overlap_schedule = True
+            logger.warning(
+                "Overlap scheduler is disabled because of using pipeline parallelism."
+            )
+
         # Data parallelism attention
         if self.enable_dp_attention:
             self.schedule_conservativeness = self.schedule_conservativeness * 0.3
@@ -316,6 +326,11 @@ class ServerArgs:
                 f"DP attention is enabled. The chunked prefill size is adjusted to {self.chunked_prefill_size} to avoid MoE kernel issues. "
             )
 
+        if self.enable_dp_lm_head:
+            assert (
+                self.enable_dp_attention
+            ), "Please enable dp attention when setting enable_dp_attention. "
+
         # DeepEP MoE
         self.enable_sp_layernorm = False
         if self.enable_deepep_moe:
@@ -323,12 +338,21 @@ class ServerArgs:
                 assert (
                     not self.enable_dp_attention
                 ), "DeepEP MoE `auto` mode is not supported with DP Attention."
+            if self.deepep_mode == "normal":
+                logger.warning("Cuda graph is disabled because deepep_mode=`normal`")
+                self.disable_cuda_graph = True
             self.ep_size = self.tp_size
             self.enable_sp_layernorm = (
                 self.dp_size < self.tp_size if self.enable_dp_attention else True
             )
             logger.warning(
                 f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
+            )
+
+        if self.pp_size > 1:
+            self.disable_overlap_schedule = True
+            logger.warning(
+                "Pipeline parallelism is incompatible with overlap schedule."
             )
 
         # Speculative Decoding
@@ -573,7 +597,7 @@ class ServerArgs:
             "--device",
             type=str,
             default=ServerArgs.device,
-            help="The device to use ('cuda', 'xpu', 'hpu', 'cpu'). Defaults to auto-detection if not specified.",
+            help="The device to use ('cuda', 'xpu', 'hpu', 'npu', 'cpu'). Defaults to auto-detection if not specified.",
         )
         parser.add_argument(
             "--served-model-name",
@@ -781,6 +805,12 @@ class ServerArgs:
             default=ServerArgs.decode_log_interval,
             help="The log interval of decode batch.",
         )
+        parser.add_argument(
+            "--enable-request-time-stats-logging",
+            action="store_true",
+            default=ServerArgs.enable_request_time_stats_logging,
+            help="Enable per request time stats logging",
+        )
 
         # API related
         parser.add_argument(
@@ -839,7 +869,7 @@ class ServerArgs:
         # Multi-node distributed serving
         parser.add_argument(
             "--dist-init-addr",
-            "--nccl-init-addr",  # For backward compatbility. This will be removed in the future.
+            "--nccl-init-addr",  # For backward compatibility. This will be removed in the future.
             type=str,
             help="The host address for initializing distributed backend (e.g., `192.168.0.2:25000`).",
         )
@@ -1064,6 +1094,11 @@ class ServerArgs:
             help="Enabling data parallelism for attention and tensor parallelism for FFN. The dp size should be equal to the tp size. Currently only DeepSeek-V2 is supported.",
         )
         parser.add_argument(
+            "--enable-dp-lm-head",
+            action="store_true",
+            help="Enable vocabulary parallel across the attention TP group to avoid all-gather across DP groups, optimizing performance under DP attention.",
+        )
+        parser.add_argument(
             "--enable-ep-moe",
             action="store_true",
             help="Enabling expert parallelism for moe. The ep size is equal to the tp size.",
@@ -1083,7 +1118,7 @@ class ServerArgs:
             "--cuda-graph-max-bs",
             type=int,
             default=ServerArgs.cuda_graph_max_bs,
-            help="Set the maximum batch size for cuda graph.",
+            help="Set the maximum batch size for cuda graph. It will extend the cuda graph capture batch size to this value.",
         )
         parser.add_argument(
             "--cuda-graph-bs",
@@ -1110,7 +1145,7 @@ class ServerArgs:
         parser.add_argument(
             "--triton-attention-reduce-in-fp32",
             action="store_true",
-            help="Cast the intermidiate attention results to fp32 to avoid possible crashes related to fp16."
+            help="Cast the intermediate attention results to fp32 to avoid possible crashes related to fp16."
             "This only affects Triton attention kernels.",
         )
         parser.add_argument(
@@ -1202,7 +1237,7 @@ class ServerArgs:
             type=int,
             default=0,
             help="The number of shared_experts need to be replicated to fuse with normal experts in deepseek v3/r1, "
-            "set it to tp_size can get best optimized performace.",
+            "set it to tp_size can get best optimized performance. Note that for architectures with SM==90, we have enabled the shared experts fusion optimization by default for DeepSeek V3/R1, with n_share_experts_fusion automatically set to the TP size.",
         )
         parser.add_argument(
             "--disable-chunked-prefix-cache",
@@ -1272,6 +1307,20 @@ class ServerArgs:
             help="The InfiniBand devices for disaggregation transfer, accepts single device (e.g., --disaggregation-ib-device mlx5_0) "
             "or multiple comma-separated devices (e.g., --disaggregation-ib-device mlx5_0,mlx5_1). "
             "Default is None, which triggers automatic device detection when mooncake backend is enabled.",
+        )
+        parser.add_argument(
+            "--pdlb-url",
+            type=str,
+            default=None,
+            help="The URL of the PD disaggregation load balancer. If set, the prefill/decode server will register with the load balancer.",
+        )
+
+        parser.add_argument(
+            "--mm-attention-backend",
+            type=str,
+            choices=["sdpa", "fa3", "triton_attn"],
+            default=ServerArgs.mm_attention_backend,
+            help="Set multimodal attention backend.",
         )
 
     @classmethod

@@ -278,7 +278,7 @@ def graceful_registry(sub_module_name: str):
             f"{sub_module_name} Received signal to shutdown. Performing graceful shutdown..."
         )
         if signum == signal.SIGTERM:
-            logger.info(f"{sub_module_name} recive sigterm")
+            logger.info(f"{sub_module_name} receive sigterm")
 
     signal.signal(signal.SIGTERM, graceful_shutdown)
 
