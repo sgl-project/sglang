@@ -119,7 +119,7 @@ class LayerCommunicator:
             forward_batch=forward_batch,
             input_mode=self.layer_scatter_modes.layer_input_mode,
             output_mode=self.layer_scatter_modes.attn_mode,
-            context=TODO,
+            context=self._compute_context(),
         )
 
     def forward_pre_mlp(
@@ -137,7 +137,7 @@ class LayerCommunicator:
             hidden_states_output_mode=self.layer_scatter_modes.mlp_mode,
             residual_output_mode=self.layer_scatter_modes.middle_residual_mode,
             layernorm=self.post_attention_layernorm,
-            context=TODO,
+            context=self._compute_context(),
         )
 
     def forward_layer_end(
@@ -153,11 +153,10 @@ class LayerCommunicator:
             hidden_states_input_mode=self.layer_scatter_modes.mlp_mode,
             residual_input_mode=self.layer_scatter_modes.middle_residual_mode,
             output_mode=self.layer_scatter_modes.layer_output_mode,
-            context=TODO,
+            context=self._compute_context(),
         )
 
 
-# TODO rename?
 @dataclass
 class _Context:
     process_group_sizes: Dict["ScatterMode", int]
