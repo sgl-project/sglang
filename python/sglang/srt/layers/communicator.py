@@ -14,3 +14,12 @@ class LayerScatterModes:
     attn_mode: ScatterMode
     ffn_mode: ScatterMode
     layer_output_mode: ScatterMode
+
+    @staticmethod
+    def init_new():
+        return LayerScatterModes(
+            layer_input_mode=TODO,
+            attn_mode=ScatterMode.TP_ATTN_FULL,
+            ffn_mode=TODO,
+            layer_output_mode=TODO,
+        )
