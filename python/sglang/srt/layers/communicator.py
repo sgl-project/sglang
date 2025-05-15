@@ -108,6 +108,11 @@ class LayerCommunicator:
         self.attn_tp_rank = get_attention_tp_rank()
         self.attn_tp_size = get_attention_tp_size()
         self.tp_size = get_tensor_model_parallel_world_size()
+        self.process_group_sizes = {
+            ScatterMode.SCATTERED: 1,
+            ScatterMode.TP_ATTN_FULL: TODO,
+            ScatterMode.FULL: TODO,
+        }
 
     def forward_pre_attn(
         self,
@@ -154,6 +159,15 @@ class LayerCommunicator:
             residual_input_mode=self.layer_scatter_modes.middle_residual_mode,
             output_mode=self.layer_scatter_modes.layer_output_mode,
             context=self._compute_context(),
+        )
+
+    def _compute_context(self):
+        return _Context(
+            process_group_sizes=self.process_group_sizes,
+            num_tokens_of_mode=TODO,
+            attn_tp_rank=self.attn_tp_rank,
+            attn_tp_size=self.attn_tp_size,
+            tp_size=self.tp_size,
         )
 
 
