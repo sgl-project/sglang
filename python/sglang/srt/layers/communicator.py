@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Optional
+from typing import Optional, Dict
 
 import torch
 from sglang.srt.distributed import get_tensor_model_parallel_world_size, tensor_model_parallel_all_reduce
@@ -14,6 +14,10 @@ class ScatterMode(Enum):
     SCATTERED = auto()
     TP_ATTN_FULL = auto()
     FULL = auto()
+
+    @staticmethod
+    def is_equivalent(a: "ScatterMode", b: "ScatterMode", group_sizes: Dict["ScatterMode", int]):
+        return group_sizes[a] == group_sizes[b]
 
 
 @dataclass
