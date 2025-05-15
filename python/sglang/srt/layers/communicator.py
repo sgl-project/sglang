@@ -200,7 +200,12 @@ def _communicate_with_all_reduce_and_layer_norm(
         and context.is_same_group_size(residual_input_mode, residual_output_mode):
         return hidden_states, residual
 
-    if hidden_states_output_mode == ScatterMode.FULL:
+    if (
+        (hidden_states_input_mode == TODO)
+        and (residual_input_mode == TODO)
+        and (hidden_states_output_mode == ScatterMode.FULL)
+        and (residual_output_mode == TODO)
+    ):
         if self.attn_tp_size != 1 and self.layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED:
             raise AssertionError("moe_layer_freq > 1 is not supported when attn_tp_size > 1")
 
@@ -227,7 +232,12 @@ def _communicate_with_all_reduce_and_layer_norm(
             )
         return hidden_states, residual
 
-    if hidden_states_output_mode == ScatterMode.SCATTERED:
+    if (
+        (hidden_states_input_mode == TODO)
+        and (residual_input_mode == TODO)
+        and (hidden_states_output_mode == ScatterMode.SCATTERED)
+        and (residual_output_mode == TODO)
+    ):
         if self.attn_tp_size != 1:
             if self.layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED:
                 tensor_list = list(hidden_states.tensor_split(self.attn_tp_size))
