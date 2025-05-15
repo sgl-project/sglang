@@ -36,7 +36,7 @@ class _LayerModeComputationContext:
     def previous_layer(self):
         assert self.is_previous_layer_sparse is not None
         return _LayerModeComputationContext(
-            layer_id=self.layer_id,
+            layer_id=self.layer_id - 1,
             is_layer_sparse=self.is_previous_layer_sparse,
             is_previous_layer_sparse=None,
             # unchanged
@@ -96,9 +96,14 @@ class LayerScatterModes:
 
     @classmethod
     def _compute_layer_output_mode(cls, context: _LayerModeComputationContext):
+        mlp_mode = cls._compute_mlp_mode(context)
         if context.layer_id == context.num_layers - 1:
             return ScatterMode.TP_ATTN_FULL
-        return cls._compute_mlp_mode(context)
+        if mlp_mode == ScatterMode.SCATTERED:
+            return ScatterMode.SCATTERED
+        if mlp_mode == ScatterMode.FULL:
+            return ScatterMode.TP_ATTN_FULL
+        raise NotImplementedError
 
 
 def enable_moe_dense_fully_dp():
@@ -193,7 +198,11 @@ def _compute_num_tokens_of_mode(
             tp_attn_full_num_tokens, attn_tp_size, attn_tp_rank
         ),
         ScatterMode.TP_ATTN_FULL: tp_attn_full_num_tokens,
-        ScatterMode.FULL: forward_batch.gathered_buffer.shape[0],
+        ScatterMode.FULL: (
+            forward_batch.gathered_buffer.shape[0]
+            if global_server_args_dict["enable_dp_attention"]
+            else forward_batch.input_ids.shape[0]
+        ),
     }
 
 
@@ -216,11 +225,14 @@ class _Context:
         return self.process_group_sizes[a] == self.process_group_sizes[b]
 
     def check_shape(self, x: torch.Tensor, mode: ScatterMode):
+        if x is None:
+            return
+
         actual_num_tokens = x.shape[0]
         expect_num_tokens = self.num_tokens_of_mode[mode]
         assert (
             actual_num_tokens == expect_num_tokens
-        ), f"{actual_num_tokens=} {expect_num_tokens=} {mode=} {x.shape=}"
+        ), f"{actual_num_tokens=} {expect_num_tokens=} {mode=} {x.shape=} {self.num_tokens_of_mode=} {self.process_group_sizes=}"
         return x
 
     def check_shapes(
@@ -285,8 +297,7 @@ def _communicate_with_all_reduce_and_layer_norm(
         if context.is_same_group_size(
             hidden_states_input_mode, hidden_states_output_mode
         ) and context.is_same_group_size(residual_input_mode, residual_output_mode):
-            if context.tp_size > 1:
-                hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+            assert context.attn_tp_size == 1
             if hidden_states.shape[0] != 0:
                 hidden_states, residual = layernorm(hidden_states, residual)
             return hidden_states, residual
@@ -305,7 +316,8 @@ def _communicate_with_all_reduce_and_layer_norm(
             )
             dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
             dp_scatter(residual, hidden_states, forward_batch)
-            hidden_states = layernorm(hidden_states)
+            if hidden_states.shape[0] != 0:
+                hidden_states = layernorm(hidden_states)
             return hidden_states, residual
 
         if (
