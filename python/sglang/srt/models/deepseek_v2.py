@@ -1173,12 +1173,12 @@ class DeepseekV2DecoderLayer(nn.Module):
             layer_scatter_modes=LayerScatterModes.init_new(
                 layer_id=layer_id,
                 num_layers=config.num_hidden_layers,
-                is_layer_sparse=self._is_layer_sparse,
+                is_layer_sparse=self._is_layer_sparse(layer_id, is_nextn=is_nextn),
+                is_previous_layer_sparse=self._is_layer_sparse(layer_id - 1, is_nextn=False),
             ),
         )
 
-    def _is_layer_sparse(self, layer_id: int) -> bool:
-        TODO_handle_is_nextn
+    def _is_layer_sparse(self, layer_id: int, is_nextn: bool) -> bool:
         return is_nextn or (
             self.config.n_routed_experts is not None
             and layer_id >= self.config.first_k_dense_replace
