@@ -307,7 +307,7 @@ class DeepseekV2MoE(nn.Module):
     def forward(
         self, hidden_states: torch.Tensor, forward_mode: Optional[ForwardMode] = None
     ) -> torch.Tensor:
-        if (
+        if (not self._enable_deepep_moe) or (
             forward_mode is not None
             and not forward_mode.is_idle()
             and hidden_states.shape[0] > 0
