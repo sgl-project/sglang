@@ -211,7 +211,6 @@ def _communicate_summable_tensor_pair(
     """It is allowed to sum hidden_states and residual if needed."""
     if hidden_states_input_mode == ScatterMode.FULL:
         # TODO(ch-wan): use reduce-scatter in MLP to avoid this scatter
-        # Scatter
         if local_dp_size != 1:
             # important: forward batch.gathered_buffer is used both after scatter and after gather.
             # be careful about this!
