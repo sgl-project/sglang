@@ -204,7 +204,7 @@ def _communicate_with_all_reduce_and_layer_norm(
         (hidden_states_input_mode == TODO)
         and (residual_input_mode == TODO)
         and (hidden_states_output_mode == ScatterMode.FULL)
-        and (residual_output_mode == TODO)
+        and (residual_output_mode == ScatterMode.TP_ATTN_FULL)
     ):
         if self.attn_tp_size != 1 and self.layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED:
             raise AssertionError("moe_layer_freq > 1 is not supported when attn_tp_size > 1")
@@ -236,7 +236,7 @@ def _communicate_with_all_reduce_and_layer_norm(
         (hidden_states_input_mode == TODO)
         and (residual_input_mode == TODO)
         and (hidden_states_output_mode == ScatterMode.SCATTERED)
-        and (residual_output_mode == TODO)
+        and (residual_output_mode == ScatterMode.SCATTERED)
     ):
         if self.attn_tp_size != 1:
             if self.layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED:
