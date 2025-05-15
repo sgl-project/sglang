@@ -3,7 +3,6 @@
 import numpy as np
 import torch
 from decord import VideoReader, cpu
-from numpy.distutils.cpuinfo import cpu
 from PIL import Image
 
 from sglang.srt.managers.multimodal_processors.base_processor import (
