@@ -163,9 +163,7 @@ void moe_align_block_size(
     int64_t block_size,
     torch::Tensor sorted_token_ids,
     torch::Tensor experts_ids,
-    torch::Tensor num_tokens_post_pad,
-    torch::Tensor token_cnts_buffer,
-    torch::Tensor cumsum_buffer) {
+    torch::Tensor num_tokens_post_pad) {
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
   int64_t padded_num_experts = ((num_experts + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;
@@ -192,12 +190,13 @@ void moe_align_block_size(
           block_size,
           topk_ids.numel());
     } else {
+      torch::Tensor cumsum_buffer =
+          torch::zeros({num_experts + 1}, torch::dtype(torch::kInt).device(topk_ids.device()));
+
       auto align_kernel = moe_align_block_size_kernel<scalar_t>;
 
       size_t num_warps = CEILDIV(padded_num_experts, experts_per_warp);
       size_t shared_mem_size = num_warps * experts_per_warp * sizeof(int32_t);
-
-      cumsum_buffer.zero_();
 
       align_kernel<<<1, threads, shared_mem_size, stream>>>(
           topk_ids.data_ptr<scalar_t>(),
