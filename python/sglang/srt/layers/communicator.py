@@ -40,7 +40,7 @@ class LayerScatterModes:
     layer_input_mode: ScatterMode
     attn_mode: ScatterMode
     # Can be further split into e.g. ffn_input_mode and ffn_output_mode if needed
-    ffn_mode: ScatterMode
+    mlp_mode: ScatterMode
     layer_output_mode: ScatterMode
 
     @classmethod
@@ -49,7 +49,7 @@ class LayerScatterModes:
         return cls(
             layer_input_mode=cls._compute_layer_input_mode(context),
             attn_mode=ScatterMode.TP_ATTN_FULL,
-            ffn_mode=cls._compute_ffn_mode(context),
+            mlp_mode=cls._compute_ffn_mode(context),
             layer_output_mode=cls._compute_layer_output_mode(context),
         )
 
@@ -112,7 +112,7 @@ class LayerCommunicator:
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        if self.layer_scatter_modes.ffn_mode == ScatterMode.FULL:
+        if self.layer_scatter_modes.mlp_mode == ScatterMode.FULL:
             if self.attn_tp_size != 1 and self.layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED:
                 raise AssertionError("moe_layer_freq > 1 is not supported when attn_tp_size > 1")
 
@@ -137,7 +137,7 @@ class LayerCommunicator:
                 hidden_states, residual = self.post_attention_layernorm(
                     hidden_states, residual
                 )
-        elif self.layer_scatter_modes.ffn_mode == ScatterMode.SCATTERED:
+        elif self.layer_scatter_modes.mlp_mode == ScatterMode.SCATTERED:
             if self.attn_tp_size != 1:
                 if self.layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED:
                     tensor_list = list(hidden_states.tensor_split(self.attn_tp_size))
@@ -166,12 +166,12 @@ class LayerCommunicator:
             hidden_states=hidden_states,
             residual=residual,
             forward_batch=forward_batch,
-            hidden_states_input_mode=self.layer_scatter_modes.ffn_mode,
+            hidden_states_input_mode=self.layer_scatter_modes.mlp_mode,
             residual_input_mode=TODO,
             output_mode=self.layer_scatter_modes.layer_output_mode,
         )
 
-        if self.layer_scatter_modes.ffn_mode == ScatterMode.FULL:
+        if self.layer_scatter_modes.mlp_mode == ScatterMode.FULL:
             # TODO(ch-wan): use reduce-scatter in MLP to avoid this scatter
             # Scatter
             if self.local_dp_size != 1:
@@ -182,7 +182,7 @@ class LayerCommunicator:
                     hidden_states,
                 )
                 dp_scatter(hidden_states, global_hidden_states, forward_batch)
-        elif self.layer_scatter_modes.ffn_mode == ScatterMode.SCATTERED:
+        elif self.layer_scatter_modes.mlp_mode == ScatterMode.SCATTERED:
             if self.layer_scatter_modes.layer_output_mode == ScatterMode.TP_ATTN_FULL and self.attn_tp_size != 1:
                 hidden_states += residual
                 residual = None
