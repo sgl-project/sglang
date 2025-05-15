@@ -51,7 +51,10 @@ class _StageExecutor:
             for op in stage:
                 with _annotate_region(debug_name=op.debug_name):
                     self._stage_output = op.fn(
-                        state=self._stage_state, **(self._stage_output or {})
+                        state=self._stage_state,
+                        **(
+                            self._stage_output if self._stage_output is not None else {}
+                        ),
                     )
 
         self._index += 1
