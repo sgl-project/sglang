@@ -162,6 +162,12 @@ class LayerCommunicator:
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
+        return _communicate_summable_tensor_pair(
+            hidden_states=hidden_states,
+            residual=residual,
+            forward_batch=forward_batch,
+        )
+
         if self.layer_scatter_modes.ffn_mode == ScatterMode.FULL:
             # TODO(ch-wan): use reduce-scatter in MLP to avoid this scatter
             # Scatter
