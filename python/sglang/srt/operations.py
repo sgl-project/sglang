@@ -10,8 +10,31 @@ if _ENABLE_PROFILE:
     import nvtx
 
 
+# TODO move?
 def compute_layer_operations():
     return TODO
+
+
+def execute_operations(
+    inputs_a, inputs_b, operations_a, operations_b, delta_stages: int
+):
+    stages_a = _convert_operations_to_stages(operations_a)
+    stages_b = _convert_operations_to_stages(operations_b)
+    executor_a = _StageExecutor("a", stages_a, inputs=inputs_a)
+    executor_b = _StageExecutor("b", stages_b, inputs=inputs_b)
+
+    for _ in range(delta_stages):
+        executor_a.next()
+
+    for _ in range(executor_a.num_stages - delta_stages):
+        executor_a.next()
+        executor_b.next()
+
+    for _ in range(delta_stages):
+        executor_b.next()
+
+    assert executor_a.done and executor_b.done
+    return executor_a.output, executor_b.output
 
 
 class YieldOperation:
@@ -28,7 +51,7 @@ Operation = Union[YieldOperation, ExecutionOperation, Callable]
 Stage = List[ExecutionOperation]
 
 
-class StageExecutor:
+class _StageExecutor:
     def __init__(self, debug_name: str, stages: List[Stage], inputs):
         self._debug_name = debug_name
         self._stages = stages
