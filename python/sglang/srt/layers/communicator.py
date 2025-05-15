@@ -123,49 +123,12 @@ class LayerCommunicator:
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        if self.layer_scatter_modes.mlp_mode == ScatterMode.FULL:
-            if self.attn_tp_size != 1 and self.layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED:
-                raise AssertionError("moe_layer_freq > 1 is not supported when attn_tp_size > 1")
-
-            if self.tp_size > 1:
-                # all gather and all reduce
-                if self.local_attn_dp_size != 1:
-                    if self.attn_tp_rank == 0:
-                        hidden_states += residual
-                    hidden_states, local_hidden_states = (
-                        forward_batch.gathered_buffer,
-                        hidden_states,
-                    )
-                    dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
-                    dp_scatter(residual, hidden_states, forward_batch)
-                    hidden_states = self.post_attention_layernorm(hidden_states)
-                else:
-                    hidden_states = tensor_model_parallel_all_reduce(hidden_states)
-                    hidden_states, residual = self.post_attention_layernorm(
-                        hidden_states, residual
-                    )
-            else:
-                hidden_states, residual = self.post_attention_layernorm(
-                    hidden_states, residual
-                )
-        elif self.layer_scatter_modes.mlp_mode == ScatterMode.SCATTERED:
-            if self.attn_tp_size != 1:
-                if self.layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED:
-                    tensor_list = list(hidden_states.tensor_split(self.attn_tp_size))
-                    hidden_states = tensor_list[self.attn_tp_rank]
-                    attn_tp_reduce_scatter(hidden_states, tensor_list)
-                else:
-                    tensor_list = list(hidden_states.tensor_split(self.attn_tp_size))
-                    hidden_states = tensor_list[self.attn_tp_rank]
-                    attn_tp_reduce_scatter(hidden_states, tensor_list)
-                    residual = residual.tensor_split(self.attn_tp_size)[self.attn_tp_rank]
-            if hidden_states.shape[0] != 0:
-                hidden_states, residual = self.post_attention_layernorm(
-                    hidden_states, residual
-                )
-        else:
-            raise NotImplementedError
-        return hidden_states, residual
+        return _communicate_with_all_reduce_and_layer_norm(
+            hidden_states=hidden_states,
+            residual=residual,
+            forward_batch=forward_batch,
+            context=TODO,
+        )
 
     def forward_layer_end(
         self,
@@ -224,7 +187,49 @@ def _communicate_with_all_reduce_and_layer_norm(
     forward_batch: ForwardBatch,
     context: _Context,
 ):
-    TODO
+    if self.layer_scatter_modes.mlp_mode == ScatterMode.FULL:
+        if self.attn_tp_size != 1 and self.layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED:
+            raise AssertionError("moe_layer_freq > 1 is not supported when attn_tp_size > 1")
+
+        if self.tp_size > 1:
+            # all gather and all reduce
+            if self.local_attn_dp_size != 1:
+                if self.attn_tp_rank == 0:
+                    hidden_states += residual
+                hidden_states, local_hidden_states = (
+                    forward_batch.gathered_buffer,
+                    hidden_states,
+                )
+                dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
+                dp_scatter(residual, hidden_states, forward_batch)
+                hidden_states = self.post_attention_layernorm(hidden_states)
+            else:
+                hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                hidden_states, residual = self.post_attention_layernorm(
+                    hidden_states, residual
+                )
+        else:
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual
+            )
+    elif self.layer_scatter_modes.mlp_mode == ScatterMode.SCATTERED:
+        if self.attn_tp_size != 1:
+            if self.layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED:
+                tensor_list = list(hidden_states.tensor_split(self.attn_tp_size))
+                hidden_states = tensor_list[self.attn_tp_rank]
+                attn_tp_reduce_scatter(hidden_states, tensor_list)
+            else:
+                tensor_list = list(hidden_states.tensor_split(self.attn_tp_size))
+                hidden_states = tensor_list[self.attn_tp_rank]
+                attn_tp_reduce_scatter(hidden_states, tensor_list)
+                residual = residual.tensor_split(self.attn_tp_size)[self.attn_tp_rank]
+        if hidden_states.shape[0] != 0:
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual
+            )
+    else:
+        raise NotImplementedError
+    return hidden_states, residual
 
 
 def _communicate_summable_tensor_pair(
