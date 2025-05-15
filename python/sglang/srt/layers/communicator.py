@@ -100,6 +100,7 @@ class LayerCommunicator:
     ):
         return _communicate_simple(
             hidden_states=hidden_states,
+            forward_batch=forward_batch,
             input_mode=self.layer_scatter_modes.layer_input_mode,
             output_mode=self.layer_scatter_modes.attn_mode,
         )
@@ -189,6 +190,7 @@ class LayerCommunicator:
 
 def _communicate_simple(
     hidden_states: torch.Tensor,
+    forward_batch: ForwardBatch,
     input_mode: ScatterMode,
     output_mode: ScatterMode,
 ) -> torch.Tensor:
