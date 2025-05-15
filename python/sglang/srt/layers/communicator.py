@@ -195,9 +195,7 @@ def _communicate_simple(
 
         raise NotImplementedError(f"{input_mode=} {output_mode=}")
 
-    hidden_states = _inner()
-    context.check_shape(hidden_states, output_mode)
-    return hidden_states
+    return context.check_shape(_inner(), output_mode)
 
 
 def _communicate_with_all_reduce_and_layer_norm(
