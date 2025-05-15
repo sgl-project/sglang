@@ -1202,6 +1202,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
 
     def _is_layer_sparse(self, layer_id: int) -> bool:
+        TODO_handle_is_nextn
         return is_nextn or (
             self.config.n_routed_experts is not None
             and layer_id >= self.config.first_k_dense_replace
