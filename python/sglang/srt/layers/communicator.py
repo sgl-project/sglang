@@ -99,7 +99,7 @@ def enable_moe_dense_fully_dp():
 class LayerCommunicator:
     def __init__(self, layer_scatter_modes: LayerScatterModes):
         self.layer_scatter_modes = layer_scatter_modes
-        self.local_dp_size = get_local_attention_dp_size()
+        self.local_attn_dp_size = get_local_attention_dp_size()
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -129,7 +129,7 @@ class LayerCommunicator:
 
             if self.tp_size > 1:
                 # all gather and all reduce
-                if self.local_dp_size != 1:
+                if self.local_attn_dp_size != 1:
                     if self.attn_tp_rank == 0:
                         hidden_states += residual
                     hidden_states, local_hidden_states = (
