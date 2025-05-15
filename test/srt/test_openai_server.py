@@ -394,6 +394,10 @@ class TestOpenAIServer(CustomTestCase):
             if line.strip() != ""
         ]
         assert len(results) == len(content)
+        if mode == "chat":
+            for result in results:
+                response = result["response"]["body"]
+                assert isinstance(response["choices"][0]["message"]["content"], str)
         for delete_fid in [uploaded_file.id, result_file_id]:
             del_pesponse = client.files.delete(delete_fid)
             assert del_pesponse.deleted
