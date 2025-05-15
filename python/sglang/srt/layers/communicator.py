@@ -89,6 +89,7 @@ class LayerCommunicator:
         self.local_dp_size = get_local_attention_dp_size()
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
+        self.tp_size = get_tensor_model_parallel_world_size()
 
     def forward_pre_attn(
         self,
@@ -119,7 +120,7 @@ class LayerCommunicator:
         forward_batch: ForwardBatch,
     ):
         if self.layer_scatter_modes.ffn_mode == ScatterMode.FULL:
-            if get_tensor_model_parallel_world_size() > 1:
+            if self.tp_size > 1:
                 # all gather and all reduce
                 if self.local_dp_size != 1:
                     if self.attn_tp_rank == 0:
