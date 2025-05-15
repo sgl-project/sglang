@@ -1,8 +1,12 @@
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Callable
+from typing import Callable, Tuple
 
+import torch
+from sglang.srt.distributed import get_tensor_model_parallel_world_size
+from sglang.srt.layers.dp_attention import dp_gather_partial, dp_scatter
 from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 class ScatterMode(Enum):
@@ -69,8 +73,36 @@ class LayerCommunicator:
     def forward_pre_attn(self):
         TODO
 
-    def forward_pre_mlp(self):
-        TODO
+    def forward_pre_mlp(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if TODO_mode_forward_ffn_with_full_input:
+            if get_tensor_model_parallel_world_size() > 1:
+                # all gather and all reduce
+                if self.local_dp_size != 1:
+                    if self.attn_tp_rank == 0:
+                        hidden_states += residual
+                    hidden_states, local_hidden_states = (
+                        forward_batch.gathered_buffer,
+                        hidden_states,
+                    )
+                    dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
+                    dp_scatter(residual, hidden_states, forward_batch)
+                    hidden_states = self.post_attention_layernorm(hidden_states)
+                else:
+                    hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                    hidden_states, residual = self.post_attention_layernorm(
+                        hidden_states, residual
+                    )
+            else:
+                hidden_states, residual = self.post_attention_layernorm(
+                    hidden_states, residual
+                )
+
+        return hidden_states, residual
 
     def forward_layer_end(self):
         TODO
