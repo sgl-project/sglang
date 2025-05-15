@@ -176,8 +176,10 @@ class LayerCommunicator:
 
 # TODO rename?
 @dataclass
-class _Utils:
+class _Context:
     group_sizes: Dict["ScatterMode", int]
+    local_dp_size: int
+    attn_tp_size: int
 
     def is_same_group_size(self, a: "ScatterMode", b: "ScatterMode"):
         return self.group_sizes[a] == self.group_sizes[b]
@@ -188,9 +190,9 @@ def _communicate_simple(
     forward_batch: ForwardBatch,
     input_mode: ScatterMode,
     output_mode: ScatterMode,
-    attn_tp_size: int,
+    context: _Context,
 ) -> torch.Tensor:
-    if ScatterMode.is_same_group_size(input_mode, output_mode, group_sizes):
+    if context.is_same_group_size(input_mode, output_mode):
         return hidden_states
 
     if input_mode == ScatterMode.SCATTERED and output_mode == ScatterMode.TP_ATTN_FULL:
@@ -199,7 +201,7 @@ def _communicate_simple(
             hidden_states,
         )
         attn_tp_all_gather(
-            list(hidden_states.tensor_split(attn_tp_size)), local_hidden_states
+            list(hidden_states.tensor_split(context.attn_tp_size)), local_hidden_states
         )
         return hidden_states
 
@@ -213,13 +215,12 @@ def _communicate_summable_tensor_pair(
     hidden_states_input_mode: ScatterMode,
     residual_input_mode: ScatterMode,
     output_mode: ScatterMode,
-    local_dp_size: int,
-    attn_tp_size: int,
+    context: _Context,
 ):
     """It is allowed to make (hidden_states, residual) := (hidden_states + residual, None) if needed."""
 
-    if ScatterMode.is_same_group_size(hidden_states_input_mode, output_mode, group_sizes) \
-        and ScatterMode.is_same_group_size(residual_input_mode, output_mode, group_sizes):
+    if context.is_same_group_size(hidden_states_input_mode, output_mode) \
+        and context.is_same_group_size(residual_input_mode, output_mode):
         return hidden_states, residual
 
     if hidden_states_input_mode == ScatterMode.FULL:
@@ -237,7 +238,7 @@ def _communicate_summable_tensor_pair(
 
     if hidden_states_input_mode == ScatterMode.SCATTERED:
         TODO_add_more_guards
-        if output_mode == ScatterMode.TP_ATTN_FULL and attn_tp_size != 1:
+        if output_mode == ScatterMode.TP_ATTN_FULL and context.attn_tp_size != 1:
             hidden_states += residual
             residual = None
             hidden_states, local_hidden_states = (
@@ -245,7 +246,7 @@ def _communicate_summable_tensor_pair(
                 hidden_states,
             )
             attn_tp_all_gather(
-                list(hidden_states.tensor_split(attn_tp_size)), local_hidden_states
+                list(hidden_states.tensor_split(context.attn_tp_size)), local_hidden_states
             )
         return hidden_states, residual
 
