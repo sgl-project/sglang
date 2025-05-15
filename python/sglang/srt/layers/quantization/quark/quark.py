@@ -16,6 +16,9 @@ from sglang.srt.utils import get_device_capability
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
+from sglang.srt.layers.quantization.quark.quark_moe import QuarkMoEMethod
 
 from typing import List
 
@@ -68,6 +71,11 @@ class QuarkConfig(QuantizationConfig):
         
         if isinstance(layer, RadixAttention):
             return QuarkKVCacheMethod(self)
+
+        if isinstance(layer, FusedMoE):
+            return QuarkMoEMethod.get_moe_method(self,
+                                                 module=layer,
+                                                 layer_name=prefix)
 
         return None
 
@@ -271,6 +279,7 @@ class QuarkConfig(QuantizationConfig):
 
         # Find the quant_scheme
         scheme = self._get_scheme_from_config(layer_quant_config)
+
         # Raise error if device does not support the scheme
         # (e.g. fp8 needs ada lovelace)
         self._check_scheme_supported(scheme.get_min_capability())
