@@ -413,7 +413,7 @@ class DeepseekV2MoE(nn.Module):
         if (not self._enable_deepep_moe) and (self.tp_size > 1):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
-        return final_hidden_states
+        state.hidden_states_after_mlp = final_hidden_states
 
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
