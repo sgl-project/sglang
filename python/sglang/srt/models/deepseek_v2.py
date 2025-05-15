@@ -1146,6 +1146,16 @@ class DeepseekV2DecoderLayer(nn.Module):
         self.is_layer_sparse = self._is_layer_sparse(layer_id, is_nextn=is_nextn)
         is_previous_layer_sparse = self._is_layer_sparse(layer_id - 1, is_nextn=False)
 
+        self.layer_scatter_modes = LayerScatterModes.init_new(
+            layer_id=layer_id,
+            num_layers=config.num_hidden_layers,
+            is_layer_sparse=self.is_layer_sparse,
+            is_previous_layer_sparse=is_previous_layer_sparse,
+        )
+        self.layer_communicator = LayerCommunicator(
+            layer_scatter_modes=self.layer_scatter_modes,
+        )
+
         if self.is_layer_sparse:
             self.mlp = DeepseekV2MoE(
                 config=config,
@@ -1170,15 +1180,6 @@ class DeepseekV2DecoderLayer(nn.Module):
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
-        )
-
-        self.layer_communicator = LayerCommunicator(
-            layer_scatter_modes=LayerScatterModes.init_new(
-                layer_id=layer_id,
-                num_layers=config.num_hidden_layers,
-                is_layer_sparse=self.is_layer_sparse,
-                is_previous_layer_sparse=is_previous_layer_sparse,
-            ),
         )
 
     def _is_layer_sparse(self, layer_id: int, is_nextn: bool) -> bool:
