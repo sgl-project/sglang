@@ -192,6 +192,9 @@ class MultimodalDataItem:
     audio_features: Union[torch.Tensor, np.array] = None
     audio_feature_lens: Optional[List[torch.Tensor]] = None
 
+    attention_mask: Optional[torch.Tensor] = None
+    feature_attention_mask: Optional[torch.Tensor] = None
+
     @staticmethod
     def is_empty_list(l):
         if l is None:
@@ -304,8 +307,9 @@ class MultimodalInputs:
     video_token_id: Optional[int] = None
 
     # audio
-    audio_start_id: Optional[torch.Tensor] = None
-    audio_end_id: Optional[torch.Tensor] = None
+    audio_token_id: Optional[int] = None
+    audio_start_id: Optional[int] = None
+    audio_end_id: Optional[int] = None
 
     @staticmethod
     def from_dict(obj: dict):
@@ -329,6 +333,7 @@ class MultimodalInputs:
             "slice_end_id",
             "audio_start_id",
             "audio_end_id",
+            "audio_token_id",
         ]
         for arg in optional_args:
             if arg in obj:

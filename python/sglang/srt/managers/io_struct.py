@@ -22,13 +22,15 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
 
+from sglang.srt.mm_utils import has_valid_data
+
 # handle serialization of Image for pydantic
 if TYPE_CHECKING:
     from PIL.Image import Image
 else:
     Image = Any
 
-from sglang.srt.managers.schedule_batch import BaseFinishReason
+from sglang.srt.managers.schedule_batch import BaseFinishReason, flatten_nested_list
 from sglang.srt.sampling.sampling_params import SamplingParams
 
 
@@ -99,6 +101,9 @@ class GenerateReqInput:
     bootstrap_host: Optional[Union[List[str], str]] = None
     bootstrap_port: Optional[Union[List[int], int]] = None
     bootstrap_room: Optional[Union[List[int], int]] = None
+
+    def contains_mm_input(self) -> bool:
+        return has_valid_data(self.image_data) or has_valid_data(self.audio_data)
 
     def normalize_batch_and_arguments(self):
         """
@@ -482,6 +487,9 @@ class EmbeddingReqInput:
     log_metrics: bool = True
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
+
+    def contains_mm_input(self) -> bool:
+        return has_valid_data(self.image_data) or has_valid_data(self.audio_data)
 
     def normalize_batch_and_arguments(self):
         # at least one of text, input_ids, or image should be provided

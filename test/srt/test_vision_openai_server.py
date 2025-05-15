@@ -54,29 +54,7 @@ class TestOpenAIVisionServer(CustomTestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    def test_single_image_chat_completion(self):
-        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
-
-        response = client.chat.completions.create(
-            model="default",
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": IMAGE_MAN_IRONING_URL},
-                        },
-                        {
-                            "type": "text",
-                            "text": "Describe this image in a very short sentence.",
-                        },
-                    ],
-                },
-            ],
-            temperature=0,
-        )
-
+    def verify_single_image_response(self, response):
         assert response.choices[0].message.role == "assistant"
         text = response.choices[0].message.content
         assert isinstance(text, str)
@@ -100,6 +78,31 @@ class TestOpenAIVisionServer(CustomTestCase):
         assert response.usage.prompt_tokens > 0
         assert response.usage.completion_tokens > 0
         assert response.usage.total_tokens > 0
+
+    def test_single_image_chat_completion(self):
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+
+        response = client.chat.completions.create(
+            model="default",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": IMAGE_MAN_IRONING_URL},
+                        },
+                        {
+                            "type": "text",
+                            "text": "Describe this image in a very short sentence.",
+                        },
+                    ],
+                },
+            ],
+            temperature=0,
+        )
+
+        self.verify_single_image_response(response=response)
 
     def test_multi_turn_chat_completion(self):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
@@ -201,7 +204,6 @@ class TestOpenAIVisionServer(CustomTestCase):
 
     def prepare_video_messages(self, video_path):
         # the memory consumed by the Vision Attention varies a lot, e.g. blocked qkv vs full-sequence sdpa
-        # the size of the video embeds differs from the `modality` argument when preprocessed
 
         # We import decord here to avoid a strange Segmentation fault (core dumped) issue.
         # The following import order will cause Segmentation fault.
@@ -209,7 +211,7 @@ class TestOpenAIVisionServer(CustomTestCase):
         # from transformers import AutoTokenizer
         from decord import VideoReader, cpu
 
-        max_frames_num = 20
+        max_frames_num = 5
         vr = VideoReader(video_path, ctx=cpu(0))
         total_frame_num = len(vr)
         uniform_sampled_frames = np.linspace(
@@ -402,77 +404,6 @@ class TestOpenAIVisionServer(CustomTestCase):
         with ThreadPoolExecutor(4) as executor:
             list(executor.map(self.run_decode_with_image, image_ids))
 
-    def prepare_audio_messages(self, prompt, audio_file_name):
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "audio_url",
-                        "audio_url": {"url": f"{audio_file_name}"},
-                    },
-                    {
-                        "type": "text",
-                        "text": prompt,
-                    },
-                ],
-            }
-        ]
-
-        return messages
-
-    def get_audio_response(self, url: str, prompt, category):
-        audio_file_path = self.get_or_download_file(url)
-        client = openai.Client(api_key="sk-123456", base_url=self.base_url)
-
-        messages = self.prepare_audio_messages(prompt, audio_file_path)
-
-        response = client.chat.completions.create(
-            model="default",
-            messages=messages,
-            temperature=0,
-            max_tokens=128,
-            stream=False,
-        )
-
-        audio_response = response.choices[0].message.content
-
-        print("-" * 30)
-        print(f"audio {category} response:\n{audio_response}")
-        print("-" * 30)
-
-        audio_response = audio_response.lower()
-
-        self.assertIsNotNone(audio_response)
-        self.assertGreater(len(audio_response), 0)
-
-        return audio_response
-
-    def _test_audio_speech_completion(self):
-        # a fragment of Trump's speech
-        audio_response = self.get_audio_response(
-            AUDIO_TRUMP_SPEECH_URL,
-            "I have an audio sample. Please repeat the person's words",
-            category="speech",
-        )
-        assert "thank you" in audio_response
-        assert "it's a privilege to be here" in audio_response
-        assert "leader" in audio_response
-        assert "science" in audio_response
-        assert "art" in audio_response
-
-    def _test_audio_ambient_completion(self):
-        # bird song
-        audio_response = self.get_audio_response(
-            AUDIO_BIRD_SONG_URL,
-            "Please listen to the audio snippet carefully and transcribe the content.",
-            "ambient",
-        )
-        assert "bird" in audio_response
-
-    def test_audio_chat_completion(self):
-        pass
-
 
 class TestQwen2VLServer(TestOpenAIVisionServer):
     @classmethod
@@ -506,7 +437,7 @@ class TestQwen2_5_VLServer(TestOpenAIVisionServer):
             api_key=cls.api_key,
             other_args=[
                 "--mem-fraction-static",
-                "0.4",
+                "0.6",
             ],
         )
         cls.base_url += "/v1"
@@ -631,6 +562,8 @@ class TestMinicpmoServer(TestOpenAIVisionServer):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--trust-remote-code",
+                "--chat-template",
+                "minicpmo",
                 "--mem-fraction-static",
                 "0.7",
             ],
@@ -805,6 +738,162 @@ class TestKimiVLServer(TestOpenAIVisionServer):
 
     def test_video_chat_completion(self):
         pass
+
+
+# Omni Models
+class TestOpenAIOmniServer(TestOpenAIVisionServer):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "Qwen/Qwen2.5-Omni-7B"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--trust-remote-code",
+                "--chat-template",
+                "qwen2-5-o",
+                "--mem-fraction-static",
+                "0.4",
+            ],
+        )
+        cls.base_url += "/v1"
+
+    def prepare_audio_messages(self, prompt, audio_file_name):
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "audio_url",
+                        "audio_url": {"url": f"{audio_file_name}"},
+                    },
+                    {
+                        "type": "text",
+                        "text": prompt,
+                    },
+                ],
+            }
+        ]
+
+        return messages
+
+    def get_audio_response(self, url: str, prompt, category):
+        audio_file_path = self.get_or_download_file(url)
+        client = openai.Client(api_key="sk-123456", base_url=self.base_url)
+
+        messages = self.prepare_audio_messages(prompt, audio_file_path)
+
+        response = client.chat.completions.create(
+            model="default",
+            messages=messages,
+            temperature=0,
+            max_tokens=128,
+            stream=False,
+        )
+
+        audio_response = response.choices[0].message.content
+
+        print("-" * 30)
+        print(f"audio {category} response:\n{audio_response}")
+        print("-" * 30)
+
+        audio_response = audio_response.lower()
+
+        self.assertIsNotNone(audio_response)
+        self.assertGreater(len(audio_response), 0)
+
+        return audio_response
+
+    def verify_speech_recognition_response(self, text):
+        text = text.lower()
+        assert "thank you" in text
+        assert "it's a privilege to be here" in text
+        assert "leader" in text
+        assert "science" in text
+        assert "art" in text
+
+    def _test_audio_speech_completion(self):
+        # a fragment of Trump's speech
+        audio_response = self.get_audio_response(
+            AUDIO_TRUMP_SPEECH_URL,
+            # "I have an audio sample. Please repeat the person's words",
+            "Repeat exactly what does the person say in the audio. Be exact",
+            category="speech",
+        )
+        self.verify_speech_recognition_response(audio_response)
+
+    def _test_audio_ambient_completion(self):
+        # bird song
+        audio_response = self.get_audio_response(
+            AUDIO_BIRD_SONG_URL,
+            "Please listen to the audio snippet carefully and transcribe the content.",
+            "ambient",
+        )
+        assert "bird" in audio_response
+
+    def test_audio_chat_completion(self):
+        self._test_audio_speech_completion()
+        self._test_audio_ambient_completion()
+
+    def test_mixed_modality_chat_completion(self):
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": IMAGE_MAN_IRONING_URL},
+                    },
+                    {
+                        "type": "audio_url",
+                        "audio_url": {"url": AUDIO_TRUMP_SPEECH_URL},
+                    },
+                    {
+                        "type": "text",
+                        "text": "I have an image and audio, which are not related at all. Please:  1. Describe the image in a sentence, 2. Repeat the exact words from the audio I provided. Be exact",
+                    },
+                ],
+            },
+        ]
+        response = client.chat.completions.create(
+            model="default",
+            messages=messages,
+            temperature=0,
+            max_tokens=128,
+            stream=False,
+        )
+
+        text = response.choices[0].message.content
+
+        print("-" * 30)
+        print(f"Mixed modality response:\n{text}")
+        print("-" * 30)
+
+        self.verify_single_image_response(response=response)
+        self.verify_speech_recognition_response(text=text)
+
+
+class TestMinicpmoServer(TestOpenAIOmniServer):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "openbmb/MiniCPM-o-2_6"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--trust-remote-code",
+                "--mem-fraction-static",
+                "0.7",
+            ],
+        )
+        cls.base_url += "/v1"
 
 
 if __name__ == "__main__":
