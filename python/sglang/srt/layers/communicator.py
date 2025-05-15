@@ -197,6 +197,7 @@ def _communicate_simple(
 
         raise NotImplementedError(f"{input_mode=} {output_mode=}")
 
+    context.check_shape(hidden_states, input_mode)
     return context.check_shape(_inner(), output_mode)
 
 
@@ -262,6 +263,7 @@ def _communicate_with_all_reduce_and_layer_norm(
         raise NotImplementedError(
             f"{hidden_states_input_mode=} {residual_input_mode=} {residual_output_mode=} {residual_output_mode=}")
 
+    context.check_shapes((hidden_states, residual), (hidden_states_input_mode, residual_input_mode))
     return context.check_shapes(_inner(), (hidden_states_output_mode, residual_output_mode))
 
 
@@ -316,4 +318,5 @@ def _communicate_summable_tensor_pair(
 
         raise NotImplementedError(f"{hidden_states_input_mode=} {residual_input_mode=} {output_mode=}")
 
+    context.check_shapes((hidden_states, residual), (hidden_states_input_mode, residual_input_mode))
     return context.check_shapes(_inner(), (output_mode, output_mode))
