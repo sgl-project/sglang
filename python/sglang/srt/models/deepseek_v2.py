@@ -1195,7 +1195,15 @@ class DeepseekV2DecoderLayer(nn.Module):
             operations=compute_layer_operations(self),
         )
 
-    def op_input_layernorm(self, state):
+    def op_input_layernorm(
+        self,
+        state,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+        zero_allocator: BumpAllocator,
+    ):
         if hidden_states.shape[0] == 0:
             residual = hidden_states
         else:
