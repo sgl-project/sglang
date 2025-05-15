@@ -84,24 +84,84 @@ class LayerCommunicator:
 
     def forward_pre_attn(self):
         if self.layer_scatter_modes.ffn_mode == ScatterMode.FULL:
-            TODO
+            assert not (
+                self.attn_tp_size != 1 and self.input_is_scattered
+            ), "moe_layer_freq > 1 is not supported when attn_tp_size > 1"
         elif self.layer_scatter_modes.ffn_mode == ScatterMode.SCATTERED:
-            TODO
+            if self.attn_tp_size != 1 and self.input_is_scattered:
+                hidden_states, local_hidden_states = (
+                    forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
+                    hidden_states,
+                )
+                attn_tp_all_gather(
+                    list(hidden_states.tensor_split(self.attn_tp_size)), local_hidden_states
+                )
         else:
             raise NotImplementedError
 
     def forward_pre_mlp(self):
         if self.layer_scatter_modes.ffn_mode == ScatterMode.FULL:
-            TODO
+            if get_tensor_model_parallel_world_size() > 1:
+                # all gather and all reduce
+                if self.local_dp_size != 1:
+                    if self.attn_tp_rank == 0:
+                        hidden_states += residual
+                    hidden_states, local_hidden_states = (
+                        forward_batch.gathered_buffer,
+                        hidden_states,
+                    )
+                    dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
+                    dp_scatter(residual, hidden_states, forward_batch)
+                    hidden_states = self.post_attention_layernorm(hidden_states)
+                else:
+                    hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                    hidden_states, residual = self.post_attention_layernorm(
+                        hidden_states, residual
+                    )
+            else:
+                hidden_states, residual = self.post_attention_layernorm(
+                    hidden_states, residual
+                )
         elif self.layer_scatter_modes.ffn_mode == ScatterMode.SCATTERED:
-            TODO
+            if self.attn_tp_size != 1:
+                if self.input_is_scattered:
+                    tensor_list = list(hidden_states.tensor_split(self.attn_tp_size))
+                    hidden_states = tensor_list[self.attn_tp_rank]
+                    attn_tp_reduce_scatter(hidden_states, tensor_list)
+                else:
+                    tensor_list = list(hidden_states.tensor_split(self.attn_tp_size))
+                    hidden_states = tensor_list[self.attn_tp_rank]
+                    attn_tp_reduce_scatter(hidden_states, tensor_list)
+                    residual = residual.tensor_split(self.attn_tp_size)[self.attn_tp_rank]
+            if hidden_states.shape[0] != 0:
+                hidden_states, residual = self.post_attention_layernorm(
+                    hidden_states, residual
+                )
         else:
             raise NotImplementedError
 
     def forward_layer_end(self):
         if self.layer_scatter_modes.ffn_mode == ScatterMode.FULL:
-            TODO
+            # TODO(ch-wan): use reduce-scatter in MLP to avoid this scatter
+            # Scatter
+            if self.local_dp_size != 1:
+                # important: forward batch.gathered_buffer is used both after scatter and after gather.
+                # be careful about this!
+                hidden_states, global_hidden_states = (
+                    forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
+                    hidden_states,
+                )
+                dp_scatter(hidden_states, global_hidden_states, forward_batch)
         elif self.layer_scatter_modes.ffn_mode == ScatterMode.SCATTERED:
-            TODO
+            if self.is_last_layer and self.attn_tp_size != 1:
+                hidden_states += residual
+                residual = None
+                hidden_states, local_hidden_states = (
+                    forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
+                    hidden_states,
+                )
+                attn_tp_all_gather(
+                    list(hidden_states.tensor_split(self.attn_tp_size)), local_hidden_states
+                )
         else:
             raise NotImplementedError
