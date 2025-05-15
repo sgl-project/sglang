@@ -213,22 +213,19 @@ def _communicate_with_all_reduce_and_layer_norm(
         if context.attn_tp_size != 1 and self.layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED:
             raise AssertionError("moe_layer_freq > 1 is not supported when attn_tp_size > 1")
 
-        if context.tp_size > 1:
-            # all gather and all reduce
-            if context.local_attn_dp_size != 1:
-                if context.attn_tp_rank == 0:
-                    hidden_states += residual
-                hidden_states, local_hidden_states = (
-                    forward_batch.gathered_buffer,
-                    hidden_states,
-                )
-                dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
-                dp_scatter(residual, hidden_states, forward_batch)
-                hidden_states = layernorm(hidden_states)
-            else:
-                hidden_states = tensor_model_parallel_all_reduce(hidden_states)
-                hidden_states, residual = layernorm(hidden_states, residual)
+        # all gather and all reduce
+        if context.local_attn_dp_size != 1:
+            if context.attn_tp_rank == 0:
+                hidden_states += residual
+            hidden_states, local_hidden_states = (
+                forward_batch.gathered_buffer,
+                hidden_states,
+            )
+            dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
+            dp_scatter(residual, hidden_states, forward_batch)
+            hidden_states = layernorm(hidden_states)
         else:
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
             hidden_states, residual = layernorm(hidden_states, residual)
         return hidden_states, residual
 
