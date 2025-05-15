@@ -172,6 +172,11 @@ class TokenizerManager:
         self.enable_metrics = server_args.enable_metrics
         self.log_requests = server_args.log_requests
         self.log_requests_level = server_args.log_requests_level
+        self.preferred_sampling_params = (
+            json.loads(server_args.preferred_sampling_params)
+            if server_args.preferred_sampling_params
+            else None
+        )
 
         # Init inter-process communication
         context = zmq.asyncio.Context(2)
@@ -527,9 +532,11 @@ class TokenizerManager:
         # Parse sampling parameters
         # Note: if there are preferred sampling params, we use them if they are not
         # explicitly passed in sampling_params
-        sampling_params = SamplingParams(
-            **{**self.server_args.preferred_sampling_params, **obj.sampling_params}
-        )
+        if self.preferred_sampling_params:
+            sampling_kwargs = {**self.preferred_sampling_params, **obj.sampling_params}
+        else:
+            sampling_kwargs = obj.sampling_params
+        sampling_params = SamplingParams(**sampling_kwargs)
         sampling_params.normalize(self.tokenizer)
         sampling_params.verify()
 
