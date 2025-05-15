@@ -1316,6 +1316,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             else:
                 hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
+        self.layer_communicator.forward_pre_attn()
         if self.attn_tp_size != 1 and self.input_is_scattered:
             hidden_states, local_hidden_states = (
                 forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
@@ -1333,6 +1334,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             zero_allocator=zero_allocator,
         )
 
+        self.layer_communicator.forward_pre_mlp()
         if self.attn_tp_size != 1:
             if self.input_is_scattered:
                 tensor_list = list(hidden_states.tensor_split(self.attn_tp_size))
@@ -1356,6 +1358,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         ):
             hidden_states = self.mlp(hidden_states, forward_batch.forward_mode)
 
+        self.layer_communicator.forward_layer_end()
         if self.is_last_layer and self.attn_tp_size != 1:
             hidden_states += residual
             residual = None
