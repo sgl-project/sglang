@@ -221,8 +221,7 @@ class DeepseekV2MoE(nn.Module):
 
         self.gate = MoEGate(config=config, prefix=add_prefix("gate", prefix))
 
-        MoEImpl = get_moe_impl_class()
-        self.experts = MoEImpl(
+        self.experts = get_moe_impl_class()(
             num_experts=config.n_routed_experts + self.n_share_experts_fusion,
             top_k=config.num_experts_per_tok + min(self.n_share_experts_fusion, 1),
             hidden_size=config.hidden_size,
@@ -1732,8 +1731,7 @@ class DeepseekV2ForCausalLM(nn.Module):
 
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
-        MoEImpl = get_moe_impl_class()
-        expert_params_mapping = MoEImpl.make_expert_params_mapping(
+        expert_params_mapping = get_moe_impl_class().make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
