@@ -124,7 +124,7 @@ class LayerCommunicator:
             forward_batch=forward_batch,
             input_mode=self.layer_scatter_modes.layer_input_mode,
             output_mode=self.layer_scatter_modes.attn_mode,
-            context=self._compute_context(),
+            context=self._compute_context(forward_batch),
         )
 
     def forward_pre_mlp(
@@ -142,7 +142,7 @@ class LayerCommunicator:
             hidden_states_output_mode=self.layer_scatter_modes.mlp_mode,
             residual_output_mode=self.layer_scatter_modes.middle_residual_mode,
             layernorm=self.post_attention_layernorm,
-            context=self._compute_context(),
+            context=self._compute_context(forward_batch),
         )
 
     def forward_layer_end(
@@ -158,10 +158,10 @@ class LayerCommunicator:
             hidden_states_input_mode=self.layer_scatter_modes.mlp_mode,
             residual_input_mode=self.layer_scatter_modes.middle_residual_mode,
             output_mode=self.layer_scatter_modes.layer_output_mode,
-            context=self._compute_context(),
+            context=self._compute_context(forward_batch),
         )
 
-    def _compute_context(self):
+    def _compute_context(self, forward_batch: ForwardBatch):
         return _Context(
             num_tokens_of_mode=TODO,
             process_group_sizes=self.process_group_sizes,
