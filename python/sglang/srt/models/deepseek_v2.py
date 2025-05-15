@@ -23,6 +23,10 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+from torch import nn
+from tqdm import tqdm
+from transformers import PretrainedConfig
+
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -94,9 +98,6 @@ from sglang.srt.utils import (
     is_hip,
     log_info_on_rank0,
 )
-from torch import nn
-from tqdm import tqdm
-from transformers import PretrainedConfig
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -1199,9 +1200,6 @@ class DeepseekV2DecoderLayer(nn.Module):
             layer_scatter_modes=self.layer_scatter_modes,
             post_attention_layernorm=self.post_attention_layernorm,
         )
-        print(
-            f"hi {get_tensor_model_parallel_rank()=} {self.layer_id=} {self.layer_scatter_modes=} {self.is_layer_sparse=}"
-        )
 
     def _is_layer_sparse(self, layer_id: int, is_nextn: bool) -> bool:
         return is_nextn or (
@@ -1238,9 +1236,6 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
     ):
-        print(
-            f"hi {get_tensor_model_parallel_rank()=} op_input_layernorm {self.layer_id=} {hidden_states.shape=}"
-        )
         if hidden_states.shape[0] == 0:
             residual = hidden_states
         else:
@@ -1302,9 +1297,6 @@ class DeepseekV2DecoderLayer(nn.Module):
             state.pop("hidden_states_mlp_output"),
             state.pop("residual_after_comm_pre_mlp"),
             state.forward_batch,
-        )
-        print(
-            f"hi {get_tensor_model_parallel_rank()=} op_comm_layer_end {self.layer_id=} {hidden_states.shape=}"
         )
 
         state.clear(expect_keys={"positions", "forward_batch", "zero_allocator"})
