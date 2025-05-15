@@ -193,3 +193,9 @@ class LayerCommunicator:
         else:
             raise NotImplementedError
         return hidden_states, residual
+
+
+def _communicate_simple(
+    hidden_states: torch.Tensor,
+) -> torch.Tensor:
+    return TODO
