@@ -299,8 +299,8 @@ class DeepseekV2MoE(nn.Module):
 
     def op_gate(self, state):
         if (
-            state.forward_mode is not None
-            and not state.forward_mode.is_idle()
+            state.forward_batch.forward_mode is not None
+            and not state.forward_batch.forward_mode.is_idle()
             and state.hidden_states_mlp_input.shape[0] > 0
         ):
             # router_logits: (num_tokens, n_experts)
@@ -311,8 +311,8 @@ class DeepseekV2MoE(nn.Module):
     def op_shared_experts(self, state):
         if (
             (self.n_share_experts_fusion == 0)
-            and (state.forward_mode is not None)
-            and not state.forward_mode.is_idle()
+            and (state.forward_batch.forward_mode is not None)
+            and not state.forward_batch.forward_mode.is_idle()
             and state.hidden_states_mlp_input.shape[0] > 0
         ):
             state.shared_output = self.self.shared_experts(
@@ -352,7 +352,7 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states=state.pop("hidden_states_mlp_input"),
                 topk_idx=state.pop("topk_idx_local"),
                 topk_weights=state.pop("topk_weights_local"),
-                forward_mode=state.forward_mode,
+                forward_mode=state.forward_batch.forward_mode,
             )
 
     def op_dispatch_b(self, state):
@@ -379,7 +379,7 @@ class DeepseekV2MoE(nn.Module):
                 masked_m=state.pop("masked_m"),
                 expected_m=state.pop("expected_m"),
                 num_recv_tokens_per_expert=state.pop("num_recv_tokens_per_expert"),
-                forward_mode=state.forward_mode,
+                forward_mode=state.forward_batch.forward_mode,
             )
         else:
             state.hidden_states_experts_output = self.experts(
@@ -393,7 +393,7 @@ class DeepseekV2MoE(nn.Module):
                 state.pop("hidden_states_experts_output"),
                 topk_idx=state.pop("topk_idx_dispatched"),
                 topk_weights=state.pop("topk_weights_dispatched"),
-                forward_mode=state.forward_mode,
+                forward_mode=state.forward_batch.forward_mode,
             )
 
     def op_combine_b(self, state):
