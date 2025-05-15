@@ -97,8 +97,14 @@ def enable_moe_dense_fully_dp():
 
 
 class LayerCommunicator:
-    def __init__(self, layer_scatter_modes: LayerScatterModes):
+    def __init__(
+        self,
+        layer_scatter_modes: LayerScatterModes,
+        post_attention_layernorm: torch.nn.Module,
+    ):
         self.layer_scatter_modes = layer_scatter_modes
+        self.post_attention_layernorm = post_attention_layernorm
+
         self.attn_tp_rank = get_attention_tp_rank()
         self.attn_tp_size = get_attention_tp_size()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -130,6 +136,7 @@ class LayerCommunicator:
             residual_input_mode=self.layer_scatter_modes.layer_input_mode,
             hidden_states_output_mode=self.layer_scatter_modes.mlp_mode,
             residual_output_mode=self.layer_scatter_modes.middle_residual_mode,
+            layernorm=self.post_attention_layernorm,
             context=TODO,
         )
 
