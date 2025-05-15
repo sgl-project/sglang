@@ -24,10 +24,6 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
-from torch import nn
-from tqdm import tqdm
-from transformers import PretrainedConfig
-
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -91,6 +87,9 @@ from sglang.srt.utils import (
     is_hip,
     log_info_on_rank0,
 )
+from torch import nn
+from tqdm import tqdm
+from transformers import PretrainedConfig
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -317,11 +316,12 @@ class DeepseekV2MoE(nn.Module):
             router_logits = None
 
         if (
-            forward_mode is not None
+            (self.n_share_experts_fusion == 0)
+            and (forward_mode is not None)
             and not forward_mode.is_idle()
             and hidden_states.shape[0] > 0
         ):
-            shared_output = self._forward_shared_experts(hidden_states)
+            shared_output = self.self.shared_experts(hidden_states)
         else:
             shared_output = None
 
@@ -397,12 +397,6 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states
-
-    def _forward_shared_experts(self, hidden_states):
-        if self.n_share_experts_fusion == 0:
-            return self.shared_experts(hidden_states)
-        else:
-            return None
 
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
