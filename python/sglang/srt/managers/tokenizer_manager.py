@@ -837,8 +837,8 @@ class TokenizerManager:
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
         assert (
-            self.server_args.dp_size == 1
-        ), "dp_size must be for update weights from distributed"
+            self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
+        ), "dp_size must be 1 or dp attention is enabled for update weights from distributed"
 
         # This means that weight sync
         # cannot run while requests are in progress.
@@ -853,8 +853,8 @@ class TokenizerManager:
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
         assert (
-            self.server_args.dp_size == 1
-        ), "dp_size must be 1 for update weights from distributed"
+            self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
+        ), "dp_size must be 1 or dp attention is enabled for update weights from tensor"
 
         # This means that weight sync
         # cannot run while requests are in progress.
