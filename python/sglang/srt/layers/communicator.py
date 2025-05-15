@@ -2,6 +2,8 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Callable
 
+from sglang.srt.managers.schedule_batch import global_server_args_dict
+
 
 class ScatterMode(Enum):
     SCATTERED = auto()
@@ -44,6 +46,11 @@ class LayerScatterModes:
 
     @classmethod
     def _compute_ffn_mode(cls, layer_id: int, context: _LayerModeComputationContext):
+        if context.is_layer_sparse(layer_id):
+            return TODO
+        else:
+            return TODO
+
         return (
             _FFNInputMode.SCATTERED
             if (global_server_args_dict["enable_deepep_moe"] and is_sparse)
