@@ -98,6 +98,12 @@ class LayerCommunicator:
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
+        return _communicate_simple(
+            hidden_states=hidden_states,
+            input_mode=self.layer_scatter_modes.layer_input_mode,
+            output_mode=self.layer_scatter_modes.attn_mode,
+        )
+
         if self.layer_scatter_modes.ffn_mode == ScatterMode.FULL:
             assert not (
                 self.attn_tp_size != 1 and self.layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED
@@ -197,5 +203,7 @@ class LayerCommunicator:
 
 def _communicate_simple(
     hidden_states: torch.Tensor,
+    input_mode: ScatterMode,
+    output_mode: ScatterMode,
 ) -> torch.Tensor:
     return TODO
