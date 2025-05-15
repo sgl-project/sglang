@@ -86,6 +86,7 @@ from sglang.srt.managers.expert_distribution import ExpertDistributionRecorder
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.operations import execute_operations
 from sglang.srt.utils import (
     BumpAllocator,
     DeepEPMode,
@@ -431,7 +432,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.num_heads = num_heads
         assert num_heads % attn_tp_size == 0
         self.num_local_heads = num_heads // attn_tp_size
-        self.scaling = self.qk_head_dim**-0.5
+        self.scaling = self.qk_head_dim ** -0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
 
@@ -587,9 +588,9 @@ class DeepseekV2AttentionMLA(nn.Module):
                 and not forward_batch.forward_mode.is_target_verify()
                 and not forward_batch.forward_mode.is_draft_extend()
                 and (
-                    sum_extend_prefix_lens >= self.chunked_prefix_cache_threshold
-                    or sum_extend_prefix_lens == 0
-                )
+                sum_extend_prefix_lens >= self.chunked_prefix_cache_threshold
+                or sum_extend_prefix_lens == 0
+            )
             ):
                 return AttnForwardMethod.MHA_CHUNKED_KV
             else:
@@ -670,16 +671,16 @@ class DeepseekV2AttentionMLA(nn.Module):
         kv = self.kv_b_proj(kv_a)[0]
         kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
         k_nope = kv[..., : self.qk_nope_head_dim]
-        v = kv[..., self.qk_nope_head_dim :]
-        k_pe = latent_cache[:, :, self.kv_lora_rank :]
+        v = kv[..., self.qk_nope_head_dim:]
+        k_pe = latent_cache[:, :, self.kv_lora_rank:]
         q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
-        q[..., self.qk_nope_head_dim :] = q_pe
+        q[..., self.qk_nope_head_dim:] = q_pe
         k = torch.empty_like(q)
         k[..., : self.qk_nope_head_dim] = k_nope
-        k[..., self.qk_nope_head_dim :] = k_pe
+        k[..., self.qk_nope_head_dim:] = k_pe
 
         latent_cache[:, :, : self.kv_lora_rank] = kv_a.unsqueeze(1)
-        latent_cache[:, :, self.kv_lora_rank :] = k_pe
+        latent_cache[:, :, self.kv_lora_rank:] = k_pe
 
         # Save latent cache
         forward_batch.token_to_kv_pool.set_kv_buffer(
@@ -726,7 +727,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             k_nope = self.kv_a_layernorm(k_nope).unsqueeze(1)
 
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-        k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
+        k_pe = latent_cache[..., self.kv_lora_rank:].unsqueeze(1)
 
         if self.use_deep_gemm_bmm:
             q_nope_val, q_nope_scale, masked_m, expected_m, aligned_m = (
@@ -866,15 +867,15 @@ class DeepseekV2AttentionMLA(nn.Module):
         k_input[..., : self.kv_lora_rank] = v_input
 
         if not enable_rope_fusion:
-            k_pe = k_input[..., self.kv_lora_rank :]
+            k_pe = k_input[..., self.kv_lora_rank:]
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
-            q_input[..., self.kv_lora_rank :] = q_pe
-            k_input[..., self.kv_lora_rank :] = k_pe
+            q_input[..., self.kv_lora_rank:] = q_pe
+            k_input[..., self.kv_lora_rank:] = k_pe
             k_pe_output = None
         else:
-            k_pe_output = torch.empty_like(k_input[..., self.kv_lora_rank :])
+            k_pe_output = torch.empty_like(k_input[..., self.kv_lora_rank:])
 
-        q_input[..., self.kv_lora_rank :] = q_pe
+        q_input[..., self.kv_lora_rank:] = q_pe
 
         # attn_output = self.attn_mqa(q_input, k_input, v_input, forward_batch)
         # Use Fused ROPE with use_rope=OFF.
@@ -931,7 +932,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         )
 
         if enable_rope_fusion:
-            k_input[..., self.kv_lora_rank :] = k_pe_output
+            k_input[..., self.kv_lora_rank:] = k_pe_output
             forward_batch.token_to_kv_pool.set_kv_buffer(
                 self.attn_mqa, forward_batch.out_cache_loc, k_input, None
             )
@@ -992,7 +993,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             kv = kv.view(
                 -1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim
             )
-            v = kv[..., self.qk_nope_head_dim :]
+            v = kv[..., self.qk_nope_head_dim:]
             k_nope = kv[..., : self.qk_nope_head_dim]
 
             k = torch.empty(
@@ -1005,7 +1006,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 device=v.device,
             )
             k[..., : self.qk_nope_head_dim] = k_nope
-            k[..., self.qk_nope_head_dim :] = k_pe
+            k[..., self.qk_nope_head_dim:] = k_pe
 
             output, lse = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
             lse = torch.transpose(lse, 0, 1).contiguous()
@@ -1047,17 +1048,17 @@ class DeepseekV2AttentionMLA(nn.Module):
         kv = self.kv_b_proj(kv_a)[0]
         kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
         k_nope = kv[..., : self.qk_nope_head_dim]
-        v = kv[..., self.qk_nope_head_dim :]
-        k_pe = latent_cache[:, :, self.kv_lora_rank :]
+        v = kv[..., self.qk_nope_head_dim:]
+        k_pe = latent_cache[:, :, self.kv_lora_rank:]
 
         q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
-        q[..., self.qk_nope_head_dim :] = q_pe
+        q[..., self.qk_nope_head_dim:] = q_pe
         k = torch.empty_like(q)
         k[..., : self.qk_nope_head_dim] = k_nope
-        k[..., self.qk_nope_head_dim :] = k_pe
+        k[..., self.qk_nope_head_dim:] = k_pe
 
         latent_cache[:, :, : self.kv_lora_rank] = kv_a.unsqueeze(1)
-        latent_cache[:, :, self.kv_lora_rank :] = k_pe
+        latent_cache[:, :, self.kv_lora_rank:] = k_pe
 
         # Save latent cache
         forward_batch.token_to_kv_pool.set_kv_buffer(
@@ -1183,6 +1184,8 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
+        return execute_operations(TODO)
+
         if hidden_states.shape[0] == 0:
             residual = hidden_states
         else:
@@ -1560,7 +1563,7 @@ class DeepseekV2ForCausalLM(nn.Module):
             for moe_layer in tqdm(
                 moe_layers,
                 desc=f"Cloning {self.n_share_experts_fusion} "
-                "replicas of the shared expert into MoE",
+                     "replicas of the shared expert into MoE",
             ):
                 for suffix in suffix_list:
                     shared_expert_weight_name = (
