@@ -234,20 +234,21 @@ def _communicate_with_all_reduce_and_layer_norm(
 
     if (
         (hidden_states_input_mode == ScatterMode.TP_ATTN_FULL)
-        and (residual_input_mode == TODO)
         and (hidden_states_output_mode == ScatterMode.SCATTERED)
         and (residual_output_mode == ScatterMode.SCATTERED)
     ):
         if self.attn_tp_size != 1:
-            if self.layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED:
+            if residual_input_mode == ScatterMode.SCATTERED:
                 tensor_list = list(hidden_states.tensor_split(self.attn_tp_size))
                 hidden_states = tensor_list[self.attn_tp_rank]
                 attn_tp_reduce_scatter(hidden_states, tensor_list)
-            else:
+            elif residual_input_mode == TODO:
                 tensor_list = list(hidden_states.tensor_split(self.attn_tp_size))
                 hidden_states = tensor_list[self.attn_tp_rank]
                 attn_tp_reduce_scatter(hidden_states, tensor_list)
                 residual = residual.tensor_split(self.attn_tp_size)[self.attn_tp_rank]
+            else:
+                raise NotImplementedError
         if hidden_states.shape[0] != 0:
             hidden_states, residual = layernorm(
                 hidden_states, residual
