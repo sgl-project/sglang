@@ -192,14 +192,13 @@ def _communicate_simple(
         return hidden_states
 
     if input_mode == ScatterMode.SCATTERED and output_mode == ScatterMode.TP_ATTN_FULL:
-        if attn_tp_size != 1:
-            hidden_states, local_hidden_states = (
-                forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
-                hidden_states,
-            )
-            attn_tp_all_gather(
-                list(hidden_states.tensor_split(attn_tp_size)), local_hidden_states
-            )
+        hidden_states, local_hidden_states = (
+            forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
+            hidden_states,
+        )
+        attn_tp_all_gather(
+            list(hidden_states.tensor_split(attn_tp_size)), local_hidden_states
+        )
         return hidden_states
 
     raise NotImplementedError(f"{input_mode=} {output_mode=}")
