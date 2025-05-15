@@ -44,7 +44,12 @@ class LayerScatterModes:
 
     @classmethod
     def _compute_ffn_mode(cls, layer_id: int, context: _LayerModeComputationContext):
-        return TODO
+        return (
+            _FFNInputMode.SCATTERED
+            if (global_server_args_dict["enable_deepep_moe"] and is_sparse)
+               or (DeepseekV2DecoderLayer._enable_moe_dense_fully_dp() and not is_sparse)
+            else _FFNInputMode.FULL
+        )
 
     @classmethod
     def _compute_layer_output_mode(cls, layer_id: int, context: _LayerModeComputationContext):
