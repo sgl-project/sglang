@@ -168,7 +168,7 @@ class _Context:
         assert actual_num_tokens == expect_num_tokens, f"{actual_num_tokens=} {expect_num_tokens=} {mode=} {x.shape=}"
         return x
 
-    def check_shapes(self, xs: Tuple[torch.Tensor], modes: Tuple[ScatterMode]) -> Tuple[torch.Tensor]:
+    def check_shapes(self, xs: Tuple[torch.Tensor, ...], modes: Tuple[ScatterMode, ...]) -> Tuple[torch.Tensor, ...]:
         return tuple([self.check_shape(x, mode) for x, mode in zip(xs, modes, strict=True)])
 
 
