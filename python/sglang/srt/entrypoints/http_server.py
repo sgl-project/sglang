@@ -1176,7 +1176,7 @@ def _execute_server_warmup(
                 url + request_name,
                 json=json_data,
                 headers=headers,
-                timeout=600,
+                timeout=6000,
             )
             assert res.status_code == 200, f"{res}"
             _global_state.tokenizer_manager.server_status = ServerStatus.Up
