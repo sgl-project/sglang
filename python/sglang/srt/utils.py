@@ -1851,9 +1851,10 @@ def get_cuda_version():
 
 
 def launch_dummy_health_check_server(host, port):
+    import asyncio
+
     import uvicorn
     from fastapi import FastAPI, Response
-    import asyncio
 
     app = FastAPI()
 
@@ -1866,9 +1867,9 @@ def launch_dummy_health_check_server(host, port):
     async def health_generate():
         """Check the health of the http server."""
         return Response(status_code=200)
-    
+
     config = uvicorn.Config(
-        app, 
+        app,
         host=host,
         port=port,
         timeout_keep_alive=5,
@@ -1879,11 +1880,15 @@ def launch_dummy_health_check_server(host, port):
 
     try:
         loop = asyncio.get_running_loop()
-        logger.info(f"Dummy health check server scheduled on existing loop at {host}:{port}")
+        logger.info(
+            f"Dummy health check server scheduled on existing loop at {host}:{port}"
+        )
         loop.create_task(server.serve())
 
     except RuntimeError:
-        logger.info(f"No existing event loop, starting dummy health check server at {host}:{port}")
+        logger.info(
+            f"No existing event loop, starting dummy health check server at {host}:{port}"
+        )
         server.run()
 
 
