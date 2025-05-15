@@ -319,10 +319,11 @@ class DeepseekV2MoE(nn.Module):
             state.shared_output = None
 
     def op_select_experts(self, state):
+        router_logits = state.pop("router_logits")
         if self._enable_deepep_moe and (router_logits is not None):
             topk_weights, topk_idx = select_experts(
                 hidden_states=hidden_states,
-                router_logits=state.pop("router_logits"),
+                router_logits=router_logits,
                 top_k=self.top_k,
                 use_grouped_topk=True,
                 renormalize=self.renormalize,
