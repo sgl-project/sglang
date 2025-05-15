@@ -9,18 +9,11 @@ from sglang.srt.layers.dp_attention import attn_tp_all_gather, dp_gather_partial
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
-_GroupSizes = Dict["ScatterMode", int]
-
 
 class ScatterMode(Enum):
     SCATTERED = auto()
     TP_ATTN_FULL = auto()
     FULL = auto()
-
-    # TODO move?
-    @staticmethod
-    def is_same_group_size(a: "ScatterMode", b: "ScatterMode", group_sizes: _GroupSizes):
-        return group_sizes[a] == group_sizes[b]
 
 
 @dataclass
@@ -179,6 +172,15 @@ class LayerCommunicator:
             local_dp_size=self.local_dp_size,
             attn_tp_size=self.attn_tp_size,
         )
+
+
+# TODO rename?
+@dataclass
+class _Utils:
+    group_sizes: Dict["ScatterMode", int]
+
+    def is_same_group_size(self, a: "ScatterMode", b: "ScatterMode"):
+        return self.group_sizes[a] == self.group_sizes[b]
 
 
 def _communicate_simple(
