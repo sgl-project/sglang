@@ -205,4 +205,7 @@ def _communicate_simple(
     input_mode: ScatterMode,
     output_mode: ScatterMode,
 ) -> torch.Tensor:
+    if input_mode == output_mode:
+        return hidden_states
+
     return TODO
