@@ -247,7 +247,7 @@ def _communicate_summable_tensor_pair(
             dp_scatter(hidden_states, global_hidden_states, forward_batch)
         return hidden_states, residual
 
-    if hidden_states_input_mode == ScatterMode.SCATTERED and residual_input_mode == ScatterMode.SCATTERED and output_mode == ScatterMode.TP_ATTN_FULL:
+    if hidden_states_input_mode == residual_input_mode == ScatterMode.SCATTERED and output_mode == ScatterMode.TP_ATTN_FULL:
         if context.attn_tp_size != 1:
             hidden_states += residual
             residual = None
