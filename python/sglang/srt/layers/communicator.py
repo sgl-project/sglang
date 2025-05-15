@@ -14,6 +14,7 @@ _IsLayerSparseCallable = Callable[[int], bool]
 
 @dataclass
 class _LayerModeComputationContext:
+    num_layers: int
     is_layer_sparse: _IsLayerSparseCallable
 
 
@@ -26,8 +27,8 @@ class LayerScatterModes:
     layer_output_mode: ScatterMode
 
     @classmethod
-    def init_new(cls, layer_id: int, is_layer_sparse: _IsLayerSparseCallable):
-        context = _LayerModeComputationContext(is_layer_sparse=is_layer_sparse)
+    def init_new(cls, layer_id: int, num_layers: int, is_layer_sparse: _IsLayerSparseCallable):
+        context = _LayerModeComputationContext(num_layers=num_layers, is_layer_sparse=is_layer_sparse)
         return cls(
             layer_input_mode=cls._compute_layer_input_mode(layer_id, context),
             attn_mode=ScatterMode.TP_ATTN_FULL,
@@ -47,6 +48,6 @@ class LayerScatterModes:
 
     @classmethod
     def _compute_layer_output_mode(cls, layer_id: int, context: _LayerModeComputationContext):
-        if layer_id == num_layers - 1:
+        if layer_id == context.num_layers - 1:
             return ScatterMode.TP_ATTN_FULL
         return cls._compute_ffn_mode(layer_id, context)
