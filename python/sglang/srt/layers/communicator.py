@@ -242,7 +242,7 @@ def _communicate_with_all_reduce_and_layer_norm(
                 tensor_list = list(hidden_states.tensor_split(self.attn_tp_size))
                 hidden_states = tensor_list[self.attn_tp_rank]
                 attn_tp_reduce_scatter(hidden_states, tensor_list)
-            elif residual_input_mode == TODO:
+            elif residual_input_mode == ScatterMode.TP_ATTN_FULL:
                 tensor_list = list(hidden_states.tensor_split(self.attn_tp_size))
                 hidden_states = tensor_list[self.attn_tp_rank]
                 attn_tp_reduce_scatter(hidden_states, tensor_list)
