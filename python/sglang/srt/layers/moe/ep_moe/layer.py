@@ -5,6 +5,7 @@ import torch
 from torch.nn import Module
 
 from sglang.srt.layers.quantization.deep_gemm import _ENABLE_JIT_DEEPGEMM
+from sglang.srt.managers.schedule_batch import global_server_args_dict
 
 try:
     from deep_gemm import (
@@ -40,7 +41,7 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     tma_align_input_scale,
 )
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
-from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoEMethodBase
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoEMethodBase, FusedMoE
 from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
