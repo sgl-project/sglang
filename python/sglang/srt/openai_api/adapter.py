@@ -352,6 +352,7 @@ async def process_batch(tokenizer_manager, batch_id: str, batch_request: BatchRe
                     request,
                     ret,
                     created,
+                    tokenizer_manager,
                     to_file=True,
                     cache_report=tokenizer_manager.server_args.enable_cache_report,
                     tool_call_parser=tokenizer_manager.server_args.tool_call_parser,
@@ -1030,9 +1031,9 @@ def v1_chat_generate_request(
                     assistant_prefix = None
 
                 try:
-                    ori_prompt_ids = tokenizer_manager.tokenizer.apply_chat_template(
+                    ori_prompt = tokenizer_manager.tokenizer.apply_chat_template(
                         openai_compatible_messages,
-                        tokenize=True,
+                        tokenize=False,
                         add_generation_prompt=False,
                         tools=tools,
                         **(
@@ -1041,10 +1042,10 @@ def v1_chat_generate_request(
                             else {}
                         ),
                     )
-                    gen_assistant_prefix_with_role_ids = (
+                    gen_assistant_prefix_with_role = (
                         tokenizer_manager.tokenizer.apply_chat_template(
-                            [""],
-                            tokenize=True,
+                            openai_compatible_messages,
+                            tokenize=False,
                             add_generation_prompt=True,
                             tools=tools,
                             **(
@@ -1059,9 +1060,9 @@ def v1_chat_generate_request(
                     #  has a different tools input format that is not compatible
                     #  with openAI's apply_chat_template tool_call format, like Mistral.
                     tools = [t if "function" in t else {"function": t} for t in tools]
-                    ori_prompt_ids = tokenizer_manager.tokenizer.apply_chat_template(
+                    ori_prompt = tokenizer_manager.tokenizer.apply_chat_template(
                         openai_compatible_messages,
-                        tokenize=True,
+                        tokenize=False,
                         add_generation_prompt=False,
                         tools=tools,
                         **(
@@ -1070,10 +1071,10 @@ def v1_chat_generate_request(
                             else {}
                         ),
                     )
-                    gen_assistant_prefix_with_role_ids = (
+                    gen_assistant_prefix_with_role = (
                         tokenizer_manager.tokenizer.apply_chat_template(
-                            [""],
-                            tokenize=True,
+                            openai_compatible_messages,
+                            tokenize=False,
                             add_generation_prompt=True,
                             tools=tools,
                             **(
@@ -1083,14 +1084,21 @@ def v1_chat_generate_request(
                             ),
                         )
                     )
-                gen_assistant_prefix_ids = []
+
+                gen_assistant_prefix = gen_assistant_prefix_with_role[len(ori_prompt) :]
+                gen_assistant_prefix_ids = tokenizer_manager.tokenizer.encode(
+                    gen_assistant_prefix, add_special_tokens=False
+                )
+                ori_prompt_ids = tokenizer_manager.tokenizer.encode(
+                    ori_prompt, add_special_tokens=False
+                )
                 if request.continue_final_message:
                     gen_assistant_prefix_ids = []
                 else:
                     prompt_with_role_ids, gen_assistant_prefix_ids = (
                         remove_first_nonblank_token(
                             tokenizer_manager.tokenizer,
-                            gen_assistant_prefix_with_role_ids,
+                            gen_assistant_prefix_ids,
                             ori_prompt_ids,
                         )
                     )
