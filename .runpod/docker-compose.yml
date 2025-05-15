@@ -1,6 +1,6 @@
 services:
   sglang-worker:
-    image: worker-sglang:dev
+    image: runpod/worker-sglang:dev
     pull_policy: never
 
     deploy:

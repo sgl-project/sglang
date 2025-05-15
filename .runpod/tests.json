@@ -8,7 +8,7 @@
           { "role": "user", "content": "What is the capital of France?" }
         ]
       },
-      "timeout": 40000
+      "timeout": 500000
     }
   ],
   "config": {

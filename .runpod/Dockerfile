@@ -1,18 +1,18 @@
-FROM nvidia/cuda:12.1.0-base-ubuntu22.04 
+FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
 
 RUN apt-get update -y \
     && apt-get install -y --no-install-recommends \
         python3.11 python3.11-dev \
         python3.11-distutils python3-setuptools build-essential \
-        cuda-cudart-dev-12-1 cuda-compiler-12-1 \
+        # cuda-cudart-dev-12-1 cuda-compiler-12-1 \
         curl ca-certificates && \
     update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1
 
-RUN ldconfig /usr/local/cuda-12.1/compat/
+# RUN ldconfig /usr/local/cuda-12.1/compat/
 
 # Provide libcuda stub for linking CUDA extensions during build
-RUN ln -sf /usr/local/cuda-12.1/targets/x86_64-linux/lib/stubs/libcuda.so /usr/lib/x86_64-linux-gnu/libcuda.so
-ENV LD_LIBRARY_PATH="/usr/local/cuda-12.1/targets/x86_64-linux/lib/stubs:${LD_LIBRARY_PATH}"
+# RUN ln -sf /usr/local/cuda-12.1/targets/x86_64-linux/lib/stubs/libcuda.so /usr/lib/x86_64-linux-gnu/libcuda.so
+# ENV LD_LIBRARY_PATH="/usr/local/cuda-12.1/targets/x86_64-linux/lib/stubs:${LD_LIBRARY_PATH}"
 
 # install uv
 RUN curl -Ls https://astral.sh/uv/install.sh | sh
@@ -26,7 +26,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # install sglang + flashinfer-python
 # see https://docs.sglang.ai/start/install.html#method-1-with-pip-or-uv
 RUN uv pip install --system "sglang[all]>=0.4.6.post3" && \
-    uv pip install --system flashinfer-python -i https://flashinfer.ai/whl/cu121/torch2.5
+    uv pip install --system flashinfer-python -i https://flashinfer.ai/whl/cu124/torch2.5
 
 # copy files
 COPY .runpod /
