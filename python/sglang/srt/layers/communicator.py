@@ -237,18 +237,17 @@ def _communicate_with_all_reduce_and_layer_norm(
         and (hidden_states_output_mode == ScatterMode.SCATTERED)
         and (residual_output_mode == ScatterMode.SCATTERED)
     ):
-        if context.attn_tp_size != 1:
-            if residual_input_mode == ScatterMode.SCATTERED:
-                tensor_list = list(hidden_states.tensor_split(context.attn_tp_size))
-                hidden_states = tensor_list[context.attn_tp_rank]
-                attn_tp_reduce_scatter(hidden_states, tensor_list)
-            elif residual_input_mode == ScatterMode.TP_ATTN_FULL:
-                tensor_list = list(hidden_states.tensor_split(context.attn_tp_size))
-                hidden_states = tensor_list[context.attn_tp_rank]
-                attn_tp_reduce_scatter(hidden_states, tensor_list)
-                residual = residual.tensor_split(context.attn_tp_size)[context.attn_tp_rank]
-            else:
-                raise NotImplementedError
+        if residual_input_mode == ScatterMode.SCATTERED:
+            tensor_list = list(hidden_states.tensor_split(context.attn_tp_size))
+            hidden_states = tensor_list[context.attn_tp_rank]
+            attn_tp_reduce_scatter(hidden_states, tensor_list)
+        elif residual_input_mode == ScatterMode.TP_ATTN_FULL:
+            tensor_list = list(hidden_states.tensor_split(context.attn_tp_size))
+            hidden_states = tensor_list[context.attn_tp_rank]
+            attn_tp_reduce_scatter(hidden_states, tensor_list)
+            residual = residual.tensor_split(context.attn_tp_size)[context.attn_tp_rank]
+        else:
+            raise NotImplementedError
         if hidden_states.shape[0] != 0:
             hidden_states, residual = layernorm(hidden_states, residual)
         return hidden_states, residual
