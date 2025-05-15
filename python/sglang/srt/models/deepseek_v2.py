@@ -18,7 +18,6 @@
 
 import logging
 import os
-from dataclasses import dataclass
 from enum import Enum, IntEnum, auto
 from typing import Any, Dict, Iterable, Optional, Tuple
 
@@ -1108,12 +1107,6 @@ class _FFNInputMode(Enum):
     FULL = auto()
 
 
-@dataclass
-class _DecoderLayerInfo:
-    is_sparse: bool
-    ffn_input_mode: _FFNInputMode
-
-
 class DeepseekV2DecoderLayer(nn.Module):
 
     def __init__(
@@ -1208,12 +1201,6 @@ class DeepseekV2DecoderLayer(nn.Module):
             and layer_id >= self.config.first_k_dense_replace
             and layer_id % self.config.moe_layer_freq == 0
         )
-
-    @staticmethod
-    def _compute_info(config: PretrainedConfig, layer_id: int, is_nextn: bool):
-        is_sparse = MOVED
-        ffn_input_mode = MOVED
-        return _DecoderLayerInfo(is_sparse=is_sparse, ffn_input_mode=ffn_input_mode)
 
     def forward(
         self,
