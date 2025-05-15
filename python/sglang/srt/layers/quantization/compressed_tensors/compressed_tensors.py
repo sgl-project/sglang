@@ -48,6 +48,22 @@ try:
 except ImportError:
     VLLM_AVAILABLE = False
 
+try:
+
+    from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
+        W4A16SPARSE24_SUPPORTED_BITS,
+        WNA16_SUPPORTED_BITS,
+        CompressedTensors24,
+        CompressedTensorsW4A16Sparse24,
+        CompressedTensorsW8A8Int8,
+        CompressedTensorsW8A16Fp8,
+        CompressedTensorsWNA16,
+    )
+
+    VLLM_AVAILABLE = True
+except ImportError:
+    VLLM_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 __all__ = ["CompressedTensorsLinearMethod"]
