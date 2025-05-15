@@ -1224,8 +1224,8 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
 
     def op_comm_pre_attn(self, state):
-        hidden_states = self.layer_communicator.forward_pre_attn(
-            hidden_states, forward_batch
+        state.hidden_states_after_comm_pre_attn = self.layer_communicator.forward_pre_attn(
+            state.pop("hidden_states_after_input_ln"), state.forward_batch
         )
 
     def op_attn(self, state):
