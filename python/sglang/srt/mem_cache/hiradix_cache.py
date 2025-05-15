@@ -458,6 +458,7 @@ class HiRadixCache(RadixCache):
                 if not new_node.evicted:
                     value.append(new_node.value)
                 node = new_node
+                key = key[prefix_len:]
                 break
             else:
                 self.inc_hit_count(child, token_ids=total_key[:total_prefix_length])
