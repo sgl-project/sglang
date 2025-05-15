@@ -367,13 +367,13 @@ class DeepseekV2MoE(nn.Module):
         if self._enable_deepep_moe:
             final_hidden_states = self.experts(
                 hidden_states=hidden_states,
-                topk_idx=state.topk_idx_dispatched,
-                topk_weights=state.topk_weights_dispatched,
-                reorder_topk_ids=state.reorder_topk_ids,
-                seg_indptr=state.seg_indptr,
-                masked_m=state.masked_m,
-                expected_m=state.expected_m,
-                num_recv_tokens_per_expert=state.num_recv_tokens_per_expert,
+                topk_idx=state.pop("topk_idx_dispatched"),
+                topk_weights=state.pop("topk_weights_dispatched"),
+                reorder_topk_ids=state.pop("reorder_topk_ids"),
+                seg_indptr=state.pop("seg_indptr"),
+                masked_m=state.pop("masked_m"),
+                expected_m=state.pop("expected_m"),
+                num_recv_tokens_per_expert=state.pop("num_recv_tokens_per_expert"),
                 forward_mode=state.forward_mode,
             )
         else:
