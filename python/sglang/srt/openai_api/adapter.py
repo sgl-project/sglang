@@ -834,7 +834,7 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
                         )
                         n_prev_token = len(
                             content["meta_info"]["output_token_logprobs"]
-                        ) 
+                        )
                     else:
                         logprobs = None
 
@@ -1348,7 +1348,7 @@ def v1_chat_generate_response(
                     ChatCompletionTokenLogprob(
                         token=token,
                         bytes=token_bytes,
-                        logprob=logprob
+                        logprob=logprob,
                         top_logprobs=top_logprobs,
                     )
                 )
@@ -1582,7 +1582,11 @@ async def v1_chat_completions(
                                 )
                             )
 
-                        choice_logprobs = ChoiceLogprobs(content=token_logprobs)
+                        choice_logprobs = (
+                            ChoiceLogprobs(content=[token_logprobs[-1]])
+                            if token_logprobs
+                            else None
+                        )
 
                     else:
                         choice_logprobs = None
@@ -1637,11 +1641,36 @@ async def v1_chat_completions(
 
                                 single_lp = None
                                 if request.logprobs:
-                                    single_lp = to_openai_style_logprobs(
+                                    raw_lp = to_openai_style_logprobs(
                                         input_token_logprobs=[in_lp[t_idx]],
                                         input_top_logprobs=(
                                             [in_top[t_idx]] if in_top[t_idx] else None
                                         ),
+                                    )
+                                    # 把 raw_lp ➜ ChoiceLogprobs
+                                    token_bytes = list(tok_text.encode("utf-8"))
+                                    top_logprobs = None
+                                    if (
+                                        raw_lp.top_logprobs
+                                        and raw_lp.top_logprobs[0] is not None
+                                    ):
+                                        top_logprobs = [
+                                            TopLogprob(
+                                                token=k,
+                                                bytes=list(k.encode("utf-8")),
+                                                logprob=v,
+                                            )
+                                            for k, v in raw_lp.top_logprobs[0].items()
+                                        ]
+                                    single_lp = ChoiceLogprobs(
+                                        content=[
+                                            ChatCompletionTokenLogprob(
+                                                token=tok_text,
+                                                bytes=token_bytes,
+                                                logprob=raw_lp.token_logprobs[0],
+                                                top_logprobs=top_logprobs,
+                                            )
+                                        ]
                                     )
 
                                 choice_data = ChatCompletionResponseStreamChoice(
@@ -1659,11 +1688,8 @@ async def v1_chat_completions(
                                 yield f"data: {chunk.model_dump_json(exclude_none=False)}\n\n"
 
                     text = content["text"]
-                    print(f"text: {text}")
                     delta = text[len(stream_buffer) :]
-                    print(f"delta: {delta}")
                     new_stream_buffer = stream_buffer + delta
-                    print(f"new_stream_buffer: {new_stream_buffer}")
 
                     enable_thinking = _get_enable_thinking_from_request(request)
 
