@@ -1,7 +1,5 @@
 from typing import List, Union
 
-import torch
-
 from sglang.srt.managers.multimodal_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )

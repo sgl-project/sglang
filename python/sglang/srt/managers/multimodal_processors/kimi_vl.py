@@ -1,9 +1,4 @@
-import asyncio
-import math
 from typing import List, Union
-
-import torch
-from PIL import Image
 
 from sglang.srt.managers.multimodal_processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
