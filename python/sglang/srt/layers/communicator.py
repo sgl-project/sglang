@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Callable
+from typing import Optional
 
 import torch
 from sglang.srt.distributed import get_tensor_model_parallel_world_size, tensor_model_parallel_all_reduce
@@ -16,13 +16,12 @@ class ScatterMode(Enum):
     FULL = auto()
 
 
-_IsLayerSparseCallable = Callable[[int], bool]
-
-
 @dataclass
 class _LayerModeComputationContext:
     num_layers: int
-    is_layer_sparse: _IsLayerSparseCallable
+    layer_id: int
+    is_layer_sparse: bool
+    is_previous_layer_sparse: Optional[bool]
 
 
 @dataclass
