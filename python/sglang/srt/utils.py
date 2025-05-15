@@ -125,10 +125,6 @@ builtins.FP8_E4M3_MAX = FP8_E4M3_MAX
 builtins.FP8_E4M3_MIN = FP8_E4M3_MIN
 
 
-def is_rocm() -> bool:
-    return torch.cuda.is_available() and torch.version.hip
-
-
 def is_cuda():
     return torch.cuda.is_available() and torch.version.cuda
 
