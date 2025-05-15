@@ -30,10 +30,23 @@ from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather,
     dp_gather_replicate,
     dp_scatter,
-    get_attention_dp_rank,
     get_attention_dp_size,
     get_attention_tp_size,
+    get_local_attention_dp_rank,
+    get_local_attention_dp_size,
 )
+from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
+from sglang.srt.utils import dump_to_file
+
+logger = logging.getLogger(__name__)
+
+
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import (
@@ -170,7 +183,7 @@ class LogitsMetadata:
             return
 
         cumtokens = torch.cumsum(self.global_num_tokens_for_logprob_gpu, dim=0)
-        dp_rank = get_attention_dp_rank()
+        dp_rank = get_local_attention_dp_rank()
         if dp_rank == 0:
             dp_local_start_pos = torch.zeros_like(
                 self.global_num_tokens_for_logprob_gpu[0]
@@ -324,7 +337,8 @@ class LogitsProcessor(nn.Module):
 
         if self.debug_tensor_dump_output_folder:
             assert (
-                not self.do_tensor_parallel_all_gather or get_attention_dp_size() == 1
+                not self.do_tensor_parallel_all_gather
+                or get_local_attention_dp_size() == 1
             ), "dp attention + sharded lm_head doesn't support full logits"
             full_logits = self._get_logits(hidden_states, lm_head, logits_metadata)
             dump_to_file(self.debug_tensor_dump_output_folder, "logits", full_logits)
