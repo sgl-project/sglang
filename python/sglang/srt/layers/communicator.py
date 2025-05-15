@@ -163,7 +163,7 @@ class LayerCommunicator:
 
     def _compute_context(self, forward_batch: ForwardBatch):
         return _Context(
-            num_tokens_of_mode=_compute_num_tokens_of_mode(forward_batch),
+            num_tokens_of_mode=_compute_num_tokens_of_mode(forward_batch, attn_tp_size=self.attn_tp_size),
             process_group_sizes=self.process_group_sizes,
             attn_tp_rank=self.attn_tp_rank,
             attn_tp_size=self.attn_tp_size,
@@ -171,12 +171,17 @@ class LayerCommunicator:
         )
 
 
-def _compute_num_tokens_of_mode(forward_batch: ForwardBatch):
+def _compute_num_tokens_of_mode(forward_batch: ForwardBatch, attn_tp_size: int):
+    tp_attn_full_num_tokens = forward_batch.input_ids.shape[0]
     return {
-        ScatterMode.SCATTERED: TODO,
-        ScatterMode.TP_ATTN_FULL: forward_batch.input_ids.shape[0],
+        ScatterMode.SCATTERED: _torch_tensor_split_len(tp_attn_full_num_tokens, attn_tp_size),
+        ScatterMode.TP_ATTN_FULL: tp_attn_full_num_tokens,
         ScatterMode.FULL: forward_batch.gathered_buffer.shape[0],
     }
+
+
+def _torch_tensor_split_len(tensor_len: int, sections: int, output_index: int):
+    return TODO
 
 
 @dataclass
