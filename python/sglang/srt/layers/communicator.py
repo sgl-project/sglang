@@ -5,7 +5,7 @@ from typing import Optional, Dict, Tuple
 import torch.distributed
 from sglang.srt.distributed import get_tensor_model_parallel_world_size, tensor_model_parallel_all_reduce
 from sglang.srt.layers.dp_attention import attn_tp_all_gather, dp_gather_partial, dp_scatter, attn_tp_reduce_scatter, \
-    get_local_attention_dp_size, get_attention_tp_size, get_attention_tp_rank
+    get_attention_tp_size, get_attention_tp_rank
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
