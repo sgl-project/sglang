@@ -307,9 +307,18 @@ class DeepseekV2MoE(nn.Module):
         ):
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
-            shared_output = self._forward_shared_experts(hidden_states)
         else:
-            router_logits = shared_output = None
+            router_logits = None
+
+        if (
+            (self.n_share_experts_fusion == 0)
+            and (forward_mode is not None)
+            and not forward_mode.is_idle()
+            and hidden_states.shape[0] > 0
+        ):
+            shared_output = self.self.shared_experts(hidden_states)
+        else:
+            shared_output = None
 
         if self._enable_deepep_moe and (router_logits is not None):
             topk_weights, topk_idx = select_experts(
@@ -383,12 +392,6 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states
-
-    def _forward_shared_experts(self, hidden_states):
-        if self.n_share_experts_fusion == 0:
-            return self.shared_experts(hidden_states)
-        else:
-            return None
 
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
