@@ -171,7 +171,7 @@ class LayerCommunicator:
             output_mode=self.layer_scatter_modes.layer_output_mode,
         )
 
-        if self.layer_scatter_modes.mlp_mode == ScatterMode.FULL:
+        if hidden_states_input_mode == ScatterMode.FULL:
             # TODO(ch-wan): use reduce-scatter in MLP to avoid this scatter
             # Scatter
             if self.local_dp_size != 1:
@@ -182,7 +182,7 @@ class LayerCommunicator:
                     hidden_states,
                 )
                 dp_scatter(hidden_states, global_hidden_states, forward_batch)
-        elif self.layer_scatter_modes.mlp_mode == ScatterMode.SCATTERED:
+        elif hidden_states_input_mode == ScatterMode.SCATTERED:
             if self.layer_scatter_modes.layer_output_mode == ScatterMode.TP_ATTN_FULL and self.attn_tp_size != 1:
                 hidden_states += residual
                 residual = None
