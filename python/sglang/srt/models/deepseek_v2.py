@@ -299,7 +299,7 @@ class DeepseekV2MoE(nn.Module):
         return global_server_args_dict["enable_deepep_moe"]
 
     def op_gate(self, state):
-        if (
+        if (not self._enable_deepep_moe) or (
             state.forward_batch.forward_mode is not None
             and not state.forward_batch.forward_mode.is_idle()
             and state.hidden_states_mlp_input.shape[0] > 0
