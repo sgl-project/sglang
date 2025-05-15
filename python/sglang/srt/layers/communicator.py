@@ -188,6 +188,10 @@ def _communicate_simple(
 def _communicate_with_all_reduce_and_layer_norm(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
+    hidden_states_input_mode: ScatterMode,
+    residual_input_mode: ScatterMode,
+    hidden_states_output_mode: ScatterMode,
+    residual_output_mode: ScatterMode,
     forward_batch: ForwardBatch,
     context: _Context,
 ):
