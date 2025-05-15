@@ -1242,12 +1242,13 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
 
     def op_mlp(self, state):
+        hidden_states = state.pop("hidden_states_after_comm_pre_mlp")
         if not (
             enable_moe_dense_fully_dp()
             and (not self.is_layer_sparse)
             and hidden_states.shape[0] == 0
         ):
-            hidden_states = self.mlp(hidden_states, forward_batch.forward_mode)
+            state.hidden_states_after_mlp = self.mlp(hidden_states, state.forward_batch.forward_mode)
 
     def op_comm_layer_end(self, state):
         hidden_states, residual = self.layer_communicator.forward_layer_end(
