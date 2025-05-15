@@ -29,8 +29,12 @@ class LayerScatterModes:
     layer_output_mode: ScatterMode
 
     @classmethod
-    def init_new(cls, layer_id: int, num_layers: int, is_layer_sparse: _IsLayerSparseCallable):
-        context = _LayerModeComputationContext(num_layers=num_layers, is_layer_sparse=is_layer_sparse)
+    def init_new(
+        cls, layer_id: int, num_layers: int, is_layer_sparse: _IsLayerSparseCallable
+    ):
+        context = _LayerModeComputationContext(
+            num_layers=num_layers, is_layer_sparse=is_layer_sparse
+        )
         return cls(
             layer_input_mode=cls._compute_layer_input_mode(layer_id, context),
             attn_mode=ScatterMode.TP_ATTN_FULL,
@@ -39,7 +43,9 @@ class LayerScatterModes:
         )
 
     @classmethod
-    def _compute_layer_input_mode(cls, layer_id: int, context: _LayerModeComputationContext):
+    def _compute_layer_input_mode(
+        cls, layer_id: int, context: _LayerModeComputationContext
+    ):
         if layer_id == 0:
             return ScatterMode.TP_ATTN_FULL
         return cls._compute_layer_output_mode(layer_id=layer_id - 1, context=context)
@@ -47,12 +53,22 @@ class LayerScatterModes:
     @classmethod
     def _compute_ffn_mode(cls, layer_id: int, context: _LayerModeComputationContext):
         if context.is_layer_sparse(layer_id):
-            return ScatterMode.SCATTERED if global_server_args_dict["enable_deepep_moe"] else ScatterMode.FULL
+            return (
+                ScatterMode.SCATTERED
+                if global_server_args_dict["enable_deepep_moe"]
+                else ScatterMode.FULL
+            )
         else:
-            return ScatterMode.SCATTERED if enable_moe_dense_fully_dp() else ScatterMode.FULL
+            return (
+                ScatterMode.SCATTERED
+                if enable_moe_dense_fully_dp()
+                else ScatterMode.FULL
+            )
 
     @classmethod
-    def _compute_layer_output_mode(cls, layer_id: int, context: _LayerModeComputationContext):
+    def _compute_layer_output_mode(
+        cls, layer_id: int, context: _LayerModeComputationContext
+    ):
         if layer_id == context.num_layers - 1:
             return ScatterMode.TP_ATTN_FULL
         return cls._compute_ffn_mode(layer_id, context)
