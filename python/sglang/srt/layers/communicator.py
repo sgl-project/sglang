@@ -41,6 +41,7 @@ class LayerScatterModes:
     attn_mode: ScatterMode
     # Can be further split into e.g. ffn_input_mode and ffn_output_mode if needed
     mlp_mode: ScatterMode
+    middle_residual_mode: ScatterMode
     layer_output_mode: ScatterMode
 
     @classmethod
@@ -50,6 +51,7 @@ class LayerScatterModes:
             layer_input_mode=cls._compute_layer_input_mode(context),
             attn_mode=ScatterMode.TP_ATTN_FULL,
             mlp_mode=cls._compute_mlp_mode(context),
+            middle_residual_mode=cls._compute_middle_residual_mode(context),
             layer_output_mode=cls._compute_layer_output_mode(context),
         )
 
@@ -73,6 +75,10 @@ class LayerScatterModes:
                 if enable_moe_dense_fully_dp()
                 else ScatterMode.FULL
             )
+
+    @classmethod
+    def _compute_middle_residual_mode(cls, context: _LayerModeComputationContext):
+        return TODO
 
     @classmethod
     def _compute_layer_output_mode(cls, context: _LayerModeComputationContext):
