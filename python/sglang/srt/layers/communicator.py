@@ -216,7 +216,9 @@ def _communicate_summable_tensor_pair(
                 hidden_states,
             )
             dp_scatter(hidden_states, global_hidden_states, forward_batch)
-    elif hidden_states_input_mode == ScatterMode.SCATTERED:
+        return hidden_states, residual
+
+    if hidden_states_input_mode == ScatterMode.SCATTERED:
         if self.layer_scatter_modes.layer_output_mode == ScatterMode.TP_ATTN_FULL and self.attn_tp_size != 1:
             hidden_states += residual
             residual = None
@@ -227,6 +229,6 @@ def _communicate_summable_tensor_pair(
             attn_tp_all_gather(
                 list(hidden_states.tensor_split(self.attn_tp_size)), local_hidden_states
             )
-    else:
-        raise NotImplementedError
-    return hidden_states, residual
+        return hidden_states, residual
+
+    raise NotImplementedError
