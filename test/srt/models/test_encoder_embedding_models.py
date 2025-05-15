@@ -126,12 +126,18 @@ class TestEncoderEmbeddingModels(CustomTestCase):
             for attention_backend in ATTENTION_BACKEND:
                 for batch_size in BATCH_SIZE:
                     for torch_dtype in TORCH_DTYPES:
-                        # Flashinfer is not support torch.float32 for dtype_q, so pass it
-                        if (
-                            torch_dtype == torch.float32
-                            and attention_backend == "flashinfer"
-                        ):
-                            continue
+                        # NOTE: FlashInfer currently has limitations with head_dim = 32 or
+                        # other dimensions.
+                        # The FlashInfer head_dim limitation itself is tracked here:
+                        # https://github.com/flashinfer-ai/flashinfer/issues/1048
+                        #
+                        # Flashinfer does not support torch.float32 for dtype_q, so skip it
+                        if attention_backend == "flashinfer":
+                            if (
+                                model == "BAAI/bge-small-en"
+                                or torch_dtype == torch.float32
+                            ):
+                                continue
 
                         self.assert_close_prefill_logits(
                             DEFAULT_PROMPTS,
