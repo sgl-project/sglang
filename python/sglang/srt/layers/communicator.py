@@ -1,11 +1,21 @@
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Optional, Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch.distributed
-from sglang.srt.distributed import get_tensor_model_parallel_world_size, tensor_model_parallel_all_reduce
-from sglang.srt.layers.dp_attention import attn_tp_all_gather, dp_gather_partial, dp_scatter, attn_tp_reduce_scatter, \
-    get_attention_tp_size, get_attention_tp_rank
+
+from sglang.srt.distributed import (
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
+)
+from sglang.srt.layers.dp_attention import (
+    attn_tp_all_gather,
+    attn_tp_reduce_scatter,
+    dp_gather_partial,
+    dp_scatter,
+    get_attention_tp_rank,
+    get_attention_tp_size,
+)
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -29,7 +39,6 @@ class _LayerModeComputationContext:
             layer_id=self.layer_id,
             is_layer_sparse=self.is_previous_layer_sparse,
             is_previous_layer_sparse=None,
-
             # unchanged
             num_layers=self.num_layers,
         )
@@ -164,7 +173,10 @@ class LayerCommunicator:
     def _compute_context(self, forward_batch: ForwardBatch):
         return _Context(
             num_tokens_of_mode=_compute_num_tokens_of_mode(
-                forward_batch, attn_tp_rank=self.attn_tp_rank, attn_tp_size=self.attn_tp_size),
+                forward_batch,
+                attn_tp_rank=self.attn_tp_rank,
+                attn_tp_size=self.attn_tp_size,
+            ),
             process_group_sizes=self.process_group_sizes,
             attn_tp_rank=self.attn_tp_rank,
             attn_tp_size=self.attn_tp_size,
@@ -172,10 +184,14 @@ class LayerCommunicator:
         )
 
 
-def _compute_num_tokens_of_mode(forward_batch: ForwardBatch, attn_tp_rank: int, attn_tp_size: int):
+def _compute_num_tokens_of_mode(
+    forward_batch: ForwardBatch, attn_tp_rank: int, attn_tp_size: int
+):
     tp_attn_full_num_tokens = forward_batch.input_ids.shape[0]
     return {
-        ScatterMode.SCATTERED: _torch_tensor_split_len(tp_attn_full_num_tokens, attn_tp_size, attn_tp_rank),
+        ScatterMode.SCATTERED: _torch_tensor_split_len(
+            tp_attn_full_num_tokens, attn_tp_size, attn_tp_rank
+        ),
         ScatterMode.TP_ATTN_FULL: tp_attn_full_num_tokens,
         ScatterMode.FULL: forward_batch.gathered_buffer.shape[0],
     }
@@ -202,11 +218,17 @@ class _Context:
     def check_shape(self, x: torch.Tensor, mode: ScatterMode):
         actual_num_tokens = x.shape[0]
         expect_num_tokens = self.num_tokens_of_mode[mode]
-        assert actual_num_tokens == expect_num_tokens, f"{actual_num_tokens=} {expect_num_tokens=} {mode=} {x.shape=}"
+        assert (
+            actual_num_tokens == expect_num_tokens
+        ), f"{actual_num_tokens=} {expect_num_tokens=} {mode=} {x.shape=}"
         return x
 
-    def check_shapes(self, xs: Tuple[torch.Tensor, ...], modes: Tuple[ScatterMode, ...]) -> Tuple[torch.Tensor, ...]:
-        return tuple([self.check_shape(x, mode) for x, mode in zip(xs, modes, strict=True)])
+    def check_shapes(
+        self, xs: Tuple[torch.Tensor, ...], modes: Tuple[ScatterMode, ...]
+    ) -> Tuple[torch.Tensor, ...]:
+        return tuple(
+            [self.check_shape(x, mode) for x, mode in zip(xs, modes, strict=True)]
+        )
 
 
 def _communicate_simple(
@@ -222,16 +244,16 @@ def _communicate_simple(
         if context.is_same_group_size(input_mode, output_mode):
             return hidden_states
 
-        if (
-            (input_mode == ScatterMode.SCATTERED)
-            and (output_mode == ScatterMode.TP_ATTN_FULL)
+        if (input_mode == ScatterMode.SCATTERED) and (
+            output_mode == ScatterMode.TP_ATTN_FULL
         ):
             hidden_states, local_hidden_states = (
                 forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
                 hidden_states,
             )
             attn_tp_all_gather(
-                list(hidden_states.tensor_split(context.attn_tp_size)), local_hidden_states
+                list(hidden_states.tensor_split(context.attn_tp_size)),
+                local_hidden_states,
             )
             return hidden_states
 
@@ -260,8 +282,9 @@ def _communicate_with_all_reduce_and_layer_norm(
     def _inner():
         nonlocal hidden_states, residual
 
-        if context.is_same_group_size(hidden_states_input_mode, hidden_states_output_mode) \
-            and context.is_same_group_size(residual_input_mode, residual_output_mode):
+        if context.is_same_group_size(
+            hidden_states_input_mode, hidden_states_output_mode
+        ) and context.is_same_group_size(residual_input_mode, residual_output_mode):
             if context.tp_size > 1:
                 hidden_states = tensor_model_parallel_all_reduce(hidden_states)
             if hidden_states.shape[0] != 0:
@@ -287,7 +310,9 @@ def _communicate_with_all_reduce_and_layer_norm(
 
         if (
             (hidden_states_input_mode == ScatterMode.TP_ATTN_FULL)
-            and (residual_input_mode in [ScatterMode.SCATTERED, ScatterMode.TP_ATTN_FULL])
+            and (
+                residual_input_mode in [ScatterMode.SCATTERED, ScatterMode.TP_ATTN_FULL]
+            )
             and (hidden_states_output_mode == ScatterMode.SCATTERED)
             and (residual_output_mode == ScatterMode.SCATTERED)
         ):
@@ -295,16 +320,23 @@ def _communicate_with_all_reduce_and_layer_norm(
             hidden_states = tensor_list[context.attn_tp_rank]
             attn_tp_reduce_scatter(hidden_states, tensor_list)
             if residual_input_mode == ScatterMode.TP_ATTN_FULL:
-                residual = residual.tensor_split(context.attn_tp_size)[context.attn_tp_rank]
+                residual = residual.tensor_split(context.attn_tp_size)[
+                    context.attn_tp_rank
+                ]
             if hidden_states.shape[0] != 0:
                 hidden_states, residual = layernorm(hidden_states, residual)
             return hidden_states, residual
 
         raise NotImplementedError(
-            f"{hidden_states_input_mode=} {residual_input_mode=} {residual_output_mode=} {residual_output_mode=}")
+            f"{hidden_states_input_mode=} {residual_input_mode=} {residual_output_mode=} {residual_output_mode=}"
+        )
 
-    context.check_shapes((hidden_states, residual), (hidden_states_input_mode, residual_input_mode))
-    return context.check_shapes(_inner(), (hidden_states_output_mode, residual_output_mode))
+    context.check_shapes(
+        (hidden_states, residual), (hidden_states_input_mode, residual_input_mode)
+    )
+    return context.check_shapes(
+        _inner(), (hidden_states_output_mode, residual_output_mode)
+    )
 
 
 def _communicate_summable_tensor_pair(
@@ -321,8 +353,9 @@ def _communicate_summable_tensor_pair(
     def _inner():
         nonlocal hidden_states, residual
 
-        if context.is_same_group_size(hidden_states_input_mode, output_mode) \
-            and context.is_same_group_size(residual_input_mode, output_mode):
+        if context.is_same_group_size(
+            hidden_states_input_mode, output_mode
+        ) and context.is_same_group_size(residual_input_mode, output_mode):
             return hidden_states, residual
 
         if (
@@ -352,11 +385,16 @@ def _communicate_summable_tensor_pair(
                 hidden_states,
             )
             attn_tp_all_gather(
-                list(hidden_states.tensor_split(context.attn_tp_size)), local_hidden_states
+                list(hidden_states.tensor_split(context.attn_tp_size)),
+                local_hidden_states,
             )
             return hidden_states, residual
 
-        raise NotImplementedError(f"{hidden_states_input_mode=} {residual_input_mode=} {output_mode=}")
+        raise NotImplementedError(
+            f"{hidden_states_input_mode=} {residual_input_mode=} {output_mode=}"
+        )
 
-    context.check_shapes((hidden_states, residual), (hidden_states_input_mode, residual_input_mode))
+    context.check_shapes(
+        (hidden_states, residual), (hidden_states_input_mode, residual_input_mode)
+    )
     return context.check_shapes(_inner(), (output_mode, output_mode))
