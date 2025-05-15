@@ -233,9 +233,11 @@ def _communicate_summable_tensor_pair(
         and context.is_same_group_size(residual_input_mode, output_mode):
         return hidden_states, residual
 
-    if hidden_states_input_mode == ScatterMode.FULL:
-        assert residual_input_mode == ScatterMode.TP_ATTN_FULL
-        assert output_mode == ScatterMode.TP_ATTN_FULL
+    if (
+        (hidden_states_input_mode == ScatterMode.FULL)
+        and (residual_input_mode == ScatterMode.TP_ATTN_FULL)
+        and (output_mode == ScatterMode.TP_ATTN_FULL)
+    ):
         # TODO(ch-wan): use reduce-scatter in MLP to avoid this scatter
         if local_dp_size != 1:
             # important: forward batch.gathered_buffer is used both after scatter and after gather.
@@ -248,8 +250,9 @@ def _communicate_summable_tensor_pair(
         return hidden_states, residual
 
     if (
-        (hidden_states_input_mode == residual_input_mode == ScatterMode.SCATTERED) and
-        (output_mode == ScatterMode.TP_ATTN_FULL)
+        (hidden_states_input_mode == ScatterMode.SCATTERED)
+        and (residual_input_mode == ScatterMode.SCATTERED)
+        and (output_mode == ScatterMode.TP_ATTN_FULL)
     ):
         hidden_states += residual
         residual = None
