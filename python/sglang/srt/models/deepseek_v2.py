@@ -293,11 +293,13 @@ class DeepseekV2MoE(nn.Module):
                 return_recv_hook=True,
             )
 
+    @property
+    def _enable_deepep_moe(self):
+        return global_server_args_dict["enable_deepep_moe"]
+
     def forward(
         self, hidden_states: torch.Tensor, forward_mode: Optional[ForwardMode] = None
     ) -> torch.Tensor:
-        enable_deepep_moe = global_server_args_dict["enable_deepep_moe"]
-
         if (
             forward_mode is not None
             and not forward_mode.is_idle()
@@ -309,7 +311,7 @@ class DeepseekV2MoE(nn.Module):
         else:
             router_logits = shared_output = None
 
-        if enable_deepep_moe and (router_logits is not None):
+        if self._enable_deepep_moe and (router_logits is not None):
             topk_weights, topk_idx = select_experts(
                 hidden_states=hidden_states,
                 router_logits=router_logits,
@@ -329,7 +331,7 @@ class DeepseekV2MoE(nn.Module):
                 (0, self.top_k), dtype=torch.float32, device=hidden_states.device
             )
 
-        if enable_deepep_moe and (self.ep_size > 1):
+        if self._enable_deepep_moe and (self.ep_size > 1):
             # TODO(ch-wan): allow users to set num_max_dispatch_tokens_per_rank value
             (
                 hidden_states,
@@ -347,7 +349,7 @@ class DeepseekV2MoE(nn.Module):
                 forward_mode=forward_mode,
             )
 
-        if enable_deepep_moe:
+        if self._enable_deepep_moe:
             final_hidden_states = self.experts(
                 hidden_states=hidden_states,
                 topk_idx=topk_idx,
@@ -364,7 +366,7 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states=hidden_states, router_logits=router_logits
             )
 
-        if enable_deepep_moe and (self.ep_size > 1):
+        if self._enable_deepep_moe and (self.ep_size > 1):
             final_hidden_states = self.deepep_dispatcher.combine(
                 final_hidden_states,
                 topk_idx,
@@ -377,7 +379,7 @@ class DeepseekV2MoE(nn.Module):
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
 
-        if (not enable_deepep_moe) and (self.tp_size > 1):
+        if (not self._enable_deepep_moe) and (self.tp_size > 1):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states
