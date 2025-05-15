@@ -33,7 +33,7 @@ from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
-    enable_moe_dense_fully_dp,
+    enable_moe_dense_fully_dp, ScatterMode,
 )
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather,
@@ -1219,7 +1219,7 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         hidden_states, residual = self.layer_communicator.forward_pre_mlp(hidden_states, residual, forward_batch)
 
-        if mode_is_forward_ffn_with_full_input or (not (
+        if (self.layer_scatter_modes.ffn_mode == ScatterMode.FULL) or (not (
             enable_moe_dense_fully_dp()
             and (not self.is_layer_sparse)
             and hidden_states.shape[0] == 0
