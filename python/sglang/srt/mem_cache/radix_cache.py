@@ -283,8 +283,7 @@ class RadixCache(BasePrefixCache):
             if len(x.parent.children) == 0:
                 heapq.heappush(leaves, x.parent)
 
-            if self.enable_kv_cache_events:
-                self._record_remove_event(x)
+            self._record_remove_event(x)
 
     def inc_lock_ref(self, node: TreeNode):
         if self.disable:
