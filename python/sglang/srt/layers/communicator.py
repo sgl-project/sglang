@@ -90,8 +90,6 @@ class LayerCommunicator:
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
 
-        self.is_last_layer = self.layer_id == config.num_hidden_layers - 1
-
     def forward_pre_attn(
         self,
         hidden_states: torch.Tensor,
@@ -179,7 +177,7 @@ class LayerCommunicator:
                 )
                 dp_scatter(hidden_states, global_hidden_states, forward_batch)
         elif self.layer_scatter_modes.ffn_mode == ScatterMode.SCATTERED:
-            if self.is_last_layer and self.attn_tp_size != 1:
+            if self.layer_scatter_modes.layer_output_mode == ScatterMode.TP_ATTN_FULL and self.attn_tp_size != 1:
                 hidden_states += residual
                 residual = None
                 hidden_states, local_hidden_states = (
