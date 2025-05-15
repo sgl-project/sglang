@@ -180,6 +180,8 @@ def _communicate_simple(
     context: _Context,
 ) -> torch.Tensor:
     def _inner():
+        nonlocal hidden_states
+
         if context.is_same_group_size(input_mode, output_mode):
             return hidden_states
 
