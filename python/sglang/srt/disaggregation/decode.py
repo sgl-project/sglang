@@ -21,6 +21,7 @@ Life cycle of a request in the decode server
 from __future__ import annotations
 
 import logging
+import os
 from collections import deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional, Tuple
@@ -37,6 +38,7 @@ from sglang.srt.disaggregation.utils import (
     ReqToMetadataIdxAllocator,
     TransferBackend,
     get_kv_class,
+    is_mla_backend,
     kv_to_page_indices,
     poll_and_all_reduce,
 )
@@ -86,6 +88,7 @@ class DecodePreallocQueue:
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.token_to_kv_pool = token_to_kv_pool_allocator.get_kvcache()
+        self.is_mla_backend = is_mla_backend(self.token_to_kv_pool)
         self.aux_dtype = aux_dtype
         self.metadata_buffers = metadata_buffers
         self.req_to_metadata_buffer_idx_allocator = req_to_metadata_buffer_idx_allocator
@@ -97,7 +100,9 @@ class DecodePreallocQueue:
         self.tp_size = tp_size
         self.bootstrap_port = bootstrap_port
 
-        self.num_reserved_decode_tokens = 512
+        self.num_reserved_decode_tokens = int(
+            os.environ.get("SGLANG_NUM_RESERVED_DECODE_TOKENS", "512")
+        )
 
         # Queue for requests pending pre-allocation
         self.queue: List[DecodeRequest] = []
@@ -128,7 +133,10 @@ class DecodePreallocQueue:
         kv_args.gpu_id = self.scheduler.gpu_id
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
         kv_manager = kv_manager_class(
-            kv_args, DisaggregationMode.DECODE, self.scheduler.server_args
+            kv_args,
+            DisaggregationMode.DECODE,
+            self.scheduler.server_args,
+            self.is_mla_backend,
         )
         return kv_manager
 
@@ -506,7 +514,7 @@ class SchedulerDisaggregationDecodeMixin:
     def event_loop_overlap_disagg_decode(self: Scheduler):
         result_queue = deque()
         self.last_batch: Optional[ScheduleBatch] = None
-        self.last_batch_in_queue = False  # last batch is modifed in-place, so we need another variable to track if it's extend
+        self.last_batch_in_queue = False  # last batch is modified in-place, so we need another variable to track if it's extend
 
         while True:
             recv_reqs = self.recv_requests()

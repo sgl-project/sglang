@@ -20,8 +20,12 @@ from typing import Optional, Tuple, Union
 import torch
 
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.distributed import get_pp_group, get_tp_group, get_world_group
-from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
+from sglang.srt.distributed import get_pp_group, get_world_group
+from sglang.srt.hf_transformers_utils import (
+    get_processor,
+    get_tokenizer,
+    get_tokenizer_from_processor,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqInput,
@@ -61,20 +65,13 @@ class TpModelWorker:
         self.pp_rank = pp_rank
 
         # Init model and tokenizer
-        self.model_config = ModelConfig(
-            (
+        self.model_config = ModelConfig.from_server_args(
+            server_args,
+            model_path=(
                 server_args.model_path
                 if not is_draft_worker
                 else server_args.speculative_draft_model_path
             ),
-            trust_remote_code=server_args.trust_remote_code,
-            revision=server_args.revision,
-            context_length=server_args.context_length,
-            model_override_args=server_args.json_model_override_args,
-            is_embedding=server_args.is_embedding,
-            enable_multimodal=server_args.enable_multimodal,
-            dtype=server_args.dtype,
-            quantization=server_args.quantization,
             is_draft_model=is_draft_worker,
         )
 
@@ -102,7 +99,7 @@ class TpModelWorker:
                     trust_remote_code=server_args.trust_remote_code,
                     revision=server_args.revision,
                 )
-                self.tokenizer = self.processor.tokenizer
+                self.tokenizer = get_tokenizer_from_processor(self.processor)
             else:
                 self.tokenizer = get_tokenizer(
                     server_args.tokenizer_path,
@@ -186,8 +183,11 @@ class TpModelWorker:
     def forward_batch_generation(
         self,
         model_worker_batch: ModelWorkerBatch,
+        launch_done: Optional[threading.Event] = None,
         skip_sample: bool = False,
-    ) -> Tuple[Union[LogitsProcessorOutput, torch.Tensor], Optional[torch.Tensor]]:
+    ) -> Tuple[
+        Union[LogitsProcessorOutput, torch.Tensor], Optional[torch.Tensor], bool
+    ]:
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
 
         pp_proxy_tensors = None
@@ -199,11 +199,11 @@ class TpModelWorker:
             )
 
         if self.pp_group.is_last_rank:
-            logits_output = self.model_runner.forward(
+            logits_output, can_run_cuda_graph = self.model_runner.forward(
                 forward_batch, pp_proxy_tensors=pp_proxy_tensors
             )
-            if model_worker_batch.launch_done is not None:
-                model_worker_batch.launch_done.set()
+            if launch_done is not None:
+                launch_done.set()
 
             if skip_sample:
                 next_token_ids = None
@@ -212,17 +212,17 @@ class TpModelWorker:
                     logits_output, model_worker_batch
                 )
 
-            return logits_output, next_token_ids
+            return logits_output, next_token_ids, can_run_cuda_graph
         else:
-            pp_proxy_tensors = self.model_runner.forward(
+            pp_proxy_tensors, can_run_cuda_graph = self.model_runner.forward(
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
-            return pp_proxy_tensors.tensors, None
+            return pp_proxy_tensors.tensors, None, can_run_cuda_graph
 
     def forward_batch_embedding(self, model_worker_batch: ModelWorkerBatch):
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
-        logits_output = self.model_runner.forward(forward_batch)
+        logits_output, _ = self.model_runner.forward(forward_batch)
         embeddings = logits_output.embeddings
         return embeddings
 
