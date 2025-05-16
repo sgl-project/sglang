@@ -9,6 +9,8 @@ import queue
 import socket
 import struct
 import threading
+import time
+from collections import defaultdict
 from functools import cache
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -157,6 +159,11 @@ class MooncakeKVManager(BaseKVManager):
                 min(cpu_count // 4, 16)
             )
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            self.heartbeat_failures = {}
+            self.addr_to_rooms = defaultdict(list)
+            self.connection_lock = threading.Lock()
+            self.heartbeat_interval = 5
+            self.max_failures = 3
             self.start_decode_thread()
             self.connection_pool: Dict[str, Dict[str, Union[str, int]]] = {}
             self.prefill_tp_size_table: Dict[str, int] = {}
@@ -384,7 +391,37 @@ class MooncakeKVManager(BaseKVManager):
                 bootstrap_room = int(bootstrap_room.decode("ascii"))
                 self.update_status(bootstrap_room, status)
 
+        def heartbeat_checker():
+            while True:
+                time.sleep(self.heartbeat_interval)
+                with self.connection_lock:
+                    addresses = list(self.prefill_dp_size_table.keys())
+
+                for addr in addresses:
+                    try:
+                        response = requests.get(f"http://{addr}/health", timeout=2)
+                        if response.status_code == 200:
+                            self.heartbeat_failures[addr] = 0
+
+                            for bootstrap_room in self.addr_to_rooms[addr]:
+                                if self.check_status(bootstrap_room) == KVPoll.Success:
+                                    self.addr_to_rooms[addr].remove(bootstrap_room)
+                        else:
+                            logger.info(f"Attempting to reconnect to {addr}...")
+                            self.heartbeat_failures[addr] = (
+                                self.heartbeat_failures.get(addr, 0) + 1
+                            )
+                    except Exception:
+                        logger.info(f"Attempting to reconnect to {addr}...")
+                        self.heartbeat_failures[addr] = (
+                            self.heartbeat_failures.get(addr, 0) + 1
+                        )
+
+                    if self.heartbeat_failures.get(addr, 0) >= self.max_failures:
+                        self._handle_node_failure(addr)
+
         threading.Thread(target=decode_thread).start()
+        threading.Thread(target=heartbeat_checker).start()
 
     def add_transfer_request(
         self,
@@ -442,7 +479,7 @@ class MooncakeKVManager(BaseKVManager):
         }
 
         try:
-            response = requests.put(url, json=payload)
+            response = requests.put(url, json=payload, timeout=5)
             if response.status_code == 200:
                 logger.debug("Prefill successfully registered to bootstrap server.")
             else:
@@ -451,6 +488,30 @@ class MooncakeKVManager(BaseKVManager):
                 )
         except Exception as e:
             logger.error(f"Prefill Failed to register to bootstrap server: {e}")
+
+    def _handle_node_failure(self, failed_bootstrap_addr):
+        with self.connection_lock:
+            keys_to_remove = [
+                k for k in self.connection_pool if k.startswith(failed_bootstrap_addr)
+            ]
+            for k in keys_to_remove:
+                del self.connection_pool[k]
+            if failed_bootstrap_addr in self.prefill_tp_size_table:
+                del self.prefill_tp_size_table[failed_bootstrap_addr]
+            if failed_bootstrap_addr in self.prefill_dp_size_table:
+                del self.prefill_dp_size_table[failed_bootstrap_addr]
+
+            possible_affected_rooms = self.addr_to_rooms.get(failed_bootstrap_addr, [])
+            del self.addr_to_rooms[failed_bootstrap_addr]
+        affected_rooms = []
+        for room in possible_affected_rooms:
+            if room in self.request_status:
+                self.update_status(room, KVPoll.Failed)
+                affected_rooms.append(room)
+
+        logger.error(
+            f"Detected failure on {failed_bootstrap_addr}, affected {len(affected_rooms)} requests"
+        )
 
 
 class MooncakeKVSender(BaseKVSender):
@@ -512,6 +573,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
         self.kv_mgr = mgr
         self.session_id = self.kv_mgr.get_session_id()
         self.kv_mgr.update_status(bootstrap_room, KVPoll.Bootstrapping)
+        self.kv_mgr.addr_to_rooms[self.bootstrap_addr].append(self.bootstrap_room)
 
         if self.bootstrap_addr not in self.kv_mgr.prefill_dp_size_table:
             self.prefill_tp_size, self.prefill_dp_size = (
@@ -624,7 +686,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
         """Fetch the bootstrap info from the bootstrap server."""
         try:
             url = f"http://{self.bootstrap_addr}/route?engine_rank={engine_rank}&target_dp_group={target_dp_group}"
-            response = requests.get(url)
+            response = requests.get(url, timeout=5)
             if response.status_code == 200:
                 bootstrap_info = response.json()
                 return bootstrap_info
@@ -743,6 +805,10 @@ class MooncakeKVBootstrapServer(BaseKVBootstrapServer):
 
     def _setup_routes(self):
         self.app.router.add_route("*", "/route", self._handle_route)
+        self.app.router.add_get("/health", self._handle_health_check)
+
+    async def _handle_health_check(self, request):
+        return web.Response(text="OK", status=200)
 
     async def _handle_route(self, request: web.Request):
         method = request.method
