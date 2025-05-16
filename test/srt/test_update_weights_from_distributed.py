@@ -162,7 +162,6 @@ def init_process_hf(
         rank=rank,
         group_name="test_parameter_update_group",
     )
-    dist.barrier(group=group, device_ids=[rank])
     torch.cuda.synchronize()
     time_begin_broadcast = time.perf_counter()
 
@@ -223,8 +222,8 @@ def init_process_sgl(
         if rank == 1:
             url = DEFAULT_URL_FOR_TEST
         else:
-            host, port = DEFAULT_URL_FOR_TEST.split(":")
-            url = ":".join(host, str(int(port) + 10000))
+            host, _, port = DEFAULT_URL_FOR_TEST.rpartition(":")
+            url = ":".join([host, str(int(port) + 10000)])
 
         print(f"[sgl] rank {rank} init server on url: {url}")
         process = popen_launch_server(
