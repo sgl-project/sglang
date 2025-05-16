@@ -317,7 +317,7 @@ class DeepseekV2MoE(nn.Module):
         else:
             router_logits = None
 
-        if (
+        if (not self._enable_deepep_moe) or (
             (self.n_share_experts_fusion == 0)
             and (forward_mode is not None)
             and not forward_mode.is_idle()
