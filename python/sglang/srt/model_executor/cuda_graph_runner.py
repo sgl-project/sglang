@@ -220,7 +220,10 @@ class CudaGraphRunner:
         if (
             "decode_attention_backend" in global_server_args_dict
             and global_server_args_dict["decode_attention_backend"] == "flashmla"
-        ) or (global_server_args_dict["attention_backend"] == "flashmla"):
+        ) or (
+            not "decode_attention_backend" in global_server_args_dict
+            and global_server_args_dict["attention_backend"] == "flashmla"
+        ):
             self.model_runner.attn_backend.init_cuda_graph_state(self.max_bs)
         else:
             self.model_runner.attn_backend.init_cuda_graph_state(self.max_num_token)
