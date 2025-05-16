@@ -45,7 +45,7 @@ include(FetchContent)
 FetchContent_Declare(
     repo-cutlass
     GIT_REPOSITORY https://github.com/NVIDIA/cutlass
-    GIT_TAG        ad7b2f5e84fcfa124cb02b91d5bd26d238c0459e
+    GIT_TAG        f115c3f85467d5d9619119d1dbeb9c03c3d73864
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-cutlass)
@@ -53,7 +53,7 @@ FetchContent_Populate(repo-cutlass)
 FetchContent_Declare(
     repo-deepgemm
     GIT_REPOSITORY https://github.com/deepseek-ai/DeepGEMM
-    GIT_TAG        4499c4ccbb5d3958b1a069f29ef666156a121278
+    GIT_TAG        d75b218b7b8f4a5dd5406ac87905039ead3ae42f
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-deepgemm)
@@ -114,7 +114,7 @@ set(SGL_KERNEL_CUDA_FLAGS
     "--expt-extended-lambda"
     "--threads=32"
 
-    # Supress warnings
+    # Suppress warnings
     "-Xcompiler=-Wconversion"
     "-Xcompiler=-fno-strict-aliasing"
 
@@ -207,6 +207,7 @@ set(SOURCES
     "csrc/moe/moe_fused_gate.cu"
     "csrc/moe/moe_topk_softmax_kernels.cu"
     "csrc/moe/fp8_blockwise_moe_kernel.cu"
+    "csrc/moe/prepare_moe_input.cu"
     "csrc/speculative/eagle_utils.cu"
     "csrc/speculative/speculative_sampling.cu"
     "csrc/speculative/packbit.cu"

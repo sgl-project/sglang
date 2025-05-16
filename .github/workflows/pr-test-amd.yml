@@ -4,14 +4,16 @@ on:
   push:
     branches: [ main ]
     paths:
-      - "python/sglang/**"
+      - "python/**"
+      - "scripts/**"
       - "test/**"
       - "sgl-kernel/**"
       - ".github/workflows/pr-test-amd.yml"
   pull_request:
     branches: [ main ]
     paths:
-      - "python/sglang/**"
+      - "python/**"
+      - "scripts/**"
       - "test/**"
       - "sgl-kernel/**"
       - ".github/workflows/pr-test-amd.yml"
@@ -25,7 +27,10 @@ jobs:
   accuracy-test-1-gpu-amd:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
       github.event.pull_request.draft == false
-    runs-on: linux-mi300-gpu-1
+    strategy:
+      matrix:
+        runner: [linux-mi300-gpu-1, linux-mi325-gpu-1]
+    runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -38,12 +43,12 @@ jobs:
           else
             DEVICE_FLAG="--device /dev/dri"
           fi
-          docker pull ghcr.io/saienduri/sglang-aiter-v0.1.1:428
+          docker pull lmsysorg/sglang:v0.4.6.post3-rocm630
           docker run -dt --user root --device=/dev/kfd $DEVICE_FLAG \
             -v ${{ github.workspace }}:/sglang-checkout --ipc=host --group-add video \
             --cap-add=SYS_PTRACE -e HF_TOKEN=${HF_TOKEN} --security-opt seccomp=unconfined \
             -w /sglang-checkout --name ci_sglang \
-            ghcr.io/saienduri/sglang-aiter-v0.1.1:428
+            lmsysorg/sglang:v0.4.6.post3-rocm630
 
       - name: Install dependencies
         run: |
@@ -65,7 +70,10 @@ jobs:
   accuracy-test-2-gpu-amd:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false
-    runs-on: linux-mi300-gpu-2
+    strategy:
+      matrix:
+        runner: [linux-mi300-gpu-2, linux-mi325-gpu-2]
+    runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -78,12 +86,12 @@ jobs:
           else
             DEVICE_FLAG="--device /dev/dri"
           fi
-          docker pull ghcr.io/saienduri/sglang-aiter-v0.1.1:428
+          docker pull lmsysorg/sglang:v0.4.6.post3-rocm630
           docker run -dt --user root --device=/dev/kfd $DEVICE_FLAG \
             -v ${{ github.workspace }}:/sglang-checkout --ipc=host --group-add video \
             --cap-add=SYS_PTRACE -e HF_TOKEN=${HF_TOKEN} --security-opt seccomp=unconfined \
             -w /sglang-checkout --name ci_sglang \
-            ghcr.io/saienduri/sglang-aiter-v0.1.1:428
+            lmsysorg/sglang:v0.4.6.post3-rocm630
 
       - name: Install dependencies
         run: |
@@ -103,7 +111,10 @@ jobs:
   mla-test-1-gpu-amd:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
       github.event.pull_request.draft == false
-    runs-on: linux-mi300-gpu-1
+    strategy:
+      matrix:
+        runner: [linux-mi300-gpu-1, linux-mi325-gpu-1]
+    runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -116,12 +127,12 @@ jobs:
           else
             DEVICE_FLAG="--device /dev/dri"
           fi
-          docker pull ghcr.io/saienduri/sglang-aiter-v0.1.1:428
+          docker pull lmsysorg/sglang:v0.4.6.post3-rocm630
           docker run -dt --user root --device=/dev/kfd $DEVICE_FLAG \
             -v ${{ github.workspace }}:/sglang-checkout --ipc=host --group-add video \
             --cap-add=SYS_PTRACE -e HF_TOKEN=${{ secrets.AMD_HF_TOKEN }} --security-opt seccomp=unconfined \
             -w /sglang-checkout --name ci_sglang \
-            ghcr.io/saienduri/sglang-aiter-v0.1.1:428
+            lmsysorg/sglang:v0.4.6.post3-rocm630
 
       - name: Install dependencies
         run: |
@@ -141,7 +152,10 @@ jobs:
   performance-test-1-gpu-part-1-amd:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false
-    runs-on: linux-mi300-gpu-1
+    strategy:
+      matrix:
+        runner: [linux-mi300-gpu-1, linux-mi325-gpu-1]
+    runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -154,12 +168,12 @@ jobs:
           else
             DEVICE_FLAG="--device /dev/dri"
           fi
-          docker pull ghcr.io/saienduri/sglang-aiter-v0.1.1:428
+          docker pull lmsysorg/sglang:v0.4.6.post3-rocm630
           docker run -dt --user root --device=/dev/kfd $DEVICE_FLAG \
             -v ${{ github.workspace }}:/sglang-checkout --ipc=host --group-add video \
             --cap-add=SYS_PTRACE -e HF_TOKEN=${HF_TOKEN} --security-opt seccomp=unconfined \
             -w /sglang-checkout --name ci_sglang \
-            ghcr.io/saienduri/sglang-aiter-v0.1.1:428
+            lmsysorg/sglang:v0.4.6.post3-rocm630
 
       - name: Install dependencies
         run: |
@@ -200,7 +214,10 @@ jobs:
   performance-test-1-gpu-part-2-amd:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false
-    runs-on: linux-mi300-gpu-1
+    strategy:
+      matrix:
+        runner: [linux-mi300-gpu-1, linux-mi325-gpu-1]
+    runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -213,12 +230,12 @@ jobs:
           else
             DEVICE_FLAG="--device /dev/dri"
           fi
-          docker pull ghcr.io/saienduri/sglang-aiter-v0.1.1:428
+          docker pull lmsysorg/sglang:v0.4.6.post3-rocm630
           docker run -dt --user root --device=/dev/kfd $DEVICE_FLAG \
             -v ${{ github.workspace }}:/sglang-checkout --ipc=host --group-add video \
             --cap-add=SYS_PTRACE -e HF_TOKEN=${HF_TOKEN} --security-opt seccomp=unconfined \
             -w /sglang-checkout --name ci_sglang \
-            ghcr.io/saienduri/sglang-aiter-v0.1.1:428
+            lmsysorg/sglang:v0.4.6.post3-rocm630
 
       - name: Install dependencies
         run: |
@@ -248,7 +265,10 @@ jobs:
   bench-test-2-gpu-amd:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
       github.event.pull_request.draft == false
-    runs-on: linux-mi300-gpu-2
+    strategy:
+      matrix:
+        runner: [linux-mi300-gpu-2, linux-mi325-gpu-2]
+    runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -261,12 +281,12 @@ jobs:
           else
             DEVICE_FLAG="--device /dev/dri"
           fi
-          docker pull ghcr.io/saienduri/sglang-aiter-v0.1.1:428
+          docker pull lmsysorg/sglang:v0.4.6.post3-rocm630
           docker run -dt --user root --device=/dev/kfd $DEVICE_FLAG \
             -v ${{ github.workspace }}:/sglang-checkout --ipc=host --group-add video \
             --cap-add=SYS_PTRACE -e HF_TOKEN=${HF_TOKEN} --security-opt seccomp=unconfined \
             -w /sglang-checkout --name ci_sglang \
-            ghcr.io/saienduri/sglang-aiter-v0.1.1:428
+            lmsysorg/sglang:v0.4.6.post3-rocm630
 
       - name: Install dependencies
         run: |
@@ -307,11 +327,135 @@ jobs:
         run: |
           docker exec -w /sglang-checkout/test/srt -e SGLANG_IS_IN_CI=1 -e SGLANG_AMD_CI=1 ci_sglang python3 -m unittest test_bench_serving.TestBenchServing.test_moe_offline_throughput_without_radix_cache
 
+  unit-test-backend-1-gpu-amd:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+      github.event.pull_request.draft == false
+    strategy:
+      matrix:
+        runner: [linux-mi300-gpu-1, linux-mi325-gpu-1]
+    runs-on: ${{matrix.runner}}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup docker
+        run: |
+          # Ensure GPU isolation if pod is part of kubernetes setup with DEVICE_FLAG.
+          if [ -f "/etc/podinfo/gha-render-devices" ]; then
+            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+          else
+            DEVICE_FLAG="--device /dev/dri"
+          fi
+          docker pull lmsysorg/sglang:v0.4.6.post3-rocm630
+          docker run -dt --user root --device=/dev/kfd $DEVICE_FLAG \
+            -v ${{ github.workspace }}:/sglang-checkout --ipc=host --group-add video \
+            --cap-add=SYS_PTRACE -e HF_TOKEN=${HF_TOKEN} --security-opt seccomp=unconfined \
+            -w /sglang-checkout --name ci_sglang \
+            lmsysorg/sglang:v0.4.6.post3-rocm630
+
+      - name: Install dependencies
+        run: |
+          docker exec ci_sglang pip install --upgrade pip
+          docker exec ci_sglang pip uninstall sgl-kernel -y || true
+          docker exec -w /sglang-checkout/sgl-kernel ci_sglang bash -c "rm -f pyproject.toml && mv pyproject_rocm.toml pyproject.toml && python3 setup_rocm.py install"
+          docker exec ci_sglang pip install -e "python[dev_hip]"
+
+          docker exec -w / ci_sglang git clone https://github.com/merrymercy/human-eval.git
+          docker exec -w /human-eval ci_sglang pip install -e .
+
+      - name: Run test
+        timeout-minutes: 30
+        run: |
+          docker exec -w /sglang-checkout/test/srt -e SGLANG_IS_IN_CI=1 -e SGLANG_AMD_CI=1 -e SGLANG_AITER_MOE=1 ci_sglang python3 run_suite.py --suite per-commit-amd
+
+  unit-test-backend-2-gpu-amd:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+      github.event.pull_request.draft == false
+    strategy:
+      matrix:
+        runner: [linux-mi300-gpu-2, linux-mi325-gpu-2]
+    runs-on: ${{matrix.runner}}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup docker
+        run: |
+          # Ensure GPU isolation if pod is part of kubernetes setup with DEVICE_FLAG.
+          if [ -f "/etc/podinfo/gha-render-devices" ]; then
+            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+          else
+            DEVICE_FLAG="--device /dev/dri"
+          fi
+          docker pull lmsysorg/sglang:v0.4.6.post3-rocm630
+          docker run -dt --user root --device=/dev/kfd $DEVICE_FLAG \
+            -v ${{ github.workspace }}:/sglang-checkout --ipc=host --group-add video \
+            --cap-add=SYS_PTRACE -e HF_TOKEN=${HF_TOKEN} --security-opt seccomp=unconfined \
+            -w /sglang-checkout --name ci_sglang \
+            lmsysorg/sglang:v0.4.6.post3-rocm630
+
+      - name: Install dependencies
+        run: |
+          docker exec ci_sglang pip install --upgrade pip
+          docker exec ci_sglang pip uninstall sgl-kernel -y || true
+          docker exec -w /sglang-checkout/sgl-kernel ci_sglang bash -c "rm -f pyproject.toml && mv pyproject_rocm.toml pyproject.toml && python3 setup_rocm.py install"
+          docker exec ci_sglang pip install -e "python[dev_hip]"
+
+          docker exec -w / ci_sglang git clone https://github.com/merrymercy/human-eval.git
+          docker exec -w /human-eval ci_sglang pip install -e .
+
+      - name: Run test
+        timeout-minutes: 30
+        run: |
+          docker exec -w /sglang-checkout/test/srt -e SGLANG_IS_IN_CI=1 -e SGLANG_AMD_CI=1 -e SGLANG_AITER_MOE=1 ci_sglang python3 run_suite.py --suite per-commit-2-gpu-amd
+
+  unit-test-backend-8-gpu-amd:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+      github.event.pull_request.draft == false
+    strategy:
+      matrix:
+        runner: [linux-mi300-gpu-8, linux-mi325-gpu-8]
+    runs-on: ${{matrix.runner}}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup docker
+        run: |
+          # Ensure GPU isolation if pod is part of kubernetes setup with DEVICE_FLAG.
+          if [ -f "/etc/podinfo/gha-render-devices" ]; then
+            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+          else
+            DEVICE_FLAG="--device /dev/dri"
+          fi
+          docker pull lmsysorg/sglang:v0.4.6.post3-rocm630
+          docker run -dt --user root --device=/dev/kfd $DEVICE_FLAG \
+            -v ${{ github.workspace }}:/sglang-checkout --ipc=host --group-add video \
+            --cap-add=SYS_PTRACE -e HF_TOKEN=${HF_TOKEN} --security-opt seccomp=unconfined \
+            -w /sglang-checkout --name ci_sglang \
+            lmsysorg/sglang:v0.4.6.post3-rocm630
+
+      - name: Install dependencies
+        run: |
+          docker exec ci_sglang pip install --upgrade pip
+          docker exec ci_sglang pip uninstall sgl-kernel -y || true
+          docker exec -w /sglang-checkout/sgl-kernel ci_sglang bash -c "rm -f pyproject.toml && mv pyproject_rocm.toml pyproject.toml && python3 setup_rocm.py install"
+          docker exec ci_sglang pip install -e "python[dev_hip]"
+
+          docker exec -w / ci_sglang git clone https://github.com/merrymercy/human-eval.git
+          docker exec -w /human-eval ci_sglang pip install -e .
+
+      - name: Run test
+        timeout-minutes: 30
+        run: |
+          docker exec -w /sglang-checkout/test/srt -e SGLANG_IS_IN_CI=1 -e SGLANG_AMD_CI=1 -e SGLANG_AITER_MOE=1 ci_sglang python3 run_suite.py --suite per-commit-8-gpu-amd
+
   finish:
     if: always()
     needs: [
       accuracy-test-1-gpu-amd, mla-test-1-gpu-amd, bench-test-2-gpu-amd,
-      accuracy-test-2-gpu-amd, performance-test-1-gpu-part-1-amd, performance-test-1-gpu-part-2-amd
+      accuracy-test-2-gpu-amd, performance-test-1-gpu-part-1-amd, performance-test-1-gpu-part-2-amd,
+      unit-test-backend-1-gpu-amd, unit-test-backend-2-gpu-amd, unit-test-backend-8-gpu-amd
     ]
     runs-on: ubuntu-latest
     steps:
