@@ -1070,11 +1070,11 @@ class ModelRunner:
             forward_batch.attn_backend = self.decode_attn_backend
         forward_batch.attn_backend.init_forward_metadata(forward_batch)
         return self.model.forward(
-                forward_batch.input_ids,
-                forward_batch.positions,
-                forward_batch,
-                **kwargs,
-            )
+            forward_batch.input_ids,
+            forward_batch.positions,
+            forward_batch,
+            **kwargs,
+        )
 
     def forward_extend(
         self,
