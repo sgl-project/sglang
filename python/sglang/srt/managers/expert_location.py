@@ -149,6 +149,19 @@ class ExpertLocationMetadata:
             logical_to_all_physical_map_num_valid=logical_to_all_physical_map_num_valid,
         )
 
+_global_expert_location_metadata: Optional[ExpertLocationMetadata] = None
+
+
+def get_global_expert_location_metadata():
+    return _global_expert_location_metadata
+
+
+def set_global_expert_location_metadata(value):
+    global _global_expert_location_metadata
+    assert _global_expert_location_metadata is None
+    _global_expert_location_metadata = value
+
+
 
 def _compute_logical_to_all_physical_map(
     physical_to_logical_map: torch.Tensor, num_logical_experts: int

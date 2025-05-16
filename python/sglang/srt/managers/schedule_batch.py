@@ -91,19 +91,6 @@ global_server_args_dict = {
     "triton_attention_reduce_in_fp32": ServerArgs.triton_attention_reduce_in_fp32,
 }
 
-_global_expert_location_metadata: Optional[ExpertLocationMetadata] = None
-
-
-def get_global_expert_location_metadata():
-    return _global_expert_location_metadata
-
-
-def set_global_expert_location_metadata(value):
-    global _global_expert_location_metadata
-    assert _global_expert_location_metadata is None
-    _global_expert_location_metadata = value
-
-
 logger = logging.getLogger(__name__)
 
 
