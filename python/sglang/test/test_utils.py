@@ -5,6 +5,7 @@ import copy
 import logging
 import os
 import random
+import ssl
 import subprocess
 import threading
 import time
@@ -24,6 +25,7 @@ from sglang.bench_serving import run_benchmark
 from sglang.global_config import global_config
 from sglang.lang.backend.openai import OpenAI
 from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
+from sglang.srt.entrypoints.http_server import SSLContextAdapter
 from sglang.srt.utils import (
     get_bool_env_var,
     is_port_available,
@@ -414,7 +416,33 @@ def popen_launch_server(
         *[str(x) for x in other_args],
     ]
 
-    if pd_separated:
+    # Handle SSL arguments
+    ssl_certfile: Optional[str] = None
+    ssl_keyfile: Optional[str] = None
+    ssl_ca_certs: Optional[str] = None
+    ssl_self_signed_cert: bool = False
+
+    for idx, arg in enumerate(other_args):
+        if arg.startswith("--ssl-certfile"):
+            ssl_certfile = other_args[idx + 1]
+        elif arg.startswith("--ssl-keyfile"):
+            ssl_keyfile = other_args[idx + 1]
+        elif arg.startswith("--ssl-ca-certs"):
+            ssl_ca_certs = other_args[idx + 1]
+        elif arg.startswith("--ssl-self-signed-cert"):
+            ssl_self_signed_cert = True
+
+    # Create SSL adapter
+    ssl_adapter = None
+    if ssl_certfile and ssl_keyfile:
+        ssl_context = ssl.create_default_context(cafile=ssl_ca_certs or ssl_certfile)
+        ssl_context.load_cert_chain(ssl_certfile, ssl_keyfile)
+        ssl_context.check_hostname = (
+            not ssl_self_signed_cert
+        )  # Need to be set to False for self-signed certs
+        ssl_adapter = SSLContextAdapter(ssl_context=ssl_context)
+
+    if pd_seperated:
         command.extend(
             [
                 "--lb-host",
@@ -451,6 +479,10 @@ def popen_launch_server(
 
     start_time = time.perf_counter()
     with requests.Session() as session:
+
+        if ssl_adapter:
+            session.mount("https://", ssl_adapter)
+
         while time.perf_counter() - start_time < timeout:
             try:
                 headers = {

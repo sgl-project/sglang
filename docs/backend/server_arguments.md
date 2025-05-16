@@ -87,6 +87,14 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `file_storage_path` | Directory for storing uploaded or generated files from API calls. | `"sglang_storage"` |
 | `enable_cache_report` | If set, includes detailed usage of cached tokens in the response usage. | `False` |
 
+### SSL configuration
+
+* `ssl_keyfile`: The file path to the SSL key file.
+* `ssl_certfile`: The file path to the SSL cert file.
+* `ssl_ca_certs`: The CA certificates file.
+* `ssl_cert_reqs`: Whether client certificate is required, see [ssl module](https://docs.python.org/3/library/ssl.html#ssl.SSLContext.verify_mode).
+* `ssl_self_signed_cert`: Whether the certfile passed is a self-signed certificate.
+
 ## Parallelism
 
 ### Tensor parallelism
