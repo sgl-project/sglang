@@ -701,8 +701,7 @@ def decode_attention_wave(
         shape,
         mfma_variant,
         max_kv_splits,
-        k_buffer.shape,
-        v_buffer.shape,
+        input_dtype=q.dtype,
         mha=mha,
     )
     hyperparams_0.update(get_default_scheduling_params())
