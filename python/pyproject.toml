@@ -98,7 +98,6 @@ torch_memory_saver = ["torch_memory_saver>=0.0.4"]
 decord = ["decord"]
 test = [
     "accelerate",
-    "torchaudio",
     "jsonlines",
     "matplotlib",
     "pandas",
