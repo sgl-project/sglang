@@ -33,7 +33,13 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
-from sglang.srt.utils import bind_port, configure_logger, get_free_port, get_zmq_socket
+from sglang.srt.utils import (
+    bind_port,
+    configure_logger,
+    get_free_port,
+    get_tcp_zmq_socket_binded_to_local_free_port,
+    get_zmq_socket,
+)
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -94,6 +100,8 @@ class DataParallelController:
 
         self.max_req_input_len = None
 
+        self.sockets_dp_attention_scheduler_to_tprank0 = None
+
     def launch_dp_schedulers(self, server_args, port_args):
         base_gpu_id = 0
 
@@ -152,7 +160,14 @@ class DataParallelController:
 
     def _dispatch_free_ports(self, server_args: ServerArgs):
         if server_args.node_rank == 0:
-            free_ports = {i: get_free_port() for i in range(server_args.dp_size)}
+            ports_and_sockets = {
+                i: get_tcp_zmq_socket_binded_to_local_free_port(self.context, zmq.PUSH)
+                for i in range(server_args.dp_size)
+            }
+            self.sockets_dp_attention_scheduler_to_tprank0 = {
+                i: socket for i, (port, socket) in ports_and_sockets.items()
+            }
+            free_ports = {i: port for i, (port, socket) in ports_and_sockets.items()}
             logger.debug(f"Free ports: {free_ports}")
 
             # broadcast dp_port_args to all dp ranks
@@ -204,16 +219,18 @@ class DataParallelController:
             dp_port_args.append(PortArgs.init_new(server_args, dp_rank))
         # Only node rank 0 runs the real data parallel controller that dispatches the requests.
         if server_args.node_rank == 0:
+            assert self.sockets_dp_attention_scheduler_to_tprank0 is not None
             for dp_rank in range(server_args.dp_size):
                 logger.debug(
                     f"Node rank 0 binding to dispatcher for dp controller {dp_rank}. scheduler_input_ipc_name: {dp_port_args[dp_rank].scheduler_input_ipc_name}"
                 )
-                self.workers[dp_rank] = get_zmq_socket(
-                    self.context,
-                    zmq.PUSH,
-                    dp_port_args[dp_rank].scheduler_input_ipc_name,
-                    True,
+                assert (
+                    self.sockets_dp_attention_scheduler_to_tprank0.get(dp_rank)
+                    is not None
                 )
+                self.workers[dp_rank] = self.sockets_dp_attention_scheduler_to_tprank0[
+                    dp_rank
+                ]
         self.launch_tensor_parallel_group(server_args, port_args, 0, None)
         return dp_port_args
 
