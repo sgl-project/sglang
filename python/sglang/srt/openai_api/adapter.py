@@ -1175,6 +1175,7 @@ def v1_chat_generate_request(
 
                 if not is_multimodal:
                     prompt_ids = tokenizer_manager.tokenizer.encode(prompt)
+                logprob_start_lens.append(-1)
         else:
             # Use the raw prompt and stop strings if the messages is already a string.
             prompt_ids = request.messages
@@ -1183,6 +1184,7 @@ def v1_chat_generate_request(
             audio_data = None
             modalities = []
             prompt = request.messages
+            logprob_start_lens.append(-1)
         input_ids.append(prompt_ids)
         return_logprobs.append(request.logprobs)
         top_logprobs_nums.append(request.top_logprobs or 0)
