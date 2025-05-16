@@ -429,7 +429,7 @@ class TokenizerManager:
                         yield response
                     else:
                         current_length = len(response["text"])
-                        if current_length != previous_length:
+                        if current_length > previous_length:
                             previous_length = current_length
                             yield response
             else:
