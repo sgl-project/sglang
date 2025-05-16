@@ -86,8 +86,8 @@ class StructureInfo:
 
 _GetInfoFunc = Callable[[str], StructureInfo]
 """
-helper alias of function
-ususally it is a function that takes a name string and returns a StructureInfo object,
+Helper alias of function
+Usually it is a function that takes a name string and returns a StructureInfo object,
 which can be used to construct a structural_tag object
 """
 

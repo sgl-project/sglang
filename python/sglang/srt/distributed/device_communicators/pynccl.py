@@ -75,7 +75,8 @@ class PyNcclCommunicator:
         self.available = True
         self.disabled = False
 
-        logger.info("sglang is using nccl==%s", self.nccl.ncclGetVersion())
+        if self.rank == 0:
+            logger.info("sglang is using nccl==%s", self.nccl.ncclGetVersion())
 
         if self.rank == 0:
             # get the unique id from NCCL

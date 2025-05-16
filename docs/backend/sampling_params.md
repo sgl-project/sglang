@@ -40,7 +40,7 @@ The `/generate` endpoint accepts the following parameters in JSON format. For de
 | Argument           | Type/Default           | Description                                                                                                                                    |
 |--------------------|------------------------|------------------------------------------------------------------------------------------------------------------------------------------------|
 | frequency_penalty  | `float = 0.0`          | Penalizes tokens based on their frequency in generation so far. Must be between `-2` and `2` where negative numbers encourage repeatment of tokens and positive number encourages sampling of new tokens. The scaling of penalization grows linearly with each appearance of a token. |
-| presence_penalty   | `float = 0.0`          | Penalizes tokens if they appeared in the generation so far. Must be between `-2` and `2` where negative numbers encourage repeatment of tokens and positive number encourages sampling of new tokens. The scaling of the penalization is constant if a token occured. |
+| presence_penalty   | `float = 0.0`          | Penalizes tokens if they appeared in the generation so far. Must be between `-2` and `2` where negative numbers encourage repeatment of tokens and positive number encourages sampling of new tokens. The scaling of the penalization is constant if a token occurred. |
 | min_new_tokens     | `int = 0`              | Forces the model to generate at least `min_new_tokens` until a stop word or EOS token is sampled. Note that this might lead to unintended behavior, for example, if the distribution is highly skewed towards these tokens. |
 
 ### Constrained decoding
@@ -135,7 +135,7 @@ Detailed example in [openai compatible api](https://docs.sglang.ai/backend/opena
 Launch a server:
 
 ```bash
-python3 -m sglang.launch_server --model-path lmms-lab/llava-onevision-qwen2-7b-ov --chat-template chatml-llava
+python3 -m sglang.launch_server --model-path lmms-lab/llava-onevision-qwen2-7b-ov
 ```
 
 Download an image:

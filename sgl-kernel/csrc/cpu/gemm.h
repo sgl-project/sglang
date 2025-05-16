@@ -1,6 +1,7 @@
 #pragma once
-
 #include <ATen/native/CPUBlas.h>
+
+#include "common.h"
 
 // amx-bf16
 #define TILE_M 16
@@ -30,6 +31,11 @@ inline bool can_use_brgemm<at::Half>(int M) {
 template <>
 inline bool can_use_brgemm<int8_t>(int M) {
   return false;
+}
+
+template <>
+inline bool can_use_brgemm<at::Float8_e4m3fn>(int M) {
+  return M > 4;
 }
 
 // work around compiler internal error
@@ -79,7 +85,7 @@ void fused_experts_int8_kernel_impl(
     int64_t topk,
     int64_t num_tokens_post_pad);
 
-// shared expert implememntation for int8 w8a8
+// shared expert implementation for int8 w8a8
 template <typename scalar_t>
 void shared_expert_int8_kernel_impl(
     scalar_t* __restrict__ output,

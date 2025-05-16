@@ -47,6 +47,8 @@ def _get_version():
                 return line.split("=")[1].strip().strip('"')
 
 
+cpu_fp8_ftz = os.getenv("SGLANG_CPU_FP8_CVT_FTZ", "1") == "1"
+
 operator_namespace = "sgl_kernel"
 include_dirs = []
 
@@ -56,6 +58,7 @@ sources = [
     "csrc/cpu/decode.cpp",
     "csrc/cpu/extend.cpp",
     "csrc/cpu/gemm.cpp",
+    "csrc/cpu/gemm_fp8.cpp",
     "csrc/cpu/gemm_int8.cpp",
     "csrc/cpu/moe.cpp",
     "csrc/cpu/moe_int8.cpp",
@@ -64,6 +67,7 @@ sources = [
     "csrc/cpu/topk.cpp",
     "csrc/cpu/interface.cpp",
     "csrc/cpu/shm.cpp",
+    "csrc/cpu/rope.cpp",
     "csrc/cpu/torch_extension_cpu.cpp",
 ]
 
@@ -75,6 +79,9 @@ extra_compile_args = {
         "-fopenmp",
     ]
 }
+if cpu_fp8_ftz:
+    extra_compile_args["cxx"].append("-DSGLANG_CPU_FP8_CVT_FTZ")
+
 libraries = ["c10", "torch", "torch_python"]
 cmdclass = {
     "build_ext": BuildExtension.with_options(use_ninja=True),

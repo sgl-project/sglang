@@ -121,7 +121,7 @@ def main(args):
     def get_one_answer(i):
         states[i] = tree_search(**arguments[i], call_generate=call_generate)
 
-    tic = time.time()
+    tic = time.perf_counter()
     if args.parallel == 1:
         for i in tqdm(range(len(questions))):
             get_one_answer(i)
@@ -134,7 +134,7 @@ def main(args):
                 )
             )
 
-    latency = time.time() - tic
+    latency = time.perf_counter() - tic
 
     answers_text = []
     for s in states:

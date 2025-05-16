@@ -294,7 +294,7 @@ class SamplingBatchInfo:
             # Set the flag to True if any of the two has custom logit processor
             self.has_custom_logit_processor = True
 
-        # Note: becasue the __len()__ operator is defined on the temperatures tensor,
+        # Note: because the __len()__ operator is defined on the temperatures tensor,
         # please make sure any merge operation with len(self) or len(other) is done before
         # the merge operation of the temperatures tensor below.
         for item in [
@@ -307,5 +307,5 @@ class SamplingBatchInfo:
             other_val = getattr(other, item, None)
             setattr(self, item, torch.cat([self_val, other_val]))
 
-        self.is_all_greedy |= other.is_all_greedy
+        self.is_all_greedy &= other.is_all_greedy
         self.need_min_p_sampling |= other.need_min_p_sampling

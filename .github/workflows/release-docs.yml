@@ -22,11 +22,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.9'
-
       - name: Install dependencies
         run: |
           find /public_sglang_ci/runner-a-gpu-1/_work/_tool/Python/3.9.21/x64/lib/python3.9/site-packages -name "sgl-kernel*" -exec rm -rf {} + || true
@@ -35,6 +30,8 @@ jobs:
           apt-get update
           apt-get install -y pandoc
           apt-get update && apt-get install -y parallel retry
+
+          ln -sf "$(which python3)" /usr/bin/python
 
       - name: Setup Jupyter Kernel
         run: |

@@ -38,7 +38,7 @@ The core features include:
    :caption: Supported Models
 
    supported_models/generative_models.md
-   supported_models/vision_language_models.md
+   supported_models/multimodal_language_models.md
    supported_models/embedding_models.md
    supported_models/reward_models.md
    supported_models/support_new_models.md
