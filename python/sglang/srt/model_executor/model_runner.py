@@ -56,11 +56,10 @@ from sglang.srt.managers.expert_distribution import (
     ExpertDistributionRecorder,
     set_global_expert_distribution_recorder,
 )
-from sglang.srt.managers.expert_location import compute_initial_expert_location_metadata
+from sglang.srt.managers.expert_location import compute_initial_expert_location_metadata, \
+    set_global_expert_location_metadata, get_global_expert_location_metadata
 from sglang.srt.managers.schedule_batch import (
-    get_global_expert_location_metadata,
     global_server_args_dict,
-    set_global_expert_location_metadata,
 )
 from sglang.srt.mem_cache.memory_pool import (
     DoubleSparseTokenToKVPool,
