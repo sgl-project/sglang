@@ -990,7 +990,7 @@ class ModelRunner:
             from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend
 
             return FlashMLABackend(self)
-        elif backend_str == "flash_attn_v3":
+        elif backend_str == "fa3":
             assert (
                 torch.cuda.get_device_capability()[0] == 8 and not self.use_mla_backend
             ) or torch.cuda.get_device_capability()[0] == 9, (
