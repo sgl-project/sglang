@@ -694,7 +694,21 @@ def moe_align_block_size(
     sorted_ids = torch.empty(
         (max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device
     )
+    
+    device_module = torch.get_device_module()
+    alt_stream = _get_or_create_alt_stream(device_module)
+    
+    alt_stream.wait_stream(device_module.current_stream())
+    
     sorted_ids.fill_(topk_ids.numel())
+    
+    with device_module.stream(alt_stream):
+        cumsum_buffer = torch.zeros(
+            num_experts + 1, dtype=torch.int32, device=topk_ids.device
+        )
+    
+    device_module.current_stream().wait_stream(alt_stream)
+    
     max_num_m_blocks = triton.cdiv(max_num_tokens_padded, block_size)
     expert_ids = torch.empty(
         (max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device
@@ -715,9 +729,6 @@ def moe_align_block_size(
             dtype=torch.int32,
             device=topk_ids.device,
         )
-        cumsum_buffer = torch.empty(
-            num_experts + 1, dtype=torch.int32, device=topk_ids.device
-        )
 
         sgl_moe_align_block_size(
             topk_ids,
@@ -730,6 +741,13 @@ def moe_align_block_size(
             cumsum_buffer,
         )
     return sorted_ids, expert_ids, num_tokens_post_pad
+
+
+def _get_or_create_alt_stream(device_module):
+    global _alt_stream
+    if _alt_stream is None:
+        _alt_stream = device_module.Stream()
+    return _alt_stream
 
 
 def invoke_fused_moe_kernel(
