@@ -47,6 +47,7 @@ from sgl_kernel.moe import (
     fp8_blockwise_scaled_grouped_mm,
     moe_align_block_size,
     moe_fused_gate,
+    prepare_moe_input,
     topk_softmax,
 )
 from sgl_kernel.sampling import (
