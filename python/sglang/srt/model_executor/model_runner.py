@@ -29,6 +29,7 @@ import torch.distributed as dist
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
+from sglang.srt.cpu_utils import cpu_has_amx_support
 from sglang.srt.distributed import (
     get_tp_group,
     get_world_group,
@@ -316,6 +317,16 @@ class ModelRunner:
 
     def model_specific_adjustment(self):
         server_args = self.server_args
+
+        if (
+            server_args.attention_backend == "intel_amx"
+            and server_args.device == "cpu"
+            and not cpu_has_amx_support()
+        ):
+            logger.info(
+                "The current platform does not support Intel AMX, will fallback to torch_native backend."
+            )
+            server_args.attention_backend = "torch_native"
 
         if server_args.attention_backend is None:
             """
