@@ -338,7 +338,6 @@ class BaseMultimodalProcessor(ABC):
         out.normalize()
         return out
 
-
     @staticmethod
     def get_mm_items_offset(
         input_ids: torch.Tensor, mm_token_id: int
