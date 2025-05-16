@@ -133,7 +133,8 @@ class ServerArgs:
 
     # Kernel backend
     attention_backend: Optional[str] = None
-    enable_flashinfer_attention_decode: bool = False
+    decode_attention_backend: Optional[str] = None
+    prefill_attention_backend: Optional[str] = None
     sampling_backend: Optional[str] = None
     grammar_backend: Optional[str] = None
 
@@ -946,9 +947,33 @@ class ServerArgs:
             help="Choose the kernels for attention layers.",
         )
         parser.add_argument(
-            "--enable-flashinfer-attention-decode",
-            action="store_true",
-            help="Use flashinfer attention backend for decode, it's only suggested for Qwen3-series in H20.",
+            "--decode-attention-backend",
+            type=str,
+            choices=[
+                "flashinfer",
+                "triton",
+                "torch_native",
+                "fa3",
+                "flashmla",
+                "cutlass_mla",
+            ],
+            default=ServerArgs.decode_attention_backend,
+            help="Choose the kernels for decode attention layers (have priority over --attention-backend).",
+        )
+
+        parser.add_argument(
+            "--prefill-attention-backend",
+            type=str,
+            choices=[
+                "flashinfer",
+                "triton",
+                "torch_native",
+                "fa3",
+                "flashmla",
+                "cutlass_mla",
+            ],
+            default=ServerArgs.prefill_attention_backend,
+            help="Choose the kernels for prefill attention layers (have priority over --attention-backend).",
         )
         parser.add_argument(
             "--sampling-backend",
