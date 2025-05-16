@@ -1,8 +1,9 @@
-import os
+import glob
 import json
 import logging
-import glob
+import os
 from shutil import rmtree
+
 from huggingface_hub import snapshot_download
 
 BASE_DIR = "/"
