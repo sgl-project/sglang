@@ -1094,6 +1094,7 @@ def v1_chat_generate_request(
                 )
                 if request.continue_final_message:
                     gen_assistant_prefix_ids = []
+                    prompt_with_role_ids = ori_prompt_ids + gen_assistant_prefix_ids
                 else:
                     prompt_with_role_ids, gen_assistant_prefix_ids = (
                         remove_first_nonblank_token(
