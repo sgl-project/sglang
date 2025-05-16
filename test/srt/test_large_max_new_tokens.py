@@ -17,11 +17,12 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     STDERR_FILENAME,
     STDOUT_FILENAME,
+    CustomTestCase,
     popen_launch_server,
 )
 
 
-class TestLargeMaxNewTokens(unittest.TestCase):
+class TestLargeMaxNewTokens(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST

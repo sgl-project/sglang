@@ -25,12 +25,14 @@ from xgrammar import (
     StructuralTagItem,
     TokenizerInfo,
     allocate_token_bitmask,
-    apply_token_bitmask_inplace,
 )
 
 from sglang.srt.constrained.base_grammar_backend import (
     BaseGrammarBackend,
     BaseGrammarObject,
+)
+from sglang.srt.constrained.triton_ops.bitmask_ops import (
+    apply_token_bitmask_inplace_triton,
 )
 
 logger = logging.getLogger(__name__)
@@ -47,15 +49,69 @@ class XGrammarGrammar(BaseGrammarObject):
         vocab_size: int,
         ctx: CompiledGrammar,
         override_stop_tokens: Optional[Union[List[int], int]],
+        key_string: Optional[str] = None,  # TODO (sk): for debugging, remove later
     ) -> None:
         self.matcher = matcher
         self.vocab_size = vocab_size
         self.ctx = ctx
         self.override_stop_tokens = override_stop_tokens
         self.finished = False
+        self.accepted_tokens = []
+        self.key_string = key_string
 
     def accept_token(self, token: int):
-        assert self.matcher.accept_token(token)
+        if not self.is_terminated():
+            accepted = self.matcher.accept_token(token)
+            if not accepted:
+                # log for debugging
+                raise ValueError(
+                    f"Tokens not accepted: {token}\n"
+                    f"Accepted tokens: {self.accepted_tokens}\n"
+                    f"Key string: {self.key_string}"
+                )
+            else:
+                self.accepted_tokens.append(token)
+
+    def rollback(self, k: int):
+        self.matcher.rollback(k)
+        self.accepted_tokens = self.accepted_tokens[:-k]
+
+    def is_terminated(self):
+        return self.matcher.is_terminated()
+
+    def allocate_vocab_mask(
+        self, vocab_size: int, batch_size: int, device
+    ) -> torch.Tensor:
+        return allocate_token_bitmask(batch_size, vocab_size)
+
+    def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
+        self.matcher.fill_next_token_bitmask(vocab_mask, idx)
+
+    @staticmethod
+    def move_vocab_mask(vocab_mask: torch.Tensor, device) -> torch.Tensor:
+        return vocab_mask.to(device, non_blocking=True)
+
+    def apply_vocab_mask(self, logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
+        if logits.device.type == "cuda":
+            apply_token_bitmask_inplace_triton(logits, vocab_mask)
+        elif logits.device.type == "cpu" and self.apply_vocab_mask_cpu:
+            self.apply_vocab_mask_cpu(logits, vocab_mask)
+        else:
+            raise RuntimeError(f"Unsupported device: {logits.device.type}")
+
+    def copy(self):
+        matcher = GrammarMatcher(
+            self.ctx,
+            max_rollback_tokens=MAX_ROLLBACK_TOKENS,
+            override_stop_tokens=self.override_stop_tokens,
+        )
+        return XGrammarGrammar(
+            matcher,
+            self.vocab_size,
+            self.ctx,
+            self.override_stop_tokens,
+            self.key_string,
+        )
 
     def try_jump_forward(self, tokenizer) -> Optional[Tuple[List[int], str]]:
         s = self.matcher.find_jump_forward_string()
@@ -84,31 +140,8 @@ class XGrammarGrammar(BaseGrammarObject):
         for i in range(k, len(new_output_ids)):
             assert self.matcher.accept_token(new_output_ids[i])
 
-    def allocate_vocab_mask(
-        self, vocab_size: int, batch_size: int, device
-    ) -> torch.Tensor:
-        return allocate_token_bitmask(batch_size, vocab_size)
-
-    def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
-        self.matcher.fill_next_token_bitmask(vocab_mask, idx)
-
-    @staticmethod
-    def move_vocab_mask(vocab_mask: torch.Tensor, device) -> torch.Tensor:
-        return vocab_mask.to(device, non_blocking=True)
-
-    @staticmethod
-    def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
-        apply_token_bitmask_inplace(logits, vocab_mask)
-
-    def copy(self):
-        matcher = GrammarMatcher(
-            self.ctx,
-            max_rollback_tokens=MAX_ROLLBACK_TOKENS,
-            override_stop_tokens=self.override_stop_tokens,
-        )
-        return XGrammarGrammar(
-            matcher, self.vocab_size, self.ctx, self.override_stop_tokens
-        )
+    def __repr__(self):
+        return f"XGrammarGrammar({self.key_string=}, {self.accepted_tokens=})"
 
 
 class XGrammarGrammarBackend(BaseGrammarBackend):
@@ -128,20 +161,27 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         self.vocab_size = vocab_size
         self.override_stop_tokens = override_stop_tokens
 
-    def _from_context(self, ctx: CompiledGrammar) -> XGrammarGrammar:
-        matcher = GrammarMatcher(ctx, max_rollback_tokens=MAX_ROLLBACK_TOKENS)
-        return XGrammarGrammar(matcher, self.vocab_size, ctx, self.override_stop_tokens)
+    def _from_context(self, ctx: CompiledGrammar, key_string: str) -> XGrammarGrammar:
+        matcher = GrammarMatcher(
+            ctx,
+            max_rollback_tokens=MAX_ROLLBACK_TOKENS,
+            override_stop_tokens=self.override_stop_tokens,
+        )
+        return XGrammarGrammar(
+            matcher, self.vocab_size, ctx, self.override_stop_tokens, key_string
+        )
 
     def dispatch_json(self, key_string: str) -> Optional[XGrammarGrammar]:
         try:
             if key_string == "$$ANY$$":
+                # Note: This builtin JSON grammar includes *all* valid JSON (including, for example, arrays at the root)
                 ctx = self.grammar_compiler.compile_builtin_json_grammar()
             else:
                 ctx = self.grammar_compiler.compile_json_schema(schema=key_string)
         except RuntimeError as e:
             logging.warning(f"Skip invalid json_schema: json_schema={key_string}, {e=}")
             return None
-        return self._from_context(ctx)
+        return self._from_context(ctx, key_string)
 
     def dispatch_ebnf(self, key_string: str) -> Optional[XGrammarGrammar]:
         try:
@@ -149,7 +189,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         except RuntimeError as e:
             logging.warning(f"Skip invalid ebnf: ebnf={key_string}, {e=}")
             return None
-        return self._from_context(ctx)
+        return self._from_context(ctx, key_string)
 
     def dispatch_regex(self, key_string: str) -> Optional[XGrammarGrammar]:
         try:
@@ -157,7 +197,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         except RuntimeError as e:
             logging.warning(f"Skip invalid regex: regex={key_string}, {e=}")
             return None
-        return self._from_context(ctx)
+        return self._from_context(ctx, key_string)
 
     def dispatch_structural_tag(self, key_string: str) -> Optional[XGrammarGrammar]:
         try:
@@ -174,9 +214,11 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
                 tags, structural_tag["triggers"]
             )
         except RuntimeError as e:
-            logging.warning(f"Skip invalid regex: regex={key_string}, {e=}")
+            logging.warning(
+                f"Skip invalid structural_tag: structural_tag={key_string}, {e=}"
+            )
             return None
-        return self._from_context(ctx)
+        return self._from_context(ctx, key_string)
 
     def reset(self):
         if self.grammar_compiler:

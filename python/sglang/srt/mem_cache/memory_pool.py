@@ -34,6 +34,8 @@ from typing import List, Optional, Tuple, Union
 import numpy as np
 import psutil
 import torch
+import triton
+import triton.language as tl
 
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.utils import debug_timing, get_compiler_backend
@@ -185,12 +187,18 @@ class TokenToKVPoolAllocator:
         if self.free_group:
             self.free(torch.cat(self.free_group))
 
+    def backup_state(self):
+        return self.free_slots
+
+    def restore_state(self, free_slots):
+        self.free_slots = free_slots
+
     def clear(self):
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
         self.free_slots = torch.arange(
             1, self.size + 1, dtype=torch.int64, device=self.device
         )
-        self.is_in_free_group = False
+        self.is_not_in_free_group = True
         self.free_group = []
 
 
@@ -206,6 +214,8 @@ class MHATokenToKVPool(KVCache):
         layer_num: int,
         device: str,
         enable_memory_saver: bool,
+        start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
     ):
         self.size = size
         self.page_size = page_size
@@ -224,6 +234,8 @@ class MHATokenToKVPool(KVCache):
         self.head_dim = head_dim
         self.layer_num = layer_num
         self._create_buffers()
+        self.start_layer = start_layer or 0
+        self.end_layer = end_layer or layer_num - 1
 
         self.layer_transfer_counter = None
         self.capture_mode = False
@@ -273,6 +285,8 @@ class MHATokenToKVPool(KVCache):
 
     # for disagg
     def get_contiguous_buf_infos(self):
+        # layer_num x [seq_len, head_num, head_dim]
+        # layer_num x [page_num, page_size, head_num, head_dim]
         kv_data_ptrs = [
             self.get_key_buffer(i).data_ptr() for i in range(self.layer_num)
         ] + [self.get_value_buffer(i).data_ptr() for i in range(self.layer_num)]
@@ -280,8 +294,12 @@ class MHATokenToKVPool(KVCache):
             self.get_key_buffer(i).nbytes for i in range(self.layer_num)
         ] + [self.get_value_buffer(i).nbytes for i in range(self.layer_num)]
         kv_item_lens = [
-            self.get_key_buffer(i)[0].nbytes for i in range(self.layer_num)
-        ] + [self.get_value_buffer(i)[0].nbytes for i in range(self.layer_num)]
+            self.get_key_buffer(i)[0].nbytes * self.page_size
+            for i in range(self.layer_num)
+        ] + [
+            self.get_value_buffer(i)[0].nbytes * self.page_size
+            for i in range(self.layer_num)
+        ]
         return kv_data_ptrs, kv_data_lens, kv_item_lens
 
     # Todo: different memory layout
@@ -308,24 +326,24 @@ class MHATokenToKVPool(KVCache):
         # transfer prepared data from host to device
         flat_data = flat_data.to(device=self.device, non_blocking=False)
         k_data, v_data = flat_data[0], flat_data[1]
-        self.k_buffer[layer_id][indices] = k_data
-        self.v_buffer[layer_id][indices] = v_data
+        self.k_buffer[layer_id - self.start_layer][indices] = k_data
+        self.v_buffer[layer_id - self.start_layer][indices] = v_data
 
     def get_key_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id)
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
         if self.store_dtype != self.dtype:
-            return self.k_buffer[layer_id].view(self.dtype)
-        return self.k_buffer[layer_id]
+            return self.k_buffer[layer_id - self.start_layer].view(self.dtype)
+        return self.k_buffer[layer_id - self.start_layer]
 
     def get_value_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id)
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
         if self.store_dtype != self.dtype:
-            return self.v_buffer[layer_id].view(self.dtype)
-        return self.v_buffer[layer_id]
+            return self.v_buffer[layer_id - self.start_layer].view(self.dtype)
+        return self.v_buffer[layer_id - self.start_layer]
 
     def get_kv_buffer(self, layer_id: int):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
@@ -356,13 +374,13 @@ class MHATokenToKVPool(KVCache):
             # Overlap the copy of K and V cache for small batch size
             current_stream = self.device_module.current_stream()
             self.alt_stream.wait_stream(current_stream)
+            self.k_buffer[layer_id - self.start_layer][loc] = cache_k
             with self.device_module.stream(self.alt_stream):
-                self.k_buffer[layer_id][loc] = cache_k
-            self.v_buffer[layer_id][loc] = cache_v
+                self.v_buffer[layer_id - self.start_layer][loc] = cache_v
             current_stream.wait_stream(self.alt_stream)
         else:
-            self.k_buffer[layer_id][loc] = cache_k
-            self.v_buffer[layer_id][loc] = cache_v
+            self.k_buffer[layer_id - self.start_layer][loc] = cache_k
+            self.v_buffer[layer_id - self.start_layer][loc] = cache_v
 
 
 @torch.compile
@@ -395,6 +413,72 @@ def copy_two_array(loc, dst_1, src_1, dst_2, src_2, dtype, store_dtype):
     dst_2[loc] = src_2.to(dtype).view(store_dtype)
 
 
+@triton.jit
+def set_mla_kv_buffer_kernel(
+    kv_buffer_ptr,
+    cache_k_nope_ptr,
+    cache_k_rope_ptr,
+    loc_ptr,
+    buffer_stride: tl.constexpr,
+    nope_stride: tl.constexpr,
+    rope_stride: tl.constexpr,
+    nope_dim: tl.constexpr,
+    rope_dim: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    pid_loc = tl.program_id(0)
+    pid_blk = tl.program_id(1)
+
+    base = pid_blk * BLOCK
+    offs = base + tl.arange(0, BLOCK)
+    total_dim = nope_dim + rope_dim
+    mask = offs < total_dim
+
+    loc = tl.load(loc_ptr + pid_loc)
+    dst_ptr = kv_buffer_ptr + loc * buffer_stride + offs
+
+    if base + BLOCK <= nope_dim:
+        src = tl.load(
+            cache_k_nope_ptr + pid_loc * nope_stride + offs,
+            mask=mask,
+        )
+    else:
+        offs_rope = offs - nope_dim
+        src = tl.load(
+            cache_k_rope_ptr + pid_loc * rope_stride + offs_rope,
+            mask=mask,
+        )
+
+    tl.store(dst_ptr, src, mask=mask)
+
+
+def set_mla_kv_buffer_triton(
+    kv_buffer: torch.Tensor,
+    loc: torch.Tensor,
+    cache_k_nope: torch.Tensor,
+    cache_k_rope: torch.Tensor,
+):
+    nope_dim = cache_k_nope.shape[-1]
+    rope_dim = cache_k_rope.shape[-1]
+    total_dim = nope_dim + rope_dim
+    BLOCK = 128
+    n_loc = loc.numel()
+    grid = (n_loc, triton.cdiv(total_dim, BLOCK))
+
+    set_mla_kv_buffer_kernel[grid](
+        kv_buffer,
+        cache_k_nope,
+        cache_k_rope,
+        loc,
+        kv_buffer.stride(0),
+        cache_k_nope.stride(0),
+        cache_k_rope.stride(0),
+        nope_dim,
+        rope_dim,
+        BLOCK=BLOCK,
+    )
+
+
 class MLATokenToKVPool(KVCache):
     def __init__(
         self,
@@ -406,8 +490,11 @@ class MLATokenToKVPool(KVCache):
         layer_num: int,
         device: str,
         enable_memory_saver: bool,
+        start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
     ):
         self.size = size
+        self.page_size = page_size
         self.dtype = dtype
         self.device = device
         if dtype in (torch.float8_e5m2, torch.float8_e4m3fn):
@@ -418,6 +505,8 @@ class MLATokenToKVPool(KVCache):
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
         self.layer_num = layer_num
+        self.start_layer = start_layer or 0
+        self.end_layer = end_layer or layer_num - 1
 
         memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
@@ -435,22 +524,47 @@ class MLATokenToKVPool(KVCache):
             ]
 
         self.layer_transfer_counter = None
+        self.page_size = page_size
+
+        kv_size = self.get_kv_size_bytes()
+        logger.info(
+            f"KV Cache is allocated. #tokens: {size}, KV size: {kv_size / GB:.2f} GB"
+        )
+
+    def get_kv_size_bytes(self):
+        assert hasattr(self, "kv_buffer")
+        kv_size_bytes = 0
+        for kv_cache in self.kv_buffer:
+            kv_size_bytes += np.prod(kv_cache.shape) * kv_cache.dtype.itemsize
+        return kv_size_bytes
+
+    # for disagg
+    def get_contiguous_buf_infos(self):
+        # MLA has only one kv_buffer, so only the information of this buffer needs to be returned.
+        kv_data_ptrs = [self.kv_buffer[i].data_ptr() for i in range(self.layer_num)]
+        kv_data_lens = [self.kv_buffer[i].nbytes for i in range(self.layer_num)]
+        kv_item_lens = [
+            self.kv_buffer[i][0].nbytes * self.page_size for i in range(self.layer_num)
+        ]
+        return kv_data_ptrs, kv_data_lens, kv_item_lens
 
     def get_key_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id)
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
         if self.store_dtype != self.dtype:
-            return self.kv_buffer[layer_id].view(self.dtype)
-        return self.kv_buffer[layer_id]
+            return self.kv_buffer[layer_id - self.start_layer].view(self.dtype)
+        return self.kv_buffer[layer_id - self.start_layer]
 
     def get_value_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id)
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
         if self.store_dtype != self.dtype:
-            return self.kv_buffer[layer_id][..., : self.kv_lora_rank].view(self.dtype)
-        return self.kv_buffer[layer_id][..., : self.kv_lora_rank]
+            return self.kv_buffer[layer_id - self.start_layer][
+                ..., : self.kv_lora_rank
+            ].view(self.dtype)
+        return self.kv_buffer[layer_id - self.start_layer][..., : self.kv_lora_rank]
 
     def get_kv_buffer(self, layer_id: int):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
@@ -466,9 +580,30 @@ class MLATokenToKVPool(KVCache):
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
         if self.store_dtype != self.dtype:
-            self.kv_buffer[layer_id][loc] = cache_k.view(self.store_dtype)
+            self.kv_buffer[layer_id - self.start_layer][loc] = cache_k.view(
+                self.store_dtype
+            )
         else:
-            self.kv_buffer[layer_id][loc] = cache_k
+            self.kv_buffer[layer_id - self.start_layer][loc] = cache_k
+
+    def set_mla_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k_nope: torch.Tensor,
+        cache_k_rope: torch.Tensor,
+    ):
+        layer_id = layer.layer_id
+        if cache_k_nope.dtype != self.dtype:
+            cache_k_nope = cache_k_nope.to(self.dtype)
+            cache_k_rope = cache_k_rope.to(self.dtype)
+        if self.store_dtype != self.dtype:
+            cache_k_nope = cache_k_nope.view(self.store_dtype)
+            cache_k_rope = cache_k_rope.view(self.store_dtype)
+
+        set_mla_kv_buffer_triton(
+            self.kv_buffer[layer_id], loc, cache_k_nope, cache_k_rope
+        )
 
     def get_flat_data(self, indices):
         # prepare a large chunk of contiguous data for efficient transfer
@@ -484,7 +619,7 @@ class MLATokenToKVPool(KVCache):
     def transfer_per_layer(self, indices, flat_data, layer_id):
         # transfer prepared data from host to device
         flat_data = flat_data.to(device=self.device, non_blocking=False)
-        self.kv_buffer[layer_id][indices] = flat_data
+        self.kv_buffer[layer_id - self.start_layer][indices] = flat_data
 
 
 class DoubleSparseTokenToKVPool(KVCache):
@@ -499,6 +634,8 @@ class DoubleSparseTokenToKVPool(KVCache):
         device: str,
         heavy_channel_num: int,
         enable_memory_saver: bool,
+        start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
     ):
         self.size = size
         self.page_size = page_size
@@ -536,17 +673,23 @@ class DoubleSparseTokenToKVPool(KVCache):
                 for _ in range(layer_num)
             ]
 
+        self.start_layer = start_layer or 0
+        self.end_layer = end_layer or layer_num - 1
+
     def get_key_buffer(self, layer_id: int):
-        return self.k_buffer[layer_id]
+        return self.k_buffer[layer_id - self.start_layer]
 
     def get_value_buffer(self, layer_id: int):
-        return self.v_buffer[layer_id]
+        return self.v_buffer[layer_id - self.start_layer]
 
     def get_label_buffer(self, layer_id: int):
-        return self.label_buffer[layer_id]
+        return self.label_buffer[layer_id - self.start_layer]
 
     def get_kv_buffer(self, layer_id: int):
-        return self.k_buffer[layer_id], self.v_buffer[layer_id]
+        return (
+            self.k_buffer[layer_id - self.start_layer],
+            self.v_buffer[layer_id - self.start_layer],
+        )
 
     def set_kv_buffer(
         self,
@@ -558,9 +701,9 @@ class DoubleSparseTokenToKVPool(KVCache):
     ):
         # NOTE(Andy): ignore the dtype check
         layer_id = layer.layer_id
-        self.k_buffer[layer_id][loc] = cache_k
-        self.v_buffer[layer_id][loc] = cache_v
-        self.label_buffer[layer_id][loc] = cache_label
+        self.k_buffer[layer_id - self.start_layer][loc] = cache_k
+        self.v_buffer[layer_id - self.start_layer][loc] = cache_v
+        self.label_buffer[layer_id - self.start_layer][loc] = cache_label
 
     def get_flat_data(self, indices):
         pass
@@ -602,22 +745,29 @@ class HostKVCache(abc.ABC):
         self,
         device_pool: MHATokenToKVPool,
         host_to_device_ratio: float,
-        pin_memory: bool = False,  # no need to use pin memory with the double buffering
-        device: str = "cpu",
+        host_size: int,
+        pin_memory: bool,
+        device: str,
+        page_size: int,
     ):
-        assert (
-            host_to_device_ratio >= 1
-        ), "The host memory should be larger than the device memory with the current protocol"
-        # todo, other ways of configuring the size
-
         self.device_pool = device_pool
-        self.host_to_device_ratio = host_to_device_ratio
+        self.dtype = device_pool.store_dtype
         self.pin_memory = pin_memory
         self.device = device
-
-        self.size = int(device_pool.size * host_to_device_ratio)
-        self.dtype = device_pool.store_dtype
+        self.page_size = page_size
         self.size_per_token = self.get_size_per_token()
+        if host_size > 0:
+            self.size = int(host_size * 1e9 // self.size_per_token)
+        else:
+            self.size = int(device_pool.size * host_to_device_ratio)
+        # Align the host memory pool size to the page size
+        self.size = self.size - (self.size % self.page_size)
+        self.start_layer = device_pool.start_layer
+        self.end_layer = device_pool.end_layer
+
+        assert (
+            self.size > device_pool.size
+        ), "The host memory should be larger than the device memory with the current protocol"
 
         # Verify there is enough available host memory.
         host_mem = psutil.virtual_memory()
@@ -769,10 +919,14 @@ class MHATokenToKVPoolHost(HostKVCache):
         self,
         device_pool: MHATokenToKVPool,
         host_to_device_ratio: float,
-        pin_memory: bool = False,  # no need to use pin memory with the double buffering
+        host_size: int,
+        page_size: int,
+        pin_memory: bool = True,
         device: str = "cpu",
     ):
-        super().__init__(device_pool, host_to_device_ratio, pin_memory, device)
+        super().__init__(
+            device_pool, host_to_device_ratio, host_size, pin_memory, device, page_size
+        )
 
     def get_size_per_token(self):
         self.head_num = self.device_pool.head_num
@@ -800,10 +954,47 @@ class MHATokenToKVPoolHost(HostKVCache):
         return self.kv_buffer[:, :, indices]
 
     def get_flat_data_by_layer(self, indices, layer_id):
-        return self.kv_buffer[:, layer_id, indices]
+        return self.kv_buffer[:, layer_id - self.start_layer, indices]
 
     def assign_flat_data(self, indices, flat_data):
         self.kv_buffer[:, :, indices] = flat_data
+
+    def write_page_all_layers(self, host_indices, device_indices, device_pool):
+        device_indices_cpu = device_indices[:: self.page_size].cpu()
+        for i in range(len(device_indices_cpu)):
+            h_index = host_indices[i * self.page_size]
+            d_index = device_indices_cpu[i]
+            for j in range(self.layer_num):
+                self.kv_buffer[0, j, h_index : h_index + self.page_size].copy_(
+                    device_pool.k_buffer[j][d_index : d_index + self.page_size],
+                    non_blocking=True,
+                )
+                self.kv_buffer[1, j, h_index : h_index + self.page_size].copy_(
+                    device_pool.v_buffer[j][d_index : d_index + self.page_size],
+                    non_blocking=True,
+                )
+
+    def load_page_per_layer(self, host_indices, device_indices, device_pool, layer_id):
+        device_indices_cpu = device_indices[:: self.page_size].cpu()
+        for i in range(len(device_indices_cpu)):
+            h_index = host_indices[i * self.page_size]
+            d_index = device_indices_cpu[i]
+            device_pool.k_buffer[layer_id - self.start_layer][
+                d_index : d_index + self.page_size
+            ].copy_(
+                self.kv_buffer[
+                    0, layer_id - self.start_layer, h_index : h_index + self.page_size
+                ],
+                non_blocking=True,
+            )
+            device_pool.v_buffer[layer_id - self.start_layer][
+                d_index : d_index + self.page_size
+            ].copy_(
+                self.kv_buffer[
+                    1, layer_id - self.start_layer, h_index : h_index + self.page_size
+                ],
+                non_blocking=True,
+            )
 
 
 class MLATokenToKVPoolHost(HostKVCache):
@@ -811,17 +1002,26 @@ class MLATokenToKVPoolHost(HostKVCache):
         self,
         device_pool: MLATokenToKVPool,
         host_to_device_ratio: float,
-        pin_memory: bool = False,  # no need to use pin memory with the double buffering
+        host_size: int,
+        page_size: int,
+        pin_memory: bool = True,
         device: str = "cpu",
     ):
-        super().__init__(device_pool, host_to_device_ratio, pin_memory, device)
+        super().__init__(
+            device_pool, host_to_device_ratio, host_size, pin_memory, device, page_size
+        )
 
     def get_size_per_token(self):
         self.kv_lora_rank = self.device_pool.kv_lora_rank
         self.qk_rope_head_dim = self.device_pool.qk_rope_head_dim
         self.layer_num = self.device_pool.layer_num
 
-        return (self.kv_lora_rank + self.qk_rope_head_dim) * 1 * self.dtype.itemsize
+        return (
+            (self.kv_lora_rank + self.qk_rope_head_dim)
+            * 1
+            * self.dtype.itemsize
+            * self.layer_num
+        )
 
     def init_kv_buffer(self):
         return torch.empty(
@@ -847,7 +1047,32 @@ class MLATokenToKVPoolHost(HostKVCache):
         return self.kv_buffer[:, indices]
 
     def get_flat_data_by_layer(self, indices, layer_id):
-        return self.kv_buffer[layer_id, indices]
+        return self.kv_buffer[layer_id - self.start_layer, indices]
 
     def assign_flat_data(self, indices, flat_data):
         self.kv_buffer[:, indices] = flat_data
+
+    def write_page_all_layers(self, host_indices, device_indices, device_pool):
+        device_indices_cpu = device_indices[:: self.page_size].cpu()
+        for i in range(len(device_indices_cpu)):
+            h_index = host_indices[i * self.page_size]
+            d_index = device_indices_cpu[i]
+            for j in range(self.layer_num):
+                self.kv_buffer[j, h_index : h_index + self.page_size].copy_(
+                    device_pool.kv_buffer[j][d_index : d_index + self.page_size],
+                    non_blocking=True,
+                )
+
+    def load_page_per_layer(self, host_indices, device_indices, device_pool, layer_id):
+        device_indices_cpu = device_indices[:: self.page_size].cpu()
+        for i in range(len(device_indices_cpu)):
+            h_index = host_indices[i * self.page_size]
+            d_index = device_indices_cpu[i]
+            device_pool.kv_buffer[layer_id - self.start_layer][
+                d_index : d_index + self.page_size
+            ].copy_(
+                self.kv_buffer[
+                    layer_id - self.start_layer, h_index : h_index + self.page_size
+                ],
+                non_blocking=True,
+            )

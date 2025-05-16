@@ -152,7 +152,7 @@ class BlockInt8LinearMethod(LinearMethodBase):
                     f"{input_size_per_partition} is not divisible by "
                     f"weight quantization block_k = {block_k}."
                 )
-        # Required by collum parallel or enabling merged weights
+        # Required by column parallel or enabling merged weights
         if (tp_size > 1 and output_size // output_size_per_partition == tp_size) or len(
             output_partition_sizes
         ) > 1:
@@ -285,7 +285,7 @@ class BlockInt8MoEMethod:
             self.quant_config.weight_block_size[1],
         )
         # NOTE(HandH1998): To ensure proper alignment of the block-wise quantization scales, the output_size of the weights for both the gate and up layers must be divisible by block_n.
-        # Required by collum parallel or enabling merged weights
+        # Required by column parallel or enabling merged weights
         if intermediate_size % block_n != 0:
             raise ValueError(
                 f"The output_size of gate's and up's weight = "
@@ -370,8 +370,10 @@ class BlockInt8MoEMethod:
         custom_routing_function: Optional[Callable] = None,
         correction_bias: Optional[torch.Tensor] = None,
         activation: str = "silu",
+        apply_router_weight_on_input: bool = False,
         inplace: bool = True,
         no_combine: bool = False,
+        routed_scaling_factor: Optional[float] = None,
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
         from sglang.srt.layers.moe.topk import select_experts
@@ -387,6 +389,7 @@ class BlockInt8MoEMethod:
             num_expert_group=num_expert_group,
             custom_routing_function=custom_routing_function,
             correction_bias=correction_bias,
+            routed_scaling_factor=routed_scaling_factor,
         )
 
         # Expert fusion with INT8 quantization
@@ -398,6 +401,7 @@ class BlockInt8MoEMethod:
             topk_ids=topk_ids,
             inplace=inplace,
             activation=activation,
+            apply_router_weight_on_input=apply_router_weight_on_input,
             use_int8_w8a8=True,
             w1_scale=(layer.w13_weight_scale_inv),
             w2_scale=(layer.w2_weight_scale_inv),

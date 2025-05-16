@@ -11,7 +11,11 @@ from sglang.srt.distributed import GroupCoordinator, patch_tensor_parallel_group
 from sglang.srt.layers.dp_attention import disable_dp_size
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import get_token_ids_logprobs, get_top_logprobs
-from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.schedule_batch import (
+    ScheduleBatch,
+    get_last_loc,
+    global_server_args_dict,
+)
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -27,13 +31,12 @@ from sglang.srt.speculative.eagle_utils import (
     EagleVerifyInput,
     EagleVerifyOutput,
     assign_draft_cache_locs,
-    fast_topk,
     select_top_k_tokens,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.utils import empty_context, get_available_gpu_memory, is_cuda_available
+from sglang.srt.utils import empty_context, fast_topk, get_available_gpu_memory, is_cuda
 
-if is_cuda_available():
+if is_cuda():
     from sgl_kernel import segment_packbits
 
 logger = logging.getLogger(__name__)
@@ -67,6 +70,7 @@ class EAGLEWorker(TpModelWorker):
         self.gpu_id = gpu_id
         self.device = server_args.device
         self.target_worker = target_worker
+        self.page_size = server_args.page_size
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
@@ -102,11 +106,12 @@ class EAGLEWorker(TpModelWorker):
         # Init draft worker
         with empty_context():
             super().__init__(
+                server_args=server_args,
                 gpu_id=gpu_id,
                 tp_rank=tp_rank,
-                server_args=server_args,
-                nccl_port=nccl_port,
+                pp_rank=0,  # FIXME
                 dp_rank=dp_rank,
+                nccl_port=nccl_port,
                 is_draft_worker=True,
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
@@ -145,15 +150,26 @@ class EAGLEWorker(TpModelWorker):
     def init_attention_backend(self):
         # Create multi-step attn backends and cuda graph runners
         if self.server_args.attention_backend == "flashinfer":
-            from sglang.srt.layers.attention.flashinfer_backend import (
-                FlashInferMultiStepDraftBackend,
-            )
+            if not global_server_args_dict["use_mla_backend"]:
+                from sglang.srt.layers.attention.flashinfer_backend import (
+                    FlashInferMultiStepDraftBackend,
+                )
 
-            self.draft_attn_backend = FlashInferMultiStepDraftBackend(
-                self.draft_model_runner,
-                self.topk,
-                self.speculative_num_steps,
-            )
+                self.draft_attn_backend = FlashInferMultiStepDraftBackend(
+                    self.draft_model_runner,
+                    self.topk,
+                    self.speculative_num_steps,
+                )
+            else:
+                from sglang.srt.layers.attention.flashinfer_mla_backend import (
+                    FlashInferMLAMultiStepDraftBackend,
+                )
+
+                self.draft_attn_backend = FlashInferMLAMultiStepDraftBackend(
+                    self.draft_model_runner,
+                    self.topk,
+                    self.speculative_num_steps,
+                )
             self.draft_extend_attn_backend = None
             self.padded_static_len = self.speculative_num_steps + 1
             self.has_prefill_wrapper_verify = True
@@ -170,22 +186,35 @@ class EAGLEWorker(TpModelWorker):
             self.draft_extend_attn_backend = None
             self.padded_static_len = self.speculative_num_steps + 1
             self.has_prefill_wrapper_verify = False
-        elif self.server_args.attention_backend == "flashinfer_mla":
-            from sglang.srt.layers.attention.flashinfer_mla_backend import (
-                FlashInferMLAMultiStepDraftBackend,
+        elif self.server_args.attention_backend == "fa3":
+            from sglang.srt.layers.attention.flashattention_backend import (
+                FlashAttentionMultiStepBackend,
             )
 
-            self.draft_attn_backend = FlashInferMLAMultiStepDraftBackend(
+            self.draft_attn_backend = FlashAttentionMultiStepBackend(
                 self.draft_model_runner,
                 self.topk,
                 self.speculative_num_steps,
             )
             self.draft_extend_attn_backend = None
             self.padded_static_len = self.speculative_num_steps + 1
-            self.has_prefill_wrapper_verify = True
+            self.has_prefill_wrapper_verify = False
+        elif self.server_args.attention_backend == "flashmla":
+            from sglang.srt.layers.attention.flashmla_backend import (
+                FlashMLAMultiStepDraftBackend,
+            )
+
+            self.draft_attn_backend = FlashMLAMultiStepDraftBackend(
+                self.draft_model_runner,
+                self.topk,
+                self.speculative_num_steps,
+            )
+            self.draft_extend_attn_backend = None
+            self.padded_static_len = self.speculative_num_steps + 1
+            self.has_prefill_wrapper_verify = False
         else:
             raise ValueError(
-                f"EAGLE is not supportted in attention backend {self.server_args.attention_backend}"
+                f"EAGLE is not supported in attention backend {self.server_args.attention_backend}"
             )
 
         self.draft_model_runner.draft_attn_backend = self.draft_attn_backend
@@ -229,18 +258,15 @@ class EAGLEWorker(TpModelWorker):
         Args:
             batch: The batch to run forward. The state of the batch is modified as it runs.
         Returns:
-            A tuple of the final logit output of the target model, next tokens accepeted,
-            the batch id (used for overlap schedule), and number of accepeted tokens.
+            A tuple of the final logit output of the target model, next tokens accepted,
+            the batch id (used for overlap schedule), and number of accepted tokens.
         """
         if batch.forward_mode.is_decode():
             with self.draft_tp_context(self.draft_model_runner.tp_group):
-                spec_info, to_free_cache_loc = self.draft(batch)
-            logits_output, verify_output, model_worker_batch = self.verify(
-                batch, spec_info
+                spec_info = self.draft(batch)
+            logits_output, verify_output, model_worker_batch, can_run_cuda_graph = (
+                self.verify(batch, spec_info)
             )
-
-            # Free cache loc (we put it here to avoid synchronization and hide kernel launch overhead.)
-            self.token_to_kv_pool_allocator.free(to_free_cache_loc)
 
             # If it is None, it means all requests are finished
             if batch.spec_info.verified_id is not None:
@@ -251,16 +277,14 @@ class EAGLEWorker(TpModelWorker):
                 verify_output.verified_id,
                 model_worker_batch.bid,
                 sum(verify_output.accept_length_per_req_cpu),
+                can_run_cuda_graph,
             )
         elif batch.forward_mode.is_idle():
             model_worker_batch = batch.get_model_worker_batch()
             logits_output, next_token_ids, _ = (
-                self.target_worker.forward_batch_generation(
-                    ForwardBatch.init_new(
-                        model_worker_batch, self.target_worker.model_runner
-                    )
-                )
+                self.target_worker.forward_batch_generation(model_worker_batch)
             )
+
             return logits_output, next_token_ids, model_worker_batch.bid, 0, False
         else:
             logits_output, next_token_ids, bid = self.forward_target_extend(batch)
@@ -268,7 +292,7 @@ class EAGLEWorker(TpModelWorker):
                 self.forward_draft_extend(
                     batch, logits_output.hidden_states, next_token_ids
                 )
-            return logits_output, next_token_ids, bid, 0
+            return logits_output, next_token_ids, bid, 0, False
 
     def forward_target_extend(
         self, batch: ScheduleBatch
@@ -287,7 +311,7 @@ class EAGLEWorker(TpModelWorker):
         # We need the full hidden states to prefill the KV cache of the draft model.
         model_worker_batch = batch.get_model_worker_batch()
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
-        logits_output, next_token_ids = self.target_worker.forward_batch_generation(
+        logits_output, next_token_ids, _ = self.target_worker.forward_batch_generation(
             model_worker_batch
         )
         return logits_output, next_token_ids, model_worker_batch.bid
@@ -305,9 +329,59 @@ class EAGLEWorker(TpModelWorker):
             )
 
         # Allocate cache locations
-        out_cache_loc = batch.alloc_token_slots(
-            num_seqs * self.topk * self.speculative_num_steps
-        )
+        if self.page_size == 1:
+            out_cache_loc, token_to_kv_pool_state_backup = batch.alloc_token_slots(
+                num_seqs * self.topk * self.speculative_num_steps, backup_state=True
+            )
+        else:
+            if self.topk == 1:
+                prefix_lens = batch.seq_lens
+                seq_lens = prefix_lens + self.speculative_num_steps
+                extend_num_tokens = num_seqs * self.speculative_num_steps
+            else:
+                # In this case, the last partial page needs to be duplicated.
+                # KV cache layout in batch.req_to_token_pool.req_to_token:
+                #
+                # | -------- | -- xxxx .. | -- xxxx .. | -- xxxx .. |
+                #    prefix     top-k = 0    tok-k = 1    top-k = 2
+                #
+                #  "-" means prefix tokens
+                #  "x" means speculative draft tokens
+                #  "." means padded tokens
+
+                # TODO: fuse these ops
+                prefix_lens = batch.seq_lens
+                last_page_lens = prefix_lens % self.page_size
+                num_new_pages = (
+                    last_page_lens + self.speculative_num_steps + self.page_size - 1
+                ) // self.page_size
+                seq_lens = (
+                    prefix_lens // self.page_size * self.page_size
+                    + num_new_pages * (self.page_size * self.topk)
+                )
+                extend_num_tokens = torch.sum(seq_lens - prefix_lens).item()
+                raise NotImplementedError(
+                    "page_size > 1 and top_k > 1 are not supported."
+                )
+                # TODO: Support page_size > 1 and top_k > 1
+                # 1. Duplicate the KV cache in the last partial page for all top-k segments
+                # 2. Modify generate_draft_decode_kv_indices accordingly
+
+            last_loc = get_last_loc(
+                batch.req_to_token_pool.req_to_token,
+                batch.req_pool_indices,
+                prefix_lens,
+            )
+            out_cache_loc, token_to_kv_pool_state_backup = (
+                batch.alloc_paged_token_slots_extend(
+                    prefix_lens,
+                    seq_lens,
+                    last_loc,
+                    extend_num_tokens,
+                    backup_state=True,
+                )
+            )
+
         assign_draft_cache_locs[(num_seqs,)](
             batch.req_pool_indices,
             batch.req_to_token_pool.req_to_token,
@@ -316,6 +390,7 @@ class EAGLEWorker(TpModelWorker):
             batch.req_to_token_pool.req_to_token.shape[1],
             self.topk,
             self.speculative_num_steps,
+            self.page_size,
         )
         batch.out_cache_loc = out_cache_loc
         batch.seq_lens_sum = torch.sum(batch.seq_lens).item()
@@ -343,6 +418,8 @@ class EAGLEWorker(TpModelWorker):
             # Run forward steps
             score_list, token_list, parents_list = self.draft_forward(forward_batch)
 
+        self.token_to_kv_pool_allocator.restore_state(token_to_kv_pool_state_backup)
+
         ret = EagleVerifyInput.create(
             spec_info.verified_id,
             score_list,
@@ -354,7 +431,7 @@ class EAGLEWorker(TpModelWorker):
             self.speculative_num_steps,
             self.server_args.speculative_num_draft_tokens,
         )
-        return ret, out_cache_loc
+        return ret
 
     def draft_forward(self, forward_batch: ForwardBatch):
         # Parse args
@@ -411,25 +488,30 @@ class EAGLEWorker(TpModelWorker):
         return score_list, token_list, parents_list
 
     def verify(self, batch: ScheduleBatch, spec_info: EagleVerifyInput):
-        spec_info.prepare_for_verify(batch)
+        spec_info.prepare_for_verify(batch, self.page_size)
         batch.forward_mode = ForwardMode.TARGET_VERIFY
         batch.spec_info = spec_info
         model_worker_batch = batch.get_model_worker_batch()
-        logits_output, _ = self.target_worker.forward_batch_generation(
-            model_worker_batch, skip_sample=True
+        logits_output, _, can_run_cuda_graph = (
+            self.target_worker.forward_batch_generation(
+                model_worker_batch, skip_sample=True
+            )
         )
         self._detect_nan_if_needed(logits_output)
         spec_info.hidden_states = logits_output.hidden_states
         res: EagleVerifyOutput = spec_info.verify(
-            batch, logits_output, self.token_to_kv_pool_allocator
+            batch,
+            logits_output,
+            self.token_to_kv_pool_allocator,
+            self.page_size,
         )
 
         # Post process based on verified outputs.
-        # Pick indices that we care (accepeted)
+        # Pick indices that we care (accepted)
         logits_output.next_token_logits = logits_output.next_token_logits[
-            res.accepeted_indices
+            res.accepted_indices
         ]
-        logits_output.hidden_states = logits_output.hidden_states[res.accepeted_indices]
+        logits_output.hidden_states = logits_output.hidden_states[res.accepted_indices]
 
         # Prepare the batch for the next draft forwards.
         batch.forward_mode = ForwardMode.DECODE
@@ -438,7 +520,7 @@ class EAGLEWorker(TpModelWorker):
         if batch.return_logprob:
             self.add_logprob_values(batch, res, logits_output)
 
-        return logits_output, res, model_worker_batch
+        return logits_output, res, model_worker_batch, can_run_cuda_graph
 
     def add_logprob_values(
         self,
@@ -524,14 +606,14 @@ class EAGLEWorker(TpModelWorker):
             model_worker_batch, self.draft_model_runner
         )
         forward_batch.return_logprob = False
-        logits_output = self.draft_model_runner.forward(forward_batch)
+        logits_output, _ = self.draft_model_runner.forward(forward_batch)
         self._detect_nan_if_needed(logits_output)
         assert isinstance(forward_batch.spec_info, EagleDraftInput)
         assert forward_batch.spec_info is batch.spec_info
         self.capture_for_decode(logits_output, forward_batch.spec_info)
 
     def forward_draft_extend_after_decode(self, batch: ScheduleBatch):
-        # Backup fileds that will be modified in-place
+        # Backup fields that will be modified in-place
         seq_lens_backup = batch.seq_lens.clone()
         req_pool_indices_backup = batch.req_pool_indices
         accept_length_backup = batch.spec_info.accept_length
@@ -551,7 +633,7 @@ class EAGLEWorker(TpModelWorker):
         )
 
         # Run
-        logits_output = self.draft_model_runner.forward(forward_batch)
+        logits_output, _ = self.draft_model_runner.forward(forward_batch)
 
         self._detect_nan_if_needed(logits_output)
         self.capture_for_decode(logits_output, forward_batch.spec_info)
@@ -586,5 +668,5 @@ def load_token_map(token_map_path: str) -> List[int]:
             ignore_patterns=["*.bin", "*.safetensors"],
         )
         token_map_path = os.path.join(cache_dir, os.path.basename(token_map_path))
-    hot_token_id = torch.load(token_map_path)
+    hot_token_id = torch.load(token_map_path, weights_only=True)
     return torch.tensor(hot_token_id, dtype=torch.int32)

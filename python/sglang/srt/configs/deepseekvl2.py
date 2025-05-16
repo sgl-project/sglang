@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import torch
-import torchvision.transforms as T
 from PIL import Image, ImageOps
 from transformers import (
     AutoProcessor,
@@ -49,6 +48,9 @@ class DictOutput(object):
     def __getitem__(self, item):
         return self.__dict__[item]
 
+    def __contains__(self, key):
+        return key in self.__dict__
+
     def __setitem__(self, key, value):
         self.__dict__[key] = value
 
@@ -75,6 +77,16 @@ class ImageTransform(object):
         self.mean = mean
         self.std = std
         self.normalize = normalize
+
+        # only load torchvision.transforms when needed
+        try:
+            import torchvision.transforms as T
+
+            # FIXME: add version check for gguf
+        except ImportError as err:
+            raise ImportError(
+                "Please install torchvision via `pip install torchvision` to use Deepseek-VL2."
+            ) from err
 
         transform_pipelines = [T.ToTensor()]
 
@@ -173,7 +185,7 @@ class DeepseekVLV2Processor(ProcessorMixin):
         tokenized_str, images, seq_mask, spatial_crop = self.tokenize_with_images(
             messages,
             pil_images[image_index : image_index + image_token_cnt],
-            bos=False,
+            bos=True,
             eos=True,
             cropping=len(pil_images) <= 2,
             max_req_input_len=max_req_input_len,
@@ -404,9 +416,9 @@ class DeepseekVLV2Processor(ProcessorMixin):
             h = w = math.ceil(
                 (self.image_size // self.patch_size) / self.downsample_ratio
             )
-            # global views tokens h * (w + 1), 1 is for line seperator
+            # global views tokens h * (w + 1), 1 is for line separator
             tokenized_image = [self.image_token_id] * h * (w + 1)
-            # add a seperator between global and local views
+            # add a separator between global and local views
             tokenized_image += [self.image_token_id]
             # local views tokens, (num_height_tiles * h) * (num_width_tiles * w + 1)
             tokenized_image += (

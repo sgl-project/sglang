@@ -3,9 +3,10 @@ import unittest
 import torch
 
 from sglang.srt.utils import DynamicGradMode
+from sglang.test.test_utils import CustomTestCase
 
 
-class TestDynamicGradMode(unittest.TestCase):
+class TestDynamicGradMode(CustomTestCase):
     def test_inference(self):
         # Test inference_mode
         DynamicGradMode.set_inference_mode(True)

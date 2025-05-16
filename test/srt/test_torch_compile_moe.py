@@ -10,11 +10,12 @@ from sglang.test.test_utils import (
     DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     popen_launch_server,
 )
 
 
-class TestTorchCompileMoe(unittest.TestCase):
+class TestTorchCompileMoe(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST
@@ -23,7 +24,7 @@ class TestTorchCompileMoe(unittest.TestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--enable-torch-compile", "--torch-compile-max-bs", "8"],
+            other_args=["--enable-torch-compile", "--torch-compile-max-bs", "4"],
         )
 
     @classmethod
@@ -61,9 +62,9 @@ class TestTorchCompileMoe(unittest.TestCase):
         res = self.run_decode(16)
 
         max_tokens = 256
-        tic = time.time()
+        tic = time.perf_counter()
         res = self.run_decode(max_tokens)
-        tok = time.time()
+        tok = time.perf_counter()
         print(f"{res=}")
         throughput = max_tokens / (tok - tic)
         self.assertGreaterEqual(throughput, 285)

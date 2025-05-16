@@ -26,6 +26,7 @@ def _qkv_lora_b_kernel(
     seg_lens,
     seg_indptr,
     weight_indices,
+    lora_ranks,
     # Offsets of q/k/v slice on output dimension
     n_offs,
     # Meta parameters
@@ -34,7 +35,7 @@ def _qkv_lora_b_kernel(
     BLOCK_K: tl.constexpr,
     # For fused output scaling and adding
     fuse_scaling_add,
-    scaling,
+    scalings,
 ):
     # This kernel packs 3 sgemms (q/k/v) into a single kernel.
 
@@ -54,6 +55,10 @@ def _qkv_lora_b_kernel(
     seg_start = tl.load(seg_indptr + batch_id)
     n_start = tl.load(n_offs + qkv_id)
     n_size = tl.load(n_offs + qkv_id + 1) - n_start
+    rank = tl.load(lora_ranks + w_index)
+    scaling = tl.load(scalings + w_index)
+    # Adjust K (rank) according to the specific LoRA adapter
+    K = tl.minimum(K, rank)
 
     # The tile in output matrix will have (pid_s, pid_n) as id
     num_pid_n = tl.cdiv(max_qkv_out_dim, BLOCK_N)
@@ -74,7 +79,7 @@ def _qkv_lora_b_kernel(
         k_offset[:, None] * w_stride_2 + n_offset[None, :] * w_stride_1
     )
 
-    # Iteate to compute the block in output matrix
+    # Iterate to compute the block in output matrix
     partial_sum = tl.zeros((BLOCK_S, BLOCK_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_K)):
         x_tile = tl.load(
@@ -112,7 +117,6 @@ def qkv_lora_b_fwd(
     output_offset: torch.Tensor,
     max_qkv_out_dim: int,
     base_output: torch.Tensor = None,
-    scaling: float = 1.0,
 ) -> torch.Tensor:
 
     # x: (s, 3 * r)
@@ -171,12 +175,13 @@ def qkv_lora_b_fwd(
         batch_info.seg_lens,
         batch_info.seg_indptr,
         batch_info.weight_indices,
+        batch_info.lora_ranks,
         output_offset,
         BLOCK_S,
         BLOCK_OUT,
         BLOCK_R,
         fuse_scaling_add,
-        scaling,
+        batch_info.scalings,
     )
 
     return output

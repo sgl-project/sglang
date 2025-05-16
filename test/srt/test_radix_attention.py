@@ -8,6 +8,7 @@ from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     kill_process_tree,
     popen_launch_server,
 )
@@ -59,7 +60,7 @@ def run_test(base_url, nodes):
     assert res.status_code == 200
 
 
-class TestRadixCacheFCFS(unittest.TestCase):
+class TestRadixCacheFCFS(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST

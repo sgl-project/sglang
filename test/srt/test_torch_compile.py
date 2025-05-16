@@ -10,11 +10,12 @@ from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     popen_launch_server,
 )
 
 
-class TestTorchCompile(unittest.TestCase):
+class TestTorchCompile(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
@@ -61,9 +62,9 @@ class TestTorchCompile(unittest.TestCase):
         res = self.run_decode(16)
 
         max_tokens = 256
-        tic = time.time()
+        tic = time.perf_counter()
         res = self.run_decode(max_tokens)
-        tok = time.time()
+        tok = time.perf_counter()
         print(f"{res=}")
         throughput = max_tokens / (tok - tic)
         print(f"Throughput: {throughput} tokens/s")

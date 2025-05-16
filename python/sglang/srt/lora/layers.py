@@ -16,21 +16,17 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from sglang.srt.lora.backend import BaseLoRABackend
+from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 
 
 class BaseLayerWithLoRA(nn.Module):
     def __init__(
         self,
         base_layer: nn.Module,
-        lora_rank: int,
-        scaling: float,
         lora_backend: BaseLoRABackend,
     ):
         super().__init__()
         self.base_layer: nn.Module = base_layer
-        self.lora_rank: int = lora_rank
-        self.scaling: float = scaling
         self.set_lora: bool = False
         self.lora_backend: BaseLoRABackend = lora_backend
 
@@ -59,11 +55,9 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
     def __init__(
         self,
         base_layer: VocabParallelEmbedding,
-        lora_rank: int,
-        scaling: float,
         lora_backend: BaseLoRABackend,
     ) -> None:
-        super().__init__(base_layer, lora_rank, scaling, lora_backend)
+        super().__init__(base_layer, lora_backend)
         self.weight = base_layer.weight
 
 
@@ -71,11 +65,9 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
     def __init__(
         self,
         base_layer: ColumnParallelLinear,
-        lora_rank: int,
-        scaling: float,
         lora_backend: BaseLoRABackend,
     ) -> None:
-        super().__init__(base_layer, lora_rank, scaling, lora_backend)
+        super().__init__(base_layer, lora_backend)
 
     def set_lora_info(
         self,
@@ -87,7 +79,7 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
         self.B_buffer = B_buffer
 
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        backend_kwargs = {"base_output": base_output, "scaling": self.scaling}
+        backend_kwargs = {"base_output": base_output}
         lora_a_output = self.lora_backend.run_lora_a_sgemm(x, self.A_buffer)
         lora_output = self.lora_backend.run_lora_b_sgemm(
             lora_a_output,
@@ -96,8 +88,8 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
         )
         return (
             lora_output
-            if self.lora_backend.fuse_output_scaling_add
-            else base_output + lora_output * self.scaling
+            if self.lora_backend.fuse_output_add
+            else base_output + lora_output
         )
 
     def forward(self, input_: torch.Tensor):
@@ -132,11 +124,9 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
     def __init__(
         self,
         base_layer: MergedColumnParallelLinear,
-        lora_rank: int,
-        scaling: float,
         lora_backend: BaseLoRABackend,
     ) -> None:
-        super().__init__(base_layer, lora_rank, scaling, lora_backend)
+        super().__init__(base_layer, lora_backend)
 
     def set_lora_info(
         self,
@@ -146,16 +136,24 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         self.set_lora = True
         self.A_buffer_gate_up = A_buffer
         if self.lora_backend.fuse_stacked_lora_b:
-            # TODO: avoid using contiguous() in GPU.
             # B_buffer_gate_up: (num_lora, 2 * output_dim, r)
-            self.B_buffer_gate_up = torch.cat(
-                (B_buffer[0], B_buffer[1]), dim=-2
-            ).contiguous()
+            if not hasattr(self, "B_buffer_gate_up") or self.B_buffer_gate_up is None:
+                self.B_buffer_gate_up = torch.empty(
+                    (
+                        B_buffer[0].shape[0],
+                        2 * B_buffer[0].shape[1],
+                        B_buffer[0].shape[2],
+                    ),
+                    dtype=B_buffer[0].dtype,
+                    device=B_buffer[0].device,
+                )
+            self.B_buffer_gate_up[:, : B_buffer[0].shape[1], :].copy_(B_buffer[0])
+            self.B_buffer_gate_up[:, B_buffer[0].shape[1] :, :].copy_(B_buffer[1])
         else:
             self.B_buffer_gate_up = (B_buffer[0], B_buffer[1])
 
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        backend_kwargs = {"base_output": base_output, "scaling": self.scaling}
+        backend_kwargs = {"base_output": base_output}
 
         lora_output = self.lora_backend.run_gate_up_lora(
             x,
@@ -165,8 +163,8 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         )
         return (
             lora_output
-            if self.lora_backend.fuse_output_scaling_add
-            else base_output + lora_output * self.scaling
+            if self.lora_backend.fuse_output_add
+            else base_output + lora_output
         )
 
     def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
@@ -181,14 +179,12 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
 
 
 class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
-    def init__(
+    def __init__(
         self,
         base_layer: QKVParallelLinear,
-        lora_rank: int,
-        scaling: float,
         lora_backend: BaseLoRABackend,
     ) -> None:
-        super().__init__(base_layer, lora_rank, scaling, lora_backend)
+        super().__init__(base_layer, lora_backend)
 
     def set_lora_info(
         self,
@@ -206,12 +202,30 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
             output_dim_q, output_dim_kv = B_buffer_q.shape[-2], B_buffer_kv.shape[-2]
 
             # B_buffer_qkv: (num_lora, output_dim_q + 2 * output_dim_kv, r)
-            self.B_buffer_qkv = torch.cat(
-                (B_buffer_q[0], B_buffer_kv[0], B_buffer_kv[1]), dim=-2
-            ).contiguous()
+            if not hasattr(self, "B_buffer_qkv") or self.B_buffer_qkv is None:
+                self.B_buffer_qkv = torch.empty(
+                    (
+                        B_buffer_q[0].shape[0],
+                        output_dim_q + 2 * output_dim_kv,
+                        B_buffer_q[0].shape[2],
+                    ),
+                    dtype=B_buffer_q[0].dtype,
+                    device=B_buffer_q[0].device,
+                )
+            self.B_buffer_qkv[:, :output_dim_q, :].copy_(B_buffer_q[0])
+            self.B_buffer_qkv[:, output_dim_q : output_dim_q + output_dim_kv, :].copy_(
+                B_buffer_kv[0]
+            )
+            self.B_buffer_qkv[:, output_dim_q + output_dim_kv :, :].copy_(
+                B_buffer_kv[1]
+            )
 
             # Offsets of q/k/v in output dimension
-            self.output_offset = torch.tensor(
+            if not hasattr(self, "output_offset") or self.output_offset is None:
+                self.output_offset = torch.empty(
+                    4, dtype=torch.int32, device=B_buffer_q.device
+                )
+            self.output_offset[:4] = torch.tensor(
                 [
                     0,
                     output_dim_q,
@@ -230,7 +244,7 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
             )
 
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        backend_kwargs = {"base_output": base_output, "scaling": self.scaling}
+        backend_kwargs = {"base_output": base_output}
         if self.lora_backend.fuse_stacked_lora_b:
             backend_kwargs["output_offset"] = self.output_offset
             backend_kwargs["max_qkv_out_dim"] = self.max_qkv_out_dim
@@ -243,8 +257,8 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         )
         return (
             lora_output
-            if self.lora_backend.fuse_output_scaling_add
-            else base_output + lora_output * self.scaling
+            if self.lora_backend.fuse_output_add
+            else base_output + lora_output
         )
 
     def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
@@ -273,11 +287,9 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
     def __init__(
         self,
         base_layer: RowParallelLinear,
-        lora_rank: int,
-        scaling: float,
         lora_backend: BaseLoRABackend,
     ) -> None:
-        super().__init__(base_layer, lora_rank, scaling, lora_backend)
+        super().__init__(base_layer, lora_backend)
 
     def set_lora_info(self, A_buffer: torch.Tensor, B_buffer: torch.Tensor):
         self.set_lora = True
@@ -285,7 +297,7 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
         self.B_buffer = B_buffer
 
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        backend_kwargs = {"base_output": base_output, "scaling": self.scaling}
+        backend_kwargs = {"base_output": base_output}
         lora_a_output = self.lora_backend.run_lora_a_sgemm(x, self.A_buffer)
         lora_output = self.lora_backend.run_lora_b_sgemm(
             lora_a_output,
@@ -294,8 +306,8 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
         )
         return (
             lora_output
-            if self.lora_backend.fuse_output_scaling_add
-            else base_output + lora_output * self.scaling
+            if self.lora_backend.fuse_output_add
+            else base_output + lora_output
         )
 
     def forward(self, input_: torch.Tensor):
@@ -344,7 +356,7 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
 
 
 def get_lora_layer(
-    layer: nn.Module, lora_rank: int, scaling: int, lora_backend: BaseLoRABackend
+    layer: nn.Module, lora_backend: BaseLoRABackend
 ) -> BaseLayerWithLoRA:
     supported_layer_types = {
         # the order matters
@@ -356,6 +368,6 @@ def get_lora_layer(
     }
     for src_layer_type, lora_layer_type in supported_layer_types.items():
         if isinstance(layer, src_layer_type):  # pylint: disable=unidiomatic-typecheck
-            ret = lora_layer_type(layer, lora_rank, scaling, lora_backend)
+            ret = lora_layer_type(layer, lora_backend)
             return ret
     raise Exception(f"No corresponding LoRA layer supported for {type(layer)}.")

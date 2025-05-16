@@ -25,6 +25,12 @@ class LoRABatchInfo:
     # The index of lora adapter used by each sequence, in shape (bs,)
     weight_indices: torch.Tensor
 
+    # ranks of each lora adapter, in shape (lora_num,)
+    lora_ranks: torch.Tensor
+
+    # scaling of each lora adapter, in shape (lora_num,)
+    scalings: torch.Tensor
+
 
 class LoRAType(Enum):
     LORA_A = 0
@@ -73,7 +79,7 @@ def get_hidden_dim(
     module_name: str, config: AutoConfig, base_model: torch.nn.Module
 ) -> Tuple[int]:
     """
-    Given a module_name (might be a stacked name), return the hidden dims of modules's input and output.
+    Given a module_name (might be a stacked name), return the hidden dims of modules' input and output.
     """
 
     if hasattr(base_model, "get_hidden_dim"):

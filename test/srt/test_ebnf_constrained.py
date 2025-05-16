@@ -15,6 +15,7 @@ from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     popen_launch_server,
 )
 
@@ -42,7 +43,7 @@ def setup_class(cls, backend: str, disable_overlap: bool):
     )
 
 
-class TestEBNFConstrained(unittest.TestCase):
+class TestEBNFConstrained(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         setup_class(cls, "xgrammar", disable_overlap=False)
@@ -235,6 +236,12 @@ class TestEBNFConstrained(unittest.TestCase):
             prompt=prompt,
             n=3,
         )
+
+
+class TestEBNFConstrainedLLGuidance(TestEBNFConstrained):
+    @classmethod
+    def setUpClass(cls):
+        setup_class(cls, "llguidance", disable_overlap=False)
 
 
 if __name__ == "__main__":

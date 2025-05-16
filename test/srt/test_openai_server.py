@@ -18,11 +18,12 @@ from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     popen_launch_server,
 )
 
 
-class TestOpenAIServer(unittest.TestCase):
+class TestOpenAIServer(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
@@ -257,7 +258,12 @@ class TestOpenAIServer(unittest.TestCase):
                     ret_num_top_logprobs == logprobs
                 ), f"{ret_num_top_logprobs} vs {logprobs}"
 
-            assert isinstance(data.content, str) or response.choices[0].finish_reason
+            assert (
+                isinstance(data.content, str)
+                or isinstance(data.reasoning_content, str)
+                or len(data.tool_calls) > 0
+                or response.choices[0].finish_reason
+            )
             assert response.id
             assert response.created
 
@@ -427,7 +433,7 @@ class TestOpenAIServer(unittest.TestCase):
                             )
 
     def test_completion_stream(self):
-        # parallel sampling adn list input are not supported in streaming mode
+        # parallel sampling and list input are not supported in streaming mode
         for echo in [False, True]:
             for logprobs in [None, 5]:
                 for use_list_input in [True, False]:
@@ -528,6 +534,7 @@ The SmartHome Mini is a compact smart home assistant available in black or white
                 },
             ],
             temperature=0,
+            extra_body={"continue_final_message": True},
         )
 
         assert (
@@ -536,12 +543,18 @@ The SmartHome Mini is a compact smart home assistant available in black or white
             .startswith('"name": "SmartHome Mini",')
         )
 
+    def test_model_list(self):
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+        models = list(client.models.list())
+        assert len(models) == 1
+        assert isinstance(getattr(models[0], "max_model_len", None), int)
+
 
 # -------------------------------------------------------------------------
 #    EBNF Test Class: TestOpenAIServerEBNF
 #    Launches the server with xgrammar, has only EBNF tests
 # -------------------------------------------------------------------------
-class TestOpenAIServerEBNF(unittest.TestCase):
+class TestOpenAIServerEBNF(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
@@ -624,7 +637,7 @@ class TestOpenAIServerEBNF(unittest.TestCase):
         )
 
 
-class TestOpenAIEmbedding(unittest.TestCase):
+class TestOpenAIEmbedding(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST
@@ -662,6 +675,95 @@ class TestOpenAIEmbedding(unittest.TestCase):
         self.assertEqual(len(response.data), 2)
         self.assertTrue(len(response.data[0].embedding) > 0)
         self.assertTrue(len(response.data[1].embedding) > 0)
+
+    def test_empty_string_embedding(self):
+        """Test embedding an empty string."""
+
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+
+        # Text embedding example with empty string
+        text = ""
+        # Expect a BadRequestError for empty input
+        with self.assertRaises(openai.BadRequestError) as cm:
+            client.embeddings.create(
+                model=self.model,
+                input=text,
+            )
+        # check the status code
+        self.assertEqual(cm.exception.status_code, 400)
+
+
+class TestOpenAIServerIgnoreEOS(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            api_key=cls.api_key,
+        )
+        cls.base_url += "/v1"
+        cls.tokenizer = get_tokenizer(DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_ignore_eos(self):
+        """
+        Test that ignore_eos=True allows generation to continue beyond EOS token
+        and reach the max_tokens limit.
+        """
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+
+        max_tokens = 200
+
+        response_default = client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": "Count from 1 to 20."},
+            ],
+            temperature=0,
+            max_tokens=max_tokens,
+            extra_body={"ignore_eos": False},
+        )
+
+        response_ignore_eos = client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": "Count from 1 to 20."},
+            ],
+            temperature=0,
+            max_tokens=max_tokens,
+            extra_body={"ignore_eos": True},
+        )
+
+        default_tokens = len(
+            self.tokenizer.encode(response_default.choices[0].message.content)
+        )
+        ignore_eos_tokens = len(
+            self.tokenizer.encode(response_ignore_eos.choices[0].message.content)
+        )
+
+        # Check if ignore_eos resulted in more tokens or exactly max_tokens
+        # The ignore_eos response should either:
+        # 1. Have more tokens than the default response (if default stopped at EOS before max_tokens)
+        # 2. Have exactly max_tokens (if it reached the max_tokens limit)
+        self.assertTrue(
+            ignore_eos_tokens > default_tokens or ignore_eos_tokens >= max_tokens,
+            f"ignore_eos did not generate more tokens: {ignore_eos_tokens} vs {default_tokens}",
+        )
+
+        self.assertEqual(
+            response_ignore_eos.choices[0].finish_reason,
+            "length",
+            f"Expected finish_reason='length' for ignore_eos=True, got {response_ignore_eos.choices[0].finish_reason}",
+        )
 
 
 if __name__ == "__main__":

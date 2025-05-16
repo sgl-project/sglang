@@ -5,14 +5,13 @@ from typing import List, Mapping, Tuple, Union
 
 import torch
 
+from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.utils import is_cuda
 
 _is_cuda = is_cuda()
 
-if _is_cuda:
-    from sglang.srt.custom_op import scaled_fp8_quant as sgl_scaled_fp8_quant
-else:
-    from vllm import _custom_ops as vllm_ops
+if not _is_cuda:
+    from vllm._custom_ops import scaled_fp8_quant
 
 
 def is_layer_skipped(
@@ -111,12 +110,33 @@ def requantize_with_max_scale(
         for idx, logical_width in enumerate(logical_widths):
             end = start + logical_width
             weight_dq = per_tensor_dequantize(weight[start:end, :], weight_scale[idx])
-            if _is_cuda:
-                weight[start:end, :], _ = sgl_scaled_fp8_quant(weight_dq, max_w_scale)
-            else:
-                weight[start:end, :], _ = vllm_ops.scaled_fp8_quant(
-                    weight_dq, max_w_scale
-                )
+            weight[start:end, :], _ = scaled_fp8_quant(weight_dq, max_w_scale)
             start = end
 
     return max_w_scale, weight
+
+
+# Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/utils/layer_utils.py
+# Newly generated tensors need to replace existing tensors that are
+# already registered as parameters by vLLM (and won't be freed)
+def replace_parameter(
+    mod: torch.nn.Module, name: str, new: Union[torch.Tensor, torch.nn.Parameter]
+) -> None:
+
+    old = getattr(mod, name)
+    if (
+        type(old) is type(new)
+        and old.dtype == new.dtype
+        and old.untyped_storage().nbytes() == new.untyped_storage().nbytes()
+    ):
+        # If we can just update in-place to avoid re-registering
+        #   can be faster if the underlying storage is the same
+        update_tensor_inplace(old, new)
+    else:
+        # Fallback re-register parameter, convert to Parameter if necessary
+        # this not only ensures we don't register a tensor as a parameter, but
+        # also ensures that all parameter subclasses get re-registered as
+        # parameters for `torch.compile` compatibility
+        if not isinstance(new, torch.nn.Parameter):
+            new = torch.nn.Parameter(new, requires_grad=False)
+        mod.register_parameter(name, torch.nn.Parameter(new, requires_grad=False))

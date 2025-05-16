@@ -25,8 +25,6 @@ from IPython.display import HTML, display
 from pydantic import BaseModel
 from tqdm import tqdm
 
-from sglang.srt.utils import kill_process_tree
-
 logger = logging.getLogger(__name__)
 
 
@@ -280,7 +278,7 @@ def graceful_registry(sub_module_name: str):
             f"{sub_module_name} Received signal to shutdown. Performing graceful shutdown..."
         )
         if signum == signal.SIGTERM:
-            logger.info(f"{sub_module_name} recive sigterm")
+            logger.info(f"{sub_module_name} receive sigterm")
 
     signal.signal(signal.SIGTERM, graceful_shutdown)
 
@@ -422,6 +420,8 @@ def terminate_process(process):
     """
     Terminate the process and automatically release the reserved port.
     """
+    from sglang.srt.utils import kill_process_tree
+
     kill_process_tree(process.pid)
 
     lock_socket = process_socket_map.pop(process, None)

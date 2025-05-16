@@ -16,6 +16,7 @@ from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     popen_launch_server,
 )
 
@@ -50,7 +51,7 @@ def setup_class(cls, backend: str):
     )
 
 
-class TestJSONConstrainedOutlinesBackend(unittest.TestCase):
+class TestJSONConstrainedOutlinesBackend(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         setup_class(cls, backend="outlines")
@@ -81,7 +82,7 @@ class TestJSONConstrainedOutlinesBackend(unittest.TestCase):
         print(json.dumps(ret))
         print("=" * 100)
 
-        if not json_schema:
+        if not json_schema or json_schema == "INVALID":
             return
 
         # Make sure the json output is valid
@@ -96,6 +97,9 @@ class TestJSONConstrainedOutlinesBackend(unittest.TestCase):
     def test_json_generate(self):
         self.run_decode(json_schema=self.json_schema)
 
+    def test_json_invalid(self):
+        self.run_decode(json_schema="INVALID")
+
     def test_json_openai(self):
         client = openai.Client(api_key="EMPTY", base_url=f"{self.base_url}/v1")
 
@@ -103,7 +107,10 @@ class TestJSONConstrainedOutlinesBackend(unittest.TestCase):
             model=self.model,
             messages=[
                 {"role": "system", "content": "You are a helpful AI assistant"},
-                {"role": "user", "content": "Introduce the capital of France."},
+                {
+                    "role": "user",
+                    "content": "Introduce the capital of France. Return in a JSON format.",
+                },
             ],
             temperature=0,
             max_tokens=128,

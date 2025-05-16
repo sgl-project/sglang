@@ -4,10 +4,10 @@ python3 -m unittest test_chunked_prefill.TestChunkedPrefill.test_mixed_chunked_p
 
 import unittest
 
-from sglang.test.test_utils import run_mmlu_test, run_mulit_request_test
+from sglang.test.test_utils import CustomTestCase, run_mmlu_test, run_mulit_request_test
 
 
-class TestChunkedPrefill(unittest.TestCase):
+class TestChunkedPrefill(CustomTestCase):
     def test_chunked_prefill(self):
         run_mmlu_test(disable_radix_cache=False, enable_mixed_chunk=False)
 

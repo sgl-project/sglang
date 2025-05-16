@@ -51,7 +51,7 @@ from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternTokenPairs,
     general_mm_embed_routine,
 )
-from sglang.srt.managers.schedule_batch import ImageInputs
+from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaForCausalLM
@@ -188,7 +188,7 @@ def trunc_normal_tf_(
     best when :math:`a \\leq \text{mean} \\leq b`.
     NOTE: this 'tf' variant behaves closer to Tensorflow / JAX impl where the
     bounds [a, b] are applied when sampling the normal distribution with mean=0, std=1.0
-    and the result is subsquently scaled and shifted by the mean and std args.
+    and the result is subsequently scaled and shifted by the mean and std args.
     Args:
         tensor: an n-dimensional `torch.Tensor`
         mean: the mean of the normal distribution
@@ -252,7 +252,7 @@ def resample_patch_embed(
     try:
         from torch import vmap
     except ImportError:
-        from functorch import vmap
+        from torch.func import vmap
 
     assert len(patch_embed.shape) == 4, "Four dimensions expected"
     assert len(new_size) == 2, "New shape should only be hw"
@@ -532,7 +532,7 @@ class VisionTransformerBlock(nn.Module):
             num_heads=num_heads,
             projection_size=dim,
             use_qkv_parallel=True,
-            use_context_forward=False,
+            qkv_backend="sdpa",
             softmax_in_single_precision=False,
             dropout=attn_drop,
         )
@@ -735,7 +735,7 @@ class VisionTransformer(nn.Module):
             img_size: Input image size.
             patch_size: Patch size.
             in_chans: Number of image input channels.
-            num_classes: Mumber of classes for classification head.
+            num_classes: Number of classes for classification head.
             global_pool: Type of global pooling for final sequence (default: 'token').
             embed_dim: Transformer embedding dimension.
             depth: Depth of transformer.
@@ -1084,7 +1084,7 @@ def create_siglip_vit(
     )
 
     if ckpt_path:
-        state_dict = torch.load(ckpt_path, map_location="cpu")
+        state_dict = torch.load(ckpt_path, map_location="cpu", weights_only=True)
 
         incompatible_keys = model.load_state_dict(state_dict, strict=False)
         print(
@@ -1959,8 +1959,8 @@ class MultiModalityCausalLM(MultiModalityPreTrainedModel):
         )
         self.logits_processor = LogitsProcessor(config)
 
-    def get_image_feature(self, image_input: ImageInputs) -> torch.Tensor:
-        pixel_values = image_input.pixel_values
+    def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        pixel_values = torch.concat([item.pixel_values for item in items], dim=0)
         bs, n = pixel_values.shape[0:2]
         pixel_values = pixel_values.to(
             device=self.vision_model.device, dtype=self.vision_model.dtype
@@ -1976,7 +1976,7 @@ class MultiModalityCausalLM(MultiModalityPreTrainedModel):
         return images_embeds
 
     def get_input_embeddings(self) -> nn.Embedding:
-        return self.language_model.model.embed_tokens
+        return self.language_model.get_input_embeddings()
 
     @torch.no_grad()
     def forward(
@@ -1984,28 +1984,22 @@ class MultiModalityCausalLM(MultiModalityPreTrainedModel):
         input_ids: torch.LongTensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
+        get_embedding: bool = False,
     ) -> torch.Tensor:
-
-        inputs_embeds = general_mm_embed_routine(
+        hidden_states = general_mm_embed_routine(
             input_ids=input_ids,
-            positions=positions,
             forward_batch=forward_batch,
-            embed_tokens=self.get_input_embeddings(),
-            image_embedding_func=self.get_image_feature,
+            image_data_embedding_func=self.get_image_feature,
+            language_model=self.language_model,
+            positions=positions,
         )
 
-        return self.language_model(
-            input_ids=None,
-            positions=positions,
-            forward_batch=forward_batch,
-            input_embeds=inputs_embeds,
-            get_embedding=False,
-        )
+        return hidden_states
 
     def prepare_gen_img_embeds(self, image_ids: torch.LongTensor):
         return self.gen_aligner(self.gen_embed(image_ids))
 
-    def pad_input_ids(self, input_ids: List[int], image_inputs: ImageInputs):
+    def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
         im_start_id = image_inputs.im_start_id
         im_end_id = image_inputs.im_end_id
         media_token_pairs = [(im_start_id, im_end_id)]

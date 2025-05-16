@@ -5,7 +5,7 @@ import unittest
 import torch
 
 import sglang as sgl
-from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, CustomTestCase
 
 
 def test_update_weights_from_tensor(tp_size):
@@ -21,9 +21,9 @@ def test_update_weights_from_tensor(tp_size):
     memory_before = torch.cuda.memory_allocated()
     new_tensor = torch.full((16384, 2048), 1.5, device="cuda")
 
-    time_start = time.time()
+    time_start = time.perf_counter()
     engine.update_weights_from_tensor([(x, new_tensor) for x in param_names])
-    print(f"Time delta: {time.time() - time_start:.03f}")
+    print(f"Time delta: {time.perf_counter() - time_start:.03f}")
 
     for param_name in param_names[:3]:
         _check_param(engine, param_name, [1.5] * 5)
@@ -40,7 +40,7 @@ def test_update_weights_from_tensor(tp_size):
     ), f"Memory leak detected: {memory_after - memory_before} bytes"
 
 
-class TestUpdateWeightsFromTensor(unittest.TestCase):
+class TestUpdateWeightsFromTensor(CustomTestCase):
     def test_update_weights_from_tensor(self):
         tp_sizes = [1, 2]
         for tp_size in tp_sizes:

@@ -1,15 +1,10 @@
 """
 Usage:
-python offline_batch_inference_vlm.py --model-path Qwen/Qwen2-VL-7B-Instruct --chat-template=qwen2-vl
+python offline_batch_inference_vlm.py --model-path Qwen/Qwen2-VL-7B-Instruct
 """
 
 import argparse
 import dataclasses
-import io
-import os
-
-import requests
-from PIL import Image
 
 import sglang as sgl
 from sglang.srt.conversation import chat_templates

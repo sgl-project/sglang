@@ -6,7 +6,6 @@ import time
 import numpy as np
 import pandas as pd
 import tiktoken
-from tqdm import tqdm
 
 from sglang.test.test_utils import (
     add_common_sglang_args_and_parse,
@@ -117,7 +116,7 @@ def main(args):
     backend = select_sglang_backend(args)
 
     # Run
-    tic = time.time()
+    tic = time.perf_counter()
     states = few_shot_mmlu.run_batch(
         arguments,
         temperature=0,
@@ -129,7 +128,7 @@ def main(args):
     preds = [
         s["answer"].strip()[0] if len(s["answer"].strip()) > 0 else "" for s in states
     ]
-    latency = time.time() - tic
+    latency = time.perf_counter() - tic
 
     # Compute accuracy
     cors = [pred == label for pred, label in zip(preds, labels)]

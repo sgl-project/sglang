@@ -138,7 +138,7 @@ class Session:
             token_ids_logprob=req.token_ids_logprob,
         )
         if last_req is not None:
-            new_req.image_inputs = last_req.image_inputs
+            new_req.multimodal_inputs = last_req.mm_inputs
         new_req.tokenizer = tokenizer
         if abort:
             new_req.to_abort = True

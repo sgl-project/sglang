@@ -6,11 +6,12 @@ from sglang.test.few_shot_gsm8k import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     popen_launch_server,
 )
 
 
-class TestQwen2(unittest.TestCase):
+class TestQwen2(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = "Qwen/Qwen2-7B-Instruct"
@@ -41,7 +42,7 @@ class TestQwen2(unittest.TestCase):
         self.assertGreater(metrics["accuracy"], 0.78)
 
 
-class TestQwen2FP8(unittest.TestCase):
+class TestQwen2FP8(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = "neuralmagic/Qwen2-7B-Instruct-FP8"

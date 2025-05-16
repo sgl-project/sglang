@@ -7,6 +7,7 @@ on:
 
 jobs:
   build-dev:
+    if: ${{ github.repository == 'sgl-project/sglang' }}
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout repository

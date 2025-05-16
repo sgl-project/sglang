@@ -25,6 +25,7 @@ import torch
 from torch import nn
 from transformers import LlamaConfig
 
+from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -33,7 +34,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.models.llama import LlamaAttention, LlamaDecoderLayer, LlamaForCausalLM
 
 
@@ -105,7 +106,10 @@ class LlamaModel(nn.Module):
             prefix=add_prefix("embed_tokens", prefix),
         )
         self.midlayer = LlamaDecoderLayer(config, 0, quant_config, prefix)
-        self.fc = torch.nn.Linear(config.hidden_size * 3, config.hidden_size)
+        if hasattr(config, "target_hidden_size"):
+            self.fc = torch.nn.Linear(config.target_hidden_size * 3, config.hidden_size)
+        else:
+            self.fc = torch.nn.Linear(config.hidden_size * 3, config.hidden_size)
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -115,6 +119,7 @@ class LlamaModel(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
         if input_embeds is None:
             embeds = self.embed_tokens(input_ids)
@@ -152,6 +157,7 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
         nn.Module.__init__(self)
         self.config = config
         self.quant_config = quant_config
+        self.pp_group = get_pp_group()
 
         if self.config.num_hidden_layers != 1:
             raise ValueError("EAGLE3 currently only supports 1 layer")
