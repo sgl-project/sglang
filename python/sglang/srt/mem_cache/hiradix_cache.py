@@ -60,15 +60,17 @@ def get_node_l3_keys(
     page_size: int = 1,
 ):
     l3_keys = []
+    total_token_len = len(token_ids)
     if page_size == 1:
         # 每个token的key构建需要加上完整的前缀
-        for i in range(token_len):
-            l3_keys.append(token_ids_to_key(token_ids[:i - token_len + 1], local_rank))
+        for i in range(total_token_len - token_len, total_token_len):
+            l3_keys.append(token_ids_to_key(token_ids[:i + 1], local_rank))
     else:
+        total_block_len = len(token_ids) // page_size
         num_key = token_len // page_size
-        for i in range(num_key):
-            prefix_block_token_ids = token_ids[: -(num_key - i) * page_size]
-            current_block_token_ids = token_ids[-(num_key - i) * page_size: -(num_key - i + 1) * page_size]
+        for i in range(total_block_len - num_key, total_block_len):
+            prefix_block_token_ids = token_ids[: i * page_size]
+            current_block_token_ids = token_ids[i * page_size : (i + 1) * page_size]
             l3_keys.append(page_token_ids_to_key(prefix_block_token_ids, current_block_token_ids, local_rank))
 
     return l3_keys
