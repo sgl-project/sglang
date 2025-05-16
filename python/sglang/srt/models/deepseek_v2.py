@@ -201,6 +201,14 @@ class MoEGate(nn.Module):
         return logits
 
 
+def is_non_idle_and_non_empty(forward_mode, hidden_states):
+    return (
+        (forward_mode is not None)
+        and not forward_mode.is_idle()
+        and hidden_states.shape[0] > 0
+    )
+
+
 class DeepseekV2MoE(nn.Module):
 
     def __init__(
@@ -299,10 +307,8 @@ class DeepseekV2MoE(nn.Module):
         return global_server_args_dict["enable_deepep_moe"]
 
     def op_gate(self, state):
-        if (not self._enable_deepep_moe) or (
-            state.forward_batch.forward_mode is not None
-            and not state.forward_batch.forward_mode.is_idle()
-            and state.hidden_states_mlp_input.shape[0] > 0
+        if (not self._enable_deepep_moe) or is_non_idle_and_non_empty(
+            forward_mode, hidden_states
         ):
             # router_logits: (num_tokens, n_experts)
             state.router_logits = self.gate(state.hidden_states_mlp_input)
@@ -310,11 +316,9 @@ class DeepseekV2MoE(nn.Module):
             state.router_logits = None
 
     def op_shared_experts(self, state):
-        if (
-            (self.n_share_experts_fusion == 0)
-            and (state.forward_batch.forward_mode is not None)
-            and not state.forward_batch.forward_mode.is_idle()
-            and state.hidden_states_mlp_input.shape[0] > 0
+        if (self.n_share_experts_fusion == 0) and (
+            (not self._enable_deepep_moe)
+            or is_non_idle_and_non_empty(forward_mode, hidden_states)
         ):
             state.shared_output = self.shared_experts(state.hidden_states_mlp_input)
         else:
