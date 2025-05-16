@@ -142,16 +142,6 @@ def get_local_attention_dp_size():
     return _LOCAL_ATTN_DP_SIZE
 
 
-def get_local_attention_dp_rank():
-    assert _LOCAL_ATTN_DP_RANK is not None, "dp attention not initialized!"
-    return _LOCAL_ATTN_DP_RANK
-
-
-def get_local_attention_dp_size():
-    assert _LOCAL_ATTN_DP_SIZE is not None, "dp attention not initialized!"
-    return _LOCAL_ATTN_DP_SIZE
-
-
 @contextmanager
 def disable_dp_size():
     """Patch the tp group temporarily until this function ends.
