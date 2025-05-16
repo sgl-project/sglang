@@ -30,6 +30,7 @@ from sglang.srt.utils import (
     get_device_memory_capacity,
     is_flashinfer_available,
     is_hip,
+    is_hpu,
     is_port_available,
     is_remote_url,
     is_valid_ipv6_address,
@@ -70,7 +71,7 @@ class ServerArgs:
     max_running_requests: Optional[int] = None
     max_total_tokens: Optional[int] = None
     chunked_prefill_size: Optional[int] = None
-    max_prefill_tokens: int = 16384
+    max_prefill_tokens: Optional[int] = None
     schedule_policy: str = "fcfs"
     schedule_conservativeness: float = 1.0
     cpu_offload_gb: int = 0
@@ -293,7 +294,7 @@ class ServerArgs:
 
         # Set kernel backends for hpu device
         if self.device == "hpu":
-            self.attention_backend = "torch_native"
+            self.attention_backend = "hpu_attn_backend"
             self.sampling_backend = "pytorch"
 
         # Set kernel backends
@@ -443,6 +444,21 @@ class ServerArgs:
         os.environ["SGLANG_DISABLE_OUTLINES_DISK_CACHE"] = (
             "1" if self.disable_outlines_disk_cache else "0"
         )
+
+        if is_hpu():
+            if self.max_running_requests is None:
+                self.max_running_requests = 128
+
+            self.page_size = 128  # Currently, HPU only supports page size of 128
+            self.disable_radix_cache = (
+                True  # Currently, HPU does not support radix cache
+            )
+            if self.max_prefill_tokens is None:
+                self.max_prefill_tokens = (
+                    4096  # Currently, HPU prefer smaller prefill batches
+                )
+        else:
+            self.max_prefill_tokens = 16384
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):

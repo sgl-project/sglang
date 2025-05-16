@@ -2082,6 +2082,12 @@ def is_fa3_default_architecture(hf_config):
     return architectures[0] in default_archs
 
 
+def get_scheduler_device(worker_device: str):
+    # HPU has higher overhead when running many small ops
+    # so we run all scheduler ops on CPU when using HPU
+    return "cpu" if is_hpu() else worker_device
+
+
 # Can be more general if it is used in multiple places (keep it simple and thus not general now)
 class BumpAllocator:
     def __init__(self, buffer_size: int, dtype, device):

@@ -132,14 +132,18 @@ from sglang.srt.utils import (
     disable_request_logging,
     get_bool_env_var,
     get_zmq_socket,
+    is_hpu,
     kill_itself_when_parent_died,
     point_to_point_pyobj,
     pyspy_dump_schedulers,
     set_gpu_proc_affinity,
     set_random_seed,
     suppress_other_loggers,
+    get_scheduler_device
 )
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
+
+_is_hpu = is_hpu()
 
 expert_distribution_recorder = ExpertDistributionRecorder()
 
@@ -301,7 +305,7 @@ class Scheduler(
             self.max_req_len,
             self.max_req_input_len,
             self.random_seed,
-            self.device,
+            self.worker_device,
             worker_global_server_args_dict,
             _,
             _,
@@ -311,6 +315,7 @@ class Scheduler(
             global_server_args_dict["max_micro_batch_size"] = max(
                 self.max_running_requests // server_args.pp_size, 1
             )
+        self.device = get_scheduler_device(self.worker_device)
 
         self.tp_group = self.tp_worker.get_tp_group()
         self.tp_cpu_group = self.tp_group.cpu_group
@@ -2087,6 +2092,8 @@ class Scheduler(
             "CPU": torch.profiler.ProfilerActivity.CPU,
             "GPU": torch.profiler.ProfilerActivity.CUDA,
         }
+        if _is_hpu:
+            activity_map["HPU"] = torch.profiler.ProfilerActivity.HPU
         torchprof_activities = [
             activity_map[a] for a in activities if a in activity_map
         ]

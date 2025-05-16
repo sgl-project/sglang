@@ -57,7 +57,11 @@ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, Forw
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import flatten_nested_list, get_compiler_backend
+from sglang.srt.utils import flatten_nested_list, get_compiler_backend, is_hpu
+
+_is_hpu = is_hpu()
+if _is_hpu:
+    from sglang.srt.hpu_utils import HPUBlockMetadata, create_hpu_block_metadata
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
@@ -1226,7 +1230,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
 
         # Write to req_to_token_pool
-        if global_server_args_dict["attention_backend"] != "torch_native":
+        if global_server_args_dict["attention_backend"] not in [
+            "torch_native",
+            "hpu_attn_backend",
+        ]:
             # TODO: some tensors can be reused for ForwardBatchInfo (e.g., extend_lens, cumsum_start)
 
             write_req_to_token_pool_triton[(bs,)](
@@ -1609,7 +1616,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         global bid
         bid += 1
-        return ModelWorkerBatch(
+        worker_batch = ModelWorkerBatch(
             bid=bid,
             forward_mode=self.forward_mode,
             input_ids=self.input_ids,
@@ -1652,6 +1659,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
             launch_done=self.launch_done,
         )
+
+        if _is_hpu:
+            worker_batch.hpu_metadata = create_hpu_block_metadata(
+                worker_batch,
+                self.token_to_kv_pool_allocator.page_size,
+                self.req_to_token_pool,
+            )
+
+        return worker_batch
 
     def copy(self):
         # Only contain fields that will be used by process_batch_result
@@ -1735,6 +1751,7 @@ class ModelWorkerBatch:
 
     # Overlap event
     launch_done: Optional[threading.Event] = None
+    hpu_metadata: Optional[HPUBlockMetadata] = None
 
 
 @triton.jit
@@ -1774,7 +1791,7 @@ def write_req_to_token_pool_triton(
         )
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend())
+@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_hpu)
 def get_last_loc(req_to_token, req_pool_indices_tensor, prefix_lens_tensor):
     return torch.where(
         prefix_lens_tensor > 0,
