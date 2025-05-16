@@ -90,6 +90,15 @@ class DataParallelController:
         # Launch data parallel workers
         self.scheduler_procs = []
         self.workers = [None] * server_args.dp_size
+        if server_args.node_rank == 0:
+            self.workers_port = {}
+            for dp_rank in range(server_args.dp_size):
+                port_and_socket = get_tcp_zmq_socket_binded_to_local_free_port(
+                    self.context, zmq.PUSH
+                )
+                self.workers[dp_rank] = port_and_socket[1]
+                self.workers_port[dp_rank] = port_and_socket[0]
+                logger.debug(f"Port assign to worker {dp_rank}: {port_and_socket[0]}")
 
         if server_args.enable_dp_attention:
             dp_port_args = self.launch_dp_attention_schedulers(server_args, port_args)
@@ -99,8 +108,6 @@ class DataParallelController:
             self.control_message_step = 1
 
         self.max_req_input_len = None
-
-        self.sockets_dp_attention_scheduler_to_tprank0 = None
 
     def launch_dp_schedulers(self, server_args, port_args):
         base_gpu_id = 0
@@ -158,16 +165,9 @@ class DataParallelController:
         while True:
             time.sleep(30 * 24 * 3600)
 
-    def _dispatch_free_ports(self, server_args: ServerArgs):
+    def _dispatch_dp_attn_ctrl_zmq_port(self, server_args: ServerArgs):
         if server_args.node_rank == 0:
-            ports_and_sockets = {
-                i: get_tcp_zmq_socket_binded_to_local_free_port(self.context, zmq.PUSH)
-                for i in range(server_args.dp_size)
-            }
-            self.sockets_dp_attention_scheduler_to_tprank0 = {
-                i: socket for i, (port, socket) in ports_and_sockets.items()
-            }
-            free_ports = {i: port for i, (port, socket) in ports_and_sockets.items()}
+            free_ports = {i: port for i, port in self.workers_port.items()}
             logger.debug(f"Free ports: {free_ports}")
 
             # broadcast dp_port_args to all dp ranks
@@ -213,24 +213,10 @@ class DataParallelController:
         PortArgs.register_dp_controller_to_attn_tp_rk0_port(free_ports)
 
     def launch_dp_attention_schedulers(self, server_args, port_args):
-        self._dispatch_free_ports(server_args)
+        self._dispatch_dp_attn_ctrl_zmq_port(server_args)
         dp_port_args = []
         for dp_rank in range(server_args.dp_size):
             dp_port_args.append(PortArgs.init_new(server_args, dp_rank))
-        # Only node rank 0 runs the real data parallel controller that dispatches the requests.
-        if server_args.node_rank == 0:
-            assert self.sockets_dp_attention_scheduler_to_tprank0 is not None
-            for dp_rank in range(server_args.dp_size):
-                logger.debug(
-                    f"Node rank 0 binding to dispatcher for dp controller {dp_rank}. scheduler_input_ipc_name: {dp_port_args[dp_rank].scheduler_input_ipc_name}"
-                )
-                assert (
-                    self.sockets_dp_attention_scheduler_to_tprank0.get(dp_rank)
-                    is not None
-                )
-                self.workers[dp_rank] = self.sockets_dp_attention_scheduler_to_tprank0[
-                    dp_rank
-                ]
         self.launch_tensor_parallel_group(server_args, port_args, 0, None)
         return dp_port_args
 
