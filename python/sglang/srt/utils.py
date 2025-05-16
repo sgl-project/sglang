@@ -2100,3 +2100,7 @@ def log_info_on_rank0(logger, msg):
 
     if get_tensor_model_parallel_rank() == 0:
         logger.info(msg)
+
+
+def dispose_tensor(x: torch.Tensor):
+    x.set_(torch.empty((0,), device=x.device, dtype=x.dtype))
