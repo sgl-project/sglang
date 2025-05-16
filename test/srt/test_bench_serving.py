@@ -356,6 +356,65 @@ class TestBenchServing(CustomTestCase):
             )
             self.assertGreater(res["input_throughput"], 4000)
 
+    def test_offline_throughput_with_and_without_mtp(self):
+        res = run_bench_serving(
+            model=DEFAULT_MTP_MODEL_FOR_TEST,
+            num_prompts=200,
+            request_rate=1,
+            sharegpt_context_len=3072,
+            disable_ignore_eos=True,
+            dataset_name="sharegpt",
+            other_server_args=[
+                "--trust-remote-code",
+                "--mem-fraction-static",
+                "0.5",
+            ],
+            need_warmup=True,
+            seed=42,
+        )
+
+        res_mtp = run_bench_serving(
+            model=DEFAULT_MTP_MODEL_FOR_TEST,
+            num_prompts=200,
+            request_rate=1,
+            sharegpt_context_len=3072,
+            disable_ignore_eos=True,
+            dataset_name="sharegpt",
+            other_server_args=[
+                "--trust-remote-code",
+                "--speculative-algorithm",
+                "EAGLE",
+                "--speculative-draft-model-path",
+                DEFAULT_MTP_MODEL_FOR_TEST,
+                "--speculative-num-steps",
+                "1",
+                "--speculative-eagle-topk",
+                "1",
+                "--speculative-num-draft-tokens",
+                "2",
+                "--mem-fraction-static",
+                "0.5",
+            ],
+            need_warmup=True,
+            seed=42,
+        )
+
+        if is_in_ci():
+            write_github_step_summary(
+                f"### test_offline_throughput_with_and_without_mtp\n"
+                f'Without MTP Output throughput: {res["output_throughput"]:.2f} token/s\n'
+                f'With MTP Output throughput: {res_mtp["output_throughput"]:.2f} token/s\n'
+            )
+        else:
+            print(f"### test_offline_throughput_with_and_without_mtp\n")
+            print(
+                f'Without MTP Output throughput: {res["output_throughput"]:.2f} token/s\n'
+            )
+            print(
+                f'With MTP Output throughput: {res_mtp["output_throughput"]:.2f} token/s\n'
+            )
+            self.assertGreater(res_mtp["output_throughput"], res["output_throughput"])
+
 
 if __name__ == "__main__":
     unittest.main()
