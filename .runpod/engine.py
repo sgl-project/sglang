@@ -10,7 +10,7 @@ import os
 class SGlangEngine:
     def __init__(
         self,
-        model=os.getenv("MODEL_NAME"),
+        model=os.getenv("MODEL_PATH"),
         host=os.getenv("HOST", "0.0.0.0"),
         port=int(os.getenv("PORT", 30000)),
     ):
@@ -33,7 +33,7 @@ class SGlangEngine:
 
         # Dictionary of all possible options and their corresponding env var names
         options = {
-            "MODEL_NAME": "--model-path",
+            "MODEL_PATH": "--model-path",
             "TOKENIZER_PATH": "--tokenizer-path",
             "TOKENIZER_MODE": "--tokenizer-mode",
             "LOAD_FORMAT": "--load-format",

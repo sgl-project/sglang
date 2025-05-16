@@ -20,34 +20,12 @@
     ],
     "env": [
       {
-        "key": "MODEL_NAME",
+        "key": "MODEL_PATH",
         "input": {
-          "name": "Model Name",
+          "name": "Model Path",
           "type": "huggingface",
           "description": "Hugging Face model name or path to load",
           "required": true
-        }
-      },
-      {
-        "key": "HOST",
-        "input": {
-          "name": "Host",
-          "type": "string",
-          "description": "Host of the server",
-          "default": "0.0.0.0",
-          "required": false,
-          "advanced": true
-        }
-      },
-      {
-        "key": "PORT",
-        "input": {
-          "name": "Port",
-          "type": "number",
-          "description": "Port of the server",
-          "default": 30000,
-          "required": false,
-          "advanced": true
         }
       },
       {
@@ -56,17 +34,6 @@
           "name": "Tokenizer Path",
           "type": "string",
           "description": "Path of the tokenizer",
-          "default": "",
-          "required": false,
-          "advanced": true
-        }
-      },
-      {
-        "key": "ADDITIONAL_PORTS",
-        "input": {
-          "name": "Additional Ports",
-          "type": "string",
-          "description": "Additional ports for the server",
           "default": "",
           "required": false,
           "advanced": true
@@ -201,17 +168,6 @@
         }
       },
       {
-        "key": "MAX_NUM_REQS",
-        "input": {
-          "name": "Max Number of Requests",
-          "type": "number",
-          "description": "Maximum requests in memory pool",
-          "default": "",
-          "required": false,
-          "advanced": true
-        }
-      },
-      {
         "key": "MAX_TOTAL_TOKENS",
         "input": {
           "name": "Max Total Tokens",
@@ -339,18 +295,7 @@
         }
       },
       {
-        "key": "MAX_CONCURRENCY",
-        "input": {
-          "name": "Max Concurrency",
-          "type": "number",
-          "description": "Max concurrent requests per worker. SGLang has an internal queue, so you don't have to worry about limiting by VRAM, this is for improving scaling/load balancing efficiency",
-          "default": 300,
-          "required": false,
-          "advanced": true
-        }
-      },
-      {
-        "key": "FILE_STORAGE_PTH",
+        "key": "FILE_STORAGE_PATH",
         "input": {
           "name": "File Storage Path",
           "type": "string",
@@ -383,39 +328,6 @@
             { "value": "round_robin", "label": "Round Robin" },
             { "value": "shortest_queue", "label": "Shortest Queue" }
           ],
-          "advanced": true
-        }
-      },
-      {
-        "key": "NCCL_INIT_ADDR",
-        "input": {
-          "name": "NCCL Init Address",
-          "type": "string",
-          "description": "NCCL init address for multi-node",
-          "default": "",
-          "required": false,
-          "advanced": true
-        }
-      },
-      {
-        "key": "NNODES",
-        "input": {
-          "name": "Number of Nodes",
-          "type": "number",
-          "description": "Number of nodes",
-          "default": "",
-          "required": false,
-          "advanced": true
-        }
-      },
-      {
-        "key": "NODE_RANK",
-        "input": {
-          "name": "Node Rank",
-          "type": "number",
-          "description": "Node rank",
-          "default": "",
-          "required": false,
           "advanced": true
         }
       },
@@ -464,44 +376,11 @@
         }
       },
       {
-        "key": "DISABLE_FLASHINFER",
-        "input": {
-          "name": "Disable Flashinfer",
-          "type": "boolean",
-          "description": "Disable flashinfer attention kernels",
-          "default": false,
-          "required": false,
-          "advanced": true
-        }
-      },
-      {
-        "key": "DISABLE_FLASHINFER_SAMPLING",
-        "input": {
-          "name": "Disable Flashinfer Sampling",
-          "type": "boolean",
-          "description": "Disable flashinfer sampling kernels",
-          "default": false,
-          "required": false,
-          "advanced": true
-        }
-      },
-      {
         "key": "DISABLE_RADIX_CACHE",
         "input": {
           "name": "Disable Radix Cache",
           "type": "boolean",
           "description": "Disable RadixAttention for prefix caching",
-          "default": false,
-          "required": false,
-          "advanced": true
-        }
-      },
-      {
-        "key": "DISABLE_REGEX_JUMP_FORWARD",
-        "input": {
-          "name": "Disable Regex Jump Forward",
-          "type": "boolean",
-          "description": "Disable regex jump-forward",
           "default": false,
           "required": false,
           "advanced": true
@@ -519,11 +398,11 @@
         }
       },
       {
-        "key": "DISABLE_DISK_CACHE",
+        "key": "DISABLE_OUTLINES_DISK_CACHE",
         "input": {
-          "name": "Disable Disk Cache",
+          "name": "Disable Outlines Disk Cache",
           "type": "boolean",
-          "description": "Disable disk cache",
+          "description": "Disable disk cache of outlines",
           "default": false,
           "required": false,
           "advanced": true
@@ -552,33 +431,22 @@
         }
       },
       {
-        "key": "ENABLE_MLA",
+        "key": "ENABLE_FLASHINFER_MLA",
         "input": {
-          "name": "Enable MLA",
+          "name": "Enable FlashInfer MLA",
           "type": "boolean",
-          "description": "Enable Multi-head Latent Attention",
+          "description": "Enable FlashInfer Multi-head Latent Attention",
           "default": false,
           "required": false,
           "advanced": true
         }
       },
       {
-        "key": "ATTENTION_REDUCE_IN_FP32",
+        "key": "TRITON_ATTENTION_REDUCE_IN_FP32",
         "input": {
-          "name": "Attention Reduce in FP32",
+          "name": "Triton Attention Reduce in FP32",
           "type": "boolean",
-          "description": "Cast attention results to fp32",
-          "default": false,
-          "required": false,
-          "advanced": true
-        }
-      },
-      {
-        "key": "EFFICIENT_WEIGHT_LOAD",
-        "input": {
-          "name": "Efficient Weight Load",
-          "type": "boolean",
-          "description": "Enable memory efficient weight loading",
+          "description": "Cast Triton attention results to fp32",
           "default": false,
           "required": false,
           "advanced": true

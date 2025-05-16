@@ -20,7 +20,7 @@
         "value": "true"
       },
       {
-        "key": "MODEL_NAME",
+        "key": "MODEL_PATH",
         "value": "HuggingFaceTB/SmolLM2-1.7B-Instruct"
       }
     ],
