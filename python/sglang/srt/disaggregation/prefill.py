@@ -40,6 +40,7 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce,
 )
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req, ScheduleBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
@@ -134,6 +135,11 @@ class PrefillBootstrapQueue:
         )
         self._process_req(req)
         self.queue.append(req)
+
+    def extend(self, reqs: List[Req]) -> None:
+        """Add a request to the pending queue."""
+        for req in reqs:
+            self.add(req)
 
     def _process_req(self, req: Req) -> None:
         """
@@ -250,8 +256,19 @@ class SchedulerDisaggregationPrefillMixin:
                 result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), result))
 
+                # Triggering the sampling_info_done event.
+                if self.last_batch is None:
+                    next_batch_sampling_info = self.tp_worker.cur_sampling_info
+                    if next_batch_sampling_info:
+                        next_batch_sampling_info.update_regex_vocab_mask()
+                        self.current_stream.synchronize()
+                        next_batch_sampling_info.sampling_info_done.set()
+
             if self.last_batch:
                 tmp_batch, tmp_result = self.result_queue.popleft()
+                tmp_batch.next_batch_sampling_info = (
+                    self.tp_worker.cur_sampling_info if batch else None
+                )
                 self.process_batch_result_disagg_prefill(tmp_batch, tmp_result)
 
             if len(self.disagg_prefill_inflight_queue) > 0:
@@ -310,6 +327,11 @@ class SchedulerDisaggregationPrefillMixin:
 
                 if self.enable_overlap:
                     self.send_kv_chunk(req, end_idx=req.tmp_end_idx)
+
+        if batch.next_batch_sampling_info:
+            batch.next_batch_sampling_info.update_regex_vocab_mask()
+            self.current_stream.synchronize()
+            batch.next_batch_sampling_info.sampling_info_done.set()
 
     def process_disagg_prefill_inflight_queue(self: Scheduler) -> None:
         """
