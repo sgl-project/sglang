@@ -4,6 +4,9 @@ You can install SGLang using any of the methods below.
 
 For running DeepSeek V3/R1, refer to [DeepSeek V3 Support](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3). It is recommended to use the latest version and deploy it with [Docker](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#using-docker-recommended) to avoid environment-related issues.
 
+> [!NOTE]
+> SGLang currently uses vLLM as an optional quantization library to support quantization methods like AWQ. You should manually install vLLM by running `pip install vllm==0.8.4` or build the Docker image by adding `RUN python3 -m pip install vllm==0.8.4` in the Dockerfile before launching the SGLang service. For details, please refer to this [issue](https://github.com/sgl-project/sglang/issues/4546).
+
 It is recommended to use uv to install the dependencies for faster installation:
 
 ## Method 1: With pip or uv
