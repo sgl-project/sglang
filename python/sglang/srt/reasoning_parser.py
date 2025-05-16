@@ -54,13 +54,14 @@ class BaseReasoningFormatDetector:
         If stream_reasoning is True:
             Streams reasoning content as it arrives
         """
-        self._buffer += new_text
+        self._buffer += new_text if new_text not in self.think_start_token else ""
         current_text = self._buffer
 
         # Strip `<think>` token if present
         if not self.stripped_think_start and self.think_start_token in current_text:
             current_text = current_text.replace(self.think_start_token, "")
             self.stripped_think_start = True
+            print("stripped_think_start", current_text)
 
         # Handle end of reasoning block
         if self._in_reasoning and self.think_end_token in current_text:

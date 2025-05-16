@@ -1662,7 +1662,6 @@ async def v1_chat_completions(
                                             [in_top[t_idx]] if in_top[t_idx] else None
                                         ),
                                     )
-                                    # 把 raw_lp ➜ ChoiceLogprobs
                                     token_bytes = list(tok_text.encode("utf-8"))
                                     top_logprobs = None
                                     if (
@@ -1687,13 +1686,47 @@ async def v1_chat_completions(
                                             )
                                         ]
                                     )
+                                delta = DeltaMessage(content=tok_text)
 
-                                choice_data = ChatCompletionResponseStreamChoice(
-                                    index=index,
-                                    delta=DeltaMessage(content=tok_text),
-                                    logprobs=single_lp,
-                                    finish_reason=None,
+                                enable_thinking = _get_enable_thinking_from_request(
+                                    request
                                 )
+                                if (
+                                    tokenizer_manager.server_args.reasoning_parser
+                                    and request.separate_reasoning
+                                    and enable_thinking
+                                ):
+                                    if index not in reasoning_parser_dict:
+                                        reasoning_parser_dict[index] = ReasoningParser(
+                                            tokenizer_manager.server_args.reasoning_parser,
+                                            request.stream_reasoning,
+                                        )
+                                    reasoning_parser = reasoning_parser_dict[index]
+                                    reasoning_text, _ = (
+                                        reasoning_parser.parse_stream_chunk(tok_text)
+                                    )
+                                    if reasoning_text:
+                                        choice_data = (
+                                            ChatCompletionResponseStreamChoice(
+                                                index=index,
+                                                delta=DeltaMessage(
+                                                    reasoning_content=(
+                                                        reasoning_text
+                                                        if reasoning_text
+                                                        else None
+                                                    )
+                                                ),
+                                                logprobs=single_lp,
+                                                finish_reason=finish_reason_type,
+                                            )
+                                        )
+                                else:
+                                    choice_data = ChatCompletionResponseStreamChoice(
+                                        index=index,
+                                        delta=delta,
+                                        logprobs=single_lp,
+                                        finish_reason=finish_reason_type,
+                                    )
                                 chunk = ChatCompletionStreamResponse(
                                     id=content["meta_info"]["id"],
                                     created=created,
