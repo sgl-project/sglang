@@ -198,6 +198,8 @@ class VILAForConditionalGeneration(nn.Module):
     mm_projector: MultimodalProjector
     vision_tower: SiglipVisionModel
 
+    image_end_token_embedding: Optional[Tensor] = None
+
     def __init__(
         self,
         config: VILAConfig,
@@ -301,26 +303,33 @@ class VILAForConditionalGeneration(nn.Module):
             )
         )
 
-        # Append image end token to every image embedding.
-        image_end_token_embedding: Tensor = self.llm.get_input_embeddings().__call__(
-            torch.tensor(
-                self.config.image_end_token_id,
-                device=next(self.llm.get_input_embeddings().parameters()).device,
-                dtype=torch.long,
-            ).view(1, -1)
-        )  # Shape: (1, 1, dim_feature)
+        ##### END COPY AND MODIFY modeling_vila.py #####
+
+        # Append the image end token to every image embedding.
+        if self.image_end_token_embedding is None:
+            image_end_token_embedding: (
+                Tensor
+            ) = self.llm.get_input_embeddings().__call__(
+                torch.tensor(
+                    self.config.image_end_token_id,
+                    device=next(self.llm.parameters()).device,
+                    dtype=torch.long,
+                ).view(1, -1)
+            )  # Shape: (1, 1, dim_feature)
+            self.image_end_token_embedding = image_end_token_embedding
+        else:
+            image_end_token_embedding = self.image_end_token_embedding
+
         image_end_token_embedding = image_end_token_embedding.expand(
             image_embedding.shape[0], 1, -1
         )  # Shape: (n_images, 1, dim_feature)
         image_embedding = torch.concat(
             [
-                image_embedding,
-                image_end_token_embedding.to(device=image_embedding.device),
+                image_embedding.to(device=image_end_token_embedding.device),
+                image_end_token_embedding,
             ],
             dim=1,
         )
-
-        ##### END COPY AND MODIFY modeling_vila.py #####
 
         return image_embedding
 
