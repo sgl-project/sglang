@@ -67,7 +67,7 @@ def resolve_transformers_arch(model_config: ModelConfig, architectures: list[str
             if not model_module.is_backend_compatible():
                 raise ValueError(
                     f"{arch} has no SGlang implementation and the Transformers "
-                    "implementation is not compatible with vLLM."
+                    "implementation is not compatible with SGLang."
                 )
             logger.warning(
                 "%s has no SGLang implementation, falling back to Transformers "

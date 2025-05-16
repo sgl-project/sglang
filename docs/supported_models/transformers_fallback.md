@@ -1,10 +1,10 @@
 # Transformers fallback in SGLang
 
-`sglang` can fallback to using models that are available in `transformers`. This works for most decoder-style language models and support for vision-language models is coming soon!
+`sglang` can fall back to using models that are available in `transformers`. This works for most decoder-style language models and support for vision-language models is coming soon!
 
 ## Example launch Command
 
-By default, we will use sglang implementation if it is available. Otherwise, we will fallback to transformers one. However, you can switch the implementation by setting `impl` to `transformers`.
+By default, we will use sglang implementation if it is available. Otherwise, we will fall back to transformers one. However, you can switch the implementation by setting `impl` to `transformers`.
 
 ```shell
 python3 -m sglang.launch_server \
@@ -18,7 +18,7 @@ python3 -m sglang.launch_server \
 
 ##### Quantization
 
-Transformers fallback has supported most of available quantization in SGlang (except GGUF). See [Quantization page](https://docs.sglang.ai/backend/quantization.html) for more information about supported quantization in gslang.
+Transformers fall back has supported most of available quantization in SGLang (except GGUF). See [Quantization page](https://docs.sglang.ai/backend/quantization.html) for more information about supported quantization in SGLang.
 
 ##### Remote code
 
@@ -35,7 +35,7 @@ class MyAttention(nn.Module):
   def forward(self, hidden_states, **kwargs): # <- kwargs are required
 
     ...
-    attention_interface = attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+    attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
     attn_output, attn_weights = attention_interface(
       self,
       query_states,
@@ -53,6 +53,6 @@ Here is what happens in the background:
 
 1. The config is loaded
 2. `MyModel` python class is loaded from the `auto_map`, and we check that the model `_supports_attention_backend`.
-3. The `TransformersModel` backend is used. See `/srt/models/transformers`, which leverage `self.config._attn_implementation = "sglang"`, thus the need to use `ALL_ATTENTION_FUNCTION`.
+3. The `TransformersModel` backend is used. See `/srt/models/transformers`, which leverages `self.config._attn_implementation = "sglang"`, thus the need to use `ALL_ATTENTION_FUNCTIONS`.
 
 That's it!

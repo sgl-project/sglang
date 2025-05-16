@@ -676,7 +676,7 @@ class ServerArgs:
             default=ServerArgs.impl,
             help="Which implementation of the model to use.\n\n"
             '* "auto" will try to use the SGLang implementation if it exists '
-            "and fallback to the Transformers implementation if no SGLang "
+            "and fall back to the Transformers implementation if no SGLang "
             "implementation is available.\n"
             '* "sglang" will use the SGLang model implementation.\n'
             '* "transformers" will use the Transformers model '
