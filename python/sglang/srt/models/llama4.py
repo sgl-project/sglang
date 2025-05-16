@@ -30,9 +30,9 @@ from sglang.srt.distributed import (
 from sglang.srt.layers.dp_attention import (
     dp_gather_partial,
     dp_scatter,
-    get_attention_dp_size,
     get_attention_tp_rank,
     get_attention_tp_size,
+    get_local_attention_dp_size,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -46,7 +46,11 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.managers.schedule_batch import global_server_args_dict
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    ForwardMode,
+    PPProxyTensors,
+)
 from sglang.srt.models.llama import LlamaForCausalLM, LlamaMLP
 from sglang.srt.utils import add_prefix, fast_topk, get_compiler_backend, make_layers
 
@@ -81,6 +85,7 @@ class Llama4MoE(nn.Module):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
         self.top_k = config.num_experts_per_tok
+        self.device_module = torch.get_device_module()
 
         intermediate_size_moe = config.intermediate_size
         self.router = ReplicatedLinear(
@@ -113,7 +118,25 @@ class Llama4MoE(nn.Module):
             reduce_results=False,  # We need to do scatter before reduce
         )
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states, forward_batch: ForwardBatch):
+        shared_out, routed_out = self._forward_core(
+            hidden_states, forward_batch.forward_mode
+        )
+
+        out_aD = routed_out + shared_out
+
+        if self.tp_size > 1:
+            out_aD = tensor_model_parallel_all_reduce(out_aD)
+
+        return out_aD
+
+    def _forward_core(self, hidden_states, forward_mode: ForwardMode):
+        if hidden_states.shape[0] < 4:
+            return self._forward_core_shared_routed_overlap(hidden_states)
+        else:
+            return self._forward_core_normal(hidden_states)
+
+    def _forward_core_normal(self, hidden_states):
         # router_scores: [num_tokens, num_experts]
         router_logits, _ = self.router(hidden_states)
         shared_out = self.shared_expert(hidden_states)
@@ -121,12 +144,35 @@ class Llama4MoE(nn.Module):
             hidden_states=hidden_states,
             router_logits=router_logits,
         )
-        out_aD = routed_out + shared_out
+        return shared_out, routed_out
 
-        if self.tp_size > 1:
-            out_aD = tensor_model_parallel_all_reduce(out_aD)
+    def _forward_core_shared_routed_overlap(self, hidden_states):
+        alt_stream = _get_or_create_alt_stream(self.device_module)
 
-        return out_aD
+        alt_stream.wait_stream(self.device_module.current_stream())
+
+        shared_out = self.shared_expert(hidden_states)
+
+        with self.device_module.stream(alt_stream):
+            # router_scores: [num_tokens, num_experts]
+            router_logits, _ = self.router(hidden_states)
+            routed_out = self.experts(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+            )
+        self.device_module.current_stream().wait_stream(alt_stream)
+
+        return shared_out, routed_out
+
+
+_alt_stream = None
+
+
+def _get_or_create_alt_stream(device_module):
+    global _alt_stream
+    if _alt_stream is None:
+        _alt_stream = device_module.Stream()
+    return _alt_stream
 
 
 class Llama4Attention(nn.Module):
@@ -152,7 +198,6 @@ class Llama4Attention(nn.Module):
         self.use_rope = int((layer_id + 1) % 4 != 0)
         self.use_qk_norm = config.use_qk_norm and self.use_rope
 
-        self.dp_size = get_attention_dp_size()
         attn_tp_rank = get_attention_tp_rank()
         attn_tp_size = get_attention_tp_size()
 
@@ -296,7 +341,7 @@ class Llama4DecoderLayer(nn.Module):
         rope_theta = config.rope_theta
         rope_scaling = config.rope_scaling
         max_position_embeddings = config.max_position_embeddings
-        self.dp_size = get_attention_dp_size()
+        self.local_dp_size = get_local_attention_dp_size()
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
 
@@ -359,7 +404,7 @@ class Llama4DecoderLayer(nn.Module):
         # Gather
         if get_tensor_model_parallel_world_size() > 1:
             # all gather and all reduce
-            if self.dp_size != 1:
+            if self.local_dp_size != 1:
                 if self.attn_tp_rank == 0:
                     hidden_states += residual
                 hidden_states, local_hidden_states = (
@@ -380,11 +425,11 @@ class Llama4DecoderLayer(nn.Module):
             )
 
         # Fully Connected
-        hidden_states = self.feed_forward(hidden_states)
+        hidden_states = self.feed_forward(hidden_states, forward_batch)
 
-        # TODO(ch-wan): ues reduce-scatter in MLP to avoid this scatter
+        # TODO(ch-wan): use reduce-scatter in MLP to avoid this scatter
         # Scatter
-        if self.dp_size != 1:
+        if self.local_dp_size != 1:
             # important: forward batch.gathered_buffer is used both after scatter and after gather.
             # be careful about this!
             hidden_states, global_hidden_states = (
@@ -431,6 +476,7 @@ class Llama4Model(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, List[torch.Tensor]]]:
         if input_embeds is None:
             hidden_states = self.embed_tokens(input_ids)
