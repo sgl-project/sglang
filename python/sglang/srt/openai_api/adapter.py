@@ -1315,6 +1315,7 @@ def v1_chat_generate_response(
             )
         else:
             gen_assistant_prefix_id = []
+            gen_assistant_prefix = ""
         logprobs = False
         if isinstance(request, list) and request[idx].logprobs:
             logprobs = True
