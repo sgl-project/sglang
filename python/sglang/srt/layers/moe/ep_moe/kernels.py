@@ -3,10 +3,9 @@ from typing import List, Optional
 
 import torch
 import triton
-import triton.language as tl
 
 from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import dispose_tensor, is_cuda
 
 logger = logging.getLogger(__name__)
 
@@ -116,7 +115,7 @@ def deepep_run_moe_deep_preprocess(topk_ids: torch.Tensor, num_experts: int):
     seg_indptr = torch.empty(num_experts + 1, device=topk_ids.device, dtype=torch.int64)
     src2dst = torch.empty(topk_ids.numel(), device=topk_ids.device, dtype=torch.int64)
 
-    # Find offet
+    # Find offset
     expert_ids = torch.arange(
         num_experts + 1, device=topk_ids.device, dtype=reorder_topk_ids.dtype
     )
@@ -653,12 +652,15 @@ def grouped_gemm_triton(
     scale_a: torch.Tensor = None,
     scale_b: torch.Tensor = None,
     block_shape: Optional[List[int]] = None,
+    c_dtype=None,
 ):
     assert weight_column_major == True  # TODO: more
     if use_fp8_w8a8 and block_shape is None:
         assert scale_a is not None and scale_b is not None
 
     if block_shape is not None:
+        a_original = a
+
         assert len(block_shape) == 2
         block_n, block_k = block_shape[0], block_shape[1]
         a, scale_a = per_token_group_quant_fp8(a, block_k)
@@ -666,6 +668,8 @@ def grouped_gemm_triton(
         assert triton.cdiv(a.shape[-1], block_k) == scale_a.shape[-1]
         assert triton.cdiv(b.shape[-2], block_n) == scale_b.shape[-2]
         assert triton.cdiv(b.shape[-1], block_k) == scale_b.shape[-1]
+
+        dispose_tensor(a_original)
 
     # TODO: adjust config or tune kernel
     # Reduce block size to prevent L40 shared memory overflow.
@@ -679,6 +683,10 @@ def grouped_gemm_triton(
     compute_m_num_tiles_indptr[(1,)](
         m_num_tiles_indptr, seg_indptr, batch_size, config["BLOCK_SIZE_M"]
     )
+
+    if c is None:
+        assert c_dtype is not None
+        c = torch.empty(a.shape[0], b.shape[1], device=a.device, dtype=c_dtype)
 
     grid = lambda META: (
         triton.cdiv(a.size(0), META["BLOCK_SIZE_M"]) + batch_size,
