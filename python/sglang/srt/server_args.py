@@ -791,7 +791,7 @@ class ServerArgs:
         parser.add_argument(
             "--sleep-on-idle",
             action="store_true",
-            help="Reduce CPU usage when sglang is idle."
+            help="Reduce CPU usage when sglang is idle.",
         )
 
         # Logging
