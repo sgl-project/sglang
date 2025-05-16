@@ -224,38 +224,36 @@ class ModelConfigForExpertLocation:
 def compute_initial_expert_location_metadata(
     server_args: ServerArgs, model_config: ModelConfig
 ) -> ExpertLocationMetadata:
-    if (data := server_args.init_expert_location) is not None:
-        if data == "trivial":
-            logger.info("init_expert_location from init_expert_location=trivial")
-            return ExpertLocationMetadata.init_trivial(server_args, model_config)
+    data = server_args.init_expert_location
+    if data == "trivial":
+        logger.info("init_expert_location from trivial")
+        return ExpertLocationMetadata.init_trivial(server_args, model_config)
 
-        # TODO unify with the utils function
-        if data.endswith(".pt"):
-            data_dict = torch.load(data, weights_only=True)
-        elif data.endswith(".json"):
-            data_dict = json.loads(Path(data).read_text())
-        else:
-            data_dict = json.loads(data)
+    # TODO unify with the utils function
+    if data.endswith(".pt"):
+        data_dict = torch.load(data, weights_only=True)
+    elif data.endswith(".json"):
+        data_dict = json.loads(Path(data).read_text())
+    else:
+        data_dict = json.loads(data)
 
-        if "physical_to_logical_map" in data_dict:
-            logger.info(
-                "init_expert_location from init_by_mapping using ServerArgs.init_expert_location"
-            )
-            return ExpertLocationMetadata.init_by_mapping(
-                server_args, model_config, **data_dict
-            )
-        elif "logical_count" in data_dict:
-            # TODO pr-chain: enable this later
-            raise NotImplementedError
-            # logger.info(
-            #     "init_expert_location from init_by_eplb using ServerArgs.init_expert_location"
-            # )
-            # return ExpertLocationMetadata.init_by_eplb(
-            #     server_args, model_config, logical_count=data_dict["logical_count"]
-            # )
-        else:
-            raise NotImplementedError(
-                f"Unknown init_expert_location format ({list(data_dict.keys())=})"
-            )
-
-    return ExpertLocationMetadata.init_trivial(server_args, model_config)
+    if "physical_to_logical_map" in data_dict:
+        logger.info(
+            "init_expert_location from init_by_mapping using ServerArgs.init_expert_location"
+        )
+        return ExpertLocationMetadata.init_by_mapping(
+            server_args, model_config, **data_dict
+        )
+    elif "logical_count" in data_dict:
+        # TODO pr-chain: enable this later
+        raise NotImplementedError
+        # logger.info(
+        #     "init_expert_location from init_by_eplb using ServerArgs.init_expert_location"
+        # )
+        # return ExpertLocationMetadata.init_by_eplb(
+        #     server_args, model_config, logical_count=data_dict["logical_count"]
+        # )
+    else:
+        raise NotImplementedError(
+            f"Unknown init_expert_location format ({list(data_dict.keys())=})"
+        )
