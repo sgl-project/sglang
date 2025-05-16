@@ -13,14 +13,13 @@ import torch.distributed as dist
 
 from sglang.srt.utils import get_ip
 
+FakeBootstrapHost = "2.2.2.2"
+
 
 class DisaggregationMode(Enum):
     NULL = "null"
     PREFILL = "prefill"
     DECODE = "decode"
-
-
-FakeBootstrapHost = "2.2.2.2"
 
 
 def poll_and_all_reduce(pollers, gloo_group):
