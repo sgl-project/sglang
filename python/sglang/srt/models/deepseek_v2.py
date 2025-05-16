@@ -323,7 +323,7 @@ class DeepseekV2MoE(nn.Module):
             and not forward_mode.is_idle()
             and hidden_states.shape[0] > 0
         ):
-            shared_output = self.self.shared_experts(hidden_states)
+            shared_output = self.shared_experts(hidden_states)
         else:
             shared_output = None
 
