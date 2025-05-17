@@ -2020,14 +2020,15 @@ class Scheduler(
         self.memory_saver_adapter.check_validity(
             caller_name="release_memory_occupation"
         )
+
+        # should directly use things on memory and no need to manually copy from gpu to cpu
+        self.stashed_model_weights = export_model_params(self.tp_worker.worker.model_runner.model)
+
         self.stashed_model_static_state = _export_static_state(
             self.tp_worker.worker.model_runner.model
         )
         self.memory_saver_adapter.pause()
         self.flush_cache()
-
-        # should directly use things on memory and no need to manually copy from gpu to cpu
-        self.stashed_model_weights = export_model_params(self.tp_worker.worker.model_runner.model)
 
         return ReleaseMemoryOccupationReqOutput()
 
