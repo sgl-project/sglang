@@ -2041,28 +2041,28 @@ class Scheduler(
         return ReleaseMemoryOccupationReqOutput()
 
     def resume_memory_occupation(self, recv_req: ResumeMemoryOccupationReqInput):
-        print(f"[Scheduler TP{self.tp_rank}] resume kill others {time.time()=:.3f}")
+        print(f"[Scheduler, TP{self.tp_rank}, {time.time()}] resume kill others")
         tp_size_per_node = self.tp_size // self.server_args.nnodes
         if self.tp_rank % tp_size_per_node == 0:
             kill_other_memory_occupying_processes()
         torch.distributed.barrier(self.tp_cpu_group)  # TODO use a better group
         busy_wait_until_enough_memory()
 
-        print(f"[Scheduler TP{self.tp_rank}] memory saver resume start {time.time()=:.3f}")
+        print(f"[Scheduler, TP{self.tp_rank}, {time.time()}] memory saver resume start")
         self.memory_saver_adapter.check_validity(caller_name="resume_memory_occupation")
         self.memory_saver_adapter.resume()
 
-        print(f"[Scheduler TP{self.tp_rank}] import static state start {time.time()=:.3f}")
+        print(f"[Scheduler, TP{self.tp_rank}, {time.time()}] import static state start")
         _import_static_state(
             self.tp_worker.worker.model_runner.model, self.stashed_model_static_state
         )
         del self.stashed_model_static_state
 
-        print(f"[Scheduler TP{self.tp_rank}] import param start {time.time()=:.3f}")
+        print(f"[Scheduler, TP{self.tp_rank}, {time.time()}] import param start")
         import_model_param(self.tp_worker.worker.model_runner.model, self.stashed_model_weights)
         del self.stashed_model_weights
 
-        print(f"[Scheduler TP{self.tp_rank}] resume END {time.time()=:.3f}")
+        print(f"[Scheduler, TP{self.tp_rank}, {time.time()}] resume END")
         return ResumeMemoryOccupationReqOutput()
 
     def slow_down(self, recv_req: SlowDownReqInput):
