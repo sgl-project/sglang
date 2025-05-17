@@ -24,7 +24,7 @@ def worker(rank, world_size):
 
         start_event.record()
 
-        num_repeat = 100
+        num_repeat = 10000
         for _ in range(num_repeat):
             a = torch.randn(1024, 1024, device=device)
             b = torch.randn(1024, 1024, device=device)
@@ -45,6 +45,8 @@ def worker(rank, world_size):
 
         print(f"[GPU {rank}] Iteration {iteration}: Avg time = {avg_time:.3f} ms")
         iteration += 1
+
+    print(f"{big_tensor.shape=}")  # reference it again
 
 
 def main():
