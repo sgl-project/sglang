@@ -32,7 +32,7 @@ def get_enable_jit_deepgemm():
 
 logger = logging.getLogger(__name__)
 
-_BUILTIN_M_LIST = list(range(1, 1024 * 16 + 1))
+_BUILTIN_M_LIST = range(1, 1024 * 16 + 1)
 _ENABLE_JIT_DEEPGEMM_PRECOMPILE = get_bool_env_var(
     "SGL_JIT_DEEPGEMM_PRECOMPILE", "true"
 )
@@ -62,19 +62,24 @@ if _ENABLE_JIT_DEEPGEMM:
 os.environ["DG_JIT_USE_NVRTC"] = os.getenv("SGL_DG_USE_NVRTC", _USE_NVRTC_DEFAULT)
 
 
-def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
-    global _BUILTIN_M_LIST
-    global _DO_COMPILE_ALL
-    global _IS_FIRST_RANK_ON_NODE
-
-    # Generate m_max
+def generate_m_range(server_args: ServerArgs):
     m_max = 1024 * 16
     if server_args.chunked_prefill_size < 1:
         m_max = 1024 * 64
     elif server_args.chunked_prefill_size > 8192:
         m_max = server_args.chunked_prefill_size * 2
     m_max = min(1024 * 128, m_max)
-    _BUILTIN_M_LIST = list(range(1, m_max + 1))
+    return m_max
+
+
+def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
+    global _BUILTIN_M_LIST
+    global _DO_COMPILE_ALL
+    global _IS_FIRST_RANK_ON_NODE
+
+    # Generate m_max
+    m_range = generate_m_range(server_args)
+    _BUILTIN_M_LIST = range(1, m_range + 1)
 
     _IS_FIRST_RANK_ON_NODE = ServerArgs.base_gpu_id == gpu_id
 
@@ -111,9 +116,13 @@ class DeepGemmKernelHelper:
 
 _INITIALIZATION_DICT: Dict[Tuple[DeepGemmKernelType, int, int, int], bool] = dict()
 
+_HAS_WARN_1 = False
+
 
 def _compile_warning_1():
-    if not _IN_PRECOMPILE_STAGE and _IS_FIRST_RANK_ON_NODE:
+    global _HAS_WARN_1
+    if not _HAS_WARN_1 and not _IN_PRECOMPILE_STAGE and _IS_FIRST_RANK_ON_NODE:
+        _HAS_WARN_1 = True
         logger.warning(
             "Entering DeepGEMM JIT Pre-Compile session. "
             "And it may takes a long time(Typically 10-20 mins) "
@@ -295,15 +304,15 @@ def _maybe_compile_deep_gemm_one_type_all(
         _INITIALIZATION_DICT[query_key] = True
 
         kernel_helper = _KERNEL_HELPER_DICT[kernel_type]
+        num_sms = get_num_sms()
+
         _compile_warning_1()
         logger.info(
-            f"Try DeepGEMM JIT Compiling for "
-            f"<{kernel_helper.name}> N={n}, K={k}, num_groups={num_groups} with all Ms."
+            f"DeepGEMM Loading/Compiling libs for "
+            f"<{kernel_helper.name}> N={n}, K={k}, num_groups={num_groups}, num_sms={num_sms}."
             f"{' It only takes a little time (typically 1 sec) if you have run `python3 -m sglang.compile_deep_gemm`. ' if not _IN_PRECOMPILE_STAGE else ''}"
         )
 
-        # NOTE(alcanderian): get_num_sms should be change when 2-batch-overlap is introduced
-        num_sms = get_num_sms()
         collected_configs = set()
         for m in m_list if m_list is not None else _BUILTIN_M_LIST:
             # Put config into set to get unique configs and reduce cases to be compiled
