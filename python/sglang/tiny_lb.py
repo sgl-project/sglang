@@ -111,9 +111,9 @@ async def handle_generate_request(request_data: dict):
         raise NotImplementedError
 
 
-def run(prefill_configs, decode_addrs, host, port):
+def run(downstream_urls, host, port):
     global load_balancer
-    load_balancer = MiniLoadBalancer(prefill_configs, decode_addrs)
+    load_balancer = MiniLoadBalancer(downstream_urls)
     uvicorn.run(app, host=host, port=port)
 
 
@@ -132,19 +132,4 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    bootstrap_ports = args.prefill_bootstrap_ports
-    if bootstrap_ports is None:
-        bootstrap_ports = [None] * len(args.prefill)
-    elif len(bootstrap_ports) == 1:
-        bootstrap_ports = bootstrap_ports * len(args.prefill)
-    else:
-        if len(bootstrap_ports) != len(args.prefill):
-            raise ValueError(
-                "Number of prefill URLs must match number of bootstrap ports"
-            )
-
-    prefill_configs = [
-        PrefillConfig(url, port) for url, port in zip(args.prefill, bootstrap_ports)
-    ]
-
-    run(prefill_configs, args.decode, args.host, args.port)
+    run(args.downstream, args.host, args.port)
