@@ -36,7 +36,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Start CI container
-        run: bash amd_start_ci_container.sh
+        run: bash scripts/amd_start_ci_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -62,7 +62,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Start CI container
-        run: bash amd_start_ci_container.sh
+        run: bash scripts/amd_start_ci_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -86,7 +86,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Start CI container
-        run: bash amd_start_ci_container.sh
+        run: bash scripts/amd_start_ci_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -110,7 +110,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Start CI container
-        run: bash amd_start_ci_container.sh
+        run: bash scripts/amd_start_ci_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -155,7 +155,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Start CI container
-        run: bash amd_start_ci_container.sh
+        run: bash scripts/amd_start_ci_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -189,7 +189,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Start CI container
-        run: bash amd_start_ci_container.sh
+        run: bash scripts/amd_start_ci_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -233,7 +233,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Start CI container
-        run: bash amd_start_ci_container.sh
+        run: bash scripts/amd_start_ci_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -257,7 +257,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Start CI container
-        run: bash amd_start_ci_container.sh
+        run: bash scripts/amd_start_ci_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -281,7 +281,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Start CI container
-        run: bash amd_start_ci_container.sh
+        run: bash scripts/amd_start_ci_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
