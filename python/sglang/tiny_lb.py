@@ -42,12 +42,15 @@ class DownstreamServer:
 
     @asynccontextmanager
     async def around_request(self):
-        TODO
+        await self._ensure_resumed()
         self._ongoing_request_num += 1
         try:
             yield
         finally:
             self._ongoing_request_num -= 1
+
+    async def _ensure_resumed(self):
+        TODO
 
 
 class MiniLoadBalancer:
