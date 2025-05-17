@@ -128,9 +128,11 @@ class LayerCommunicator:
     def __init__(
         self,
         layer_scatter_modes: LayerScatterModes,
+        input_layernorm: torch.nn.Module,
         post_attention_layernorm: torch.nn.Module,
     ):
         self.layer_scatter_modes = layer_scatter_modes
+        self.input_layernorm = input_layernorm
         self.post_attention_layernorm = post_attention_layernorm
 
         self.attn_tp_rank = get_attention_tp_rank()
@@ -146,15 +148,27 @@ class LayerCommunicator:
     def forward_pre_attn(
         self,
         hidden_states: torch.Tensor,
+        residual: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        return _communicate_simple(
+        if hidden_states.shape[0] == 0:
+            residual = hidden_states
+        else:
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.input_layernorm(hidden_states)
+            else:
+                hidden_states, residual = self.input_layernorm(hidden_states, residual)
+
+        hidden_states = _communicate_simple(
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             input_mode=self.layer_scatter_modes.layer_input_mode,
             output_mode=self.layer_scatter_modes.attn_mode,
             context=self._compute_context(forward_batch),
         )
+
+        return hidden_states, residual
 
     def forward_pre_mlp(
         self,
