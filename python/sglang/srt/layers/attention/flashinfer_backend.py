@@ -596,9 +596,12 @@ class FlashInferIndicesUpdaterDecode:
         for wrapper_id in range(2):
             if wrapper_id == 0:
                 # Sliding window attention
-                paged_kernel_lens_tmp = torch.minimum(  # TODO: replace this with clamp
-                    seq_lens,
-                    torch.tensor(self.sliding_window_size + 1),
+                upper_bound = (
+                    1 if not self.sliding_window_size else self.sliding_window_size + 1
+                )
+                paged_kernel_lens_tmp = torch.clamp(
+                    input=seq_lens,
+                    max=upper_bound,
                 )
                 paged_kernel_lens_sum_tmp = paged_kernel_lens_tmp.sum().item()
                 kv_start_idx_tmp = seq_lens - paged_kernel_lens_tmp
