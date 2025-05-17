@@ -575,7 +575,10 @@ class Qwen2MoeModel(nn.Module):
                 positions, hidden_states, forward_batch, residual
             )
         if hidden_states.shape[0] != 0:
-            hidden_states, _ = self.norm(hidden_states, residual)
+            if residual is None:
+                hidden_states = self.norm(hidden_states)
+            else:
+                hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
 
