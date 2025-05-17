@@ -11,15 +11,14 @@ import orjson
 import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
-from sglang.srt.disaggregation.utils import PDRegistryRequest
 
 
 def setup_logger():
-    logger = logging.getLogger("pdlb")
+    logger = logging.getLogger("tiny_lb")
     logger.setLevel(logging.INFO)
 
     formatter = logging.Formatter(
-        "[PDLB (Python)] %(asctime)s - %(levelname)s - %(message)s",
+        "[tiny_lb] %(asctime)s - %(levelname)s - %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
