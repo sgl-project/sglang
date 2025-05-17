@@ -250,7 +250,11 @@ class ModelRunner:
     def model_specific_adjustment(self):
         server_args = self.server_args
 
-        if server_args.attention_backend is None:
+        if (
+            server_args.attention_backend is None
+            and server_args.decode_attention_backend is None
+            and server_args.prefill_attention_backend is None
+        ):
             """
             Auto select the fastest attention backend.
 
