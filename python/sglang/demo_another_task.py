@@ -14,7 +14,7 @@ def worker(rank, world_size):
     print(f"[GPU {rank}] started")
 
     # TODO use more memory
-    big_tensor = torch.empty(1024 * 1024 * 1024 * 60, dtype=torch.int8)
+    big_tensor = torch.zeros(1024 * 1024 * 1024 * 60, dtype=torch.int8)
     print(f"[GPU {rank}] allocated big tensor {big_tensor.shape=}")
 
     iteration = 0
