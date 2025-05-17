@@ -6,14 +6,13 @@ import asyncio
 import dataclasses
 import logging
 import random
-from itertools import chain
 from typing import List, Optional
 
 import aiohttp
 import orjson
 import uvicorn
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import ORJSONResponse, Response, StreamingResponse
+from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
 from sglang.srt.disaggregation.utils import PDRegistryRequest
 
 
@@ -103,74 +102,6 @@ app = FastAPI()
 load_balancer = None
 
 
-@app.get("/health")
-async def health_check():
-    return Response(status_code=200)
-
-
-@app.get("/health_generate")
-async def health_check():
-    prefill_servers, decode_servers = (
-        load_balancer.prefill_servers,
-        load_balancer.decode_servers,
-    )
-    async with aiohttp.ClientSession() as session:
-        # Create the tasks
-        tasks = []
-        for server in chain(prefill_servers, decode_servers):
-            tasks.append(session.post(f"{server}/health_generate"))
-        for i, response in enumerate(asyncio.as_completed(tasks)):
-            await response
-    return Response(status_code=200)
-
-
-@app.post("/flush_cache")
-async def flush_cache():
-    prefill_servers, decode_servers = (
-        load_balancer.prefill_servers,
-        load_balancer.decode_servers,
-    )
-    async with aiohttp.ClientSession() as session:
-        # Create the tasks
-        tasks = []
-        for server in chain(prefill_servers, decode_servers):
-            tasks.append(session.post(f"{server}/flush_cache"))
-        for i, response in enumerate(asyncio.as_completed(tasks)):
-            await response
-    return Response(status_code=200)
-
-
-@app.get("/get_server_info")
-async def get_server_info():
-    prefill_servers, decode_servers = (
-        load_balancer.prefill_servers,
-        load_balancer.decode_servers,
-    )
-    prefill_infos = []
-    decode_infos = []
-    async with aiohttp.ClientSession() as session:
-        for server in chain(prefill_servers):
-            server_info = await session.get(f"{server}/get_server_info")
-            prefill_infos.append(await server_info.json())
-        for server in chain(decode_servers):
-            server_info = await session.get(f"{server}/get_server_info")
-            decode_infos.append(await server_info.json())
-
-    return {"prefill": prefill_infos, "decode": decode_infos}
-
-
-@app.get("/get_model_info")
-async def get_model_info():
-    # Dummy model information
-    model_info = {
-        "model_path": "/path/to/dummy/model",
-        "tokenizer_path": "/path/to/dummy/tokenizer",
-        "is_generation": True,
-        "preferred_sampling_params": {"temperature": 0.7, "max_new_tokens": 128},
-    }
-    return ORJSONResponse(content=model_info)
-
-
 @app.post("/generate")
 async def handle_generate_request(request_data: dict):
     server = load_balancer.select_server()
@@ -178,48 +109,6 @@ async def handle_generate_request(request_data: dict):
         return await load_balancer.generate_stream(request_data, server)
     else:
         raise NotImplementedError
-
-
-@app.get("/v1/models")
-async def get_models():
-    prefill_server = load_balancer.prefill_servers[0]  # Get the first prefill server
-    async with aiohttp.ClientSession() as session:
-        try:
-            response = await session.get(f"{prefill_server}/v1/models")
-            if response.status != 200:
-                raise HTTPException(
-                    status_code=response.status,
-                    detail=f"Prefill server error: Status {response.status}",
-                )
-            return ORJSONResponse(content=await response.json())
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/register")
-async def register(obj: PDRegistryRequest):
-    if obj.mode == "prefill":
-        load_balancer.prefill_configs.append(
-            PrefillConfig(obj.registry_url, obj.bootstrap_port)
-        )
-        logger.info(
-            f"Registered prefill server: {obj.registry_url} with bootstrap port: {obj.bootstrap_port}"
-        )
-    elif obj.mode == "decode":
-        load_balancer.decode_servers.append(obj.registry_url)
-        logger.info(f"Registered decode server: {obj.registry_url}")
-    else:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid mode. Must be either PREFILL or DECODE.",
-        )
-
-    logger.info(
-        f"#Prefill servers: {len(load_balancer.prefill_configs)}, "
-        f"#Decode servers: {len(load_balancer.decode_servers)}"
-    )
-
-    return Response(status_code=200)
 
 
 def run(prefill_configs, decode_addrs, host, port):
