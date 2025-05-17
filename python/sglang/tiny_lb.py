@@ -6,7 +6,6 @@ import asyncio
 import dataclasses
 import logging
 import random
-import urllib
 from itertools import chain
 from typing import List, Optional
 
@@ -174,84 +173,11 @@ async def get_model_info():
 
 @app.post("/generate")
 async def handle_generate_request(request_data: dict):
-    prefill_server, bootstrap_port, decode_server = load_balancer.select_pair()
-
-    # Parse and transform prefill_server for bootstrap data
-    parsed_url = urllib.parse.urlparse(prefill_server)
-    hostname = parsed_url.hostname
-    modified_request = request_data.copy()
-
-    batch_size = _get_request_batch_size(modified_request)
-    if batch_size is not None:
-        modified_request.update(
-            {
-                "bootstrap_host": [hostname] * batch_size,
-                "bootstrap_port": [bootstrap_port] * batch_size,
-                "bootstrap_room": [
-                    _generate_bootstrap_room() for _ in range(batch_size)
-                ],
-            }
-        )
-    else:
-        modified_request.update(
-            {
-                "bootstrap_host": hostname,
-                "bootstrap_port": bootstrap_port,
-                "bootstrap_room": _generate_bootstrap_room(),
-            }
-        )
-
+    server = load_balancer.select_server()
     if request_data.get("stream", False):
-        return await load_balancer.generate_stream(
-            modified_request, prefill_server, decode_server, "generate"
-        )
+        return await load_balancer.generate_stream(request_data, server)
     else:
         raise NotImplementedError
-
-
-@app.post("/v1/chat/completions")
-async def handle_completion_request(request_data: dict):
-    prefill_server, bootstrap_port, decode_server = load_balancer.select_pair()
-
-    # Parse and transform prefill_server for bootstrap data
-    parsed_url = urllib.parse.urlparse(prefill_server)
-    hostname = parsed_url.hostname
-    modified_request = request_data.copy()
-    modified_request.update(
-        {
-            "bootstrap_host": hostname,
-            "bootstrap_port": bootstrap_port,
-            "bootstrap_room": random.randint(0, 2 ** 63 - 1),
-        }
-    )
-
-    if request_data.get("stream", False):
-        return await load_balancer.generate_stream(
-            modified_request,
-            prefill_server,
-            decode_server,
-            endpoint="v1/chat/completions",
-        )
-    else:
-        return await load_balancer.generate(
-            modified_request,
-            prefill_server,
-            decode_server,
-            endpoint="v1/chat/completions",
-        )
-
-
-def _generate_bootstrap_room():
-    return random.randint(0, 2 ** 63 - 1)
-
-
-# We may utilize `GenerateReqInput`'s logic later
-def _get_request_batch_size(request):
-    if (text := request.get("text")) is not None:
-        return None if isinstance(text, str) else len(text)
-    if (input_ids := request.get("input_ids")) is not None:
-        return None if isinstance(input_ids[0], int) else len(input_ids)
-    return None
 
 
 @app.get("/v1/models")
