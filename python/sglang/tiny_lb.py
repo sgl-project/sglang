@@ -33,12 +33,13 @@ logger = setup_logger()
 
 
 class DownstreamServer:
-    def __init__(self, url: str):
+    def __init__(self, url: str, max_concurrency_per_server):
         self.url = url
+        self.max_concurrency_per_server = max_concurrency_per_server
         self._ongoing_request_num = 0
 
     def is_full(self):
-        return self._ongoing_request_num >= TODO
+        return self._ongoing_request_num >= self.max_concurrency_per_server
 
     @asynccontextmanager
     async def around_request(self):
@@ -126,7 +127,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--port", type=int, default=8000, help="Port to bind the server (default: 8000)"
     )
+    parser.add_argument("--max-concurrency-per-server", type=int, default=None)
     args = parser.parse_args()
 
-    downstream_servers = [DownstreamServer(url) for url in args.downstream]
+    downstream_servers = [DownstreamServer(url, args.max_concurrency_per_server) for url in args.downstream]
     run(downstream_servers, args.host, args.port)
