@@ -2071,6 +2071,9 @@ class Scheduler(
         import_model_param(self.tp_worker.worker.model_runner.model, self.stashed_model_weights)
         del self.stashed_model_weights
 
+        print(f"[Scheduler, TP{self.tp_rank}, {time.time()}] torch cuda synchronize start")
+        torch.cuda.synchronize()
+
         print(f"[Scheduler, TP{self.tp_rank}, {time.time()}] resume END")
         return ResumeMemoryOccupationReqOutput()
 
