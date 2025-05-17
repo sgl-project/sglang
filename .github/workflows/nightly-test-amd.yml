@@ -28,7 +28,7 @@ jobs:
       - name: Setup docker
         run: |
           touch github_summary.md
-          bash scripts/amd_start_ci_container.sh
+          bash scripts/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
