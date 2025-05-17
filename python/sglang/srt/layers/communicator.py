@@ -145,7 +145,7 @@ class LayerCommunicator:
             ScatterMode.FULL: self.tp_size,
         }
 
-    def forward_pre_attn(
+    def prepare_attn(
         self,
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
@@ -170,7 +170,7 @@ class LayerCommunicator:
 
         return hidden_states, residual
 
-    def forward_pre_mlp(
+    def prepare_mlp(
         self,
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
@@ -188,7 +188,7 @@ class LayerCommunicator:
             context=self._compute_context(forward_batch),
         )
 
-    def forward_layer_end(
+    def postprocess_layer(
         self,
         hidden_states: torch.Tensor,
         residual: torch.Tensor,

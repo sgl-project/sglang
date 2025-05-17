@@ -1188,7 +1188,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
-        hidden_states, residual = self.layer_communicator.forward_pre_attn(
+        hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
         )
 
@@ -1199,13 +1199,13 @@ class DeepseekV2DecoderLayer(nn.Module):
             zero_allocator=zero_allocator,
         )
 
-        hidden_states, residual = self.layer_communicator.forward_pre_mlp(
+        hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
 
         hidden_states = self.mlp(hidden_states, forward_batch.forward_mode)
 
-        hidden_states, residual = self.layer_communicator.forward_layer_end(
+        hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
         )
 
