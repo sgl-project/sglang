@@ -65,8 +65,6 @@ def import_model_param(model, data):
 if __name__ == '__main__':
     other_process_killer = OtherProcessKiller()
 
-    input("press enter to start kill...")
-
     print(f"{time.time()=} {torch.cuda.mem_get_info()=}")
     print(f"{time.time()=} kill start")
     other_process_killer.kill()
