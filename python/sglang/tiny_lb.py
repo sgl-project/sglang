@@ -35,17 +35,19 @@ logger = setup_logger()
 class DownstreamServer:
     def __init__(self, url: str):
         self.url = url
+        self._ongoing_request_num = 0
 
     def is_full(self):
-        return TODO
+        return self._ongoing_request_num >= TODO
 
     @asynccontextmanager
     async def around_request(self):
         TODO
+        self._ongoing_request_num += 1
         try:
             yield
         finally:
-            TODO
+            self._ongoing_request_num -= 1
 
 
 class MiniLoadBalancer:
