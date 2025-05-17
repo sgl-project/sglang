@@ -13,6 +13,7 @@
 # ==============================================================================
 """A scheduler that manages a tensor parallel GPU worker."""
 
+import torch_memory_saver
 import faulthandler
 import json
 import logging
@@ -2031,17 +2032,20 @@ class Scheduler(
             caller_name="release_memory_occupation"
         )
 
-        # should directly use things on memory and no need to manually copy from gpu to cpu
-        self.stashed_model_weights = export_model_params(self.tp_worker.worker.model_runner.model)
+        # # should directly use things on memory and no need to manually copy from gpu to cpu
+        # self.stashed_model_weights = export_model_params(self.tp_worker.worker.model_runner.model)
 
-        print(f"PARAMS=" + json.dumps([
-            (name, tuple(tensor.shape), str(tensor.dtype))
-            for name, tensor in self.stashed_model_weights["params"]
-        ]))
+        # print(f"PARAMS=" + json.dumps([
+        #     (name, tuple(tensor.shape), str(tensor.dtype))
+        #     for name, tensor in self.stashed_model_weights["params"]
+        # ]))
 
-        self.stashed_model_static_state = _export_static_state(
-            self.tp_worker.worker.model_runner.model
-        )
+        # self.stashed_model_static_state = _export_static_state(
+        #     self.tp_worker.worker.model_runner.model
+        # )
+
+        torch_memory_saver._global_info.binary_info.cdll.tms_copy_device_to_host()
+
         self.memory_saver_adapter.pause()
         self.flush_cache(
             # NOTE
@@ -2063,18 +2067,24 @@ class Scheduler(
         self.memory_saver_adapter.check_validity(caller_name="resume_memory_occupation")
         self.memory_saver_adapter.resume()
 
-        print(f"[Scheduler, TP{self.tp_rank}, {time.time()}] import static state start")
-        _import_static_state(
-            self.tp_worker.worker.model_runner.model, self.stashed_model_static_state
-        )
-        del self.stashed_model_static_state
-
         print(f"[Scheduler, TP{self.tp_rank}, {time.time()}] torch cuda synchronize start")
         torch.cuda.synchronize()
 
-        print(f"[Scheduler, TP{self.tp_rank}, {time.time()}] import param start")
-        import_model_param(self.tp_worker.worker.model_runner.model, self.stashed_model_weights)
-        del self.stashed_model_weights
+        print(f"[Scheduler, TP{self.tp_rank}, {time.time()}] tms_copy_host_to_device start")
+        torch_memory_saver._global_info.binary_info.cdll.tms_copy_host_to_device()
+
+        # print(f"[Scheduler, TP{self.tp_rank}, {time.time()}] import static state start")
+        # _import_static_state(
+        #     self.tp_worker.worker.model_runner.model, self.stashed_model_static_state
+        # )
+        # del self.stashed_model_static_state
+        #
+        # print(f"[Scheduler, TP{self.tp_rank}, {time.time()}] torch cuda synchronize start")
+        # torch.cuda.synchronize()
+        #
+        # print(f"[Scheduler, TP{self.tp_rank}, {time.time()}] import param start")
+        # import_model_param(self.tp_worker.worker.model_runner.model, self.stashed_model_weights)
+        # del self.stashed_model_weights
 
         print(f"[Scheduler, TP{self.tp_rank}, {time.time()}] torch cuda synchronize start")
         torch.cuda.synchronize()
