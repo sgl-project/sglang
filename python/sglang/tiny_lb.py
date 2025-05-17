@@ -122,16 +122,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Mini Load Balancer Server")
     parser.add_argument(
-        "--prefill", type=str, default=[], nargs="+", help="URLs for prefill servers"
-    )
-    parser.add_argument(
-        "--decode", type=str, default=[], nargs="+", help="URLs for decode servers"
-    )
-    parser.add_argument(
-        "--prefill-bootstrap-ports",
-        type=int,
-        nargs="+",
-        help="Bootstrap ports for prefill servers",
+        "--downstream", type=str, default=[], nargs="+", help="URLs for downstream servers"
     )
     parser.add_argument(
         "--host", default="0.0.0.0", help="Host to bind the server (default: 0.0.0.0)"
