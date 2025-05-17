@@ -199,6 +199,19 @@ class EAGLEWorker(TpModelWorker):
             self.draft_extend_attn_backend = None
             self.padded_static_len = self.speculative_num_steps + 1
             self.has_prefill_wrapper_verify = False
+        elif self.server_args.attention_backend == "flashmla":
+            from sglang.srt.layers.attention.flashmla_backend import (
+                FlashMLAMultiStepDraftBackend,
+            )
+
+            self.draft_attn_backend = FlashMLAMultiStepDraftBackend(
+                self.draft_model_runner,
+                self.topk,
+                self.speculative_num_steps,
+            )
+            self.draft_extend_attn_backend = None
+            self.padded_static_len = self.speculative_num_steps + 1
+            self.has_prefill_wrapper_verify = False
         else:
             raise ValueError(
                 f"EAGLE is not supported in attention backend {self.server_args.attention_backend}"

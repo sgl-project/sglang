@@ -631,7 +631,6 @@ class ModelRunner:
                 rank=rank,
                 group_name=group_name,
             )
-            dist.barrier(group=self._model_update_group, device_ids=[rank])
             return True, "Succeeded to initialize custom process group."
         except Exception as e:
             message = f"Failed to initialize custom process group: {e}."
