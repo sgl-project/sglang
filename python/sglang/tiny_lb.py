@@ -15,7 +15,6 @@ import orjson
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
-
 from sglang.srt.disaggregation.utils import PDRegistryRequest
 
 
@@ -58,28 +57,6 @@ class MiniLoadBalancer:
         prefill_config = random.choice(self.prefill_configs)
         decode_server = random.choice(self.decode_servers)
         return prefill_config.url, prefill_config.bootstrap_port, decode_server
-
-    async def generate(
-        self, modified_request, prefill_server, decode_server, endpoint
-    ) -> ORJSONResponse:
-        assert endpoint[0] != "/", f"Endpoint should not start with '/': {endpoint}"
-
-        async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(
-                total=3600
-            )  # Add timeout for request reliability
-        ) as session:
-            tasks = [
-                session.post(f"{prefill_server}/{endpoint}", json=modified_request),
-                session.post(f"{decode_server}/{endpoint}", json=modified_request),
-            ]
-            # Wait for both responses to complete. Prefill should end first.
-            _, decode_response = await asyncio.gather(*tasks)
-
-            return ORJSONResponse(
-                content=await decode_response.json(),
-                status_code=decode_response.status,
-            )
 
     async def generate_stream(
         self, modified_request, prefill_server, decode_server, endpoint="generate"
@@ -229,9 +206,7 @@ async def handle_generate_request(request_data: dict):
             modified_request, prefill_server, decode_server, "generate"
         )
     else:
-        return await load_balancer.generate(
-            modified_request, prefill_server, decode_server, "generate"
-        )
+        raise NotImplementedError
 
 
 @app.post("/v1/chat/completions")
@@ -246,7 +221,7 @@ async def handle_completion_request(request_data: dict):
         {
             "bootstrap_host": hostname,
             "bootstrap_port": bootstrap_port,
-            "bootstrap_room": random.randint(0, 2**63 - 1),
+            "bootstrap_room": random.randint(0, 2 ** 63 - 1),
         }
     )
 
@@ -267,7 +242,7 @@ async def handle_completion_request(request_data: dict):
 
 
 def _generate_bootstrap_room():
-    return random.randint(0, 2**63 - 1)
+    return random.randint(0, 2 ** 63 - 1)
 
 
 # We may utilize `GenerateReqInput`'s logic later
