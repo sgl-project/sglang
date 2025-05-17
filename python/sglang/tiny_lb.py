@@ -65,6 +65,7 @@ class DownstreamServer:
             TODO_lock
             await self.resume_memory_occupation()
 
+    # do not copy-paste
     async def release_memory_occupation(self):
         self._change_state(DownstreamState.NORMAL, DownstreamState.PAUSING)
         async with aiohttp.ClientSession() as session:
