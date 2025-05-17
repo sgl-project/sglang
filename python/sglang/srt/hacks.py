@@ -22,13 +22,13 @@ def busy_wait_until_enough_memory():
 
 
 def export_model_params(model):
-    return dict(weights=[(name, param.data.detach().cpu()) for name, param in model.named_parameters()])
+    return dict(params=[(name, param.data.detach().cpu()) for name, param in model.named_parameters()])
 
 
 def import_model_param(model, data):
-    self_named_weights = dict(model.named_weights())
-    for name, tensor in data["weights"]:
-        self_named_weights[name][...] = tensor.to("cuda")
+    self_named_params = dict(model.named_parameters())
+    for name, tensor in data["params"]:
+        self_named_params[name].data[...] = tensor.to("cuda")
 
 
 if __name__ == '__main__':
