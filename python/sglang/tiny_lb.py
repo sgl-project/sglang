@@ -41,10 +41,12 @@ class MiniLoadBalancer:
         self.downstream_servers = downstream_servers
 
     async def select_server(self):
-        assert len(self.downstream_urls) > 0
-        return TODO
+        for downstream_server in downstream_servers:
+            if downstream_server.is_available():
+                return downstream_server
+        raise Exception("no available server")
 
-    async def generate_stream(self, req, server, endpoint="generate"):
+    async def generate_stream(self, req, downstream_server: DownstreamServer, endpoint="generate"):
         assert endpoint[0] != "/", f"Endpoint should not start with '/': {endpoint}"
 
         async def stream_results():
@@ -54,7 +56,7 @@ class MiniLoadBalancer:
                 )  # Add timeout for request reliability
             ) as session:
                 try:
-                    response = await session.post(f"{server}/{endpoint}", json=req)
+                    response = await session.post(f"{downstream_server.url}/{endpoint}", json=req)
                     async for chunk in response.content:
                         yield chunk
                 except Exception as e:
