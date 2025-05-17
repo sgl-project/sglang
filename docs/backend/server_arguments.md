@@ -63,6 +63,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `kv_cache_dtype` | Dtype of the kv cache. | `auto` |
 | `context_length` | The model's maximum context length. Defaults to None (will use the value from the model's config.json instead). Note that extending the default might lead to strange behavior. | None |
 | `device` | The device we put the model. | None |
+| `impl` | The implementation of the model to use. Defaults to SGlang implementation and fall back to transformers if needed | `auto` |
 | `served_model_name` | Override the model name returned by the v1/models endpoint in OpenAI API server.| None |
 | `is_embedding` | Set to `true` to perform [embedding](./openai_api_embeddings.ipynb) / [encode](https://docs.sglang.ai/backend/native_api#Encode-(embedding-model)) and [reward](https://docs.sglang.ai/backend/native_api#Classify-(reward-model)) tasks. | `False` |
 | `revision` | Adjust if a specific version of the model should be used. | None |
