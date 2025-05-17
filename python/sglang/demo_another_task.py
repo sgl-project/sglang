@@ -11,16 +11,35 @@ from setproctitle import setproctitle
 from sglang.srt.utils import get_zmq_socket
 
 
-def worker_background_thread():
-    context = zmq.Context(2)
-    recv_socket = get_zmq_socket(context, zmq.PULL, TODO, False)
+def worker_background_thread(rank: int):
+    port = 50000 + rank
 
     memory_saver = torch_memory_saver.TorchMemorySaver(enable_use_mem_pool=False)
+
+    context = zmq.Context(2)
+    recv_socket = get_zmq_socket(context, zmq.PULL, f"tcp://localhost:{port}", False)
+
+    print(f"worker_background_thread init {port=}")
+
+    while True:
+        try:
+            recv_req = recv_socket.recv_pyobj(zmq.NOBLOCK)
+            print(f"{recv_req=}")
+            break
+        except zmq.ZMQError:
+            time.sleep(0.001)
+            continue
+
+    print(f"[GPU {rank}, {time.time()}] pause start")
     memory_saver.pause()
+
+    print(f"[GPU {rank}, {time.time()}] synchronize start")
+    torch.cuda.synchronize()
+    print(f"[GPU {rank}, {time.time()}] synchronize end")
 
 
 def worker(rank, world_size):
-    thread = threading.Thread(target=worker_background_thread)
+    thread = threading.Thread(target=worker_background_thread, args=(rank,))
     thread.daemon = True
     thread.start()
 
