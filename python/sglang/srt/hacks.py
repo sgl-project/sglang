@@ -1,6 +1,8 @@
 import subprocess
 import time
 
+import torch
+
 
 def kill_other_memory_occupying_processes():
     cmd = "pkill -f demo_another_task"
@@ -18,8 +20,6 @@ def kill_other_memory_occupying_processes():
 
 
 if __name__ == '__main__':
-    import torch
-
     print(f"{time.time()=} {torch.cuda.mem_get_info()=}")
     print(f"{time.time()=} kill start")
     kill_other_memory_occupying_processes()
