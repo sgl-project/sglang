@@ -3,6 +3,7 @@ Minimal HTTP load balancer for prefill and decode servers for testing.
 """
 
 import logging
+from asyncio import Condition
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -62,10 +63,14 @@ class DownstreamServer:
 
     async def _ensure_resumed(self):
         if self._downstream_state == DownstreamState.PAUSED:
+            self._resuming_condition = Condition()
             await self.resume_memory_occupation()
-            TODO
+            async with self._resuming_condition:
+                self._resuming_condition.notify_all()
+            del self._resuming_condition
         elif self._downstream_state == DownstreamState.RESUMING:
-            TODO
+            async with self._resuming_condition:
+                await self._resuming_condition.wait()
 
     # do not copy-paste
     async def release_memory_occupation(self):
