@@ -1,5 +1,6 @@
 def run():
-    TODO
+    while True:
+        TODO
 
 
 if __name__ == '__main__':
