@@ -332,6 +332,7 @@ def _communicate_with_all_reduce_and_layer_norm(
             and context.is_same_group_size(residual_input_mode, residual_output_mode)
             and context.attn_tp_size == 1
         ):
+            # TODO move these `if shape != 0` into LayerNorm itself
             if hidden_states.shape[0] != 0:
                 hidden_states, residual = layernorm(hidden_states, residual)
             return hidden_states, residual
