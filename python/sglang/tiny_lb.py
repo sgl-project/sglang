@@ -3,7 +3,7 @@ Minimal HTTP load balancer for prefill and decode servers for testing.
 """
 
 import logging
-from contextlib import contextmanager
+from contextlib import asynccontextmanager
 from typing import List, Optional
 
 import aiohttp
@@ -39,8 +39,8 @@ class DownstreamServer:
     def is_full(self):
         return TODO
 
-    @contextmanager
-    def ongoing_request(self):
+    @asynccontextmanager
+    async def around_request(self):
         TODO
         try:
             yield
@@ -67,7 +67,7 @@ class MiniLoadBalancer:
                     total=3600
                 )  # Add timeout for request reliability
             ) as session:
-                with downstream_server.ongoing_request():
+                async with downstream_server.around_request():
                     try:
                         response = await session.post(f"{downstream_server.url}/{endpoint}", json=req)
                         async for chunk in response.content:
