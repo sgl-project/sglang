@@ -61,9 +61,11 @@ class DownstreamServer:
             self._ongoing_request_num -= 1
 
     async def _ensure_resumed(self):
-        if self._is_downstream_paused:
-            TODO_lock
+        if self._downstream_state == DownstreamState.PAUSED:
             await self.resume_memory_occupation()
+            TODO
+        elif self._downstream_state == DownstreamState.RESUMING:
+            TODO
 
     # do not copy-paste
     async def release_memory_occupation(self):
