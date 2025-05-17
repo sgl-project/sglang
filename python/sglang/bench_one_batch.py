@@ -246,7 +246,7 @@ def extend(reqs, model_runner):
     _maybe_prepare_dp_attn_batch(batch, model_runner)
     model_worker_batch = batch.get_model_worker_batch()
     forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
-    logits_output = model_runner.forward(forward_batch)
+    logits_output, _ = model_runner.forward(forward_batch)
     next_token_ids = model_runner.sample(logits_output, forward_batch)
     return next_token_ids, logits_output.next_token_logits, batch
 
@@ -258,7 +258,7 @@ def decode(input_token_ids, batch, model_runner):
     _maybe_prepare_dp_attn_batch(batch, model_runner)
     model_worker_batch = batch.get_model_worker_batch()
     forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
-    logits_output = model_runner.forward(forward_batch)
+    logits_output, _ = model_runner.forward(forward_batch)
     next_token_ids = model_runner.sample(logits_output, forward_batch)
     return next_token_ids, logits_output.next_token_logits
 
@@ -269,6 +269,7 @@ def _maybe_prepare_dp_attn_batch(batch: ScheduleBatch, model_runner):
             batch,
             dp_size=model_runner.server_args.dp_size,
             attn_tp_size=1,
+            moe_dense_tp_size=model_runner.server_args.moe_dense_tp_size,
             tp_cpu_group=model_runner.tp_group.cpu_group,
             get_idle_batch=None,
             disable_cuda_graph=model_runner.server_args.disable_cuda_graph,

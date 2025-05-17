@@ -189,6 +189,7 @@ async def health_generate(request: Request) -> Response:
         if _global_state.tokenizer_manager.last_receive_tstamp > tic:
             task.cancel()
             _global_state.tokenizer_manager.rid_to_state.pop(rid, None)
+            _global_state.tokenizer_manager.health_check_failed = False
             return Response(status_code=200)
 
     task.cancel()
@@ -202,6 +203,7 @@ async def health_generate(request: Request) -> Response:
         f"last_heartbeat time: {last_receive_time}"
     )
     _global_state.tokenizer_manager.rid_to_state.pop(rid, None)
+    _global_state.tokenizer_manager.health_check_failed = True
     return Response(status_code=503)
 
 
@@ -222,7 +224,7 @@ async def get_server_info():
     return {
         **dataclasses.asdict(_global_state.tokenizer_manager.server_args),
         **_global_state.scheduler_info,
-        **internal_states,
+        "internal_states": internal_states,
         "version": __version__,
     }
 
@@ -338,7 +340,11 @@ async def start_profile_async(obj: Optional[ProfileReqInput] = None):
         obj = ProfileReqInput()
 
     await _global_state.tokenizer_manager.start_profile(
-        obj.output_dir, obj.num_steps, obj.activities
+        output_dir=obj.output_dir,
+        num_steps=obj.num_steps,
+        activities=obj.activities,
+        with_stack=obj.with_stack,
+        record_shapes=obj.record_shapes,
     )
     return Response(
         content="Start profiling.\n",

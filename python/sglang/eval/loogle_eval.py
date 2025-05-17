@@ -142,7 +142,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model",
         default="meta-llama/Llama-4-Maverick-17B-128E-Instruct",
-        help="Model name or ID",
+        help="Model name or ID, only used for model name",
     )
     parser.add_argument(
         "--max-concurrency", type=int, default=144, help="Maximum concurrent requests"

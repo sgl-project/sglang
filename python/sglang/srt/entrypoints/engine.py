@@ -47,6 +47,7 @@ from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
+    ImageDataItem,
     InitWeightsUpdateGroupReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
@@ -150,9 +151,9 @@ class Engine(EngineBase):
         # See also python/sglang/srt/utils.py:load_image for more details.
         image_data: Optional[
             Union[
-                List[List[Union[Image, str]]],
-                List[Union[Image, str]],
-                Union[Image, str],
+                List[List[ImageDataItem]],
+                List[ImageDataItem],
+                ImageDataItem,
             ]
         ] = None,
         return_logprob: Optional[Union[List[bool], bool]] = False,
@@ -221,9 +222,9 @@ class Engine(EngineBase):
         # See also python/sglang/srt/utils.py:load_image for more details.
         image_data: Optional[
             Union[
-                List[List[Union[Image, str]]],
-                List[Union[Image, str]],
-                Union[Image, str],
+                List[List[ImageDataItem]],
+                List[ImageDataItem],
+                ImageDataItem,
             ]
         ] = None,
         return_logprob: Optional[Union[List[bool], bool]] = False,
@@ -330,7 +331,7 @@ class Engine(EngineBase):
         return {
             **dataclasses.asdict(self.tokenizer_manager.server_args),
             **self.scheduler_info,
-            **internal_states,
+            "internal_states": internal_states,
             "version": __version__,
         }
 

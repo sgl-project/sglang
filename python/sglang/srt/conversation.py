@@ -634,6 +634,20 @@ register_conv_template(
     )
 )
 
+# reference: https://huggingface.co/mistralai/Mistral-Small-3.1-24B-Instruct-2503/blob/main/chat_template.json
+register_conv_template(
+    Conversation(
+        name="mistral",
+        system_template="[SYSTEM_PROMPT]\n{system_message}\n[/SYSTEM_PROMPT]\n\n",
+        roles=("[INST]", "[/INST]"),
+        sep_style=SeparatorStyle.LLAMA2,
+        sep=" ",
+        sep2=" </s><s>",
+        stop_str=["[INST]", "[/INST]", "[SYSTEM_PROMPT]", "[/SYSTEM_PROMPT]"],
+        image_token="[IMG]",
+    )
+)
+
 # reference: https://huggingface.co/meta-llama/Llama-4-Scout-17B-16E-Instruct/blob/main/chat_template.json
 register_conv_template(
     Conversation(
@@ -880,11 +894,17 @@ def match_vicuna(model_path: str):
 @register_conv_template_matching_function
 def match_llama2_chat(model_path: str):
     if re.search(
-        r"llama-2.*chat|(mistral|mixtral).*instruct|codellama.*instruct",
+        r"llama-2.*chat|codellama.*instruct",
         model_path,
         re.IGNORECASE,
     ):
         return "llama-2"
+
+
+@register_conv_template_matching_function
+def match_mistral(model_path: str):
+    if re.search(r"pixtral|(mistral|mixtral).*instruct", model_path, re.IGNORECASE):
+        return "mistral"
 
 
 @register_conv_template_matching_function
