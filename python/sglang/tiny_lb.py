@@ -53,21 +53,25 @@ class DownstreamServer:
         return self._ongoing_request_num >= self.max_concurrency_per_server
 
     @asynccontextmanager
-    async def around_request(self):
+    async def around_request(self, request_id):
+        logger.info(f"around_reqeuest START {request_id=} {self.url=}")
         await self._ensure_resumed()
         self._ongoing_request_num += 1
         try:
             yield
         finally:
             self._ongoing_request_num -= 1
+        logger.info(f"around_reqeuest END {request_id=} {self.url=}")
 
     async def _ensure_resumed(self):
         if self._downstream_state == DownstreamState.PAUSED:
+            logger.info(f"ensure_resumed resume START")
             self._resuming_condition = Condition()
             await self.resume_memory_occupation()
             async with self._resuming_condition:
                 self._resuming_condition.notify_all()
             del self._resuming_condition
+            logger.info(f"ensure_resumed resume END")
         elif self._downstream_state == DownstreamState.RESUMING:
             logger.info(f"ensure_resumed wait condition START")
             async with self._resuming_condition:
@@ -109,7 +113,7 @@ class MiniLoadBalancer:
                 return downstream_server
         raise Exception("no available server")
 
-    async def generate_stream(self, req, downstream_server: DownstreamServer, endpoint="generate"):
+    async def generate_stream(self, req, downstream_server: DownstreamServer, request_id, endpoint="generate"):
         assert endpoint[0] != "/", f"Endpoint should not start with '/': {endpoint}"
 
         async def stream_results():
@@ -118,7 +122,7 @@ class MiniLoadBalancer:
                     total=3600
                 )  # Add timeout for request reliability
             ) as session:
-                async with downstream_server.around_request():
+                async with downstream_server.around_request(request_id):
                     try:
                         response = await session.post(f"{downstream_server.url}/{endpoint}", json=req)
                         async for chunk in response.content:
@@ -142,13 +146,18 @@ class MiniLoadBalancer:
 
 app = FastAPI()
 load_balancer: Optional[MiniLoadBalancer] = None
+next_request_id = 0
 
 
 @app.post("/generate")
 async def handle_generate_request(request_data: dict):
+    global next_request_id
+    request_id = next_request_id
+    next_request_id += 1
+
     server = await load_balancer.select_server()
     if request_data.get("stream", False):
-        return await load_balancer.generate_stream(request_data, server)
+        return await load_balancer.generate_stream(request_data, server, request_id)
     else:
         raise NotImplementedError
 
