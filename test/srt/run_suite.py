@@ -61,6 +61,7 @@ suites = {
         TestFile("test_radix_attention.py", 167),
         TestFile("test_reasoning_content.py", 89),
         TestFile("test_enable_thinking.py", 70),
+        TestFile("test_thinking_budget.py", 60),
         TestFile("test_regex_constrained.py", 64),
         TestFile("test_release_memory_occupation.py", 44),
         TestFile("test_request_length_validation.py", 31),
