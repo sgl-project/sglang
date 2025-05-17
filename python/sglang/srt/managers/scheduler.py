@@ -14,6 +14,7 @@
 """A scheduler that manages a tensor parallel GPU worker."""
 
 import faulthandler
+import json
 import logging
 import os
 import signal
@@ -2030,6 +2031,11 @@ class Scheduler(
 
         # should directly use things on memory and no need to manually copy from gpu to cpu
         self.stashed_model_weights = export_model_params(self.tp_worker.worker.model_runner.model)
+
+        print(f"PARAMS=" + json.dumps([
+            (name, tuple(tensor.shape), str(tensor.dtype))
+            for name, tensor in self.stashed_model_weights["params"]
+        ]))
 
         self.stashed_model_static_state = _export_static_state(
             self.tp_worker.worker.model_runner.model
