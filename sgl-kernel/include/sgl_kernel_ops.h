@@ -190,9 +190,7 @@ void moe_align_block_size(
     int64_t block_size,
     torch::Tensor sorted_token_ids,
     torch::Tensor experts_ids,
-    torch::Tensor num_tokens_post_pad,
-    torch::Tensor token_cnts_buffer,
-    torch::Tensor cumsum_buffer);
+    torch::Tensor num_tokens_post_pad);
 
 void topk_softmax(
     torch::Tensor& topk_weights,
