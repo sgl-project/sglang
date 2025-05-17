@@ -21,7 +21,7 @@ def setup_logger():
 
     formatter = logging.Formatter(
         "[tiny_lb] %(asctime)s - %(levelname)s - %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
+        datefmt="%Y-%m-%d %H:%M:%S.%f",
     )
 
     handler = logging.StreamHandler()
@@ -72,17 +72,17 @@ class DownstreamServer:
         assert self._ongoing_request_num == 0
         self._change_state(DownstreamState.NORMAL, DownstreamState.PAUSING)
         async with aiohttp.ClientSession() as session:
-            print(f"release_memory_occupation START {self.url=}")
+            logger.info(f"release_memory_occupation START {self.url=}")
             response = await session.post(f"{self.url}/release_memory_occupation")
-            print(f"release_memory_occupation END {response.text()=}")
+            logger.info(f"release_memory_occupation END {response.text()=}")
         self._change_state(DownstreamState.PAUSING, DownstreamState.PAUSED)
 
     async def resume_memory_occupation(self):
         self._change_state(DownstreamState.PAUSED, DownstreamState.RESUMING)
         async with aiohttp.ClientSession() as session:
-            print(f"resume_memory_occupation START {self.url=}")
+            logger.info(f"resume_memory_occupation START {self.url=}")
             response = await session.post(f"{self.url}/resume_memory_occupation")
-            print(f"resume_memory_occupation END {response.text()=}")
+            logger.info(f"resume_memory_occupation END {response.text()=}")
         self._change_state(DownstreamState.RESUMING, DownstreamState.NORMAL)
 
     def _change_state(self, old_state, new_state):
