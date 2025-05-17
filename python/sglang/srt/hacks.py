@@ -16,5 +16,5 @@ if __name__ == '__main__':
     kill_other_memory_occupying_processes()
     print(f"{time.time()=} kill end")
 
-    while True:
+    for i in range(1000):
         print(f"{time.time()=} {torch.cuda.mem_get_info()=}")
