@@ -21,6 +21,7 @@ class OtherProcessKiller:
         try:
             tp_rank = get_tensor_model_parallel_rank()
         except Exception as e:
+            print(f"error getting tp_rank {e=}")
             tp_rank = -1
 
         # cmd = "pkill -f demo_another_task"
