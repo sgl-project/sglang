@@ -37,7 +37,6 @@ from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
-    ScatterMode,
     enable_moe_dense_fully_dp,
 )
 from sglang.srt.layers.dp_attention import (

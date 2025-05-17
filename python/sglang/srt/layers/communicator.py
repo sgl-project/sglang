@@ -54,7 +54,6 @@ class _LayerModeComputationContext:
             layer_id=self.layer_id - 1,
             is_layer_sparse=self.is_previous_layer_sparse,
             is_previous_layer_sparse=None,
-            # unchanged
             num_layers=self.num_layers,
         )
 
