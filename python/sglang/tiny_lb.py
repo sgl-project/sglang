@@ -57,9 +57,9 @@ class DownstreamServer:
 
     async def release_memory_occupation(self):
         async with aiohttp.ClientSession() as session:
-            print(f"release_memory_occupation START")
+            print(f"release_memory_occupation START {self.url=}")
             response = await session.post(f"{self.url}/release_memory_occupation")
-            print(f"release_memory_occupation END {response=}")
+            print(f"release_memory_occupation END {response.text()=}")
 
 
 class MiniLoadBalancer:
