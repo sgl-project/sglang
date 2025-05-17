@@ -1820,7 +1820,7 @@ class Scheduler(
         success = self.flush_cache()
         return FlushCacheReqOutput(success=success)
 
-    def flush_cache(self):
+    def flush_cache(self, hack_skip_cuda_empty_cache=False):
         """Flush the memory pool and cache."""
         if (
             len(self.waiting_queue) == 0
@@ -1845,7 +1845,12 @@ class Scheduler(
             self.spec_num_total_forward_ct = 0
             self.cum_spec_accept_length = 0
             self.cum_spec_accept_count = 0
-            torch.cuda.empty_cache()
+
+            if hack_skip_cuda_empty_cache:
+                print("hack_skip_cuda_empty_cache thus do not call empty_cache")
+            else:
+                torch.cuda.empty_cache()
+
             logger.info("Cache flushed successfully!")
             if_success = True
         else:
@@ -2028,7 +2033,10 @@ class Scheduler(
             self.tp_worker.worker.model_runner.model
         )
         self.memory_saver_adapter.pause()
-        self.flush_cache()
+        self.flush_cache(
+            # NOTE
+            hack_skip_cuda_empty_cache=True,
+        )
 
         return ReleaseMemoryOccupationReqOutput()
 
