@@ -20,7 +20,7 @@ class OtherProcessKiller:
     def kill(self):
         # cmd = "pkill -f demo_another_task"
         print(
-            f"[Hacks, TP{get_tensor_model_parallel_rank()}, {time.time()}] kill_other_memory_occupying_processes start {cmd=}")
+            f"[Hacks, TP{get_tensor_model_parallel_rank()}, {time.time()}] kill_other_memory_occupying_processes start")
 
         for sender in self.senders:
             sender.send_pyobj("stop")
