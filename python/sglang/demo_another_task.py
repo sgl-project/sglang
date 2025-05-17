@@ -20,7 +20,8 @@ def worker(rank, world_size):
 
         start_event.record()
 
-        for _ in range(100):
+        num_repeat = 100
+        for _ in range(num_repeat):
             a = torch.randn(1024, 1024, device=device)
             b = torch.randn(1024, 1024, device=device)
             c = torch.matmul(a, b)
@@ -36,7 +37,7 @@ def worker(rank, world_size):
         torch.cuda.synchronize()
 
         elapsed_time_ms = start_event.elapsed_time(end_event)
-        avg_time = elapsed_time_ms / 100
+        avg_time = elapsed_time_ms / num_repeat
 
         print(f"[GPU {rank}] Iteration {iteration}: Avg time = {avg_time:.3f} ms")
         iteration += 1
@@ -44,9 +45,6 @@ def worker(rank, world_size):
 
 def main():
     world_size = 8
-    if torch.cuda.device_count() < world_size:
-        print("Need at least 8 GPUs")
-        return
 
     mp.set_start_method('spawn')
     processes = []
