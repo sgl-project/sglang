@@ -53,7 +53,7 @@ class DownstreamServer:
             self._ongoing_request_num -= 1
 
     async def _ensure_resumed(self):
-        if TODO:
+        if self._is_downstream_paused:
             TODO_lock
             await self.resume_memory_occupation()
 
