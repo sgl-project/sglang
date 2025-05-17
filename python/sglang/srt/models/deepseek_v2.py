@@ -28,7 +28,6 @@ from tqdm import tqdm
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     parallel_state,
     tensor_model_parallel_all_reduce,
@@ -40,10 +39,6 @@ from sglang.srt.layers.communicator import (
     enable_moe_dense_fully_dp,
 )
 from sglang.srt.layers.dp_attention import (
-    attn_tp_all_gather,
-    attn_tp_reduce_scatter,
-    dp_gather_partial,
-    dp_scatter,
     get_attention_tp_rank,
     get_attention_tp_size,
     get_local_attention_dp_size,
@@ -56,9 +51,8 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, EPMoE, get_moe_impl_class
+from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPDispatcher
-from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.deep_gemm import _ENABLE_JIT_DEEPGEMM
@@ -76,7 +70,7 @@ from sglang.srt.layers.quantization.int8_utils import (
     block_dequant as int8_block_dequant,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import get_rope, get_rope_wrapper
+from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
