@@ -74,7 +74,11 @@ from sglang.srt.openai_api.protocol import (
     UsageInfo,
 )
 from sglang.srt.reasoning_parser import ReasoningParser
-from sglang.utils import convert_json_schema_to_str, get_exception_traceback
+from sglang.utils import (
+    convert_json_schema_to_str,
+    get_exception_traceback,
+    remove_first_nonblank_token,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -348,9 +352,11 @@ async def process_batch(tokenizer_manager, batch_id: str, batch_request: BatchRe
                     request,
                     ret,
                     created,
+                    tokenizer_manager,
                     to_file=True,
                     cache_report=tokenizer_manager.server_args.enable_cache_report,
                     tool_call_parser=tokenizer_manager.server_args.tool_call_parser,
+                    gen_assistant_prefix_ids_list=adapted_request.gen_assistant_prefix_ids_list,
                 )
             else:
                 responses = v1_generate_response(
@@ -959,6 +965,7 @@ def v1_chat_generate_request(
     top_logprobs_nums = []
     modalities_list = []
     lora_paths = []
+    gen_assistant_prefix_ids_list = []
 
     # NOTE: with openai API, the prompt's logprobs are always not computed
 
@@ -1024,26 +1031,39 @@ def v1_chat_generate_request(
                     assistant_prefix = None
 
                 try:
-                    prompt_ids = tokenizer_manager.tokenizer.apply_chat_template(
+                    ori_prompt = tokenizer_manager.tokenizer.apply_chat_template(
                         openai_compatible_messages,
-                        tokenize=True,
-                        add_generation_prompt=True,
+                        tokenize=False,
+                        add_generation_prompt=False,
                         tools=tools,
                         **(
                             request.chat_template_kwargs
                             if request.chat_template_kwargs
                             else {}
                         ),
+                    )
+                    gen_assistant_prefix_with_role = (
+                        tokenizer_manager.tokenizer.apply_chat_template(
+                            openai_compatible_messages,
+                            tokenize=False,
+                            add_generation_prompt=True,
+                            tools=tools,
+                            **(
+                                request.chat_template_kwargs
+                                if request.chat_template_kwargs
+                                else {}
+                            ),
+                        )
                     )
                 except:
                     #  This except branch will be triggered when the chosen model
                     #  has a different tools input format that is not compatible
                     #  with openAI's apply_chat_template tool_call format, like Mistral.
                     tools = [t if "function" in t else {"function": t} for t in tools]
-                    prompt_ids = tokenizer_manager.tokenizer.apply_chat_template(
+                    ori_prompt = tokenizer_manager.tokenizer.apply_chat_template(
                         openai_compatible_messages,
-                        tokenize=True,
-                        add_generation_prompt=True,
+                        tokenize=False,
+                        add_generation_prompt=False,
                         tools=tools,
                         **(
                             request.chat_template_kwargs
@@ -1051,6 +1071,53 @@ def v1_chat_generate_request(
                             else {}
                         ),
                     )
+                    gen_assistant_prefix_with_role = (
+                        tokenizer_manager.tokenizer.apply_chat_template(
+                            openai_compatible_messages,
+                            tokenize=False,
+                            add_generation_prompt=True,
+                            tools=tools,
+                            **(
+                                request.chat_template_kwargs
+                                if request.chat_template_kwargs
+                                else {}
+                            ),
+                        )
+                    )
+
+                gen_assistant_prefix = gen_assistant_prefix_with_role[len(ori_prompt) :]
+                gen_assistant_prefix_ids = tokenizer_manager.tokenizer.encode(
+                    gen_assistant_prefix, add_special_tokens=False
+                )
+                ori_prompt_ids = tokenizer_manager.tokenizer.encode(
+                    ori_prompt, add_special_tokens=False
+                )
+                if request.continue_final_message:
+                    gen_assistant_prefix_ids = []
+                    prompt_with_role_ids = ori_prompt_ids + gen_assistant_prefix_ids
+                else:
+                    prompt_with_role_ids, gen_assistant_prefix_ids = (
+                        remove_first_nonblank_token(
+                            tokenizer_manager.tokenizer,
+                            gen_assistant_prefix_ids,
+                            ori_prompt_ids,
+                        )
+                    )
+
+                gen_assistant_prefix_ids_list.extend(
+                    [gen_assistant_prefix_ids] * request.n
+                )
+                if request.logprob_start_len:
+                    request.logprob_start_len = max(
+                        request.logprob_start_len, len(gen_assistant_prefix_ids)
+                    )
+                    logprob_start_lens.append(request.logprob_start_len)
+                elif len(gen_assistant_prefix_ids) > 0:
+                    logprob_start_lens.append(len(gen_assistant_prefix_ids))
+                else:
+                    logprob_start_lens.append(-1)
+
+                prompt_ids = prompt_with_role_ids + gen_assistant_prefix_ids
 
                 if assistant_prefix:
                     encoded = tokenizer_manager.tokenizer.encode(assistant_prefix)
@@ -1060,6 +1127,7 @@ def v1_chat_generate_request(
                     ):
                         encoded = encoded[1:]
                     prompt_ids += encoded
+
                 if is_multimodal:
                     prompt = tokenizer_manager.tokenizer.decode(prompt_ids)
                 stop = request.stop
@@ -1108,6 +1176,7 @@ def v1_chat_generate_request(
 
                 if not is_multimodal:
                     prompt_ids = tokenizer_manager.tokenizer.encode(prompt)
+                logprob_start_lens.append(-1)
         else:
             # Use the raw prompt and stop strings if the messages is already a string.
             prompt_ids = request.messages
@@ -1116,9 +1185,9 @@ def v1_chat_generate_request(
             audio_data = None
             modalities = []
             prompt = request.messages
+            logprob_start_lens.append(-1)
         input_ids.append(prompt_ids)
         return_logprobs.append(request.logprobs)
-        logprob_start_lens.append(-1)
         top_logprobs_nums.append(request.top_logprobs or 0)
         lora_paths.append(request.lora_path)
         prompts.append(prompt)
@@ -1216,6 +1285,7 @@ def v1_chat_generate_request(
         rid=request_ids,
         modalities=modalities_list,
         lora_path=lora_paths,
+        gen_assistant_prefix_ids_list=gen_assistant_prefix_ids_list,
         bootstrap_host=all_requests[0].bootstrap_host,
         bootstrap_port=all_requests[0].bootstrap_port,
         bootstrap_room=all_requests[0].bootstrap_room,
@@ -1228,26 +1298,46 @@ def v1_chat_generate_response(
     request,
     ret,
     created,
+    tokenizer_manager,
     to_file=False,
     cache_report=False,
     tool_call_parser=None,
     reasoning_parser=None,
+    gen_assistant_prefix_ids_list=None,
 ):
     choices = []
 
     for idx, ret_item in enumerate(ret):
+        if gen_assistant_prefix_ids_list and idx < len(gen_assistant_prefix_ids_list):
+            gen_assistant_prefix_id = gen_assistant_prefix_ids_list[idx]
+            gen_assistant_prefix = tokenizer_manager.tokenizer.decode(
+                gen_assistant_prefix_id, skip_special_tokens=True
+            )
+        else:
+            gen_assistant_prefix_id = []
+            gen_assistant_prefix = ""
         logprobs = False
         if isinstance(request, list) and request[idx].logprobs:
             logprobs = True
         elif (not isinstance(request, list)) and request.logprobs:
             logprobs = True
         if logprobs:
+            # Calculate prefix token length
+            k = len(gen_assistant_prefix_id)
+
+            # Extract input token logprobs and top logprobs for the prefix
+            in_lp = ret_item["meta_info"].get("input_token_logprobs")
+            in_top = ret_item["meta_info"].get("input_top_logprobs")
+            prefix_lp = in_lp[-k:] if in_lp and k else None
+            prefix_top = in_top[-k:] if in_top and k else None
+
             logprobs = to_openai_style_logprobs(
+                input_token_logprobs=prefix_lp,
+                input_top_logprobs=prefix_top,
                 output_token_logprobs=ret_item["meta_info"]["output_token_logprobs"],
-                output_top_logprobs=ret_item["meta_info"].get(
-                    "output_top_logprobs", None
-                ),
+                output_top_logprobs=ret_item["meta_info"].get("output_top_logprobs"),
             )
+
             token_logprobs = []
             for token_idx, (token, logprob) in enumerate(
                 zip(logprobs.tokens, logprobs.token_logprobs)
@@ -1282,7 +1372,11 @@ def v1_chat_generate_response(
         finish_reason = ret_item["meta_info"]["finish_reason"]
 
         tool_calls = None
-        text = ret_item["text"]
+        text = (
+            gen_assistant_prefix + ret_item["text"]
+            if gen_assistant_prefix
+            else ret_item["text"]
+        )
 
         if isinstance(request, list):
             tool_choice = request[idx].tool_choice
@@ -1453,6 +1547,9 @@ async def v1_chat_completions(
                     is_first = is_firsts.get(index, True)
                     stream_buffer = stream_buffers.get(index, "")
                     n_prev_token = n_prev_tokens.get(index, 0)
+                    gen_assistant_prefix_ids = (
+                        adapted_request.gen_assistant_prefix_ids_list[index] or []
+                    )
 
                     prompt_tokens[index] = content["meta_info"]["prompt_tokens"]
                     completion_tokens[index] = content["meta_info"]["completion_tokens"]
@@ -1497,7 +1594,11 @@ async def v1_chat_completions(
                                 )
                             )
 
-                        choice_logprobs = ChoiceLogprobs(content=token_logprobs)
+                        choice_logprobs = (
+                            ChoiceLogprobs(content=[token_logprobs[-1]])
+                            if token_logprobs
+                            else None
+                        )
 
                     else:
                         choice_logprobs = None
@@ -1520,7 +1621,7 @@ async def v1_chat_completions(
                                 if finish_reason and "matched" in finish_reason
                                 else None
                             ),
-                            logprobs=choice_logprobs,
+                            logprobs=None,
                         )
                         chunk = ChatCompletionStreamResponse(
                             id=content["meta_info"]["id"],
@@ -1529,6 +1630,107 @@ async def v1_chat_completions(
                             model=request.model,
                         )
                         yield f"data: {chunk.model_dump_json()}\n\n"
+                        # gen_assistant_prefix
+                        if gen_assistant_prefix_ids:
+                            if request.logprobs:
+                                k = len(gen_assistant_prefix_ids)
+                                in_lp = content["meta_info"]["input_token_logprobs"][
+                                    -k:
+                                ]
+                                in_top = (
+                                    content["meta_info"]["input_top_logprobs"][-k:]
+                                    if content["meta_info"].get("input_top_logprobs")
+                                    else [None] * k
+                                )
+                            else:
+                                in_lp, in_top = [None] * len(
+                                    gen_assistant_prefix_ids
+                                ), [None] * len(gen_assistant_prefix_ids)
+                            for t_idx, tok_id in enumerate(gen_assistant_prefix_ids):
+                                tok_text = tokenizer_manager.tokenizer.decode(
+                                    tok_id, skip_special_tokens=True
+                                )
+
+                                single_lp = None
+                                if request.logprobs:
+                                    raw_lp = to_openai_style_logprobs(
+                                        input_token_logprobs=[in_lp[t_idx]],
+                                        input_top_logprobs=(
+                                            [in_top[t_idx]] if in_top[t_idx] else None
+                                        ),
+                                    )
+                                    token_bytes = list(tok_text.encode("utf-8"))
+                                    top_logprobs = None
+                                    if (
+                                        raw_lp.top_logprobs
+                                        and raw_lp.top_logprobs[0] is not None
+                                    ):
+                                        top_logprobs = [
+                                            TopLogprob(
+                                                token=k,
+                                                bytes=list(k.encode("utf-8")),
+                                                logprob=v,
+                                            )
+                                            for k, v in raw_lp.top_logprobs[0].items()
+                                        ]
+                                    single_lp = ChoiceLogprobs(
+                                        content=[
+                                            ChatCompletionTokenLogprob(
+                                                token=tok_text,
+                                                bytes=token_bytes,
+                                                logprob=raw_lp.token_logprobs[0],
+                                                top_logprobs=top_logprobs,
+                                            )
+                                        ]
+                                    )
+                                delta = DeltaMessage(content=tok_text)
+
+                                enable_thinking = _get_enable_thinking_from_request(
+                                    request
+                                )
+                                if (
+                                    tokenizer_manager.server_args.reasoning_parser
+                                    and request.separate_reasoning
+                                    and enable_thinking
+                                ):
+                                    if index not in reasoning_parser_dict:
+                                        reasoning_parser_dict[index] = ReasoningParser(
+                                            tokenizer_manager.server_args.reasoning_parser,
+                                            request.stream_reasoning,
+                                        )
+                                    reasoning_parser = reasoning_parser_dict[index]
+                                    reasoning_text, _ = (
+                                        reasoning_parser.parse_stream_chunk(tok_text)
+                                    )
+                                    if reasoning_text:
+                                        choice_data = (
+                                            ChatCompletionResponseStreamChoice(
+                                                index=index,
+                                                delta=DeltaMessage(
+                                                    reasoning_content=(
+                                                        reasoning_text
+                                                        if reasoning_text
+                                                        else None
+                                                    )
+                                                ),
+                                                logprobs=single_lp,
+                                                finish_reason=finish_reason_type,
+                                            )
+                                        )
+                                else:
+                                    choice_data = ChatCompletionResponseStreamChoice(
+                                        index=index,
+                                        delta=delta,
+                                        logprobs=single_lp,
+                                        finish_reason=finish_reason_type,
+                                    )
+                                chunk = ChatCompletionStreamResponse(
+                                    id=content["meta_info"]["id"],
+                                    created=created,
+                                    model=request.model,
+                                    choices=[choice_data],
+                                )
+                                yield f"data: {chunk.model_dump_json(exclude_none=False)}\n\n"
 
                     text = content["text"]
                     delta = text[len(stream_buffer) :]
@@ -1764,9 +1966,11 @@ async def v1_chat_completions(
         request,
         ret,
         created,
+        tokenizer_manager,
         cache_report=tokenizer_manager.server_args.enable_cache_report,
         tool_call_parser=tokenizer_manager.server_args.tool_call_parser,
         reasoning_parser=tokenizer_manager.server_args.reasoning_parser,
+        gen_assistant_prefix_ids_list=adapted_request.gen_assistant_prefix_ids_list,
     )
 
     return response

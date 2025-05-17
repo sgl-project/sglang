@@ -396,6 +396,7 @@ class ChatCompletionRequest(BaseModel):
     bootstrap_host: Optional[str] = None
     bootstrap_port: Optional[int] = None
     bootstrap_room: Optional[int] = None
+    logprob_start_len: int = -1
 
 
 class ChatMessage(BaseModel):

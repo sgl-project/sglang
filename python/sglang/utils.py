@@ -512,3 +512,22 @@ async def async_stream_and_merge(llm, prompt, sampling_params):
         cleaned_chunk = trim_overlap(final_text, chunk_text)
         final_text += cleaned_chunk
         yield cleaned_chunk  # yield the non-overlapping portion
+
+
+def remove_first_nonblank_token(tokenizer, token_ids, tokenized_chat):
+    idx = 0
+    prefix_ids = []
+
+    while idx < len(token_ids):
+        token_str = tokenizer.decode([token_ids[idx]], skip_special_tokens=True)
+        if token_str.isspace() or token_str == "":
+            prefix_ids.append(token_ids[idx])
+            idx += 1
+        else:
+            prefix_ids.append(token_ids[idx])
+            idx += 1
+            break
+
+    updated_tokenized_chat = tokenized_chat + prefix_ids
+
+    return updated_tokenized_chat, token_ids[idx:]
