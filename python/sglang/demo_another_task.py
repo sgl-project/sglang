@@ -3,6 +3,7 @@ import os
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from setproctitle import setproctitle
 
 
 def worker(rank, world_size):
@@ -11,6 +12,7 @@ def worker(rank, world_size):
     dist.init_process_group(backend='nccl', rank=rank, world_size=world_size)
     torch.cuda.set_device(rank)
     device = torch.device(f'cuda:{rank}')
+    setproctitle(f"demo_another_task::worker::{rank}")
     print(f"[GPU {rank}] started")
 
     # TODO use more memory
