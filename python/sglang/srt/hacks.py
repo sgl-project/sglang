@@ -22,7 +22,8 @@ class OtherProcessKiller:
         print(
             f"[Hacks, TP{get_tensor_model_parallel_rank()}, {time.time()}] kill_other_memory_occupying_processes start {cmd=}")
 
-        TODO
+        for sender in self.senders:
+            sender.send_pyobj("stop")
         # subprocess.run(cmd, shell=True)
 
         print(
