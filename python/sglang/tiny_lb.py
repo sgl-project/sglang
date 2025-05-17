@@ -68,8 +68,8 @@ class MiniLoadBalancer:
                         error_msg, option=orjson.OPT_NON_STR_KEYS
                     ) + b"\n\n"
                 finally:
-                    if prefill_response is not None:
-                        await prefill_response.release()
+                    if response is not None:
+                        await response.release()
 
         return StreamingResponse(
             stream_results(),
