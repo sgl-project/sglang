@@ -17,22 +17,22 @@ class OtherProcessKiller:
             for port in range(base_port, base_port + num_tasks)
         ]
 
-        try:
-            self.tp_rank = get_tensor_model_parallel_rank()
-        except Exception as e:
-            self.tp_rank = -1
-
     def kill(self):
+        try:
+            tp_rank = get_tensor_model_parallel_rank()
+        except Exception as e:
+            tp_rank = -1
+
         # cmd = "pkill -f demo_another_task"
         print(
-            f"[Hacks, TP{self.tp_rank}, {time.time()}] kill_other_memory_occupying_processes start")
+            f"[Hacks, TP{tp_rank}, {time.time()}] kill_other_memory_occupying_processes start")
 
         for sender in self.senders:
             sender.send_pyobj("stop")
         # subprocess.run(cmd, shell=True)
 
         print(
-            f"[Hacks, TP{self.tp_rank}, {time.time()}] kill_other_memory_occupying_processes subprocess end")
+            f"[Hacks, TP{tp_rank}, {time.time()}] kill_other_memory_occupying_processes subprocess end")
 
 
 def busy_wait_until_enough_memory():
