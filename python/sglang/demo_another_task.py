@@ -53,7 +53,9 @@ def worker(rank, world_size):
 
         print(f"[GPU {rank}] Iteration {iteration}: Avg time = {avg_time:.3f} ms")
 
+    print(f"[GPU {rank}, {time.time()}] synchronize & barrier")
     torch.cuda.synchronize()
+    torch.distributed.barrier(device_ids=[rank])
 
     print(f"[GPU {rank}, {time.time()}] del start")
     del big_tensors, a, b, c, x, y, z, t
@@ -67,6 +69,9 @@ def worker(rank, world_size):
     print(f"[GPU {rank}, {time.time()}] synchronize end")
 
     print(f"[GPU {rank}, {time.time()}] {torch.cuda.mem_get_info()=}")
+
+    print(f"[GPU {rank}, {time.time()}] barrier")
+    torch.distributed.barrier(device_ids=[rank])
 
 
 def main():
