@@ -2049,7 +2049,7 @@ class Scheduler(
         )
         del self.stashed_model_static_state
 
-        print(f"[Scheduler TP{self.tp_rank}] import weight start {time.time()=:.3f}")
+        print(f"[Scheduler TP{self.tp_rank}] import param start {time.time()=:.3f}")
         import_model_param(self.tp_worker.worker.model_runner.model, self.stashed_model_weights)
         del self.stashed_model_weights
 
