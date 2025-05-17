@@ -53,7 +53,9 @@ class DownstreamServer:
             self._ongoing_request_num -= 1
 
     async def _ensure_resumed(self):
-        TODO
+        if TODO:
+            TODO_lock
+            await self.resume_memory_occupation()
 
     async def release_memory_occupation(self):
         async with aiohttp.ClientSession() as session:
