@@ -1,17 +1,23 @@
-import subprocess
 import time
 
 import torch
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 
 
-def kill_other_memory_occupying_processes():
-    cmd = "pkill -f demo_another_task"
-    print(
-        f"[Hacks, TP{get_tensor_model_parallel_rank()}, {time.time()}] kill_other_memory_occupying_processes start {cmd=}")
-    subprocess.run(cmd, shell=True)
-    print(
-        f"[Hacks, TP{get_tensor_model_parallel_rank()}, {time.time()}] kill_other_memory_occupying_processes subprocess end")
+class OtherProcessKiller:
+    def __init__(self):
+        TODO
+
+    def kill(self):
+        # cmd = "pkill -f demo_another_task"
+        print(
+            f"[Hacks, TP{get_tensor_model_parallel_rank()}, {time.time()}] kill_other_memory_occupying_processes start {cmd=}")
+
+        TODO
+        # subprocess.run(cmd, shell=True)
+
+        print(
+            f"[Hacks, TP{get_tensor_model_parallel_rank()}, {time.time()}] kill_other_memory_occupying_processes subprocess end")
 
 
 def busy_wait_until_enough_memory():
