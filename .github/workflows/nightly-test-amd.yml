@@ -37,5 +37,5 @@ jobs:
 
       - name: Nightly Test
         run: |
-          ./scripts/amd_ci_exec.sh -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" python3 run_suite.py --suite nightly-amd --timeout-per-file 7200
+          bash scripts/amd_ci_exec.sh -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" python3 run_suite.py --suite nightly-amd --timeout-per-file 7200
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY

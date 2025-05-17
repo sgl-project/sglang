@@ -46,9 +46,9 @@ jobs:
       - name: Evaluate Accuracy
         timeout-minutes: 20
         run: |
-          ./scripts/amd_ci_exec.sh python3 test_eval_accuracy_large.py
-          ./scripts/amd_ci_exec.sh python3 test_eval_fp8_accuracy.py
-          ./scripts/amd_ci_exec.sh python3 python3 models/test_qwen_models.py
+          bash scripts/amd_ci_exec.sh python3 test_eval_accuracy_large.py
+          bash scripts/amd_ci_exec.sh python3 test_eval_fp8_accuracy.py
+          bash scripts/amd_ci_exec.sh python3 python3 models/test_qwen_models.py
 
   accuracy-test-2-gpu-amd:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
@@ -72,7 +72,7 @@ jobs:
       - name: Evaluate accuracy (TP=2)
         timeout-minutes: 20
         run: |
-          ./scripts/amd_ci_exec.sh python3 test_moe_eval_accuracy_large.py
+          bash scripts/amd_ci_exec.sh python3 test_moe_eval_accuracy_large.py
 
   mla-test-1-gpu-amd:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
@@ -96,7 +96,7 @@ jobs:
       - name: MLA TEST
         timeout-minutes: 20
         run: |
-          ./scripts/amd_ci_exec.sh python3 test_mla.py
+          bash scripts/amd_ci_exec.sh python3 test_mla.py
 
   performance-test-1-gpu-part-1-amd:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
@@ -120,28 +120,28 @@ jobs:
       - name: Benchmark single latency
         timeout-minutes: 10
         run: |
-          ./scripts/amd_ci_exec.sh python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_bs1_small
-          ./scripts/amd_ci_exec.sh python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_bs1_default
+          bash scripts/amd_ci_exec.sh python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_bs1_small
+          bash scripts/amd_ci_exec.sh python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_bs1_default
 
       - name: Benchmark online latency
         timeout-minutes: 10
         run: |
-          ./scripts/amd_ci_exec.sh python3 -m unittest test_bench_serving.TestBenchServing.test_online_latency_default
+          bash scripts/amd_ci_exec.sh python3 -m unittest test_bench_serving.TestBenchServing.test_online_latency_default
 
       - name: Benchmark offline throughput
         timeout-minutes: 10
         run: |
-          ./scripts/amd_ci_exec.sh python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_default
+          bash scripts/amd_ci_exec.sh python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_default
 
       - name: Benchmark offline throughput (Non-streaming, small batch size)
         timeout-minutes: 10
         run: |
-          ./scripts/amd_ci_exec.sh python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_non_stream_small_batch_size
+          bash scripts/amd_ci_exec.sh python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_non_stream_small_batch_size
 
       - name: Benchmark online latency (EAGLE)
         timeout-minutes: 10
         run: |
-          ./scripts/amd_ci_exec.sh python3 -m unittest test_bench_serving.TestBenchServing.test_online_latency_eagle
+          bash scripts/amd_ci_exec.sh python3 -m unittest test_bench_serving.TestBenchServing.test_online_latency_eagle
 
   performance-test-1-gpu-part-2-amd:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
@@ -165,17 +165,17 @@ jobs:
       - name: Benchmark offline throughput (w/o RadixAttention)
         timeout-minutes: 10
         run: |
-          ./scripts/amd_ci_exec.sh python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_without_radix_cache
+          bash scripts/amd_ci_exec.sh python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_without_radix_cache
 
       - name: Benchmark offline throughput (w/ Triton)
         timeout-minutes: 10
         run: |
-          ./scripts/amd_ci_exec.sh python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_with_triton_attention_backend
+          bash scripts/amd_ci_exec.sh python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_with_triton_attention_backend
 
       - name: Benchmark offline throughput (w/ FP8)
         timeout-minutes: 10
         run: |
-          ./scripts/amd_ci_exec.sh python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_default_fp8
+          bash scripts/amd_ci_exec.sh python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_default_fp8
 
   bench-test-2-gpu-amd:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
@@ -199,27 +199,27 @@ jobs:
       - name: Benchmark dummy grok (TP=2)
         timeout-minutes: 20
         run: |
-          ./scripts/amd_ci_exec.sh python3 models/test_dummy_grok_models.py
+          bash scripts/amd_ci_exec.sh python3 models/test_dummy_grok_models.py
 
       - name: Benchmark single latency (TP=2)
         timeout-minutes: 20
         run: |
-          ./scripts/amd_ci_exec.sh python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_moe_tp2_bs1
+          bash scripts/amd_ci_exec.sh python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_moe_tp2_bs1
 
       - name: Benchmark single latency + torch.compile (TP=2)
         timeout-minutes: 20
         run: |
-          ./scripts/amd_ci_exec.sh python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_torch_compile_tp2_bs1
+          bash scripts/amd_ci_exec.sh python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_torch_compile_tp2_bs1
 
       - name: Benchmark offline throughput (TP=2)
         timeout-minutes: 20
         run: |
-          ./scripts/amd_ci_exec.sh python3 -m unittest test_bench_serving.TestBenchServing.test_moe_offline_throughput_default
+          bash scripts/amd_ci_exec.sh python3 -m unittest test_bench_serving.TestBenchServing.test_moe_offline_throughput_default
 
       - name: Benchmark offline throughput (w/o RadixAttention) (TP=2)
         timeout-minutes: 20
         run: |
-          ./scripts/amd_ci_exec.sh python3 -m unittest test_bench_serving.TestBenchServing.test_moe_offline_throughput_without_radix_cache
+          bash scripts/amd_ci_exec.sh python3 -m unittest test_bench_serving.TestBenchServing.test_moe_offline_throughput_without_radix_cache
 
   unit-test-backend-1-gpu-amd:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
@@ -243,7 +243,7 @@ jobs:
       - name: Run test
         timeout-minutes: 30
         run: |
-          ./scripts/amd_ci_exec.sh python3 run_suite.py --suite per-commit-amd
+          bash scripts/amd_ci_exec.sh python3 run_suite.py --suite per-commit-amd
 
   unit-test-backend-2-gpu-amd:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
@@ -267,7 +267,7 @@ jobs:
       - name: Run test
         timeout-minutes: 30
         run: |
-          ./scripts/amd_ci_exec.sh python3 run_suite.py --suite per-commit-2-gpu-amd
+          bash scripts/amd_ci_exec.sh python3 run_suite.py --suite per-commit-2-gpu-amd
 
   unit-test-backend-8-gpu-amd:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
@@ -291,7 +291,7 @@ jobs:
       - name: Run test
         timeout-minutes: 30
         run: |
-          ./scripts/amd_ci_exec.sh python3 run_suite.py --suite per-commit-8-gpu-amd
+          bash scripts/amd_ci_exec.sh python3 run_suite.py --suite per-commit-8-gpu-amd
 
   finish:
     if: always()
