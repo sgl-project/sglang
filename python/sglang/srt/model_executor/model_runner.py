@@ -292,6 +292,7 @@ class ModelRunner:
                     "triton",
                     "flashmla",
                     "cutlass_mla",
+                    "torch_native",
                 ]:
                     if self.should_log:
                         logger.info(
@@ -302,7 +303,17 @@ class ModelRunner:
                         f"Invalid attention backend for MLA: {server_args.attention_backend}"
                     )
             else:
-                raise ValueError("MLA optimization not supported on CPU.")
+                if server_args.attention_backend in [
+                    "torch_native",
+                ]:
+                    if self.should_log:
+                        logger.info(
+                            f"MLA optimization is turned on. Use {server_args.attention_backend} backend."
+                        )
+                else:
+                    raise ValueError(
+                        f"Invalid attention backend for MLA: {server_args.attention_backend}"
+                    )
 
         if (
             server_args.attention_backend == "fa3"
