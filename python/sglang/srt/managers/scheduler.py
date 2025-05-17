@@ -13,9 +13,7 @@
 # ==============================================================================
 """A scheduler that manages a tensor parallel GPU worker."""
 
-import torch_memory_saver
 import faulthandler
-import json
 import logging
 import os
 import signal
@@ -32,6 +30,7 @@ from typing import Dict, List, Optional, Tuple, Union
 import psutil
 import setproctitle
 import torch
+import torch_memory_saver
 import zmq
 from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
@@ -2063,15 +2062,15 @@ class Scheduler(
         torch.distributed.barrier(self.tp_cpu_group)  # TODO use a better group
         busy_wait_until_enough_memory()
 
-        print(f"[Scheduler, TP{self.tp_rank}, {time.time()}] memory saver resume start")
-        self.memory_saver_adapter.check_validity(caller_name="resume_memory_occupation")
-        self.memory_saver_adapter.resume()
+        # print(f"[Scheduler, TP{self.tp_rank}, {time.time()}] memory saver resume start")
+        # self.memory_saver_adapter.check_validity(caller_name="resume_memory_occupation")
+        # self.memory_saver_adapter.resume()
 
         print(f"[Scheduler, TP{self.tp_rank}, {time.time()}] torch cuda synchronize start")
         torch.cuda.synchronize()
 
         print(f"[Scheduler, TP{self.tp_rank}, {time.time()}] tms_copy_host_to_device start")
-        torch_memory_saver._global_info.binary_info.cdll.tms_copy_host_to_device()
+        torch_memory_saver._global_info.binary_info.cdll.tms_resume_and_copy_host_to_device()
 
         # print(f"[Scheduler, TP{self.tp_rank}, {time.time()}] import static state start")
         # _import_static_state(
