@@ -321,7 +321,8 @@ class Engine(EngineBase):
         loop.run_until_complete(self.tokenizer_manager.start_profile())
 
     def stop_profile(self):
-        self.tokenizer_manager.stop_profile()
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(self.tokenizer_manager.stop_profile())
 
     def get_server_info(self):
         loop = asyncio.get_event_loop()
