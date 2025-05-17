@@ -13,7 +13,6 @@
 # ==============================================================================
 """ModelRunner runs the forward passes of the models."""
 
-import collections
 import datetime
 import gc
 import inspect
@@ -26,7 +25,6 @@ from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
-
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
@@ -107,19 +105,19 @@ class ModelRunner:
     """ModelRunner runs the forward passes of the models."""
 
     def __init__(
-        self,
-        model_config: ModelConfig,
-        mem_fraction_static: float,
-        gpu_id: int,
-        tp_rank: int,
-        tp_size: int,
-        pp_rank: int,
-        pp_size: int,
-        nccl_port: int,
-        server_args: ServerArgs,
-        is_draft_worker: bool = False,
-        req_to_token_pool: Optional[ReqToTokenPool] = None,
-        token_to_kv_pool_allocator: Optional[TokenToKVPoolAllocator] = None,
+            self,
+            model_config: ModelConfig,
+            mem_fraction_static: float,
+            gpu_id: int,
+            tp_rank: int,
+            tp_size: int,
+            pp_rank: int,
+            pp_size: int,
+            nccl_port: int,
+            server_args: ServerArgs,
+            is_draft_worker: bool = False,
+            req_to_token_pool: Optional[ReqToTokenPool] = None,
+            token_to_kv_pool_allocator: Optional[TokenToKVPoolAllocator] = None,
     ):
         # Parse args
         self.model_config = model_config
@@ -179,7 +177,7 @@ class ModelRunner:
         )
 
         # CPU offload
-        set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024**3))
+        set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024 ** 3))
 
         # Get memory before model loading
         min_per_gpu_memory = self.init_torch_distributed()
@@ -193,7 +191,7 @@ class ModelRunner:
 
         # temporary cached values
         self.support_pp = (
-            "pp_proxy_tensors" in inspect.signature(self.model.forward).parameters
+                "pp_proxy_tensors" in inspect.signature(self.model.forward).parameters
         )
 
     def initialize(self, min_per_gpu_memory: float):
@@ -265,9 +263,9 @@ class ModelRunner:
             if not self.use_mla_backend:
                 # MHA architecture
                 if (
-                    is_hopper_with_cuda_12_3()
-                    and is_no_spec_infer_or_topk_one(server_args)
-                    and is_fa3_default_architecture(self.model_config.hf_config)
+                        is_hopper_with_cuda_12_3()
+                        and is_no_spec_infer_or_topk_one(server_args)
+                        and is_fa3_default_architecture(self.model_config.hf_config)
                 ):
                     server_args.attention_backend = "fa3"
                 else:
@@ -305,8 +303,8 @@ class ModelRunner:
                 raise ValueError("MLA optimization not supported on CPU.")
 
         if (
-            server_args.attention_backend == "fa3"
-            and server_args.kv_cache_dtype == "fp8_e5m2"
+                server_args.attention_backend == "fa3"
+                and server_args.kv_cache_dtype == "fp8_e5m2"
         ):
             logger.warning(
                 "FlashAttention3 only supports fp8_e4m3 if using FP8; "
@@ -469,12 +467,12 @@ class ModelRunner:
         monkey_patch_vllm_parallel_state()
         monkey_patch_isinstance_for_vllm_base_layer()
 
-        with self.memory_saver_adapter.region():
-            self.model = get_model(
-                model_config=self.model_config,
-                load_config=self.load_config,
-                device_config=DeviceConfig(self.device),
-            )
+        # with self.memory_saver_adapter.region():
+        self.model = get_model(
+            model_config=self.model_config,
+            load_config=self.load_config,
+            device_config=DeviceConfig(self.device),
+        )
         monkey_patch_vllm_parallel_state(reverse=True)
         monkey_patch_isinstance_for_vllm_base_layer(reverse=True)
 
@@ -532,7 +530,7 @@ class ModelRunner:
             ) from None
 
     def update_weights_from_disk(
-        self, model_path: str, load_format: str
+            self, model_path: str, load_format: str
     ) -> tuple[bool, str]:
         """Update engine weights in-place from the disk."""
         logger.info(
@@ -593,13 +591,13 @@ class ModelRunner:
         return True, "Succeeded to update model weights."
 
     def init_weights_update_group(
-        self,
-        master_address,
-        master_port,
-        rank_offset,
-        world_size,
-        group_name,
-        backend="nccl",
+            self,
+            master_address,
+            master_port,
+            rank_offset,
+            world_size,
+            group_name,
+            backend="nccl",
     ):
         """Initialize the Torch process group for model parameter updates.
 
@@ -652,7 +650,7 @@ class ModelRunner:
         )
 
         assert (
-            self._model_update_group is not None
+                self._model_update_group is not None
         ), "model update group must be initialized"
 
         try:
@@ -671,9 +669,9 @@ class ModelRunner:
             return False, error_msg
 
     def update_weights_from_tensor(
-        self,
-        named_tensors: List[Tuple[str, Union[torch.Tensor, "LocalSerializedTensor"]]],
-        load_format: Optional[str] = None,
+            self,
+            named_tensors: List[Tuple[str, Union[torch.Tensor, "LocalSerializedTensor"]]],
+            load_format: Optional[str] = None,
     ):
         named_tensors = [
             (name, _unwrap_tensor(tensor, tp_rank=self.tp_rank))
@@ -688,7 +686,7 @@ class ModelRunner:
         return True, "Success"
 
     def get_weights_by_name(
-        self, name: str, truncate_size: int = 100
+            self, name: str, truncate_size: int = 100
     ) -> Optional[torch.Tensor]:
         """Get the weights of the parameter by its name. Similar to `get_parameter` in Hugging Face.
 
@@ -734,29 +732,29 @@ class ModelRunner:
             # FIXME: pipeline parallelism is not compatible with mla backend
             assert self.pp_size == 1
             cell_size = (
-                (self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim)
-                * num_layers
-                * torch._utils._element_size(self.kv_cache_dtype)
+                    (self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim)
+                    * num_layers
+                    * torch._utils._element_size(self.kv_cache_dtype)
             )
         else:
             cell_size = (
-                self.model_config.get_num_kv_heads(get_attention_tp_size())
-                * self.model_config.head_dim
-                * self.num_effective_layers
-                * 2
-                * torch._utils._element_size(self.kv_cache_dtype)
+                    self.model_config.get_num_kv_heads(get_attention_tp_size())
+                    * self.model_config.head_dim
+                    * self.num_effective_layers
+                    * 2
+                    * torch._utils._element_size(self.kv_cache_dtype)
             )
         rest_memory = available_gpu_memory - total_gpu_memory * (
-            1 - self.mem_fraction_static
+                1 - self.mem_fraction_static
         )
         max_num_token = int(rest_memory * (1 << 30) // cell_size)
         return max_num_token
 
     def init_memory_pool(
-        self,
-        total_gpu_memory: int,
-        max_num_reqs: Optional[int] = None,
-        max_total_tokens: Optional[int] = None,
+            self,
+            total_gpu_memory: int,
+            max_num_reqs: Optional[int] = None,
+            max_total_tokens: Optional[int] = None,
     ):
         if self.server_args.kv_cache_dtype == "auto":
             self.kv_cache_dtype = self.dtype
@@ -797,15 +795,15 @@ class ModelRunner:
                 # We are sharing the `token_to_kv_pool`, and both verify and draft tokens
                 # can be concurrently allocated, so we should give a headroom for it.
                 self.server_args.draft_runner_cache_size = (
-                    self.max_total_num_tokens
-                    # draft
-                    + max_num_reqs
-                    * self.server_args.speculative_num_steps
-                    * self.server_args.speculative_eagle_topk
-                    # verify
-                    + max_num_reqs * self.server_args.speculative_num_draft_tokens
-                    # buffer
-                    + 100
+                        self.max_total_num_tokens
+                        # draft
+                        + max_num_reqs
+                        * self.server_args.speculative_num_steps
+                        * self.server_args.speculative_eagle_topk
+                        # verify
+                        + max_num_reqs * self.server_args.speculative_num_draft_tokens
+                        # buffer
+                        + 100
                 )
                 # Target worker and draft worker shares the same indices for the
                 # token_to_kv_pool, so we should make sure to match max_total_num_tokens.
@@ -822,9 +820,9 @@ class ModelRunner:
             self.max_total_num_tokens = min(self.max_total_num_tokens, max_total_tokens)
 
         self.max_total_num_tokens = (
-            self.max_total_num_tokens
-            // self.server_args.page_size
-            * self.server_args.page_size
+                self.max_total_num_tokens
+                // self.server_args.page_size
+                * self.server_args.page_size
         )
 
         if self.max_total_num_tokens <= 0:
@@ -970,8 +968,8 @@ class ModelRunner:
             self.attn_backend = FlashMLABackend(self)
         elif self.server_args.attention_backend == "fa3":
             assert (
-                torch.cuda.get_device_capability()[0] == 8 and not self.use_mla_backend
-            ) or torch.cuda.get_device_capability()[0] == 9, (
+                           torch.cuda.get_device_capability()[0] == 8 and not self.use_mla_backend
+                   ) or torch.cuda.get_device_capability()[0] == 9, (
                 "FlashAttention v3 Backend requires SM>=80 and SM<=90. "
                 "Please use `--attention-backend flashinfer`."
             )
@@ -1002,7 +1000,7 @@ class ModelRunner:
             key = "model.layers." + str(i) + ".self_attn" + selected_channel
             self.sorted_channels.append(
                 torch.tensor(channel_config[key])[
-                    :, : self.server_args.ds_heavy_channel_num
+                :, : self.server_args.ds_heavy_channel_num
                 ]
                 .contiguous()
                 .cuda()
@@ -1040,7 +1038,7 @@ class ModelRunner:
         tensor_parallel(self.model, device_mesh)
 
     def forward_decode(
-        self, forward_batch: ForwardBatch, pp_proxy_tensors=None
+            self, forward_batch: ForwardBatch, pp_proxy_tensors=None
     ) -> LogitsProcessorOutput:
         self.attn_backend.init_forward_metadata(forward_batch)
         # FIXME: add pp_proxy_tensors arg to all models
@@ -1052,10 +1050,10 @@ class ModelRunner:
         )
 
     def forward_extend(
-        self,
-        forward_batch: ForwardBatch,
-        skip_attn_backend_init: bool = False,
-        pp_proxy_tensors=None,
+            self,
+            forward_batch: ForwardBatch,
+            skip_attn_backend_init: bool = False,
+            pp_proxy_tensors=None,
     ) -> LogitsProcessorOutput:
         if not skip_attn_backend_init:
             self.attn_backend.init_forward_metadata(forward_batch)
@@ -1075,7 +1073,7 @@ class ModelRunner:
         )
 
     def forward_idle(
-        self, forward_batch: ForwardBatch, pp_proxy_tensors=None
+            self, forward_batch: ForwardBatch, pp_proxy_tensors=None
     ) -> LogitsProcessorOutput:
         kwargs = {}
         if self.support_pp:
@@ -1088,10 +1086,10 @@ class ModelRunner:
         )
 
     def forward(
-        self,
-        forward_batch: ForwardBatch,
-        skip_attn_backend_init: bool = False,
-        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+            self,
+            forward_batch: ForwardBatch,
+            skip_attn_backend_init: bool = False,
+            pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Tuple[Union[LogitsProcessorOutput, PPProxyTensors], bool]:
         can_run_cuda_graph = bool(
             forward_batch.forward_mode.is_cuda_graph()
@@ -1120,7 +1118,7 @@ class ModelRunner:
         return ret, can_run_cuda_graph
 
     def _preprocess_logits(
-        self, logits_output: LogitsProcessorOutput, sampling_info: SamplingBatchInfo
+            self, logits_output: LogitsProcessorOutput, sampling_info: SamplingBatchInfo
     ):
         # Apply logit bias
         if sampling_info.sampling_info_done:
@@ -1134,9 +1132,9 @@ class ModelRunner:
         sampling_info.apply_logits_bias(logits_output.next_token_logits)
 
     def sample(
-        self,
-        logits_output: LogitsProcessorOutput,
-        forward_batch: ForwardBatch,
+            self,
+            logits_output: LogitsProcessorOutput,
+            forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         """Sample and compute logprobs and update logits_output.
 
@@ -1183,7 +1181,7 @@ class ModelRunner:
         RemoteModelLoader.save_model(self.model, self.model_config.model_path, url)
 
     def save_sharded_model(
-        self, path: str, pattern: Optional[str] = None, max_size: Optional[int] = None
+            self, path: str, pattern: Optional[str] = None, max_size: Optional[int] = None
     ):
         from sglang.srt.model_loader.loader import ShardedStateLoader
 
