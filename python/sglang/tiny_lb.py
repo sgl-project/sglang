@@ -2,7 +2,6 @@
 Minimal HTTP load balancer for prefill and decode servers for testing.
 """
 
-import dataclasses
 import logging
 from typing import List, Optional
 
@@ -30,12 +29,6 @@ def setup_logger():
 
 
 logger = setup_logger()
-
-
-@dataclasses.dataclass
-class PrefillConfig:
-    url: str
-    bootstrap_port: Optional[int] = None
 
 
 class MiniLoadBalancer:
