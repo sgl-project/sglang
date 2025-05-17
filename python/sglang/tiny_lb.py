@@ -69,6 +69,7 @@ class DownstreamServer:
 
     # do not copy-paste
     async def release_memory_occupation(self):
+        async self._ongoing_request_num == 0
         self._change_state(DownstreamState.NORMAL, DownstreamState.PAUSING)
         async with aiohttp.ClientSession() as session:
             print(f"release_memory_occupation START {self.url=}")
