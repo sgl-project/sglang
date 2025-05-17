@@ -1,15 +1,28 @@
 import os
+import threading
 import time
 
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch_memory_saver
+import zmq
 from setproctitle import setproctitle
+from sglang.srt.utils import get_zmq_socket
+
+
+def worker_background_thread():
+    context = zmq.Context(2)
+    recv_socket = get_zmq_socket(context, zmq.PULL, TODO, False)
+
+    memory_saver = torch_memory_saver.TorchMemorySaver(enable_use_mem_pool=False)
+    memory_saver.pause()
 
 
 def worker(rank, world_size):
-    memory_saver = torch_memory_saver.TorchMemorySaver(enable_use_mem_pool=False)
+    thread = threading.Thread(target=worker_background_thread)
+    thread.daemon = True
+    thread.start()
 
     os.environ['MASTER_ADDR'] = '127.0.0.1'
     os.environ['MASTER_PORT'] = '29500'
@@ -26,8 +39,8 @@ def worker(rank, world_size):
     ]
     print(f"[GPU {rank}] allocated big tensors {[x.shape for x in big_tensors]=}")
 
-    # num_iterations = 1000000000
-    num_iterations = 3
+    num_iterations = 1000000000
+    # num_iterations = 3
 
     for iteration in range(num_iterations):
         start_event = torch.cuda.Event(enable_timing=True)
