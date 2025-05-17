@@ -46,7 +46,7 @@ class DownstreamServer:
         self.url = url
         self.max_concurrency_per_server = max_concurrency_per_server
         self._ongoing_request_num = 0
-        self._downstream_state = DownstreamState
+        self._downstream_state = DownstreamState.NORMAL
 
     def is_full(self):
         return self._ongoing_request_num >= self.max_concurrency_per_server
@@ -66,18 +66,24 @@ class DownstreamServer:
             await self.resume_memory_occupation()
 
     async def release_memory_occupation(self):
+        self._change_state(DownstreamState.NORMAL, DownstreamState.PAUSING)
         async with aiohttp.ClientSession() as session:
             print(f"release_memory_occupation START {self.url=}")
             response = await session.post(f"{self.url}/release_memory_occupation")
             print(f"release_memory_occupation END {response.text()=}")
-        self._is_downstream_paused = True
+        self._change_state(DownstreamState.PAUSING, DownstreamState.PAUSED)
 
     async def resume_memory_occupation(self):
+        self._change_state(DownstreamState.PAUSED, DownstreamState.RESUMING)
         async with aiohttp.ClientSession() as session:
             print(f"resume_memory_occupation START {self.url=}")
             response = await session.post(f"{self.url}/resume_memory_occupation")
             print(f"resume_memory_occupation END {response.text()=}")
-        self._is_downstream_paused = False
+        self._change_state(DownstreamState.RESUMING, DownstreamState.NORMAL)
+
+    def _change_state(self, old_state, new_state):
+        assert self._downstream_state == old_state
+        self._downstream_state = new_state
 
 
 class MiniLoadBalancer:
