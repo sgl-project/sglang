@@ -40,6 +40,10 @@ class SessionParams:
     replace: Optional[bool] = None
 
 
+AudioDataItem = Union[str, Dict]
+ImageDataItem = Union[Image, str, Dict]
+
+
 @dataclass
 class GenerateReqInput:
     # The input prompt. It can be a single prompt or a batch of prompts.
@@ -55,10 +59,10 @@ class GenerateReqInput:
     # - List of lists of images (multiple images per request)
     # See also python/sglang/srt/utils.py:load_image for more details.
     image_data: Optional[
-        Union[List[List[Union[Image, str]]], List[Union[Image, str]], Union[Image, str]]
+        Union[List[List[ImageDataItem]], List[ImageDataItem], ImageDataItem]
     ] = None
     # The audio input. Like image data, it can be a file name, a url, or base64 encoded string.
-    audio_data: Optional[Union[List[str], str]] = None
+    audio_data: Optional[Union[List[AudioDataItem], AudioDataItem]] = None
     # The sampling_params. See descriptions below.
     sampling_params: Optional[Union[List[Dict], Dict]] = None
     # The request id.
