@@ -60,6 +60,14 @@ class DownstreamServer:
             print(f"release_memory_occupation START {self.url=}")
             response = await session.post(f"{self.url}/release_memory_occupation")
             print(f"release_memory_occupation END {response.text()=}")
+        self._is_downstream_paused = True
+
+    async def resume_memory_occupation(self):
+        async with aiohttp.ClientSession() as session:
+            print(f"resume_memory_occupation START {self.url=}")
+            response = await session.post(f"{self.url}/resume_memory_occupation")
+            print(f"resume_memory_occupation END {response.text()=}")
+        self._is_downstream_paused = False
 
 
 class MiniLoadBalancer:
