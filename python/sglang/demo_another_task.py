@@ -16,8 +16,11 @@ def worker(rank, world_size):
     print(f"[GPU {rank}] started")
 
     # TODO use more memory
-    big_tensor = torch.empty(1024 * 1024 * 1024 * 60, dtype=torch.int8, device=device)
-    print(f"[GPU {rank}] allocated big tensor {big_tensor.shape=}")
+    big_tensors = [
+        torch.empty(1024 * 1024 * 1024, dtype=torch.int8, device=device)
+        for i in range(60)
+    ]
+    print(f"[GPU {rank}] allocated big tensors {[x.shape for x in big_tensors]=}")
 
     iteration = 0
     while True:
@@ -47,8 +50,6 @@ def worker(rank, world_size):
 
         print(f"[GPU {rank}] Iteration {iteration}: Avg time = {avg_time:.3f} ms")
         iteration += 1
-
-    print(f"{big_tensor.shape=}")  # reference it again
 
 
 def main():
