@@ -62,7 +62,7 @@ class _LayerModeComputationContext:
 class LayerScatterModes:
     layer_input_mode: ScatterMode
     attn_mode: ScatterMode
-    # Can be further split into e.g. ffn_input_mode and ffn_output_mode if needed
+    # Can be further split into e.g. mlp_input_mode and mlp_output_mode if needed
     mlp_mode: ScatterMode
     middle_residual_mode: ScatterMode
     layer_output_mode: ScatterMode
