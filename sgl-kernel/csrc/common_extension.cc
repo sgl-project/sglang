@@ -216,6 +216,15 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "maybe_top_p_arr, float top_p_val, bool deterministic, Generator? gen) -> ()");
   m.impl("top_p_sampling_from_probs", torch::kCUDA, &top_p_sampling_from_probs);
 
+  m.def(
+      "qserve_w4a8_per_chn_gemm(Tensor _in_feats, Tensor _kernel, Tensor _wscales, Tensor _ascales, Tensor _w_szs, "
+      "Tensor _a_ssums, Tensor! _out_feats) -> ()");
+  m.impl("qserve_w4a8_per_chn_gemm", torch::kCUDA, &qserve_w4a8_per_chn_gemm);
+
+  m.def(
+      "qserve_w4a8_per_group_gemm(Tensor _in_feats, Tensor _kernel, Tensor _zeros, Tensor _scales_i8, Tensor _wscales, "
+      "Tensor _ascales, Tensor! _out_feats) -> ()");
+  m.impl("qserve_w4a8_per_group_gemm", torch::kCUDA, &qserve_w4a8_per_group_gemm);
   /*
    * From Sparse Flash Attention
    */
