@@ -21,11 +21,11 @@ def busy_wait_until_enough_memory():
     print(f"[{time.time()=:.3f}] busy_wait_until_enough_memory see free memory {free_memory=}")
 
 
-def export_model_weights(model):
-    return dict(weights=[(name, weight.detach().clone()) for name, weight in model.named_weights()])
+def export_model_params(model):
+    return dict(weights=[(name, param.data.detach().cpu()) for name, param in model.named_parameters()])
 
 
-def import_model_weights(model, data):
+def import_model_param(model, data):
     self_named_weights = dict(model.named_weights())
     for name, tensor in data["weights"]:
         self_named_weights[name][...] = tensor
