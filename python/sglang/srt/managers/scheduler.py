@@ -50,8 +50,8 @@ from sglang.srt.disaggregation.utils import (
     TransferBackend,
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
-from sglang.srt.hacks import kill_other_memory_occupying_processes, busy_wait_until_enough_memory, export_model_params, \
-    import_model_param
+from sglang.srt.hacks import busy_wait_until_enough_memory, export_model_params, \
+    import_model_param, OtherProcessKiller
 from sglang.srt.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -457,6 +457,8 @@ class Scheduler(
             self.server_args.disaggregation_mode
         )
         self.init_disaggregation()
+
+        self.other_process_killer = OtherProcessKiller()
 
     def init_tokenizer(self):
         server_args = self.server_args
@@ -2053,7 +2055,7 @@ class Scheduler(
         print(f"[Scheduler, TP{self.tp_rank}, {time.time()}] resume kill others")
         tp_size_per_node = self.tp_size // self.server_args.nnodes
         if self.tp_rank % tp_size_per_node == 0:
-            kill_other_memory_occupying_processes()
+            self.other_process_killer.kill()
         torch.distributed.barrier(self.tp_cpu_group)  # TODO use a better group
         busy_wait_until_enough_memory()
 
