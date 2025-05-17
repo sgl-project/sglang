@@ -137,6 +137,8 @@ class DeepseekV2MLP(nn.Module):
         tp_size: Optional[int] = None,
     ) -> None:
         super().__init__()
+        self.tp_size = tp_size
+
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
@@ -164,6 +166,9 @@ class DeepseekV2MLP(nn.Module):
         self.act_fn = SiluAndMul()
 
     def forward(self, x, forward_mode: Optional[ForwardMode] = None):
+        if (self.tp_size == 1) and x.shape[0] == 0:
+            return x
+
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
@@ -1208,12 +1213,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
-        if not (
-            enable_moe_dense_fully_dp()
-            and (not self.is_layer_sparse)
-            and hidden_states.shape[0] == 0
-        ):
-            hidden_states = self.mlp(hidden_states, forward_batch.forward_mode)
+        hidden_states = self.mlp(hidden_states, forward_batch.forward_mode)
 
         hidden_states, residual = self.layer_communicator.forward_layer_end(
             hidden_states, residual, forward_batch
