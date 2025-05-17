@@ -133,6 +133,8 @@ class ServerArgs:
 
     # Kernel backend
     attention_backend: Optional[str] = None
+    decode_attention_backend: Optional[str] = None
+    prefill_attention_backend: Optional[str] = None
     sampling_backend: Optional[str] = None
     grammar_backend: Optional[str] = None
 
@@ -943,6 +945,35 @@ class ServerArgs:
             ],
             default=ServerArgs.attention_backend,
             help="Choose the kernels for attention layers.",
+        )
+        parser.add_argument(
+            "--decode-attention-backend",
+            type=str,
+            choices=[
+                "flashinfer",
+                "triton",
+                "torch_native",
+                "fa3",
+                "flashmla",
+                "cutlass_mla",
+            ],
+            default=ServerArgs.decode_attention_backend,
+            help="Choose the kernels for decode attention layers (have priority over --attention-backend).",
+        )
+
+        parser.add_argument(
+            "--prefill-attention-backend",
+            type=str,
+            choices=[
+                "flashinfer",
+                "triton",
+                "torch_native",
+                "fa3",
+                "flashmla",
+                "cutlass_mla",
+            ],
+            default=ServerArgs.prefill_attention_backend,
+            help="Choose the kernels for prefill attention layers (have priority over --attention-backend).",
         )
         parser.add_argument(
             "--sampling-backend",
