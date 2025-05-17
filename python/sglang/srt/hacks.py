@@ -1,12 +1,21 @@
 import time
 
 import torch
+import zmq
 from sglang.srt.distributed import get_tensor_model_parallel_rank
+from sglang.srt.utils import get_zmq_socket
 
 
 class OtherProcessKiller:
     def __init__(self):
-        TODO
+        base_port = 50000
+        num_tasks = 8
+
+        context = zmq.Context(2)
+        self.senders = [
+            get_zmq_socket(context, zmq.PUSH, f"tcp://localhost:{port}", False)
+            for port in range(base_port, base_port + num_tasks)
+        ]
 
     def kill(self):
         # cmd = "pkill -f demo_another_task"
