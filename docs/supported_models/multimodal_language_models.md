@@ -27,4 +27,3 @@ python3 -m sglang.launch_server \
 | **Gemma 3 (Multimodal)**   | `google/gemma-3-4b-it`                     | `gemma-it`       | Gemma 3's larger models (4B, 12B, 27B) accept images (each image encoded as 256 tokens) alongside text in a combined 128K-token context.                                                                        |
 | **Kimi-VL** (A3B)          | `moonshotai/Kimi-VL-A3B-Instruct`          | `kimi-vl`        | Kimi-VL is a multimodal model that can understand and generate text from images.                                                                                                                                |
 | **Mistral-Small-3.1-24B**  | `mistralai/Mistral-Small-3.1-24B-Instruct-2503` | `mistral`   | Mistral 3.1 is a multimodal model that can generate text from text or images input. It also supports tool calling and structured output. |
-
