@@ -69,8 +69,10 @@ class DownstreamServer:
                 self._resuming_condition.notify_all()
             del self._resuming_condition
         elif self._downstream_state == DownstreamState.RESUMING:
+            logger.info(f"ensure_resumed wait condition START")
             async with self._resuming_condition:
                 await self._resuming_condition.wait()
+            logger.info(f"ensure_resumed wait condition END")
 
     # do not copy-paste
     async def release_memory_occupation(self):
