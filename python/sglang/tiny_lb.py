@@ -35,6 +35,9 @@ class DownstreamServer:
     def __init__(self, url: str):
         self.url = url
 
+    def is_full(self):
+        return TODO
+
 
 class MiniLoadBalancer:
     def __init__(self, downstream_servers: List[DownstreamServer]):
@@ -42,7 +45,7 @@ class MiniLoadBalancer:
 
     async def select_server(self):
         for downstream_server in downstream_servers:
-            if downstream_server.is_available():
+            if not downstream_server.is_full():
                 return downstream_server
         raise Exception("no available server")
 
