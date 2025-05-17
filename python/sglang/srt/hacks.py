@@ -27,7 +27,12 @@ def busy_wait_until_enough_memory():
 
 
 def export_model_params(model):
-    return dict(params=[(name, param.data.detach().cpu()) for name, param in model.named_parameters()])
+    params = []
+    for name, param in model.named_parameters():
+        param_pin_memory = torch.empty_like(param.data, device="cpu", pin_memory=True)
+        param_pin_memory.copy_(param.data)
+        params.append((name, param_pin_memory))
+    return dict(params=params)
 
 
 def import_model_param(model, data):
