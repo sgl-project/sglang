@@ -15,6 +15,7 @@ def kill_other_memory_occupying_processes():
 
 
 def busy_wait_until_enough_memory():
+    # TODO overlap
     while True:
         free_memory, _ = torch.cuda.mem_get_info()
         if free_memory > 70_000_000_000:
