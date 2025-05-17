@@ -33,7 +33,13 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
-from sglang.srt.utils import bind_port, configure_logger, get_zmq_socket
+from sglang.srt.utils import (
+    bind_port,
+    configure_logger,
+    get_free_port,
+    get_tcp_zmq_socket_binded_to_local_free_port,
+    get_zmq_socket,
+)
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -84,6 +90,15 @@ class DataParallelController:
         # Launch data parallel workers
         self.scheduler_procs = []
         self.workers = [None] * server_args.dp_size
+        if server_args.node_rank == 0:
+            self.workers_port = {}
+            for dp_rank in range(server_args.dp_size):
+                port_and_socket = get_tcp_zmq_socket_binded_to_local_free_port(
+                    self.context, zmq.PUSH
+                )
+                self.workers[dp_rank] = port_and_socket[1]
+                self.workers_port[dp_rank] = port_and_socket[0]
+                logger.debug(f"Port assign to worker {dp_rank}: {port_and_socket[0]}")
 
         if server_args.enable_dp_attention:
             dp_port_args = self.launch_dp_attention_schedulers(server_args, port_args)
@@ -91,16 +106,6 @@ class DataParallelController:
         else:
             dp_port_args = self.launch_dp_schedulers(server_args, port_args)
             self.control_message_step = 1
-
-        # Only node rank 0 runs the real data parallel controller that dispatches the requests.
-        if server_args.node_rank == 0:
-            for dp_rank in range(server_args.dp_size):
-                self.workers[dp_rank] = get_zmq_socket(
-                    self.context,
-                    zmq.PUSH,
-                    dp_port_args[dp_rank].scheduler_input_ipc_name,
-                    True,
-                )
 
         self.max_req_input_len = None
 
@@ -160,11 +165,59 @@ class DataParallelController:
         while True:
             time.sleep(30 * 24 * 3600)
 
+    def _dispatch_dp_attn_ctrl_zmq_port(self, server_args: ServerArgs):
+        if server_args.node_rank == 0:
+            free_ports = {i: port for i, port in self.workers_port.items()}
+            logger.debug(f"Free ports: {free_ports}")
+
+            # broadcast dp_port_args to all dp ranks
+            rep_socket = get_zmq_socket(
+                self.context, zmq.REP, f"tcp://{server_args.dist_init_addr}", True
+            )
+
+            connected_nodes = 0
+            expected_nodes = server_args.nnodes - 1
+
+            logger.debug(
+                f"DP Controller: Node Rank 0 started, waiting for {expected_nodes} nodes to connect."
+            )
+            while connected_nodes < expected_nodes:
+                msg = rep_socket.recv()
+                logger.debug(f"Node 0 received handshake from node {msg.decode()}")
+                # send dp_port_args to the node
+                rep_socket.send_pyobj(free_ports)
+                connected_nodes += 1
+                logger.debug(
+                    f"DP Controller: {connected_nodes}/{expected_nodes} nodes connected."
+                )
+            logger.debug("DP Controller: All nodes connected")
+
+            rep_socket.close()
+        else:
+            req_socket = get_zmq_socket(
+                self.context, zmq.REQ, f"tcp://{server_args.dist_init_addr}", False
+            )
+
+            req_socket.setsockopt(zmq.RCVTIMEO, 60 * 1000)  # 1 min timeout
+            req_socket.setsockopt(zmq.SNDTIMEO, 60 * 1000)
+
+            try:
+                req_socket.send(str(server_args.node_rank).encode())
+                free_ports = req_socket.recv_pyobj()
+                logger.debug(
+                    f"Node {server_args.node_rank} received handshake from node 0, len {len(free_ports)}"
+                )
+            except zmq.Again:
+                logger.error("Handshake timeout with node 0")
+                raise
+        PortArgs.register_dp_controller_to_attn_tp_rk0_port(free_ports)
+
     def launch_dp_attention_schedulers(self, server_args, port_args):
-        self.launch_tensor_parallel_group(server_args, port_args, 0, None)
+        self._dispatch_dp_attn_ctrl_zmq_port(server_args)
         dp_port_args = []
         for dp_rank in range(server_args.dp_size):
             dp_port_args.append(PortArgs.init_new(server_args, dp_rank))
+        self.launch_tensor_parallel_group(server_args, port_args, 0, None)
         return dp_port_args
 
     def launch_tensor_parallel_group(
@@ -253,6 +306,9 @@ class DataParallelController:
                 self.workers
             )
         else:
+            logger.debug(
+                f"DP round_robin scheduler Room {req.bootstrap_room} -> Worker {req.bootstrap_room % len(self.workers)}"
+            )
             self.workers[req.bootstrap_room % len(self.workers)].send_pyobj(req)
 
     def shortest_queue_scheduler(self, input_requests):
