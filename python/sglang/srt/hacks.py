@@ -58,9 +58,11 @@ def import_model_param(model, data):
 
 
 if __name__ == '__main__':
+    other_process_killer = OtherProcessKiller()
+
     print(f"{time.time()=} {torch.cuda.mem_get_info()=}")
     print(f"{time.time()=} kill start")
-    kill_other_memory_occupying_processes()
+    other_process_killer.kill()
     print(f"{time.time()=} kill end")
 
     for i in range(5000):
