@@ -42,10 +42,8 @@ class PrefillConfig:
 
 
 class MiniLoadBalancer:
-    def __init__(self, prefill_configs: List[PrefillConfig], decode_servers: List[str]):
-        self.prefill_configs = prefill_configs
-        self.prefill_servers = [p.url for p in prefill_configs]
-        self.decode_servers = decode_servers
+    def __init__(self, downstream_urls: List[str]):
+        self.downstream_urls = downstream_urls
 
     def select_pair(self):
         # TODO: return some message instead of panic
