@@ -26,8 +26,8 @@ def worker(rank, world_size):
             b = torch.randn(1024, 1024, device=device)
             c = torch.matmul(a, b)
 
-            x = torch.randn(1_000_000, device=device)
-            y = torch.randn(1_000_000, device=device)
+            x = torch.randn(1048576, device=device)
+            y = torch.randn(1048576, device=device)
             z = x + y
 
             t = torch.randn(1024, device=device)
