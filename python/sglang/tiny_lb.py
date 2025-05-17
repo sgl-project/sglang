@@ -3,6 +3,7 @@ Minimal HTTP load balancer for prefill and decode servers for testing.
 """
 
 import logging
+from contextlib import contextmanager
 from typing import List, Optional
 
 import aiohttp
@@ -38,6 +39,14 @@ class DownstreamServer:
     def is_full(self):
         return TODO
 
+    @contextmanager
+    def ongoing_request(self):
+        TODO
+        try:
+            yield
+        finally:
+            TODO
+
 
 class MiniLoadBalancer:
     def __init__(self, downstream_servers: List[DownstreamServer]):
@@ -58,20 +67,21 @@ class MiniLoadBalancer:
                     total=3600
                 )  # Add timeout for request reliability
             ) as session:
-                try:
-                    response = await session.post(f"{downstream_server.url}/{endpoint}", json=req)
-                    async for chunk in response.content:
-                        yield chunk
-                except Exception as e:
-                    error_msg = {
-                        "error": {"message": f"Stream processing error: {str(e)}"}
-                    }
-                    yield b"data: " + orjson.dumps(
-                        error_msg, option=orjson.OPT_NON_STR_KEYS
-                    ) + b"\n\n"
-                finally:
-                    if response is not None:
-                        await response.release()
+                with downstream_server.ongoing_request():
+                    try:
+                        response = await session.post(f"{downstream_server.url}/{endpoint}", json=req)
+                        async for chunk in response.content:
+                            yield chunk
+                    except Exception as e:
+                        error_msg = {
+                            "error": {"message": f"Stream processing error: {str(e)}"}
+                        }
+                        yield b"data: " + orjson.dumps(
+                            error_msg, option=orjson.OPT_NON_STR_KEYS
+                        ) + b"\n\n"
+                    finally:
+                        if response is not None:
+                            await response.release()
 
         return StreamingResponse(
             stream_results(),
