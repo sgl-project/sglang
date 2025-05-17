@@ -1,4 +1,5 @@
 import os
+import time
 
 import torch
 import torch.distributed as dist
@@ -22,8 +23,10 @@ def worker(rank, world_size):
     ]
     print(f"[GPU {rank}] allocated big tensors {[x.shape for x in big_tensors]=}")
 
-    iteration = 0
-    while True:
+    # num_iterations = 1000000000
+    num_iterations = 3
+
+    for iteration in range(num_iterations):
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
 
@@ -49,7 +52,12 @@ def worker(rank, world_size):
         avg_time = elapsed_time_ms / num_repeat
 
         print(f"[GPU {rank}] Iteration {iteration}: Avg time = {avg_time:.3f} ms")
-        iteration += 1
+
+    torch.cuda.synchronize()
+    print(f"[GPU {rank}, {time.time()}] del start")
+    del big_tensors, a, b, c, x, y, z, t
+    print(f"[GPU {rank}, {time.time()}] empty_cache start")
+    torch.cuda.empty_cache()
 
 
 def main():
