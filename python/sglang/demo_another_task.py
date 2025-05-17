@@ -17,7 +17,7 @@ def worker_background_thread(rank: int):
     memory_saver = torch_memory_saver.TorchMemorySaver(enable_use_mem_pool=False)
 
     context = zmq.Context(2)
-    recv_socket = get_zmq_socket(context, zmq.PULL, f"tcp://localhost:{port}", False)
+    recv_socket = get_zmq_socket(context, zmq.PULL, f"tcp://localhost:{port}", True)
 
     print(f"worker_background_thread init {port=}")
 
