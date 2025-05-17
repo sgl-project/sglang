@@ -48,9 +48,7 @@ class MiniLoadBalancer:
         assert len(self.downstream_urls) > 0
         return TODO
 
-    async def generate_stream(
-        self, modified_request, prefill_server, decode_server, endpoint="generate"
-    ):
+    async def generate_stream(self, req, server, endpoint="generate"):
         assert endpoint[0] != "/", f"Endpoint should not start with '/': {endpoint}"
 
         async def stream_results():
@@ -62,12 +60,7 @@ class MiniLoadBalancer:
                 try:
                     # Create the tasks for both prefill and decode requests
                     tasks = [
-                        session.post(
-                            f"{prefill_server}/{endpoint}", json=modified_request
-                        ),
-                        session.post(
-                            f"{decode_server}/{endpoint}", json=modified_request
-                        ),
+                        session.post(f"{server}/{endpoint}", json=req),
                     ]
                     # Wait for both responses to complete. Since this is streaming, they return immediately.
                     prefill_response, decode_response = await asyncio.gather(*tasks)
