@@ -168,8 +168,8 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | Arguments              | Description | Defaults |
 |------------------------|-------------|---------|
 | `attention_backend`    | This argument specifies the backend for attention computation and KV cache management, which can be `fa3`, `flashinfer`, `triton`, `cutlass_mla`, or `torch_native`. When deploying DeepSeek models, use this argument to specify the MLA backend. | None |
-| `decode_attention_backend` | This argument specifies the backend for decode attention computation and KV cache management, which can be `fa3`, `flashinfer`, `triton`, `cutlass_mla`, or `torch_native`. Note that this argument has priority over `attention_backend`. | None |
-| `prefill_attention_backend` | This argument specifies the backend for prefill attention computation and KV cache management, which can be `fa3`, `flashinfer`, `triton`, `cutlass_mla`, or `torch_native`. Note that this argument has priority over `attention_backend`. | None |
+| `decode_attention_backend` | (Experimental) This argument specifies the backend for decode attention computation and KV cache management, which can be `fa3`, `flashinfer`, `triton`, `cutlass_mla`, or `torch_native`. Note that this argument has priority over `attention_backend`. | None |
+| `prefill_attention_backend` | (Experimental) This argument specifies the backend for prefill attention computation and KV cache management, which can be `fa3`, `flashinfer`, `triton`, `cutlass_mla`, or `torch_native`. Note that this argument has priority over `attention_backend`. | None |
 | `sampling_backend`     | Specifies the backend used for sampling. | None |
 | `mm_attention_backend` | Set multimodal attention backend.
 
