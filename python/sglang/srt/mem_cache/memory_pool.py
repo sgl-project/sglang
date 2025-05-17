@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter, with_tms_disable_cpu_backup
 
 """
 Memory pool.
@@ -49,11 +49,11 @@ class ReqToTokenPool:
     """A memory pool that maps a request to its token locations."""
 
     def __init__(
-        self,
-        size: int,
-        max_context_len: int,
-        device: str,
-        enable_memory_saver: bool,
+            self,
+            size: int,
+            max_context_len: int,
+            device: str,
+            enable_memory_saver: bool,
     ):
         memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
@@ -62,7 +62,8 @@ class ReqToTokenPool:
         self.size = size
         self.max_context_len = max_context_len
         self.device = device
-        with memory_saver_adapter.region():
+        # with memory_saver_adapter.region():
+        with with_tms_disable_cpu_backup():
             self.req_to_token = torch.zeros(
                 (size, max_context_len), dtype=torch.int32, device=device
             )
@@ -109,11 +110,11 @@ class KVCache(abc.ABC):
 
     @abc.abstractmethod
     def set_kv_buffer(
-        self,
-        layer: RadixAttention,
-        loc: torch.Tensor,
-        cache_k: torch.Tensor,
-        cache_v: torch.Tensor,
+            self,
+            layer: RadixAttention,
+            loc: torch.Tensor,
+            cache_k: torch.Tensor,
+            cache_v: torch.Tensor,
     ) -> None:
         raise NotImplementedError()
 
@@ -137,11 +138,11 @@ class TokenToKVPoolAllocator:
     """An allocator managing the indices to kv cache data."""
 
     def __init__(
-        self,
-        size: int,
-        dtype: torch.dtype,
-        device: str,
-        kvcache: KVCache,
+            self,
+            size: int,
+            dtype: torch.dtype,
+            device: str,
+            kvcache: KVCache,
     ):
         self.size = size
         self.dtype = dtype
@@ -205,17 +206,17 @@ class TokenToKVPoolAllocator:
 class MHATokenToKVPool(KVCache):
 
     def __init__(
-        self,
-        size: int,
-        page_size: int,
-        dtype: torch.dtype,
-        head_num: int,
-        head_dim: int,
-        layer_num: int,
-        device: str,
-        enable_memory_saver: bool,
-        start_layer: Optional[int] = None,
-        end_layer: Optional[int] = None,
+            self,
+            size: int,
+            page_size: int,
+            dtype: torch.dtype,
+            head_num: int,
+            head_dim: int,
+            layer_num: int,
+            device: str,
+            enable_memory_saver: bool,
+            start_layer: Optional[int] = None,
+            end_layer: Optional[int] = None,
     ):
         self.size = size
         self.page_size = page_size
@@ -248,7 +249,8 @@ class MHATokenToKVPool(KVCache):
         )
 
     def _create_buffers(self):
-        with self.memory_saver_adapter.region():
+        # with self.memory_saver_adapter.region():
+        with with_tms_disable_cpu_backup():
             # [size, head_num, head_dim] for each layer
             # The padded slot 0 is used for writing dummy outputs from padded tokens.
             self.k_buffer = [
@@ -288,18 +290,18 @@ class MHATokenToKVPool(KVCache):
         # layer_num x [seq_len, head_num, head_dim]
         # layer_num x [page_num, page_size, head_num, head_dim]
         kv_data_ptrs = [
-            self.get_key_buffer(i).data_ptr() for i in range(self.layer_num)
-        ] + [self.get_value_buffer(i).data_ptr() for i in range(self.layer_num)]
+                           self.get_key_buffer(i).data_ptr() for i in range(self.layer_num)
+                       ] + [self.get_value_buffer(i).data_ptr() for i in range(self.layer_num)]
         kv_data_lens = [
-            self.get_key_buffer(i).nbytes for i in range(self.layer_num)
-        ] + [self.get_value_buffer(i).nbytes for i in range(self.layer_num)]
+                           self.get_key_buffer(i).nbytes for i in range(self.layer_num)
+                       ] + [self.get_value_buffer(i).nbytes for i in range(self.layer_num)]
         kv_item_lens = [
-            self.get_key_buffer(i)[0].nbytes * self.page_size
-            for i in range(self.layer_num)
-        ] + [
-            self.get_value_buffer(i)[0].nbytes * self.page_size
-            for i in range(self.layer_num)
-        ]
+                           self.get_key_buffer(i)[0].nbytes * self.page_size
+                           for i in range(self.layer_num)
+                       ] + [
+                           self.get_value_buffer(i)[0].nbytes * self.page_size
+                           for i in range(self.layer_num)
+                       ]
         return kv_data_ptrs, kv_data_lens, kv_item_lens
 
     # Todo: different memory layout
@@ -349,13 +351,13 @@ class MHATokenToKVPool(KVCache):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
 
     def set_kv_buffer(
-        self,
-        layer: RadixAttention,
-        loc: torch.Tensor,
-        cache_k: torch.Tensor,
-        cache_v: torch.Tensor,
-        k_scale: Optional[float] = None,
-        v_scale: Optional[float] = None,
+            self,
+            layer: RadixAttention,
+            loc: torch.Tensor,
+            cache_k: torch.Tensor,
+            cache_v: torch.Tensor,
+            k_scale: Optional[float] = None,
+            v_scale: Optional[float] = None,
     ):
         layer_id = layer.layer_id
         if cache_k.dtype != self.dtype:
@@ -385,14 +387,14 @@ class MHATokenToKVPool(KVCache):
 
 @torch.compile
 def fused_downcast(
-    cache_k: torch.Tensor,
-    cache_v: torch.Tensor,
-    k_scale: torch.Tensor,
-    v_scale: torch.Tensor,
-    dtype: torch.dtype,
-    store_dtype: torch.dtype,
-    max_fp8: float,
-    min_fp8: float,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        k_scale: torch.Tensor,
+        v_scale: torch.Tensor,
+        dtype: torch.dtype,
+        store_dtype: torch.dtype,
+        max_fp8: float,
+        min_fp8: float,
 ):
     cache_k = cache_k / k_scale
     cache_k = torch.clamp(cache_k, min_fp8, max_fp8)
@@ -415,16 +417,16 @@ def copy_two_array(loc, dst_1, src_1, dst_2, src_2, dtype, store_dtype):
 
 @triton.jit
 def set_mla_kv_buffer_kernel(
-    kv_buffer_ptr,
-    cache_k_nope_ptr,
-    cache_k_rope_ptr,
-    loc_ptr,
-    buffer_stride: tl.constexpr,
-    nope_stride: tl.constexpr,
-    rope_stride: tl.constexpr,
-    nope_dim: tl.constexpr,
-    rope_dim: tl.constexpr,
-    BLOCK: tl.constexpr,
+        kv_buffer_ptr,
+        cache_k_nope_ptr,
+        cache_k_rope_ptr,
+        loc_ptr,
+        buffer_stride: tl.constexpr,
+        nope_stride: tl.constexpr,
+        rope_stride: tl.constexpr,
+        nope_dim: tl.constexpr,
+        rope_dim: tl.constexpr,
+        BLOCK: tl.constexpr,
 ):
     pid_loc = tl.program_id(0)
     pid_blk = tl.program_id(1)
@@ -453,10 +455,10 @@ def set_mla_kv_buffer_kernel(
 
 
 def set_mla_kv_buffer_triton(
-    kv_buffer: torch.Tensor,
-    loc: torch.Tensor,
-    cache_k_nope: torch.Tensor,
-    cache_k_rope: torch.Tensor,
+        kv_buffer: torch.Tensor,
+        loc: torch.Tensor,
+        cache_k_nope: torch.Tensor,
+        cache_k_rope: torch.Tensor,
 ):
     nope_dim = cache_k_nope.shape[-1]
     rope_dim = cache_k_rope.shape[-1]
@@ -481,17 +483,17 @@ def set_mla_kv_buffer_triton(
 
 class MLATokenToKVPool(KVCache):
     def __init__(
-        self,
-        size: int,
-        page_size: int,
-        dtype: torch.dtype,
-        kv_lora_rank: int,
-        qk_rope_head_dim: int,
-        layer_num: int,
-        device: str,
-        enable_memory_saver: bool,
-        start_layer: Optional[int] = None,
-        end_layer: Optional[int] = None,
+            self,
+            size: int,
+            page_size: int,
+            dtype: torch.dtype,
+            kv_lora_rank: int,
+            qk_rope_head_dim: int,
+            layer_num: int,
+            device: str,
+            enable_memory_saver: bool,
+            start_layer: Optional[int] = None,
+            end_layer: Optional[int] = None,
     ):
         self.size = size
         self.page_size = page_size
@@ -512,7 +514,8 @@ class MLATokenToKVPool(KVCache):
             enable=enable_memory_saver
         )
 
-        with memory_saver_adapter.region():
+        # with memory_saver_adapter.region():
+        with with_tms_disable_cpu_backup():
             # The padded slot 0 is used for writing dummy outputs from padded tokens.
             self.kv_buffer = [
                 torch.zeros(
@@ -562,19 +565,19 @@ class MLATokenToKVPool(KVCache):
 
         if self.store_dtype != self.dtype:
             return self.kv_buffer[layer_id - self.start_layer][
-                ..., : self.kv_lora_rank
-            ].view(self.dtype)
+                   ..., : self.kv_lora_rank
+                   ].view(self.dtype)
         return self.kv_buffer[layer_id - self.start_layer][..., : self.kv_lora_rank]
 
     def get_kv_buffer(self, layer_id: int):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
 
     def set_kv_buffer(
-        self,
-        layer: RadixAttention,
-        loc: torch.Tensor,
-        cache_k: torch.Tensor,
-        cache_v: torch.Tensor,
+            self,
+            layer: RadixAttention,
+            loc: torch.Tensor,
+            cache_k: torch.Tensor,
+            cache_v: torch.Tensor,
     ):
         layer_id = layer.layer_id
         if cache_k.dtype != self.dtype:
@@ -587,11 +590,11 @@ class MLATokenToKVPool(KVCache):
             self.kv_buffer[layer_id - self.start_layer][loc] = cache_k
 
     def set_mla_kv_buffer(
-        self,
-        layer: RadixAttention,
-        loc: torch.Tensor,
-        cache_k_nope: torch.Tensor,
-        cache_k_rope: torch.Tensor,
+            self,
+            layer: RadixAttention,
+            loc: torch.Tensor,
+            cache_k_nope: torch.Tensor,
+            cache_k_rope: torch.Tensor,
     ):
         layer_id = layer.layer_id
         if cache_k_nope.dtype != self.dtype:
@@ -624,18 +627,18 @@ class MLATokenToKVPool(KVCache):
 
 class DoubleSparseTokenToKVPool(KVCache):
     def __init__(
-        self,
-        size: int,
-        page_size: int,
-        dtype: torch.dtype,
-        head_num: int,
-        head_dim: int,
-        layer_num: int,
-        device: str,
-        heavy_channel_num: int,
-        enable_memory_saver: bool,
-        start_layer: Optional[int] = None,
-        end_layer: Optional[int] = None,
+            self,
+            size: int,
+            page_size: int,
+            dtype: torch.dtype,
+            head_num: int,
+            head_dim: int,
+            layer_num: int,
+            device: str,
+            heavy_channel_num: int,
+            enable_memory_saver: bool,
+            start_layer: Optional[int] = None,
+            end_layer: Optional[int] = None,
     ):
         self.size = size
         self.page_size = page_size
@@ -650,7 +653,8 @@ class DoubleSparseTokenToKVPool(KVCache):
             enable=enable_memory_saver
         )
 
-        with memory_saver_adapter.region():
+        # with memory_saver_adapter.region():
+        with with_tms_disable_cpu_backup():
             # [size, head_num, head_dim] for each layer
             self.k_buffer = [
                 torch.zeros(
@@ -692,12 +696,12 @@ class DoubleSparseTokenToKVPool(KVCache):
         )
 
     def set_kv_buffer(
-        self,
-        layer: RadixAttention,
-        loc: torch.Tensor,
-        cache_k: torch.Tensor,
-        cache_v: torch.Tensor,
-        cache_label: torch.Tensor,
+            self,
+            layer: RadixAttention,
+            loc: torch.Tensor,
+            cache_k: torch.Tensor,
+            cache_v: torch.Tensor,
+            cache_label: torch.Tensor,
     ):
         # NOTE(Andy): ignore the dtype check
         layer_id = layer.layer_id
@@ -742,13 +746,13 @@ def synchronized(debug_only=False):
 class HostKVCache(abc.ABC):
 
     def __init__(
-        self,
-        device_pool: MHATokenToKVPool,
-        host_to_device_ratio: float,
-        host_size: int,
-        pin_memory: bool,
-        device: str,
-        page_size: int,
+            self,
+            device_pool: MHATokenToKVPool,
+            host_to_device_ratio: float,
+            host_size: int,
+            pin_memory: bool,
+            device: str,
+            page_size: int,
     ):
         self.device_pool = device_pool
         self.dtype = device_pool.store_dtype
@@ -766,14 +770,14 @@ class HostKVCache(abc.ABC):
         self.end_layer = device_pool.end_layer
 
         assert (
-            self.size > device_pool.size
+                self.size > device_pool.size
         ), "The host memory should be larger than the device memory with the current protocol"
 
         # Verify there is enough available host memory.
         host_mem = psutil.virtual_memory()
         requested_bytes = self.size * self.size_per_token
         # preserve at least 10GB for other usage
-        ten_gb = 10 * (1024**3)
+        ten_gb = 10 * (1024 ** 3)
         if requested_bytes > host_mem.available - ten_gb:
             raise ValueError(
                 f"Not enough host memory available. Requesting "
@@ -853,7 +857,7 @@ class HostKVCache(abc.ABC):
         assert len(indices) > 0, "The indices should not be empty"
         states = self.mem_state[indices]
         assert (
-            states == states[0]
+                states == states[0]
         ).all(), "The memory slots should have the same state {}".format(states)
         return MemoryStateInt(states[0].item())
 
@@ -916,13 +920,13 @@ class HostKVCache(abc.ABC):
 
 class MHATokenToKVPoolHost(HostKVCache):
     def __init__(
-        self,
-        device_pool: MHATokenToKVPool,
-        host_to_device_ratio: float,
-        host_size: int,
-        page_size: int,
-        pin_memory: bool = True,
-        device: str = "cpu",
+            self,
+            device_pool: MHATokenToKVPool,
+            host_to_device_ratio: float,
+            host_size: int,
+            page_size: int,
+            pin_memory: bool = True,
+            device: str = "cpu",
     ):
         super().__init__(
             device_pool, host_to_device_ratio, host_size, pin_memory, device, page_size
@@ -965,12 +969,12 @@ class MHATokenToKVPoolHost(HostKVCache):
             h_index = host_indices[i * self.page_size]
             d_index = device_indices_cpu[i]
             for j in range(self.layer_num):
-                self.kv_buffer[0, j, h_index : h_index + self.page_size].copy_(
-                    device_pool.k_buffer[j][d_index : d_index + self.page_size],
+                self.kv_buffer[0, j, h_index: h_index + self.page_size].copy_(
+                    device_pool.k_buffer[j][d_index: d_index + self.page_size],
                     non_blocking=True,
                 )
-                self.kv_buffer[1, j, h_index : h_index + self.page_size].copy_(
-                    device_pool.v_buffer[j][d_index : d_index + self.page_size],
+                self.kv_buffer[1, j, h_index: h_index + self.page_size].copy_(
+                    device_pool.v_buffer[j][d_index: d_index + self.page_size],
                     non_blocking=True,
                 )
 
@@ -980,18 +984,18 @@ class MHATokenToKVPoolHost(HostKVCache):
             h_index = host_indices[i * self.page_size]
             d_index = device_indices_cpu[i]
             device_pool.k_buffer[layer_id - self.start_layer][
-                d_index : d_index + self.page_size
+            d_index: d_index + self.page_size
             ].copy_(
                 self.kv_buffer[
-                    0, layer_id - self.start_layer, h_index : h_index + self.page_size
+                0, layer_id - self.start_layer, h_index: h_index + self.page_size
                 ],
                 non_blocking=True,
             )
             device_pool.v_buffer[layer_id - self.start_layer][
-                d_index : d_index + self.page_size
+            d_index: d_index + self.page_size
             ].copy_(
                 self.kv_buffer[
-                    1, layer_id - self.start_layer, h_index : h_index + self.page_size
+                1, layer_id - self.start_layer, h_index: h_index + self.page_size
                 ],
                 non_blocking=True,
             )
@@ -999,13 +1003,13 @@ class MHATokenToKVPoolHost(HostKVCache):
 
 class MLATokenToKVPoolHost(HostKVCache):
     def __init__(
-        self,
-        device_pool: MLATokenToKVPool,
-        host_to_device_ratio: float,
-        host_size: int,
-        page_size: int,
-        pin_memory: bool = True,
-        device: str = "cpu",
+            self,
+            device_pool: MLATokenToKVPool,
+            host_to_device_ratio: float,
+            host_size: int,
+            page_size: int,
+            pin_memory: bool = True,
+            device: str = "cpu",
     ):
         super().__init__(
             device_pool, host_to_device_ratio, host_size, pin_memory, device, page_size
@@ -1017,10 +1021,10 @@ class MLATokenToKVPoolHost(HostKVCache):
         self.layer_num = self.device_pool.layer_num
 
         return (
-            (self.kv_lora_rank + self.qk_rope_head_dim)
-            * 1
-            * self.dtype.itemsize
-            * self.layer_num
+                (self.kv_lora_rank + self.qk_rope_head_dim)
+                * 1
+                * self.dtype.itemsize
+                * self.layer_num
         )
 
     def init_kv_buffer(self):
@@ -1058,8 +1062,8 @@ class MLATokenToKVPoolHost(HostKVCache):
             h_index = host_indices[i * self.page_size]
             d_index = device_indices_cpu[i]
             for j in range(self.layer_num):
-                self.kv_buffer[j, h_index : h_index + self.page_size].copy_(
-                    device_pool.kv_buffer[j][d_index : d_index + self.page_size],
+                self.kv_buffer[j, h_index: h_index + self.page_size].copy_(
+                    device_pool.kv_buffer[j][d_index: d_index + self.page_size],
                     non_blocking=True,
                 )
 
@@ -1069,10 +1073,10 @@ class MLATokenToKVPoolHost(HostKVCache):
             h_index = host_indices[i * self.page_size]
             d_index = device_indices_cpu[i]
             device_pool.kv_buffer[layer_id - self.start_layer][
-                d_index : d_index + self.page_size
+            d_index: d_index + self.page_size
             ].copy_(
                 self.kv_buffer[
-                    layer_id - self.start_layer, h_index : h_index + self.page_size
+                layer_id - self.start_layer, h_index: h_index + self.page_size
                 ],
                 non_blocking=True,
             )

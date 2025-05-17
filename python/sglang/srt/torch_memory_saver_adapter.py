@@ -88,3 +88,12 @@ class _TorchMemorySaverAdapterNoop(TorchMemorySaverAdapter):
     @property
     def enabled(self):
         return False
+
+
+@contextmanager
+def with_tms_disable_cpu_backup():
+    torch_memory_saver._global_info.binary_info.cdll.tms_disable_cpu_backup()
+    try:
+        yield
+    finally:
+        torch_memory_saver._global_info.binary_info.cdll.tms_enable_cpu_backup()
