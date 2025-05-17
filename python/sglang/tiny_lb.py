@@ -2,7 +2,6 @@
 Minimal HTTP load balancer for prefill and decode servers for testing.
 """
 
-import asyncio
 import dataclasses
 import logging
 from typing import List, Optional
@@ -58,13 +57,8 @@ class MiniLoadBalancer:
                 )  # Add timeout for request reliability
             ) as session:
                 try:
-                    # Create the tasks for both prefill and decode requests
-                    tasks = [
-                        session.post(f"{server}/{endpoint}", json=req),
-                    ]
-                    # Wait for both responses to complete. Since this is streaming, they return immediately.
-                    prefill_response, decode_response = await asyncio.gather(*tasks)
-                    async for chunk in decode_response.content:
+                    response = await session.post(f"{server}/{endpoint}", json=req)
+                    async for chunk in response.content:
                         yield chunk
                 except Exception as e:
                     error_msg = {
