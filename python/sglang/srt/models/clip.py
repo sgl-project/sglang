@@ -168,7 +168,7 @@ class CLIPEncoderLayer(nn.Module):
             softmax_in_single_precision=softmax_in_single_precision,
             flatten_batch=True,
             quant_config=quant_config,
-            prefix=add_prefix("attn", prefix),
+            prefix=add_prefix("self_attn", prefix),
         )
         self.mlp = CLIPMLP(
             config,
