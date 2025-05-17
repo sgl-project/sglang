@@ -922,22 +922,33 @@ class ModelRunner:
         return c
 
     def init_attention_backend(self):
-        self.attn_backend = self._get_attention_backend_from_str(
-            self.server_args.attention_backend
+        self.decode_attention_backend_str = (
+            self.server_args.decode_attention_backend
+            if self.server_args.decode_attention_backend
+            else self.server_args.attention_backend
         )
-        if self.server_args.decode_attention_backend:
-            self.decode_attn_backend = self._get_attention_backend_from_str(
-                self.server_args.decode_attention_backend
+        self.prefill_attention_backend_str = (
+            self.server_args.prefill_attention_backend
+            if self.server_args.prefill_attention_backend
+            else self.server_args.attention_backend
+        )
+        if self.decode_attention_backend_str != self.prefill_attention_backend_str:
+            from sglang.srt.layers.attention.hybrid_attn_backend import (
+                HybridAttnBackend,
             )
-        else:
-            self.decode_attn_backend = None
 
-        if self.server_args.prefill_attention_backend:
-            self.prefill_attn_backend = self._get_attention_backend_from_str(
-                self.server_args.prefill_attention_backend
+            self.attn_backend = HybridAttnBackend(
+                decode_backend=self._get_attention_backend_from_str(
+                    self.decode_attention_backend_str
+                ),
+                prefill_backend=self._get_attention_backend_from_str(
+                    self.prefill_attention_backend_str
+                ),
             )
         else:
-            self.prefill_attn_backend = None
+            self.attn_backend = self._get_attention_backend_from_str(
+                self.server_args.attention_backend
+            )
 
     def _get_attention_backend_from_str(self, backend_str: str):
         """Init attention kernel backend."""
@@ -1062,13 +1073,11 @@ class ModelRunner:
     def forward_decode(
         self, forward_batch: ForwardBatch, pp_proxy_tensors=None
     ) -> LogitsProcessorOutput:
+        self.attn_backend.init_forward_metadata(forward_batch)
         # FIXME: add pp_proxy_tensors arg to all models
         kwargs = {}
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
-        if self.decode_attn_backend is not None:
-            forward_batch.attn_backend = self.decode_attn_backend
-        forward_batch.attn_backend.init_forward_metadata(forward_batch)
         return self.model.forward(
             forward_batch.input_ids,
             forward_batch.positions,
@@ -1082,10 +1091,8 @@ class ModelRunner:
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors=None,
     ) -> LogitsProcessorOutput:
-        if self.prefill_attn_backend is not None:
-            forward_batch.attn_backend = self.prefill_attn_backend
         if not skip_attn_backend_init:
-            forward_batch.attn_backend.init_forward_metadata(forward_batch)
+            self.attn_backend.init_forward_metadata(forward_batch)
 
         kwargs = {}
         if self.support_pp:
