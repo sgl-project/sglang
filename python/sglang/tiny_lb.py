@@ -5,6 +5,7 @@ Minimal HTTP load balancer for prefill and decode servers for testing.
 import logging
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from enum import Enum, auto
 from typing import List, Optional
 
 import aiohttp
@@ -33,12 +34,19 @@ def setup_logger():
 logger = setup_logger()
 
 
+class DownstreamState(Enum):
+    PAUSED = auto()
+    NORMAL = auto()
+    PAUSING = auto()
+    RESUMING = auto()
+
+
 class DownstreamServer:
     def __init__(self, url: str, max_concurrency_per_server):
         self.url = url
         self.max_concurrency_per_server = max_concurrency_per_server
         self._ongoing_request_num = 0
-        self._is_downstream_paused = False
+        self._downstream_state = DownstreamState
 
     def is_full(self):
         return self._ongoing_request_num >= self.max_concurrency_per_server
