@@ -6,17 +6,6 @@ from types import SimpleNamespace
 import requests
 import torch
 
-import sglang as sgl
-from sglang.srt.configs.model_config import AttentionArch
-from sglang.srt.distributed import (
-    init_distributed_environment,
-    initialize_model_parallel,
-)
-from sglang.srt.layers.dp_attention import initialize_dp_attention
-from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_device_sm, kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.runners import HFRunner, SRTRunner, check_close_model_outputs
@@ -188,6 +177,14 @@ class TestHybridAttnBackendE2EMLA(TestHybridAttnBackendE2EBase):
     @classmethod
     def get_server_args(cls):
         return DEFAULT_SERVER_ARGS
+
+
+class TestHybridAttnBackendE2ETorchCompile(TestHybridAttnBackendE2EBase):
+    accuracy_threshold = 0.65
+
+    @classmethod
+    def get_server_args(cls):
+        return DEFAULT_SERVER_ARGS + ["--enable-torch-compile"]
 
 
 if __name__ == "__main__":
