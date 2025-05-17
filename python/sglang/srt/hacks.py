@@ -38,7 +38,7 @@ def export_model_params(model):
 def import_model_param(model, data):
     self_named_params = dict(model.named_parameters())
     for name, tensor in data["params"]:
-        self_named_params[name].data[...] = tensor.to("cuda")
+        self_named_params[name].data.copy_(tensor, non_blocking=True)
 
 
 if __name__ == '__main__':
