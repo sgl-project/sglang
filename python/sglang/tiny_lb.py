@@ -79,7 +79,8 @@ class DownstreamServer:
         async with aiohttp.ClientSession() as session:
             logger.info(f"release_memory_occupation START {self.url=}")
             response = await session.post(f"{self.url}/release_memory_occupation")
-            logger.info(f"release_memory_occupation END {response.text()=}")
+            text = await response.text()
+            logger.info(f"release_memory_occupation END {text=}")
         self._change_state(DownstreamState.PAUSING, DownstreamState.PAUSED)
 
     async def resume_memory_occupation(self):
@@ -87,7 +88,8 @@ class DownstreamServer:
         async with aiohttp.ClientSession() as session:
             logger.info(f"resume_memory_occupation START {self.url=}")
             response = await session.post(f"{self.url}/resume_memory_occupation")
-            logger.info(f"resume_memory_occupation END {response.text()=}")
+            text = await response.text()
+            logger.info(f"resume_memory_occupation END {text=}")
         self._change_state(DownstreamState.RESUMING, DownstreamState.NORMAL)
 
     def _change_state(self, old_state, new_state):
