@@ -154,7 +154,7 @@ class SchedulerMetricsCollector:
         from prometheus_client import Counter, Gauge
 
         self.labels = labels
-        self.last_log_time = time.time()
+        self.last_log_time = time.perf_counter()
 
         self.num_running_reqs = Gauge(
             name="sglang:num_running_reqs",
@@ -294,7 +294,7 @@ class SchedulerMetricsCollector:
             self.num_decode_transfer_queue_reqs, stats.num_decode_transfer_queue_reqs
         )
 
-        self.last_log_time = time.time()
+        self.last_log_time = time.perf_counter()
 
 
 class TokenizerMetricsCollector:

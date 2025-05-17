@@ -526,9 +526,9 @@ def popen_launch_pd_server(
     else:
         process = subprocess.Popen(command, stdout=None, stderr=None, env=env)
 
-    start_time = time.time()
+    start_time = time.perf_counter()
     with requests.Session() as session:
-        while time.time() - start_time < timeout:
+        while time.perf_counter() - start_time < timeout:
             try:
                 headers = {
                     "Content-Type": "application/json; charset=utf-8",

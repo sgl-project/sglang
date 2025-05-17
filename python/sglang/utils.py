@@ -436,7 +436,7 @@ def wait_for_server(base_url: str, timeout: int = None) -> None:
         base_url: The base URL of the server
         timeout: Maximum time to wait in seconds. None means wait forever.
     """
-    start_time = time.time()
+    start_time = time.perf_counter()
     while True:
         try:
             response = requests.get(
@@ -455,7 +455,7 @@ def wait_for_server(base_url: str, timeout: int = None) -> None:
                 )
                 break
 
-            if timeout and time.time() - start_time > timeout:
+            if timeout and time.perf_counter() - start_time > timeout:
                 raise TimeoutError("Server did not become ready within timeout period")
         except requests.exceptions.RequestException:
             time.sleep(1)
