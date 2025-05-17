@@ -49,7 +49,8 @@ from sglang.srt.disaggregation.utils import (
     TransferBackend,
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
-from sglang.srt.hacks import kill_other_memory_occupying_processes, busy_wait_until_enough_memory
+from sglang.srt.hacks import kill_other_memory_occupying_processes, busy_wait_until_enough_memory, export_model_weights, \
+    import_model_weights
 from sglang.srt.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -2024,6 +2025,10 @@ class Scheduler(
         )
         self.memory_saver_adapter.pause()
         self.flush_cache()
+
+        # should directly use things on memory and no need to manually copy from gpu to cpu
+        self.stashed_model_weights = export_model_weights(self.tp_worker.worker.model_runner.model)
+
         return ReleaseMemoryOccupationReqOutput()
 
     def resume_memory_occupation(self, recv_req: ResumeMemoryOccupationReqInput):
@@ -2034,15 +2039,19 @@ class Scheduler(
         torch.distributed.barrier(self.tp_cpu_group)  # TODO use a better group
         busy_wait_until_enough_memory()
 
-        print(f"[Scheduler TP{self.tp_rank}] memory saver resume {time.time()=:.3f}")
+        print(f"[Scheduler TP{self.tp_rank}] memory saver resume start {time.time()=:.3f}")
         self.memory_saver_adapter.check_validity(caller_name="resume_memory_occupation")
         self.memory_saver_adapter.resume()
 
-        print(f"[Scheduler TP{self.tp_rank}] import static state {time.time()=:.3f}")
+        print(f"[Scheduler TP{self.tp_rank}] import static state start {time.time()=:.3f}")
         _import_static_state(
             self.tp_worker.worker.model_runner.model, self.stashed_model_static_state
         )
         del self.stashed_model_static_state
+
+        print(f"[Scheduler TP{self.tp_rank}] import weight start {time.time()=:.3f}")
+        import_model_weights(self.tp_worker.worker.model_runner.model, self.stashed_model_weights)
+        del self.stashed_model_weights
 
         print(f"[Scheduler TP{self.tp_rank}] resume END {time.time()=:.3f}")
         return ResumeMemoryOccupationReqOutput()

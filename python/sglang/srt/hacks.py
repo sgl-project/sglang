@@ -21,6 +21,16 @@ def busy_wait_until_enough_memory():
     print(f"[{time.time()=:.3f}] busy_wait_until_enough_memory see free memory {free_memory=}")
 
 
+def export_model_weights(model):
+    return dict(weights=[(name, weight.detach().clone()) for name, weight in model.named_weights()])
+
+
+def import_model_weights(model, data):
+    self_named_weights = dict(model.named_weights())
+    for name, tensor in data["weights"]:
+        self_named_weights[name][...] = tensor
+
+
 if __name__ == '__main__':
     print(f"{time.time()=} {torch.cuda.mem_get_info()=}")
     print(f"{time.time()=} kill start")
