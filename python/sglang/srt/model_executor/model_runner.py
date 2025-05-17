@@ -250,11 +250,7 @@ class ModelRunner:
     def model_specific_adjustment(self):
         server_args = self.server_args
 
-        if (
-            server_args.attention_backend is None
-            and server_args.decode_attention_backend is None
-            and server_args.prefill_attention_backend is None
-        ):
+        if server_args.attention_backend is None:
             """
             Auto select the fastest attention backend.
 
@@ -937,6 +933,9 @@ class ModelRunner:
             else self.server_args.attention_backend
         )
         if self.decode_attention_backend_str != self.prefill_attention_backend_str:
+            assert (
+                self.server_args.speculative_algorithm is None
+            ), "Currently HybridAttentionBackend does not support speculative decoding."
             from sglang.srt.layers.attention.hybrid_attn_backend import (
                 HybridAttnBackend,
             )
@@ -949,10 +948,27 @@ class ModelRunner:
                     self.prefill_attention_backend_str
                 ),
             )
+            if self.should_log:
+                logger.info(
+                    f"Using hybrid attention backend for decode and prefill: "
+                    f"decode_backend={self.decode_attention_backend_str}, "
+                    f"prefill_backend={self.prefill_attention_backend_str}."
+                )
+                logger.warning(
+                    f"Warning: Attention backend specified by --attention-backend or default backend might be overridden."
+                    f"The feature of hybrid attention backend is experimental and unstable. Please raise an issue if you encounter any problem."
+                )
         else:
             self.attn_backend = self._get_attention_backend_from_str(
                 self.server_args.attention_backend
             )
+
+        global_server_args_dict.update(
+            {
+                "decode_attention_backend": self.decode_attention_backend_str,
+                "prefill_attention_backend": self.prefill_attention_backend_str,
+            }
+        )
 
     def _get_attention_backend_from_str(self, backend_str: str):
         """Init attention kernel backend."""

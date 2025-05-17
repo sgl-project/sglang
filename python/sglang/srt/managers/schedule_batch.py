@@ -1587,16 +1587,28 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             extend_prefix_lens = self.prefix_lens
             extend_logprob_start_lens = self.extend_logprob_start_lens
 
-        # Create seq_lens_cpu when needed
-        if (
-            (
-                global_server_args_dict["use_mla_backend"]
-                and global_server_args_dict["attention_backend"] == "flashinfer"
+        def get_seq_lens_cpu():
+            # Handle the case of hybrid attention backend
+            if self.forward_mode.is_decode_or_idle():
+                attention_backend_str = global_server_args_dict[
+                    "decode_attention_backend"
+                ]
+            else:
+                attention_backend_str = global_server_args_dict[
+                    "prefill_attention_backend"
+                ]
+            return (
+                (
+                    global_server_args_dict["use_mla_backend"]
+                    and attention_backend_str == "flashinfer"
+                )
+                or attention_backend_str == "flashmla"
+                or attention_backend_str == "fa3"
+                or attention_backend_str == "cutlass_mla"
             )
-            or global_server_args_dict["attention_backend"] == "flashmla"
-            or global_server_args_dict["attention_backend"] == "fa3"
-            or global_server_args_dict["attention_backend"] == "cutlass_mla"
-        ):
+
+        # Create seq_lens_cpu when needed
+        if get_seq_lens_cpu():
             seq_lens_cpu = self.seq_lens.cpu()
         else:
             seq_lens_cpu = None
