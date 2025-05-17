@@ -4,6 +4,7 @@ Minimal HTTP load balancer for prefill and decode servers for testing.
 
 import logging
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from typing import List, Optional
 
 import aiohttp
@@ -37,6 +38,7 @@ class DownstreamServer:
         self.url = url
         self.max_concurrency_per_server = max_concurrency_per_server
         self._ongoing_request_num = 0
+        self._is_downstream_paused = False
 
     def is_full(self):
         return self._ongoing_request_num >= self.max_concurrency_per_server
@@ -51,6 +53,9 @@ class DownstreamServer:
             self._ongoing_request_num -= 1
 
     async def _ensure_resumed(self):
+        TODO
+
+    async def release_memory_occupation(self):
         TODO
 
 
@@ -106,6 +111,16 @@ async def handle_generate_request(request_data: dict):
         return await load_balancer.generate_stream(request_data, server)
     else:
         raise NotImplementedError
+
+
+@dataclass
+class ReleaseMemoryOccupationReqInput:
+    server_index: int
+
+
+@app.api_route("/release_memory_occupation", methods=["GET", "POST"])
+async def release_memory_occupation(obj: ReleaseMemoryOccupationReqInput):
+    await load_balancer.downstream_servers[obj.server_index].release_memory_occupation()
 
 
 def run(downstream_urls, host, port):
