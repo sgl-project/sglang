@@ -2022,6 +2022,8 @@ class Scheduler(
         return GetWeightsByNameReqOutput(parameter)
 
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
+        print(f"[Scheduler, TP{self.tp_rank}, {time.time()}] release start")
+
         self.memory_saver_adapter.check_validity(
             caller_name="release_memory_occupation"
         )
@@ -2038,6 +2040,7 @@ class Scheduler(
             hack_skip_cuda_empty_cache=True,
         )
 
+        print(f"[Scheduler, TP{self.tp_rank}, {time.time()}] release end")
         return ReleaseMemoryOccupationReqOutput()
 
     def resume_memory_occupation(self, recv_req: ResumeMemoryOccupationReqInput):
