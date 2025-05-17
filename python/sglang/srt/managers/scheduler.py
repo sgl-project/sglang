@@ -49,7 +49,7 @@ from sglang.srt.disaggregation.utils import (
     TransferBackend,
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
-from sglang.srt.hacks import kill_other_memory_occupying_processes
+from sglang.srt.hacks import kill_other_memory_occupying_processes, busy_wait_until_enough_memory
 from sglang.srt.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -2032,6 +2032,7 @@ class Scheduler(
         if self.tp_rank % tp_size_per_node == 0:
             kill_other_memory_occupying_processes()
         torch.distributed.barrier(self.tp_cpu_group)  # TODO use a better group
+        busy_wait_until_enough_memory()
 
         print(f"[Scheduler TP{self.tp_rank}] memory saver resume {time.time()=:.3f}")
         self.memory_saver_adapter.check_validity(caller_name="resume_memory_occupation")
