@@ -5,7 +5,6 @@ Minimal HTTP load balancer for prefill and decode servers for testing.
 import asyncio
 import dataclasses
 import logging
-import random
 from typing import List, Optional
 
 import aiohttp
@@ -45,14 +44,9 @@ class MiniLoadBalancer:
     def __init__(self, downstream_urls: List[str]):
         self.downstream_urls = downstream_urls
 
-    def select_pair(self):
-        # TODO: return some message instead of panic
-        assert len(self.prefill_configs) > 0, "No prefill servers available"
-        assert len(self.decode_servers) > 0, "No decode servers available"
-
-        prefill_config = random.choice(self.prefill_configs)
-        decode_server = random.choice(self.decode_servers)
-        return prefill_config.url, prefill_config.bootstrap_port, decode_server
+    async def select_server(self):
+        assert len(self.downstream_urls) > 0
+        return TODO
 
     async def generate_stream(
         self, modified_request, prefill_server, decode_server, endpoint="generate"
@@ -97,12 +91,12 @@ class MiniLoadBalancer:
 
 
 app = FastAPI()
-load_balancer = None
+load_balancer: Optional[MiniLoadBalancer] = None
 
 
 @app.post("/generate")
 async def handle_generate_request(request_data: dict):
-    server = load_balancer.select_server()
+    server = await load_balancer.select_server()
     if request_data.get("stream", False):
         return await load_balancer.generate_stream(request_data, server)
     else:
