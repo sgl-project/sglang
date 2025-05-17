@@ -28,7 +28,7 @@ def export_model_params(model):
 def import_model_param(model, data):
     self_named_weights = dict(model.named_weights())
     for name, tensor in data["weights"]:
-        self_named_weights[name][...] = tensor
+        self_named_weights[name][...] = tensor.to("cuda")
 
 
 if __name__ == '__main__':
