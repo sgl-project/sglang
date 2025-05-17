@@ -19,7 +19,6 @@ import warnings
 from pathlib import Path
 from typing import Dict, Optional, Type, Union
 
-import transformers
 from huggingface_hub import snapshot_download
 from transformers import (
     AutoConfig,

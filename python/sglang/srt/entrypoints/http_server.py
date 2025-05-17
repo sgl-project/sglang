@@ -189,6 +189,7 @@ async def health_generate(request: Request) -> Response:
         if _global_state.tokenizer_manager.last_receive_tstamp > tic:
             task.cancel()
             _global_state.tokenizer_manager.rid_to_state.pop(rid, None)
+            _global_state.tokenizer_manager.health_check_failed = False
             return Response(status_code=200)
 
     task.cancel()
@@ -202,6 +203,7 @@ async def health_generate(request: Request) -> Response:
         f"last_heartbeat time: {last_receive_time}"
     )
     _global_state.tokenizer_manager.rid_to_state.pop(rid, None)
+    _global_state.tokenizer_manager.health_check_failed = True
     return Response(status_code=503)
 
 
