@@ -2059,8 +2059,9 @@ class Scheduler(
         tp_size_per_node = self.tp_size // self.server_args.nnodes
         if self.tp_rank % tp_size_per_node == 0:
             self.other_process_killer.kill()
-        torch.distributed.barrier(self.tp_cpu_group)  # TODO use a better group
-        busy_wait_until_enough_memory()
+
+        # torch.distributed.barrier(self.tp_cpu_group)  # TODO use a better group
+        # busy_wait_until_enough_memory()
 
         # print(f"[Scheduler, TP{self.tp_rank}, {time.time()}] memory saver resume start")
         # self.memory_saver_adapter.check_validity(caller_name="resume_memory_occupation")
