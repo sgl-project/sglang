@@ -4,12 +4,13 @@ from types import SimpleNamespace
 from sglang.srt.utils import kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval
 from sglang.test.test_utils import (
-    DEFAULT_MTP_MODEL_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
 )
+
+DEFAULT_MTP_MODEL_FOR_TEST = "XiaomiMiMo/MiMo-7B-RL"
 
 
 class TestMTP(CustomTestCase):
@@ -25,8 +26,6 @@ class TestMTP(CustomTestCase):
                 "--trust-remote-code",
                 "--speculative-algorithm",
                 "EAGLE",
-                "--speculative-draft-model-path",
-                DEFAULT_MTP_MODEL_FOR_TEST,
                 "--speculative-num-steps",
                 "1",
                 "--speculative-eagle-topk",
