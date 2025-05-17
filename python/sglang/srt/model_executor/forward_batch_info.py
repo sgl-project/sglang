@@ -218,6 +218,9 @@ class ForwardBatch:
     # For input embeddings
     input_embeds: Optional[torch.tensor] = None
 
+    # For cross-encoder model
+    token_type_ids: Optional[int] = None
+
     # Sampling info
     sampling_info: SamplingBatchInfo = None
 
@@ -289,6 +292,7 @@ class ForwardBatch:
             spec_info=batch.spec_info,
             capture_hidden_mode=batch.capture_hidden_mode,
             input_embeds=batch.input_embeds,
+            token_type_ids=batch.token_type_ids,
             extend_input_logprob_token_ids_gpu=extend_input_logprob_token_ids_gpu,
         )
 
@@ -336,8 +340,8 @@ class ForwardBatch:
             ret.extend_prefix_lens = torch.tensor(
                 batch.extend_prefix_lens, dtype=torch.int32
             ).to(device, non_blocking=True)
+            ret.extend_num_tokens = batch.extend_num_tokens
             if model_runner.server_args.attention_backend != "torch_native":
-                ret.extend_num_tokens = batch.extend_num_tokens
                 positions, ret.extend_start_loc = compute_position_triton(
                     ret.extend_prefix_lens,
                     ret.extend_seq_lens,
