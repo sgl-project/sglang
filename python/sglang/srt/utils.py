@@ -125,10 +125,6 @@ builtins.FP8_E4M3_MAX = FP8_E4M3_MAX
 builtins.FP8_E4M3_MIN = FP8_E4M3_MIN
 
 
-def is_rocm() -> bool:
-    return torch.cuda.is_available() and torch.version.hip
-
-
 def is_cuda():
     return torch.cuda.is_available() and torch.version.cuda
 
@@ -2106,3 +2102,7 @@ def log_info_on_rank0(logger, msg):
         logger.info(msg)
     else:
         logger.debug(msg)
+
+
+def dispose_tensor(x: torch.Tensor):
+    x.set_(torch.empty((0,), device=x.device, dtype=x.dtype))
