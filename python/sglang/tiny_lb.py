@@ -31,9 +31,14 @@ def setup_logger():
 logger = setup_logger()
 
 
+class DownstreamServer:
+    def __init__(self, url: str):
+        self.url = url
+
+
 class MiniLoadBalancer:
-    def __init__(self, downstream_urls: List[str]):
-        self.downstream_urls = downstream_urls
+    def __init__(self, downstream_servers: List[DownstreamServer]):
+        self.downstream_servers = downstream_servers
 
     async def select_server(self):
         assert len(self.downstream_urls) > 0
@@ -103,4 +108,5 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    run(args.downstream, args.host, args.port)
+    downstream_servers = [DownstreamServer(url) for url in args.downstream]
+    run(downstream_servers, args.host, args.port)
