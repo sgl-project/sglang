@@ -52,7 +52,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, EPMoE
+from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, EPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPDispatcher
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import select_experts
@@ -230,13 +230,7 @@ class DeepseekV2MoE(nn.Module):
 
         self.gate = MoEGate(config=config, prefix=add_prefix("gate", prefix))
 
-        MoEImpl = (
-            DeepEPMoE
-            if global_server_args_dict["enable_deepep_moe"]
-            else (EPMoE if global_server_args_dict["enable_ep_moe"] else FusedMoE)
-        )
-
-        self.experts = MoEImpl(
+        self.experts = get_moe_impl_class()(
             num_experts=config.n_routed_experts + self.n_share_experts_fusion,
             top_k=config.num_experts_per_tok + min(self.n_share_experts_fusion, 1),
             hidden_size=config.hidden_size,
@@ -259,26 +253,19 @@ class DeepseekV2MoE(nn.Module):
         if config.n_shared_experts is not None and self.n_share_experts_fusion == 0:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
             # disable tp for shared experts when enable deepep moe
-            if not global_server_args_dict["enable_deepep_moe"]:
-                self.shared_experts = DeepseekV2MLP(
-                    hidden_size=config.hidden_size,
-                    intermediate_size=intermediate_size,
-                    hidden_act=config.hidden_act,
-                    quant_config=quant_config,
-                    reduce_results=False,
-                    prefix=add_prefix("shared_experts", prefix),
-                )
-            else:
-                self.shared_experts = DeepseekV2MLP(
-                    hidden_size=config.hidden_size,
-                    intermediate_size=intermediate_size,
-                    hidden_act=config.hidden_act,
-                    quant_config=quant_config,
-                    reduce_results=False,
-                    prefix=add_prefix("shared_experts", prefix),
-                    tp_rank=0,
-                    tp_size=1,
-                )
+            self.shared_experts = DeepseekV2MLP(
+                hidden_size=config.hidden_size,
+                intermediate_size=intermediate_size,
+                hidden_act=config.hidden_act,
+                quant_config=quant_config,
+                reduce_results=False,
+                prefix=add_prefix("shared_experts", prefix),
+                **(
+                    dict(tp_rank=0, tp_size=1)
+                    if global_server_args_dict["enable_deepep_moe"]
+                    else {}
+                ),
+            )
 
         self.top_k = config.num_experts_per_tok
 
@@ -1341,28 +1328,16 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
 
         if self.attn_tp_size != 1:
-            if self.input_is_scattered:
-                tensor_list = list(hidden_states.tensor_split(self.attn_tp_size))
-                hidden_states = tensor_list[self.attn_tp_rank]
-                attn_tp_reduce_scatter(hidden_states, tensor_list)
-                if hidden_states.shape[0] != 0:
-                    hidden_states, residual = self.post_attention_layernorm(
-                        hidden_states, residual
-                    )
-            else:
-                if self.attn_tp_rank == 0:
-                    hidden_states += residual
-                tensor_list = list(hidden_states.tensor_split(self.attn_tp_size))
-                hidden_states = tensor_list[self.attn_tp_rank]
-                attn_tp_reduce_scatter(hidden_states, tensor_list)
-                residual = hidden_states
-                if hidden_states.shape[0] != 0:
-                    hidden_states = self.post_attention_layernorm(hidden_states)
-        else:
-            if hidden_states.shape[0] != 0:
-                hidden_states, residual = self.post_attention_layernorm(
-                    hidden_states, residual
-                )
+            tensor_list = list(hidden_states.tensor_split(self.attn_tp_size))
+            hidden_states = tensor_list[self.attn_tp_rank]
+            attn_tp_reduce_scatter(hidden_states, tensor_list)
+            if not self.input_is_scattered:
+                residual = residual.tensor_split(self.attn_tp_size)[self.attn_tp_rank]
+
+        if hidden_states.shape[0] != 0:
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual
+            )
 
         if not (
             self._enable_moe_dense_fully_dp()
@@ -1743,12 +1718,7 @@ class DeepseekV2ForCausalLM(nn.Module):
 
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
-        MoEImpl = (
-            DeepEPMoE
-            if global_server_args_dict["enable_deepep_moe"]
-            else (EPMoE if global_server_args_dict["enable_ep_moe"] else FusedMoE)
-        )
-        expert_params_mapping = MoEImpl.make_expert_params_mapping(
+        expert_params_mapping = get_moe_impl_class().make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
