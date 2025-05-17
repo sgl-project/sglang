@@ -129,7 +129,6 @@ from sglang.srt.utils import (
     DynamicGradMode,
     broadcast_pyobj,
     configure_logger,
-    crash_on_warnings,
     disable_request_logging,
     get_bool_env_var,
     get_zmq_socket,
