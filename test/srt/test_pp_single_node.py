@@ -4,7 +4,6 @@ python3 -m unittest test_pp_single_node.TestPPAccuracy.test_gsm8k
 python3 -m unittest test_pp_single_node.TestFixedBugs.test_chunked_prefill_with_small_bs
 """
 
-import os
 import time
 import unittest
 from types import SimpleNamespace
