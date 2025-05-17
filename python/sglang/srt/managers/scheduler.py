@@ -2026,13 +2026,20 @@ class Scheduler(
         return ReleaseMemoryOccupationReqOutput()
 
     def resume_memory_occupation(self, recv_req: ResumeMemoryOccupationReqInput):
+        print(f"[Scheduler TP{self.tp_rank}] resume kill others {time.time()=:.3f}")
         kill_other_memory_occupying_processes()
+
+        print(f"[Scheduler TP{self.tp_rank}] memory saver resume {time.time()=:.3f}")
         self.memory_saver_adapter.check_validity(caller_name="resume_memory_occupation")
         self.memory_saver_adapter.resume()
+
+        print(f"[Scheduler TP{self.tp_rank}] import static state {time.time()=:.3f}")
         _import_static_state(
             self.tp_worker.worker.model_runner.model, self.stashed_model_static_state
         )
         del self.stashed_model_static_state
+
+        print(f"[Scheduler TP{self.tp_rank}] resume END {time.time()=:.3f}")
         return ResumeMemoryOccupationReqOutput()
 
     def slow_down(self, recv_req: SlowDownReqInput):

@@ -933,7 +933,9 @@ class TokenizerManager:
         request: Optional[fastapi.Request] = None,
     ):
         self.auto_create_handle_loop()
+        print(f"[TokenizerManager] resume START {time.time()=:.3f}")
         await self.resume_memory_occupation_communicator(obj)
+        print(f"[TokenizerManager] resume END {time.time()=:.3f}")
 
     async def slow_down(
         self,
