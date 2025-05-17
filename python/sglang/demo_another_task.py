@@ -54,10 +54,19 @@ def worker(rank, world_size):
         print(f"[GPU {rank}] Iteration {iteration}: Avg time = {avg_time:.3f} ms")
 
     torch.cuda.synchronize()
+
     print(f"[GPU {rank}, {time.time()}] del start")
     del big_tensors, a, b, c, x, y, z, t
+
+    print(f"[GPU {rank}, {time.time()}] {torch.cuda.mem_get_info()=}")
     print(f"[GPU {rank}, {time.time()}] empty_cache start")
     torch.cuda.empty_cache()
+
+    print(f"[GPU {rank}, {time.time()}] synchronize start")
+    torch.cuda.synchronize()
+    print(f"[GPU {rank}, {time.time()}] synchronize end")
+
+    print(f"[GPU {rank}, {time.time()}] {torch.cuda.mem_get_info()=}")
 
 
 def main():
