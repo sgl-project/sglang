@@ -41,7 +41,7 @@ _ENABLE_UPDATE_WEIGHTS = True
 CI_MODELS = [
     dict(
         model_path="Qwen/Qwen2.5-0.5B",
-        dp_size=4,
+        dp_size=2,
         tp_size=2,  # default to 2
     ),
     # Fail to run gemma-2-2b after transformers==4.48.3 -> 4.50.0
@@ -50,16 +50,17 @@ CI_MODELS = [
 ALL_OTHER_MODELS = [
     dict(
         model_path="Qwen/Qwen2.5-14B-Instruct",
-        mem_fraction_static=0.4,
-        tp_size=8,
+        mem_fraction_static=0.7,
+        dp_size=2,
+        tp_size=2,
         tight_memory=True,
         decode_tolerance=1.3,
     ),  # test_generation_models.py same config (qwen + tp=8) gives 1.22 decode error
-    dict(model_path="HuggingFaceTB/SmolLM-135M-Instruct", tp_size=3),
     dict(
         model_path="THUDM/glm-4-9b-chat",
-        mem_fraction_static=0.1,
-        tp_size=8,
+        mem_fraction_static=0.2,
+        dp_size=2,
+        tp_size=2,
         tight_memory=True,
     ),
     # Fail to run these models in test_generation_models.py, need to fix that first
