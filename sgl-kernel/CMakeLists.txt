@@ -45,7 +45,7 @@ include(FetchContent)
 FetchContent_Declare(
     repo-cutlass
     GIT_REPOSITORY https://github.com/NVIDIA/cutlass
-    GIT_TAG        ad7b2f5e84fcfa124cb02b91d5bd26d238c0459e
+    GIT_TAG        f115c3f85467d5d9619119d1dbeb9c03c3d73864
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-cutlass)
@@ -207,6 +207,7 @@ set(SOURCES
     "csrc/moe/moe_fused_gate.cu"
     "csrc/moe/moe_topk_softmax_kernels.cu"
     "csrc/moe/fp8_blockwise_moe_kernel.cu"
+    "csrc/moe/prepare_moe_input.cu"
     "csrc/speculative/eagle_utils.cu"
     "csrc/speculative/speculative_sampling.cu"
     "csrc/speculative/packbit.cu"
