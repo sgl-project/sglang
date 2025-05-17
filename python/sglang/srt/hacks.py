@@ -12,11 +12,11 @@ def kill_other_memory_occupying_processes():
 
     while True:
         free_memory, _ = torch.cuda.mem_get_info()
-        if free_memory > 50_000_000_000:
+        if free_memory > 70_000_000_000:
             break
         time.sleep(0.001)
 
-    print(f"[{time.time()=:.3f}] kill_other_memory_occupying_processes see free memory")
+    print(f"[{time.time()=:.3f}] kill_other_memory_occupying_processes see free memory {free_memory=}")
 
 
 if __name__ == '__main__':
