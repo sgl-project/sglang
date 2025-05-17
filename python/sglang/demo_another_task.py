@@ -4,10 +4,13 @@ import time
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+import torch_memory_saver
 from setproctitle import setproctitle
 
 
 def worker(rank, world_size):
+    memory_saver = torch_memory_saver.TorchMemorySaver(enable_use_mem_pool=False)
+
     os.environ['MASTER_ADDR'] = '127.0.0.1'
     os.environ['MASTER_PORT'] = '29500'
     dist.init_process_group(backend='nccl', rank=rank, world_size=world_size)
@@ -57,12 +60,17 @@ def worker(rank, world_size):
     torch.cuda.synchronize()
     torch.distributed.barrier(device_ids=[rank])
 
-    print(f"[GPU {rank}, {time.time()}] del start")
-    del big_tensors, a, b, c, x, y, z, t
+    if 1:
+        print(f"[GPU {rank}, {time.time()}] pause start")
+        memory_saver.pause()
 
-    print(f"[GPU {rank}, {time.time()}] {torch.cuda.mem_get_info()=}")
-    print(f"[GPU {rank}, {time.time()}] empty_cache start")
-    torch.cuda.empty_cache()
+    if 0:
+        print(f"[GPU {rank}, {time.time()}] del start")
+        del big_tensors, a, b, c, x, y, z, t
+
+        print(f"[GPU {rank}, {time.time()}] {torch.cuda.mem_get_info()=}")
+        print(f"[GPU {rank}, {time.time()}] empty_cache start")
+        torch.cuda.empty_cache()
 
     print(f"[GPU {rank}, {time.time()}] synchronize start")
     torch.cuda.synchronize()
