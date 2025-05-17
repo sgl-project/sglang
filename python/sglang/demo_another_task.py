@@ -13,6 +13,10 @@ def worker(rank, world_size):
     device = torch.device(f'cuda:{rank}')
     print(f"[GPU {rank}] started")
 
+    # TODO use more memory
+    big_tensor = torch.empty(1024 * 1024 * 1024 * 75, dtype=torch.int8)
+    print(f"[GPU {rank}] allocated big tensor {big_tensor.shape=}")
+
     iteration = 0
     while True:
         start_event = torch.cuda.Event(enable_timing=True)
