@@ -57,16 +57,16 @@ def worker(args, rank, world_size):
         thread.daemon = True
         thread.start()
 
-    if args.stop_mode == "torch_empty_cache":
-        recv_socket = _create_recv_socket(rank)
-
     os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = "29500"
+    os.environ["MASTER_PORT"] = "29400"
     dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
     torch.cuda.set_device(rank)
     device = torch.device(f"cuda:{rank}")
     setproctitle(f"demo_another_task::worker::{rank}")
     print(f"[GPU {rank}] started")
+
+    if args.stop_mode == "torch_empty_cache":
+        recv_socket = _create_recv_socket(rank)
 
     # TODO use more memory
     big_tensors = [
