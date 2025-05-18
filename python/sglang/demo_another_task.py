@@ -12,24 +12,31 @@ from setproctitle import setproctitle
 from sglang.srt.utils import get_zmq_socket
 
 
-def worker_background_thread(rank: int):
+def _create_recv_socket(rank: int):
     port = 50000 + rank
-
-    memory_saver = torch_memory_saver.TorchMemorySaver(enable_use_mem_pool=False)
-
     context = zmq.Context(2)
-    recv_socket = get_zmq_socket(context, zmq.PULL, f"tcp://localhost:{port}", True)
+    return get_zmq_socket(context, zmq.PULL, f"tcp://localhost:{port}", True)
 
+
+def _try_recv():
+    try:
+        recv_req = recv_socket.recv_pyobj(zmq.NOBLOCK)
+        print(f"{recv_req=}")
+        return True
+    except zmq.ZMQError:
+        return False
+
+
+def worker_background_thread(rank: int):
+    memory_saver = torch_memory_saver.TorchMemorySaver(enable_use_mem_pool=False)
+    recv_socket = _create_recv_socket(rank)
     print(f"worker_background_thread init {port=}")
 
     while True:
-        try:
-            recv_req = recv_socket.recv_pyobj(zmq.NOBLOCK)
-            print(f"{recv_req=}")
+        if _try_recv():
             break
-        except zmq.ZMQError:
+        else:
             time.sleep(0.001)
-            continue
 
     print(f"[GPU {rank}, {time.time()}] pause start")
     memory_saver.pause()
@@ -40,9 +47,12 @@ def worker_background_thread(rank: int):
 
 
 def worker(args, rank, world_size):
-    thread = threading.Thread(target=worker_background_thread, args=(rank,))
-    thread.daemon = True
-    thread.start()
+    if args.stop_mode == 'background_thread_memory_saver':
+        thread = threading.Thread(target=worker_background_thread, args=(rank,))
+        thread.daemon = True
+        thread.start()
+
+    if args.stop_mode == 'torch_empty_cache':
 
     os.environ['MASTER_ADDR'] = '127.0.0.1'
     os.environ['MASTER_PORT'] = '29500'
@@ -63,12 +73,14 @@ def worker(args, rank, world_size):
     # num_iterations = 3
 
     for iteration in range(num_iterations):
+        if args.stop_mode == 'torch_empty_cache':
+
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
 
         start_event.record()
 
-        num_repeat = 10000
+        num_repeat = 10
         for _ in range(num_repeat):
             a = torch.randn(1024, 1024, device=device)
             b = torch.randn(1024, 1024, device=device)
