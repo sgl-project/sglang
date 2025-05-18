@@ -174,6 +174,7 @@ class ServerArgs:
         Literal["stat", "per_pass", "per_token"]
     ] = None
     expert_distribution_recorder_buffer_size: Optional[int] = None
+    deepep_config: Optional[str] = None
     enable_torch_compile: bool = False
     torch_compile_max_bs: int = 32
     cuda_graph_max_bs: Optional[int] = None
@@ -1280,6 +1281,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.expert_distribution_recorder_buffer_size,
             help="Circular buffer size of expert distribution recorder. Set to -1 to denote infinite buffer.",
+        )
+        parser.add_argument(
+            "--deepep-config",
+            type=str,
+            default=ServerArgs.deepep_config,
+            help="Tuned DeepEP config suitable for your own cluster.",
         )
 
         parser.add_argument(

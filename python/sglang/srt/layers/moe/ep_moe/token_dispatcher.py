@@ -1,11 +1,14 @@
+import logging
+
 from sglang.srt.layers.quantization.deep_gemm import _ENABLE_JIT_DEEPGEMM
 from sglang.srt.managers.expert_distribution import (
     get_global_expert_distribution_recorder,
 )
-from sglang.srt.utils import DeepEPMode
+from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.utils import DeepEPMode, load_json_config
 
 try:
-    from deep_ep import Buffer
+    from deep_ep import Buffer, Config
 
     from sglang.srt.layers.quantization.fp8_kernel import (
         sglang_per_token_group_quant_fp8,
@@ -28,6 +31,8 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
+logger = logging.getLogger(__name__)
+
 
 class DeepEPDispatchMode(IntEnum):
     NORMAL = auto()
@@ -35,7 +40,6 @@ class DeepEPDispatchMode(IntEnum):
 
 
 class DeepEPBuffer:
-
     _buffer = None
     _dispatch_mode: Optional[DeepEPDispatchMode] = None
     _hidden_size: Optional[int] = None
@@ -63,8 +67,10 @@ class DeepEPBuffer:
         if deepep_mode.enable_normal():
             hidden_bytes = hidden_size * param_bytes
             for config in (
-                Buffer.get_dispatch_config(group.size()),
-                Buffer.get_combine_config(group.size()),
+                _DeepEPConfig.get_instance().normal_dispatch_config
+                or Buffer.get_dispatch_config(group.size()),
+                _DeepEPConfig.get_instance().normal_combine_config
+                or Buffer.get_combine_config(group.size()),
             ):
                 num_nvl_bytes = max(
                     config.get_nvl_buffer_size_hint(hidden_bytes, group.size()),
@@ -114,6 +120,28 @@ class DeepEPBuffer:
         if cls._dispatch_mode == DeepEPDispatchMode.NORMAL:
             cls.clean_buffer()
         cls._dispatch_mode = DeepEPDispatchMode.LOW_LATENCY
+
+
+class _DeepEPConfig:
+    _instance = None
+
+    def __init__(self):
+        config_str = global_server_args_dict["deepep_config"]
+        if config_str:
+            config_parsed = load_json_config(config_str)
+            if torch.distributed.get_rank() == 0:
+                logger.info(f"Use DeepEP Config: {config_parsed}")
+            self.normal_dispatch_config = Config(**config_parsed["normal_dispatch"])
+            self.normal_combine_config = Config(**config_parsed["normal_combine"])
+        else:
+            self.normal_dispatch_config = None
+            self.normal_combine_config = None
+
+    @classmethod
+    def get_instance(cls):
+        if cls._instance is None:
+            cls._instance = _DeepEPConfig()
+        return cls._instance
 
 
 class _DeepEPDispatcherImplBase:
@@ -298,6 +326,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             async_finish=self.async_finish,
             allocate_on_comm_stream=(previous_event is not None) and self.async_finish,
             expert_alignment=128 if _ENABLE_JIT_DEEPGEMM else 1,
+            config=_DeepEPConfig.get_instance().normal_dispatch_config,
         )
 
         get_global_expert_distribution_recorder().on_deepep_dispatch_normal(
@@ -404,6 +433,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             async_finish=self.async_finish,
             previous_event=previous_event,
             allocate_on_comm_stream=previous_event is not None,
+            config=_DeepEPConfig.get_instance().normal_combine_config,
         )
         return combined_x, event
 
