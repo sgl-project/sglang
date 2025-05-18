@@ -308,22 +308,23 @@ class CustomAllreduce:
         Creates a shared buffer and returns a list of pointers
         representing the buffer on all processes in the group.
         """
-        lib = CudaRTLibrary()
-        pointer = lib.cudaMalloc(size_in_bytes)
-        handle = lib.cudaIpcGetMemHandle(pointer)
-        world_size = dist.get_world_size(group=group)
-        rank = dist.get_rank(group=group)
-        handles = [None] * world_size
-        dist.all_gather_object(handles, handle, group=group)
+        with with_tms_disable_region():
+            lib = CudaRTLibrary()
+            pointer = lib.cudaMalloc(size_in_bytes)
+            handle = lib.cudaIpcGetMemHandle(pointer)
+            world_size = dist.get_world_size(group=group)
+            rank = dist.get_rank(group=group)
+            handles = [None] * world_size
+            dist.all_gather_object(handles, handle, group=group)
 
-        pointers: List[int] = []
-        for i, h in enumerate(handles):
-            if i == rank:
-                pointers.append(pointer.value)  # type: ignore
-            else:
-                pointers.append(lib.cudaIpcOpenMemHandle(h).value)  # type: ignore
+            pointers: List[int] = []
+            for i, h in enumerate(handles):
+                if i == rank:
+                    pointers.append(pointer.value)  # type: ignore
+                else:
+                    pointers.append(lib.cudaIpcOpenMemHandle(h).value)  # type: ignore
 
-        return pointers
+            return pointers
 
     @staticmethod
     def free_shared_buffer(
@@ -346,8 +347,7 @@ class CustomAllreduce:
         finally:
             self._IS_CAPTURING = False
             if not self.disabled:
-                with with_tms_disable_region():
-                    self.register_graph_buffers()
+                self.register_graph_buffers()
 
     def _get_ipc_meta(self, inp: torch.Tensor):
         # _share_cuda_() doesn't accept meta buffer not allocated from
