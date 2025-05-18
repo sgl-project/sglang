@@ -33,6 +33,7 @@ class ExpertLocationMetadata:
     physical_to_logical_map: torch.Tensor  # (layers, num_physical_experts)
     logical_to_all_physical_map: torch.Tensor  # (layers, num_logical_experts, X)
     logical_to_all_physical_map_num_valid: torch.Tensor  # (layers, num_logical_experts)
+    logical_to_rank_dispatch_physical_map: torch.Tensor  # (layers, num_logical_experts)
 
     # -------------------------------- properties ------------------------------------
 
@@ -66,9 +67,11 @@ class ExpertLocationMetadata:
         num_layers_2, num_logical_experts_1 = (
             self.logical_to_all_physical_map_num_valid.shape
         )
-        # TODO pr-chain: enable this later
-        # assert num_layers_0 == num_layers_1 == num_layers_2 == num_layers_3
-        # assert num_logical_experts_0 == num_logical_experts_1 == num_logical_experts_2
+        num_layers_3, num_logical_experts_2 = (
+            self.logical_to_rank_dispatch_physical_map.shape
+        )
+        assert num_layers_0 == num_layers_1 == num_layers_2 == num_layers_3
+        assert num_logical_experts_0 == num_logical_experts_1 == num_logical_experts_2
         assert num_physical_experts_0 == num_physical_experts_1
 
     # -------------------------------- construction ------------------------------------
@@ -160,6 +163,13 @@ class ExpertLocationMetadata:
             physical_to_logical_map=physical_to_logical_map,
             logical_to_all_physical_map=logical_to_all_physical_map_padded,
             logical_to_all_physical_map_num_valid=logical_to_all_physical_map_num_valid,
+            logical_to_rank_dispatch_physical_map=compute_logical_to_rank_dispatch_physical_map(
+                logical_to_all_physical_map=logical_to_all_physical_map,
+                logical_to_all_physical_map_num_valid=logical_to_all_physical_map_num_valid,
+                num_gpus=ep_size,
+                num_physical_experts=num_physical_experts,
+                ep_rank=torch.distributed.get_rank(),
+            ),
         )
 
 
@@ -211,6 +221,51 @@ def _pad_nested_array(arr, pad_value):
         for outer in arr
     ]
     return padded
+
+
+# TODO use more sophisticated approaches
+def compute_logical_to_rank_dispatch_physical_map(
+    logical_to_all_physical_map: torch.Tensor,
+    logical_to_all_physical_map_num_valid: torch.Tensor,
+    num_gpus: int,
+    num_physical_experts: int,
+    ep_rank: int,
+    base_seed: int = 42,
+):
+    device = logical_to_all_physical_map.device
+
+    num_local_physical_experts = num_physical_experts // num_gpus
+    num_layers, num_logical_experts, _ = logical_to_all_physical_map.shape
+
+    g = torch.Generator(device=device)
+    g.manual_seed(base_seed + ep_rank)
+
+    output_shape = (num_layers, num_logical_experts)
+    chosen_index = (
+        torch.randint(
+            0, 65536, output_shape, dtype=torch.int32, device=device, generator=g
+        )
+        % logical_to_all_physical_map_num_valid
+    )
+    logical_to_rank_dispatch_physical_map = torch.gather(
+        logical_to_all_physical_map, dim=2, index=chosen_index.unsqueeze(-1)
+    ).squeeze(-1)
+    assert logical_to_rank_dispatch_physical_map.shape == output_shape
+
+    for index in range(logical_to_all_physical_map_num_valid.max().item()):
+        partial_logical_to_all_physical_map = logical_to_all_physical_map[:, :, index]
+        is_valid = partial_logical_to_all_physical_map != -1
+        is_same_gpu = (
+            partial_logical_to_all_physical_map // num_local_physical_experts
+        ) == ep_rank
+        logical_to_rank_dispatch_physical_map = torch.where(
+            is_valid & is_same_gpu,
+            partial_logical_to_all_physical_map,
+            logical_to_rank_dispatch_physical_map,
+        )
+
+    assert torch.all(logical_to_rank_dispatch_physical_map != -1)
+    return logical_to_rank_dispatch_physical_map
 
 
 @dataclass
