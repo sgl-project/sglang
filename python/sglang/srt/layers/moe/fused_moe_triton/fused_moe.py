@@ -24,12 +24,12 @@ from sglang.srt.layers.quantization.int8_kernel import (
     sglang_per_token_group_quant_int8,
 )
 from sglang.srt.utils import (
+    add_rank_zero_filter,
     direct_register_custom_op,
     get_bool_env_var,
     get_device_name,
     is_cuda,
     is_hip,
-    log_info_on_rank0,
 )
 
 _is_hip = is_hip()
@@ -931,6 +931,7 @@ def get_moe_configs(
     kernel on a given batch size bs, the closest batch size in the grid should
     be picked and the associated configuration chosen to invoke the kernel.
     """
+    add_rank_zero_filter(logger)
 
     # First look up if an optimized configuration is available in the configs
     # directory
@@ -946,9 +947,7 @@ def get_moe_configs(
             # For example, updating the Triton version might cause all old configs to become suboptimal.
             # To achieve the best performance, consider re-tuning the Triton fused MOE kernel in your environment.
             # For the tuning method, refer to: https://github.com/sgl-project/sglang/tree/main/benchmark/kernels/fused_moe_triton
-            log_info_on_rank0(
-                logger, f"Using MoE kernel config from {config_file_path}."
-            )
+            logger.info(f"Using MoE kernel config from {config_file_path}.")
             # If a configuration has been found, return it
             return {int(key): val for key, val in json.load(f).items()}
 

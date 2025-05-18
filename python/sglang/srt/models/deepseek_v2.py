@@ -85,11 +85,11 @@ from sglang.srt.utils import (
     BumpAllocator,
     DeepEPMode,
     add_prefix,
+    add_rank_zero_filter,
     get_bool_env_var,
     get_int_env_var,
     is_cuda,
     is_hip,
-    log_info_on_rank0,
 )
 
 _is_hip = is_hip()
@@ -1444,6 +1444,7 @@ class DeepseekV2ForCausalLM(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        add_rank_zero_filter(logger)
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
@@ -1474,8 +1475,7 @@ class DeepseekV2ForCausalLM(nn.Module):
             ):
                 self.n_share_experts_fusion = 0
                 global_server_args_dict["n_share_experts_fusion"] = 0
-                log_info_on_rank0(
-                    logger,
+                logger.info(
                     "Only Deepseek V3/R1 on NV-platform can use shared experts fusion optimization. Shared experts fusion optimization is disabled.",
                 )
             else:
@@ -1492,8 +1492,7 @@ class DeepseekV2ForCausalLM(nn.Module):
             ):
                 self.n_share_experts_fusion = self.tp_size
                 global_server_args_dict["n_share_experts_fusion"] = self.tp_size
-                log_info_on_rank0(
-                    logger,
+                logger.info(
                     "Deepseek V3/R1 with fp8 can use shared experts fusion optimization when SM version >=90. Shared experts fusion optimization is enabled.",
                 )
 

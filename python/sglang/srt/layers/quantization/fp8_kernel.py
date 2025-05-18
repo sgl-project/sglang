@@ -25,12 +25,12 @@ import triton.language as tl
 
 from sglang.srt.layers.quantization.deep_gemm import _ENABLE_JIT_DEEPGEMM
 from sglang.srt.utils import (
+    add_rank_zero_filter,
     direct_register_custom_op,
     get_device_core_count,
     get_device_name,
     is_cuda,
     is_hip,
-    log_info_on_rank0,
     supports_custom_op,
 )
 
@@ -688,7 +688,7 @@ def get_w8a8_block_fp8_configs(
     kernel on a given batch size bs, the closest batch size in the grid should
     be picked and the associated configuration chosen to invoke the kernel.
     """
-
+    add_rank_zero_filter(logger)
     # First look up if an optimized configuration is available in the configs
     # directory
     device_name = get_device_name().replace(" ", "_")
@@ -699,8 +699,7 @@ def get_w8a8_block_fp8_configs(
     )
     if os.path.exists(config_file_path):
         with open(config_file_path) as f:
-            log_info_on_rank0(
-                logger,
+            logger.info(
                 f"Using configuration from {config_file_path} for W8A8 Block FP8 kernel.",
             )
             # If a configuration has been found, return it

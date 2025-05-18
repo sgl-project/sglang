@@ -2110,11 +2110,50 @@ class BumpAllocator:
         return output
 
 
-def log_info_on_rank0(logger, msg):
-    from sglang.srt.distributed import get_tensor_model_parallel_rank
+class RankZeroFilter(logging.Filter):
+    """Filter that only allows INFO level logs from rank 0, but allows all other levels from any rank."""
 
-    if get_tensor_model_parallel_rank() == 0:
-        logger.info(msg)
+    def __init__(self, is_rank_zero: Optional[bool] = None):
+        super().__init__()
+        if is_rank_zero is None:
+            from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+            self.is_rank_zero = get_tensor_model_parallel_rank() == 0
+        else:
+            self.is_rank_zero = is_rank_zero
+
+    def filter(self, record):
+        if record.levelno == logging.INFO:
+            return self.is_rank_zero
+        return True
+
+
+def add_rank_zero_filter(logger, is_rank_zero: Optional[bool] = None):
+    """Add RankZeroFilter to a logger if it doesn't already have one.
+
+    This ensures INFO level logs only appear on rank 0.
+
+    IMPORTANT: To avoid circular import issues, DO NOT call this function at the module level
+    immediately after creating a logger. Instead, call it:
+    1. Inside a function or method that's called after the distributed environment is initialized
+    2. Inside a class's __init__ method
+    3. Inside a delayed initialization function
+
+    Example (recommended):
+    ```python
+    logger = logging.getLogger(__name__)
+
+    def some_function():
+        # Call this when the function is used, not at import time
+        add_rank_zero_filter(logger)
+        logger.info("This will only show on rank 0")
+    ```
+
+    If the distributed environment is not initialized yet, this will
+    allow all INFO logs until it is initialized.
+    """
+    if not any(isinstance(f, RankZeroFilter) for f in logger.filters):
+        logger.addFilter(RankZeroFilter(is_rank_zero))
 
 
 def load_json_config(data: str):

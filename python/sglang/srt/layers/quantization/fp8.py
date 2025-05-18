@@ -64,10 +64,10 @@ from sglang.srt.layers.quantization.utils import (
     requantize_with_max_scale,
 )
 from sglang.srt.utils import (
+    add_rank_zero_filter,
     get_bool_env_var,
     is_cuda,
     is_hip,
-    log_info_on_rank0,
     print_warning_once,
     set_weight_attrs,
 )
@@ -104,9 +104,10 @@ class Fp8Config(QuantizationConfig):
         ignored_layers: Optional[List[str]] = None,
         weight_block_size: List[int] = None,
     ) -> None:
+        add_rank_zero_filter(logger)
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
         if is_checkpoint_fp8_serialized:
-            log_info_on_rank0(logger, "Detected fp8 checkpoint.")
+            logger.info("Detected fp8 checkpoint.")
         if activation_scheme not in ACTIVATION_SCHEMES:
             raise ValueError(f"Unsupported activation scheme {activation_scheme}")
         self.activation_scheme = activation_scheme

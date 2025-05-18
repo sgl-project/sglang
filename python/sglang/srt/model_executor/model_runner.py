@@ -78,6 +78,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import (
     MultiprocessingSerializer,
+    add_rank_zero_filter,
     enable_show_time_cost,
     get_available_gpu_memory,
     get_bool_env_var,
@@ -101,19 +102,6 @@ SGLANG_CI_SMALL_KV_SIZE = os.getenv("SGLANG_CI_SMALL_KV_SIZE", None)
 UNBALANCED_MODEL_LOADING_TIMEOUT_S = 300
 
 logger = logging.getLogger(__name__)
-
-
-class RankZeroFilter(logging.Filter):
-    """Filter that only allows INFO level logs from rank 0, but allows all other levels from any rank."""
-
-    def __init__(self, is_rank_zero):
-        super().__init__()
-        self.is_rank_zero = is_rank_zero
-
-    def filter(self, record):
-        if record.levelno == logging.INFO:
-            return self.is_rank_zero
-        return True
 
 
 class ModelRunner:
@@ -141,8 +129,7 @@ class ModelRunner:
         self.gpu_id = gpu_id
 
         # Apply the rank zero filter to logger
-        if not any(isinstance(f, RankZeroFilter) for f in logger.filters):
-            logger.addFilter(RankZeroFilter(tp_rank == 0))
+        add_rank_zero_filter(logger, tp_rank == 0)
         self.tp_rank = tp_rank
         self.tp_size = tp_size
         self.pp_rank = pp_rank
