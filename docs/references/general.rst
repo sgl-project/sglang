@@ -10,4 +10,5 @@ General Guidance
    faq.md
    learn_more.md
    modelscope.md
+   environment_variables.md
    production_metrics.md

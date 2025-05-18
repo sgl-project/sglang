@@ -75,7 +75,7 @@ def main(args):
             )
             states[i] = answer
 
-        tic = time.time()
+        tic = time.perf_counter()
         if args.parallel == 1:
             for i in tqdm(range(len(questions))):
                 get_one_answer(i)
@@ -106,9 +106,9 @@ def main(args):
                 for j in range(len(rets)):
                     states[i + j] = rets[j]
 
-        tic = time.time()
+        tic = time.perf_counter()
         asyncio.run(batched_call(batch_size=args.parallel))
-    latency = time.time() - tic
+    latency = time.perf_counter() - tic
 
     preds = []
     for i in range(len(states)):

@@ -51,7 +51,7 @@ class MultiModalityDataPaddingPatternTokenPairs(MultiModalityDataPaddingPattern)
         self, input_ids: List[int], mm_inputs: MultimodalInputs
     ) -> List[int]:
         """
-        This function will replace the data-tokens inbetween with pad_values accordingly
+        This function will replace the data-tokens in between with pad_values accordingly
         """
         pad_values = [item.pad_value for item in mm_inputs.mm_items]
         data_token_pairs = self.data_token_id_pairs
@@ -368,13 +368,13 @@ def general_mm_embed_routine(
     input_ids: torch.Tensor,
     forward_batch: ForwardBatch,
     language_model: nn.Module,
-    image_data_embedding_func: Callable[
-        [List[MultimodalDataItem]], torch.Tensor
+    image_data_embedding_func: Optional[
+        Callable[[List[MultimodalDataItem]], torch.Tensor]
     ] = None,
-    audio_data_embedding_func: Callable[
-        [List[MultimodalDataItem]], torch.Tensor
+    audio_data_embedding_func: Optional[
+        Callable[[List[MultimodalDataItem]], torch.Tensor]
     ] = None,
-    placeholder_tokens: dict[Modality, List[int]] = None,
+    placeholder_tokens: Optional[dict[Modality, List[int]]] = None,
     **kwargs,
 ) -> torch.Tensor:
     """
@@ -389,7 +389,6 @@ def general_mm_embed_routine(
             forwarded hidden states
 
     """
-
     assert hasattr(language_model, "get_input_embeddings")
     embed_tokens = language_model.get_input_embeddings()
     if (
