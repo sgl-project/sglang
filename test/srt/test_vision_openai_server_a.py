@@ -4,6 +4,8 @@ python3 -m unittest test_vision_openai_server.TestOpenAIVisionServer.test_mixed_
 python3 -m unittest test_vision_openai_server.TestOpenAIVisionServer.test_multi_images_chat_completion
 """
 
+from test.srt.test_vision_openai_server_common import *
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -11,8 +13,6 @@ from sglang.test.test_utils import (
     CustomTestCase,
     popen_launch_server,
 )
-
-from test.srt.test_vision_openai_server_common import *
 
 
 class TestQwen2VLServer(TestOpenAIVisionServer):
@@ -181,7 +181,6 @@ class TestMinicpmoServer(TestOpenAIVisionServer):
     def test_audio_chat_completion(self):
         self._test_audio_speech_completion()
         self._test_audio_ambient_completion()
-
 
 
 if __name__ == "__main__":

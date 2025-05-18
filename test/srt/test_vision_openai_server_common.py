@@ -18,7 +18,6 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-
 # image
 IMAGE_MAN_IRONING_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/images/man_ironing_on_back_of_suv.png"
 IMAGE_SGL_LOGO_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/images/sgl_logo.png"
@@ -168,7 +167,7 @@ class TestOpenAIVisionServer(CustomTestCase):
                         {
                             "type": "text",
                             "text": "I have two very different images. They are not related at all. "
-                                    "Please describe the first image in one sentence, and then describe the second image in another sentence.",
+                            "Please describe the first image in one sentence, and then describe the second image in another sentence.",
                         },
                     ],
                 },
@@ -467,4 +466,3 @@ class TestOpenAIVisionServer(CustomTestCase):
 
     def test_audio_chat_completion(self):
         pass
-

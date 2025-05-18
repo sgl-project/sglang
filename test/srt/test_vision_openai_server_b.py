@@ -1,3 +1,5 @@
+from test.srt.test_vision_openai_server_common import *
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -5,8 +7,6 @@ from sglang.test.test_utils import (
     CustomTestCase,
     popen_launch_server,
 )
-
-from test.srt.test_vision_openai_server_common import *
 
 
 class TestPixtralServer(TestOpenAIVisionServer):
@@ -194,5 +194,7 @@ class TestKimiVLServer(TestOpenAIVisionServer):
 
     def test_video_chat_completion(self):
         pass
+
+
 if __name__ == "__main__":
     unittest.main()
