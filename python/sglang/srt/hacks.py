@@ -1,8 +1,8 @@
 import time
+from pathlib import Path
 
 import torch
 import zmq
-
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.utils import get_zmq_socket
 
@@ -13,10 +13,12 @@ class OtherProcessKiller:
         num_tasks = 8
 
         context = zmq.Context(2)
-        self.senders = [
-            get_zmq_socket(context, zmq.PUSH, f"tcp://localhost:{port}", False)
-            for port in range(base_port, base_port + num_tasks)
-        ]
+        self.senders = []
+        for index in range(num_tasks):
+            path = f"/tmp/demo_another_task_{index}"
+            Path(path).write_text("")
+            endpoint = f"ipc://{path}"
+            self.senders.append(get_zmq_socket(context, zmq.PUSH, endpoint, False))
 
     def kill(self):
         try:
