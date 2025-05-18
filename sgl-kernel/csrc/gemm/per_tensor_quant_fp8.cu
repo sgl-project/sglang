@@ -7,6 +7,10 @@
 
 #include "utils.h"
 
+__device__ __forceinline__ float silu(const float& val) {
+  return val / (1.0f + __expf(-val));
+}
+
 template <typename T>
 __global__ void
 per_tensor_absmax_kernel(const T* __restrict__ input, float* __restrict__ output_s, const int64_t num_elements) {
