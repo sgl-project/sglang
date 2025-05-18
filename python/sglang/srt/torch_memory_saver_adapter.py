@@ -101,3 +101,12 @@ def with_tms_disable_cpu_backup():
         yield
     finally:
         torch_memory_saver._global_info.binary_info.cdll.tms_enable_cpu_backup()
+
+
+@contextmanager
+def with_tms_disable_region():
+    torch_memory_saver._global_info.binary_info.cdll.tms_region_leave()
+    try:
+        yield
+    finally:
+        torch_memory_saver._global_info.binary_info.cdll.tms_region_enter()
