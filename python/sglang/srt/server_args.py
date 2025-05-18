@@ -104,9 +104,6 @@ class ServerArgs:
     file_storage_path: str = "sglang_storage"
     enable_cache_report: bool = False
     reasoning_parser: Optional[str] = None
-    logprobs_normalization: Optional[str] = (
-        "none"  # Options: "auto" (SGLang default), "none" (OpenAI-style)
-    )
 
     # Data parallelism
     dp_size: int = 1
@@ -790,13 +787,6 @@ class ServerArgs:
             choices=list(ReasoningParser.DetectorMap.keys()),
             default=ServerArgs.reasoning_parser,
             help=f"Specify the parser for reasoning models, supported parsers are: {list(ReasoningParser.DetectorMap.keys())}.",
-        )
-        parser.add_argument(
-            "--logprobs-normalization",
-            type=str,
-            default=ServerArgs.logprobs_normalization,
-            choices=["auto", "none"],
-            help="Whether to return normalized logprobs. 'auto' (re-compute logprobs after applying for top-p), or 'none' (return original logprobs, OpenAI style)",
         )
 
         # Data parallelism

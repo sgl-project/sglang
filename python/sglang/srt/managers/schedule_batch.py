@@ -76,7 +76,6 @@ global_server_args_dict = {
     "enable_ep_moe": ServerArgs.enable_ep_moe,
     "enable_nan_detection": ServerArgs.enable_nan_detection,
     "flashinfer_mla_disable_ragged": ServerArgs.flashinfer_mla_disable_ragged,
-    "logprobs_normalization": ServerArgs.logprobs_normalization,
     "max_micro_batch_size": ServerArgs.max_micro_batch_size,
     "moe_dense_tp_size": ServerArgs.moe_dense_tp_size,
     "n_share_experts_fusion": ServerArgs.n_share_experts_fusion,
