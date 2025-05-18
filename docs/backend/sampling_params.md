@@ -40,7 +40,7 @@ The `/generate` endpoint accepts the following parameters in JSON format. For de
 | Argument           | Type/Default           | Description                                                                                                                                    |
 |--------------------|------------------------|------------------------------------------------------------------------------------------------------------------------------------------------|
 | frequency_penalty  | `float = 0.0`          | Penalizes tokens based on their frequency in generation so far. Must be between `-2` and `2` where negative numbers encourage repeatment of tokens and positive number encourages sampling of new tokens. The scaling of penalization grows linearly with each appearance of a token. |
-| presence_penalty   | `float = 0.0`          | Penalizes tokens if they appeared in the generation so far. Must be between `-2` and `2` where negative numbers encourage repeatment of tokens and positive number encourages sampling of new tokens. The scaling of the penalization is constant if a token occured. |
+| presence_penalty   | `float = 0.0`          | Penalizes tokens if they appeared in the generation so far. Must be between `-2` and `2` where negative numbers encourage repeatment of tokens and positive number encourages sampling of new tokens. The scaling of the penalization is constant if a token occurred. |
 | min_new_tokens     | `int = 0`              | Forces the model to generate at least `min_new_tokens` until a stop word or EOS token is sampled. Note that this might lead to unintended behavior, for example, if the distribution is highly skewed towards these tokens. |
 
 ### Constrained decoding
@@ -64,7 +64,6 @@ Please refer to our dedicated guide on [constrained decoding](./structured_outpu
 | ignore_eos                    | `bool = False`                  | Don't stop generation when EOS token is sampled.                                                                                               |
 | skip_special_tokens           | `bool = True`                   | Remove special tokens during decoding.                                                                                                         |
 | custom_params                 | `Optional[List[Optional[Dict[str, Any]]]] = None` | Used when employing `CustomLogitProcessor`. For usage, see below.                                                                              |
-| thinking_budget               | `Optional[int] = None`          | The maximum number of reasoning tokens that can be generated for a request. |
 
 ## Examples
 
@@ -136,7 +135,7 @@ Detailed example in [openai compatible api](https://docs.sglang.ai/backend/opena
 Launch a server:
 
 ```bash
-python3 -m sglang.launch_server --model-path lmms-lab/llava-onevision-qwen2-7b-ov --chat-template chatml-llava
+python3 -m sglang.launch_server --model-path lmms-lab/llava-onevision-qwen2-7b-ov
 ```
 
 Download an image:
@@ -292,32 +291,6 @@ response = requests.post(
             "temperature": 0.0,
             "max_new_tokens": 32,
             "custom_params": {"token_id": 5},
-        },
-    },
-)
-print(response.json())
-```
-
-### Thinking Budget
-
-Launch a server with `--reasoning-parser`.
-
-```bash
-python3 -m sglang.launch_server --model Qwen/Qwen3-8B --reasoning-parser qwen3
-```
-
-Send a request:
-
-```python
-import requests
-response = requests.post(
-    "http://localhost:30000/generate",
-    json={
-        "text": "9.11 and 9.8, which is greater?",
-        "sampling_params": {
-            "temperature": 0.3,
-            "max_new_tokens": 256,
-            "thinking_budget": 20,
         },
     },
 )

@@ -62,9 +62,9 @@ class TestTorchCompile(CustomTestCase):
         res = self.run_decode(16)
 
         max_tokens = 256
-        tic = time.time()
+        tic = time.perf_counter()
         res = self.run_decode(max_tokens)
-        tok = time.time()
+        tok = time.perf_counter()
         print(f"{res=}")
         throughput = max_tokens / (tok - tic)
         print(f"Throughput: {throughput} tokens/s")

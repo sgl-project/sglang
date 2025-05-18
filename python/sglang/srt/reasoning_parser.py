@@ -32,7 +32,7 @@ class BaseReasoningFormatDetector:
         One-time parsing: Detects and parses reasoning sections in the provided text.
         Returns both reasoning content and normal text separately.
         """
-        text = text.replace(self.think_start_token, "")
+        text = text.replace(self.think_start_token, "").strip()
         if self.think_end_token not in text:
             # Assume reasoning was truncated before `</think>` token
             return StreamingParseResult(reasoning_text=text)
@@ -73,7 +73,7 @@ class BaseReasoningFormatDetector:
             normal_text = current_text[end_idx + len(self.think_end_token) :]
 
             return StreamingParseResult(
-                normal_text=normal_text, reasoning_text=reasoning_text
+                normal_text=normal_text, reasoning_text=reasoning_text.rstrip()
             )
 
         # Continue with reasoning content
@@ -147,7 +147,7 @@ class ReasoningParser:
 
     Args:
         model_type (str): Type of model to parse reasoning from
-        stream_reasoning (bool): If Flase, accumulates reasoning content until complete.
+        stream_reasoning (bool): If False, accumulates reasoning content until complete.
             If True, streams reasoning content as it arrives.
     """
 

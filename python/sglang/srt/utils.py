@@ -125,10 +125,6 @@ builtins.FP8_E4M3_MAX = FP8_E4M3_MAX
 builtins.FP8_E4M3_MIN = FP8_E4M3_MIN
 
 
-def is_rocm() -> bool:
-    return torch.cuda.is_available() and torch.version.hip
-
-
 def is_cuda():
     return torch.cuda.is_available() and torch.version.cuda
 
@@ -250,7 +246,7 @@ def mark_start(name, interval=0.1, color=0, indent=0):
     torch.cuda.synchronize()
     if time_infos.get(name, None) is None:
         time_infos[name] = TimeInfo(name, interval, color, indent)
-    time_infos[name].acc_time -= time.time()
+    time_infos[name].acc_time -= time.perf_counter()
 
 
 def mark_end(name):
@@ -258,7 +254,7 @@ def mark_end(name):
     if not show_time_cost:
         return
     torch.cuda.synchronize()
-    time_infos[name].acc_time += time.time()
+    time_infos[name].acc_time += time.perf_counter()
     if time_infos[name].check():
         time_infos[name].pretty_print()
 
@@ -268,11 +264,11 @@ def calculate_time(show=False, min_cost_ms=0.0):
         def inner_func(*args, **kwargs):
             torch.cuda.synchronize()
             if show:
-                start_time = time.time()
+                start_time = time.perf_counter()
             result = func(*args, **kwargs)
             torch.cuda.synchronize()
             if show:
-                cost_time = (time.time() - start_time) * 1000
+                cost_time = (time.perf_counter() - start_time) * 1000
                 if cost_time > min_cost_ms:
                     print(f"Function {func.__name__} took {cost_time} ms to run.")
             return result
@@ -282,7 +278,9 @@ def calculate_time(show=False, min_cost_ms=0.0):
     return wrapper
 
 
-def get_available_gpu_memory(device, gpu_id, distributed=False, empty_cache=True):
+def get_available_gpu_memory(
+    device, gpu_id, distributed=False, empty_cache=True, cpu_group=None
+):
     """
     Get available memory for cuda:gpu_id device.
     When distributed is True, the available memory is the minimum available memory of all GPUs.
@@ -344,10 +342,10 @@ def get_available_gpu_memory(device, gpu_id, distributed=False, empty_cache=True
         free_gpu_memory, total_gpu_memory = torch.npu.mem_get_info()
 
     if distributed:
-        tensor = torch.tensor(free_gpu_memory, dtype=torch.float32).to(
-            torch.device(device, gpu_id)
+        tensor = torch.tensor(free_gpu_memory, dtype=torch.float32)
+        torch.distributed.all_reduce(
+            tensor, op=torch.distributed.ReduceOp.MIN, group=cpu_group
         )
-        torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.MIN)
         free_gpu_memory = tensor.item()
 
     return free_gpu_memory / (1 << 30)
@@ -2076,7 +2074,6 @@ def is_fa3_default_architecture(hf_config):
         "Llama4ForConditionalGeneration",
         "LlamaForCausalLM",
         "MistralForCausalLM",
-        "MixtralForCausalLM",
         "Gemma2ForCausalLM",
         "Gemma3ForConditionalGeneration",
         "Qwen3ForCausalLM",
@@ -2103,3 +2100,7 @@ def log_info_on_rank0(logger, msg):
 
     if get_tensor_model_parallel_rank() == 0:
         logger.info(msg)
+
+
+def dispose_tensor(x: torch.Tensor):
+    x.set_(torch.empty((0,), device=x.device, dtype=x.dtype))
