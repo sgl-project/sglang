@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
+from sglang.srt.utils import require_gathered_buffer
 from sglang.srt.disaggregation.base import BaseKVManager, KVArgs, KVPoll
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
@@ -200,11 +201,8 @@ class SchedulerDisaggregationPrefillMixin:
             batch = self.get_new_batch_prefill()
 
             # Handle DP attention
-            if (
-                self.server_args.enable_dp_attention
-                or self.server_args.enable_sp_layernorm
-            ):
-                batch, _ = self.prepare_dp_attn_batch(batch)
+            if require_gathered_buffer(self.server_args):
+                batch, _ = self.prepare_gathered_buffer_batch(batch)
 
             self.cur_batch = batch
 
@@ -238,11 +236,8 @@ class SchedulerDisaggregationPrefillMixin:
             batch = self.get_new_batch_prefill()
 
             # Handle DP attention
-            if (
-                self.server_args.enable_dp_attention
-                or self.server_args.enable_sp_layernorm
-            ):
-                batch, _ = self.prepare_dp_attn_batch(batch)
+            if require_gathered_buffer(self.server_args):
+                batch, _ = self.prepare_gathered_buffer_batch(batch)
 
             self.cur_batch = batch
 

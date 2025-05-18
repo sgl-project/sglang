@@ -42,6 +42,9 @@ from sglang.srt.utils import (
     get_available_gpu_memory,
     get_device_memory_capacity,
     rank0_log,
+    require_attn_tp_gather,
+    require_gathered_buffer,
+    require_mlp_tp_gather
 )
 
 if TYPE_CHECKING:
@@ -186,8 +189,9 @@ class CudaGraphRunner:
         self.enable_torch_compile = model_runner.server_args.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
-        self.enable_dp_attention = model_runner.server_args.enable_dp_attention
-        self.enable_sp_layernorm = model_runner.server_args.enable_sp_layernorm
+        self.enable_gathered_buffer = require_gathered_buffer(model_runner.server_args)
+        self.enable_attn_tp_gather = require_attn_tp_gather(model_runner.server_args)
+        self.enable_mlp_tp_gather = require_mlp_tp_gather(model_runner.server_args)
         self.speculative_algorithm = model_runner.server_args.speculative_algorithm
         self.tp_size = model_runner.server_args.tp_size
         self.dp_size = model_runner.server_args.dp_size
@@ -281,18 +285,26 @@ class CudaGraphRunner:
                 )
             else:
                 self.encoder_lens = None
-            if self.enable_dp_attention or self.enable_sp_layernorm:
-                # TODO(ch-wan): SP layernorm should use a different logic to manage gathered_buffer
-                self.gathered_buffer = torch.zeros(
-                    (
-                        self.max_bs * self.dp_size * self.num_tokens_per_bs,
-                        self.model_runner.model_config.hidden_size,
-                    ),
-                    dtype=self.model_runner.dtype,
-                )
-                self.global_num_tokens_gpu = torch.zeros(
-                    (self.dp_size,), dtype=torch.int32
-                )
+            if self.enable_gathered_buffer:
+                if self.enable_mlp_tp_gather:
+                    self.gathered_buffer = torch.zeros(
+                        (
+                            self.max_bs * self.dp_size * self.num_tokens_per_bs,
+                            self.model_runner.model_config.hidden_size,
+                        ),
+                        dtype=self.model_runner.dtype,
+                    )
+                    self.global_num_tokens_gpu = torch.zeros(
+                        (self.dp_size,), dtype=torch.int32
+                    )
+                else:
+                    self.gathered_buffer = torch.zeros(
+                        (
+                            self.max_bs * self.num_tokens_per_bs,
+                            self.model_runner.model_config.hidden_size,
+                        ),
+                        dtype=self.model_runner.dtype,
+                    )
 
         # Capture
         try:
@@ -324,9 +336,8 @@ class CudaGraphRunner:
             self.model_runner.token_to_kv_pool.capture_mode = False
 
     def can_run(self, forward_batch: ForwardBatch):
-        if self.enable_dp_attention or self.enable_sp_layernorm:
+        if self.enable_mlp_tp_gather:
             total_global_tokens = sum(forward_batch.global_num_tokens_cpu)
-
             is_bs_supported = forward_batch.can_run_dp_cuda_graph and (
                 total_global_tokens in self.graphs
                 if self.disable_padding
@@ -412,7 +423,7 @@ class CudaGraphRunner:
                 {k: v[:num_tokens] for k, v in self.pp_proxy_tensors.items()}
             )
 
-        if self.enable_dp_attention or self.enable_sp_layernorm:
+        if self.enable_mlp_tp_gather:
             self.global_num_tokens_gpu.copy_(
                 torch.tensor(
                     [
@@ -542,7 +553,7 @@ class CudaGraphRunner:
         raw_num_token = raw_bs * self.num_tokens_per_bs
 
         # Pad
-        if self.enable_dp_attention or self.enable_sp_layernorm:
+        if self.enable_mlp_tp_gather:
             index = bisect.bisect_left(
                 self.capture_bs, sum(forward_batch.global_num_tokens_cpu)
             )
@@ -574,7 +585,7 @@ class CudaGraphRunner:
             self.encoder_lens[:raw_bs].copy_(forward_batch.encoder_lens)
         if forward_batch.mrope_positions is not None:
             self.mrope_positions[:, :raw_bs].copy_(forward_batch.mrope_positions)
-        if self.enable_dp_attention or self.enable_sp_layernorm:
+        if self.enable_mlp_tp_gather:
             self.global_num_tokens_gpu.copy_(forward_batch.global_num_tokens_gpu)
 
         if hasattr(forward_batch.spec_info, "hidden_states"):

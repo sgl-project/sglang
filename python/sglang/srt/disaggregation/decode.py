@@ -30,6 +30,7 @@ import numpy as np
 import torch
 from torch.distributed import ProcessGroup
 
+from sglang.srt.utils import require_gathered_buffer
 from sglang.srt.disaggregation.base import BaseKVManager, BaseKVReceiver, KVArgs, KVPoll
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
@@ -459,7 +460,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
 class SchedulerDisaggregationDecodeMixin:
 
     def _prepare_idle_batch_and_run(self, batch, delay_process=False):
-        batch, _ = self.prepare_dp_attn_batch(batch)
+        batch, _ = self.prepare_gathered_buffer_batch(batch)
         result = None
         if batch:
             result = self.run_batch(batch)
@@ -479,24 +480,21 @@ class SchedulerDisaggregationDecodeMixin:
             batch = self.get_next_disagg_decode_batch_to_run()
             self.cur_batch = batch
 
-            prepare_dp_attn_flag = (
-                self.server_args.enable_dp_attention
-                or self.server_args.enable_sp_layernorm
-            )
+            prepare_gathered_buffer_flag = require_gathered_buffer(self.server_args)
 
             if batch:
                 # Generate fake extend output.
                 if batch.forward_mode.is_extend():
                     # Note: Logprobs should be handled on the prefill engine.
                     self.stream_output(batch.reqs, False)
-                    if prepare_dp_attn_flag:
+                    if prepare_gathered_buffer_flag:
                         self._prepare_idle_batch_and_run(None)
                 else:
-                    if prepare_dp_attn_flag:
-                        self.prepare_dp_attn_batch(batch)
+                    if prepare_gathered_buffer_flag:
+                        self.prepare_gathered_buffer_batch(batch)
                     result = self.run_batch(batch)
                     self.process_batch_result(batch, result)
-            elif prepare_dp_attn_flag:
+            elif prepare_gathered_buffer_flag:
                 batch, _ = self._prepare_idle_batch_and_run(None)
 
             if batch is None and (
@@ -525,17 +523,14 @@ class SchedulerDisaggregationDecodeMixin:
             self.cur_batch = batch
             last_batch_in_queue = False
 
-            prepare_dp_attn_flag = (
-                self.server_args.enable_dp_attention
-                or self.server_args.enable_sp_layernorm
-            )
+            prepare_gathered_buffer_flag = require_gathered_buffer(self.server_args)
 
             if batch:
                 # Generate fake extend output.
                 if batch.forward_mode.is_extend():
                     # Note: Logprobs should be handled on the prefill engine.
                     self.stream_output(batch.reqs, False)
-                    if prepare_dp_attn_flag:
+                    if prepare_gathered_buffer_flag:
                         batch_, result = self._prepare_idle_batch_and_run(
                             None, delay_process=True
                         )
@@ -543,12 +538,12 @@ class SchedulerDisaggregationDecodeMixin:
                             result_queue.append((batch_.copy(), result))
                             last_batch_in_queue = True
                 else:
-                    if prepare_dp_attn_flag:
-                        self.prepare_dp_attn_batch(batch)
+                    if prepare_gathered_buffer_flag:
+                        self.prepare_gathered_buffer_batch(batch)
                     result = self.run_batch(batch)
                     result_queue.append((batch.copy(), result))
                     last_batch_in_queue = True
-            elif prepare_dp_attn_flag:
+            elif prepare_gathered_buffer_flag:
                 batch, result = self._prepare_idle_batch_and_run(
                     None, delay_process=True
                 )

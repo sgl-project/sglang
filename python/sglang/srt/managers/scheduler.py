@@ -135,6 +135,7 @@ from sglang.srt.utils import (
     kill_itself_when_parent_died,
     point_to_point_pyobj,
     pyspy_dump_schedulers,
+    require_gathered_buffer,
     set_gpu_proc_affinity,
     set_random_seed,
     suppress_other_loggers,
@@ -1306,8 +1307,8 @@ class Scheduler(
                 ret = None
 
         # Handle DP attention
-        if self.server_args.enable_dp_attention or self.server_args.enable_sp_layernorm:
-            ret, _ = self.prepare_dp_attn_batch(ret)
+        if require_gathered_buffer(self.server_args):
+            ret, _ = self.prepare_gathered_buffer_batch(ret)
 
         return ret
 
@@ -1605,8 +1606,8 @@ class Scheduler(
             self.return_health_check_ct -= 1
             self.send_to_tokenizer.send_pyobj(HealthCheckOutput())
 
-    def prepare_dp_attn_batch(self, local_batch: ScheduleBatch):
-        return self.prepare_dp_attn_batch_raw(
+    def prepare_gathered_buffer_batch(self, local_batch: ScheduleBatch):
+        return self.prepare_gathered_buffer_batch_raw(
             local_batch,
             dp_size=self.server_args.dp_size,
             attn_tp_size=self.attn_tp_size,
@@ -1619,7 +1620,7 @@ class Scheduler(
         )
 
     @staticmethod
-    def prepare_dp_attn_batch_raw(
+    def prepare_gathered_buffer_batch_raw(
         local_batch: ScheduleBatch,
         dp_size,
         attn_tp_size: int,
