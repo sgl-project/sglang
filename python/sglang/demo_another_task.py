@@ -145,6 +145,6 @@ def main(args):
 
 if __name__ == '__main__':
     parser = ArgumentParser()
-    parser.add_argument("--stop-mode", type=str)
+    parser.add_argument("--stop-mode", type=str, choices=['background_thread_memory_saver', 'torch_empty_cache'])
     args = parser.parse_args()
     main(args)
