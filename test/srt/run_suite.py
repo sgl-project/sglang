@@ -85,6 +85,12 @@ suites = {
         TestFile("test_w8a8_quantization.py", 46),
         TestFile("models/lora/test_lora_cuda_graph.py", 250),
     ],
+    "per-commit-amd": [
+        TestFile("test_mla.py", 242),
+        TestFile("test_mla_deepseek_v3.py", 221),
+        TestFile("test_torch_compile.py", 76),
+        TestFile("test_torch_compile_moe.py", 172),
+    ],
     "per-commit-2-gpu": [
         TestFile("models/lora/test_lora_tp.py", 116),
         TestFile("test_data_parallelism.py", 73),
@@ -94,6 +100,9 @@ suites = {
         TestFile("test_patch_torch.py", 19),
         TestFile("test_update_weights_from_distributed.py", 103),
         TestFile("test_verl_engine.py", 64),
+    ],
+    "per-commit-2-gpu-amd": [
+        TestFile("test_mla_tp.py", 170),
     ],
     "per-commit-8-gpu": [
         # Disabled deepep tests temporarily because it takes too much time.
@@ -106,6 +115,9 @@ suites = {
         TestFile("test_disaggregation_different_tp.py", 210),
         TestFile("test_full_deepseek_v3.py", 250),
         TestFile("test_pp_single_node.py", 150),
+    ],
+    "per-commit-8-gpu-amd": [
+        TestFile("test_full_deepseek_v3.py", 250),
     ],
     "nightly": [
         TestFile("test_nightly_gsm8k_eval.py"),

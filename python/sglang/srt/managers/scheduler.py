@@ -129,7 +129,6 @@ from sglang.srt.utils import (
     DynamicGradMode,
     broadcast_pyobj,
     configure_logger,
-    crash_on_warnings,
     disable_request_logging,
     get_bool_env_var,
     get_zmq_socket,
@@ -207,7 +206,8 @@ class Scheduler(
         self.page_size = server_args.page_size
 
         # Distributed rank info
-        self.attn_tp_rank, self.attn_tp_size, self.dp_rank = (
+        self.dp_size = server_args.dp_size
+        self.attn_tp_rank, self.attn_tp_size, self.attn_dp_rank = (
             compute_dp_attention_world_info(
                 server_args.enable_dp_attention,
                 self.tp_rank,
@@ -348,8 +348,8 @@ class Scheduler(
         self.forward_ct_decode = 0
         self.num_generated_tokens = 0
         self.num_prefill_tokens = 0
-        self.last_decode_stats_tic = time.time()
-        self.last_prefill_stats_tic = time.time()
+        self.last_decode_stats_tic = time.perf_counter()
+        self.last_prefill_stats_tic = time.perf_counter()
         self.return_health_check_ct = 0
         self.current_stream = torch.get_device_module(self.device).current_stream()
         if self.device == "cpu":
@@ -768,7 +768,7 @@ class Scheduler(
                         )
 
                     # send out reqs to the next stage
-                    dp_offset = self.dp_rank * self.attn_tp_size
+                    dp_offset = self.attn_dp_rank * self.attn_tp_size
                     if self.attn_tp_rank == 0:
                         point_to_point_pyobj(
                             recv_reqs,
@@ -815,7 +815,7 @@ class Scheduler(
                 recv_reqs = None
         else:
             if self.attn_tp_rank == 0:
-                dp_offset = self.dp_rank * self.attn_tp_size
+                dp_offset = self.attn_dp_rank * self.attn_tp_size
                 recv_reqs = point_to_point_pyobj(
                     [],
                     self.pp_rank * self.tp_size + dp_offset,
@@ -1032,13 +1032,13 @@ class Scheduler(
                 add_to_grammar_queue = True
 
         if add_to_grammar_queue:
-            req.queue_time_start = time.time()
+            req.queue_time_start = time.perf_counter()
             self.grammar_queue.append(req)
         else:
             self._add_request_to_queue(req)
 
     def _add_request_to_queue(self, req: Req):
-        req.queue_time_start = time.time()
+        req.queue_time_start = time.perf_counter()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.disagg_prefill_bootstrap_queue.add(req)
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
@@ -1085,7 +1085,7 @@ class Scheduler(
                 req.finished_reason = FINISH_ABORT(
                     error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
                 )
-                req.queue_time_start = time.time()
+                req.queue_time_start = time.perf_counter()
                 self.waiting_queue.append(req)
                 return
 
@@ -1109,8 +1109,8 @@ class Scheduler(
         can_run_list: List[Req],
         running_bs: int,
     ):
-        gap_latency = time.time() - self.last_prefill_stats_tic
-        self.last_prefill_stats_tic = time.time()
+        gap_latency = time.perf_counter() - self.last_prefill_stats_tic
+        self.last_prefill_stats_tic = time.perf_counter()
         self.last_input_throughput = self.num_prefill_tokens / gap_latency
         self.num_prefill_tokens = 0
 
@@ -1160,8 +1160,8 @@ class Scheduler(
     ):
         batch = running_batch or self.running_batch
 
-        gap_latency = time.time() - self.last_decode_stats_tic
-        self.last_decode_stats_tic = time.time()
+        gap_latency = time.perf_counter() - self.last_decode_stats_tic
+        self.last_decode_stats_tic = time.perf_counter()
         self.last_gen_throughput = self.num_generated_tokens / gap_latency
         self.num_generated_tokens = 0
         num_running_reqs = len(batch.reqs)
@@ -1245,7 +1245,7 @@ class Scheduler(
         if (
             self.enable_metrics
             and self.attn_tp_rank == 0
-            and time.time() > self.metrics_collector.last_log_time + 30
+            and time.perf_counter() > self.metrics_collector.last_log_time + 30
         ):
             # During idle time, also collect metrics every 30 seconds.
             num_used = self.max_total_num_tokens - (
@@ -1410,7 +1410,7 @@ class Scheduler(
         if self.enable_metrics:
             # only record queue time when enable_metrics is True to avoid overhead
             for req in can_run_list:
-                req.queue_time_end = time.time()
+                req.queue_time_end = time.perf_counter()
 
         self.waiting_queue = [
             x for x in self.waiting_queue if x not in set(can_run_list)
@@ -1610,6 +1610,7 @@ class Scheduler(
             local_batch,
             dp_size=self.server_args.dp_size,
             attn_tp_size=self.attn_tp_size,
+            moe_dense_tp_size=self.server_args.moe_dense_tp_size,
             tp_cpu_group=self.tp_cpu_group,
             get_idle_batch=self.get_idle_batch,
             disable_cuda_graph=self.server_args.disable_cuda_graph,
@@ -1622,6 +1623,7 @@ class Scheduler(
         local_batch: ScheduleBatch,
         dp_size,
         attn_tp_size: int,
+        moe_dense_tp_size: Optional[int],
         tp_cpu_group,
         get_idle_batch,
         disable_cuda_graph: bool,
@@ -1631,15 +1633,15 @@ class Scheduler(
         # Check if other DP workers have running batches
         if local_batch is None:
             num_tokens = 0
-            global_num_tokens_for_logprob = 0
+            num_tokens_for_logprob = 0
         elif local_batch.forward_mode.is_decode():
             num_tokens = local_batch.batch_size()
             if not spec_algorithm.is_none() and spec_algorithm.is_eagle():
                 num_tokens = num_tokens * speculative_num_draft_tokens
-            global_num_tokens_for_logprob = num_tokens
+            num_tokens_for_logprob = num_tokens
         else:
             num_tokens = local_batch.extend_num_tokens
-            global_num_tokens_for_logprob = sum(
+            num_tokens_for_logprob = sum(
                 [
                     # We should have at least 1 token for sample in every case.
                     max(extend_len - logprob_start_len, 1)
@@ -1666,7 +1668,7 @@ class Scheduler(
             [
                 num_tokens,
                 can_cuda_graph,
-                global_num_tokens_for_logprob,
+                num_tokens_for_logprob,
                 is_extend_in_batch,
             ],
             dtype=torch.int64,
@@ -1689,8 +1691,15 @@ class Scheduler(
             local_batch = get_idle_batch()
 
         if local_batch is not None:
-            local_batch.global_num_tokens = global_num_tokens
-            local_batch.global_num_tokens_for_logprob = global_num_tokens_for_logprob
+            # TODO: handle the case when moe_dense_tp_size != 1
+            if moe_dense_tp_size == 1 and global_server_args_dict["enable_dp_lm_head"]:
+                local_batch.global_num_tokens = [num_tokens]
+                local_batch.global_num_tokens_for_logprob = [num_tokens_for_logprob]
+            else:
+                local_batch.global_num_tokens = global_num_tokens
+                local_batch.global_num_tokens_for_logprob = (
+                    global_num_tokens_for_logprob
+                )
 
             # Check forward mode for cuda graph
             if not disable_cuda_graph:
@@ -1774,10 +1783,10 @@ class Scheduler(
     def watchdog_thread(self):
         """A watch dog thread that will try to kill the server itself if one forward batch takes too long."""
         self.watchdog_last_forward_ct = 0
-        self.watchdog_last_time = time.time()
+        self.watchdog_last_time = time.perf_counter()
 
         while True:
-            current = time.time()
+            current = time.perf_counter()
             if self.cur_batch is not None:
                 if self.watchdog_last_forward_ct == self.forward_ct:
                     if current > self.watchdog_last_time + self.watchdog_timeout:
@@ -2177,8 +2186,8 @@ class Scheduler(
 
     def get_print_prefix(self):
         prefix = ""
-        if self.dp_rank is not None:
-            prefix += f" DP{self.dp_rank}"
+        if self.attn_dp_rank is not None:
+            prefix += f" DP{self.attn_dp_rank}"
         if self.server_args.tp_size > 1:
             prefix += f" TP{self.tp_rank}"
         if self.pp_size > 1:

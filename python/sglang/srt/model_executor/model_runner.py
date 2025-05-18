@@ -401,6 +401,7 @@ class ModelRunner:
                 tp_rank=self.tp_rank,
                 tp_size=self.tp_size,
                 dp_size=self.server_args.dp_size,
+                moe_dense_tp_size=self.server_args.moe_dense_tp_size,
                 pp_size=self.server_args.pp_size,
             )
 
@@ -630,7 +631,6 @@ class ModelRunner:
                 rank=rank,
                 group_name=group_name,
             )
-            dist.barrier(group=self._model_update_group, device_ids=[rank])
             return True, "Succeeded to initialize custom process group."
         except Exception as e:
             message = f"Failed to initialize custom process group: {e}."
@@ -1019,7 +1019,7 @@ class ModelRunner:
         if self.server_args.disable_cuda_graph:
             return
 
-        tic = time.time()
+        tic = time.perf_counter()
         before_mem = get_available_gpu_memory(self.device, self.gpu_id)
         logger.info(
             f"Capture cuda graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
@@ -1027,7 +1027,7 @@ class ModelRunner:
         self.cuda_graph_runner = CudaGraphRunner(self)
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         logger.info(
-            f"Capture cuda graph end. Time elapsed: {time.time() - tic:.2f} s. "
+            f"Capture cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
             f"mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
         )
 
