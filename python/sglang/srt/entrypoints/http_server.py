@@ -355,7 +355,7 @@ async def start_profile_async(obj: Optional[ProfileReqInput] = None):
 @app.api_route("/stop_profile", methods=["GET", "POST"])
 async def stop_profile_async():
     """Stop profiling."""
-    _global_state.tokenizer_manager.stop_profile()
+    await _global_state.tokenizer_manager.stop_profile()
     return Response(
         content="Stop profiling. This will take some time.\n",
         status_code=200,
