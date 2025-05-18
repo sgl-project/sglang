@@ -183,7 +183,8 @@ class HiCacheController:
         enable_mooncake_store_l3_cache: bool,
         load_cache_event: threading.Event = None,
         write_policy: str = "write_through_selective",
-        mooncake_l3_kv_pool: MooncakeStore = None
+        mooncake_l3_kv_pool: MooncakeStore = None,
+        mooncake_l3_load_cache_event: threading.Event = None,
     ):
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
         self.mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
@@ -241,6 +242,8 @@ class HiCacheController:
             self.mooncake_l3_load_queue = PriorityQueue()
 
             self.mooncake_l3_stop_event = threading.Event()
+
+            self.mooncake_l3_load_cache_event = mooncake_l3_load_cache_event
 
             self.mooncake_l3_write_stream = torch.cuda.Stream()
             self.mooncake_l3_load_stream = torch.cuda.Stream()
@@ -456,10 +459,10 @@ class HiCacheController:
     def mooncake_l3_load_thread_func_layer_by_layer(self):
         with torch.cuda.stream(self.mooncake_l3_load_stream):
             while not self.mooncake_l3_stop_event.is_set():
-                self.load_cache_event.wait(timeout=1)
-                if not self.load_cache_event.is_set():
+                self.mooncake_l3_load_cache_event.wait(timeout=1)
+                if not self.mooncake_l3_load_cache_event.is_set():
                     continue
-                self.load_cache_event.clear()
+                self.mooncake_l3_load_cache_event.clear()
 
                 batch_operation = None
                 while self.mooncake_l3_load_queue.qsize() > 0:
@@ -480,7 +483,7 @@ class HiCacheController:
                     self.mem_pool_device.transfer_page_per_layer(
                         batch_operation.device_indices, flat_data_list, layer_id)
 
-                    self.load_stream.synchronize()
+                    self.mooncake_l3_load_stream.synchronize()
                     self.layer_done_counter.increment()
 
                 for node_id in batch_operation.node_ids:

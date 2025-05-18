@@ -101,11 +101,13 @@ class HiRadixCache(RadixCache):
             raise ValueError(f"HiRadixCache only supports MHA and MLA yet")
 
         self.mooncake_l3_kv_pool = None
+        self.mooncake_l3_load_cache_event = None
         self.enable_mooncake_store_l3_cache = enable_mooncake_store_l3_cache
         if enable_mooncake_store_l3_cache:
             # TODO(huangtingwei9988):L3 cache only support write_through_selective and write_through write policy
             assert hicache_write_policy in ["write_through_selective", "write_through"]
             self.mooncake_l3_kv_pool = MooncakeStore()
+            self.mooncake_l3_load_cache_event = threading.Event()
 
         self.tp_group = tp_cache_group
         self.page_size = page_size
@@ -118,7 +120,8 @@ class HiRadixCache(RadixCache):
             enable_mooncake_store_l3_cache,
             load_cache_event=self.load_cache_event,
             write_policy=hicache_write_policy,
-            mooncake_l3_kv_pool=self.mooncake_l3_kv_pool
+            mooncake_l3_kv_pool=self.mooncake_l3_kv_pool,
+            mooncake_l3_load_cache_event=self.mooncake_l3_load_cache_event
         )
 
         # record the nodes with ongoing write through
@@ -414,6 +417,8 @@ class HiRadixCache(RadixCache):
 
     def ready_to_load_cache(self):
         self.load_cache_event.set()
+        if self.mooncake_l3_load_cache_event:
+            self.mooncake_l3_load_cache_event.set()
 
     def match_prefix(self, key: List[int], include_evicted=False, **kwargs):
         empty_value = torch.empty((0,), dtype=torch.int64, device=self.device)
@@ -479,7 +484,8 @@ class HiRadixCache(RadixCache):
                                            torch.cuda.current_device(), self.page_size)
                 l3_exist_keys = []
                 for item in l3_keys:
-                    if self.mooncake_l3_kv_pool.is_exist(item):
+                    key_ = f"{item}_{0}"
+                    if self.mooncake_l3_kv_pool.is_exist(key_):
                         l3_exist_keys.append(item)
                     else:
                         break
