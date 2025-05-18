@@ -33,25 +33,29 @@ inline __device__ void apply_token_rotary_embedding(
     int rot_offset,
     int embed_dim) {
   int x_index, y_index;
-  scalar_t cos_val, sin_val;  // Renamed to avoid conflict with input ptrs
+  scalar_t cos_val_x, sin_val_x;
   if (IS_NEOX) {
-    // GPT-NeoX style rotary embedding.
+    // NEOX-specific case (unchanged)
     x_index = rot_offset;
-    y_index = embed_dim + rot_offset;  // This was embed_dim + rot_offset, which is correct for NeoX's interleaved pairs
-    cos_val = SGLANG_LDG(cos_ptr + x_index);
-    sin_val = SGLANG_LDG(sin_ptr + x_index);
+    y_index = embed_dim + rot_offset;
+    cos_val_x = SGLANG_LDG(cos_ptr + rot_offset);
+    sin_val_x = SGLANG_LDG(sin_ptr + rot_offset);
   } else {
-    // GPT-J style rotary embedding.
-    x_index = 2 * rot_offset;
-    y_index = 2 * rot_offset + 1;
-    cos_val = SGLANG_LDG(cos_ptr + rot_offset);  // x_index / 2 = rot_offset
-    sin_val = SGLANG_LDG(sin_ptr + rot_offset);  // x_index / 2 = rot_offset
+    // GPT-J style - modified to match Python implementation
+    x_index = rot_offset;
+    y_index = rot_offset + embed_dim;
+    cos_val_x = SGLANG_LDG(cos_ptr + rot_offset);
+    sin_val_x = SGLANG_LDG(sin_ptr + rot_offset);
   }
 
   const scalar_t x = arr[x_index];
   const scalar_t y = arr[y_index];
-  arr[x_index] = x * cos_val - y * sin_val;
-  arr[y_index] = y * cos_val + x * sin_val;
+
+  // Modified to match Python implementation
+  // Python: q_embed = (q * cos) + (rotate_half(q) * sin)
+  // Where rotate_half negates the second half
+  arr[x_index] = x * cos_val_x - y * sin_val_x;  // First half: q[i]*cos[i] - q[i+half]*sin[i]
+  arr[y_index] = y * cos_val_x + x * sin_val_x;  // Second half: q[i+half]*cos[i] + q[i]*sin[i]
 }
 
 template <typename scalar_t, bool IS_NEOX>
@@ -101,8 +105,8 @@ inline __device__ void apply_rotary_embedding(
 
 template <typename scalar_t, bool IS_NEOX>
 __global__ void rotary_embedding_kernel(
-    const scalar_t* __restrict__ cos_data,  // [num_tokens, rot_dim / 2]
-    const scalar_t* __restrict__ sin_data,  // [num_tokens, rot_dim / 2]
+    const scalar_t* __restrict__ cos_data,  // [num_tokens, rot_dim]
+    const scalar_t* __restrict__ sin_data,  // [num_tokens, rot_dim]
     scalar_t* __restrict__ query_total,     // [num_tokens, num_heads, head_size] or [num_tokens, num_heads * head_size]
     scalar_t* __restrict__ key_total,       // nullptr or similar shape to query_total
     const int rot_dim,
@@ -117,8 +121,8 @@ __global__ void rotary_embedding_kernel(
   const int token_idx = blockIdx.x;
   const int embed_dim = rot_dim / 2;
 
-  const scalar_t* current_token_cos_ptr = cos_data + token_idx * embed_dim;
-  const scalar_t* current_token_sin_ptr = sin_data + token_idx * embed_dim;
+  const scalar_t* current_token_cos_ptr = cos_data + token_idx * rot_dim;
+  const scalar_t* current_token_sin_ptr = sin_data + token_idx * rot_dim;
 
   scalar_t* query_for_token = query_total + token_idx * (int)query_token_stride;
   scalar_t* key_for_token = (key_total != nullptr) ? (key_total + token_idx * (int)key_token_stride) : nullptr;
@@ -137,9 +141,9 @@ __global__ void rotary_embedding_kernel(
 }
 
 void rotary_embedding(
-    at::Tensor& cos_cache,                 // [num_tokens, rot_dim / 2]
-    at::Tensor& sin_cache,                 // [num_tokens, rot_dim / 2]
-    at::Tensor& query,                     // [num_tokens, num_heads * head_size]
+    at::Tensor& cos_cache,                 // [num_tokens, rot_dim]
+    at::Tensor& sin_cache,                 // [num_tokens, rot_dim]
+    at::Tensor& query,                     // [num_tokens, num_heads, head_size]
     const std::optional<at::Tensor>& key,  // null or similar to query
     int64_t head_size,
     bool is_neox) {
@@ -194,7 +198,7 @@ void rotary_embedding(
   }
   TORCH_CHECK(num_heads % num_kv_heads == 0, "num_heads must be divisible by num_kv_heads");
 
-  int rot_dim = (int)cos_cache.size(1) * 2;
+  int rot_dim = (int)cos_cache.size(1);
   //  TORCH_CHECK(rot_dim <= head_size, "rot_dim must be <= head_size");
 
   // Strides to get to the next token's data

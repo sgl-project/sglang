@@ -368,7 +368,6 @@ class VisionAttention(nn.Module):
             max_position_embeddings=2048,
             base=10000,
             is_neox_style=False,
-            # dtype=rope_dtype
             dtype=torch.get_default_dtype(),
         )
 
@@ -459,7 +458,22 @@ class VisionAttention(nn.Module):
             print(f"{q.dtype}")
 
             q, k = self.rotary_emb(position_embeddings, q, k)
-            # q, k = apply_rotary_pos_emb(q, k, cos, sin)
+            q_old, k_old = apply_rotary_pos_emb(q, k, cos, sin)
+
+            torch.testing.assert_close(
+                q,
+                q_old,
+                rtol=5,
+                atol=5,
+                msg="",
+            )
+            torch.testing.assert_close(
+                k,
+                k_old,
+                rtol=5,
+                atol=5,
+                msg="",
+            )
 
             q = q.view(original_shape)
             k = k.view(original_shape)

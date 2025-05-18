@@ -185,10 +185,8 @@ class RotaryEmbedding(CustomOp):
                 query,
                 key,
                 self.head_size,
-                # self.cos_sin_cache,
                 self.is_neox_style,
             )
-
             query = query.to(dtype=orig_q_dtype)
             key = key.to(dtype=orig_k_dtype)
         return query, key
