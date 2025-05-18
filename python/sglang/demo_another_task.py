@@ -18,7 +18,7 @@ def _create_recv_socket(rank: int):
     return get_zmq_socket(context, zmq.PULL, f"tcp://localhost:{port}", True)
 
 
-def _try_recv():
+def _try_recv(recv_socket):
     try:
         recv_req = recv_socket.recv_pyobj(zmq.NOBLOCK)
         print(f"{recv_req=}")
@@ -30,10 +30,10 @@ def _try_recv():
 def worker_background_thread(rank: int):
     memory_saver = torch_memory_saver.TorchMemorySaver(enable_use_mem_pool=False)
     recv_socket = _create_recv_socket(rank)
-    print(f"worker_background_thread init {port=}")
+    print(f"worker_background_thread init")
 
     while True:
-        if _try_recv():
+        if _try_recv(recv_socket):
             break
         else:
             time.sleep(0.001)
@@ -53,6 +53,7 @@ def worker(args, rank, world_size):
         thread.start()
 
     if args.stop_mode == 'torch_empty_cache':
+        recv_socket = _create_recv_socket(rank)
 
     os.environ['MASTER_ADDR'] = '127.0.0.1'
     os.environ['MASTER_PORT'] = '29500'
@@ -74,6 +75,8 @@ def worker(args, rank, world_size):
 
     for iteration in range(num_iterations):
         if args.stop_mode == 'torch_empty_cache':
+            if _try_recv(recv_socket):
+                break
 
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
@@ -101,21 +104,20 @@ def worker(args, rank, world_size):
 
         print(f"[GPU {rank}] Iteration {iteration}: Avg time = {avg_time:.3f} ms")
 
-    print(f"[GPU {rank}, {time.time()}] synchronize & barrier")
-    torch.cuda.synchronize()
-    torch.distributed.barrier(device_ids=[rank])
+    # print(f"[GPU {rank}, {time.time()}] synchronize & barrier")
+    # torch.cuda.synchronize()
+    # torch.distributed.barrier(device_ids=[rank])
 
-    if 1:
-        print(f"[GPU {rank}, {time.time()}] pause start")
-        memory_saver.pause()
+    # if 1:
+    #     print(f"[GPU {rank}, {time.time()}] pause start")
+    #     memory_saver.pause()
 
-    if 0:
-        print(f"[GPU {rank}, {time.time()}] del start")
-        del big_tensors, a, b, c, x, y, z, t
+    print(f"[GPU {rank}, {time.time()}] del start")
+    del big_tensors, a, b, c, x, y, z, t
 
-        print(f"[GPU {rank}, {time.time()}] {torch.cuda.mem_get_info()=}")
-        print(f"[GPU {rank}, {time.time()}] empty_cache start")
-        torch.cuda.empty_cache()
+    print(f"[GPU {rank}, {time.time()}] {torch.cuda.mem_get_info()=}")
+    print(f"[GPU {rank}, {time.time()}] empty_cache start")
+    torch.cuda.empty_cache()
 
     print(f"[GPU {rank}, {time.time()}] synchronize start")
     torch.cuda.synchronize()
