@@ -27,11 +27,9 @@ def apply_rotary_pos_emb(
     # embedding is performed in float
     cos = cos.unsqueeze(unsqueeze_dim).float()
     sin = sin.unsqueeze(unsqueeze_dim).float()
-    print(f"{cos.shape=}")
-    print(f"{q.shape=}")
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
-
+    print(f"perform in {cos.dtype=}")
     q_embed = q_embed.to(orig_q_dtype)
     k_embed = k_embed.to(orig_k_dtype)
 
@@ -103,6 +101,9 @@ class RotaryEmbedding(torch.nn.Module):
         key: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """A PyTorch-native implementation of forward()."""
+        cos, sin = cos.float(), sin.float()
+        query, key = query.float(), key.float()
+        print(f"kernel: perform in {cos.dtype=}")
         rotary_embedding(
             cos,
             sin,
@@ -159,14 +160,18 @@ def test_correctness(
     print(f"{cos.shape=}")
 
     # Modification: float32 is required for the rotary embedding to work correctly
-    query_native_out, key_native_out = rope_ref.forward_native(cos, sin, query, key)
+    query_native_out, key_native_out = rope_ref.forward_native(
+        cos, sin, query.clone(), key.clone()
+    )
 
     # in-place
-    rope_ref.forward_kernel_inplace(cos, sin, query, key)
+    query_kernel_out, key_kernel_out = rope_ref.forward_kernel_inplace(
+        cos, sin, query, key
+    )
 
-    torch.testing.assert_close(query_native_out, query, atol=1e-1, rtol=1e-1)
-    torch.testing.assert_close(key_native_out, key, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(query_native_out, query_kernel_out, atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(key_native_out, key_kernel_out, atol=1e-3, rtol=1e-3)
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    pytest.main([__file__, "--capture=no"])

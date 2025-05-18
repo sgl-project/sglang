@@ -398,7 +398,7 @@ class Qwen2_5_VisionTransformer(nn.Module):
             seq_len // self.spatial_merge_unit, self.spatial_merge_unit, -1
         )
         rotary_pos_emb = rotary_pos_emb[window_index, :, :]
-        rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
+        rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1).float()
         emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
         position_embeddings = (emb.cos(), emb.sin())
 

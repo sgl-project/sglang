@@ -361,7 +361,6 @@ class VisionAttention(nn.Module):
             softmax_in_single_precision=softmax_in_single_precision,
         )
 
-        print(f"{self.head_size=}")
         self.rotary_emb = RotaryEmbedding(
             head_size=self.head_size,
             rotary_dim=self.head_size,
@@ -454,26 +453,26 @@ class VisionAttention(nn.Module):
             q = q.view(-1, head, self.head_size)
             k = k.view(-1, head, self.head_size)
 
-            print(f"{cos.dtype}")
-            print(f"{q.dtype}")
+            # print(f"{cos.dtype}")
+            # print(f"{q.dtype}")
 
             q, k = self.rotary_emb(position_embeddings, q, k)
-            q_old, k_old = apply_rotary_pos_emb(q, k, cos, sin)
+            # q_old, k_old = apply_rotary_pos_emb(q, k, cos, sin)
 
-            torch.testing.assert_close(
-                q,
-                q_old,
-                rtol=5,
-                atol=5,
-                msg="",
-            )
-            torch.testing.assert_close(
-                k,
-                k_old,
-                rtol=5,
-                atol=5,
-                msg="",
-            )
+            # torch.testing.assert_close(
+            #     q,
+            #     q_old,
+            #     rtol=5,
+            #     atol=5,
+            #     msg="",
+            # )
+            # torch.testing.assert_close(
+            #     k,
+            #     k_old,
+            #     rtol=5,
+            #     atol=5,
+            #     msg="",
+            # )
 
             q = q.view(original_shape)
             k = k.view(original_shape)

@@ -170,15 +170,10 @@ class RotaryEmbedding(CustomOp):
         else:
             orig_q_dtype = query.dtype
             orig_k_dtype = key.dtype
-            self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
             cos, sin = positions
-            query = query.to(dtype=cos.dtype)
-            key = key.to(dtype=cos.dtype)
+            cos, sin = cos.float(), sin.float()
+            query, key = query.float(), key.float()
 
-            print(f"{type(cos)=}")
-            print(f"{cos.shape=}")
-            print(f"{query.shape=}")
-            print(f"{key.shape=}")
             self.sglang_rotary_embedding(
                 cos,
                 sin,
