@@ -9,7 +9,6 @@ import torch.multiprocessing as mp
 import torch_memory_saver
 import zmq
 from setproctitle import setproctitle
-
 from sglang.srt.utils import get_zmq_socket
 
 
@@ -32,6 +31,11 @@ def worker_background_thread(rank: int):
     memory_saver = torch_memory_saver.TorchMemorySaver(enable_use_mem_pool=False)
     recv_socket = _create_recv_socket(rank)
     print(f"worker_background_thread init")
+
+    # cleanup existing queued things
+    while True:
+        if not _try_recv(recv_socket):
+            break
 
     while True:
         if _try_recv(recv_socket):
@@ -103,7 +107,8 @@ def worker(args, rank, world_size):
         elapsed_time_ms = start_event.elapsed_time(end_event)
         avg_time = elapsed_time_ms / num_repeat
 
-        print(f"[GPU {rank}] Iteration {iteration}: Avg time = {avg_time:.3f} ms")
+        if iteration % 1000 == 0:
+            print(f"[GPU {rank}] Iteration {iteration}: Avg time = {avg_time:.3f} ms")
 
     # print(f"[GPU {rank}, {time.time()}] synchronize & barrier")
     # torch.cuda.synchronize()
