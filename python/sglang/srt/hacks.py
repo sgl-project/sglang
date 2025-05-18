@@ -1,6 +1,5 @@
 import os
 import time
-from pathlib import Path
 
 import torch
 import zmq
@@ -19,7 +18,7 @@ class OtherProcessKiller:
         self.senders = []
         for index in range(num_tasks):
             path = f"/tmp/demo_another_task_{hack_ipc_prefix}_{index}"
-            Path(path).write_text("")
+            # Path(path).write_text("")
             endpoint = f"ipc://{path}"
             print(f"{endpoint=}")
             self.senders.append(get_zmq_socket(context, zmq.PUSH, endpoint, False))
