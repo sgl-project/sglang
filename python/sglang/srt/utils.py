@@ -2102,5 +2102,12 @@ def log_info_on_rank0(logger, msg):
         logger.info(msg)
 
 
+def load_json_config(data: str):
+    try:
+        return json.loads(data)
+    except JSONDecodeError:
+        return json.loads(Path(data).read_text())
+
+
 def dispose_tensor(x: torch.Tensor):
     x.set_(torch.empty((0,), device=x.device, dtype=x.dtype))
