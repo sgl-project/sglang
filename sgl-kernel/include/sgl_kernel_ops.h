@@ -324,6 +324,14 @@ void top_p_sampling_from_probs(
     bool deterministic,
     std::optional<at::Generator> gen);
 
+void rotary_embedding(
+    at::Tensor& cos_cache,                 // [num_tokens, rot_dim / 2]
+    at::Tensor& sin_cache,                 // [num_tokens, rot_dim / 2]
+    at::Tensor& query,                     // [num_tokens, num_heads * head_size]
+    const std::optional<at::Tensor>& key,  // null or similar to query
+    int64_t head_size,
+    bool is_neox);
+
 namespace flash {
 /*
  * From fa2 sparse

@@ -27,7 +27,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.quantization import QuantizationConfig
-from sglang.srt.layers.rotary_embedding import apply_rotary_pos_emb
+from sglang.srt.layers.rotary_embedding import RotaryEmbedding, apply_rotary_pos_emb
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.utils import add_prefix, logger
 
@@ -361,6 +361,17 @@ class VisionAttention(nn.Module):
             softmax_in_single_precision=softmax_in_single_precision,
         )
 
+        print(f"{self.head_size=}")
+        self.rotary_emb = RotaryEmbedding(
+            head_size=self.head_size,
+            rotary_dim=self.head_size,
+            max_position_embeddings=2048,
+            base=10000,
+            is_neox_style=False,
+            # dtype=rope_dtype
+            dtype=torch.get_default_dtype(),
+        )
+
         self.use_qkv_parallel = use_qkv_parallel
         if use_qkv_parallel:
             self.qkv_proj = QKVParallelLinear(
@@ -444,7 +455,11 @@ class VisionAttention(nn.Module):
             q = q.view(-1, head, self.head_size)
             k = k.view(-1, head, self.head_size)
 
-            q, k = apply_rotary_pos_emb(q, k, cos, sin)
+            print(f"{cos.dtype}")
+            print(f"{q.dtype}")
+
+            q, k = self.rotary_emb(position_embeddings, q, k)
+            # q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
             q = q.view(original_shape)
             k = k.view(original_shape)
