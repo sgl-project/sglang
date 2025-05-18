@@ -53,8 +53,11 @@ class TorchMemorySaverAdapter(ABC):
 
 
 class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
+    @contextmanager
     def configure_subprocess(self):
-        return torch_memory_saver.configure_subprocess()
+        with torch_memory_saver.configure_subprocess():
+            with torch_memory_saver.change_env("TMS_INIT_IS_INTERESTING_REGION", "1"):
+                yield
 
     def region(self):
         return _primary_memory_saver.region()
