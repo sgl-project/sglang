@@ -102,7 +102,7 @@ class TestDisaggregationMooncakeDifferentTP(CustomTestCase):
 
     @classmethod
     def wait_server_ready(cls, url, timeout=60):
-        start_time = time.time()
+        start_time = time.perf_counter()
         while True:
             try:
                 response = requests.get(url)
@@ -112,7 +112,7 @@ class TestDisaggregationMooncakeDifferentTP(CustomTestCase):
             except Exception:
                 pass
 
-            if time.time() - start_time > timeout:
+            if time.perf_counter() - start_time > timeout:
                 raise RuntimeError(f"Server {url} failed to start in {timeout}s")
             time.sleep(1)
 
