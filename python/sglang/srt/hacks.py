@@ -2,6 +2,7 @@ import time
 
 import torch
 import zmq
+
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.utils import get_zmq_socket
 
@@ -26,14 +27,16 @@ class OtherProcessKiller:
 
         # cmd = "pkill -f demo_another_task"
         print(
-            f"[Hacks, TP{tp_rank}, {time.time()}] kill_other_memory_occupying_processes start")
+            f"[Hacks, TP{tp_rank}, {time.time()}] kill_other_memory_occupying_processes start"
+        )
 
         for sender in self.senders:
             sender.send_pyobj("stop")
         # subprocess.run(cmd, shell=True)
 
         print(
-            f"[Hacks, TP{tp_rank}, {time.time()}] kill_other_memory_occupying_processes subprocess end")
+            f"[Hacks, TP{tp_rank}, {time.time()}] kill_other_memory_occupying_processes subprocess end"
+        )
 
 
 def busy_wait_until_enough_memory():
@@ -45,7 +48,8 @@ def busy_wait_until_enough_memory():
         time.sleep(0.001)
 
     print(
-        f"[Hacks, TP{get_tensor_model_parallel_rank()}, {time.time()}] busy_wait_until_enough_memory see free memory {free_memory=}")
+        f"[Hacks, TP{get_tensor_model_parallel_rank()}, {time.time()}] busy_wait_until_enough_memory see free memory {free_memory=}"
+    )
 
 
 def export_model_params(model):
@@ -63,7 +67,7 @@ def import_model_param(model, data):
         self_named_params[name].data.copy_(tensor, non_blocking=True)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     other_process_killer = OtherProcessKiller()
 
     print(f"{time.time()=} {torch.cuda.mem_get_info()=}")

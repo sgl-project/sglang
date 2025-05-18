@@ -9,6 +9,7 @@ import torch.multiprocessing as mp
 import torch_memory_saver
 import zmq
 from setproctitle import setproctitle
+
 from sglang.srt.utils import get_zmq_socket
 
 
@@ -47,19 +48,19 @@ def worker_background_thread(rank: int):
 
 
 def worker(args, rank, world_size):
-    if args.stop_mode == 'background_thread_memory_saver':
+    if args.stop_mode == "background_thread_memory_saver":
         thread = threading.Thread(target=worker_background_thread, args=(rank,))
         thread.daemon = True
         thread.start()
 
-    if args.stop_mode == 'torch_empty_cache':
+    if args.stop_mode == "torch_empty_cache":
         recv_socket = _create_recv_socket(rank)
 
-    os.environ['MASTER_ADDR'] = '127.0.0.1'
-    os.environ['MASTER_PORT'] = '29500'
-    dist.init_process_group(backend='nccl', rank=rank, world_size=world_size)
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = "29500"
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
     torch.cuda.set_device(rank)
-    device = torch.device(f'cuda:{rank}')
+    device = torch.device(f"cuda:{rank}")
     setproctitle(f"demo_another_task::worker::{rank}")
     print(f"[GPU {rank}] started")
 
@@ -74,7 +75,7 @@ def worker(args, rank, world_size):
     # num_iterations = 3
 
     for iteration in range(num_iterations):
-        if args.stop_mode == 'torch_empty_cache':
+        if args.stop_mode == "torch_empty_cache":
             if _try_recv(recv_socket):
                 break
 
@@ -132,7 +133,7 @@ def worker(args, rank, world_size):
 def main(args):
     world_size = 8
 
-    mp.set_start_method('spawn')
+    mp.set_start_method("spawn")
     processes = []
     for rank in range(world_size):
         p = mp.Process(target=worker, args=(args, rank, world_size))
@@ -143,13 +144,13 @@ def main(args):
         p.join()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     parser = ArgumentParser()
     parser.add_argument(
         "--stop-mode",
         type=str,
-        choices=['background_thread_memory_saver', 'torch_empty_cache'],
-        default='background_thread_memory_saver',
+        choices=["background_thread_memory_saver", "torch_empty_cache"],
+        default="background_thread_memory_saver",
     )
     args = parser.parse_args()
     main(args)

@@ -9,6 +9,9 @@ from typing import Any, Callable, List, Optional, TypeVar, Union
 
 import torch
 import torch.distributed as dist
+from torch.distributed import ProcessGroup
+from typing_extensions import ParamSpec
+
 from sglang.srt import _custom_ops as ops
 from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
 from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
@@ -17,8 +20,6 @@ from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import 
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
 from sglang.srt.torch_memory_saver_adapter import with_tms_disable_region
 from sglang.srt.utils import is_cuda, is_hip
-from torch.distributed import ProcessGroup
-from typing_extensions import ParamSpec
 
 logger = logging.getLogger(__name__)
 

@@ -83,12 +83,12 @@ class DownstreamServer:
         assert self._ongoing_request_num == 0
         self._change_state(DownstreamState.NORMAL, DownstreamState.PAUSING)
         async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(
-                total=3600
-            )
+            timeout=aiohttp.ClientTimeout(total=3600)
         ) as session:
             logger.info(f"release_memory_occupation START {self.url=}")
-            response = await session.post(f"{self.url}/release_memory_occupation", json={})
+            response = await session.post(
+                f"{self.url}/release_memory_occupation", json={}
+            )
             text = await response.text()
             logger.info(f"release_memory_occupation END {text=}")
         self._change_state(DownstreamState.PAUSING, DownstreamState.PAUSED)
@@ -96,12 +96,12 @@ class DownstreamServer:
     async def resume_memory_occupation(self):
         self._change_state(DownstreamState.PAUSED, DownstreamState.RESUMING)
         async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(
-                total=3600
-            )
+            timeout=aiohttp.ClientTimeout(total=3600)
         ) as session:
             logger.info(f"resume_memory_occupation START {self.url=}")
-            response = await session.post(f"{self.url}/resume_memory_occupation", json={})
+            response = await session.post(
+                f"{self.url}/resume_memory_occupation", json={}
+            )
             text = await response.text()
             logger.info(f"resume_memory_occupation END {text=}")
         self._change_state(DownstreamState.RESUMING, DownstreamState.NORMAL)
@@ -121,7 +121,9 @@ class MiniLoadBalancer:
                 return downstream_server
         raise Exception("no available server")
 
-    async def generate_stream(self, req, downstream_server: DownstreamServer, request_id, endpoint="generate"):
+    async def generate_stream(
+        self, req, downstream_server: DownstreamServer, request_id, endpoint="generate"
+    ):
         assert endpoint[0] != "/", f"Endpoint should not start with '/': {endpoint}"
 
         async def stream_results():
@@ -132,7 +134,9 @@ class MiniLoadBalancer:
             ) as session:
                 async with downstream_server.around_request(request_id):
                     try:
-                        response = await session.post(f"{downstream_server.url}/{endpoint}", json=req)
+                        response = await session.post(
+                            f"{downstream_server.url}/{endpoint}", json=req
+                        )
                         async for chunk in response.content:
                             yield chunk
                     except Exception as e:
@@ -191,7 +195,11 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Mini Load Balancer Server")
     parser.add_argument(
-        "--downstream", type=str, default=[], nargs="+", help="URLs for downstream servers"
+        "--downstream",
+        type=str,
+        default=[],
+        nargs="+",
+        help="URLs for downstream servers",
     )
     parser.add_argument(
         "--host", default="0.0.0.0", help="Host to bind the server (default: 0.0.0.0)"
@@ -202,5 +210,8 @@ if __name__ == "__main__":
     parser.add_argument("--max-concurrency-per-server", type=int, default=None)
     args = parser.parse_args()
 
-    downstream_servers = [DownstreamServer(url, args.max_concurrency_per_server) for url in args.downstream]
+    downstream_servers = [
+        DownstreamServer(url, args.max_concurrency_per_server)
+        for url in args.downstream
+    ]
     run(downstream_servers, args.host, args.port)
