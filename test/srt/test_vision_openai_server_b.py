@@ -1,4 +1,4 @@
-from test.srt.test_vision_openai_server_common import *
+from test_vision_openai_server_common import *
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
