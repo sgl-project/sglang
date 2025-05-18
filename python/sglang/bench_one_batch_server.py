@@ -92,8 +92,8 @@ def launch_server_process(server_args: ServerArgs):
     base_url = f"http://{server_args.host}:{server_args.port}"
     timeout = 600
 
-    start_time = time.time()
-    while time.time() - start_time < timeout:
+    start_time = time.perf_counter()
+    while time.perf_counter() - start_time < timeout:
         try:
             headers = {
                 "Content-Type": "application/json; charset=utf-8",
@@ -141,7 +141,7 @@ def run_one_case(
     else:
         json_schema = None
 
-    tic = time.time()
+    tic = time.perf_counter()
     response = requests.post(
         url + "/generate",
         json={
@@ -175,9 +175,9 @@ def run_one_case(
                 or data["meta_info"]["finish_reason"]["type"] == "length"
             )
             if data["meta_info"]["completion_tokens"] == 1:
-                ttft = time.time() - tic
+                ttft = time.perf_counter() - tic
 
-    latency = time.time() - tic
+    latency = time.perf_counter() - tic
     input_throughput = batch_size * input_len / ttft
     output_throughput = batch_size * output_len / (latency - ttft)
     overall_throughput = batch_size * (input_len + output_len) / latency
