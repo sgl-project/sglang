@@ -83,12 +83,12 @@ if(CCACHE_FOUND AND ENABLE_CCACHE AND DEFINED ENV{CCACHE_DIR})
     set_property(GLOBAL PROPERTY RULE_LAUNCH_LINK "ccache")
 endif()
 
-# Enable below SM90
+# Enable gencode below SM90
 option(ENABLE_BELOW_SM90 "Enable below SM90" ON)
 
 if (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
     set(ENABLE_BELOW_SM90 OFF)
-    message(STATUS "For aarch64, disable below SM90 by default")
+    message(STATUS "For aarch64, disable gencode below SM90 by default")
 endif()
 
 
