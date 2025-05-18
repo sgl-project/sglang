@@ -33,7 +33,7 @@ class TestPPAccuracy(unittest.TestCase):
                 "--tp-size",
                 2,
                 "--pp-size",
-                4,
+                2,
                 "--chunked-prefill-size",
                 256,
             ],

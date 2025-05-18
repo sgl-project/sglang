@@ -104,17 +104,19 @@ suites = {
     "per-commit-2-gpu-amd": [
         TestFile("test_mla_tp.py", 170),
     ],
+    "per-commit-4-gpu": [
+        TestFile("test_local_attn.py", 250),
+        TestFile("test_pp_single_node.py", 150),
+    ],
     "per-commit-8-gpu": [
         # Disabled deepep tests temporarily because it takes too much time.
         # TODO: re-enable them after reducing the test time with compilation cache and smaller models.
         # TestFile("test_deepep_intranode.py", 50),
         # TestFile("test_deepep_low_latency.py", 50),
         # TestFile("test_moe_deepep_eval_accuracy_large.py", 250),
-        TestFile("test_disaggregation.py", 210),
-        TestFile("test_local_attn.py", 250),
+        # TestFile("test_disaggregation.py", 210), # disabled since we have different_tp test
         TestFile("test_disaggregation_different_tp.py", 210),
         TestFile("test_full_deepseek_v3.py", 250),
-        TestFile("test_pp_single_node.py", 150),
     ],
     "per-commit-8-gpu-amd": [
         TestFile("test_full_deepseek_v3.py", 250),
