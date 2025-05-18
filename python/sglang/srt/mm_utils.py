@@ -36,6 +36,16 @@ from io import BytesIO
 import numpy as np
 from PIL import Image
 
+from sglang.srt.utils import flatten_nested_list
+
+
+def has_valid_data(data) -> bool:
+    if data is None:
+        return False
+    if isinstance(data, list):
+        return any(has_valid_data(item) for item in flatten_nested_list(data))
+    return True
+
 
 def select_best_resolution(original_size, possible_resolutions):
     """
