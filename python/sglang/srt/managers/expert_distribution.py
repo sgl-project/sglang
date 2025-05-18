@@ -21,7 +21,6 @@ from typing import Dict, List, Literal, Optional, Tuple, Type
 
 import torch
 import torch.distributed
-
 from sglang.srt.managers.expert_location import ExpertLocationMetadata
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -327,8 +326,8 @@ class _SelectExpertsSinglePassGatherer(_LayerBasedSinglePassGatherer):
         torch.cuda.synchronize()
 
         global_physical_count = [
-            0
-        ] * self._expert_location_metadata.num_physical_experts
+                                    0
+                                ] * self._expert_location_metadata.num_physical_experts
         for token_record in topk_ids_list:
             for global_physical_expert_idx in token_record:
                 global_physical_count[global_physical_expert_idx] += 1
@@ -411,7 +410,7 @@ def _convert_local_to_global_physical_count(
 
     ans = torch.zeros((num_layers, num_physical_experts), dtype=dtype, device=device)
     ans[
-        :, num_local_physical_experts * rank : num_local_physical_experts * (rank + 1)
+    :, num_local_physical_experts * rank: num_local_physical_experts * (rank + 1)
     ] = local_physical_count
     return ans
 
@@ -436,9 +435,8 @@ class _Accumulator(ABC):
     def get_class(server_args: ServerArgs) -> Type["_Accumulator"]:
         return {
             "stat": _StatAccumulator,
-            # TODO pr-chain: enable this later
-            # "per_pass": _DetailAccumulator,
-            # "per_token": _DetailAccumulator,
+            "per_pass": _DetailAccumulator,
+            "per_token": _DetailAccumulator,
         }[server_args.expert_distribution_recorder_mode]
 
     def __init__(
@@ -470,6 +468,61 @@ class _Accumulator(ABC):
 
     def dump(self, output_mode: _OutputMode):
         pass
+
+
+class _DetailAccumulator(_Accumulator):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._records = []
+
+    def get_single_pass_gatherer_keys(self):
+        if False:  # TODO `server_args.enable_two_batch_overlap`
+            return [_SINGLE_PASS_GATHERER_KEY_PRIMARY, "child_a", "child_b"]
+        return super().get_single_pass_gatherer_keys()
+
+    def get_single_pass_gatherer_key(self, debug_name: Optional[str]):
+        if False:  # TODO `server_args.enable_two_batch_overlap`
+            return debug_name or _SINGLE_PASS_GATHERER_KEY_PRIMARY
+        return super().get_single_pass_gatherer_key(debug_name)
+
+    def append(
+        self,
+        forward_pass_id: int,
+        gatherer_key: str,
+        single_pass_data: Dict,
+    ):
+        super().append(forward_pass_id, gatherer_key, single_pass_data)
+
+        def _process_object(obj):
+            if isinstance(obj, torch.Tensor):
+                return obj.cpu().clone()
+            return obj
+
+        single_pass_data_processed = {
+            k: _process_object(v) for k, v in single_pass_data.items()
+        }
+
+        self._records.append(
+            dict(
+                forward_pass_id=forward_pass_id,
+                rank=self._rank,
+                gatherer_key=gatherer_key,
+                **single_pass_data_processed,
+            )
+        )
+
+    def reset(self):
+        super().reset()
+        self._records.clear()
+
+    def dump(self, output_mode: _OutputMode):
+        assert output_mode == "file"
+        output = dict(
+            records=self._records,
+            # NOTE: This may change during recording, so here we say it is the "last" one
+            last_physical_to_logical_map=self._expert_location_metadata.physical_to_logical_map,
+        )
+        _dump_to_file(f"expert_distribution_recorder_{time.time()}_{self._rank}.pt", output)
 
 
 class _StatAccumulator(_Accumulator):
