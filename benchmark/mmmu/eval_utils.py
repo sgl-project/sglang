@@ -201,7 +201,7 @@ def prepare_samples(eval_args: EvalArgs):
 
 
 def get_sampling_params(eval_args):
-    max_new_tokens = 5 if eval_args.profile else 30
+    max_new_tokens = 30
     temperature = 0.001
 
     extra_request_body = {}

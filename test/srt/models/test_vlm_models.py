@@ -27,27 +27,19 @@ from sglang.test.test_utils import (
 
 # VLM models for testing
 MODELS = [
-    # SimpleNamespace(
-    #     model="google/gemma-3-4b-it", chat_template="gemma-it", mmmu_accuracy=0.384
-    # ),
     SimpleNamespace(
-        model="Qwen/Qwen2.5-VL-7B-Instruct",
-        chat_template="qwen2-vl",
-        mmmu_accuracy=0.466,
+        model="google/gemma-3-4b-it", chat_template="gemma-it", mmmu_accuracy=0.384
     ),
-    # SimpleNamespace(
-    #     model="google/gemma-3-4b-it", mmmu_accuracy=0.384
-    # ),
     SimpleNamespace(
         model="Qwen/Qwen2.5-VL-3B-Instruct",
         mmmu_accuracy=0.466,
     ),
-    # SimpleNamespace(
-    #     # model="openbmb/MiniCPM-V-2_6", mmmu_accuracy=0.435
-    #     model="openbmb/MiniCPM-V-2_6",
-    #     chat_template="minicpmv",
-    #     mmmu_accuracy=0.3867,
-    # ),
+    SimpleNamespace(
+        # model="openbmb/MiniCPM-V-2_6", mmmu_accuracy=0.435
+        model="openbmb/MiniCPM-V-2_6",
+        chat_template="minicpmv",
+        mmmu_accuracy=0.3867,
+    ),
 ]
 
 
@@ -170,11 +162,12 @@ class TestVLMModels(unittest.IsolatedAsyncioTestCase):
                         print("Profiler started")
 
                 # Run evaluation
-                self.run_mmmu_eval(model.model,
-                                   self.parsed_args.batch_size,
-                                   "./logs",
-                                   limit=str(1) if self.parsed_args.profile else None,
-                                   )
+                self.run_mmmu_eval(
+                    model.model,
+                    self.parsed_args.batch_size,
+                    "./logs",
+                    limit=str(1) if self.parsed_args.profile else None,
+                )
 
                 if args.profile:
                     profile_output = await async_request_profile(
@@ -238,13 +231,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=4,
+        default=1,
     )
     parser.add_argument(
         "--profile",
         action="store_true",
         help="Use Torch Profiler. The endpoint must be launched with "
-             "SGLANG_TORCH_PROFILER_DIR to enable profiler",
+        "SGLANG_TORCH_PROFILER_DIR to enable profiler",
         default=False,
     )
     # Parse args intended for unittest
