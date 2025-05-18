@@ -60,7 +60,8 @@ class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
                 yield
 
     def region(self):
-        return _primary_memory_saver.region()
+        raise NotImplementedError("dont use this")
+        # return _primary_memory_saver.region()
 
     def pause(self):
         return _primary_memory_saver.pause()
