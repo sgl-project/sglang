@@ -47,6 +47,7 @@ from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
+    ImageDataItem,
     InitWeightsUpdateGroupReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
@@ -150,9 +151,9 @@ class Engine(EngineBase):
         # See also python/sglang/srt/utils.py:load_image for more details.
         image_data: Optional[
             Union[
-                List[List[Union[Image, str]]],
-                List[Union[Image, str]],
-                Union[Image, str],
+                List[List[ImageDataItem]],
+                List[ImageDataItem],
+                ImageDataItem,
             ]
         ] = None,
         return_logprob: Optional[Union[List[bool], bool]] = False,
@@ -221,9 +222,9 @@ class Engine(EngineBase):
         # See also python/sglang/srt/utils.py:load_image for more details.
         image_data: Optional[
             Union[
-                List[List[Union[Image, str]]],
-                List[Union[Image, str]],
-                Union[Image, str],
+                List[List[ImageDataItem]],
+                List[ImageDataItem],
+                ImageDataItem,
             ]
         ] = None,
         return_logprob: Optional[Union[List[bool], bool]] = False,
@@ -320,7 +321,8 @@ class Engine(EngineBase):
         loop.run_until_complete(self.tokenizer_manager.start_profile())
 
     def stop_profile(self):
-        self.tokenizer_manager.stop_profile()
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(self.tokenizer_manager.stop_profile())
 
     def get_server_info(self):
         loop = asyncio.get_event_loop()

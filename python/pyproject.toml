@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sglang"
-version = "0.4.6.post3"
+version = "0.4.6.post4"
 description = "SGLang is yet another fast serving framework for large language models and vision language models."
 readme = "README.md"
 requires-python = ">=3.8"
@@ -19,7 +19,6 @@ dependencies = ["aiohttp", "requests", "tqdm", "numpy", "IPython", "setproctitle
 runtime_common = [
     "compressed-tensors",
     "datasets",
-    "decord",
     "fastapi",
     "hf_transfer",
     "huggingface_hub",
@@ -65,6 +64,7 @@ blackwell = [
     "cuda-python",
     "outlines>=0.0.44,<=0.1.11",
     "einops",
+    "flashinfer_python==0.2.5",
 ]
 
 # HIP (Heterogeneous-computing Interface for Portability) for AMD
@@ -95,20 +95,22 @@ openai = ["openai>=1.0", "tiktoken"]
 anthropic = ["anthropic>=0.20.0"]
 litellm = ["litellm>=1.0.0"]
 torch_memory_saver = ["torch_memory_saver>=0.0.4"]
+decord = ["decord"]
 test = [
+    "accelerate",
     "jsonlines",
     "matplotlib",
     "pandas",
-    "sentence_transformers",
-    "accelerate",
     "peft",
+    "timm",
+    "sentence_transformers",
 ]
-all = ["sglang[srt]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]", "sglang[torch_memory_saver]"]
-all_hip = ["sglang[srt_hip]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]"]
-all_xpu = ["sglang[srt_xpu]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]"]
-all_hpu = ["sglang[srt_hpu]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]"]
-all_cpu = ["sglang[srt_cpu]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]"]
-all_npu = ["sglang[srt_npu]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]"]
+all = ["sglang[srt]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]", "sglang[torch_memory_saver]", "sglang[decord]"]
+all_hip = ["sglang[srt_hip]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]", "sglang[decord]"]
+all_xpu = ["sglang[srt_xpu]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]", "sglang[decord]"]
+all_hpu = ["sglang[srt_hpu]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]", "sglang[decord]"]
+all_cpu = ["sglang[srt_cpu]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]", "sglang[decord]"]
+all_npu = ["sglang[srt_npu]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]", "sglang[decord]"]
 
 dev = ["sglang[all]", "sglang[test]"]
 dev_hip = ["sglang[all_hip]", "sglang[test]"]
