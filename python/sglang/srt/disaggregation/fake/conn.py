@@ -54,7 +54,7 @@ class FakeKVSender(BaseKVSender):
             logger.info(f"FakeKVSender send success")
         else:
             self.has_sent = False
-            logger.info(f"FakeKVSender send fake transfering")
+            logger.info(f"FakeKVSender send fake transferring")
 
     def failure_exception(self):
         raise Exception("Fake KVSender Exception")

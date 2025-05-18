@@ -22,11 +22,7 @@ from typing import Dict, List, Optional, Set, Union
 
 import torch
 
-from sglang.srt.managers.schedule_batch import (
-    Req,
-    ScheduleBatch,
-    global_server_args_dict,
-)
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode
@@ -499,12 +495,12 @@ class PrefillAdder:
                     ),
                 )
             else:
-                if self.rem_chunk_tokens == 0:
+                # Make sure at least one page is available
+                trunc_len = self.rem_chunk_tokens - self.tree_cache.page_size + 1
+                if trunc_len <= 0:
                     return AddReqResult.OTHER
 
                 # Chunked prefill
-                trunc_len = self.rem_chunk_tokens
-
                 req.extend_input_len = trunc_len
                 req.fill_ids = req.fill_ids[: len(req.prefix_indices) + trunc_len]
 

@@ -89,7 +89,7 @@ def run_eval(args):
     }
 
     # Run requests
-    tic = time.time()
+    tic = time.perf_counter()
 
     loop = asyncio.get_event_loop()
 
@@ -98,7 +98,7 @@ def run_eval(args):
     )
 
     # End requests
-    latency = time.time() - tic
+    latency = time.perf_counter() - tic
 
     # Shutdown the engine
     engine.shutdown()

@@ -71,9 +71,9 @@ def run_eval(args):
     )
 
     # Run eval
-    tic = time.time()
+    tic = time.perf_counter()
     result = eval_obj(sampler)
-    latency = time.time() - tic
+    latency = time.perf_counter() - tic
 
     # Dump reports
     metrics = result.metrics | {"score": result.score}

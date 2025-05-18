@@ -1,5 +1,5 @@
 #include <ATen/record_function.h>
-#include <torch/extension.h>
+#include <torch/all.h>
 
 #include "shm.h"
 

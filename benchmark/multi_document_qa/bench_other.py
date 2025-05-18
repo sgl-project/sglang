@@ -17,7 +17,7 @@ ASSISTANT_SUFFIX = " </s><s>"
 
 def multi_document_qa(docs, question, generate):
     s = USER_PREFIX
-    s += "Pleaes answer a question according to given documents.\n"
+    s += "Please answer a question according to given documents.\n"
     s += "Question:" + question + "Documents begin.\n"
 
     s += "".join(docs)
@@ -61,7 +61,7 @@ def main(args):
     def get_one_answer(i):
         states[i] = multi_document_qa(generate=call_generate, **arguments[i])
 
-    tic = time.time()
+    tic = time.perf_counter()
     if args.parallel == 1:
         for i in tqdm(range(len(labels))):
             get_one_answer(i)
@@ -74,7 +74,7 @@ def main(args):
                 )
             )
 
-    latency = time.time() - tic
+    latency = time.perf_counter() - tic
 
     # Compute accuracy
     print(states)

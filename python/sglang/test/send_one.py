@@ -27,6 +27,7 @@ class BenchArgs:
         "Human: Give me a fully functional FastAPI server. Show the python code.\n\nAssistant:"
     )
     image: bool = False
+    many_images: bool = False
     stream: bool = False
 
     @staticmethod
@@ -48,6 +49,7 @@ class BenchArgs:
         parser.add_argument("--return-logprob", action="store_true")
         parser.add_argument("--prompt", type=str, default=BenchArgs.prompt)
         parser.add_argument("--image", action="store_true")
+        parser.add_argument("--many-images", action="store_true")
         parser.add_argument("--stream", action="store_true")
 
     @classmethod
@@ -62,6 +64,17 @@ def send_one_prompt(args):
             "Human: Describe this image in a very short sentence.\n\nAssistant:"
         )
         image_data = "https://raw.githubusercontent.com/sgl-project/sglang/main/test/lang/example_image.png"
+    elif args.many_images:
+        args.prompt = (
+            "Human: I have one reference image and many images."
+            "Describe their relationship in a very short sentence.\n\nAssistant:"
+        )
+        image_data = [
+            "https://raw.githubusercontent.com/sgl-project/sglang/main/test/lang/example_image.png",
+            "https://raw.githubusercontent.com/sgl-project/sglang/main/test/lang/example_image.png",
+            "https://raw.githubusercontent.com/sgl-project/sglang/main/test/lang/example_image.png",
+            "https://raw.githubusercontent.com/sgl-project/sglang/main/test/lang/example_image.png",
+        ]
     else:
         image_data = None
 
@@ -74,9 +87,6 @@ def send_one_prompt(args):
             "Write in a format of json.\nAssistant:"
         )
         json_schema = "$$ANY$$"
-        json_schema = (
-            '{"type": "object", "properties": {"population": {"type": "integer"}}}'
-        )
     else:
         json_schema = None
 
