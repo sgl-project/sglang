@@ -127,9 +127,11 @@ class TpModelWorkerClient:
         batch_lists = [None] * 2
 
         while True:
-            model_worker_batch, future_token_ids_ct = self.input_queue.get()
+            model_worker_batch, future_token_ids_ct, sync_event = self.input_queue.get()
             if not model_worker_batch:
                 break
+
+            sync_event.wait()
 
             # Keep a reference of model_worker_batch by storing it into a list.
             # Otherwise, the tensor members of model_worker_batch will be released
@@ -214,10 +216,11 @@ class TpModelWorkerClient:
         )
 
         # A cuda stream sync here to avoid the cuda illegal memory access error.
-        self.scheduler_stream.synchronize()
+        sync_event = torch.get_device_module(self.device).Event()
+        sync_event.record(self.scheduler_stream)
 
         # Push a new batch to the queue
-        self.input_queue.put((model_worker_batch, self.future_token_ids_ct))
+        self.input_queue.put((model_worker_batch, self.future_token_ids_ct, sync_event))
 
         # Allocate output future objects
         bs = len(model_worker_batch.seq_lens)

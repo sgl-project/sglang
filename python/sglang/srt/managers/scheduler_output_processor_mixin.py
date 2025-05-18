@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import logging
 import threading
+import time
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import BatchEmbeddingOut, BatchTokenIDOut
 from sglang.srt.managers.schedule_batch import BaseFinishReason, Req, ScheduleBatch
@@ -14,6 +17,8 @@ if TYPE_CHECKING:
         ScheduleBatch,
         Scheduler,
     )
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_FORCE_STREAM_INTERVAL = 50
 
@@ -83,6 +88,7 @@ class SchedulerOutputProcessorMixin:
 
                     if req.finished():
                         self.tree_cache.cache_finished_req(req)
+                        req.time_stats.completion_time = time.time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         # This updates radix so others can match
                         self.tree_cache.cache_unfinished_req(req)
@@ -149,10 +155,7 @@ class SchedulerOutputProcessorMixin:
                             )
                             logprob_pt += num_input_logprobs
 
-            if batch.next_batch_sampling_info:
-                batch.next_batch_sampling_info.update_regex_vocab_mask()
-                self.current_stream.synchronize()
-                batch.next_batch_sampling_info.sampling_info_done.set()
+            self.set_next_batch_sampling_info_done(batch)
 
         else:  # embedding or reward model
             embeddings, bid = result.embeddings, result.bid
@@ -233,6 +236,7 @@ class SchedulerOutputProcessorMixin:
             req.check_finished()
             if req.finished():
                 self.tree_cache.cache_finished_req(req)
+                req.time_stats.completion_time = time.time()
 
             if req.return_logprob and batch.spec_algorithm.is_none():
                 # speculative worker handles logprob in speculative decoding
@@ -262,13 +266,8 @@ class SchedulerOutputProcessorMixin:
                 req.grammar.accept_token(next_token_id)
                 req.grammar.finished = req.finished()
 
-        if batch.next_batch_sampling_info:
-            batch.next_batch_sampling_info.update_regex_vocab_mask()
-            self.current_stream.synchronize()
-            batch.next_batch_sampling_info.sampling_info_done.set()
-
+        self.set_next_batch_sampling_info_done(batch)
         self.stream_output(batch.reqs, batch.return_logprob)
-
         self.token_to_kv_pool_allocator.free_group_end()
 
         self.forward_ct_decode = (self.forward_ct_decode + 1) % (1 << 30)
@@ -530,16 +529,27 @@ class SchedulerOutputProcessorMixin:
                     )
 
             if should_output:
+                send_token_offset = req.send_token_offset
+                send_output_token_logprobs_offset = (
+                    req.send_output_token_logprobs_offset
+                )
                 rids.append(req.rid)
                 finished_reasons.append(
                     req.finished_reason.to_json() if req.finished_reason else None
                 )
                 decoded_texts.append(req.decoded_text)
                 decode_ids, read_offset = req.init_incremental_detokenize()
-                decode_ids_list.append(decode_ids)
+
+                if self.model_config.is_multimodal_gen:
+                    decode_ids_list.append(decode_ids)
+                else:
+                    decode_ids_list.append(decode_ids[req.send_decode_id_offset :])
+
+                req.send_decode_id_offset = len(decode_ids)
                 read_offsets.append(read_offset)
                 if self.skip_tokenizer_init:
-                    output_ids.append(req.output_ids)
+                    output_ids.append(req.output_ids[send_token_offset:])
+                req.send_token_offset = len(req.output_ids)
                 skip_special_tokens.append(req.sampling_params.skip_special_tokens)
                 spaces_between_special_tokens.append(
                     req.sampling_params.spaces_between_special_tokens
@@ -553,36 +563,90 @@ class SchedulerOutputProcessorMixin:
                     spec_verify_ct.append(req.spec_verify_ct)
 
                 if return_logprob:
-                    input_token_logprobs_val.append(req.input_token_logprobs_val)
-                    input_token_logprobs_idx.append(req.input_token_logprobs_idx)
-                    output_token_logprobs_val.append(req.output_token_logprobs_val)
-                    output_token_logprobs_idx.append(req.output_token_logprobs_idx)
-                    input_top_logprobs_val.append(req.input_top_logprobs_val)
-                    input_top_logprobs_idx.append(req.input_top_logprobs_idx)
-                    output_top_logprobs_val.append(req.output_top_logprobs_val)
-                    output_top_logprobs_idx.append(req.output_top_logprobs_idx)
-                    input_token_ids_logprobs_val.append(
-                        req.input_token_ids_logprobs_val
-                    )
-                    input_token_ids_logprobs_idx.append(
-                        req.input_token_ids_logprobs_idx
-                    )
-                    output_token_ids_logprobs_val.append(
-                        req.output_token_ids_logprobs_val
-                    )
-                    output_token_ids_logprobs_idx.append(
-                        req.output_token_ids_logprobs_idx
-                    )
+                    if (
+                        req.return_logprob
+                        and not req.input_logprob_sent
+                        # Decode server does not send input logprobs
+                        and self.disaggregation_mode != DisaggregationMode.DECODE
+                    ):
+                        input_token_logprobs_val.append(req.input_token_logprobs_val)
+                        input_token_logprobs_idx.append(req.input_token_logprobs_idx)
+                        input_top_logprobs_val.append(req.input_top_logprobs_val)
+                        input_top_logprobs_idx.append(req.input_top_logprobs_idx)
+                        input_token_ids_logprobs_val.append(
+                            req.input_token_ids_logprobs_val
+                        )
+                        input_token_ids_logprobs_idx.append(
+                            req.input_token_ids_logprobs_idx
+                        )
+                        req.input_logprob_sent = True
+                    else:
+                        input_token_logprobs_val.append([])
+                        input_token_logprobs_idx.append([])
+                        input_top_logprobs_val.append([])
+                        input_top_logprobs_idx.append([])
+                        input_token_ids_logprobs_val.append([])
+                        input_token_ids_logprobs_idx.append([])
+
+                    if req.return_logprob:
+                        output_token_logprobs_val.append(
+                            req.output_token_logprobs_val[
+                                send_output_token_logprobs_offset:
+                            ]
+                        )
+                        output_token_logprobs_idx.append(
+                            req.output_token_logprobs_idx[
+                                send_output_token_logprobs_offset:
+                            ]
+                        )
+                        output_top_logprobs_val.append(
+                            req.output_top_logprobs_val[
+                                send_output_token_logprobs_offset:
+                            ]
+                        )
+                        output_top_logprobs_idx.append(
+                            req.output_top_logprobs_idx[
+                                send_output_token_logprobs_offset:
+                            ]
+                        )
+                        output_token_ids_logprobs_val.append(
+                            req.output_token_ids_logprobs_val[
+                                send_output_token_logprobs_offset:
+                            ]
+                        )
+                        output_token_ids_logprobs_idx.append(
+                            req.output_token_ids_logprobs_idx[
+                                send_output_token_logprobs_offset:
+                            ]
+                        )
+                        req.send_output_token_logprobs_offset = len(
+                            req.output_token_logprobs_val
+                        )
+                    else:
+                        output_token_logprobs_val.append([])
+                        output_token_logprobs_idx.append([])
+                        output_top_logprobs_val.append([])
+                        output_top_logprobs_idx.append([])
+                        output_token_ids_logprobs_val.append([])
+                        output_token_ids_logprobs_idx.append([])
 
                 if req.return_hidden_states:
                     if output_hidden_states is None:
                         output_hidden_states = []
                     output_hidden_states.append(req.hidden_states)
 
+            if (
+                req.finished()
+                and self.tp_rank == 0
+                and self.server_args.enable_request_time_stats_logging
+            ):
+                req.log_time_stats()
+
         # Send to detokenizer
         if rids:
             if self.model_config.is_multimodal_gen:
                 return
+
             self.send_to_detokenizer.send_pyobj(
                 BatchTokenIDOut(
                     rids,
