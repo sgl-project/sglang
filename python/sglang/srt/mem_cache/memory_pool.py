@@ -313,6 +313,14 @@ class MHATokenToKVPool(KVCache):
         )
         return flatten
 
+    def get_flat_data_by_layer(self, indices, layer_id):
+        return torch.stack(
+            [
+                self.k_buffer[layer_id - self.start_layer][indices],
+                self.v_buffer[layer_id - self.start_layer][indices]
+            ]
+        )
+
     @debug_timing
     def transfer(self, indices, flat_data):
         # transfer prepared data from host to device
@@ -328,6 +336,22 @@ class MHATokenToKVPool(KVCache):
         k_data, v_data = flat_data[0], flat_data[1]
         self.k_buffer[layer_id - self.start_layer][indices] = k_data
         self.v_buffer[layer_id - self.start_layer][indices] = v_data
+
+    def transfer_page_per_layer(self, indices, flat_data_list, layer_id):
+        indices_cpu = indices[:: self.page_size].cpu()
+        flat_data = torch.concat(flat_data_list, dim=2)
+        flat_data = flat_data.to(device=self.device, non_blocking=False)
+        k_data, v_data = flat_data[0], flat_data[1]
+        off_set = 0
+        for i in range(len(indices_cpu)):
+            d_index = indices_cpu[i]
+            self.k_buffer[layer_id - self.start_layer][
+                d_index : d_index + self.page_size
+            ].copy_(k_data[:, off_set : off_set + self.page_size])
+            self.v_buffer[layer_id - self.start_layer][
+                d_index : d_index + self.page_size
+            ].copy_(v_data[:, off_set : off_set + self.page_size])
+            off_set += self.page_size
 
     def get_key_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
@@ -609,6 +633,10 @@ class MLATokenToKVPool(KVCache):
         # prepare a large chunk of contiguous data for efficient transfer
         return torch.stack([self.kv_buffer[i][indices] for i in range(self.layer_num)])
 
+    def get_flat_data_by_layer(self, indices, layer_id):
+        # prepare a large chunk of contiguous data for efficient transfer
+        return self.kv_buffer[layer_id - self.start_layer][indices]
+
     @debug_timing
     def transfer(self, indices, flat_data):
         # transfer prepared data from host to device
@@ -620,6 +648,18 @@ class MLATokenToKVPool(KVCache):
         # transfer prepared data from host to device
         flat_data = flat_data.to(device=self.device, non_blocking=False)
         self.kv_buffer[layer_id - self.start_layer][indices] = flat_data
+
+    def transfer_page_per_layer(self, indices, flat_data_list, layer_id):
+        flat_data = torch.concat(flat_data_list, dim=1)
+        flat_data = flat_data.to(device=self.device, non_blocking=False)
+        device_indices_cpu = indices[:: self.page_size].cpu()
+        off_set = 0
+        for i in range(len(device_indices_cpu)):
+            d_index = device_indices_cpu[i]
+            self.kv_buffer[layer_id - self.start_layer][
+            d_index: d_index + self.page_size
+            ].copy_(flat_data[:, off_set : off_set + self.page_size])
+            off_set += self.page_size
 
 
 class DoubleSparseTokenToKVPool(KVCache):
