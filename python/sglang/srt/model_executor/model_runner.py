@@ -352,7 +352,6 @@ class ModelRunner:
             )
             if not self.is_multimodal_chunked_prefill_supported:
                 server_args.chunked_prefill_size = -1
-                if self.should_log:
                 logger.info(
                     f"Automatically turn of --chunked-prefill-size as it is not supported for "
                     f"{self.model_config.hf_config.model_type}"

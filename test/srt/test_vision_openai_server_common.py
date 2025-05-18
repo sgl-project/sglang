@@ -294,7 +294,9 @@ class TestOpenAIVisionServer(CustomTestCase):
         print("-" * 30)
 
         # Add assertions to validate the video response
-        assert "iPod" in video_response or "device" in video_response, f"video_response: {video_response}, should contain 'iPod' or 'device'"
+        assert (
+            "iPod" in video_response or "device" in video_response
+        ), f"video_response: {video_response}, should contain 'iPod' or 'device'"
         assert (
             "man" in video_response
             or "person" in video_response
@@ -307,7 +309,9 @@ class TestOpenAIVisionServer(CustomTestCase):
             or "display" in video_response
             or "hold" in video_response
         ), f"video_response: {video_response}, should contain 'present', 'examine', 'display', or 'hold'"
-        assert "black" in video_response or "dark" in video_response, f"video_response: {video_response}, should contain 'black' or 'dark'"
+        assert (
+            "black" in video_response or "dark" in video_response
+        ), f"video_response: {video_response}, should contain 'black' or 'dark'"
         self.assertIsNotNone(video_response)
         self.assertGreater(len(video_response), 0)
 
