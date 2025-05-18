@@ -129,7 +129,6 @@ from sglang.srt.utils import (
     DynamicGradMode,
     broadcast_pyobj,
     configure_logger,
-    crash_on_warnings,
     disable_request_logging,
     get_bool_env_var,
     get_zmq_socket,
@@ -349,8 +348,8 @@ class Scheduler(
         self.forward_ct_decode = 0
         self.num_generated_tokens = 0
         self.num_prefill_tokens = 0
-        self.last_decode_stats_tic = time.time()
-        self.last_prefill_stats_tic = time.time()
+        self.last_decode_stats_tic = time.perf_counter()
+        self.last_prefill_stats_tic = time.perf_counter()
         self.return_health_check_ct = 0
         self.current_stream = torch.get_device_module(self.device).current_stream()
         if self.device == "cpu":
@@ -1033,13 +1032,13 @@ class Scheduler(
                 add_to_grammar_queue = True
 
         if add_to_grammar_queue:
-            req.queue_time_start = time.time()
+            req.queue_time_start = time.perf_counter()
             self.grammar_queue.append(req)
         else:
             self._add_request_to_queue(req)
 
     def _add_request_to_queue(self, req: Req):
-        req.queue_time_start = time.time()
+        req.queue_time_start = time.perf_counter()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.disagg_prefill_bootstrap_queue.add(req)
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
@@ -1086,7 +1085,7 @@ class Scheduler(
                 req.finished_reason = FINISH_ABORT(
                     error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
                 )
-                req.queue_time_start = time.time()
+                req.queue_time_start = time.perf_counter()
                 self.waiting_queue.append(req)
                 return
 
@@ -1110,8 +1109,8 @@ class Scheduler(
         can_run_list: List[Req],
         running_bs: int,
     ):
-        gap_latency = time.time() - self.last_prefill_stats_tic
-        self.last_prefill_stats_tic = time.time()
+        gap_latency = time.perf_counter() - self.last_prefill_stats_tic
+        self.last_prefill_stats_tic = time.perf_counter()
         self.last_input_throughput = self.num_prefill_tokens / gap_latency
         self.num_prefill_tokens = 0
 
@@ -1161,8 +1160,8 @@ class Scheduler(
     ):
         batch = running_batch or self.running_batch
 
-        gap_latency = time.time() - self.last_decode_stats_tic
-        self.last_decode_stats_tic = time.time()
+        gap_latency = time.perf_counter() - self.last_decode_stats_tic
+        self.last_decode_stats_tic = time.perf_counter()
         self.last_gen_throughput = self.num_generated_tokens / gap_latency
         self.num_generated_tokens = 0
         num_running_reqs = len(batch.reqs)
@@ -1246,7 +1245,7 @@ class Scheduler(
         if (
             self.enable_metrics
             and self.attn_tp_rank == 0
-            and time.time() > self.metrics_collector.last_log_time + 30
+            and time.perf_counter() > self.metrics_collector.last_log_time + 30
         ):
             # During idle time, also collect metrics every 30 seconds.
             num_used = self.max_total_num_tokens - (
@@ -1411,7 +1410,7 @@ class Scheduler(
         if self.enable_metrics:
             # only record queue time when enable_metrics is True to avoid overhead
             for req in can_run_list:
-                req.queue_time_end = time.time()
+                req.queue_time_end = time.perf_counter()
 
         self.waiting_queue = [
             x for x in self.waiting_queue if x not in set(can_run_list)
@@ -1513,7 +1512,7 @@ class Scheduler(
             self.profiler_target_forward_ct
             and self.profiler_target_forward_ct <= self.forward_ct
         ):
-            self.stop_profile()
+            self.send_to_tokenizer.send_pyobj(self.stop_profile())
 
         if self.forward_sleep_time is not None:
             logger.info(f"Scheduler.run_batch sleep {self.forward_sleep_time}s")
@@ -1784,10 +1783,10 @@ class Scheduler(
     def watchdog_thread(self):
         """A watch dog thread that will try to kill the server itself if one forward batch takes too long."""
         self.watchdog_last_forward_ct = 0
-        self.watchdog_last_time = time.time()
+        self.watchdog_last_time = time.perf_counter()
 
         while True:
-            current = time.time()
+            current = time.perf_counter()
             if self.cur_batch is not None:
                 if self.watchdog_last_forward_ct == self.forward_ct:
                     if current > self.watchdog_last_time + self.watchdog_timeout:
@@ -2115,7 +2114,10 @@ class Scheduler(
 
     def stop_profile(self) -> None:
         if self.profiler_activities is None:
-            return
+            return ProfileReqOutput(
+                success=False,
+                message="Profiling is not in progress. Call /start_profile first.",
+            )
 
         logger.info("Stop profiling...")
         if self.torch_profiler is not None:
@@ -2146,10 +2148,7 @@ class Scheduler(
         self.torch_profiler_output_dir = None
         self.profiler_activities = None
 
-        if self.profiler_target_forward_ct:
-            self.send_to_tokenizer.send_pyobj(
-                ProfileReqOutput(success=True, message="Succeeded.")
-            )
+        return ProfileReqOutput(success=True, message="Succeeded")
 
     def expert_distribution_handle(self, recv_req: ExpertDistributionReq):
         if recv_req == ExpertDistributionReq.START_RECORD:
