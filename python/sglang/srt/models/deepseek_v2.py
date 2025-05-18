@@ -1238,17 +1238,30 @@ class DeepseekV2DecoderLayer(nn.Module):
             else:
                 hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-            assert not (
-                self.attn_tp_size != 1 and self.input_is_scattered
-            ), "moe_layer_freq > 1 is not supported when attn_tp_size > 1"
-
-            # Self Attention
-            hidden_states = self.self_attn(
-                positions=positions,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
-                zero_allocator=zero_allocator,
+        if self.attn_tp_size != 1 and self.input_is_scattered:
+            hidden_states, local_hidden_states = (
+                forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
+                hidden_states,
             )
+            attn_tp_all_gather(
+                list(hidden_states.tensor_split(self.attn_tp_size)), local_hidden_states
+            )
+            hidden_states = hidden_states.clone()
+            residual, local_residual = (
+                forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
+                residual,
+            )
+            attn_tp_all_gather(
+                list(residual.tensor_split(self.attn_tp_size)), local_residual
+            )
+
+        # Self Attention
+        hidden_states = self.self_attn(
+            positions=positions,
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+            zero_allocator=zero_allocator,
+        )
 
         # Gather
         if get_tensor_model_parallel_world_size() > 1:
