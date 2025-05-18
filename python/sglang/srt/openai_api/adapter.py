@@ -1193,6 +1193,7 @@ def v1_chat_generate_request(
         top_logprobs_nums = top_logprobs_nums[0]
         modalities_list = modalities_list[0]
         lora_paths = lora_paths[0]
+        request_ids = request_ids[0]
     else:
         if tokenizer_manager.model_config.is_multimodal:
             # processor will need text input
@@ -1429,7 +1430,9 @@ async def v1_chat_completions(
         return create_error_response("Invalid request body, error: ", str(e))
     all_requests = [ChatCompletionRequest(**request_json)]
     created = int(time.time())
-    adapted_request, request = v1_chat_generate_request(all_requests, tokenizer_manager)
+    adapted_request, request = v1_chat_generate_request(
+        all_requests, tokenizer_manager, request_ids=[all_requests[0].rid]
+    )
 
     if adapted_request.stream:
         parser_dict = {}
@@ -1824,8 +1827,10 @@ def v1_embedding_request(all_requests, tokenizer_manager):
             )
         else:
             prompt_kwargs = {"input_ids": prompts}
+    request_ids = [req.request_id for req in all_requests]
 
     adapted_request = EmbeddingReqInput(
+        rid=request_ids,
         **prompt_kwargs,
     )
 
