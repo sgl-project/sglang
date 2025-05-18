@@ -20,6 +20,7 @@ from typing import Optional
 import torch
 import torch.distributed
 import torch.nn.functional as F
+
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.model_loader import get_model_architecture
 from sglang.srt.server_args import ServerArgs
@@ -116,7 +117,9 @@ class ExpertLocationMetadata:
         )
 
     @staticmethod
-    def init_by_eplb(server_args: ServerArgs, model_config: ModelConfig, logical_count: torch.Tensor):
+    def init_by_eplb(
+        server_args: ServerArgs, model_config: ModelConfig, logical_count: torch.Tensor
+    ):
         if not isinstance(logical_count, torch.Tensor):
             logical_count = torch.tensor(logical_count)
         if len(logical_count.shape) == 2:
