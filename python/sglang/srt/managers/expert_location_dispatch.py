@@ -58,8 +58,8 @@ def topk_ids_logical_to_physical(
 
     if info.ep_dispatch_algorithm == "static":
         return _topk_ids_logical_to_physical_static(topk_ids, info)
-    if info.ep_dispatch_algorithm == "random":
-        return _topk_ids_logical_to_physical_random(topk_ids, info)
+    if info.ep_dispatch_algorithm == "dynamic":
+        return _topk_ids_logical_to_physical_dynamic(topk_ids, info)
     raise NotImplementedError
 
 
@@ -69,7 +69,7 @@ def _topk_ids_logical_to_physical_static(
     return info.partial_logical_to_rank_dispatch_physical_map[topk_ids]
 
 
-def _topk_ids_logical_to_physical_random(
+def _topk_ids_logical_to_physical_dynamic(
     topk_ids: torch.Tensor, info: Optional[ExpertLocationDispatchInfo]
 ) -> torch.Tensor:
     topk_ids_original_shape = topk_ids.shape
