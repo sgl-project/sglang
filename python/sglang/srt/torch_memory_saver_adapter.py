@@ -53,11 +53,15 @@ class TorchMemorySaverAdapter(ABC):
 
 
 class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
+    @contextmanager
     def configure_subprocess(self):
-        return torch_memory_saver.configure_subprocess()
+        with torch_memory_saver.configure_subprocess():
+            with torch_memory_saver.change_env("TMS_INIT_IS_INTERESTING_REGION", "1"):
+                yield
 
     def region(self):
-        return _primary_memory_saver.region()
+        raise NotImplementedError("dont use this")
+        # return _primary_memory_saver.region()
 
     def pause(self):
         return _primary_memory_saver.pause()
@@ -88,3 +92,21 @@ class _TorchMemorySaverAdapterNoop(TorchMemorySaverAdapter):
     @property
     def enabled(self):
         return False
+
+
+@contextmanager
+def with_tms_disable_cpu_backup():
+    torch_memory_saver._global_info.binary_info.cdll.tms_disable_cpu_backup()
+    try:
+        yield
+    finally:
+        torch_memory_saver._global_info.binary_info.cdll.tms_enable_cpu_backup()
+
+
+@contextmanager
+def with_tms_disable_region():
+    torch_memory_saver._global_info.binary_info.cdll.tms_region_leave()
+    try:
+        yield
+    finally:
+        torch_memory_saver._global_info.binary_info.cdll.tms_region_enter()

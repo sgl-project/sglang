@@ -13,7 +13,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from sglang.srt.torch_memory_saver_adapter import (
+    TorchMemorySaverAdapter,
+    with_tms_disable_cpu_backup,
+)
 
 """
 Memory pool.
@@ -62,7 +65,8 @@ class ReqToTokenPool:
         self.size = size
         self.max_context_len = max_context_len
         self.device = device
-        with memory_saver_adapter.region():
+        # with memory_saver_adapter.region():
+        with with_tms_disable_cpu_backup():
             self.req_to_token = torch.zeros(
                 (size, max_context_len), dtype=torch.int32, device=device
             )
@@ -248,7 +252,8 @@ class MHATokenToKVPool(KVCache):
         )
 
     def _create_buffers(self):
-        with self.memory_saver_adapter.region():
+        # with self.memory_saver_adapter.region():
+        with with_tms_disable_cpu_backup():
             # [size, head_num, head_dim] for each layer
             # The padded slot 0 is used for writing dummy outputs from padded tokens.
             self.k_buffer = [
@@ -512,7 +517,8 @@ class MLATokenToKVPool(KVCache):
             enable=enable_memory_saver
         )
 
-        with memory_saver_adapter.region():
+        # with memory_saver_adapter.region():
+        with with_tms_disable_cpu_backup():
             # The padded slot 0 is used for writing dummy outputs from padded tokens.
             self.kv_buffer = [
                 torch.zeros(
@@ -649,7 +655,8 @@ class DoubleSparseTokenToKVPool(KVCache):
             enable=enable_memory_saver
         )
 
-        with memory_saver_adapter.region():
+        # with memory_saver_adapter.region():
+        with with_tms_disable_cpu_backup():
             # [size, head_num, head_dim] for each layer
             self.k_buffer = [
                 torch.zeros(

@@ -30,9 +30,8 @@ from typing import Dict, List, Optional, Tuple, Union
 import psutil
 import setproctitle
 import torch
+import torch_memory_saver
 import zmq
-from torch.distributed import barrier
-
 from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constrained.base_grammar_backend import create_grammar_backend
@@ -51,6 +50,12 @@ from sglang.srt.disaggregation.utils import (
     TransferBackend,
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
+from sglang.srt.hacks import (
+    OtherProcessKiller,
+    busy_wait_until_enough_memory,
+    export_model_params,
+    import_model_param,
+)
 from sglang.srt.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -140,6 +145,7 @@ from sglang.srt.utils import (
     suppress_other_loggers,
 )
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
+from torch.distributed import barrier
 
 expert_distribution_recorder = ExpertDistributionRecorder()
 
@@ -396,8 +402,8 @@ class Scheduler(
             1.0,
         )
         self.new_token_ratio_decay = (
-            self.init_new_token_ratio - self.min_new_token_ratio
-        ) / global_config.default_new_token_ratio_decay_steps
+                                         self.init_new_token_ratio - self.min_new_token_ratio
+                                     ) / global_config.default_new_token_ratio_decay_steps
         self.new_token_ratio = self.init_new_token_ratio
 
         # Init watchdog thread
@@ -455,6 +461,8 @@ class Scheduler(
             self.server_args.disaggregation_mode
         )
         self.init_disaggregation()
+
+        self.other_process_killer = OtherProcessKiller()
 
     def init_tokenizer(self):
         server_args = self.server_args
@@ -1127,6 +1135,7 @@ class Scheduler(
             f"#cached-token: {adder.log_hit_tokens}, "
             f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
             f"#running-req: {running_bs}, "
+            f"gap_latency: {gap_latency:.2f}, "
         )
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -1369,10 +1378,10 @@ class Scheduler(
             if (
                 self.lora_paths
                 and len(
-                    lora_set
-                    | set([req.lora_path for req in adder.can_run_list])
-                    | set([req.lora_path])
-                )
+                lora_set
+                | set([req.lora_path for req in adder.can_run_list])
+                | set([req.lora_path])
+            )
                 > self.max_loras_per_batch
             ):
                 self.running_batch.batch_is_full = True
@@ -1646,8 +1655,8 @@ class Scheduler(
                     # We should have at least 1 token for sample in every case.
                     max(extend_len - logprob_start_len, 1)
                     for logprob_start_len, extend_len in zip(
-                        local_batch.extend_logprob_start_lens, local_batch.extend_lens
-                    )
+                    local_batch.extend_logprob_start_lens, local_batch.extend_lens
+                )
                 ]
             )
 
@@ -1818,7 +1827,7 @@ class Scheduler(
         success = self.flush_cache()
         return FlushCacheReqOutput(success=success)
 
-    def flush_cache(self):
+    def flush_cache(self, hack_skip_cuda_empty_cache=False):
         """Flush the memory pool and cache."""
         if (
             len(self.waiting_queue) == 0
@@ -1843,7 +1852,12 @@ class Scheduler(
             self.spec_num_total_forward_ct = 0
             self.cum_spec_accept_length = 0
             self.cum_spec_accept_count = 0
-            torch.cuda.empty_cache()
+
+            if hack_skip_cuda_empty_cache:
+                print("hack_skip_cuda_empty_cache thus do not call empty_cache")
+            else:
+                torch.cuda.empty_cache()
+
             logger.info("Cache flushed successfully!")
             if_success = True
         else:
@@ -2015,23 +2029,78 @@ class Scheduler(
         return GetWeightsByNameReqOutput(parameter)
 
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
+        print(f"[Scheduler, TP{self.tp_rank}, {time.time()}] release start")
+
         self.memory_saver_adapter.check_validity(
             caller_name="release_memory_occupation"
         )
-        self.stashed_model_static_state = _export_static_state(
-            self.tp_worker.worker.model_runner.model
+
+        # # should directly use things on memory and no need to manually copy from gpu to cpu
+        # self.stashed_model_weights = export_model_params(self.tp_worker.worker.model_runner.model)
+
+        # print(f"PARAMS=" + json.dumps([
+        #     (name, tuple(tensor.shape), str(tensor.dtype))
+        #     for name, tensor in self.stashed_model_weights["params"]
+        # ]))
+
+        # self.stashed_model_static_state = _export_static_state(
+        #     self.tp_worker.worker.model_runner.model
+        # )
+
+        torch_memory_saver._global_info.binary_info.cdll.tms_copy_device_to_host()
+
+        self.flush_cache(
+            # NOTE
+            hack_skip_cuda_empty_cache=True,
         )
+
         self.memory_saver_adapter.pause()
-        self.flush_cache()
+
+        print(f"[Scheduler, TP{self.tp_rank}, {time.time()}] release end")
         return ReleaseMemoryOccupationReqOutput()
 
     def resume_memory_occupation(self, recv_req: ResumeMemoryOccupationReqInput):
-        self.memory_saver_adapter.check_validity(caller_name="resume_memory_occupation")
-        self.memory_saver_adapter.resume()
-        _import_static_state(
-            self.tp_worker.worker.model_runner.model, self.stashed_model_static_state
+        print(f"[Scheduler, TP{self.tp_rank}, {time.time()}] resume kill others")
+        tp_size_per_node = self.tp_size // self.server_args.nnodes
+        if self.tp_rank % tp_size_per_node == 0:
+            self.other_process_killer.kill()
+
+        # torch.distributed.barrier(self.tp_cpu_group)  # TODO use a better group
+        # busy_wait_until_enough_memory()
+
+        # print(f"[Scheduler, TP{self.tp_rank}, {time.time()}] memory saver resume start")
+        # self.memory_saver_adapter.check_validity(caller_name="resume_memory_occupation")
+        # self.memory_saver_adapter.resume()
+
+        # print(
+        #     f"[Scheduler, TP{self.tp_rank}, {time.time()}] torch cuda synchronize start"
+        # )
+        # torch.cuda.synchronize()
+
+        print(
+            f"[Scheduler, TP{self.tp_rank}, {time.time()}] tms_copy_host_to_device start"
         )
-        del self.stashed_model_static_state
+        torch_memory_saver._global_info.binary_info.cdll.tms_resume_and_copy_host_to_device()
+
+        # print(f"[Scheduler, TP{self.tp_rank}, {time.time()}] import static state start")
+        # _import_static_state(
+        #     self.tp_worker.worker.model_runner.model, self.stashed_model_static_state
+        # )
+        # del self.stashed_model_static_state
+        #
+        # print(f"[Scheduler, TP{self.tp_rank}, {time.time()}] torch cuda synchronize start")
+        # torch.cuda.synchronize()
+        #
+        # print(f"[Scheduler, TP{self.tp_rank}, {time.time()}] import param start")
+        # import_model_param(self.tp_worker.worker.model_runner.model, self.stashed_model_weights)
+        # del self.stashed_model_weights
+
+        print(
+            f"[Scheduler, TP{self.tp_rank}, {time.time()}] torch cuda synchronize start"
+        )
+        torch.cuda.synchronize()
+
+        print(f"[Scheduler, TP{self.tp_rank}, {time.time()}] resume END")
         return ResumeMemoryOccupationReqOutput()
 
     def slow_down(self, recv_req: SlowDownReqInput):

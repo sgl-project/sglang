@@ -13,7 +13,6 @@
 # ==============================================================================
 """ModelRunner runs the forward passes of the models."""
 
-import collections
 import datetime
 import gc
 import inspect
@@ -470,12 +469,12 @@ class ModelRunner:
         monkey_patch_vllm_parallel_state()
         monkey_patch_isinstance_for_vllm_base_layer()
 
-        with self.memory_saver_adapter.region():
-            self.model = get_model(
-                model_config=self.model_config,
-                load_config=self.load_config,
-                device_config=DeviceConfig(self.device),
-            )
+        # with self.memory_saver_adapter.region():
+        self.model = get_model(
+            model_config=self.model_config,
+            load_config=self.load_config,
+            device_config=DeviceConfig(self.device),
+        )
         monkey_patch_vllm_parallel_state(reverse=True)
         monkey_patch_isinstance_for_vllm_base_layer(reverse=True)
 

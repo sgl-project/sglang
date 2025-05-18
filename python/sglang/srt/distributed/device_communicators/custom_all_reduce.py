@@ -18,6 +18,7 @@ from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import 
     gpu_p2p_access_check,
 )
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
+from sglang.srt.torch_memory_saver_adapter import with_tms_disable_region
 from sglang.srt.utils import is_cuda, is_hip
 
 logger = logging.getLogger(__name__)
