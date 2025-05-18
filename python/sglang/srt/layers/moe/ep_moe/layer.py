@@ -17,7 +17,6 @@ try:
 
     from sglang.srt.layers.quantization.fp8_kernel import (
         sglang_per_token_group_quant_fp8,
-        sglang_silu_and_mul_per_token_group_quant_fp8,
     )
 
     use_deep_gemm = True
@@ -1082,18 +1081,17 @@ class DeepEPMoE(EPMoE):
             device=gateup_output.device,
             dtype=torch.bfloat16,
         )
-        down_input_fp8, down_input_scale = (
-            sglang_silu_and_mul_per_token_group_quant_fp8(
-                gateup_output.view(-1, N), down_input, scale_block_size
-            )
-        )
+        silu_and_mul(gateup_output.view(-1, N), down_input)
         del gateup_output
-        del down_input
         down_output = torch.empty(
             (all_tokens, K),
             device=hidden_states_fp8_device,
             dtype=torch.bfloat16,
         )
+        down_input_fp8, down_input_scale = sglang_per_token_group_quant_fp8(
+            down_input, scale_block_size
+        )
+        del down_input
         down_input_scale = tma_align_input_scale(down_input_scale)
         m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(
             (down_input_fp8, down_input_scale),
