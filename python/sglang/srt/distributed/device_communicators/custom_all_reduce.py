@@ -9,9 +9,6 @@ from typing import Any, Callable, List, Optional, TypeVar, Union
 
 import torch
 import torch.distributed as dist
-from torch.distributed import ProcessGroup
-from typing_extensions import ParamSpec
-
 from sglang.srt import _custom_ops as ops
 from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
 from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
@@ -20,6 +17,8 @@ from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import 
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
 from sglang.srt.torch_memory_saver_adapter import with_tms_disable_region
 from sglang.srt.utils import is_cuda, is_hip
+from torch.distributed import ProcessGroup
+from typing_extensions import ParamSpec
 
 logger = logging.getLogger(__name__)
 
@@ -308,23 +307,22 @@ class CustomAllreduce:
         Creates a shared buffer and returns a list of pointers
         representing the buffer on all processes in the group.
         """
-        with with_tms_disable_region():
-            lib = CudaRTLibrary()
-            pointer = lib.cudaMalloc(size_in_bytes)
-            handle = lib.cudaIpcGetMemHandle(pointer)
-            world_size = dist.get_world_size(group=group)
-            rank = dist.get_rank(group=group)
-            handles = [None] * world_size
-            dist.all_gather_object(handles, handle, group=group)
+        lib = CudaRTLibrary()
+        pointer = lib.cudaMalloc(size_in_bytes)
+        handle = lib.cudaIpcGetMemHandle(pointer)
+        world_size = dist.get_world_size(group=group)
+        rank = dist.get_rank(group=group)
+        handles = [None] * world_size
+        dist.all_gather_object(handles, handle, group=group)
 
-            pointers: List[int] = []
-            for i, h in enumerate(handles):
-                if i == rank:
-                    pointers.append(pointer.value)  # type: ignore
-                else:
-                    pointers.append(lib.cudaIpcOpenMemHandle(h).value)  # type: ignore
+        pointers: List[int] = []
+        for i, h in enumerate(handles):
+            if i == rank:
+                pointers.append(pointer.value)  # type: ignore
+            else:
+                pointers.append(lib.cudaIpcOpenMemHandle(h).value)  # type: ignore
 
-            return pointers
+        return pointers
 
     @staticmethod
     def free_shared_buffer(
