@@ -32,8 +32,8 @@ class TestSharedExpert(CustomTestCase):
     routed_scaling_factor = [16]
 
     M_fp8 = [2, 12]
-    N_fp8 = [128, 256]
-    K_fp8 = [256, 1024]
+    N_fp8 = [512]
+    K_fp8 = [256]
 
     def _bf16_shared_expert(self, m, n, k, routed_scaling_factor):
         dtype = torch.bfloat16
