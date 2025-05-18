@@ -83,6 +83,15 @@ if(CCACHE_FOUND AND ENABLE_CCACHE AND DEFINED ENV{CCACHE_DIR})
     set_property(GLOBAL PROPERTY RULE_LAUNCH_LINK "ccache")
 endif()
 
+# Enable below SM90
+option(ENABLE_BELOW_SM90 "Enable below SM90" ON)
+
+if (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
+    set(ENABLE_BELOW_SM90 OFF)
+    message(STATUS "For aarch64, disable below SM90 by default")
+endif()
+
+
 include_directories(
     ${PROJECT_SOURCE_DIR}/include
     ${PROJECT_SOURCE_DIR}/csrc
@@ -98,9 +107,6 @@ set(SGL_KERNEL_CUDA_FLAGS
     "-O3"
     "-Xcompiler"
     "-fPIC"
-    "-gencode=arch=compute_75,code=sm_75"
-    "-gencode=arch=compute_80,code=sm_80"
-    "-gencode=arch=compute_89,code=sm_89"
     "-gencode=arch=compute_90,code=sm_90"
     "-std=c++17"
     "-DFLASHINFER_ENABLE_F16"
@@ -129,6 +135,14 @@ option(SGL_KERNEL_ENABLE_BF16             "Enable BF16"             ON)
 option(SGL_KERNEL_ENABLE_FP8              "Enable FP8"              ON)
 option(SGL_KERNEL_ENABLE_FP4              "Enable FP4"              OFF)
 option(SGL_KERNEL_ENABLE_FA3              "Enable FA3"              OFF)
+
+if (ENABLE_BELOW_SM90)
+    list(APPEND SGL_KERNEL_CUDA_FLAGS
+        "-gencode=arch=compute_75,code=sm_75"
+        "-gencode=arch=compute_80,code=sm_80"
+        "-gencode=arch=compute_89,code=sm_89"
+    )
+endif()
 
 if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "13.0" OR SGL_KERNEL_ENABLE_SM100A)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
@@ -251,8 +265,6 @@ if (SGL_KERNEL_ENABLE_FA3)
         "-O3"
         "-Xcompiler"
         "-fPIC"
-        "-gencode=arch=compute_80,code=sm_80"
-        "-gencode=arch=compute_86,code=sm_86"
         "-gencode=arch=compute_90a,code=sm_90a"
         "-std=c++17"
         "-DCUTE_USE_PACKED_TUPLE=1"
@@ -267,6 +279,13 @@ if (SGL_KERNEL_ENABLE_FA3)
         "-Xcompiler=-Wconversion"
         "-Xcompiler=-fno-strict-aliasing"
     )
+
+    if (ENABLE_BELOW_SM90)
+        list(APPEND SGL_FLASH_KERNEL_CUDA_FLAGS
+            "-gencode=arch=compute_80,code=sm_80"
+            "-gencode=arch=compute_86,code=sm_86"
+        )
+    endif()
 
     # SM8X Logic
     file(GLOB FA3_SM8X_GEN_SRCS
