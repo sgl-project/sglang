@@ -792,6 +792,7 @@ class TokenizerManager:
         with_stack: Optional[bool] = None,
         record_shapes: Optional[bool] = None,
     ):
+        self.auto_create_handle_loop()
         req = ProfileReq(
             type=ProfileReqType.START_PROFILE,
             output_dir=output_dir,
@@ -814,16 +815,20 @@ class TokenizerManager:
         return result
 
     def stop_profile(self):
+        self.auto_create_handle_loop()
         req = ProfileReq(type=ProfileReqType.STOP_PROFILE)
         self.send_to_scheduler.send_pyobj(req)
 
     async def start_expert_distribution_record(self):
+        self.auto_create_handle_loop()
         await self.expert_distribution_communicator(ExpertDistributionReq.START_RECORD)
 
     async def stop_expert_distribution_record(self):
+        self.auto_create_handle_loop()
         await self.expert_distribution_communicator(ExpertDistributionReq.STOP_RECORD)
 
     async def dump_expert_distribution_record(self):
+        self.auto_create_handle_loop()
         await self.expert_distribution_communicator(ExpertDistributionReq.DUMP_RECORD)
 
     async def update_weights_from_disk(
