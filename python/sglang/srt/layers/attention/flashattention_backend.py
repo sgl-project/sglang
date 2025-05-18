@@ -918,7 +918,10 @@ class FlashAttentionBackend(AttentionBackend):
             and local_attn_metadata is not None
             and (hasattr(layer, "use_irope") and layer.use_irope)
         )
-        # We do cascade attention for Draft Decode with topk > 1
+        
+        # When Spec Decode enabled, forward_decode would be called with two mode: 
+        # 1. DRAFT_DECODE: we enable cascade attention when top_k > 1
+        # 2. IDLE: we don’t need cascade attention, spec_info will be none in this case
         use_cascade_attn = forward_batch.spec_info is not None and self.topk > 1
 
         # Calculate window size (can be moved to metadata if layer properties don't change)
