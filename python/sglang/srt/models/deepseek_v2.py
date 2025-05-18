@@ -165,7 +165,7 @@ class DeepseekV2MLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
 
-    def forward(self, x, forward_mode: Optional[ForwardMode] = None):
+    def forward(self, x, forward_batch: Optional[ForwardBatch] = None):
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
@@ -300,7 +300,7 @@ class DeepseekV2MoE(nn.Module):
         return global_server_args_dict["enable_deepep_moe"]
 
     def forward(
-        self, hidden_states: torch.Tensor, forward_mode: Optional[ForwardMode] = None
+        self, hidden_states: torch.Tensor, forward_batch: Optional[ForwardBatch] = None
     ) -> torch.Tensor:
         if (not self._enable_deepep_moe) or is_non_idle_and_non_empty(
             forward_mode, hidden_states
@@ -329,6 +329,7 @@ class DeepseekV2MoE(nn.Module):
                 num_expert_group=self.num_expert_group,
                 correction_bias=self.correction_bias,
                 routed_scaling_factor=self.routed_scaling_factor,
+                num_token_non_padded=forward_batch.num_token_non_padded,
             )
         else:
             topk_idx = torch.full(
@@ -1344,7 +1345,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             and (not self.info.is_sparse)
             and hidden_states.shape[0] == 0
         ):
-            hidden_states = self.mlp(hidden_states, forward_batch.forward_mode)
+            hidden_states = self.mlp(hidden_states, forward_batch)
 
         if self.is_last_layer and self.attn_tp_size != 1:
             hidden_states += residual
