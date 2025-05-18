@@ -16,6 +16,7 @@
 # Adapted from
 # https://github.com/lm-sys/FastChat/blob/main/fastchat/conversation.py
 import dataclasses
+import re
 from enum import IntEnum, auto
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
@@ -48,6 +49,7 @@ class SeparatorStyle(IntEnum):
     DeepSeekVL2 = auto()
     QWEN2_VL_EMBED = auto()
     GEMMA3 = auto()
+    MPT = auto()
 
 
 @dataclasses.dataclass
@@ -327,6 +329,16 @@ class Conversation:
                     ret += role
             return ret
 
+        elif self.sep_style == SeparatorStyle.MPT:
+            ret = system_prompt + self.sep
+            for role, message in self.messages:
+                if message:
+                    if type(message) is tuple:
+                        message, _, _ = message
+                    ret += role + message + self.sep
+                else:
+                    ret += role
+            return ret
         else:
             raise ValueError(f"Invalid style: {self.sep_style}")
 
@@ -570,8 +582,11 @@ def generate_chat_conv(
                             real_content += "\n"  # for video
                         real_content += content.text
                     elif content.type == "image_url":
-                        # NOTE: Only works for llava
-                        real_content += image_token
+                        # NOTE: works for llava and intervl2_5
+                        if conv.name == "internvl-2-5":
+                            real_content = image_token + real_content
+                        else:
+                            real_content += image_token
                         conv.append_image(content.image_url.url)
                     elif content.type == "audio_url":
                         real_content += audio_token
@@ -616,6 +631,20 @@ register_conv_template(
         sep=" ",
         sep2=" </s><s>",
         stop_str=["[INST]", "[/INST]", "<<SYS>>", "<</SYS>>"],
+    )
+)
+
+# reference: https://huggingface.co/mistralai/Mistral-Small-3.1-24B-Instruct-2503/blob/main/chat_template.json
+register_conv_template(
+    Conversation(
+        name="mistral",
+        system_template="[SYSTEM_PROMPT]\n{system_message}\n[/SYSTEM_PROMPT]\n\n",
+        roles=("[INST]", "[/INST]"),
+        sep_style=SeparatorStyle.LLAMA2,
+        sep=" ",
+        sep2=" </s><s>",
+        stop_str=["[INST]", "[/INST]", "[SYSTEM_PROMPT]", "[/SYSTEM_PROMPT]"],
+        image_token="[IMG]",
     )
 )
 
@@ -703,6 +732,19 @@ register_conv_template(
     )
 )
 
+register_conv_template(
+    Conversation(
+        name="internvl-2-5",
+        system_template="<|im_start|>system\n{system_message}",
+        system_message="你是书生·万象，英文名是InternVL，是由上海人工智能实验室、清华大学及多家合作单位联合开发的多模态大语言模型。",
+        roles=("<|im_start|>user\n", "<|im_start|>assistant\n"),
+        sep_style=SeparatorStyle.MPT,
+        sep="<|im_end|>\n",
+        stop_str=["<|im_end|>", "<|action_end|>"],
+        image_token="<image>",
+    )
+)
+
 # Reference: https://huggingface.co/docs/transformers/main/model_doc/qwen2_vl#usage-example
 register_conv_template(
     Conversation(
@@ -739,7 +781,7 @@ register_conv_template(
     Conversation(
         name="gemma-it",
         system_message="You are a helpful assistant.",
-        system_template="<start_of_turn>user{system_message}\n\n",
+        system_template="<start_of_turn>user\n{system_message}\n\n",
         roles=("<start_of_turn>user\n", "<start_of_turn>model\n"),
         sep="<end_of_turn>\n",
         sep_style=SeparatorStyle.GEMMA3,
@@ -826,90 +868,80 @@ register_conv_template(
 
 
 @register_conv_template_matching_function
-def match_deepseek_janus_pro(model_path: str):
-    if (
-        "llama" in model_path.lower()
-        and "3.2" in model_path.lower()
-        and "vision" in model_path.lower()
-    ):
+def match_internvl(model_path: str):
+    if re.search(r"internvl2_5", model_path, re.IGNORECASE):
+        return "internvl-2-5"
+
+
+@register_conv_template_matching_function
+def match_llama_3_vision(model_path: str):
+    if re.search(r"llama.*3\.2.*vision", model_path, re.IGNORECASE):
         return "llama_3_vision"
 
 
 @register_conv_template_matching_function
 def match_deepseek_janus_pro(model_path: str):
-    if "janus" in model_path.lower():
+    if re.search(r"janus", model_path, re.IGNORECASE):
         return "janus-pro"
 
 
 @register_conv_template_matching_function
 def match_vicuna(model_path: str):
-    if "vicuna" in model_path.lower():
-        return "vicuna_v1.1"
-    if "llava-v1.5" in model_path.lower():
-        return "vicuna_v1.1"
-    if "llava-next-video-7b" in model_path.lower():
+    if re.search(r"vicuna|llava-v1\.5|llava-next-video-7b", model_path, re.IGNORECASE):
         return "vicuna_v1.1"
 
 
 @register_conv_template_matching_function
 def match_llama2_chat(model_path: str):
-    model_path = model_path.lower()
-    if "llama-2" in model_path and "chat" in model_path:
+    if re.search(
+        r"llama-2.*chat|codellama.*instruct",
+        model_path,
+        re.IGNORECASE,
+    ):
         return "llama-2"
-    if (
-        "mistral" in model_path or "mixtral" in model_path
-    ) and "instruct" in model_path:
-        return "llama-2"
-    if "codellama" in model_path and "instruct" in model_path:
-        return "llama-2"
+
+
+@register_conv_template_matching_function
+def match_mistral(model_path: str):
+    if re.search(r"pixtral|(mistral|mixtral).*instruct", model_path, re.IGNORECASE):
+        return "mistral"
 
 
 @register_conv_template_matching_function
 def match_deepseek_vl(model_path: str):
-    model_path = model_path.lower()
-    if "deepseek" in model_path and "vl2" in model_path:
+    if re.search(r"deepseek.*vl2", model_path, re.IGNORECASE):
         return "deepseek-vl2"
 
 
 @register_conv_template_matching_function
-def match_chat_ml(model_path: str):
-    # import pdb;pdb.set_trace()
-    model_path = model_path.lower()
-    # Now the suffix for qwen2 chat model is "instruct"
-    if "gme" in model_path and "qwen" in model_path and "vl" in model_path:
+def match_qwen_chat_ml(model_path: str):
+    if re.search(r"gme.*qwen.*vl", model_path, re.IGNORECASE):
         return "gme-qwen2-vl"
-    if "qwen" in model_path and "vl" in model_path:
+    if re.search(r"qwen.*vl", model_path, re.IGNORECASE):
         return "qwen2-vl"
-    if (
-        "llava-v1.6-34b" in model_path
-        or "llava-v1.6-yi-34b" in model_path
-        or "llava-next-video-34b" in model_path
-        or "llava-onevision-qwen2" in model_path
+    if re.search(
+        r"llava-v1\.6-34b|llava-v1\.6-yi-34b|llava-next-video-34b|llava-onevision-qwen2",
+        model_path,
+        re.IGNORECASE,
     ):
         return "chatml-llava"
 
 
 @register_conv_template_matching_function
-def match_gemma_it(model_path: str):
-    model_path = model_path.lower()
-    if "gemma" in model_path and "it" in model_path:
-        return "gemma-it"
-    if "gemma-3" in model_path and "1b" not in model_path:
-        # gemma-3-1b-it is completion model
+def match_gemma3_instruct(model_path: str):
+    if re.search(r"gemma-3.*it", model_path, re.IGNORECASE):
         return "gemma-it"
 
 
 @register_conv_template_matching_function
 def match_openbmb_minicpm(model_path: str):
-    model_path = model_path.lower()
-    if "minicpm-v" in model_path:
+    if re.search(r"minicpm-v", model_path, re.IGNORECASE):
         return "minicpmv"
-    elif "minicpm-o" in model_path:
+    elif re.search(r"minicpm-o", model_path, re.IGNORECASE):
         return "minicpmo"
 
 
 @register_conv_template_matching_function
 def match_moonshot_kimivl(model_path: str):
-    model_path = model_path.lower()
-    if "kimi" in model_path and "vl" in model_path:
+    if re.search(r"kimi.*vl", model_path, re.IGNORECASE):
         return "kimi-vl"

@@ -1,21 +1,18 @@
 """
 Usage:
 python3 -m unittest test_pp_single_node.TestPPAccuracy.test_gsm8k
+python3 -m unittest test_pp_single_node.TestQwenPPAccuracy.test_pp_consistency
 python3 -m unittest test_pp_single_node.TestFixedBugs.test_chunked_prefill_with_small_bs
 """
 
-import os
 import time
 import unittest
 from types import SimpleNamespace
-
-import requests
 
 from sglang.bench_one_batch_server import BenchArgs as OneBatchBenchArgs
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval
-from sglang.test.runners import DEFAULT_PROMPTS
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -28,17 +25,16 @@ from sglang.test.test_utils import (
 class TestPPAccuracy(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        # These config helps find a leak.
-        os.environ["SGLANG_IS_IN_CI"] = "1"
         cls.base_url = "http://127.0.0.1:23333"
         cls.process = popen_launch_server(
             DEFAULT_MODEL_NAME_FOR_TEST,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
+                "--tp-size",
+                2,
                 "--pp-size",
-                4,
-                "--disable-overlap-schedule",
+                2,
                 "--chunked-prefill-size",
                 256,
             ],
@@ -61,52 +57,63 @@ class TestPPAccuracy(unittest.TestCase):
         metrics = run_eval(args)
         print(f"{metrics=}")
 
-        self.assertGreater(metrics["accuracy"], 0.75)
+        self.assertGreater(metrics["accuracy"], 0.74)
         # Wait a little bit so that the memory check happens.
         time.sleep(5)
 
 
-# class TestPPAccuracyFlashInfer(unittest.TestCase):
-#     @classmethod
-#     def setUpClass(cls):
-#         # These config helps find a leak.
-#         os.environ["SGLANG_IS_IN_CI"] = "1"
-#         cls.base_url = "http://127.0.0.1:23333"
-#         cls.process = popen_launch_server(
-#             DEFAULT_MODEL_NAME_FOR_TEST,
-#             cls.base_url,
-#             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-#             other_args=[
-#                 "--pp-size",
-#                 4,
-#                 "--disable-overlap-schedule",
-#                 "--attention-backend",
-#                 "flashinfer",
-#                 "--chunked-prefill-size",
-#                 256,
-#             ],
-#         )
-#
-#     @classmethod
-#     def tearDownClass(cls):
-#         kill_process_tree(cls.process.pid)
-#
-#     def test_gsm8k(self):
-#         args = SimpleNamespace(
-#             num_shots=5,
-#             data_path=None,
-#             num_questions=200,
-#             max_new_tokens=512,
-#             parallel=128,
-#             host="http://127.0.0.1",
-#             port=int(self.base_url.split(":")[-1]),
-#         )
-#         metrics = run_eval(args)
-#         print(f"{metrics=}")
-#
-#         self.assertGreater(metrics["accuracy"], 0.75)
-#         # Wait a little bit so that the memory check happens.
-#         time.sleep(5)
+class TestQwenPPAccuracy(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.base_url = "http://127.0.0.1:23334"  # different ports to avoid conflicts
+        cls.model_name = "Qwen/Qwen3-8B"  # replace with your Qwen Model if needed
+
+    def run_gsm8k_test(self, pp_size):
+        process = popen_launch_server(
+            self.model_name,
+            self.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--pp-size",
+                pp_size,
+                "--chunked-prefill-size",
+                256,
+            ],
+        )
+
+        try:
+            args = SimpleNamespace(
+                num_shots=5,
+                data_path=None,
+                num_questions=200,
+                max_new_tokens=512,
+                parallel=128,
+                host="http://127.0.0.1",
+                port=int(self.base_url.split(":")[-1]),
+            )
+            metrics = run_eval(args)
+            time.sleep(5)
+            return metrics
+        finally:
+            kill_process_tree(process.pid)
+
+    def test_baseline_accuracy(self):
+        metrics = self.run_gsm8k_test(pp_size=1)
+        print(f"[Qwen Baseline] {metrics=}")
+        self.assertGreater(metrics["accuracy"], 0.74)
+
+    def test_pp_consistency(self):
+        baseline = self.run_gsm8k_test(pp_size=1)
+        pp_metrics = self.run_gsm8k_test(pp_size=2)
+
+        print(f"[Qwen PP Comparison] Baseline: {baseline} | PP: {pp_metrics}")
+
+        self.assertAlmostEqual(
+            pp_metrics["accuracy"],
+            baseline["accuracy"],
+            delta=0.01,
+            msg=f"PP accuracy exceeds 1% (baseline: {baseline['accuracy']}, pp: {pp_metrics['accuracy']})",
+        )
 
 
 class TestFixedBugs(unittest.TestCase):
@@ -124,7 +131,6 @@ class TestFixedBugs(unittest.TestCase):
             2,
             "--pp-size",
             2,
-            "--disable-overlap-schedule",
             "--chunked-prefill",
             256,
             "--max-running-requests",

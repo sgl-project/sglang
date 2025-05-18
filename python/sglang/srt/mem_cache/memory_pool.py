@@ -374,9 +374,9 @@ class MHATokenToKVPool(KVCache):
             # Overlap the copy of K and V cache for small batch size
             current_stream = self.device_module.current_stream()
             self.alt_stream.wait_stream(current_stream)
+            self.k_buffer[layer_id - self.start_layer][loc] = cache_k
             with self.device_module.stream(self.alt_stream):
-                self.k_buffer[layer_id - self.start_layer][loc] = cache_k
-            self.v_buffer[layer_id - self.start_layer][loc] = cache_v
+                self.v_buffer[layer_id - self.start_layer][loc] = cache_v
             current_stream.wait_stream(self.alt_stream)
         else:
             self.k_buffer[layer_id - self.start_layer][loc] = cache_k
@@ -524,7 +524,6 @@ class MLATokenToKVPool(KVCache):
             ]
 
         self.layer_transfer_counter = None
-        self.page_size = page_size
 
         kv_size = self.get_kv_size_bytes()
         logger.info(
@@ -762,6 +761,8 @@ class HostKVCache(abc.ABC):
             self.size = int(device_pool.size * host_to_device_ratio)
         # Align the host memory pool size to the page size
         self.size = self.size - (self.size % self.page_size)
+        self.start_layer = device_pool.start_layer
+        self.end_layer = device_pool.end_layer
 
         assert (
             self.size > device_pool.size
