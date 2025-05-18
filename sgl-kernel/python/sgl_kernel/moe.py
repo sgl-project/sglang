@@ -60,6 +60,11 @@ def moe_fused_gate(
 
 def fp8_blockwise_scaled_grouped_mm(
     output,
+    a_ptrs,
+    b_ptrs,
+    out_ptrs,
+    a_scales_ptrs,
+    b_scales_ptrs,
     a,
     b,
     scales_a,
@@ -71,9 +76,15 @@ def fp8_blockwise_scaled_grouped_mm(
     layout_sfb,
     problem_sizes,
     expert_offsets,
+    workspace,
 ):
     torch.ops.sgl_kernel.fp8_blockwise_scaled_grouped_mm.default(
         output,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
         a,
         b,
         scales_a,
@@ -85,4 +96,29 @@ def fp8_blockwise_scaled_grouped_mm(
         layout_sfb,
         problem_sizes,
         expert_offsets,
+        workspace,
+    )
+
+
+def prepare_moe_input(
+    topk_ids,
+    expert_offsets,
+    problem_sizes1,
+    problem_sizes2,
+    input_permutation,
+    output_permutation,
+    num_experts,
+    n,
+    k,
+):
+    torch.ops.sgl_kernel.prepare_moe_input.default(
+        topk_ids,
+        expert_offsets,
+        problem_sizes1,
+        problem_sizes2,
+        input_permutation,
+        output_permutation,
+        num_experts,
+        n,
+        k,
     )
