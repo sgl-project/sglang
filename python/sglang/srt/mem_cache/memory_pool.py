@@ -524,7 +524,6 @@ class MLATokenToKVPool(KVCache):
             ]
 
         self.layer_transfer_counter = None
-        self.page_size = page_size
 
         kv_size = self.get_kv_size_bytes()
         logger.info(

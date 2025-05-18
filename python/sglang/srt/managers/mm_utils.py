@@ -2,6 +2,7 @@
 Multi-modality utils
 """
 
+import dataclasses
 import logging
 from abc import abstractmethod
 from typing import Callable, List, Optional, Tuple
@@ -46,11 +47,26 @@ class MultiModalityDataPaddingPattern:
 class MultiModalityDataPaddingPatternTokenPairs(MultiModalityDataPaddingPattern):
     """In this pattern, data tokens should be enclosed by special token pairs (e.g. <image>...</image>, data_token_pairs)
 
+    The padded value in a region enclosed by a token pair with be the same one, as the MultimodalDataItem's pad value
+
     This strategy should be applied when data content is marked by start/end token pairs in the input sequence.
     """
 
-    def __init__(self, data_token_pairs: Optional[List[Tuple[int, int]]]) -> None:
+    def __init__(
+        self,
+        data_token_pairs: Optional[List[Tuple[int, int]]],
+        data_start_token_ids: Optional[List[int]] = None,
+    ) -> None:
+        """
+
+        Args:
+            data_start_token_ids marks the start of a single multimodal data
+            See Minicpmo's slice_start_id for example
+        """
         self.data_token_id_pairs = data_token_pairs
+        self.data_start_token_ids = data_start_token_ids or [
+            s for s, _e in data_token_pairs
+        ]
 
     def pad_input_tokens(
         self, input_ids: List[int], mm_inputs: MultimodalInputs
@@ -84,7 +100,7 @@ class MultiModalityDataPaddingPatternTokenPairs(MultiModalityDataPaddingPattern)
         for start_idx, end_idx in zip(start_indices, end_indices):
             padded_ids.extend(input_ids[last_idx : start_idx + 1])
 
-            if input_ids[start_idx] in start_token_ids:
+            if input_ids[start_idx] in self.data_start_token_ids:
                 data_idx += 1
                 mm_inputs.data_offsets += [start_idx]
 
@@ -175,7 +191,6 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
                 output_ids_tensor[start_idx:end_idx] = pad_value
             else:
                 logger.warning(f"Skipping region {i} due to None pad_value.")
-
         return output_ids_tensor.tolist()
 
 
@@ -305,11 +320,30 @@ def get_embedding_and_mask(
         placeholder_tensor,
     ).unsqueeze(-1)
 
-    num_mm_tokens_in_input_ids = special_multimodal_mask.sum()
+    num_mm_tokens_in_input_ids = special_multimodal_mask.sum().item()
+    if num_mm_tokens_in_input_ids != num_mm_tokens_in_embedding:
+        logger.warning(
+            f"Number of tokens in multimodal embedding does not match those in the input text. "
+            f"Got {num_mm_tokens_in_input_ids} tokens in the text but {num_mm_tokens_in_embedding} "
+            "tokens from multimodal embeddings."
+        )
+        if num_mm_tokens_in_input_ids < num_mm_tokens_in_embedding:
+            chunked_prefill_size = global_server_args_dict["chunked_prefill_size"]
+            if chunked_prefill_size != -1:
+                logger.warning(
+                    "You may want to avoid this issue by raising `chunked_prefill_size`, or disabling chunked prefill"
+                )
+            # extract from the end: this is a compromise
+            if embedding.dim() == 2:
+                embedding = embedding[-num_mm_tokens_in_input_ids:, :]
+            else:
+                num_multimodal = num_mm_tokens_in_input_ids // embedding.shape[0]
+                embedding = embedding[-num_multimodal:, :]
+        else:
+            raise RuntimeError(
+                f"Insufficient multimodal embedding length: {num_mm_tokens_in_input_ids=} vs {num_mm_tokens_in_embedding=}. This is an internal error"
+            )
 
-    assert (
-        num_mm_tokens_in_input_ids == num_mm_tokens_in_embedding
-    ), f"expected {num_mm_tokens_in_input_ids}, got {num_mm_tokens_in_embedding}"
     return embedding, special_multimodal_mask
 
 
