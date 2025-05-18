@@ -13,9 +13,11 @@ from sglang.srt.utils import get_zmq_socket
 
 
 def _create_recv_socket(rank: int):
-    port = 50000 + rank
+    hack_ipc_prefix = os.environ["SGLANG_HACK_IPC_PREFIX"]
+    path = f"/tmp/demo_another_task_{hack_ipc_prefix}_{rank}"
+    endpoint = f"ipc://{path}"
     context = zmq.Context(2)
-    return get_zmq_socket(context, zmq.PULL, f"tcp://localhost:{port}", True)
+    return get_zmq_socket(context, zmq.PULL, endpoint, True)
 
 
 def _try_recv(recv_socket):

@@ -1,3 +1,4 @@
+import os
 import time
 from pathlib import Path
 
@@ -12,12 +13,15 @@ class OtherProcessKiller:
         base_port = 50000
         num_tasks = 8
 
+        hack_ipc_prefix = os.environ["SGLANG_HACK_IPC_PREFIX"]
+
         context = zmq.Context(2)
         self.senders = []
         for index in range(num_tasks):
-            path = f"/tmp/demo_another_task_{index}"
+            path = f"/tmp/demo_another_task_{hack_ipc_prefix}_{index}"
             Path(path).write_text("")
             endpoint = f"ipc://{path}"
+            print(f"{endpoint=}")
             self.senders.append(get_zmq_socket(context, zmq.PUSH, endpoint, False))
 
     def kill(self):
