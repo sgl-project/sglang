@@ -64,7 +64,7 @@ def gpu_tensor_hash(tensor: torch.Tensor) -> int:
         XCONST=PRIME_2,
     )
 
-    # TODO: threads cant be synced on triton kernel
+    # TODO: threads can't be synced on triton kernel
     final_hash = intermediate_hashes.sum().item()
 
     return final_hash
