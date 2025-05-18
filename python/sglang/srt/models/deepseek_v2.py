@@ -775,16 +775,36 @@ class DeepseekV2AttentionMLA(nn.Module):
             q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
 
         q_nope_out = q_nope_out.transpose(0, 1)
-        q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+        if self.rotary_emb.can_fuse_kv_cache(k_nope, forward_batch):
+            attn_save_kv = False
+            q_pe, k_pe = self.rotary_emb.forward_with_kv_cache(
+                positions,
+                q_pe,
+                k_pe,
+                self,
+                forward_batch,
+                k_nope=k_nope,
+            )
+        else:
+            attn_save_kv = True
+            q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
         if self.attention_backend == "fa3" or self.attention_backend == "flashinfer":
             attn_output = self.attn_mqa(
-                q_nope_out, k_nope, k_nope, forward_batch, q_rope=q_pe, k_rope=k_pe
+                q_nope_out,
+                k_nope,
+                k_nope,
+                forward_batch,
+                q_rope=q_pe,
+                k_rope=k_pe,
+                save_kv_cache=attn_save_kv,
             )
         else:
             q = torch.cat([q_nope_out, q_pe], dim=-1)
             k = torch.cat([k_nope, k_pe], dim=-1)
-            attn_output = self.attn_mqa(q, k, k_nope, forward_batch)
+            attn_output = self.attn_mqa(
+                q, k, k_nope, forward_batch, save_kv_cache=attn_save_kv
+            )
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
         if self.use_deep_gemm_bmm:

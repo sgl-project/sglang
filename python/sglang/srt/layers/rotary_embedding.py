@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 
 from sglang.srt.custom_op import CustomOp
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import is_cuda
 
 _is_cuda = is_cuda()
@@ -116,6 +117,12 @@ class RotaryEmbedding(CustomOp):
         cache = torch.cat((cos, sin), dim=-1)
         return cache
 
+    def can_fuse_kv_cache(self, key: torch.Tensor, forward_batch: ForwardBatch) -> bool:
+        kv_pool = forward_batch.token_to_kv_pool
+        if kv_pool.dtype == key.dtype and kv_pool.dtype == kv_pool.store_dtype:
+            return _is_cuda
+        return False
+
     def forward_native(
         self,
         positions: torch.Tensor,
@@ -173,6 +180,34 @@ class RotaryEmbedding(CustomOp):
                 self.is_neox_style,
             )
         return query, key
+
+    def forward_with_kv_cache(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        layer,
+        forward_batch: ForwardBatch,
+        value: Optional[torch.Tensor] = None,
+        k_nope: Optional[torch.Tensor] = None,
+        offsets: Optional[torch.Tensor] = None,
+    ):
+        assert _is_cuda, "only support cuda"
+        assert k_nope is not None, "currently only support mla rope with kv cache"
+
+        query, key = self.forward(positions, query, key, offsets)
+
+        out_cache_loc = forward_batch.out_cache_loc
+        k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+
+        if k_nope is not None:
+            k_cache[out_cache_loc] = torch.cat([k_nope, key], dim=-1)
+        else:
+            assert value is not None
+            v_cache = forward_batch.token_to_kv_pool.get_value_buffer(self.layer_id)
+            k_cache[out_cache_loc] = key
+            v_cache[out_cache_loc] = value
+            pass
 
     def extra_repr(self) -> str:
         s = f"head_size={self.head_size}, rotary_dim={self.rotary_dim}"
@@ -521,6 +556,9 @@ class Phi3LongRoPEScaledRotaryEmbedding(nn.Module):
         cache = torch.cat((cos, sin), dim=-1)
         return cache
 
+    def can_fuse_kv_cache(self, key: torch.Tensor, forward_batch: ForwardBatch) -> bool:
+        return False
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -795,6 +833,9 @@ class Llama4VisionRotaryEmbedding(RotaryEmbedding):
         )
         return cache
 
+    def can_fuse_kv_cache(self, key: torch.Tensor, forward_batch: ForwardBatch) -> bool:
+        return False
+
     def forward(
         self,
         query: torch.Tensor,
@@ -833,6 +874,9 @@ class MRotaryEmbedding(RotaryEmbedding):
         self.mrope_section = mrope_section
         if self.mrope_section:
             assert sum(self.mrope_section) == rotary_dim // 2
+
+    def can_fuse_kv_cache(self, key: torch.Tensor, forward_batch: ForwardBatch) -> bool:
+        return False
 
     def forward(
         self,
