@@ -2148,9 +2148,6 @@ def add_rank_zero_filter(logger, is_rank_zero: Optional[bool] = None):
         add_rank_zero_filter(logger)
         logger.info("This will only show on rank 0")
     ```
-
-    If the distributed environment is not initialized yet, this will
-    allow all INFO logs until it is initialized.
     """
     if not any(isinstance(f, RankZeroFilter) for f in logger.filters):
         logger.addFilter(RankZeroFilter(is_rank_zero))
