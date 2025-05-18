@@ -2049,11 +2049,12 @@ class Scheduler(
 
         torch_memory_saver._global_info.binary_info.cdll.tms_copy_device_to_host()
 
-        self.memory_saver_adapter.pause()
         self.flush_cache(
             # NOTE
             hack_skip_cuda_empty_cache=True,
         )
+
+        self.memory_saver_adapter.pause()
 
         print(f"[Scheduler, TP{self.tp_rank}, {time.time()}] release end")
         return ReleaseMemoryOccupationReqOutput()
