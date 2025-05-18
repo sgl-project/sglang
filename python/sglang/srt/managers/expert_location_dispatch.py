@@ -18,7 +18,6 @@ from typing import Literal, Optional
 import torch
 from sglang.srt.managers.expert_location import get_global_expert_location_metadata
 from sglang.srt.managers.schedule_batch import global_server_args_dict
-from sglang.srt.utils import get_compiler_backend
 
 
 @dataclass
