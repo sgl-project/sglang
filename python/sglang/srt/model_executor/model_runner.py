@@ -54,6 +54,7 @@ from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.managers.expert_distribution import (
     ExpertDistributionRecorder,
+    get_global_expert_distribution_recorder,
     set_global_expert_distribution_recorder,
 )
 from sglang.srt.managers.expert_location import (
@@ -153,6 +154,8 @@ class ModelRunner:
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
         self.attention_chunk_size = model_config.attention_chunk_size
+
+        self.forward_pass_id = 0
 
         # Model-specific adjustment
         self.model_specific_adjustment()
@@ -1115,6 +1118,22 @@ class ModelRunner:
         forward_batch: ForwardBatch,
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> Tuple[Union[LogitsProcessorOutput, PPProxyTensors], bool]:
+        self.forward_pass_id += 1
+
+        with get_global_expert_distribution_recorder().with_forward_pass(
+            self.forward_pass_id,
+            forward_batch,
+        ):
+            return self._forward_raw(
+                forward_batch, skip_attn_backend_init, pp_proxy_tensors
+            )
+
+    def _forward_raw(
+        self,
+        forward_batch: ForwardBatch,
+        skip_attn_backend_init: bool,
+        pp_proxy_tensors: Optional[PPProxyTensors],
     ) -> Tuple[Union[LogitsProcessorOutput, PPProxyTensors], bool]:
         can_run_cuda_graph = bool(
             forward_batch.forward_mode.is_cuda_graph()
