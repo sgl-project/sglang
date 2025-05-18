@@ -1,6 +1,7 @@
 import os
 import threading
 import time
+from argparse import ArgumentParser
 
 import torch
 import torch.distributed as dist
@@ -38,7 +39,7 @@ def worker_background_thread(rank: int):
     print(f"[GPU {rank}, {time.time()}] synchronize end")
 
 
-def worker(rank, world_size):
+def worker(args, rank, world_size):
     thread = threading.Thread(target=worker_background_thread, args=(rank,))
     thread.daemon = True
     thread.start()
@@ -114,13 +115,13 @@ def worker(rank, world_size):
     torch.distributed.barrier(device_ids=[rank])
 
 
-def main():
+def main(args):
     world_size = 8
 
     mp.set_start_method('spawn')
     processes = []
     for rank in range(world_size):
-        p = mp.Process(target=worker, args=(rank, world_size))
+        p = mp.Process(target=worker, args=(args, rank, world_size))
         p.start()
         processes.append(p)
 
@@ -129,4 +130,7 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    parser = ArgumentParser()
+    parser.add_argument("--stop-mode", type=str)
+    args = parser.parse_args()
+    main(args)
