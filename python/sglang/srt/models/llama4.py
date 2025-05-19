@@ -17,7 +17,7 @@
 """Inference-only LLaMA model compatible with HuggingFace weights."""
 
 import logging
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -51,6 +51,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     PPProxyTensors,
 )
+from sglang.srt.model_loader.common_weight_loader import common_load_weights
 from sglang.srt.models.llama import LlamaForCausalLM, LlamaMLP
 from sglang.srt.utils import add_prefix, fast_topk, get_compiler_backend, make_layers
 
@@ -527,6 +528,23 @@ class Llama4ForCausalLM(LlamaForCausalLM):
         prefix: str = "",
     ):
         return Llama4Model(config, quant_config=quant_config, prefix=prefix)
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            (".qkv_proj", ".q_proj", "q"),
+            (".qkv_proj", ".k_proj", "k"),
+            (".qkv_proj", ".v_proj", "v"),
+            (".gate_up_proj", ".gate_proj", 0),
+            (".gate_up_proj", ".up_proj", 1),
+        ]
+
+        return common_load_weights(
+            model=self,
+            weights=weights,
+            stacked_params_mapping=stacked_params_mapping,
+            tie_word_embeddings=self.config.tie_word_embeddings,
+        )
 
 
 EntryClass = [Llama4ForCausalLM]

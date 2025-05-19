@@ -47,6 +47,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_loader.common_weight_loader import common_load_weights
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     kv_cache_scales_loader,
@@ -539,61 +540,12 @@ class LlamaForCausalLM(nn.Module):
             (".gate_up_proj", ".up_proj", 1),
         ]
 
-        params_dict = dict(self.named_parameters())
-
-        for name, loaded_weight in weights:
-            layer_id = get_layer_id(name)
-            if (
-                layer_id is not None
-                and hasattr(self.model, "start_layer")
-                and (
-                    layer_id < self.model.start_layer
-                    or layer_id >= self.model.end_layer
-                )
-            ):
-                continue
-            if "rotary_emb.inv_freq" in name or "projector" in name:
-                continue
-            if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
-                # Models trained using ColossalAI may include these tensors in
-                # the checkpoint. Skip them.
-                continue
-            if name.startswith("model.vision_tower") and name not in params_dict:
-                continue
-            if self.config.tie_word_embeddings and "lm_head.weight" in name:
-                continue
-            # Handle FP8 kv-scale remapping
-            if "scale" in name:
-                name = maybe_remap_kv_scale_name(name, params_dict)
-                if name is None:
-                    continue
-
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                # Skip loading kv_scale from ckpts towards new design.
-                if name.endswith(".kv_scale") and name not in params_dict:
-                    continue
-                if name in params_dict.keys():
-                    param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight)
-                else:
-                    logger.warning(f"Parameter {name} not found in params_dict")
+        return common_load_weights(
+            model=self,
+            weights=weights,
+            stacked_params_mapping=stacked_params_mapping,
+            tie_word_embeddings=self.config.tie_word_embeddings,
+        )
 
     def get_weights_by_name(
         self, name: str, truncate_size: int = 100, tp_size: int = 1
