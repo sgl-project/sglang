@@ -10,13 +10,10 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-DEFAULT_MTP_MODEL_FOR_TEST = "XiaomiMiMo/MiMo-7B-RL"
-
-
 class TestMiMoMTP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_MTP_MODEL_FOR_TEST
+        cls.model = "XiaomiMiMo/MiMo-7B-RL"
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
