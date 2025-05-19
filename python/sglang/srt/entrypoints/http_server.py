@@ -49,6 +49,7 @@ from sglang.srt.disaggregation.utils import (
 from sglang.srt.entrypoints.engine import _launch_subprocesses
 from sglang.srt.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
+    AbortReq,
     CloseSessionReqInput,
     ConfigureLoggingReq,
     EmbeddingReqInput,
@@ -62,6 +63,7 @@ from sglang.srt.managers.io_struct import (
     ResumeMemoryOccupationReqInput,
     SeparateReasoningReqInput,
     SetInternalStateReq,
+    SlowDownReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
@@ -180,13 +182,14 @@ async def health_generate(request: Request) -> Response:
         async for _ in _global_state.tokenizer_manager.generate_request(gri, request):
             break
 
-    tic = time.time()
+    tic = time.perf_counter()
     task = asyncio.create_task(gen())
-    while time.time() < tic + HEALTH_CHECK_TIMEOUT:
+    while time.perf_counter() < tic + HEALTH_CHECK_TIMEOUT:
         await asyncio.sleep(1)
         if _global_state.tokenizer_manager.last_receive_tstamp > tic:
             task.cancel()
             _global_state.tokenizer_manager.rid_to_state.pop(rid, None)
+            _global_state.tokenizer_manager.health_check_failed = False
             return Response(status_code=200)
 
     task.cancel()
@@ -200,6 +203,7 @@ async def health_generate(request: Request) -> Response:
         f"last_heartbeat time: {last_receive_time}"
     )
     _global_state.tokenizer_manager.rid_to_state.pop(rid, None)
+    _global_state.tokenizer_manager.health_check_failed = True
     return Response(status_code=503)
 
 
@@ -220,7 +224,7 @@ async def get_server_info():
     return {
         **dataclasses.asdict(_global_state.tokenizer_manager.server_args),
         **_global_state.scheduler_info,
-        **internal_states,
+        "internal_states": internal_states,
         "version": __version__,
     }
 
@@ -336,7 +340,11 @@ async def start_profile_async(obj: Optional[ProfileReqInput] = None):
         obj = ProfileReqInput()
 
     await _global_state.tokenizer_manager.start_profile(
-        obj.output_dir, obj.num_steps, obj.activities
+        output_dir=obj.output_dir,
+        num_steps=obj.num_steps,
+        activities=obj.activities,
+        with_stack=obj.with_stack,
+        record_shapes=obj.record_shapes,
     )
     return Response(
         content="Start profiling.\n",
@@ -347,7 +355,7 @@ async def start_profile_async(obj: Optional[ProfileReqInput] = None):
 @app.api_route("/stop_profile", methods=["GET", "POST"])
 async def stop_profile_async():
     """Stop profiling."""
-    _global_state.tokenizer_manager.stop_profile()
+    await _global_state.tokenizer_manager.stop_profile()
     return Response(
         content="Stop profiling. This will take some time.\n",
         status_code=200,
@@ -494,6 +502,19 @@ async def resume_memory_occupation(
         return _create_error_response(e)
 
 
+@app.api_route("/slow_down", methods=["GET", "POST"])
+async def slow_down(obj: SlowDownReqInput, request: Request):
+    """Slow down the system deliberately. Only for testing. Example scenario:
+    when we want to test performance of D in large-scale PD disaggregation and have no enough nodes for P,
+    we can use this to slow down D to let it have enough running sequences, and then disable slowdown
+    to let it run in full batch size.
+    """
+    try:
+        await _global_state.tokenizer_manager.slow_down(obj, request)
+    except Exception as e:
+        return _create_error_response(e)
+
+
 @app.api_route("/open_session", methods=["GET", "POST"])
 async def open_session(obj: OpenSessionReqInput, request: Request):
     """Open a session, and return its unique session id."""
@@ -523,6 +544,16 @@ async def configure_logging(obj: ConfigureLoggingReq, request: Request):
     """Configure the request logging options."""
     _global_state.tokenizer_manager.configure_logging(obj)
     return Response(status_code=200)
+
+
+@app.post("/abort_request")
+async def abort_request(obj: AbortReq, request: Request):
+    """Abort a request."""
+    try:
+        _global_state.tokenizer_manager.abort_request(rid=obj.rid)
+        return Response(status_code=200)
+    except Exception as e:
+        return _create_error_response(e)
 
 
 @app.post("/parse_function_call")

@@ -12,7 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 """
-The definition of objects transfered between different
+The definition of objects transferred between different
 processes (TokenizerManager, DetokenizerManager, Controller).
 """
 
@@ -22,13 +22,15 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
 
+from sglang.srt.mm_utils import has_valid_data
+
 # handle serialization of Image for pydantic
 if TYPE_CHECKING:
     from PIL.Image import Image
 else:
     Image = Any
 
-from sglang.srt.managers.schedule_batch import BaseFinishReason
+from sglang.srt.managers.schedule_batch import BaseFinishReason, flatten_nested_list
 from sglang.srt.sampling.sampling_params import SamplingParams
 
 
@@ -38,6 +40,10 @@ class SessionParams:
     rid: Optional[str] = None
     offset: Optional[int] = None
     replace: Optional[bool] = None
+
+
+AudioDataItem = Union[str, Dict]
+ImageDataItem = Union[Image, str, Dict]
 
 
 @dataclass
@@ -55,10 +61,10 @@ class GenerateReqInput:
     # - List of lists of images (multiple images per request)
     # See also python/sglang/srt/utils.py:load_image for more details.
     image_data: Optional[
-        Union[List[List[Union[Image, str]]], List[Union[Image, str]], Union[Image, str]]
+        Union[List[List[ImageDataItem]], List[ImageDataItem], ImageDataItem]
     ] = None
     # The audio input. Like image data, it can be a file name, a url, or base64 encoded string.
-    audio_data: Optional[Union[List[str], str]] = None
+    audio_data: Optional[Union[List[AudioDataItem], AudioDataItem]] = None
     # The sampling_params. See descriptions below.
     sampling_params: Optional[Union[List[Dict], Dict]] = None
     # The request id.
@@ -99,6 +105,9 @@ class GenerateReqInput:
     bootstrap_host: Optional[Union[List[str], str]] = None
     bootstrap_port: Optional[Union[List[int], int]] = None
     bootstrap_room: Optional[Union[List[int], int]] = None
+
+    def contains_mm_input(self) -> bool:
+        return has_valid_data(self.image_data) or has_valid_data(self.audio_data)
 
     def normalize_batch_and_arguments(self):
         """
@@ -483,6 +492,9 @@ class EmbeddingReqInput:
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
 
+    def contains_mm_input(self) -> bool:
+        return has_valid_data(self.image_data) or has_valid_data(self.audio_data)
+
     def normalize_batch_and_arguments(self):
         # at least one of text, input_ids, or image should be provided
         if self.text is None and self.input_ids is None and self.image_data is None:
@@ -791,6 +803,16 @@ class ResumeMemoryOccupationReqOutput:
 
 
 @dataclass
+class SlowDownReqInput:
+    forward_sleep_time: Optional[float]
+
+
+@dataclass
+class SlowDownReqOutput:
+    pass
+
+
+@dataclass
 class AbortReq:
     # The request id
     rid: str
@@ -826,6 +848,8 @@ class ProfileReqInput:
     # the caller doesn't need to run stop_profile.
     num_steps: Optional[int] = None
     activities: Optional[List[Literal["CPU", "GPU", "MEM", "CUDA_PROFILER"]]] = None
+    with_stack: Optional[bool] = None
+    record_shapes: Optional[bool] = None
 
 
 class ProfileReqType(Enum):

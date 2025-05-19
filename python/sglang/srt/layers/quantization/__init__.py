@@ -109,7 +109,7 @@ def get_quantization_config(quantization: str) -> Type[QuantizationConfig]:
     if quantization in VLLM_QUANTIZATION_METHODS and not VLLM_AVAILABLE:
         raise ValueError(
             f"{quantization} quantization requires some operators from vllm. "
-            "Pleaes install vllm by `pip install vllm==0.8.4`"
+            "Please install vllm by `pip install vllm==0.8.4`"
         )
 
     return QUANTIZATION_METHODS[quantization]

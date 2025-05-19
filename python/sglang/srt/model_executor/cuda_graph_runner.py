@@ -19,7 +19,7 @@ import bisect
 import inspect
 import os
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Callable, Optional, Union
 
 import torch
 import tqdm
@@ -29,6 +29,7 @@ from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.parallel_state import GroupCoordinator, graph_capture
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.torchao_utils import save_gemlite_cache
+from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -39,14 +40,11 @@ from sglang.srt.patch_torch import monkey_patch_torch_compile
 from sglang.srt.utils import (
     get_available_gpu_memory,
     get_device_memory_capacity,
-    is_hip,
     rank0_log,
 )
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
-
-_is_hip = is_hip()
 
 
 def _to_torch(model: torch.nn.Module, reverse: bool, num_tokens: int):
@@ -127,7 +125,6 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
             )
 
         gpu_mem = get_device_memory_capacity()
-        # Batch size of each rank will not become so large when DP is on
         if gpu_mem is not None and gpu_mem > 96 * 1024:
             capture_bs += list(range(160, 257, 8))
 
@@ -138,12 +135,15 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
             model_runner.req_to_token_pool.size
         ]
 
-    capture_bs = list(sorted(set(capture_bs)))
-
-    assert len(capture_bs) > 0 and capture_bs[0] > 0
-    capture_bs = [bs for bs in capture_bs if bs <= model_runner.req_to_token_pool.size]
     if server_args.cuda_graph_max_bs:
         capture_bs = [bs for bs in capture_bs if bs <= server_args.cuda_graph_max_bs]
+        if max(capture_bs) < server_args.cuda_graph_max_bs:
+            capture_bs += list(
+                range(max(capture_bs), server_args.cuda_graph_max_bs + 1, 16)
+            )
+    capture_bs = [bs for bs in capture_bs if bs <= model_runner.req_to_token_pool.size]
+    capture_bs = list(sorted(set(capture_bs)))
+    assert len(capture_bs) > 0 and capture_bs[0] > 0
     compile_bs = (
         [bs for bs in capture_bs if bs <= server_args.torch_compile_max_bs]
         if server_args.enable_torch_compile
@@ -201,7 +201,10 @@ class CudaGraphRunner:
         # Attention backend
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
-        self.model_runner.attn_backend.init_cuda_graph_state(self.max_num_token)
+        if global_server_args_dict["attention_backend"] == "flashmla":
+            self.model_runner.attn_backend.init_cuda_graph_state(self.max_bs)
+        else:
+            self.model_runner.attn_backend.init_cuda_graph_state(self.max_num_token)
         self.seq_len_fill_value = (
             self.model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
         )
@@ -227,6 +230,7 @@ class CudaGraphRunner:
             self.out_cache_loc = torch.zeros((self.max_num_token,), dtype=torch.int64)
             self.positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
             self.mrope_positions = torch.zeros((3, self.max_bs), dtype=torch.int64)
+            self.num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
 
             # pipeline parallelism
             if self.pp_size > 1:
@@ -286,12 +290,12 @@ class CudaGraphRunner:
                 self.capture()
         except RuntimeError as e:
             raise Exception(
-                f"Capture cuda graph failed: {e}\n"
+                f"Capture CUDA graph failed: {e}\n"
                 "Possible solutions:\n"
                 "1. set --mem-fraction-static to a smaller value (e.g., 0.8 or 0.7)\n"
                 "2. set --cuda-graph-max-bs to a smaller value (e.g., 16)\n"
                 "3. disable torch compile by not using --enable-torch-compile\n"
-                "4. disable cuda graph by --disable-cuda-graph. (Not recommonded. Huge perf loss)\n"
+                "4. disable CUDA graph by --disable-cuda-graph. (Not recommended. Huge performance loss)\n"
                 "Open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose \n"
             )
 
@@ -390,6 +394,7 @@ class CudaGraphRunner:
         else:
             encoder_lens = None
         mrope_positions = self.mrope_positions[:, :bs]
+        self.num_token_non_padded[...] = num_tokens
 
         # pipeline parallelism
         if self.pp_size > 1:
@@ -448,6 +453,7 @@ class CudaGraphRunner:
             spec_info=spec_info,
             capture_hidden_mode=self.capture_hidden_mode,
             lora_paths=lora_paths,
+            num_token_non_padded=self.num_token_non_padded,
         )
 
         if lora_paths is not None:
@@ -543,6 +549,7 @@ class CudaGraphRunner:
         self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
         self.out_cache_loc[:raw_num_token].copy_(forward_batch.out_cache_loc)
         self.positions[:raw_num_token].copy_(forward_batch.positions)
+        self.num_token_non_padded[...] = len(forward_batch.input_ids)
         if forward_batch.seq_lens_cpu is not None:
             if bs != raw_bs:
                 self.seq_lens_cpu.fill_(1)

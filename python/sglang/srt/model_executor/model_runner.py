@@ -32,6 +32,7 @@ from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
 from sglang.srt.distributed import (
     get_tp_group,
+    get_world_group,
     init_distributed_environment,
     initialize_model_parallel,
     set_custom_all_reduce,
@@ -102,6 +103,19 @@ UNBALANCED_MODEL_LOADING_TIMEOUT_S = 300
 logger = logging.getLogger(__name__)
 
 
+class RankZeroFilter(logging.Filter):
+    """Filter that only allows INFO level logs from rank 0, but allows all other levels from any rank."""
+
+    def __init__(self, is_rank_zero):
+        super().__init__()
+        self.is_rank_zero = is_rank_zero
+
+    def filter(self, record):
+        if record.levelno == logging.INFO:
+            return self.is_rank_zero
+        return True
+
+
 class ModelRunner:
     """ModelRunner runs the forward passes of the models."""
 
@@ -125,6 +139,10 @@ class ModelRunner:
         self.mem_fraction_static = mem_fraction_static
         self.device = server_args.device
         self.gpu_id = gpu_id
+
+        # Apply the rank zero filter to logger
+        if not any(isinstance(f, RankZeroFilter) for f in logger.filters):
+            logger.addFilter(RankZeroFilter(tp_rank == 0))
         self.tp_rank = tp_rank
         self.tp_size = tp_size
         self.pp_rank = pp_rank
@@ -134,7 +152,6 @@ class ModelRunner:
         self.is_draft_worker = is_draft_worker
         self.is_generation = model_config.is_generation
         self.is_multimodal = model_config.is_multimodal
-        self.should_log = tp_rank == 0
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
@@ -164,6 +181,7 @@ class ModelRunner:
                 "enable_dp_attention": server_args.enable_dp_attention,
                 "enable_ep_moe": server_args.enable_ep_moe,
                 "enable_deepep_moe": server_args.enable_deepep_moe,
+                "deepep_config": server_args.deepep_config,
                 "flashinfer_mla_disable_ragged": server_args.flashinfer_mla_disable_ragged,
                 "moe_dense_tp_size": server_args.moe_dense_tp_size,
                 "n_share_experts_fusion": server_args.n_share_experts_fusion,
@@ -173,6 +191,7 @@ class ModelRunner:
                 "speculative_accept_threshold_single": server_args.speculative_accept_threshold_single,
                 "speculative_accept_threshold_acc": server_args.speculative_accept_threshold_acc,
                 "use_mla_backend": self.use_mla_backend,
+                "mm_attention_backend": server_args.mm_attention_backend,
             }
         )
 
@@ -325,13 +344,12 @@ class ModelRunner:
         if self.is_multimodal:
             self.mem_fraction_static *= 0.90
             logger.info(
-                f"Automatically reduce --mem-fraction-static to {self.mem_fraction_static:.3f} "
-                f"because this is a multimodal model."
+                f"Automatically reduce --mem-fraction-static to {self.mem_fraction_static:.3f} because this is a multimodal model."
             )
+            server_args.chunked_prefill_size = -1
             logger.info(
                 "Automatically turn off --chunked-prefill-size for multimodal model."
             )
-            server_args.chunked_prefill_size = -1
 
         if not self.use_mla_backend:
             server_args.disable_chunked_prefix_cache = True
@@ -393,11 +411,15 @@ class ModelRunner:
                 tp_rank=self.tp_rank,
                 tp_size=self.tp_size,
                 dp_size=self.server_args.dp_size,
+                moe_dense_tp_size=self.server_args.moe_dense_tp_size,
                 pp_size=self.server_args.pp_size,
             )
 
         min_per_gpu_memory = get_available_gpu_memory(
-            self.device, self.gpu_id, distributed=self.tp_size > 1
+            self.device,
+            self.gpu_id,
+            distributed=get_world_group().world_size > 1,
+            cpu_group=get_world_group().cpu_group,
         )
         self.tp_group = get_tp_group()
         self.attention_tp_group = get_attention_tp_group()
@@ -538,23 +560,12 @@ class ModelRunner:
 
         def get_weight_iter(config):
             iter = loader._get_weights_iterator(
-                DefaultModelLoader.Source(
-                    config.model_path,
-                    revision=config.revision,
-                    fall_back_to_pt=getattr(
-                        self.model, "fall_back_to_pt_during_load", True
-                    ),
-                )
+                DefaultModelLoader.Source.init_new(config, self.model)
             )
             return iter
 
         def model_load_weights(model, iter):
-            model.load_weights(iter)
-            for _, module in self.model.named_modules():
-                quant_method = getattr(module, "quant_method", None)
-                if quant_method is not None:
-                    with device_loading_context(module, target_device):
-                        quant_method.process_weights_after_loading(module)
+            DefaultModelLoader.load_weights_and_postprocess(model, iter, target_device)
             return model
 
         with set_default_torch_dtype(self.model_config.dtype):
@@ -622,7 +633,6 @@ class ModelRunner:
                 rank=rank,
                 group_name=group_name,
             )
-            dist.barrier(group=self._model_update_group, device_ids=[rank])
             return True, "Succeeded to initialize custom process group."
         except Exception as e:
             message = f"Failed to initialize custom process group: {e}."
@@ -712,7 +722,10 @@ class ModelRunner:
 
     def profile_max_num_token(self, total_gpu_memory: int):
         available_gpu_memory = get_available_gpu_memory(
-            self.device, self.gpu_id, distributed=self.tp_size > 1
+            self.device,
+            self.gpu_id,
+            distributed=get_world_group().world_size > 1,
+            cpu_group=get_world_group().cpu_group,
         )
         if self.use_mla_backend:
             num_layers = (
@@ -1008,7 +1021,7 @@ class ModelRunner:
         if self.server_args.disable_cuda_graph:
             return
 
-        tic = time.time()
+        tic = time.perf_counter()
         before_mem = get_available_gpu_memory(self.device, self.gpu_id)
         logger.info(
             f"Capture cuda graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
@@ -1016,7 +1029,7 @@ class ModelRunner:
         self.cuda_graph_runner = CudaGraphRunner(self)
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         logger.info(
-            f"Capture cuda graph end. Time elapsed: {time.time() - tic:.2f} s. "
+            f"Capture cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
             f"mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
         )
 
@@ -1080,31 +1093,32 @@ class ModelRunner:
         forward_batch: ForwardBatch,
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
-    ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+    ) -> Tuple[Union[LogitsProcessorOutput, PPProxyTensors], bool]:
         can_run_cuda_graph = bool(
             forward_batch.forward_mode.is_cuda_graph()
             and self.cuda_graph_runner
             and self.cuda_graph_runner.can_run(forward_batch)
         )
         if can_run_cuda_graph:
-            return self.cuda_graph_runner.replay(
+            ret = self.cuda_graph_runner.replay(
                 forward_batch,
                 skip_attn_backend_init=skip_attn_backend_init,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
-
-        if forward_batch.forward_mode.is_decode():
-            return self.forward_decode(forward_batch, pp_proxy_tensors=pp_proxy_tensors)
+        elif forward_batch.forward_mode.is_decode():
+            ret = self.forward_decode(forward_batch, pp_proxy_tensors=pp_proxy_tensors)
         elif forward_batch.forward_mode.is_extend():
-            return self.forward_extend(
+            ret = self.forward_extend(
                 forward_batch,
                 skip_attn_backend_init=skip_attn_backend_init,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
         elif forward_batch.forward_mode.is_idle():
-            return self.forward_idle(forward_batch, pp_proxy_tensors=pp_proxy_tensors)
+            ret = self.forward_idle(forward_batch, pp_proxy_tensors=pp_proxy_tensors)
         else:
             raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode}")
+
+        return ret, can_run_cuda_graph
 
     def _preprocess_logits(
         self, logits_output: LogitsProcessorOutput, sampling_info: SamplingBatchInfo
@@ -1157,7 +1171,7 @@ class ModelRunner:
     def model_is_mrope(self) -> bool:
         """Detect if the model has "mrope" rope_scaling type.
         mrope requires keep "rope_deltas" between prompt and decoding phases."""
-        rope_scaling = getattr(self.model_config.hf_config, "rope_scaling", {})
+        rope_scaling = getattr(self.model_config.hf_text_config, "rope_scaling", {})
         if rope_scaling is None:
             return False
         is_mrope_enabled = "mrope_section" in rope_scaling
