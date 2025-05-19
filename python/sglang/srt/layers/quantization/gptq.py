@@ -5,7 +5,10 @@ from typing import Any, Callable, Dict, List, Optional, Union
 import torch
 
 from sglang.srt.layers.linear import LinearBase, set_weight_attrs
-from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.base_config import (
+    QuantizationConfig,
+    QuantizeMethodBase,
+)
 from sglang.srt.layers.quantization.utils import replace_parameter
 from sglang.srt.utils import is_cuda
 
@@ -32,9 +35,9 @@ try:
 except ImportError:
     VLLM_AVAILABLE = False
 
-    GPTQLinearMethod = MarlinLinearMethod = QuantizeMethodBase = FusedMoEMethodBase = (
-        Any
-    )
+    GPTQLinearMethod = MarlinLinearMethod = QuantizeMethodBase = Any
+
+    FusedMoEMethodBase = QuantizeMethodBase
 
     class scalar_types:
         uint4b8 = "uint4b8"
