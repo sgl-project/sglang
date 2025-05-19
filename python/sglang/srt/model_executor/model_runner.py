@@ -29,7 +29,6 @@ import torch.distributed as dist
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
-from sglang.srt.cpu_utils import cpu_has_amx_support
 from sglang.srt.distributed import (
     get_tp_group,
     get_world_group,
@@ -92,6 +91,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import (
     MultiprocessingSerializer,
+    cpu_has_amx_support,
     enable_show_time_cost,
     get_available_gpu_memory,
     get_bool_env_var,
@@ -381,7 +381,9 @@ class ModelRunner:
                     )
             else:
                 if server_args.attention_backend != "intel_amx":
-                    raise ValueError("MLA optimization not supported on CPU except for intel_amx backend.")
+                    raise ValueError(
+                        "MLA optimization not supported on CPU except for intel_amx backend."
+                    )
 
         if (
             server_args.attention_backend == "fa3"
@@ -1084,7 +1086,10 @@ class ModelRunner:
 
             return CutlassMLABackend(self)
         elif self.server_args.attention_backend == "intel_amx":
-            from sglang.srt.layers.attention.intel_amx_backend import IntelAMXAttnBackend
+            from sglang.srt.layers.attention.intel_amx_backend import (
+                IntelAMXAttnBackend,
+            )
+
             return IntelAMXAttnBackend(self)
         else:
             raise ValueError(

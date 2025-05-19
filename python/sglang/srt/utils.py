@@ -2225,3 +2225,21 @@ def bind_or_assign(target, source):
         return target
     else:
         return source
+
+
+def support_triton(backend: str):
+    if backend in ["torch_native", "intel_amx"]:
+        return False
+    return True
+
+
+try:
+    from sgl_kernel.cpu import convert_weight_packed
+
+    is_intel_amx_backend_available = True
+except:
+    is_intel_amx_backend_available = False
+
+
+def cpu_has_amx_support():
+    return torch._C._cpu._is_amx_tile_supported() and is_intel_amx_backend_available
