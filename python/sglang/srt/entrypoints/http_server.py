@@ -228,6 +228,14 @@ async def get_server_info():
         "version": __version__,
     }
 
+@app.get("/get_load")
+async def get_load():
+    internal_states = await _global_state.tokenizer_manager.get_internal_state()
+    load = internal_states[0]["load"]
+    return {
+        "load": load,
+    }
+
 
 @app.api_route("/set_internal_state", methods=["POST", "PUT"])
 async def set_internal_state(obj: SetInternalStateReq, request: Request):
