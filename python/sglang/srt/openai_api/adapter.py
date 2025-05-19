@@ -1828,9 +1828,10 @@ def v1_embedding_request(all_requests, tokenizer_manager):
             )
         else:
             prompt_kwargs = {"input_ids": prompts}
+        request_ids = [req.rid for req in all_requests]
 
     adapted_request = EmbeddingReqInput(
-        rid=all_requests[0].rid,
+        rid=request_ids,
         **prompt_kwargs,
     )
 
