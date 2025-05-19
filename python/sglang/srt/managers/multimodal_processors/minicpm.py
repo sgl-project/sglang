@@ -115,9 +115,6 @@ class MiniCPMMultimodalProcessor(BaseMultimodalProcessor):
         )
         image_offsets.extend(slice_offsets)
         image_offsets = sorted(image_offsets)
-        audio_offsets = self.get_mm_items_offset_by_pair(
-            input_ids=input_ids, mm_start_id=audio_start_id, mm_end_id=audio_end_id
-        )
 
         if len(pixel_values) != 0:
             item = MultimodalDataItem(
@@ -133,6 +130,14 @@ class MiniCPMMultimodalProcessor(BaseMultimodalProcessor):
             and res["audio_features"] is not None
             and len(res["audio_features"]) != 0
         ):
+            if audio_start_id is not None and audio_end_id is not None:
+                audio_offsets = self.get_mm_items_offset_by_pair(
+                    input_ids=input_ids,
+                    mm_start_id=audio_start_id,
+                    mm_end_id=audio_end_id,
+                )
+            else:
+                audio_offsets = None
             item = MultimodalDataItem(
                 audio_features=[res["audio_features"]],
                 audio_feature_lens=res["audio_feature_lens"],
