@@ -235,7 +235,7 @@ class DataParallelController:
                 )
                 ctx = (
                     memory_saver_adapter.change_env(TODO, TODO)
-                    if get_bool_env_var("SGLANG_HACK_CUPTI_MEMORY_PROFILER")
+                    if get_bool_env_var("SGLANG_HACK_ENABLE_CUPTI_MEMORY_PROFILER")
                     else nullcontext()
                 )
                 with memory_saver_adapter.configure_subprocess():
