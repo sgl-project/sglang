@@ -209,6 +209,15 @@ class InternVLImageProcessor(BaseMultimodalProcessor):
                 return None
 
         pixel_values = torch.cat(pixel_values, dim=0)
+
+        for idx, num_patches in enumerate(num_patches_list):
+            image_tokens = (
+                self.IMG_START_TOKEN
+                + self.IMG_CONTEXT_TOKEN * self.num_image_token * num_patches
+                + self.IMG_END_TOKEN
+            )
+            input_text = input_text.replace("<image>", image_tokens, 1)
+
         tokenizer = self._processor
         input_ids = tokenizer(input_text, return_tensors="pt")["input_ids"].flatten()
         image_offsets = self.get_mm_items_offset(
@@ -223,15 +232,6 @@ class InternVLImageProcessor(BaseMultimodalProcessor):
             )
         ]
 
-        for idx, num_patches in enumerate(num_patches_list):
-            image_tokens = (
-                self.IMG_START_TOKEN
-                + self.IMG_CONTEXT_TOKEN * self.num_image_token * num_patches
-                + self.IMG_END_TOKEN
-            )
-            input_text = input_text.replace("<image>", image_tokens, 1)
-
-        tokenizer = self._processor
         return {
             "input_ids": input_ids.tolist(),
             "mm_items": items,
