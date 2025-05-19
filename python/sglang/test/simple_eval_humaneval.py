@@ -121,7 +121,7 @@ class HumanEval(Eval):
                 convo=convo,
                 metrics={
                     f"pass@{k}": estimate_pass_at_k([total], [correct], k)
-                    # this will be aggrated so no need of .mean()
+                    # this will be aggregated so no need of .mean()
                     for k in self._ks_passes
                     if total >= k
                 },

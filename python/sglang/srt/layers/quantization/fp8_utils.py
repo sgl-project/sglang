@@ -80,6 +80,12 @@ def cutlass_fp8_supported():
     return False
 
 
+def is_sm100_supported(device=None) -> bool:
+    return (torch.cuda.get_device_capability(device)[0] == 10) and (
+        torch.version.cuda >= "12.8"
+    )
+
+
 def normalize_e4m3fn_to_e4m3fnuz(
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
@@ -233,6 +239,41 @@ def block_quant_to_tensor_quant(
         else input_to_float8(x_dq_block, dtype=x_q_block.dtype)
     )
     return x_q_tensor, scale
+
+
+def block_quant_dequant(
+    x_q_block: torch.Tensor,
+    x_s: torch.Tensor,
+    block_size: List[int],
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """This function converts block-wise quantization to unquantized.
+    The inputs are block-wise quantization tensor `x_q_block`, block-wise quantization scale
+    and the block size.
+    The output is an unquantized tensor with dtype.
+    """
+    block_n, block_k = block_size[0], block_size[1]
+    n, k = x_q_block.shape
+    n_tiles = (n + block_n - 1) // block_n
+    k_tiles = (k + block_k - 1) // block_k
+    assert n_tiles == x_s.shape[0]
+    assert k_tiles == x_s.shape[1]
+
+    x_dq_block = torch.empty_like(x_q_block, dtype=dtype)
+
+    for j in range(n_tiles):
+        for i in range(k_tiles):
+            x_q_block_tile = x_q_block[
+                j * block_n : min((j + 1) * block_n, n),
+                i * block_k : min((i + 1) * block_k, k),
+            ]
+            x_dq_block_tile = x_dq_block[
+                j * block_n : min((j + 1) * block_n, n),
+                i * block_k : min((i + 1) * block_k, k),
+            ]
+            x_dq_block_tile[:, :] = x_q_block_tile.to(torch.float32) * x_s[j][i]
+
+    return x_dq_block
 
 
 def channel_quant_to_tensor_quant(

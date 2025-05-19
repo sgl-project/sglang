@@ -30,9 +30,9 @@ from sglang.srt.distributed import (
 from sglang.srt.layers.dp_attention import (
     dp_gather_partial,
     dp_scatter,
-    get_attention_dp_size,
     get_attention_tp_rank,
     get_attention_tp_size,
+    get_local_attention_dp_size,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -198,7 +198,6 @@ class Llama4Attention(nn.Module):
         self.use_rope = int((layer_id + 1) % 4 != 0)
         self.use_qk_norm = config.use_qk_norm and self.use_rope
 
-        self.dp_size = get_attention_dp_size()
         attn_tp_rank = get_attention_tp_rank()
         attn_tp_size = get_attention_tp_size()
 
@@ -342,7 +341,7 @@ class Llama4DecoderLayer(nn.Module):
         rope_theta = config.rope_theta
         rope_scaling = config.rope_scaling
         max_position_embeddings = config.max_position_embeddings
-        self.dp_size = get_attention_dp_size()
+        self.local_dp_size = get_local_attention_dp_size()
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
 
@@ -405,7 +404,7 @@ class Llama4DecoderLayer(nn.Module):
         # Gather
         if get_tensor_model_parallel_world_size() > 1:
             # all gather and all reduce
-            if self.dp_size != 1:
+            if self.local_dp_size != 1:
                 if self.attn_tp_rank == 0:
                     hidden_states += residual
                 hidden_states, local_hidden_states = (
@@ -428,9 +427,9 @@ class Llama4DecoderLayer(nn.Module):
         # Fully Connected
         hidden_states = self.feed_forward(hidden_states, forward_batch)
 
-        # TODO(ch-wan): ues reduce-scatter in MLP to avoid this scatter
+        # TODO(ch-wan): use reduce-scatter in MLP to avoid this scatter
         # Scatter
-        if self.dp_size != 1:
+        if self.local_dp_size != 1:
             # important: forward batch.gathered_buffer is used both after scatter and after gather.
             # be careful about this!
             hidden_states, global_hidden_states = (

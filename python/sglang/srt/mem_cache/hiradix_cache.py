@@ -449,14 +449,14 @@ class HiRadixCache(RadixCache):
 
     def _match_prefix_helper(self, node: TreeNode, key: List):
         total_key = key
-        node.last_access_time = time.time()
+        node.last_access_time = time.monotonic()
         child_key = self.get_child_key_fn(key)
         value = []
         total_prefix_length = 0
 
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
-            child.last_access_time = time.time()
+            child.last_access_time = time.monotonic()
             prefix_len = self.key_match_fn(child.key, key)
             total_prefix_length += prefix_len
             if prefix_len < len(child.key):
@@ -529,7 +529,7 @@ class HiRadixCache(RadixCache):
 
     def _insert_helper(self, node: TreeNode, key: List, value):
         total_key = key
-        node.last_access_time = time.time()
+        node.last_access_time = time.monotonic()
         if len(key) == 0:
             return 0
 
@@ -538,7 +538,7 @@ class HiRadixCache(RadixCache):
 
         while len(key) > 0 and child_key in node.children.keys():
             node = node.children[child_key]
-            node.last_access_time = time.time()
+            node.last_access_time = time.monotonic()
             prefix_len = self.key_match_fn(node.key, key)
 
             if prefix_len == len(node.key):
