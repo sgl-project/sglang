@@ -1,9 +1,5 @@
-from typing import Optional
-
-import torch
 from torch import nn
 
-from sglang.srt.layers.moe.fused_moe_native import fused_moe_forward_native
 from sglang.srt.utils import is_cuda, is_hip
 
 _is_cuda = is_cuda()
@@ -19,6 +15,10 @@ class CustomOp(nn.Module):
         # NOTE: Temporarily workaround MoE
         if "FusedMoE" in self.__class__.__name__:
             if num_tokens == 1:
+                from sglang.srt.layers.moe.fused_moe_native import (
+                    fused_moe_forward_native,
+                )
+
                 # The performance of torch.compile on this layer is not always good when bs > 1,
                 # so we decide to only use torch.compile when bs =1
                 self._forward_method = fused_moe_forward_native
