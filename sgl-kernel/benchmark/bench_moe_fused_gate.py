@@ -18,6 +18,7 @@ def biased_grouped_topk_org(scores, bias, num_expert_group, topk_group, topk):
         renormalize=True,
         num_expert_group=num_expert_group,
         topk_group=topk_group,
+        routed_scaling_factor=1.0,
     )
 
 
