@@ -239,11 +239,11 @@ class DataParallelController:
                         f"/host_home/temp_sglang_server2local/cupti_memory_profiler_{time.time()}_{tp_rank}.log",
                     ):
                         with torch_memory_saver.change_env(
-                            'LD_PRELOAD',
-                            "/host_home/primary_synced/tom_sglang_server/misc/cupti_memory_profiler.so" + ":" + str(
-                                torch_memory_saver.get_binary_path())
+                            'CUDA_INJECTION64_PATH',
+                            "/host_home/primary_synced/tom_sglang_server/misc/cupti_memory_profiler.so"
                         ):
-                            proc.start()
+                            with memory_saver_adapter.configure_subprocess():
+                                proc.start()
                 else:
                     with memory_saver_adapter.configure_subprocess():
                         proc.start()
