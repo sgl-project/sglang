@@ -12,13 +12,22 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-MODELS = [
+STANDARD_MODELS = [
     SimpleNamespace(model="Qwen/Qwen3-4B", accuracy=0.85),
     SimpleNamespace(
         model="Qwen/Qwen3-14B",
         accuracy=0.87,
     ),
     SimpleNamespace(model="Qwen/Qwen3-32B", accuracy=0.87),
+]
+
+FP8_MODELS = [
+    SimpleNamespace(model="Qwen/Qwen3-4B-FP8", accuracy=0.85),
+    SimpleNamespace(
+        model="Qwen/Qwen3-14B-FP8",
+        accuracy=0.85,
+    ),
+    SimpleNamespace(model="Qwen/Qwen3-32B-FP8", accuracy=0.85),
 ]
 
 
@@ -29,10 +38,12 @@ class TestQwen3(CustomTestCase):
 
     def test_gsm8k(self):
 
-        models_to_test = MODELS
+        models_to_test = STANDARD_MODELS + FP8_MODELS
 
         if is_in_ci():
-            models_to_test = [random.choice(MODELS)]
+            models_to_test = [random.choice(STANDARD_MODELS)] + [
+                random.choice(FP8_MODELS)
+            ]
 
         for model in models_to_test:
             try:
