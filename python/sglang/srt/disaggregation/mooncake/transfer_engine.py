@@ -30,16 +30,24 @@ class MooncakeTransferEngine:
         self.session_id = f"{self.hostname}:{self.engine.get_rpc_port()}"
 
     def register(self, ptr, length):
-        ret_value = self.engine.register_memory(ptr, length)
+        try:
+            ret_value = self.engine.register_memory(ptr, length)
+        except Exception:
+            # Mark register as failed
+            ret_value = -1
+
         if ret_value != 0:
-            logger.error("Mooncake memory registration failed.")
-            raise RuntimeError("Mooncake memory registration failed.")
+            logger.info("Mooncake memory registration %s failed.", ptr)
 
     def deregister(self, ptr):
-        ret_value = self.engine.unregister_memory(ptr)
+        try:
+            ret_value = self.engine.unregister_memory(ptr)
+        except Exception:
+            # Mark deregister as failed
+            ret_value = -1
+
         if ret_value != 0:
-            logger.error("Mooncake memory deregistration failed.")
-            raise RuntimeError("Mooncake memory deregistration failed.")
+            logger.info("Mooncake memory deregistration %s failed.", ptr)
 
     def initialize(
         self,
@@ -61,17 +69,24 @@ class MooncakeTransferEngine:
         self, session_id: str, buffer: int, peer_buffer_address: int, length: int
     ) -> int:
         """Synchronously transfer data to the specified address."""
+        try:
+            ret = self.engine.transfer_sync_write(
+                session_id, buffer, peer_buffer_address, length
+            )
+        except Exception:
+            # Mark transfer request as failed
+            ret = -1
 
-        ret = self.engine.transfer_sync_write(
-            session_id, buffer, peer_buffer_address, length
-        )
         if ret < 0:
-            logger.error("Mooncake Transfer Engine Return Error.")
-            raise RuntimeError("Mooncake Transfer Engine Return Error.")
-        return ret
+            # Do not raise an exception here, since some transfer requests fail should be accepted and the execution thread should not be stopped.
+            logger.info(
+                "Failed to transfer data from %s to %s - %s.",
+                buffer,
+                session_id,
+                peer_buffer_address,
+            )
 
-    def get_localhost(self):
-        return self.hostname
+        return ret
 
     def get_session_id(self):
         return self.session_id

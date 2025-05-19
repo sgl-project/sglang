@@ -156,7 +156,7 @@ class MooncakeKVManager(BaseKVManager):
             # Determine the number of threads to use for kv sender
             cpu_count = os.cpu_count()
             self.executor = concurrent.futures.ThreadPoolExecutor(
-                min(cpu_count // 4, 16)
+                min(max(1, cpu_count // 8), 8)
             )
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.heartbeat_failures = {}
