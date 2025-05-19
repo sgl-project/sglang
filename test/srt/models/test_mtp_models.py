@@ -13,7 +13,7 @@ from sglang.test.test_utils import (
 DEFAULT_MTP_MODEL_FOR_TEST = "XiaomiMiMo/MiMo-7B-RL"
 
 
-class TestMTP(CustomTestCase):
+class TestMiMoMTP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MTP_MODEL_FOR_TEST
