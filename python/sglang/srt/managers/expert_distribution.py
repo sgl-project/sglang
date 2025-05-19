@@ -23,10 +23,9 @@ import torch
 import torch.distributed
 
 from sglang.srt.managers.expert_location import ExpertLocationMetadata
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import Withable, get_bool_env_var
+from sglang.srt.utils import Withable
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +34,7 @@ logger = logging.getLogger(__name__)
 _OutputMode = Literal["file", "object"]
 
 
-class ExpertDistributionRecorder:
+class ExpertDistributionRecorder(ABC):
     """Global expert distribution recording"""
 
     @staticmethod
@@ -248,8 +247,7 @@ class _SinglePassGatherer(ABC):
                 server_args, expert_location_metadata, rank
             )
         if server_args.enable_deepep_moe:
-            # `auto` has many restrictions now, so we lower the priority to implement low-latency capturing for auto
-            if server_args.deepep_mode in ["normal", "auto"]:
+            if server_args.deepep_mode == "normal":
                 return _DeepepNormalSinglePassGatherer(expert_location_metadata, rank)
             elif server_args.deepep_mode == "low_latency":
                 return _DeepepLowLatencySinglePassGatherer(
