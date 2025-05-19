@@ -280,6 +280,7 @@ class Llama4Attention(nn.Module):
             layer_id=layer_id,
             prefix=add_prefix("attn", prefix),
             use_irope=self.use_rope,
+            quant_config=quant_config,
         )
 
     def _get_attn_scale(self, positions: torch.Tensor) -> torch.Tensor:

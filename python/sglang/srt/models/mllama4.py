@@ -17,7 +17,9 @@ from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInp
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix
-
+from sglang.srt.model_loader.weight_utils import (
+    maybe_remap_kv_scale_name,
+)
 
 class Llama4ForConditionalGeneration(nn.Module):
     packed_modules_mapping = {
@@ -145,12 +147,18 @@ class Llama4ForConditionalGeneration(nn.Module):
             ckpt_up_proj_name="up_proj",
             num_experts=num_experts,
         )
-
+        
         for name, loaded_weight in weights:
             if not "vision" in name:
                 name, loaded_weight = self.permute_qk_weight_for_rotary(
                     name, loaded_weight
                 )
+
+            # Handle FP8 kv-scale remapping
+            if "scale" in name:
+                name = maybe_remap_kv_scale_name(name, params_dict)
+                if name is None:
+                    continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
