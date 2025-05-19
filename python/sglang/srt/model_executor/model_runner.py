@@ -729,12 +729,10 @@ class ModelRunner:
         )
         if self.use_mla_backend:
             num_layers = (
-                self.model_config.num_hidden_layers
+                self.num_effective_layers
                 if not self.is_draft_worker
                 else self.model_config.hf_config.num_nextn_predict_layers
             )
-            # FIXME: pipeline parallelism is not compatible with mla backend
-            assert self.pp_size == 1
             cell_size = (
                 (self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim)
                 * num_layers
@@ -853,10 +851,10 @@ class ModelRunner:
                 kv_lora_rank=self.model_config.kv_lora_rank,
                 qk_rope_head_dim=self.model_config.qk_rope_head_dim,
                 layer_num=(
-                    self.model_config.num_hidden_layers
+                    self.num_effective_layers
                     if not self.is_draft_worker
                     else self.model_config.hf_config.num_nextn_predict_layers
-                ),  # PP is not compatible with mla backend
+                ),
                 device=self.device,
                 enable_memory_saver=self.server_args.enable_memory_saver,
                 start_layer=self.start_layer,
