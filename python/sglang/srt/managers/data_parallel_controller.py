@@ -233,14 +233,15 @@ class DataParallelController:
                     ),
                 )
                 if get_bool_env_var("SGLANG_HACK_ENABLE_CUPTI_MEMORY_PROFILER") and tp_rank == 3:
-                    with memory_saver_adapter.change_env(
+                    import torch_memory_saver
+                    with torch_memory_saver.change_env(
                         'CUPTI_MEMORY_PROFILER_OUTPUT_PATH',
                         f"/host_home/temp_sglang_server2local/cupti_memory_profiler_{time.time()}_{tp_rank}.log",
                     ):
-                        with memory_saver_adapter.change_env(
+                        with torch_memory_saver.change_env(
                             'LD_PRELOAD',
                             "/host_home/primary_synced/tom_sglang_server/misc/cupti_memory_profiler.so" + ":" + str(
-                                memory_saver_adapter.get_binary_path())
+                                torch_memory_saver.get_binary_path())
                         ):
                             proc.start()
                 else:
