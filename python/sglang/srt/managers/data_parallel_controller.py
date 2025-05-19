@@ -238,8 +238,8 @@ class DataParallelController:
                         "/host_home/primary_synced/tom_sglang_server/misc/cupti_memory_profiler.so" + ":" + str(
                             memory_saver_adapter.get_binary_path())
                     )
-                    if get_bool_env_var("SGLANG_HACK_ENABLE_CUPTI_MEMORY_PROFILER")
-                    else memory_saver_adapter.configure_subprocess():
+                    if get_bool_env_var("SGLANG_HACK_ENABLE_CUPTI_MEMORY_PROFILER") and tp_rank == 3
+                    else memory_saver_adapter.configure_subprocess()
                 )
                 with ctx:
                     proc.start()
