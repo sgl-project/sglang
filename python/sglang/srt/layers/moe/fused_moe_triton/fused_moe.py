@@ -931,7 +931,6 @@ def get_moe_configs(
     kernel on a given batch size bs, the closest batch size in the grid should
     be picked and the associated configuration chosen to invoke the kernel.
     """
-    add_rank_zero_filter(logger)
 
     # First look up if an optimized configuration is available in the configs
     # directory
@@ -942,6 +941,7 @@ def get_moe_configs(
     )
     if os.path.exists(config_file_path):
         with open(config_file_path) as f:
+            add_rank_zero_filter(logger)
             # Please note that although we find the config files, performance might still be suboptimal.
             # This is because the tuning environment might differ from your current environment.
             # For example, updating the Triton version might cause all old configs to become suboptimal.
