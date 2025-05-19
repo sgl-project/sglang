@@ -27,7 +27,7 @@ ALL_MODELS = [
     # Memory access fault with Deepseek-R1 (3 layers) on TP=1 on MI300.
     ModelCase("fxmarty/deepseek_r1_3_layers_mxfp4", tp_size=8),
     ModelCase("/shared_volume/repos/vllm/Llama-4-Scout-17B-16E-Instruct-2-layers-mxfp4", tp_size=1, mem_fraction_static=0.7, context_length=100000),
-    ModelCase("/shared_volume/repos/vllm/Llama-4-Scout-17B-16E-Instruct-2-layers-mxfp4", tp_size=8),
+    ModelCase("/shared_volume/repos/vllm/Llama-4-Scout-17B-16E-Instruct-2-layers-mxfp4", tp_size=8, mem_fraction_static=0.7, context_length=1000000),
 ]
 
 
@@ -78,7 +78,9 @@ class TestR1MXFP4Accuracy(CustomTestCase):
             "--tp",
             "8",
             "--mem-fraction-static",
-            "0.7",
+            "0.9",
+            "--context-length",
+            "38768"
         ]
 
         cls.process = popen_launch_server(
@@ -104,7 +106,7 @@ class TestR1MXFP4Accuracy(CustomTestCase):
         )
         metrics = run_eval(args)
         print(f"{metrics=}")
-        self.assertGreater(metrics["accuracy"], 0.78)
+        self.assertGreater(metrics["accuracy"], 0.96)
 
 
 if __name__ == "__main__":
