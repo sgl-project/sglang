@@ -50,7 +50,9 @@ def _get_version():
 cpu_fp8_ftz = os.getenv("SGLANG_CPU_FP8_CVT_FTZ", "1") == "1"
 
 operator_namespace = "sgl_kernel"
-include_dirs = []
+include_dirs = [
+    "../../include",
+]
 
 sources = [
     "csrc/cpu/activation.cpp",

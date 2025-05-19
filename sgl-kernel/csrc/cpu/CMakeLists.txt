@@ -1,21 +1,11 @@
 cmake_minimum_required(VERSION 3.18 FATAL_ERROR)
 project(sgl_kernel)
 
-include(FetchContent)
-FetchContent_Declare(
-  pybind11
-  GIT_REPOSITORY https://github.com/pybind/pybind11.git
-  GIT_TAG        v2.12.0
-)
-FetchContent_MakeAvailable(pybind11)
-
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# Torch
-find_package(Torch REQUIRED)
-find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
+find_package(Python COMPONENTS Interpreter Development.Module ${SKBUILD_SABI_COMPONENT} REQUIRED)
 
 execute_process(
     COMMAND ${Python_EXECUTABLE}
@@ -26,12 +16,14 @@ execute_process(
 
 message(STATUS ${TORCH_PY_PREFIX})
 list(APPEND CMAKE_PREFIX_PATH ${TORCH_PY_PREFIX}/Torch)
+find_package(Torch REQUIRED)
 
 include_directories(
     ${TORCH_INCLUDE_DIRS}
     ${TORCH_INSTALL_PREFIX}/include
-    ${Python3_INCLUDE_DIRS}
-    ${CMAKE_SOURCE_DIR}/csrc
+    ${Python_INCLUDE_DIRS}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../csrc
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
 )
 
 # Platform-specific library directory
@@ -55,33 +47,10 @@ add_compile_options(
     -fopenmp
 )
 
-add_library(sgl_kernel_common_ops SHARED ${SOURCES})
-pybind11_add_module(common_ops ${SOURCES})
+Python_add_library(common_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
+target_link_libraries(common_ops PRIVATE ${TORCH_LIBRARIES})
+target_include_directories(common_ops PRIVATE ${TORCH_INCLUDE_DIRS})
 
-execute_process(
-    COMMAND ${Python_EXECUTABLE}
-            -c "import os, torch; print(os.path.join(os.path.dirname(torch.__file__), 'lib'))"
-    OUTPUT_VARIABLE TORCH_LIB_PREFIX
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-)
-
-file(GLOB TORCH_PYTHON_LIB "${TORCH_LIB_PREFIX}/libtorch_python.so")
-target_link_libraries(sgl_kernel_common_ops
-    PRIVATE
-    ${TORCH_LIBRARIES}
-    ${Python3_LIBRARIES}
-    ${TORCH_PYTHON_LIB}
-)
-
-set_target_properties(sgl_kernel_common_ops PROPERTIES
-    INSTALL_RPATH "$ORIGIN/../torch/lib"
-    PREFIX ""
-    OUTPUT_NAME "common_ops"
-)
-
-target_compile_definitions(sgl_kernel_common_ops PRIVATE TORCH_EXTENSION_NAME=common_ops TORCH_API_INCLUDE_EXTENSION_H)
-
-# Install
-install(TARGETS sgl_kernel_common_ops
-    LIBRARY DESTINATION ${Python3_SITEARCH}/sgl_kernel
+install(TARGETS common_ops
+    LIBRARY DESTINATION sgl_kernel
 )
