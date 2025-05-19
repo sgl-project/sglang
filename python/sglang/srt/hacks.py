@@ -1,3 +1,4 @@
+import ctypes
 import os
 import time
 
@@ -71,6 +72,24 @@ def import_model_param(model, data):
     for name, tensor in data["params"]:
         self_named_params[name].data.copy_(tensor, non_blocking=True)
 
+
+class CuptiMemoryProfiler:
+    def __init__(self):
+        self._cdll = None
+
+    def initialize(self):
+        os.environ[
+            'CUPTI_MEMORY_PROFILER_OUTPUT_PATH'] = f"/host_home/temp_sglang_server2local/cupti_memory_profiler_{time.time()}.log"
+        self._cdll = ctypes.CDLL("/host_home/primary_synced/tom_sglang_server/misc/cupti_memory_profiler.so")
+        self._cdll.cuptiMemoryProfilerInit()
+
+    def shutdown(self):
+        if self._cdll is not None:
+            print("hi call cuptiMemoryProfilerShutdown")
+            self._cdll.cuptiMemoryProfilerShutdown()
+
+
+cupti_memory_profiler_instance = CuptiMemoryProfiler()
 
 if __name__ == "__main__":
     other_process_killer = OtherProcessKiller()
