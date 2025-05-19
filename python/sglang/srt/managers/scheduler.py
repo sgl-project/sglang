@@ -12,7 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 """A scheduler that manages a tensor parallel GPU worker."""
-
+import ctypes
 import faulthandler
 import logging
 import os
@@ -2291,6 +2291,12 @@ def run_scheduler_process(
     dp_rank: Optional[int],
     pipe_writer,
 ):
+    if get_bool_env_var("SGLANG_HACK_ENABLE_CUPTI_MEMORY_PROFILER") and tp_rank == 3:
+        os.environ[
+            'CUPTI_MEMORY_PROFILER_OUTPUT_PATH'] = f"/host_home/temp_sglang_server2local/cupti_memory_profiler_{time.time()}_{tp_rank}.log"
+        cdll = ctypes.CDLL("/host_home/primary_synced/tom_sglang_server/misc/cupti_memory_profiler.so")
+        cdll.cuptiMemoryProfilerInit()
+
     # Generate the prefix
     prefix = ""
     if dp_rank is not None:

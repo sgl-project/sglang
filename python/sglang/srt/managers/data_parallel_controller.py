@@ -232,21 +232,8 @@ class DataParallelController:
                         writer,
                     ),
                 )
-                if get_bool_env_var("SGLANG_HACK_ENABLE_CUPTI_MEMORY_PROFILER") and tp_rank == 3:
-                    import torch_memory_saver
-                    with torch_memory_saver.change_env(
-                        'CUPTI_MEMORY_PROFILER_OUTPUT_PATH',
-                        f"/host_home/temp_sglang_server2local/cupti_memory_profiler_{time.time()}_{tp_rank}.log",
-                    ):
-                        # with torch_memory_saver.change_env(
-                        #     'CUDA_INJECTION64_PATH',
-                        #     "/host_home/primary_synced/tom_sglang_server/misc/cupti_memory_profiler.so"
-                        # ):
-                        with memory_saver_adapter.configure_subprocess():
-                            proc.start()
-                else:
-                    with memory_saver_adapter.configure_subprocess():
-                        proc.start()
+                with memory_saver_adapter.configure_subprocess():
+                    proc.start()
                 self.scheduler_procs.append(proc)
                 scheduler_pipe_readers.append(reader)
 
