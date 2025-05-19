@@ -34,10 +34,6 @@ class TestOpenAIServer(CustomTestCase):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
-        cls._start_server()
-
-    @classmethod
-    def _start_server(cls):
         other_args = []
         if cls.return_hidden_states:
             other_args.append("--cuda-graph-max-bs=8")
@@ -530,7 +526,7 @@ class TestOpenAIServer(CustomTestCase):
             if return_hidden_states != self.return_hidden_states:
                 kill_process_tree(self.process.pid)
                 self.__class__.return_hidden_states = return_hidden_states
-                self.__class__._start_server()
+                self.__class__.setUpClass()
             for echo in [False, True]:
                 for logprobs in [None, 5]:
                     for use_list_input in [True, False]:
@@ -551,7 +547,7 @@ class TestOpenAIServer(CustomTestCase):
             if return_hidden_states != self.return_hidden_states:
                 kill_process_tree(self.process.pid)
                 self.__class__.return_hidden_states = return_hidden_states
-                self.__class__._start_server()
+                self.__class__.setUpClass()
             for echo in [False, True]:
                 for logprobs in [None, 5]:
                     for use_list_input in [True, False]:
@@ -571,7 +567,7 @@ class TestOpenAIServer(CustomTestCase):
             if return_hidden_states != self.return_hidden_states:
                 kill_process_tree(self.process.pid)
                 self.__class__.return_hidden_states = return_hidden_states
-                self.__class__._start_server()
+                self.__class__.setUpClass()
             for logprobs in [None, 5]:
                 for parallel_sample_num in [1, 2]:
                     self.run_chat_completion(
@@ -583,7 +579,7 @@ class TestOpenAIServer(CustomTestCase):
             if return_hidden_states != self.return_hidden_states:
                 kill_process_tree(self.process.pid)
                 self.__class__.return_hidden_states = return_hidden_states
-                self.__class__._start_server()
+                self.__class__.setUpClass()
             for logprobs in [None, 5]:
                 for parallel_sample_num in [1, 2]:
                     self.run_chat_completion_stream(
