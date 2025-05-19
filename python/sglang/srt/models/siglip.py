@@ -286,5 +286,9 @@ class SiglipVisionModel(nn.Module):
             config, quant_config, prefix=add_prefix("vision_model", prefix)
         )
 
+    @property
+    def device(self) -> torch.device:
+        return self.vision_model.device
+
     def forward(self, pixel_values: torch.Tensor):
         return self.vision_model(pixel_values)
