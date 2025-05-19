@@ -425,7 +425,7 @@ class TokenizerManager:
                 self._send_one_request(obj, tokenized_obj, created_time)
                 previous_length = 0
                 async for response in self._wait_one_response(obj, request):
-                    if self.tokenizer is None:
+                    if response.get("text") is None:   # For embedding models and other outputs that do not go through tokenizer.decode
                         yield response
                     else:
                         current_length = len(response["text"])
