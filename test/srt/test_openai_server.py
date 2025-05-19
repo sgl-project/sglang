@@ -26,7 +26,7 @@ from sglang.test.test_utils import (
 )
 
 
-class TestOpenAIServerBase(CustomTestCase):
+class TestOpenAIServer(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
@@ -874,7 +874,7 @@ class TestOpenAIServerIgnoreEOS(CustomTestCase):
         )
 
 
-class TestOpenAIServerWithReturnHiddenStates(TestOpenAIServerBase):
+class TestOpenAIServerWithReturnHiddenStates(TestOpenAIServer):
     @classmethod
     def _get_other_args(cls):
         return ["--cuda-graph-max-bs", "8"]
