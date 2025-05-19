@@ -1819,7 +1819,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                     if name.endswith(".bias") and name not in params_dict:
                         continue
 
-                    if fuse_qkv_a_proj and (
+                    if self.fuse_qkv_a_proj and (
                         "q_a_proj" in name or "kv_a_proj_with_mqa" in name
                     ):
                         cached_a_proj[name] = loaded_weight
