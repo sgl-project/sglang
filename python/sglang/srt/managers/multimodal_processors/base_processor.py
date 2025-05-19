@@ -53,13 +53,12 @@ class MultimodalSpecialTokens:
     def _to_regex(
         self, pattern: Optional[Union[str, re.Pattern]]
     ) -> Optional[re.Pattern]:
-        match pattern:
-            case str():
-                return re.compile(re.escape(pattern))
-            case re.Pattern():
-                return pattern
-            case _:
-                return None
+        if isinstance(pattern, str):
+            return re.compile(re.escape(pattern))
+        elif isinstance(pattern, re.Pattern):
+            return pattern
+        else:
+            return None
 
     def collect(self) -> re.Pattern:
         tokens = [
