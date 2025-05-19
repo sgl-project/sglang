@@ -232,13 +232,17 @@ class DataParallelController:
                         writer,
                     ),
                 )
-                if get_bool_env_var("SGLANG_HACK_ENABLE_CUPTI_MEMORY_PROFILER") and tp_rank == 3
+                if get_bool_env_var("SGLANG_HACK_ENABLE_CUPTI_MEMORY_PROFILER") and tp_rank == 3:
                     with memory_saver_adapter.change_env(
-                        'LD_PRELOAD',
-                        "/host_home/primary_synced/tom_sglang_server/misc/cupti_memory_profiler.so" + ":" + str(
-                            memory_saver_adapter.get_binary_path())
+                        'CUPTI_MEMORY_PROFILER_OUTPUT_PATH',
+                        TODO,
                     ):
-                        proc.start()
+                        with memory_saver_adapter.change_env(
+                            'LD_PRELOAD',
+                            "/host_home/primary_synced/tom_sglang_server/misc/cupti_memory_profiler.so" + ":" + str(
+                                memory_saver_adapter.get_binary_path())
+                        ):
+                            proc.start()
                 else:
                     with memory_saver_adapter.configure_subprocess():
                         proc.start()
