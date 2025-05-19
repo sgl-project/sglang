@@ -3,6 +3,7 @@ Usage:
 python -m unittest test_moe_eval_accuracy_large.TestMoEEvalAccuracyLarge.test_mmlu
 """
 
+import time
 import unittest
 from types import SimpleNamespace
 
@@ -39,6 +40,11 @@ class TestMoEEvalAccuracyLarge(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
+
+    def tearDown(self):
+        # Delay between tests to allow GPU memory cleanup
+        if os.getenv("SGLANG_AMD_CI") == "1":
+            time.sleep(90)
 
     def test_mmlu(self):
         args = SimpleNamespace(

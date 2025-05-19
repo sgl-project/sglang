@@ -1,3 +1,4 @@
+import time
 import unittest
 from types import SimpleNamespace
 
@@ -27,6 +28,11 @@ class TestEvalFP8Accuracy(CustomTestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
+    def tearDown(self):
+        # Delay between tests to allow GPU memory cleanup
+        if os.getenv("SGLANG_AMD_CI") == "1":
+            time.sleep(90)
+
     def test_mmlu(self):
         args = SimpleNamespace(
             base_url=self.base_url,
@@ -46,6 +52,11 @@ class TestEvalFP8Accuracy(CustomTestCase):
 
 
 class TestEvalFP8DynamicQuantAccuracy(CustomTestCase):
+
+    def tearDown(self):
+        # Delay between tests to allow GPU memory cleanup
+        if os.getenv("SGLANG_AMD_CI") == "1":
+            time.sleep(90)
 
     def _run_test(self, model, other_args, expected_score):
         base_url = DEFAULT_URL_FOR_TEST

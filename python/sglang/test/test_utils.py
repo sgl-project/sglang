@@ -611,6 +611,9 @@ def run_unittest_files(files: List[TestFile], timeout_per_file: float):
                 f".\n.\nEnd ({i}/{len(files) - 1}):\n{filename=}, {elapsed=:.0f}, {estimated_time=}\n.\n.\n",
                 flush=True,
             )
+            # Delay between tests to allow GPU memory cleanup
+            if os.getenv("SGLANG_AMD_CI") == "1":
+                time.sleep(90)
             return process.returncode
 
         try:

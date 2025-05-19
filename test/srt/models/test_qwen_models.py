@@ -1,3 +1,4 @@
+import time
 import unittest
 from types import SimpleNamespace
 
@@ -26,6 +27,11 @@ class TestQwen2(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
+
+    def tearDown(self):
+        # Delay between tests to allow GPU memory cleanup
+        if os.getenv("SGLANG_AMD_CI") == "1":
+            time.sleep(90)
 
     def test_gsm8k(self):
         args = SimpleNamespace(
@@ -57,6 +63,11 @@ class TestQwen2FP8(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
+
+    def tearDown(self):
+        # Delay between tests to allow GPU memory cleanup
+        if os.getenv("SGLANG_AMD_CI") == "1":
+            time.sleep(90)
 
     def test_gsm8k(self):
         args = SimpleNamespace(
