@@ -133,8 +133,12 @@ def worker(args, rank, world_size):
 
     print(f"[GPU {rank}, {time.time()}] {torch.cuda.mem_get_info()=}")
 
-    print(f"[GPU {rank}, {time.time()}] barrier")
-    torch.distributed.barrier(device_ids=[rank])
+    # print(f"[GPU {rank}, {time.time()}] barrier")
+    # torch.distributed.barrier(device_ids=[rank])
+
+    while True:
+        print(f"sleep forever...")
+        time.sleep(5)
 
 
 def main(args):
