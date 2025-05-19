@@ -18,12 +18,12 @@ import multiprocessing as mp
 import signal
 import threading
 import time
+from contextlib import nullcontext
 from enum import Enum, auto
 
 import psutil
 import setproctitle
 import zmq
-
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import (
     TokenizedEmbeddingReqInput,
@@ -33,7 +33,7 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
-from sglang.srt.utils import bind_port, configure_logger, get_zmq_socket
+from sglang.srt.utils import bind_port, configure_logger, get_zmq_socket, get_bool_env_var
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -235,7 +235,7 @@ class DataParallelController:
                 )
                 ctx = (
                     memory_saver_adapter.change_env(TODO, TODO)
-                    if TODO
+                    if get_bool_env_var("SGLANG_HACK_CUPTI_MEMORY_PROFILER")
                     else nullcontext()
                 )
                 with memory_saver_adapter.configure_subprocess():
