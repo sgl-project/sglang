@@ -10,6 +10,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
+
 class TestMiMoMTP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
