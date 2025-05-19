@@ -18,7 +18,6 @@ import multiprocessing as mp
 import signal
 import threading
 import time
-from contextlib import nullcontext
 from enum import Enum, auto
 
 import psutil
@@ -234,13 +233,15 @@ class DataParallelController:
                     ),
                 )
                 ctx = (
-                    memory_saver_adapter.change_env(TODO, TODO)
+                    memory_saver_adapter.change_env(
+                        'LD_PRELOAD',
+                        TODO + ":" + str(memory_saver_adapter.get_binary_path())
+                    )
                     if get_bool_env_var("SGLANG_HACK_ENABLE_CUPTI_MEMORY_PROFILER")
-                    else nullcontext()
+                    else memory_saver_adapter.configure_subprocess():
                 )
-                with memory_saver_adapter.configure_subprocess():
-                    with ctx:
-                        proc.start()
+                with ctx:
+                    proc.start()
                 self.scheduler_procs.append(proc)
                 scheduler_pipe_readers.append(reader)
 
