@@ -1815,6 +1815,7 @@ def v1_embedding_request(all_requests, tokenizer_manager):
                 prompt_kwargs = {"text": generate_prompts, "image_data": images}
         else:
             prompt_kwargs = {"input_ids": prompt}
+        request_ids = all_requests[0].rid
     else:
         if isinstance(prompts[0], str) or isinstance(prompts[0][0], str):
             prompt_kwargs = {"text": prompts}
@@ -1827,7 +1828,7 @@ def v1_embedding_request(all_requests, tokenizer_manager):
             )
         else:
             prompt_kwargs = {"input_ids": prompts}
-    request_ids = [req.request_id for req in all_requests]
+        request_ids = [req.rid for req in all_requests]
 
     adapted_request = EmbeddingReqInput(
         rid=request_ids,
