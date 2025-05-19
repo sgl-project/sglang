@@ -151,7 +151,7 @@ async fn health_generate(
         for dst in prefill_servers.iter() {
             let dst = dst.join("health_generate")?;
             ctx.client.get(dst.clone()).send().await
-                .with_context(|| format!("failed send health generate to: {}", dst))?;
+                .with_context(|| format!("failed send health_generate to: {}", dst))?;
         }
         Result::<_, anyhow::Error>::Ok(())
     };
@@ -178,7 +178,7 @@ async fn flush_cache(
         for dst in prefill_servers.iter().chain(&decode_servers) {
             let dst = dst.join("flush_cache")?;
             ctx.client.get(dst.clone()).send().await
-                .with_context(|| format!("failed send flush cache to: {}", dst))?;
+                .with_context(|| format!("failed send flush_cache to: {}", dst))?;
         }
         Result::<_, anyhow::Error>::Ok(())
     };
@@ -208,7 +208,7 @@ async fn get_server_info(
         for x in prefill_servers {
             let dst = x.join("get_server_info")?;
             let resp = ctx.client.get(dst.clone()).send().await
-                .with_context(|| format!("failed send get server_info to: {}", dst))?;
+                .with_context(|| format!("failed send get_server_info to: {}", dst))?;
 
             let out: serde_json::Value = resp.json().await?;
             prefill_infos.push(out);
@@ -217,7 +217,7 @@ async fn get_server_info(
         for x in decode_servers {
             let dst = x.join("get_server_info")?;
             let resp = ctx.client.get(dst.clone()).send().await
-                .with_context(|| format!("failed send get server_info to: {}", dst))?;
+                .with_context(|| format!("failed send get_server_info to: {}", dst))?;
 
             let out: serde_json::Value = resp.json().await?;
             decode_infos.push(out);
@@ -407,7 +407,7 @@ async fn chat_completions(
         let pair = ctx.select_pair()?;
         let bootstrap_host = pair.prefill_server.host_str().ok_or_else(|| anyhow!("prefill server host is empty"))?;
         let bootstrap_port = pair.bootstrap_port.map(|port| serde_json::Value::from(port));
-        let bootstrap_room: u32 = ctx.room_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let bootstrap_room: u32 = ctx.room_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         body.insert(String::from("bootstrap_host"), serde_json::Value::from(bootstrap_host));
         if let Some(bootstrap_port) = bootstrap_port {

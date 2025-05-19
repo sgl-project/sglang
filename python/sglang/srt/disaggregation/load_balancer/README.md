@@ -34,6 +34,6 @@ Example
 ```sh
 cargo run --release -- \
   --prefill http://127.0.0.1:30001 \
-  --decode http://127.0.0.1:30001 \
+  --decode http://127.0.0.1:30002 \
   --prefill-bootstrap-ports 8998
 ```
