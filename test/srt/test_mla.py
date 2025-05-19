@@ -1,3 +1,4 @@
+import os
 import time
 import unittest
 from types import SimpleNamespace
@@ -39,7 +40,7 @@ class TestMLA(CustomTestCase):
     def tearDown(self):
         # Delay between tests to allow GPU memory cleanup
         if os.getenv("SGLANG_AMD_CI") == "1":
-            time.sleep(90)
+            time.sleep(180)
 
     def test_mmlu(self):
         args = SimpleNamespace(
