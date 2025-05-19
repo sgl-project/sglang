@@ -16,6 +16,7 @@ limitations under the License.
 #include <ATen/ATen.h>
 #include <torch/all.h>
 #include <torch/library.h>
+#include <torch/extension.h>
 
 #include "shm.h"
 

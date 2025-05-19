@@ -99,7 +99,7 @@ ext_modules = [
         extra_compile_args=extra_compile_args,
         libraries=libraries,
         extra_link_args=extra_link_args,
-        py_limited_api=True,
+        py_limited_api=False,
     ),
 ]
 
