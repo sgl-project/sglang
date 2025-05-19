@@ -170,6 +170,7 @@ async def benchmark(
         prompt_len=test_prompt_len,
         output_len=test_output_len,
         lora_name="dummy",  # the lora_name argument will not be used
+        image_data=None,
         extra_request_body=extra_request_body,
     )
     test_output = await request_func(request_func_input=test_input)
@@ -194,6 +195,7 @@ async def benchmark(
             prompt_len=prompt_len,
             output_len=output_len,
             lora_name="dummy",
+            image_data=None,
             extra_request_body=extra_request_body,
         )
         tasks.append(

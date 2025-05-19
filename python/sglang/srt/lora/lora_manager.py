@@ -170,9 +170,7 @@ class LoRAManager:
                 dim=0,
                 out=self.cuda_graph_batch_info.seg_indptr[1 : bs + 1],
             )
-            self.cuda_graph_batch_info.max_len = int(
-                torch.max(self.cuda_graph_batch_info.seg_lens[:bs])
-            )
+            self.cuda_graph_batch_info.max_len = 1
 
             for i, lora_path in enumerate(forward_batch.lora_paths):
                 self.cuda_graph_batch_info.weight_indices[i] = (
