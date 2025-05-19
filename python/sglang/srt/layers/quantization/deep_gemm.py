@@ -11,6 +11,7 @@ from tqdm.contrib.concurrent import thread_map
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_bool_env_var, get_device_sm, get_int_env_var, is_cuda
 
+logger = logging.getLogger(__name__)
 _ENABLE_JIT_DEEPGEMM = False
 
 try:
@@ -26,14 +27,12 @@ try:
         if get_bool_env_var("SGL_ENABLE_JIT_DEEPGEMM", default="true"):
             _ENABLE_JIT_DEEPGEMM = True
 except ImportError:
-    _ENABLE_JIT_DEEPGEMM = False
+    logger.warning("Failed to import deepgemm, disable _ENABLE_JIT_DEEPGEMM.")
 
 
 def get_enable_jit_deepgemm():
     return _ENABLE_JIT_DEEPGEMM
 
-
-logger = logging.getLogger(__name__)
 
 _BUILTIN_M_LIST = list(range(1, 1024 * 16 + 1))
 _ENABLE_JIT_DEEPGEMM_PRECOMPILE = get_bool_env_var(
