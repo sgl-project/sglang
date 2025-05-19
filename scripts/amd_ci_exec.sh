@@ -30,10 +30,6 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# Sleep before execution to allow GPU resources to be freed
-echo "Sleeping 180 seconds to allow GPU cleanup..."
-sleep 180
-
 # Run docker exec
 docker exec \
   -w "$WORKDIR" \

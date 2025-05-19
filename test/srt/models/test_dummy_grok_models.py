@@ -1,15 +1,9 @@
-import os
-import time
 import unittest
 
 from sglang.test.test_utils import CustomTestCase, is_in_ci, run_bench_one_batch
 
 
 class TestDummyGrok1(CustomTestCase):
-    def tearDown(self):
-        # Delay between tests to allow GPU memory cleanup
-        if os.getenv("SGLANG_AMD_CI") == "1":
-            time.sleep(180)
 
     def test_dummy_grok_1(self):
         output_throughput = run_bench_one_batch(
