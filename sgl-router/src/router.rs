@@ -273,6 +273,14 @@ impl Router {
             let mut unhealthy_workers = Vec::new();
 
             for url in worker_urls {
+                if !url.contains(':') {
+                    let msg = format!(
+                        "{} is not a url, skip checking /health endpoint",
+                        url
+                    );
+                    warn!("{}", msg);
+                    continue;
+                }
                 match sync_client.get(&format!("{}/health", url)).send() {
                     Ok(res) => {
                         if !res.status().is_success() {
@@ -453,7 +461,7 @@ impl Router {
     }
 
     // TODO: return Result<String, String> instead of panicking
-    fn select_generate_worker(&self, body: &Bytes, route: &str) -> String {
+    pub fn select_generate_worker(&self, body: &Bytes, route: &str) -> String {
         let text = self.get_text_from_request(&body, route);
 
         let worker_url = match self {
