@@ -32,7 +32,9 @@ try:
 except ImportError:
     VLLM_AVAILABLE = False
 
-    GPTQLinearMethod = MarlinLinearMethod = QuantizeMethodBase = Any
+    GPTQLinearMethod = MarlinLinearMethod = QuantizeMethodBase = FusedMoEMethodBase = (
+        Any
+    )
 
     class scalar_types:
         uint4b8 = "uint4b8"
