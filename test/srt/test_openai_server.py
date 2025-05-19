@@ -524,7 +524,7 @@ class TestOpenAIServer(CustomTestCase):
     def test_completion(self):
         for return_hidden_states in [False, True]:
             if return_hidden_states != self.return_hidden_states:
-                kill_process_tree(self.process.pid)
+                self.__class__.tearDownClass()
                 self.__class__.return_hidden_states = return_hidden_states
                 self.__class__.setUpClass()
             for echo in [False, True]:
@@ -538,14 +538,14 @@ class TestOpenAIServer(CustomTestCase):
                                     use_list_input,
                                     parallel_sample_num,
                                     token_input,
-                                    self.return_hidden_states,
+                                    return_hidden_states,
                                 )
 
     def test_completion_stream(self):
         # parallel sampling and list input are not supported in streaming mode
         for return_hidden_states in [False, True]:
             if return_hidden_states != self.return_hidden_states:
-                kill_process_tree(self.process.pid)
+                self.__class__.tearDownClass()
                 self.__class__.return_hidden_states = return_hidden_states
                 self.__class__.setUpClass()
             for echo in [False, True]:
@@ -559,31 +559,31 @@ class TestOpenAIServer(CustomTestCase):
                                     use_list_input,
                                     parallel_sample_num,
                                     token_input,
-                                    self.return_hidden_states,
+                                    return_hidden_states,
                                 )
 
     def test_chat_completion(self):
         for return_hidden_states in [False, True]:
             if return_hidden_states != self.return_hidden_states:
-                kill_process_tree(self.process.pid)
+                self.__class__.tearDownClass()
                 self.__class__.return_hidden_states = return_hidden_states
                 self.__class__.setUpClass()
             for logprobs in [None, 5]:
                 for parallel_sample_num in [1, 2]:
                     self.run_chat_completion(
-                        logprobs, parallel_sample_num, self.return_hidden_states
+                        logprobs, parallel_sample_num, return_hidden_states
                     )
 
     def test_chat_completion_stream(self):
         for return_hidden_states in [False, True]:
             if return_hidden_states != self.return_hidden_states:
-                kill_process_tree(self.process.pid)
+                self.__class__.tearDownClass()
                 self.__class__.return_hidden_states = return_hidden_states
                 self.__class__.setUpClass()
             for logprobs in [None, 5]:
                 for parallel_sample_num in [1, 2]:
                     self.run_chat_completion_stream(
-                        logprobs, parallel_sample_num, self.return_hidden_states
+                        logprobs, parallel_sample_num, return_hidden_states
                     )
 
     def test_batch(self):
