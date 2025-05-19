@@ -41,6 +41,8 @@ import logging
 import triton
 import triton.language as tl
 
+import functools
+
 from sglang.srt.utils import is_hip
 
 is_hip_ = is_hip()
@@ -643,6 +645,71 @@ def decode_attention_fwd_grouped(
     _decode_softmax_reducev_fwd(attn_logits, q, o, v_buffer, b_seq_len, num_kv_splits)
 
 
+@functools.lru_cache
+def get_wave_kernel(
+    shape: paged_decode_attention_shape,
+    max_kv_splits,
+    input_dtype,
+):
+    mha = (shape.num_query_heads // shape.num_kv_heads) == 1
+
+        # Get the kernels (either compile or load from cache).
+    if mha:
+        mfma_variant = (
+            GenericDot(along_dim=MMAOperand.M, k_vec_size=4, k_mult=1),
+            GenericDot(along_dim=MMAOperand.M, k_vec_size=1, k_mult=64),
+        )
+    else:
+        mfma_variant = (MMAType.F32_16x16x16_F16, MMAType.F32_16x16x16_F16)
+
+    (
+        phase_0,
+        phase_1,
+        hyperparams_0,
+        hyperparams_1,
+        dynamic_symbols,
+        dynamic_symbols_map,
+    ) = get_paged_decode_attention_kernels(
+        shape,
+        mfma_variant,
+        max_kv_splits,
+        input_dtype=input_dtype,
+        mha=mha,
+    )
+    hyperparams_0.update(get_default_scheduling_params())
+    hyperparams_1.update(get_default_scheduling_params())
+
+    options = WaveCompileOptions(
+        subs=hyperparams_0,
+        canonicalize=True,
+        run_bench=False,
+        use_buffer_load_ops=False,
+        use_buffer_store_ops=False,
+        waves_per_eu=2,
+        dynamic_symbols=dynamic_symbols,
+        dynamic_symbols_map=dynamic_symbols_map,
+        wave_runtime=True,
+    )
+    options = set_default_run_config(options)
+    phase_0 = wave_compile(options, phase_0)
+
+    options = WaveCompileOptions(
+        subs=hyperparams_1,
+        canonicalize=True,
+        run_bench=False,
+        use_buffer_load_ops=False,
+        use_buffer_store_ops=False,
+        waves_per_eu=4,
+        dynamic_symbols=dynamic_symbols,
+        dynamic_symbols_map=dynamic_symbols_map,
+        wave_runtime=True,
+    )
+    options = set_default_run_config(options)
+    phase_1 = wave_compile(options, phase_1)
+
+    return phase_0, phase_1
+
+
 def view_trunc(tensor, shape):
     size = math.prod(shape)
     return tensor.view(-1)[:size].view(shape)
@@ -681,45 +748,7 @@ def decode_attention_wave(
     k_buffer = view_trunc(k_buffer, (num_seqs, seq_len, num_kv_heads, head_size))
     v_buffer = view_trunc(v_buffer, (num_seqs, seq_len, num_kv_heads, head_size_kv))
 
-    # Get the kernels (either compile or load from cache).
-    if mha:
-        mfma_variant = (
-            GenericDot(along_dim=MMAOperand.M, k_vec_size=4, k_mult=1),
-            GenericDot(along_dim=MMAOperand.M, k_vec_size=1, k_mult=64),
-        )
-    else:
-        mfma_variant = (MMAType.F32_16x16x16_F16, MMAType.F32_16x16x16_F16)
-
-    (
-        phase_0,
-        phase_1,
-        hyperparams_0,
-        hyperparams_1,
-        dynamic_symbols,
-        dynamic_symbols_map,
-    ) = get_paged_decode_attention_kernels(
-        shape,
-        mfma_variant,
-        max_kv_splits,
-        input_dtype=q.dtype,
-        mha=mha,
-    )
-    hyperparams_0.update(get_default_scheduling_params())
-    hyperparams_1.update(get_default_scheduling_params())
-
-    options = WaveCompileOptions(
-        subs=hyperparams_0,
-        canonicalize=True,
-        run_bench=False,
-        use_buffer_load_ops=False,
-        use_buffer_store_ops=False,
-        waves_per_eu=2,
-        dynamic_symbols=dynamic_symbols,
-        dynamic_symbols_map=dynamic_symbols_map,
-        wave_runtime=True,
-    )
-    options = set_default_run_config(options)
-    phase_0 = wave_compile(options, phase_0)
+    phase_0, phase_1 = get_wave_kernel(shape, max_kv_splits, q.dtype)
 
     mb_qk = phase_0(
         q,
@@ -734,21 +763,6 @@ def decode_attention_wave(
         filename = f"wave_decode_attention_phase0_{'x'.join(map(str, shape))}.mlir"
         with open(filename, "w") as f:
             f.write(mb_qk.module_op.get_asm())
-
-
-    options = WaveCompileOptions(
-        subs=hyperparams_1,
-        canonicalize=True,
-        run_bench=False,
-        use_buffer_load_ops=False,
-        use_buffer_store_ops=False,
-        waves_per_eu=4,
-        dynamic_symbols=dynamic_symbols,
-        dynamic_symbols_map=dynamic_symbols_map,
-        wave_runtime=True,
-    )
-    options = set_default_run_config(options)
-    phase_1 = wave_compile(options, phase_1)
 
     mb_sv = phase_1(attn_logits, attn_logits_max, b_req_idx, o)
     if dump_generated_mlir:
