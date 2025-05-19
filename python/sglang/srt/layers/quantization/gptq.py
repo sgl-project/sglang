@@ -16,7 +16,6 @@ _is_cuda = is_cuda()
 
 try:
     from vllm import _custom_ops as ops
-    from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
     from vllm.model_executor.layers.quantization.gptq import GPTQLinearMethod
     from vllm.model_executor.layers.quantization.gptq_marlin import (
         FusedMoE,
@@ -35,7 +34,7 @@ try:
 except ImportError:
     VLLM_AVAILABLE = False
 
-    GPTQLinearMethod = MarlinLinearMethod = QuantizeMethodBase = Any
+    GPTQLinearMethod = MarlinLinearMethod = Any
 
     FusedMoEMethodBase = QuantizeMethodBase
 
