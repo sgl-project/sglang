@@ -38,7 +38,7 @@ runtime_common = [
     "python-multipart",
     "pyzmq>=25.1.2",
     "soundfile==0.13.1",
-    "torchao>=0.9.0",
+    "torchao==0.9.0",
     "transformers==4.51.1",
     "uvicorn",
     "uvloop",
@@ -48,7 +48,7 @@ runtime_common = [
 
 srt = [
     "sglang[runtime_common]",
-    "sgl-kernel==0.1.2.post1",
+    "sgl-kernel==0.1.3",
     "flashinfer_python==0.2.5",
     "torch==2.6.0",
     "torchvision==0.21.0",
@@ -99,7 +99,6 @@ torch_memory_saver = ["torch_memory_saver>=0.0.4"]
 decord = ["decord"]
 test = [
     "accelerate",
-    "torchaudio",
     "jsonlines",
     "matplotlib",
     "pandas",
