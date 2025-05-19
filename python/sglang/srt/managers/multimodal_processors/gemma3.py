@@ -19,8 +19,6 @@ class Gemma3SGLangImageProcessor(SGLangBaseProcessor):
 
     def __init__(self, hf_config, server_args, _processor):
         super().__init__(hf_config, server_args, _processor)
-        # The single, pre-expanded image token.
-        self.IMAGE_TOKEN = "<start_of_image>"
         # The regex that matches expanded image tokens.
         self.IMAGE_TOKEN_REGEX = re.compile(
             r"<start_of_image>(?:(?:<image_soft_token>)*<end_of_image>)?"
@@ -42,13 +40,11 @@ class Gemma3SGLangImageProcessor(SGLangBaseProcessor):
         if isinstance(image_data, str):
             image_data = [image_data]
 
-        image_token = self.IMAGE_TOKEN
-        image_token_regex = self.IMAGE_TOKEN_REGEX
         base_output = self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
             multimodal_tokens=MultimodalSpecialTokens(
-                image_token=image_token, image_token_regex=image_token_regex
+                image_token_pattern=self.IMAGE_TOKEN_REGEX
             ),
             max_req_input_len=max_req_input_len,
             discard_alpha_channel=True,

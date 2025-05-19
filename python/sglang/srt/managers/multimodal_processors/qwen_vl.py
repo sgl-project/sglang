@@ -24,8 +24,6 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
 
     def __init__(self, hf_config, server_args, _processor):
         super().__init__(hf_config, server_args, _processor)
-        # The single, pre-expanded image token.
-        self.IMAGE_TOKEN = "<|vision_start|><|image_pad|><|vision_end|>"
         # The regex that matches expanded image tokens.
         self.IMAGE_TOKEN_REGEX = re.compile(
             r"<\|vision_start\|>(?:<\|image_pad\|>)+<\|vision_end\|>"
@@ -58,8 +56,7 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
             prompt=input_text,
             image_data=image_data,
             multimodal_tokens=MultimodalSpecialTokens(
-                image_token=self.IMAGE_TOKEN,
-                image_token_regex=self.IMAGE_TOKEN_REGEX,
+                image_token_pattern=self.IMAGE_TOKEN_REGEX,
             ),
             max_req_input_len=max_req_input_len,
         )

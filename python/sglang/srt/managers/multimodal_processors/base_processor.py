@@ -36,33 +36,30 @@ class BaseMultiModalProcessorOutput:
 
 @dataclasses.dataclass
 class MultimodalSpecialTokens:
-    image_token: Optional[Union[int, str, List[str]]] = None
-    video_token: Optional[Union[int, str, List[str]]] = None
-    audio_token: Optional[Union[int, str, List[str]]] = None
-
-    def convert_to_str(self, token: Union[str, int], processor) -> str:
-        if token is None:
-            return token
-        if isinstance(token, str):
-            return token
-        return processor.tokenizer.convert_ids_to_tokens([token])[0]
-
-    def convert_to_strs(self, processor):
-        self.image_token = self.convert_to_str(self.image_token, processor)
-        self.video_token = self.convert_to_str(self.video_token, processor)
-        self.audio_token = self.convert_to_str(self.audio_token, processor)
-
     image_token_regex: Optional[re.Pattern] = None
     video_token_regex: Optional[re.Pattern] = None
     audio_token_regex: Optional[re.Pattern] = None
 
-    def __post_init__(self):
-        if self.image_token_regex is None and self.image_token is not None:
-            self.image_token_regex = re.compile(re.escape(self.image_token))
-        if self.video_token_regex is None and self.video_token is not None:
-            self.video_token_regex = re.compile(re.escape(self.video_token))
-        if self.audio_token_regex is None and self.audio_token is not None:
-            self.audio_token_regex = re.compile(re.escape(self.audio_token))
+    def __init__(
+        self,
+        image_token_pattern: Optional[Union[str, re.Pattern]] = None,
+        video_token_pattern: Optional[Union[str, re.Pattern]] = None,
+        audio_token_pattern: Optional[Union[str, re.Pattern]] = None,
+    ):
+        self.image_token_regex = self._to_regex(image_token_pattern)
+        self.video_token_regex = self._to_regex(video_token_pattern)
+        self.audio_token_regex = self._to_regex(audio_token_pattern)
+
+    def _to_regex(
+        self, pattern: Optional[Union[str, re.Pattern]]
+    ) -> Optional[re.Pattern]:
+        match pattern:
+            case str():
+                return re.compile(re.escape(pattern))
+            case re.Pattern():
+                return pattern
+            case _:
+                return None
 
     def collect(self) -> re.Pattern:
         tokens = [
@@ -276,7 +273,6 @@ class BaseMultimodalProcessor(ABC):
         if image_data is None:
             image_data = []
 
-        multimodal_tokens.convert_to_strs(self._processor)
         multimodal_tokens_pattern = multimodal_tokens.collect()
 
         if isinstance(prompt, list) and return_text:
@@ -308,29 +304,13 @@ class BaseMultimodalProcessor(ABC):
                 task_ptr += 1
 
                 if task_type == Modality.IMAGE:
-                    # If data is already processed it will be a
-                    # dictionary. In this case we want to keep the
-                    # expanded tokens in text_part. Otherwise, we will
-                    # call the processor code, so keep only a single image
-                    # token.
-                    mm_tokens = (
-                        text_part
-                        if isinstance(data, dict)
-                        else multimodal_tokens.image_token
-                    )
                     frames = [result] if not isinstance(result, list) else result
                     if frames:
                         images += frames
-                        new_text += mm_tokens * len(frames)
+                        new_text += text_part * len(frames)
                 elif task_type == Modality.AUDIO:
-                    # audio
-                    mm_tokens = (
-                        text_part
-                        if isinstance(data, dict)
-                        else multimodal_tokens.audio_token
-                    )
                     audios.append(result)
-                    new_text += mm_tokens
+                    new_text += text_part
                 # TODO: handle video
             else:
                 new_text += text_part
