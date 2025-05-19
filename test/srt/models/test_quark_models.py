@@ -26,8 +26,8 @@ ALL_MODELS = [
     ModelCase("fxmarty/qwen_1.5-moe-a2.7b-mxfp4", tp_size=2),
     # Memory access fault with Deepseek-R1 (3 layers) on TP=1 on MI300.
     ModelCase("fxmarty/deepseek_r1_3_layers_mxfp4", tp_size=8),
-    ModelCase("/shared_volume/repos/vllm/Llama-4-Scout-17B-16E-Instruct-2-layers-mxfp4", tp_size=1, mem_fraction_static=0.7, context_length=100000),
-    ModelCase("/shared_volume/repos/vllm/Llama-4-Scout-17B-16E-Instruct-2-layers-mxfp4", tp_size=8, mem_fraction_static=0.7, context_length=1000000),
+    ModelCase("fxmarty/Llama-4-Scout-17B-16E-Instruct-2-layers-mxfp4", tp_size=1, mem_fraction_static=0.7, context_length=100000),
+    ModelCase("fxmarty/Llama-4-Scout-17B-16E-Instruct-2-layers-mxfp4", tp_size=8, mem_fraction_static=0.7, context_length=1000000),
 ]
 
 
