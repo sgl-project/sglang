@@ -447,32 +447,12 @@ class VisionAttention(nn.Module):
             ]
 
         if position_embeddings is not None:
-            cos, sin = position_embeddings
             original_shape = q.shape
             # [total_tokens, head, head_size]
             q = q.view(-1, head, self.head_size)
             k = k.view(-1, head, self.head_size)
 
-            # print(f"{cos.dtype}")
-            # print(f"{q.dtype}")
-
             q, k = self.rotary_emb(position_embeddings, q, k)
-            # q_old, k_old = apply_rotary_pos_emb(q, k, cos, sin)
-
-            # torch.testing.assert_close(
-            #     q,
-            #     q_old,
-            #     rtol=5,
-            #     atol=5,
-            #     msg="",
-            # )
-            # torch.testing.assert_close(
-            #     k,
-            #     k_old,
-            #     rtol=5,
-            #     atol=5,
-            #     msg="",
-            # )
 
             q = q.view(original_shape)
             k = k.view(original_shape)

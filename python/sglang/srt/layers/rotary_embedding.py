@@ -173,7 +173,6 @@ class RotaryEmbedding(CustomOp):
             cos, sin = positions
             cos, sin = cos.float(), sin.float()
             query, key = query.float(), key.float()
-
             self.sglang_rotary_embedding(
                 cos,
                 sin,
