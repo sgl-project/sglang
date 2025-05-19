@@ -233,8 +233,14 @@ class DataParallelController:
                         writer,
                     ),
                 )
+                ctx = (
+                    memory_saver_adapter.change_env(TODO, TODO)
+                    if TODO
+                    else nullcontext()
+                )
                 with memory_saver_adapter.configure_subprocess():
-                    proc.start()
+                    with ctx:
+                        proc.start()
                 self.scheduler_procs.append(proc)
                 scheduler_pipe_readers.append(reader)
 
