@@ -219,7 +219,9 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         return output
 
 
-_global_expert_distribution_recorder: Optional[ExpertDistributionRecorder] = None
+_global_expert_distribution_recorder: Optional[ExpertDistributionRecorder] = (
+    _ExpertDistributionRecorderNoop()
+)
 
 
 def get_global_expert_distribution_recorder():
@@ -228,7 +230,6 @@ def get_global_expert_distribution_recorder():
 
 def set_global_expert_distribution_recorder(value):
     global _global_expert_distribution_recorder
-    assert _global_expert_distribution_recorder is None
     _global_expert_distribution_recorder = value
 
 
