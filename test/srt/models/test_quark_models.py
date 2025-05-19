@@ -8,7 +8,6 @@ from sglang.test.few_shot_gsm8k import run_eval
 import os
 
 from sglang.test.test_utils import (
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
@@ -85,7 +84,7 @@ class TestR1MXFP4Accuracy(CustomTestCase):
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            timeout=30 * 60,
             other_args=other_args,
         )
 

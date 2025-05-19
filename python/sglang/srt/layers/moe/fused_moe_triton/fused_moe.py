@@ -12,7 +12,6 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.platforms.interface import Platform
 from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
@@ -31,6 +30,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     log_info_on_rank0,
+    supports_mx,
 )
 
 from sglang.srt.layers.quantization.mxfp4_utils import (dequant_mxfp4, quant_dequant_mxfp4)
@@ -809,7 +809,7 @@ def invoke_fused_moe_kernel(
         assert block_shape is None or block_shape[0] == 0
     elif use_mxfp4_w4a4:
         assert block_shape is None
-        if not Platform.supports_mx():
+        if not supports_mx():
             A = quant_dequant_mxfp4(A)
         else:
             raise NotImplementedError()
@@ -1362,7 +1362,7 @@ def fused_experts_impl(
     if use_int4_w4a16:
         assert hidden_states.shape[1] // 2 == w1.shape[2], "Hidden size mismatch"
     elif use_mxfp4_w4a4:
-        if Platform.supports_mx() or get_bool_env_var("SGLANG_QUARK_EMU_MEM_OPT"):
+        if supports_mx() or get_bool_env_var("SGLANG_QUARK_EMU_MEM_OPT"):
             # 16bit activation and fp4x2 packed weight
             assert hidden_states.shape[1] // 2 == w1.shape[
                 2], "hidden size mismatch"
@@ -1436,7 +1436,7 @@ def fused_experts_impl(
     else:
         out_hidden_states = torch.empty_like(hidden_states)
 
-    if use_mxfp4_w4a4 and not Platform.supports_mx() and get_bool_env_var("SGLANG_QUARK_EMU_MEM_OPT"):
+    if use_mxfp4_w4a4 and not supports_mx() and get_bool_env_var("SGLANG_QUARK_EMU_MEM_OPT"):
         # Weight has to be dequantized for mxfp4 emulation.
         w1 = dequant_mxfp4(w1, w1_scale, hidden_states.dtype)
         w1_scale = None

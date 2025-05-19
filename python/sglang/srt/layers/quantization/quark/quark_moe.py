@@ -8,11 +8,9 @@ import logging
 from sglang.srt.layers.quantization.mxfp4_utils import (
     OCP_MX_BLOCK_SIZE, dequant_mxfp4)
 
-from sglang.srt.platforms.interface import Platform
-
 from sglang.srt.utils import set_weight_attrs
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoEMethodBase, FusedMoeWeightScaleSupported
-from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils import get_bool_env_var, supports_mx
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +58,7 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
                 f"{weight_qscheme}, {input_qscheme}")  # noqa E501
 
         self.static_input_scales = not self.input_quant.get("is_dynamic")
-        self.emulate = not Platform.supports_mx()
+        self.emulate = not supports_mx()
 
     def create_weights(self, layer: torch.nn.Module, num_experts: int,
                        hidden_size: int, intermediate_size_per_partition: int,
