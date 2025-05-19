@@ -50,6 +50,7 @@ from sglang.srt.layers.quantization.deep_gemm import (
     update_deep_gemm_config,
 )
 from sglang.srt.layers.sampler import Sampler
+from sglang.srt.layers.quark_utils import apply_quark_quant_config_to_model
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.managers.schedule_batch import global_server_args_dict
@@ -186,6 +187,7 @@ class ModelRunner:
                 "moe_dense_tp_size": server_args.moe_dense_tp_size,
                 "n_share_experts_fusion": server_args.n_share_experts_fusion,
                 "triton_attention_reduce_in_fp32": server_args.triton_attention_reduce_in_fp32,
+                "quark_config": server_args.quark_config,
                 "torchao_config": server_args.torchao_config,
                 "sampling_backend": server_args.sampling_backend,
                 "speculative_accept_threshold_single": server_args.speculative_accept_threshold_single,
@@ -218,6 +220,10 @@ class ModelRunner:
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=self.server_args.enable_memory_saver
         )
+
+        apply_quark_quant_config_to_model(
+            self.model_config, global_server_args_dict["quark_config"])
+
 
         # Load the model
         self.sampler = Sampler()

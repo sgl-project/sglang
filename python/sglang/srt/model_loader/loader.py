@@ -35,6 +35,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from sglang.srt.layers.quark_utils import online_quant
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_loader.utils import (
     get_model_architecture,
@@ -379,13 +380,14 @@ class DefaultModelLoader(BaseModelLoader):
                 )
 
             self.load_weights_and_postprocess(
-                model, self._get_all_weights(model_config, model), target_device
+                model, model_config, self._get_all_weights(model_config, model), target_device
             )
 
         return model.eval()
 
     @staticmethod
-    def load_weights_and_postprocess(model, weights, target_device):
+    def load_weights_and_postprocess(model, model_config, weights, target_device):
+        weights = online_quant(model_config, weights)
         model.load_weights(weights)
 
         for _, module in model.named_modules():

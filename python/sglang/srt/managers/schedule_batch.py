@@ -87,6 +87,7 @@ global_server_args_dict = {
     "sampling_backend": ServerArgs.sampling_backend,
     "speculative_accept_threshold_acc": ServerArgs.speculative_accept_threshold_acc,
     "speculative_accept_threshold_single": ServerArgs.speculative_accept_threshold_single,
+    "quark_config": ServerArgs.quark_config,
     "torchao_config": ServerArgs.torchao_config,
     "triton_attention_reduce_in_fp32": ServerArgs.triton_attention_reduce_in_fp32,
 }
