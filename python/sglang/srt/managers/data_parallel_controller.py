@@ -235,7 +235,7 @@ class DataParallelController:
                 if get_bool_env_var("SGLANG_HACK_ENABLE_CUPTI_MEMORY_PROFILER") and tp_rank == 3:
                     with memory_saver_adapter.change_env(
                         'CUPTI_MEMORY_PROFILER_OUTPUT_PATH',
-                        TODO,
+                        f"/host_home/temp_sglang_server2local/cupti_memory_profiler_{time.time()}_{tp_rank}.log",
                     ):
                         with memory_saver_adapter.change_env(
                             'LD_PRELOAD',
