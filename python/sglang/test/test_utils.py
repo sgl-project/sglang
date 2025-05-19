@@ -405,6 +405,12 @@ def popen_launch_server(
     else:
         command = "sglang.launch_server"
 
+    # In test_oprnai_server.py, some tests need to return hidden states.
+    # So we need to set --mem-fraction-static to 0.9 to avoid OOM.
+    other_args = list(other_args)
+    if not any("--mem-fraction-static" in str(x) for x in other_args):
+        other_args += ["--mem-fraction-static", "0.9"]
+
     command = [
         "python3",
         "-m",
