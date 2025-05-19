@@ -514,6 +514,7 @@ class EmbeddingReqInput:
         if self.text is not None:
             if isinstance(self.text, list):
                 self.batch_size += len(self.text)
+                self.is_single = False
             else:
                 self.batch_size += 1
 
