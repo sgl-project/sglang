@@ -44,7 +44,8 @@ class TestDynamicEPLB(CustomTestCase):
                 "50",
                 "--expert-distribution-recorder-buffer-size",
                 "50",
-                "--enable-expert-distribution-metrics",
+                # TODO pr-chain: enable later
+                # "--enable-expert-distribution-metrics",
                 # TODO auto determine these flags
                 "--expert-distribution-recorder-mode",
                 "stat",
@@ -85,7 +86,8 @@ class TestStaticEPLB(CustomTestCase):
                 tp_size=2,
                 dp_size=2,
                 log_level="info",
-                enable_expert_distribution_metrics=True,
+                # TODO pr-chain: enable later
+                # enable_expert_distribution_metrics=True,
             )
 
             print(f"Action: start engine")
