@@ -1357,14 +1357,13 @@ class DeepseekV2Model(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
+        device = input_embeds.device if input_embeds is not None else input_ids.device
         zero_allocator = BumpAllocator(
             buffer_size=len(self.layers)
                         * 2
                         * (2 if global_server_args_dict["enable_two_batch_overlap"] else 1),
             dtype=torch.float32,
-            device=(
-                input_embeds.device if input_embeds is not None else input_ids.device
-            ),
+            device=device,
         )
 
         if input_embeds is None:
