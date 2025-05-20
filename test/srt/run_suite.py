@@ -107,6 +107,16 @@ suites = {
         TestFile("test_full_deepseek_v3.py", 250),
         TestFile("test_pp_single_node.py", 150),
     ],
+    "per-commit-cpu": [
+        TestFile("test_mla.py"),
+        TestFile("test_mla_deepseek_v3.py"),
+        TestFile("test_mla_flashinfer.py"),
+        TestFile("test_mla_fp8.py"),
+        TestFile("test_mla_tp.py"),
+        TestFile("test_fp8_kernel.py"),
+        TestFile("test_fused_moe.py"),
+        TestFile("test_moe_ep.py"),
+    ],
     "nightly": [
         TestFile("test_nightly_gsm8k_eval.py"),
     ],
