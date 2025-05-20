@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Optional, Union, Tuple
 
 import torch
 import triton
-from torch.ops.sgl_kernel import flash_mla_with_kvcache, get_mla_metadata
+from sgl_kernel import flash_mla_with_kvcache, get_mla_metadata
 
 from sglang.global_config import global_config
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
