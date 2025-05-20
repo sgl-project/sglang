@@ -144,7 +144,7 @@ def model_forward_tbo_layers(
     assert get_attention_tp_size() == 1
     forward_mode = forward_batch.forward_mode
 
-    inputs_a, inputs_b = _model_forward_split_inputs(
+    inputs_arr = _model_forward_split_inputs(
         positions=positions,
         hidden_states=hidden_states,
         forward_batch=forward_batch,
@@ -170,13 +170,13 @@ def model_forward_tbo_layers(
     )
 
     with configure_deep_gemm_num_sms(deep_gemm_num_sms):
-        [output_a, output_b] = execute_overlapped_operations(
-            inputs_arr=[inputs_a, inputs_b],
+        outputs_arr = execute_overlapped_operations(
+            inputs_arr=inputs_arr,
             operations_arr=[operations] * 2,
             delta_stages=[0, delta_stages],
         )
 
-    return _model_forward_merge_outputs(output_a, output_b)
+    return _model_forward_merge_outputs(*outputs_arr)
 
 
 def _model_forward_split_inputs(
@@ -184,21 +184,17 @@ def _model_forward_split_inputs(
     residual: torch.Tensor,
     positions: torch.Tensor,
     forward_batch: "ForwardBatch",
-) -> Tuple[Dict, Dict]:
-    return tuple(
-        [
-            _model_forward_filter_inputs(
-                hidden_states=hidden_states,
-                residual=residual,
-                positions=positions,
-                output_forward_batch=output_forward_batch,
-                tbo_subbatch_index=tbo_subbatch_index,
-            )
-            for tbo_subbatch_index, output_forward_batch in enumerate(
-            forward_batch.tbo_children
+) -> List[Dict]:
+    return [
+        _model_forward_filter_inputs(
+            hidden_states=hidden_states,
+            residual=residual,
+            positions=positions,
+            output_forward_batch=output_forward_batch,
+            tbo_subbatch_index=tbo_subbatch_index,
         )
-        ]
-    )
+        for tbo_subbatch_index, output_forward_batch in enumerate(forward_batch.tbo_children)
+    ]
 
 
 def _model_forward_filter_inputs(
