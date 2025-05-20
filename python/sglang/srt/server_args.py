@@ -104,6 +104,7 @@ class ServerArgs:
     collect_tokens_histogram: bool = False
     decode_log_interval: int = 40
     enable_request_time_stats_logging: bool = False
+    kv_events_config: Optional[str] = None
 
     # API related
     api_key: Optional[str] = None
@@ -170,6 +171,7 @@ class ServerArgs:
     enable_ep_moe: bool = False
     enable_deepep_moe: bool = False
     deepep_mode: Optional[Literal["auto", "normal", "low_latency"]] = "auto"
+    deepep_config: Optional[str] = None
     enable_torch_compile: bool = False
     torch_compile_max_bs: int = 32
     cuda_graph_max_bs: Optional[int] = None
@@ -827,6 +829,12 @@ class ServerArgs:
             help="Collect prompt/generation tokens histogram.",
         )
         parser.add_argument(
+            "--kv-events-config",
+            type=str,
+            default=None,
+            help="Config in json format for NVIDIA dynamo KV event publishing. Publishing will be enabled if this flag is used.",
+        )
+        parser.add_argument(
             "--decode-log-interval",
             type=int,
             default=ServerArgs.decode_log_interval,
@@ -1261,6 +1269,12 @@ class ServerArgs:
             choices=["normal", "low_latency", "auto"],
             default="auto",
             help="Select the mode when enable DeepEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch.",
+        )
+        parser.add_argument(
+            "--deepep-config",
+            type=str,
+            default=ServerArgs.deepep_config,
+            help="Tuned DeepEP config suitable for your own cluster.",
         )
 
         parser.add_argument(
