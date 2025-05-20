@@ -1,3 +1,17 @@
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Dict, Optional, Tuple
@@ -40,7 +54,6 @@ class _LayerModeComputationContext:
             layer_id=self.layer_id - 1,
             is_layer_sparse=self.is_previous_layer_sparse,
             is_previous_layer_sparse=None,
-            # unchanged
             num_layers=self.num_layers,
         )
 
@@ -49,7 +62,7 @@ class _LayerModeComputationContext:
 class LayerScatterModes:
     layer_input_mode: ScatterMode
     attn_mode: ScatterMode
-    # Can be further split into e.g. ffn_input_mode and ffn_output_mode if needed
+    # Can be further split into e.g. mlp_input_mode and mlp_output_mode if needed
     mlp_mode: ScatterMode
     middle_residual_mode: ScatterMode
     layer_output_mode: ScatterMode
@@ -115,9 +128,11 @@ class LayerCommunicator:
     def __init__(
         self,
         layer_scatter_modes: LayerScatterModes,
+        input_layernorm: torch.nn.Module,
         post_attention_layernorm: torch.nn.Module,
     ):
         self.layer_scatter_modes = layer_scatter_modes
+        self.input_layernorm = input_layernorm
         self.post_attention_layernorm = post_attention_layernorm
 
         self.attn_tp_rank = get_attention_tp_rank()
@@ -130,12 +145,22 @@ class LayerCommunicator:
             ScatterMode.FULL: self.tp_size,
         }
 
-    def forward_pre_attn(
+    def prepare_attn(
         self,
         hidden_states: torch.Tensor,
+        residual: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        return _communicate_simple(
+        if hidden_states.shape[0] == 0:
+            residual = hidden_states
+        else:
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.input_layernorm(hidden_states)
+            else:
+                hidden_states, residual = self.input_layernorm(hidden_states, residual)
+
+        hidden_states = _communicate_simple(
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             input_mode=self.layer_scatter_modes.layer_input_mode,
@@ -143,7 +168,9 @@ class LayerCommunicator:
             context=self._compute_context(forward_batch),
         )
 
-    def forward_pre_mlp(
+        return hidden_states, residual
+
+    def prepare_mlp(
         self,
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
@@ -161,7 +188,7 @@ class LayerCommunicator:
             context=self._compute_context(forward_batch),
         )
 
-    def forward_layer_end(
+    def postprocess_layer(
         self,
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
@@ -305,6 +332,7 @@ def _communicate_with_all_reduce_and_layer_norm(
             and context.is_same_group_size(residual_input_mode, residual_output_mode)
             and context.attn_tp_size == 1
         ):
+            # TODO move these `if shape != 0` into LayerNorm itself
             if hidden_states.shape[0] != 0:
                 hidden_states, residual = layernorm(hidden_states, residual)
             return hidden_states, residual
