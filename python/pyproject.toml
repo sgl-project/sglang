@@ -25,6 +25,7 @@ runtime_common = [
     "interegular",
     "llguidance>=0.7.11,<0.8.0",
     "modelscope",
+    "msgspec",
     "ninja",
     "orjson",
     "packaging",
