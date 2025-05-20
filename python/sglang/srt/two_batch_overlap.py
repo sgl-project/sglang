@@ -148,8 +148,6 @@ def model_forward_tbo_layers(
     # The attn_tp_size!=1 case is not yet extracted to master
     assert get_attention_tp_size() == 1
 
-    forward_mode = forward_batch.forward_mode
-
     inputs_arr = _model_forward_split_inputs(
         positions=positions,
         hidden_states=hidden_states,
@@ -158,7 +156,7 @@ def model_forward_tbo_layers(
     )
     del hidden_states, residual
 
-    operations = compute_layers_operations(layers, forward_mode)
+    operations = compute_layers_operations(layers, forward_batch.forward_mode)
 
     # TODO do not hardcode
     delta_stages = {
