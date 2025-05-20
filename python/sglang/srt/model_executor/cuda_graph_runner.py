@@ -485,6 +485,7 @@ class CudaGraphRunner:
             lora_paths=lora_paths,
             num_token_non_padded=self.num_token_non_padded,
             tbo_split_seq_index=tbo_split_seq_index,
+            global_forward_mode=self.capture_forward_mode,
         )
         forward_batch.prepare_tbo()
 

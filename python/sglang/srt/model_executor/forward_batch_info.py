@@ -238,6 +238,7 @@ class ForwardBatch:
     dp_local_num_tokens: Optional[torch.Tensor] = None  # cached info at runtime
     gathered_buffer: Optional[torch.Tensor] = None
     can_run_dp_cuda_graph: bool = False
+    global_forward_mode: Optional[ForwardMode] = None
 
     # Speculative decoding
     spec_info: Optional[Union[EagleVerifyInput, EagleDraftInput]] = None
@@ -284,6 +285,7 @@ class ForwardBatch:
             top_logprobs_nums=batch.top_logprobs_nums,
             token_ids_logprobs=batch.token_ids_logprobs,
             can_run_dp_cuda_graph=batch.can_run_dp_cuda_graph,
+            global_forward_mode=batch.global_forward_mode,
             lora_paths=batch.lora_paths,
             sampling_info=batch.sampling_info,
             req_to_token_pool=model_runner.req_to_token_pool,
