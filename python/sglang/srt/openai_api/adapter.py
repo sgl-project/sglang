@@ -24,7 +24,7 @@ from http import HTTPStatus
 from typing import Dict, List
 
 from fastapi import HTTPException, Request, UploadFile
-from fastapi.responses import ORJSONResponse, StreamingResponse
+from fastapi.responses import StreamingResponse
 from pydantic import ValidationError
 
 from sglang.srt.code_completion_parser import (
@@ -106,7 +106,7 @@ def create_error_response(
     status_code: HTTPStatus = HTTPStatus.BAD_REQUEST,
 ):
     error = ErrorResponse(message=message, type=err_type, code=status_code.value)
-    return ORJSONResponse(content=error.model_dump(), status_code=error.code)
+    return error.model_dump(), status_code.value
 
 
 def create_streaming_error_response(
@@ -1946,11 +1946,13 @@ async def v1_score(tokenizer_manager, raw_request):
             model=request.model,
             usage=result["usage"]
         )
-        return ORJSONResponse(response.model_dump())
+        return response
 
     except Exception as e:
         logger.error(f"Error in v1_score: {str(e)}")
-        return ORJSONResponse(
-            {"error": {"message": str(e)}},
-            status_code=HTTPStatus.BAD_REQUEST
+        error = ErrorResponse(
+            message=str(e),
+            type="BadRequestError",
+            code=HTTPStatus.BAD_REQUEST.value
         )
+        return error
