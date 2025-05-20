@@ -1,6 +1,6 @@
-from typing import TYPE_CHECKING, Optional, Sequence
+import torch
+from typing import TYPE_CHECKING, Optional, Sequence, Tuple, Dict
 
-from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.utils import DeepEPMode
 
 if TYPE_CHECKING:
@@ -124,3 +124,56 @@ class TboDPAttentionPreparer:
         return all(value == x[0] for value in x)
 
 # -------------------------------- Execute ---------------------------------------
+
+
+
+def model_forward_split_inputs(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    positions: torch.Tensor,
+    forward_batch: "ForwardBatch",
+) -> Tuple[Dict, Dict]:
+    return tuple(
+        [
+            _model_forward_filter_inputs(
+                hidden_states=hidden_states,
+                residual=residual,
+                positions=positions,
+                output_forward_batch=output_forward_batch,
+                tbo_subbatch_index=tbo_subbatch_index,
+            )
+            for tbo_subbatch_index, output_forward_batch in enumerate(
+            forward_batch.tbo_children
+        )
+        ]
+    )
+
+
+def _model_forward_filter_inputs(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    positions: torch.Tensor,
+    output_forward_batch: "ForwardBatch",
+    tbo_subbatch_index: int,
+) -> Dict:
+    token_slice = slice(*output_forward_batch.tbo_parent_token_range)
+    return dict(
+        hidden_states=hidden_states[token_slice],
+        residual=None if residual is None else residual[token_slice],
+        positions=positions[token_slice],
+        forward_batch=output_forward_batch,
+        tbo_subbatch_index=tbo_subbatch_index,
+    )
+
+
+def model_forward_merge_outputs(output_a, output_b):
+    def _handle_key(name):
+        value_a = output_a[name]
+        value_b = output_b[name]
+        assert (value_a is None) == (value_b is None)
+        if value_a is None:
+            return None
+        return torch.concat([value_a, value_b], dim=0)
+
+    return _handle_key("hidden_states"), _handle_key("residual")
+
