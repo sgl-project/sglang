@@ -20,7 +20,8 @@ FILES_TO_UPDATE = docker/Dockerfile.rocm \
                  python/pyproject.toml \
                  python/sglang/version.py \
                  docs/developer/setup_github_runner.md \
-                 docs/start/install.md
+                 docs/start/install.md \
+				 benchmark/deepseek_v3/README.md
 
 update: ## Update version numbers across project files. Usage: make update <new_version>
 	@if [ -z "$(filter-out $@,$(MAKECMDGOALS))" ]; then \

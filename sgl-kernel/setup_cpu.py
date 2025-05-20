@@ -14,6 +14,7 @@
 # ==============================================================================
 
 import os
+import platform
 import shutil
 import sys
 from pathlib import Path
@@ -24,9 +25,19 @@ from setuptools.command.build_py import build_py
 from torch.utils.cpp_extension import BuildExtension, CppExtension
 
 root = Path(__file__).parent.resolve()
+arch = platform.machine().lower()
+
+if arch in ("x86_64", "amd64"):
+    plat_name = "manylinux2014_x86_64"
+elif arch in ("aarch64", "arm64"):
+    plat_name = "manylinux2014_aarch64"
+elif arch.startswith("ppc"):
+    plat_name = "manylinux2014_ppc64le"
+else:
+    plat_name = f"manylinux2014_{arch}"
 
 if "bdist_wheel" in sys.argv and "--plat-name" not in sys.argv:
-    sys.argv.extend(["--plat-name", "manylinux2014_x86_64"])
+    sys.argv.extend(["--plat-name", plat_name])
 
 
 def _get_version():
@@ -35,6 +46,8 @@ def _get_version():
             if line.startswith("version"):
                 return line.split("=")[1].strip().strip('"')
 
+
+cpu_fp8_ftz = os.getenv("SGLANG_CPU_FP8_CVT_FTZ", "1") == "1"
 
 operator_namespace = "sgl_kernel"
 include_dirs = []
@@ -45,14 +58,17 @@ sources = [
     "csrc/cpu/decode.cpp",
     "csrc/cpu/extend.cpp",
     "csrc/cpu/gemm.cpp",
+    "csrc/cpu/gemm_fp8.cpp",
     "csrc/cpu/gemm_int8.cpp",
     "csrc/cpu/moe.cpp",
+    "csrc/cpu/moe_fp8.cpp",
     "csrc/cpu/moe_int8.cpp",
     "csrc/cpu/norm.cpp",
     "csrc/cpu/qkv_proj.cpp",
     "csrc/cpu/topk.cpp",
     "csrc/cpu/interface.cpp",
     "csrc/cpu/shm.cpp",
+    "csrc/cpu/rope.cpp",
     "csrc/cpu/torch_extension_cpu.cpp",
 ]
 
@@ -64,13 +80,16 @@ extra_compile_args = {
         "-fopenmp",
     ]
 }
+if cpu_fp8_ftz:
+    extra_compile_args["cxx"].append("-DSGLANG_CPU_FP8_CVT_FTZ")
+
 libraries = ["c10", "torch", "torch_python"]
 cmdclass = {
     "build_ext": BuildExtension.with_options(use_ninja=True),
 }
 Extension = CppExtension
 
-extra_link_args = ["-Wl,-rpath,$ORIGIN/../../torch/lib", "-L/usr/lib/x86_64-linux-gnu"]
+extra_link_args = ["-Wl,-rpath,$ORIGIN/../../torch/lib", f"-L/usr/lib/{arch}-linux-gnu"]
 
 ext_modules = [
     Extension(

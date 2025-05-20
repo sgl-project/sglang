@@ -16,20 +16,16 @@ import itertools
 import json
 import multiprocessing
 import os
-import random
 import time
-from pathlib import Path
 from typing import Tuple
 
 import numpy as np
 import requests
-import torch
-import torch.multiprocessing as mp
 
-from sglang.srt import fine_grained_benchmark
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
+from sglang.test.test_utils import is_in_ci, write_github_step_summary
 
 
 @dataclasses.dataclass
@@ -38,17 +34,13 @@ class BenchArgs:
     batch_size: Tuple[int] = (1,)
     input_len: Tuple[int] = (1024,)
     output_len: Tuple[int] = (16,)
+    temperature: float = 0.0
+    return_logprob: bool = False
+    input_len_step_percentage: float = 0.0
     result_filename: str = "result.jsonl"
     base_url: str = ""
     skip_warmup: bool = False
-    profile: bool = False
-    profile_activities: Tuple[str] = ("CUDA_PROFILER",)
-    profile_with_stack: bool = False
-    profile_record_shapes: bool = False
-    profile_skip_cases: int = 0
-    enable_expert_distribution_recorder: bool = False
-    expert_distribution_recorder_dir: str = "/tmp"
-    seed: int = 1
+    show_report: bool = False
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -62,38 +54,19 @@ class BenchArgs:
         parser.add_argument(
             "--output-len", type=int, nargs="+", default=BenchArgs.output_len
         )
+        parser.add_argument("--temperature", type=float, default=BenchArgs.temperature)
+        parser.add_argument("--return-logprob", action="store_true")
+        parser.add_argument(
+            "--input-len-step-percentage",
+            type=float,
+            default=BenchArgs.input_len_step_percentage,
+        )
         parser.add_argument(
             "--result-filename", type=str, default=BenchArgs.result_filename
         )
         parser.add_argument("--base-url", type=str, default=BenchArgs.base_url)
         parser.add_argument("--skip-warmup", action="store_true")
-        parser.add_argument(
-            "--profile",
-            action="store_true",
-            help="Use Torch Profiler. The endpoint must be launched with "
-            "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
-        )
-        parser.add_argument(
-            "--profile-activities",
-            type=str,
-            nargs="+",
-            default=BenchArgs.profile_activities,
-        )
-        parser.add_argument("--profile-with-stack", action="store_true")
-        parser.add_argument("--profile-record-shapes", action="store_true")
-        parser.add_argument(
-            "--profile-skip-cases", type=int, default=BenchArgs.profile_skip_cases
-        )
-        parser.add_argument(
-            "--enable-expert-distribution-recorder",
-            action="store_true",
-        )
-        parser.add_argument(
-            "--expert-distribution-recorder-dir",
-            type=str,
-            default=BenchArgs.expert_distribution_recorder_dir,
-        )
-        parser.add_argument("--seed", type=int, default=1, help="The random seed.")
+        parser.add_argument("--show-report", action="store_true")
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
@@ -114,16 +87,13 @@ def launch_server_internal(server_args):
 
 
 def launch_server_process(server_args: ServerArgs):
-    if fine_grained_benchmark.is_enabled():
-        os.environ["SGLANG_ENABLE_COLOCATED_BATCH_GEN"] = "true"
-
     proc = multiprocessing.Process(target=launch_server_internal, args=(server_args,))
     proc.start()
     base_url = f"http://{server_args.host}:{server_args.port}"
     timeout = 600
 
-    start_time = time.time()
-    while time.time() - start_time < timeout:
+    start_time = time.perf_counter()
+    while time.perf_counter() - start_time < timeout:
         try:
             headers = {
                 "Content-Type": "application/json; charset=utf-8",
@@ -142,56 +112,89 @@ def run_one_case(
     batch_size: int,
     input_len: int,
     output_len: int,
+    temperature: float,
+    return_logprob: bool,
+    input_len_step_percentage: float,
     run_name: str,
     result_filename: str,
 ):
+    requests.post(url + "/flush_cache")
+    input_lens = [
+        int(input_len * (1 + (i - (batch_size - 1) / 2) * input_len_step_percentage))
+        for i in range(batch_size)
+    ]
     input_ids = [
-        [int(x) for x in np.random.randint(0, high=16384, size=(input_len,))]
-        for _ in range(batch_size)
+        [int(x) for x in np.random.randint(0, high=16384, size=(input_lens[i],))]
+        for i in range(batch_size)
     ]
 
-    if fine_grained_benchmark.is_enabled():
-        fine_grained_benchmark.clear_output()
+    use_structured_outputs = False
+    if use_structured_outputs:
+        texts = []
+        for _ in range(batch_size):
+            texts.append(
+                "Human: What is the capital city of france? can you give as many trivial information as possible about that city? answer in json.\n"
+                * 50
+                + "Assistant:"
+            )
+        json_schema = "$$ANY$$"
+    else:
+        json_schema = None
 
-    tic = time.time()
+    tic = time.perf_counter()
     response = requests.post(
         url + "/generate",
         json={
+            # "text": texts,
             "input_ids": input_ids,
             "sampling_params": {
-                "temperature": 0,
+                "temperature": temperature,
                 "max_new_tokens": output_len,
                 "ignore_eos": True,
+                "json_schema": json_schema,
             },
+            "return_logprob": return_logprob,
+            "stream": True,
         },
+        stream=True,
     )
-    latency = time.time() - tic
 
-    _ = response.json()
+    # The TTFT of the last request in the batch
+    ttft = 0.0
+    for chunk in response.iter_lines(decode_unicode=False):
+        chunk = chunk.decode("utf-8")
+        if chunk and chunk.startswith("data:"):
+            if chunk == "data: [DONE]":
+                break
+            data = json.loads(chunk[5:].strip("\n"))
+            if "error" in data:
+                raise RuntimeError(f"Request has failed. {data}.")
 
-    output_throughput = batch_size * output_len / latency
+            assert (
+                data["meta_info"]["finish_reason"] is None
+                or data["meta_info"]["finish_reason"]["type"] == "length"
+            )
+            if data["meta_info"]["completion_tokens"] == 1:
+                ttft = time.perf_counter() - tic
+
+    latency = time.perf_counter() - tic
+    input_throughput = batch_size * input_len / ttft
+    output_throughput = batch_size * output_len / (latency - ttft)
     overall_throughput = batch_size * (input_len + output_len) / latency
 
+    server_info = requests.get(url + "/get_server_info").json()
+    acc_length = server_info["internal_states"][0].get("avg_spec_accept_length", None)
+    last_gen_throughput = server_info["internal_states"][0]["last_gen_throughput"]
+
     print(f"batch size: {batch_size}")
+    print(f"input_len: {input_len}")
+    print(f"output_len: {output_len}")
     print(f"latency: {latency:.2f} s")
-    print(f"output throughput: {output_throughput:.2f} token/s")
-    print(f"(input + output) throughput: {overall_throughput:.2f} token/s")
-
-    if fine_grained_benchmark.is_enabled():
-        import pandas as pd
-
-        fine_grained_output = fine_grained_benchmark.read_output()
-        df = pd.DataFrame(fine_grained_output)
-        df["throughput"] = df["num_tokens"] / df["latency"]
-        with pd.option_context(
-            "display.max_rows",
-            10000,
-            "display.max_columns",
-            10000,
-            "display.width",
-            10000,
-        ):
-            print(df[df["tp_rank"] == 0].drop(["start_time", "tp_rank"], axis=1))
+    print(f"ttft: {ttft:.2f} s")
+    print(f"Last generation throughput: {last_gen_throughput:.2f} tok/s")
+    print(f"Input throughput: {input_throughput:.2f} tok/s")
+    if output_len != 1:
+        print(f"output throughput: {output_throughput:.2f} tok/s")
 
     if result_filename:
         with open(result_filename, "a") as fout:
@@ -203,61 +206,23 @@ def run_one_case(
                 "latency": round(latency, 4),
                 "output_throughput": round(output_throughput, 2),
                 "overall_throughput": round(overall_throughput, 2),
+                "last_gen_throughput": round(last_gen_throughput, 2),
             }
-            if fine_grained_benchmark.is_enabled():
-                res["fine_grained_output"] = fine_grained_output
             fout.write(json.dumps(res) + "\n")
 
-
-def _process_expert_distribution_record(bench_args, response):
-    response.raise_for_status()
-    data = response.json()
-    path = (
-        Path(bench_args.expert_distribution_recorder_dir) / "expert_distribution.json"
+    return (
+        batch_size,
+        latency,
+        ttft,
+        input_throughput,
+        output_throughput,
+        overall_throughput,
+        last_gen_throughput,
+        acc_length,
     )
-    print(f"Write expert_distribution_recorder information to {path}", flush=True)
-    path.write_text(json.dumps(data))
-
-    import polars as pl
-
-    df = pl.read_json(path, infer_schema_length=1000000)
-    df = df.with_row_index("temp_index")
-    df = df.explode("physical_count")
-    df = df.with_columns(
-        layer_id=(pl.col("physical_count").cum_count() - 1).over("temp_index")
-    )
-    df = df.drop("temp_index")
-    df = df.with_columns(
-        total_num_tokens=pl.col("physical_count").list.sum(),
-        max_expert_num_tokens=pl.col("physical_count").list.max(),
-        min_expert_num_tokens=pl.col("physical_count").list.min(),
-    )
-    df = df.filter(pl.col("total_num_tokens") > 0)
-    df = df.sort("forward_pass_id", "layer_id", "gatherer_key", "rank")
-    df = df.select(
-        "forward_pass_id",
-        "layer_id",
-        "gatherer_key",
-        "rank",
-        "total_num_tokens",
-        "max_expert_num_tokens",
-        "min_expert_num_tokens",
-        "physical_count",
-    )
-    with pl.Config(
-        fmt_str_lengths=1000,
-        tbl_cols=-1,
-        tbl_rows=-1,
-        fmt_table_cell_list_len=1000,
-        tbl_width_chars=-1,
-    ):
-        print(df, flush=True)
 
 
 def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-
     if bench_args.base_url:
         proc, base_url = None, bench_args.base_url
     else:
@@ -265,72 +230,86 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
 
     # warmup
     if not bench_args.skip_warmup:
+        print("=" * 8 + " Warmup Begin " + "=" * 8)
         run_one_case(
             base_url,
             batch_size=16,
             input_len=1024,
             output_len=16,
+            temperature=bench_args.temperature,
+            return_logprob=bench_args.return_logprob,
+            input_len_step_percentage=bench_args.input_len_step_percentage,
             run_name="",
             result_filename="",
         )
+        print("=" * 8 + " Warmup End   " + "=" * 8 + "\n")
 
     # benchmark
+    result = []
     try:
-        for index, (bs, il, ol) in enumerate(
-            itertools.product(
-                bench_args.batch_size, bench_args.input_len, bench_args.output_len
-            )
+        for bs, il, ol in itertools.product(
+            bench_args.batch_size, bench_args.input_len, bench_args.output_len
         ):
-            if (
-                bench_args.enable_expert_distribution_recorder
-                and index == bench_args.profile_skip_cases
-            ):
-                requests.post(
-                    base_url + "/start_expert_distribution_record"
-                ).raise_for_status()
-            if bench_args.profile and index == bench_args.profile_skip_cases:
-                # TODO extract to PR
-                print("bench script call cudaProfilerStart")
-                torch.cuda.cudart().cudaProfilerStart()
-                # print("Execute start_profile")
-                # requests.post(
-                #     base_url + "/start_profile",
-                #     json={
-                #         "activities": bench_args.profile_activities,
-                #         "with_stack": bench_args.profile_with_stack,
-                #         "record_shapes": bench_args.profile_record_shapes,
-                #     },
-                # ).raise_for_status()
-            run_one_case(
-                base_url,
-                bs,
-                il,
-                ol,
-                bench_args.run_name,
-                bench_args.result_filename,
+            result.append(
+                run_one_case(
+                    base_url,
+                    bs,
+                    il,
+                    ol,
+                    temperature=bench_args.temperature,
+                    return_logprob=bench_args.return_logprob,
+                    input_len_step_percentage=bench_args.input_len_step_percentage,
+                    run_name=bench_args.run_name,
+                    result_filename=bench_args.result_filename,
+                )
             )
-        if bench_args.enable_expert_distribution_recorder:
-            requests.post(
-                base_url + "/stop_expert_distribution_record"
-            ).raise_for_status()
-            _process_expert_distribution_record(
-                bench_args, requests.post(base_url + "/dump_expert_distribution_record")
-            )
-        if bench_args.profile:
-            # TODO extract to PR
-            print("bench script call cudaProfilerStop")
-            torch.cuda.cudart().cudaProfilerStop()
-            # print("Execute stop_profile")
-            # requests.post(base_url + "/stop_profile").raise_for_status()
     finally:
         if proc:
             kill_process_tree(proc.pid)
 
     print(f"\nResults are saved to {bench_args.result_filename}")
 
+    if not bench_args.show_report:
+        return
+
+    summary = " | batch size | latency (s) | input throughput (tok/s)  | output throughput (tok/s) | acc length | ITL (ms) | input price ($/1M) | output price ($/1M) |\n"
+    summary += "| ---------- | ----------- | ------------------------- | ------------------------- | ---------- | -------- | ------------------ | ------------------- |\n"
+
+    for (
+        batch_size,
+        latency,
+        ttft,
+        input_throughput,
+        output_throughput,
+        overall_throughput,
+        last_gen_throughput,
+        acc_length,
+    ) in result:
+        hourly_cost = 2 * server_args.tp_size  # $2/hour for one H100
+        input_util = 0.7
+        accept_length = round(acc_length, 2) if acc_length is not None else "n/a"
+        line = (
+            f"| {batch_size} | "
+            f"{latency:.2f} | "
+            f"{input_throughput:.2f} | "
+            f"{output_throughput:.2f} | "
+            f"{accept_length} | "
+            f"{1 / (output_throughput/batch_size) * 1000:.2f} | "
+            f"{1e6 / (input_throughput * input_util) / 3600 * hourly_cost:.2f} | "
+            f"{1e6 / output_throughput / 3600 * hourly_cost:.2f} |\n"
+        )
+        summary += line
+
+    # print metrics table
+    print(summary)
+
+    if is_in_ci():
+        write_github_step_summary(
+            f"### Test Nightly Benchmark (bench_one_batch) \n{summary}"
+        )
+
 
 if __name__ == "__main__":
-    mp.set_start_method("spawn", force=True)
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
     BenchArgs.add_cli_args(parser)

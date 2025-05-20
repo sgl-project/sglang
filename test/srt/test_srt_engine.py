@@ -185,6 +185,35 @@ class TestSRTEngine(CustomTestCase):
         result = throughput_test(server_args=server_args, bench_args=bench_args)
         self.assertGreater(result["total_throughput"], 3000)
 
+    def test_8_engine_async_encode_consistency(self):
+        prompt = "Today is a sunny day and I like"
+        model_path = DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST
+
+        engine = sgl.Engine(
+            model_path=model_path,
+            is_embedding=True,
+            random_seed=42,
+            disable_radix_cache=True,
+        )
+
+        # Get sync and async embeddings
+        out1 = torch.tensor(engine.encode(prompt)["embedding"])
+        loop = asyncio.get_event_loop()
+        out2 = torch.tensor(
+            loop.run_until_complete(engine.async_encode(prompt))["embedding"]
+        )
+
+        engine.shutdown()
+
+        print("\n==== Shapes ====")
+        print(f"sync shape: {out1.shape}")
+        print(f"async shape: {out2.shape}")
+
+        self.assertTrue(
+            torch.allclose(out1, out2, atol=1e-5, rtol=1e-3),
+            "Sync and async embeddings are not equal within tolerance",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

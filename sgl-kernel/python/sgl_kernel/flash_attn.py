@@ -10,10 +10,18 @@ except:
 
 
 def is_fa3_supported(device=None) -> bool:
-    #  now sgl-kernel only build fa3 for sm90a && cuda >= 12.3
-    return (torch.cuda.get_device_capability(device)[0] == 9) and (
-        torch.version.cuda >= "12.3"
-    )
+    #  There some fa3 FYI
+    #  FA3 can fail without a enough shared memory for a some shapes, such as higher
+    #  hidden_dim or some special cases.
+    #  Right now, fa3 is supported for sm80/sm87 and sm86/sm89. The main different
+    #  Between sm80/sm87 and sm86/sm89 is the shared memory size. you can follow the link below for more information
+    #  https://docs.nvidia.com/cuda/cuda-c-programming-guide/#shared-memory-8-x
+    #  And for sgl-kernel right now, we can build fa3 on sm80/sm86/sm89/sm90a.
+    #  That means if you use A100/A*0/L20/L40/L40s/4090 you can use fa3.
+    return (
+        torch.cuda.get_device_capability(device)[0] == 9
+        or torch.cuda.get_device_capability(device)[0] == 8
+    ) and (torch.version.cuda >= "12.3")
 
 
 def maybe_contiguous(x):
@@ -136,10 +144,6 @@ def flash_attn_with_kvcache(
             logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
             normalization factor).
     """
-    if not is_fa3_supported():
-        raise NotImplementedError(
-            "flash_attn at sgl-kernel is only supported on sm90 and cu123 above"
-        )
     assert k_cache.stride(-1) == 1, "k_cache must have contiguous last dimension"
     assert v_cache.stride(-1) == 1, "v_cache must have contiguous last dimension"
     if softmax_scale is None:
