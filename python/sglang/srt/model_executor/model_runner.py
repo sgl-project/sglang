@@ -52,6 +52,16 @@ from sglang.srt.layers.quantization.deep_gemm import (
 from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
+from sglang.srt.managers.expert_distribution import (
+    ExpertDistributionRecorder,
+    get_global_expert_distribution_recorder,
+    set_global_expert_distribution_recorder,
+)
+from sglang.srt.managers.expert_location import (
+    compute_initial_expert_location_metadata,
+    get_global_expert_location_metadata,
+    set_global_expert_location_metadata,
+)
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.mem_cache.memory_pool import (
     DoubleSparseTokenToKVPool,
@@ -161,6 +171,8 @@ class ModelRunner:
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
         self.attention_chunk_size = model_config.attention_chunk_size
 
+        self.forward_pass_id = 0
+
         # Model-specific adjustment
         self.model_specific_adjustment()
 
@@ -218,6 +230,25 @@ class ModelRunner:
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=self.server_args.enable_memory_saver
         )
+
+        if not self.is_draft_worker:
+            set_global_expert_location_metadata(
+                compute_initial_expert_location_metadata(server_args, self.model_config)
+            )
+            if self.tp_rank == 0 and get_bool_env_var(
+                "SGLANG_LOG_EXPERT_LOCATION_METADATA"
+            ):
+                logger.info(
+                    f"Initial expert_location_metadata: {get_global_expert_location_metadata().debug_str()}"
+                )
+
+            set_global_expert_distribution_recorder(
+                ExpertDistributionRecorder.init_new(
+                    server_args,
+                    get_global_expert_location_metadata(),
+                    rank=self.tp_rank,
+                )
+            )
 
         # Load the model
         self.sampler = Sampler()
@@ -1093,6 +1124,22 @@ class ModelRunner:
         forward_batch: ForwardBatch,
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> Tuple[Union[LogitsProcessorOutput, PPProxyTensors], bool]:
+        self.forward_pass_id += 1
+
+        with get_global_expert_distribution_recorder().with_forward_pass(
+            self.forward_pass_id,
+            forward_batch,
+        ):
+            return self._forward_raw(
+                forward_batch, skip_attn_backend_init, pp_proxy_tensors
+            )
+
+    def _forward_raw(
+        self,
+        forward_batch: ForwardBatch,
+        skip_attn_backend_init: bool,
+        pp_proxy_tensors: Optional[PPProxyTensors],
     ) -> Tuple[Union[LogitsProcessorOutput, PPProxyTensors], bool]:
         can_run_cuda_graph = bool(
             forward_batch.forward_mode.is_cuda_graph()
