@@ -13,7 +13,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
 
-# -------------------------------- Compute Info ---------------------------------------
+# -------------------------------- Compute Basic Info ---------------------------------------
 
 # TODO: may smartly disable TBO when batch size is too small b/c it will slow down
 def compute_split_seq_index(
@@ -60,6 +60,8 @@ def compute_split_token_index(
     else:
         raise NotImplementedError
 
+
+# -------------------------------- Preparation ---------------------------------------
 
 class TboDPAttentionPreparer:
     def prepare_all_gather(
@@ -130,7 +132,7 @@ class TboDPAttentionPreparer:
         return all(value == x[0] for value in x)
 
 
-# -------------------------------- Execute ---------------------------------------
+# -------------------------------- Execution ---------------------------------------
 
 # TODO rename?
 def model_forward_tbo_layers(
