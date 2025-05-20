@@ -112,6 +112,8 @@ class TestEPLBMisc(CustomTestCase):
                 **engine_kwargs,
                 init_expert_location=str(snapshot_path),
                 port=21000,
+                # TODO auto determine these flags
+                ep_dispatch_algorithm="static",
             )
             self._assert_engine_generate_correct(engine)
             print(f"Action: shutdown engine")
