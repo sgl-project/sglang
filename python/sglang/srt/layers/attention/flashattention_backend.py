@@ -338,6 +338,7 @@ class FlashAttentionBackend(AttentionBackend):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
         metadata = FlashAttentionMetadata()
         seqlens_in_batch = forward_batch.seq_lens
+        seqlens_in_batch_cpu = forward_batch.seq_lens_cpu
         batch_size = forward_batch.batch_size
         device = seqlens_in_batch.device
 
