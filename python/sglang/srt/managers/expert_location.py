@@ -15,7 +15,7 @@ import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 import torch
 import torch.distributed
@@ -197,6 +197,19 @@ class ExpertLocationMetadata:
             logical_to_all_physical_map=logical_to_all_physical_map_padded,
             logical_to_all_physical_map_num_valid=logical_to_all_physical_map_num_valid,
         )
+
+    # -------------------------------- usage ------------------------------------
+
+    def logical_to_all_physical(
+        self, layer_id: int, logical_expert_id: int
+    ) -> List[int]:
+        return [
+            physical_expert_id
+            for physical_expert_id in self.logical_to_all_physical_map[
+                layer_id, logical_expert_id
+            ].tolist()
+            if physical_expert_id != -1
+        ]
 
 
 _global_expert_location_metadata: Optional[ExpertLocationMetadata] = None
