@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Optional, Sequence, Tuple, Dict
 
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.quantization.deep_gemm import configure_deep_gemm_num_sms
+from sglang.srt.operations import execute_overlapped_operations
 from sglang.srt.operations_strategy import compute_layers_operations
 from sglang.srt.utils import DeepEPMode
 
@@ -150,6 +151,14 @@ def model_forward_tbo_layers(
     )
     del hidden_states, residual
 
+    operations=compute_layers_operations(layers, forward_mode)
+
+    # TODO do not hardcode
+    delta_stages={
+        ForwardMode.EXTEND: 0,
+        ForwardMode.DECODE: 2,
+    }[forward_batch.global_forward_mode]
+
     # TODO do not hardcode
     total_num_sm = torch.cuda.get_device_properties(device="cuda").multi_processor_count
     extend_mode_communication_num_sm = DEEPEP_NUM_SMS
@@ -160,18 +169,11 @@ def model_forward_tbo_layers(
     )
 
     with configure_deep_gemm_num_sms(deep_gemm_num_sms):
-        return model_forward_execute_two_batch(
-            inputs_a=inputs_a,
-            inputs_b=inputs_b,
-            operations_a=compute_layers_operations(layers, forward_mode),
-            operations_b=compute_layers_operations(layers, forward_mode),
-            # TODO do not hardcode
-            delta_stages={
-                ForwardMode.EXTEND: 0,
-                ForwardMode.DECODE: 2,
-            }[forward_batch.global_forward_mode],
+        output_a, output_b = execute_overlapped_operations(
+            inputs_a, inputs_b, operations, operations, delta_stages=delta_stages
         )
 
+    return _model_forward_merge_outputs(output_a, output_b)
 
 def _model_forward_split_inputs(
     hidden_states: torch.Tensor,
@@ -212,7 +214,7 @@ def _model_forward_filter_inputs(
     )
 
 
-def model_forward_merge_outputs(output_a, output_b):
+def _model_forward_merge_outputs(output_a, output_b):
     def _handle_key(name):
         value_a = output_a[name]
         value_b = output_b[name]
