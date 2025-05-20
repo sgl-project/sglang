@@ -510,6 +510,16 @@ class EmbeddingResponse(BaseModel):
     usage: Optional[UsageInfo] = None
 
 
+class ScoringRequest(BaseModel):
+    """Request model for the scoring API."""
+    text_1: str
+    text_2: List[str]
+    positive_token_id: int
+    negative_token_id: int
+    prepend: bool = False
+    model: str  # Required for model identification
+
+
 def exclude_if_none(obj, field_names: List[str]):
     omit_if_none_fields = {k for k, v in obj.model_fields.items() if k in field_names}
     return {k: v for k, v in obj if k not in omit_if_none_fields or v is not None}

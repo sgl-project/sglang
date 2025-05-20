@@ -17,6 +17,7 @@ import asyncio
 import base64
 import json
 import logging
+import math
 import os
 import time
 import uuid
@@ -72,6 +73,7 @@ from sglang.srt.openai_api.protocol import (
     ToolCall,
     TopLogprob,
     UsageInfo,
+    ScoringRequest,
 )
 from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.utils import convert_json_schema_to_str, get_exception_traceback
@@ -1245,6 +1247,7 @@ def v1_chat_generate_request(
                 prompt_kwargs = {"text": input_ids}
             else:
                 prompt_kwargs = {"input_ids": input_ids}
+        request_ids = [req.rid for req in all_requests]
 
     adapted_request = GenerateReqInput(
         **prompt_kwargs,
@@ -2006,3 +2009,34 @@ def to_openai_style_logprobs(
         append_top_logprobs(output_top_logprobs)
 
     return ret_logprobs
+
+
+async def v1_score(tokenizer_manager, raw_request):
+    """Score a list of items against a prompt using positive/negative token logits."""
+    try:
+        # Parse request
+        request_data = await raw_request.json()
+        request = ScoringRequest(**request_data)
+
+        # Use tokenizer_manager's score_request method directly
+        result = await tokenizer_manager.score_request(
+            text_1=request.text_1,
+            text_2=request.text_2,
+            positive_token_id=request.positive_token_id,
+            negative_token_id=request.negative_token_id,
+            prepend=request.prepend,
+            request=request,
+        )
+
+        return ORJSONResponse({
+            "scores": result["scores"],
+            "model": request.model,
+            "usage": result["usage"]
+        })
+
+    except Exception as e:
+        logger.error(f"Error in v1_score: {str(e)}")
+        return ORJSONResponse(
+            {"error": {"message": str(e)}},
+            status_code=HTTPStatus.BAD_REQUEST
+        )

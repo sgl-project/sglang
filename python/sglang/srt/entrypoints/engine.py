@@ -472,6 +472,84 @@ class Engine(EngineBase):
     def save_sharded_model(self, **kwargs):
         self.collective_rpc("save_sharded_model", **kwargs)
 
+    def score(
+        self,
+        text_1: str,
+        text_2: Union[str, List[str]],
+        positive_token_id: int,
+        negative_token_id: int,
+        prepend: bool = False,
+    ) -> Dict:
+        """
+        Score a list of items against a prompt using positive/negative token probabilities.
+        
+        This method computes a score for each item in text_2 by comparing the model's probability
+        of generating the positive token versus the negative token immediately after the prompt.
+        The score is computed as: prob(positive) / (prob(positive) + prob(negative)).
+        
+        For example, given:
+        - text_1 = "My name is "
+        - text_2 = ["John", "you"]
+        - positive_token_id = token_id("John")
+        - negative_token_id = token_id("you")
+        
+        The method will return higher scores for items where the model assigns higher probability
+        to the positive token compared to the negative token.
+
+        Args:
+            text_1: The prompt text to score against. Must not be empty.
+            text_2: The text(s) to score. Can be a single string or list of strings.
+            positive_token_id: The token ID to use for positive scoring. Must be in model's vocabulary.
+            negative_token_id: The token ID to use for negative scoring. Must be in model's vocabulary.
+            prepend: If True, prepends text_2 to text_1 (i.e. text_2 + text_1). 
+                    If False (default), appends text_2 to text_1 (i.e. text_1 + text_2).
+                    No additional characters (like newlines) are inserted between the texts.
+
+        Returns:
+            Dict containing:
+            - scores: List[float] - Scores in range [0,1] where higher values indicate stronger
+              preference for the positive token. None if logprobs are not available.
+            - model_info: Dict with model name and context length
+            - usage: Dict with token usage statistics (prompt_tokens, completion_tokens, cached_tokens, total_tokens)
+
+        Raises:
+            ValueError: If text_1 is empty, token IDs are out of vocabulary, or logprobs are not available
+                      for the specified tokens.
+        """
+        loop = asyncio.get_event_loop()
+        return loop.run_until_complete(
+            self.tokenizer_manager.score_request(
+                text_1=text_1,
+                text_2=text_2,
+                positive_token_id=positive_token_id,
+                negative_token_id=negative_token_id,
+                prepend=prepend,
+                request=None
+            )
+        )
+
+    async def async_score(
+        self,
+        text_1: str,
+        text_2: Union[str, List[str]],
+        positive_token_id: int,
+        negative_token_id: int,
+        prepend: bool = False,
+    ) -> Dict:
+        """
+        Asynchronous version of score method.
+
+        See score() for detailed documentation.
+        """
+        return await self.tokenizer_manager.score_request(
+            text_1=text_1,
+            text_2=text_2,
+            positive_token_id=positive_token_id,
+            negative_token_id=negative_token_id,
+            prepend=prepend,
+            request=None
+        )
+
 
 def _set_envs_and_config(server_args: ServerArgs):
     # Set global environments

@@ -82,8 +82,19 @@ from sglang.srt.openai_api.adapter import (
     v1_retrieve_batch,
     v1_retrieve_file,
     v1_retrieve_file_content,
+    v1_score,
 )
-from sglang.srt.openai_api.protocol import ModelCard, ModelList
+from sglang.srt.openai_api.protocol import (
+    ModelCard,
+    ModelList,
+    ChatCompletionRequest,
+    ChatCompletionResponse,
+    CompletionRequest,
+    CompletionResponse,
+    EmbeddingRequest,
+    EmbeddingResponse,
+    ScoringRequest,
+)
 from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
@@ -712,6 +723,12 @@ async def vertex_generate(vertex_req: VertexGenerateReqInput, raw_request: Reque
     if isinstance(ret, Response):
         return ret
     return ORJSONResponse({"predictions": ret})
+
+
+@app.post("/v1/score")
+async def openai_v1_score(raw_request: Request):
+    """OpenAI-compatible endpoint for the scoring API. See Engine.score() for detailed documentation."""
+    return await v1_score(_global_state.tokenizer_manager, raw_request)
 
 
 def _create_error_response(e):
