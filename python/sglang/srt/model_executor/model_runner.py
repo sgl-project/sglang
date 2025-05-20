@@ -204,6 +204,7 @@ class ModelRunner:
                 "speculative_accept_threshold_acc": server_args.speculative_accept_threshold_acc,
                 "use_mla_backend": self.use_mla_backend,
                 "mm_attention_backend": server_args.mm_attention_backend,
+                "ep_num_redundant_experts": server_args.ep_num_redundant_experts,
             }
         )
 
