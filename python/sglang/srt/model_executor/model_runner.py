@@ -78,7 +78,7 @@ from sglang.srt.model_loader.loader import (
     device_loading_context,
     get_model_loader,
 )
-from sglang.srt.model_loader.utils import set_default_torch_dtype
+from sglang.srt.model_loader.utils import SupportsPP, set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.patch_torch import monkey_patch_torch_reductions
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -219,11 +219,6 @@ class ModelRunner:
 
         # If it is a draft model, tp_group can be different
         self.initialize(min_per_gpu_memory)
-
-        # temporary cached values
-        self.support_pp = (
-            "pp_proxy_tensors" in inspect.signature(self.model.forward).parameters
-        )
 
     def initialize(self, min_per_gpu_memory: float):
         server_args = self.server_args
@@ -517,6 +512,22 @@ class ModelRunner:
             )
         monkey_patch_vllm_parallel_state(reverse=True)
         monkey_patch_isinstance_for_vllm_base_layer(reverse=True)
+
+        # check model support pipeline parallelism
+        if isinstance(self.model, SupportsPP):
+            self.support_pp = True
+            if self.model.config.tie_word_embeddings:
+                raise RuntimeError(
+                    "model %s does not support pipeline parallelism now when enabled tie_word_embeddings.",
+                    self.model.__class__,
+                )
+        else:
+            self.support_pp = False
+            if self.pp_size > 1:
+                raise RuntimeError(
+                    "model %s does not support pipeline parallelism now.",
+                    self.model.__class__,
+                )
 
         if self.server_args.kv_cache_dtype == "fp8_e4m3":
             if self.server_args.quantization_param_path is not None:
