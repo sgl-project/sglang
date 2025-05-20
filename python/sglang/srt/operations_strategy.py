@@ -4,6 +4,12 @@ from sglang.srt import operations
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
+class OperationStrategy:
+    @staticmethod
+    def init_new() -> "OperationStrategy":
+        return TODO
+
+# --------------------------------------- TODO remove -----------------------------------------
 
 def compute_layers_operations(
     layers: torch.nn.ModuleList,
