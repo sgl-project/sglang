@@ -37,6 +37,7 @@ class FlashAttentionMetadata:
     max_seq_len_k: int = 0
     # Cumulative sequence lengths for query
     cu_seqlens_q: torch.Tensor = None
+    cu_seqlens_q_cpu: torch.Tensor = None
     # Cumulative sequence lengths for key
     cu_seqlens_k: torch.Tensor = None
     # Window size (typically used by Gemma)
@@ -359,6 +360,9 @@ class FlashAttentionBackend(AttentionBackend):
                     metadata.cu_seqlens_q = torch.arange(
                         0, batch_size + 1, dtype=torch.int32, device=device
                     )
+                    metadata.cu_seqlens_q_cpu = torch.arange(
+                        0, batch_size + 1, dtype=torch.int32, device="cpu"
+                    )
                     metadata.cu_seqlens_k = torch.nn.functional.pad(
                         torch.cumsum(
                             metadata.cache_seqlens_int32, dim=0, dtype=torch.int32
@@ -381,6 +385,13 @@ class FlashAttentionBackend(AttentionBackend):
                         step=self.topk,
                         dtype=torch.int32,
                         device=device,
+                    )
+                    metadata.cu_seqlens_q_cpu = torch.arange(
+                        0,
+                        batch_size * self.topk + 1,
+                        step=self.topk,
+                        dtype=torch.int32,
+                        device="cpu",
                     )
                     metadata.cu_seqlens_k = torch.nn.functional.pad(
                         torch.cumsum(
@@ -413,6 +424,12 @@ class FlashAttentionBackend(AttentionBackend):
                         dtype=torch.int32,
                         device=device,
                     )
+                    metadata_expand.cu_seqlens_q_cpu = torch.arange(
+                        0,
+                        metadata_expand.cache_seqlens_int32.numel() + 1,
+                        dtype=torch.int32,
+                        device="cpu",
+                    )
                     metadata_expand.cu_seqlens_k = torch.arange(
                         0,
                         metadata_expand.cache_seqlens_int32.numel() * decode_length + 1,
@@ -434,6 +451,9 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
                 metadata.cu_seqlens_q = torch.arange(
                     0, batch_size + 1, dtype=torch.int32, device=device
+                )
+                metadata.cu_seqlens_q_cpu = torch.arange(
+                    0, batch_size + 1, dtype=torch.int32, device="cpu"
                 )
                 metadata.cu_seqlens_k = torch.nn.functional.pad(
                     torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
@@ -463,6 +483,13 @@ class FlashAttentionBackend(AttentionBackend):
                     dtype=torch.int32,
                     device=device,
                 )
+                metadata.cu_seqlens_q_cpu = torch.arange(
+                    0,
+                    batch_size * self.speculative_num_draft_tokens + 1,
+                    self.speculative_num_draft_tokens,
+                    dtype=torch.int32,
+                    device="cpu",
+                )
                 metadata.cu_seqlens_k = torch.nn.functional.pad(
                     torch.cumsum(
                         metadata.cache_seqlens_int32, dim=0, dtype=torch.int32
@@ -487,6 +514,13 @@ class FlashAttentionBackend(AttentionBackend):
                     step=self.speculative_num_draft_tokens,
                     dtype=torch.int32,
                     device=device,
+                )
+                metadata.cu_seqlens_q_cpu = torch.arange(
+                    0,
+                    batch_size * self.speculative_num_draft_tokens + 1,
+                    step=self.speculative_num_draft_tokens,
+                    dtype=torch.int32,
+                    device="cpu",
                 )
                 metadata.cu_seqlens_k = torch.nn.functional.pad(
                     torch.cumsum(
@@ -592,13 +626,20 @@ class FlashAttentionBackend(AttentionBackend):
                 or forward_batch.forward_mode == ForwardMode.DRAFT_EXTEND
             ):
                 extend_seq_lens = forward_batch.extend_seq_lens
-                metadata.max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
+                extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+                metadata.max_seq_len_q = max(extend_seq_lens_cpu)
                 metadata.cu_seqlens_q = torch.nn.functional.pad(
                     torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32), (1, 0)
+                )
+                metadata.cu_seqlens_q_cpu = torch.nn.functional.pad(
+                    torch.cumsum(extend_seq_lens_cpu, dim=0, dtype=torch.int32), (1, 0)
                 )
             else:
                 metadata.max_seq_len_q = metadata.max_seq_len_k
                 metadata.cu_seqlens_q = metadata.cu_seqlens_k
+                metadata.cu_seqlens_q_cpu = torch.nn.functional.pad(
+                    torch.cumsum(seqlens_in_batch_cpu, dim=0, dtype=torch.int32), (1, 0)
+                )
 
             # Setup local attention if enabled
             if forward_batch.forward_mode == ForwardMode.EXTEND:
@@ -1812,15 +1853,17 @@ class FlashAttentionBackend(AttentionBackend):
             metadata.local_attn_metadata = None
             return
 
-        cu_seqlens_q = metadata.cu_seqlens_q
-        cache_seqlens_int32 = metadata.cache_seqlens_int32
+        cu_seqlens_q_cpu = metadata.cu_seqlens_q_cpu
+        cache_seqlens_int32_cpu = metadata.cache_seqlens_int32_cpu
         page_table = metadata.page_table
-        if cu_seqlens_q is None or cache_seqlens_int32 is None or page_table is None:
+        if (
+            cu_seqlens_q_cpu is None
+            or cache_seqlens_int32_cpu is None
+            or page_table is None
+        ):
             metadata.local_attn_metadata = None
             return
 
-        cu_seqlens_q_np = cu_seqlens_q.cpu().numpy()
-        seq_lens_np = cache_seqlens_int32.cpu().numpy()
         (
             seqlens_q_local_np,
             cu_seqlens_q_local_np,
@@ -1828,8 +1871,8 @@ class FlashAttentionBackend(AttentionBackend):
             block_table_local,
         ) = make_local_attention_virtual_batches(
             self.attention_chunk_size,
-            cu_seqlens_q_np,
-            seq_lens_np,
+            cu_seqlens_q_cpu.numpy(),
+            cache_seqlens_int32_cpu.numpy(),
             page_table,
             self.page_size,
         )
@@ -1852,12 +1895,11 @@ class FlashAttentionBackend(AttentionBackend):
         during the CUDA graph capture phase, optimizing memory usage by creating views of
         pre-allocated buffers with exactly the sizes needed.
         """
-        seq_lens_capture = metadata.cache_seqlens_int32
-        max_seq_len = int(seq_lens_capture.max().item())
-        page_table_capture = metadata.page_table
 
-        cu_seqlens_q_np = metadata.cu_seqlens_q.cpu().numpy()
-        seqlens_np = seq_lens_capture.cpu().numpy()
+        cu_seqlens_q_cpu = torch.arange(
+            bs + 1, device="cpu", dtype=metadata.cu_seqlens_q.dtype
+        )
+
         (
             seqlens_q_local_np,
             cu_seqlens_q_local_np,
@@ -1865,9 +1907,9 @@ class FlashAttentionBackend(AttentionBackend):
             block_table_local_np,
         ) = make_local_attention_virtual_batches(
             self.attention_chunk_size,
-            cu_seqlens_q_np,
-            seqlens_np,
-            page_table_capture,
+            cu_seqlens_q_cpu.numpy(),
+            metadata.cache_seqlens_int32_cpu[:bs].numpy(),
+            metadata.page_table,
             self.page_size,
         )
 
@@ -1896,7 +1938,7 @@ class FlashAttentionBackend(AttentionBackend):
             local_seqused_k=local_seqused_k,
             local_block_table=local_block_table,
             local_max_query_len=1,
-            local_max_seq_len=max_seq_len,
+            local_max_seq_len=1,
         )
 
     def _update_local_attn_metadata_for_replay(
@@ -1918,24 +1960,8 @@ class FlashAttentionBackend(AttentionBackend):
 
         # Create a modified version for local attention that only processes the last token
         # This mimics the normal decode pattern
-        cu_seqlens_q = torch.arange(
-            bs + 1, device=cu_seqlens_q.device, dtype=cu_seqlens_q.dtype
-        )
-        cu_seqlens_q_cpu = torch.arange(bs + 1, dtype=cu_seqlens_q.dtype)
-        seqlens = metadata.cache_seqlens_int32_cpu[:bs]
-        # Slice the page_table to match the batch size and actual sequence length
-        # This serves three important purposes:
-        # 1. Ensures we only process the actual batch size (bs) and not the maximum batch size
-        # 2. Limits the sequence length to prevent processing padding tokens or garbage values
-        # 3. Prevents zeros in the block table which can cause garbage output during replay
-        #
-        # Without this slicing, the pre-allocated page_table may contain zeros or invalid indices
-        # beyond the actual sequence length, leading to incorrect attention calculations
-        max_seq_len = int(seqlens.max().item())
-        sliced_page_table = metadata.page_table[:bs, :max_seq_len]
+        cu_seqlens_q_cpu = torch.arange(bs + 1, device="cpu", dtype=cu_seqlens_q.dtype)
 
-        cu_seqlens_q_np = cu_seqlens_q_cpu.numpy()
-        seqlens_np = seqlens.numpy()
         (
             seqlens_q_local_np,
             cu_seqlens_q_local_np,
@@ -1943,9 +1969,9 @@ class FlashAttentionBackend(AttentionBackend):
             block_table_local,
         ) = make_local_attention_virtual_batches(
             self.attention_chunk_size,
-            cu_seqlens_q_np,
-            seqlens_np,
-            sliced_page_table,
+            cu_seqlens_q_cpu.numpy(),
+            metadata.cache_seqlens_int32_cpu[:bs].numpy(),
+            metadata.page_table[:bs, : metadata.max_seq_len_k],
             self.page_size,
         )
 
