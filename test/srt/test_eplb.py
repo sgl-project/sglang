@@ -52,6 +52,7 @@ class TestDynamicEPLB(CustomTestCase):
                 "--ep-dispatch-algorithm",
                 "static",
             ],
+            env={"SGL_ENABLE_JIT_DEEPGEMM": "0", **os.environ},
         )
 
     @classmethod
@@ -73,6 +74,8 @@ class TestDynamicEPLB(CustomTestCase):
 
 class TestStaticEPLB(CustomTestCase):
     def test_save_expert_distribution_and_init_expert_location(self):
+        os.environ["SGL_ENABLE_JIT_DEEPGEMM"] = "0"
+
         with tempfile.TemporaryDirectory() as tmp_dir:
             engine_kwargs = dict(
                 model_path=DEFAULT_MLA_MODEL_NAME_FOR_TEST,
