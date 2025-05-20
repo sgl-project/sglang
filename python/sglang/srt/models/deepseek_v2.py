@@ -679,7 +679,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                     and forward_batch.forward_mode.is_decode()
                 ):
                     return self.forward_absorb_fused_mla_rope(
-                        positions, hidden_states, forward_batch
+                        positions, hidden_states, forward_batch, zero_allocator
                     )
                 else:
                     return self.forward_absorb(
