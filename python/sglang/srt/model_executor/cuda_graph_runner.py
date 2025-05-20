@@ -347,7 +347,14 @@ class CudaGraphRunner:
             if self.is_encoder_decoder
             else True
         )
-        return is_bs_supported and is_encoder_lens_supported
+
+        is_tbo_supported = (
+            forward_batch.can_run_tbo
+            if self.model_runner.server_args.enable_two_batch_overlap
+            else True
+        )
+
+        return is_bs_supported and is_encoder_lens_supported and is_tbo_supported
 
     def capture(self):
         with graph_capture() as graph_capture_context:
@@ -442,6 +449,19 @@ class CudaGraphRunner:
         else:
             lora_paths = None
 
+        if self.model_runner.server_args.enable_two_batch_overlap:
+            tbo_split_seq_index = two_batch_overlap.compute_split_seq_index(
+                forward_mode=self.capture_forward_mode,
+                num_tokens=num_tokens,
+                extend_lens=None,
+            )
+            # For simplicity, when two_batch_overlap is enabled, we only capture CUDA Graph for tbo=true
+            assert (
+                tbo_split_seq_index is not None
+            ), f"{self.capture_forward_mode=} {num_tokens=}"
+        else:
+            tbo_split_seq_index = None
+
         forward_batch = ForwardBatch(
             forward_mode=self.capture_forward_mode,
             batch_size=bs,
@@ -464,7 +484,9 @@ class CudaGraphRunner:
             capture_hidden_mode=self.capture_hidden_mode,
             lora_paths=lora_paths,
             num_token_non_padded=self.num_token_non_padded,
+            tbo_split_seq_index=tbo_split_seq_index,
         )
+        forward_batch.prepare_tbo()
 
         if lora_paths is not None:
             self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
