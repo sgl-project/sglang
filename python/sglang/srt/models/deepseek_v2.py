@@ -1381,6 +1381,10 @@ class DeepseekV2Model(nn.Module):
         residual: torch.Tensor,
         start_layer: int,
     ):
+        end_layer = len(self.layers)
+        if start_layer == end_layer:
+            return hidden_states, residual
+
         if self.attn_tp_size != 1:
             hidden_states += residual
             residual = None
