@@ -290,7 +290,9 @@ class DeepseekV2MoE(nn.Module):
             )
 
             if global_server_args_dict["enable_two_batch_overlap"]:
-                self.tbo_deepep_dispatchers = [self._create_deepep_dispatcher() for _ in range(2)]
+                self.tbo_deepep_dispatchers = [
+                    self._create_deepep_dispatcher() for _ in range(2)
+                ]
             else:
                 self.deepep_dispatcher = self._create_deepep_dispatcher()
 
@@ -375,7 +377,9 @@ class DeepseekV2MoE(nn.Module):
 
     def op_dispatch_b(self, state):
         if self._enable_deepep_moe and (self.ep_size > 1):
-            with get_global_expert_distribution_recorder().with_current_layer(self.layer_id):
+            with get_global_expert_distribution_recorder().with_current_layer(
+                self.layer_id
+            ):
                 (
                     state.hidden_states_experts_input,
                     state.topk_idx_dispatched,
@@ -418,7 +422,9 @@ class DeepseekV2MoE(nn.Module):
 
     def op_combine_b(self, state):
         if self._enable_deepep_moe and (self.ep_size > 1):
-            state.hidden_states_after_combine = self._get_deepep_dispatcher(state).combine_b()
+            state.hidden_states_after_combine = self._get_deepep_dispatcher(
+                state
+            ).combine_b()
 
     def op_output(self, state):
         final_hidden_states = (
@@ -1348,7 +1354,9 @@ class DeepseekV2Model(nn.Module):
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
         zero_allocator = BumpAllocator(
-            buffer_size=len(self.layers) * 2 * (2 if global_server_args_dict["enable_two_batch_overlap"] else 1),
+            buffer_size=len(self.layers)
+            * 2
+            * (2 if global_server_args_dict["enable_two_batch_overlap"] else 1),
             dtype=torch.float32,
             device=(
                 input_embeds.device if input_embeds is not None else input_ids.device
@@ -1388,7 +1396,6 @@ class DeepseekV2Model(nn.Module):
             else:
                 hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
-
 
 
 class DeepseekV2ForCausalLM(nn.Module):

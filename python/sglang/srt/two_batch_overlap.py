@@ -1,7 +1,7 @@
 from contextlib import nullcontext
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple
 
 import torch
-from typing import TYPE_CHECKING, Optional, Sequence, Tuple, Dict, List
 
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.quantization.deep_gemm import configure_deep_gemm_num_sms
@@ -14,6 +14,7 @@ if TYPE_CHECKING:
 
 
 # -------------------------------- Compute Basic Info ---------------------------------------
+
 
 # TODO: may smartly disable TBO when batch size is too small b/c it will slow down
 def compute_split_seq_index(
@@ -62,6 +63,7 @@ def compute_split_token_index(
 
 
 # -------------------------------- Preparation ---------------------------------------
+
 
 class TboDPAttentionPreparer:
     def prepare_all_gather(
@@ -134,6 +136,7 @@ class TboDPAttentionPreparer:
 
 # -------------------------------- Execution ---------------------------------------
 
+
 # TODO rename?
 def model_forward_tbo_layers(
     layers,
@@ -196,7 +199,9 @@ def _model_forward_split_inputs(
             output_forward_batch=output_forward_batch,
             tbo_subbatch_index=tbo_subbatch_index,
         )
-        for tbo_subbatch_index, output_forward_batch in enumerate(forward_batch.tbo_children)
+        for tbo_subbatch_index, output_forward_batch in enumerate(
+            forward_batch.tbo_children
+        )
     ]
 
 

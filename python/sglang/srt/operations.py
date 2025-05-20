@@ -180,6 +180,6 @@ def _decorate_operation(operation: Operation, debug_name_prefix: str):
         return operation
     return ExecutionOperation(
         debug_name=debug_name_prefix
-                   + getattr(operation, "__name__", "unknown").replace("op_", ""),
+        + getattr(operation, "__name__", "unknown").replace("op_", ""),
         fn=operation,
     )
