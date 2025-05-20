@@ -162,7 +162,7 @@ def model_forward_tbo(layers, inputs):
     assert get_attention_tp_size() == 1
 
     inputs_arr = _model_forward_split_inputs(**inputs)
-    del hidden_states, residual
+    del inputs
 
     operations = compute_layers_operations(layers, forward_batch.forward_mode)
 
