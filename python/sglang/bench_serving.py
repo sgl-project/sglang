@@ -421,6 +421,7 @@ async def async_request_sglang_generate(
             output.error = "".join(traceback.format_exception(*exc_info))
             print(f"{output.error=}")
 
+    print(f"async_request_sglang_generate {output.latency=:.3f}")
     if pbar:
         pbar.update(1)
     return output
