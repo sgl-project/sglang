@@ -1,7 +1,10 @@
+from contextlib import nullcontext
+
 import torch
 from typing import TYPE_CHECKING, Optional, Sequence, Tuple, Dict
 
 from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.layers.quantization.deep_gemm import configure_deep_gemm_num_sms
 from sglang.srt.utils import DeepEPMode
 
 if TYPE_CHECKING:
@@ -136,7 +139,7 @@ def model_forward_tbo_layers(
     # The attn_tp_size!=1 case is not yet extracted to master
     assert get_attention_tp_size() == 1
 
-    inputs_a, inputs_b = model_forward_split_inputs(
+    inputs_a, inputs_b = _model_forward_split_inputs(
         positions=positions,
         hidden_states=hidden_states,
         forward_batch=forward_batch,
@@ -157,7 +160,7 @@ def model_forward_tbo_layers(
         else nullcontext()
     )
     with num_sm_context:
-        return two_batch_overlap.model_forward_execute_two_batch(
+        return model_forward_execute_two_batch(
             inputs_a=inputs_a,
             inputs_b=inputs_b,
             operations_a=compute_operations(0),
@@ -169,7 +172,7 @@ def model_forward_tbo_layers(
         )
 
 
-def model_forward_split_inputs(
+def _model_forward_split_inputs(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
     positions: torch.Tensor,
