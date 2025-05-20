@@ -1381,6 +1381,22 @@ class DeepseekV2Model(nn.Module):
         residual: torch.Tensor,
         start_layer: int,
     ):
+        end_layer = len(self.layers)
+        if start_layer == end_layer:
+            return hidden_states, residual
+
+        if self.attn_tp_size != 1:
+            hidden_states += residual
+            residual = None
+
+            hidden_states, local_hidden_states = (
+                forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
+                hidden_states,
+            )
+            tp_all_gather(
+                list(hidden_states.tensor_split(self.attn_tp_size)), local_hidden_states
+            )
+
         inputs_a, inputs_b = model_forward_split_inputs(
             positions=positions,
             hidden_states=hidden_states,
