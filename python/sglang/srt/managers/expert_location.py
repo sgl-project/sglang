@@ -118,6 +118,41 @@ class ExpertLocationMetadata:
         )
 
     @staticmethod
+    def init_by_eplb(
+        server_args: ServerArgs, model_config: ModelConfig, logical_count: torch.Tensor
+    ):
+        if not isinstance(logical_count, torch.Tensor):
+            logical_count = torch.tensor(logical_count)
+        if len(logical_count.shape) == 2:
+            logical_count = logical_count.unsqueeze(0)
+        logical_count = logical_count.to(server_args.device)
+
+        common = ExpertLocationMetadata._init_common(server_args, model_config)
+        model_config_for_expert_location = common["model_config_for_expert_location"]
+        num_physical_experts = common["num_physical_experts"]
+
+        phase = server_args.disaggregation_mode
+        if phase == "null":
+            phase = "decode"
+
+        physical_to_logical_map, logical_to_all_physical_map, expert_count = (
+            deepseek_eplb.rebalance_experts(
+                tokens_per_expert=logical_count,
+                num_physical_experts=num_physical_experts,
+                num_local_physical_experts=num_physical_experts // common["ep_size"],
+                num_groups=model_config_for_expert_location.num_groups,
+                num_nodes=server_args.nnodes,
+                phase=phase,
+            )
+        )
+
+        return ExpertLocationMetadata._init_raw(
+            ep_size=common["ep_size"],
+            physical_to_logical_map=physical_to_logical_map,
+            logical_to_all_physical_map=logical_to_all_physical_map,
+        )
+
+    @staticmethod
     def _init_common(server_args: ServerArgs, model_config: ModelConfig):
         model_config_for_expert_location = (
             ModelConfigForExpertLocation.from_model_config(model_config)
@@ -272,14 +307,12 @@ def compute_initial_expert_location_metadata(
             server_args, model_config, **data_dict
         )
     elif "logical_count" in data_dict:
-        # TODO pr-chain: enable this later
-        raise NotImplementedError
-        # logger.info(
-        #     "init_expert_location from init_by_eplb using ServerArgs.init_expert_location"
-        # )
-        # return ExpertLocationMetadata.init_by_eplb(
-        #     server_args, model_config, logical_count=data_dict["logical_count"]
-        # )
+        logger.info(
+            "init_expert_location from init_by_eplb using ServerArgs.init_expert_location"
+        )
+        return ExpertLocationMetadata.init_by_eplb(
+            server_args, model_config, logical_count=data_dict["logical_count"]
+        )
     else:
         raise NotImplementedError(
             f"Unknown init_expert_location format ({list(data_dict.keys())=})"
