@@ -144,9 +144,6 @@ def model_forward_tbo_layers(
     )
     del hidden_states, residual
 
-    inputs_a = _postprocess_splitted_inputs(**inputs_a)
-    inputs_b = _postprocess_splitted_inputs(**inputs_b)
-
     # TODO do not hardcode
     total_num_sm = torch.cuda.get_device_properties(
         device="cuda"
