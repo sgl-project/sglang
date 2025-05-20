@@ -631,8 +631,12 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.cu_seqlens_q = torch.nn.functional.pad(
                     torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32), (1, 0)
                 )
+                extend_seq_lens_cpu_tensor = torch.tensor(
+                    extend_seq_lens_cpu, dtype=torch.int32, device="cpu"
+                )
                 metadata.cu_seqlens_q_cpu = torch.nn.functional.pad(
-                    torch.cumsum(extend_seq_lens_cpu, dim=0, dtype=torch.int32), (1, 0)
+                    torch.cumsum(extend_seq_lens_cpu_tensor, dim=0, dtype=torch.int32),
+                    (1, 0),
                 )
             else:
                 metadata.max_seq_len_q = metadata.max_seq_len_k
