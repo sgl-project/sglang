@@ -1235,6 +1235,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
+        tbo_subbatch_index: Optional[int] = None,
     ):
         state.hidden_states_after_comm_pre_attn, state.residual_after_input_ln = (
             self.layer_communicator.prepare_attn(
@@ -1246,6 +1247,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 forward_batch=forward_batch,
                 positions=positions,
                 zero_allocator=zero_allocator,
+                tbo_subbatch_index=tbo_subbatch_index,
             )
         )
 
