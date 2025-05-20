@@ -1302,6 +1302,7 @@ async def benchmark(
     )
 
     print("\n{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=50, c="="))
+    print("{:<40} {:<10}".format("Model:", model_id))
     print("{:<40} {:<10}".format("Backend:", backend))
     print("{:<40} {:<10}".format("Traffic request rate:", request_rate))
     print(
@@ -1370,6 +1371,7 @@ async def benchmark(
     ):
         result = {
             # Arguments
+            "model": model_id,
             "backend": args.backend,
             "dataset_name": args.dataset_name,
             "request_rate": request_rate,
