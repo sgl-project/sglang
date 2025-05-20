@@ -1,23 +1,31 @@
-import torch
+from abc import ABC
 
+import torch
 from sglang.srt import operations
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
-class OperationStrategy:
+
+class OperationStrategy(ABC):
     @staticmethod
     def init_new() -> "OperationStrategy":
         return TODO
 
-# --------------------------------------- TODO remove -----------------------------------------
+    def compute_layers_operations(self, layers: torch.nn.ModuleList):
+        return [
+            op for layer in layers for op in self.compute_layer_operations(layer)
+        ]
 
-def compute_layers_operations(
-    layers: torch.nn.ModuleList,
-    forward_mode: ForwardMode,
-):
-    return [
-        op for layer in layers for op in compute_layer_operations(layer, forward_mode)
-    ]
+    def compute_layer_operations(self, layer: torch.nn.Module):
+        raise NotImplementedError
+
+
+class _DenseOperationStrategy(OperationStrategy):
+    def compute_layer_operations(self, layer: torch.nn.Module):
+        return TODO
+
+
+# --------------------------------------- TODO remove -----------------------------------------
 
 
 # TODO refactor this if there are more overlapping strategies
