@@ -370,7 +370,9 @@ class FlashAttentionBackend(AttentionBackend):
                     ]
                 else:
                     metadata.cache_seqlens_int32 = (seqlens_in_batch).to(torch.int32)
-                    metadata.cache_seqlens_int32_cpu = (seqlens_in_batch_cpu).to(torch.int32)
+                    metadata.cache_seqlens_int32_cpu = (seqlens_in_batch_cpu).to(
+                        torch.int32
+                    )
                     metadata.max_seq_len_q = self.topk
                     metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
                     metadata.cu_seqlens_q = torch.arange(
@@ -475,7 +477,9 @@ class FlashAttentionBackend(AttentionBackend):
                 self._init_local_attn_metadata(metadata, device)
             else:
                 metadata.cache_seqlens_int32 = forward_batch.seq_lens.to(torch.int32)
-                metadata.cache_seqlens_int32_cpu = forward_batch.seq_lens_cpu.to(torch.int32)
+                metadata.cache_seqlens_int32_cpu = forward_batch.seq_lens_cpu.to(
+                    torch.int32
+                )
                 metadata.max_seq_len_q = self.speculative_num_draft_tokens
                 metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
                 metadata.cu_seqlens_q = torch.arange(
@@ -560,7 +564,9 @@ class FlashAttentionBackend(AttentionBackend):
                 )  # (bsz, draft_num)
                 metadata_expand.page_table = non_masked_page_table.gather(1, sort_order)
                 metadata_expand.cache_seqlens_int32 = mask.sum(dim=1).to(torch.int32)
-                metadata_expand.cache_seqlens_int32_cpu = mask.sum(dim=1).to(torch.int32).cpu()
+                metadata_expand.cache_seqlens_int32_cpu = (
+                    mask.sum(dim=1).to(torch.int32).cpu()
+                )
                 metadata_expand.cu_seqlens_k = torch.nn.functional.pad(
                     torch.cumsum(
                         metadata_expand.cache_seqlens_int32, dim=0, dtype=torch.int32
@@ -1376,8 +1382,8 @@ class FlashAttentionBackend(AttentionBackend):
                         "cache_seqlens"
                     ][:bs]
                     metadata.cache_seqlens_int32_cpu = self.decode_cuda_graph_metadata[
-                       "cache_seqlens_cpu"
-                   ][:bs]
+                        "cache_seqlens_cpu"
+                    ][:bs]
                     metadata.max_seq_len_k = seq_lens.max().item() + (
                         self.speculative_step_id + 1
                     )
@@ -1418,7 +1424,7 @@ class FlashAttentionBackend(AttentionBackend):
                     # 2. The second half of metadata for draft tokens (per_batch_num_tokens = topk)
                     metadata_expand.cache_seqlens_int32 = (
                         self.draft_decode_metadata_topk_expand["cache_seqlens"][
-                        : bs * self.topk
+                            : bs * self.topk
                         ]
                     )
                     metadata_expand.cache_seqlens_int32_cpu = (
@@ -1476,8 +1482,8 @@ class FlashAttentionBackend(AttentionBackend):
                     "cache_seqlens"
                 ][:bs]
                 metadata.cache_seqlens_int32_cpu = self.target_verify_metadata[
-                                                   "cache_seqlens_cpu"
-                                               ][:bs]
+                    "cache_seqlens_cpu"
+                ][:bs]
                 metadata.cache_seqlens_int32.copy_(
                     (seq_lens + self.speculative_num_draft_tokens).to(torch.int32)
                 )
@@ -1525,7 +1531,7 @@ class FlashAttentionBackend(AttentionBackend):
                 # 2. The second half of metadata for draft tokens (per_batch_num_tokens = topk)
                 metadata_expand.cache_seqlens_int32 = (
                     self.target_verify_metadata_topk_expand["cache_seqlens"][
-                    : bs * self.speculative_num_draft_tokens
+                        : bs * self.speculative_num_draft_tokens
                     ]
                 )
                 metadata_expand.cache_seqlens_int32_cpu = (
