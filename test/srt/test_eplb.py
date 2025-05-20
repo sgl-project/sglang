@@ -17,7 +17,7 @@ from sglang.test.test_utils import (
 )
 
 
-class TestEPLBEndToEnd(CustomTestCase):
+class TestDynamicEPLB(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
@@ -70,7 +70,7 @@ class TestEPLBEndToEnd(CustomTestCase):
         self.assertGreater(metrics["score"], 0.5)
 
 
-class TestEPLBMisc(CustomTestCase):
+class TestStaticEPLB(CustomTestCase):
     def test_save_expert_distribution_and_init_expert_location(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             engine_kwargs = dict(
