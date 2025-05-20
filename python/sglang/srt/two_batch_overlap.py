@@ -1,7 +1,7 @@
 from contextlib import nullcontext
 
 import torch
-from typing import TYPE_CHECKING, Optional, Sequence, Tuple, Dict
+from typing import TYPE_CHECKING, Optional, Sequence, Tuple, Dict, List
 
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.quantization.deep_gemm import configure_deep_gemm_num_sms
