@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 _OutputMode = Literal["file", "object"]
 
 
-class ExpertDistributionRecorder:
+class ExpertDistributionRecorder(ABC):
     """Global expert distribution recording"""
 
     @staticmethod
@@ -220,7 +220,9 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         return output
 
 
-_global_expert_distribution_recorder: Optional[ExpertDistributionRecorder] = None
+_global_expert_distribution_recorder: Optional[ExpertDistributionRecorder] = (
+    _ExpertDistributionRecorderNoop()
+)
 
 
 def get_global_expert_distribution_recorder():
@@ -229,7 +231,6 @@ def get_global_expert_distribution_recorder():
 
 def set_global_expert_distribution_recorder(value):
     global _global_expert_distribution_recorder
-    assert _global_expert_distribution_recorder is None
     _global_expert_distribution_recorder = value
 
 
@@ -248,8 +249,7 @@ class _SinglePassGatherer(ABC):
                 server_args, expert_location_metadata, rank
             )
         if server_args.enable_deepep_moe:
-            # `auto` has many restrictions now, so we lower the priority to implement low-latency capturing for auto
-            if server_args.deepep_mode in ["normal", "auto"]:
+            if server_args.deepep_mode == "normal":
                 return _DeepepNormalSinglePassGatherer(expert_location_metadata, rank)
             elif server_args.deepep_mode == "low_latency":
                 return _DeepepLowLatencySinglePassGatherer(

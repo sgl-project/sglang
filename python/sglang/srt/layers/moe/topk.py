@@ -372,7 +372,6 @@ def select_experts(
             renormalize=renormalize,
         )
 
-    if (r := get_global_expert_distribution_recorder()) is not None:
-        r.on_select_experts(topk_ids=topk_ids)
+    get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
 
     return topk_weights, topk_ids

@@ -103,6 +103,7 @@ class ServerArgs:
     collect_tokens_histogram: bool = False
     decode_log_interval: int = 40
     enable_request_time_stats_logging: bool = False
+    kv_events_config: Optional[str] = None
 
     # API related
     api_key: Optional[str] = None
@@ -828,6 +829,12 @@ class ServerArgs:
             action="store_true",
             default=ServerArgs.collect_tokens_histogram,
             help="Collect prompt/generation tokens histogram.",
+        )
+        parser.add_argument(
+            "--kv-events-config",
+            type=str,
+            default=None,
+            help="Config in json format for NVIDIA dynamo KV event publishing. Publishing will be enabled if this flag is used.",
         )
         parser.add_argument(
             "--decode-log-interval",
