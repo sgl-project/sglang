@@ -140,7 +140,7 @@ def model_forward_maybe_tbo_layers(
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         hidden_states: torch.Tensor,
-        residual: torch.Tensor,
+        residual: Optional[torch.Tensor],
 ):
     if enable_tbo:
         return model_forward_tbo_layers(
