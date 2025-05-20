@@ -1,20 +1,8 @@
-import os
-from contextlib import contextmanager
-from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
-    Any,
-    Callable,
-    Dict,
-    Generator,
-    List,
     Optional,
     Sequence,
-    Tuple,
-    Union,
 )
-
-import torch
 
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 
@@ -65,4 +53,3 @@ def compute_split_token_index(
         return 0
     else:
         raise NotImplementedError
-
