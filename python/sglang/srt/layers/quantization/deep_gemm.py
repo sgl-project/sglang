@@ -391,3 +391,12 @@ def _log_jit_build(M: int, N: int, K: int, kernel_type: DeepGemmKernelType):
     RuntimeCache.get = __patched_func
     yield
     RuntimeCache.get = origin_func
+
+@contextmanager
+def configure_deep_gemm_num_sms(num_sms):
+    original_num_sms = deep_gemm.get_num_sms()
+    deep_gemm.set_num_sms(num_sms)
+    try:
+        yield
+    finally:
+        deep_gemm.set_num_sms(original_num_sms)
