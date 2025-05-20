@@ -82,6 +82,7 @@ from sglang.srt.managers.expert_location import ModelConfigForExpertLocation
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.two_batch_overlap import model_forward_tbo_layers
 from sglang.srt.utils import (
     BumpAllocator,
     DeepEPMode,
@@ -1360,13 +1361,26 @@ class DeepseekV2Model(nn.Module):
             hidden_states = input_embeds
 
         residual = None
-        for i in range(len(self.layers)):
-            layer = self.layers[i]
-            hidden_states, residual = layer(
-                positions, hidden_states, forward_batch, residual, zero_allocator
-            )
 
-        TODO
+        normal_num_layers = (
+            self.first_k_dense_replace
+            if forward_batch.can_run_tbo
+            else len(self.layers)
+        )
+        for i in range(normal_num_layers):
+            with get_global_expert_distribution_recorder().with_current_layer(i):
+                layer = self.layers[i]
+                hidden_states, residual = layer(
+                    positions, hidden_states, forward_batch, residual, zero_allocator
+                )
+
+        hidden_states, residual = model_forward_tbo_layers(
+            positions=positions,
+            forward_batch=forward_batch,
+            hidden_states=hidden_states,
+            residual=residual,
+            start_layer=normal_num_layers,
+        )
 
         if not forward_batch.forward_mode.is_idle():
             if residual is None:
