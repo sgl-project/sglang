@@ -1398,8 +1398,6 @@ class DeepseekV2Model(nn.Module):
                 )
             ]
 
-        # print(
-        #     f"hi [{get_tensor_model_parallel_rank()}] forward_tbo_layers start {forward_batch.tbo_split_seq_index=} {hidden_states.shape=}")
         if self.attn_tp_size != 1:
             hidden_states += residual
             residual = None
@@ -1412,8 +1410,6 @@ class DeepseekV2Model(nn.Module):
                 list(hidden_states.tensor_split(self.attn_tp_size)), local_hidden_states
             )
 
-        # print(
-        #     f"hi [{get_tensor_model_parallel_rank()}] forward_tbo_layers gathered {hidden_states.shape=}")
         inputs_a, inputs_b = model_forward_split_inputs(
             positions=positions,
             hidden_states=hidden_states,
@@ -1421,9 +1417,6 @@ class DeepseekV2Model(nn.Module):
             residual=residual,
         )
         del hidden_states, residual
-
-        # print(
-        #     f"hi [{get_tensor_model_parallel_rank()}] forward_tbo_layers TBO-split {inputs_a['hidden_states'].shape=} {inputs_b['hidden_states'].shape=}")
 
         def _postprocess_splitted_inputs(hidden_states, residual, **kwargs):
             if self.attn_tp_size != 1:
@@ -1435,8 +1428,6 @@ class DeepseekV2Model(nn.Module):
 
         inputs_a = _postprocess_splitted_inputs(**inputs_a)
         inputs_b = _postprocess_splitted_inputs(**inputs_b)
-        # print(
-        #     f"hi [{get_tensor_model_parallel_rank()}] forward_tbo_layers postprocessed {inputs_a['hidden_states'].shape=} {inputs_b['hidden_states'].shape=}")
 
         # TODO do not hardcode
         total_num_sm = torch.cuda.get_device_properties(
