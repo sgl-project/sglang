@@ -148,18 +148,15 @@ def model_forward_tbo_layers(
     del hidden_states, residual
 
     # TODO do not hardcode
-    total_num_sm = torch.cuda.get_device_properties(
-        device="cuda"
-    ).multi_processor_count
+    total_num_sm = torch.cuda.get_device_properties(device="cuda").multi_processor_count
     extend_mode_communication_num_sm = DEEPEP_NUM_SMS
-    num_sm_context = (
-        configure_deep_gemm_num_sms(
-            num_sms=total_num_sm - extend_mode_communication_num_sm
-        )
+    deep_gemm_num_sms = (
+        total_num_sm - extend_mode_communication_num_sm
         if forward_batch.forward_mode.is_extend()
-        else nullcontext()
+        else None
     )
-    with num_sm_context:
+
+    with configure_deep_gemm_num_sms(deep_gemm_num_sms):
         return model_forward_execute_two_batch(
             inputs_a=inputs_a,
             inputs_b=inputs_b,
