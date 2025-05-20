@@ -807,6 +807,7 @@ class TokenizerManager:
         return await self._execute_profile(req)
 
     async def stop_profile(self):
+        self.auto_create_handle_loop()
         req = ProfileReq(type=ProfileReqType.STOP_PROFILE)
         return await self._execute_profile(req)
 
@@ -815,11 +816,6 @@ class TokenizerManager:
         if not result.success:
             raise RuntimeError(result.message)
         return result
-
-    def stop_profile(self):
-        self.auto_create_handle_loop()
-        req = ProfileReq(type=ProfileReqType.STOP_PROFILE)
-        self.send_to_scheduler.send_pyobj(req)
 
     async def start_expert_distribution_record(self):
         self.auto_create_handle_loop()
