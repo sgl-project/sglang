@@ -67,9 +67,9 @@ class DeepEPBuffer:
         if deepep_mode.enable_normal():
             hidden_bytes = hidden_size * param_bytes
             for config in (
-                _DeepEPConfig.get_instance().normal_dispatch_config
+                DeepEPConfig.get_instance().normal_dispatch_config
                 or Buffer.get_dispatch_config(group.size()),
-                _DeepEPConfig.get_instance().normal_combine_config
+                DeepEPConfig.get_instance().normal_combine_config
                 or Buffer.get_combine_config(group.size()),
             ):
                 num_nvl_bytes = max(
@@ -100,7 +100,7 @@ class DeepEPBuffer:
             num_qps_per_rank=(
                 max(
                     num_experts // group.size(),
-                    _DeepEPConfig.get_instance().num_sms // 2,
+                    DeepEPConfig.get_instance().num_sms // 2,
                 )
             ),
         )
@@ -127,7 +127,7 @@ class DeepEPBuffer:
         cls._dispatch_mode = DeepEPDispatchMode.LOW_LATENCY
 
 
-class _DeepEPConfig:
+class DeepEPConfig:
     _instance = None
 
     def __init__(self):
@@ -152,7 +152,7 @@ class _DeepEPConfig:
     @classmethod
     def get_instance(cls):
         if cls._instance is None:
-            cls._instance = _DeepEPConfig()
+            cls._instance = DeepEPConfig()
         return cls._instance
 
 
@@ -338,7 +338,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             async_finish=self.async_finish,
             allocate_on_comm_stream=(previous_event is not None) and self.async_finish,
             expert_alignment=128 if _ENABLE_JIT_DEEPGEMM else 1,
-            config=_DeepEPConfig.get_instance().normal_dispatch_config,
+            config=DeepEPConfig.get_instance().normal_dispatch_config,
         )
 
         get_global_expert_distribution_recorder().on_deepep_dispatch_normal(
@@ -445,7 +445,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             async_finish=self.async_finish,
             previous_event=previous_event,
             allocate_on_comm_stream=previous_event is not None,
-            config=_DeepEPConfig.get_instance().normal_combine_config,
+            config=DeepEPConfig.get_instance().normal_combine_config,
         )
         return combined_x, event
 
