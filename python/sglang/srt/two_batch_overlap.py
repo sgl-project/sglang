@@ -125,6 +125,55 @@ class TboDPAttentionPreparer:
 
 # -------------------------------- Execute ---------------------------------------
 
+def _forward_tbo_layers(
+    self,
+    positions: torch.Tensor,
+    forward_batch: ForwardBatch,
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    start_layer: int,
+):
+    end_layer = len(self.layers)
+    if start_layer == end_layer:
+        return hidden_states, residual
+
+    # The attn_tp_size!=1 case is not yet extracted to master
+    assert self.attn_tp_size == 1
+
+    inputs_a, inputs_b = model_forward_split_inputs(
+        positions=positions,
+        hidden_states=hidden_states,
+        forward_batch=forward_batch,
+        residual=residual,
+    )
+    del hidden_states, residual
+
+    inputs_a = _postprocess_splitted_inputs(**inputs_a)
+    inputs_b = _postprocess_splitted_inputs(**inputs_b)
+
+    # TODO do not hardcode
+    total_num_sm = torch.cuda.get_device_properties(
+        device="cuda"
+    ).multi_processor_count
+    extend_mode_communication_num_sm = DEEPEP_NUM_SMS
+    num_sm_context = (
+        configure_deep_gemm_num_sms(
+            num_sms=total_num_sm - extend_mode_communication_num_sm
+        )
+        if forward_batch.forward_mode.is_extend()
+        else nullcontext()
+    )
+    with num_sm_context:
+        return two_batch_overlap.model_forward_execute_two_batch(
+            inputs_a=inputs_a,
+            inputs_b=inputs_b,
+            operations_a=compute_operations(0),
+            operations_b=compute_operations(1),
+            delta_stages={
+                ForwardMode.EXTEND: 0,
+                ForwardMode.DECODE: 2,
+            }[forward_batch.global_forward_mode],
+        )
 
 
 def model_forward_split_inputs(
@@ -176,4 +225,5 @@ def model_forward_merge_outputs(output_a, output_b):
         return torch.concat([value_a, value_b], dim=0)
 
     return _handle_key("hidden_states"), _handle_key("residual")
+
 
