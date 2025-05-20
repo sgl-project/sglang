@@ -403,7 +403,6 @@ class FlashAttentionBackend(AttentionBackend):
                     metadata_expand.cache_seqlens_int32_cpu = torch.full(
                         (seqlens_in_batch_cpu.numel() * self.topk,),
                         decode_length,
-                        device=device,
                         dtype=torch.int32,
                     )
                     metadata_expand.max_seq_len_q = 1
