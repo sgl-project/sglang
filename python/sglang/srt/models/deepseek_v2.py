@@ -1364,6 +1364,8 @@ class DeepseekV2Model(nn.Module):
                 positions, hidden_states, forward_batch, residual, zero_allocator
             )
 
+        TODO
+
         if not forward_batch.forward_mode.is_idle():
             if residual is None:
                 hidden_states = self.norm(hidden_states)

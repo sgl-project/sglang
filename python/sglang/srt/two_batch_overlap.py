@@ -1,6 +1,7 @@
 import torch
 from typing import TYPE_CHECKING, Optional, Sequence, Tuple, Dict
 
+from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.utils import DeepEPMode
 
 if TYPE_CHECKING:
@@ -125,20 +126,15 @@ class TboDPAttentionPreparer:
 
 # -------------------------------- Execute ---------------------------------------
 
-def _forward_tbo_layers(
-    self,
+def model_forward_tbo_layers(
+    layers,
     positions: torch.Tensor,
     forward_batch: ForwardBatch,
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
-    start_layer: int,
 ):
-    end_layer = len(self.layers)
-    if start_layer == end_layer:
-        return hidden_states, residual
-
     # The attn_tp_size!=1 case is not yet extracted to master
-    assert self.attn_tp_size == 1
+    assert get_attention_tp_size() == 1
 
     inputs_a, inputs_b = model_forward_split_inputs(
         positions=positions,
