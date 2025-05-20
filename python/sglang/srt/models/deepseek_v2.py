@@ -224,6 +224,7 @@ class DeepseekV2MoE(nn.Module):
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
         self.n_share_experts_fusion = global_server_args_dict["n_share_experts_fusion"]
+        self.config = config
 
         if self.tp_size > config.n_routed_experts:
             raise ValueError(
@@ -290,19 +291,26 @@ class DeepseekV2MoE(nn.Module):
                 if self.gate.e_score_correction_bias is not None
                 else None
             )
+            self.deepep_dispatcher = self._create_deepep_dispatcher(config)
 
-            self.deepep_dispatcher = DeepEPDispatcher(
-                group=parallel_state.get_tp_group().device_group,
-                router_topk=self.top_k,
-                permute_fusion=True,
-                num_experts=config.n_routed_experts,
-                num_local_experts=config.n_routed_experts // self.tp_size,
-                hidden_size=config.hidden_size,
-                params_dtype=config.torch_dtype,
-                deepep_mode=DeepEPMode[global_server_args_dict["deepep_mode"]],
-                async_finish=True,  # TODO
-                return_recv_hook=True,
-            )
+            if global_server_args_dict["enable_two_batch_overlap"]:
+                self.tbo_deepep_dispatchers = [
+                    self._create_deepep_dispatcher(config) for i in range(2)
+                ]
+
+    def _create_deepep_dispatcher(self):
+        return DeepEPDispatcher(
+            group=parallel_state.get_tp_group().device_group,
+            router_topk=self.top_k,
+            permute_fusion=True,
+            num_experts=self.config.n_routed_experts,
+            num_local_experts=self.config.n_routed_experts // self.tp_size,
+            hidden_size=self.config.hidden_size,
+            params_dtype=self.config.torch_dtype,
+            deepep_mode=DeepEPMode[global_server_args_dict["deepep_mode"]],
+            async_finish=True,
+            return_recv_hook=True,
+        )
 
     @property
     def _enable_deepep_moe(self):
