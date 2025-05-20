@@ -1,8 +1,4 @@
-from typing import (
-    TYPE_CHECKING,
-    Optional,
-    Sequence,
-)
+from typing import TYPE_CHECKING, Optional, Sequence
 
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.utils import DeepEPMode
@@ -58,7 +54,9 @@ def compute_split_token_index(
 
 
 class TboDPAttentionPreparer:
-    def prepare_all_gather(self, local_batch, deepep_mode, enable_deepep_moe, enable_two_batch_overlap):
+    def prepare_all_gather(
+        self, local_batch, deepep_mode, enable_deepep_moe, enable_two_batch_overlap
+    ):
         self.enable_two_batch_overlap = enable_two_batch_overlap
 
         if local_batch is not None:
@@ -85,7 +83,9 @@ class TboDPAttentionPreparer:
         local_can_run_tbo_aggregated = min(partial_global_info[:, 0, 0].tolist())
         forward_modes = partial_global_info[:, 0, 1].tolist()
 
-        global_forward_mode, forward_mode_agree = self._compute_global_forward_mode(forward_modes)
+        global_forward_mode, forward_mode_agree = self._compute_global_forward_mode(
+            forward_modes
+        )
 
         can_run_tbo = (
             self.enable_two_batch_overlap
@@ -100,9 +100,7 @@ class TboDPAttentionPreparer:
     @staticmethod
     def _compute_local_forward_mode(local_batch):
         return (
-            local_batch.forward_mode
-            if local_batch is not None
-            else ForwardMode.IDLE
+            local_batch.forward_mode if local_batch is not None else ForwardMode.IDLE
         ).value
 
     @staticmethod
@@ -111,7 +109,9 @@ class TboDPAttentionPreparer:
             ForwardMode.DECODE.value if x == ForwardMode.IDLE.value else x
             for x in forward_modes
         ]
-        forward_mode_agree = TboDPAttentionPreparer._is_all_same(converted_forward_modes)
+        forward_mode_agree = TboDPAttentionPreparer._is_all_same(
+            converted_forward_modes
+        )
         global_forward_mode = (
             ForwardMode(converted_forward_modes[0]) if forward_mode_agree else None
         )
