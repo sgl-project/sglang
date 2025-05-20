@@ -215,6 +215,7 @@ class DeepseekV2MoE(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
+        layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
@@ -223,6 +224,7 @@ class DeepseekV2MoE(nn.Module):
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
         self.n_share_experts_fusion = global_server_args_dict["n_share_experts_fusion"]
+        self.layer_id = layer_id
 
         if self.tp_size > config.n_routed_experts:
             raise ValueError(
@@ -344,6 +346,9 @@ class DeepseekV2MoE(nn.Module):
                     num_expert_group=self.num_expert_group,
                     correction_bias=self.correction_bias,
                     routed_scaling_factor=self.routed_scaling_factor,
+                    expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                        layer_id=self.layer_id,
+                    ),
                 )
             else:
                 state.topk_idx_local = torch.full(
@@ -1183,6 +1188,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 config=config,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
+                layer_id=self.layer_id,
             )
         else:
             if enable_moe_dense_fully_dp():
