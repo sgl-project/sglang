@@ -137,6 +137,10 @@ class _DeepEPConfig:
             self.normal_dispatch_config = None
             self.normal_combine_config = None
 
+    @property
+    def num_sms(self):
+        return TODO
+
     @classmethod
     def get_instance(cls):
         if cls._instance is None:
