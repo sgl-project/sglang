@@ -144,44 +144,24 @@ def model_forward_maybe_tbo(
         residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
 ):
-    if enable_tbo:
-        return model_forward_tbo(
-            layers=layers,
-            positions=positions,
-            forward_batch=forward_batch,
-            hidden_states=hidden_states,
-            residual=residual,
-            zero_allocator=zero_allocator,
-        )
-    else:
-        return model_forward_non_tbo(
-            layers=layers,
-            positions=positions,
-            forward_batch=forward_batch,
-            hidden_states=hidden_states,
-            residual=residual,
-            zero_allocator=zero_allocator,
-        )
-
-
-def model_forward_tbo(
-        layers,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        hidden_states: torch.Tensor,
-        residual: torch.Tensor,
-        zero_allocator: BumpAllocator,
-):
-    # The attn_tp_size!=1 case is not yet extracted to master
-    assert get_attention_tp_size() == 1
-
-    inputs_arr = _model_forward_split_inputs(
+    inputs = dict(
         positions=positions,
         hidden_states=hidden_states,
         forward_batch=forward_batch,
         residual=residual,
         zero_allocator=zero_allocator,
     )
+    if enable_tbo:
+        return model_forward_tbo(layers=layers, inputs=inputs)
+    else:
+        return model_forward_non_tbo(layers=layers, inputs=inputs)
+
+
+def model_forward_tbo(layers, inputs):
+    # The attn_tp_size!=1 case is not yet extracted to master
+    assert get_attention_tp_size() == 1
+
+    inputs_arr = _model_forward_split_inputs(**inputs)
     del hidden_states, residual
 
     operations = compute_layers_operations(layers, forward_batch.forward_mode)
@@ -204,15 +184,7 @@ def model_forward_tbo(
     return _model_forward_merge_outputs(*outputs_arr)
 
 
-def model_forward_non_tbo(
-        layers,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        hidden_states: torch.Tensor,
-        residual: torch.Tensor,
-        zero_allocator: BumpAllocator,
-):
-    inputs = TODO
+def model_forward_non_tbo(layers, inputs):
     operations = compute_layers_operations(layers, forward_batch.forward_mode)
     outputs = execute_operations(inputs, operations)
     return outputs["hidden_states"], outputs["residual"]
