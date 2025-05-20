@@ -51,6 +51,7 @@ from sglang.srt.layers.quantization.deep_gemm import (
 from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
+from sglang.srt.managers.eplb_manager import EPLBManager
 from sglang.srt.managers.expert_distribution import (
     ExpertDistributionRecorder,
     get_global_expert_distribution_recorder,
@@ -252,6 +253,7 @@ class ModelRunner:
                     rank=self.tp_rank,
                 )
             )
+            self.eplb_manager = EPLBManager(self) if self.server_args.enable_eplb else None
 
         # Load the model
         self.sampler = Sampler()
