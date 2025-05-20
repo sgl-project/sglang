@@ -209,6 +209,26 @@ class ExpertLocationMetadata:
             ),
         )
 
+    # -------------------------------- mutation ------------------------------------
+
+    def update(
+        self,
+        other: "ExpertLocationMetadata",
+    ):
+        for field in [
+            "ep_size",
+        ]:
+            assert getattr(self, field) == getattr(other, field)
+
+        for field in [
+            "physical_to_logical_map",
+            "logical_to_all_physical_map",
+            "logical_to_all_physical_map_num_valid",
+            "logical_to_rank_dispatch_physical_map",
+        ]:
+            dst = getattr(self, field)
+            dst[...] = getattr(other, field)
+
     # -------------------------------- usage ------------------------------------
 
     def logical_to_all_physical(
