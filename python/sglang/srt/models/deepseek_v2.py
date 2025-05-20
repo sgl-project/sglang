@@ -291,10 +291,11 @@ class DeepseekV2MoE(nn.Module):
                 if self.gate.e_score_correction_bias is not None
                 else None
             )
-            self.deepep_dispatcher = self._create_deepep_dispatcher()
 
             if global_server_args_dict["enable_two_batch_overlap"]:
                 self.tbo_deepep_dispatchers = [self._create_deepep_dispatcher() for _ in range(2)]
+            else:
+                self.deepep_dispatcher = self._create_deepep_dispatcher()
 
     def _create_deepep_dispatcher(self):
         return DeepEPDispatcher(
@@ -313,6 +314,12 @@ class DeepseekV2MoE(nn.Module):
     @property
     def _enable_deepep_moe(self):
         return global_server_args_dict["enable_deepep_moe"]
+
+    def _get_deepep_dispatcher(self, state):
+        if global_server_args_dict["enable_two_batch_overlap"]:
+            return self.tbo_deepep_dispatchers[state.tbo_subbatch_index]
+        else:
+            return self.deepep_dispatcher
 
     def op_gate(self, state):
         if (not self._enable_deepep_moe) or is_non_idle_and_non_empty(
