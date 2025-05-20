@@ -144,6 +144,7 @@ def model_forward_tbo_layers(
 ):
     # The attn_tp_size!=1 case is not yet extracted to master
     assert get_attention_tp_size() == 1
+
     forward_mode = forward_batch.forward_mode
 
     inputs_arr = _model_forward_split_inputs(
