@@ -20,7 +20,22 @@ class OperationStrategy(ABC):
         raise NotImplementedError
 
 
-class _DenseOperationStrategy(OperationStrategy):
+class _MlpNormalOperationStrategy(OperationStrategy):
+    def compute_layer_operations(self, layer: torch.nn.Module):
+        return TODO
+
+
+class _MoeNormalOperationStrategy(OperationStrategy):
+    def compute_layer_operations(self, layer: torch.nn.Module):
+        return TODO
+
+
+class _TboDeepseekClassicalExtendOperationStrategy(OperationStrategy):
+    def compute_layer_operations(self, layer: torch.nn.Module):
+        return TODO
+
+
+class _TboDeepseekClassicalDecodeOperationStrategy(OperationStrategy):
     def compute_layer_operations(self, layer: torch.nn.Module):
         return TODO
 
@@ -28,7 +43,6 @@ class _DenseOperationStrategy(OperationStrategy):
 # --------------------------------------- TODO remove -----------------------------------------
 
 
-# TODO refactor this if there are more overlapping strategies
 def compute_layer_operations(
     layer: torch.nn.Module,
     forward_mode: ForwardMode,
