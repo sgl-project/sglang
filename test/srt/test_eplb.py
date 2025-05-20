@@ -45,6 +45,11 @@ class TestEPLBEndToEnd(CustomTestCase):
                 "--expert-distribution-recorder-buffer-size",
                 "50",
                 "--enable-expert-distribution-metrics",
+                # TODO auto determine these flags
+                "--expert-distribution-recorder-mode",
+                "stat",
+                "--ep-dispatch-algorithm",
+                "static",
             ],
         )
 
