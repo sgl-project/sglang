@@ -1,175 +1,47 @@
-import logging
-from fractions import Fraction
-from typing import Any, Callable, Dict, List, Optional, Union
+# SPDX-License-Identifier: Apache-2.0
+
+from typing import Any, Callable, Dict, List, Optional, Set, Union
 
 import torch
-
-from sglang.srt.layers.linear import LinearBase, set_weight_attrs
-from sglang.srt.layers.quantization.base_config import (
+import vllm.model_executor.layers.fused_moe  # noqa
+from vllm import _custom_ops as ops
+from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe.layer import (
+    FusedMoE,
+    FusedMoEMethodBase,
+    FusedMoeWeightScaleSupported,
+)
+from vllm.model_executor.layers.linear import LinearMethodBase, set_weight_attrs
+from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.layers.quantization.utils import replace_parameter
-from sglang.srt.utils import is_cuda
-
-_is_cuda = is_cuda()
-
-try:
-    from vllm import _custom_ops as ops
-
-except ImportError:
-    VLLM_AVAILABLE = False
-
-
-class scalar_types:
-    uint4b8 = "uint4b8"
-    uint8b128 = "uint8b128"
-
-
-import enum
-from enum import Enum
-
-from torch.nn.parameter import Parameter
-
-from sglang.srt.layers.linear import (
-    LinearBase,
-    LinearMethodBase,
-    UnquantizedLinearMethod,
+from vllm.model_executor.layers.quantization.kernels.mixed_precision import (
+    MPLinearLayerConfig,
+    choose_mp_linear_kernel,
 )
-from sglang.srt.layers.parameter import (
-    BasevLLMParameter,
-    BlockQuantScaleParameter,
+from vllm.model_executor.layers.quantization.moe_wna16 import MoeWNA16Config
+from vllm.model_executor.layers.quantization.utils import replace_parameter
+from vllm.model_executor.layers.quantization.utils.gptq_utils import (
+    get_linear_quant_method,
+)
+from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+    check_marlin_supported,
+    marlin_moe_permute_scales,
+    marlin_repeat_scales_on_all_ranks,
+    verify_marlin_supported,
+)
+from vllm.model_executor.parameter import (
     ChannelQuantScaleParameter,
     GroupQuantScaleParameter,
     PackedColumnParameter,
     PackedvLLMParameter,
-    PerTensorScaleParameter,
     RowvLLMParameter,
-    _ColumnvLLMParameter,
 )
-from sglang.srt.layers.quantization.gptq_marlin import (
-    FusedMoE,
-    FusedMoEMethodBase,
-    FusedMoeWeightScaleSupported,
-    GPTQMarlinLinearMethod,
-    marlin_moe_permute_scales,
-)
-from sglang.srt.layers.quantization.marlin import MarlinLinearMethod
-from sglang.srt.layers.quantization.marlin_utils import check_marlin_supported
+from vllm.platforms import current_platform
+from vllm.scalar_type import scalar_types
 
-logger = logging.getLogger(__name__)
-
-
-def check_marlin_format(hf_quant_cfg: Dict[str, Any]) -> bool:
-    # compat: gptqmodel and autogptq (eol) main use checkpoint_format: str
-    # compat: autogptq <=0.7.1 is_marlin_format: bool
-    return hf_quant_cfg.get("checkpoint_format") == "marlin" or hf_quant_cfg.get(
-        "is_marlin_format", False
-    )
-
-
-class GPTQConfig(QuantizationConfig):
-    """Config class for GPTQ.
-
-    Reference: https://arxiv.org/abs/2210.17323
-    """
-
-    def __init__(
-        self,
-        weight_bits: int,
-        group_size: int,
-        desc_act: bool,
-        lm_head_quantized: bool,
-        dynamic: Dict[str, Dict[str, Union[int, bool]]],
-    ) -> None:
-        # GPTQModel use `dynamic` config property to allow per module
-        # quantization config so each module can be individually optimized.
-        # Format is Dict[str, Dict] where key is a regex string that can
-        # perform both positive ("+:" prefixed) or negative ("-:" prefixed)
-        # matching of a module.
-        # Default to positive match, override base quant config mode, if no
-        # prefix is used. Value is in dict format of field key and override
-        # value.
-        # Negative matching will skip quantization init for this module
-        # entirely:
-        # non-quantized inference. More details and quantization examples can be
-        # found at: https://github.com/ModelCloud/GPTQModel
-        # Example:
-        #  # last 1/2 of the layers 10-21 has 8bit vs 4bit for 0-9
-        #  # last 1/4 of the layers 16-21 has 8bit and group_size 64
-        # dynamic = {
-        #  #`.*\.` matches the layers_node prefix
-        #  # positive match layer 10-15
-        #  r"+:.*\.(?:1[0-5])\..*": {"bits": 8,},
-        #  # positive match layer 16-21
-        #  r"+:.*\.(?:1[6-9]|20|21)\..*": {"bits": 8, "group_size": 64,},
-        #  r"-:.*\.moe\..*": {}, # negative match (skip) all `moe` layers
-        # }
-        super().__init__()
-        self.dynamic = dynamic
-
-        self.weight_bits = weight_bits
-        self.group_size = group_size
-        self.desc_act = desc_act
-        self.lm_head_quantized = lm_head_quantized
-        self.pack_factor = Fraction(32, self.weight_bits)
-        if self.weight_bits not in [2, 3, 4, 8]:
-            raise ValueError(
-                "Currently, only 2/3/4/8-bit weight quantization is "
-                f"supported for GPTQ, but got {self.weight_bits} bits."
-            )
-
-    def __repr__(self) -> str:
-        return (
-            f"GPTQConfig(weight_bits={self.weight_bits}, "
-            f"group_size={self.group_size}, "
-            f"desc_act={self.desc_act}),"
-            f"lm_head_quantized={self.lm_head_quantized}), "
-            f"dynamic={self.dynamic}"
-        )
-
-    def get_scaled_act_names(self) -> List[str]:
-        """Returns the activation function names that should be post-scaled.
-
-        For now, this is only used by AWQ.
-        """
-        raise NotImplementedError
-
-    @classmethod
-    def get_name(cls) -> str:
-        return "gptq"
-
-    @classmethod
-    def get_supported_act_dtypes(cls) -> List[torch.dtype]:
-        return [torch.half]
-
-    @classmethod
-    # Need to figure it out
-    def get_min_capability(cls) -> int:
-        return 60
-
-    @classmethod
-    def get_config_filenames(cls) -> List[str]:
-        return ["quantize_config.json"]
-
-    @classmethod
-    def from_config(cls, config: Dict[str, Any]) -> "GPTQConfig":
-        dynamic = cls.get_from_keys_or(config, ["dynamic"], default={})
-        dynamic = {} if dynamic is None else dynamic
-
-        weight_bits = cls.get_from_keys(config, ["bits"])
-        group_size = cls.get_from_keys(config, ["group_size"])
-        desc_act = cls.get_from_keys(config, ["desc_act"])
-        lm_head_quantized = cls.get_from_keys_or(config, ["lm_head"], default=False)
-        return cls(weight_bits, group_size, desc_act, lm_head_quantized, dynamic)
-
-    def get_quant_method(
-        self, layer: torch.nn.Module, prefix: str
-    ) -> Optional["GPTQLinearMethod"]:
-        # Delay the import to avoid circular dependency
-        from sglang.srt.layers.quantization import get_linear_quant_method
-
-        return get_linear_quant_method(self, layer, prefix, GPTQLinearMethod)
+logger = init_logger(__name__)
 
 
 class GPTQMarlinConfig(QuantizationConfig):
@@ -236,7 +108,6 @@ class GPTQMarlinConfig(QuantizationConfig):
                 "Unsupported quantization config: " f"bits={weight_bits}, sym={is_sym}"
             )
 
-        # (num_bits, is_sym) -> quant_type
         self.quant_type = self.TYPE_MAP[(weight_bits, is_sym)]
 
     def __repr__(self) -> str:
@@ -247,13 +118,6 @@ class GPTQMarlinConfig(QuantizationConfig):
             f"lm_head_quantized={self.lm_head_quantized}), "
             f"dynamic={self.dynamic}"
         )
-
-    def get_scaled_act_names(self) -> List[str]:
-        """Returns the activation function names that should be post-scaled.
-
-        For now, this is only used by AWQ.
-        """
-        raise NotImplementedError
 
     @classmethod
     def get_name(cls) -> str:
@@ -293,15 +157,13 @@ class GPTQMarlinConfig(QuantizationConfig):
 
     @classmethod
     def override_quantization_method(cls, hf_quant_cfg, user_quant) -> Optional[str]:
-        is_marlin_format = check_marlin_format(hf_quant_cfg)
-
         can_convert = cls.is_gptq_marlin_compatible(hf_quant_cfg)
 
         is_valid_user_quant = (
             user_quant is None or user_quant == "marlin" or user_quant == "gptq_marlin"
         )
 
-        if not is_marlin_format and can_convert and is_valid_user_quant:
+        if can_convert and is_valid_user_quant:
             msg = (
                 "The model is convertible to {} during runtime."
                 " Using {} kernel.".format(cls.get_name(), cls.get_name())
@@ -309,7 +171,7 @@ class GPTQMarlinConfig(QuantizationConfig):
             logger.info(msg)
             return cls.get_name()
 
-        if not is_marlin_format and can_convert and user_quant == "gptq":
+        if can_convert and user_quant == "gptq":
             logger.info(
                 "Detected that the model can run with gptq_marlin"
                 ", however you specified quantization=gptq explicitly,"
@@ -320,21 +182,15 @@ class GPTQMarlinConfig(QuantizationConfig):
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
-    ) -> Optional[QuantizeMethodBase]:
-        # Delay the import to avoid circular dependency
-        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-        from sglang.srt.layers.quantization import get_linear_quant_method
-
+    ) -> Optional["QuantizeMethodBase"]:
         if isinstance(layer, FusedMoE):
-            return GPTQMarlinMoEMethod(self)
-            # TODO: re-enable after SGLang syncs with vllm >= 0.7.3
-            # if layer.num_experts > 32:
-            #     # For MoEs with many experts the moe_wna16 kernel is faster
-            #     return MoeWNA16Config.from_config(self.full_config).get_quant_method(
-            #         layer, prefix
-            #     )
-            # else:
-            #     return GPTQMarlinMoEMethod(self)
+            if layer.local_num_experts > 32:
+                # For MoEs with many experts the moe_wna16 kernel is faster
+                return MoeWNA16Config.from_config(self.full_config).get_quant_method(
+                    layer, prefix
+                )
+            else:
+                return GPTQMarlinMoEMethod(self)
         return get_linear_quant_method(self, layer, prefix, GPTQMarlinLinearMethod)
 
     @classmethod
@@ -345,7 +201,7 @@ class GPTQMarlinConfig(QuantizationConfig):
         sym = quant_config.get("sym")
         desc_act = quant_config.get("desc_act")
 
-        if not _is_cuda:
+        if not current_platform.is_cuda():
             return False
 
         if quant_method != "gptq":
@@ -363,121 +219,23 @@ class GPTQMarlinConfig(QuantizationConfig):
         )
 
 
-class MarlinConfig(QuantizationConfig):
-    """Config class for Marlin.
-
-    Reference: https://github.com/IST-DASLab/marlin/tree/master
-    """
-
-    def __init__(
-        self,
-        group_size: int,
-        lm_head_quantized: bool,
-    ) -> None:
-        # Group size for the quantization.
-        self.group_size = group_size
-        self.lm_head_quantized = lm_head_quantized
-        if self.group_size != 128 and self.group_size != -1:
-            raise ValueError(
-                "Currently, only group size 128 and -1 (channelwise) "
-                "is supported for Marlin, but got group_size of "
-                f"{self.group_size}"
-            )
-
-        # 4 Bits packed into 32 bit datatype.
-        self.pack_factor = 32 // 4
-
-        # Tile size used by marlin kernels.
-        self.tile_size = 16
-
-        # Min out_features dim
-        self.min_n_threads = 64
-
-        # Min in_features dim
-        self.min_k_threads = 128
-
-        # Max parallel problems to solve at once (improves large
-        # batch performance)
-        self.max_parallel = 16
-
-        # Permutation length used by the marlin kernels.
-        self.perm_len = 1024
-
-    def __repr__(self) -> str:
-        return (
-            f"MarlinConfig(group_size={self.group_size}, "
-            f"lm_head_quantized={self.lm_head_quantized})"
-        )
-
-    @classmethod
-    def get_name(cls) -> str:
-        return "marlin"
-
-    @classmethod
-    def get_supported_act_dtypes(cls) -> List[torch.dtype]:
-        return [torch.half]
-
-    @classmethod
-    # Need to figure it out
-    def get_min_capability(cls) -> int:
-        return 80
-
-    @classmethod
-    def get_config_filenames(cls) -> List[str]:
-        return ["quantize_config.json"]
-
-    @classmethod
-    def from_config(cls, config: Dict[str, Any]) -> "MarlinConfig":
-        group_size = cls.get_from_keys(config, ["group_size"])
-        lm_head_quantized = cls.get_from_keys_or(config, ["lm_head"], default=False)
-        return cls(group_size, lm_head_quantized)
-
-    @classmethod
-    def override_quantization_method(cls, hf_quant_cfg, user_quant) -> Optional[str]:
-        is_marlin_format = check_marlin_format(hf_quant_cfg)
-
-        is_valid_user_quant = (
-            user_quant is None or user_quant == "gptq" or user_quant == "marlin"
-        )
-
-        if is_marlin_format and is_valid_user_quant:
-            msg = "The model is serialized in {} format. Using {} kernel.".format(
-                cls.get_name(), cls.get_name()
-            )
-            logger.info(msg)
-            return cls.get_name()
-
-        return None
-
-    def get_quant_method(
-        self, layer: torch.nn.Module, prefix: str
-    ) -> Optional[MarlinLinearMethod]:
-        # Delay the import to avoid circular dependency
-        from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
-
-        if isinstance(layer, LinearBase) or (
-            isinstance(layer, ParallelLMHead) and self.lm_head_quantized
-        ):
-            return MarlinLinearMethod(self)
-        return None
-
-
-class ExllamaState(Enum):
-
-    UNUSED = enum.auto()
-    UNINITIALIZED = enum.auto()
-    READY = enum.auto()
-
-
-class GPTQLinearMethod(LinearMethodBase):
-    """Linear method for GPTQ.
+class GPTQMarlinLinearMethod(LinearMethodBase):
+    """Linear method for GPTQ Marlin.
 
     Args:
-        quant_config: The GPTQ quantization config.
+        quant_config: The GPTQ Marlin quantization config.
     """
 
-    def __init__(self, quant_config: GPTQConfig):
+    _kernel_backends_being_used: Set[str] = set()
+
+    def __init__(self, quant_config: GPTQMarlinConfig) -> None:
         self.quant_config = quant_config
+
+        # Verify supported on platform.
+        verify_marlin_supported(
+            quant_type=self.quant_config.quant_type,
+            group_size=self.quant_config.group_size,
+        )
 
     def create_weights(
         self,
@@ -488,42 +246,51 @@ class GPTQLinearMethod(LinearMethodBase):
         output_size: int,
         params_dtype: torch.dtype,
         **extra_weight_attrs,
-    ):
-        del output_size  # Unused.
-        weight_loader = extra_weight_attrs.get("weight_loader")
-        if input_size_per_partition % self.quant_config.group_size != 0:
-            raise ValueError(
-                "The input size is not aligned with the quantized "
-                "weight shape. This can be caused by too large "
-                "tensor parallel size."
-            )
+    ) -> None:
         output_size_per_partition = sum(output_partition_sizes)
-        if output_size_per_partition % self.quant_config.pack_factor.numerator != 0:
-            raise ValueError(
-                "The output size is not aligned with the quantized "
-                "weight shape. This can be caused by too large "
-                "tensor parallel size."
-            )
+        is_row_parallel = input_size != input_size_per_partition
+        weight_loader = extra_weight_attrs.get("weight_loader")
 
+        mp_linear_kernel_config = MPLinearLayerConfig(
+            full_weight_shape=(input_size, output_size),
+            partition_weight_shape=(
+                input_size_per_partition,
+                output_size_per_partition,
+            ),
+            weight_type=self.quant_config.quant_type,
+            act_type=params_dtype,
+            group_size=self.quant_config.group_size,
+            zero_points=False,
+            has_g_idx=self.quant_config.desc_act,
+        )
+
+        kernel_type = choose_mp_linear_kernel(mp_linear_kernel_config)
+
+        if kernel_type.__name__ not in self._kernel_backends_being_used:
+            logger.info("Using %s for GPTQMarlinLinearMethod", kernel_type.__name__)
+            self._kernel_backends_being_used.add(kernel_type.__name__)
+
+        # Normalize group_size
         if self.quant_config.group_size != -1:
             group_size = self.quant_config.group_size
         else:
             group_size = input_size
-        exllama_state = ExllamaState.UNINITIALIZED
-        scale_and_zero_size = input_size // group_size
-        scale_and_zero_input_dim = None
-        if (
-            input_size != input_size_per_partition
-            and self.quant_config.group_size != -1
-        ):
-            # For act-order models, we cannot use Exllama for row parallel layer
-            if self.quant_config.desc_act:
-                exllama_state = ExllamaState.UNUSED
-            else:
-                # we need to partition qzeros and scales for exllama kernel
-                scale_and_zero_size = input_size_per_partition // group_size
-                scale_and_zero_input_dim = 0
 
+        # Determine sharding
+        if marlin_repeat_scales_on_all_ranks(
+            self.quant_config.desc_act, self.quant_config.group_size, is_row_parallel
+        ):
+            # By setting scale_dim == None, weight_loader will
+            # repeat the scales on each GPU in TP>1 case.
+            scales_and_zp_input_dim = None
+            scales_and_zp_size = input_size // group_size
+        else:
+            # By setting scale_dim == 0, weight_loader will
+            # shard the scales in TP>1 case.
+            scales_and_zp_input_dim = 0
+            scales_and_zp_size = input_size_per_partition // group_size
+
+        # Quantized weights
         qweight = PackedvLLMParameter(
             data=torch.empty(
                 input_size_per_partition // self.quant_config.pack_factor,
@@ -537,20 +304,19 @@ class GPTQLinearMethod(LinearMethodBase):
             weight_loader=weight_loader,
         )
 
+        # Activation order
         g_idx = RowvLLMParameter(
-            data=torch.tensor(
-                [
-                    i // self.quant_config.group_size
-                    for i in range(input_size_per_partition)
-                ],
+            data=torch.empty(
+                input_size_per_partition,
                 dtype=torch.int32,
             ),
             input_dim=0,
             weight_loader=weight_loader,
         )
+
         qzeros_args = {
             "data": torch.empty(
-                scale_and_zero_size,
+                scales_and_zp_size,
                 output_size_per_partition // self.quant_config.pack_factor,
                 dtype=torch.int32,
             ),
@@ -558,13 +324,14 @@ class GPTQLinearMethod(LinearMethodBase):
         }
         weight_scale_args = {
             "data": torch.empty(
-                scale_and_zero_size,
+                scales_and_zp_size,
                 output_size_per_partition,
                 dtype=params_dtype,
             ),
             "weight_loader": weight_loader,
         }
-        if scale_and_zero_input_dim is None:
+
+        if scales_and_zp_input_dim is None:
             scales = ChannelQuantScaleParameter(output_dim=1, **weight_scale_args)
             qzeros = PackedColumnParameter(
                 output_dim=1,
@@ -587,29 +354,19 @@ class GPTQLinearMethod(LinearMethodBase):
 
         layer.register_parameter("qweight", qweight)
         layer.register_parameter("g_idx", g_idx)
-        layer.register_parameter("qzeros", qzeros)
         layer.register_parameter("scales", scales)
+        layer.register_parameter("qzeros", qzeros)
 
-        layer.exllama_state = exllama_state
+        self.kernel = kernel_type(
+            mp_linear_kernel_config,
+            w_q_param_name="qweight",
+            w_s_param_name="scales",
+            w_zp_param_name="qzeros",
+            w_gidx_param_name="g_idx",
+        )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # for torch.compile
-        layer.qzeros = Parameter(layer.qzeros.data, requires_grad=False)
-        layer.qweight = Parameter(layer.qweight.data, requires_grad=False)
-        layer.g_idx = Parameter(layer.g_idx.data, requires_grad=False)
-        layer.scales = Parameter(layer.scales.data, requires_grad=False)
-
-        # exllama needs to shuffle the weight after the weight is loaded
-        # here we do the shuffle on first forward pass
-        if layer.exllama_state == ExllamaState.UNINITIALIZED:
-            if self.quant_config.desc_act:
-                layer.g_idx.data = torch.argsort(layer.g_idx).to(torch.int)
-            else:
-                layer.g_idx.data = torch.empty(
-                    (0,), dtype=torch.int, device=layer.g_idx.device
-                )
-            layer.exllama_state = ExllamaState.READY
-            ops.gptq_shuffle(layer.qweight, layer.g_idx, self.quant_config.weight_bits)
+        self.kernel.process_weights_after_loading(layer)
 
     def apply(
         self,
@@ -617,21 +374,7 @@ class GPTQLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        out_shape = x.shape[:-1] + (layer.qweight.shape[-1],)
-        reshaped_x = x.reshape(-1, x.shape[-1])
-
-        output = ops.gptq_gemm(
-            reshaped_x,
-            layer.qweight,
-            layer.qzeros,
-            layer.scales,
-            layer.g_idx,
-            layer.exllama_state == ExllamaState.READY,
-            self.quant_config.weight_bits,
-        )
-        if bias is not None:
-            output.add_(bias)
-        return output.reshape(out_shape)
+        return self.kernel.apply_weights(layer, x, bias)
 
 
 class GPTQMarlinMoEMethod(FusedMoEMethodBase):
@@ -649,16 +392,16 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        intermediate_size = extra_weight_attrs.pop("intermediate_size")
+        intermediate_size_full = extra_weight_attrs.pop("intermediate_size_full")
 
         self.is_k_full = (not self.quant_config.desc_act) or (
-            intermediate_size_per_partition == intermediate_size
+            intermediate_size_per_partition == intermediate_size_full
         )
 
         if self.quant_config.group_size != -1:
             scales_size13 = hidden_size // self.quant_config.group_size
             w2_scales_size = (
-                intermediate_size
+                intermediate_size_full
                 if self.quant_config.desc_act
                 else intermediate_size_per_partition
             )
@@ -878,9 +621,15 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
         custom_routing_function: Optional[Callable] = None,
         scoring_func: str = "softmax",
         e_score_correction_bias: Optional[torch.Tensor] = None,
+        apply_router_weight_on_input: bool = False,
         activation: str = "silu",
     ) -> torch.Tensor:
         assert activation == "silu", "Only SiLU activation is supported."
+        if apply_router_weight_on_input is not None:
+            raise NotImplementedError(
+                "Apply router weight on input is not supported for"
+                "fused Marlin MoE method."
+            )
 
         # The input must currently be float16
         orig_dtype = x.dtype

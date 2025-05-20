@@ -22,14 +22,9 @@ try:
     from vllm.model_executor.layers.quantization.experts_int8 import ExpertsInt8Config
     from vllm.model_executor.layers.quantization.fbgemm_fp8 import FBGEMMFp8Config
     from vllm.model_executor.layers.quantization.gguf import GGUFConfig
-    from vllm.model_executor.layers.quantization.gptq import GPTQLinearMethod
-    from vllm.model_executor.layers.quantization.gptq_marlin import (
-        GPTQMarlinLinearMethod,
-    )
     from vllm.model_executor.layers.quantization.gptq_marlin_24 import (
         GPTQMarlin24Config,
     )
-    from vllm.model_executor.layers.quantization.marlin import MarlinConfig
     from vllm.model_executor.layers.quantization.qqq import QQQConfig
     from vllm.model_executor.layers.quantization.tpu_int8 import Int8TpuConfig
 
@@ -48,7 +43,6 @@ except ImportError:
         MarlinConfig
     ) = QQQConfig = Int8TpuConfig = DummyConfig
 
-
 from sglang.srt.layers.linear import LinearBase, UnquantizedLinearMethod
 from sglang.srt.layers.quantization.awq import AWQConfig
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -59,9 +53,12 @@ from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.gptq import (
     GPTQConfig,
+    GPTQLinearMethod,
     GPTQMarlinConfig,
     GPTQMarlinMoEMethod,
 )
+from sglang.srt.layers.quantization.gptq_marlin import GPTQMarlinLinearMethod
+from sglang.srt.layers.quantization.marlin import MarlinConfig
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp8Config,
