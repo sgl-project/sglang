@@ -7,6 +7,8 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
 
+# -------------------------------- Compute Info ---------------------------------------
+
 # TODO: may smartly disable TBO when batch size is too small b/c it will slow down
 def compute_split_seq_index(
     forward_mode: "ForwardMode",
@@ -120,3 +122,5 @@ class TboDPAttentionPreparer:
     @staticmethod
     def _is_all_same(x):
         return all(value == x[0] for value in x)
+
+# -------------------------------- Execute ---------------------------------------
