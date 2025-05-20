@@ -21,10 +21,10 @@ def execute_operations(inputs, operations):
 
 
 def execute_overlapped_operations(
-    inputs_arr: List,
-    operations_arr: List,
-    delta_stages: List[int],
-):
+    inputs_arr: Sequence,
+    operations_arr: Sequence,
+    delta_stages: Sequence[int],
+) -> Sequence:
     # Make it explicit for clarity; if we need multi-batch overlap, this can be generalized
     inputs_a, inputs_b = inputs_arr
     operations_a, operations_b = operations_arr
