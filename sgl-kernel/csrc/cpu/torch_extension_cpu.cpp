@@ -50,9 +50,12 @@ std::tuple<at::Tensor, at::Tensor> biased_grouped_topk_cpu(
 // attention
 void decode_attention_cpu(
     at::Tensor& query,
-    at::Tensor& output,
     at::Tensor& k_cache,
-    at::Tensor& v_cahce,
+    at::Tensor& v_cache,
+    at::Tensor& output,
+    at::Tensor& key,
+    at::Tensor& value,
+    at::Tensor& loc,
     at::Tensor& attn_logits,
     at::Tensor& req_to_token,
     at::Tensor& req_pool_indices,
