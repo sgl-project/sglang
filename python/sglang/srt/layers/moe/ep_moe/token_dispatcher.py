@@ -1,4 +1,5 @@
 import logging
+from dataclasses import dataclass
 
 from sglang.srt.layers.quantization.deep_gemm import _ENABLE_JIT_DEEPGEMM
 from sglang.srt.managers.expert_distribution import (
@@ -18,7 +19,7 @@ try:
 except ImportError:
     use_deepep = False
 
-from enum import IntEnum, auto
+from enum import IntEnum, auto, Enum
 from typing import Optional, Tuple, Union
 
 import torch
@@ -469,9 +470,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         buffer = self._get_buffer()
         topk_idx = topk_idx.to(torch.int64)
         expected_m = (
-            hidden_states.shape[0] * buffer.group_size * topk_idx.shape[1]
-            + self.num_experts
-        ) // self.num_experts
+                         hidden_states.shape[0] * buffer.group_size * topk_idx.shape[1]
+                         + self.num_experts
+                     ) // self.num_experts
         hidden_states, masked_m, event, hook = self._dispatch_core(
             hidden_states,
             topk_idx,
@@ -615,6 +616,14 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         )
 
 
+@dataclass
+class _DeepEPDispatcherState(Enum):
+    INITIAL = auto()
+    AFTER_DISPATCH_A = auto()
+    AFTER_DISPATCH_B = auto()
+    AFTER_COMBINE_A = auto()
+
+
 class DeepEPDispatcher:
     def __init__(
         self,
@@ -653,6 +662,8 @@ class DeepEPDispatcher:
                 **common_kwargs,
             )
 
+        self._state = _DeepEPDispatcherState.INITIAL
+
     def dispatch(self, *args, **kwargs) -> Tuple:
         self.dispatch_a(*args, **kwargs)
         ret = self.dispatch_b()
@@ -665,6 +676,7 @@ class DeepEPDispatcher:
         topk_weights: torch.Tensor,
         forward_mode: ForwardMode = None,
     ):
+        self._update_state(_DeepEPDispatcherState.INITIAL, _DeepEPDispatcherState.AFTER_DISPATCH_A)
         inner_state = self._get_impl(forward_mode).dispatch_a(
             hidden_states=hidden_states,
             topk_idx=topk_idx,
@@ -673,6 +685,7 @@ class DeepEPDispatcher:
         self._dispatch_intermediate_state = forward_mode, inner_state
 
     def dispatch_b(self):
+        self._update_state(_DeepEPDispatcherState.AFTER_DISPATCH_A, _DeepEPDispatcherState.AFTER_DISPATCH_B)
         forward_mode, inner_state = self._dispatch_intermediate_state
         del self._dispatch_intermediate_state
         return self._get_impl(forward_mode).dispatch_b(*inner_state)
@@ -689,6 +702,7 @@ class DeepEPDispatcher:
         topk_weights: torch.Tensor,
         forward_mode: ForwardMode,
     ):
+        self._update_state(_DeepEPDispatcherState.AFTER_DISPATCH_B, _DeepEPDispatcherState.AFTER_COMBINE_A)
         inner_state = self._get_impl(forward_mode).combine_a(
             hidden_states=hidden_states,
             topk_idx=topk_idx,
@@ -697,6 +711,7 @@ class DeepEPDispatcher:
         self._combine_intermediate_state = forward_mode, inner_state
 
     def combine_b(self):
+        self._update_state(_DeepEPDispatcherState.AFTER_COMBINE_A, _DeepEPDispatcherState.INITIAL)
         forward_mode, inner_state = self._combine_intermediate_state
         del self._combine_intermediate_state
         return self._get_impl(forward_mode).combine_b(*inner_state)
