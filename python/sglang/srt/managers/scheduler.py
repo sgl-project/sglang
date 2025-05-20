@@ -128,6 +128,7 @@ from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from sglang.srt.two_batch_overlap import TboDPAttentionPreparer
 from sglang.srt.utils import (
     DeepEPMode,
     DynamicGradMode,
@@ -1683,21 +1684,7 @@ class Scheduler(
             local_batch.forward_mode.is_extend() if local_batch else False
         )
 
-        if local_batch is not None:
-            local_tbo_split_seq_index = two_batch_overlap.compute_split_seq_index(
-                forward_mode=local_batch.forward_mode,
-                num_tokens=local_batch.input_ids.shape[0],
-                extend_lens=local_batch.extend_lens,
-            )
-            resolved_deepep_mode = deepep_mode.resolve(local_batch.forward_mode)
-            local_can_run_tbo = (local_tbo_split_seq_index is not None) and not (
-                local_batch.forward_mode.is_extend()
-                and enable_deepep_moe
-                and (resolved_deepep_mode == DeepEPMode.low_latency)
-            )
-        else:
-            local_tbo_split_seq_index = 0
-            local_can_run_tbo = True
+        tbo_preparer = TboDPAttentionPreparer()
 
         local_info = torch.tensor(
             [
@@ -1705,12 +1692,7 @@ class Scheduler(
                 can_cuda_graph,
                 num_tokens_for_logprob,
                 is_extend_in_batch,
-                local_can_run_tbo,
-                (
-                    local_batch.forward_mode
-                    if local_batch is not None
-                    else ForwardMode.IDLE
-                ).value,
+                *tbo_preparer.prepare_all_gather(local_batch, deepep_mode, enable_deepep_moe, enable_two_batch_overlap),
             ],
             dtype=torch.int64,
         )
@@ -1727,23 +1709,8 @@ class Scheduler(
         can_cuda_graph = min(global_info[:, 0, 1].tolist())
         global_num_tokens_for_logprob = global_info[:, 0, 2].tolist()
         is_extend_in_batch = global_info[:, 0, 3].tolist()
-        local_can_run_tbo_aggregated = min(global_info[:, 0, 4].tolist())
-        forward_modes = global_info[:, 0, 5].tolist()
 
-        converted_forward_modes = [
-            ForwardMode.DECODE.value if x == ForwardMode.IDLE.value else x
-            for x in forward_modes
-        ]
-        forward_mode_agree = _is_all_same(converted_forward_modes)
-        global_forward_mode = (
-            ForwardMode(converted_forward_modes[0]) if forward_mode_agree else None
-        )
-
-        can_run_tbo = (
-            enable_two_batch_overlap
-            and local_can_run_tbo_aggregated
-            and forward_mode_agree
-        )
+        tbo_split_seq_index, global_forward_mode = tbo_preparer.compute_output(global_info[:, :, 4:6])
 
         if local_batch is None and max(global_num_tokens) > 0:
             local_batch = get_idle_batch()
@@ -1758,12 +1725,8 @@ class Scheduler(
                 local_batch.global_num_tokens_for_logprob = (
                     global_num_tokens_for_logprob
                 )
-            local_batch.tbo_split_seq_index = (
-                local_tbo_split_seq_index if can_run_tbo else None
-            )
-            local_batch.global_forward_mode = (
-                global_forward_mode if can_run_tbo else None
-            )
+            local_batch.tbo_split_seq_index = tbo_split_seq_index
+            local_batch.global_forward_mode = global_forward_mode
 
             # Check forward mode for cuda graph
             if not disable_cuda_graph:
@@ -2282,10 +2245,6 @@ def _import_static_state(model, static_params):
     self_named_buffers = dict(model.named_buffers())
     for name, tensor in static_params["buffers"]:
         self_named_buffers[name][...] = tensor
-
-
-def _is_all_same(x):
-    return all(value == x[0] for value in x)
 
 
 def run_scheduler_process(
