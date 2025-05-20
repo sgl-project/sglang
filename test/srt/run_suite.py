@@ -81,7 +81,8 @@ suites = {
         TestFile("test_vertex_endpoint.py", 31),
         TestFile("test_vision_chunked_prefill.py", 175),
         TestFile("test_vlm_accuracy.py", 60),
-        TestFile("test_vision_openai_server.py", 637),
+        TestFile("test_vision_openai_server_a.py", 700),
+        TestFile("test_vision_openai_server_b.py", 700),
         TestFile("test_w8a8_quantization.py", 46),
         TestFile("models/lora/test_lora_cuda_graph.py", 250),
     ],
@@ -104,17 +105,19 @@ suites = {
     "per-commit-2-gpu-amd": [
         TestFile("test_mla_tp.py", 170),
     ],
+    "per-commit-4-gpu": [
+        TestFile("test_local_attn.py", 250),
+        TestFile("test_pp_single_node.py", 150),
+    ],
     "per-commit-8-gpu": [
         # Disabled deepep tests temporarily because it takes too much time.
         # TODO: re-enable them after reducing the test time with compilation cache and smaller models.
         # TestFile("test_deepep_intranode.py", 50),
         # TestFile("test_deepep_low_latency.py", 50),
         # TestFile("test_moe_deepep_eval_accuracy_large.py", 250),
-        TestFile("test_disaggregation.py", 210),
-        TestFile("test_local_attn.py", 250),
+        # TestFile("test_disaggregation.py", 210), # disabled since we have different_tp test
         TestFile("test_disaggregation_different_tp.py", 210),
         TestFile("test_full_deepseek_v3.py", 250),
-        TestFile("test_pp_single_node.py", 150),
     ],
     "per-commit-8-gpu-amd": [
         TestFile("test_full_deepseek_v3.py", 250),
