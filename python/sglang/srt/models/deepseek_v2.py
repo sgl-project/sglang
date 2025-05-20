@@ -570,6 +570,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         super().__init__()
+        self.quant_config = quant_config
         self.layer_id = layer_id
         self.hidden_size = hidden_size
         self.qk_nope_head_dim = qk_nope_head_dim

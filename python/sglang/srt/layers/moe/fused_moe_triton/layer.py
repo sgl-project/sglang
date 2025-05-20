@@ -5,6 +5,7 @@ from enum import Enum
 from typing import Callable, List, Optional, Tuple
 
 import torch
+from torch.nn.parameter import UninitializedParameter
 
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import (
@@ -310,6 +311,7 @@ class FusedMoE(torch.nn.Module):
         self.tp_size = (
             tp_size if tp_size is not None else get_tensor_model_parallel_world_size()
         )
+        self.quant_config = quant_config
         self.routed_scaling_factor = routed_scaling_factor
         self.top_k = top_k
         self.num_experts = num_experts
@@ -525,7 +527,13 @@ class FusedMoE(torch.nn.Module):
         # dimension intermediate_size is used.
         SHARD_ID_TO_SHARDED_DIM = {"w1": 0, "w2": 1, "w3": 0}
 
-        expert_data = param.data[expert_id]
+        is_gguf_weight = getattr(param, "is_gguf_weight", False)
+        is_gguf_weight_type = getattr(param, "is_gguf_weight_type", False)
+        if is_gguf_weight_type:
+            param.weight_type = loaded_weight.item()
+            param.data.copy_(loaded_weight)
+            return
+
         tp_rank = get_tensor_model_parallel_rank()
 
         # is_transposed: if the dim to shard the weight
@@ -536,6 +544,19 @@ class FusedMoE(torch.nn.Module):
         if is_transposed:
             shard_dim = ~shard_dim
 
+        full_load = len(loaded_weight.shape) == 3
+        if full_load:
+            shard_dim += 1
+
+        # Materialize GGUF UninitializedParameter
+        if is_gguf_weight and isinstance(param, UninitializedParameter):
+            final_shape = list(loaded_weight.shape)
+            if shard_id in ["w1", "w3"]:
+                final_shape[1] *= 2
+            final_shape[shard_dim] = final_shape[shard_dim] // self.tp_size
+            param.materialize(final_shape, dtype=loaded_weight.dtype)
+
+        expert_data = param.data if full_load else param.data[expert_id]
         # Case input scale: input_scale loading is only supported for fp8
         if "input_scale" in weight_name:
             # INT4-FP8 (INT4 MoE Weight, FP8 Compute): Adjust input_scale for e4m3fnuz (AMD)
@@ -642,6 +663,9 @@ class FusedMoE(torch.nn.Module):
         assert self.quant_method is not None
 
         # Matrix multiply.
+        kwargs = {}
+        if self.quant_config.get_name() != "gguf":
+            kwargs = {"routed_scaling_facto": self.routed_scaling_factor}
         final_hidden_states = self.quant_method.apply(
             layer=self,
             x=hidden_states,
@@ -652,10 +676,10 @@ class FusedMoE(torch.nn.Module):
             topk_group=self.topk_group,
             num_expert_group=self.num_expert_group,
             custom_routing_function=self.custom_routing_function,
-            correction_bias=self.correction_bias,
+            e_score_correction_bias=self.correction_bias,
             activation=self.activation,
             apply_router_weight_on_input=self.apply_router_weight_on_input,
-            routed_scaling_factor=self.routed_scaling_factor,
+            **kwargs
         )
 
         if self.reduce_results and self.tp_size > 1:
