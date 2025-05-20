@@ -1277,8 +1277,16 @@ class DeepseekV2DecoderLayer(nn.Module):
             state.forward_batch,
         )
 
+        output = dict(
+            positions=state.positions,
+            hidden_states=hidden_states,
+            residual=residual,
+            forward_batch=state.forward_batch,
+            tbo_subbatch_index=state.tbo_subbatch_index,
+        )
+
         state.clear(expect_keys={"positions", "forward_batch", "zero_allocator"})
-        return hidden_states, residual
+        return output
 
 
 class DeepseekV2Model(nn.Module):
