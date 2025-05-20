@@ -1375,11 +1375,11 @@ class DeepseekV2Model(nn.Module):
                 )
 
         hidden_states, residual = model_forward_tbo_layers(
+            layers=self.layers[normal_num_layers:],
             positions=positions,
             forward_batch=forward_batch,
             hidden_states=hidden_states,
             residual=residual,
-            start_layer=normal_num_layers,
         )
 
         if not forward_batch.forward_mode.is_idle():
