@@ -30,8 +30,10 @@ class TestTwoBatchOverlap(unittest.TestCase):
                 "2",
                 "--enable-dp-attention",
                 "--enable-deepep-moe",
+                "--deepep-mode",
+                "normal",
+                "--disable-cuda-graph", # DeepEP normal does not support CUDA Graph
                 "--enable-two-batch-overlap",
-                "--disable-cuda-graph",  # TODO DeepEP does not support this yet
             ],
         )
 
