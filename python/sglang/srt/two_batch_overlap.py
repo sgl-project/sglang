@@ -165,6 +165,7 @@ def model_forward_tbo_layers(
             inputs_b=inputs_b,
             operations_a=compute_layers_operations(layers, forward_mode),
             operations_b=compute_layers_operations(layers, forward_mode),
+            # TODO do not hardcode
             delta_stages={
                 ForwardMode.EXTEND: 0,
                 ForwardMode.DECODE: 2,
