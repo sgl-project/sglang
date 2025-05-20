@@ -6,7 +6,6 @@ def compute_layer_operations(
 ):
     if not layer.is_layer_sparse:
         return [
-            layer.op_input_layernorm,
             layer.op_comm_pre_attn,
             layer.op_attn,
             layer.op_comm_pre_mlp,
@@ -16,7 +15,6 @@ def compute_layer_operations(
 
     # Will add TBO operation orders here
     return [
-        layer.op_input_layernorm,
         layer.op_comm_pre_attn,
         layer.op_attn,
         layer.op_comm_pre_mlp,
