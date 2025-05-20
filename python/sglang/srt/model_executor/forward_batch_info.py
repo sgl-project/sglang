@@ -31,11 +31,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import IntEnum, auto
-from typing import TYPE_CHECKING, Dict, List, Optional, Union, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
 import triton
 import triton.language as tl
+
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.utils import flatten_nested_list, get_compiler_backend
 
@@ -456,18 +457,18 @@ class ForwardBatch:
                             [
                                 pos
                                 for pos in range(
-                                extend_prefix_len,
-                                extend_prefix_len + extend_seq_len,
-                            )
+                                    extend_prefix_len,
+                                    extend_prefix_len + extend_seq_len,
+                                )
                             ]
                         ]
                         * 3
                     )
                 else:
                     mrope_positions = mm_input.mrope_positions[
-                                      :,
-                                      extend_prefix_len: extend_prefix_len + extend_seq_len,
-                                      ]
+                        :,
+                        extend_prefix_len : extend_prefix_len + extend_seq_len,
+                    ]
                 mrope_positions_list[batch_idx] = mrope_positions
 
         self.mrope_positions = torch.cat(
@@ -558,8 +559,8 @@ class ForwardBatch:
         self.prefix_chunk_len = chunk_capacity // self.batch_size
 
         self.num_prefix_chunks = (
-                                     max(self.extend_prefix_lens_cpu) + self.prefix_chunk_len - 1
-                                 ) // self.prefix_chunk_len
+            max(self.extend_prefix_lens_cpu) + self.prefix_chunk_len - 1
+        ) // self.prefix_chunk_len
 
         # Here we compute chunk lens twice to avoid stream sync, once on gpu and once on cpu.
         prefix_chunk_starts_cuda, prefix_chunk_seq_lens_cuda = (

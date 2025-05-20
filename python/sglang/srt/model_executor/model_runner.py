@@ -25,6 +25,7 @@ from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
+
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
@@ -208,7 +209,7 @@ class ModelRunner:
         )
 
         # CPU offload
-        set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024 ** 3))
+        set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024**3))
 
         # Get memory before model loading
         min_per_gpu_memory = self.init_torch_distributed()
@@ -1013,8 +1014,8 @@ class ModelRunner:
             return FlashMLABackend(self)
         elif self.server_args.attention_backend == "fa3":
             assert (
-                       torch.cuda.get_device_capability()[0] == 8 and not self.use_mla_backend
-                   ) or torch.cuda.get_device_capability()[0] == 9, (
+                torch.cuda.get_device_capability()[0] == 8 and not self.use_mla_backend
+            ) or torch.cuda.get_device_capability()[0] == 9, (
                 "FlashAttention v3 Backend requires SM>=80 and SM<=90. "
                 "Please use `--attention-backend flashinfer`."
             )
@@ -1045,7 +1046,7 @@ class ModelRunner:
             key = "model.layers." + str(i) + ".self_attn" + selected_channel
             self.sorted_channels.append(
                 torch.tensor(channel_config[key])[
-                :, : self.server_args.ds_heavy_channel_num
+                    :, : self.server_args.ds_heavy_channel_num
                 ]
                 .contiguous()
                 .cuda()
