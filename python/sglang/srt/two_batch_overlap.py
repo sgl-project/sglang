@@ -1,12 +1,13 @@
 from typing import TYPE_CHECKING, Dict, List, Optional, Sequence
 
 import torch
+
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPConfig
 from sglang.srt.layers.quantization.deep_gemm import configure_deep_gemm_num_sms
-from sglang.srt.operations import execute_overlapped_operations, execute_operations
+from sglang.srt.operations import execute_operations, execute_overlapped_operations
 from sglang.srt.operations_strategy import compute_layers_operations
-from sglang.srt.utils import DeepEPMode, BumpAllocator
+from sglang.srt.utils import BumpAllocator, DeepEPMode
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -17,9 +18,9 @@ if TYPE_CHECKING:
 
 # TODO: may smartly disable TBO when batch size is too small b/c it will slow down
 def compute_split_seq_index(
-        forward_mode: "ForwardMode",
-        num_tokens: int,
-        extend_lens: Optional[Sequence[int]],
+    forward_mode: "ForwardMode",
+    num_tokens: int,
+    extend_lens: Optional[Sequence[int]],
 ) -> Optional[int]:
     if forward_mode.is_extend():
         assert extend_lens is not None
@@ -45,9 +46,9 @@ def _split_array_by_half_sum(arr: Sequence[int]) -> int:
 
 
 def compute_split_token_index(
-        split_seq_index: int,
-        forward_mode: "ForwardMode",
-        extend_seq_lens: Optional[Sequence[int]],
+    split_seq_index: int,
+    forward_mode: "ForwardMode",
+    extend_seq_lens: Optional[Sequence[int]],
 ) -> int:
     if forward_mode.is_extend():
         assert extend_seq_lens is not None
@@ -66,7 +67,7 @@ def compute_split_token_index(
 
 class TboDPAttentionPreparer:
     def prepare_all_gather(
-            self, local_batch, deepep_mode, enable_deepep_moe, enable_two_batch_overlap
+        self, local_batch, deepep_mode, enable_deepep_moe, enable_two_batch_overlap
     ):
         self.enable_two_batch_overlap = enable_two_batch_overlap
 
@@ -78,9 +79,9 @@ class TboDPAttentionPreparer:
             )
             resolved_deepep_mode = deepep_mode.resolve(local_batch.forward_mode)
             local_can_run_tbo = (self.local_tbo_split_seq_index is not None) and not (
-                    local_batch.forward_mode.is_extend()
-                    and enable_deepep_moe
-                    and (resolved_deepep_mode == DeepEPMode.low_latency)
+                local_batch.forward_mode.is_extend()
+                and enable_deepep_moe
+                and (resolved_deepep_mode == DeepEPMode.low_latency)
             )
         else:
             self.local_tbo_split_seq_index = 0
@@ -99,9 +100,9 @@ class TboDPAttentionPreparer:
         )
 
         can_run_tbo = (
-                self.enable_two_batch_overlap
-                and local_can_run_tbo_aggregated
-                and forward_mode_agree
+            self.enable_two_batch_overlap
+            and local_can_run_tbo_aggregated
+            and forward_mode_agree
         )
 
         tbo_split_seq_index = self.local_tbo_split_seq_index if can_run_tbo else None
@@ -135,14 +136,15 @@ class TboDPAttentionPreparer:
 
 # -------------------------------- Execution ---------------------------------------
 
+
 def model_forward_maybe_tbo(
-        layers,
-        enable_tbo: bool,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        hidden_states: torch.Tensor,
-        residual: Optional[torch.Tensor],
-        zero_allocator: BumpAllocator,
+    layers,
+    enable_tbo: bool,
+    positions: torch.Tensor,
+    forward_batch: ForwardBatch,
+    hidden_states: torch.Tensor,
+    residual: Optional[torch.Tensor],
+    zero_allocator: BumpAllocator,
 ):
     inputs = dict(
         positions=positions,
@@ -195,18 +197,20 @@ def model_forward_non_tbo(layers, inputs):
 # TODO generalize if needed
 def _compute_deep_gemm_num_sms(forward_mode: ForwardMode):
     if this_batch_enable_tbo and this_layer_enable_tbo and forward_mode.is_extend():
-        total_num_sms = torch.cuda.get_device_properties(device="cuda").multi_processor_count
+        total_num_sms = torch.cuda.get_device_properties(
+            device="cuda"
+        ).multi_processor_count
         return total_num_sms - DeepEPConfig.get_instance().num_sms
     else:
         return None
 
 
 def _model_forward_split_inputs(
-        hidden_states: torch.Tensor,
-        residual: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: "ForwardBatch",
-        zero_allocator: BumpAllocator,
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    positions: torch.Tensor,
+    forward_batch: "ForwardBatch",
+    zero_allocator: BumpAllocator,
 ) -> List[Dict]:
     return [
         dict(
@@ -226,11 +230,11 @@ def _model_forward_split_inputs(
 
 
 def _model_forward_filter_inputs(
-        hidden_states: torch.Tensor,
-        residual: torch.Tensor,
-        positions: torch.Tensor,
-        output_forward_batch: "ForwardBatch",
-        tbo_subbatch_index: int,
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    positions: torch.Tensor,
+    output_forward_batch: "ForwardBatch",
+    tbo_subbatch_index: int,
 ) -> Dict:
     token_slice = slice(*output_forward_batch.tbo_parent_token_range)
     return dict(
