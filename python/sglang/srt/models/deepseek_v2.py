@@ -241,7 +241,9 @@ class DeepseekV2MoE(nn.Module):
         self.gate = MoEGate(config=config, prefix=add_prefix("gate", prefix))
 
         self.experts = get_moe_impl_class()(
-            num_experts=config.n_routed_experts + self.n_share_experts_fusion,
+            num_experts=config.n_routed_experts
+            + self.n_share_experts_fusion
+            + global_server_args_dict["ep_num_redundant_experts"],
             top_k=config.num_experts_per_tok + min(self.n_share_experts_fusion, 1),
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
@@ -283,7 +285,10 @@ class DeepseekV2MoE(nn.Module):
         if global_server_args_dict["enable_deepep_moe"]:
             # TODO: we will support tp < ep in the future
             self.ep_size = get_tensor_model_parallel_world_size()
-            self.num_experts = config.n_routed_experts
+            self.num_experts = (
+                config.n_routed_experts
+                + global_server_args_dict["ep_num_redundant_experts"]
+            )
             self.renormalize = config.norm_topk_prob
             self.topk_group = config.topk_group
             self.num_expert_group = config.n_group
@@ -297,7 +302,7 @@ class DeepseekV2MoE(nn.Module):
                 group=parallel_state.get_tp_group().device_group,
                 router_topk=self.top_k,
                 permute_fusion=True,
-                num_experts=config.n_routed_experts,
+                num_experts=self.num_experts,
                 num_local_experts=config.n_routed_experts // self.tp_size,
                 hidden_size=config.hidden_size,
                 params_dtype=config.torch_dtype,
