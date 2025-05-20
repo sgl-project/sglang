@@ -66,7 +66,7 @@ class SupportsPP(ABC):
             layer_id < self.start_layer or layer_id >= self.end_layer
         )
 
-    def filter_weights(
+    def filter_weights_by_layers(
         self, weights: Iterable[Tuple[str, torch.Tensor]]
     ) -> Iterator[Tuple[str, torch.Tensor]]:
         """Lazily filter weights based on pipeline stage"""
