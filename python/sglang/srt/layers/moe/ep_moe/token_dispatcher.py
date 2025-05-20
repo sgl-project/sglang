@@ -133,13 +133,11 @@ class _DeepEPConfig:
                 logger.info(f"Use DeepEP Config: {config_parsed}")
             self.normal_dispatch_config = Config(**config_parsed["normal_dispatch"])
             self.normal_combine_config = Config(**config_parsed["normal_combine"])
+            self.num_sms = config_parsed["normal_dispatch"]["num_sms"]
         else:
             self.normal_dispatch_config = None
             self.normal_combine_config = None
-
-    @property
-    def num_sms(self):
-        return TODO
+            self.num_sms = Buffer.num_sms
 
     @classmethod
     def get_instance(cls):
