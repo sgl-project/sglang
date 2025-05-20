@@ -4,7 +4,6 @@ import torch
 import math
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from sglang.srt.entrypoints.engine import Engine
-from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
 def get_test_model_name():
     """Get the model name from environment or use a default test model."""
