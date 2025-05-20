@@ -1315,7 +1315,8 @@ class DeepseekV2Model(nn.Module):
             config.hidden_size,
             enable_tp=not global_server_args_dict["enable_dp_attention"],
         )
-        self.alt_stream = torch.cuda.Stream()
+        # TODO(haishaw): multi-stream performance on ROCm
+        self.alt_stream = None if _is_hip else torch.cuda.Stream()
         self.layers = nn.ModuleList(
             [
                 DeepseekV2DecoderLayer(
