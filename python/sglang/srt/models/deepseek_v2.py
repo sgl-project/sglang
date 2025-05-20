@@ -1374,21 +1374,18 @@ class DeepseekV2Model(nn.Module):
 
         residual = None
 
-        normal_num_layers = (
-            self.first_k_dense_replace
-            if forward_batch.can_run_tbo
-            else len(self.layers)
+        hidden_states, residual = model_forward_maybe_tbo_layers(
+            layers=self.layers[:self.first_k_dense_replace],
+            enable_tbo=False,
+            positions=positions,
+            forward_batch=forward_batch,
+            hidden_states=hidden_states,
+            residual=residual,
         )
-        for i in range(normal_num_layers):
-            with get_global_expert_distribution_recorder().with_current_layer(i):
-                layer = self.layers[i]
-                hidden_states, residual = layer(
-                    positions, hidden_states, forward_batch, residual, zero_allocator
-                )
 
         hidden_states, residual = model_forward_maybe_tbo_layers(
-            layers=self.layers[normal_num_layers:],
-            enable_tbo=TODO,
+            layers=self.layers[self.first_k_dense_replace:],
+            enable_tbo=forward_batch.can_run_tbo,
             positions=positions,
             forward_batch=forward_batch,
             hidden_states=hidden_states,
