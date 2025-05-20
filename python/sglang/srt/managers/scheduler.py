@@ -31,8 +31,6 @@ import psutil
 import setproctitle
 import torch
 import zmq
-from torch.distributed import barrier
-
 from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constrained.base_grammar_backend import create_grammar_backend
@@ -141,9 +139,10 @@ from sglang.srt.utils import (
     pyspy_dump_schedulers,
     set_gpu_proc_affinity,
     set_random_seed,
-    suppress_other_loggers,
+    suppress_other_loggers, DeepEPMode,
 )
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
+from torch.distributed import barrier
 
 logger = logging.getLogger(__name__)
 
@@ -398,8 +397,8 @@ class Scheduler(
             1.0,
         )
         self.new_token_ratio_decay = (
-            self.init_new_token_ratio - self.min_new_token_ratio
-        ) / global_config.default_new_token_ratio_decay_steps
+                                         self.init_new_token_ratio - self.min_new_token_ratio
+                                     ) / global_config.default_new_token_ratio_decay_steps
         self.new_token_ratio = self.init_new_token_ratio
 
         # Init watchdog thread
@@ -1380,10 +1379,10 @@ class Scheduler(
             if (
                 self.lora_paths
                 and len(
-                    lora_set
-                    | set([req.lora_path for req in adder.can_run_list])
-                    | set([req.lora_path])
-                )
+                lora_set
+                | set([req.lora_path for req in adder.can_run_list])
+                | set([req.lora_path])
+            )
                 > self.max_loras_per_batch
             ):
                 self.running_batch.batch_is_full = True
@@ -1625,9 +1624,11 @@ class Scheduler(
             tp_cpu_group=self.tp_cpu_group,
             get_idle_batch=self.get_idle_batch,
             disable_cuda_graph=self.server_args.disable_cuda_graph,
-            enable_two_batch_overlap=self.server_args.enable_two_batch_overlap,
             spec_algorithm=self.spec_algorithm,
             speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
+            enable_two_batch_overlap=self.server_args.enable_two_batch_overlap,
+            enable_deepep_moe=self.server_args.enable_deepep_moe,
+            deepep_mode=DeepEPMode[self.server_args.deepep_mode],
         )
 
     @staticmethod
@@ -1639,9 +1640,11 @@ class Scheduler(
         tp_cpu_group,
         get_idle_batch,
         disable_cuda_graph: bool,
-        enable_two_batch_overlap: bool,
         spec_algorithm,
         speculative_num_draft_tokens,
+        enable_two_batch_overlap: bool,
+        enable_deepep_moe: bool,
+        deepep_mode: DeepEPMode,
     ):
         # Check if other DP workers have running batches
         if local_batch is None:
@@ -1659,8 +1662,8 @@ class Scheduler(
                     # We should have at least 1 token for sample in every case.
                     max(extend_len - logprob_start_len, 1)
                     for logprob_start_len, extend_len in zip(
-                        local_batch.extend_logprob_start_lens, local_batch.extend_lens
-                    )
+                    local_batch.extend_logprob_start_lens, local_batch.extend_lens
+                )
                 ]
             )
 
@@ -1677,17 +1680,43 @@ class Scheduler(
         is_extend_in_batch = (
             local_batch.forward_mode.is_extend() if local_batch else False
         )
+
+        if local_batch is not None:
+            local_tbo_split_seq_index = two_batch_overlap.compute_split_seq_index(
+                forward_mode=local_batch.forward_mode,
+                num_tokens=local_batch.input_ids.shape[0],
+                extend_lens=local_batch.extend_lens,
+            )
+            resolved_deepep_mode = deepep_mode.resolve(local_batch.forward_mode)
+            local_can_run_tbo = (
+                (local_tbo_split_seq_index is not None)
+                and not (
+                local_batch.forward_mode.is_extend()
+                and enable_deepep_moe
+                and (resolved_deepep_mode == DeepEPMode.low_latency)
+            )
+            )
+        else:
+            local_tbo_split_seq_index = 0
+            local_can_run_tbo = True
+
         local_info = torch.tensor(
             [
                 num_tokens,
                 can_cuda_graph,
                 num_tokens_for_logprob,
                 is_extend_in_batch,
+                local_can_run_tbo,
+                (
+                    local_batch.forward_mode
+                    if local_batch is not None
+                    else ForwardMode.IDLE
+                ).value,
             ],
             dtype=torch.int64,
         )
         global_info = torch.empty(
-            (dp_size, attn_tp_size, 4),
+            (dp_size, attn_tp_size, 6),
             dtype=torch.int64,
         )
         torch.distributed.all_gather_into_tensor(
@@ -1699,6 +1728,23 @@ class Scheduler(
         can_cuda_graph = min(global_info[:, 0, 1].tolist())
         global_num_tokens_for_logprob = global_info[:, 0, 2].tolist()
         is_extend_in_batch = global_info[:, 0, 3].tolist()
+        local_can_run_tbo_aggregated = min(global_info[:, 0, 4].tolist())
+        forward_modes = global_info[:, 0, 5].tolist()
+
+        converted_forward_modes = [
+            ForwardMode.DECODE.value if x == ForwardMode.IDLE.value else x
+            for x in forward_modes
+        ]
+        forward_mode_agree = _is_all_same(converted_forward_modes)
+        global_forward_mode = (
+            ForwardMode(converted_forward_modes[0]) if forward_mode_agree else None
+        )
+
+        can_run_tbo = (
+            enable_two_batch_overlap
+            and local_can_run_tbo_aggregated
+            and forward_mode_agree
+        )
 
         if local_batch is None and max(global_num_tokens) > 0:
             local_batch = get_idle_batch()
@@ -1713,6 +1759,12 @@ class Scheduler(
                 local_batch.global_num_tokens_for_logprob = (
                     global_num_tokens_for_logprob
                 )
+            local_batch.tbo_split_seq_index = (
+                local_tbo_split_seq_index if can_run_tbo else None
+            )
+            local_batch.global_forward_mode = (
+                global_forward_mode if can_run_tbo else None
+            )
 
             # Check forward mode for cuda graph
             if not disable_cuda_graph:
@@ -2231,6 +2283,10 @@ def _import_static_state(model, static_params):
     self_named_buffers = dict(model.named_buffers())
     for name, tensor in static_params["buffers"]:
         self_named_buffers[name][...] = tensor
+
+
+def _is_all_same(x):
+    return all(value == x[0] for value in x)
 
 
 def run_scheduler_process(
