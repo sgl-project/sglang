@@ -166,14 +166,7 @@ def model_forward_tbo_layers(
         ForwardMode.DECODE: 2,
     }[forward_batch.global_forward_mode]
 
-    # TODO do not hardcode
-    total_num_sm = torch.cuda.get_device_properties(device="cuda").multi_processor_count
-    extend_mode_communication_num_sm = DEEPEP_NUM_SMS
-    deep_gemm_num_sms = (
-        total_num_sm - extend_mode_communication_num_sm
-        if forward_batch.forward_mode.is_extend()
-        else None
-    )
+    deep_gemm_num_sms = _compute_deep_gemm_num_sms(forward_batch)
 
     with configure_deep_gemm_num_sms(deep_gemm_num_sms):
         outputs_arr = execute_overlapped_operations(
@@ -183,6 +176,17 @@ def model_forward_tbo_layers(
         )
 
     return _model_forward_merge_outputs(*outputs_arr)
+
+
+def _compute_deep_gemm_num_sms(forward_batch):
+    total_num_sm = torch.cuda.get_device_properties(device="cuda").multi_processor_count
+    extend_mode_communication_num_sm = DEEPEP_NUM_SMS
+    deep_gemm_num_sms = (
+        total_num_sm - extend_mode_communication_num_sm
+        if forward_batch.forward_mode.is_extend()
+        else None
+    )
+    return deep_gemm_num_sms
 
 
 def _model_forward_split_inputs(
