@@ -16,7 +16,7 @@
 import time
 from typing import Dict, List, Optional, Union
 
-from pydantic import BaseModel, Field, model_serializer, root_validator
+from pydantic import BaseModel, Field, root_validator
 from typing_extensions import Literal
 
 
@@ -182,7 +182,6 @@ class CompletionRequest(BaseModel):
     skip_special_tokens: bool = True
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
     session_params: Optional[Dict] = None
-    return_hidden_states: Optional[bool] = False
 
 
 class CompletionResponseChoice(BaseModel):
@@ -191,11 +190,6 @@ class CompletionResponseChoice(BaseModel):
     logprobs: Optional[LogProbs] = None
     finish_reason: Literal["stop", "length", "content_filter"]
     matched_stop: Union[None, int, str] = None
-    hidden_states: Optional[object] = None
-
-    @model_serializer
-    def _serialize(self):
-        return exclude_if_none(self, ["hidden_states"])
 
 
 class CompletionResponse(BaseModel):
@@ -213,11 +207,6 @@ class CompletionResponseStreamChoice(BaseModel):
     logprobs: Optional[LogProbs] = None
     finish_reason: Optional[Literal["stop", "length", "content_filter"]] = None
     matched_stop: Union[None, int, str] = None
-    hidden_states: Optional[object] = None
-
-    @model_serializer
-    def _serialize(self):
-        return exclude_if_none(self, ["hidden_states"])
 
 
 class CompletionStreamResponse(BaseModel):
@@ -411,9 +400,6 @@ class ChatCompletionRequest(BaseModel):
     bootstrap_port: Optional[int] = None
     bootstrap_room: Optional[int] = None
 
-    # Hidden States
-    return_hidden_states: Optional[bool] = False
-
 
 class ChatMessage(BaseModel):
     role: Optional[str] = None
@@ -430,11 +416,6 @@ class ChatCompletionResponseChoice(BaseModel):
         "stop", "length", "tool_calls", "content_filter", "function_call"
     ]
     matched_stop: Union[None, int, str] = None
-    hidden_states: Optional[object] = None
-
-    @model_serializer
-    def _serialize(self):
-        return exclude_if_none(self, ["hidden_states"])
 
 
 class ChatCompletionResponse(BaseModel):
@@ -451,11 +432,6 @@ class DeltaMessage(BaseModel):
     content: Optional[str] = None
     reasoning_content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
-    hidden_states: Optional[object] = None
-
-    @model_serializer
-    def _serialize(self):
-        return exclude_if_none(self, ["hidden_states"])
 
 
 class ChatCompletionResponseStreamChoice(BaseModel):
@@ -508,8 +484,3 @@ class EmbeddingResponse(BaseModel):
     model: str
     object: str = "list"
     usage: Optional[UsageInfo] = None
-
-
-def exclude_if_none(obj, field_names: List[str]):
-    omit_if_none_fields = {k for k, v in obj.model_fields.items() if k in field_names}
-    return {k: v for k, v in obj if k not in omit_if_none_fields or v is not None}
