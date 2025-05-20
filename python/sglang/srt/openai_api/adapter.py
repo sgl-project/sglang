@@ -17,7 +17,6 @@ import asyncio
 import base64
 import json
 import logging
-import math
 import os
 import time
 import uuid
@@ -74,6 +73,7 @@ from sglang.srt.openai_api.protocol import (
     TopLogprob,
     UsageInfo,
     ScoringRequest,
+    ScoringResponse,
 )
 from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.utils import convert_json_schema_to_str, get_exception_traceback
@@ -2012,7 +2012,6 @@ def to_openai_style_logprobs(
 
 
 async def v1_score(tokenizer_manager, raw_request):
-    """Score a list of items against a prompt using positive/negative token logits."""
     try:
         # Parse request
         request_data = await raw_request.json()
@@ -2028,11 +2027,12 @@ async def v1_score(tokenizer_manager, raw_request):
             request=request,
         )
 
-        return ORJSONResponse({
-            "scores": result["scores"],
-            "model": request.model,
-            "usage": result["usage"]
-        })
+        response = ScoringResponse(
+            scores=result["scores"],
+            model=request.model,
+            usage=result["usage"]
+        )
+        return ORJSONResponse(response.model_dump())
 
     except Exception as e:
         logger.error(f"Error in v1_score: {str(e)}")

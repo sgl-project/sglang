@@ -481,9 +481,9 @@ class Engine(EngineBase):
         prepend: bool = False,
     ) -> Dict:
         """
-        Score a list of items against a prompt using positive/negative token probabilities.
+        Score a list of texts using decoder-only models using positive/negative token probabilities.
         
-        This method computes a score for each item in text_2 by comparing the model's probability
+        A score is computed for each pair of text_1 + text_2 by comparing the model's probability
         of generating the positive token versus the negative token immediately after the prompt.
         The score is computed as: prob(positive) / (prob(positive) + prob(negative)).
         

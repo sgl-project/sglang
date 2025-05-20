@@ -84,17 +84,7 @@ from sglang.srt.openai_api.adapter import (
     v1_retrieve_file_content,
     v1_score,
 )
-from sglang.srt.openai_api.protocol import (
-    ModelCard,
-    ModelList,
-    ChatCompletionRequest,
-    ChatCompletionResponse,
-    CompletionRequest,
-    CompletionResponse,
-    EmbeddingRequest,
-    EmbeddingResponse,
-    ScoringRequest,
-)
+from sglang.srt.openai_api.protocol import ModelCard, ModelList
 from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
