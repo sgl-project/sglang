@@ -1,11 +1,14 @@
 import torch
 
-from sglang.srt import two_batch_overlap, operations
+from sglang.srt import operations
+from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
 
+# TODO refactor this if there are more overlapping strategies
 def compute_layer_operations(
     layer: torch.nn.Module,
+    forward_mode: ForwardMode,
 ):
     if not layer.is_layer_sparse:
         return [
@@ -16,7 +19,7 @@ def compute_layer_operations(
             layer.op_comm_postprocess_layer,
         ]
 
-    if enable_two_batch_overlap:
+    if global_server_args_dict["enable_two_batch_overlap"]:
         if forward_mode == ForwardMode.EXTEND:
             return [
                 layer.op_comm_prepare_attn,
@@ -38,9 +41,9 @@ def compute_layer_operations(
         elif forward_mode == ForwardMode.DECODE:
             return [
                 layer.op_comm_prepare_attn,
-                layer.op_decode_attn_0, # TODO
+                layer.op_decode_attn_0,  # TODO
                 operations.YieldOperation(),
-                layer.op_decode_attn_1, # TODO
+                layer.op_decode_attn_1,  # TODO
                 layer.op_comm_prepare_mlp,
                 layer.mlp.op_gate,
                 layer.mlp.op_select_experts,
@@ -75,4 +78,3 @@ def compute_layer_operations(
         layer.mlp.op_output,
         layer.op_comm_postprocess_layer,
     ]
-
