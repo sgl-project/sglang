@@ -167,7 +167,7 @@ class DeepseekV2MLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
 
-    def forward(self, x, forward_mode: Optional[ForwardMode] = None):
+    def forward(self, x, forward_batch=None):
         if (self.tp_size == 1) and x.shape[0] == 0:
             return x
 
@@ -1212,7 +1212,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
-        hidden_states = self.mlp(hidden_states, forward_batch.forward_mode)
+        hidden_states = self.mlp(hidden_states, forward_batch)
 
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
