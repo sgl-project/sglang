@@ -56,6 +56,7 @@ class ExpertLocationMetadata:
 
     @property
     def ep_size(self):
+        # TODO change when EP size != world size
         return torch.distributed.get_world_size()
 
     def __post_init__(self):
