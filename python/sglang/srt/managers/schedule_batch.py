@@ -83,6 +83,7 @@ global_server_args_dict = {
     "flashinfer_mla_disable_ragged": ServerArgs.flashinfer_mla_disable_ragged,
     "max_micro_batch_size": ServerArgs.max_micro_batch_size,
     "moe_dense_tp_size": ServerArgs.moe_dense_tp_size,
+    "ep_dispatch_algorithm": ServerArgs.ep_dispatch_algorithm,
     "n_share_experts_fusion": ServerArgs.n_share_experts_fusion,
     "sampling_backend": ServerArgs.sampling_backend,
     "speculative_accept_threshold_acc": ServerArgs.speculative_accept_threshold_acc,
