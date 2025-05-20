@@ -1934,7 +1934,7 @@ class FlashAttentionBackend(AttentionBackend):
         sliced_page_table = metadata.page_table[:bs, :max_seq_len]
 
         cu_seqlens_q_np = cu_seqlens_q.cpu().numpy()
-        seqlens_np = seqlens.cpu().numpy()
+        seqlens_np = seqlens.numpy()
         (
             seqlens_q_local_np,
             cu_seqlens_q_local_np,
