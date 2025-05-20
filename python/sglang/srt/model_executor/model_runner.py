@@ -197,6 +197,7 @@ class ModelRunner:
                 "deepep_config": server_args.deepep_config,
                 "flashinfer_mla_disable_ragged": server_args.flashinfer_mla_disable_ragged,
                 "moe_dense_tp_size": server_args.moe_dense_tp_size,
+                "ep_dispatch_algorithm": server_args.ep_dispatch_algorithm,
                 "n_share_experts_fusion": server_args.n_share_experts_fusion,
                 "triton_attention_reduce_in_fp32": server_args.triton_attention_reduce_in_fp32,
                 "torchao_config": server_args.torchao_config,
