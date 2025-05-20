@@ -7,11 +7,11 @@ from typing import List
 import torch
 import torch.distributed
 import torch.multiprocessing as mp
-from sglang.srt.model_executor import expert_location_updater
-from sglang.test.test_utils import CustomTestCase
-from sglang.test.test_utils import find_available_port
-from sglang.utils import is_in_ci
 from torch.multiprocessing import Process
+
+from sglang.srt.model_executor import expert_location_updater
+from sglang.test.test_utils import CustomTestCase, find_available_port
+from sglang.utils import is_in_ci
 
 
 @dataclass
@@ -32,8 +32,14 @@ class TestExpertLocationUpdater(CustomTestCase):
         self._test_core(
             num_gpus=32,
             device="cpu",
-            infos=[_TestInfo(nnodes=4, num_logical_experts=256, num_physical_experts=288, num_repeat=10000)],
-
+            infos=[
+                _TestInfo(
+                    nnodes=4,
+                    num_logical_experts=256,
+                    num_physical_experts=288,
+                    num_repeat=10000,
+                )
+            ],
         )
 
     def test_cpu_slow(self):
@@ -42,7 +48,14 @@ class TestExpertLocationUpdater(CustomTestCase):
         self._test_core(
             num_gpus=144,
             device="cpu",
-            infos=[_TestInfo(nnodes=18, num_logical_experts=256, num_physical_experts=288, num_repeat=10000)],
+            infos=[
+                _TestInfo(
+                    nnodes=18,
+                    num_logical_experts=256,
+                    num_physical_experts=288,
+                    num_repeat=10000,
+                )
+            ],
         )
 
     def test_gpu(self):
@@ -56,12 +69,15 @@ class TestExpertLocationUpdater(CustomTestCase):
         for nnodes in [1, 2, 4]:
             for num_logical_experts in [2, 5, 20, 256]:
                 for num_physical_experts in [8, 16, 256, 288]:
-                    if num_logical_experts > num_physical_experts: continue
-                    infos.append(_TestInfo(
-                        nnodes=nnodes,
-                        num_logical_experts=num_logical_experts,
-                        num_physical_experts=num_physical_experts,
-                    ))
+                    if num_logical_experts > num_physical_experts:
+                        continue
+                    infos.append(
+                        _TestInfo(
+                            nnodes=nnodes,
+                            num_logical_experts=num_logical_experts,
+                            num_physical_experts=num_physical_experts,
+                        )
+                    )
 
         self._test_core(num_gpus=8, device=device, infos=infos)
 
@@ -91,7 +107,9 @@ class TestExpertLocationUpdater(CustomTestCase):
             processes.append(p)
 
         for _ in range(num_gpus):
-            self.assertTrue(output_reader.recv(), f"Subprocess has error, please see logs above.")
+            self.assertTrue(
+                output_reader.recv(), f"Subprocess has error, please see logs above."
+            )
 
         for p in processes:
             p.join()
@@ -110,8 +128,11 @@ def _run_subprocess(
         os.environ["MASTER_PORT"] = str(master_port)
 
         torch.random.manual_seed(42)
-        torch.distributed.init_process_group(rank=rank, world_size=num_gpus,
-                                             backend={"cpu": "gloo", "cuda": None}[device])
+        torch.distributed.init_process_group(
+            rank=rank,
+            world_size=num_gpus,
+            backend={"cpu": "gloo", "cuda": None}[device],
+        )
         if device == "cuda":
             torch.cuda.set_device(f"cuda:{rank}")
 
@@ -139,21 +160,31 @@ def _execute_test(info: _TestInfo, rank: int, num_gpus: int, device: str):
 
     def _create_routed_experts_weights(physical_to_logical_map):
         local_logical_expert_ids = physical_to_logical_map[
-                                   rank * num_local_physical_experts: (rank + 1) * num_local_physical_experts].cpu()
+            rank * num_local_physical_experts : (rank + 1) * num_local_physical_experts
+        ].cpu()
         return [
             local_logical_expert_ids.to(device).clone(),
-            torch.tensor([
-                [local_logical_expert_id * 10, local_logical_expert_id * 100]
-                for local_logical_expert_id in local_logical_expert_ids.tolist()
-            ], device=device),
+            torch.tensor(
+                [
+                    [local_logical_expert_id * 10, local_logical_expert_id * 100]
+                    for local_logical_expert_id in local_logical_expert_ids.tolist()
+                ],
+                device=device,
+            ),
         ]
 
     def _create_physical_to_logical_map():
         if rank == 0:
-            ans = torch.concat([
-                torch.arange(0, info.num_logical_experts),
-                torch.randint(0, info.num_logical_experts, (info.num_physical_experts - info.num_logical_experts,)),
-            ])
+            ans = torch.concat(
+                [
+                    torch.arange(0, info.num_logical_experts),
+                    torch.randint(
+                        0,
+                        info.num_logical_experts,
+                        (info.num_physical_experts - info.num_logical_experts,),
+                    ),
+                ]
+            )
             ans = ans[torch.randperm(ans.shape[0])]
         else:
             ans = torch.empty((info.num_physical_experts,), dtype=torch.int64)
@@ -176,7 +207,9 @@ def _execute_test(info: _TestInfo, rank: int, num_gpus: int, device: str):
 
         output_logs = expert_location_updater.update_expert_weights_single_layer(
             routed_experts_weights=routed_experts_weights,
-            temp_buffers=expert_location_updater.create_temp_buffers(routed_experts_weights),
+            temp_buffers=expert_location_updater.create_temp_buffers(
+                routed_experts_weights
+            ),
             old_physical_to_logical_map=physical_to_logical_map,
             new_physical_to_logical_map=new_physical_to_logical_map,
             num_local_physical_experts=num_local_physical_experts,
@@ -190,7 +223,9 @@ def _execute_test(info: _TestInfo, rank: int, num_gpus: int, device: str):
             for x, y in zip(routed_experts_weights, expect_new_weights, strict=True)
         )
         global_has_error = torch.tensor(local_has_error, device=device)
-        torch.distributed.all_reduce(global_has_error, op=torch.distributed.ReduceOp.MAX)
+        torch.distributed.all_reduce(
+            global_has_error, op=torch.distributed.ReduceOp.MAX
+        )
 
         if global_has_error.cpu().item():
             output_logs_str = "\n".join(output_logs)
