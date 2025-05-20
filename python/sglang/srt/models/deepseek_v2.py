@@ -1231,7 +1231,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             operations=compute_layer_operations(self),
         )
 
-    def op_comm_pre_attn(
+    def op_comm_prepare_attn(
         self,
         state,
         positions: torch.Tensor,
@@ -1241,7 +1241,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         zero_allocator: BumpAllocator,
     ):
         state.hidden_states_after_comm_pre_attn, state.residual_after_input_ln = (
-            self.layer_communicator.forward_pre_attn(
+            self.layer_communicator.prepare_attn(
                 hidden_states, residual, state.forward_batch
             )
         )
@@ -1261,9 +1261,9 @@ class DeepseekV2DecoderLayer(nn.Module):
             zero_allocator=state.zero_allocator,
         )
 
-    def op_comm_pre_mlp(self, state):
+    def op_comm_prepare_mlp(self, state):
         state.hidden_states_mlp_input, state.residual_after_comm_pre_mlp = (
-            self.layer_communicator.forward_pre_mlp(
+            self.layer_communicator.prepare_mlp(
                 state.pop("hidden_states_after_attn"),
                 state.pop("residual_after_input_ln"),
                 state.forward_batch,
@@ -1283,8 +1283,8 @@ class DeepseekV2DecoderLayer(nn.Module):
         else:
             state.hidden_states_mlp_output = hidden_states
 
-    def op_comm_layer_end(self, state):
-        hidden_states, residual = self.layer_communicator.forward_layer_end(
+    def op_comm_postprocess_layer(self, state):
+        hidden_states, residual = self.layer_communicator.postprocess_layer(
             state.pop("hidden_states_mlp_output"),
             state.pop("residual_after_comm_pre_mlp"),
             state.forward_batch,
