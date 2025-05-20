@@ -1146,9 +1146,14 @@ class ModelRunner:
             self.forward_pass_id,
             forward_batch,
         ):
-            return self._forward_raw(
+            output = self._forward_raw(
                 forward_batch, skip_attn_backend_init, pp_proxy_tensors
             )
+
+        if self.eplb_manager is not None:
+            self.eplb_manager.on_forward_pass_end(self.forward_pass_id)
+
+        return output
 
     def _forward_raw(
         self,
