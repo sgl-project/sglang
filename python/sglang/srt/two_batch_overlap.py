@@ -2,6 +2,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Sequence
 
 import torch
 from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPConfig
 from sglang.srt.layers.quantization.deep_gemm import configure_deep_gemm_num_sms
 from sglang.srt.operations import execute_overlapped_operations
 from sglang.srt.operations_strategy import compute_layers_operations
@@ -200,7 +201,7 @@ def model_forward_tbo_layers(
 def _compute_deep_gemm_num_sms(forward_batch):
     if forward_batch.forward_mode.is_extend():
         total_num_sm = torch.cuda.get_device_properties(device="cuda").multi_processor_count
-        return total_num_sm - DEEPEP_NUM_SMS
+        return total_num_sm - DeepEPConfig.get_instance().num_sms
     else:
         return None
 
