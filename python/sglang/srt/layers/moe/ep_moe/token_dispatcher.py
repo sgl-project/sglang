@@ -97,7 +97,12 @@ class DeepEPBuffer:
             num_nvl_bytes,
             num_rdma_bytes,
             low_latency_mode=deepep_mode.enable_low_latency(),
-            num_qps_per_rank=(max(num_experts // group.size(), _DeepEPConfig.get_instance().num_sms // 2)),
+            num_qps_per_rank=(
+                max(
+                    num_experts // group.size(),
+                    _DeepEPConfig.get_instance().num_sms // 2,
+                )
+            ),
         )
         return cls._buffer
 
@@ -476,9 +481,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         buffer = self._get_buffer()
         topk_idx = topk_idx.to(torch.int64)
         expected_m = (
-                         hidden_states.shape[0] * buffer.group_size * topk_idx.shape[1]
-                         + self.num_experts
-                     ) // self.num_experts
+            hidden_states.shape[0] * buffer.group_size * topk_idx.shape[1]
+            + self.num_experts
+        ) // self.num_experts
         hidden_states, masked_m, event, hook = self._dispatch_core(
             hidden_states,
             topk_idx,
