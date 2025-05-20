@@ -1921,6 +1921,7 @@ class FlashAttentionBackend(AttentionBackend):
         cu_seqlens_q = torch.arange(
             bs + 1, device=cu_seqlens_q.device, dtype=cu_seqlens_q.dtype
         )
+        cu_seqlens_q_cpu = torch.arange(bs + 1, dtype=cu_seqlens_q.dtype)
         seqlens = metadata.cache_seqlens_int32_cpu[:bs]
         # Slice the page_table to match the batch size and actual sequence length
         # This serves three important purposes:
@@ -1933,7 +1934,7 @@ class FlashAttentionBackend(AttentionBackend):
         max_seq_len = int(seqlens.max().item())
         sliced_page_table = metadata.page_table[:bs, :max_seq_len]
 
-        cu_seqlens_q_np = cu_seqlens_q.cpu().numpy()
+        cu_seqlens_q_np = cu_seqlens_q_cpu.numpy()
         seqlens_np = seqlens.numpy()
         (
             seqlens_q_local_np,
