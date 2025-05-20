@@ -4,11 +4,8 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.utils import libentry
-
 
 # From FlagGems
-@libentry()
 @triton.jit(do_not_specialize=["eps"])
 def rms_norm_kernel(
     Y,  # pointer to the output
@@ -59,7 +56,6 @@ def rms_norm_triton(x, normalized_shape, weight, eps=1e-5):
     return _RmsNorm.apply(x, normalized_shape, weight, eps)
 
 
-@libentry()
 @triton.jit(do_not_specialize=["eps"])
 def fused_add_rms_norm_kernel(
     input_ptr,  # [..., hidden_size]

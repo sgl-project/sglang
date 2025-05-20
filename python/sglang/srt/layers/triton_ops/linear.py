@@ -2,11 +2,8 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.utils import libentry
-
 
 # from FlagGems
-@libentry()
 @triton.autotune(
     configs=[
         triton.Config(
@@ -149,7 +146,6 @@ def heur_even_k(args):
 
 
 # From FlagGems
-@libentry()
 @triton.autotune(
     configs=[
         # basic configs for compute-bound matmuls

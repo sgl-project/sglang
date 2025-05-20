@@ -4,11 +4,8 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.utils import libentry
-
 
 # From FlagGems
-@libentry()
 @triton.jit
 def apply_rotary_pos_emb_kernel(
     oq_ptr,
