@@ -10,10 +10,11 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
 
+# TODO: may smartly disable TBO when batch size is too small b/c it will slow down
 def compute_split_seq_index(
-        forward_mode: "ForwardMode",
-        num_tokens: int,
-        extend_lens: Optional[Sequence[int]],
+    forward_mode: "ForwardMode",
+    num_tokens: int,
+    extend_lens: Optional[Sequence[int]],
 ) -> Optional[int]:
     if forward_mode.is_extend():
         assert extend_lens is not None
@@ -39,9 +40,9 @@ def _split_array_by_half_sum(arr: Sequence[int]) -> int:
 
 
 def compute_split_token_index(
-        split_seq_index: int,
-        forward_mode: "ForwardMode",
-        extend_seq_lens: Optional[Sequence[int]],
+    split_seq_index: int,
+    forward_mode: "ForwardMode",
+    extend_seq_lens: Optional[Sequence[int]],
 ) -> int:
     if forward_mode.is_extend():
         assert extend_seq_lens is not None
