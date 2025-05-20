@@ -24,8 +24,11 @@ from sglang.srt.managers.schedule_batch import global_server_args_dict
 @dataclass
 class ExpertLocationDispatchInfo:
     ep_dispatch_algorithm: Literal["static", "random"]
+    # (num_logical_experts,)
     partial_logical_to_rank_dispatch_physical_map: torch.Tensor
+    # (num_logical_experts, X)
     partial_logical_to_all_physical_map: torch.Tensor
+    # (num_logical_experts,)
     partial_logical_to_all_physical_map_num_valid: torch.Tensor
     num_physical_experts: int
 
