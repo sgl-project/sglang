@@ -617,7 +617,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
 
 
 @dataclass
-class _DeepEPDispatcherState(Enum):
+class _DeepEPDispatcherStage(Enum):
     INITIAL = auto()
     AFTER_DISPATCH_A = auto()
     AFTER_DISPATCH_B = auto()
@@ -662,7 +662,7 @@ class DeepEPDispatcher:
                 **common_kwargs,
             )
 
-        self._state = _DeepEPDispatcherState.INITIAL
+        self._stage = _DeepEPDispatcherStage.INITIAL
 
     def dispatch(self, *args, **kwargs) -> Tuple:
         self.dispatch_a(*args, **kwargs)
@@ -676,8 +676,8 @@ class DeepEPDispatcher:
         topk_weights: torch.Tensor,
         forward_mode: ForwardMode = None,
     ):
-        self._update_state(
-            _DeepEPDispatcherState.INITIAL, _DeepEPDispatcherState.AFTER_DISPATCH_A
+        self._update_stage(
+            _DeepEPDispatcherStage.INITIAL, _DeepEPDispatcherStage.AFTER_DISPATCH_A
         )
         inner_state = self._get_impl(forward_mode).dispatch_a(
             hidden_states=hidden_states,
@@ -687,9 +687,9 @@ class DeepEPDispatcher:
         self._dispatch_intermediate_state = forward_mode, inner_state
 
     def dispatch_b(self):
-        self._update_state(
-            _DeepEPDispatcherState.AFTER_DISPATCH_A,
-            _DeepEPDispatcherState.AFTER_DISPATCH_B,
+        self._update_stage(
+            _DeepEPDispatcherStage.AFTER_DISPATCH_A,
+            _DeepEPDispatcherStage.AFTER_DISPATCH_B,
         )
         forward_mode, inner_state = self._dispatch_intermediate_state
         del self._dispatch_intermediate_state
@@ -707,9 +707,9 @@ class DeepEPDispatcher:
         topk_weights: torch.Tensor,
         forward_mode: ForwardMode,
     ):
-        self._update_state(
-            _DeepEPDispatcherState.AFTER_DISPATCH_B,
-            _DeepEPDispatcherState.AFTER_COMBINE_A,
+        self._update_stage(
+            _DeepEPDispatcherStage.AFTER_DISPATCH_B,
+            _DeepEPDispatcherStage.AFTER_COMBINE_A,
         )
         inner_state = self._get_impl(forward_mode).combine_a(
             hidden_states=hidden_states,
@@ -719,8 +719,8 @@ class DeepEPDispatcher:
         self._combine_intermediate_state = forward_mode, inner_state
 
     def combine_b(self):
-        self._update_state(
-            _DeepEPDispatcherState.AFTER_COMBINE_A, _DeepEPDispatcherState.INITIAL
+        self._update_stage(
+            _DeepEPDispatcherStage.AFTER_COMBINE_A, _DeepEPDispatcherStage.INITIAL
         )
         forward_mode, inner_state = self._combine_intermediate_state
         del self._combine_intermediate_state
@@ -735,6 +735,6 @@ class DeepEPDispatcher:
         else:
             raise ValueError(f"Invalid deepep_mode: {self.deepep_mode}")
 
-    def _update_state(self, old_state, new_state):
-        assert self._state == old_state
-        self._state = new_state
+    def _update_stage(self, old_stage, new_stage):
+        assert self._stage == old_stage
+        self._stage = new_stage
