@@ -724,3 +724,7 @@ class DeepEPDispatcher:
             return self._low_latency_dispatcher
         else:
             raise ValueError(f"Invalid deepep_mode: {self.deepep_mode}")
+
+    def _update_state(self, old_state, new_state):
+        assert self._state == old_state
+        self._state = new_state
