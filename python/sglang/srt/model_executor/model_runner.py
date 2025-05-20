@@ -484,9 +484,11 @@ class ModelRunner:
         set_mscclpp_all_reduce(self.server_args.enable_mscclpp)
 
         if not self.is_draft_worker:
-            # Bind OpenMP threads to CPU cores
-            if self.device == "cpu" and self.local_omp_cpuid != "all":
-                torch.ops._C_utils.init_cpu_threads_env(self.local_omp_cpuid)
+            if self.device == "cpu":
+                import sgl_kernel.common_ops
+                # Bind OpenMP threads to CPU cores
+                if self.local_omp_cpuid != "all":
+                    sgl_kernel.common_ops.init_cpu_threads_env(self.local_omp_cpuid)
 
             # Only initialize the distributed environment on the target model worker.
             init_distributed_environment(
