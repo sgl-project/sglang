@@ -1385,15 +1385,6 @@ class DeepseekV2Model(nn.Module):
         if start_layer == end_layer:
             return hidden_states, residual
 
-        def compute_operations(tbo_child_index: int):
-            return [
-                op
-                for i in range(start_layer, end_layer)
-                for op in self.layers[i].get_forward_tbo_operations(
-                    forward_batch.global_forward_mode, tbo_child_index
-                )
-            ]
-
         if self.attn_tp_size != 1:
             hidden_states += residual
             residual = None

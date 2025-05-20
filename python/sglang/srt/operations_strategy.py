@@ -4,6 +4,12 @@ from sglang.srt import operations
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
+def compute_layers_operations(
+    layers: torch.nn.ModuleList,
+    forward_mode: ForwardMode,
+):
+    return [op for layer in layers for op in compute_layer_operations(layer, forward_mode)]
+
 
 # TODO refactor this if there are more overlapping strategies
 def compute_layer_operations(
