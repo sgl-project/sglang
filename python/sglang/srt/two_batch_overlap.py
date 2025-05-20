@@ -4,7 +4,7 @@ import torch
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPConfig
 from sglang.srt.layers.quantization.deep_gemm import configure_deep_gemm_num_sms
-from sglang.srt.operations import execute_overlapped_operations
+from sglang.srt.operations import execute_overlapped_operations, execute_operations
 from sglang.srt.operations_strategy import compute_layers_operations
 from sglang.srt.utils import DeepEPMode, BumpAllocator
 
@@ -154,7 +154,10 @@ def model_forward_maybe_tbo_layers(
             zero_allocator=zero_allocator,
         )
     else:
-        return TODO
+        inputs = TODO
+        operations = compute_layers_operations(layers, forward_batch.forward_mode)
+        outputs = execute_operations(inputs, operations)
+        return outputs["hidden_states"], outputs["residual"]
 
 
 def model_forward_tbo_layers(
