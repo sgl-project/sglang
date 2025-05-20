@@ -1376,6 +1376,92 @@ class DeepseekV2Model(nn.Module):
         return hidden_states
 
 
+    # TODO
+    def _forward_tbo_layers(
+        self,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        start_layer: int,
+    ):
+        end_layer = len(self.layers)
+        if start_layer == end_layer:
+            return hidden_states, residual
+
+        def compute_operations(tbo_child_index: int):
+            return [
+                op
+                for i in range(start_layer, end_layer)
+                for op in self.layers[i].get_forward_tbo_operations(
+                    forward_batch.global_forward_mode, tbo_child_index
+                )
+            ]
+
+        # print(
+        #     f"hi [{get_tensor_model_parallel_rank()}] forward_tbo_layers start {forward_batch.tbo_split_seq_index=} {hidden_states.shape=}")
+        if self.attn_tp_size != 1:
+            hidden_states += residual
+            residual = None
+
+            hidden_states, local_hidden_states = (
+                forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
+                hidden_states,
+            )
+            tp_all_gather(
+                list(hidden_states.tensor_split(self.attn_tp_size)), local_hidden_states
+            )
+
+        # print(
+        #     f"hi [{get_tensor_model_parallel_rank()}] forward_tbo_layers gathered {hidden_states.shape=}")
+        inputs_a, inputs_b = model_forward_split_inputs(
+            positions=positions,
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+            residual=residual,
+        )
+        del hidden_states, residual
+
+        # print(
+        #     f"hi [{get_tensor_model_parallel_rank()}] forward_tbo_layers TBO-split {inputs_a['hidden_states'].shape=} {inputs_b['hidden_states'].shape=}")
+
+        def _postprocess_splitted_inputs(hidden_states, residual, **kwargs):
+            if self.attn_tp_size != 1:
+                assert residual is None
+                tensor_list = list(hidden_states.tensor_split(self.attn_tp_size))
+                hidden_states = tensor_list[self.attn_tp_rank]
+
+            return dict(hidden_states=hidden_states, residual=residual, **kwargs)
+
+        inputs_a = _postprocess_splitted_inputs(**inputs_a)
+        inputs_b = _postprocess_splitted_inputs(**inputs_b)
+        # print(
+        #     f"hi [{get_tensor_model_parallel_rank()}] forward_tbo_layers postprocessed {inputs_a['hidden_states'].shape=} {inputs_b['hidden_states'].shape=}")
+
+        # TODO do not hardcode
+        total_num_sm = torch.cuda.get_device_properties(
+            device="cuda"
+        ).multi_processor_count
+        extend_mode_communication_num_sm = DEEPEP_NUM_SMS
+        num_sm_context = (
+            configure_deep_gemm_num_sms(
+                num_sms=total_num_sm - extend_mode_communication_num_sm
+            )
+            if forward_batch.forward_mode.is_extend()
+            else nullcontext()
+        )
+        with num_sm_context:
+            return two_batch_overlap.model_forward_execute_two_batch(
+                inputs_a=inputs_a,
+                inputs_b=inputs_b,
+                operations_a=compute_operations(0),
+                operations_b=compute_operations(1),
+                delta_stages={
+                    ForwardMode.EXTEND: 0,
+                    ForwardMode.DECODE: 2,
+                }[forward_batch.global_forward_mode],
+            )
+
 class DeepseekV2ForCausalLM(nn.Module):
 
     def __init__(
