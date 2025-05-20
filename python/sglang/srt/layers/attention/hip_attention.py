@@ -30,9 +30,9 @@ class HiPAttentionBackend(AttentionBackend):
     def __init__(self, model_runner: ModelRunner):
         super().__init__()
 
-        from hip_attn.v1_2 import forward_paged_hip
+        from hip_attn.v1_2.paged_hip import PagedHiPStateful
 
-        self.forward_paged_hip = forward_paged_hip
+        self.forward_paged_hip = PagedHiPStateful()
 
         self.hip_config: HiPAttentionConfig = (
             model_runner.server_args.hip_attention_config
