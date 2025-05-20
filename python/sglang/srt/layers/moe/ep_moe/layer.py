@@ -141,6 +141,7 @@ class EPMoE(torch.nn.Module):
         top_k: int,
         hidden_size: int,
         intermediate_size: int,
+        layer_id: int,
         params_dtype: Optional[torch.dtype] = None,
         renormalize: bool = True,
         use_grouped_topk: bool = False,
@@ -164,6 +165,7 @@ class EPMoE(torch.nn.Module):
         )
         self.tp_rank = get_tensor_model_parallel_rank()
 
+        self.layer_id = layer_id
         self.num_experts = num_experts
         assert self.num_experts % self.tp_size == 0
         self.num_experts_per_partition = self.num_experts // self.tp_size
@@ -828,6 +830,7 @@ class DeepEPMoE(EPMoE):
         top_k: int,
         hidden_size: int,
         intermediate_size: int,
+        layer_id: int,
         params_dtype: Optional[torch.dtype] = None,
         renormalize: bool = True,
         use_grouped_topk: bool = False,
@@ -847,6 +850,7 @@ class DeepEPMoE(EPMoE):
             top_k,
             hidden_size,
             intermediate_size,
+            layer_id,
             params_dtype,
             renormalize,
             use_grouped_topk,
