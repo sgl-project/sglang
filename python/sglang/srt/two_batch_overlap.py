@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Optional, Sequence, Tuple, Dict
 
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.quantization.deep_gemm import configure_deep_gemm_num_sms
+from sglang.srt.operations_strategy import compute_layers_operations
 from sglang.srt.utils import DeepEPMode
 
 if TYPE_CHECKING:
@@ -129,6 +130,7 @@ class TboDPAttentionPreparer:
 
 # -------------------------------- Execute ---------------------------------------
 
+# TODO rename?
 def model_forward_tbo_layers(
     layers,
     positions: torch.Tensor,
@@ -138,6 +140,7 @@ def model_forward_tbo_layers(
 ):
     # The attn_tp_size!=1 case is not yet extracted to master
     assert get_attention_tp_size() == 1
+    forward_mode = forward_batch.forward_mode
 
     inputs_a, inputs_b = _model_forward_split_inputs(
         positions=positions,
@@ -160,8 +163,8 @@ def model_forward_tbo_layers(
         return model_forward_execute_two_batch(
             inputs_a=inputs_a,
             inputs_b=inputs_b,
-            operations_a=compute_operations(0),
-            operations_b=compute_operations(1),
+            operations_a=compute_layers_operations(layers, forward_mode),
+            operations_b=compute_layers_operations(layers, forward_mode),
             delta_stages={
                 ForwardMode.EXTEND: 0,
                 ForwardMode.DECODE: 2,
