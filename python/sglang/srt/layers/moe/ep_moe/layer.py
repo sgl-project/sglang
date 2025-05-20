@@ -5,6 +5,8 @@ import torch
 from torch.nn import Module
 
 from sglang.srt.layers.quantization.deep_gemm import _ENABLE_JIT_DEEPGEMM
+from sglang.srt.managers.expert_location import get_global_expert_location_metadata
+from sglang.srt.managers.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 
 try:
@@ -236,6 +238,9 @@ class EPMoE(torch.nn.Module):
             correction_bias=self.correction_bias,
             custom_routing_function=self.custom_routing_function,
             routed_scaling_factor=self.routed_scaling_factor,
+            expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                layer_id=self.layer_id,
+            ),
         )
 
         reorder_topk_ids, src2dst, seg_indptr = run_moe_ep_preproess(
@@ -419,6 +424,28 @@ class EPMoE(torch.nn.Module):
         ]
 
     def weight_loader(
+        self,
+        param: torch.nn.Parameter,
+        loaded_weight: torch.Tensor,
+        weight_name: str,
+        shard_id: str,
+        expert_id: int,
+    ) -> None:
+        physical_expert_ids = (
+            get_global_expert_location_metadata().logical_to_all_physical(
+                self.layer_id, expert_id
+            )
+        )
+        for physical_expert_id in physical_expert_ids:
+            self._weight_loader_physical(
+                param=param,
+                loaded_weight=loaded_weight,
+                weight_name=weight_name,
+                shard_id=shard_id,
+                expert_id=physical_expert_id,
+            )
+
+    def _weight_loader_physical(
         self,
         param: torch.nn.Parameter,
         loaded_weight: torch.Tensor,
