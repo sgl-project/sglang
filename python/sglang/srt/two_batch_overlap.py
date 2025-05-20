@@ -129,6 +129,7 @@ class TboDPAttentionPreparer:
     def _is_all_same(x):
         return all(value == x[0] for value in x)
 
+
 # -------------------------------- Execute ---------------------------------------
 
 # TODO rename?
@@ -151,10 +152,10 @@ def model_forward_tbo_layers(
     )
     del hidden_states, residual
 
-    operations=compute_layers_operations(layers, forward_mode)
+    operations = compute_layers_operations(layers, forward_mode)
 
     # TODO do not hardcode
-    delta_stages={
+    delta_stages = {
         ForwardMode.EXTEND: 0,
         ForwardMode.DECODE: 2,
     }[forward_batch.global_forward_mode]
@@ -174,6 +175,7 @@ def model_forward_tbo_layers(
         )
 
     return _model_forward_merge_outputs(output_a, output_b)
+
 
 def _model_forward_split_inputs(
     hidden_states: torch.Tensor,
@@ -224,5 +226,3 @@ def _model_forward_merge_outputs(output_a, output_b):
         return torch.concat([value_a, value_b], dim=0)
 
     return _handle_key("hidden_states"), _handle_key("residual")
-
-
