@@ -37,6 +37,7 @@ from sglang.srt.distributed import (
     set_custom_all_reduce,
 )
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
+from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
     get_attention_tp_size,
@@ -956,7 +957,13 @@ class ModelRunner:
 
     def init_attention_backend(self):
         """Init attention kernel backend."""
-        self.attn_backend = self._get_attention_backend(self)
+        if self.server_args.enable_two_batch_overlap:
+            self.attn_backend = TboAttnBackend(
+                primary=self._get_attention_backend(),
+                children=[self._get_attention_backend() for _ in range(2)],
+            )
+        else:
+            self.attn_backend = self._get_attention_backend()
 
     # TODO unify with 6338
     def _get_attention_backend(self):
