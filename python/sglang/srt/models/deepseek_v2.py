@@ -1231,9 +1231,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             operations=compute_layer_operations(self),
         )
 
-    TODO
-
-    def op_input_layernorm(
+    def op_comm_pre_attn(
         self,
         state,
         positions: torch.Tensor,
@@ -1242,22 +1240,16 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
     ):
+        state.hidden_states_after_comm_pre_attn, state.residual_after_input_ln = (
+            self.layer_communicator.forward_pre_attn(
+                hidden_states, residual, state.forward_batch
+            )
+        )
         state.update(
             dict(
-                hidden_states_after_input_ln=hidden_states,
-                residual_after_input_ln=residual,
                 forward_batch=forward_batch,
                 positions=positions,
                 zero_allocator=zero_allocator,
-            )
-        )
-
-    TODO_rename
-
-    def op_comm_pre_attn(self, state):
-        state.hidden_states_after_comm_pre_attn = (
-            self.layer_communicator.forward_pre_attn(
-                state.pop("hidden_states_after_input_ln"), state.forward_batch
             )
         )
 
