@@ -5,7 +5,7 @@ from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.quantization.deep_gemm import configure_deep_gemm_num_sms
 from sglang.srt.operations import execute_overlapped_operations
 from sglang.srt.operations_strategy import compute_layers_operations
-from sglang.srt.utils import DeepEPMode
+from sglang.srt.utils import DeepEPMode, BumpAllocator
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -141,6 +141,7 @@ def model_forward_maybe_tbo_layers(
         forward_batch: ForwardBatch,
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
+        zero_allocator: BumpAllocator,
 ):
     if enable_tbo:
         return model_forward_tbo_layers(
@@ -149,6 +150,7 @@ def model_forward_maybe_tbo_layers(
             forward_batch=forward_batch,
             hidden_states=hidden_states,
             residual=residual,
+            zero_allocator=zero_allocator,
         )
     else:
         return TODO
@@ -160,6 +162,7 @@ def model_forward_tbo_layers(
         forward_batch: ForwardBatch,
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
+        zero_allocator: BumpAllocator,
 ):
     # The attn_tp_size!=1 case is not yet extracted to master
     assert get_attention_tp_size() == 1
@@ -169,6 +172,7 @@ def model_forward_tbo_layers(
         hidden_states=hidden_states,
         forward_batch=forward_batch,
         residual=residual,
+        zero_allocator=zero_allocator,
     )
     del hidden_states, residual
 
@@ -206,14 +210,18 @@ def _model_forward_split_inputs(
         residual: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: "ForwardBatch",
+        zero_allocator: BumpAllocator,
 ) -> List[Dict]:
     return [
-        _model_forward_filter_inputs(
-            hidden_states=hidden_states,
-            residual=residual,
-            positions=positions,
-            output_forward_batch=output_forward_batch,
-            tbo_subbatch_index=tbo_subbatch_index,
+        dict(
+            **_model_forward_filter_inputs(
+                hidden_states=hidden_states,
+                residual=residual,
+                positions=positions,
+                output_forward_batch=output_forward_batch,
+                tbo_subbatch_index=tbo_subbatch_index,
+            ),
+            zero_allocator=zero_allocator,
         )
         for tbo_subbatch_index, output_forward_batch in enumerate(
             forward_batch.tbo_children

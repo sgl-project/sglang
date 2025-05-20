@@ -1381,6 +1381,7 @@ class DeepseekV2Model(nn.Module):
             forward_batch=forward_batch,
             hidden_states=hidden_states,
             residual=residual,
+            zero_allocator=zero_allocator,
         )
 
         hidden_states, residual = model_forward_maybe_tbo_layers(
@@ -1390,6 +1391,7 @@ class DeepseekV2Model(nn.Module):
             forward_batch=forward_batch,
             hidden_states=hidden_states,
             residual=residual,
+            zero_allocator=zero_allocator,
         )
 
         if not forward_batch.forward_mode.is_idle():
