@@ -135,7 +135,7 @@ class TboDPAttentionPreparer:
 
 # -------------------------------- Execution ---------------------------------------
 
-def model_forward_maybe_tbo_layers(
+def model_forward_maybe_tbo(
         layers,
         enable_tbo: bool,
         positions: torch.Tensor,
@@ -145,7 +145,7 @@ def model_forward_maybe_tbo_layers(
         zero_allocator: BumpAllocator,
 ):
     if enable_tbo:
-        return model_forward_tbo_layers(
+        return model_forward_tbo(
             layers=layers,
             positions=positions,
             forward_batch=forward_batch,
@@ -154,13 +154,17 @@ def model_forward_maybe_tbo_layers(
             zero_allocator=zero_allocator,
         )
     else:
-        inputs = TODO
-        operations = compute_layers_operations(layers, forward_batch.forward_mode)
-        outputs = execute_operations(inputs, operations)
-        return outputs["hidden_states"], outputs["residual"]
+        return model_forward_non_tbo(
+            layers=layers,
+            positions=positions,
+            forward_batch=forward_batch,
+            hidden_states=hidden_states,
+            residual=residual,
+            zero_allocator=zero_allocator,
+        )
 
 
-def model_forward_tbo_layers(
+def model_forward_tbo(
         layers,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
@@ -198,6 +202,20 @@ def model_forward_tbo_layers(
         )
 
     return _model_forward_merge_outputs(*outputs_arr)
+
+
+def model_forward_non_tbo(
+        layers,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        zero_allocator: BumpAllocator,
+):
+    inputs = TODO
+    operations = compute_layers_operations(layers, forward_batch.forward_mode)
+    outputs = execute_operations(inputs, operations)
+    return outputs["hidden_states"], outputs["residual"]
 
 
 # TODO generalize if needed

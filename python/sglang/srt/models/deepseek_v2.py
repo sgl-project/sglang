@@ -79,7 +79,7 @@ from sglang.srt.managers.expert_location_dispatch import ExpertLocationDispatchI
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.two_batch_overlap import model_forward_tbo_layers, model_forward_maybe_tbo_layers
+from sglang.srt.two_batch_overlap import model_forward_tbo, model_forward_maybe_tbo
 from sglang.srt.utils import (
     BumpAllocator,
     DeepEPMode,
@@ -1374,7 +1374,7 @@ class DeepseekV2Model(nn.Module):
 
         residual = None
 
-        hidden_states, residual = model_forward_maybe_tbo_layers(
+        hidden_states, residual = model_forward_maybe_tbo(
             layers=self.layers[:self.first_k_dense_replace],
             enable_tbo=False,
             positions=positions,
@@ -1384,7 +1384,7 @@ class DeepseekV2Model(nn.Module):
             zero_allocator=zero_allocator,
         )
 
-        hidden_states, residual = model_forward_maybe_tbo_layers(
+        hidden_states, residual = model_forward_maybe_tbo(
             layers=self.layers[self.first_k_dense_replace:],
             enable_tbo=forward_batch.can_run_tbo,
             positions=positions,
