@@ -200,8 +200,8 @@ def model_forward_tbo_layers(
 # TODO generalize if needed
 def _compute_deep_gemm_num_sms(forward_batch):
     if forward_batch.forward_mode.is_extend():
-        total_num_sm = torch.cuda.get_device_properties(device="cuda").multi_processor_count
-        return total_num_sm - DeepEPConfig.get_instance().num_sms
+        total_num_sms = torch.cuda.get_device_properties(device="cuda").multi_processor_count
+        return total_num_sms - DeepEPConfig.get_instance().num_sms
     else:
         return None
 
