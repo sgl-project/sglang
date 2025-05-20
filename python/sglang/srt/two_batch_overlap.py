@@ -180,13 +180,10 @@ def model_forward_tbo_layers(
 
 def _compute_deep_gemm_num_sms(forward_batch):
     total_num_sm = torch.cuda.get_device_properties(device="cuda").multi_processor_count
-    extend_mode_communication_num_sm = DEEPEP_NUM_SMS
-    deep_gemm_num_sms = (
-        total_num_sm - extend_mode_communication_num_sm
-        if forward_batch.forward_mode.is_extend()
-        else None
-    )
-    return deep_gemm_num_sms
+    if forward_batch.forward_mode.is_extend():
+        return total_num_sm - DEEPEP_NUM_SMS
+    else:
+        return None
 
 
 def _model_forward_split_inputs(
