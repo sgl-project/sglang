@@ -32,44 +32,40 @@ def compute_layer_operations(
 
     if forward_mode == ForwardMode.EXTEND:
         return [
-            self._forward_tbo_op_input_layernorm,
-            self._forward_tbo_op_prefill_attn,
-            self._forward_tbo_op_post_attn_layernorm,
-            self.mlp._forward_tbo_op_gate,
-            self.mlp._forward_tbo_op_dispatch_a_part_one,
-            self.mlp._forward_tbo_op_dispatch_a_part_two,
+            self.op_comm_prepare_attn,
+            self.op_attn,
+            self.op_comm_prepare_mlp,
+            self.mlp.op_gate,
+            self.mlp.op_select_experts,
+            self.mlp.op_dispatch_a,
             two_batch_overlap.YieldOperation(),
-            partial(
-                self.mlp._forward_tbo_op_dispatch_b, tbo_child_index=tbo_child_index
-            ),
-            self.mlp._forward_tbo_op_mlp,
-            self.mlp._forward_tbo_op_combine_a,
+            self.mlp.op_dispatch_b,
+            self.mlp.op_mlp,
+            self.mlp.op_combine_a,
             two_batch_overlap.YieldOperation(),
-            self.mlp._forward_tbo_op_shared,
-            self.mlp._forward_tbo_op_combine_b,
-            self._forward_tbo_op_compute_layer_output,
+            self.mlp.op_shared,
+            self.mlp.op_combine_b,
+            self.op_compute_layer_output,
         ]
     elif forward_mode == ForwardMode.DECODE:
         return [
-            self._forward_tbo_op_input_layernorm,
-            self._forward_tbo_op_decode_attn_0,
+            self.op_comm_prepare_attn,
+            self.op_decode_attn_0, # TODO
             two_batch_overlap.YieldOperation(),
-            self._forward_tbo_op_decode_attn_1,
-            self._forward_tbo_op_post_attn_layernorm,
-            self.mlp._forward_tbo_op_gate,
-            self.mlp._forward_tbo_op_dispatch_a_part_one,
+            self.op_decode_attn_1, # TODO
+            self.op_comm_prepare_mlp,
+            self.mlp.op_gate,
+            self.mlp.op_select_experts,
             two_batch_overlap.YieldOperation(),
-            self.mlp._forward_tbo_op_dispatch_a_part_two,
-            self.mlp._forward_tbo_op_shared,
+            self.mlp.op_dispatch_a,
+            self.mlp.op_shared,
             two_batch_overlap.YieldOperation(),
-            partial(
-                self.mlp._forward_tbo_op_dispatch_b, tbo_child_index=tbo_child_index
-            ),
-            self.mlp._forward_tbo_op_mlp,
-            self.mlp._forward_tbo_op_combine_a,
+            self.mlp.op_dispatch_b,
+            self.mlp.op_mlp,
+            self.mlp.op_combine_a,
             two_batch_overlap.YieldOperation(),
-            self.mlp._forward_tbo_op_combine_b,
-            self._forward_tbo_op_compute_layer_output,
+            self.mlp.op_combine_b,
+            self.op_compute_layer_output,
             two_batch_overlap.YieldOperation(),
         ]
     else:
