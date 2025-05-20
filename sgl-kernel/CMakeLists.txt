@@ -212,6 +212,8 @@ set(SOURCES
     "csrc/speculative/speculative_sampling.cu"
     "csrc/speculative/packbit.cu"
     "csrc/grammar/apply_token_bitmask_inplace_cuda.cu"
+    "csrc/quantization/gptq_marlin/gptq_marlin.cu"
+    "csrc/quantization/gptq_marlin/gptq_marlin_repack.cu"
     "csrc/common_extension.cc"
     "${repo-flashinfer_SOURCE_DIR}/csrc/norm.cu"
     "${repo-flashinfer_SOURCE_DIR}/csrc/renorm.cu"

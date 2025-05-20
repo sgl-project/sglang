@@ -19,6 +19,14 @@ limitations under the License.
 #include "sgl_kernel_ops.h"
 
 TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
+  // The default behavior in PyTorch 2.6 is "requires_contiguous", so we need
+  // to override this for many GEMMs with the following tag. Otherwise,
+  // torch.compile will force all input tensors to be contiguous(), which
+  // will break many custom ops that require column-major weight matrices.
+  // TODO: remove this for PyTorch 2.8, when the default is planned to switch
+  // to match exact eager-mode strides.
+  at::Tag stride_tag = at::Tag::needs_fixed_stride_order;
+
   /*
    * From csrc/allreduce
    */
@@ -265,6 +273,24 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
    */
   m.def("apply_token_bitmask_inplace_cuda(Tensor logits, Tensor bitmask, Tensor? indices=None) -> ()");
   m.impl("apply_token_bitmask_inplace_cuda", &ApplyTokenBitmaskInplace);
+
+  /*
+   * From GPTQ Marlin
+   */
+  m.def(
+      "gptq_marlin_gemm(Tensor a, Tensor? c_or_none, Tensor b_q_weight, "
+      "Tensor b_scales, Tensor? global_scale, Tensor? b_zeros_or_none, Tensor? "
+      "g_idx_or_none, Tensor? perm_or_none, Tensor workspace, int b_q_type, "
+      "SymInt size_m, SymInt size_n, SymInt size_k, bool is_k_full, "
+      "bool use_atomic_add, bool use_fp32_reduce, bool is_zp_float) -> Tensor",
+      {stride_tag});
+  m.impl("gptq_marlin_gemm", torch::kCUDA, &gptq_marlin_gemm);
+
+  // TODO(yinfan98): try impl registrations in source file for conditional compiled
+  m.def(
+      "gptq_marlin_repack(Tensor b_q_weight, Tensor perm, "
+      "SymInt size_k, SymInt size_n, int num_bits) -> Tensor");
+  m.impl("gptq_marlin_repack", torch::kCUDA, &gptq_marlin_repack);
 }
 
 REGISTER_EXTENSION(common_ops)
