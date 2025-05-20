@@ -48,7 +48,7 @@ def execute_overlapped_operations(
         executor_b.next()
 
     assert executor_a.done and executor_b.done
-    return executor_a.output, executor_b.output
+    return [executor_a.output, executor_b.output]
 
 
 class YieldOperation:

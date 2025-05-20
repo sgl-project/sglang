@@ -170,7 +170,7 @@ def model_forward_tbo_layers(
     )
 
     with configure_deep_gemm_num_sms(deep_gemm_num_sms):
-        output_a, output_b = execute_overlapped_operations(
+        [output_a, output_b] = execute_overlapped_operations(
             inputs_arr=[inputs_a, inputs_b],
             operations_arr=[operations] * 2,
             delta_stages=[0, delta_stages],
