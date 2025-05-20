@@ -57,6 +57,7 @@ from sglang.srt.managers.expert_distribution import (
     set_global_expert_distribution_recorder,
 )
 from sglang.srt.managers.expert_location import (
+    ExpertLocationMetadata,
     compute_initial_expert_location_metadata,
     get_global_expert_location_metadata,
     set_global_expert_location_metadata,
@@ -70,6 +71,7 @@ from sglang.srt.mem_cache.memory_pool import (
     TokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.paged_allocator import PagedTokenToKVPoolAllocator
+from sglang.srt.model_executor import expert_location_updater
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader import get_model
@@ -570,6 +572,16 @@ class ModelRunner:
             raise ValueError(
                 f"TP rank {self.tp_rank} could finish the model loading, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
             ) from None
+
+    def update_expert_location(
+        self, new_expert_location_metadata: ExpertLocationMetadata
+    ):
+        expert_location_updater.update_expert_location(
+            self.model.routed_experts_weights_of_layer,
+            new_expert_location_metadata,
+            nnodes=self.server_args.nnodes,
+            rank=self.tp_rank,
+        )
 
     def update_weights_from_disk(
         self, model_path: str, load_format: str

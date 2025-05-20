@@ -315,6 +315,13 @@ class DeepseekV2MoE(nn.Module):
     def _enable_deepep_moe(self):
         return global_server_args_dict["enable_deepep_moe"]
 
+    def get_moe_weights(self):
+        return [
+            x.data
+            for name, x in self.experts.named_parameters()
+            if name not in ["correction_bias"]
+        ]
+
     def op_gate(self, state):
         if (not self._enable_deepep_moe) or is_non_idle_and_non_empty(
             state.forward_batch.forward_mode, state.hidden_states_mlp_input
@@ -1590,6 +1597,12 @@ class DeepseekV2ForCausalLM(nn.Module):
                 self_attn.w_kc = w_kc.transpose(1, 2).contiguous()
                 self_attn.w_vc = w_vc.contiguous()
                 self_attn.use_deep_gemm_bmm = True
+
+        self.routed_experts_weights_of_layer = {
+            layer_id: layer.mlp.get_moe_weights()
+            for layer_id, layer in enumerate(self.model.layers)
+            if isinstance(layer.mlp, DeepseekV2MoE)
+        }
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
         if is_nextn:
