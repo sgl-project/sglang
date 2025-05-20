@@ -41,6 +41,7 @@ from sglang.srt.disaggregation.decode import (
     DecodeTransferQueue,
     SchedulerDisaggregationDecodeMixin,
 )
+from sglang.srt.disaggregation.kv_events import EventPublisherFactory, KVEventBatch
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
@@ -129,7 +130,6 @@ from sglang.srt.utils import (
     DynamicGradMode,
     broadcast_pyobj,
     configure_logger,
-    crash_on_warnings,
     disable_request_logging,
     get_bool_env_var,
     get_zmq_socket,
@@ -198,6 +198,7 @@ class Scheduler(
         self.enable_overlap = not server_args.disable_overlap_schedule
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
         self.enable_metrics = server_args.enable_metrics
+        self.enable_kv_cache_events = server_args.kv_events_config is not None
         self.stream_interval = server_args.stream_interval
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
@@ -205,7 +206,6 @@ class Scheduler(
         self.gpu_id = gpu_id
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
         self.page_size = server_args.page_size
-
         # Distributed rank info
         self.dp_size = server_args.dp_size
         self.attn_tp_rank, self.attn_tp_size, self.attn_dp_rank = (
@@ -349,8 +349,8 @@ class Scheduler(
         self.forward_ct_decode = 0
         self.num_generated_tokens = 0
         self.num_prefill_tokens = 0
-        self.last_decode_stats_tic = time.time()
-        self.last_prefill_stats_tic = time.time()
+        self.last_decode_stats_tic = time.perf_counter()
+        self.last_prefill_stats_tic = time.perf_counter()
         self.return_health_check_ct = 0
         self.current_stream = torch.get_device_module(self.device).current_stream()
         if self.device == "cpu":
@@ -423,6 +423,7 @@ class Scheduler(
 
         # Init metrics stats
         self.init_metrics()
+        self.init_kv_events(server_args.kv_events_config)
 
         # Init request dispatcher
         self._request_dispatcher = TypeBasedDispatcher(
@@ -516,6 +517,7 @@ class Scheduler(
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                     page_size=self.page_size,
                     disable=server_args.disable_radix_cache,
+                    enable_kv_cache_events=self.enable_kv_cache_events,
                 )
 
         self.decode_mem_cache_buf_multiplier = (
@@ -547,6 +549,10 @@ class Scheduler(
                     "engine_type": engine_type,
                 },
             )
+
+    def init_kv_events(self, kv_events_config: Optional[str]):
+        if self.enable_kv_cache_events:
+            self.kv_event_publisher = EventPublisherFactory.create(kv_events_config)
 
     def init_disaggregation(self):
         self.transfer_backend = TransferBackend(
@@ -1033,13 +1039,13 @@ class Scheduler(
                 add_to_grammar_queue = True
 
         if add_to_grammar_queue:
-            req.queue_time_start = time.time()
+            req.queue_time_start = time.perf_counter()
             self.grammar_queue.append(req)
         else:
             self._add_request_to_queue(req)
 
     def _add_request_to_queue(self, req: Req):
-        req.queue_time_start = time.time()
+        req.queue_time_start = time.perf_counter()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.disagg_prefill_bootstrap_queue.add(req)
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
@@ -1086,7 +1092,7 @@ class Scheduler(
                 req.finished_reason = FINISH_ABORT(
                     error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
                 )
-                req.queue_time_start = time.time()
+                req.queue_time_start = time.perf_counter()
                 self.waiting_queue.append(req)
                 return
 
@@ -1110,8 +1116,8 @@ class Scheduler(
         can_run_list: List[Req],
         running_bs: int,
     ):
-        gap_latency = time.time() - self.last_prefill_stats_tic
-        self.last_prefill_stats_tic = time.time()
+        gap_latency = time.perf_counter() - self.last_prefill_stats_tic
+        self.last_prefill_stats_tic = time.perf_counter()
         self.last_input_throughput = self.num_prefill_tokens / gap_latency
         self.num_prefill_tokens = 0
 
@@ -1155,14 +1161,15 @@ class Scheduler(
             self.stats.avg_request_queue_latency = total_queue_latency / num_new_seq
 
             self.metrics_collector.log_stats(self.stats)
+        self._publish_kv_events()
 
     def log_decode_stats(
         self, can_run_cuda_graph: bool, running_batch: ScheduleBatch = None
     ):
         batch = running_batch or self.running_batch
 
-        gap_latency = time.time() - self.last_decode_stats_tic
-        self.last_decode_stats_tic = time.time()
+        gap_latency = time.perf_counter() - self.last_decode_stats_tic
+        self.last_decode_stats_tic = time.perf_counter()
         self.last_gen_throughput = self.num_generated_tokens / gap_latency
         self.num_generated_tokens = 0
         num_running_reqs = len(batch.reqs)
@@ -1214,6 +1221,7 @@ class Scheduler(
             self.stats.num_grammar_queue_reqs = len(self.grammar_queue)
             self.stats.spec_accept_length = spec_accept_length
             self.metrics_collector.log_stats(self.stats)
+        self._publish_kv_events()
 
     def check_memory(self):
         available_size = (
@@ -1246,7 +1254,7 @@ class Scheduler(
         if (
             self.enable_metrics
             and self.attn_tp_rank == 0
-            and time.time() > self.metrics_collector.last_log_time + 30
+            and time.perf_counter() > self.metrics_collector.last_log_time + 30
         ):
             # During idle time, also collect metrics every 30 seconds.
             num_used = self.max_total_num_tokens - (
@@ -1261,6 +1269,7 @@ class Scheduler(
             self.stats.num_queue_reqs = len(self.waiting_queue)
             self.stats.num_grammar_queue_reqs = len(self.grammar_queue)
             self.metrics_collector.log_stats(self.stats)
+        self._publish_kv_events()
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
         # Merge the prefill batch into the running batch
@@ -1411,7 +1420,7 @@ class Scheduler(
         if self.enable_metrics:
             # only record queue time when enable_metrics is True to avoid overhead
             for req in can_run_list:
-                req.queue_time_end = time.time()
+                req.queue_time_end = time.perf_counter()
 
         self.waiting_queue = [
             x for x in self.waiting_queue if x not in set(can_run_list)
@@ -1513,7 +1522,7 @@ class Scheduler(
             self.profiler_target_forward_ct
             and self.profiler_target_forward_ct <= self.forward_ct
         ):
-            self.stop_profile()
+            self.send_to_tokenizer.send_pyobj(self.stop_profile())
 
         if self.forward_sleep_time is not None:
             logger.info(f"Scheduler.run_batch sleep {self.forward_sleep_time}s")
@@ -1784,10 +1793,10 @@ class Scheduler(
     def watchdog_thread(self):
         """A watch dog thread that will try to kill the server itself if one forward batch takes too long."""
         self.watchdog_last_forward_ct = 0
-        self.watchdog_last_time = time.time()
+        self.watchdog_last_time = time.perf_counter()
 
         while True:
-            current = time.time()
+            current = time.perf_counter()
             if self.cur_batch is not None:
                 if self.watchdog_last_forward_ct == self.forward_ct:
                     if current > self.watchdog_last_time + self.watchdog_timeout:
@@ -2115,7 +2124,10 @@ class Scheduler(
 
     def stop_profile(self) -> None:
         if self.profiler_activities is None:
-            return
+            return ProfileReqOutput(
+                success=False,
+                message="Profiling is not in progress. Call /start_profile first.",
+            )
 
         logger.info("Stop profiling...")
         if self.torch_profiler is not None:
@@ -2146,10 +2158,7 @@ class Scheduler(
         self.torch_profiler_output_dir = None
         self.profiler_activities = None
 
-        if self.profiler_target_forward_ct:
-            self.send_to_tokenizer.send_pyobj(
-                ProfileReqOutput(success=True, message="Succeeded.")
-            )
+        return ProfileReqOutput(success=True, message="Succeeded")
 
     def expert_distribution_handle(self, recv_req: ExpertDistributionReq):
         if recv_req == ExpertDistributionReq.START_RECORD:
@@ -2194,6 +2203,13 @@ class Scheduler(
         if self.pp_size > 1:
             prefix += f" PP{self.pp_rank}"
         return prefix
+
+    def _publish_kv_events(self):
+        if self.enable_kv_cache_events:
+            events = self.tree_cache.take_events()
+            if events:
+                batch = KVEventBatch(ts=time.time(), events=events)
+                self.kv_event_publisher.publish(batch)
 
 
 def is_health_check_generate_req(recv_req):
