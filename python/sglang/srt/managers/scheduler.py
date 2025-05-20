@@ -1625,6 +1625,7 @@ class Scheduler(
             tp_cpu_group=self.tp_cpu_group,
             get_idle_batch=self.get_idle_batch,
             disable_cuda_graph=self.server_args.disable_cuda_graph,
+            enable_two_batch_overlap=self.server_args.enable_two_batch_overlap,
             spec_algorithm=self.spec_algorithm,
             speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
         )
@@ -1638,6 +1639,7 @@ class Scheduler(
         tp_cpu_group,
         get_idle_batch,
         disable_cuda_graph: bool,
+        enable_two_batch_overlap: bool,
         spec_algorithm,
         speculative_num_draft_tokens,
     ):
