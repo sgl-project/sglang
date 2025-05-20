@@ -186,6 +186,7 @@ def model_forward_tbo(layers, inputs):
 
 
 def model_forward_non_tbo(layers, inputs):
+    forward_batch = inputs["forward_batch"]
     operations = compute_layers_operations(layers, forward_batch.forward_mode)
     outputs = execute_operations(inputs, operations)
     return outputs["hidden_states"], outputs["residual"]
