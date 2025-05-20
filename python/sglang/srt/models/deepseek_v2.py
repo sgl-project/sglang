@@ -113,7 +113,6 @@ if _is_hip:
         decode_attention_fwd_grouped_rope,
     )
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -305,6 +304,7 @@ class DeepseekV2MoE(nn.Module):
     def forward(
         self, hidden_states: torch.Tensor, forward_batch: Optional[ForwardBatch] = None
     ) -> torch.Tensor:
+        forward_mode = forward_batch.forward_mode
         if (not self._enable_deepep_moe) or is_non_idle_and_non_empty(
             forward_mode, hidden_states
         ):
@@ -1281,7 +1281,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             )
 
         # Fully Connected
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states, forward_batch)
 
         # TODO(ch-wan): use reduce-scatter in MLP to avoid this scatter
         # Scatter
