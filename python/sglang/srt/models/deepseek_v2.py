@@ -1385,17 +1385,8 @@ class DeepseekV2Model(nn.Module):
         if start_layer == end_layer:
             return hidden_states, residual
 
-        if self.attn_tp_size != 1:
-            hidden_states += residual
-            residual = None
-
-            hidden_states, local_hidden_states = (
-                forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
-                hidden_states,
-            )
-            tp_all_gather(
-                list(hidden_states.tensor_split(self.attn_tp_size)), local_hidden_states
-            )
+        # The attn_tp_size!=1 case is not yet extracted to master
+        assert self.attn_tp_size == 1
 
         inputs_a, inputs_b = model_forward_split_inputs(
             positions=positions,
@@ -1404,14 +1395,6 @@ class DeepseekV2Model(nn.Module):
             residual=residual,
         )
         del hidden_states, residual
-
-        def _postprocess_splitted_inputs(hidden_states, residual, **kwargs):
-            if self.attn_tp_size != 1:
-                assert residual is None
-                tensor_list = list(hidden_states.tensor_split(self.attn_tp_size))
-                hidden_states = tensor_list[self.attn_tp_rank]
-
-            return dict(hidden_states=hidden_states, residual=residual, **kwargs)
 
         inputs_a = _postprocess_splitted_inputs(**inputs_a)
         inputs_b = _postprocess_splitted_inputs(**inputs_b)
