@@ -20,6 +20,29 @@ def execute_operations(inputs, operations):
     return executor.output
 
 
+# Make it explicit for clarity; if we need multi-batch overlap, this can be generalized
+def execute_overlapped_operations(
+    inputs_a, inputs_b, operations_a, operations_b, delta_stages: int
+):
+    stages_a = _convert_operations_to_stages(operations_a)
+    stages_b = _convert_operations_to_stages(operations_b)
+    executor_a = _StageExecutor("a", stages_a, inputs=inputs_a)
+    executor_b = _StageExecutor("b", stages_b, inputs=inputs_b)
+
+    for _ in range(delta_stages):
+        executor_a.next()
+
+    for _ in range(executor_a.num_stages - delta_stages):
+        executor_a.next()
+        executor_b.next()
+
+    for _ in range(delta_stages):
+        executor_b.next()
+
+    assert executor_a.done and executor_b.done
+    return executor_a.output, executor_b.output
+
+
 class YieldOperation:
     pass
 
@@ -149,6 +172,6 @@ def _decorate_operation(operation: Operation, debug_name_prefix: str):
         return operation
     return ExecutionOperation(
         debug_name=debug_name_prefix
-        + getattr(operation, "__name__", "unknown").replace("op_", ""),
+                   + getattr(operation, "__name__", "unknown").replace("op_", ""),
         fn=operation,
     )
