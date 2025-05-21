@@ -157,7 +157,9 @@ class PrefillBootstrapQueue:
             if poll == KVPoll.Bootstrapping:
                 continue
             elif poll == KVPoll.Failed:
-                raise Exception("Bootstrap failed")
+                if hasattr(req.disagg_kv_sender, "clear"):
+                    req.disagg_kv_sender.clear()
+                logger.error(f"Transfer failed for request {req.req.rid}")
 
             # KV.WaitingForInput
             num_kv_indices = len(req.origin_input_ids)
@@ -333,9 +335,14 @@ class SchedulerDisaggregationPrefillMixin:
                 self.tree_cache.cache_finished_req(req)  # unlock the tree
                 req.finished_reason = FINISH_LENGTH(length=0)
                 # FIXME: clean up req's data in transfer engine
+                if hasattr(req.disagg_kv_sender, "clear"):
+                    req.disagg_kv_sender.clear()
                 done_reqs.append(req)
             elif poll == KVPoll.Failed:
-                raise Exception("Transferring failed")
+                if hasattr(req.disagg_kv_sender, "clear"):
+                    req.disagg_kv_sender.clear()
+                logger.error(f"Transfer failed for request {req.req.rid}")
+                done_reqs.append(req)
 
         for req in done_reqs:
             self.disagg_prefill_bootstrap_queue.req_to_metadata_buffer_idx_allocator.free(

@@ -178,7 +178,7 @@ class DecodePreallocQueue:
             elif poll == KVPoll.WaitingForInput:
                 decode_req.waiting_for_input = True
             elif poll == KVPoll.Failed:
-                raise Exception("Handshake failed")
+                logger.error("Handshake failed")
 
     def pop_preallocated(self) -> List[DecodeRequest]:
         """Pop the preallocated requests from the pending queue (FIFO)."""
@@ -321,19 +321,24 @@ class DecodeTransferQueue:
     def extend(self, req_conns) -> None:
         self.queue.extend(req_conns)
 
-    def pop_transferred(self) -> List[DecodeRequest]:
+    def pop_transferred(self) -> Tuple[List[DecodeRequest], List[DecodeRequest]]:
         if not self.queue:
-            return []
+            return [], []
 
         polls = poll_and_all_reduce(
             [decode_req.kv_receiver for decode_req in self.queue], self.gloo_group
         )
 
         transferred_reqs = []
+        failed_reqs = []
         indices_to_remove = set()
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
             if poll == KVPoll.Failed:
-                raise Exception("Transfer failed")
+                logger.error(f"Transfer failed for request {decode_req.req.rid}")
+                if hasattr(decode_req.kv_receiver, "clear"):
+                    decode_req.kv_receiver.clear()
+                failed_reqs.append(decode_req)
+                indices_to_remove.add(i)
             elif poll == KVPoll.Success:
                 # pop and push it to waiting queue
                 idx = decode_req.metadata_buffer_index
@@ -344,6 +349,8 @@ class DecodeTransferQueue:
                 assert len(decode_req.req.output_ids) == 0
                 assert decode_req.req.transferred_output_id is None
                 decode_req.req.transferred_output_id = output_id
+                if hasattr(decode_req.kv_receiver, "clear"):
+                    decode_req.kv_receiver.clear()
                 transferred_reqs.append(decode_req)
                 indices_to_remove.add(i)
             elif poll in [
@@ -364,7 +371,7 @@ class DecodeTransferQueue:
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
         ]
 
-        return transferred_reqs
+        return transferred_reqs, failed_reqs
 
 
 class ScheduleBatchDisaggregationDecodeMixin:
@@ -661,9 +668,24 @@ class SchedulerDisaggregationDecodeMixin:
 
         self.num_tokens_pre_allocated += sum(_num_pre_alloc(req) for req in req_conns)
         self.disagg_decode_transfer_queue.extend(req_conns)
-        alloc_reqs = (
+        alloc_reqs, failed_reqs = (
             self.disagg_decode_transfer_queue.pop_transferred()
         )  # the requests which kv has arrived
         self.num_tokens_pre_allocated -= sum(_num_pre_alloc(req) for req in alloc_reqs)
+        failed_num_tokens_pre_allocated = sum(
+            _num_pre_alloc(req) for req in failed_reqs
+        )
+        self.num_tokens_pre_allocated -= failed_num_tokens_pre_allocated
+
+        for failed_req in failed_reqs:
+            req = failed_req.req
+            if req.req_pool_idx is not None:
+                self.req_to_token_pool.free([req.req_pool_idx])
+                token_locs = self.req_to_token_pool.req_to_token[req.req_pool_idx][
+                    : req.extend_input_len
+                ]
+                self.token_to_kv_pool_allocator.free(token_locs)
+                req.req_pool_idx = None
+                # req.to_abort = True
 
         self.waiting_queue.extend([req.req for req in alloc_reqs])

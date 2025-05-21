@@ -160,7 +160,7 @@ class MooncakeKVManager(BaseKVManager):
             )
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.heartbeat_failures = {}
-            self.addr_to_rooms = defaultdict(list)
+            self.addr_to_rooms_tracker = defaultdict(list)
             self.connection_lock = threading.Lock()
             self.heartbeat_interval = 5
             self.max_failures = 3
@@ -239,8 +239,6 @@ class MooncakeKVManager(BaseKVManager):
         for future in concurrent.futures.as_completed(futures):
             status = future.result()
             if status != 0:
-                # Immediate shutdown on first error (existing tasks will finish)
-                self.executor.shutdown(wait=False)
                 for f in futures:
                     f.cancel()
                 return status
@@ -403,9 +401,12 @@ class MooncakeKVManager(BaseKVManager):
                         if response.status_code == 200:
                             self.heartbeat_failures[addr] = 0
 
-                            for bootstrap_room in self.addr_to_rooms[addr]:
-                                if self.check_status(bootstrap_room) == KVPoll.Success:
-                                    self.addr_to_rooms[addr].remove(bootstrap_room)
+                            for bootstrap_room in self.addr_to_rooms_tracker[addr]:
+                                # Remove KVPoll.Success requests from the map
+                                if bootstrap_room not in self.request_status:
+                                    self.addr_to_rooms_tracker[addr].remove(
+                                        bootstrap_room
+                                    )
                         else:
                             logger.info(f"Attempting to reconnect to {addr}...")
                             self.heartbeat_failures[addr] = (
@@ -452,10 +453,13 @@ class MooncakeKVManager(BaseKVManager):
         if bootstrap_room not in self.request_status:
             self.request_status[bootstrap_room] = status
         else:
-            # NOTE: The prefill engine could recv bootstrapping first
-            self.request_status[bootstrap_room] = max(
-                self.request_status[bootstrap_room], status
-            )
+            # NOTE: status is only allowed to be incremented unless it is KVPoll.Failed
+            if status == KVPoll.Failed:
+                self.request_status[bootstrap_room] = KVPoll.Failed
+            else:
+                self.request_status[bootstrap_room] = max(
+                    self.request_status[bootstrap_room], status
+                )
 
     def get_session_id(self):
         return self.engine.get_session_id()
@@ -501,14 +505,20 @@ class MooncakeKVManager(BaseKVManager):
             if failed_bootstrap_addr in self.prefill_dp_size_table:
                 del self.prefill_dp_size_table[failed_bootstrap_addr]
 
-            possible_affected_rooms = self.addr_to_rooms.get(failed_bootstrap_addr, [])
-            del self.addr_to_rooms[failed_bootstrap_addr]
+            possible_affected_rooms = self.addr_to_rooms_tracker.get(
+                failed_bootstrap_addr, []
+            )
+            del self.addr_to_rooms_tracker[failed_bootstrap_addr]
+
+        # Report the requests associated with the failed bootstrap addr and mark their status as KVPoll.Failed
         affected_rooms = []
         for room in possible_affected_rooms:
-            if room in self.request_status:
+            if (
+                room in self.request_status
+                and self.check_status(room) != KVPoll.Success
+            ):
                 self.update_status(room, KVPoll.Failed)
                 affected_rooms.append(room)
-
         logger.error(
             f"Detected failure on {failed_bootstrap_addr}, affected {len(affected_rooms)} requests"
         )
@@ -552,6 +562,9 @@ class MooncakeKVSender(BaseKVSender):
     def poll(self) -> KVPoll:
         return self.kv_mgr.check_status(self.bootstrap_room)
 
+    def clear(self) -> None:
+        self.kv_mgr.request_status.pop(self.bootstrap_room)
+
     def failure_exception(self):
         raise Exception("Fake KVSender Exception")
 
@@ -573,7 +586,9 @@ class MooncakeKVReceiver(BaseKVReceiver):
         self.kv_mgr = mgr
         self.session_id = self.kv_mgr.get_session_id()
         self.kv_mgr.update_status(bootstrap_room, KVPoll.Bootstrapping)
-        self.kv_mgr.addr_to_rooms[self.bootstrap_addr].append(self.bootstrap_room)
+        self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].append(
+            self.bootstrap_room
+        )
 
         if self.bootstrap_addr not in self.kv_mgr.prefill_dp_size_table:
             self.prefill_tp_size, self.prefill_dp_size = (
@@ -583,6 +598,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
                 logger.error(
                     f"Could not fetch prefill parallel info for bootstrap_addr: {self.bootstrap_addr}"
                 )
+                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
             else:
                 self.kv_mgr.prefill_tp_size_table[self.bootstrap_addr] = (
                     self.prefill_tp_size
@@ -716,7 +732,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
                 return None
         except Exception as e:
             logger.error(f"Error fetching prefill parallel info from bootstrap: {e}")
-            return None
+            return None, None
 
     def _register_kv_args(self):
         for bootstrap_info in self.bootstrap_infos:
@@ -779,6 +795,9 @@ class MooncakeKVReceiver(BaseKVReceiver):
 
     def poll(self) -> KVPoll:
         return self.kv_mgr.check_status(self.bootstrap_room)
+
+    def clear(self) -> None:
+        self.kv_mgr.request_status.pop(self.bootstrap_room)
 
     def failure_exception(self):
         raise Exception("Fake KVReceiver Exception")
