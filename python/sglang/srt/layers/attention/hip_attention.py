@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 
 """
 HiP Attention Backend for SGLang
@@ -139,6 +140,13 @@ class HiPAttentionBackend(AttentionBackend):
         if layer.use_irope:
             using_chunked_sw = True
             sw_size = self.attention_chunk_size
+        
+        run_benchmark = (not torch.cuda.is_current_stream_capturing()) and os.getenv('HIP_DEBUG_BENCH', '0') == '1'
+
+        if run_benchmark:
+            start_event = torch.cuda.Event(True)
+            end_event = torch.cuda.Event(True)
+            start_event.record()
 
         o, _ = self.forward_paged_hip(
             query=q_reshaped,
@@ -175,6 +183,13 @@ class HiPAttentionBackend(AttentionBackend):
             sliding_window_size=sw_size,
             using_chunked_sliding_window=using_chunked_sw,
         )
+
+        if run_benchmark:
+            end_event.record()
+            end_event.synchronize()
+
+            elapsed = start_event.elapsed_time(end_event)
+            print(f'layer {layer.layer_id} took {elapsed:.2f} ms')
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
