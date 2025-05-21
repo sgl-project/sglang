@@ -253,9 +253,12 @@ class ModelRunner:
                     rank=self.tp_rank,
                 )
             )
-            self.eplb_manager = (
-                EPLBManager(self) if self.server_args.enable_eplb else None
-            )
+
+        self.eplb_manager = (
+            EPLBManager(self)
+            if self.server_args.enable_eplb and (not self.is_draft_worker)
+            else None
+        )
 
         # Load the model
         self.sampler = Sampler()
