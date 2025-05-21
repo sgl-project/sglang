@@ -58,72 +58,80 @@ def _compute_layer_operations(
 
 
 def _compute_mlp_normal(layer):
-    return [
-        layer.op_comm_prepare_attn,
-        layer.op_attn,
-        layer.op_comm_prepare_mlp,
-        layer.op_mlp,
-        layer.op_comm_postprocess_layer,
-    ]
+    return OperationsStrategy(
+        operations=[
+            layer.op_comm_prepare_attn,
+            layer.op_attn,
+            layer.op_comm_prepare_mlp,
+            layer.op_mlp,
+            layer.op_comm_postprocess_layer,
+        ],
+    )
 
 
 def _compute_moe_normal(layer):
-    return [
-        layer.op_comm_prepare_attn,
-        layer.op_attn,
-        layer.op_comm_prepare_mlp,
-        layer.mlp.op_gate,
-        layer.mlp.op_shared_experts,
-        layer.mlp.op_select_experts,
-        layer.mlp.op_dispatch_a,
-        layer.mlp.op_dispatch_b,
-        layer.mlp.op_experts,
-        layer.mlp.op_combine_a,
-        layer.mlp.op_combine_b,
-        layer.mlp.op_output,
-        layer.op_comm_postprocess_layer,
-    ]
+    return OperationsStrategy(
+        operations=[
+            layer.op_comm_prepare_attn,
+            layer.op_attn,
+            layer.op_comm_prepare_mlp,
+            layer.mlp.op_gate,
+            layer.mlp.op_shared_experts,
+            layer.mlp.op_select_experts,
+            layer.mlp.op_dispatch_a,
+            layer.mlp.op_dispatch_b,
+            layer.mlp.op_experts,
+            layer.mlp.op_combine_a,
+            layer.mlp.op_combine_b,
+            layer.mlp.op_output,
+            layer.op_comm_postprocess_layer,
+        ],
+    )
 
 
 def _compute_moe_deepseek_blog_prefill(layer):
-    return [
-        layer.op_comm_prepare_attn,
-        layer.op_attn,
-        layer.op_comm_prepare_mlp,
-        layer.mlp.op_gate,
-        layer.mlp.op_select_experts,
-        layer.mlp.op_dispatch_a,
-        operations.YieldOperation(),
-        layer.mlp.op_dispatch_b,
-        layer.mlp.op_experts,
-        layer.mlp.op_combine_a,
-        operations.YieldOperation(),
-        layer.mlp.op_shared_experts,
-        layer.mlp.op_combine_b,
-        layer.mlp.op_output,
-        layer.op_comm_postprocess_layer,
-    ]
+    return OperationsStrategy(
+        operations=[
+            layer.op_comm_prepare_attn,
+            layer.op_attn,
+            layer.op_comm_prepare_mlp,
+            layer.mlp.op_gate,
+            layer.mlp.op_select_experts,
+            layer.mlp.op_dispatch_a,
+            operations.YieldOperation(),
+            layer.mlp.op_dispatch_b,
+            layer.mlp.op_experts,
+            layer.mlp.op_combine_a,
+            operations.YieldOperation(),
+            layer.mlp.op_shared_experts,
+            layer.mlp.op_combine_b,
+            layer.mlp.op_output,
+            layer.op_comm_postprocess_layer,
+        ],
+    )
 
 
 def _compute_moe_deepseek_blog_decode(layer):
-    return [
-        layer.op_comm_prepare_attn,
-        layer.op_decode_attn_0,  # TODO
-        operations.YieldOperation(),
-        layer.op_decode_attn_1,  # TODO
-        layer.op_comm_prepare_mlp,
-        layer.mlp.op_gate,
-        layer.mlp.op_select_experts,
-        operations.YieldOperation(),
-        layer.mlp.op_dispatch_a,
-        layer.mlp.op_shared_experts,
-        operations.YieldOperation(),
-        layer.mlp.op_dispatch_b,
-        layer.mlp.op_experts,
-        layer.mlp.op_combine_a,
-        operations.YieldOperation(),
-        layer.mlp.op_combine_b,
-        layer.mlp.op_output,
-        layer.op_comm_postprocess_layer,
-        operations.YieldOperation(),
-    ]
+    return OperationsStrategy(
+        operations=[
+            layer.op_comm_prepare_attn,
+            layer.op_decode_attn_0,  # TODO
+            operations.YieldOperation(),
+            layer.op_decode_attn_1,  # TODO
+            layer.op_comm_prepare_mlp,
+            layer.mlp.op_gate,
+            layer.mlp.op_select_experts,
+            operations.YieldOperation(),
+            layer.mlp.op_dispatch_a,
+            layer.mlp.op_shared_experts,
+            operations.YieldOperation(),
+            layer.mlp.op_dispatch_b,
+            layer.mlp.op_experts,
+            layer.mlp.op_combine_a,
+            operations.YieldOperation(),
+            layer.mlp.op_combine_b,
+            layer.mlp.op_output,
+            layer.op_comm_postprocess_layer,
+            operations.YieldOperation(),
+        ],
+    )
