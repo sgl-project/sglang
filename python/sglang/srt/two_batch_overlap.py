@@ -154,12 +154,12 @@ def model_forward_maybe_tbo(
     )
     operations_strategy = OperationsStrategy.init_new(layers, forward_batch.forward_mode, enable_tbo=enable_tbo)
     if enable_tbo:
-        return _model_forward_tbo(layers, inputs, operations_strategy)
+        return _model_forward_tbo(inputs, operations_strategy)
     else:
-        return _model_forward_non_tbo(layers, inputs, operations_strategy)
+        return _model_forward_non_tbo(inputs, operations_strategy)
 
 
-def _model_forward_tbo(layers, inputs, operations_strategy: OperationsStrategy):
+def _model_forward_tbo(inputs, operations_strategy: OperationsStrategy):
     # The attn_tp_size!=1 case is not yet extracted to master
     assert get_attention_tp_size() == 1
 
@@ -177,7 +177,7 @@ def _model_forward_tbo(layers, inputs, operations_strategy: OperationsStrategy):
     return _model_forward_tbo_merge_outputs(*outputs_arr)
 
 
-def _model_forward_non_tbo(layers, inputs, operations_strategy: OperationsStrategy):
+def _model_forward_non_tbo(inputs, operations_strategy: OperationsStrategy):
     forward_batch = inputs["forward_batch"]
     assert operations_strategy.deep_gemm_num_sms is None, "unsupported"
     assert operations_strategy.tbo_delta_stages is None, "unsupported"
