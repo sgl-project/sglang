@@ -30,6 +30,7 @@ from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
 from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
+from sglang.srt.cpu_utils import get_cpu_ids_by_node
 from sglang.srt.distributed import (
     get_tp_group,
     get_world_group,
@@ -214,7 +215,24 @@ class ModelRunner:
         # Init OpenMP threads binding
         omp_cpuids = os.environ.get("SGLANG_CPU_OMP_THREADS_BIND", "all")
         if omp_cpuids == "all":
-            self.local_omp_cpuid = "all"
+            cpu_ids_by_node = get_cpu_ids_by_node()
+            n_numa_node = len(cpu_ids_by_node)
+
+            assert self.tp_size <= n_numa_node, (
+                f"SGLANG_CPU_OMP_THREADS_BIND is not set, in this case, "
+                f"tp_size {self.tp_size} should be smaller than number of numa node on the machine {n_numa_node}. "
+                f"If you need tp_size to be larger than number of numa node, please set the CPU cores for each tp rank via SGLANG_CPU_OMP_THREADS_BIND explicitly. "
+                f"For example, on a machine with 2 numa nodes, where core 0-31 are on numa node 0 and core 32-63 are on numa node 1, "
+                f"it is suggested to use -tp 2 and bind tp rank 0 to core 0-31 and tp rank 1 to core 32-63. "
+                f"This is the default behavior if SGLANG_CPU_OMP_THREADS_BIND is not set and it is the same as setting SGLANG_CPU_OMP_THREADS_BIND=0-31|32-63. "
+                f"If you do need tp_size to be large than the number of numa nodes, you could set SGLANG_CPU_OMP_THREADS_BIND explicitly for example SGLANG_CPU_OMP_THREADS_BIND=0-15|16-31|32-47|48-63 and run with -tp 4. "
+                f"If you don't want each tp rank to use all the cores on one numa node, you could set for example SGLANG_CPU_OMP_THREADS_BIND=0-15|32-47 and run with -tp 2."
+            )
+            if self.tp_size < n_numa_node:
+                logger.warning(
+                    f"Detected the current machine has {n_numa_node} numa nodes available, but tp_size is set to {self.tp_size}, so use only {self.tp_size} numa nodes are used."
+                )
+            self.local_omp_cpuid = cpu_ids_by_node[self.tp_rank]
         else:
             self.local_omp_cpuid = omp_cpuids.split("|")[tp_rank]
 
@@ -487,8 +505,7 @@ class ModelRunner:
             if self.device == "cpu":
                 import sgl_kernel.common_ops
                 # Bind OpenMP threads to CPU cores
-                if self.local_omp_cpuid != "all":
-                    sgl_kernel.common_ops.init_cpu_threads_env(self.local_omp_cpuid)
+                sgl_kernel.common_ops.init_cpu_threads_env(self.local_omp_cpuid)
 
             # Only initialize the distributed environment on the target model worker.
             init_distributed_environment(
