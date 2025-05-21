@@ -1596,11 +1596,13 @@ class DeepseekV2ForCausalLM(nn.Module):
                 self_attn.w_vc = w_vc.contiguous()
                 self_attn.use_deep_gemm_bmm = True
 
-        self.routed_experts_weights_of_layer = {
-            layer_id: layer.mlp.get_moe_weights()
-            for layer_id, layer in enumerate(self.model.layers)
-            if isinstance(layer.mlp, DeepseekV2MoE)
-        }
+        # TODO support nextn later
+        if not is_nextn:
+            self.routed_experts_weights_of_layer = {
+                layer_id: layer.mlp.get_moe_weights()
+                for layer_id, layer in enumerate(self.model.layers)
+                if isinstance(layer.mlp, DeepseekV2MoE)
+            }
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
         if is_nextn:
