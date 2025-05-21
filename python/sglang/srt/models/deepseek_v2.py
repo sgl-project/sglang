@@ -665,37 +665,27 @@ class DeepseekV2AttentionMLA(nn.Module):
             else:
                 return _dispatch_mla_subtype()
 
-    def forward(
+    def op_prepare(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
-    ) -> torch.Tensor:
+    ):
         if hidden_states.shape[0] == 0:
             assert (
                 not self.o_proj.reduce_results
             ), "short-circuiting allreduce will lead to hangs"
-            return hidden_states
+            return (hidden_states,)
 
         attn_forward_method = self.dispatch_attn_forward_method(forward_batch)
-
-        if attn_forward_method == AttnForwardMethod.MHA:
-            return self.forward_normal(positions, hidden_states, forward_batch)
-        elif attn_forward_method == AttnForwardMethod.MHA_CHUNKED_KV:
-            return self.forward_normal_chunked_kv(
-                positions, hidden_states, forward_batch
-            )
-        elif attn_forward_method == AttnForwardMethod.MLA:
-            return self.forward_absorb(
-                positions, hidden_states, forward_batch, zero_allocator
-            )
-        elif attn_forward_method == AttnForwardMethod.MLA_FUSED_ROPE:
-            return self.forward_absorb_fused_mla_rope(
-                positions, hidden_states, forward_batch
-            )
-        else:
-            raise NotImplementedError
+        fn = {
+            AttnForwardMethod.MHA: self.op_normal_prepare,
+            AttnForwardMethod.MHA_CHUNKED_KV: self.op_normal_chunked_kv_prepare,
+            AttnForwardMethod.MLA: self.op_absorb_prepare,
+            AttnForwardMethod.MLA_FUSED_ROPE: self.op_absorb_fused_mla_rope_prepare,
+        }[attn_forward_method]
+        return fn(positions, hidden_states, forward_batch, zero_allocator)
 
     def op_normal_prepare(
         self,
