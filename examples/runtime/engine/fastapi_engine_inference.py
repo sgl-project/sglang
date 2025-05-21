@@ -89,9 +89,9 @@ def start_server(args, timeout=60):
 
     process = subprocess.Popen(command, stdout=None, stderr=None)
 
-    start_time = time.time()
+    start_time = time.perf_counter()
     with requests.Session() as session:
-        while time.time() - start_time < timeout:
+        while time.perf_counter() - start_time < timeout:
             try:
                 # Check the /docs endpoint which FastAPI provides by default
                 response = session.get(

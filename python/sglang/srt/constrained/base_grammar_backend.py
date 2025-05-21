@@ -37,6 +37,12 @@ class BaseGrammarObject:
         """
         raise NotImplementedError()
 
+    def rollback(self, k: int):
+        raise NotImplementedError()
+
+    def is_terminated(self):
+        return False
+
     def allocate_vocab_mask(
         self, vocab_size: int, batch_size: int, device
     ) -> torch.Tensor:

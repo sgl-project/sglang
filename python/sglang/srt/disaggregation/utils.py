@@ -13,14 +13,13 @@ import torch.distributed as dist
 
 from sglang.srt.utils import get_ip
 
+FakeBootstrapHost = "2.2.2.2"
+
 
 class DisaggregationMode(Enum):
     NULL = "null"
     PREFILL = "prefill"
     DECODE = "decode"
-
-
-FakeBootstrapHost = "2.2.2.2"
 
 
 def poll_and_all_reduce(pollers, gloo_group):
@@ -162,3 +161,9 @@ def register_disaggregation_server(
         warnings.warn(
             f"Failed to register disaggregation server: {res.status_code} {res.text}"
         )
+
+
+def is_mla_backend(target_kv_pool) -> bool:
+    from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+
+    return isinstance(target_kv_pool, MLATokenToKVPool)
