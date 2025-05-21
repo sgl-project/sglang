@@ -25,7 +25,6 @@ try:
     from vllm.model_executor.layers.quantization.gptq import GPTQLinearMethod
     from vllm.model_executor.layers.quantization.gptq_marlin import (
         GPTQMarlinLinearMethod,
-        GPTQMarlinMoEMethod,
     )
     from vllm.model_executor.layers.quantization.gptq_marlin_24 import (
         GPTQMarlin24Config,
@@ -58,8 +57,12 @@ from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import
     CompressedTensorsConfig,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config
-from sglang.srt.layers.quantization.gptq import GPTQConfig, GPTQMarlinConfig
 from sglang.srt.layers.quantization.auto_round import AutoRoundConfig
+from sglang.srt.layers.quantization.gptq import (
+    GPTQConfig,
+    GPTQMarlinConfig,
+    GPTQMarlinMoEMethod,
+)
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp8Config,

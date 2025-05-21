@@ -199,6 +199,19 @@ class EAGLEWorker(TpModelWorker):
             self.draft_extend_attn_backend = None
             self.padded_static_len = self.speculative_num_steps + 1
             self.has_prefill_wrapper_verify = False
+        elif self.server_args.attention_backend == "flashmla":
+            from sglang.srt.layers.attention.flashmla_backend import (
+                FlashMLAMultiStepDraftBackend,
+            )
+
+            self.draft_attn_backend = FlashMLAMultiStepDraftBackend(
+                self.draft_model_runner,
+                self.topk,
+                self.speculative_num_steps,
+            )
+            self.draft_extend_attn_backend = None
+            self.padded_static_len = self.speculative_num_steps + 1
+            self.has_prefill_wrapper_verify = False
         else:
             raise ValueError(
                 f"EAGLE is not supported in attention backend {self.server_args.attention_backend}"
@@ -215,7 +228,7 @@ class EAGLEWorker(TpModelWorker):
             return
 
         # Capture draft
-        tic = time.time()
+        tic = time.perf_counter()
         before_mem = get_available_gpu_memory(self.device, self.gpu_id)
         logger.info(
             f"Capture draft cuda graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
@@ -223,7 +236,7 @@ class EAGLEWorker(TpModelWorker):
         self.cuda_graph_runner = EAGLEDraftCudaGraphRunner(self)
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         logger.info(
-            f"Capture draft cuda graph end. Time elapsed: {time.time() - tic:.2f} s. avail mem={after_mem:.2f} GB. mem usage={(before_mem - after_mem):.2f} GB."
+            f"Capture draft cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. avail mem={after_mem:.2f} GB. mem usage={(before_mem - after_mem):.2f} GB."
         )
 
         # Capture extend
@@ -251,8 +264,8 @@ class EAGLEWorker(TpModelWorker):
         if batch.forward_mode.is_decode():
             with self.draft_tp_context(self.draft_model_runner.tp_group):
                 spec_info = self.draft(batch)
-            logits_output, verify_output, model_worker_batch = self.verify(
-                batch, spec_info
+            logits_output, verify_output, model_worker_batch, can_run_cuda_graph = (
+                self.verify(batch, spec_info)
             )
 
             # If it is None, it means all requests are finished
@@ -264,21 +277,22 @@ class EAGLEWorker(TpModelWorker):
                 verify_output.verified_id,
                 model_worker_batch.bid,
                 sum(verify_output.accept_length_per_req_cpu),
+                can_run_cuda_graph,
             )
         elif batch.forward_mode.is_idle():
             model_worker_batch = batch.get_model_worker_batch()
-            logits_output, next_token_ids = self.target_worker.forward_batch_generation(
-                model_worker_batch
+            logits_output, next_token_ids, _ = (
+                self.target_worker.forward_batch_generation(model_worker_batch)
             )
 
-            return logits_output, next_token_ids, model_worker_batch.bid, 0
+            return logits_output, next_token_ids, model_worker_batch.bid, 0, False
         else:
             logits_output, next_token_ids, bid = self.forward_target_extend(batch)
             with self.draft_tp_context(self.draft_model_runner.tp_group):
                 self.forward_draft_extend(
                     batch, logits_output.hidden_states, next_token_ids
                 )
-            return logits_output, next_token_ids, bid, 0
+            return logits_output, next_token_ids, bid, 0, False
 
     def forward_target_extend(
         self, batch: ScheduleBatch
@@ -297,7 +311,7 @@ class EAGLEWorker(TpModelWorker):
         # We need the full hidden states to prefill the KV cache of the draft model.
         model_worker_batch = batch.get_model_worker_batch()
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
-        logits_output, next_token_ids = self.target_worker.forward_batch_generation(
+        logits_output, next_token_ids, _ = self.target_worker.forward_batch_generation(
             model_worker_batch
         )
         return logits_output, next_token_ids, model_worker_batch.bid
@@ -478,8 +492,10 @@ class EAGLEWorker(TpModelWorker):
         batch.forward_mode = ForwardMode.TARGET_VERIFY
         batch.spec_info = spec_info
         model_worker_batch = batch.get_model_worker_batch()
-        logits_output, _ = self.target_worker.forward_batch_generation(
-            model_worker_batch, skip_sample=True
+        logits_output, _, can_run_cuda_graph = (
+            self.target_worker.forward_batch_generation(
+                model_worker_batch, skip_sample=True
+            )
         )
         self._detect_nan_if_needed(logits_output)
         spec_info.hidden_states = logits_output.hidden_states
@@ -504,7 +520,7 @@ class EAGLEWorker(TpModelWorker):
         if batch.return_logprob:
             self.add_logprob_values(batch, res, logits_output)
 
-        return logits_output, res, model_worker_batch
+        return logits_output, res, model_worker_batch, can_run_cuda_graph
 
     def add_logprob_values(
         self,
@@ -590,7 +606,7 @@ class EAGLEWorker(TpModelWorker):
             model_worker_batch, self.draft_model_runner
         )
         forward_batch.return_logprob = False
-        logits_output = self.draft_model_runner.forward(forward_batch)
+        logits_output, _ = self.draft_model_runner.forward(forward_batch)
         self._detect_nan_if_needed(logits_output)
         assert isinstance(forward_batch.spec_info, EagleDraftInput)
         assert forward_batch.spec_info is batch.spec_info
@@ -617,7 +633,7 @@ class EAGLEWorker(TpModelWorker):
         )
 
         # Run
-        logits_output = self.draft_model_runner.forward(forward_batch)
+        logits_output, _ = self.draft_model_runner.forward(forward_batch)
 
         self._detect_nan_if_needed(logits_output)
         self.capture_for_decode(logits_output, forward_batch.spec_info)
