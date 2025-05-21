@@ -1,4 +1,3 @@
-import logging
 import os
 from typing import List, Optional, Tuple
 
@@ -31,14 +30,12 @@ from sglang.srt.utils import (
     is_cuda,
     is_flashinfer_available,
     is_hip,
-    log_info_on_rank0,
 )
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_fp8_fnuz = is_fp8_fnuz()
 
-logger = logging.getLogger(__name__)
 
 use_aiter_moe = get_bool_env_var("SGLANG_AITER_MOE")
 
@@ -154,7 +151,6 @@ def apply_w8a8_block_fp8_linear(
     )
     if ENABLE_FLASHINFER_GEMM:
         assert is_sm100_supported(), "Flashinfer Blockwise GEMM only supports SM100"
-        log_info_on_rank0(logger, "Enabling Flashinfer GEMM kernels on Blackwell GPUs")
         q_input, x_scale = per_token_group_quant_fp8(
             input_2d, block_size[1], column_major_scales=False
         )
