@@ -255,17 +255,17 @@ class MaybeTboDeepEPDispatcher:
             DeepEPDispatcher(**kwargs) for _ in range(num_inner_dispatchers)
         ]
 
-    def _get(self, tbo_subbatch_index: Optional[int]):
-        return self._inners[tbo_subbatch_index or 0]
+    def _execute(self, name, tbo_subbatch_index: Optional[int], **kwargs):
+        return getattr(self._inners[tbo_subbatch_index or 0], name)(**kwargs)
 
-    def dispatch_a(self, *, tbo_subbatch_index: Optional[int], **kwargs):
-        return self._get(tbo_subbatch_index).dispatch_a(**kwargs)
+    def dispatch_a(self, **kwargs):
+        return self._execute("dispatch_a", **kwargs)
 
-    def dispatch_b(self, *, tbo_subbatch_index: Optional[int], **kwargs):
-        return self._get(tbo_subbatch_index).dispatch_b(**kwargs)
+    def dispatch_b(self, **kwargs):
+        return self._execute("dispatch_b", **kwargs)
 
-    def combine_a(self, *, tbo_subbatch_index: Optional[int], **kwargs):
-        return self._get(tbo_subbatch_index).combine_a(**kwargs)
+    def combine_a(self, **kwargs):
+        return self._execute("combine_a", **kwargs)
 
-    def combine_b(self, *, tbo_subbatch_index: Optional[int], **kwargs):
-        return self._get(tbo_subbatch_index).combine_b(**kwargs)
+    def combine_b(self, **kwargs):
+        return self._execute("combine_b", **kwargs)
