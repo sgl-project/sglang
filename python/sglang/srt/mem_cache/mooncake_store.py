@@ -8,6 +8,7 @@ from this remote lookup buffer.
 import json
 import logging
 import os
+import uuid
 from dataclasses import dataclass
 from typing import Optional
 
@@ -84,6 +85,8 @@ class MooncakeStore:
                              self.config.device_name,
                              self.config.master_server_address)
             logger.info("Connect to Mooncake store successfully.")
+            self.warmup()
+            logger.info("Mooncake store warmup successfully.")
 
         except ValueError as e:
             logger.error("Configuration loading failed: %s", e)
@@ -93,10 +96,27 @@ class MooncakeStore:
                 "An error occurred while loading the configuration: %s", exc)
             raise
 
+    def warmup(self):
+        warmup_key = "sglang_mooncake_store_warmup_key" + uuid.uuid4().hex
+        # 10 MB
+        warmup_value = bytes(10 * 1024 * 1024)
+        self.store.put(warmup_key, warmup_value)
+        assert self.store.is_exist(warmup_key) == 1
+        self.store.get(warmup_key)
+        self.store.remove(warmup_key)
+
     def close(self):
         # MooncakeDistributedStore will automatically call the destructor, so
         # it is unnecessary to close it manually.
         pass
+
+    def remove(
+        self,
+        key: str,
+    ) -> None:
+        if key is not None:
+            if self.is_exist(key):
+                self.store.remove(key)
 
     def put(
         self,
