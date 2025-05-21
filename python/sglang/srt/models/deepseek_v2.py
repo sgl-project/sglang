@@ -1114,13 +1114,13 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         return accum_output
 
-    def forward_normal_chunked_kv(
+    def op_normal_chunked_kv_prepare(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
-    ) -> torch.Tensor:
+    ):
         # In normal mha, the k and v tensors will become overly large when the prefix length is long.
         # To avoid this, we split the kv cache into chunks and process them one after another.
         # Since mha is compute friendly, the for loop induced here will not introduce significant overhead.
@@ -1163,6 +1163,9 @@ class DeepseekV2AttentionMLA(nn.Module):
             self.attn_mha, forward_batch.out_cache_loc, latent_cache, None
         )
 
+        return q, k, v, forward_batch
+
+    def op_normal_chunked_kv_core(self, q, k, v, forward_batch):
         # Do mha for extended part without prefix
         forward_batch.set_attn_attend_prefix_cache(False)
         attn_output, lse = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
