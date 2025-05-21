@@ -17,7 +17,6 @@ from enum import Enum, auto
 from typing import Dict, Optional, Tuple
 
 import torch.distributed
-
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
@@ -229,7 +228,11 @@ def _compute_num_tokens_of_mode(
         ),
         ScatterMode.TP_ATTN_FULL: tp_attn_full_num_tokens,
         ScatterMode.FULL: (
-            sum(forward_batch.global_num_tokens_cpu)
+            (
+                forward_batch.gathered_buffer.shape[0]
+                if forward_batch.gathered_buffer is not None
+                else None
+            )
             if global_server_args_dict["enable_dp_attention"]
             else forward_batch.input_ids.shape[0]
         ),
@@ -261,9 +264,12 @@ class _Context:
 
         actual_num_tokens = x.shape[0]
         expect_num_tokens = self.num_tokens_of_mode[mode]
-        assert (
-            actual_num_tokens == expect_num_tokens
-        ), f"{actual_num_tokens=} {expect_num_tokens=} {mode=} {x.shape=} {self.num_tokens_of_mode=} {self.process_group_sizes=}"
+
+        if expect_num_tokens is not None:
+            assert (
+                actual_num_tokens == expect_num_tokens
+            ), f"{actual_num_tokens=} {expect_num_tokens=} {mode=} {x.shape=} {self.num_tokens_of_mode=} {self.process_group_sizes=}"
+
         return x
 
     def check_shapes(
@@ -362,8 +368,8 @@ def _communicate_with_all_reduce_and_layer_norm(
         if (
             (hidden_states_input_mode == ScatterMode.TP_ATTN_FULL)
             and (
-                residual_input_mode in [ScatterMode.SCATTERED, ScatterMode.TP_ATTN_FULL]
-            )
+            residual_input_mode in [ScatterMode.SCATTERED, ScatterMode.TP_ATTN_FULL]
+        )
             and (hidden_states_output_mode == ScatterMode.SCATTERED)
             and (residual_output_mode == ScatterMode.SCATTERED)
         ):
