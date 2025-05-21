@@ -1,14 +1,20 @@
+import itertools
 import unittest
 from typing import Optional, Tuple, Union
 
 import torch
 from sgl_kernel.common_ops import fused_add_rmsnorm_cpu as fused_add_rmsnorm
 from sgl_kernel.common_ops import rmsnorm_cpu as rmsnorm
+from utils import precision
 
 from sglang.test.test_utils import CustomTestCase
 
 
 class TestNorm(CustomTestCase):
+    M = [4096, 1024]
+    N = [4096, 4096 + 13]
+    dtype = [torch.float16, torch.bfloat16]
+
     def _forward_native(
         self,
         x: torch.Tensor,
@@ -30,24 +36,22 @@ class TestNorm(CustomTestCase):
         else:
             return x, residual
 
-    def _run_single_test(self, shape, dtype, device="cuda"):
+    def _norm_test(self, m, n, dtype):
 
-        x = torch.randn(shape, dtype=dtype).to(device=device)
+        x = torch.randn([m, n], dtype=dtype)
         hidden_size = x.size(-1)
-        weight = torch.randn(hidden_size, dtype=dtype).to(device=device)
+        weight = torch.randn(hidden_size, dtype=dtype)
         variance_epsilon = 1e-6
 
         # TEST: rmsnorm
         out = rmsnorm(x, weight, variance_epsilon)
         ref_out = self._forward_native(x, weight, variance_epsilon)
 
-        torch.testing.assert_close(out, ref_out)
+        atol = rtol = precision[ref_out.dtype]
+        self.assertTrue(torch.allclose(ref_out, out, atol=atol, rtol=rtol))
 
-        # TEST: fused_add_rmsnorm
-        # flashinfer writes x and residual inplaced
         ref_x = x.clone()
-
-        residual = torch.randn(shape, dtype=dtype).to(device=device)
+        residual = torch.randn([m, n], dtype=dtype)
         ref_residual = residual.clone()
 
         fused_add_rmsnorm(x, residual, weight, variance_epsilon)
@@ -56,13 +60,13 @@ class TestNorm(CustomTestCase):
             ref_x, weight, variance_epsilon, ref_residual
         )
 
-        torch.testing.assert_close(x, ref_x)
-        torch.testing.assert_close(residual, ref_residual)
+        self.assertTrue(torch.allclose(x, ref_x, atol=atol, rtol=rtol))
+        self.assertTrue(torch.allclose(residual, ref_residual, atol=atol, rtol=rtol))
 
     def test_norm(self):
-        self._run_single_test([4096, 4096], torch.bfloat16, "cpu")
-        self._run_single_test([1024, 4096], torch.bfloat16, "cpu")
-        self._run_single_test([1024, 4096 + 13], torch.float16, "cpu")
+        for params in itertools.product(self.M, self.N, self.dtype):
+            with self.subTest(m=params[0], n=params[1], dtype=params[2]):
+                self._norm_test(*params)
 
 
 if __name__ == "__main__":

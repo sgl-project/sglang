@@ -4,37 +4,35 @@ import torch
 from sgl_kernel.common_ops import (
     rotary_position_embedding_cpu as rotary_position_embedding,
 )
+from utils import _rotate_gptj, _rotate_neox, precision
 
 from sglang.test.test_utils import CustomTestCase
 
 
 class TestROPE(CustomTestCase):
-    def _rotate_neox(self, x: torch.Tensor) -> torch.Tensor:
-        x1 = x[..., : x.shape[-1] // 2]
-        x2 = x[..., x.shape[-1] // 2 :]
-        return torch.cat((-x2, x1), dim=-1)
 
-    def _rotate_gptj(self, x: torch.Tensor) -> torch.Tensor:
-        x1 = x[..., ::2]
-        x2 = x[..., 1::2]
-        x = torch.stack((-x2, x1), dim=-1)
-        return x.flatten(-2)
-
-    def _forward_ref(self, positions, query, key, cos_sin_cache, offsets=None):
-        self.rotary_dim = 64
-        self.head_size = 64
-        self.is_neox_style = False
-        query_rot = query[..., : self.rotary_dim]
-        key_rot = key[..., : self.rotary_dim]
-        if self.rotary_dim < self.head_size:
-            query_pass = query[..., self.rotary_dim :]
-            key_pass = key[..., self.rotary_dim :]
+    def _forward_ref(
+        self,
+        positions,
+        query,
+        key,
+        cos_sin_cache,
+        rotary_dim,
+        head_size,
+        is_neox_style,
+        offsets=None,
+    ):
+        query_rot = query[..., :rotary_dim]
+        key_rot = key[..., :rotary_dim]
+        if rotary_dim < head_size:
+            query_pass = query[..., rotary_dim:]
+            key_pass = key[..., rotary_dim:]
 
         cos_sin = cos_sin_cache[
             torch.add(positions, offsets) if offsets is not None else positions
         ]
         cos, sin = cos_sin.chunk(2, dim=-1)
-        if self.is_neox_style:
+        if is_neox_style:
             # shape [batch_size, seq_len].
             cos = cos.repeat(1, 1, 2).unsqueeze(-2)
             sin = sin.repeat(1, 1, 2).unsqueeze(-2)
@@ -42,11 +40,11 @@ class TestROPE(CustomTestCase):
             cos = cos.repeat_interleave(2, dim=-1).unsqueeze(-2)
             sin = sin.repeat_interleave(2, dim=-1).unsqueeze(-2)
 
-        rotate_fn = self._rotate_neox if self.is_neox_style else self._rotate_gptj
+        rotate_fn = _rotate_neox if is_neox_style else _rotate_gptj
         query_rot = query_rot * cos + rotate_fn(query_rot) * sin
         key_rot = key_rot * cos + rotate_fn(key_rot) * sin
 
-        if self.rotary_dim < self.head_size:
+        if rotary_dim < head_size:
             query = torch.cat((query_rot, query_pass), dim=-1)
             key = torch.cat((key_rot, key_pass), dim=-1)
         else:
@@ -86,14 +84,18 @@ class TestROPE(CustomTestCase):
                 k_pe_clone = k_clone[:, :, k_dim - qk_rope_head_dim :]
 
                 # ref kernel
-                q_pe, k_pe = self._forward_ref(positions, q_pe, k_pe, cos_sin_cache)
+                q_pe, k_pe = self._forward_ref(
+                    positions, q_pe, k_pe, cos_sin_cache, 64, 64, False
+                )
 
                 # fused rope kernel
                 q_pe_clone, k_pe_clone = rotary_position_embedding(
                     positions, q_pe_clone, k_pe_clone, cos_sin_cache
                 )
 
-                torch.testing.assert_close(q_pe, q_pe_clone)
+                atol = rtol = precision[q_pe.dtype]
+                self.assertTrue(torch.allclose(q_pe, q_pe_clone, atol=atol, rtol=rtol))
+                self.assertTrue(torch.allclose(k_pe, k_pe_clone, atol=atol, rtol=rtol))
                 torch.testing.assert_close(k_pe, k_pe_clone)
 
 

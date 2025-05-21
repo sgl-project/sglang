@@ -1,28 +1,32 @@
+import itertools
 import unittest
 
 import torch
 import torch.nn.functional as F
 from sgl_kernel.common_ops import silu_and_mul_cpu as silu_and_mul
+from utils import SiluAndMul, precision
 
 from sglang.test.test_utils import CustomTestCase
 
 
 class TestActivation(CustomTestCase):
-    def _forward_native(self, x: torch.Tensor) -> torch.Tensor:
-        d = x.shape[-1] // 2
-        return F.silu(x[..., :d]) * x[..., d:]
+    M = [128, 129, 257]
+    N = [22016, 22018]
+    dtype = [torch.float16, torch.bfloat16]
 
-    def _run_single_test(self, shape, dtype, device):
-        x = torch.randn(shape, dtype=dtype).to(device=device)
+    def _activation_test(self, m, n, dtype):
+        x = torch.randn([m, n], dtype=dtype)
 
         out = silu_and_mul(x)
-        ref_out = self._forward_native(x)
+        ref_out = SiluAndMul(x)
 
-        torch.testing.assert_close(out, ref_out)
+        atol = rtol = precision[ref_out.dtype]
+        self.assertTrue(torch.allclose(ref_out, out, atol=atol, rtol=rtol))
 
     def test_activation(self):
-        self._run_single_test([128, 22016], torch.bfloat16, "cpu")
-        self._run_single_test([129, 22016], torch.float16, "cpu")
+        for params in itertools.product(self.M, self.N, self.dtype):
+            with self.subTest(m=params[0], n=params[1], dtype=params[2]):
+                self._activation_test(*params)
 
 
 if __name__ == "__main__":
