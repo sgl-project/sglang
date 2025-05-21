@@ -162,10 +162,12 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> qkv_proj_with_rope(
     at::Tensor& cos_sin_cache,
     double eps,
     bool use_int8_w8a8,
+    bool use_fp8_w8a16,
     std::optional<at::Tensor> q_a_proj_scale,
     std::optional<at::Tensor> q_b_proj_scale,
     std::optional<at::Tensor> kv_a_proj_scale,
-    bool is_vnni);
+    bool is_vnni,
+    std::optional<std::vector<int64_t>> block_size);
 
 // shared memory init
 void initialize(int64_t size, int64_t rank);
@@ -262,8 +264,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def(
       "qkv_proj_with_rope(Tensor hidden_states, Tensor q_a_proj_weight, Tensor q_b_proj_weight, Tensor "
       "kv_a_proj_weight, Tensor w_kc, Tensor q_a_layernorm_weight, Tensor kv_a_layernorm_weight, Tensor positions, "
-      "Tensor cos_sin_cache, float eps, bool use_int8_w8a8, Tensor? q_a_proj_scale, Tensor? q_b_proj_scale, Tensor? "
-      "kv_a_proj_scale, bool is_vnni) -> (Tensor, Tensor, Tensor)");
+      "Tensor cos_sin_cache, float eps, bool use_int8_w8a8, bool use_fp8_w8a16, Tensor? q_a_proj_scale, Tensor? q_b_proj_scale, Tensor? "
+      "kv_a_proj_scale, bool is_vnni, int[]? block_size) -> (Tensor, Tensor, Tensor)");
   m.impl("qkv_proj_with_rope", torch::kCPU, &qkv_proj_with_rope);
 
   // shared expert
