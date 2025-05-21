@@ -2,7 +2,6 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 import torch
-
 from sglang.srt import operations
 from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -71,7 +70,8 @@ def _compute_mlp_normal(layer):
     return OperationsStrategy(
         operations=[
             layer.op_comm_prepare_attn,
-            layer.op_attn,
+            layer.self_attn.op_prepare,
+            layer.self_attn.op_core,
             layer.op_comm_prepare_mlp,
             layer.op_mlp,
             layer.op_comm_postprocess_layer,
@@ -83,7 +83,8 @@ def _compute_moe_normal(layer):
     return OperationsStrategy(
         operations=[
             layer.op_comm_prepare_attn,
-            layer.op_attn,
+            layer.self_attn.op_prepare,
+            layer.self_attn.op_core,
             layer.op_comm_prepare_mlp,
             layer.mlp.op_gate,
             layer.mlp.op_shared_experts,
@@ -109,7 +110,8 @@ def _compute_moe_deepseek_blog_prefill(layer):
         tbo_delta_stages=0,
         operations=[
             layer.op_comm_prepare_attn,
-            layer.op_attn,
+            layer.self_attn.op_prepare,
+            layer.self_attn.op_core,
             layer.op_comm_prepare_mlp,
             layer.mlp.op_gate,
             layer.mlp.op_select_experts,
@@ -133,9 +135,9 @@ def _compute_moe_deepseek_blog_decode(layer):
         tbo_delta_stages=2,
         operations=[
             layer.op_comm_prepare_attn,
-            layer.op_decode_attn_0,  # TODO
+            layer.self_attn.op_prepare,
             operations.YieldOperation(),
-            layer.op_decode_attn_1,  # TODO
+            layer.self_attn.op_core,
             layer.op_comm_prepare_mlp,
             layer.mlp.op_gate,
             layer.mlp.op_select_experts,
