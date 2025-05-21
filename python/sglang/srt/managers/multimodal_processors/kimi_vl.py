@@ -1,7 +1,7 @@
 import re
-import torch
-from typing import List, Union, Dict
+from typing import Dict, List, Union
 
+import torch
 
 from sglang.srt.managers.multimodal_processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
@@ -60,11 +60,17 @@ class KimiVLImageProcessor(SGLangBaseProcessor):
                         for item in base_output.images
                     ]
                 )
-                precomputed_features = torch.concat(values) if (values := [
-                    item.precomputed_features
-                    for item in base_output.images
-                    if item.precomputed_features is not None
-                ]) else None
+                precomputed_features = (
+                    torch.concat(values)
+                    if (
+                        values := [
+                            item.precomputed_features
+                            for item in base_output.images
+                            if item.precomputed_features is not None
+                        ]
+                    )
+                    else None
+                )
                 pixel_values = None
             else:
                 image_grid_hws = ret["image_grid_hws"]

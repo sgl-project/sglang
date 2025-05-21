@@ -145,7 +145,7 @@ class KimiVLForConditionalGeneration(nn.Module):
                     "MM inputs where only some items are precomputed."
                 )
             return torch.concat([item.precomputed_features for item in items])
-        
+
         pixel_values = (
             torch.cat([item.pixel_values for item in items], dim=0)
             .type(self.vision_tower.dtype)

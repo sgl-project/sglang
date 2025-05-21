@@ -417,7 +417,9 @@ class TestKimiVLImageUnderstanding(VisionLLMLogitsBase):
         req = self.get_completion_request()
         processor_output = self.get_processor_output(req=req)
         with torch.inference_mode():
-            precomputed_features = self.visual(processor_output["pixel_values"], processor_output["image_grid_hws"])
+            precomputed_features = self.visual(
+                processor_output["pixel_values"], processor_output["image_grid_hws"]
+            )
         output = await self.engine.async_generate(
             input_ids=processor_output["input_ids"][0].detach().cpu().tolist(),
             image_data=[
