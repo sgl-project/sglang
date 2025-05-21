@@ -96,17 +96,27 @@ class _TorchMemorySaverAdapterNoop(TorchMemorySaverAdapter):
 
 @contextmanager
 def with_tms_disable_cpu_backup():
-    torch_memory_saver._global_info.binary_info.cdll.tms_disable_cpu_backup()
-    try:
+    cdll = torch_memory_saver._global_info.binary_info.cdll
+    if cdll is None:
+        print("with_tms_disable_cpu_backup skipped")
         yield
-    finally:
-        torch_memory_saver._global_info.binary_info.cdll.tms_enable_cpu_backup()
+    else:
+        cdll.tms_disable_cpu_backup()
+        try:
+            yield
+        finally:
+            cdll.tms_enable_cpu_backup()
 
 
 @contextmanager
 def with_tms_disable_region():
-    torch_memory_saver._global_info.binary_info.cdll.tms_region_leave()
-    try:
+    cdll = torch_memory_saver._global_info.binary_info.cdll
+    if cdll is None:
+        print("with_tms_disable_region skipped")
         yield
-    finally:
-        torch_memory_saver._global_info.binary_info.cdll.tms_region_enter()
+    else:
+        cdll.tms_region_leave()
+        try:
+            yield
+        finally:
+            cdll.tms_region_enter()
