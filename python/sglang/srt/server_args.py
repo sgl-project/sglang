@@ -170,6 +170,7 @@ class ServerArgs:
     enable_ep_moe: bool = False
     enable_deepep_moe: bool = False
     deepep_mode: Optional[Literal["auto", "normal", "low_latency"]] = "auto"
+    ep_num_redundant_experts: int = 0
     ep_dispatch_algorithm: Optional[Literal["static", "dynamic"]] = None
     init_expert_location: str = "trivial"
     expert_distribution_recorder_mode: Optional[
@@ -957,6 +958,7 @@ class ServerArgs:
             "--attention-backend",
             type=str,
             choices=[
+                "aiter",
                 "flashinfer",
                 "triton",
                 "torch_native",
@@ -1271,6 +1273,12 @@ class ServerArgs:
             choices=["normal", "low_latency", "auto"],
             default="auto",
             help="Select the mode when enable DeepEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch.",
+        )
+        parser.add_argument(
+            "--ep-num-redundant-experts",
+            type=int,
+            default=ServerArgs.ep_num_redundant_experts,
+            help="Allocate this number of redundant experts in expert parallel.",
         )
         parser.add_argument(
             "--ep-dispatch-algorithm",
