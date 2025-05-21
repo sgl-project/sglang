@@ -8,13 +8,6 @@ on:
       - "scripts/**"
       - "test/**"
       - ".github/workflows/pr-test.yml"
-  pull_request:
-    branches: [ main ]
-    paths:
-      - "python/**"
-      - "scripts/**"
-      - "test/**"
-      - ".github/workflows/pr-test.yml"
   workflow_dispatch:
     inputs:
       version:
