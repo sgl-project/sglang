@@ -615,19 +615,6 @@ def download_and_cache_file(url: str, filename: Optional[str] = None):
 
     return filename
 
-def load_file_and_auto_download(
-    dataset_path: str,
-    url: str,
-):
-    # Download if necessary
-    if not os.path.isfile(dataset_path) and dataset_path == "":
-        dataset_path = download_and_cache_file(url)
-
-    # Load the dataset.
-    with open(dataset_path) as f:
-        dataset = json.load(f)
-
-    return dataset
 
 @dataclass
 class DatasetRow:
@@ -767,7 +754,13 @@ def sample_sharegpt_requests(
     if fixed_output_len is not None and fixed_output_len < 4:
         raise ValueError("output_len too small")
 
-    dataset = load_file_and_auto_download(dataset_path, url=SHAREGPT_URL)
+    # Download sharegpt if necessary
+    if not os.path.isfile(dataset_path) and dataset_path == "":
+        dataset_path = download_and_cache_file(SHAREGPT_URL)
+
+    # Load the dataset.
+    with open(dataset_path) as f:
+        dataset = json.load(f)
 
     # Filter out the conversations with less than 2 turns.
     dataset = [
@@ -859,8 +852,13 @@ def sample_random_requests(
     if random_sample:
         # Sample token ids from ShareGPT and repeat/truncate them to satisfy the input_lens
 
-        dataset = load_file_and_auto_download(dataset_path, url=SHAREGPT_URL)
+        # Download sharegpt if necessary
+        if not os.path.isfile(dataset_path):
+            dataset_path = download_and_cache_file(SHAREGPT_URL)
 
+        # Load the dataset.
+        with open(dataset_path) as f:
+            dataset = json.load(f)
         # Filter out the conversations with less than 2 turns.
         dataset = [
             data
