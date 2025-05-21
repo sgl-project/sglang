@@ -1,8 +1,18 @@
-import torch
+from dataclasses import dataclass
+from typing import List, Optional
 
+import torch
 from sglang.srt import operations
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.operations import Operation
+
+
+@dataclass
+class OperationsStrategy:
+    operations: List[Operation]
+    deep_gemm_num_sms: Optional[int]
+    tbo_delta_stages: Optional[int]
 
 
 def compute_layers_operations(
