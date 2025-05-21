@@ -2402,6 +2402,7 @@ class Scheduler(
             else:
                 self.init_profile(
                     recv_req.output_dir,
+                    recv_req.start_step,
                     recv_req.num_steps,
                     recv_req.activities,
                     recv_req.with_stack,
@@ -2416,6 +2417,7 @@ class Scheduler(
     def init_profile(
         self,
         output_dir: Optional[str],
+        start_step: Optional[int],
         num_steps: Optional[int],
         activities: Optional[List[str]],
         with_stack: Optional[bool],
