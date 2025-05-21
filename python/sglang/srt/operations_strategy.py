@@ -41,13 +41,7 @@ def _compute_layer_operations(
     forward_mode: ForwardMode,
 ) -> OperationsStrategy:
     if not layer.is_layer_sparse:
-        return [
-            layer.op_comm_prepare_attn,
-            layer.op_attn,
-            layer.op_comm_prepare_mlp,
-            layer.op_mlp,
-            layer.op_comm_postprocess_layer,
-        ]
+        return _compute_mlp_normal()
 
     if these_layers_of_this_batch_needs_tbo:
         if forward_mode == ForwardMode.EXTEND:
@@ -93,6 +87,20 @@ def _compute_layer_operations(
         else:
             raise NotImplementedError(f"Unsupported {forward_mode=}")
 
+    return _compute_moe_normal()
+
+
+def _compute_mlp_normal():
+    return [
+        layer.op_comm_prepare_attn,
+        layer.op_attn,
+        layer.op_comm_prepare_mlp,
+        layer.op_mlp,
+        layer.op_comm_postprocess_layer,
+    ]
+
+
+def _compute_moe_normal():
     return [
         layer.op_comm_prepare_attn,
         layer.op_attn,
