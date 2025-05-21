@@ -51,7 +51,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, EPMoE, get_moe_impl_class
+from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPDispatcher
 from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -76,13 +76,12 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.managers.expert_distribution import (
-    ExpertDistributionRecorder,
     get_global_expert_distribution_recorder,
 )
 from sglang.srt.managers.expert_location import ModelConfigForExpertLocation
 from sglang.srt.managers.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.managers.schedule_batch import global_server_args_dict
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.operations import execute_operations
 from sglang.srt.operations_strategy import compute_layer_operations
@@ -113,7 +112,6 @@ if _is_hip:
     from sglang.srt.layers.attention.triton_ops.rocm_mla_decode_rope import (
         decode_attention_fwd_grouped_rope,
     )
-
 
 logger = logging.getLogger(__name__)
 
@@ -216,6 +214,7 @@ class DeepseekV2MoE(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
+        layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
@@ -224,6 +223,7 @@ class DeepseekV2MoE(nn.Module):
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
         self.n_share_experts_fusion = global_server_args_dict["n_share_experts_fusion"]
+        self.layer_id = layer_id
 
         if self.tp_size > config.n_routed_experts:
             raise ValueError(
@@ -244,6 +244,7 @@ class DeepseekV2MoE(nn.Module):
             top_k=config.num_experts_per_tok + min(self.n_share_experts_fusion, 1),
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
+            layer_id=self.layer_id,
             renormalize=config.norm_topk_prob,
             quant_config=quant_config,
             use_grouped_topk=True,
@@ -344,6 +345,9 @@ class DeepseekV2MoE(nn.Module):
                     num_expert_group=self.num_expert_group,
                     correction_bias=self.correction_bias,
                     routed_scaling_factor=self.routed_scaling_factor,
+                    expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                        layer_id=self.layer_id,
+                    ),
                 )
             else:
                 state.topk_idx_local = torch.full(
@@ -1183,6 +1187,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 config=config,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
+                layer_id=self.layer_id,
             )
         else:
             if enable_moe_dense_fully_dp():
@@ -1246,9 +1251,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         zero_allocator: BumpAllocator,
     ):
         state.hidden_states_after_comm_pre_attn, state.residual_after_input_ln = (
-            self.layer_communicator.prepare_attn(
-                hidden_states, residual, state.forward_batch
-            )
+            self.layer_communicator.prepare_attn(hidden_states, residual, forward_batch)
         )
         state.update(
             dict(
@@ -1317,8 +1320,7 @@ class DeepseekV2Model(nn.Module):
             config.hidden_size,
             enable_tp=not global_server_args_dict["enable_dp_attention"],
         )
-        # TODO(haishaw): multi-stream performance on ROCm
-        self.alt_stream = None if _is_hip else torch.cuda.Stream()
+        self.alt_stream = torch.cuda.Stream() if _is_cuda else None
         self.layers = nn.ModuleList(
             [
                 DeepseekV2DecoderLayer(
