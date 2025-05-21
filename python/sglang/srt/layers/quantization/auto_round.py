@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from fractions import Fraction
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Optional, Union
 
 import torch
 
@@ -45,7 +45,7 @@ class AutoRoundConfig(QuantizationConfig):
     SUPPORTED_DTYPES = {"int"}
     SUPPORTED_FORMATS = {"auto_round:auto_gptq", "auto_round:auto_awq"}
     SUPPORTED_BACKENDS = {
-        "auto", "gptq", "gptq:marlin", "awq", "awq:marlin", "marlin", "ipex"
+        "auto", "gptq", "gptq:marlin", "awq", "awq:marlin", "marlin"
     }
 
     def __init__(
@@ -54,8 +54,8 @@ class AutoRoundConfig(QuantizationConfig):
         group_size: int,
         sym: bool = True,
         packing_format: str = "auto_round:auto_gptq",
-        block_name_to_quantize: Optional[Union[str, List[str]]] = None,
-        extra_config: Optional[Dict[str, Any]] = None,
+        block_name_to_quantize: Optional[Union[str, list[str]]] = None,
+        extra_config: Optional[dict[str, Any]] = None,
         data_type: str = "int",
         backend: str = "auto",
     ) -> None:
@@ -97,7 +97,7 @@ class AutoRoundConfig(QuantizationConfig):
         return "auto-round"
 
     @classmethod
-    def get_supported_act_dtypes(cls) -> List[torch.dtype]:
+    def get_supported_act_dtypes(cls) -> list[torch.dtype]:
         return [torch.half, torch.bfloat16]
 
     @classmethod
@@ -105,11 +105,11 @@ class AutoRoundConfig(QuantizationConfig):
         return 60
 
     @classmethod
-    def get_config_filenames(cls) -> List[str]:
+    def get_config_filenames(cls) -> list[str]:
         return ["quantization_config.json"]
 
     @classmethod
-    def from_config(cls, config: Dict[str, Any]) -> "AutoRoundConfig":
+    def from_config(cls, config: dict[str, Any]) -> "AutoRoundConfig":
         return cls(
             weight_bits=cls.get_from_keys(config, ["bits"]),
             group_size=cls.get_from_keys(config, ["group_size"]),
@@ -121,10 +121,10 @@ class AutoRoundConfig(QuantizationConfig):
                 None),
             extra_config=cls.get_from_keys_or(config, ["extra_config"], None),
             data_type=cls.get_from_keys_or(config, ["data_type"], "int"),
-            backend=cls.get_from_keys_or(config, ["vllm_backend"], "auto"),
+            backend=cls.get_from_keys_or(config, ["sglang_backend"], "auto"),
         )
 
-    def get_scaled_act_names(self) -> List[str]:
+    def get_scaled_act_names(self) -> list[str]:
         """Returns the activation function names that should be post-scaled.
 
         For now, this is only used by AWQ.
@@ -163,7 +163,8 @@ class AutoRoundConfig(QuantizationConfig):
             else:
                 return None
 
-        logger.debug(prefix, layer.__class__.__name__, weight_bits, group_size,
+        logger.debug("[%s] Type: %s, Bits: %s, Group Size: %s, Sym: %s",
+                     prefix, layer.__class__.__name__, weight_bits, group_size,
                      sym)
         if backend == "auto" or "marlin" in backend:
             if isinstance(layer, FusedMoE):
@@ -234,7 +235,8 @@ class AutoRoundConfig(QuantizationConfig):
             else:
                 return None
 
-        logger.debug(prefix, layer.__class__.__name__, weight_bits, group_size,
+        logger.debug("[%s] Type: %s, Bits: %s, Group Size: %s, Sym: %s",
+                     prefix, layer.__class__.__name__, weight_bits, group_size,
                      sym)
         if backend == "auto" or "marlin" in backend:
             if isinstance(layer, FusedMoE):
@@ -290,40 +292,11 @@ class AutoRoundConfig(QuantizationConfig):
                 return GPTQMarlinLinearMethod(quant_args_marlin)
             else:
                 return GPTQLinearMethod(quant_args)
-
+        
         return None
 
-    def apply_ipex_quant_layer(self, layer, prefix: str):
-        weight_bits, group_size, sym = self.get_layer_config(layer, prefix)
-        if not self.check_quantized(weight_bits):
-            if isinstance(layer, (LinearBase, ParallelLMHead)):
-                return UnquantizedLinearMethod()
-            else:
-                return None
-        from vllm.model_executor.layers.quantization.ipex_quant import (
-            IPEXAWQLinearMethod, IPEXConfig, IPEXGPTQLinearMethod)
-        if isinstance(layer, (LinearBase, ParallelLMHead)):
-            if "awq" in self.packing_format:
-                config = IPEXConfig(method="awq",
-                                    weight_bits=weight_bits,
-                                    group_size=group_size)
-                return IPEXAWQLinearMethod(config)
-            elif "gptq" in self.packing_format:
-                config = IPEXConfig(method="gptq",
-                                    weight_bits=weight_bits,
-                                    group_size=group_size)
-                return IPEXGPTQLinearMethod(config)
-            else:
-                raise ValueError(
-                    f"ipex backend only supports awq "
-                    f"and gptq format, but got {self.packing_format}")
-        else:
-            return None
-
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
-        if current_platform is not None and (current_platform.is_cpu() or current_platform.is_xpu()
-                or self.backend == "ipex"):
-            return self.apply_ipex_quant_layer(layer, prefix)
+        # TODO enable CPU quant method later
         if "gptq" in self.packing_format or "gptq" in self.backend:
             return self.apply_gptq_quant_layer(layer, prefix)
         if "awq" in self.packing_format or "awq" in self.backend:

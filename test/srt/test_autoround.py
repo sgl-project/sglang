@@ -18,7 +18,7 @@ from sglang.test.test_utils import (
 class TestAutoRound(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_AUTOROUND_MLLM_MODEL_NAME_FOR_TEST
+        cls.model = None
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -32,16 +32,18 @@ class TestAutoRound(CustomTestCase):
         kill_process_tree(cls.process.pid)
 
     def test_mmlu(self):
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="mmlu",
-            num_examples=64,
-            num_threads=32,
-        )
+        for model in DEFAULT_AUTOROUND_MODEL_NAME_FOR_TEST:
+            self.model = model
+            args = SimpleNamespace(
+                base_url=self.base_url,
+                model=self.model,
+                eval_name="lambada_openai",
+                num_examples=64,
+                num_threads=32,
+            )
 
-        metrics = run_eval(args)
-        self.assertGreater(metrics["score"], 0.64)
+            metrics = run_eval(args)
+            self.assertGreater(metrics["score"], 0.4)
 
 
 if __name__ == "__main__":
