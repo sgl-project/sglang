@@ -45,19 +45,19 @@ def _compute_layer_operations(
     if enable_tbo:
         assert layer.is_layer_sparse
         if forward_mode == ForwardMode.EXTEND:
-            return _compute_moe_deepseek_blog_prefill()
+            return _compute_moe_deepseek_blog_prefill(layer)
         elif forward_mode == ForwardMode.DECODE:
-            return _compute_moe_deepseek_blog_decode()
+            return _compute_moe_deepseek_blog_decode(layer)
         else:
             raise NotImplementedError(f"Unsupported {forward_mode=}")
     else:
         if layer.is_layer_sparse:
-            return _compute_moe_normal()
+            return _compute_moe_normal(layer)
         else:
-            return _compute_mlp_normal()
+            return _compute_mlp_normal(layer)
 
 
-def _compute_mlp_normal():
+def _compute_mlp_normal(layer):
     return [
         layer.op_comm_prepare_attn,
         layer.op_attn,
@@ -67,7 +67,7 @@ def _compute_mlp_normal():
     ]
 
 
-def _compute_moe_normal():
+def _compute_moe_normal(layer):
     return [
         layer.op_comm_prepare_attn,
         layer.op_attn,
@@ -85,7 +85,7 @@ def _compute_moe_normal():
     ]
 
 
-def _compute_moe_deepseek_blog_prefill():
+def _compute_moe_deepseek_blog_prefill(layer):
     return [
         layer.op_comm_prepare_attn,
         layer.op_attn,
@@ -105,7 +105,7 @@ def _compute_moe_deepseek_blog_prefill():
     ]
 
 
-def _compute_moe_deepseek_blog_decode():
+def _compute_moe_deepseek_blog_decode(layer):
     return [
         layer.op_comm_prepare_attn,
         layer.op_decode_attn_0,  # TODO
