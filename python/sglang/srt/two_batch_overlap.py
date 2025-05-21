@@ -5,7 +5,7 @@ from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPConfig
 from sglang.srt.layers.quantization.deep_gemm import configure_deep_gemm_num_sms
 from sglang.srt.operations import execute_operations, execute_overlapped_operations
-from sglang.srt.operations_strategy import compute_operations_strategy
+from sglang.srt.operations_strategy import compute_operations_strategy, OperationsStrategy
 from sglang.srt.utils import BumpAllocator, DeepEPMode
 
 if TYPE_CHECKING:
@@ -166,13 +166,13 @@ def model_forward_tbo(layers, inputs):
     inputs_arr = _model_forward_split_inputs(**inputs)
     del inputs
 
-    operations = compute_operations_strategy(layers, forward_batch.forward_mode)
+    operations_strategy = OperationsStrategy.init_new(layers, forward_batch.forward_mode, enable_tbo=True)
 
-    with configure_deep_gemm_num_sms(deep_gemm_num_sms):
+    with configure_deep_gemm_num_sms(operations_strategy.deep_gemm_num_sms):
         outputs_arr = execute_overlapped_operations(
             inputs_arr=inputs_arr,
-            operations_arr=[operations] * 2,
-            delta_stages=[0, delta_stages],
+            operations_arr=[operations_strategy.operations] * 2,
+            delta_stages=[0, operations_strategy.tbo_delta_stages],
         )
 
     return _model_forward_merge_outputs(*outputs_arr)
