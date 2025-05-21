@@ -73,6 +73,12 @@ class RequestFuncOutput:
     error: str = ""
     output_len: int = 0
 
+    @staticmethod
+    def init_new(request_func_input: RequestFuncInput):
+        output = RequestFuncOutput()
+        output.prompt_len = request_func_input.prompt_len
+        return output
+
 
 def remove_prefix(text: str, prefix: str) -> str:
     return text[len(prefix) :] if text.startswith(prefix) else text
@@ -114,8 +120,7 @@ async def async_request_trt_llm(
         if args.disable_ignore_eos:
             del payload["min_length"]
             del payload["end_id"]
-        output = RequestFuncOutput()
-        output.prompt_len = request_func_input.prompt_len
+        output = RequestFuncOutput.init_new(request_func_input)
 
         ttft = 0.0
         st = time.perf_counter()
@@ -186,8 +191,7 @@ async def async_request_openai_completions(
         }
         headers = get_auth_headers()
 
-        output = RequestFuncOutput()
-        output.prompt_len = request_func_input.prompt_len
+        output = RequestFuncOutput.init_new(request_func_input)
 
         generated_text = ""
         output_len = request_func_input.output_len
@@ -269,8 +273,7 @@ async def async_request_truss(
         }
         headers = get_auth_headers()
 
-        output = RequestFuncOutput()
-        output.prompt_len = request_func_input.prompt_len
+        output = RequestFuncOutput.init_new(request_func_input)
 
         generated_text = ""
         ttft = 0.0
@@ -355,8 +358,7 @@ async def async_request_sglang_generate(
 
         headers = get_auth_headers()
 
-        output = RequestFuncOutput()
-        output.prompt_len = request_func_input.prompt_len
+        output = RequestFuncOutput.init_new(request_func_input)
 
         generated_text = ""
         output_len = request_func_input.output_len
@@ -469,6 +471,10 @@ def get_model(pretrained_model_name_or_path: str) -> str:
 def get_tokenizer(
     pretrained_model_name_or_path: str,
 ) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
+    assert (
+        pretrained_model_name_or_path is not None
+        and pretrained_model_name_or_path != ""
+    )
     if pretrained_model_name_or_path.endswith(
         ".json"
     ) or pretrained_model_name_or_path.endswith(".model"):
@@ -610,12 +616,19 @@ def download_and_cache_file(url: str, filename: Optional[str] = None):
     return filename
 
 
+@dataclass
+class DatasetRow:
+    prompt: str
+    prompt_len: int
+    output_len: int
+
+
 def sample_mmmu_requests(
     num_requests: int,
     tokenizer: PreTrainedTokenizerBase,
     fixed_output_len: Optional[int] = None,
     random_sample: bool = True,
-) -> List[Tuple[str, int, int]]:
+) -> List[DatasetRow]:
     """
     Sample requests from the MMMU dataset using HuggingFace datasets.
 
@@ -716,7 +729,11 @@ def sample_mmmu_requests(
 
                 output_len = fixed_output_len if fixed_output_len is not None else 256
 
-                filtered_dataset.append((prompt, prompt_len, output_len))
+                filtered_dataset.append(
+                    DatasetRow(
+                        prompt=prompt, prompt_len=prompt_len, output_len=output_len
+                    )
+                )
 
         except Exception as e:
             print(f"Error processing example {i}: {e}")
@@ -733,7 +750,7 @@ def sample_sharegpt_requests(
     context_len: Optional[int] = None,
     prompt_suffix: Optional[str] = "",
     apply_chat_template=False,
-) -> List[Tuple[str, int, int]]:
+) -> List[DatasetRow]:
     if fixed_output_len is not None and fixed_output_len < 4:
         raise ValueError("output_len too small")
 
@@ -764,7 +781,7 @@ def sample_sharegpt_requests(
     random.shuffle(dataset)
 
     # Filter out sequences that are too long or too short
-    filtered_dataset: List[Tuple[str, int, int]] = []
+    filtered_dataset: List[DatasetRow] = []
     for i in range(len(dataset)):
         if len(filtered_dataset) == num_requests:
             break
@@ -802,10 +819,12 @@ def sample_sharegpt_requests(
             # Prune too long sequences.
             continue
 
-        filtered_dataset.append((prompt, prompt_len, output_len))
+        filtered_dataset.append(
+            DatasetRow(prompt=prompt, prompt_len=prompt_len, output_len=output_len)
+        )
 
-    print(f"#Input tokens: {np.sum([x[1] for x in filtered_dataset])}")
-    print(f"#Output tokens: {np.sum([x[2] for x in filtered_dataset])}")
+    print(f"#Input tokens: {np.sum([x.prompt_len for x in filtered_dataset])}")
+    print(f"#Output tokens: {np.sum([x.output_len for x in filtered_dataset])}")
     return filtered_dataset
 
 
@@ -817,7 +836,8 @@ def sample_random_requests(
     tokenizer: PreTrainedTokenizerBase,
     dataset_path: str,
     random_sample: bool = True,
-) -> List[Tuple[str, int, int]]:
+    return_text: bool = True,
+) -> List[DatasetRow]:
     input_lens = np.random.randint(
         max(int(input_len * range_ratio), 1),
         input_len + 1,
@@ -857,7 +877,7 @@ def sample_random_requests(
         random.shuffle(dataset)
 
         # Filter out sequences that are too long or too short
-        input_requests: List[Tuple[str, int, int]] = []
+        input_requests: List[DatasetRow] = []
         for data in dataset:
             i = len(input_requests)
             if i == num_prompts:
@@ -877,20 +897,34 @@ def sample_random_requests(
             else:
                 ratio = (input_lens[i] + prompt_len - 1) // prompt_len
                 input_ids = (prompt_token_ids * ratio)[: input_lens[i]]
-            prompt = tokenizer.decode(input_ids)
-            input_requests.append((prompt, int(input_lens[i]), int(output_lens[i])))
+            input_content = input_ids
+            if return_text:
+                input_content = tokenizer.decode(input_content)
+            input_requests.append(
+                DatasetRow(
+                    prompt=input_content,
+                    prompt_len=int(input_lens[i]),
+                    output_len=int(output_lens[i]),
+                )
+            )
     else:
         # Sample token ids from random integers. This can cause some NaN issues.
         offsets = np.random.randint(0, tokenizer.vocab_size, size=num_prompts)
         input_requests = []
         for i in range(num_prompts):
-            prompt = tokenizer.decode(
-                [
-                    (offsets[i] + i + j) % tokenizer.vocab_size
-                    for j in range(input_lens[i])
-                ]
+            input_content = [
+                (offsets[i] + i + j) % tokenizer.vocab_size
+                for j in range(input_lens[i])
+            ]
+            if return_text:
+                input_content = tokenizer.decode(input_content)
+            input_requests.append(
+                DatasetRow(
+                    prompt=input_content,
+                    prompt_len=int(input_lens[i]),
+                    output_len=int(output_lens[i]),
+                )
             )
-            input_requests.append((prompt, int(input_lens[i]), int(output_lens[i])))
 
     print(f"#Input tokens: {np.sum(input_lens)}")
     print(f"#Output tokens: {np.sum(output_lens)}")
@@ -925,7 +959,7 @@ def sample_generated_shared_prefix_requests(
     output_len: int,
     tokenizer: PreTrainedTokenizerBase,
     args: argparse.Namespace,
-) -> List[Tuple[str, int, int]]:
+) -> List[DatasetRow]:
     """Generate benchmark requests with shared system prompts using random tokens and caching."""
     cache_path = get_gen_prefix_cache_path(args, tokenizer)
 
@@ -963,7 +997,11 @@ def sample_generated_shared_prefix_requests(
             full_prompt = f"{system_prompt}\n\n{question}"
             prompt_len = len(tokenizer.encode(full_prompt))
 
-            input_requests.append((full_prompt, prompt_len, output_len))
+            input_requests.append(
+                DatasetRow(
+                    prompt=full_prompt, prompt_len=prompt_len, output_len=output_len
+                )
+            )
             total_input_tokens += prompt_len
             total_output_tokens += output_len
 
@@ -994,9 +1032,9 @@ def sample_generated_shared_prefix_requests(
 
 
 async def get_request(
-    input_requests: List[Tuple[str, int, int]],
+    input_requests: List[DatasetRow],
     request_rate: float,
-) -> AsyncGenerator[Tuple[str, int, int], None]:
+) -> AsyncGenerator[DatasetRow, None]:
     input_requests = iter(input_requests)
     for request in input_requests:
         yield request
@@ -1012,7 +1050,7 @@ async def get_request(
 
 
 def calculate_metrics(
-    input_requests: List[Tuple[str, int, int]],
+    input_requests: List[DatasetRow],
     outputs: List[RequestFuncOutput],
     dur_s: float,
     tokenizer: PreTrainedTokenizerBase,
@@ -1034,7 +1072,7 @@ def calculate_metrics(
                 tokenizer.encode(outputs[i].generated_text, add_special_tokens=False)
             )
             retokenized_output_lens.append(retokenized_output_len)
-            total_input += input_requests[i][1]
+            total_input += input_requests[i].prompt_len
             if output_len > 1:
                 tpots.append((outputs[i].latency - outputs[i].ttft) / (output_len - 1))
             itls += outputs[i].itl
@@ -1096,7 +1134,7 @@ async def benchmark(
     base_url: str,
     model_id: str,
     tokenizer: PreTrainedTokenizerBase,
-    input_requests: List[Tuple[str, int, int]],
+    input_requests: List[DatasetRow],
     request_rate: float,
     max_concurrency: Optional[int],
     disable_tqdm: bool,
@@ -1126,7 +1164,12 @@ async def benchmark(
     print(f"Starting warmup with {warmup_requests} sequences...")
 
     # Use the first request for all warmup iterations
-    test_prompt, test_prompt_len, test_output_len = input_requests[0]
+    test_request = input_requests[0]
+    test_prompt, test_prompt_len, test_output_len = (
+        test_request.prompt,
+        test_request.prompt_len,
+        test_request.output_len,
+    )
     if lora_names is not None and len(lora_names) != 0:
         lora_name = lora_names[0]
     else:
@@ -1194,7 +1237,11 @@ async def benchmark(
     benchmark_start_time = time.perf_counter()
     tasks: List[asyncio.Task] = []
     async for request in get_request(input_requests, request_rate):
-        prompt, prompt_len, output_len = request
+        prompt, prompt_len, output_len = (
+            request.prompt,
+            request.prompt_len,
+            request.output_len,
+        )
         if lora_names is not None and len(lora_names) != 0:
             idx = random.randint(0, len(lora_names) - 1)
             lora_name = lora_names[idx]
@@ -1380,21 +1427,24 @@ async def benchmark(
         else:
             output_file_name = f"{args.backend}_{now}_{args.num_prompts}_sharegpt.jsonl"
 
+    result_details = {
+        "input_lens": [output.prompt_len for output in outputs],
+        "output_lens": output_lens,
+        "ttfts": [output.ttft for output in outputs],
+        "itls": [output.itl for output in outputs],
+        "generated_texts": [output.generated_text for output in outputs],
+        "errors": [output.error for output in outputs],
+    }
+
     # Append results to a JSONL file
     with open(output_file_name, "a") as file:
-        file.write(json.dumps(result) + "\n")
+        if args.output_details:
+            result_for_dump = result | result_details
+        else:
+            result_for_dump = result
+        file.write(json.dumps(result_for_dump) + "\n")
 
-    result.update(
-        {
-            "input_lens": [output.prompt_len for output in outputs],
-            "output_lens": output_lens,
-            "ttfts": [output.ttft for output in outputs],
-            "itls": [output.itl for output in outputs],
-            "generated_texts": [output.generated_text for output in outputs],
-            "errors": [output.error for output in outputs],
-        }
-    )
-    return result
+    return result | result_details
 
 
 def check_chat_template(model_path):
@@ -1423,6 +1473,9 @@ def run_benchmark(args_: argparse.Namespace):
     # Set default value for warmup_requests if not present
     if not hasattr(args, "warmup_requests"):
         args.warmup_requests = 1
+
+    if not hasattr(args, "output_details"):
+        args.output_details = False
 
     print(f"benchmark_args={args}")
 
@@ -1668,6 +1721,9 @@ if __name__ == "__main__":
         "if the server is not processing requests fast enough to keep up.",
     )
     parser.add_argument("--output-file", type=str, help="Output JSONL file name.")
+    parser.add_argument(
+        "--output-details", action="store_true", help="Output details of benchmarking."
+    )
     parser.add_argument(
         "--disable-tqdm",
         action="store_true",
