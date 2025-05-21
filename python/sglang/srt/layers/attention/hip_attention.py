@@ -235,6 +235,9 @@ class HiPAttentionBackend(AttentionBackend):
         if layer.use_irope:
             using_chunked_sw = True
             sw_size = self.attention_chunk_size
+        
+        if k_cache.dtype not in [torch.float32, torch.float16, torch.bfloat16]:
+            assert layer.k_scale is not None, "fp8 scale should be handled"
 
         o, metadata = self.forward_paged_hip(
             query=q_reshaped,
