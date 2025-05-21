@@ -586,9 +586,6 @@ class MooncakeKVReceiver(BaseKVReceiver):
         self.kv_mgr = mgr
         self.session_id = self.kv_mgr.get_session_id()
         self.kv_mgr.update_status(bootstrap_room, KVPoll.Bootstrapping)
-        self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].append(
-            self.bootstrap_room
-        )
 
         if self.bootstrap_addr not in self.kv_mgr.prefill_dp_size_table:
             self.prefill_tp_size, self.prefill_dp_size = (
@@ -614,6 +611,9 @@ class MooncakeKVReceiver(BaseKVReceiver):
                 self.bootstrap_addr
             ]
 
+        self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].append(
+            self.bootstrap_room
+        )
         # Currently, we don't allow prefill instance and decode instance to
         # have different TP sizes per DP rank, except for models using MLA.
         local_tp_size_per_dp_rank = self.kv_mgr.tp_size // self.kv_mgr.dp_size
