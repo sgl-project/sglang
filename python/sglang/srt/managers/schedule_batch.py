@@ -453,6 +453,7 @@ class Req:
         self.origin_input_ids = origin_input_ids
         # Each decode stage's output ids
         self.output_ids = []
+        self.stop_buffer = ""
         # fill_ids = origin_input_ids + output_ids. Updated if chunked.
         self.fill_ids = None
         self.session_id = session_id
@@ -724,12 +725,14 @@ class Req:
 
         # Check stop strings
         if len(self.sampling_params.stop_strs) > 0:
-            tail_str = self.tokenizer.decode(
-                self.output_ids[-(self.sampling_params.stop_str_max_len + 1) :]
-            )
+            tail_str = self.tokenizer.decode(self.output_ids[-1:])
+            if len(self.stop_buffer) < self.sampling_params.stop_str_max_len:
+                self.stop_buffer += tail_str
+            else:
+                self.stop_buffer = self.stop_buffer[1:] + tail_str
 
             for stop_str in self.sampling_params.stop_strs:
-                if stop_str in tail_str or stop_str in self.decoded_text:
+                if self.stop_buffer.endwith(stop_str) or stop_str in self.decoded_text:
                     self.finished_reason = FINISH_MATCHED_STR(matched=stop_str)
                     return
 
