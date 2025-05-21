@@ -8,52 +8,62 @@ If you want a high-level endpoint that can automatically handle chat templates, 
 
 The `/generate` endpoint accepts the following parameters in JSON format. For detailed usage, see the [native API doc](./native_api.ipynb).
 
-* `text: Optional[Union[List[str], str]] = None` The input prompt. Can be a single prompt or a batch of prompts.
-* `input_ids: Optional[Union[List[List[int]], List[int]]] = None` Alternative to `text`. Specify the input as token IDs instead of text.
-* `sampling_params: Optional[Union[List[Dict], Dict]] = None` The sampling parameters as described in the sections below.
-* `return_logprob: Optional[Union[List[bool], bool]] = None` Whether to return log probabilities for tokens.
-* `logprob_start_len: Optional[Union[List[int], int]] = None` If returning log probabilities, specifies the start position in the prompt. Default is "-1", which returns logprobs only for output tokens.
-* `top_logprobs_num: Optional[Union[List[int], int]] = None` If returning log probabilities, specifies the number of top logprobs to return at each position.
-* `stream: bool = False` Whether to stream the output.
-* `lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None` Path to LoRA weights.
-* `custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None` Custom logit processor for advanced sampling control. For usage see below.
-* `return_hidden_states: bool = False` Whether to return hidden states of the model. Note that each time it changes, the CUDA graph will be recaptured, which might lead to a performance hit. See the [examples](https://github.com/sgl-project/sglang/blob/main/examples/runtime/hidden_states) for more information.
+| Argument               | Type/Default                                            | Description                                                                                                                                    |
+|------------------------|---------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------|
+| text                   | `Optional[Union[List[str], str]] = None`                | The input prompt. Can be a single prompt or a batch of prompts.                                                                                |
+| input_ids              | `Optional[Union[List[List[int]], List[int]]] = None`    | Alternative to `text`. Specify the input as token IDs instead of text.                                                                         |
+| sampling_params        | `Optional[Union[List[Dict], Dict]] = None`              | The sampling parameters as described in the sections below.                                                                                    |
+| return_logprob         | `Optional[Union[List[bool], bool]] = None`              | Whether to return log probabilities for tokens.                                                                                                |
+| logprob_start_len      | `Optional[Union[List[int], int]] = None`                | If returning log probabilities, specifies the start position in the prompt. Default is "-1", which returns logprobs only for output tokens.   |
+| top_logprobs_num       | `Optional[Union[List[int], int]] = None`                | If returning log probabilities, specifies the number of top logprobs to return at each position.                                               |
+| stream                 | `bool = False`                                          | Whether to stream the output.                                                                                                                  |
+| lora_path              | `Optional[Union[List[Optional[str]], Optional[str]]] = None`| Path to LoRA weights.                                                                                                                          |
+| custom_logit_processor | `Optional[Union[List[Optional[str]], str]] = None`      | Custom logit processor for advanced sampling control. For usage see below.                                                                     |
+| return_hidden_states   | `bool = False`                                          | Whether to return hidden states of the model. Note that each time it changes, the CUDA graph will be recaptured, which might lead to a performance hit. See the [examples](https://github.com/sgl-project/sglang/blob/main/examples/runtime/hidden_states) for more information. |
 
 ## Sampling parameters
 
 ### Core parameters
 
-* `max_new_tokens: int = 128` The maximum output length measured in tokens.
-* `stop: Optional[Union[str, List[str]]] = None` One or multiple [stop words](https://platform.openai.com/docs/api-reference/chat/create#chat-create-stop). Generation will stop if one of these words is sampled.
-* `stop_token_ids: Optional[List[int]] = None` Provide stop words in the form of token IDs. Generation will stop if one of these token IDs is sampled.
-* `temperature: float = 1.0` [Temperature](https://platform.openai.com/docs/api-reference/chat/create#chat-create-temperature) when sampling the next token. `temperature = 0` corresponds to greedy sampling, a higher temperature leads to more diversity.
-* `top_p: float = 1.0` [Top-p](https://platform.openai.com/docs/api-reference/chat/create#chat-create-top_p) selects tokens from the smallest sorted set whose cumulative probability exceeds `top_p`. When `top_p = 1`, this reduces to unrestricted sampling from all tokens.
-* `top_k: int = -1` [Top-k](https://developer.nvidia.com/blog/how-to-get-better-outputs-from-your-large-language-model/#predictability_vs_creativity) randomly selects from the `k` highest-probability tokens.
-* `min_p: float = 0.0` [Min-p](https://github.com/huggingface/transformers/issues/27670) samples from tokens with probability larger than `min_p * highest_token_probability`.
+| Argument        | Type/Default                                 | Description                                                                                                                                    |
+|-----------------|----------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------|
+| max_new_tokens  | `int = 128`                                  | The maximum output length measured in tokens.                                                                                                  |
+| stop            | `Optional[Union[str, List[str]]] = None`     | One or multiple [stop words](https://platform.openai.com/docs/api-reference/chat/create#chat-create-stop). Generation will stop if one of these words is sampled. |
+| stop_token_ids  | `Optional[List[int]] = None`                 | Provide stop words in the form of token IDs. Generation will stop if one of these token IDs is sampled.                                        |
+| temperature     | `float = 1.0`                                | [Temperature](https://platform.openai.com/docs/api-reference/chat/create#chat-create-temperature) when sampling the next token. `temperature = 0` corresponds to greedy sampling, a higher temperature leads to more diversity. |
+| top_p           | `float = 1.0`                                | [Top-p](https://platform.openai.com/docs/api-reference/chat/create#chat-create-top_p) selects tokens from the smallest sorted set whose cumulative probability exceeds `top_p`. When `top_p = 1`, this reduces to unrestricted sampling from all tokens. |
+| top_k           | `int = -1`                                   | [Top-k](https://developer.nvidia.com/blog/how-to-get-better-outputs-from-your-large-language-model/#predictability_vs_creativity) randomly selects from the `k` highest-probability tokens. |
+| min_p           | `float = 0.0`                                | [Min-p](https://github.com/huggingface/transformers/issues/27670) samples from tokens with probability larger than `min_p * highest_token_probability`. |
 
 ### Penalizers
 
-* `frequency_penalty: float = 0.0`: Penalizes tokens based on their frequency in generation so far. Must be between `-2` and `2` where negative numbers encourage repeatment of tokens and positive number encourages sampling of new tokens. The scaling of penalization grows linearly with each appearance of a token.
-* `presence_penalty: float = 0.0`: Penalizes tokens if they appeared in the generation so far. Must be between `-2` and `2` where negative numbers encourage repeatment of tokens and positive number encourages sampling of new tokens. The scaling of the penalization is constant if a token occured.
-* `min_new_tokens: int = 0`: Forces the model to generate at least `min_new_tokens` until a stop word or EOS token is sampled. Note that this might lead to unintended behavior, for example, if the distribution is highly skewed towards these tokens.
+| Argument           | Type/Default           | Description                                                                                                                                    |
+|--------------------|------------------------|------------------------------------------------------------------------------------------------------------------------------------------------|
+| frequency_penalty  | `float = 0.0`          | Penalizes tokens based on their frequency in generation so far. Must be between `-2` and `2` where negative numbers encourage repeatment of tokens and positive number encourages sampling of new tokens. The scaling of penalization grows linearly with each appearance of a token. |
+| presence_penalty   | `float = 0.0`          | Penalizes tokens if they appeared in the generation so far. Must be between `-2` and `2` where negative numbers encourage repeatment of tokens and positive number encourages sampling of new tokens. The scaling of the penalization is constant if a token occurred. |
+| min_new_tokens     | `int = 0`              | Forces the model to generate at least `min_new_tokens` until a stop word or EOS token is sampled. Note that this might lead to unintended behavior, for example, if the distribution is highly skewed towards these tokens. |
 
 ### Constrained decoding
 
 Please refer to our dedicated guide on [constrained decoding](./structured_outputs.ipynb) for the following parameters.
 
-* `json_schema: Optional[str] = None`: JSON schema for structured outputs.
-* `regex: Optional[str] = None`: Regex for structured outputs.
-* `ebnf: Optional[str] = None`: EBNF for structured outputs.
+| Argument     | Type/Default                    | Description                                                                                                                                    |
+|--------------|---------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------|
+| json_schema  | `Optional[str] = None`          | JSON schema for structured outputs.                                                                                                            |
+| regex        | `Optional[str] = None`          | Regex for structured outputs.                                                                                                                  |
+| ebnf         | `Optional[str] = None`          | EBNF for structured outputs.                                                                                                                   |
 
 ### Other options
 
-* `n: int = 1`: Specifies the number of output sequences to generate per request. (Generating multiple outputs in one request (n > 1) is discouraged; repeating the same prompts several times offers better control and efficiency.)
-* `spaces_between_special_tokens: bool = True`: Whether or not to add spaces between special tokens during detokenization.
-* `no_stop_trim: bool = False`: Don't trim stop words or EOS token from the generated text.
-* `continue_final_message: bool = False` : When enabled, the final assistant message is removed and its content is used as a prefill so that the model continues that message instead of starting a new turn. See [openai_chat_with_response_prefill.py](https://github.com/sgl-project/sglang/blob/main/examples/runtime/openai_chat_with_response_prefill.py) for examples.
-* `ignore_eos: bool = False`: Don't stop generation when EOS token is sampled.
-* `skip_special_tokens: bool = True`: Remove special tokens during decoding.
-* `custom_params: Optional[List[Optional[Dict[str, Any]]]] = None`: Used when employing `CustomLogitProcessor`. For usage, see below.
+| Argument                      | Type/Default                    | Description                                                                                                                                    |
+|-------------------------------|---------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------|
+| n                             | `int = 1`                       | Specifies the number of output sequences to generate per request. (Generating multiple outputs in one request (n > 1) is discouraged; repeating the same prompts several times offers better control and efficiency.) |
+| spaces_between_special_tokens | `bool = True`                   | Whether or not to add spaces between special tokens during detokenization.                                                                     |
+| no_stop_trim                  | `bool = False`                  | Don't trim stop words or EOS token from the generated text.                                                                                    |
+| continue_final_message        | `bool = False`                  | When enabled, the final assistant message is removed and its content is used as a prefill so that the model continues that message instead of starting a new turn. See [openai_chat_with_response_prefill.py](https://github.com/sgl-project/sglang/blob/main/examples/runtime/openai_chat_with_response_prefill.py) for examples. |
+| ignore_eos                    | `bool = False`                  | Don't stop generation when EOS token is sampled.                                                                                               |
+| skip_special_tokens           | `bool = True`                   | Remove special tokens during decoding.                                                                                                         |
+| custom_params                 | `Optional[List[Optional[Dict[str, Any]]]] = None` | Used when employing `CustomLogitProcessor`. For usage, see below.                                                                              |
 
 ## Examples
 
@@ -125,7 +135,7 @@ Detailed example in [openai compatible api](https://docs.sglang.ai/backend/opena
 Launch a server:
 
 ```bash
-python3 -m sglang.launch_server --model-path lmms-lab/llava-onevision-qwen2-7b-ov --chat-template chatml-llava
+python3 -m sglang.launch_server --model-path lmms-lab/llava-onevision-qwen2-7b-ov
 ```
 
 Download an image:

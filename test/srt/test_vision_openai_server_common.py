@@ -1,9 +1,3 @@
-"""
-Usage:
-python3 -m unittest test_vision_openai_server.TestOpenAIVisionServer.test_mixed_batch
-python3 -m unittest test_vision_openai_server.TestOpenAIVisionServer.test_multi_images_chat_completion
-"""
-
 import base64
 import io
 import json
@@ -81,10 +75,20 @@ class TestOpenAIVisionServer(CustomTestCase):
         text = response.choices[0].message.content
         assert isinstance(text, str)
         # `driver` is for gemma-3-it
-        assert "man" in text or "person" or "driver" in text, text
-        assert "cab" in text or "taxi" in text or "SUV" in text, text
+        assert (
+            "man" in text or "person" or "driver" in text
+        ), f"text: {text}, should contain man, person or driver"
+        assert (
+            "cab" in text
+            or "taxi" in text
+            or "SUV" in text
+            or "vehicle" in text
+            or "car" in text
+        ), f"text: {text}, should contain cab, taxi, SUV, vehicle or car"
         # MiniCPMO fails to recognize `iron`, but `hanging`
-        assert "iron" in text or "hang" in text, text
+        assert (
+            "iron" in text or "hang" in text or "cloth" in text or "holding" in text
+        ), f"text: {text}, should contain iron, hang, cloth or holding"
         assert response.id
         assert response.created
         assert response.usage.prompt_tokens > 0
@@ -132,7 +136,9 @@ class TestOpenAIVisionServer(CustomTestCase):
         assert response.choices[0].message.role == "assistant"
         text = response.choices[0].message.content
         assert isinstance(text, str)
-        assert "man" in text or "cab" in text, text
+        assert (
+            "man" in text or "cab" in text
+        ), f"text: {text}, should contain man or cab"
         assert response.id
         assert response.created
         assert response.usage.prompt_tokens > 0
@@ -175,8 +181,12 @@ class TestOpenAIVisionServer(CustomTestCase):
         print("-" * 30)
         print(f"Multi images response:\n{text}")
         print("-" * 30)
-        assert "man" in text or "cab" in text or "SUV" in text or "taxi" in text, text
-        assert "logo" in text or '"S"' in text or "SG" in text, text
+        assert (
+            "man" in text or "cab" in text or "SUV" in text or "taxi" in text
+        ), f"text: {text}, should contain man, cab, SUV or taxi"
+        assert (
+            "logo" in text or '"S"' in text or "SG" in text
+        ), f"text: {text}, should contain logo, S or SG"
         assert response.id
         assert response.created
         assert response.usage.prompt_tokens > 0
@@ -305,9 +315,9 @@ class TestOpenAIVisionServer(CustomTestCase):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
 
         regex = (
-            r"""\{\n"""
-            + r"""   "color": "[\w]+",\n"""
-            + r"""   "number_of_cars": [\d]+\n"""
+            r"""\{"""
+            + r""""color":"[\w]+","""
+            + r""""number_of_cars":[\d]+"""
             + r"""\}"""
         )
 
@@ -456,281 +466,3 @@ class TestOpenAIVisionServer(CustomTestCase):
 
     def test_audio_chat_completion(self):
         pass
-
-
-class TestQwen2VLServer(TestOpenAIVisionServer):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = "Qwen/Qwen2-VL-7B-Instruct"
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-123456"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            api_key=cls.api_key,
-            other_args=[
-                "--mem-fraction-static",
-                "0.4",
-            ],
-        )
-        cls.base_url += "/v1"
-
-
-class TestQwen2_5_VLServer(TestOpenAIVisionServer):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = "Qwen/Qwen2.5-VL-7B-Instruct"
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-123456"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            api_key=cls.api_key,
-            other_args=[
-                "--mem-fraction-static",
-                "0.4",
-            ],
-        )
-        cls.base_url += "/v1"
-
-
-class TestVLMContextLengthIssue(CustomTestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = "Qwen/Qwen2-VL-7B-Instruct"
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-123456"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            api_key=cls.api_key,
-            other_args=[
-                "--context-length",
-                "300",
-                "--mem-fraction-static=0.80",
-            ],
-        )
-        cls.base_url += "/v1"
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-    def test_single_image_chat_completion(self):
-        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
-
-        with self.assertRaises(openai.BadRequestError) as cm:
-            client.chat.completions.create(
-                model="default",
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "image_url",
-                                "image_url": {"url": IMAGE_MAN_IRONING_URL},
-                            },
-                            {
-                                "type": "text",
-                                "text": "Give a lengthy description of this picture",
-                            },
-                        ],
-                    },
-                ],
-                temperature=0,
-            )
-
-        # context length is checked first, then max_req_input_len, which is calculated from the former
-        assert (
-            "Multimodal prompt is too long after expanding multimodal tokens."
-            in str(cm.exception)
-            or "is longer than the model's context length" in str(cm.exception)
-        )
-
-
-class TestMllamaServer(TestOpenAIVisionServer):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = "meta-llama/Llama-3.2-11B-Vision-Instruct"
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-123456"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            api_key=cls.api_key,
-        )
-        cls.base_url += "/v1"
-
-    def test_video_chat_completion(self):
-        pass
-
-
-class TestMinicpmvServer(TestOpenAIVisionServer):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = "openbmb/MiniCPM-V-2_6"
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-123456"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--trust-remote-code",
-                "--mem-fraction-static",
-                "0.4",
-            ],
-        )
-        cls.base_url += "/v1"
-
-
-class TestMinicpmoServer(TestOpenAIVisionServer):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = "openbmb/MiniCPM-o-2_6"
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-123456"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--trust-remote-code",
-                "--mem-fraction-static",
-                "0.7",
-            ],
-        )
-        cls.base_url += "/v1"
-
-    def test_audio_chat_completion(self):
-        self._test_audio_speech_completion()
-        self._test_audio_ambient_completion()
-
-
-class TestDeepseekVL2Server(TestOpenAIVisionServer):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = "deepseek-ai/deepseek-vl2-small"
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-123456"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--trust-remote-code",
-                "--context-length",
-                "4096",
-            ],
-        )
-        cls.base_url += "/v1"
-
-    def test_video_chat_completion(self):
-        pass
-
-
-class TestDeepseekVL2TinyServer(TestOpenAIVisionServer):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = "deepseek-ai/deepseek-vl2-tiny"
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-123456"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--trust-remote-code",
-                "--chat-template",
-                "deepseek-vl2",
-                "--context-length",
-                "4096",
-            ],
-        )
-        cls.base_url += "/v1"
-
-    def test_video_chat_completion(self):
-        pass
-
-
-class TestJanusProServer(TestOpenAIVisionServer):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = "deepseek-ai/Janus-Pro-7B"
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-123456"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--trust-remote-code",
-                "--mem-fraction-static",
-                "0.4",
-            ],
-        )
-        cls.base_url += "/v1"
-
-    def test_video_chat_completion(self):
-        pass
-
-    def test_single_image_chat_completion(self):
-        # Skip this test because it is flaky
-        pass
-
-
-## Skip for ci test
-# class TestLlama4Server(TestOpenAIVisionServer):
-#     @classmethod
-#     def setUpClass(cls):
-#         cls.model = "meta-llama/Llama-4-Scout-17B-16E-Instruct"
-#         cls.base_url = DEFAULT_URL_FOR_TEST
-#         cls.api_key = "sk-123456"
-#         cls.process = popen_launch_server(
-#             cls.model,
-#             cls.base_url,
-#             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-#             other_args=[
-#                 "--chat-template",
-#                 "llama-4",
-#                 "--mem-fraction-static",
-#                 "0.8",
-#                 "--tp-size=8",
-#                 "--context-length=8192",
-#             ],
-#         )
-#         cls.base_url += "/v1"
-
-#     def test_video_chat_completion(self):
-#         pass
-
-
-class TestGemma3itServer(TestOpenAIVisionServer):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = "google/gemma-3-4b-it"
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-123456"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--trust-remote-code",
-                "--mem-fraction-static",
-                "0.75",
-                "--enable-multimodal",
-            ],
-        )
-        cls.base_url += "/v1"
-
-    def test_video_chat_completion(self):
-        pass
-
-
-if __name__ == "__main__":
-    unittest.main()

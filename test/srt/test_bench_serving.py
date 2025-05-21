@@ -1,3 +1,4 @@
+import os
 import unittest
 
 from sglang.test.test_utils import (
@@ -6,6 +7,8 @@ from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_MODEL_NAME_FOR_TEST_FP8,
     DEFAULT_MOE_MODEL_NAME_FOR_TEST,
+    DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST,
+    DEFAULT_VLM_CHAT_TEMPLATE_FOR_TEST,
     CustomTestCase,
     is_in_ci,
     run_bench_serving,
@@ -28,7 +31,10 @@ class TestBenchServing(CustomTestCase):
                 f"### test_offline_throughput_default\n"
                 f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
             )
-            self.assertGreater(res["output_throughput"], 3800)
+            if os.getenv("SGLANG_AMD_CI") == "1":
+                self.assertGreater(res["output_throughput"], 3500)
+            else:
+                self.assertGreater(res["output_throughput"], 3800)
 
     def test_offline_throughput_non_stream_small_batch_size(self):
         res = run_bench_serving(
@@ -63,7 +69,10 @@ class TestBenchServing(CustomTestCase):
                 f"### test_offline_throughput_without_radix_cache\n"
                 f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
             )
-            self.assertGreater(res["output_throughput"], 3800)
+            if os.getenv("SGLANG_AMD_CI") == "1":
+                self.assertGreater(res["output_throughput"], 3500)
+            else:
+                self.assertGreater(res["output_throughput"], 3800)
 
     def test_offline_throughput_without_chunked_prefill(self):
         res = run_bench_serving(
@@ -98,7 +107,10 @@ class TestBenchServing(CustomTestCase):
                 f"### test_offline_throughput_with_triton_attention_backend\n"
                 f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
             )
-            self.assertGreater(res["output_throughput"], 3700)
+            if os.getenv("SGLANG_AMD_CI") == "1":
+                self.assertGreater(res["output_throughput"], 3500)
+            else:
+                self.assertGreater(res["output_throughput"], 3700)
 
     def test_offline_throughput_default_fp8(self):
         res = run_bench_serving(
@@ -113,7 +125,10 @@ class TestBenchServing(CustomTestCase):
                 f"### test_offline_throughput_default_fp8\n"
                 f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
             )
-            self.assertGreater(res["output_throughput"], 4300)
+            if os.getenv("SGLANG_AMD_CI") == "1":
+                self.assertGreater(res["output_throughput"], 4000)
+            else:
+                self.assertGreater(res["output_throughput"], 4300)
 
     def test_online_latency_default(self):
         res = run_bench_serving(
@@ -129,8 +144,59 @@ class TestBenchServing(CustomTestCase):
                 f'median_e2e_latency_ms: {res["median_e2e_latency_ms"]:.2f} ms\n'
             )
             self.assertLess(res["median_e2e_latency_ms"], 11000)
-            self.assertLess(res["median_ttft_ms"], 86)
+            if os.getenv("SGLANG_AMD_CI") == "1":
+                self.assertLess(res["median_ttft_ms"], 115)
+            else:
+                self.assertLess(res["median_ttft_ms"], 86)
             self.assertLess(res["median_itl_ms"], 10)
+
+    def test_vlm_offline_throughput(self):
+        res = run_bench_serving(
+            model=DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST,
+            num_prompts=200,
+            request_rate=float("inf"),
+            other_server_args=[
+                "--mem-fraction-static",
+                "0.7",
+            ],
+            dataset_name="mmmu",
+        )
+
+        if is_in_ci():
+            write_github_step_summary(
+                f"### test_vlm_offline_throughput\n"
+                f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
+            )
+            if os.getenv("SGLANG_AMD_CI") == "1":
+                self.assertGreater(res["output_throughput"], 2000)
+                # TODO: not set yet, need AMD machine
+            else:
+                self.assertGreater(res["output_throughput"], 2500)
+
+    def test_vlm_online_latency(self):
+        res = run_bench_serving(
+            model=DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST,
+            num_prompts=50,
+            request_rate=1,
+            other_server_args=[
+                "--mem-fraction-static",
+                "0.7",
+            ],
+            dataset_name="mmmu",
+        )
+
+        if is_in_ci():
+            write_github_step_summary(
+                f"### test_vlm_online_latency\n"
+                f'median_e2e_latency_ms: {res["median_e2e_latency_ms"]:.2f} ms\n'
+            )
+            self.assertLess(res["median_e2e_latency_ms"], 16500)
+            if os.getenv("SGLANG_AMD_CI") == "1":
+                self.assertLess(res["median_ttft_ms"], 150)
+                # TODO: not set yet, need AMD machine
+            else:
+                self.assertLess(res["median_ttft_ms"], 90)
+            self.assertLess(res["median_itl_ms"], 8)
 
     def test_online_latency_eagle(self):
         res = run_bench_serving(
@@ -164,7 +230,10 @@ class TestBenchServing(CustomTestCase):
                 f'median_e2e_latency_ms: {res["median_e2e_latency_ms"]:.2f} ms\n'
                 f'accept_length: {res["accept_length"]:.2f} \n'
             )
-            self.assertLess(res["median_e2e_latency_ms"], 900)
+            if os.getenv("SGLANG_AMD_CI") == "1":
+                self.assertLess(res["median_e2e_latency_ms"], 1800)
+            else:
+                self.assertLess(res["median_e2e_latency_ms"], 900)
             self.assertGreater(res["accept_length"], 3.0)
 
     def test_moe_offline_throughput_default(self):
@@ -180,7 +249,10 @@ class TestBenchServing(CustomTestCase):
                 f"### test_moe_offline_throughput_default\n"
                 f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
             )
-            self.assertGreater(res["output_throughput"], 2200)
+            if os.getenv("SGLANG_AMD_CI") == "1":
+                self.assertGreater(res["output_throughput"], 2100)
+            else:
+                self.assertGreater(res["output_throughput"], 2200)
 
     def test_moe_offline_throughput_without_radix_cache(self):
         res = run_bench_serving(
@@ -195,7 +267,54 @@ class TestBenchServing(CustomTestCase):
                 f"### test_moe_offline_throughput_without_radix_cache\n"
                 f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
             )
-            self.assertGreater(res["output_throughput"], 2200)
+            if os.getenv("SGLANG_AMD_CI") == "1":
+                self.assertGreater(res["output_throughput"], 2100)
+            else:
+                self.assertGreater(res["output_throughput"], 2200)
+
+    def test_pp_offline_throughput_default_decode(self):
+        res = run_bench_serving(
+            model=DEFAULT_MOE_MODEL_NAME_FOR_TEST,
+            num_prompts=1000,
+            request_rate=float("inf"),
+            random_input_len=1,
+            random_output_len=1024,
+            other_server_args=["--pp", "2"],
+            need_warmup=True,
+            seed=42,
+        )
+
+        if is_in_ci():
+            write_github_step_summary(
+                f"### test_pp_offline_throughput_default_decode\n"
+                f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
+            )
+            self.assertGreater(res["output_throughput"], 7500)
+
+    def test_pp_long_context_prefill(self):
+        res = run_bench_serving(
+            model="meta-llama/Llama-3.3-70B-Instruct",
+            num_prompts=4,
+            request_rate=float("inf"),
+            random_input_len=128000,
+            random_output_len=1,
+            dataset_name="random",
+            other_server_args=[
+                "--quantization",
+                "fp8",
+                "--pp",
+                2,
+            ],
+            need_warmup=False,
+            seed=42,
+        )
+
+        if is_in_ci():
+            write_github_step_summary(
+                f"### test_pp_long_context_latency_prefill\n"
+                f'input_throughput: {res["input_throughput"]:.2f} ms\n'
+            )
+            self.assertGreater(res["input_throughput"], 4000)
 
 
 if __name__ == "__main__":

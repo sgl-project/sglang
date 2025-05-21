@@ -14,6 +14,7 @@
 """Conversion between OpenAI APIs and native SRT APIs"""
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -172,6 +173,32 @@ def guess_chat_template_name_from_model_path(model_path):
         logger.info(
             f"Infer the chat template name from the model path and obtain the result: {chat_template_name}."
         )
+
+
+def _validate_prompt(prompt: str):
+    """Validate that the prompt is not empty or whitespace only."""
+    is_invalid = False
+
+    # Check for empty/whitespace string
+    if isinstance(prompt, str):
+        is_invalid = not prompt.strip()
+    # Check for various invalid list cases: [], [""], [" "], [[]]
+    elif isinstance(prompt, list):
+        is_invalid = not prompt or (
+            len(prompt) == 1
+            and (
+                (isinstance(prompt[0], str) and not prompt[0].strip())
+                or (isinstance(prompt[0], list) and not prompt[0])
+            )
+        )
+
+    if is_invalid:
+        raise HTTPException(
+            status_code=400,
+            detail="Input cannot be empty or contain only whitespace.",
+        )
+
+    return prompt
 
 
 async def v1_files_create(
@@ -589,7 +616,7 @@ def v1_generate_response(
     echo = False
 
     if (not isinstance(request, list)) and request.echo:
-        # TODO: handle the case propmt is token ids
+        # TODO: handle the case prompt is token ids
         if isinstance(request.prompt, list) and isinstance(request.prompt[0], str):
             # for the case of multiple str prompts
             prompts = request.prompt
@@ -645,7 +672,7 @@ def v1_generate_response(
         finish_reason = ret_item["meta_info"]["finish_reason"]
 
         if to_file:
-            # to make the choise data json serializable
+            # to make the choice data json serializable
             choice_data = {
                 "index": 0,
                 "text": text,
@@ -899,6 +926,24 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
     return response
 
 
+def _get_enable_thinking_from_request(request_obj):
+    """Extracts the 'enable_thinking' flag from request chat_template_kwargs.
+
+    Args:
+        request_obj: The request object (or an item from a list of requests).
+
+    Returns:
+        The boolean value of 'enable_thinking' if found and not True, otherwise True.
+    """
+    if (
+        hasattr(request_obj, "chat_template_kwargs")
+        and request_obj.chat_template_kwargs
+        and request_obj.chat_template_kwargs.get("enable_thinking") is not None
+    ):
+        return request_obj.chat_template_kwargs.get("enable_thinking")
+    return True
+
+
 def v1_chat_generate_request(
     all_requests: List[ChatCompletionRequest],
     tokenizer_manager,
@@ -948,47 +993,23 @@ def v1_chat_generate_request(
 
             if chat_template_name is None:
                 openai_compatible_messages = []
-                if (
-                    tools
-                    and tokenizer_manager.server_args.tool_call_parser == "deepseekv3"
-                ):
-                    # add function call prompt to deepseekv3
-                    openai_compatible_messages.append(
-                        {
-                            "role": "system",
-                            "content": """You are a helpful Assistant.
-                    ## Tools
-                    ### Function
-                    You have the following functions available:
-                    """
-                            + "".join(
-                                [
-                                    f"""
-                        - `{tool['name']}`:
-                        ```json
-                        {json.dumps(tool)}
-                        ```
-                        """
-                                    for tool in tools
-                                ]
-                            ),
-                        }
-                    )
 
                 for message in request.messages:
                     if message.content is None:
                         message.content = ""
-                    if isinstance(message.content, str):
-                        openai_compatible_messages.append(
-                            {"role": message.role, "content": message.content}
-                        )
+                    msg_dict = message.dict()
+                    if isinstance(msg_dict.get("content"), list):
+                        for chunk in msg_dict["content"]:
+                            if isinstance(chunk, dict) and chunk.get("type") == "text":
+                                new_msg = msg_dict.copy()
+                                new_msg["content"] = chunk["text"]
+                                new_msg = {
+                                    k: v for k, v in new_msg.items() if v is not None
+                                }
+                                openai_compatible_messages.append(new_msg)
                     else:
-                        content_list = message.dict()["content"]
-                        for content in content_list:
-                            if content["type"] == "text":
-                                openai_compatible_messages.append(
-                                    {"role": message.role, "content": content["text"]}
-                                )
+                        msg_dict = {k: v for k, v in msg_dict.items() if v is not None}
+                        openai_compatible_messages.append(msg_dict)
                 if (
                     openai_compatible_messages
                     and openai_compatible_messages[-1]["role"] == "assistant"
@@ -1172,6 +1193,7 @@ def v1_chat_generate_request(
         top_logprobs_nums = top_logprobs_nums[0]
         modalities_list = modalities_list[0]
         lora_paths = lora_paths[0]
+        request_ids = request_ids[0]
     else:
         if tokenizer_manager.model_config.is_multimodal:
             # processor will need text input
@@ -1263,31 +1285,16 @@ def v1_chat_generate_response(
         tool_calls = None
         text = ret_item["text"]
 
-        enable_thinking = True
         if isinstance(request, list):
             tool_choice = request[idx].tool_choice
             tools = request[idx].tools
             separate_reasoning = request[idx].separate_reasoning
-
-            if (
-                request[idx].chat_template_kwargs
-                and request[idx].chat_template_kwargs.get("enable_thinking") is not None
-            ):
-                enable_thinking = request[idx].chat_template_kwargs.get(
-                    "enable_thinking", True
-                )
+            enable_thinking = _get_enable_thinking_from_request(request[idx])
         else:
             tool_choice = request.tool_choice
             tools = request.tools
             separate_reasoning = request.separate_reasoning
-
-            if (
-                request.chat_template_kwargs
-                and request.chat_template_kwargs.get("enable_thinking") is not None
-            ):
-                enable_thinking = request.chat_template_kwargs.get(
-                    "enable_thinking", True
-                )
+            enable_thinking = _get_enable_thinking_from_request(request)
 
         reasoning_text = None
         if reasoning_parser and separate_reasoning and enable_thinking:
@@ -1313,7 +1320,8 @@ def v1_chat_generate_response(
                     text, call_info_list = parser.parse_non_stream(text)
                     tool_calls = [
                         ToolCall(
-                            id=str(call_info.tool_index),
+                            id=f"call_{base64.urlsafe_b64encode(uuid.uuid4().bytes).rstrip(b'=').decode()}",
+                            index=call_info.tool_index,
                             function=FunctionResponse(
                                 name=call_info.name, arguments=call_info.parameters
                             ),
@@ -1422,13 +1430,16 @@ async def v1_chat_completions(
         return create_error_response("Invalid request body, error: ", str(e))
     all_requests = [ChatCompletionRequest(**request_json)]
     created = int(time.time())
-    adapted_request, request = v1_chat_generate_request(all_requests, tokenizer_manager)
+    adapted_request, request = v1_chat_generate_request(
+        all_requests, tokenizer_manager, request_ids=[all_requests[0].rid]
+    )
 
     if adapted_request.stream:
         parser_dict = {}
         reasoning_parser_dict = {}
 
         async def generate_stream_resp():
+            tool_call_first = True
             is_firsts = {}
             stream_buffers = {}
             n_prev_tokens = {}
@@ -1526,9 +1537,12 @@ async def v1_chat_completions(
                     delta = text[len(stream_buffer) :]
                     new_stream_buffer = stream_buffer + delta
 
+                    enable_thinking = _get_enable_thinking_from_request(request)
+
                     if (
                         tokenizer_manager.server_args.reasoning_parser
                         and request.separate_reasoning
+                        and enable_thinking
                     ):
                         if index not in reasoning_parser_dict:
                             reasoning_parser_dict[index] = ReasoningParser(
@@ -1592,7 +1606,6 @@ async def v1_chat_completions(
                         # 2) if we found calls, we output them as separate chunk(s)
                         for call_item in calls:
                             # transform call_item -> FunctionResponse + ToolCall
-
                             if finish_reason_type == "stop":
                                 latest_delta_len = 0
                                 if isinstance(call_item.parameters, str):
@@ -1615,14 +1628,19 @@ async def v1_chat_completions(
                                 call_item.parameters = remaining_call
 
                                 finish_reason_type = "tool_calls"
-
                             tool_call = ToolCall(
-                                id=str(call_item.tool_index),
+                                id=(
+                                    f"call_{base64.urlsafe_b64encode(uuid.uuid4().bytes).rstrip(b'=').decode()}"
+                                    if tool_call_first
+                                    else None
+                                ),
+                                index=call_item.tool_index,
                                 function=FunctionResponse(
                                     name=call_item.name,
                                     arguments=call_item.parameters,
                                 ),
                             )
+                            tool_call_first = False
                             choice_data = ChatCompletionResponseStreamChoice(
                                 index=index,
                                 delta=DeltaMessage(tool_calls=[tool_call]),
@@ -1764,6 +1782,8 @@ def v1_embedding_request(all_requests, tokenizer_manager):
 
     for request in all_requests:
         prompt = request.input
+        # Check for empty/whitespace string
+        prompt = _validate_prompt(request.input)
         assert (
             type(prompt) is first_prompt_type
         ), "All prompts must be of the same type in file input settings"
@@ -1795,6 +1815,7 @@ def v1_embedding_request(all_requests, tokenizer_manager):
                 prompt_kwargs = {"text": generate_prompts, "image_data": images}
         else:
             prompt_kwargs = {"input_ids": prompt}
+        request_ids = all_requests[0].rid
     else:
         if isinstance(prompts[0], str) or isinstance(prompts[0][0], str):
             prompt_kwargs = {"text": prompts}
@@ -1807,8 +1828,10 @@ def v1_embedding_request(all_requests, tokenizer_manager):
             )
         else:
             prompt_kwargs = {"input_ids": prompts}
+        request_ids = [req.rid for req in all_requests]
 
     adapted_request = EmbeddingReqInput(
+        rid=request_ids,
         **prompt_kwargs,
     )
 

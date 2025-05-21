@@ -81,6 +81,41 @@ router = Router(
 
 Use the `--verbose` flag with the CLI for more detailed logs.
 
+### Kubernetes Service Discovery
+
+SGL Router supports automatic service discovery for worker nodes in Kubernetes environments. When enabled, the router will automatically:
+
+- Discover and add worker pods with matching labels
+- Remove unhealthy or deleted worker pods
+- Dynamically adjust the worker pool based on pod health and availability
+
+#### Command Line Usage
+
+```bash
+python -m sglang_router.launch_router \
+    --service-discovery \
+    --selector app=sglang-worker role=inference \
+    --service-discovery-port 8000 \
+    --service-discovery-namespace default
+```
+
+#### Service Discovery Arguments
+
+- `--service-discovery`: Enable Kubernetes service discovery feature
+- `--selector`: One or more label key-value pairs for pod selection (format: key1=value1 key2=value2)
+- `--service-discovery-port`: Port to use when generating worker URLs (default: 80)
+- `--service-discovery-namespace`: Optional. Kubernetes namespace to watch for pods. If not provided, watches all namespaces (requires cluster-wide permissions)
+
+#### RBAC Requirements
+
+When using service discovery, you must configure proper Kubernetes RBAC permissions:
+
+- **If using namespace-scoped discovery** (with `--service-discovery-namespace`):
+  Set up a ServiceAccount, Role, and RoleBinding
+
+- **If watching all namespaces** (without specifying namespace):
+  Set up a ServiceAccount, ClusterRole, and ClusterRoleBinding with permissions to list/watch pods at the cluster level
+
 ### Troubleshooting
 
 1. If rust analyzer is not working in VSCode, set `rust-analyzer.linkedProjects` to the absolute path of `Cargo.toml` in your repo. For example:

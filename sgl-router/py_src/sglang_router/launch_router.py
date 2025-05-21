@@ -2,7 +2,7 @@ import argparse
 import dataclasses
 import logging
 import sys
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from sglang_router import Router
 from sglang_router_rs import PolicyType
@@ -43,6 +43,11 @@ class RouterArgs:
     max_payload_size: int = 4 * 1024 * 1024  # 4MB
     verbose: bool = False
     log_dir: Optional[str] = None
+    # Service discovery configuration
+    service_discovery: bool = False
+    selector: Dict[str, str] = dataclasses.field(default_factory=dict)
+    service_discovery_port: int = 80
+    service_discovery_namespace: Optional[str] = None
 
     @staticmethod
     def add_cli_args(
@@ -149,6 +154,28 @@ class RouterArgs:
             default=None,
             help="Directory to store log files. If not specified, logs are only output to console.",
         )
+        parser.add_argument(
+            f"--{prefix}service-discovery",
+            action="store_true",
+            help="Enable Kubernetes service discovery",
+        )
+        parser.add_argument(
+            f"--{prefix}selector",
+            type=str,
+            nargs="+",
+            help="Label selector for Kubernetes service discovery (format: key1=value1 key2=value2)",
+        )
+        parser.add_argument(
+            f"--{prefix}service-discovery-port",
+            type=int,
+            default=RouterArgs.service_discovery_port,
+            help="Port to use for discovered worker pods",
+        )
+        parser.add_argument(
+            f"--{prefix}service-discovery-namespace",
+            type=str,
+            help="Kubernetes namespace to watch for pods. If not provided, watches all namespaces (requires cluster-wide permissions)",
+        )
 
     @classmethod
     def from_cli_args(
@@ -182,7 +209,25 @@ class RouterArgs:
             max_payload_size=getattr(args, f"{prefix}max_payload_size"),
             verbose=getattr(args, f"{prefix}verbose", False),
             log_dir=getattr(args, f"{prefix}log_dir", None),
+            service_discovery=getattr(args, f"{prefix}service_discovery", False),
+            selector=cls._parse_selector(getattr(args, f"{prefix}selector", None)),
+            service_discovery_port=getattr(args, f"{prefix}service_discovery_port"),
+            service_discovery_namespace=getattr(
+                args, f"{prefix}service_discovery_namespace", None
+            ),
         )
+
+    @staticmethod
+    def _parse_selector(selector_list):
+        if not selector_list:
+            return {}
+
+        selector = {}
+        for item in selector_list:
+            if "=" in item:
+                key, value = item.split("=", 1)
+                selector[key] = value
+        return selector
 
 
 def policy_from_str(policy_str: str) -> PolicyType:
@@ -229,6 +274,10 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
             max_payload_size=router_args.max_payload_size,
             verbose=router_args.verbose,
             log_dir=router_args.log_dir,
+            service_discovery=router_args.service_discovery,
+            selector=router_args.selector,
+            service_discovery_port=router_args.service_discovery_port,
+            service_discovery_namespace=router_args.service_discovery_namespace,
         )
 
         router.start()

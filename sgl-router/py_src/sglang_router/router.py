@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from sglang_router_rs import PolicyType
 from sglang_router_rs import Router as _Router
@@ -32,6 +32,14 @@ class Router:
         max_tree_size: Maximum size of the approximation tree for cache-aware routing. Default: 2^24
         verbose: Enable verbose logging. Default: False
         log_dir: Directory to store log files. If None, logs are only output to console. Default: None
+        service_discovery: Enable Kubernetes service discovery. When enabled, the router will
+            automatically discover worker pods based on the selector. Default: False
+        selector: Dictionary mapping of label keys to values for Kubernetes pod selection.
+            Example: {"app": "sglang-worker"}. Default: {}
+        service_discovery_port: Port to use for service discovery. The router will generate
+            worker URLs using this port. Default: 80
+        service_discovery_namespace: Kubernetes namespace to watch for pods. If not provided,
+            watches pods across all namespaces (requires cluster-wide permissions). Default: None
     """
 
     def __init__(
@@ -50,7 +58,14 @@ class Router:
         max_payload_size: int = 4 * 1024 * 1024,  # 4MB
         verbose: bool = False,
         log_dir: Optional[str] = None,
+        service_discovery: bool = False,
+        selector: Dict[str, str] = None,
+        service_discovery_port: int = 80,
+        service_discovery_namespace: Optional[str] = None,
     ):
+        if selector is None:
+            selector = {}
+
         self._router = _Router(
             worker_urls=worker_urls,
             policy=policy,
@@ -66,6 +81,10 @@ class Router:
             max_payload_size=max_payload_size,
             verbose=verbose,
             log_dir=log_dir,
+            service_discovery=service_discovery,
+            selector=selector,
+            service_discovery_port=service_discovery_port,
+            service_discovery_namespace=service_discovery_namespace,
         )
 
     def start(self) -> None:

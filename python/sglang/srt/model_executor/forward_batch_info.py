@@ -31,7 +31,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import IntEnum, auto
-from typing import TYPE_CHECKING, List, Optional, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 import torch
 import triton
@@ -58,7 +58,7 @@ class ForwardMode(IntEnum):
     DECODE = auto()
     # Contains both EXTEND and DECODE when doing chunked prefill.
     MIXED = auto()
-    # No sequence to forward. For data parallel attention, some workers wil be IDLE if no sequence are allocated.
+    # No sequence to forward. For data parallel attention, some workers will be IDLE if no sequence are allocated.
     IDLE = auto()
 
     # Used in speculative decoding: verify a batch in the target model.
@@ -247,6 +247,7 @@ class ForwardBatch:
 
     # For padding
     padded_static_len: int = -1  # -1 if not padded
+    num_token_non_padded: Optional[torch.Tensor] = None  # scalar tensor
 
     # For Qwen2-VL
     mrope_positions: torch.Tensor = None
@@ -290,6 +291,9 @@ class ForwardBatch:
             capture_hidden_mode=batch.capture_hidden_mode,
             input_embeds=batch.input_embeds,
             extend_input_logprob_token_ids_gpu=extend_input_logprob_token_ids_gpu,
+            num_token_non_padded=torch.tensor(
+                len(batch.input_ids), dtype=torch.int32
+            ).to(device, non_blocking=True),
         )
 
         # For DP attention
@@ -583,6 +587,36 @@ class ForwardBatch:
 
         # Precompute the kv indices for each chunk
         self.prepare_chunked_kv_indices(device)
+
+
+class PPProxyTensors:
+    # adapted from https://github.com/vllm-project/vllm/blob/d14e98d924724b284dc5eaf8070d935e214e50c0/vllm/sequence.py#L1103
+    tensors: Dict[str, torch.Tensor]
+
+    def __init__(self, tensors):
+        # manually define this function, so that
+        # Dynamo knows `IntermediateTensors()` comes from this file.
+        # Otherwise, dataclass will generate this function by evaluating
+        # a string, and we will lose the information about the source file.
+        self.tensors = tensors
+
+    def __getitem__(self, key: Union[str, slice]):
+        if isinstance(key, str):
+            return self.tensors[key]
+        elif isinstance(key, slice):
+            return self.__class__({k: v[key] for k, v in self.tensors.items()})
+
+    def __setitem__(self, key: str, value: torch.Tensor):
+        self.tensors[key] = value
+
+    def __len__(self):
+        return len(self.tensors)
+
+    def __eq__(self, other: object):
+        return isinstance(other, self.__class__) and self
+
+    def __repr__(self) -> str:
+        return f"PPProxyTensors(tensors={self.tensors})"
 
 
 def compute_position_triton(

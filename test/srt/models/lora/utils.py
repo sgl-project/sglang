@@ -93,6 +93,41 @@ ALL_OTHER_LORA_MODELS = [
     ),
 ]
 
+CI_MULTI_LORA_MODELS = [
+    # multi-rank case
+    LoRAModelCase(
+        base="meta-llama/Llama-2-7b-hf",
+        adaptors=[
+            LoRAAdaptor(
+                name="winddude/wizardLM-LlaMA-LoRA-7B",
+                prefill_tolerance=1e-1,
+            ),
+            LoRAAdaptor(
+                name="RuterNorway/Llama-2-7b-chat-norwegian-LoRa",
+                prefill_tolerance=3e-1,
+            ),
+        ],
+        max_loras_per_batch=2,
+    ),
+]
+
+ALL_OTHER_MULTI_LORA_MODELS = [
+    LoRAModelCase(
+        base="meta-llama/Llama-3.1-8B-Instruct",
+        adaptors=[
+            LoRAAdaptor(
+                name="algoprog/fact-generation-llama-3.1-8b-instruct-lora",
+                prefill_tolerance=1e-1,
+            ),
+            LoRAAdaptor(
+                name="Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
+                prefill_tolerance=1e-1,
+            ),
+        ],
+        max_loras_per_batch=2,
+    ),
+]
+
 
 def run_lora_test_one_by_one(
     prompts: List[str],
@@ -143,7 +178,9 @@ def run_lora_test_one_by_one(
         torch_dtype=torch_dtype,
         model_type="generation",
         tp_size=model_case.tp_size,
-        lora_paths=[adaptor.name for adaptor in model_case.adaptors],
+        lora_paths=[
+            adaptor.name for adaptor in model_case.adaptors if adaptor.name is not None
+        ],
         max_loras_per_batch=model_case.max_loras_per_batch,
         lora_backend=backend,
         disable_cuda_graph=disable_cuda_graph,
@@ -288,7 +325,9 @@ def run_lora_test_by_batch(
         torch_dtype=torch_dtype,
         model_type="generation",
         tp_size=model_case.tp_size,
-        lora_paths=[adaptor.name for adaptor in model_case.adaptors],
+        lora_paths=[
+            adaptor.name for adaptor in model_case.adaptors if adaptor.name is not None
+        ],
         max_loras_per_batch=model_case.max_loras_per_batch,
         lora_backend=backend,
         disable_cuda_graph=disable_cuda_graph,

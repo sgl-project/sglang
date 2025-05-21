@@ -1,7 +1,9 @@
 use pyo3::prelude::*;
 pub mod logging;
+use std::collections::HashMap;
 pub mod router;
 pub mod server;
+pub mod service_discovery;
 pub mod tree;
 
 #[pyclass(eq)]
@@ -29,6 +31,10 @@ struct Router {
     max_payload_size: usize,
     verbose: bool,
     log_dir: Option<String>,
+    service_discovery: bool,
+    selector: HashMap<String, String>,
+    service_discovery_port: u16,
+    service_discovery_namespace: Option<String>,
 }
 
 #[pymethods]
@@ -49,6 +55,10 @@ impl Router {
         max_payload_size = 4 * 1024 * 1024,
         verbose = false,
         log_dir = None,
+        service_discovery = false,
+        selector = HashMap::new(),
+        service_discovery_port = 80,
+        service_discovery_namespace = None
     ))]
     fn new(
         worker_urls: Vec<String>,
@@ -65,6 +75,10 @@ impl Router {
         max_payload_size: usize,
         verbose: bool,
         log_dir: Option<String>,
+        service_discovery: bool,
+        selector: HashMap<String, String>,
+        service_discovery_port: u16,
+        service_discovery_namespace: Option<String>,
     ) -> PyResult<Self> {
         Ok(Router {
             host,
@@ -81,6 +95,10 @@ impl Router {
             max_payload_size,
             verbose,
             log_dir,
+            service_discovery,
+            selector,
+            service_discovery_port,
+            service_discovery_namespace,
         })
     }
 
@@ -105,6 +123,19 @@ impl Router {
             },
         };
 
+        // Create service discovery config if enabled
+        let service_discovery_config = if self.service_discovery {
+            Some(service_discovery::ServiceDiscoveryConfig {
+                enabled: true,
+                selector: self.selector.clone(),
+                check_interval: std::time::Duration::from_secs(60),
+                port: self.service_discovery_port,
+                namespace: self.service_discovery_namespace.clone(),
+            })
+        } else {
+            None
+        };
+
         actix_web::rt::System::new().block_on(async move {
             server::startup(server::ServerConfig {
                 host: self.host.clone(),
@@ -114,6 +145,7 @@ impl Router {
                 verbose: self.verbose,
                 max_payload_size: self.max_payload_size,
                 log_dir: self.log_dir.clone(),
+                service_discovery_config,
             })
             .await
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;

@@ -1,13 +1,14 @@
 import ctypes
 import os
+import platform
 
 import torch
 
-if os.path.exists("/usr/local/cuda/targets/x86_64-linux/lib/libcudart.so.12"):
-    ctypes.CDLL(
-        "/usr/local/cuda/targets/x86_64-linux/lib/libcudart.so.12",
-        mode=ctypes.RTLD_GLOBAL,
-    )
+SYSTEM_ARCH = platform.machine()
+
+cuda_path = f"/usr/local/cuda/targets/{SYSTEM_ARCH}-linux/lib/libcudart.so.12"
+if os.path.exists(cuda_path):
+    ctypes.CDLL(cuda_path, mode=ctypes.RTLD_GLOBAL)
 
 from sgl_kernel import common_ops
 from sgl_kernel.allreduce import *
@@ -46,6 +47,7 @@ from sgl_kernel.moe import (
     fp8_blockwise_scaled_grouped_mm,
     moe_align_block_size,
     moe_fused_gate,
+    prepare_moe_input,
     topk_softmax,
 )
 from sgl_kernel.sampling import (
