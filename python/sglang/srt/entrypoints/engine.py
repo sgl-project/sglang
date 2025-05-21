@@ -324,6 +324,24 @@ class Engine(EngineBase):
         loop = asyncio.get_event_loop()
         loop.run_until_complete(self.tokenizer_manager.stop_profile())
 
+    def start_expert_distribution_record(self):
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(
+            self.tokenizer_manager.start_expert_distribution_record()
+        )
+
+    def stop_expert_distribution_record(self):
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(
+            self.tokenizer_manager.stop_expert_distribution_record()
+        )
+
+    def dump_expert_distribution_record(self):
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(
+            self.tokenizer_manager.dump_expert_distribution_record()
+        )
+
     def get_server_info(self):
         loop = asyncio.get_event_loop()
         internal_states = loop.run_until_complete(
@@ -488,7 +506,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     if _is_cuda:
         assert_pkg_version(
             "sgl-kernel",
-            "0.1.2.post1",
+            "0.1.3",
             "Please reinstall the latest version with `pip install sgl-kernel --force-reinstall`",
         )
 

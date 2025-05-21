@@ -46,7 +46,19 @@ from importlib.util import find_spec
 from io import BytesIO
 from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Protocol, Set, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Generic,
+    List,
+    Optional,
+    Protocol,
+    Set,
+    Tuple,
+    TypeVar,
+    Union,
+)
 
 import numpy as np
 import psutil
@@ -1847,6 +1859,8 @@ def get_cuda_version():
 
 
 def launch_dummy_health_check_server(host, port):
+    import asyncio
+
     import uvicorn
     from fastapi import FastAPI, Response
 
@@ -1862,13 +1876,27 @@ def launch_dummy_health_check_server(host, port):
         """Check the health of the http server."""
         return Response(status_code=200)
 
-    uvicorn.run(
+    config = uvicorn.Config(
         app,
         host=host,
         port=port,
         timeout_keep_alive=5,
-        loop="uvloop",
+        loop="auto",
+        log_config=None,
+        log_level="warning",
     )
+    server = uvicorn.Server(config=config)
+
+    try:
+        loop = asyncio.get_running_loop()
+        logger.info(
+            f"Dummy health check server scheduled on existing loop at {host}:{port}"
+        )
+        loop.create_task(server.serve())
+
+    except RuntimeError:
+        logger.info(f"Starting dummy health check server at {host}:{port}")
+        server.run()
 
 
 def create_checksum(directory: str):
@@ -2073,7 +2101,6 @@ def is_fa3_default_architecture(hf_config):
         "Qwen2ForCausalLM",
         "Llama4ForConditionalGeneration",
         "LlamaForCausalLM",
-        "MistralForCausalLM",
         "Gemma2ForCausalLM",
         "Gemma3ForConditionalGeneration",
         "Qwen3ForCausalLM",
@@ -2111,3 +2138,25 @@ def load_json_config(data: str):
 
 def dispose_tensor(x: torch.Tensor):
     x.set_(torch.empty((0,), device=x.device, dtype=x.dtype))
+
+
+T = TypeVar("T")
+
+
+class Withable(Generic[T]):
+    def __init__(self):
+        self._value: Optional[T] = None
+
+    @property
+    def value(self) -> T:
+        return self._value
+
+    @contextmanager
+    def with_value(self, new_value: T):
+        assert self._value is None
+        self._value = new_value
+        try:
+            yield
+        finally:
+            assert self._value is new_value
+            self._value = None
