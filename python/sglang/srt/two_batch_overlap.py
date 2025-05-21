@@ -163,7 +163,7 @@ def _model_forward_tbo(layers, inputs):
     assert get_attention_tp_size() == 1
 
     forward_batch = inputs["forward_batch"]
-    inputs_arr = _model_forward_split_inputs(**inputs)
+    inputs_arr = _model_forward_tbo_split_inputs(**inputs)
     del inputs
 
     operations_strategy = OperationsStrategy.init_new(layers, forward_batch.forward_mode, enable_tbo=True)
@@ -175,7 +175,7 @@ def _model_forward_tbo(layers, inputs):
             delta_stages=[0, operations_strategy.tbo_delta_stages],
         )
 
-    return _model_forward_merge_outputs(*outputs_arr)
+    return _model_forward_tbo_merge_outputs(*outputs_arr)
 
 
 def _model_forward_non_tbo(layers, inputs):
@@ -187,7 +187,7 @@ def _model_forward_non_tbo(layers, inputs):
     return outputs["hidden_states"], outputs["residual"]
 
 
-def _model_forward_split_inputs(
+def _model_forward_tbo_split_inputs(
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
         positions: torch.Tensor,
@@ -228,7 +228,7 @@ def _model_forward_filter_inputs(
     )
 
 
-def _model_forward_merge_outputs(output_a, output_b):
+def _model_forward_tbo_merge_outputs(output_a, output_b):
     def _handle_key(name):
         value_a = output_a[name]
         value_b = output_b[name]
