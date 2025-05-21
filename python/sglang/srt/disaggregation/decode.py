@@ -44,7 +44,7 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPoolAllocator
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
 logger = logging.getLogger(__name__)
@@ -73,6 +73,7 @@ class DecodePreallocQueue:
         self,
         req_to_token_pool: ReqToTokenPool,
         token_to_kv_pool_allocator: TokenToKVPoolAllocator,
+        draft_token_to_kv_pool: Optional[KVCache],
         req_to_metadata_buffer_idx_allocator: ReqToMetadataIdxAllocator,
         metadata_buffers: List[torch.Tensor],
         aux_dtype: torch.dtype,
@@ -88,6 +89,7 @@ class DecodePreallocQueue:
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.token_to_kv_pool = token_to_kv_pool_allocator.get_kvcache()
+        self.draft_token_to_kv_pool = draft_token_to_kv_pool
         self.is_mla_backend = is_mla_backend(self.token_to_kv_pool)
         self.aux_dtype = aux_dtype
         self.metadata_buffers = metadata_buffers
@@ -115,6 +117,14 @@ class DecodePreallocQueue:
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )
+
+        if self.draft_token_to_kv_pool is not None:
+            draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
+                self.draft_token_to_kv_pool.get_contiguous_buf_infos()
+            )
+            kv_data_ptrs += draft_kv_data_ptrs
+            kv_data_lens += draft_kv_data_lens
+            kv_item_lens += draft_kv_item_lens
 
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
@@ -454,6 +464,41 @@ class ScheduleBatchDisaggregationDecodeMixin:
                 self.output_ids.append(req.transferred_output_id)
             self.tree_cache.cache_unfinished_req(req)
         self.output_ids = torch.tensor(self.output_ids, device=self.device)
+
+        # Simulate the eagle run. We add mock data to hidden states for the
+        # ease of implementation now meaning the first token will have acc rate
+        # of 0.
+        if not self.spec_algorithm.is_none():
+
+            b = len(self.reqs)
+            topk_p = torch.arange(
+                b * server_args.speculative_eagle_topk,
+                0,
+                -1,
+                device=self.device,
+                dtype=torch.float32,
+            )
+            topk_p = topk_p.reshape(b, server_args.speculative_eagle_topk)
+            topk_p /= b * server_args.speculative_eagle_topk
+            topk_index = torch.arange(
+                b * server_args.speculative_eagle_topk, device=self.device
+            )
+            topk_index = topk_index.reshape(b, server_args.speculative_eagle_topk)
+
+            # local import to avoid circular import
+            from sglang.srt.speculative.eagle_utils import EagleDraftInput
+
+            spec_info = EagleDraftInput(
+                topk_p=topk_p,
+                topk_index=topk_index,
+                hidden_states=torch.ones(
+                    (b, model_config.hidden_size), device=self.device
+                ),
+                verified_id=self.output_ids,
+            )
+            spec_info.prepare_for_extend(self)
+            spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
+            self.spec_info = spec_info
 
 
 class SchedulerDisaggregationDecodeMixin:
