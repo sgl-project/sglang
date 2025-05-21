@@ -2046,7 +2046,11 @@ class Scheduler(
         #     self.tp_worker.worker.model_runner.model
         # )
 
-        torch_memory_saver._global_info.binary_info.cdll.tms_copy_device_to_host()
+        if get_bool_env_var("SGLANG_HACK_HOST_MEMORY_LARGE"):
+            torch_memory_saver._global_info.binary_info.cdll.tms_copy_device_to_host()
+        else:
+            print(
+                "WARN! since SGLANG_HACK_HOST_MEMORY_LARGE is false, skip copy-device-to-host, thus cannot do resume later")
 
         self.flush_cache(
             # NOTE
