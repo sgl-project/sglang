@@ -76,7 +76,6 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.managers.expert_distribution import (
-    ExpertDistributionRecorder,
     get_global_expert_distribution_recorder,
 )
 from sglang.srt.managers.expert_location import ModelConfigForExpertLocation
