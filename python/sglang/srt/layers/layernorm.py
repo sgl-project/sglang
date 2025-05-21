@@ -19,11 +19,6 @@ from typing import Optional, Tuple, Union
 import torch
 import torch.nn as nn
 
-from sglang.srt.layers.triton_ops.layernorm import (
-    fused_add_rms_norm_triton,
-    rms_norm_triton,
-)
-
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -33,6 +28,8 @@ from sglang.srt.utils import (
     is_hip,
     is_npu,
 )
+from sglang.srt.layers.elementwise import fused_rmsnorm
+from sglang.srt.layers.triton_ops.layernorm import fused_add_rms_norm_triton
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -209,9 +206,7 @@ class RMSNorm(CustomOp):
             )
             return x, residual
 
-        out = rms_norm_triton(
-            x, [len(self.weight.data)], self.weight.data, self.variance_epsilon
-        )
+        out = fused_rmsnorm(x, self.weight.data, self.variance_epsilon, autotune=True)
         return out
 
 
