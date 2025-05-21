@@ -1367,6 +1367,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states=hidden_states,
             residual=residual,
             forward_batch=state.forward_batch,
+            zero_allocator=state.zero_allocator,
             tbo_subbatch_index=state.tbo_subbatch_index,
         )
 
