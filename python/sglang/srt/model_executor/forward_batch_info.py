@@ -739,6 +739,7 @@ class ForwardBatch:
                 top_p_normalized_logprobs=False,
                 top_p=None,
                 mm_inputs=None,
+                num_token_non_padded=None,
             )
         )
 
