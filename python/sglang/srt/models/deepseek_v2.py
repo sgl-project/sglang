@@ -1311,6 +1311,25 @@ class DeepseekV2DecoderLayer(nn.Module):
             and layer_id % self.config.moe_layer_freq == 0
         )
 
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+        zero_allocator: BumpAllocator,
+    ) -> torch.Tensor:
+        return execute_operations(
+            inputs=dict(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+                residual=residual,
+                zero_allocator=zero_allocator,
+            ),
+            operations=compute_layer_operations(self),
+        )
+
     def op_comm_prepare_attn(
         self,
         state,
