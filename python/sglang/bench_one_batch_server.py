@@ -268,6 +268,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
                     input_len_step_percentage=bench_args.input_len_step_percentage,
                     run_name=bench_args.run_name,
                     result_filename=bench_args.result_filename,
+                    tokenizer=tokenizer,
                 )
             )
     finally:
