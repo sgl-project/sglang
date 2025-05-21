@@ -140,6 +140,9 @@ class _StateDict:
         for k, v in values.items():
             setattr(self, k, v)
 
+    def get(self, item):
+        return self._data.get(item)
+
     def clear(self, expect_keys: Sequence[str]):
         if set(self._data.keys()) != set(expect_keys):
             raise Exception(
