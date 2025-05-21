@@ -12,7 +12,7 @@ if _ENABLE_PROFILE:
 
 
 def execute_operations(inputs, operations):
-    stages = _convert_operations_to_stages(decorate_operations(operations))
+    stages = _convert_operations_to_stages(operations)
     executor = _StageExecutor("primary", stages, inputs=inputs)
     for _ in range(executor.num_stages):
         executor.next()
@@ -153,6 +153,7 @@ class _StateDict:
 
 
 def _convert_operations_to_stages(operations: List[Operation]) -> List[Stage]:
+    operations = _decorate_operations(operations)
     operation_chunks = list(
         _chunk_by_separator(operations, lambda op: isinstance(op, YieldOperation))
     )
@@ -174,7 +175,7 @@ def _chunk_by_separator(
         yield pending_items
 
 
-def decorate_operations(operations: List[Operation], debug_name_prefix: str = ""):
+def _decorate_operations(operations: List[Operation], debug_name_prefix: str = ""):
     return [_decorate_operation(op, debug_name_prefix) for op in operations]
 
 
