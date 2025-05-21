@@ -1,0 +1,138 @@
+FROM lmsysorg/sglang:v0.4.6.post2-cu124 AS build
+
+# CMake
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        wget \
+        libssl-dev \
+        devscripts \
+        debhelper \
+        fakeroot \
+        pkg-config \
+        dkms \
+        cmake \
+        libfabric-dev
+
+ARG HTTP_PROXY
+ENV HTTP_PROXY=$HTTP_PROXY
+ENV HTTPS_PROXY=$HTTP_PROXY
+ENV NO_PROXY=localhost,127.0.0.1
+
+# GDRCopy
+WORKDIR /tmp
+RUN git clone https://github.com/NVIDIA/gdrcopy.git
+WORKDIR /tmp/gdrcopy
+RUN git checkout v2.4.4
+
+
+WORKDIR /tmp/gdrcopy/packages
+RUN CUDA=/usr/local/cuda ./build-deb-packages.sh
+RUN dpkg -i gdrdrv-dkms_*.deb
+RUN dpkg -i libgdrapi_*.deb
+RUN dpkg -i gdrcopy-tests_*.deb
+RUN dpkg -i gdrcopy_*.deb
+
+ENV GDRCOPY_HOME=/usr/src/gdrdrv-2.4.4/
+
+# ucx
+WORKDIR /sgl-workspace
+RUN wget https://github.com/openucx/ucx/releases/download/v1.18.0/ucx-1.18.0.tar.gz \
+    && tar -xvf ucx-1.18.0.tar.gz                   \
+    && cd ucx-1.18.0                                \
+    && ./configure                                  \
+            --enable-shared                         \
+            --disable-static                        \
+            --disable-doxygen-doc                   \
+            --enable-optimizations                  \
+            --enable-cma                            \
+            --enable-devel-headers                  \
+            --with-cuda=/usr/local/cuda-12.4        \
+            --with-verbs                            \
+            --with-dm                               \
+            --with-gdrcopy=/usr/src/gdrdrv-2.4.4    \
+            --enable-mt                             \
+            --prefix=/opt/hpcx/ucx-1.18.0           \
+    && make -j                                      \
+    && make -j install-strip                        \
+    && ldconfig
+
+# nixl
+WORKDIR /sgl-workspace
+RUN python3 -m pip install meson ninja pybind11
+RUN git clone --branch 0.2.0 https://github.com/ai-dynamo/nixl.git nixl-0.2.0 \
+    && cd nixl-0.2.0                                        \
+    && meson setup build -Ducx_path=/opt/hpcx/ucx-1.18.0    \
+    && cd build                                             \
+    && ninja                                                \
+    && ninja install                                        \
+    && cd ..                                                \
+    && python3 -m pip install .
+
+# ep statistics
+WORKDIR /sgl-workspace
+RUN wget https://github.com/user-attachments/files/20036217/attachment_ep_statistics.zip \
+    && unzip attachment_ep_statistics.zip \
+    && rm attachment_ep_statistics.zip \
+    && mv attachment_ep_statistics /sgl-workspace/eps
+
+# IBGDA dependency
+RUN ln -s /usr/lib/x86_64-linux-gnu/libmlx5.so.1 /usr/lib/x86_64-linux-gnu/libmlx5.so
+# RUN apt-get install -y libfabric-dev
+
+WORKDIR /sgl-workspace
+RUN git clone https://github.com/deepseek-ai/FlashMLA.git
+WORKDIR /sgl-workspace/FlashMLA
+RUN python3 setup.py install
+
+# DeepEP
+WORKDIR /sgl-workspace
+RUN git clone --branch h20_support https://github.com/bytedance-iaas/DeepEP.git
+
+# NVSHMEM
+WORKDIR /sgl-workspace
+RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.2.5/source/nvshmem_src_3.2.5-1.txz
+RUN tar -xf nvshmem_src_3.2.5-1.txz \
+    && mv nvshmem_src nvshmem
+
+WORKDIR /sgl-workspace/nvshmem
+RUN git apply /sgl-workspace/DeepEP/third-party/nvshmem.patch
+
+WORKDIR /sgl-workspace/nvshmem
+ENV CUDA_HOME=/usr/local/cuda
+RUN NVSHMEM_SHMEM_SUPPORT=0 \
+    NVSHMEM_UCX_SUPPORT=0 \
+    NVSHMEM_USE_NCCL=0 \
+    NVSHMEM_MPI_SUPPORT=0 \
+    NVSHMEM_IBGDA_SUPPORT=1 \
+    NVSHMEM_PMIX_SUPPORT=0 \
+    NVSHMEM_TIMEOUT_DEVICE_POLLING=0 \
+    NVSHMEM_USE_GDRCOPY=1 \
+    cmake -S . -B build/ -DCMAKE_INSTALL_PREFIX=/sgl-workspace/nvshmem/install -DCMAKE_CUDA_ARCHITECTURES=90 \
+    && cd build \
+    && make install -j
+
+WORKDIR /sgl-workspace/DeepEP
+ENV NVSHMEM_DIR=/sgl-workspace/nvshmem/install
+RUN NVSHMEM_DIR=/sgl-workspace/nvshmem/install pip install .
+
+
+# Install sglang
+WORKDIR /sgl-workspace
+RUN git clone --branch deepseek_ep_0520  --depth=1 https://github.com/bytedance-iaas/sglang.git sglang_deepep
+# COPY ../python /sgl-workspace/sglang_deepep/python
+
+WORKDIR /sgl-workspace/sglang_deepep
+RUN python3 -m pip install --upgrade pip setuptools wheel html5lib six \
+    && python3 -m pip --no-cache-dir install -e "python[all]" --find-links https://flashinfer.ai/whl/cu124/torch2.6/flashinfer-python
+
+# Set workspace
+WORKDIR /sgl-workspace
+
+
+FROM build AS release
+
+ENV HTTP_PROXY=
+ENV HTTPS_PROXY=
+
+WORKDIR /sgl-workspace
