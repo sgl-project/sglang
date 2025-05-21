@@ -1373,7 +1373,7 @@ class DeepseekV2Model(nn.Module):
             config.hidden_size,
             enable_tp=not global_server_args_dict["enable_dp_attention"],
         )
-        self.alt_stream = torch.cuda.Stream() if not _is_hip else None
+        self.alt_stream = torch.cuda.Stream() if _is_cuda else None
         self.layers = nn.ModuleList(
             [
                 DeepseekV2DecoderLayer(

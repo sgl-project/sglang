@@ -56,11 +56,11 @@ from sglang.srt.utils import (
     add_prefix,
     fast_topk,
     get_compiler_backend,
-    is_hip,
+    is_cuda,
     make_layers,
 )
 
-_is_hip = is_hip()
+_is_cuda = is_cuda()
 
 logger = logging.getLogger(__name__)
 
@@ -139,7 +139,7 @@ class Llama4MoE(nn.Module):
         return out_aD
 
     def _forward_core(self, hidden_states, forward_mode: ForwardMode):
-        if hidden_states.shape[0] < 4 and not _is_hip:
+        if hidden_states.shape[0] < 4 and _is_cuda:
             return self._forward_core_shared_routed_overlap(hidden_states)
         else:
             return self._forward_core_normal(hidden_states)
