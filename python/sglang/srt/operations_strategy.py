@@ -14,6 +14,19 @@ class OperationsStrategy:
     deep_gemm_num_sms: Optional[int]
     tbo_delta_stages: Optional[int]
 
+    @classmethod
+    def concat(cls, items: List["OperationsStrategy"]) -> "OperationsStrategy":
+        return OperationsStrategy(
+            operations=[x for item in items for x in item.operations],
+            deep_gemm_num_sms=_assert_all_same([item.deep_gemm_num_sms for item in items]),
+            tbo_delta_stages=_assert_all_same([item.tbo_delta_stages for item in items]),
+        )
+
+
+def _assert_all_same(items: List):
+    assert all(item == items[0] for item in items)
+    return items[0]
+
 
 def compute_layers_operations(
     layers: torch.nn.ModuleList,
