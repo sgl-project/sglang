@@ -277,6 +277,7 @@ class TritonAttnBackend(AttentionBackend):
             mask_indptr = None
             max_extend_len = None
         elif forward_batch.forward_mode.is_target_verify():
+            #TODO: Support sliding window in spec inference
             bs = len(forward_batch.req_pool_indices)
             qo_indptr = torch.arange(
                 0,
@@ -455,7 +456,7 @@ class TritonAttnBackend(AttentionBackend):
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     ):
         assert encoder_lens is None, "Not supported"
-        window_kv_indptr = None
+        window_kv_indptr = self.window_kv_indptr
         window_kv_indices = None
         window_num_kv_splits = None
 
