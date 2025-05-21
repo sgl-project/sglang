@@ -22,22 +22,23 @@ class OperationsStrategy:
             tbo_delta_stages=_assert_all_same([item.tbo_delta_stages for item in items]),
         )
 
+    @staticmethod
+    def init_new(
+        layers: torch.nn.ModuleList,
+        forward_mode: ForwardMode,
+        enable_tbo: bool,
+    ) -> "OperationsStrategy":
+        return OperationsStrategy.concat(
+            [_compute_layer_operations_strategy(layer, forward_mode, enable_tbo) for layer in layers])
+
 
 def _assert_all_same(items: List):
     assert all(item == items[0] for item in items)
     return items[0]
 
 
-def compute_layers_operations(
-    layers: torch.nn.ModuleList,
-    forward_mode: ForwardMode,
-    enable_tbo: bool,
-) -> OperationsStrategy:
-    return OperationsStrategy.concat([_compute_layer_operations(layer, forward_mode, enable_tbo) for layer in layers])
-
-
 # TODO can refactor to make it more fancy if we have more complex strategies
-def _compute_layer_operations(
+def _compute_layer_operations_strategy(
     layer: torch.nn.Module,
     forward_mode: ForwardMode,
     enable_tbo: bool,

@@ -5,7 +5,7 @@ from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPConfig
 from sglang.srt.layers.quantization.deep_gemm import configure_deep_gemm_num_sms
 from sglang.srt.operations import execute_operations, execute_overlapped_operations
-from sglang.srt.operations_strategy import compute_layers_operations
+from sglang.srt.operations_strategy import compute_operations_strategy
 from sglang.srt.utils import BumpAllocator, DeepEPMode
 
 if TYPE_CHECKING:
@@ -166,7 +166,7 @@ def model_forward_tbo(layers, inputs):
     inputs_arr = _model_forward_split_inputs(**inputs)
     del inputs
 
-    operations = compute_layers_operations(layers, forward_batch.forward_mode)
+    operations = compute_operations_strategy(layers, forward_batch.forward_mode)
 
     with configure_deep_gemm_num_sms(deep_gemm_num_sms):
         outputs_arr = execute_overlapped_operations(
@@ -180,7 +180,7 @@ def model_forward_tbo(layers, inputs):
 
 def model_forward_non_tbo(layers, inputs):
     forward_batch = inputs["forward_batch"]
-    operations = compute_layers_operations(layers, forward_batch.forward_mode)
+    operations = compute_operations_strategy(layers, forward_batch.forward_mode)
     outputs = execute_operations(inputs, operations)
     return outputs["hidden_states"], outputs["residual"]
 
