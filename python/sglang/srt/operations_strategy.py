@@ -31,16 +31,18 @@ def _assert_all_same(items: List):
 def compute_layers_operations(
     layers: torch.nn.ModuleList,
     forward_mode: ForwardMode,
+    enable_tbo: bool,
 ) -> OperationsStrategy:
-    return OperationsStrategy.concat([_compute_layer_operations(layer, forward_mode) for layer in layers])
+    return OperationsStrategy.concat([_compute_layer_operations(layer, forward_mode, enable_tbo) for layer in layers])
 
 
 # TODO can refactor to make it more fancy if we have more complex strategies
 def _compute_layer_operations(
     layer: torch.nn.Module,
     forward_mode: ForwardMode,
+    enable_tbo: bool,
 ) -> OperationsStrategy:
-    if these_layers_of_this_batch_needs_tbo:
+    if enable_tbo:
         assert layer.is_layer_sparse
         if forward_mode == ForwardMode.EXTEND:
             return _compute_moe_deepseek_blog_prefill()
