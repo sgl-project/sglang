@@ -180,8 +180,10 @@ def _model_forward_tbo(layers, inputs):
 
 def _model_forward_non_tbo(layers, inputs):
     forward_batch = inputs["forward_batch"]
-    operations = compute_operations_strategy(layers, forward_batch.forward_mode)
-    outputs = execute_operations(inputs, operations)
+    operations_strategy = OperationsStrategy.init_new(layers, forward_batch.forward_mode, enable_tbo=True)
+    assert operations_strategy.deep_gemm_num_sms is None, "unsupported"
+    assert operations_strategy.tbo_delta_stages is None, "unsupported"
+    outputs = execute_operations(inputs, operations_strategy.operations)
     return outputs["hidden_states"], outputs["residual"]
 
 
