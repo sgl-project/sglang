@@ -3,6 +3,7 @@ from typing import List, Optional
 
 import torch
 from sglang.srt import operations
+from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPConfig
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.operations import Operation
@@ -90,8 +91,12 @@ def _compute_moe_normal(layer):
 
 
 def _compute_moe_deepseek_blog_prefill(layer):
+    device_properties = torch.cuda.get_device_properties(device="cuda")
+    total_num_sms = device_properties.multi_processor_count
+    deep_gemm_num_sms = total_num_sms - DeepEPConfig.get_instance().num_sms
+
     return OperationsStrategy(
-        deep_gemm_num_sms=TODO,
+        deep_gemm_num_sms=deep_gemm_num_sms,
         tbo_delta_stages=0,
         operations=[
             layer.op_comm_prepare_attn,
