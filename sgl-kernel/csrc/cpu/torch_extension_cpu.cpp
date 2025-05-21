@@ -49,9 +49,12 @@ std::tuple<at::Tensor, at::Tensor> biased_grouped_topk_cpu(
 // attention
 void decode_attention_cpu(
     at::Tensor& query,
-    at::Tensor& output,
     at::Tensor& k_cache,
-    at::Tensor& v_cahce,
+    at::Tensor& v_cache,
+    at::Tensor& output,
+    at::Tensor& key,
+    at::Tensor& value,
+    at::Tensor& loc,
     at::Tensor& attn_logits,
     at::Tensor& req_to_token,
     at::Tensor& req_pool_indices,
@@ -139,8 +142,10 @@ at::Tensor shared_expert_cpu(
     double routed_scaling_factor,
     bool inplace,
     bool use_int8_w8a8,
+    bool use_fp8_w8a16,
     std::optional<at::Tensor>& w1_scale,
     std::optional<at::Tensor>& w2_scale,
+    std::optional<std::vector<int64_t>> block_size,
     std::optional<at::Tensor>& a1_scale,
     std::optional<at::Tensor>& a2_scale,
     bool is_vnni);
