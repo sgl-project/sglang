@@ -3,8 +3,9 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Sequence
 import torch
 
 from sglang.srt.layers.dp_attention import get_attention_tp_size
-from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPConfig
+from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPConfig, DeepEPDispatcher
 from sglang.srt.layers.quantization.deep_gemm import configure_deep_gemm_num_sms
+from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.operations import execute_operations, execute_overlapped_operations
 from sglang.srt.operations_strategy import (
     OperationsStrategy,
@@ -240,3 +241,10 @@ def _model_forward_tbo_merge_outputs(output_a, output_b):
         return torch.concat([value_a, value_b], dim=0)
 
     return _handle_key("hidden_states"), _handle_key("residual")
+
+# -------------------------------- Utilities and wrappers ---------------------------------------
+
+class MaybeTboDeepEPDispatcher:
+    def __init__(self, **kwargs):
+        num_inner_dispatchers = 2 if global_server_args_dict["enable_two_batch_overlap"] else 1
+        self._inners = [DeepEPDispatcher(**kwargs) for _ in range(num_inner_dispatchers)]
