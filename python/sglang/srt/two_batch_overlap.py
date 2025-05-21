@@ -3,14 +3,11 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Sequence
 import torch
 
 from sglang.srt.layers.dp_attention import get_attention_tp_size
-from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPConfig, DeepEPDispatcher
+from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPDispatcher
 from sglang.srt.layers.quantization.deep_gemm import configure_deep_gemm_num_sms
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.operations import execute_operations, execute_overlapped_operations
-from sglang.srt.operations_strategy import (
-    OperationsStrategy,
-    compute_operations_strategy,
-)
+from sglang.srt.operations_strategy import OperationsStrategy
 from sglang.srt.utils import BumpAllocator, DeepEPMode
 
 if TYPE_CHECKING:
