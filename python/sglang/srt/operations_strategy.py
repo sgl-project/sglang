@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 import torch
+
 from sglang.srt import operations
 from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -18,8 +19,12 @@ class OperationsStrategy:
     def concat(cls, items: List["OperationsStrategy"]) -> "OperationsStrategy":
         return OperationsStrategy(
             operations=[x for item in items for x in item.operations],
-            deep_gemm_num_sms=_assert_all_same([item.deep_gemm_num_sms for item in items]),
-            tbo_delta_stages=_assert_all_same([item.tbo_delta_stages for item in items]),
+            deep_gemm_num_sms=_assert_all_same(
+                [item.deep_gemm_num_sms for item in items]
+            ),
+            tbo_delta_stages=_assert_all_same(
+                [item.tbo_delta_stages for item in items]
+            ),
         )
 
     @staticmethod
@@ -29,7 +34,11 @@ class OperationsStrategy:
         enable_tbo: bool,
     ) -> "OperationsStrategy":
         return OperationsStrategy.concat(
-            [_compute_layer_operations_strategy(layer, forward_mode, enable_tbo) for layer in layers])
+            [
+                _compute_layer_operations_strategy(layer, forward_mode, enable_tbo)
+                for layer in layers
+            ]
+        )
 
 
 def _assert_all_same(items: List):
