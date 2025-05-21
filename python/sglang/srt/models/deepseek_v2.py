@@ -665,7 +665,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             else:
                 return _dispatch_mla_subtype()
 
-    def op_prepare(
+    def forward_prepare(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
@@ -687,8 +687,15 @@ class DeepseekV2AttentionMLA(nn.Module):
         }[attn_forward_method]
         return fn(positions, hidden_states, forward_batch, zero_allocator)
 
-    def op_core(self, state):
-        TODO
+    def forward_core(self, intermediate_state):
+        attn_forward_method = self.dispatch_attn_forward_method(forward_batch)
+        fn = {
+            AttnForwardMethod.MHA: self.forward_normal_core,
+            AttnForwardMethod.MHA_CHUNKED_KV: self.forward_normal_chunked_kv_core,
+            AttnForwardMethod.MLA: self.forward_absorb_core,
+            AttnForwardMethod.MLA_FUSED_ROPE: self.forward_absorb_fused_mla_rope_core,
+        }[attn_forward_method]
+        return fn(positions, hidden_states, forward_batch, zero_allocator)
 
     def forward_normal_prepare(
         self,
