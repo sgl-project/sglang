@@ -684,6 +684,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
                 head_dim_qk=self.qk_nope_head_dim + self.qk_rope_head_dim,
                 head_dim_vo=self.v_head_dim,
                 q_data_type=self.q_data_type,
+                custom_mask=custom_mask,
             )
         else:
             # mla paged prefill
@@ -701,6 +702,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
                 sm_scale,
                 self.q_data_type,
                 self.data_type,
+                custom_mask=custom_mask,
             )
 
 
