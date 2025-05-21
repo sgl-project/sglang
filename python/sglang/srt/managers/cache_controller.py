@@ -321,7 +321,7 @@ class HiCacheController:
             self.l3_layer_counter = RLockCounter(self.mem_pool_device.layer_num)
 
             self.mooncake_l3_write_thread = threading.Thread(
-                target=self.mooncake_l3_write_thread_func_direct, daemon=True,
+                target=self.mooncake_l3_write_thread_func_layer_by_layer, daemon=True,
             )
             self.mooncake_l3_load_thread = threading.Thread(
                 target=self.mooncake_l3_load_thread_func_layer_by_layer, daemon=True
@@ -488,7 +488,6 @@ class HiCacheController:
             if not self.mooncake_l3_load_cache_event.is_set():
                 continue
             self.mooncake_l3_load_cache_event.clear()
-            self.layer_done_counter.reset()
 
             batch_operation = None
             while self.mooncake_l3_load_queue.qsize() > 0:
@@ -500,6 +499,7 @@ class HiCacheController:
             if batch_operation is None:
                 continue
 
+            self.layer_done_counter.reset()
             self.l3_layer_counter.reset()
             for layer_id in range(self.mem_pool_host.layer_num):
                 flat_data_list = []
@@ -529,7 +529,6 @@ class HiCacheController:
             if not self.load_cache_event.is_set():
                 continue
             self.load_cache_event.clear()
-            self.layer_done_counter.reset()
 
             batch_operation = None
             while self.load_queue.qsize() > 0:
@@ -541,6 +540,7 @@ class HiCacheController:
             if batch_operation is None:
                 continue
 
+            self.layer_done_counter.reset()
             if self.enable_mooncake_store_l3_cache:
                 self.l2_layer_counter.reset()
 
