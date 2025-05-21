@@ -178,7 +178,7 @@ class InternVLImageProcessor(BaseMultimodalProcessor):
         base_output = self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
-            multimodal_tokens=MultimodalSpecialTokens(image_token=self.IMG_TOKEN),
+            multimodal_tokens=MultimodalSpecialTokens(image_token_pattern=self.IMG_TOKEN),
             max_req_input_len=max_req_input_len,
             discard_alpha_channel=True,
         )

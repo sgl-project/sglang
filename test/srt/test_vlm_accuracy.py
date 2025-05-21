@@ -1,5 +1,4 @@
-"""
-"""
+""" """
 
 import unittest
 from io import BytesIO
@@ -220,8 +219,7 @@ class TestMiniCPMVLogits(VisionLLMLogitsBase):
                 # per image
                 if len(pixel_b) != len(tgt_b):
                     raise ValueError(
-                        "Inconsistent N lengths, found: "
-                        f"{len(pixel_b)} vs {len(tgt_b)}"
+                        f"Inconsistent N lengths, found: {len(pixel_b)} vs {len(tgt_b)}"
                     )
                 for pixel_n, tgt_n in zip(pixel_b, tgt_b):
                     pixel_values_flat += [pixel_n]
@@ -248,8 +246,7 @@ class TestMiniCPMVLogits(VisionLLMLogitsBase):
         self.compare_outputs(sglang_output, hf_output)
 
 
-class TestQwenVLUnderstandsImage(VisionLLMLogitsBase):
-
+class TestQwenVLImageUnderstanding(VisionLLMLogitsBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
@@ -309,8 +306,7 @@ class TestQwenVLUnderstandsImage(VisionLLMLogitsBase):
         self.assertIn("taxi", output["text"].lower())
 
 
-class TestGemmaUnderstandsImage(VisionLLMLogitsBase):
-
+class TestGemmaImageUnderstanding(VisionLLMLogitsBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
@@ -365,6 +361,70 @@ class TestGemmaUnderstandsImage(VisionLLMLogitsBase):
                 dict(
                     modality="IMAGE",
                     precomputed_features=precomputed_features,
+                )
+            ],
+            sampling_params=dict(temperature=0.0),
+        )
+        self.assertIn("taxi", output["text"].lower())
+
+
+class TestKimiVLImageUnderstanding(VisionLLMLogitsBase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.model_path = "moonshotai/Kimi-VL-A3B-Instruct"
+        cls.chat_template = "kimi-vl"
+        cls.processor = AutoProcessor.from_pretrained(
+            cls.model_path, trust_remote_code=True, use_fast=True
+        )
+        model = AutoModel.from_pretrained(
+            "moonshotai/Kimi-VL-A3B-Instruct", trust_remote_code=True
+        )
+        cls.vision_tower = model.vision_tower.eval().to(cls.device)
+        cls.mm_projector = model.multi_modal_projector.eval().to(cls.device)
+
+    @classmethod
+    def visual(cls, pixel_values, grid_hws):
+        vision_outputs = cls.vision_tower(pixel_values=pixel_values, grid_hws=grid_hws)
+        image_features = cls.mm_projector(vision_outputs)
+        return image_features
+
+    def setUp(self):
+        self.engine = Engine(
+            model_path=self.model_path,
+            chat_template=self.chat_template,
+            device=self.device.type,
+            mem_fraction_static=0.5,
+            enable_multimodal=True,
+            trust_remote_code=True,
+        )
+
+    def tearDown(self):
+        self.engine.shutdown()
+
+    async def test_kimivl_understands_image(self):
+        req = self.get_completion_request()
+        conv = generate_chat_conv(req, template_name=self.chat_template)
+        text = conv.get_prompt()
+        output = await self.engine.async_generate(
+            prompt=text,
+            image_data=[self.main_image],
+            sampling_params=dict(temperature=0.0),
+        )
+        self.assertIn("taxi", output["text"].lower())
+
+    async def test_kimivl_understands_precomputed_features(self):
+        req = self.get_completion_request()
+        processor_output = self.get_processor_output(req=req)
+        with torch.inference_mode():
+            precomputed_features = self.visual(processor_output["pixel_values"], processor_output["image_grid_hws"])
+        output = await self.engine.async_generate(
+            input_ids=processor_output["input_ids"][0].detach().cpu().tolist(),
+            image_data=[
+                dict(
+                    modality="IMAGE",
+                    precomputed_features=precomputed_features,
+                    image_grid_thws=processor_output["image_grid_hws"],
                 )
             ],
             sampling_params=dict(temperature=0.0),

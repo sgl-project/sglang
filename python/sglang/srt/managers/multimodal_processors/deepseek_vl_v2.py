@@ -54,7 +54,7 @@ class DeepseekVL2ImageProcessor(BaseMultimodalProcessor):
         base_output = self.load_mm_data(
             input_text,
             image_data=image_data,
-            multimodal_tokens=MultimodalSpecialTokens(image_token=image_token),
+            multimodal_tokens=MultimodalSpecialTokens(image_token_pattern=image_token),
             max_req_input_len=max_req_input_len,
         )
         res = self.process_mm_data(
