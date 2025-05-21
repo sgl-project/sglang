@@ -320,11 +320,6 @@ class ServerArgs:
         if self.grammar_backend is None:
             self.grammar_backend = "xgrammar"
 
-        if self.pp_size > 1:
-            self.disable_overlap_schedule = True
-            logger.warning(
-                "Overlap scheduler is disabled because of using pipeline parallelism."
-            )
 
         # Data parallelism attention
         if self.enable_dp_attention:
@@ -361,11 +356,6 @@ class ServerArgs:
                 f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
 
-        if self.pp_size > 1:
-            self.disable_overlap_schedule = True
-            logger.warning(
-                "Pipeline parallelism is incompatible with overlap schedule."
-            )
 
         if self.expert_distribution_recorder_buffer_size is None:
             # TODO pr-chain: enable this later
