@@ -3,14 +3,15 @@ from typing import Any, Dict, List, Optional, Union
 
 import torch
 
-from sglang.srt.managers.multimodal_processors.base_processor import (
+from sglang.srt.managers.multimodal_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
-from sglang.srt.managers.multimodal_processors.base_processor import (
-    MultimodalSpecialTokens,
-)
+from sglang.srt.managers.multimodal_processor import MultimodalSpecialTokens
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.models.kimi_vl import KimiVLForConditionalGeneration
+from sglang.srt.models.multimodal_processors.base_processor import (
+    BaseMultimodalProcessor as SGLangBaseProcessor,
+)
 
 
 # Compatible with KimiVLForConditionalGeneration

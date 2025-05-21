@@ -2,17 +2,19 @@ from typing import List, Union
 
 import torch
 
-from sglang.srt.managers.multimodal_processors.base_processor import (
-    BaseMultimodalProcessor,
-    MultimodalSpecialTokens,
-)
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.models.minicpmo import MiniCPMO
 from sglang.srt.models.minicpmv import MiniCPMV
+from sglang.srt.models.multimodal_processors.base_processor import (
+    BaseMultimodalProcessor as SGLangBaseProcessor,
+)
+from sglang.srt.models.multimodal_processors.base_processor import (
+    MultimodalSpecialTokens,
+)
 
 
 # Compatible with both 'O' and 'V'
-class MiniCPMMultimodalProcessor(BaseMultimodalProcessor):
+class MiniCPMMultimodalProcessor(SGLangBaseProcessor):
     models = [MiniCPMV, MiniCPMO]
 
     def __init__(self, hf_config, server_args, _processor):
