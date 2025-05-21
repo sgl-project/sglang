@@ -196,6 +196,7 @@ class ServerArgs:
     disable_chunked_prefix_cache: bool = False
     disable_fast_image_processor: bool = False
     mm_attention_backend: Optional[str] = None
+    enable_return_hidden_states: bool = False
 
     # Debug tensor dumps
     debug_tensor_dump_output_folder: Optional[str] = None
@@ -1302,6 +1303,12 @@ class ServerArgs:
             type=str,
             default=ServerArgs.debug_tensor_dump_inject,
             help="Inject the outputs from jax as the input of every layer.",
+        )
+
+        parser.add_argument(
+            "--enable-return-hidden-states",
+            action="store_true",
+            help="Enable returning hidden states with responses.",
         )
 
         # Disaggregation
