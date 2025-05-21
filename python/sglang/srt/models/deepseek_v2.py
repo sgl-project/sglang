@@ -680,10 +680,10 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         attn_forward_method = self.dispatch_attn_forward_method(forward_batch)
         fn = {
-            AttnForwardMethod.MHA: self.op_normal_prepare,
-            AttnForwardMethod.MHA_CHUNKED_KV: self.op_normal_chunked_kv_prepare,
-            AttnForwardMethod.MLA: self.op_absorb_prepare,
-            AttnForwardMethod.MLA_FUSED_ROPE: self.op_absorb_fused_mla_rope_prepare,
+            AttnForwardMethod.MHA: self.forward_normal_prepare,
+            AttnForwardMethod.MHA_CHUNKED_KV: self.forward_normal_chunked_kv_prepare,
+            AttnForwardMethod.MLA: self.forward_absorb_prepare,
+            AttnForwardMethod.MLA_FUSED_ROPE: self.forward_absorb_fused_mla_rope_prepare,
         }[attn_forward_method]
         return fn(positions, hidden_states, forward_batch, zero_allocator)
 
