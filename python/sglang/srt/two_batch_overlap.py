@@ -153,12 +153,12 @@ def model_forward_maybe_tbo(
         zero_allocator=zero_allocator,
     )
     if enable_tbo:
-        return model_forward_tbo(layers=layers, inputs=inputs)
+        return _model_forward_tbo(layers=layers, inputs=inputs)
     else:
-        return model_forward_non_tbo(layers=layers, inputs=inputs)
+        return _model_forward_non_tbo(layers=layers, inputs=inputs)
 
 
-def model_forward_tbo(layers, inputs):
+def _model_forward_tbo(layers, inputs):
     # The attn_tp_size!=1 case is not yet extracted to master
     assert get_attention_tp_size() == 1
 
@@ -178,7 +178,7 @@ def model_forward_tbo(layers, inputs):
     return _model_forward_merge_outputs(*outputs_arr)
 
 
-def model_forward_non_tbo(layers, inputs):
+def _model_forward_non_tbo(layers, inputs):
     forward_batch = inputs["forward_batch"]
     operations = compute_operations_strategy(layers, forward_batch.forward_mode)
     outputs = execute_operations(inputs, operations)

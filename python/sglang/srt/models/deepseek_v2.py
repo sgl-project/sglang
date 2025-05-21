@@ -83,7 +83,7 @@ from sglang.srt.managers.expert_location_dispatch import ExpertLocationDispatchI
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.two_batch_overlap import model_forward_maybe_tbo, model_forward_tbo
+from sglang.srt.two_batch_overlap import model_forward_maybe_tbo, _model_forward_tbo
 from sglang.srt.utils import (
     BumpAllocator,
     DeepEPMode,
