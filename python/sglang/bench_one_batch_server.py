@@ -149,7 +149,7 @@ def run_one_case(
     response = requests.post(
         url + "/generate",
         json={
-            "input_ids": [input_ids for input_ids, _, _ in input_requests],
+            "input_ids": [req.prompt for req in input_requests],
             "sampling_params": {
                 "temperature": temperature,
                 "max_new_tokens": output_len,
