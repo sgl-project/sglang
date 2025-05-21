@@ -35,6 +35,7 @@ def compute_layers_operations(
     return OperationsStrategy.concat([_compute_layer_operations(layer, forward_mode) for layer in layers])
 
 
+# TODO can refactor to make it more fancy if we have more complex strategies
 def _compute_layer_operations(
     layer: torch.nn.Module,
     forward_mode: ForwardMode,
