@@ -168,9 +168,6 @@ def model_forward_tbo(layers, inputs):
 
     operations = compute_layers_operations(layers, forward_batch.forward_mode)
 
-    # TODO move to operations
-    deep_gemm_num_sms = _compute_deep_gemm_num_sms(forward_batch.forward_mode)
-
     with configure_deep_gemm_num_sms(deep_gemm_num_sms):
         outputs_arr = execute_overlapped_operations(
             inputs_arr=inputs_arr,
@@ -186,13 +183,6 @@ def model_forward_non_tbo(layers, inputs):
     operations = compute_layers_operations(layers, forward_batch.forward_mode)
     outputs = execute_operations(inputs, operations)
     return outputs["hidden_states"], outputs["residual"]
-
-
-# TODO move to operations
-def _compute_deep_gemm_num_sms(forward_mode: ForwardMode):
-    if forward_mode.is_extend():
-    else:
-        return None
 
 
 def _model_forward_split_inputs(
