@@ -40,18 +40,19 @@ def _compute_layer_operations(
     layer: torch.nn.Module,
     forward_mode: ForwardMode,
 ) -> OperationsStrategy:
-    if not layer.is_layer_sparse:
-        return _compute_mlp_normal()
-
     if these_layers_of_this_batch_needs_tbo:
+        assert layer.is_layer_sparse
         if forward_mode == ForwardMode.EXTEND:
             return _compute_moe_deepseek_blog_prefill()
         elif forward_mode == ForwardMode.DECODE:
             return _compute_moe_deepseek_blog_decode()
         else:
             raise NotImplementedError(f"Unsupported {forward_mode=}")
-
-    return _compute_moe_normal()
+    else:
+        if layer.is_layer_sparse:
+            return _compute_moe_normal()
+        else:
+            return _compute_mlp_normal()
 
 
 def _compute_mlp_normal():
