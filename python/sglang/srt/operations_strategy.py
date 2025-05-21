@@ -32,9 +32,7 @@ def compute_layers_operations(
     layers: torch.nn.ModuleList,
     forward_mode: ForwardMode,
 ) -> OperationsStrategy:
-    return [
-        op for layer in layers for op in compute_layer_operations(layer, forward_mode)
-    ]
+    return OperationsStrategy.concat([compute_layer_operations(layer, forward_mode) for layer in layers])
 
 
 # TODO refactor this if there are more overlapping strategies
