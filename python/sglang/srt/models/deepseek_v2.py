@@ -429,7 +429,8 @@ class DeepseekV2MoE(nn.Module):
             )
 
     def op_output(self, state):
-        state.pop("hidden_states_mlp_input")
+        if self._enable_deepep_moe:
+            state.pop("hidden_states_mlp_input")
 
         final_hidden_states = (
             state.pop("hidden_states_after_combine")
