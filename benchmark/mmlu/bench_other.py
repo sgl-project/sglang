@@ -76,7 +76,7 @@ def evaluate(args, subject, dev_df, test_df, call_generate):
             pred = call_generate(prompts[i], temperature=0, max_tokens=max_tokens)
             preds[i] = pred.strip()[0]
 
-        tic = time.time()
+        tic = time.perf_counter()
         if args.parallel == 1:
             for i in range(len(prompts)):
                 get_one_answer(i)
@@ -94,9 +94,9 @@ def evaluate(args, subject, dev_df, test_df, call_generate):
                 for j in range(len(rets)):
                     preds[i + j] = rets[j].strip()[0]
 
-        tic = time.time()
+        tic = time.perf_counter()
         asyncio.run(batched_call(batch_size=args.parallel))
-    latency = time.time() - tic
+    latency = time.perf_counter() - tic
 
     # Compute accuracy
     cors = [pred == label for pred, label in zip(preds, labels)]
