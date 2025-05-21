@@ -5,8 +5,9 @@ import logging
 import pkgutil
 from functools import lru_cache
 
-from sglang.srt.managers.multimodal_processors.base_processor import (
+from sglang.srt.models.multimodal_processors.base_processor import (
     BaseMultimodalProcessor,
+    DummyMultimodalProcessor,
 )
 from sglang.srt.server_args import ServerArgs
 
@@ -15,21 +16,13 @@ logger = logging.getLogger(__name__)
 PROCESSOR_MAPPING = {}
 
 
-class DummyMultimodalProcessor(BaseMultimodalProcessor):
-    def __init__(self):
-        pass
-
-    async def process_mm_data_async(self, *args, **kwargs):
-        return None
-
-
 def get_dummy_processor():
     return DummyMultimodalProcessor()
 
 
 @lru_cache()
 def import_processors():
-    package_name = "sglang.srt.managers.multimodal_processors"
+    package_name = "sglang.srt.models.multimodal_processors"
     package = importlib.import_module(package_name)
     for _, name, ispkg in pkgutil.iter_modules(package.__path__, package_name + "."):
         if not ispkg:

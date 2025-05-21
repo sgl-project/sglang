@@ -22,8 +22,6 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
-from sglang.srt.mm_utils import has_valid_data
-
 # handle serialization of Image for pydantic
 if TYPE_CHECKING:
     from PIL.Image import Image

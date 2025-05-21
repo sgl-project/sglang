@@ -1,14 +1,14 @@
 from typing import List, Union
 
-from sglang.srt.managers.multimodal_processors.base_processor import (
-    BaseMultimodalProcessor,
-)
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.models.clip import CLIPModel
+from sglang.srt.models.multimodal_processors.base_processor import (
+    BaseMultimodalProcessor as SGLangBaseProcessor,
+)
 from sglang.srt.utils import load_image
 
 
-class ClipImageProcessor(BaseMultimodalProcessor):
+class ClipImageProcessor(SGLangBaseProcessor):
     models = [CLIPModel]
 
     def __init__(self, hf_config, server_args, _processor):
