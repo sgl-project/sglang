@@ -88,6 +88,7 @@ class ForwardMetadata:
     window_kv_indices: torch.Tensor
     window_num_kv_splits: torch.Tensor
 
+
 class TritonAttnBackend(AttentionBackend):
     def __init__(
         self,
@@ -126,12 +127,14 @@ class TritonAttnBackend(AttentionBackend):
         else:
             self.kv_indptr = kv_indptr_buf
 
-        # If sliding window is enabled, we might need two sets of buffers 
+        # If sliding window is enabled, we might need two sets of buffers
         # because of interleaved attention types (e.g. for Gemma3)
         self.window_kv_indptr = None
         if self.sliding_window_size is not None and self.sliding_window_size > 0:
             if kv_indptr_buf is None:
-                self.window_kv_indptr = torch.zeros((max_bs + 1,), dtype=torch.int32, device=model_runner.device)
+                self.window_kv_indptr = torch.zeros(
+                    (max_bs + 1,), dtype=torch.int32, device=model_runner.device
+                )
             else:
                 # When provided a buffer, create a clone for the second buffer
                 self.window_kv_indptr = torch.zeros_like(kv_indptr_buf)
@@ -269,15 +272,17 @@ class TritonAttnBackend(AttentionBackend):
             num_kv_splits = torch.empty((bs,), dtype=torch.int32, device=self.device)
             self.get_num_kv_splits(num_kv_splits, forward_batch.seq_lens)
             if self.sliding_window_size > 0:
-                window_num_kv_splits = torch.empty((bs,), dtype=torch.int32, device=self.device)
+                window_num_kv_splits = torch.empty(
+                    (bs,), dtype=torch.int32, device=self.device
+                )
                 self.get_num_kv_splits(window_num_kv_splits, window_kv_lens)
-                
+
             qo_indptr = None
             custom_mask = None
             mask_indptr = None
             max_extend_len = None
         elif forward_batch.forward_mode.is_target_verify():
-            #TODO: Support sliding window in spec inference
+            # TODO: Support sliding window in spec inference
             bs = len(forward_batch.req_pool_indices)
             qo_indptr = torch.arange(
                 0,
@@ -427,7 +432,7 @@ class TritonAttnBackend(AttentionBackend):
                 dtype=torch.uint8,
                 device=self.device,
             )
-        
+
         if self.sliding_window_size is not None and self.sliding_window_size > 0:
             if kv_indices_buf is None:
                 self.cuda_graph_window_kv_indices = torch.zeros(
@@ -437,12 +442,9 @@ class TritonAttnBackend(AttentionBackend):
                 )
             else:
                 self.cuda_graph_window_kv_indices = torch.zeros_like(kv_indices_buf)
-            
+
             self.cuda_graph_window_num_kv_splits = torch.full(
-                (max_bs,),
-                self.max_kv_splits,
-                dtype=torch.int32,
-                device=self.device
+                (max_bs,), self.max_kv_splits, dtype=torch.int32, device=self.device
             )
 
     def init_forward_metadata_capture_cuda_graph(
@@ -477,8 +479,7 @@ class TritonAttnBackend(AttentionBackend):
                 )
                 if self.sliding_window_size > 0:
                     window_kv_lens = torch.minimum(
-                        seq_lens,
-                        torch.tensor(self.sliding_window_size + 1)
+                        seq_lens, torch.tensor(self.sliding_window_size + 1)
                     )
                     window_kv_indptr[1 : bs + 1] = torch.cumsum(window_kv_lens, dim=0)
                     window_kv_indptr = window_kv_indptr[: bs + 1]
@@ -586,8 +587,7 @@ class TritonAttnBackend(AttentionBackend):
                 num_token = bs
                 if self.sliding_window_size > 0:
                     window_kv_lens = torch.minimum(
-                        seq_lens[:bs],
-                        torch.tensor(self.sliding_window_size + 1)
+                        seq_lens[:bs], torch.tensor(self.sliding_window_size + 1)
                     )
                     window_kv_indptr[1 : bs + 1] = torch.cumsum(window_kv_lens, dim=0)
                     window_kv_indptr = window_kv_indptr[: bs + 1]
@@ -602,15 +602,19 @@ class TritonAttnBackend(AttentionBackend):
                         window_kv_indices,
                         self.req_to_token.stride(0),
                     )
-                    
+
             else:
                 kv_indptr[: spec_info.kv_indptr.shape[0]] = spec_info.kv_indptr
                 kv_indices[: spec_info.kv_indices.shape[0]] = spec_info.kv_indices
                 num_token = spec_info.kv_indptr.shape[0] - 1
             self.get_num_kv_splits(num_kv_splits[:num_token], seq_lens[:bs])
             if self.sliding_window_size > 0:
-                window_num_kv_splits = torch.empty((bs,), dtype=torch.int32, device=self.device)
-                self.get_num_kv_splits(window_num_kv_splits[:num_token], window_kv_lens[:bs])
+                window_num_kv_splits = torch.empty(
+                    (bs,), dtype=torch.int32, device=self.device
+                )
+                self.get_num_kv_splits(
+                    window_num_kv_splits[:num_token], window_kv_lens[:bs]
+                )
         elif forward_mode.is_target_verify():
             # Update qo_indptr, kv_indptr, kv_indices, custom_mask, mask_indptr
             bs = len(req_pool_indices)
@@ -670,9 +674,11 @@ class TritonAttnBackend(AttentionBackend):
         causal = True
         if layer.attn_type == AttentionType.ENCODER_ONLY:
             causal = False
-            
+
         if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
-            sliding_window_size = layer.sliding_window_size # Needed for sliding window mask
+            sliding_window_size = (
+                layer.sliding_window_size
+            )  # Needed for sliding window mask
             kv_indptr = self.forward_metadata.window_kv_indptr
             kv_indices = self.forward_metadata.window_kv_indices
         else:
@@ -723,21 +729,21 @@ class TritonAttnBackend(AttentionBackend):
             forward_batch.token_to_kv_pool.set_kv_buffer(
                 layer, forward_batch.out_cache_loc, k, v
             )
-            
+
         if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
             kv_indptr = self.forward_metadata.window_kv_indptr
             kv_indices = self.forward_metadata.window_kv_indices
         else:
             kv_indptr = self.forward_metadata.kv_indptr
             kv_indices = self.forward_metadata.kv_indices
-            
+
         self.decode_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
             forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
             o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
             kv_indptr,
-            kv_indices, 
+            kv_indices,
             self.forward_metadata.attn_logits,
             self.forward_metadata.attn_lse,
             self.forward_metadata.num_kv_splits,
