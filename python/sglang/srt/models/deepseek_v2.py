@@ -1318,16 +1318,15 @@ class DeepseekV2DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
-    ) -> torch.Tensor:
-        return execute_operations(
-            inputs=dict(
-                positions=positions,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
-                residual=residual,
-                zero_allocator=zero_allocator,
-            ),
-            operations=compute_layer_operations(self),
+    ):
+        return model_forward_maybe_tbo(
+            layers=[self],
+            enable_tbo=False,
+            positions=positions,
+            forward_batch=forward_batch,
+            hidden_states=hidden_states,
+            residual=residual,
+            zero_allocator=zero_allocator,
         )
 
     def op_comm_prepare_attn(
