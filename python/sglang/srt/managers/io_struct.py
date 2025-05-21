@@ -885,6 +885,7 @@ class ProfileReqInput:
     # If set, it profile as many as this number of steps.
     # If it is set, profiling is automatically stopped after this step, and
     # the caller doesn't need to run stop_profile.
+    start_step: Optional[int] = None
     num_steps: Optional[int] = None
     activities: Optional[List[str]] = None
     profile_by_stage: bool = False
@@ -912,6 +913,7 @@ class ExpertDistributionReqOutput:
 class ProfileReq:
     type: ProfileReqType
     output_dir: Optional[str] = None
+    start_step: Optional[int] = None
     num_steps: Optional[int] = None
     activities: Optional[List[str]] = None
     profile_by_stage: bool = False
