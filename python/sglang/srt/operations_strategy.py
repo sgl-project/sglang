@@ -28,7 +28,7 @@ def compute_layer_operations(
             layer.op_comm_postprocess_layer,
         ]
 
-    if global_server_args_dict["enable_two_batch_overlap"]:
+    if these_layers_of_this_batch_needs_tbo:
         if forward_mode == ForwardMode.EXTEND:
             return [
                 layer.op_comm_prepare_attn,
