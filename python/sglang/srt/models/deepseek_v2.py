@@ -687,6 +687,9 @@ class DeepseekV2AttentionMLA(nn.Module):
         }[attn_forward_method]
         return fn(positions, hidden_states, forward_batch, zero_allocator)
 
+    def op_core(self, state):
+        TODO
+
     def op_normal_prepare(
         self,
         positions: torch.Tensor,
