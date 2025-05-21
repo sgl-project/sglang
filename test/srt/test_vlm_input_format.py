@@ -125,7 +125,7 @@ class VLMInputTestBase:
         self.assertIn("taxi", output["text"].lower())
 
     def _precomputed_image_data(self, processor_output, precomputed_features):
-        """Override in subclass if needed."""
+        """This should not be overridden."""
         return dict(
             modality="IMAGE",
             precomputed_features=precomputed_features,
