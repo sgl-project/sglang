@@ -31,7 +31,7 @@ def _assert_all_same(items: List):
 def compute_layers_operations(
     layers: torch.nn.ModuleList,
     forward_mode: ForwardMode,
-):
+) -> OperationsStrategy:
     return [
         op for layer in layers for op in compute_layer_operations(layer, forward_mode)
     ]
@@ -41,7 +41,7 @@ def compute_layers_operations(
 def compute_layer_operations(
     layer: torch.nn.Module,
     forward_mode: ForwardMode,
-):
+) -> OperationsStrategy:
     if not layer.is_layer_sparse:
         return [
             layer.op_comm_prepare_attn,
