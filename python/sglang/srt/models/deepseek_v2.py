@@ -676,7 +676,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             assert (
                 not self.o_proj.reduce_results
             ), "short-circuiting allreduce will lead to hangs"
-            return (hidden_states,)
+            return hidden_states, forward_batch, None
 
         attn_forward_method = self.dispatch_attn_forward_method(forward_batch)
         fn = {
@@ -685,9 +685,14 @@ class DeepseekV2AttentionMLA(nn.Module):
             AttnForwardMethod.MLA: self.forward_absorb_prepare,
             AttnForwardMethod.MLA_FUSED_ROPE: self.forward_absorb_fused_mla_rope_prepare,
         }[attn_forward_method]
-        return fn(positions, hidden_states, forward_batch, zero_allocator)
+        inner_state = fn(positions, hidden_states, forward_batch, zero_allocator)
+        return None, forward_batch, inner_state
 
     def forward_core(self, intermediate_state):
+        hidden_states, forward_batch, inner_state = intermediate_state
+        if inner_state is None:
+            return hidden_states
+
         attn_forward_method = self.dispatch_attn_forward_method(forward_batch)
         fn = {
             AttnForwardMethod.MHA: self.forward_normal_core,
@@ -695,7 +700,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             AttnForwardMethod.MLA: self.forward_absorb_core,
             AttnForwardMethod.MLA_FUSED_ROPE: self.forward_absorb_fused_mla_rope_core,
         }[attn_forward_method]
-        return fn(positions, hidden_states, forward_batch, zero_allocator)
+        return fn(intermediate_state)
 
     def forward_normal_prepare(
         self,
