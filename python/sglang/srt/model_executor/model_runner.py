@@ -13,7 +13,6 @@
 # ==============================================================================
 """ModelRunner runs the forward passes of the models."""
 
-import collections
 import datetime
 import gc
 import inspect
@@ -103,6 +102,8 @@ from sglang.srt.utils import (
     set_cpu_offload_max_bytes,
     set_cuda_arch,
 )
+
+_is_hip = is_hip()
 
 # Use a small KV cache pool size for tests in CI
 SGLANG_CI_SMALL_KV_SIZE = os.getenv("SGLANG_CI_SMALL_KV_SIZE", None)
@@ -199,6 +200,7 @@ class ModelRunner:
                 "deepep_config": server_args.deepep_config,
                 "flashinfer_mla_disable_ragged": server_args.flashinfer_mla_disable_ragged,
                 "moe_dense_tp_size": server_args.moe_dense_tp_size,
+                "ep_dispatch_algorithm": server_args.ep_dispatch_algorithm,
                 "n_share_experts_fusion": server_args.n_share_experts_fusion,
                 "triton_attention_reduce_in_fp32": server_args.triton_attention_reduce_in_fp32,
                 "torchao_config": server_args.torchao_config,
@@ -207,6 +209,7 @@ class ModelRunner:
                 "speculative_accept_threshold_acc": server_args.speculative_accept_threshold_acc,
                 "use_mla_backend": self.use_mla_backend,
                 "mm_attention_backend": server_args.mm_attention_backend,
+                "ep_num_redundant_experts": server_args.ep_num_redundant_experts,
             }
         )
 
@@ -321,6 +324,8 @@ class ModelRunner:
                     and is_fa3_default_architecture(self.model_config.hf_config)
                 ):
                     server_args.attention_backend = "fa3"
+                elif _is_hip:
+                    server_args.attention_backend = "aiter"
                 else:
                     server_args.attention_backend = (
                         "flashinfer" if is_flashinfer_available() else "triton"
@@ -800,7 +805,7 @@ class ModelRunner:
         if self.server_args.kv_cache_dtype == "auto":
             self.kv_cache_dtype = self.dtype
         elif self.server_args.kv_cache_dtype == "fp8_e5m2":
-            if is_hip():  # Using natively supported format
+            if _is_hip:  # Using natively supported format
                 self.kv_cache_dtype = torch.float8_e5m2fnuz
             else:
                 self.kv_cache_dtype = torch.float8_e5m2
@@ -978,6 +983,10 @@ class ModelRunner:
                 )
 
                 self.attn_backend = FlashInferMLAAttnBackend(self)
+        elif self.server_args.attention_backend == "aiter":
+            from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
+
+            self.attn_backend = AiterAttnBackend(self)
         elif self.server_args.attention_backend == "triton":
             assert self.sliding_window_size is None, (
                 "Window attention is not supported in the triton attention backend. "
