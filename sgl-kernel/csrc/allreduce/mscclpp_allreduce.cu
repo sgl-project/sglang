@@ -1,0 +1,126 @@
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAStream.h>
+#include <torch/all.h>
+#include <torch/library.h>
+
+#include "mscclpp_allreduce.cuh"
+
+enum MscclContextSelection {
+  MSCCL1SHOT1NODELL = 1,
+  MSCCL1SHOT2NODELL = 2,
+};
+
+class MscclContext {
+ public:
+  MscclContextSelection selection_;
+  std::shared_ptr<sglang::Msccl1Shot1NodeLLcontext> msccl_1shot_1nodeLL_context;
+  std::shared_ptr<sglang::Msccl1Shot2NodeLLcontext> msccl_1shot_2nodeLL_context;
+  MscclContext(MscclContextSelection selection) : selection_(selection) {}
+  template <typename T>
+  void allreduce(
+      cudaStream_t stream, T* input, T* output, const size_t input_numel, int threads = 512, int block_limit = 21) {
+    if (selection_ == MSCCL1SHOT1NODELL) {
+      msccl_1shot_1nodeLL_context->allreduce<T>(stream, input, output, input_numel, threads, block_limit);
+    } else if (selection_ == MSCCL1SHOT2NODELL) {
+      msccl_1shot_2nodeLL_context->allreduce<T>(stream, input, output, input_numel, threads, block_limit);
+    }
+  }
+};
+
+using fptr_t = int64_t;
+static_assert(sizeof(void*) == sizeof(fptr_t));
+
+torch::Tensor _unique_id2tensor(const mscclpp::UniqueId& uid) {
+  auto options = torch::TensorOptions().dtype(torch::kByte).device(torch::kCPU);
+  torch::Tensor tensor =
+      torch::from_blob(const_cast<uint8_t*>(uid.data()), {static_cast<int64_t>(uid.size())}, options);
+  return tensor;
+}
+
+// Function to convert vector of int32_t back to array of uint8_t
+mscclpp::UniqueId _tensor2unique_id(const torch::Tensor& tensor) {
+  mscclpp::UniqueId unique_id;
+  std::memcpy(unique_id.data(), tensor.data_ptr<uint8_t>(), unique_id.size());
+  return unique_id;
+}
+
+torch::Tensor mscclpp_generate_unique_id() {
+  mscclpp::UniqueId unique_id = mscclpp::TcpBootstrap::createUniqueId();
+  return _unique_id2tensor(unique_id);
+}
+
+fptr_t mscclpp_init_context(
+    const torch::Tensor& unique_id,
+    const int64_t rank,
+    const int64_t world_size,
+    torch::Tensor& scratch,
+    torch::Tensor& put_buffer,
+    const std::vector<int64_t>& rank_to_node,
+    const std::vector<int64_t>& rank_to_ib,
+    const int64_t context_selection) {
+  MscclContext* context_ptr = new MscclContext(static_cast<MscclContextSelection>(context_selection));
+  mscclpp::UniqueId uid = _tensor2unique_id(unique_id);
+  if (context_selection == MSCCL1SHOT1NODELL) {
+    void* scratch_ptr = reinterpret_cast<void*>(scratch.data_ptr());
+    const size_t scratch_bytes = scratch.numel() * scratch.element_size();
+    context_ptr->msccl_1shot_1nodeLL_context = std::make_shared<sglang::Msccl1Shot1NodeLLcontext>(
+        uid, rank, world_size, scratch_ptr, scratch_bytes, rank_to_node, rank_to_ib);
+  } else if (context_selection == MSCCL1SHOT2NODELL) {
+    void* scratch_ptr = reinterpret_cast<void*>(scratch.data_ptr());
+    const size_t scratch_bytes = scratch.numel() * scratch.element_size();
+    void* put_buffer_ptr = reinterpret_cast<void*>(put_buffer.data_ptr());
+    const size_t put_buffer_bytes = put_buffer.numel() * put_buffer.element_size();
+    context_ptr->msccl_1shot_2nodeLL_context = std::make_shared<sglang::Msccl1Shot2NodeLLcontext>(
+        uid, rank, world_size, scratch_ptr, scratch_bytes, put_buffer_ptr, put_buffer_bytes, rank_to_node, rank_to_ib);
+  } else {
+    throw std::runtime_error("invalid context selection");
+  }
+  return (fptr_t)context_ptr;
+}
+
+bool _mscclpp_is_weak_contiguous(torch::Tensor& t) {
+  return t.is_contiguous() ||
+         (t.storage().nbytes() - t.storage_offset() * t.element_size() == t.numel() * t.element_size());
+}
+void mscclpp_allreduce(fptr_t _context, torch::Tensor& inp, torch::Tensor& out) {
+  MscclContext* context = reinterpret_cast<MscclContext*>(_context);
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(inp));
+  auto stream = c10::cuda::getCurrentCUDAStream().stream();
+
+  TORCH_CHECK_EQ(inp.scalar_type(), out.scalar_type());
+  TORCH_CHECK_EQ(inp.numel(), out.numel());
+  TORCH_CHECK(_mscclpp_is_weak_contiguous(out));
+  TORCH_CHECK(_mscclpp_is_weak_contiguous(inp));
+  auto input_size = inp.numel() * inp.element_size();
+  switch (out.scalar_type()) {
+    case at::ScalarType::Float: {
+      context->allreduce<float>(
+          stream, reinterpret_cast<float*>(inp.data_ptr()), reinterpret_cast<float*>(out.data_ptr()), inp.numel());
+      break;
+    }
+    case at::ScalarType::Half: {
+      context->allreduce<half>(
+          stream, reinterpret_cast<half*>(inp.data_ptr()), reinterpret_cast<half*>(out.data_ptr()), inp.numel());
+      break;
+    }
+#if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
+    case at::ScalarType::BFloat16: {
+      context->allreduce<__nv_bfloat16>(
+          stream,
+          reinterpret_cast<__nv_bfloat16*>(inp.data_ptr()),
+          reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
+          inp.numel());
+      break;
+    }
+#endif
+    default:
+      throw std::runtime_error("custom allreduce only supports float32, float16 and bfloat16");
+  }
+}
+
+// uncomment this for cpp_extension load check
+// PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+//   m.def("mscclpp_generate_unique_id", &mscclpp_generate_unique_id);
+//   m.def("mscclpp_init_context", &mscclpp_init_context);
+//   m.def("mscclpp_allreduce", &mscclpp_allreduce);
+// }

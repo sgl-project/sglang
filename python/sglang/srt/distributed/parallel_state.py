@@ -189,6 +189,7 @@ class GroupCoordinator:
     cpu_group: ProcessGroup  # group for CPU communication
     device_group: ProcessGroup  # group for device communication
     use_pynccl: bool  # a hint of whether to use PyNccl
+    use_pymsccl: bool  # a hint of whether to use PyMsccl
     use_custom_allreduce: bool  # a hint of whether to use CustomAllreduce
     use_message_queue_broadcaster: (
         bool  # a hint of whether to use message queue broadcaster
@@ -204,6 +205,7 @@ class GroupCoordinator:
         local_rank: int,
         torch_distributed_backend: Union[str, Backend],
         use_pynccl: bool,
+        use_pymsccl: bool,
         use_custom_allreduce: bool,
         use_hpu_communicator: bool,
         use_xpu_communicator: bool,
@@ -243,6 +245,7 @@ class GroupCoordinator:
             self.device = torch.device("cpu")
 
         self.use_pynccl = use_pynccl
+        self.use_pymsccl = use_pymsccl
         self.use_custom_allreduce = use_custom_allreduce
         self.use_hpu_communicator = use_hpu_communicator
         self.use_xpu_communicator = use_xpu_communicator
@@ -261,6 +264,17 @@ class GroupCoordinator:
         if use_pynccl and self.world_size > 1:
             self.pynccl_comm = PyNcclCommunicator(
                 group=self.cpu_group,
+                device=self.device,
+            )
+
+        from sglang.srt.distributed.device_communicators.pymscclpp import (
+            PyMscclppCommunicator,
+        )
+
+        self.pymsccl_comm = Optional[PyMscclppCommunicator] = None
+        if use_pymsccl and self.world_size > 1:
+            self.pymsccl_comm = PyMscclppCommunicator(
+                cpu_group=self.cpu_group,
                 device=self.device,
             )
 
@@ -372,11 +386,15 @@ class GroupCoordinator:
             # --------------------------------------------
             # custom allreduce       | enabled | enabled |
             # PyNccl                 | disabled| enabled |
+            # PyMsccl                | disabled| enabled |
             # torch.distributed      | enabled | disabled|
             #
             # Note that custom allreduce will have a runtime check, if the
             #  tensor size is too large, it will fallback to the next
             #  available option.
+            # Note that the PyMsccl needs to register the tensor in ahead,
+            #  which will introduce large overhead in the eager case,
+            #  therefore it is only supported in the graph case.
             # In summary: When using CUDA graph, we use
             #  either custom all-reduce kernel or pynccl. When not using
             #  CUDA graph, we use either custom all-reduce kernel or
@@ -391,7 +409,14 @@ class GroupCoordinator:
                 maybe_pynccl_context = pynccl_comm.change_state(
                     enable=True, stream=torch.cuda.current_stream()
                 )
-            with maybe_pynccl_context:
+
+            pymsccl_comm = self.pymsccl_comm
+            maybe_pymsccl_context: Any
+            if not pymsccl_comm:
+                maybe_pymsccl_context = nullcontext()
+            else:
+                maybe_pymsccl_context = pymsccl_comm.change_state(enable=True)
+            with maybe_pynccl_context, maybe_pymsccl_context:
                 yield graph_capture_context
 
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
@@ -436,6 +461,10 @@ class GroupCoordinator:
             self.ca_comm is not None
             and not self.ca_comm.disabled
             and self.ca_comm.should_custom_ar(input_)
+        ) or (
+            self.pymsccl_comm is not None
+            and not self.pymsccl_comm.disabled
+            and self.pymsccl_comm.should_msccl_allreduce(input_)
         ):
             return torch.ops.sglang.outplace_all_reduce(
                 input_, group_name=self.unique_name
@@ -446,9 +475,13 @@ class GroupCoordinator:
 
     def _all_reduce_out_place(self, input_: torch.Tensor) -> torch.Tensor:
         ca_comm = self.ca_comm
-        assert ca_comm is not None
-        assert not ca_comm.disabled
-        out = ca_comm.custom_all_reduce(input_)
+        pymsccl_comm = self.pymsccl_comm
+        assert ca_comm is not None or pymsccl_comm is not None
+        assert not ca_comm.disabled or not pymsccl_comm.disabled
+        if ca_comm is not None:
+            out = ca_comm.custom_all_reduce(input_)
+        else:
+            out = pymsccl_comm.all_reduce(input_)
         assert out is not None
         return out
 
@@ -957,6 +990,7 @@ def init_world_group(
         local_rank=local_rank,
         torch_distributed_backend=backend,
         use_pynccl=False,
+        use_pymsccl=False,
         use_custom_allreduce=False,
         use_hpu_communicator=False,
         use_xpu_communicator=False,
@@ -972,9 +1006,12 @@ def init_model_parallel_group(
     use_custom_allreduce: Optional[bool] = None,
     use_message_queue_broadcaster: bool = False,
     group_name: Optional[str] = None,
+    use_msccl_allreduce: Optional[bool] = None,
 ) -> GroupCoordinator:
     if use_custom_allreduce is None:
         use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
+    if use_msccl_allreduce is None:
+        use_msccl_allreduce = _ENABLE_MSCCL_ALL_REDUCE
     return GroupCoordinator(
         group_ranks=group_ranks,
         local_rank=local_rank,
@@ -1036,11 +1073,17 @@ def graph_capture():
 logger = logging.getLogger(__name__)
 
 _ENABLE_CUSTOM_ALL_REDUCE = True
+_ENABLE_MSCCL_ALL_REDUCE = False
 
 
 def set_custom_all_reduce(enable: bool):
     global _ENABLE_CUSTOM_ALL_REDUCE
     _ENABLE_CUSTOM_ALL_REDUCE = enable
+
+
+def set_mscclpp_all_reduce(enable: bool):
+    global _ENABLE_MSCCL_ALL_REDUCE
+    _ENABLE_MSCCL_ALL_REDUCE = enable
 
 
 def init_distributed_environment(
