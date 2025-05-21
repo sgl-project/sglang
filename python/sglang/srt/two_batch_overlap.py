@@ -152,21 +152,20 @@ def model_forward_maybe_tbo(
         residual=residual,
         zero_allocator=zero_allocator,
     )
+    operations_strategy = OperationsStrategy.init_new(layers, forward_batch.forward_mode, enable_tbo=enable_tbo)
     if enable_tbo:
-        return _model_forward_tbo(layers=layers, inputs=inputs)
+        return _model_forward_tbo(layers, inputs, operations_strategy)
     else:
-        return _model_forward_non_tbo(layers=layers, inputs=inputs)
+        return _model_forward_non_tbo(layers, inputs, operations_strategy)
 
 
-def _model_forward_tbo(layers, inputs):
+def _model_forward_tbo(layers, inputs, operations_strategy: OperationsStrategy):
     # The attn_tp_size!=1 case is not yet extracted to master
     assert get_attention_tp_size() == 1
 
     forward_batch = inputs["forward_batch"]
     inputs_arr = _model_forward_tbo_split_inputs(**inputs)
     del inputs
-
-    operations_strategy = OperationsStrategy.init_new(layers, forward_batch.forward_mode, enable_tbo=True)
 
     with configure_deep_gemm_num_sms(operations_strategy.deep_gemm_num_sms):
         outputs_arr = execute_overlapped_operations(
@@ -178,9 +177,8 @@ def _model_forward_tbo(layers, inputs):
     return _model_forward_tbo_merge_outputs(*outputs_arr)
 
 
-def _model_forward_non_tbo(layers, inputs):
+def _model_forward_non_tbo(layers, inputs, operations_strategy: OperationsStrategy):
     forward_batch = inputs["forward_batch"]
-    operations_strategy = OperationsStrategy.init_new(layers, forward_batch.forward_mode, enable_tbo=True)
     assert operations_strategy.deep_gemm_num_sms is None, "unsupported"
     assert operations_strategy.tbo_delta_stages is None, "unsupported"
     outputs = execute_operations(inputs, operations_strategy.operations)
