@@ -20,6 +20,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek import DeepseekForCausalLM
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
+from sglang.srt.utils import try_use_precomputed_features
 
 
 class DeepseekVL2MlpProjector(nn.Module):
@@ -260,6 +261,9 @@ class DeepseekVL2ForCausalLM(nn.Module):
         return helper.pad_input_tokens(input_ids, image_inputs)
 
     def get_image_feature(self, items: List[MultimodalDataItem]):
+        result = try_use_precomputed_features(items)
+        if result is not None:
+            return result
 
         images_spatial_crop = torch.cat(
             [item.image_spatial_crop for item in items], dim=0

@@ -55,6 +55,7 @@ from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInp
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaForCausalLM
+from sglang.srt.utils import try_use_precomputed_features
 from sglang.utils import logger
 
 #################################################################################
@@ -1960,6 +1961,9 @@ class MultiModalityCausalLM(MultiModalityPreTrainedModel):
         self.logits_processor = LogitsProcessor(config)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        result = try_use_precomputed_features(items)
+        if result is not None:
+            return result
         pixel_values = torch.concat([item.pixel_values for item in items], dim=0)
         bs, n = pixel_values.shape[0:2]
         pixel_values = pixel_values.to(

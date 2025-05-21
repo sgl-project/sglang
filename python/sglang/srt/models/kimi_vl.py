@@ -75,7 +75,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
 from sglang.srt.models.kimi_vl_moonvit import MoonVitPretrainedModel
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, try_use_precomputed_features
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +139,9 @@ class KimiVLForConditionalGeneration(nn.Module):
         )
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        result = try_use_precomputed_features(items)
+        if result is not None:
+            return result
         pixel_values = (
             torch.cat([item.pixel_values for item in items], dim=0)
             .type(self.vision_tower.dtype)
@@ -149,8 +152,7 @@ class KimiVLForConditionalGeneration(nn.Module):
         ).to(self.vision_tower.device)
         image_features = self.vision_tower(pixel_values, image_grid_thws)
         assert isinstance(image_features, list)
-        # lengths = [x.shape[0] for x in image_features]
-        res = self.multi_modal_projector(torch.cat(image_features))  # .split(lengths)
+        res = self.multi_modal_projector(torch.cat(image_features))
         return res
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):

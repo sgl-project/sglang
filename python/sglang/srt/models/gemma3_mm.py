@@ -42,7 +42,7 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.models.gemma3_causal import Gemma3ForCausalLM
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, try_use_precomputed_features
 
 logger = logging.getLogger(__name__)
 
@@ -278,12 +278,9 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
         Returns:
             image_features (`torch.Tensor`): Image feature tensor of shape `(num_images, image_length, embed_dim)`).
         """
-        if any(item.precomputed_features is not None for item in items):
-            if not all(item.precomputed_features is not None for item in items):
-                raise NotImplementedError(
-                    "MM inputs where only some items are precomputed."
-                )
-            return torch.concat([item.precomputed_features for item in items])
+        result = try_use_precomputed_features(items)
+        if result is not None:
+            return result
         pixel_values = torch.stack(
             flatten_nested_list([item.pixel_values for item in items]), dim=0
         )

@@ -51,7 +51,12 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaForCausalLM
 from sglang.srt.models.mistral import MistralForCausalLM
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
-from sglang.srt.utils import add_prefix, flatten_nested_list, logger
+from sglang.srt.utils import (
+    add_prefix,
+    flatten_nested_list,
+    logger,
+    try_use_precomputed_features,
+)
 
 
 class LlavaBaseForCausalLM(nn.Module):
@@ -750,6 +755,9 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
         Returns:
             torch.Tensor: features from image inputs, concatenated
         """
+        result = try_use_precomputed_features(items)
+        if result is not None:
+            return result
         features = []
         for item in items:
             # in each item, we assume pixel_values is always batched

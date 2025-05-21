@@ -59,7 +59,11 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2Config, Qwen2ForCausalLM
-from sglang.srt.utils import add_prefix, flatten_nested_list
+from sglang.srt.utils import (
+    add_prefix,
+    flatten_nested_list,
+    try_use_precomputed_features,
+)
 
 RawImageType = Union[Image.Image, torch.Tensor]
 
@@ -1016,6 +1020,9 @@ class MiniCPMV2_6(MiniCPMBaseModel):
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         # list of tensors
+        result = try_use_precomputed_features(items)
+        if result is not None:
+            return result
         pixel_values = flatten_nested_list([item.pixel_values for item in items])
         tgt_sizes = torch.stack(
             flatten_nested_list([item.tgt_size for item in items]), dim=0

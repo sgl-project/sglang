@@ -16,7 +16,7 @@ from sglang.srt.managers.mm_utils import (
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, try_use_precomputed_features
 
 
 class Llama4ForConditionalGeneration(nn.Module):
@@ -60,6 +60,9 @@ class Llama4ForConditionalGeneration(nn.Module):
         self,
         items: List[MultimodalDataItem],
     ) -> torch.Tensor:
+        result = try_use_precomputed_features(items)
+        if result is not None:
+            return result
         pixel_values = (
             torch.concat([item.pixel_values for item in items])
             .to(next(self.vision_model.parameters()).device)

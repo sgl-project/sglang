@@ -2160,3 +2160,18 @@ class Withable(Generic[T]):
         finally:
             assert self._value is new_value
             self._value = None
+
+
+def try_use_precomputed_features(items) -> Optional[torch.Tensor]:
+    """
+    If all items have precomputed_features, return their concatenation.
+    If some but not all have precomputed_features, raise NotImplementedError.
+    If none have precomputed_features, return None.
+    """
+    if any(item.precomputed_features is not None for item in items):
+        if not all(item.precomputed_features is not None for item in items):
+            raise NotImplementedError(
+                "MM inputs where only some items are precomputed."
+            )
+        return torch.concat([item.precomputed_features for item in items])
+    return None

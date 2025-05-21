@@ -37,6 +37,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_janus_pro import DropPath
 from sglang.srt.models.internlm2 import InternLM2ForCausalLM
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
+from sglang.srt.utils import try_use_precomputed_features
 from sglang.utils import logger
 
 
@@ -575,6 +576,9 @@ class InternVLChatModel(nn.Module):
         Returns:
             image_features (`torch.Tensor`): Image feature tensor of shape `(num_images, image_length, embed_dim)`).
         """
+        result = try_use_precomputed_features(items)
+        if result is not None:
+            return result
         pixel_values = torch.cat([item.pixel_values for item in items])
         image_features = self.extract_feature(pixel_values)
         return image_features

@@ -20,6 +20,7 @@ from transformers.models.mistral3.modeling_mistral3 import Mistral3MultiModalPro
 
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.models.llama import LlamaForCausalLM
+from sglang.srt.utils import try_use_precomputed_features
 
 
 class MistralForCausalLM(LlamaForCausalLM):
@@ -53,6 +54,9 @@ class Mistral3ForConditionalGeneration:
         Returns:
             torch.Tensor: features from image inputs, concatenated
         """
+        result = try_use_precomputed_features(items)
+        if result is not None:
+            return result
         features = []
         for item in items:
             # in each item, we assume pixel_values is always batched

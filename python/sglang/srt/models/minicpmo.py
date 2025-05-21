@@ -57,7 +57,7 @@ from sglang.srt.models.minicpmv import (
     Resampler2_5,
 )
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
-from sglang.srt.utils import logger
+from sglang.srt.utils import logger, try_use_precomputed_features
 
 try:
     from transformers import LogitsWarper
@@ -1781,6 +1781,9 @@ class MiniCPMO(MiniCPMBaseModel):
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         # list of tensors
+        result = try_use_precomputed_features(items)
+        if result is not None:
+            return result
         pixel_values = flatten_nested_list([item.pixel_values for item in items])
         tgt_sizes = torch.stack(
             flatten_nested_list([item.tgt_size for item in items]), dim=0
