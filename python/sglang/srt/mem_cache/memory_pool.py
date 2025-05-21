@@ -38,12 +38,17 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.utils import debug_timing, get_compiler_backend, is_hip, next_power_of_2
+from sglang.srt.utils import (
+    debug_timing,
+    get_compiler_backend,
+    is_cuda,
+    next_power_of_2,
+)
 
 logger = logging.getLogger(__name__)
 
 GB = 1024 * 1024 * 1024
-_is_hip = is_hip()
+_is_cuda = is_cuda()
 
 
 class ReqToTokenPool:
@@ -263,7 +268,7 @@ class MHATokenToKVPool(KVCache):
         self.layer_transfer_counter = None
         self.capture_mode = False
         self.device_module = torch.get_device_module(self.device)
-        self.alt_stream = self.device_module.Stream() if not _is_hip else None
+        self.alt_stream = self.device_module.Stream() if is_cuda else None
 
         k_size, v_size = self.get_kv_size_bytes()
         logger.info(
