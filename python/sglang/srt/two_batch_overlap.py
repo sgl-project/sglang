@@ -152,7 +152,7 @@ def model_forward_maybe_tbo(
         zero_allocator=zero_allocator,
     )
     operations_strategy = OperationsStrategy.init_new(
-        layers, forward_batch.forward_mode, enable_tbo=enable_tbo
+        layers, forward_batch.global_forward_mode, enable_tbo=enable_tbo
     )
     if enable_tbo:
         return _model_forward_tbo(inputs, operations_strategy)
