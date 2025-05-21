@@ -168,12 +168,6 @@ def model_forward_tbo(layers, inputs):
 
     operations = compute_layers_operations(layers, forward_batch.forward_mode)
 
-    # TODO do not hardcode
-    delta_stages = {
-        ForwardMode.EXTEND: 0,
-        ForwardMode.DECODE: 2,
-    }[forward_batch.global_forward_mode]
-
     # TODO move to operations
     deep_gemm_num_sms = _compute_deep_gemm_num_sms(forward_batch.forward_mode)
 

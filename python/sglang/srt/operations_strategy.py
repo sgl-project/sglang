@@ -92,7 +92,7 @@ def _compute_moe_normal(layer):
 def _compute_moe_deepseek_blog_prefill(layer):
     return OperationsStrategy(
         deep_gemm_num_sms=TODO,
-        tbo_delta_stages=TODO,
+        tbo_delta_stages=0,
         operations=[
             layer.op_comm_prepare_attn,
             layer.op_attn,
@@ -116,7 +116,7 @@ def _compute_moe_deepseek_blog_prefill(layer):
 def _compute_moe_deepseek_blog_decode(layer):
     return OperationsStrategy(
         deep_gemm_num_sms=None,
-        tbo_delta_stages=TODO,
+        tbo_delta_stages=2,
         operations=[
             layer.op_comm_prepare_attn,
             layer.op_decode_attn_0,  # TODO
