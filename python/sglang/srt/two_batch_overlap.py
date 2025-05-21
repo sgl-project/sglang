@@ -163,7 +163,6 @@ def _model_forward_tbo(inputs, operations_strategy: OperationsStrategy):
     # The attn_tp_size!=1 case is not yet extracted to master
     assert get_attention_tp_size() == 1
 
-    forward_batch = inputs["forward_batch"]
     inputs_arr = _model_forward_tbo_split_inputs(**inputs)
     del inputs
 
@@ -178,7 +177,6 @@ def _model_forward_tbo(inputs, operations_strategy: OperationsStrategy):
 
 
 def _model_forward_non_tbo(inputs, operations_strategy: OperationsStrategy):
-    forward_batch = inputs["forward_batch"]
     assert operations_strategy.deep_gemm_num_sms is None, "unsupported"
     assert operations_strategy.tbo_delta_stages is None, "unsupported"
     outputs = execute_operations(inputs, operations_strategy.operations)
