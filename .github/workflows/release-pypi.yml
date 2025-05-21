@@ -1,0 +1,31 @@
+name: Release PyPI
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "python/sglang/version.py"
+  workflow_dispatch:
+
+jobs:
+  publish:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: ubuntu-latest
+    environment: 'prod'
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Upload to pypi
+        run: |
+          cd python
+          cp ../README.md ../LICENSE .
+          pip install build
+          python3 -m build
+          pip install twine
+          python3 -m twine upload dist/* -u __token__ -p ${{ secrets.PYPI_TOKEN }}
