@@ -602,6 +602,8 @@ class ForwardBatch:
         if self.tbo_split_seq_index is None:
             return
 
+        from sglang.srt import two_batch_overlap
+
         tbo_split_token_index = two_batch_overlap.compute_split_token_index(
             split_seq_index=self.tbo_split_seq_index,
             forward_mode=self.forward_mode,
