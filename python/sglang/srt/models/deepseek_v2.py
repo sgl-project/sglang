@@ -366,7 +366,7 @@ class DeepseekV2MoE(nn.Module):
         if self._enable_deepep_moe and (self.ep_size > 1):
             # TODO(ch-wan): allow users to set num_max_dispatch_tokens_per_rank value
             self.deepep_dispatcher.dispatch_a(
-                hidden_states=state.pop("hidden_states_mlp_input"),
+                hidden_states=state.hidden_states_mlp_input,
                 topk_idx=state.pop("topk_idx_local"),
                 topk_weights=state.pop("topk_weights_local"),
                 forward_mode=state.forward_batch.forward_mode,
@@ -428,6 +428,8 @@ class DeepseekV2MoE(nn.Module):
             )
 
     def op_output(self, state):
+        state.pop("hidden_states_mlp_input")
+
         final_hidden_states = (
             state.pop("hidden_states_after_combine")
             if self._enable_deepep_moe
