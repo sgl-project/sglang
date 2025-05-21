@@ -69,7 +69,6 @@ def _check_shape(input: torch.Tensor, output: torch.Tensor) -> None:
 
 def sglang_silu_and_mul_per_token_group_quant_fp8(
     input: torch.Tensor,
-    out: Optional[torch.Tensor] = None,
     group_size: int = 128,
     eps: float = 1e-10,
     column_major_scales: bool = False,
@@ -77,42 +76,38 @@ def sglang_silu_and_mul_per_token_group_quant_fp8(
 ):
     if input.shape[-1] * input.dtype.itemsize % 16 != 0:
         raise ValueError("The pointers must be multiple of 16 bytes.")
-    if out is not None:
-        _check_shape(input, out)
-    else:
-        out = torch.empty(
-            input.shape[:-1] + (input.shape[-1] // 2,),
-            device=input.device,
-            dtype=input.dtype,
-        )
+    x_q = torch.empty(
+        input.shape[:-1] + (input.shape[-1] // 2,),
+        device=input.device,
+        dtype=torch.float8_e4m3fn,
+    )
+    _check_shape(input, x_q)
     assert (
-        out.shape[-1] % group_size == 0
-    ), "the last dimension of `out` cannot be divisible by `group_size`"
-    assert out.is_contiguous(), "`out` is not contiguous"
-
-    x_q = torch.empty_like(out, device=out.device, dtype=torch.float8_e4m3fn)
+        x_q.shape[-1] % group_size == 0
+    ), "the last dimension of `x_q` cannot be divisible by `group_size`"
+    assert x_q.is_contiguous(), "`x_q` is not contiguous"
     if column_major_scales:
         if scale_tma_aligned:
             # aligned to 4 * sizeof(float)
-            aligned_size = (out.shape[-2] + 3) // 4 * 4
+            aligned_size = (x_q.shape[-2] + 3) // 4 * 4
             x_s = torch.empty(
-                out.shape[:-2] + (out.shape[-1] // group_size, aligned_size),
-                device=out.device,
+                x_q.shape[:-2] + (x_q.shape[-1] // group_size, aligned_size),
+                device=x_q.device,
                 dtype=torch.float32,
-            ).permute(-1, -2)[: out.shape[-2], :]
+            ).permute(-1, -2)[: x_q.shape[-2], :]
         else:
             x_s = torch.empty(
-                (out.shape[-1] // group_size,) + out.shape[:-1],
-                device=out.device,
+                (x_q.shape[-1] // group_size,) + x_q.shape[:-1],
+                device=x_q.device,
                 dtype=torch.float32,
             ).permute(-1, -2)
     else:
         x_s = torch.empty(
-            out.shape[:-1] + (out.shape[-1] // group_size,),
-            device=out.device,
+            x_q.shape[:-1] + (x_q.shape[-1] // group_size,),
+            device=x_q.device,
             dtype=torch.float32,
         )
-    if out.shape[0] > 0:
+    if x_q.shape[0] > 0:
         sgl_silu_and_mul_per_token_group_quant_fp8(
             input, x_q, x_s, group_size, eps, fp8_min, fp8_max
         )
@@ -145,24 +140,24 @@ def benchmark(num_tokens, hidden_dim, provider):
     scale_block_size = 128
     if provider == "fused":
 
-        def fused(gateup_output, down_input, scale_block_size):
+        def fused(gateup_output, scale_block_size):
             return sglang_silu_and_mul_per_token_group_quant_fp8(
-                gateup_output, down_input, scale_block_size
+                gateup_output, scale_block_size
             )
 
         ms, min_ms, max_ms = triton.testing.do_bench(
-            lambda: fused(gateup_output, down_input, scale_block_size),
+            lambda: fused(gateup_output, scale_block_size),
             quantiles=quantiles,
         )
     elif provider == "fused_cudagraph":
 
-        def fused(gateup_output, down_input, scale_block_size):
+        def fused(gateup_output, scale_block_size):
             return sglang_silu_and_mul_per_token_group_quant_fp8(
-                gateup_output, down_input, scale_block_size
+                gateup_output, scale_block_size
             )
 
         ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
-            lambda: fused(gateup_output, down_input, scale_block_size),
+            lambda: fused(gateup_output, scale_block_size),
             quantiles=quantiles,
         )
     elif provider == "split":
