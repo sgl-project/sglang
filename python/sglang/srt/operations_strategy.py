@@ -11,8 +11,8 @@ from sglang.srt.operations import Operation
 @dataclass
 class OperationsStrategy:
     operations: List[Operation]
-    deep_gemm_num_sms: Optional[int]
-    tbo_delta_stages: Optional[int]
+    deep_gemm_num_sms: Optional[int] = None
+    tbo_delta_stages: Optional[int] = None
 
     @classmethod
     def concat(cls, items: List["OperationsStrategy"]) -> "OperationsStrategy":
@@ -91,6 +91,8 @@ def _compute_moe_normal(layer):
 
 def _compute_moe_deepseek_blog_prefill(layer):
     return OperationsStrategy(
+        deep_gemm_num_sms=TODO,
+        tbo_delta_stages=TODO,
         operations=[
             layer.op_comm_prepare_attn,
             layer.op_attn,
@@ -113,6 +115,8 @@ def _compute_moe_deepseek_blog_prefill(layer):
 
 def _compute_moe_deepseek_blog_decode(layer):
     return OperationsStrategy(
+        deep_gemm_num_sms=None,
+        tbo_delta_stages=TODO,
         operations=[
             layer.op_comm_prepare_attn,
             layer.op_decode_attn_0,  # TODO
