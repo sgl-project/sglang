@@ -131,7 +131,10 @@ class TestStaticEPLB(CustomTestCase):
             sampling_params=dict(max_new_tokens=8, temperature=0.0),
         )
         print(f"engine.generate {output=}")
-        self.assertEqual([x["text"] for x in output], [", 4+4=8,", ", four plus four is eight, eight"])
+        self.assertEqual(
+            [x["text"] for x in output],
+            [", 4+4=8,", ", four plus four is eight, eight"],
+        )
 
 
 if __name__ == "__main__":
