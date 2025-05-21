@@ -1155,7 +1155,12 @@ def _execute_server_warmup(
         passkey = "The passkey is $000310$. " * 3
         filler = "The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again. "
         repeat = int(int(os.getenv('PASSKEY_LEN', '64')) * 1024 / 24 / 2)
-        text = f"<|header_start|>user<|header_end|>\n\nYour task is find the passkey value from the text. {filler * repeat} {passkey} {filler * repeat}.<|eot|><|header_start|>assistant<|header_end|>\n\nThe passkey is $"
+        if 'Llama-4' in server_args.model_path:
+            text = f"<|header_start|>user<|header_end|>\n\nYour task is find the passkey value from the text. {filler * repeat} {passkey} {filler * repeat}.<|eot|><|header_start|>assistant<|header_end|>\n\nThe passkey is $"
+        elif 'Llama-3' in server_args.model_path:
+            text = f"<|start_header_id|>user<|end_header_id|>\n\nYour task is find the passkey value from the text. {filler * repeat} {passkey} {filler * repeat}.<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\nThe passkey is $"
+        else:
+            text = f"### User\n\nYour task is find the passkey value from the text. {filler * repeat} {passkey} {filler * repeat}.\n\n### Response\n\nThe passkey is $"
         
         json_data["text"] = [text] * server_args.dp_size
         # TODO Workaround the bug that embedding errors for list of size 1
