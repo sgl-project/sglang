@@ -873,7 +873,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # Whether to return hidden states
     return_hidden_states: bool = False
-    
+
     # For draft model extend
     extend_draft_model = False
     extend_data_for_draft_model_ready = False
