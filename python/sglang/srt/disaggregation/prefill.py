@@ -38,6 +38,7 @@ from sglang.srt.disaggregation.utils import (
     kv_to_page_indices,
     kv_to_page_num,
     poll_and_all_reduce,
+    prepare_abort,
 )
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req, ScheduleBatch
 
@@ -157,7 +158,18 @@ class PrefillBootstrapQueue:
             if poll == KVPoll.Bootstrapping:
                 continue
             elif poll == KVPoll.Failed:
-                raise Exception("Bootstrap failed")
+                error_message = f"Prefill bootstrap failed for request rank={self.tp_rank} {req.rid=} {req.bootstrap_room=}"
+                try:
+                    req.disagg_kv_sender.failure_exception()
+                except Exception as e:
+                    error_message += f" with exception {e}"
+                logger.error(error_message)
+                prepare_abort(
+                    req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
+                )
+                self.scheduler.stream_output([req], req.return_logprob)
+                indices_to_remove.add(i)
+                continue
 
             # KV.WaitingForInput
             num_kv_indices = len(req.origin_input_ids)
@@ -335,7 +347,17 @@ class SchedulerDisaggregationPrefillMixin:
                 # FIXME: clean up req's data in transfer engine
                 done_reqs.append(req)
             elif poll == KVPoll.Failed:
-                raise Exception("Transferring failed")
+                error_message = f"Prefill transfer failed for request rank={self.tp_rank} {req.rid=} {req.bootstrap_room=}"
+                try:
+                    req.disagg_kv_sender.failure_exception()
+                except Exception as e:
+                    error_message += f" with exception {e}"
+                logger.warning(error_message)
+                self.tree_cache.cache_finished_req(req)  # unlock the tree
+                prepare_abort(
+                    req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
+                )
+                done_reqs.append(req)
 
         for req in done_reqs:
             self.disagg_prefill_bootstrap_queue.req_to_metadata_buffer_idx_allocator.free(

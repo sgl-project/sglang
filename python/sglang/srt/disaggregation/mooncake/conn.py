@@ -492,6 +492,7 @@ class MooncakeKVSender(BaseKVSender):
         return self.kv_mgr.check_status(self.bootstrap_room)
 
     def failure_exception(self):
+        # TODO: raise a real exception
         raise Exception("Fake KVSender Exception")
 
 
@@ -719,6 +720,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
         return self.kv_mgr.check_status(self.bootstrap_room)
 
     def failure_exception(self):
+        # TODO: raise a real exception
         raise Exception("Fake KVReceiver Exception")
 
 
