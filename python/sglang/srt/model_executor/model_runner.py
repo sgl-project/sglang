@@ -981,16 +981,15 @@ class ModelRunner:
                     self.prefill_attention_backend_str
                 ),
             )
-            if self.should_log:
-                logger.info(
-                    f"Using hybrid attention backend for decode and prefill: "
-                    f"decode_backend={self.decode_attention_backend_str}, "
-                    f"prefill_backend={self.prefill_attention_backend_str}."
-                )
-                logger.warning(
-                    f"Warning: Attention backend specified by --attention-backend or default backend might be overridden."
-                    f"The feature of hybrid attention backend is experimental and unstable. Please raise an issue if you encounter any problem."
-                )
+            logger.info(
+                f"Using hybrid attention backend for decode and prefill: "
+                f"decode_backend={self.decode_attention_backend_str}, "
+                f"prefill_backend={self.prefill_attention_backend_str}."
+            )
+            logger.warning(
+                f"Warning: Attention backend specified by --attention-backend or default backend might be overridden."
+                f"The feature of hybrid attention backend is experimental and unstable. Please raise an issue if you encounter any problem."
+            )
         else:
             self.attn_backend = self._get_attention_backend_from_str(
                 self.server_args.attention_backend
