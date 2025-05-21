@@ -50,6 +50,7 @@ from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    prepare_abort,
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.hf_transformers_utils import (
@@ -138,7 +139,6 @@ from sglang.srt.utils import (
     get_zmq_socket,
     kill_itself_when_parent_died,
     point_to_point_pyobj,
-    prepare_abort,
     pyspy_dump_schedulers,
     set_gpu_proc_affinity,
     set_random_seed,
