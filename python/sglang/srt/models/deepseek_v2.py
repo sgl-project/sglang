@@ -311,12 +311,6 @@ class DeepseekV2MoE(nn.Module):
     def _enable_deepep_moe(self):
         return global_server_args_dict["enable_deepep_moe"]
 
-    def _get_deepep_dispatcher(self, state):
-        if global_server_args_dict["enable_two_batch_overlap"]:
-            return self.tbo_deepep_dispatchers[state.tbo_subbatch_index]
-        else:
-            return self.deepep_dispatcher
-
     def op_gate(self, state):
         if (not self._enable_deepep_moe) or is_non_idle_and_non_empty(
             state.forward_batch.forward_mode, state.hidden_states_mlp_input
@@ -368,7 +362,7 @@ class DeepseekV2MoE(nn.Module):
     def op_dispatch_a(self, state):
         if self._enable_deepep_moe and (self.ep_size > 1):
             # TODO(ch-wan): allow users to set num_max_dispatch_tokens_per_rank value
-            self._get_deepep_dispatcher(state).dispatch_a(
+            self.deepep_dispatcher.dispatch_a(
                 hidden_states=state.pop("hidden_states_mlp_input"),
                 topk_idx=state.pop("topk_idx_local"),
                 topk_weights=state.pop("topk_weights_local"),
