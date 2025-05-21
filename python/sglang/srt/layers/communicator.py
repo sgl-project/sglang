@@ -229,7 +229,7 @@ def _compute_num_tokens_of_mode(
         ),
         ScatterMode.TP_ATTN_FULL: tp_attn_full_num_tokens,
         ScatterMode.FULL: (
-            forward_batch.gathered_buffer.shape[0]
+            sum(forward_batch.global_num_tokens_cpu)
             if global_server_args_dict["enable_dp_attention"]
             else forward_batch.input_ids.shape[0]
         ),
