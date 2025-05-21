@@ -570,6 +570,7 @@ class TritonAttnBackend(AttentionBackend):
         if forward_mode.is_decode_or_idle():
             # Update kv_indptr, kv_indices
             kv_indptr = self.kv_indptr
+            window_kv_indptr = self.window_kv_indptr
             kv_indices = self.cuda_graph_kv_indices
             num_kv_splits = self.cuda_graph_num_kv_splits
             if spec_info is None:
