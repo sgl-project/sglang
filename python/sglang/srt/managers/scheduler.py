@@ -647,8 +647,10 @@ class Scheduler(
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
 
-                if not batch.extend_draft_model and batch.extend_data_for_draft_model_ready:
-                    print("[INFO] TTFT speed up")
+                if (
+                    not batch.extend_draft_model
+                    and batch.extend_data_for_draft_model_ready
+                ):
                     batch.forward_mode = ForwardMode.EXTEND
                     result = self.run_batch(batch)
             else:
