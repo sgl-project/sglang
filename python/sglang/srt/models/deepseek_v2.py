@@ -725,7 +725,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             AttnForwardMethod.MLA: self.forward_absorb_core,
             AttnForwardMethod.MLA_FUSED_ROPE: self.forward_absorb_fused_mla_rope_core,
         }[attn_forward_method]
-        return fn(*intermediate_state)
+        return fn(*inner_state)
 
     def forward_normal_prepare(
         self,
