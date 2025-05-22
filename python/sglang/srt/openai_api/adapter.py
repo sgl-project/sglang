@@ -998,6 +998,13 @@ def v1_chat_generate_request(
                     if message.content is None:
                         message.content = ""
                     msg_dict = message.dict()
+                    if "tool_calls" in msg_dict and type(msg_dict["tool_calls"]) is list:
+                        for call in msg_dict["tool_calls"]:
+                            try:
+                                if "arguments" in call["function"] and type(call["function"]["arguments"]) is str:
+                                    call["function"]["arguments"] = json.loads(call["function"]["arguments"])
+                            except:
+                                continue
                     if isinstance(msg_dict.get("content"), list):
                         for chunk in msg_dict["content"]:
                             if isinstance(chunk, dict) and chunk.get("type") == "text":
