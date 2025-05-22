@@ -38,6 +38,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.patch_torch import monkey_patch_torch_compile
+from sglang.srt.two_batch_overlap import TboForwardBatchPreparer
 from sglang.srt.utils import (
     get_available_gpu_memory,
     get_device_memory_capacity,
@@ -487,7 +488,7 @@ class CudaGraphRunner:
             tbo_split_seq_index=tbo_split_seq_index,
             global_forward_mode=self.capture_forward_mode,
         )
-        forward_batch.prepare_tbo()
+        TboForwardBatchPreparer.prepare(forward_batch)
 
         if lora_paths is not None:
             self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
