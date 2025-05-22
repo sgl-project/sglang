@@ -33,11 +33,14 @@ VISION_MODELS = [
     "unsloth/Qwen2-VL-7B-Instruct-bnb-4bit",
     "unsloth/Llama-3.2-11B-Vision-Instruct-bnb-4bit",
     "unsloth/Llama-3.2-11B-Vision-bnb-4bit",
+    "unsloth/gemma-3-4b-it-bnb-4bit",
+    "unsloth/gemma-3-4b-it-unsloth-bnb-4bit",
 ]
 LANGUAGE_MODELS = [
     "unsloth/Qwen2.5-7B-Instruct-bnb-4bit",
     "unsloth/Qwen2-7B-Instruct-bnb-4bit",
     "unsloth/Llama-3.2-3B-Instruct-bnb-4bit",
+    "unsloth/gemma-3-1b-it-bnb-4bit",
 ]
 
 # image
@@ -256,6 +259,7 @@ class TestVisionModel(CustomTestCase):
                     "0.6",
                     "--load-format",
                     "bitsandbytes",
+                    "--enable-multimodal",
                 ]
                 try:
                     process = popen_launch_server_wrapper(

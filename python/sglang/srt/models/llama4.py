@@ -52,7 +52,15 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.models.llama import LlamaForCausalLM, LlamaMLP
-from sglang.srt.utils import add_prefix, fast_topk, get_compiler_backend, make_layers
+from sglang.srt.utils import (
+    add_prefix,
+    fast_topk,
+    get_compiler_backend,
+    is_cuda,
+    make_layers,
+)
+
+_is_cuda = is_cuda()
 
 logger = logging.getLogger(__name__)
 
@@ -131,7 +139,7 @@ class Llama4MoE(nn.Module):
         return out_aD
 
     def _forward_core(self, hidden_states, forward_mode: ForwardMode):
-        if hidden_states.shape[0] < 4:
+        if hidden_states.shape[0] < 4 and _is_cuda:
             return self._forward_core_shared_routed_overlap(hidden_states)
         else:
             return self._forward_core_normal(hidden_states)

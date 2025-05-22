@@ -264,7 +264,7 @@ pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
             // Default handler for unmatched routes.
             .default_service(web::route().to(sink_handler))
     })
-    .bind((config.host, config.port))?
+    .bind_auto_h2c((config.host, config.port))?
     .run()
     .await
 }

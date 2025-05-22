@@ -463,7 +463,8 @@ at::Tensor convert_weight_packed(at::Tensor& weight) {
 // bias : [N]
 // out  : [M, N]
 //
-at::Tensor weight_packed_linear(at::Tensor& mat1, at::Tensor& mat2, std::optional<at::Tensor>& bias, bool is_vnni) {
+at::Tensor
+weight_packed_linear(at::Tensor& mat1, at::Tensor& mat2, const std::optional<at::Tensor>& bias, bool is_vnni) {
   RECORD_FUNCTION("sgl-kernel::weight_packed_linear", std::vector<c10::IValue>({mat1, mat2, bias}));
 
   auto packed_w = is_vnni ? mat2 : convert_weight_packed(mat2);

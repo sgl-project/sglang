@@ -5,9 +5,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# Torch
-find_package(Torch REQUIRED)
-find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
+find_package(Python COMPONENTS Interpreter Development.Module ${SKBUILD_SABI_COMPONENT} REQUIRED)
 
 execute_process(
     COMMAND ${Python_EXECUTABLE}
@@ -23,8 +21,9 @@ find_package(Torch REQUIRED)
 include_directories(
     ${TORCH_INCLUDE_DIRS}
     ${TORCH_INSTALL_PREFIX}/include
-    ${Python3_INCLUDE_DIRS}
-    ${CMAKE_SOURCE_DIR}/csrc
+    ${Python_INCLUDE_DIRS}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../csrc
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
 )
 
 # Platform-specific library directory
@@ -39,23 +38,7 @@ else()
 endif()
 link_directories(${PLAT_LIB_DIR})
 
-set(SOURCES
-    ${CMAKE_CURRENT_SOURCE_DIR}/activation.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/bmm.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/decode.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/extend.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/gemm.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/gemm_int8.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/moe.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/moe_int8.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/norm.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/qkv_proj.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/topk.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/rope.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/interface.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/shm.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/torch_extension_cpu.cpp
-)
+file(GLOB SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
 
 add_compile_options(
     -O3
@@ -64,24 +47,10 @@ add_compile_options(
     -fopenmp
 )
 
-add_library(sgl_kernel_common_ops SHARED ${SOURCES})
+Python_add_library(common_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
+target_link_libraries(common_ops PRIVATE ${TORCH_LIBRARIES})
+target_include_directories(common_ops PRIVATE ${TORCH_INCLUDE_DIRS})
 
-target_link_libraries(sgl_kernel_common_ops
-    PRIVATE
-    ${TORCH_LIBRARIES}
-    ${Python3_LIBRARIES}
-    c10
-)
-
-set_target_properties(sgl_kernel_common_ops PROPERTIES
-    INSTALL_RPATH "$ORIGIN/../../torch/lib"
-    PREFIX ""
-    OUTPUT_NAME "sgl_kernel.common_ops"
-)
-
-target_compile_definitions(sgl_kernel_common_ops PRIVATE TORCH_API_INCLUDE_EXTENSION_H)
-
-# Install
-install(TARGETS sgl_kernel_common_ops
-    LIBRARY DESTINATION ${Python3_SITEARCH}
+install(TARGETS common_ops
+    LIBRARY DESTINATION sgl_kernel
 )
