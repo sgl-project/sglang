@@ -149,7 +149,7 @@ def run_one_case(
     response = requests.post(
         url + "/generate",
         json={
-            "input_ids": [input_ids for input_ids, _, _ in input_requests],
+            "input_ids": [req.prompt for req in input_requests],
             "sampling_params": {
                 "temperature": temperature,
                 "max_new_tokens": output_len,
@@ -268,6 +268,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
                     input_len_step_percentage=bench_args.input_len_step_percentage,
                     run_name=bench_args.run_name,
                     result_filename=bench_args.result_filename,
+                    tokenizer=tokenizer,
                 )
             )
     finally:
