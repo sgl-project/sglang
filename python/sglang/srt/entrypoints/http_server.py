@@ -1090,7 +1090,7 @@ def _execute_server_warmup(
     else:
         passkey = "The passkey is $000310$. " * 3
         filler = "The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again. "
-        repeat = int(int(os.getenv('PASSKEY_LEN', '64')) * 1024 / 24 / 2)
+        repeat = int(int(os.getenv('PASSKEY_LEN', '8')) * 1024 / 24 / 2)
         if 'Llama-4' in server_args.model_path:
             text = f"<|header_start|>user<|header_end|>\n\nYour task is find the passkey value from the text. {filler * repeat} {passkey} {filler * repeat}.<|eot|><|header_start|>assistant<|header_end|>\n\nThe passkey is $"
         elif 'Llama-3' in server_args.model_path:
