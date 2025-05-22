@@ -22,6 +22,7 @@ import torch.distributed
 import torch.nn.functional as F
 
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.managers import deepseek_eplb
 from sglang.srt.model_loader import get_model_architecture
 from sglang.srt.server_args import ServerArgs
 
@@ -206,6 +207,26 @@ class ExpertLocationMetadata:
                 ep_rank=torch.distributed.get_rank(),
             ),
         )
+
+    # -------------------------------- mutation ------------------------------------
+
+    def update(
+        self,
+        other: "ExpertLocationMetadata",
+    ):
+        for field in [
+            "ep_size",
+        ]:
+            assert getattr(self, field) == getattr(other, field)
+
+        for field in [
+            "physical_to_logical_map",
+            "logical_to_all_physical_map",
+            "logical_to_all_physical_map_num_valid",
+            "logical_to_rank_dispatch_physical_map",
+        ]:
+            dst = getattr(self, field)
+            dst[...] = getattr(other, field)
 
     # -------------------------------- usage ------------------------------------
 
