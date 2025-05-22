@@ -53,7 +53,7 @@ from sglang.srt.hacks import (
     OtherProcessKiller,
     busy_wait_until_enough_memory,
     export_model_params,
-    import_model_param, cupti_memory_profiler_instance,
+    import_model_param, cupti_memory_profiler_instance, nccl_tms_release,
 )
 from sglang.srt.hf_transformers_utils import (
     get_processor,
@@ -2057,6 +2057,9 @@ class Scheduler(
             hack_skip_cuda_empty_cache=True,
         )
 
+        if get_bool_env_var("SGLANG_HACK_ENABLE_NCCL_TMS_RELEASE_RESUME"):
+            nccl_tms_release()
+
         self.memory_saver_adapter.pause()
 
         cupti_memory_profiler_instance.shutdown()
@@ -2069,6 +2072,9 @@ class Scheduler(
         tp_size_per_node = self.tp_size // self.server_args.nnodes
         if self.tp_rank % tp_size_per_node == 0:
             self.other_process_killer.kill()
+
+        if get_bool_env_var("SGLANG_HACK_ENABLE_NCCL_TMS_RELEASE_RESUME"):
+            TODO
 
         # torch.distributed.barrier(self.tp_cpu_group)  # TODO use a better group
         # busy_wait_until_enough_memory()
