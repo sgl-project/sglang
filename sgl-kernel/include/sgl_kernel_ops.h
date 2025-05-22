@@ -74,6 +74,17 @@ std::tuple<std::vector<int64_t>, std::vector<int64_t>> get_graph_buffer_ipc_meta
 void register_buffer(fptr_t _fa, const std::vector<fptr_t>& fake_ipc_ptrs);
 void register_graph_buffers(
     fptr_t _fa, const std::vector<std::vector<int64_t>>& handles, const std::vector<std::vector<int64_t>>& offsets);
+void all_to_all(fptr_t _fa, torch::Tensor& output, torch::Tensor& input, torch::Tensor& plan_meta, fptr_t _reg_buffer);
+void all_to_all_plan(
+    fptr_t _fa,
+    torch::Tensor& output,
+    torch::Tensor& input,
+    torch::Tensor& output_split_sizes,
+    torch::Tensor& input_split_sizes,
+    int64_t chunk_size,
+    torch::Tensor& output_split_offsets,
+    torch::Tensor& input_split_offsets,
+    torch::Tensor& plan_meta);
 #endif
 
 /*
