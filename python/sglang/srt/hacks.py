@@ -1,10 +1,13 @@
 import ctypes
+import datetime
 import os
 import time
 
 import torch
+import torch.distributed as dist
 import zmq
 from sglang.srt.distributed import get_tensor_model_parallel_rank
+from sglang.srt.distributed.device_communicators.pynccl_wrapper import find_nccl_library
 from sglang.srt.utils import get_zmq_socket
 
 
@@ -91,6 +94,49 @@ class CuptiMemoryProfiler:
 
 
 cupti_memory_profiler_instance = CuptiMemoryProfiler()
+
+
+def _get_nccl_lib():
+    # ref: NCCLLibrary
+    so_file = find_nccl_library()
+    lib = ctypes.CDLL(so_file)
+    return lib
+
+
+def _curr_t():
+    return datetime.datetime.now().isoformat()
+
+
+def nccl_tms_release(rank, cpu_group):
+    lib = _get_nccl_lib()
+
+    print(f"[{rank}, {_curr_t()}] release START, deliberate sleep")
+    print(f"[{rank}, {_curr_t()}] {torch.cuda.mem_get_info()=}")
+    time.sleep(5)
+
+    print(f"[{rank}, {_curr_t()}] call torch empty cache")
+    torch.cuda.empty_cache()
+    print(f"[{rank}, {_curr_t()}] sleep")
+    print(f"[{rank}, {_curr_t()}] {torch.cuda.mem_get_info()=}")
+    time.sleep(5)
+
+    print(f"[{rank}, {_curr_t()}] release call barrier")
+    dist.barrier(group=cpu_group)
+
+    print(f"[{rank}, {_curr_t()}] call nccl_tms_copyToHostAndReleaseA")
+    lib.nccl_tms_copyToHostAndReleaseA()
+
+    print(f"[{rank}, {_curr_t()}] call barrier")
+    dist.barrier(group=cpu_group)
+
+    print(f"[{rank}, {_curr_t()}] call nccl_tms_copyToHostAndReleaseB")
+    lib.nccl_tms_copyToHostAndReleaseB()
+
+    print(f"[{rank}, {_curr_t()}] call barrier")
+    dist.barrier(group=cpu_group)
+
+    print(f"[{rank}, {_curr_t()}] release END")
+
 
 if __name__ == "__main__":
     other_process_killer = OtherProcessKiller()
