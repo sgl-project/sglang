@@ -212,29 +212,9 @@ class ModelRunner:
         # CPU offload
         set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024**3))
 
-        # Init OpenMP threads binding
-        omp_cpuids = os.environ.get("SGLANG_CPU_OMP_THREADS_BIND", "all")
-        if omp_cpuids == "all":
-            cpu_ids_by_node = get_cpu_ids_by_node()
-            n_numa_node = len(cpu_ids_by_node)
-
-            assert self.tp_size <= n_numa_node, (
-                f"SGLANG_CPU_OMP_THREADS_BIND is not set, in this case, "
-                f"tp_size {self.tp_size} should be smaller than number of numa node on the machine {n_numa_node}. "
-                f"If you need tp_size to be larger than number of numa node, please set the CPU cores for each tp rank via SGLANG_CPU_OMP_THREADS_BIND explicitly. "
-                f"For example, on a machine with 2 numa nodes, where core 0-31 are on numa node 0 and core 32-63 are on numa node 1, "
-                f"it is suggested to use -tp 2 and bind tp rank 0 to core 0-31 and tp rank 1 to core 32-63. "
-                f"This is the default behavior if SGLANG_CPU_OMP_THREADS_BIND is not set and it is the same as setting SGLANG_CPU_OMP_THREADS_BIND=0-31|32-63. "
-                f"If you do need tp_size to be large than the number of numa nodes, you could set SGLANG_CPU_OMP_THREADS_BIND explicitly for example SGLANG_CPU_OMP_THREADS_BIND=0-15|16-31|32-47|48-63 and run with -tp 4. "
-                f"If you don't want each tp rank to use all the cores on one numa node, you could set for example SGLANG_CPU_OMP_THREADS_BIND=0-15|32-47 and run with -tp 2."
-            )
-            if self.tp_size < n_numa_node:
-                logger.warning(
-                    f"Detected the current machine has {n_numa_node} numa nodes available, but tp_size is set to {self.tp_size}, so use only {self.tp_size} numa nodes are used."
-                )
-            self.local_omp_cpuid = cpu_ids_by_node[self.tp_rank]
-        else:
-            self.local_omp_cpuid = omp_cpuids.split("|")[tp_rank]
+        # Init OpenMP threads binding for CPU
+        if self.device == "cpu":
+            self.init_threads_binding()
 
         # Get memory before model loading
         min_per_gpu_memory = self.init_torch_distributed()
@@ -504,6 +484,7 @@ class ModelRunner:
         if not self.is_draft_worker:
             if self.device == "cpu":
                 import sgl_kernel
+
                 # Bind OpenMP threads to CPU cores
                 torch.ops.sgl_kernel.init_cpu_threads_env(self.local_omp_cpuid)
 
@@ -1299,6 +1280,30 @@ class ModelRunner:
             f"Capture cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
             f"mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
         )
+
+    def init_threads_binding(self):
+        omp_cpuids = os.environ.get("SGLANG_CPU_OMP_THREADS_BIND", "all")
+        if omp_cpuids == "all":
+            cpu_ids_by_node = get_cpu_ids_by_node()
+            n_numa_node = len(cpu_ids_by_node)
+
+            assert self.tp_size <= n_numa_node, (
+                f"SGLANG_CPU_OMP_THREADS_BIND is not set, in this case, "
+                f"tp_size {self.tp_size} should be smaller than number of numa node on the machine {n_numa_node}. "
+                f"If you need tp_size to be larger than number of numa node, please set the CPU cores for each tp rank via SGLANG_CPU_OMP_THREADS_BIND explicitly. "
+                f"For example, on a machine with 2 numa nodes, where core 0-31 are on numa node 0 and core 32-63 are on numa node 1, "
+                f"it is suggested to use -tp 2 and bind tp rank 0 to core 0-31 and tp rank 1 to core 32-63. "
+                f"This is the default behavior if SGLANG_CPU_OMP_THREADS_BIND is not set and it is the same as setting SGLANG_CPU_OMP_THREADS_BIND=0-31|32-63. "
+                f"If you do need tp_size to be large than the number of numa nodes, you could set SGLANG_CPU_OMP_THREADS_BIND explicitly for example SGLANG_CPU_OMP_THREADS_BIND=0-15|16-31|32-47|48-63 and run with -tp 4. "
+                f"If you don't want each tp rank to use all the cores on one numa node, you could set for example SGLANG_CPU_OMP_THREADS_BIND=0-15|32-47 and run with -tp 2."
+            )
+            if self.tp_size < n_numa_node:
+                logger.warning(
+                    f"Detected the current machine has {n_numa_node} numa nodes available, but tp_size is set to {self.tp_size}, so use only {self.tp_size} numa nodes are used."
+                )
+            self.local_omp_cpuid = cpu_ids_by_node[self.tp_rank]
+        else:
+            self.local_omp_cpuid = omp_cpuids.split("|")[self.tp_rank]
 
     def apply_torch_tp(self):
         logger.info(f"Enabling torch tensor parallelism on {self.tp_size} devices.")
