@@ -171,7 +171,7 @@ class RotaryEmbedding(CustomOp):
             orig_q_dtype = query.dtype
             orig_k_dtype = key.dtype
             cos, sin = positions
-            cos, sin = cos.float(), sin.float()
+            cos, sin = cos.float().contiguous(), sin.float().contiguous()
             query, key = query.float(), key.float()
             self.sglang_rotary_embedding(
                 cos,

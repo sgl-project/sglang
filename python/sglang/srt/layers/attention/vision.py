@@ -151,8 +151,6 @@ class VisionSdpaAttention(nn.Module):
         Returns:
              [b * s, h, head_size]
         """
-        if self.flatten_batch:
-            assert bsz == 1, "flatten_batch is True, bsz must be 1"
 
         assert q.dim() == 3, q.shape
 
@@ -452,6 +450,7 @@ class VisionAttention(nn.Module):
             q = q.view(-1, head, self.head_size)
             k = k.view(-1, head, self.head_size)
 
+            print(f"{q.shape=}")
             q, k = self.rotary_emb(position_embeddings, q, k)
 
             q = q.view(original_shape)

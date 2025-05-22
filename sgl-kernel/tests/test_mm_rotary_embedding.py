@@ -9,7 +9,7 @@ from sgl_kernel import rotary_embedding
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
     x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
+    x2 = x[..., x.shape[-1] // 2:]
     return torch.cat((-x2, x1), dim=-1)
 
 
@@ -117,10 +117,13 @@ class RotaryEmbedding(torch.nn.Module):
         return query, key
 
 
+@pytest.mark.benchmark(group="rotary_embedding")
 @pytest.mark.parametrize(
     "head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype, device, batch_size, seq_len, num_q_heads, num_kv_heads",
     [
         (80, 80, 1e6, 1e6, False, torch.bfloat16, "cuda", 32, 32, 16, 16),
+        (320, 230, 1e6, 1e6, False, torch.bfloat16, "cuda", 32, 32, 16, 16),
+        (80, 80, 1e6, 1e6, True, torch.bfloat16, "cuda", 32, 32, 16, 16),
     ],
 )
 def test_correctness(
@@ -156,10 +159,6 @@ def test_correctness(
     cos = torch.randn(batch_size * seq_len, head_size, dtype=dtype, device=device)
     sin = torch.randn(batch_size * seq_len, head_size, dtype=dtype, device=device)
 
-    print(f"{query.shape=}")
-    print(f"{cos.shape=}")
-
-    # Modification: float32 is required for the rotary embedding to work correctly
     query_native_out, key_native_out = rope_ref.forward_native(
         cos, sin, query.clone(), key.clone()
     )
@@ -171,6 +170,58 @@ def test_correctness(
 
     torch.testing.assert_close(query_native_out, query_kernel_out, atol=1e-3, rtol=1e-3)
     torch.testing.assert_close(key_native_out, key_kernel_out, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.benchmark(group="rotary_embedding")
+@pytest.mark.parametrize(
+    "head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype, device, batch_size, seq_len, num_q_heads, num_kv_heads",
+    [
+        (80, 80, 1e6, 1e6, False, torch.bfloat16, "cuda", 1, 8840, 16, 16),
+        (80, 80, 1e6, 1e6, False, torch.bfloat16, "cuda", 1, 4000, 16, 16),
+        (80, 80, 1e6, 1e6, True, torch.bfloat16, "cuda", 8, 8840, 16, 16),
+    ],
+)
+def test_rotary_embedding_benchmark(
+    benchmark,
+    head_size: int,
+    rotary_dim: int,
+    max_position_embeddings: int,
+    base: int,
+    is_neox_style: bool,
+    dtype: torch.dtype,
+    device: str,
+    batch_size: int,
+    seq_len: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+):
+    rope_ref = RotaryEmbedding(
+        head_size,
+        rotary_dim,
+        max_position_embeddings,
+        base,
+        dtype=dtype,
+        is_neox_style=is_neox_style,
+    ).to(device)
+    query = torch.randn(
+        batch_size * seq_len, num_q_heads, head_size, dtype=dtype, device=device
+    )
+    key = torch.randn(
+        batch_size * seq_len, num_kv_heads, head_size, dtype=dtype, device=device
+    )
+    cos = torch.randn(batch_size * seq_len, head_size, dtype=dtype, device=device)
+    sin = torch.randn(batch_size * seq_len, head_size, dtype=dtype, device=device)
+
+    def run_kernel():
+        rope_ref.forward_kernel_inplace(
+            cos,
+            sin,
+            query,
+            key,
+        )
+        torch.cuda.synchronize()
+
+    benchmark.pedantic(run_kernel, rounds=20000, warmup_rounds=5)
 
 
 if __name__ == "__main__":

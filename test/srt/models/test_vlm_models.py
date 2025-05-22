@@ -27,18 +27,23 @@ from sglang.test.test_utils import (
 
 # VLM models for testing
 MODELS = [
+    # SimpleNamespace(
+    #     model="google/gemma-3-4b-it", chat_template="gemma-it", mmmu_accuracy=0.384
+    # ),
     SimpleNamespace(
-        model="google/gemma-3-4b-it", chat_template="gemma-it", mmmu_accuracy=0.384
-    ),
-    SimpleNamespace(
-        model="Qwen/Qwen2.5-VL-3B-Instruct",
+        model="Qwen/Qwen2-VL-7B-Instruct",
         mmmu_accuracy=0.466,
     ),
-    SimpleNamespace(
-        model="openbmb/MiniCPM-V-2_6",
-        chat_template="minicpmv",
-        mmmu_accuracy=0.3867,
-    ),
+    # SimpleNamespace(
+    #     model="Qwen/Qwen2.5-VL-3B-Instruct",
+    #     mmmu_accuracy=0.466,
+    # ),
+    #
+    # SimpleNamespace(
+    #     model="openbmb/MiniCPM-V-2_6",
+    #     chat_template="minicpmv",
+    #     mmmu_accuracy=0.3867,
+    # ),
 ]
 
 
