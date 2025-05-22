@@ -161,7 +161,7 @@ class TestSessionControl(CustomTestCase):
             ]
         )
 
-        # query with a non-existing rid (the last one should be disappeared becuase of backtrack), should see abort
+        # query with a non-existing rid (the last one should be disappeared because of backtrack), should see abort
         response = requests.post(
             self.base_url + "/generate",
             json={
@@ -668,7 +668,7 @@ class TestSessionControlVision(CustomTestCase):
         ).json()
         outputs_from_session.append(response["text"])
 
-        # query with a non-existing rid (the last one should be disappeared becuase of backtrack), should see abort
+        # query with a non-existing rid (the last one should be disappeared because of backtrack), should see abort
         response = requests.post(
             self.base_url + "/generate",
             json={
