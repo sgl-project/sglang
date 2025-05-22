@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import dataclasses
+import os
+import random
 import warnings
 from collections import deque
 from enum import Enum
@@ -15,6 +17,9 @@ from sglang.srt.utils import get_ip
 
 FakeBootstrapHost = "2.2.2.2"
 
+# env var for testing failure, convert to float explicitly
+FAILURE_PROB = float(os.getenv("XAI_DISAGGREGATION_TEST_FAILURE_PROB", 0))
+
 
 class DisaggregationMode(Enum):
     NULL = "null"
@@ -23,7 +28,16 @@ class DisaggregationMode(Enum):
 
 
 def poll_and_all_reduce(pollers, gloo_group):
-    polls = [int(poller.poll()) for poller in pollers]
+    # at a certain prob, the poll is failed to simulate failure
+    if FAILURE_PROB > 0:
+        from sglang.srt.disaggregation.base import KVPoll
+
+        polls = [
+            int(KVPoll.Failed) if random.random() < FAILURE_PROB else int(poller.poll())
+            for poller in pollers
+        ]
+    else:
+        polls = [int(poller.poll()) for poller in pollers]
     tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
     dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=gloo_group)
     return tensor_to_reduce.tolist()
