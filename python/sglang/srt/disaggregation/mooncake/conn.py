@@ -249,14 +249,27 @@ class MooncakeKVManager(BaseKVManager):
             for (src_ptr, dst_ptr, item_len) in layers_params
         ]
 
-        for future in concurrent.futures.as_completed(futures):
-            status = future.result()
-            if status != 0:
-                for f in futures:
-                    f.cancel()
-                return status
+        try:
+            done, not_done = concurrent.futures.wait(
+                futures, timeout=3, return_when=concurrent.futures.ALL_COMPLETED
+            )
 
-        return 0
+            if not_done:
+                logger.error(
+                    f"transfer_sync timed out with {len(not_done)} unfinished layers"
+                )
+                for f in not_done:
+                    f.cancel()
+                return -1
+
+            for future in done:
+                status = future.result()
+                if status != 0:
+                    return status
+            return 0
+
+        except Exception as e:
+            return -1
 
     def send_aux(
         self,
@@ -391,6 +404,11 @@ class MooncakeKVManager(BaseKVManager):
 
                 except queue.Empty:
                     continue
+                except Exception as e:
+                    raise RuntimeError(
+                        "Transfer thread failed. Prefill instance with {bootstrap_port=%s} is dead.",
+                        self.bootstrap_port,
+                    )
 
         threading.Thread(target=bootstrap_thread).start()
         threading.Thread(target=transfer_thread).start()
@@ -451,6 +469,10 @@ class MooncakeKVManager(BaseKVManager):
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last or (is_last and aux_index is not None)
+
+        if self.check_status(bootstrap_room) == KVPoll.Failed:
+            logger.info("Request with bootstrap_room=%s already failed", bootstrap_room)
+            return
 
         self.transfer_queue.put(
             TransferKVChunk(
@@ -605,7 +627,9 @@ class MooncakeKVSender(BaseKVSender):
     def failure_exception(self):
         self.clear()
         with self.kv_mgr.failure_lock:
-            failure_reason = self.kv_mgr.failure_records.pop(self.bootstrap_room)
+            failure_reason = self.kv_mgr.failure_records.pop(
+                self.bootstrap_room, "Failed due to an unknown reason from another rank"
+            )
         raise KVTransferError(self.bootstrap_room, failure_reason)
 
 
@@ -851,7 +875,9 @@ class MooncakeKVReceiver(BaseKVReceiver):
     def failure_exception(self):
         self.clear()
         with self.kv_mgr.failure_lock:
-            failure_reason = self.kv_mgr.failure_records.pop(self.bootstrap_room)
+            failure_reason = self.kv_mgr.failure_records.pop(
+                self.bootstrap_room, "Failed due to an unknown reason from another rank"
+            )
         raise KVTransferError(self.bootstrap_room, failure_reason)
 
 
