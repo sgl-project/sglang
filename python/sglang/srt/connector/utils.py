@@ -20,6 +20,7 @@ def parse_model_name(url: str) -> str:
 def pull_files_from_db(
     connector: BaseConnector,
     model_name: str,
+    get_func: callable,
     allow_pattern: Optional[list[str]] = None,
     ignore_pattern: Optional[list[str]] = None,
 ) -> None:
@@ -32,4 +33,6 @@ def pull_files_from_db(
         local_dir = Path(destination_file).parent
         os.makedirs(local_dir, exist_ok=True)
         with open(destination_file, "wb") as f:
-            f.write(connector.getstr(file).encode("utf-8"))
+            content = get_func(connector, file)
+            assert content is not None
+            f.write(content)

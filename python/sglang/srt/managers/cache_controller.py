@@ -13,6 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import hashlib
 import logging
 import math
 import threading
@@ -25,9 +26,21 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 
-from sglang.srt.mem_cache.hicache_storage import HiCacheFile, get_hash_str
+from sglang.srt.connector import create_remote_connector
 
 logger = logging.getLogger(__name__)
+
+
+def get_hash_str(token_ids: List[int], prior_hash: Optional[str] = None) -> str:
+    hasher = hashlib.sha256()
+
+    if prior_hash:
+        hasher.update(bytes.fromhex(prior_hash))
+
+    for t in token_ids:
+        hasher.update(t.to_bytes(4, byteorder="little", signed=False))
+
+    return hasher.hexdigest()
 
 
 class LayerDoneCounter:
@@ -244,17 +257,12 @@ class HiCacheController:
         self.enable_storage = False
         # todo: move backend initialization to storage backend module
         if storage_backend is not None:
-            if storage_backend == "file":
-                self.storage_backend = HiCacheFile()
-                self.enable_storage = True
-                # tracking prefetch operation progress
-                self.ongoing_prefetch: dict[int, PrefetchOperation] = {}
-                # todo: threshold policy for prefetching
-                self.prefetch_threshold = prefetch_threshold
-            else:
-                raise NotImplementedError(
-                    f"Unsupported storage backend: {storage_backend}"
-                )
+            self.storage_backend = create_remote_connector(storage_backend)
+            self.enable_storage = True
+            # tracking prefetch operation progress
+            self.ongoing_prefetch: dict[int, PrefetchOperation] = {}
+            # todo: threshold policy for prefetching
+            self.prefetch_threshold = prefetch_threshold
 
         self.load_cache_event = load_cache_event
         self.layer_done_counter = LayerDoneCounter(self.mem_pool_device.layer_num)

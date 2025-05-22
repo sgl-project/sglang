@@ -11,18 +11,72 @@ import torch
 
 
 class BaseConnector(ABC):
+    pass
+
+
+class BaseKVConnector(BaseConnector):
     """
-    For fs connector such as s3:
+    HiCacheStorage is a class that provides a generic key-value interface for storing and retrieving KV cache.
+    It abstracts the underlying storage mechanism, allowing different implementations to be used.
+    """
+
+    @abstractmethod
+    def get(
+        self, key: str, target_location: Optional[torch.Tensor] = None
+    ) -> torch.Tensor | None:
+        """
+        Retrieve the value associated with the given key.
+        Returns None if the key does not exist.
+        """
+        raise NotImplementedError()
+
+    @abstractmethod
+    def batch_get(
+        self, keys: List[str], target_locations: Optional[List[torch.Tensor]] = None
+    ) -> List[torch.Tensor | None]:
+        """
+        Retrieve values for multiple keys.
+        Returns a list of tensors or None for each key.
+        """
+        pass
+
+    @abstractmethod
+    def set(self, key, value) -> bool:
+        """
+        Store the value associated with the given key.
+        Returns True if the operation was successful, False otherwise.
+        """
+        raise NotImplementedError()
+
+    @abstractmethod
+    def batch_set(self, keys: List[str], values: List[torch.Tensor]) -> bool:
+        """
+        Store multiple key-value pairs.
+        Returns True if all operations were successful, False otherwise.
+        """
+        pass
+
+    @abstractmethod
+    def exists(self, key: str) -> bool:
+        """
+        Check if the key exists in the storage.
+        Returns True if the key exists, False otherwise.
+        """
+        raise NotImplementedError()
+
+
+class BaseWeightConnector(BaseConnector):
+    """
+    For fs connector such as s3, url looks like:
     <connector_type>://<path>/<filename>
 
-    For kv connector such as redis:
+    For kv connector such as redis, url looks like:
     <connector_type>://<host>:<port>/<model_name>/keys/<key>
     <connector_type://<host>:<port>/<model_name>/files/<filename>
     """
 
-    def __init__(self, url: str, device: torch.device = "cpu"):
+    def __init__(self, url: str):
         self.url = url
-        self.device = device
         self.closed = False
         self.local_dir = tempfile.mkdtemp()
         for sig in (signal.SIGINT, signal.SIGTERM):
@@ -73,30 +127,7 @@ class BaseConnector(ABC):
         return new_handler
 
 
-class BaseKVConnector(BaseConnector):
-
-    @abstractmethod
-    def get(self, key: str) -> Optional[torch.Tensor]:
-        raise NotImplementedError()
-
-    @abstractmethod
-    def getstr(self, key: str) -> Optional[str]:
-        raise NotImplementedError()
-
-    @abstractmethod
-    def set(self, key: str, obj: torch.Tensor) -> None:
-        raise NotImplementedError()
-
-    @abstractmethod
-    def setstr(self, key: str, obj: str) -> None:
-        raise NotImplementedError()
-
-    @abstractmethod
-    def list(self, prefix: str) -> List[str]:
-        raise NotImplementedError()
-
-
-class BaseFileConnector(BaseConnector):
+class BaseFileSystemConnector(BaseConnector):
     """
     List full file names from remote fs path and filter by allow pattern.
 

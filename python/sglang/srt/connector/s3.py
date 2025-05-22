@@ -7,7 +7,7 @@ from typing import Generator, Optional, Tuple
 
 import torch
 
-from sglang.srt.connector import BaseFileConnector
+from sglang.srt.connector import BaseFileSystemConnector, BaseWeightConnector
 
 
 def _filter_allow(paths: list[str], patterns: list[str]) -> list[str]:
@@ -66,7 +66,7 @@ def list_files(
     return bucket_name, prefix, paths
 
 
-class S3Connector(BaseFileConnector):
+class S3Connector(BaseFileSystemConnector, BaseWeightConnector):
 
     def __init__(self, url: str) -> None:
         import boto3

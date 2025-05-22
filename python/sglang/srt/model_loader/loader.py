@@ -1350,7 +1350,7 @@ class RemoteModelLoader(BaseModelLoader):
         client,
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
         """Get an iterator for the model weights from remote storage."""
-        assert get_connector_type(client) == ConnectorType.KV
+        assert get_connector_type(client) == ConnectorType.KV | ConnectorType.WEIGHT
         rank = get_tensor_model_parallel_rank()
         return client.weight_iterator(rank)
 
@@ -1359,7 +1359,7 @@ class RemoteModelLoader(BaseModelLoader):
         client,
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
         """Get an iterator for the model weights from remote storage."""
-        assert get_connector_type(client) == ConnectorType.FS
+        assert get_connector_type(client) == ConnectorType.FS | ConnectorType.WEIGHT
         return client.weight_iterator()
 
     def download_model(self, model_config: ModelConfig) -> None:
@@ -1372,7 +1372,7 @@ class RemoteModelLoader(BaseModelLoader):
         url: str,
     ) -> None:
         with create_remote_connector(url) as client:
-            assert get_connector_type(client) == ConnectorType.KV
+            assert get_connector_type(client) == ConnectorType.KV | ConnectorType.WEIGHT
             model_name = parse_model_name(url)
             rank = get_tensor_model_parallel_rank()
             state_dict = ShardedStateLoader._filter_subtensors(model.state_dict())
@@ -1389,12 +1389,13 @@ class RemoteModelLoader(BaseModelLoader):
                         ".bin",
                         ".pt",
                         ".safetensors",
+                        ".jpg",  # ignore jpg file
                     ):
                         file_path = os.path.join(root, file_name)
                         with open(file_path, encoding="utf-8") as file:
                             file_content = file.read()
                             f_key = f"{model_name}/files/{file_name}"
-                            client.setstr(f_key, file_content)
+                            client.set(f_key, file_content)
 
     def _load_model_from_remote_kv(self, model: nn.Module, client):
         for _, module in model.named_modules():
@@ -1470,14 +1471,19 @@ class RemoteModelLoader(BaseModelLoader):
                     if quant_method is not None:
                         quant_method.process_weights_after_loading(module)
 
-            with create_remote_connector(model_weights, device_config.device) as client:
+            with create_remote_connector(
+                model_weights, device=device_config.device
+            ) as client:
                 connector_type = get_connector_type(client)
-                if connector_type == ConnectorType.KV:
+                assert connector_type & ConnectorType.WEIGHT
+                if connector_type & ConnectorType.KV:
                     self._load_model_from_remote_kv(model, client)
-                elif connector_type == ConnectorType.FS:
+                elif connector_type & ConnectorType.FS:
                     self._load_model_from_remote_fs(
                         model, client, model_config, device_config
                     )
+                else:
+                    raise ValueError(f"Unknown connector type {connector_type}")
 
         end = time.perf_counter()
         logger.info("Loaded weights from remote storage in %.2f seconds.", end - start)

@@ -6,26 +6,28 @@ from urllib.parse import urlparse
 
 import torch
 
-from sglang.srt.connector import BaseKVConnector
+from sglang.srt.connector import BaseKVConnector, BaseWeightConnector
 from sglang.srt.connector.serde import create_serde
 from sglang.srt.connector.utils import pull_files_from_db
 
 logger = logging.getLogger(__name__)
 
 
-class RedisConnector(BaseKVConnector):
+class RedisConnector(BaseWeightConnector, BaseKVConnector):
 
-    def __init__(self, url: str, device: torch.device = "cpu"):
+    def __init__(self, url: str):
         import redis
 
-        super().__init__(url, device)
+        super().__init__(url)
         parsed_url = urlparse(url)
         self.connection = redis.Redis(host=parsed_url.hostname, port=parsed_url.port)
         self.model_name = parsed_url.path.lstrip("/")
         # TODO: more serde options
         self.s, self.d = create_serde("safe")
 
-    def get(self, key: str) -> Optional[torch.Tensor]:
+    def get(
+        self, key: str, target: Optional[torch.Tensor] = None
+    ) -> Optional[torch.Tensor]:
         val = self.connection.get(key)
 
         if val is None:
@@ -34,20 +36,20 @@ class RedisConnector(BaseKVConnector):
 
         return self.d.from_bytes(val)
 
-    def getstr(self, key: str) -> Optional[str]:
-        val = self.connection.get(key)
-        if val is None:
-            logger.error("Key %s not found", key)
-            return None
+    def set(self, key: str, val) -> bool:
+        assert val is not None
+        if isinstance(val, str):
+            self.connection.set(key, val)
+            return True
+        elif isinstance(val, torch.Tensor):
+            self.connection.set(key, self.s.to_bytes(val))
+            return True
+        else:
+            logger.error(f"unsupported Redis set type {type(val)}")
+            return False
 
-        return val.decode("utf-8")
-
-    def set(self, key: str, tensor: torch.Tensor) -> None:
-        assert tensor is not None
-        self.connection.set(key, self.s.to_bytes(tensor))
-
-    def setstr(self, key: str, obj: str) -> None:
-        self.connection.set(key, obj)
+    def exists(self, key: str) -> bool:
+        return self.connection.exists(key)
 
     def list(self, prefix: str) -> List[str]:
         cursor = 0
@@ -78,7 +80,10 @@ class RedisConnector(BaseKVConnector):
         allow_pattern: Optional[List[str]] = None,
         ignore_pattern: Optional[List[str]] = None,
     ) -> None:
-        pull_files_from_db(self, self.model_name, allow_pattern, ignore_pattern)
+        def getstr(self, file):
+            return self.connection.get(file)
+
+        pull_files_from_db(self, self.model_name, getstr, allow_pattern, ignore_pattern)
 
     def close(self):
         self.connection.close()
