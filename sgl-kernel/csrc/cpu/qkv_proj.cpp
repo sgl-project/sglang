@@ -431,6 +431,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> qkv_proj_with_rope(
     std::optional<at::Tensor> kv_a_proj_scale,
     bool is_vnni,
     std::optional<std::vector<int64_t>> block_size) {
+
   RECORD_FUNCTION(
       "sgl-kernel::qkv_proj_with_rope",
       std::vector<c10::IValue>({hidden_states, q_a_proj_weight, q_b_proj_weight, kv_a_proj_weight, w_kc}));

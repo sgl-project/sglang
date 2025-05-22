@@ -50,9 +50,12 @@ std::tuple<at::Tensor, at::Tensor> biased_grouped_topk_cpu(
 // attention
 void decode_attention_cpu(
     at::Tensor& query,
-    at::Tensor& output,
     at::Tensor& k_cache,
-    at::Tensor& v_cahce,
+    at::Tensor& v_cache,
+    at::Tensor& output,
+    at::Tensor& key,
+    at::Tensor& value,
+    at::Tensor& loc,
     at::Tensor& attn_logits,
     at::Tensor& req_to_token,
     at::Tensor& req_pool_indices,
@@ -169,6 +172,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> qkv_proj_with_rope(
     bool is_vnni,
     std::optional<std::vector<int64_t>> block_size);
 
+
 // shared memory init
 void initialize(int64_t size, int64_t rank);
 
@@ -208,8 +212,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   // decode
   m.def(
-      "decode_attention_cpu(Tensor query, Tensor output, Tensor k_cache, Tensor v_cahce, Tensor attn_logits, Tensor "
-      "req_to_token, Tensor req_pool_indices, Tensor seq_lens, float sm_scale, float logit_cap) -> ()");
+      "decode_attention_cpu(Tensor query, Tensor k_cache, Tensor v_cahce, Tensor output, Tensor key, Tensor value, "
+      "Tensor loc, Tensor attn_logits, Tensor req_to_token, Tensor req_pool_indices, Tensor seq_lens, float sm_scale, "
+      "float logit_cap) -> ()");
   m.impl("decode_attention_cpu", torch::kCPU, &decode_attention_cpu);
 
   // extend
