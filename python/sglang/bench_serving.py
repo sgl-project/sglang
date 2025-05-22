@@ -583,15 +583,13 @@ class BenchmarkMetrics:
 SHAREGPT_URL = "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
 
 
-def download_and_cache_file(
-    url: str, filename: Optional[str] = None, force_redownload: bool = False
-):
+def download_and_cache_file(url: str, filename: Optional[str] = None):
     """Read and cache a file from a url."""
     if filename is None:
         filename = os.path.join("/tmp", url.split("/")[-1])
 
     # Check if the cache file already exists
-    if os.path.exists(filename) and (not force_redownload):
+    if is_file_valid_json(filename):
         return filename
 
     print(f"Downloading from {url} to {filename}")
@@ -775,7 +773,7 @@ def sample_sharegpt_requests(
 
     # Download sharegpt if necessary
     if not is_file_valid_json(dataset_path) and dataset_path == "":
-        dataset_path = download_and_cache_file(SHAREGPT_URL, force_redownload=True)
+        dataset_path = download_and_cache_file(SHAREGPT_URL)
 
     # Load the dataset.
     with open(dataset_path) as f:
@@ -873,7 +871,7 @@ def sample_random_requests(
 
         # Download sharegpt if necessary
         if not is_file_valid_json(dataset_path):
-            dataset_path = download_and_cache_file(SHAREGPT_URL, force_redownload=True)
+            dataset_path = download_and_cache_file(SHAREGPT_URL)
 
         # Load the dataset.
         with open(dataset_path) as f:
