@@ -240,8 +240,8 @@ class AutoRoundConfig(QuantizationConfig):
             from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
 
             config = {
-                "linear_quant_method": "awq",
-                "weight_bits": weight_bits,
+                "quant_method": "awq",
+                "bits": weight_bits,
                 "group_size": group_size,
                 "zero_point": not sym,
             }
@@ -325,11 +325,11 @@ class AutoRoundConfig(QuantizationConfig):
                 from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
 
                 config = {
-                    "linear_quant_method": "gptq",
-                    "weight_bits": weight_bits,
+                    "quant_method": "gptq",
+                    "bits": weight_bits,
                     "group_size": group_size,
                     "sym": sym,
-                    "lm_head_quantized": False,
+                    "lm_head": False,
                 }
                 return MoeWNA16Config.from_config(config).get_quant_method(
                     layer, prefix

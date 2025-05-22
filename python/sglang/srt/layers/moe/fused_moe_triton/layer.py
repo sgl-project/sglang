@@ -314,6 +314,7 @@ class FusedMoE(torch.nn.Module):
         self.top_k = top_k
         self.num_experts = num_experts
         assert intermediate_size % self.tp_size == 0
+        self.hidden_size = hidden_size
         self.intermediate_size_per_partition = intermediate_size // self.tp_size
         self.reduce_results = reduce_results
         self.renormalize = renormalize
@@ -330,7 +331,6 @@ class FusedMoE(torch.nn.Module):
         self.inplace = inplace
         self.no_combine = no_combine
         self.local_num_experts = num_experts
-
         if quant_config is None:
             self.quant_method: Optional[QuantizeMethodBase] = (
                 UnquantizedFusedMoEMethod()
