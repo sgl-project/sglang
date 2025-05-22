@@ -1257,8 +1257,7 @@ class Scheduler(
                 f"{self.token_to_kv_pool_allocator.available_size()=}\n"
                 f"{self.tree_cache.evictable_size()=}\n"
             )
-            logger.error(msg)
-            # raise ValueError(msg)
+            raise ValueError(msg)
 
         if len(self.req_to_token_pool.free_slots) != self.req_to_token_pool.size:
             msg = (
@@ -1266,8 +1265,7 @@ class Scheduler(
                 f"available_size={len(self.req_to_token_pool.free_slots)}, "
                 f"total_size={self.req_to_token_pool.size}\n"
             )
-            logger.error(msg)
-            # raise ValueError(msg)
+            raise ValueError(msg)
 
         if (
             self.enable_metrics

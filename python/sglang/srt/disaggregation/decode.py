@@ -31,7 +31,6 @@ import numpy as np
 import torch
 from torch.distributed import ProcessGroup
 
-from sglang.srt.managers.schedule_batch import FINISH_ABORT
 from sglang.srt.disaggregation.base import BaseKVManager, BaseKVReceiver, KVArgs, KVPoll
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
@@ -45,6 +44,7 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce,
     prepare_abort,
 )
+from sglang.srt.managers.schedule_batch import FINISH_ABORT
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -345,7 +345,7 @@ class DecodeTransferQueue:
         polls = poll_and_all_reduce(
             [decode_req.kv_receiver for decode_req in self.queue], self.gloo_group
         )
-        
+
         # First, remove all failed requests from the queue
         for i, decode_req in enumerate(self.queue):
             if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
@@ -371,6 +371,9 @@ class DecodeTransferQueue:
                 )
                 self.scheduler.stream_output(
                     [decode_req.req], decode_req.req.return_logprob
+                )
+                print(
+                    f"[cleanup] {decode_req.req.rid=} {decode_req.req.req_pool_idx=} {len(decode_req.req.origin_input_ids)=} {len(decode_req.req.output_ids)=} {len(decode_req.req.fill_ids)=}"
                 )
                 # unlock the kv cache or it will have memory leak
                 self.tree_cache.cache_finished_req(decode_req.req)
@@ -407,7 +410,6 @@ class DecodeTransferQueue:
         ]
 
         return transferred_reqs
-
 
 
 class SchedulerDisaggregationDecodeMixin:

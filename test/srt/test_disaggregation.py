@@ -16,8 +16,7 @@ from sglang.test.test_utils import (
     run_with_timeout,
 )
 
-# skip this test because we have different_tp test
-@unittest.skip("skip this test because we have different_tp test")
+
 class TestDisaggregationMooncake(CustomTestCase):
     @classmethod
     def setUpClass(cls):

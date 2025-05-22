@@ -48,7 +48,9 @@ from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.disaggregation.base import BaseKVSender
-from sglang.srt.disaggregation.decode_schedule_batch_mixin import ScheduleBatchDisaggregationDecodeMixin
+from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
+    ScheduleBatchDisaggregationDecodeMixin,
+)
 from sglang.srt.layers.multimodal import gpu_tensor_hash
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
