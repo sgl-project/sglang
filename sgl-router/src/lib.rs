@@ -148,7 +148,7 @@ impl Router {
 
         // Create Prometheus config if enabled
         let prometheus_config = Some(PrometheusConfig {
-            port: self.prometheus_port.unwrap_or(31000),
+            port: self.prometheus_port.unwrap_or(29000),
             host: self
                 .prometheus_host
                 .clone()

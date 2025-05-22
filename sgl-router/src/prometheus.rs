@@ -11,7 +11,7 @@ pub struct PrometheusConfig {
 impl Default for PrometheusConfig {
     fn default() -> Self {
         Self {
-            port: 31000,
+            port: 29000,
             host: "0.0.0.0".to_string(),
         }
     }

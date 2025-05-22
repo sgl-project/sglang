@@ -183,7 +183,7 @@ class RouterArgs:
         parser.add_argument(
             f"--{prefix}prometheus-port",
             type=int,
-            default=31000,
+            default=29000,
             help="Port to expose Prometheus metrics. If not specified, Prometheus metrics are disabled",
         )
         parser.add_argument(
