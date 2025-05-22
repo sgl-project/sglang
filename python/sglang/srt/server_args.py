@@ -173,6 +173,8 @@ class ServerArgs:
     ep_num_redundant_experts: int = 0
     ep_dispatch_algorithm: Optional[Literal["static", "dynamic"]] = None
     init_expert_location: str = "trivial"
+    enable_eplb: bool = False
+    eplb_rebalance_num_iterations: int = 1000
     expert_distribution_recorder_mode: Optional[
         Literal["stat", "per_pass", "per_token"]
     ] = None
@@ -1292,6 +1294,17 @@ class ServerArgs:
             type=str,
             default=ServerArgs.init_expert_location,
             help="Initial location of EP experts.",
+        )
+        parser.add_argument(
+            "--enable-eplb",
+            action="store_true",
+            help="Enable EPLB algorithm",
+        )
+        parser.add_argument(
+            "--eplb-rebalance-num-iterations",
+            type=int,
+            default=ServerArgs.eplb_rebalance_num_iterations,
+            help="Number of iterations to automatically trigger a EPLB re-balance.",
         )
         parser.add_argument(
             "--expert-distribution-recorder-mode",
