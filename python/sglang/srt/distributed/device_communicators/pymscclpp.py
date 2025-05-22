@@ -177,7 +177,7 @@ class PyMscclppCommunicator:
     def should_msccl_allreduce(
         self, inp: torch.Tensor, op: ReduceOp = ReduceOp.SUM
     ) -> bool:
-        if self.disable or self._context is None:
+        if self.disabled or self._context is None:
             return False
         if inp.dtype not in PyMscclppCommunicator._SUPPORTED_DTYPE:
             return False
@@ -186,7 +186,7 @@ class PyMscclppCommunicator:
         # only support sum op
         if op != ReduceOp.SUM:
             return False
-        if inp.numel() * inp.element_size() > self.MAX_BYTES:
+        if inp.numel() * inp.element_size() > self.max_size:
             return False
         return True
 
@@ -194,9 +194,9 @@ class PyMscclppCommunicator:
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
                 self.graph_input_set.add((tensor.dtype, tensor.numel()))
-        stream = torch.cuda.current_stream()
-        self.allreduce_algo.register_tensor(tensor)
-        return self.allreduce_algo(stream)
+        result = torch.empty_like(tensor)
+        ops.mscclpp_allreduce(self._context, tensor, result)
+        return result
 
     @contextmanager
     def change_state(

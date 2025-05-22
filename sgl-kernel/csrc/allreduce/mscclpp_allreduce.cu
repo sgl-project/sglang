@@ -30,10 +30,10 @@ class MscclContext {
 using fptr_t = int64_t;
 static_assert(sizeof(void*) == sizeof(fptr_t));
 
-torch::Tensor _unique_id2tensor(const mscclpp::UniqueId& uid) {
+torch::Tensor _unique_id2tensor(const mscclpp::UniqueId& unique_id) {
   auto options = torch::TensorOptions().dtype(torch::kByte).device(torch::kCPU);
-  torch::Tensor tensor =
-      torch::from_blob(const_cast<uint8_t*>(uid.data()), {static_cast<int64_t>(uid.size())}, options);
+  auto tensor = torch::empty({static_cast<int64_t>(unique_id.size())}, options);
+  std::memcpy(tensor.data_ptr<uint8_t>(), unique_id.data(), unique_id.size());
   return tensor;
 }
 
@@ -117,10 +117,3 @@ void mscclpp_allreduce(fptr_t _context, torch::Tensor& inp, torch::Tensor& out) 
       throw std::runtime_error("custom allreduce only supports float32, float16 and bfloat16");
   }
 }
-
-// uncomment this for cpp_extension load check
-// PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-//   m.def("mscclpp_generate_unique_id", &mscclpp_generate_unique_id);
-//   m.def("mscclpp_init_context", &mscclpp_init_context);
-//   m.def("mscclpp_allreduce", &mscclpp_allreduce);
-// }

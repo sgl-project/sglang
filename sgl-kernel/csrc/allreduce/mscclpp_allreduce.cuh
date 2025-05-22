@@ -451,6 +451,41 @@ class MscclCommGroup {
       registered_memories.emplace(r, mem_feature.get());
     }
   }
+
+  void make_device_memory_handle_base_on_new_ptr(
+      const std::unordered_map<int, mscclpp::MemoryChannel>& old_memory_channels,
+      std::unordered_map<int, mscclpp::RegisteredMemory>& registered_sm_memories,
+      std::unordered_map<int, std::shared_ptr<mscclpp::MemoryDevice2DeviceSemaphore>>& memory_semaphores,
+      std::unordered_map<int, mscclpp::MemoryChannel>& memory_channels,
+      mscclpp::GpuBuffer<mscclpp::MemoryChannelDeviceHandle>& device_memory_handle,
+      void* input,
+      void* scratch,
+      const cudaStream_t stream) {
+    memory_channels.clear();
+    for (const auto& [peer, channel] : old_memory_channels) {
+      memory_channels.emplace(
+          peer, mscclpp::MemoryChannel(memory_semaphores[peer], registered_sm_memories[peer], input, scratch));
+    }
+    std::vector<mscclpp::MemoryChannel> memory_channels_list;
+    for (int r = 0; r < world_size_; r++) {
+      if (r == rank_) continue;
+      if (is_same_node(r, rank_)) {
+        memory_channels_list.push_back(memory_channels[r]);
+      }
+    }
+    std::vector<mscclpp::MemoryChannelDeviceHandle> memory_channel_handlers(memory_channels_list.size());
+    std::transform(
+        memory_channels_list.begin(),
+        memory_channels_list.end(),
+        memory_channel_handlers.begin(),
+        [](const mscclpp::MemoryChannel& channel) { return channel.deviceHandle(); });
+    mscclpp::gpuMemcpyAsync<mscclpp::MemoryChannelDeviceHandle>(
+        device_memory_handle.data(),
+        memory_channel_handlers.data(),
+        memory_channel_handlers.size(),
+        stream,
+        cudaMemcpyHostToDevice);
+  }
 };
 
 class Msccl1Shot1NodeLLcontext {
@@ -465,7 +500,8 @@ class Msccl1Shot1NodeLLcontext {
   std::unordered_map<int, std::shared_ptr<mscclpp::MemoryDevice2DeviceSemaphore>> memory_semaphores_;
   std::unordered_map<int, mscclpp::MemoryChannel> memory_channels_;
   mscclpp::GpuBuffer<mscclpp::MemoryChannelDeviceHandle> d_memHandles_;
-  std::vector<mscclpp::MemoryChannel> sm_channels;
+  std::unordered_map<void*, std::unordered_map<int, mscclpp::MemoryChannel>> input_ptr2memory_channels_;
+  std::unordered_map<void*, mscclpp::GpuBuffer<mscclpp::MemoryChannelDeviceHandle>> input_ptr2d_memHandles_;
   cudaStream_t h2d_stream;
 
  public:
@@ -480,7 +516,6 @@ class Msccl1Shot1NodeLLcontext {
       : scratch_(scratch), scratch_bytes_(scratch_bytes), d_memHandles_(world_size - 1) {
     CHECK_CUDA_SUCCESS(cudaStreamCreateWithFlags(&h2d_stream, cudaStreamNonBlocking));
     comm_group_ = std::make_shared<MscclCommGroup>(unique_id, rank, world_size, rank_to_node, rank_to_ib);
-    sm_channels.clear();
     comm_group_->make_connection(same_node_connections_, cross_node_connections_);
     comm_group_->make_memory_channels_with_scratch(
         scratch_,
@@ -513,46 +548,51 @@ class Msccl1Shot1NodeLLcontext {
   template <typename T>
   void
   allreduce(cudaStream_t stream, T* input, T* output, size_t input_numel, int threads = 512, int block_limit = 21) {
-    std::unordered_map<int, mscclpp::MemoryChannel> memory_channels;
-    for (const auto& [peer, channel] : memory_channels_) {
-      memory_channels.emplace(
-          peer, mscclpp::MemoryChannel(memory_semaphores_[peer], registered_sm_memories_[peer], input, scratch_));
-    }
-    std::vector<mscclpp::MemoryChannel> memory_channels_list;
-    for (int r = 0; r < comm_group_->world_size_; r++) {
-      if (r == comm_group_->rank_) continue;
-      if (comm_group_->is_same_node(r, comm_group_->rank_)) {
-        memory_channels_list.push_back(memory_channels[r]);
-      }
-    }
-    std::vector<mscclpp::MemoryChannelDeviceHandle> memory_channel_handlers(memory_channels_list.size());
-    std::transform(
-        memory_channels_list.begin(),
-        memory_channels_list.end(),
-        memory_channel_handlers.begin(),
-        [](const mscclpp::MemoryChannel& channel) { return channel.deviceHandle(); });
-    mscclpp::gpuMemcpyAsync<mscclpp::MemoryChannelDeviceHandle>(
-        d_memHandles_.data(),
-        memory_channel_handlers.data(),
-        memory_channel_handlers.size(),
-        h2d_stream,
-        cudaMemcpyHostToDevice);
-    cudaStreamCaptureStatus capturing_status;
-    CHECK_CUDA_SUCCESS(cudaStreamIsCapturing(stream, &capturing_status));
-    if (capturing_status != cudaStreamCaptureStatusActive) {
-      CHECK_CUDA_SUCCESS(cudaStreamSynchronize(h2d_stream));
-    }
-    std::swap(memory_channels, memory_channels_);
     dim3 nthrs(threads);
     dim3 nblks(block_limit);
+    cudaStreamCaptureStatus capturing_status;
+    CHECK_CUDA_SUCCESS(cudaStreamIsCapturing(stream, &capturing_status));
+    mscclpp::MemoryChannelDeviceHandle* memChans;
+    if (capturing_status != cudaStreamCaptureStatusActive) {
+      std::unordered_map<int, mscclpp::MemoryChannel> memory_channels;
+      comm_group_->make_device_memory_handle_base_on_new_ptr(
+          memory_channels_,
+          registered_sm_memories_,
+          memory_semaphores_,
+          memory_channels,
+          d_memHandles_,
+          input,
+          scratch_,
+          h2d_stream);
+      CHECK_CUDA_SUCCESS(cudaStreamSynchronize(h2d_stream));
+      memChans = d_memHandles_.data();
+    } else {
+      void* input_void_ptr = reinterpret_cast<void*>(input);
+      if (input_ptr2d_memHandles_.find(input_void_ptr) == input_ptr2d_memHandles_.end()) {
+        std::unordered_map<int, mscclpp::MemoryChannel> memory_channels;
+        mscclpp::GpuBuffer<mscclpp::MemoryChannelDeviceHandle> device_memory_handle(comm_group_->world_size_ - 1);
+        comm_group_->make_device_memory_handle_base_on_new_ptr(
+            memory_channels_,
+            registered_sm_memories_,
+            memory_semaphores_,
+            memory_channels,
+            device_memory_handle,
+            input,
+            scratch_,
+            h2d_stream);
+        input_ptr2memory_channels_.emplace(input_void_ptr, memory_channels);
+        input_ptr2d_memHandles_.emplace(input_void_ptr, device_memory_handle);
+      }
+      auto it = input_ptr2d_memHandles_.find(input_void_ptr);
+      memChans = it->second.data();
+    }
     allreduce_1shotLL_1node<T><<<nblks, nthrs, 0, stream>>>(
-        d_memHandles_.data(),
-        (T*)input,
-        (T*)scratch_,
-        output,
-        comm_group_->rank_,
-        comm_group_->world_size_,
-        input_numel);
+        memChans, (T*)input, (T*)scratch_, output, comm_group_->rank_, comm_group_->world_size_, input_numel);
+
+    cudaError_t status = cudaGetLastError();
+    if (status != cudaSuccess) {
+      printf("rank: %lu failed to launch allreduce_1shot_1node: %s\n", comm_group_->rank_, cudaGetErrorString(status));
+    }
   }
 };
 
@@ -600,7 +640,7 @@ class Msccl1Shot2NodeLLcontext {
         d_portHandles_(world_size - 1) {
     CHECK_CUDA_SUCCESS(cudaStreamCreateWithFlags(&h2d_stream, cudaStreamNonBlocking));
     comm_group_ = std::make_shared<MscclCommGroup>(unique_id, rank, world_size, rank_to_node, rank_to_ib);
-    proxyService = std::make_shared<mscclpp::ProxyService>();  // TODO: start proxy service
+    proxyService = std::make_shared<mscclpp::ProxyService>();
     proxyService->startProxy();
     comm_group_->make_connection(same_node_connections_, cross_node_connections_);
     comm_group_->make_memory_channels_with_scratch(
@@ -661,38 +701,44 @@ class Msccl1Shot2NodeLLcontext {
   template <typename T>
   void allreduce(
       cudaStream_t stream, T* input, T* output, const size_t input_numel, int threads = 512, int block_limit = 21) {
-    std::unordered_map<int, mscclpp::MemoryChannel> memory_channels;
-    for (const auto& [peer, channel] : memory_channels_) {
-      memory_channels.emplace(
-          peer, mscclpp::MemoryChannel(memory_semaphores_[peer], registered_sm_memories_[peer], input, scratch_));
-    }
-    std::vector<mscclpp::MemoryChannel> memory_channels_list;
-    for (int r = 0; r < comm_group_->world_size_; r++) {
-      if (r == comm_group_->rank_) continue;
-      if (comm_group_->is_same_node(r, comm_group_->rank_)) {
-        memory_channels_list.push_back(memory_channels[r]);
-      }
-    }
-    std::vector<mscclpp::MemoryChannelDeviceHandle> memory_channel_handlers(memory_channels_list.size());
-    std::transform(
-        memory_channels_list.begin(),
-        memory_channels_list.end(),
-        memory_channel_handlers.begin(),
-        [](const mscclpp::MemoryChannel& channel) { return channel.deviceHandle(); });
-    mscclpp::gpuMemcpyAsync<mscclpp::MemoryChannelDeviceHandle>(
-        d_memHandles_.data(),
-        memory_channel_handlers.data(),
-        memory_channel_handlers.size(),
-        h2d_stream,
-        cudaMemcpyHostToDevice);
-    cudaStreamCaptureStatus capturing_status;
-    CHECK_CUDA_SUCCESS(cudaStreamIsCapturing(stream, &capturing_status));
-    if (capturing_status != cudaStreamCaptureStatusActive) {
-      CHECK_CUDA_SUCCESS(cudaStreamSynchronize(h2d_stream));
-    }
-    std::swap(memory_channels, memory_channels_);
     dim3 nthrs(threads);
     dim3 nblks(block_limit);
+    cudaStreamCaptureStatus capturing_status;
+    CHECK_CUDA_SUCCESS(cudaStreamIsCapturing(stream, &capturing_status));
+    mscclpp::MemoryChannelDeviceHandle* memChans;
+    if (capturing_status != cudaStreamCaptureStatusActive) {
+      std::unordered_map<int, mscclpp::MemoryChannel> memory_channels;
+      comm_group_->make_device_memory_handle_base_on_new_ptr(
+          memory_channels_,
+          registered_sm_memories_,
+          memory_semaphores_,
+          memory_channels,
+          d_memHandles_,
+          input,
+          scratch_,
+          h2d_stream);
+      CHECK_CUDA_SUCCESS(cudaStreamSynchronize(h2d_stream));
+      memChans = d_memHandles_.data();
+    } else {
+      void* input_void_ptr = reinterpret_cast<void*>(input);
+      if (input_ptr2d_memHandles_.find(input_void_ptr) == input_ptr2d_memHandles_.end()) {
+        std::unordered_map<int, mscclpp::MemoryChannel> memory_channels;
+        mscclpp::GpuBuffer<mscclpp::MemoryChannelDeviceHandle> device_memory_handle(comm_group_->world_size_ - 1);
+        comm_group_->make_device_memory_handle_base_on_new_ptr(
+            memory_channels_,
+            registered_sm_memories_,
+            memory_semaphores_,
+            memory_channels,
+            device_memory_handle,
+            input,
+            scratch_,
+            h2d_stream);
+        input_ptr2memory_channels_.emplace(input_void_ptr, memory_channels);
+        input_ptr2d_memHandles_.emplace(input_void_ptr, device_memory_handle);
+      }
+      auto it = input_ptr2d_memHandles_.find(input_void_ptr);
+      memChans = it->second.data();
+    }
     allreduce_1shotLL_2node<T><<<nblks, nthrs, 0, stream>>>(
         d_memHandles_.data(),
         d_portHandles_.data(),
@@ -704,6 +750,11 @@ class Msccl1Shot2NodeLLcontext {
         8,
         comm_group_->world_size_,
         input_numel);
+
+    cudaError_t status = cudaGetLastError();
+    if (status != cudaSuccess) {
+      printf("rank: %lu failed to launch allreduce_1shot_2node: %s\n", comm_group_->rank_, cudaGetErrorString(status));
+    }
   }
 };
 

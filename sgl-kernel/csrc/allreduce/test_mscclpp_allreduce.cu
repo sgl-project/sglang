@@ -4,14 +4,14 @@
 usage:
 cd PATH-TO-THIS-FILE
 export MPI_HOME=/usr/local/mpi
+# export MPI_HOME=/opt/hpcx/ompi/
 export MSCCLPP_HOME=/workspace/test/mscclpp
-export TORCH_HOME=/usr/local/lib/python3.10/dist-packages/torch
 nvcc -O2 -arch=native -std=c++17 test_mscclpp_allreduce.cu \
   -o test_mscclpp_allreduce -D_GLIBCXX_USE_CXX11_ABI=0 \
-  -I/usr/include/python3.10/ -I${TORCH_HOME}/include -L${TORCH_HOME}/lib -ltorch \
   -I${MSCCLPP_HOME}/include -L${MSCCLPP_HOME}/build -lmscclpp \
   -lnccl -I${MPI_HOME}/include -L${MPI_HOME}/lib -lmpi
 
+/opt/hpcx/ompi/bin/
 mpirun --allow-run-as-root -H 127.0.0.1:8 -np 8 \
   --map-by ppr:8:node \
   --mca btl_openib_warn_no_device_params_found 0 \
@@ -24,7 +24,6 @@ mpirun --allow-run-as-root -H 127.0.0.1:8 -np 8 \
 #include <thrust/detail/raw_pointer_cast.h>
 #include <thrust/device_vector.h>
 #include <thrust/host_vector.h>
-
 
 #ifndef CHECK_CUDA_SUCCESS
 #define CHECK_CUDA_SUCCESS(cmd)                                                             \
@@ -83,8 +82,8 @@ int main(int argc, char* argv[]) {
   if (rank == 0) unique_id = mscclpp::TcpBootstrap::createUniqueId();
   MPI_Bcast(&unique_id, sizeof(unique_id), MPI_BYTE, 0, MPI_COMM_WORLD);
 
-  std::vector<int> rank_to_node(nranks);
-  std::vector<int> rank_to_ib(nranks);
+  std::vector<int64_t> rank_to_node(nranks);
+  std::vector<int64_t> rank_to_ib(nranks);
   for (int i = 0; i < nranks; i++) {
     rank_to_node[i] = i / 8;
     rank_to_ib[i] = i % 8;
