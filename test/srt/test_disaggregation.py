@@ -67,6 +67,8 @@ class TestDisaggregationAccuracy(CustomTestCase):
             str(cls.base_port + 100),
             "--tp",
             "4",
+            # "--disaggregation-ib-device",
+            # "mlx5_roce0,mlx5_roce1,mlx5_roce2,mlx5_roce3",
         ]
         cls.process_prefill = popen_launch_pd_server(
             cls.model,
@@ -89,6 +91,8 @@ class TestDisaggregationAccuracy(CustomTestCase):
             "4",
             "--base-gpu-id",
             "4",
+            # "--disaggregation-ib-device",
+            # "mlx5_roce4,mlx5_roce5,mlx5_roce6,mlx5_roce7",
         ]
         cls.process_decode = popen_launch_pd_server(
             cls.model,
@@ -220,8 +224,8 @@ class TestDisaggregationSpecAccuracy(CustomTestCase):
             str(cls.base_port + 100),
             "--tp",
             "4",
-            "--disaggregation-ib-device",
-            "mlx5_roce0,mlx5_roce1,mlx5_roce2,mlx5_roce3",
+            # "--disaggregation-ib-device",
+            # "mlx5_roce0,mlx5_roce1,mlx5_roce2,mlx5_roce3",
         ] + cls.spec_args
 
         cls.process_prefill = popen_launch_pd_server(
@@ -245,8 +249,8 @@ class TestDisaggregationSpecAccuracy(CustomTestCase):
             "4",
             "--base-gpu-id",
             "4",
-            "--disaggregation-ib-device",
-            "mlx5_roce4,mlx5_roce5,mlx5_roce6,mlx5_roce7",
+            # "--disaggregation-ib-device",
+            # "mlx5_roce4,mlx5_roce5,mlx5_roce6,mlx5_roce7",
         ] + cls.spec_args
         cls.process_decode = popen_launch_pd_server(
             cls.model,
