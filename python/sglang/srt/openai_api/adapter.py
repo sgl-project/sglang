@@ -980,12 +980,12 @@ def v1_chat_generate_request(
                 request.skip_special_tokens = False
                 if not isinstance(request.tool_choice, str):
                     tools = [
-                        item.function.model_dump()
+                        item.model_dump()
                         for item in request.tools
                         if item.function.name == request.tool_choice.function.name
                     ]
                 else:
-                    tools = [item.function.model_dump() for item in request.tools]
+                    tools = [item.model_dump() for item in request.tools]
 
                 tool_call_parser = tokenizer_manager.server_args.tool_call_parser
                 parser = FunctionCallParser(request.tools, tool_call_parser)
