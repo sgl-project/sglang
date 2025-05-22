@@ -53,6 +53,16 @@ def group_concurrent_contiguous(
     return src_groups, dst_groups
 
 
+class KVTransferError(Exception):
+    def __init__(self, bootstrap_room: int, failure_reason: str):
+        super().__init__(failure_reason)
+        self.bootstrap_room = bootstrap_room
+        self.failure_reason = failure_reason
+
+    def __str__(self):
+        return f"KVTransferError(bootstrap_room={self.bootstrap_room}): {self.failure_reason}"
+
+
 @dataclasses.dataclass
 class TransferKVChunk:
     room: int
@@ -530,7 +540,7 @@ class MooncakeKVManager(BaseKVManager):
             ):
                 self.record_failure(
                     room,
-                    f"KV transfer failed due to losing connection with prefill intance (bootstrap_addr: {self.bootstrap_addr})",
+                    f"KV transfer failed due to losing connection with prefill intance (bootstrap_addr: {failed_bootstrap_addr})",
                 )
                 self.update_status(room, KVPoll.Failed)
                 affected_rooms.append(room)
@@ -550,6 +560,7 @@ class MooncakeKVSender(BaseKVSender):
         self.aux_index = None
         self.bootstrap_server_url = bootstrap_addr
         self.session_id = self.kv_mgr.get_session_id()
+        self.conclude_state = None
         # inner state
         self.curr_idx = 0
 
@@ -579,7 +590,14 @@ class MooncakeKVSender(BaseKVSender):
             )
 
     def poll(self) -> KVPoll:
-        return self.kv_mgr.check_status(self.bootstrap_room)
+        if self.conclude_state is None:
+            status = self.kv_mgr.check_status(self.bootstrap_room)
+            if status in (KVPoll.Success, KVPoll.Failed):
+                self.conclude_state = status
+
+            return status
+        else:
+            return self.conclude_state
 
     def clear(self) -> None:
         self.kv_mgr.request_status.pop(self.bootstrap_room)
@@ -588,7 +606,7 @@ class MooncakeKVSender(BaseKVSender):
         self.clear()
         with self.kv_mgr.failure_lock:
             failure_reason = self.kv_mgr.failure_records.pop(self.bootstrap_room)
-        raise Exception(failure_reason)
+        raise KVTransferError(self.bootstrap_room, failure_reason)
 
 
 class MooncakeKVReceiver(BaseKVReceiver):
@@ -608,6 +626,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
         self.kv_mgr = mgr
         self.session_id = self.kv_mgr.get_session_id()
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
+        self.conclude_state = None
 
         if self.bootstrap_addr not in self.kv_mgr.prefill_dp_size_table:
             self.prefill_tp_size, self.prefill_dp_size = (
@@ -817,7 +836,14 @@ class MooncakeKVReceiver(BaseKVReceiver):
                 )
 
     def poll(self) -> KVPoll:
-        return self.kv_mgr.check_status(self.bootstrap_room)
+        if self.conclude_state is None:
+            status = self.kv_mgr.check_status(self.bootstrap_room)
+            if status in (KVPoll.Success, KVPoll.Failed):
+                self.conclude_state = status
+
+            return status
+        else:
+            return self.conclude_state
 
     def clear(self) -> None:
         self.kv_mgr.request_status.pop(self.bootstrap_room)
@@ -826,7 +852,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
         self.clear()
         with self.kv_mgr.failure_lock:
             failure_reason = self.kv_mgr.failure_records.pop(self.bootstrap_room)
-        raise Exception(failure_reason)
+        raise KVTransferError(self.bootstrap_room, failure_reason)
 
 
 class MooncakeKVBootstrapServer(BaseKVBootstrapServer):
