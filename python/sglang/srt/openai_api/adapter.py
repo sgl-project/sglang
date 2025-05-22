@@ -1250,8 +1250,8 @@ def v1_chat_generate_response(
                 ),
             )
             token_logprobs = []
-            for token_idx, (token, logprob) in enumerate(
-                zip(logprobs.tokens, logprobs.token_logprobs)
+            for token_idx, (token, token_id, logprob) in enumerate(
+                zip(logprobs.tokens, logprobs.token_ids, logprobs.token_logprobs)
             ):
                 token_bytes = list(token.encode("utf-8"))
                 top_logprobs = []
@@ -1270,6 +1270,7 @@ def v1_chat_generate_response(
                 token_logprobs.append(
                     ChatCompletionTokenLogprob(
                         token=token,
+                        token_id=token_id,
                         bytes=token_bytes,
                         logprob=logprob,
                         top_logprobs=top_logprobs,
@@ -1474,8 +1475,8 @@ async def v1_chat_completions(
                             content["meta_info"]["output_token_logprobs"]
                         )
                         token_logprobs = []
-                        for token, logprob in zip(
-                            logprobs.tokens, logprobs.token_logprobs
+                        for token, token_id, logprob in zip(
+                            logprobs.tokens, logprobs.token_ids, logprobs.token_logprobs
                         ):
                             token_bytes = list(token.encode("utf-8"))
                             top_logprobs = []
@@ -1494,6 +1495,7 @@ async def v1_chat_completions(
                             token_logprobs.append(
                                 ChatCompletionTokenLogprob(
                                     token=token,
+                                    token_id=token_id,
                                     bytes=token_bytes,
                                     logprob=logprob,
                                     top_logprobs=top_logprobs,
@@ -1894,10 +1896,10 @@ def to_openai_style_logprobs(
     ret_logprobs = LogProbs()
 
     def append_token_logprobs(token_logprobs):
-        for logprob, _, token_text in token_logprobs:
+        for logprob, token_id, token_text in token_logprobs:
             ret_logprobs.tokens.append(token_text)
             ret_logprobs.token_logprobs.append(logprob)
-
+            ret_logprobs.token_ids.append(token_id)
             # Not supported yet
             ret_logprobs.text_offset.append(-1)
 

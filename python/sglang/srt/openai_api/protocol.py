@@ -49,6 +49,7 @@ class ErrorResponse(BaseModel):
 class LogProbs(BaseModel):
     text_offset: List[int] = Field(default_factory=list)
     token_logprobs: List[Optional[float]] = Field(default_factory=list)
+    token_ids: List[int] = Field(default_factory=list)
     tokens: List[str] = Field(default_factory=list)
     top_logprobs: List[Optional[Dict[str, float]]] = Field(default_factory=list)
 
@@ -61,6 +62,7 @@ class TopLogprob(BaseModel):
 
 class ChatCompletionTokenLogprob(BaseModel):
     token: str
+    token_id: Optional[int] = None
     bytes: List[int]
     logprob: float
     top_logprobs: List[TopLogprob]
