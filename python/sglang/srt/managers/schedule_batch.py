@@ -469,7 +469,7 @@ class Req:
         self.return_hidden_states = return_hidden_states
         self.lora_path = lora_path
 
-        if self.sampling_params.stop_str and len(self.sampling_params.stop_strs) > 0:
+        if self.sampling_params.stop_strs and len(self.sampling_params.stop_strs) > 0:
             self.stop_buffer = ""
             self.max_buffer_size = max(20, self.sampling_params.stop_str_max_len * 2)
 
