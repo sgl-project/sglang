@@ -936,11 +936,11 @@ void shared_expert_kernel_impl(
 static inline void check_moe_scales(
     bool use_int8_w8a8,
     bool use_fp8_w8a16,
-    std::optional<at::Tensor>& w1_scale,
-    std::optional<at::Tensor>& w2_scale,
-    std::optional<std::vector<int64_t>> block_size,
-    std::optional<at::Tensor>& a1_scale,
-    std::optional<at::Tensor>& a2_scale) {
+    const std::optional<at::Tensor>& w1_scale,
+    const std::optional<at::Tensor>& w2_scale,
+    const std::optional<std::vector<int64_t>> block_size,
+    const std::optional<at::Tensor>& a1_scale,
+    const std::optional<at::Tensor>& a2_scale) {
   if (use_int8_w8a8) {
     TORCH_CHECK(w1_scale.has_value(), "missing w1_scale for int8 w8a8.");
     TORCH_CHECK(w2_scale.has_value(), "missing w2_scale for int8 w8a8.");
