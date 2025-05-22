@@ -24,6 +24,7 @@ import logging
 import os
 from collections import deque
 from dataclasses import dataclass
+from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import numpy as np
@@ -344,7 +345,7 @@ class DecodeTransferQueue:
         indices_to_remove = set()
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
             if poll == KVPoll.Failed:
-                error_message = f"Decode transfer failed for request rank={self.tp_rank} {decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
+                error_message = f"Decode transfer failed for request {decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
                 try:
                     decode_req.kv_receiver.failure_exception()
                 except Exception as e:
