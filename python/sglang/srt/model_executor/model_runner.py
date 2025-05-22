@@ -503,9 +503,9 @@ class ModelRunner:
 
         if not self.is_draft_worker:
             if self.device == "cpu":
-                import sgl_kernel.common_ops
+                import sgl_kernel
                 # Bind OpenMP threads to CPU cores
-                sgl_kernel.common_ops.init_cpu_threads_env(self.local_omp_cpuid)
+                torch.ops.sgl_kernel.init_cpu_threads_env(self.local_omp_cpuid)
 
             # Only initialize the distributed environment on the target model worker.
             init_distributed_environment(
