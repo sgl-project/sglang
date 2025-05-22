@@ -19,6 +19,8 @@ from sglang.test.test_utils import (
 )
 
 
+# skip the test because we have different_tp test
+@unittest.skip("skip the test because we have different_tp test")
 class TestDisaggregationAccuracy(CustomTestCase):
     @classmethod
     def setUpClass(cls):

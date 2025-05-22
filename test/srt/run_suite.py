@@ -115,7 +115,7 @@ suites = {
         # TestFile("test_deepep_intranode.py", 50),
         # TestFile("test_deepep_low_latency.py", 50),
         # TestFile("test_moe_deepep_eval_accuracy_large.py", 250),
-        # TestFile("test_disaggregation.py", 210), # disabled since we have different_tp test
+        TestFile("test_disaggregation.py", 210),
         TestFile("test_disaggregation_different_tp.py", 210),
         TestFile("test_full_deepseek_v3.py", 250),
     ],
