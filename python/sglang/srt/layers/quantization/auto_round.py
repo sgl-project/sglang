@@ -32,7 +32,6 @@ from sglang.srt.layers.linear import (
     LinearMethodBase,
     UnquantizedLinearMethod,
 )
-from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 
@@ -152,6 +151,7 @@ class AutoRoundConfig(QuantizationConfig):
         return weight_bits < 16
 
     def apply_awq_quant_layer(self, layer, prefix: str, backend: str = "auto"):
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
         from vllm.model_executor.layers.quantization.utils.marlin_utils import (
             check_marlin_supported, check_moe_marlin_supports_layer)
 
@@ -224,6 +224,7 @@ class AutoRoundConfig(QuantizationConfig):
                                layer,
                                prefix: str,
                                backend: str = "auto"):
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
         from vllm.model_executor.layers.quantization.utils.marlin_utils import (
             check_marlin_supported, check_moe_marlin_supports_layer)
         weight_bits, group_size, sym = self.get_layer_config(layer, prefix)
