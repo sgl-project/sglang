@@ -383,12 +383,9 @@ class DefaultModelLoader(BaseModelLoader):
                 else:
                     model = model_class
 
-            start_time = time.time()
             self.load_weights_and_postprocess(
                 model, self._get_all_weights(model_config, model), target_device
             )
-            cost = time.time() - start_time
-            print(f"load weights: {cost} seconds")
 
         return model.eval()
 
