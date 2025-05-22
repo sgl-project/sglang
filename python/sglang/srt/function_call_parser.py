@@ -351,10 +351,19 @@ class Qwen25Detector(BaseFormatDetector):
         pattern = rf"{self.bot_token}(.*?){self.eot_token}"
         match_result_list = re.findall(pattern, text, re.DOTALL)
         calls = []
-        for match_result in match_result_list:
-            match_result = json.loads(match_result)
-            calls.extend(self.parse_base_json(match_result, tools))
-        return StreamingParseResult(normal_text=normal_text, calls=calls)
+        try:
+            for match_result in match_result_list:
+                try:
+                    parsed_result = json.loads(match_result)
+                    calls.extend(self.parse_base_json(parsed_result, tools))
+                except json.JSONDecodeError as e:
+                    logger.warning(f"Failed to parse JSON part: {match_result}")
+                    logger.warning(f"JSON parse error: {str(e)}")
+                    continue
+            return StreamingParseResult(normal_text=normal_text, calls=calls)
+        except Exception as e:
+            logger.error(f"Error in detect_and_parse: {e}")
+            return StreamingParseResult(normal_text=text)
 
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(
@@ -411,12 +420,20 @@ class MistralDetector(BaseFormatDetector):
         tool_content = text.replace("[TOOL_CALLS]", "").strip()
         raw_tool_calls = self.tool_call_regex.findall(tool_content)
         calls = []
-        if len(raw_tool_calls) > 0:
-            raw_tool_call = raw_tool_calls[0]
-            function_call_arr = json.loads(raw_tool_call)
-            for match_result in function_call_arr:
-                calls.extend(self.parse_base_json(match_result, tools))
-        return StreamingParseResult(normal_text=normal_text, calls=calls)
+        try:
+            if len(raw_tool_calls) > 0:
+                raw_tool_call = raw_tool_calls[0]
+                try:
+                    function_call_arr = json.loads(raw_tool_call)
+                    for match_result in function_call_arr:
+                        calls.extend(self.parse_base_json(match_result, tools))
+                except json.JSONDecodeError as e:
+                    logger.warning(f"Failed to parse JSON part: {raw_tool_call}")
+                    logger.warning(f"JSON parse error: {str(e)}")
+            return StreamingParseResult(normal_text=normal_text, calls=calls)
+        except Exception as e:
+            logger.error(f"Error in detect_and_parse: {e}")
+            return StreamingParseResult(normal_text=text)
 
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(
@@ -445,31 +462,37 @@ class Llama32Detector(BaseFormatDetector):
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         """Parse function calls from text, handling multiple JSON objects."""
-        if "<|python_tag|>" not in text and not text.startswith("{"):
+        try:
+            if "<|python_tag|>" not in text and not text.startswith("{"):
+                return StreamingParseResult(normal_text=text, calls=[])
+
+            if "<|python_tag|>" in text:
+                normal_text, action_text = text.split("<|python_tag|>")
+            else:
+                normal_text, action_text = "", text
+
+            # Split by semicolon and process each part
+            json_parts = [
+                part.strip() for part in action_text.split(";") if part.strip()
+            ]
+            all_actions = []
+            for part in json_parts:
+                try:
+                    # Parse each individual JSON object
+                    action = json.loads(part)
+                    all_actions.append(action)
+                except json.JSONDecodeError as e:
+                    logger.warning(f"Failed to parse JSON part: {part}")
+                    logger.warning(f"JSON parse error: {str(e)}")
+                    continue
+            calls = []
+            # Only process if we found valid JSON objects
+            if all_actions:
+                calls = self.parse_base_json(all_actions, tools)
+            return StreamingParseResult(normal_text=normal_text, calls=calls)
+        except Exception as e:
+            logger.error(f"Error in detect_and_parse: {e}")
             return StreamingParseResult(normal_text=text, calls=[])
-
-        if "<|python_tag|>" in text:
-            normal_text, action_text = text.split("<|python_tag|>")
-        else:
-            normal_text, action_text = "", text
-
-        # Split by semicolon and process each part
-        json_parts = [part.strip() for part in action_text.split(";") if part.strip()]
-        all_actions = []
-        for part in json_parts:
-            try:
-                # Parse each individual JSON object
-                action = json.loads(part)
-                all_actions.append(action)
-            except json.JSONDecodeError as e:
-                logger.warning(f"Failed to parse JSON part: {part}")
-                logger.warning(f"JSON parse error: {str(e)}")
-                continue
-        calls = []
-        # Only process if we found valid JSON objects
-        if all_actions:
-            calls = self.parse_base_json(all_actions, tools)
-        return StreamingParseResult(normal_text=normal_text, calls=calls)
 
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(
