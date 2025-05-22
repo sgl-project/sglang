@@ -13,14 +13,13 @@ import torch.distributed as dist
 
 from sglang.srt.utils import get_ip
 
+FakeBootstrapHost = "2.2.2.2"
+
 
 class DisaggregationMode(Enum):
     NULL = "null"
     PREFILL = "prefill"
     DECODE = "decode"
-
-
-FakeBootstrapHost = "2.2.2.2"
 
 
 def poll_and_all_reduce(pollers, gloo_group):
@@ -112,7 +111,7 @@ def get_kv_class(transfer_backend: TransferBackend, class_type: KVClassType):
 
 
 def kv_to_page_indices(kv_indices: np.ndarray, page_size: int):
-    # 1. The page is guaruanteed to be full except the last page.
+    # 1. The page is guaranteed to be full except the last page.
     # 2. page index = kv_index // page_size
     # The return vector is kv_indices[::page_size] // page_size
     if page_size == 1:  # shortcut
@@ -162,3 +161,24 @@ def register_disaggregation_server(
         warnings.warn(
             f"Failed to register disaggregation server: {res.status_code} {res.text}"
         )
+
+
+def is_mla_backend(target_kv_pool) -> bool:
+    from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+
+    return isinstance(target_kv_pool, MLATokenToKVPool)
+
+
+def prepare_abort(req: Req, error_message: str, status_code=None):
+    from sglang.srt.managers.schedule_batch import FINISH_ABORT
+
+    # populate finish metadata and stream output
+    req.finished_reason = FINISH_ABORT(error_message, status_code)
+
+    if req.return_logprob:
+        req.input_token_logprobs_val = []
+        req.input_token_logprobs_idx = []
+        req.input_top_logprobs_val = []
+        req.input_top_logprobs_idx = []
+        req.input_token_ids_logprobs_val = []
+        req.input_token_ids_logprobs_idx = []

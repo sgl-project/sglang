@@ -104,7 +104,7 @@ def _per_token_group_quant_fp8(
     y_s_ptr,
     # Stride of input
     y_stride,
-    # Collums of input
+    # Columns of input
     N,
     # Avoid to divide zero
     eps,
@@ -308,8 +308,8 @@ def sglang_per_token_group_quant_fp8(
             device=x.device,
             dtype=torch.float32,
         )
-
-    sgl_per_token_group_quant_fp8(x, x_q, x_s, group_size, eps, fp8_min, fp8_max)
+    if x.shape[0] > 0:
+        sgl_per_token_group_quant_fp8(x, x_q, x_s, group_size, eps, fp8_min, fp8_max)
 
     return x_q, x_s
 
@@ -342,7 +342,7 @@ def _static_quant_fp8(
     y_s_repeat_ptr,
     # Stride of input
     y_stride,
-    # Collums of input
+    # Columns of input
     N,
     # Information for float8
     fp8_min,
@@ -794,7 +794,7 @@ def w8a8_block_fp8_matmul(
             config = configs[min(configs.keys(), key=lambda x: abs(x - M))]
         else:
             # Default config
-            # Block-wise quant: BLOCK_SIZE_K must be divisable by block_size[1]
+            # Block-wise quant: BLOCK_SIZE_K must be divisible by block_size[1]
             config = {
                 "BLOCK_SIZE_M": 64,
                 "BLOCK_SIZE_N": block_size[0],

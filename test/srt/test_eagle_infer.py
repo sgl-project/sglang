@@ -97,7 +97,9 @@ class TestEAGLEEngine(CustomTestCase):
 
         print(f"{engine.get_server_info()=}")
 
-        avg_spec_accept_length = engine.get_server_info()["avg_spec_accept_length"]
+        avg_spec_accept_length = engine.get_server_info()["internal_states"][0][
+            "avg_spec_accept_length"
+        ]
         print(f"{avg_spec_accept_length=}")
         self.assertGreater(avg_spec_accept_length, 1.9)
 
@@ -296,7 +298,9 @@ class TestEAGLEServer(CustomTestCase):
         self.assertGreater(metrics["accuracy"], 0.20)
 
         server_info = requests.get(self.base_url + "/get_server_info").json()
-        avg_spec_accept_length = server_info["avg_spec_accept_length"]
+        avg_spec_accept_length = server_info["internal_states"][0][
+            "avg_spec_accept_length"
+        ]
         print(f"{avg_spec_accept_length=}")
 
         speculative_eagle_topk = server_info["speculative_eagle_topk"]
@@ -476,6 +480,41 @@ class TestEAGLEServer(CustomTestCase):
         random.shuffle(args * 5)
         with ThreadPoolExecutor(8) as executor:
             list(executor.map(self.run_decode, args))
+
+    def test_constrained_decoding(self):
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "Give me a json"},
+        ]
+
+        response = requests.post(
+            self.base_url + "/v1/chat/completions",
+            json={
+                "model": DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
+                "messages": messages,
+                "temperature": 0,
+                "response_format": {"type": "json_object"},
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        res = response.json()
+
+        # Validate response structure
+        self.assertIn("choices", res)
+        self.assertEqual(len(res["choices"]), 1)
+        self.assertIn("message", res["choices"][0])
+        self.assertIn("content", res["choices"][0]["message"])
+
+        # Validate JSON content
+        content_json = res["choices"][0]["message"]["content"]
+        is_valid_json = True
+        try:
+            content = json.loads(content_json)
+            self.assertIsInstance(content, dict)
+        except Exception:
+            print(f"parse JSON failed: {content_json}")
+            is_valid_json = False
+        self.assertTrue(is_valid_json)
 
 
 class TestEAGLERetract(TestEAGLEServer):
