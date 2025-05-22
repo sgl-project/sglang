@@ -37,8 +37,8 @@ inline __device__ void apply_token_rotary_embedding(
     x_index = rot_offset;
     y_index = embed_dim + rot_offset;
 
-    scalar_t cos_val = cos_ptr[rot_offset];
-    scalar_t sin_val = sin_ptr[rot_offset];
+    scalar_t cos_val = SGLANG_LDG(cos_ptr + rot_offset);
+    scalar_t sin_val = SGLANG_LDG(sin_ptr + rot_offset);
 
     const scalar_t x = arr[x_index];
     const scalar_t y = arr[y_index];
@@ -47,13 +47,13 @@ inline __device__ void apply_token_rotary_embedding(
 
   } else {
     // GPT-J style / LLaMA style, matching the Python if cos/sin are [..., head_size]
-    x_index = rot_offset;
-    y_index = rot_offset + embed_dim;
+    x_index = rot_offset;              // first half
+    y_index = rot_offset + embed_dim;  // second half
 
-    const scalar_t cos_val_x = cos_ptr[rot_offset];
-    const scalar_t sin_val_x = sin_ptr[rot_offset];
-    const scalar_t cos_val_y = cos_ptr[rot_offset + embed_dim];
-    const scalar_t sin_val_y = sin_ptr[rot_offset + embed_dim];
+    const scalar_t cos_val_x = SGLANG_LDG(cos_ptr + rot_offset);
+    const scalar_t sin_val_x = SGLANG_LDG(sin_ptr + rot_offset);
+    const scalar_t cos_val_y = SGLANG_LDG(cos_ptr + rot_offset + embed_dim);
+    const scalar_t sin_val_y = SGLANG_LDG(sin_ptr + rot_offset + embed_dim);
 
     const scalar_t x = arr[x_index];
     const scalar_t y = arr[y_index];
@@ -78,8 +78,8 @@ inline __device__ void apply_rotary_embedding(
 
   const int nq_pairs = num_heads * embed_dim_for_rotation;
   for (int i = threadIdx.x; i < nq_pairs; i += blockDim.x) {
-    const int rot_offset = i % embed_dim_for_rotation;
     const int head_idx = i / embed_dim_for_rotation;
+    const int rot_offset = i % embed_dim_for_rotation;
 
     scalar_t* query_for_token_head = query + head_idx * (int)head_stride_query;
 
@@ -115,20 +115,9 @@ __global__ void rotary_embedding_kernel(
     const int num_heads,
     const int num_kv_heads,
     const int head_size) {
-  extern __shared__ char smem[];
-  scalar_t* shared_cos = reinterpret_cast<scalar_t*>(smem);
-  scalar_t* shared_sin = shared_cos + rot_dim_arg;
-
   const int token_idx = blockIdx.x;
   const scalar_t* current_token_cos_ptr = cos_data + token_idx * rot_dim_arg;
   const scalar_t* current_token_sin_ptr = sin_data + token_idx * rot_dim_arg;
-
-  for (int i = threadIdx.x; i < rot_dim_arg; i += blockDim.x) {
-    shared_cos[i] = current_token_cos_ptr[i];
-    shared_sin[i] = current_token_sin_ptr[i];
-  }
-
-  __syncthreads();
 
   scalar_t* query_for_token = query_total + token_idx * (int)query_token_stride;
   scalar_t* key_for_token = (key_total != nullptr) ? (key_total + token_idx * (int)key_token_stride) : nullptr;
@@ -136,8 +125,8 @@ __global__ void rotary_embedding_kernel(
   apply_rotary_embedding<scalar_t, IS_NEOX>(
       query_for_token,
       key_for_token,
-      shared_cos,
-      shared_sin,
+      current_token_cos_ptr,
+      current_token_sin_ptr,
       head_size,
       num_heads,
       num_kv_heads,
@@ -237,9 +226,8 @@ void rotary_embedding(
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
   SGLANG_DISPATCH_FLOATING_TYPES(query.scalar_type(), "rotary_embedding", [&] {
-    const size_t shared_mem_size = 2 * rot_dim_from_cache * sizeof(scalar_t);
     if (is_neox) {
-      rotary_embedding_kernel<scalar_t, true><<<grid, block, shared_mem_size, stream>>>(
+      rotary_embedding_kernel<scalar_t, true><<<grid, block, 0, stream>>>(
           cos.data_ptr<scalar_t>(),
           sin.data_ptr<scalar_t>(),
           query.data_ptr<scalar_t>(),
@@ -253,7 +241,7 @@ void rotary_embedding(
           num_kv_heads,
           (int)head_size);
     } else {
-      rotary_embedding_kernel<scalar_t, false><<<grid, block, shared_mem_size, stream>>>(
+      rotary_embedding_kernel<scalar_t, false><<<grid, block, 0, stream>>>(
           cos.data_ptr<scalar_t>(),
           sin.data_ptr<scalar_t>(),
           query.data_ptr<scalar_t>(),

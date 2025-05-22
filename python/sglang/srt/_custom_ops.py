@@ -1,6 +1,6 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/_custom_ops.py
 import logging
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 import torch
 
@@ -23,6 +23,7 @@ if not is_hpu():
             import sgl_kernel
         except ImportError as e:
             logger.warning("Failed to import from custom_ar with %r", e)
+
 
 if not is_hip():
     if use_vllm_custom_allreduce:

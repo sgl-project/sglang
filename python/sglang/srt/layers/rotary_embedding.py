@@ -84,9 +84,9 @@ class RotaryEmbedding(CustomOp):
             cache = cache.to(dtype)
 
         if not _is_cuda or self.head_size not in [64, 128, 256, 512]:
-            from sgl_kernel import rotary_embedding
+            from vllm._custom_ops import rotary_embedding
 
-            self.sglang_rotary_embedding = rotary_embedding
+            self.vllm_rotary_embedding = rotary_embedding
 
         self.cos_sin_cache: torch.Tensor
         self.register_buffer("cos_sin_cache", cache, persistent=False)
@@ -118,7 +118,7 @@ class RotaryEmbedding(CustomOp):
 
     def forward_native(
         self,
-        positions: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+        positions: torch.Tensor,
         query: torch.Tensor,
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
@@ -126,15 +126,10 @@ class RotaryEmbedding(CustomOp):
         """A PyTorch-native implementation of forward()."""
         if offsets is not None:
             positions = positions + offsets
-
-        if isinstance(positions, torch.Tensor):
-            positions = positions.flatten()
-            cos_sin = self.cos_sin_cache.index_select(0, positions)
-            cos, sin = cos_sin.chunk(2, dim=-1)
-            num_tokens = positions.shape[0]
-        else:
-            cos, sin = positions
-            num_tokens = cos.shape[0]
+        positions = positions.flatten()
+        num_tokens = positions.shape[0]
+        cos_sin = self.cos_sin_cache.index_select(0, positions)
+        cos, sin = cos_sin.chunk(2, dim=-1)
 
         query_shape = query.shape
         query = query.view(num_tokens, -1, self.head_size)
@@ -153,7 +148,7 @@ class RotaryEmbedding(CustomOp):
 
     def forward_cuda(
         self,
-        positions: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+        positions: torch.Tensor,
         query: torch.Tensor,
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
@@ -168,24 +163,15 @@ class RotaryEmbedding(CustomOp):
                 is_neox=self.is_neox_style,
             )
         else:
-
-            cos, sin = positions
-            assert cos.dtype == torch.float and cos.is_contiguous()
-            assert sin.dtype == torch.float and sin.is_contiguous()
-            orig_q_dtype = query.dtype
-            orig_k_dtype = key.dtype
-            query, key = query.float(), key.float()
-
-            self.sglang_rotary_embedding(
-                cos,
-                sin,
+            self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
+            self.vllm_rotary_embedding(
+                positions,
                 query,
                 key,
                 self.head_size,
+                self.cos_sin_cache,
                 self.is_neox_style,
             )
-            query = query.to(dtype=orig_q_dtype)
-            key = key.to(dtype=orig_k_dtype)
         return query, key
 
     def extra_repr(self) -> str:
