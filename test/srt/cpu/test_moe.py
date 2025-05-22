@@ -5,9 +5,9 @@ import unittest
 import torch
 
 # TODO: use interface in cpu.py
-from sgl_kernel.common_ops import convert_weight_packed
-from sgl_kernel.common_ops import fused_experts_cpu as fused_experts
-from sgl_kernel.common_ops import grouped_topk_cpu as grouped_topk
+import sgl_kernel
+kernel = torch.ops.sgl_kernel
+
 from utils import (
     BLOCK_K,
     BLOCK_N,
@@ -32,13 +32,13 @@ def fused_moe(a, w1, w2, score, topk, renormalize, prepack):
     B, D = a.shape
     topk_weights = torch.empty(B, topk, dtype=torch.float32)
     topk_ids = torch.empty(B, topk, dtype=torch.int32)
-    topk_weights, topk_ids = grouped_topk(a, score, topk, renormalize, G, topk_group)
+    topk_weights, topk_ids = kernel.grouped_topk_cpu(a, score, topk, renormalize, G, topk_group)
 
-    packed_w1 = convert_weight_packed(w1) if prepack else w1
-    packed_w2 = convert_weight_packed(w2) if prepack else w2
+    packed_w1 = kernel.convert_weight_packed(w1) if prepack else w1
+    packed_w2 = kernel.convert_weight_packed(w2) if prepack else w2
 
     inplace = True
-    return fused_experts(
+    return kernel.fused_experts_cpu(
         a,
         packed_w1,
         packed_w2,
@@ -146,9 +146,9 @@ class TestFusedExperts(CustomTestCase):
         )
 
         inplace = True
-        packed_w1 = convert_weight_packed(w1) if prepack else w1
-        packed_w2 = convert_weight_packed(w2) if prepack else w2
-        out = fused_experts(
+        packed_w1 = kernel.convert_weight_packed(w1) if prepack else w1
+        packed_w2 = kernel.convert_weight_packed(w2) if prepack else w2
+        out = kernel.fused_experts_cpu(
             a,
             packed_w1,
             packed_w2,
@@ -209,13 +209,13 @@ class TestFusedExperts(CustomTestCase):
         score = torch.softmax(score, dim=-1, dtype=torch.float32)
         topk_weight, topk_ids = torch.topk(score, topk)
 
-        w1 = convert_weight_packed(w1)
-        w2 = convert_weight_packed(w2)
+        w1 = kernel.convert_weight_packed(w1)
+        w2 = kernel.convert_weight_packed(w2)
 
         ref_out = native_fp8_fused_moe(
             a, w1_scaled, w2_scaled, topk_weight, topk_ids, topk
         )
-        out = fused_experts(
+        out = kernel.fused_experts_cpu(
             a,
             w1,
             w2,
