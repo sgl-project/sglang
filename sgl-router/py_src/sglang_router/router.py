@@ -40,8 +40,8 @@ class Router:
             worker URLs using this port. Default: 80
         service_discovery_namespace: Kubernetes namespace to watch for pods. If not provided,
             watches pods across all namespaces (requires cluster-wide permissions). Default: None
-        prometheus_port: Port to expose Prometheus metrics. If None, Prometheus metrics are disabled. Default: None
-        prometheus_host: Host address to bind the Prometheus metrics server. Default: '127.0.0.1'
+        prometheus_port: Port to expose Prometheus metrics. Default: None
+        prometheus_host: Host address to bind the Prometheus metrics server. Default: None
     """
 
     def __init__(

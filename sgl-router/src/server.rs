@@ -1,8 +1,8 @@
 use crate::logging::{self, LoggingConfig};
+use crate::prometheus::{self, PrometheusConfig};
 use crate::router::PolicyConfig;
 use crate::router::Router;
 use crate::service_discovery::{start_service_discovery, ServiceDiscoveryConfig};
-use crate::prometheus::{self, PrometheusConfig};
 use actix_web::{
     error, get, post, web, App, Error, HttpRequest, HttpResponse, HttpServer, Responder,
 };
@@ -188,12 +188,14 @@ pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
 
     // Initialize prometheus metrics exporter
     if let Some(prometheus_config) = config.prometheus_config {
-        info!("🚧 Initializing Prometheus metrics on {}:{}", prometheus_config.host, prometheus_config.port);
+        info!(
+            "🚧 Initializing Prometheus metrics on {}:{}",
+            prometheus_config.host, prometheus_config.port
+        );
         prometheus::start_prometheus(prometheus_config);
     } else {
         info!("🚧 Prometheus metrics disabled");
     }
-
 
     info!("🚧 Initializing router on {}:{}", config.host, config.port);
     info!("🚧 Initializing workers on {:?}", config.worker_urls);

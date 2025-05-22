@@ -1,4 +1,5 @@
 use crate::tree::Tree;
+use ::metrics::{counter, gauge, histogram};
 use actix_web::http::header::{HeaderValue, CONTENT_TYPE};
 use actix_web::{HttpRequest, HttpResponse};
 use bytes::Bytes;
@@ -10,10 +11,9 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
+use std::time::Instant;
 use tokio;
 use tracing::{debug, error, info, warn};
-use ::metrics::{counter, gauge, histogram};
-use std::time::Instant;
 
 fn copy_request_headers(req: &HttpRequest) -> Vec<(String, String)> {
     req.headers()
@@ -364,10 +364,12 @@ impl Router {
         if route != "/health" {
             let duration = start.elapsed();
             counter!("sgl_router_requests_total", "route" => route.to_string()).increment(1);
-            histogram!("sgl_router_request_duration_seconds", "route" => route.to_string()).record(duration.as_secs_f64());
+            histogram!("sgl_router_request_duration_seconds", "route" => route.to_string())
+                .record(duration.as_secs_f64());
 
             if !response.status().is_success() {
-                counter!("sgl_router_request_errors_total", "route" => route.to_string()).increment(1);
+                counter!("sgl_router_request_errors_total", "route" => route.to_string())
+                    .increment(1);
             }
         }
         response
@@ -562,7 +564,8 @@ impl Router {
                     .get_mut(&selected_url)
                     .unwrap() += 1;
 
-                gauge!("sgl_router_running_requests", "worker" => selected_url.to_string()).set(*running_queue.get(&selected_url).unwrap() as f64);
+                gauge!("sgl_router_running_requests", "worker" => selected_url.to_string())
+                    .set(*running_queue.get(&selected_url).unwrap() as f64);
                 counter!("sgl_router_processed_requests_total", "worker" => selected_url.to_string()).increment(1);
 
                 tree.insert(&text, &selected_url);
@@ -693,7 +696,8 @@ impl Router {
                     let health_response =
                         self.send_request(client, &worker_url, "/health", req).await;
                     if health_response.status().is_success() {
-                        counter!("sgl_router_request_errors_total", "route" => route.to_string()).increment(1);
+                        counter!("sgl_router_request_errors_total", "route" => route.to_string())
+                            .increment(1);
                         return response;
                     }
                 }

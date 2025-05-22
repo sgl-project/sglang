@@ -183,6 +183,7 @@ class RouterArgs:
         parser.add_argument(
             f"--{prefix}prometheus-port",
             type=int,
+            default=31000,
             help="Port to expose Prometheus metrics. If not specified, Prometheus metrics are disabled",
         )
         parser.add_argument(
@@ -295,6 +296,8 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
             selector=router_args.selector,
             service_discovery_port=router_args.service_discovery_port,
             service_discovery_namespace=router_args.service_discovery_namespace,
+            prometheus_port=router_args.prometheus_port,
+            prometheus_host=router_args.prometheus_host,
         )
 
         router.start()

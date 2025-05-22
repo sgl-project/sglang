@@ -1,6 +1,6 @@
-use metrics_exporter_prometheus::{PrometheusBuilder, Matcher};
-use std::time::Duration;
+use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::time::Duration;
 
 #[derive(Debug, Clone)]
 pub struct PrometheusConfig {
@@ -20,11 +20,14 @@ impl Default for PrometheusConfig {
 pub fn start_prometheus(config: PrometheusConfig) {
     let duration_matcher = Matcher::Suffix(String::from("duration"));
     let duration_bucket = [
-        0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
-        15.0, 30.0, 45.0, 60.0, 90.0, 120.0, 180.0, 240.0,
+        0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 15.0, 30.0, 45.0,
+        60.0, 90.0, 120.0, 180.0, 240.0,
     ];
 
-    let ip_addr: IpAddr = config.host.parse().unwrap_or(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)));
+    let ip_addr: IpAddr = config
+        .host
+        .parse()
+        .unwrap_or(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)));
     let socket_addr = SocketAddr::new(ip_addr, config.port);
 
     PrometheusBuilder::new()
@@ -34,5 +37,4 @@ pub fn start_prometheus(config: PrometheusConfig) {
         .expect("failed to set duration bucket")
         .install()
         .expect("failed to install Prometheus metrics exporter");
-    // metrics::set_global_recorder(recorder).expect("failed to set global metrics recorder");
 }

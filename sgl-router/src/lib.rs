@@ -1,11 +1,11 @@
 use pyo3::prelude::*;
 pub mod logging;
 use std::collections::HashMap;
+pub mod prometheus;
 pub mod router;
 pub mod server;
 pub mod service_discovery;
 pub mod tree;
-pub mod prometheus;
 use crate::prometheus::PrometheusConfig;
 
 #[pyclass(eq)]
@@ -147,11 +147,13 @@ impl Router {
         };
 
         // Create Prometheus config if enabled
-        let prometheus_config =
-            Some(PrometheusConfig {
-                port: self.prometheus_port.unwrap_or(31000),
-                host: self.prometheus_host.clone().unwrap_or_else(|| "127.0.0.1".to_string()),
-            });
+        let prometheus_config = Some(PrometheusConfig {
+            port: self.prometheus_port.unwrap_or(31000),
+            host: self
+                .prometheus_host
+                .clone()
+                .unwrap_or_else(|| "127.0.0.1".to_string()),
+        });
 
         actix_web::rt::System::new().block_on(async move {
             server::startup(server::ServerConfig {
