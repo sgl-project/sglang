@@ -308,18 +308,18 @@ void rotary_emb_kernel_impl(
 }  // anonymous namespace
 
 extern at::Tensor
-weight_packed_linear(at::Tensor& mat1, at::Tensor& mat2, std::optional<at::Tensor>& bias, bool is_vnni);
+weight_packed_linear(at::Tensor& mat1, at::Tensor& mat2, const std::optional<at::Tensor>& bias, bool is_vnni);
 
 extern at::Tensor int8_scaled_mm_with_quant(
     at::Tensor& mat1,
     at::Tensor& mat2,
     at::Tensor& scales2,
-    std::optional<at::Tensor>& bias,
+    const std::optional<at::Tensor>& bias,
     at::ScalarType out_dtype,
     bool is_vnni);
 
 extern void
-bmm_cpu(at::Tensor& out, at::Tensor& mat1, at::Tensor& mat2, bool is_vnni, std::optional<at::Tensor>& scale);
+bmm_cpu(at::Tensor& out, at::Tensor& mat1, at::Tensor& mat2, bool is_vnni, const std::optional<at::Tensor>& scale);
 
 // NB: shapes in DeepDeek R1
 //
@@ -343,9 +343,9 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> qkv_proj_with_rope(
     at::Tensor& cos_sin_cache,
     double eps,
     bool use_int8_w8a8,
-    std::optional<at::Tensor>& q_a_proj_scale,
-    std::optional<at::Tensor>& q_b_proj_scale,
-    std::optional<at::Tensor>& kv_a_proj_scale,
+    std::optional<at::Tensor> q_a_proj_scale,
+    std::optional<at::Tensor> q_b_proj_scale,
+    std::optional<at::Tensor> kv_a_proj_scale,
     bool is_vnni) {
   RECORD_FUNCTION(
       "sgl-kernel::qkv_proj_with_rope",
