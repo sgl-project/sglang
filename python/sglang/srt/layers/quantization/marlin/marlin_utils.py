@@ -4,13 +4,14 @@ from typing import List, Optional, Tuple
 
 import numpy
 import torch
-import vllm.envs as envs
 from vllm import _custom_ops as ops
-from vllm.model_executor.layers.linear import LinearBase
 from vllm.platforms import current_platform
-from vllm.scalar_type import ScalarType, scalar_types
+from vllm.scalar_type import ScalarType
 
+from sglang.srt.layers.linear import LinearBase
+from sglang.srt.layers.quantization.gptq.gptq import scalar_types
 from sglang.srt.layers.quantization.utils import pack_cols, unpack_cols
+from sglang.srt.utils import get_bool_env_var
 
 GPTQ_MARLIN_TILE = 16
 GPTQ_MARLIN_MIN_THREAD_N = 64
@@ -319,8 +320,11 @@ def should_use_atomic_add_reduce(
     m: int, n: int, k: int, device: torch.device, dtype: torch.dtype
 ) -> bool:
     # disable atomicAdd reduce by default,
-    # one can enable it with VLLM_MARLIN_USE_ATOMIC_ADD=1
-    if not envs.VLLM_MARLIN_USE_ATOMIC_ADD or device.type != "cuda":
+    # one can enable it with SGLANG_MARLIN_USE_ATOMIC_ADD=1
+    if (
+        not get_bool_env_var("SGLANG_MARLIN_USE_ATOMIC_ADD", "false")
+        or device.type != "cuda"
+    ):
         return False
 
     # sm8x doesn't support atomicAdd + bfloat16 natively

@@ -43,6 +43,16 @@ except ImportError:
         MarlinConfig
     ) = QQQConfig = Int8TpuConfig = DummyConfig
 
+from python.sglang.srt.layers.quantization.gptq.gptq import (
+    GPTQConfig,
+    GPTQLinearMethod,
+    GPTQMarlinConfig,
+    GPTQMarlinMoEMethod,
+)
+from python.sglang.srt.layers.quantization.gptq.gptq_marlin import (
+    GPTQMarlinLinearMethod,
+)
+from python.sglang.srt.layers.quantization.marlin.marlin import MarlinConfig
 from sglang.srt.layers.linear import LinearBase, UnquantizedLinearMethod
 from sglang.srt.layers.quantization.awq import AWQConfig
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -51,14 +61,6 @@ from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import
     CompressedTensorsConfig,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config
-from sglang.srt.layers.quantization.gptq import (
-    GPTQConfig,
-    GPTQLinearMethod,
-    GPTQMarlinConfig,
-    GPTQMarlinMoEMethod,
-)
-from sglang.srt.layers.quantization.gptq_marlin import GPTQMarlinLinearMethod
-from sglang.srt.layers.quantization.marlin import MarlinConfig
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp8Config,
