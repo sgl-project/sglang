@@ -600,18 +600,17 @@ class ForwardBatch:
         self.prepare_chunked_kv_indices(device)
 
     def prepare_tbo(self):
+        from sglang.srt import two_batch_overlap
+        from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
+
         if self.tbo_split_seq_index is None:
             return
-
-        from sglang.srt import two_batch_overlap
 
         tbo_split_token_index = two_batch_overlap.compute_split_token_index(
             split_seq_index=self.tbo_split_seq_index,
             forward_mode=self.forward_mode,
             extend_seq_lens=self.extend_seq_lens_cpu,
         )
-
-        from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 
         assert isinstance(self.attn_backend, TboAttnBackend)
         attn_backend_child_a, attn_backend_child_b = self.attn_backend.children
@@ -643,6 +642,8 @@ class ForwardBatch:
         end_seq_index: int,
         output_attn_backend: AttentionBackend,
     ):
+        from sglang.srt.managers.schedule_batch import global_server_args_dict
+
         num_tokens = self.input_ids.shape[0]
         num_seqs = self.batch_size
 
@@ -703,8 +704,6 @@ class ForwardBatch:
         )
 
         # TODO improve, e.g. unify w/ `init_raw`
-        from sglang.srt.managers.schedule_batch import global_server_args_dict
-
         if global_server_args_dict["moe_dense_tp_size"] == 1:
             sum_len = end_token_index - start_token_index
             gathered_buffer = torch.zeros(
