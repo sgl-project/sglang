@@ -2058,7 +2058,7 @@ class Scheduler(
         )
 
         if get_bool_env_var("SGLANG_HACK_ENABLE_NCCL_TMS_RELEASE_RESUME"):
-            nccl_tms_release()
+            nccl_tms_release(rank=self.tp_rank, cpu_group=self.tp_cpu_group)
 
         self.memory_saver_adapter.pause()
 
