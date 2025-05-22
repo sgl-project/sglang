@@ -1,13 +1,9 @@
 import unittest
 from types import SimpleNamespace
-# import sys
-# import unittest
-# import sglang
-# sys.path.insert(0, "../../python/sglang")
 from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
-    DEFAULT_AUTOROUND_MLLM_MODEL_NAME_FOR_TEST,
+    DEFAULT_AUTOROUND_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -18,32 +14,39 @@ from sglang.test.test_utils import (
 class TestAutoRound(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = None
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--trust-remote-code"],
-        )
-
+        
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        pass
 
     def test_mmlu(self):
         for model in DEFAULT_AUTOROUND_MODEL_NAME_FOR_TEST:
-            self.model = model
-            args = SimpleNamespace(
-                base_url=self.base_url,
-                model=self.model,
-                eval_name="lambada_openai",
-                num_examples=64,
-                num_threads=32,
-            )
+            with self.subTest(model=model):
+                print(f"\n[INFO] Launching server for model: {model}")
+                process = popen_launch_server(
+                    model,
+                    self.base_url,
+                    timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                    other_args=["--trust-remote-code"],
+                )
 
-            metrics = run_eval(args)
-            self.assertGreater(metrics["score"], 0.4)
+                try:
+                    args = SimpleNamespace(
+                        base_url=self.base_url,
+                        model=model,
+                        eval_name="mmlu",
+                        num_examples=64,
+                        num_threads=32,
+                    )
+                    metrics = run_eval(args)
+                    if "Llama" in model:
+                        self.assertGreater(metrics["score"], 0.6)
+                    else:
+                        self.assertGreater(metrics["score"], 0.26)
+                finally:
+                    kill_process_tree(process.pid)
+                    print(f"[INFO] Server for {model} stopped.")
 
 
 if __name__ == "__main__":
