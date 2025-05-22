@@ -453,7 +453,6 @@ class Req:
         self.origin_input_ids = origin_input_ids
         # Each decode stage's output ids
         self.output_ids = []
-        self.stop_buffer = ""
         # fill_ids = origin_input_ids + output_ids. Updated if chunked.
         self.fill_ids = None
         self.session_id = session_id
@@ -470,7 +469,9 @@ class Req:
         self.return_hidden_states = return_hidden_states
         self.lora_path = lora_path
 
-        self.max_buffer_size = max(20, self.sampling_params.stop_str_max_len * 2)
+        if self.sampling_params.stop_str and len(self.sampling_params.stop_strs) > 0:
+            self.stop_buffer = ""
+            self.max_buffer_size = max(20, self.sampling_params.stop_str_max_len * 2)
 
         # Memory pool info
         self.req_pool_idx: Optional[int] = None
