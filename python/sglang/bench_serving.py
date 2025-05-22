@@ -625,10 +625,12 @@ def is_file_valid_json(path):
     try:
         with open(path) as f:
             json.load(f)
+        return True
     except JSONDecodeError as e:
         print(
             f"{path} exists but json loading fails ({e=}), thus treat as invalid file"
         )
+        return False
 
 
 @dataclass
