@@ -359,7 +359,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   // CPU and memory binding
   m.def("init_cpu_threads_env(str cpu_ids) -> str");
-  m.impl("init_cpu_threads_env", torch::kCPU, &init_cpu_threads_env);  
+}
+
+TORCH_LIBRARY_IMPL(sgl_kernel, CatchAll, m) {
+    m.impl("init_cpu_threads_env", init_cpu_threads_env);
 }
 
 REGISTER_EXTENSION(common_ops)
