@@ -18,7 +18,7 @@ from sglang.srt.utils import get_ip
 FakeBootstrapHost = "2.2.2.2"
 
 # env var for testing failure, convert to float explicitly
-FAILURE_PROB = float(os.getenv("XAI_DISAGGREGATION_TEST_FAILURE_PROB", 0))
+FAILURE_PROB = float(os.getenv("DISAGGREGATION_TEST_FAILURE_PROB", 0))
 
 
 class DisaggregationMode(Enum):

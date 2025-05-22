@@ -372,9 +372,6 @@ class DecodeTransferQueue:
                 self.scheduler.stream_output(
                     [decode_req.req], decode_req.req.return_logprob
                 )
-                print(
-                    f"[cleanup] {decode_req.req.rid=} {decode_req.req.req_pool_idx=} {len(decode_req.req.origin_input_ids)=} {len(decode_req.req.output_ids)=} {len(decode_req.req.fill_ids)=}"
-                )
                 # unlock the kv cache or it will have memory leak
                 self.tree_cache.cache_finished_req(decode_req.req)
                 indices_to_remove.add(i)
