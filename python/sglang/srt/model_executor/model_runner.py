@@ -51,12 +51,14 @@ from sglang.srt.layers.quantization.deep_gemm import (
 from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
+from sglang.srt.managers.eplb_manager import EPLBManager
 from sglang.srt.managers.expert_distribution import (
     ExpertDistributionRecorder,
     get_global_expert_distribution_recorder,
     set_global_expert_distribution_recorder,
 )
 from sglang.srt.managers.expert_location import (
+    ExpertLocationMetadata,
     compute_initial_expert_location_metadata,
     get_global_expert_location_metadata,
     set_global_expert_location_metadata,
@@ -70,6 +72,7 @@ from sglang.srt.mem_cache.memory_pool import (
     TokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.paged_allocator import PagedTokenToKVPoolAllocator
+from sglang.srt.model_executor import expert_location_updater
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader import get_model
@@ -252,6 +255,12 @@ class ModelRunner:
                     rank=self.tp_rank,
                 )
             )
+
+        self.eplb_manager = (
+            EPLBManager(self)
+            if self.server_args.enable_eplb and (not self.is_draft_worker)
+            else None
+        )
 
         # Load the model
         self.sampler = Sampler()
@@ -574,6 +583,16 @@ class ModelRunner:
             raise ValueError(
                 f"TP rank {self.tp_rank} could finish the model loading, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
             ) from None
+
+    def update_expert_location(
+        self, new_expert_location_metadata: ExpertLocationMetadata
+    ):
+        expert_location_updater.update_expert_location(
+            self.model.routed_experts_weights_of_layer,
+            new_expert_location_metadata,
+            nnodes=self.server_args.nnodes,
+            rank=self.tp_rank,
+        )
 
     def update_weights_from_disk(
         self, model_path: str, load_format: str
@@ -1140,9 +1159,14 @@ class ModelRunner:
             self.forward_pass_id,
             forward_batch,
         ):
-            return self._forward_raw(
+            output = self._forward_raw(
                 forward_batch, skip_attn_backend_init, pp_proxy_tensors
             )
+
+        if self.eplb_manager is not None:
+            self.eplb_manager.on_forward_pass_end(self.forward_pass_id)
+
+        return output
 
     def _forward_raw(
         self,
