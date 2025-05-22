@@ -179,6 +179,7 @@ class ServerArgs:
         Literal["stat", "per_pass", "per_token"]
     ] = None
     expert_distribution_recorder_buffer_size: Optional[int] = None
+    enable_expert_distribution_metrics: bool = False
     deepep_config: Optional[str] = None
     enable_torch_compile: bool = False
     torch_compile_max_bs: int = 32
@@ -1316,6 +1317,11 @@ class ServerArgs:
             type=int,
             default=ServerArgs.expert_distribution_recorder_buffer_size,
             help="Circular buffer size of expert distribution recorder. Set to -1 to denote infinite buffer.",
+        )
+        parser.add_argument(
+            "--enable-expert-distribution-metrics",
+            action="store_true",
+            help="Enable logging metrics for expert balancedness",
         )
         parser.add_argument(
             "--deepep-config",
