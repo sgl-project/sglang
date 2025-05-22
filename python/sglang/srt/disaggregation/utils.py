@@ -167,3 +167,18 @@ def is_mla_backend(target_kv_pool) -> bool:
     from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 
     return isinstance(target_kv_pool, MLATokenToKVPool)
+
+
+def prepare_abort(req: Req, error_message: str, status_code=None):
+    from sglang.srt.managers.schedule_batch import FINISH_ABORT
+
+    # populate finish metadata and stream output
+    req.finished_reason = FINISH_ABORT(error_message, status_code)
+
+    if req.return_logprob:
+        req.input_token_logprobs_val = []
+        req.input_token_logprobs_idx = []
+        req.input_top_logprobs_val = []
+        req.input_top_logprobs_idx = []
+        req.input_token_ids_logprobs_val = []
+        req.input_token_ids_logprobs_idx = []
