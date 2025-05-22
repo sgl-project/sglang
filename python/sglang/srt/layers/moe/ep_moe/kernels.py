@@ -556,6 +556,7 @@ def grouped_gemm_triton_kernel(
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
+    USE_BF16_DOT: tl.constexpr,
 ):
     c_dtype = c.dtype.element_ty
 
@@ -609,12 +610,18 @@ def grouped_gemm_triton_kernel(
             offs_ks = k_start // group_k
             a_scale = tl.load(a_scale_ptrs + offs_ks * as_stride_1)
             b_scale = tl.load(b_scale_ptrs + offs_ks * bs_stride_2)
-            # Original line: accumulator += tl.dot(a_tile, b_tile.T) * a_scale * b_scale[None, :]
-            # convert to bf16 to avoid Unsupported conversion from 'f8E4M3FN' to 'f16' on AMD MI300X
-            a_tile_compute = a_tile.to(tl.bfloat16)
-            b_tile_compute = b_tile.to(tl.bfloat16)
-            dot_product_result = tl.dot(a_tile_compute, b_tile_compute.T)
-            accumulator += dot_product_result * a_scale * b_scale[None, :]
+
+            if USE_BF16_DOT:
+                # MI300X: up-cast to BF16 first
+                a_tile_bf16 = a_tile.to(tl.bfloat16)
+                b_tile_bf16 = b_tile.to(tl.bfloat16)
+                dot_res = tl.dot(a_tile_bf16, b_tile_bf16.T)
+            else:
+                # Original path (may trigger f8→f16 cast)
+                dot_res = tl.dot(a_tile, b_tile.T)
+
+            accumulator += dot_res * a_scale * b_scale[None, :]
+
         else:
             accumulator = tl.dot(a_tile, b_tile.T, accumulator)
         a_ptr += BLOCK_SIZE_K
@@ -697,6 +704,8 @@ def grouped_gemm_triton(
         triton.cdiv(a.size(0), META["BLOCK_SIZE_M"]) + batch_size,
         triton.cdiv(b.size(1), META["BLOCK_SIZE_N"]),
     )
+    
+    is_rocm = torch.version.hip
 
     grouped_gemm_triton_kernel[grid](
         a,
@@ -722,6 +731,7 @@ def grouped_gemm_triton(
         scale_b.stride(2) if scale_b is not None and scale_b.ndim == 3 else 0,
         scale_b.stride(1) if scale_b is not None and scale_b.ndim >= 2 else 0,
         **config,
+        USE_BF16_DOT=int(is_rocm is not None),
     )
     return c
 
