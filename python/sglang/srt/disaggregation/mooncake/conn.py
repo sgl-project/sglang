@@ -173,6 +173,9 @@ class MooncakeKVManager(BaseKVManager):
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
             )
 
+        self.failure_records: Dict[int, str] = {}
+        self.failure_lock = threading.Lock()
+
     def register_buffer_to_engine(self):
         for kv_data_ptr, kv_data_len in zip(
             self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens
@@ -332,6 +335,10 @@ class MooncakeKVManager(BaseKVManager):
                                 chunked_dst_kv_indice,
                             )
                             if ret != 0:
+                                self.record_failure(
+                                    kv_chunk.room,
+                                    f"Failed to send kv chunk to {kv_chunk.room}",
+                                )
                                 self.update_status(kv_chunk.room, KVPoll.Failed)
                                 self.sync_status_to_decode_endpoint(
                                     req.endpoint, req.dst_port, req.room
@@ -461,6 +468,10 @@ class MooncakeKVManager(BaseKVManager):
                     self.request_status[bootstrap_room], status
                 )
 
+    def record_failure(self, bootstrap_room: int, failure_reason: str):
+        with self.failure_lock:
+            self.failure_records[bootstrap_room] = failure_reason
+
     def get_session_id(self):
         return self.engine.get_session_id()
 
@@ -517,6 +528,10 @@ class MooncakeKVManager(BaseKVManager):
                 room in self.request_status
                 and self.check_status(room) != KVPoll.Success
             ):
+                self.record_failure(
+                    room,
+                    f"KV transfer failed due to losing connection with prefill intance (bootstrap_addr: {self.bootstrap_addr})",
+                )
                 self.update_status(room, KVPoll.Failed)
                 affected_rooms.append(room)
         logger.error(
@@ -570,8 +585,10 @@ class MooncakeKVSender(BaseKVSender):
         self.kv_mgr.request_status.pop(self.bootstrap_room)
 
     def failure_exception(self):
-        # TODO: raise a real exception
-        raise Exception("Fake KVSender Exception")
+        self.clear()
+        with self.kv_mgr.failure_lock:
+            failure_reason = self.kv_mgr.failure_records.pop(self.bootstrap_room)
+        raise Exception(failure_reason)
 
 
 class MooncakeKVReceiver(BaseKVReceiver):
@@ -590,17 +607,19 @@ class MooncakeKVReceiver(BaseKVReceiver):
         self.bootstrap_addr = bootstrap_addr
         self.kv_mgr = mgr
         self.session_id = self.kv_mgr.get_session_id()
-        self.kv_mgr.update_status(bootstrap_room, KVPoll.Bootstrapping)
+        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
 
         if self.bootstrap_addr not in self.kv_mgr.prefill_dp_size_table:
             self.prefill_tp_size, self.prefill_dp_size = (
-                self._get_prefill_dp_size_from_server()
+                self._get_prefill_parallel_info_from_server()
             )
             if self.prefill_tp_size is None or self.prefill_dp_size is None:
-                logger.error(
-                    f"Could not fetch prefill parallel info for bootstrap_addr: {self.bootstrap_addr}"
+                self.kv_mgr.record_failure(
+                    self.bootstrap_room,
+                    f"Could not fetch prefill parallel info from bootstrap_addr: {self.bootstrap_addr}",
                 )
                 self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                return
             else:
                 self.kv_mgr.prefill_tp_size_table[self.bootstrap_addr] = (
                     self.prefill_tp_size
@@ -616,9 +635,6 @@ class MooncakeKVReceiver(BaseKVReceiver):
                 self.bootstrap_addr
             ]
 
-        self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].append(
-            self.bootstrap_room
-        )
         # Currently, we don't allow prefill instance and decode instance to
         # have different TP sizes per DP rank, except for models using MLA.
         local_tp_size_per_dp_rank = self.kv_mgr.tp_size // self.kv_mgr.dp_size
@@ -662,7 +678,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
             self.target_tp_rank = self.target_tp_ranks[0]
             self.required_dst_info_num = 1
 
-        self.target_dp_group = bootstrap_room % self.prefill_dp_size
+        self.target_dp_group = self.bootstrap_room % self.prefill_dp_size
 
         # NOTE: key distinguished by bootstrap_addr, target_dp_group, and target_tp_rank
         bootstrap_key = (
@@ -684,24 +700,26 @@ class MooncakeKVReceiver(BaseKVReceiver):
                     )
                     bootstrap_infos.append(bootstrap_info)
                 else:
-                    logger.error(
-                        f"Could not fetch bootstrap info for engine rank: {self.kv_mgr.kv_args.engine_rank} and target_dp_group: {self.target_dp_group}"
+                    self.kv_mgr.record_failure(
+                        self.bootstrap_room,
+                        f"Could not fetch bootstrap info for engine rank: {self.kv_mgr.kv_args.engine_rank} and target_dp_group: {self.target_dp_group}",
                     )
-            self.bootstrap_infos = bootstrap_infos
+                    self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                    return
 
-            if len(self.bootstrap_infos) == 0:
-                logger.error(
-                    f"Could not fetch bootstrap info for engine rank: {self.kv_mgr.kv_args.engine_rank}"
-                )
-            else:
-                self.kv_mgr.connection_pool[bootstrap_key] = self.bootstrap_infos
-                # Register kv_args only once to prefill KVManager according to the info fetched from the bootstrap server
-                self._register_kv_args()
+            self.bootstrap_infos = bootstrap_infos
+            self.kv_mgr.connection_pool[bootstrap_key] = self.bootstrap_infos
+
+            # Register kv_args only once to prefill KVManager according to the info fetched from the bootstrap server
+            self._register_kv_args()
         else:
             self.bootstrap_infos = self.kv_mgr.connection_pool[bootstrap_key]
 
         assert len(self.bootstrap_infos) > 0
-        self.kv_mgr.update_status(bootstrap_room, KVPoll.WaitingForInput)
+        self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].append(
+            self.bootstrap_room
+        )
+        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
 
     def _get_bootstrap_info_from_server(self, engine_rank, target_dp_group):
         """Fetch the bootstrap info from the bootstrap server."""
@@ -720,7 +738,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
             logger.error(f"Error fetching prefill info from bootstrap: {e}")
             return None
 
-    def _get_prefill_dp_size_from_server(self) -> int:
+    def _get_prefill_parallel_info_from_server(self) -> Tuple[int, int]:
         """Fetch the prefill parallel info from the bootstrap server."""
         try:
             url = f"http://{self.bootstrap_addr}/route?engine_rank={-1}&target_dp_group={-1}"
@@ -734,7 +752,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
                 logger.error(
                     f"Failed to get prefill parallel info: {response.status_code}, {response.text}"
                 )
-                return None
+                return None, None
         except Exception as e:
             logger.error(f"Error fetching prefill parallel info from bootstrap: {e}")
             return None, None
@@ -805,8 +823,10 @@ class MooncakeKVReceiver(BaseKVReceiver):
         self.kv_mgr.request_status.pop(self.bootstrap_room)
 
     def failure_exception(self):
-        # TODO: raise a real exception
-        raise Exception("Fake KVReceiver Exception")
+        self.clear()
+        with self.kv_mgr.failure_lock:
+            failure_reason = self.kv_mgr.failure_records.pop(self.bootstrap_room)
+        raise Exception(failure_reason)
 
 
 class MooncakeKVBootstrapServer(BaseKVBootstrapServer):
