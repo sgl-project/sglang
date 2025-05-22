@@ -3,6 +3,7 @@ from __future__ import annotations
 import subprocess
 from collections import defaultdict
 
+
 def parse_lscpu_topology():
     try:
         # Get CPU topology: CPU,Core,Socket,Node
