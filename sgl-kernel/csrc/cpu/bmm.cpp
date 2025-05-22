@@ -74,7 +74,8 @@ void bmm_kernel_impl(
 // out  : [B, M, N]
 // scale: [] 0-dim tensor for per tensor quant
 //
-void bmm_cpu(at::Tensor& out, at::Tensor& mat1, at::Tensor& mat2, bool is_vnni, std::optional<at::Tensor>& scale) {
+void bmm_cpu(
+    at::Tensor& out, at::Tensor& mat1, at::Tensor& mat2, bool is_vnni, const std::optional<at::Tensor>& scale) {
   RECORD_FUNCTION("sgl-kernel::bmm_cpu", std::vector<c10::IValue>({out, mat1, mat2}));
 
   auto packed_w = is_vnni ? mat2 : convert_weight_packed(mat2);
