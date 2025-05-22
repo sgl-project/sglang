@@ -333,6 +333,8 @@ class DecodeTransferQueue:
         indices_to_remove = set()
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
             if poll == KVPoll.Failed:
+                if hasattr(decode_req.kv_receiver, "clear"):
+                    decode_req.kv_receiver.clear()
                 raise Exception("Transfer failed")
             elif poll == KVPoll.Success:
                 # pop and push it to waiting queue
