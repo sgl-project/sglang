@@ -34,6 +34,7 @@ from sglang.srt.disaggregation.utils import (
     ReqToMetadataIdxAllocator,
     TransferBackend,
     get_kv_class,
+    is_mla_backend,
     kv_to_page_indices,
     kv_to_page_num,
     poll_and_all_reduce,
@@ -69,6 +70,7 @@ class PrefillBootstrapQueue:
         scheduler: Scheduler,
     ):
         self.token_to_kv_pool = token_to_kv_pool
+        self.is_mla_backend = is_mla_backend(token_to_kv_pool)
         self.aux_dtype = aux_dtype
 
         self.metadata_buffers = metadata_buffers
@@ -112,7 +114,10 @@ class PrefillBootstrapQueue:
         kv_args.gpu_id = self.scheduler.gpu_id
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
         kv_manager = kv_manager_class(
-            kv_args, DisaggregationMode.PREFILL, self.scheduler.server_args
+            kv_args,
+            DisaggregationMode.PREFILL,
+            self.scheduler.server_args,
+            self.is_mla_backend,
         )
         return kv_manager
 
@@ -277,19 +282,17 @@ class SchedulerDisaggregationPrefillMixin:
             next_token_ids,
             extend_input_len_per_req,
             extend_logprob_start_len_per_req,
-            bid,
         ) = (
             result.logits_output,
             result.next_token_ids,
             result.extend_input_len_per_req,
             result.extend_logprob_start_len_per_req,
-            result.bid,
         )
 
         # Transfer kv for prefill completed requests and add it into disagg_prefill_infight_queue
         if self.enable_overlap:
             # wait
-            _, next_token_ids = self.tp_worker.resolve_last_batch_result(launch_done)
+            _, next_token_ids, _ = self.tp_worker.resolve_last_batch_result(launch_done)
         else:
             next_token_ids = result.next_token_ids.tolist()
 

@@ -24,34 +24,15 @@ from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe.ep_moe.layer import EPMoE
-from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.fp8_utils import (
-    block_quant_to_tensor_quant,
-    normalize_e4m3fn_to_e4m3fnuz,
-)
-from sglang.srt.layers.quantization.int8_utils import (
-    block_dequant as int8_block_dequant,
-)
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer, DeepseekV3ForCausalLM
-from sglang.srt.utils import BumpAllocator, add_prefix, is_cuda, is_hip
-
-_is_hip = is_hip()
-_is_cuda = is_cuda()
-
-if _is_cuda:
-    from sgl_kernel import awq_dequantize
-else:
-    from vllm._custom_ops import awq_dequantize
-
+from sglang.srt.utils import BumpAllocator, add_prefix
 
 logger = logging.getLogger(__name__)
 

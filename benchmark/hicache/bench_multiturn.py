@@ -261,7 +261,7 @@ class WorkloadGenerator:
             client_id, payload = item
             response = await async_request_sglang_generate(payload, self.url, self.pbar)
             if self.pbar.n == self.pbar.total:
-                self.finished_time = time.time()
+                self.finished_time = time.perf_counter()
             self.response_queue.put((client_id, response))
         except Exception as e:
             print(f"Request failed: {e}")
@@ -334,7 +334,7 @@ class WorkloadGenerator:
         request_thread = threading.Thread(target=self.request_sender, daemon=True)
         response_thread = threading.Thread(target=self.response_handler, daemon=True)
 
-        self.start_time = time.time()
+        self.start_time = time.perf_counter()
         request_thread.start()
         response_thread.start()
 
