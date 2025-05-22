@@ -400,10 +400,16 @@ extern at::Tensor int8_scaled_mm_with_quant(
 extern void
 bmm_cpu(at::Tensor& out, at::Tensor& mat1, at::Tensor& mat2, bool is_vnni, const std::optional<at::Tensor>& scale);
 
-extern at::Tensor fp8_scaled_mm_cpu(at::Tensor& mat1, at::Tensor& mat2, at::Tensor& scales2,
-  std::vector<int64_t> block_size, const std::optional<at::Tensor>& bias, at::ScalarType out_dtype, bool is_vnni);
+extern at::Tensor fp8_scaled_mm_cpu(
+    at::Tensor& mat1,
+    at::Tensor& mat2,
+    at::Tensor& scales2,
+    std::vector<int64_t> block_size,
+    const std::optional<at::Tensor>& bias,
+    at::ScalarType out_dtype,
+    bool is_vnni);
 
-  // NB: shapes in DeepDeek R1
+// NB: shapes in DeepDeek R1
 //
 //   hidden_states    : [num_seqs, hidden_size] [1, 7168]
 //   q_a_proj_weight  : [q_lora_rank, hidden_size] [1536, 7168]
@@ -431,7 +437,6 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> qkv_proj_with_rope(
     std::optional<at::Tensor> kv_a_proj_scale,
     bool is_vnni,
     std::optional<std::vector<int64_t>> block_size) {
-
   RECORD_FUNCTION(
       "sgl-kernel::qkv_proj_with_rope",
       std::vector<c10::IValue>({hidden_states, q_a_proj_weight, q_b_proj_weight, kv_a_proj_weight, w_kc}));
@@ -528,28 +533,28 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> qkv_proj_with_rope(
           kv_lora_rank + qk_rope_head_dim,
           hidden_size);
     } else if (use_fp8_w8a16) {
-        int64_t block_size_N = block_size.value()[0];
-        int64_t block_size_K = block_size.value()[1];
-        auto q_a_proj_s = q_a_proj_scale.value();
-        auto kv_a_proj_s = kv_a_proj_scale.value();
-        CHECK_EQ(q_a_proj_s.size(0), div_up(q_lora_rank, block_size_N));
-        CHECK_EQ(q_a_proj_s.size(1), div_up(hidden_size, block_size_K));
-        CHECK_EQ(kv_a_proj_s.size(0), div_up(kv_lora_rank + qk_rope_head_dim, block_size_N));
-        CHECK_EQ(kv_a_proj_s.size(1), div_up(hidden_size, block_size_K));
-        segment_gemm_kernel_impl<scalar_t>(
-              qa.data_ptr<scalar_t>(),
-              k_input.data_ptr<scalar_t>(),
-              hidden_states.data_ptr<scalar_t>(),
-              q_a_proj_weight.data_ptr<at::Float8_e4m3fn>(),
-              kv_a_proj_weight.data_ptr<at::Float8_e4m3fn>(),
-              q_a_proj_s.data_ptr<float>(),
-              kv_a_proj_s.data_ptr<float>(),
-              num_seqs,
-              q_lora_rank,
-              kv_lora_rank + qk_rope_head_dim,
-              hidden_size,
-              block_size_N,
-              block_size_K);
+      int64_t block_size_N = block_size.value()[0];
+      int64_t block_size_K = block_size.value()[1];
+      auto q_a_proj_s = q_a_proj_scale.value();
+      auto kv_a_proj_s = kv_a_proj_scale.value();
+      CHECK_EQ(q_a_proj_s.size(0), div_up(q_lora_rank, block_size_N));
+      CHECK_EQ(q_a_proj_s.size(1), div_up(hidden_size, block_size_K));
+      CHECK_EQ(kv_a_proj_s.size(0), div_up(kv_lora_rank + qk_rope_head_dim, block_size_N));
+      CHECK_EQ(kv_a_proj_s.size(1), div_up(hidden_size, block_size_K));
+      segment_gemm_kernel_impl<scalar_t>(
+          qa.data_ptr<scalar_t>(),
+          k_input.data_ptr<scalar_t>(),
+          hidden_states.data_ptr<scalar_t>(),
+          q_a_proj_weight.data_ptr<at::Float8_e4m3fn>(),
+          kv_a_proj_weight.data_ptr<at::Float8_e4m3fn>(),
+          q_a_proj_s.data_ptr<float>(),
+          kv_a_proj_s.data_ptr<float>(),
+          num_seqs,
+          q_lora_rank,
+          kv_lora_rank + qk_rope_head_dim,
+          hidden_size,
+          block_size_N,
+          block_size_K);
     } else {
       segment_gemm_kernel_impl<scalar_t>(
           qa.data_ptr<scalar_t>(),
@@ -584,7 +589,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> qkv_proj_with_rope(
   if (use_int8_w8a8) {
     qb = int8_scaled_mm_with_quant(qa, q_b_proj_weight, q_b_proj_scale.value(), bias, at::kBFloat16, is_vnni);
   } else if (use_fp8_w8a16) {
-    qb = fp8_scaled_mm_cpu(qa, q_b_proj_weight, q_b_proj_scale.value(), block_size.value(), bias, at::kBFloat16, is_vnni);
+    qb = fp8_scaled_mm_cpu(
+        qa, q_b_proj_weight, q_b_proj_scale.value(), block_size.value(), bias, at::kBFloat16, is_vnni);
   } else {
     qb = weight_packed_linear(qa, q_b_proj_weight, bias, is_vnni);
   }
