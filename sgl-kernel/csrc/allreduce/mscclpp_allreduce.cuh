@@ -621,6 +621,9 @@ class Msccl1Shot2NodeLLcontext {
   std::shared_ptr<mscclpp::ProxyService> proxyService;
   cudaStream_t h2d_stream;
 
+  std::unordered_map<void*, std::unordered_map<int, mscclpp::MemoryChannel>> input_ptr2memory_channels_;
+  std::unordered_map<void*, mscclpp::GpuBuffer<mscclpp::MemoryChannelDeviceHandle>> input_ptr2d_memHandles_;
+
  public:
   Msccl1Shot2NodeLLcontext(
       mscclpp::UniqueId unique_id,

@@ -11,26 +11,25 @@ torchrun --nproc_per_node gpu \
 --master_addr $MASTER_ADDR \
 --master_port $MASTER_PORT benchmark_mscclpp.py
 """
+
 import os
-from contextlib import contextmanager, nullcontext
-from typing import Any, List, Optional, Union
+from contextlib import nullcontext
+from typing import List
 
 import torch
 import torch.distributed as dist
-from torch.distributed import ProcessGroup, ReduceOp
+from torch.distributed import ProcessGroup
 
 from sglang.srt.distributed import init_distributed_environment
-from sglang.srt.distributed.device_communicators.custom_all_reduce import (
-    CustomAllreduce,
-)
 from sglang.srt.distributed.device_communicators.pymscclpp import PyMscclppCommunicator
 from sglang.srt.distributed.device_communicators.pynccl import PyNcclCommunicator
 from sglang.srt.distributed.parallel_state import (
     get_tensor_model_parallel_group,
     graph_capture,
     initialize_model_parallel,
-    set_mscclpp_all_reduce
+    set_mscclpp_all_reduce,
 )
+
 
 def torch_allreduce(torch_input: torch.Tensor, group: ProcessGroup) -> torch.Tensor:
     dist.all_reduce(torch_input, group=group)
@@ -48,6 +47,7 @@ def pynccl_allreduce(
 ) -> torch.Tensor:
     pynccl_comm.all_reduce(msccl_input)
     return msccl_input
+
 
 def _bench_graph_time(func, inp_randn, warmup_loop=2, graph_loop=10, test_loop=10):
     graph_input = inp_randn.clone()
@@ -79,6 +79,7 @@ def _bench_graph_time(func, inp_randn, warmup_loop=2, graph_loop=10, test_loop=1
     func_cost_us = sum(latencies) / len(latencies) / graph_loop * 1000
     graph.reset()
     return func_output, func_cost_us
+
 
 def _bench_eager_time(func, inp_randn, warmup_loop=2, test_loop=10):
     eager_input = inp_randn.clone()
@@ -118,6 +119,36 @@ def get_torch_prof_ctx(do_prof: bool):
     return ctx
 
 
+def human_readable_size(size, decimal_places=1):
+    for unit in ["B", "KiB", "MiB", "GiB", "TiB", "PiB"]:
+        if size < 1024.0 or unit == "PiB":
+            break
+        size /= 1024.0
+    return f"{size:.{decimal_places}f} {unit}"
+
+
+try:
+    from tabulate import tabulate
+except ImportError:
+    print("tabulate not installed, skipping table printing")
+    tabulate = None
+
+
+def print_markdown_table(data):
+    if tabulate is not None:
+        print(tabulate(data, headers="keys", tablefmt="github"))
+        return
+    headers = data[0].keys()
+    header_row = "| " + " | ".join(headers) + " |"
+    separator = "| " + " | ".join(["---"] * len(headers)) + " |"
+    rows = []
+    for item in data:
+        row = "| " + " | ".join(str(item[key]) for key in headers) + " |"
+        rows.append(row)
+    markdown_table = "\n".join([header_row, separator] + rows)
+    print(markdown_table)
+
+
 if __name__ == "__main__":
     import logging
 
@@ -139,62 +170,48 @@ if __name__ == "__main__":
         rank=rank,
         local_rank=rank % 8,
     )
-    print(f"[{rank}] init_distributed_environment finished")
     initialize_model_parallel(tensor_model_parallel_size=world_size)
-    print(f"[{rank}] initialize_model_parallel finished")
     group = get_tensor_model_parallel_group().device_group
-    cpu_group = get_tensor_model_parallel_group().cpu_group
     pynccl_comm = get_tensor_model_parallel_group().pynccl_comm
     pymscclpp_comm = get_tensor_model_parallel_group().pymscclpp_comm
     dist.barrier()
     profile = False
+    dtype = torch.bfloat16
     ctx = get_torch_prof_ctx(profile)
+    result = []
     with ctx:
-        dtype = torch.bfloat16
-        torch.cuda.cudart().cudaProfilerStart()
         for i in range(10, 20):
             sz = 2**i
             inp_randn = torch.randint(1, 16, (sz,), dtype=dtype, device=device)
             torch_eager_output, torch_eager_time = _bench_eager_time(
                 lambda inp: torch_allreduce(inp, group), inp_randn
             )
-            if rank == 0:
-                print(
-                    f"[{rank}] sz={sz}, dtype={dtype} torch_eager cost {torch_eager_time} {torch_eager_output}"
-                )
-            
             msccl_eager_output, msccl_eager_time = _bench_eager_time(
                 lambda inp: msccl_allreduce(inp, pymscclpp_comm), inp_randn
             )
-            if rank == 0:
-                print(
-                    f"[{rank}] sz={sz}, dtype={dtype} msccl_eager cost {msccl_eager_time}: {msccl_eager_output}"
-                )
-
+            msccl_graph_output, msccl_graph_time = _bench_graph_time(
+                lambda inp: msccl_allreduce(inp, pymscclpp_comm), inp_randn
+            )
             # since pynccl is inplace op, this return result is not correct if graph loop > 1
             _, pynccl_graph_time = _bench_graph_time(
                 lambda inp: pynccl_allreduce(inp, pynccl_comm), inp_randn
             )
-            if rank == 0:
-                print(
-                    f"[{rank}] sz={sz}, dtype={dtype} pynccl_graph cost {pynccl_graph_time}"
-                )
-
-            msccl_graph_output, msccl_graph_time = _bench_graph_time(
-                lambda inp: msccl_allreduce(inp, pymscclpp_comm), inp_randn
-            )
-            if rank == 0:
-                print(
-                    f"[{rank}] sz={sz}, dtype={dtype} msccl_graph cost {msccl_graph_time}: {msccl_graph_output}"
-                )
-            torch.cuda.cudart().cudaProfilerStop()
-
+            inp_bytes = inp_randn.numel() * inp_randn.element_size()
             torch.testing.assert_close(torch_eager_output, msccl_graph_output)
             torch.testing.assert_close(torch_eager_output, msccl_eager_output)
-
+            result.append(
+                {
+                    "msg_size": human_readable_size(inp_bytes),
+                    "torch eager time": torch_eager_time,
+                    "msccl eager time": msccl_eager_time,
+                    "msccl graph time": msccl_graph_time,
+                    "pynccl graph time": pynccl_graph_time,
+                }
+            )
             if rank == 0:
-                print(f"[{rank}] sz={sz}, dtype={dtype}: PASS!")
-
+                print(f"sz={sz}, dtype={dtype}: correctness check PASS!")
+    if rank == 0:
+        print_markdown_table(result)
     if profile:
         prof_dir = f"prof/msccl"
         os.makedirs(prof_dir, exist_ok=True)
