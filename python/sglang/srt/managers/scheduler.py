@@ -492,6 +492,13 @@ class Scheduler(
             self.tp_worker.get_memory_pool()
         )
 
+        if self.tp_worker.worker.model_runner.is_hybrid is not None:
+            self.token_to_kv_pool_allocator_local = (
+                self.tp_worker.get_memory_pool_local()
+            )
+        else:
+            self.token_to_kv_pool_allocator_local = None
+
         if (
             server_args.chunked_prefill_size is not None
             and server_args.disable_radix_cache
@@ -500,6 +507,7 @@ class Scheduler(
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                 page_size=self.page_size,
+                token_to_kv_pool_allocator_local=self.token_to_kv_pool_allocator_local,
             )
         else:
             if self.enable_hierarchical_cache:
@@ -1258,9 +1266,15 @@ class Scheduler(
             and time.perf_counter() > self.metrics_collector.last_log_time + 30
         ):
             # During idle time, also collect metrics every 30 seconds.
+            if self.token_to_kv_pool_allocator is not None:
+                available_size = min(
+                    self.token_to_kv_pool_allocator.available_size(),
+                    self.token_to_kv_pool_allocator_local.available_size(),
+                )
+            else:
+                available_size = self.token_to_kv_pool_allocator.available_size()
             num_used = self.max_total_num_tokens - (
-                self.token_to_kv_pool_allocator.available_size()
-                + self.tree_cache.evictable_size()
+                available_size + self.tree_cache.evictable_size()
             )
             num_running_reqs = len(self.running_batch.reqs)
             self.stats.num_running_reqs = num_running_reqs
@@ -1366,6 +1380,7 @@ class Scheduler(
             self.max_prefill_tokens,
             self.chunked_prefill_size,
             running_bs if self.is_mixed_chunk else 0,
+            self.token_to_kv_pool_allocator_local,
         )
 
         if self.chunked_req is not None:
@@ -1452,6 +1467,7 @@ class Scheduler(
             self.spec_algorithm,
             self.server_args.enable_custom_logit_processor,
             chunked_req=self.chunked_req,
+            token_to_kv_pool_allocator_local=self.token_to_kv_pool_allocator_local,
         )
         new_batch.prepare_for_extend()
 
@@ -1843,6 +1859,8 @@ class Scheduler(
                 self.grammar_backend.reset()
             self.req_to_token_pool.clear()
             self.token_to_kv_pool_allocator.clear()
+            if self.token_to_kv_pool_allocator_local is not None:
+                self.token_to_kv_pool_allocator_local.clear()
 
             if not self.spec_algorithm.is_none():
                 self.draft_worker.model_runner.req_to_token_pool.clear()

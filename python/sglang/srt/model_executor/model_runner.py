@@ -167,6 +167,8 @@ class ModelRunner:
         self.page_size = server_args.page_size
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+        self.is_hybrid = model_config.is_hybrid
+        self.token_to_kv_pool_allocator_local = None
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
         self.attention_chunk_size = model_config.attention_chunk_size
 
@@ -785,6 +787,29 @@ class ModelRunner:
         max_num_token = int(rest_memory * (1 << 30) // cell_size)
         return max_num_token
 
+    def get_num_token_hybrid(self):
+        temp_ratio = (
+            (1 - self.is_hybrid)
+            + self.is_hybrid * self.attention_chunk_size / self.model_config.context_len
+        )
+        self.local_max_num_tokens = (
+            4 * self.max_total_num_tokens * temp_ratio // (3 * temp_ratio + 1)
+        )
+        self.max_total_num_tokens = (
+            4 * self.max_total_num_tokens
+            - 12 * self.max_total_num_tokens * temp_ratio // (3 * temp_ratio + 1)
+        )
+        self.local_max_num_tokens = int(
+            self.local_max_num_tokens
+            // self.server_args.page_size
+            * self.server_args.page_size
+        )
+        self.max_total_num_tokens = int(
+            self.max_total_num_tokens
+            // self.server_args.page_size
+            * self.server_args.page_size
+        )
+
     def init_memory_pool(
         self,
         total_gpu_memory: int,
@@ -860,6 +885,10 @@ class ModelRunner:
             * self.server_args.page_size
         )
 
+        # create token size for hybrid cache
+        if self.is_hybrid is not None:
+            self.get_num_token_hybrid()
+
         if self.max_total_num_tokens <= 0:
             raise RuntimeError(
                 "Not enough memory. Please try to increase --mem-fraction-static."
@@ -871,6 +900,7 @@ class ModelRunner:
                 max_context_len=self.model_config.context_len + 4,
                 device=self.device,
                 enable_memory_saver=self.server_args.enable_memory_saver,
+                is_hybrid=self.is_hybrid,
             )
         else:
             # Draft worker shares req_to_token_pool with the target worker.
@@ -919,6 +949,7 @@ class ModelRunner:
                 enable_memory_saver=self.server_args.enable_memory_saver,
                 start_layer=self.start_layer,
                 end_layer=self.end_layer,
+                local_size=self.local_max_num_tokens,
             )
 
         if self.token_to_kv_pool_allocator is None:
@@ -929,6 +960,14 @@ class ModelRunner:
                     device=self.device,
                     kvcache=self.token_to_kv_pool,
                 )
+                if self.is_hybrid is not None:
+                    self.token_to_kv_pool_allocator_local = TokenToKVPoolAllocator(
+                        self.local_max_num_tokens,
+                        dtype=self.kv_cache_dtype,
+                        device=self.device,
+                        kvcache=self.token_to_kv_pool,
+                    )
+
             else:
                 self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
                     self.max_total_num_tokens,

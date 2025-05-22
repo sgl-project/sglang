@@ -34,6 +34,7 @@ from typing import List, Optional, Tuple, Union
 import numpy as np
 import psutil
 import torch
+import torch.distributed as dist
 import triton
 import triton.language as tl
 
@@ -54,6 +55,7 @@ class ReqToTokenPool:
         max_context_len: int,
         device: str,
         enable_memory_saver: bool,
+        is_hybrid: Optional[float] = None,
     ):
         memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
@@ -62,14 +64,25 @@ class ReqToTokenPool:
         self.size = size
         self.max_context_len = max_context_len
         self.device = device
+        self.is_hybrid = is_hybrid
         with memory_saver_adapter.region():
             self.req_to_token = torch.zeros(
                 (size, max_context_len), dtype=torch.int32, device=device
             )
+            if self.is_hybrid is not None:
+                self.req_to_token_local = torch.zeros(
+                    (size, max_context_len), dtype=torch.int32, device=device
+                )
+            else:
+                self.req_to_token_local = None
+
         self.free_slots = list(range(size))
 
     def write(self, indices, values):
         self.req_to_token[indices] = values
+
+    def write_local(self, indices, values):
+        self.req_to_token_local[indices] = values
 
     def available_size(self):
         return len(self.free_slots)
@@ -243,6 +256,7 @@ class MHATokenToKVPool(KVCache):
         enable_memory_saver: bool,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
+        local_size: Optional[int] = None,
     ):
         super().__init__(
             size,
@@ -254,7 +268,7 @@ class MHATokenToKVPool(KVCache):
             start_layer,
             end_layer,
         )
-
+        self.local_size = local_size
         self.head_num = head_num
         self.head_dim = head_dim
         self._create_buffers()
@@ -273,22 +287,42 @@ class MHATokenToKVPool(KVCache):
         with self.memory_saver_adapter.region():
             # [size, head_num, head_dim] for each layer
             # The padded slot 0 is used for writing dummy outputs from padded tokens.
-            self.k_buffer = [
-                torch.zeros(
-                    (self.size + self.page_size, self.head_num, self.head_dim),
-                    dtype=self.store_dtype,
-                    device=self.device,
-                )
-                for _ in range(self.layer_num)
-            ]
-            self.v_buffer = [
-                torch.zeros(
-                    (self.size + self.page_size, self.head_num, self.head_dim),
-                    dtype=self.store_dtype,
-                    device=self.device,
-                )
-                for _ in range(self.layer_num)
-            ]
+            if self.local_size is not None:
+                self.k_buffer = []
+                self.v_buffer = []
+                for i in range(self.layer_num):
+                    temp_size = self.local_size if int((i + 1) % 4 != 0) else self.size
+                    self.k_buffer.append(
+                        torch.zeros(
+                            (temp_size + self.page_size, self.head_num, self.head_dim),
+                            dtype=self.store_dtype,
+                            device=self.device,
+                        )
+                    )
+                    self.v_buffer.append(
+                        torch.zeros(
+                            (temp_size + self.page_size, self.head_num, self.head_dim),
+                            dtype=self.store_dtype,
+                            device=self.device,
+                        )
+                    )
+            else:
+                self.k_buffer = [
+                    torch.zeros(
+                        (self.size + self.page_size, self.head_num, self.head_dim),
+                        dtype=self.store_dtype,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+                self.v_buffer = [
+                    torch.zeros(
+                        (self.size + self.page_size, self.head_num, self.head_dim),
+                        dtype=self.store_dtype,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
 
     def _clear_buffers(self):
         del self.k_buffer

@@ -207,6 +207,8 @@ class SchedulerOutputProcessorMixin:
                 next_token_logprobs = logits_output.next_token_logprobs.tolist()
 
         self.token_to_kv_pool_allocator.free_group_begin()
+        if self.token_to_kv_pool_allocator_local is not None:
+            self.token_to_kv_pool_allocator_local.free_group_begin()
 
         # Check finish condition
         # NOTE: the length of reqs and next_token_ids don't match if it is spec decoding.
@@ -219,6 +221,10 @@ class SchedulerOutputProcessorMixin:
                 # Free the one extra delayed token
                 if self.page_size == 1:
                     self.token_to_kv_pool_allocator.free(batch.out_cache_loc[i : i + 1])
+                    if self.token_to_kv_pool_allocator_local is not None:
+                        self.token_to_kv_pool_allocator_local.free(
+                            batch.out_cache_loc_local[i : i + 1]
+                        )
                 else:
                     # Only free when the extra token is in a new page
                     if (
@@ -269,6 +275,8 @@ class SchedulerOutputProcessorMixin:
         self.set_next_batch_sampling_info_done(batch)
         self.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()
+        if self.token_to_kv_pool_allocator_local is not None:
+            self.token_to_kv_pool_allocator_local.free_group_end()
 
         self.forward_ct_decode = (self.forward_ct_decode + 1) % (1 << 30)
         if (

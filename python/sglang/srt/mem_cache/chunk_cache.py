@@ -2,7 +2,7 @@ from __future__ import annotations
 
 """Cache for chunked prefill, used when RadixCache is disabled."""
 
-from typing import TYPE_CHECKING, Any, Callable, List, Tuple
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple
 
 import torch
 
@@ -25,10 +25,12 @@ class ChunkCache(BasePrefixCache):
         req_to_token_pool: ReqToTokenPool,
         token_to_kv_pool_allocator: TokenToKVPoolAllocator,
         page_size: int,
+        token_to_kv_pool_allocator_local: Optional[TokenToKVPoolAllocator] = None,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.page_size = page_size
+        self.token_to_kv_pool_allocator_local = token_to_kv_pool_allocator_local
 
     def reset(self):
         pass
@@ -42,6 +44,14 @@ class ChunkCache(BasePrefixCache):
         ]
         self.req_to_token_pool.free(req.req_pool_idx)
         self.token_to_kv_pool_allocator.free(kv_indices)
+        if self.token_to_kv_pool_allocator_local is not None:
+            kv_indices_local = self.req_to_token_pool.req_to_token_local[
+                req.req_pool_idx,
+                req.evicted_seqlen_local : len(req.origin_input_ids)
+                + len(req.output_ids)
+                - 1,
+            ]
+            self.token_to_kv_pool_allocator_local.free(kv_indices_local)
 
     def cache_unfinished_req(self, req: Req):
         kv_indices = self.req_to_token_pool.req_to_token[
@@ -50,9 +60,29 @@ class ChunkCache(BasePrefixCache):
 
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
         req.prefix_indices = kv_indices
+        if self.token_to_kv_pool_allocator_local is not None:
+            kv_indices_local = self.req_to_token_pool.req_to_token_local[
+                req.req_pool_idx, : len(req.fill_ids)
+            ]
+            req.prefix_indices_local = kv_indices_local
 
     def insert(self):
         raise NotImplementedError()
+
+    def evict_hybrid(
+        self,
+        req: Req,
+        attention_chunk_size: int,
+    ):
+        if req.seqlen > req.evicted_seqlen_local + attention_chunk_size:
+            loc_idx = attention_chunk_size * (req.seqlen // attention_chunk_size)
+            with open("log.txt", "a") as f:
+                f.write(f"seqlen: {req.seqlen}, loc_idx: {loc_idx}\n")
+            free_slots = self.req_to_token_pool.req_to_token_local[
+                req.req_pool_idx, req.evicted_seqlen_local : loc_idx
+            ]
+            self.token_to_kv_pool_allocator_local.free(free_slots)
+            req.evicted_seqlen_local = loc_idx
 
     def evict(self, num_tokens: int):
         pass

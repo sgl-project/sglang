@@ -238,6 +238,10 @@ class CudaGraphRunner:
                 (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
             )
             self.out_cache_loc = torch.zeros((self.max_num_token,), dtype=torch.int64)
+            if self.model_runner.is_hybrid is not None:
+                self.out_cache_loc_local = torch.zeros(
+                    (self.max_num_token,), dtype=torch.int64
+                )
             self.positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
             self.mrope_positions = torch.zeros((3, self.max_bs), dtype=torch.int64)
             self.num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
@@ -398,6 +402,10 @@ class CudaGraphRunner:
         req_pool_indices = self.req_pool_indices[:bs]
         seq_lens = self.seq_lens[:bs]
         out_cache_loc = self.out_cache_loc[:num_tokens]
+        if self.model_runner.is_hybrid is not None:
+            out_cache_loc_local = self.out_cache_loc_local[:num_tokens]
+        else:
+            out_cache_loc_local = None
         positions = self.positions[:num_tokens]
         if self.is_encoder_decoder:
             encoder_lens = self.encoder_lens[:bs]
@@ -452,6 +460,7 @@ class CudaGraphRunner:
             token_to_kv_pool=self.model_runner.token_to_kv_pool,
             attn_backend=self.model_runner.attn_backend,
             out_cache_loc=out_cache_loc,
+            out_cache_loc_local=out_cache_loc_local,
             seq_lens_sum=seq_lens.sum(),
             encoder_lens=encoder_lens,
             return_logprob=False,
@@ -552,12 +561,18 @@ class CudaGraphRunner:
         if bs != raw_bs:
             self.seq_lens.fill_(1)
             self.out_cache_loc.zero_()
+            if self.model_runner.is_hybrid is not None:
+                self.out_cache_loc_local.zero_()
 
         # Common inputs
         self.input_ids[:raw_num_token].copy_(forward_batch.input_ids)
         self.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
         self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
         self.out_cache_loc[:raw_num_token].copy_(forward_batch.out_cache_loc)
+        if self.model_runner.is_hybrid is not None:
+            self.out_cache_loc_local[:raw_num_token].copy_(
+                forward_batch.out_cache_loc_local
+            )
         self.positions[:raw_num_token].copy_(forward_batch.positions)
         self.num_token_non_padded[...] = len(forward_batch.input_ids)
         if forward_batch.seq_lens_cpu is not None:
