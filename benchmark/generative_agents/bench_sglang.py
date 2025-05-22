@@ -35,14 +35,14 @@ def main(args):
 
     states = []
     # Run requests
-    tic = time.time()
+    tic = time.perf_counter()
     for a in arguments:
         # only a single key in the dict
         for func, arg in a.items():
             result = func.run(**arg)
         result.sync()
         states.append(result)
-    latency = time.time() - tic
+    latency = time.perf_counter() - tic
 
     # Compute accuracy
     print(f"Latency: {latency:.3f}")

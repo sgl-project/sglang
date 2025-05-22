@@ -2,7 +2,7 @@
 Bench the sglang-hosted vLM with benchmark MMMU
 
 Usage:
-    Host the VLM: python -m sglang.launch_server --model-path Qwen/Qwen2-VL-7B-Instruct --chat-template qwen2-vl --port 30000
+    Host the VLM: python -m sglang.launch_server --model-path Qwen/Qwen2-VL-7B-Instruct --port 30000
 
     Benchmark: python benchmark/mmmu/bench_sglang.py --port 30000 --concurrency 16
 
@@ -119,7 +119,7 @@ async def eval_mmmu(args) -> None:
         api_key="sk", base_url=f"http://127.0.0.1:{args.port}/v1"
     )
     semaphore = asyncio.Semaphore(args.concurrency)
-    start = time.time()
+    start = time.perf_counter()
     base_url = f"http://127.0.0.1:{args.port}"
 
     if args.profile:
@@ -147,7 +147,7 @@ async def eval_mmmu(args) -> None:
         if profile_output.success:
             print("Profiler stopped")
 
-    print(f"Benchmark time: {time.time() - start}")
+    print(f"Benchmark time: {time.perf_counter() - start}")
     args.output_path = f"./val_sglang.json"
     save_json(args.output_path, out_samples)
     eval_result(model_answer_path=args.output_path, answer_dict=answer_dict)
