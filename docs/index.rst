@@ -55,6 +55,7 @@ The core features include:
    backend/custom_chat_template.md
    backend/quantization.md
    backend/lora.ipynb
+   backend/pd_disaggregation.md
 
 .. toctree::
    :maxdepth: 1
