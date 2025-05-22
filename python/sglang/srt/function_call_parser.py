@@ -490,6 +490,7 @@ class DeepSeekV3Detector(BaseFormatDetector):
         super().__init__()
         self.bot_token = "<｜tool▁calls▁begin｜>"
         self.eot_token = "<｜tool▁calls▁end｜>"
+        self.tool_call_sub_start = "<｜tool▁call▁begin｜>"
         self.func_call_regex = r"<｜tool▁call▁begin｜>.*?<｜tool▁call▁end｜>"
         self.func_detail_regex = r"<｜tool▁call▁begin｜>(.*)<｜tool▁sep｜>(.*)\n```json\n(.*)\n```<｜tool▁call▁end｜>"
         self._last_arguments = ""
@@ -544,7 +545,7 @@ class DeepSeekV3Detector(BaseFormatDetector):
         self._buffer += new_text
         current_text = self._buffer
 
-        if self.bot_token not in current_text:
+        if self.bot_token not in current_text and self.tool_call_sub_start not in current_text:
             self._buffer = ""
             for e_token in [self.eot_token, "```", "<｜tool▁call▁end｜>"]:
                 if e_token in new_text:
