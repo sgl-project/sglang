@@ -103,6 +103,7 @@ class ServerArgs:
     collect_tokens_histogram: bool = False
     decode_log_interval: int = 40
     enable_request_time_stats_logging: bool = False
+    kv_events_config: Optional[str] = None
 
     # API related
     api_key: Optional[str] = None
@@ -169,6 +170,13 @@ class ServerArgs:
     enable_ep_moe: bool = False
     enable_deepep_moe: bool = False
     deepep_mode: Optional[Literal["auto", "normal", "low_latency"]] = "auto"
+    ep_num_redundant_experts: int = 0
+    ep_dispatch_algorithm: Optional[Literal["static", "dynamic"]] = None
+    init_expert_location: str = "trivial"
+    expert_distribution_recorder_mode: Optional[
+        Literal["stat", "per_pass", "per_token"]
+    ] = None
+    expert_distribution_recorder_buffer_size: Optional[int] = None
     deepep_config: Optional[str] = None
     enable_torch_compile: bool = False
     torch_compile_max_bs: int = 32
@@ -359,6 +367,15 @@ class ServerArgs:
             logger.warning(
                 "Pipeline parallelism is incompatible with overlap schedule."
             )
+
+        if self.expert_distribution_recorder_buffer_size is None:
+            # TODO pr-chain: enable this later
+            # if (x := self.eplb_rebalance_num_iterations) is not None:
+            #     self.expert_distribution_recorder_buffer_size = x
+            if False:
+                pass
+            elif self.expert_distribution_recorder_mode is not None:
+                self.expert_distribution_recorder_buffer_size = 1000
 
         # Speculative Decoding
         if self.speculative_algorithm == "NEXTN":
@@ -815,6 +832,12 @@ class ServerArgs:
             help="Collect prompt/generation tokens histogram.",
         )
         parser.add_argument(
+            "--kv-events-config",
+            type=str,
+            default=None,
+            help="Config in json format for NVIDIA dynamo KV event publishing. Publishing will be enabled if this flag is used.",
+        )
+        parser.add_argument(
             "--decode-log-interval",
             type=int,
             default=ServerArgs.decode_log_interval,
@@ -935,6 +958,7 @@ class ServerArgs:
             "--attention-backend",
             type=str,
             choices=[
+                "aiter",
                 "flashinfer",
                 "triton",
                 "torch_native",
@@ -1249,6 +1273,36 @@ class ServerArgs:
             choices=["normal", "low_latency", "auto"],
             default="auto",
             help="Select the mode when enable DeepEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch.",
+        )
+        parser.add_argument(
+            "--ep-num-redundant-experts",
+            type=int,
+            default=ServerArgs.ep_num_redundant_experts,
+            help="Allocate this number of redundant experts in expert parallel.",
+        )
+        parser.add_argument(
+            "--ep-dispatch-algorithm",
+            type=str,
+            default=ServerArgs.ep_dispatch_algorithm,
+            help="The algorithm to choose ranks for redundant experts in expert parallel.",
+        )
+        parser.add_argument(
+            "--init-expert-location",
+            type=str,
+            default=ServerArgs.init_expert_location,
+            help="Initial location of EP experts.",
+        )
+        parser.add_argument(
+            "--expert-distribution-recorder-mode",
+            type=str,
+            default=ServerArgs.expert_distribution_recorder_mode,
+            help="Mode of expert distribution recorder.",
+        )
+        parser.add_argument(
+            "--expert-distribution-recorder-buffer-size",
+            type=int,
+            default=ServerArgs.expert_distribution_recorder_buffer_size,
+            help="Circular buffer size of expert distribution recorder. Set to -1 to denote infinite buffer.",
         )
         parser.add_argument(
             "--deepep-config",
