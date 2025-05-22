@@ -20,6 +20,7 @@ import logging
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 import torch
+from srt.model_loader.utils import SupportsPP
 from torch import nn
 from transformers import LlamaConfig
 
@@ -378,7 +379,7 @@ class LlamaModel(nn.Module):
                 )
 
 
-class LlamaForCausalLM(nn.Module):
+class LlamaForCausalLM(nn.Module, SupportsPP):
     # BitandBytes specific attributes
     default_bitsandbytes_target_modules = [
         ".gate_proj.",
@@ -480,14 +481,6 @@ class LlamaForCausalLM(nn.Module):
         else:
             return hidden_states
 
-    @property
-    def start_layer(self):
-        return self.model.start_layer
-
-    @property
-    def end_layer(self):
-        return self.model.end_layer
-
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
 
@@ -541,17 +534,8 @@ class LlamaForCausalLM(nn.Module):
 
         params_dict = dict(self.named_parameters())
 
-        for name, loaded_weight in weights:
-            layer_id = get_layer_id(name)
-            if (
-                layer_id is not None
-                and hasattr(self.model, "start_layer")
-                and (
-                    layer_id < self.model.start_layer
-                    or layer_id >= self.model.end_layer
-                )
-            ):
-                continue
+        filtered_weights = self.filter_weights_by_layers(weights)
+        for name, loaded_weight in filtered_weights:
             if "rotary_emb.inv_freq" in name or "projector" in name:
                 continue
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
