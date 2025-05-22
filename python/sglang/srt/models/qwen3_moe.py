@@ -55,7 +55,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
-from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, EPMoE
+from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPDispatcher
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import select_experts
@@ -67,6 +67,8 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.managers.expert_location import ModelConfigForExpertLocation
+from sglang.srt.managers.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
@@ -99,14 +101,9 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 f"the number of experts {config.num_experts}."
             )
 
-        MoEImpl = (
-            DeepEPMoE
-            if global_server_args_dict["enable_deepep_moe"]
-            else (EPMoE if global_server_args_dict["enable_ep_moe"] else FusedMoE)
-        )
-
-        self.experts = MoEImpl(
-            num_experts=config.num_experts,
+        self.experts = get_moe_impl_class()(
+            num_experts=config.num_experts
+            + global_server_args_dict["ep_num_redundant_experts"],
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
@@ -157,8 +154,14 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         else:
             return self.forward_deepep(hidden_states, forward_mode)
 
-    def forward_normal(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def get_moe_weights(self):
+        return [
+            x.data
+            for name, x in self.experts.named_parameters()
+            if name not in ["correction_bias"]
+        ]
 
+    def forward_normal(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
@@ -189,6 +192,9 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 top_k=self.top_k,
                 use_grouped_topk=False,
                 renormalize=self.renormalize,
+                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                    layer_id=self.layer_id,
+                ),
             )
         else:
             topk_idx = torch.full(
@@ -685,15 +691,7 @@ class Qwen3MoeForCausalLM(nn.Module):
             ("gate_up_proj", "up_proj", 1),
         ]
 
-        # Params for weights, fp8 weight scales, fp8 activation scales
-        # (param_name, weight_name, expert_id, shard_id)
-        MoEImpl = (
-            DeepEPMoE
-            if global_server_args_dict["enable_deepep_moe"]
-            else (EPMoE if global_server_args_dict["enable_ep_moe"] else FusedMoE)
-        )
-
-        expert_params_mapping = MoEImpl.make_expert_params_mapping(
+        expert_params_mapping = get_moe_impl_class().make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
@@ -769,6 +767,20 @@ class Qwen3MoeForCausalLM(nn.Module):
                         weight_loader(param, loaded_weight)
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
+
+        self.routed_experts_weights_of_layer = {
+            layer_id: layer.mlp.get_moe_weights()
+            for layer_id, layer in enumerate(self.model.layers)
+            if isinstance(layer.mlp, Qwen3MoeSparseMoeBlock)
+        }
+
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        return ModelConfigForExpertLocation(
+            num_layers=config.num_hidden_layers,
+            num_logical_experts=config.num_experts,
+            num_groups=None,
+        )
 
 
 EntryClass = Qwen3MoeForCausalLM
