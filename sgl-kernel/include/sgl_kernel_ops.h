@@ -137,14 +137,14 @@ torch::Tensor int8_scaled_mm(
     const torch::Tensor& scales_a,
     const torch::Tensor& scales_b,
     const torch::Dtype& out_dtype,
-    const c10::optional<torch::Tensor>& bias);
+    const std::optional<torch::Tensor>& bias);
 torch::Tensor fp8_scaled_mm(
     const torch::Tensor& mat_a,
     const torch::Tensor& mat_b,
     const torch::Tensor& scales_a,
     const torch::Tensor& scales_b,
     const torch::Dtype& out_dtype,
-    const c10::optional<torch::Tensor>& bias);
+    const std::optional<torch::Tensor>& bias);
 torch::Tensor fp8_blockwise_scaled_mm(
     const torch::Tensor& mat_a,
     const torch::Tensor& mat_b,
@@ -353,12 +353,12 @@ std::vector<at::Tensor> mha_varlen_fwd_sparse(
     const at::Tensor& block_offset,
     const at::Tensor& column_count,
     const at::Tensor& column_index,
-    const c10::optional<at::Tensor>& out_,  // total_q x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
+    const std::optional<at::Tensor>& out_,  // total_q x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
     const at::Tensor& cu_seqlens_q,         // b+1
     const at::Tensor& cu_seqlens_k,         // b+1
-    const c10::optional<at::Tensor>&
+    const std::optional<at::Tensor>&
         seqused_k,  // b. If given, only this many elements of each batch element's keys are used.
-    const c10::optional<at::Tensor>& alibi_slopes_,  // num_heads or b x num_heads
+    const std::optional<at::Tensor>& alibi_slopes_,  // num_heads or b x num_heads
     int64_t max_seqlen_q,
     const int64_t max_seqlen_k,
     const double p_dropout,
@@ -367,7 +367,7 @@ std::vector<at::Tensor> mha_varlen_fwd_sparse(
     bool is_causal,
     const double softcap,
     const bool return_softmax,
-    c10::optional<at::Generator> gen_);
+    std::optional<at::Generator> gen_);
 }  // namespace flash
 
 void convert_vertical_slash_indexes(
@@ -403,4 +403,4 @@ void convert_vertical_slash_indexes_mergehead(
 /*
  * From XGrammar
  */
-void ApplyTokenBitmaskInplace(at::Tensor logits, at::Tensor bitmask, at::optional<at::Tensor> indices = at::nullopt);
+void ApplyTokenBitmaskInplace(at::Tensor logits, at::Tensor bitmask, std::optional<at::Tensor> indices = std::nullopt);
