@@ -21,6 +21,7 @@ from typing import Any, Callable, List, Optional, Tuple, Type, Union
 
 import numpy as np
 import requests
+from huggingface_hub import HfApi, hf_hub_download
 from IPython.display import HTML, display
 from pydantic import BaseModel
 from tqdm import tqdm
@@ -512,3 +513,56 @@ async def async_stream_and_merge(llm, prompt, sampling_params):
         cleaned_chunk = trim_overlap(final_text, chunk_text)
         final_text += cleaned_chunk
         yield cleaned_chunk  # yield the non-overlapping portion
+
+
+def find_tokenizer_file(files: list[str]) -> str:
+    import re
+
+    pattern = r"^tokenizer\.model\.v.*$|^tekken\.json$|^tokenizer\.mm\.model\.v.*$"
+    matches = [f for f in files if re.match(pattern, f)]
+
+    if not matches:
+        raise OSError(f"No tokenizer found in {files}")
+    if len(matches) > 1:
+        raise OSError(f"Multiple tokenizers found: {matches}")
+
+    return matches[0]
+
+
+def list_local_repo_files(repo_id: str, revision: Optional[str] = None) -> list[str]:
+    import huggingface_hub as hf
+
+    # Build cache path
+    cache_path = os.path.join(
+        hf.constants.HF_HUB_CACHE,
+        hf.constants.REPO_ID_SEPARATOR.join(["models", *repo_id.split("/")]),
+    )
+
+    # Get revision from main ref if not specified
+    if not revision:
+        ref_path = os.path.join(cache_path, "refs", "main")
+        if os.path.isfile(ref_path):
+            with open(ref_path) as f:
+                revision = f.read().strip()
+
+    # List files from revision directory
+    if revision:
+        rev_dir = os.path.join(cache_path, "snapshots", revision)
+        if os.path.isdir(rev_dir):
+            return os.listdir(rev_dir)
+
+    return []
+
+
+def _download_tokenizer_file_from_hf(
+    tokenizer_name: str, revision: Optional[str] = None
+) -> str:
+    try:
+        files = HfApi().list_repo_files(repo_id=tokenizer_name, revision=revision)
+    except ConnectionError as exc:
+        files = list_local_repo_files(tokenizer_name, revision)
+        if not files:
+            raise exc
+
+    filename = find_tokenizer_file(files)
+    return hf_hub_download(tokenizer_name, filename=filename, revision=revision)

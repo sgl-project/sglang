@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Dict, Optional, Type, Union
 
 import torch
-from huggingface_hub import snapshot_download
+from huggingface_hub import HfApi, hf_hub_download, snapshot_download
 from transformers import (
     AutoConfig,
     AutoProcessor,
@@ -216,6 +216,20 @@ def get_tokenizer(
         client.pull_files(ignore_pattern=["*.pt", "*.safetensors", "*.bin"])
         tokenizer_name = client.get_local_dir()
 
+    if tokenizer_mode == "mistral":
+        try:
+            from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
+        except ImportError as e:
+            raise ImportError(
+                "MistralTokenizer requires mistral-common package.\n"
+                "Please install it with `pip install mistral-common --upgrade` "
+                "to use mistral tokenizer mode."
+            ) from e
+        tokenizer_file = download_tokenizer_file_from_hf(
+            tokenizer_name, tokenizer_revision
+        )
+        return MistralTokenizerWrapper(MistralTokenizer.from_file(tokenizer_file))
+
     try:
         tokenizer = AutoTokenizer.from_pretrained(
             tokenizer_name,
@@ -329,3 +343,132 @@ def check_gguf_file(model: Union[str, os.PathLike]) -> bool:
     with open(model, "rb") as f:
         header = f.read(4)
     return header == b"GGUF"
+
+
+def download_tokenizer_file_from_hf(
+    path_or_repo_id: str, revision: Optional[str] = None
+) -> str:
+    path = Path(path_or_repo_id)
+
+    # Handle HuggingFace repo ID
+    if not path.exists():
+        if len(path_or_repo_id.split("/")) != 2:
+            raise ValueError(f"Invalid path or repo ID: {path_or_repo_id}")
+        from sglang.utils import _download_tokenizer_file_from_hf
+
+        return _download_tokenizer_file_from_hf(path_or_repo_id, revision)
+
+    # Handle local directory
+    if path.is_dir():
+        from sglang.utils import find_tokenizer_file
+
+        tokenizer_name = find_tokenizer_file(os.listdir(path_or_repo_id))
+        return str(path / tokenizer_name)
+
+    # Handle local file
+    if not path.is_file():
+        raise ValueError(f"Invalid path: {path_or_repo_id}")
+    return str(path)
+
+
+class MistralTokenizerWrapper(PreTrainedTokenizer):
+    def __init__(self, tokenizer):
+        super().__init__()
+        self.instruct = tokenizer.instruct_tokenizer
+        self.tokenizer = self.instruct.tokenizer
+        self._vocab = self.tokenizer.vocab()
+
+        # Convert to a dict[str, int] to match protocol, but this is a lossy
+        # conversion. There may be multiple token ids that decode to the same
+        # string due to partial UTF-8 byte sequences being converted to �
+        self._vocab_dict = {token: idx for idx, token in enumerate(self._vocab)}
+        self._max_token_id = self.vocab_size - 1
+
+    def __call__(self, text: str):
+        return self.tokenizer.encode(text)
+
+    def decode(self, ids: list[int]):
+        return self.tokenizer.decode(ids)
+
+    @property
+    def all_special_tokens_extended(self) -> list[str]:
+        from mistral_common.tokens.tokenizers.base import SpecialTokens
+
+        # tekken defines its own extended special tokens list
+        if hasattr(self.tokenizer, "SPECIAL_TOKENS"):
+            special_tokens = self.tokenizer.SPECIAL_TOKENS
+        else:
+            special_tokens = list(SpecialTokens)
+        return [s.value if isinstance(s, SpecialTokens) else s for s in special_tokens]
+
+    @property
+    def all_special_tokens(self) -> list[str]:
+        return self.all_special_tokens_extended
+
+    @property
+    def all_special_ids(self) -> list[int]:
+        return [self.all_special_tokens.index(t) for t in self.all_special_tokens]
+
+    @property
+    def bos_token_id(self) -> int:
+        return self.tokenizer.bos_id
+
+    @property
+    def eos_token_id(self) -> int:
+        return self.tokenizer.eos_id
+
+    @property
+    def sep_token(self) -> str:
+        raise NotImplementedError()
+
+    @property
+    def pad_token(self) -> str:
+        raise NotImplementedError()
+
+    @property
+    def is_fast(self) -> bool:
+        return True
+
+    @property
+    def vocab_size(self) -> int:
+        return len(self._vocab)
+
+    @property
+    def max_token_id(self) -> int:
+        return self._max_token_id
+
+    def __len__(self) -> int:
+        return self.vocab_size
+
+    # def __call__(
+    #     self,
+    #     text: Union[str, list[str], list[int]],
+    #     text_pair: Optional[str] = None,
+    #     add_special_tokens: bool = False,
+    #     truncation: bool = False,
+    #     max_length: Optional[int] = None,
+    # ):
+    #     input_ids: Union[list[int], list[list[int]]]
+    #     # For list[str], original prompt text
+    #     if is_list_of(text, str):
+    #         input_ids_: list[list[int]] = []
+    #         for p in text:
+    #             each_input_ids = self.encode_one(p, truncation, max_length)
+    #             input_ids_.append(each_input_ids)
+    #         input_ids = input_ids_
+    #     # For list[int], apply chat template output, already tokens.
+    #     elif is_list_of(text, int):
+    #         input_ids = text
+    #     # For str, single prompt text
+    #     else:
+    #         input_ids = self.encode_one(text, truncation, max_length)
+    #     return Encoding(input_ids=input_ids)
+
+    def get_vocab(self) -> dict[str, int]:
+        # NB: the dictionary form of the vocabulary collapses token ids that map
+        # to the same string but have different bytes
+        return self._vocab_dict
+
+    def get_added_vocab(self) -> dict[str, int]:
+        # Mistral tokenizers have no added vocabulary
+        return {}

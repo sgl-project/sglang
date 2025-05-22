@@ -486,10 +486,11 @@ class ServerArgs:
             "--tokenizer-mode",
             type=str,
             default=ServerArgs.tokenizer_mode,
-            choices=["auto", "slow"],
+            choices=["auto", "slow", "mistral"],
             help="Tokenizer mode. 'auto' will use the fast "
             "tokenizer if available, and 'slow' will "
-            "always use the slow tokenizer.",
+            "always use the slow tokenizer. 'mistral' will "
+            "use the Mistral tokenizer.",
         )
         parser.add_argument(
             "--skip-tokenizer-init",
