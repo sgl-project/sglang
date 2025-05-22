@@ -47,6 +47,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_loader.common_weight_loader import common_load_weights
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix, make_layers
 
@@ -379,6 +380,11 @@ class MixtralForCausalLM(nn.Module):
         return self.model.end_layer
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        from sglang.srt.layers.moe.ep_moe.layer import EPMoE
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+        from sglang.srt.managers.schedule_batch import global_server_args_dict
+        from sglang.srt.model_loader.common_weight_loader import common_load_weights
+
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -386,8 +392,6 @@ class MixtralForCausalLM(nn.Module):
             ("qkv_proj", "v_proj", "v"),
         ]
 
-        # Params for weights, fp8 weight scales, fp8 activation scales
-        # (param_name, weight_name, expert_id, shard_id)
         MoEImpl = EPMoE if global_server_args_dict["enable_ep_moe"] else FusedMoE
         expert_params_mapping = MoEImpl.make_expert_params_mapping(
             ckpt_gate_proj_name="w1",
@@ -396,77 +400,12 @@ class MixtralForCausalLM(nn.Module):
             num_experts=self.config.num_local_experts,
         )
 
-        params_dict = dict(self.named_parameters())
-        for name, loaded_weight in weights:
-            layer_id = get_layer_id(name)
-            if (
-                layer_id is not None
-                and hasattr(self.model, "start_layer")
-                and (
-                    layer_id < self.model.start_layer
-                    or layer_id >= self.model.end_layer
-                )
-            ):
-                continue
-
-            if "rotary_emb.inv_freq" in name:
-                continue
-
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                if (
-                    name.endswith(".bias") or name.endswith("_bias")
-                ) and name not in params_dict:
-                    continue
-
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                for mapping in expert_params_mapping:
-                    param_name, weight_name, expert_id, shard_id = mapping
-                    if weight_name not in name:
-                        continue
-                    name = name.replace(weight_name, param_name)
-
-                    if (
-                        name.endswith(".bias") or name.endswith("_bias")
-                    ) and name not in params_dict:
-                        continue
-                    param = params_dict[name]
-                    weight_loader = param.weight_loader
-                    weight_loader(
-                        param,
-                        loaded_weight,
-                        name,
-                        shard_id=shard_id,
-                        expert_id=expert_id,
-                    )
-                    break
-                else:
-                    # Skip loading extra bias for GPTQ models.
-                    if (
-                        name.endswith(".bias") or name.endswith("_bias")
-                    ) and name not in params_dict:
-                        continue
-                    # Skip loading kv_scale from ckpts towards new design.
-                    if name.endswith(".kv_scale") and name not in params_dict:
-                        continue
-                    if name is None:
-                        continue
-
-                    if name in params_dict.keys():
-                        param = params_dict[name]
-                        weight_loader = getattr(
-                            param, "weight_loader", default_weight_loader
-                        )
-                        weight_loader(param, loaded_weight)
-                    else:
-                        logger.warning(f"Parameter {name} not found in params_dict")
+        return common_load_weights(
+            model=self,
+            weights=weights,
+            stacked_params_mapping=stacked_params_mapping,
+            expert_params_mapping=expert_params_mapping,
+        )
 
 
 EntryClass = MixtralForCausalLM
