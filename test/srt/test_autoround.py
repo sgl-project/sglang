@@ -1,5 +1,6 @@
 import unittest
 from types import SimpleNamespace
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
@@ -15,7 +16,7 @@ class TestAutoRound(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.base_url = DEFAULT_URL_FOR_TEST
-        
+
     @classmethod
     def tearDownClass(cls):
         pass

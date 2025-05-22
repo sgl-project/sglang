@@ -6,12 +6,14 @@ from typing import Any, Optional, Union
 import torch
 
 try:
-    from vllm.model_executor.layers.quantization.utils.marlin_utils import (
-        check_marlin_supported, check_moe_marlin_supports_layer
-    )
-    from vllm.scalar_type import scalar_types
-    from vllm.platforms import current_platform
     from vllm.logger import init_logger
+    from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+        check_marlin_supported,
+        check_moe_marlin_supports_layer,
+    )
+    from vllm.platforms import current_platform
+    from vllm.scalar_type import scalar_types
+
     logger = init_logger(__name__)
     VLLM_AVAILABLE = True
 except ImportError:
@@ -25,6 +27,7 @@ except ImportError:
 
     current_platform = None
     import logging
+
     logger = logging.getLogger(__name__)
 
 from sglang.srt.layers.linear import (
@@ -35,6 +38,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 
+
 class AutoRoundConfig(QuantizationConfig):
     """Config class for AutoRound.
     Reference: https://arxiv.org/pdf/2309.05516
@@ -43,9 +47,7 @@ class AutoRoundConfig(QuantizationConfig):
     SUPPORTED_BITS = {2, 3, 4, 8}
     SUPPORTED_DTYPES = {"int"}
     SUPPORTED_FORMATS = {"auto_round:auto_gptq", "auto_round:auto_awq"}
-    SUPPORTED_BACKENDS = {
-        "auto", "gptq", "gptq:marlin", "awq", "awq:marlin", "marlin"
-    }
+    SUPPORTED_BACKENDS = {"auto", "gptq", "gptq:marlin", "awq", "awq:marlin", "marlin"}
 
     def __init__(
         self,
@@ -60,36 +62,45 @@ class AutoRoundConfig(QuantizationConfig):
     ) -> None:
         super().__init__()
         if weight_bits not in self.SUPPORTED_BITS:
-            raise ValueError(f"Unsupported weight_bits: {weight_bits}, "
-                             f"currently only support  {self.SUPPORTED_BITS}")
+            raise ValueError(
+                f"Unsupported weight_bits: {weight_bits}, "
+                f"currently only support  {self.SUPPORTED_BITS}"
+            )
         if data_type not in self.SUPPORTED_DTYPES:
             raise ValueError(
                 f"Unsupported data_type: {data_type},"
-                f" currently only support  {self.SUPPORTED_DTYPES}")
+                f" currently only support  {self.SUPPORTED_DTYPES}"
+            )
         if packing_format not in self.SUPPORTED_FORMATS:
             raise ValueError(
                 f"Unsupported packing_format: {packing_format}, "
-                f"currently only support  {self.SUPPORTED_FORMATS}")
+                f"currently only support  {self.SUPPORTED_FORMATS}"
+            )
         if backend not in self.SUPPORTED_BACKENDS:
             raise ValueError(
                 f"Unsupported backend: {backend},  "
-                f"currently only support  {self.SUPPORTED_BACKENDS}")
+                f"currently only support  {self.SUPPORTED_BACKENDS}"
+            )
 
         self.weight_bits = weight_bits
         self.group_size = group_size
         self.sym = sym
         self.packing_format = packing_format
-        self.block_name_to_quantize = (block_name_to_quantize.split(",") if
-                                       isinstance(block_name_to_quantize, str)
-                                       else block_name_to_quantize)
+        self.block_name_to_quantize = (
+            block_name_to_quantize.split(",")
+            if isinstance(block_name_to_quantize, str)
+            else block_name_to_quantize
+        )
         self.extra_config = extra_config
         self.data_type = data_type
         self.backend = backend
         self.pack_factor = Fraction(32, weight_bits)
 
     def __repr__(self) -> str:
-        return (f"AutoRoundConfig(weight_bits={self.weight_bits}, "
-                f"group_size={self.group_size}, sym={self.sym})")
+        return (
+            f"AutoRoundConfig(weight_bits={self.weight_bits}, "
+            f"group_size={self.group_size}, sym={self.sym})"
+        )
 
     @classmethod
     def get_name(cls):  ## use str will trigger preci issue
@@ -113,14 +124,17 @@ class AutoRoundConfig(QuantizationConfig):
             weight_bits=cls.get_from_keys(config, ["bits"]),
             group_size=cls.get_from_keys(config, ["group_size"]),
             sym=cls.get_from_keys(config, ["sym"]),
-            packing_format=cls.get_from_keys_or(config, ["packing_format"],
-                                                "auto_round:auto_gptq"),
+            packing_format=cls.get_from_keys_or(
+                config, ["packing_format"], "auto_round:auto_gptq"
+            ),
             block_name_to_quantize=cls.get_from_keys_or(
-                config, ["block_name_to_quantize", "to_quant_block_names"],
-                None),
+                config, ["block_name_to_quantize", "to_quant_block_names"], None
+            ),
             extra_config=cls.get_from_keys_or(config, ["extra_config"], None),
             data_type=cls.get_from_keys_or(config, ["data_type"], "int"),
-            backend=cls.get_from_keys_or(config, ["backend", "vllm_backend", "sglang_backend"], "auto"),
+            backend=cls.get_from_keys_or(
+                config, ["backend", "vllm_backend", "sglang_backend"], "auto"
+            ),
         )
 
     def get_scaled_act_names(self) -> list[str]:
@@ -134,26 +148,34 @@ class AutoRoundConfig(QuantizationConfig):
         # Priority: extra_config > block_name_to_quantize > type fallback
         if self.extra_config and layer_name in self.extra_config:
             cfg = self.extra_config[layer_name]
-            return cfg.get("bits", self.weight_bits), cfg.get(
-                "group_size", self.group_size), cfg.get("sym", self.sym)
+            return (
+                cfg.get("bits", self.weight_bits),
+                cfg.get("group_size", self.group_size),
+                cfg.get("sym", self.sym),
+            )
 
         quantized = True
         if self.block_name_to_quantize:
-            quantized = any(name in layer_name
-                            for name in self.block_name_to_quantize)
+            quantized = any(name in layer_name for name in self.block_name_to_quantize)
         elif isinstance(layer, ParallelLMHead):
             quantized = False
 
-        return (self.weight_bits, self.group_size,
-                self.sym) if quantized else (16, -1, True)
+        return (
+            (self.weight_bits, self.group_size, self.sym)
+            if quantized
+            else (16, -1, True)
+        )
 
     def check_quantized(self, weight_bits: int) -> bool:
         return weight_bits < 16
 
     def apply_awq_quant_layer(self, layer, prefix: str, backend: str = "auto"):
-        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
         from vllm.model_executor.layers.quantization.utils.marlin_utils import (
-            check_marlin_supported, check_moe_marlin_supports_layer)
+            check_marlin_supported,
+            check_moe_marlin_supports_layer,
+        )
+
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         weight_bits, group_size, sym = self.get_layer_config(layer, prefix)
         if not self.check_quantized(weight_bits):
@@ -162,9 +184,14 @@ class AutoRoundConfig(QuantizationConfig):
             else:
                 return None
 
-        logger.debug("[%s] Type: %s, Bits: %s, Group Size: %s, Sym: %s",
-                     prefix, layer.__class__.__name__, weight_bits, group_size,
-                     sym)
+        logger.debug(
+            "[%s] Type: %s, Bits: %s, Group Size: %s, Sym: %s",
+            prefix,
+            layer.__class__.__name__,
+            weight_bits,
+            group_size,
+            sym,
+        )
         if backend == "auto" or "marlin" in backend:
             if isinstance(layer, FusedMoE):
 
@@ -175,24 +202,32 @@ class AutoRoundConfig(QuantizationConfig):
                     4: scalar_types.uint4,
                     8: scalar_types.uint8,
                 }
-                use_marlin = ((weight_bits, sym) in AWQ_TYPE_MAP
-                              and check_marlin_supported(
-                                  AWQ_TYPE_MAP[(weight_bits)], group_size,
-                                  not sym))
+                use_marlin = (
+                    weight_bits,
+                    sym,
+                ) in AWQ_TYPE_MAP and check_marlin_supported(
+                    AWQ_TYPE_MAP[(weight_bits)], group_size, not sym
+                )
         else:
             use_marlin = False
         if use_marlin:
             from vllm.model_executor.layers.quantization.awq_marlin import (
-                AWQMarlinConfig, AWQMarlinLinearMethod, AWQMoEMethod)
-            quant_args_marlin = AWQMarlinConfig(weight_bits=weight_bits,
-                                                group_size=group_size,
-                                                zero_point=not sym,
-                                                lm_head_quantized=False,
-                                                full_config={},
-                                                modules_to_not_convert=[])
+                AWQMarlinConfig,
+                AWQMarlinLinearMethod,
+                AWQMoEMethod,
+            )
+
+            quant_args_marlin = AWQMarlinConfig(
+                weight_bits=weight_bits,
+                group_size=group_size,
+                zero_point=not sym,
+                lm_head_quantized=False,
+                full_config={},
+                modules_to_not_convert=[],
+            )
         else:
-            from sglang.srt.layers.quantization.awq import (
-                AWQConfig, AWQLinearMethod)
+            from sglang.srt.layers.quantization.awq import AWQConfig, AWQLinearMethod
+
             quant_args = AWQConfig(
                 weight_bits=weight_bits,
                 group_size=group_size,
@@ -202,16 +237,15 @@ class AutoRoundConfig(QuantizationConfig):
         if isinstance(layer, FusedMoE):
             if use_marlin:
                 return AWQMoEMethod(quant_args_marlin)
-            from sglang.srt.layers.quantization.moe_wna16 import (
-                MoeWNA16Config)
+            from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
+
             config = {
                 "linear_quant_method": "awq",
                 "weight_bits": weight_bits,
                 "group_size": group_size,
                 "zero_point": not sym,
             }
-            return MoeWNA16Config.from_config(config).get_quant_method(
-                layer, prefix)
+            return MoeWNA16Config.from_config(config).get_quant_method(layer, prefix)
 
         if isinstance(layer, (LinearBase, ParallelLMHead)):
             if use_marlin:
@@ -220,13 +254,14 @@ class AutoRoundConfig(QuantizationConfig):
                 return AWQLinearMethod(quant_args)
         return None
 
-    def apply_gptq_quant_layer(self,
-                               layer,
-                               prefix: str,
-                               backend: str = "auto"):
-        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+    def apply_gptq_quant_layer(self, layer, prefix: str, backend: str = "auto"):
         from vllm.model_executor.layers.quantization.utils.marlin_utils import (
-            check_marlin_supported, check_moe_marlin_supports_layer)
+            check_marlin_supported,
+            check_moe_marlin_supports_layer,
+        )
+
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+
         weight_bits, group_size, sym = self.get_layer_config(layer, prefix)
         if not self.check_quantized(weight_bits):
             if isinstance(layer, (LinearBase, ParallelLMHead)):
@@ -234,9 +269,14 @@ class AutoRoundConfig(QuantizationConfig):
             else:
                 return None
 
-        logger.debug("[%s] Type: %s, Bits: %s, Group Size: %s, Sym: %s",
-                     prefix, layer.__class__.__name__, weight_bits, group_size,
-                     sym)
+        logger.debug(
+            "[%s] Type: %s, Bits: %s, Group Size: %s, Sym: %s",
+            prefix,
+            layer.__class__.__name__,
+            weight_bits,
+            group_size,
+            sym,
+        )
         if backend == "auto" or "marlin" in backend:
             if isinstance(layer, FusedMoE):
                 use_marlin = check_moe_marlin_supports_layer(layer, group_size)
@@ -245,36 +285,45 @@ class AutoRoundConfig(QuantizationConfig):
                     (4, True): scalar_types.uint4b8,
                     (8, True): scalar_types.uint8b128,
                 }
-                use_marlin = ((weight_bits, sym) in GPTQ_TYPE_MAP
-                              and check_marlin_supported(
-                                  GPTQ_TYPE_MAP[(weight_bits, sym)],
-                                  group_size,
-                                  has_zp=not sym))
+                use_marlin = (
+                    weight_bits,
+                    sym,
+                ) in GPTQ_TYPE_MAP and check_marlin_supported(
+                    GPTQ_TYPE_MAP[(weight_bits, sym)], group_size, has_zp=not sym
+                )
         else:
             use_marlin = False
         if use_marlin:
             from sglang.srt.layers.quantization.gptq import (
-                GPTQMarlinConfig, GPTQMarlinLinearMethod, GPTQMarlinMoEMethod)
-            quant_args_marlin = GPTQMarlinConfig(weight_bits=weight_bits,
-                                                 group_size=group_size,
-                                                 is_sym=sym,
-                                                 lm_head_quantized=False,
-                                                 desc_act=False,
-                                                 dynamic={},
-                                                 full_config={})
+                GPTQMarlinConfig,
+                GPTQMarlinLinearMethod,
+                GPTQMarlinMoEMethod,
+            )
+
+            quant_args_marlin = GPTQMarlinConfig(
+                weight_bits=weight_bits,
+                group_size=group_size,
+                is_sym=sym,
+                lm_head_quantized=False,
+                desc_act=False,
+                dynamic={},
+                full_config={},
+            )
         else:
-            from sglang.srt.layers.quantization.gptq import (
-                GPTQConfig, GPTQLinearMethod)
-            quant_args = GPTQConfig(weight_bits=weight_bits,
-                                    group_size=group_size,
-                                    lm_head_quantized=False,
-                                    desc_act=False,
-                                    dynamic={})
+            from sglang.srt.layers.quantization.gptq import GPTQConfig, GPTQLinearMethod
+
+            quant_args = GPTQConfig(
+                weight_bits=weight_bits,
+                group_size=group_size,
+                lm_head_quantized=False,
+                desc_act=False,
+                dynamic={},
+            )
 
         if isinstance(layer, FusedMoE):
             if use_marlin:
-                from sglang.srt.layers.quantization.moe_wna16 import (
-                    MoeWNA16Config)
+                from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
+
                 config = {
                     "linear_quant_method": "gptq",
                     "weight_bits": weight_bits,
@@ -283,7 +332,8 @@ class AutoRoundConfig(QuantizationConfig):
                     "lm_head_quantized": False,
                 }
                 return MoeWNA16Config.from_config(config).get_quant_method(
-                    layer, prefix)
+                    layer, prefix
+                )
             return GPTQMarlinMoEMethod(quant_args_marlin)
 
         if isinstance(layer, (LinearBase, ParallelLMHead)):
@@ -291,7 +341,7 @@ class AutoRoundConfig(QuantizationConfig):
                 return GPTQMarlinLinearMethod(quant_args_marlin)
             else:
                 return GPTQLinearMethod(quant_args)
-        
+
         return None
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
