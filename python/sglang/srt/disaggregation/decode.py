@@ -174,6 +174,8 @@ class DecodePreallocQueue:
             [decode_req.kv_receiver for decode_req in self.queue], self.gloo_group
         )
 
+        indices_to_remove = set()
+
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
             if poll == KVPoll.Bootstrapping:
                 pass
@@ -191,6 +193,11 @@ class DecodePreallocQueue:
                     error_message,
                     status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
                 )
+                indices_to_remove.add(i)
+
+        self.queue = [
+            entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
+        ]
 
     def pop_preallocated(self) -> List[DecodeRequest]:
         """Pop the preallocated requests from the pending queue (FIFO)."""
@@ -321,11 +328,15 @@ class DecodeTransferQueue:
         gloo_group: ProcessGroup,
         req_to_metadata_buffer_idx_allocator: ReqToMetadataIdxAllocator,
         metadata_buffers: torch.Tensor,
+        scheduler: Scheduler,
+        tree_cache: BasePrefixCache,
     ):
         self.queue: List[DecodeRequest] = []
         self.gloo_group = gloo_group
         self.req_to_metadata_buffer_idx_allocator = req_to_metadata_buffer_idx_allocator
         self.metadata_buffers = metadata_buffers
+        self.scheduler = scheduler
+        self.tree_cache = tree_cache
 
     def add(self, req_conn: DecodeRequest) -> None:
         self.queue.append(req_conn)
@@ -345,7 +356,7 @@ class DecodeTransferQueue:
         indices_to_remove = set()
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
             if poll == KVPoll.Failed:
-                error_message = f"Decode transfer failed for request {decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
+                error_message = f"Decode transfer failed for request rank={self.scheduler.tp_rank} {decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
                 try:
                     decode_req.kv_receiver.failure_exception()
                 except Exception as e:
@@ -359,8 +370,14 @@ class DecodeTransferQueue:
                 self.scheduler.stream_output(
                     [decode_req.req], decode_req.req.return_logprob
                 )
+
                 # unlock the kv cache or it will have memory leak
-                self.tree_cache.cache_finished_req(decode_req.req)
+                self.scheduler.req_to_token_pool.free([decode_req.req.req_pool_idx])
+                token_locs = self.scheduler.req_to_token_pool.req_to_token[
+                    decode_req.req.req_pool_idx
+                ][: decode_req.req.extend_input_len]
+                self.scheduler.token_to_kv_pool_allocator.free(token_locs)
+                # self.tree_cache.cache_finished_req(decode_req.req)
                 indices_to_remove.add(i)
                 continue
             elif poll == KVPoll.Success:
