@@ -1,7 +1,8 @@
 #include <numa.h>
-#include <unistd.h>
-#include <string>
 #include <sched.h>
+#include <unistd.h>
+
+#include <string>
 
 #include "common.h"
 
@@ -37,8 +38,7 @@ std::string init_cpu_threads_env(const std::string& cpu_ids) {
     *(src_mask->maskp) = *(src_mask->maskp) ^ *(mask->maskp);
     int page_num = numa_migrate_pages(pid, src_mask, mask);
     if (page_num == -1) {
-      TORCH_CHECK(false,
-                  "numa_migrate_pages failed. errno: " + std::to_string(errno));
+      TORCH_CHECK(false, "numa_migrate_pages failed. errno: " + std::to_string(errno));
     }
 
     // restrict memory allocation node.
@@ -64,8 +64,7 @@ std::string init_cpu_threads_env(const std::string& cpu_ids) {
     CPU_SET(omp_cpu_ids[i], &mask);
     int ret = sched_setaffinity(0, sizeof(cpu_set_t), &mask);
     if (ret == -1) {
-      TORCH_CHECK(false,
-                  "sched_setaffinity failed. errno: " + std::to_string(errno));
+      TORCH_CHECK(false, "sched_setaffinity failed. errno: " + std::to_string(errno));
     }
 
     omp_set_lock(&writelock);
@@ -79,8 +78,8 @@ std::string init_cpu_threads_env(const std::string& cpu_ids) {
 
   std::stringstream ss;
   ss << "OMP threads binding of Process " << getpid() << ":\n";
-  std::sort(thread_core_mapping.begin(), thread_core_mapping.end(),
-            [](auto&& a, auto&& b) { return a.second < b.second; });
+  std::sort(
+      thread_core_mapping.begin(), thread_core_mapping.end(), [](auto&& a, auto&& b) { return a.second < b.second; });
   for (auto&& item : thread_core_mapping) {
     ss << "\t"
        << "OMP tid: " << item.first << ", core " << item.second << "\n";

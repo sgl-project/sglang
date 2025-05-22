@@ -362,7 +362,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 }
 
 TORCH_LIBRARY_IMPL(sgl_kernel, CatchAll, m) {
-    m.impl("init_cpu_threads_env", init_cpu_threads_env);
+  m.impl("init_cpu_threads_env", init_cpu_threads_env);
 }
 
 REGISTER_EXTENSION(common_ops)
