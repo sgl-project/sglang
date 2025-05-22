@@ -293,6 +293,9 @@ def get_embedding_and_mask(
         embedding_items_per_req = embedding_items[items_size[i] : items_size[i + 1]]
         items_offset = items_offset_list[i]
         embedding_items_hash = get_embedding_hash(embedding_items_per_req)
+        # if all items has been prefixed, we do not need to calculate embedding
+        if all([offset_end < prefix_length[i] for _, offset_end in items_offset]):
+            continue
         embedding_per_req = embedding_cache.get(embedding_items_hash)
         if embedding_per_req is None:
             embedding_per_req = data_embedding_func(embedding_items_per_req)
@@ -309,9 +312,16 @@ def get_embedding_and_mask(
             items_offset=items_offset,
         )
         # remove this item from cache if chunk reaches to the end
-        if end_index == embedding_per_req.shape[0]:
+        embedding_per_req_length = (
+            embedding_per_req.shape[0]
+            if embedding_per_req.dim() == 2
+            else embedding_per_req.shape[0] * embedding_per_req.shape[1]
+        )
+        if end_index == embedding_per_req_length:
             embedding_cache.free(embedding_items_hash)
         embedding_list.append(embedding_per_req_chunk)
+    if len(embedding_list) == 0:
+        return None, None
     embedding = torch.concat(embedding_list, dim=0)
     # 2. Check the embedding
     num_mm_tokens_in_embedding = embedding.shape[0]
@@ -482,6 +492,8 @@ def embed_mm_inputs(
 
     # 4. scatter embeddings into input embedding
     for embedding, mask in zip(embeddings, masks):
+        if embedding is None or mask is None:
+            continue
         mask = mask.expand_as(inputs_embeds).to(inputs_embeds.device)
         inputs_embeds = inputs_embeds.masked_scatter(
             mask,
