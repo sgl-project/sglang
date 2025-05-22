@@ -450,7 +450,6 @@ class VisionAttention(nn.Module):
             q = q.view(-1, head, self.head_size)
             k = k.view(-1, head, self.head_size)
 
-            print(f"{q.shape=}")
             q, k = self.rotary_emb(position_embeddings, q, k)
 
             q = q.view(original_shape)
