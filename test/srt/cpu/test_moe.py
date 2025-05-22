@@ -2,10 +2,10 @@ import itertools
 import math
 import unittest
 
-import torch
-
 # TODO: use interface in cpu.py
 import sgl_kernel
+import torch
+
 kernel = torch.ops.sgl_kernel
 
 from utils import (
@@ -32,7 +32,9 @@ def fused_moe(a, w1, w2, score, topk, renormalize, prepack):
     B, D = a.shape
     topk_weights = torch.empty(B, topk, dtype=torch.float32)
     topk_ids = torch.empty(B, topk, dtype=torch.int32)
-    topk_weights, topk_ids = kernel.grouped_topk_cpu(a, score, topk, renormalize, G, topk_group)
+    topk_weights, topk_ids = kernel.grouped_topk_cpu(
+        a, score, topk, renormalize, G, topk_group
+    )
 
     packed_w1 = kernel.convert_weight_packed(w1) if prepack else w1
     packed_w2 = kernel.convert_weight_packed(w2) if prepack else w2

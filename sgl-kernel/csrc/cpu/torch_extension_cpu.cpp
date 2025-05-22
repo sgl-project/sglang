@@ -213,7 +213,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def(
       "decode_attention_cpu(Tensor query, Tensor k_cache, Tensor v_cache, Tensor output, Tensor key, Tensor "
       "value, Tensor loc, Tensor attn_logits, Tensor req_to_token, Tensor req_pool_indices, Tensor seq_lens,"
-       "float sm_scale, float logit_cap) -> ()");
+      "float sm_scale, float logit_cap) -> ()");
   m.impl("decode_attention_cpu", torch::kCPU, &decode_attention_cpu);
 
   // extend
@@ -260,7 +260,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   // moe
   m.def(
       "fused_experts_cpu(Tensor hidden_states, Tensor w1, Tensor w2, Tensor topk_weights, Tensor topk_ids, bool "
-      "inplace, bool use_int8_w8a8, bool use_fp8_w8a16, Tensor? w1_scale, Tensor? w2_scale, int[]? block_size, Tensor? a1_scale, Tensor? a2_scale, bool "
+      "inplace, bool use_int8_w8a8, bool use_fp8_w8a16, Tensor? w1_scale, Tensor? w2_scale, int[]? block_size, Tensor? "
+      "a1_scale, Tensor? a2_scale, bool "
       "is_vnni) -> Tensor");
   m.impl("fused_experts_cpu", torch::kCPU, &fused_experts_cpu);
 
