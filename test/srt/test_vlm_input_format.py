@@ -39,7 +39,6 @@ class VLMInputTestBase:
         cls._init_visual()
 
     @classmethod
-    # @abstractmethod
     def _init_visual(cls):
         """Override in subclass to set up cls.visual as a callable for precomputed features."""
         raise NotImplementedError
@@ -80,7 +79,6 @@ class VLMInputTestBase:
         text = conv.get_prompt()
 
         # Process inputs using processor
-        # FIXME: the formal arguments may differ
         inputs = self.processor(
             text=[text],
             images=[self.main_image],
@@ -132,11 +130,8 @@ class VLMInputTestBase:
         )
 
     def _pixel_values_image_data(self, processor_output):
-        """Override in subclass if needed."""
-        return dict(
-            modality="IMAGE",
-            pixel_values=processor_output["pixel_values"][0],
-        )
+        """Override in subclass to pass the correct set of arguments."""
+        raise NotImplementedError
 
 
 class TestQwenVLUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTestCase):
@@ -179,6 +174,12 @@ class TestGemmaUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTestCa
             cls.vision_tower(
                 pixel_values=processor_output["pixel_values"]
             ).last_hidden_state
+        )
+
+    def _pixel_values_image_data(self, processor_output):
+        return dict(
+            modality="IMAGE",
+            pixel_values=processor_output["pixel_values"][0],
         )
 
 
