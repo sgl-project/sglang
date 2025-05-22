@@ -95,6 +95,8 @@ def update_expert_weights_single_layer(
         tensor.shape[0] == num_local_physical_experts
         for tensor in routed_experts_weights
     ), f"{num_local_physical_experts=} {[x.shape for x in routed_experts_weights]=}"
+    assert isinstance(old_physical_to_logical_map, list)
+    assert isinstance(new_physical_to_logical_map, list)
 
     output_logs = [] if debug else None
 

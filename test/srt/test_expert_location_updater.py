@@ -210,8 +210,8 @@ def _execute_test(info: _TestInfo, rank: int, num_gpus: int, device: str):
             temp_buffers=expert_location_updater.create_temp_buffers(
                 routed_experts_weights
             ),
-            old_physical_to_logical_map=physical_to_logical_map,
-            new_physical_to_logical_map=new_physical_to_logical_map,
+            old_physical_to_logical_map=physical_to_logical_map.tolist(),
+            new_physical_to_logical_map=new_physical_to_logical_map.tolist(),
             num_local_physical_experts=num_local_physical_experts,
             num_gpu_per_node=num_gpu_per_node,
             rank=rank,
