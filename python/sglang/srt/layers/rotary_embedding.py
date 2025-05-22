@@ -168,11 +168,14 @@ class RotaryEmbedding(CustomOp):
                 is_neox=self.is_neox_style,
             )
         else:
+
+            cos, sin = positions
+            assert cos.dtype == torch.float and cos.is_contiguous()
+            assert sin.dtype == torch.float and sin.is_contiguous()
             orig_q_dtype = query.dtype
             orig_k_dtype = key.dtype
-            cos, sin = positions
-            cos, sin = cos.float().contiguous(), sin.float().contiguous()
             query, key = query.float(), key.float()
+
             self.sglang_rotary_embedding(
                 cos,
                 sin,

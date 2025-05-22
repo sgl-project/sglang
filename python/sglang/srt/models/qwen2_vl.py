@@ -402,7 +402,10 @@ class Qwen2VisionTransformer(nn.Module):
         # compute position embedding
         rotary_pos_emb = self.rot_pos_emb(grid_thw)
         emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
-        position_embeddings = (emb.cos(), emb.sin())
+        position_embeddings = (
+            emb.cos().float().contiguous(),
+            emb.sin().float().contiguous(),
+        )
         # compute cu_seqlens
         cu_seqlens = torch.repeat_interleave(
             grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
@@ -413,7 +416,6 @@ class Qwen2VisionTransformer(nn.Module):
         x = x.unsqueeze(1)
         for blk in self.blocks:
             x = blk(x, cu_seqlens=cu_seqlens, position_embeddings=position_embeddings)
-
         # adapter
         x = self.merger(x)
         return x
