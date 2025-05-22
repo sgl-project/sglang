@@ -38,6 +38,13 @@ else()
 endif()
 link_directories(${PLAT_LIB_DIR})
 
+# Conda library path support
+if(DEFINED ENV{CONDA_PREFIX})
+    set(CONDA_LIB_DIR "$ENV{CONDA_PREFIX}/lib")
+    message(STATUS "Using Conda lib dir: ${CONDA_LIB_DIR}")
+    link_directories(${CONDA_LIB_DIR})
+endif()
+
 file(GLOB SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
 
 add_compile_options(
@@ -48,7 +55,7 @@ add_compile_options(
 )
 
 Python_add_library(common_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
-target_link_libraries(common_ops PRIVATE ${TORCH_LIBRARIES})
+target_link_libraries(common_ops PRIVATE ${TORCH_LIBRARIES} numa)
 target_include_directories(common_ops PRIVATE ${TORCH_INCLUDE_DIRS})
 
 install(TARGETS common_ops
