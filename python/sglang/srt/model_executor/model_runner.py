@@ -77,6 +77,7 @@ from sglang.srt.model_loader.loader import (
     DefaultModelLoader,
     device_loading_context,
     get_model_loader,
+    initialize_model,
 )
 from sglang.srt.model_loader.utils import SupportsPP, set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -504,30 +505,37 @@ class ModelRunner:
         monkey_patch_vllm_parallel_state()
         monkey_patch_isinstance_for_vllm_base_layer()
 
-        with self.memory_saver_adapter.region():
-            self.model = get_model(
-                model_config=self.model_config,
-                load_config=self.load_config,
-                device_config=DeviceConfig(self.device),
-            )
-        monkey_patch_vllm_parallel_state(reverse=True)
-        monkey_patch_isinstance_for_vllm_base_layer(reverse=True)
+        device_config = DeviceConfig(self.device)
+        target_device = torch.device(device_config.device)
+        with set_default_torch_dtype(self.model_config.dtype):
+            with target_device:
+                model_class = initialize_model(self.model_config, self.load_config)
 
         # check model support pipeline parallelism
-        if isinstance(self.model, SupportsPP):
+        if isinstance(model_class, SupportsPP):
             self.support_pp = True
-            if self.model.config.tie_word_embeddings:
+            if model_class.config.tie_word_embeddings:
                 raise RuntimeError(
                     "model %s does not support pipeline parallelism now when enabled tie_word_embeddings.",
-                    self.model.__class__,
+                    model_class,
                 )
         else:
             self.support_pp = False
             if self.pp_size > 1:
                 raise RuntimeError(
                     "model %s does not support pipeline parallelism now.",
-                    self.model.__class__,
+                    model_class,
                 )
+
+        with self.memory_saver_adapter.region():
+            self.model = get_model(
+                model_config=self.model_config,
+                load_config=self.load_config,
+                device_config=device_config,
+                model_class=model_class,
+            )
+        monkey_patch_vllm_parallel_state(reverse=True)
+        monkey_patch_isinstance_for_vllm_base_layer(reverse=True)
 
         if self.server_args.kv_cache_dtype == "fp8_e4m3":
             if self.server_args.quantization_param_path is not None:

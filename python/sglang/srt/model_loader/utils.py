@@ -3,7 +3,7 @@
 """Utilities for selecting and loading models."""
 import contextlib
 from abc import ABC
-from typing import Iterable, Iterator, Tuple, Type, runtime_checkable
+from typing import Iterable, Iterator, Tuple, Type
 
 import torch
 from torch import nn
@@ -43,7 +43,6 @@ def get_architecture_class_name(model_config: ModelConfig) -> str:
     return get_model_architecture(model_config)[1]
 
 
-@runtime_checkable
 class SupportsPP(ABC):
     """Base class for PipelineParallel models with lazy weight filtering"""
 
@@ -57,7 +56,15 @@ class SupportsPP(ABC):
     def end_layer(self) -> int:
         if hasattr(self, "model") and hasattr(self.model, "end_layer"):
             return self.model.end_layer
-        raise AttributeError("No end_layer implementation found")
+        if hasattr(self, "config") and hasattr(self.config, "num_hidden_layers"):
+            return self.config.num_hidden_layers
+        raise AttributeError(
+            "No end_layer implementation found and config.num_hidden_layers not available"
+        )
+
+    @property
+    def num_effective_layers(self) -> int:
+        self.num_effective_layers = self.end_layer - self.start_layer
 
     def should_skip_layer(self, name: str) -> bool:
         """Check if a layer should be skipped based on pipeline stage"""
