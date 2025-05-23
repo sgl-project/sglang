@@ -302,29 +302,23 @@ def _communicate_simple(
     output_mode: ScatterMode,
     context: _Context,
 ) -> torch.Tensor:
-    def _inner():
-        nonlocal hidden_states
+    if context.is_same_group_size(input_mode, output_mode):
+        return hidden_states
 
-        if context.is_same_group_size(input_mode, output_mode):
-            return hidden_states
+    if (input_mode == ScatterMode.SCATTERED) and (
+        output_mode == ScatterMode.TP_ATTN_FULL
+    ):
+        hidden_states, local_hidden_states = (
+            forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
+            hidden_states,
+        )
+        attn_tp_all_gather(
+            list(hidden_states.tensor_split(context.attn_tp_size)),
+            local_hidden_states,
+        )
+        return hidden_states
 
-        if (input_mode == ScatterMode.SCATTERED) and (
-            output_mode == ScatterMode.TP_ATTN_FULL
-        ):
-            hidden_states, local_hidden_states = (
-                forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
-                hidden_states,
-            )
-            attn_tp_all_gather(
-                list(hidden_states.tensor_split(context.attn_tp_size)),
-                local_hidden_states,
-            )
-            return hidden_states
-
-        raise NotImplementedError(f"{input_mode=} {output_mode=}")
-
-    context.check_shape(hidden_states, input_mode)
-    return context.check_shape(_inner(), output_mode)
+    raise NotImplementedError(f"{input_mode=} {output_mode=}")
 
 
 def _communicate_with_all_reduce_and_layer_norm(
@@ -343,71 +337,55 @@ def _communicate_with_all_reduce_and_layer_norm(
     2. Apply layer norm
     """
 
-    def _inner():
-        nonlocal hidden_states, residual
+    if (
+        context.is_same_group_size(hidden_states_input_mode, hidden_states_output_mode)
+        and context.is_same_group_size(residual_input_mode, residual_output_mode)
+        and context.attn_tp_size == 1
+    ):
+        # TODO move these `if shape != 0` into LayerNorm itself
+        if hidden_states.shape[0] != 0:
+            hidden_states, residual = layernorm(hidden_states, residual)
+        return hidden_states, residual
 
-        if (
-            context.is_same_group_size(
-                hidden_states_input_mode, hidden_states_output_mode
+    if (
+        (hidden_states_input_mode == ScatterMode.TP_ATTN_FULL)
+        and (residual_input_mode == ScatterMode.TP_ATTN_FULL)
+        and (hidden_states_output_mode == ScatterMode.FULL)
+        and (residual_output_mode == ScatterMode.TP_ATTN_FULL)
+    ):
+        if context.local_attn_dp_size != 1:
+            if context.attn_tp_rank == 0:
+                hidden_states += residual
+            hidden_states, local_hidden_states = (
+                forward_batch.gathered_buffer,
+                hidden_states,
             )
-            and context.is_same_group_size(residual_input_mode, residual_output_mode)
-            and context.attn_tp_size == 1
-        ):
-            # TODO move these `if shape != 0` into LayerNorm itself
+            dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
+            dp_scatter(residual, hidden_states, forward_batch)
             if hidden_states.shape[0] != 0:
-                hidden_states, residual = layernorm(hidden_states, residual)
-            return hidden_states, residual
+                hidden_states = layernorm(hidden_states)
+        else:
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+            hidden_states, residual = layernorm(hidden_states, residual)
+        return hidden_states, residual
 
-        if (
-            (hidden_states_input_mode == ScatterMode.TP_ATTN_FULL)
-            and (residual_input_mode == ScatterMode.TP_ATTN_FULL)
-            and (hidden_states_output_mode == ScatterMode.FULL)
-            and (residual_output_mode == ScatterMode.TP_ATTN_FULL)
-        ):
-            if context.local_attn_dp_size != 1:
-                if context.attn_tp_rank == 0:
-                    hidden_states += residual
-                hidden_states, local_hidden_states = (
-                    forward_batch.gathered_buffer,
-                    hidden_states,
-                )
-                dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
-                dp_scatter(residual, hidden_states, forward_batch)
-                if hidden_states.shape[0] != 0:
-                    hidden_states = layernorm(hidden_states)
-            else:
-                hidden_states = tensor_model_parallel_all_reduce(hidden_states)
-                hidden_states, residual = layernorm(hidden_states, residual)
-            return hidden_states, residual
+    if (
+        (hidden_states_input_mode == ScatterMode.TP_ATTN_FULL)
+        and (residual_input_mode in [ScatterMode.SCATTERED, ScatterMode.TP_ATTN_FULL])
+        and (hidden_states_output_mode == ScatterMode.SCATTERED)
+        and (residual_output_mode == ScatterMode.SCATTERED)
+    ):
+        tensor_list = list(hidden_states.tensor_split(context.attn_tp_size))
+        hidden_states = tensor_list[context.attn_tp_rank]
+        attn_tp_reduce_scatter(hidden_states, tensor_list)
+        if residual_input_mode == ScatterMode.TP_ATTN_FULL:
+            residual = residual.tensor_split(context.attn_tp_size)[context.attn_tp_rank]
+        if hidden_states.shape[0] != 0:
+            hidden_states, residual = layernorm(hidden_states, residual)
+        return hidden_states, residual
 
-        if (
-            (hidden_states_input_mode == ScatterMode.TP_ATTN_FULL)
-            and (
-                residual_input_mode in [ScatterMode.SCATTERED, ScatterMode.TP_ATTN_FULL]
-            )
-            and (hidden_states_output_mode == ScatterMode.SCATTERED)
-            and (residual_output_mode == ScatterMode.SCATTERED)
-        ):
-            tensor_list = list(hidden_states.tensor_split(context.attn_tp_size))
-            hidden_states = tensor_list[context.attn_tp_rank]
-            attn_tp_reduce_scatter(hidden_states, tensor_list)
-            if residual_input_mode == ScatterMode.TP_ATTN_FULL:
-                residual = residual.tensor_split(context.attn_tp_size)[
-                    context.attn_tp_rank
-                ]
-            if hidden_states.shape[0] != 0:
-                hidden_states, residual = layernorm(hidden_states, residual)
-            return hidden_states, residual
-
-        raise NotImplementedError(
-            f"{hidden_states_input_mode=} {residual_input_mode=} {residual_output_mode=} {residual_output_mode=}"
-        )
-
-    context.check_shapes(
-        (hidden_states, residual), (hidden_states_input_mode, residual_input_mode)
-    )
-    return context.check_shapes(
-        _inner(), (hidden_states_output_mode, residual_output_mode)
+    raise NotImplementedError(
+        f"{hidden_states_input_mode=} {residual_input_mode=} {residual_output_mode=} {residual_output_mode=}"
     )
 
 
@@ -422,51 +400,43 @@ def _communicate_summable_tensor_pair(
 ):
     """It is allowed to make (hidden_states, residual) := (hidden_states + residual, None) if needed."""
 
-    def _inner():
-        nonlocal hidden_states, residual
+    if context.is_same_group_size(
+        hidden_states_input_mode, output_mode
+    ) and context.is_same_group_size(residual_input_mode, output_mode):
+        return hidden_states, residual
 
-        if context.is_same_group_size(
-            hidden_states_input_mode, output_mode
-        ) and context.is_same_group_size(residual_input_mode, output_mode):
-            return hidden_states, residual
-
-        if (
-            (hidden_states_input_mode == ScatterMode.FULL)
-            and (residual_input_mode == ScatterMode.TP_ATTN_FULL)
-            and (output_mode == ScatterMode.TP_ATTN_FULL)
-        ):
-            # TODO(ch-wan): use reduce-scatter in MLP to avoid this scatter
-            # important: forward batch.gathered_buffer is used both after scatter and after gather.
-            # be careful about this!
-            hidden_states, global_hidden_states = (
-                forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
-                hidden_states,
-            )
-            dp_scatter(hidden_states, global_hidden_states, forward_batch)
-            return hidden_states, residual
-
-        if (
-            (hidden_states_input_mode == ScatterMode.SCATTERED)
-            and (residual_input_mode == ScatterMode.SCATTERED)
-            and (output_mode == ScatterMode.TP_ATTN_FULL)
-        ):
-            hidden_states += residual
-            residual = None
-            hidden_states, local_hidden_states = (
-                forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
-                hidden_states,
-            )
-            attn_tp_all_gather(
-                list(hidden_states.tensor_split(context.attn_tp_size)),
-                local_hidden_states,
-            )
-            return hidden_states, residual
-
-        raise NotImplementedError(
-            f"{hidden_states_input_mode=} {residual_input_mode=} {output_mode=}"
+    if (
+        (hidden_states_input_mode == ScatterMode.FULL)
+        and (residual_input_mode == ScatterMode.TP_ATTN_FULL)
+        and (output_mode == ScatterMode.TP_ATTN_FULL)
+    ):
+        # TODO(ch-wan): use reduce-scatter in MLP to avoid this scatter
+        # important: forward batch.gathered_buffer is used both after scatter and after gather.
+        # be careful about this!
+        hidden_states, global_hidden_states = (
+            forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
+            hidden_states,
         )
+        dp_scatter(hidden_states, global_hidden_states, forward_batch)
+        return hidden_states, residual
 
-    context.check_shapes(
-        (hidden_states, residual), (hidden_states_input_mode, residual_input_mode)
+    if (
+        (hidden_states_input_mode == ScatterMode.SCATTERED)
+        and (residual_input_mode == ScatterMode.SCATTERED)
+        and (output_mode == ScatterMode.TP_ATTN_FULL)
+    ):
+        hidden_states += residual
+        residual = None
+        hidden_states, local_hidden_states = (
+            forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
+            hidden_states,
+        )
+        attn_tp_all_gather(
+            list(hidden_states.tensor_split(context.attn_tp_size)),
+            local_hidden_states,
+        )
+        return hidden_states, residual
+
+    raise NotImplementedError(
+        f"{hidden_states_input_mode=} {residual_input_mode=} {output_mode=}"
     )
-    return context.check_shapes(_inner(), (output_mode, output_mode))
