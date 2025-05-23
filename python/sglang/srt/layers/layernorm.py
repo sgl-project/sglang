@@ -70,6 +70,18 @@ class RMSNorm(CustomOp):
         if _use_aiter:
             self._forward_method = self.forward_aiter
 
+    def forward(self, *args, **kwargs):
+        if get_bool_env_var("SGL_USE_TRITON_NON_ATTN"):
+            return self.forward_triton(*args, **kwargs)
+        if torch.compiler.is_compiling():
+            return self.forward_native(*args, **kwargs)
+        if _is_cuda:
+            return self.forward_cuda(*args, **kwargs)
+        elif _is_hip:
+            return self.forward_hip(*args, **kwargs)
+        else:
+            return self.forward_native(*args, **kwargs)
+
     def forward_cuda(
         self,
         x: torch.Tensor,
