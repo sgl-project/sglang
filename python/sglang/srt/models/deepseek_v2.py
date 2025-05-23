@@ -569,7 +569,7 @@ def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
     return 0.1 * mscale * math.log(scale) + 1.0
 
 
-global_attn_forward_method = None
+_attn_forward_method_cache = None
 
 
 class DeepseekV2AttentionMLA(nn.Module):
@@ -739,6 +739,11 @@ class DeepseekV2AttentionMLA(nn.Module):
             "SGL_CHUNKED_PREFIX_CACHE_THRESHOLD", 8192
         )
 
+    @staticmethod
+    def clear_forward_pass_cache():
+        global _attn_forward_method_cache
+        _attn_forward_method_cache = None
+
     def dispatch_attn_forward_method(
         self, forward_batch: ForwardBatch
     ) -> AttnForwardMethod:
@@ -821,12 +826,12 @@ class DeepseekV2AttentionMLA(nn.Module):
             ), "short-circuiting allreduce will lead to hangs"
             return hidden_states, None, forward_batch, None
 
-        global global_attn_forward_method
-        if global_attn_forward_method is None:
-            global_attn_forward_method = self.dispatch_attn_forward_method(
+        global _attn_forward_method_cache
+        if _attn_forward_method_cache is None:
+            _attn_forward_method_cache = self.dispatch_attn_forward_method(
                 forward_batch
             )
-        attn_forward_method = global_attn_forward_method
+        attn_forward_method = _attn_forward_method_cache
 
         if attn_forward_method == AttnForwardMethod.MHA:
             inner_state = self.forward_normal_prepare(
@@ -1717,8 +1722,7 @@ class DeepseekV2ForCausalLM(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-        global global_attn_forward_method
-        global_attn_forward_method = None
+        DeepseekV2AttentionMLA.clear_forward_pass_cache()
 
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
 
