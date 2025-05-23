@@ -22,16 +22,11 @@ def silu_and_mul_kernel(out_ptr, x_ptr, d: tl.constexpr, d_padded: tl.constexpr)
     tl.store(out_ptr + token_idx * d + idx, result, mask=mask)
 
 
-class _SiluAndMul(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, out, x):
-        d = x.shape[-1] // 2
-        d_padded = 1 << (d - 1).bit_length()  # Calculate d_padded in Python
-        num_tokens = x.shape[0]
-
-        # Launch the Triton kernel
-        silu_and_mul_kernel[(num_tokens,)](out, x, d=d, d_padded=d_padded)
-
-
 def silu_and_mul_triton(out, x):
-    _SiluAndMul.apply(out, x)
+    d = x.shape[-1] // 2
+    d_padded = 1 << (d - 1).bit_length()  # Calculate d_padded in Python
+    num_tokens = x.shape[0]
+
+    # Launch the Triton kernel
+    with torch.no_grad():
+        silu_and_mul_kernel[(num_tokens,)](out, x, d=d, d_padded=d_padded)

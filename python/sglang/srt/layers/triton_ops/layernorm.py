@@ -44,24 +44,21 @@ def fused_add_rms_norm_kernel(
     tl.store(input_ptr + cols * y_stride_c, normed_z, mask=mask)
 
 
-class _FusedAddRMSNorm(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, input, residual, normalized_shape, weight, eps=1e-5):
-        dim = input.ndim - len(normalized_shape)
-        M = math.prod(input.shape[:dim])
-        N = math.prod(normalized_shape)
+def fused_add_rms_norm_triton(input, residual, normalized_shape, weight, eps=1e-5):
+    dim = input.ndim - len(normalized_shape)
+    M = math.prod(input.shape[:dim])
+    N = math.prod(normalized_shape)
 
-        BLOCK_SIZE = triton.next_power_of_2(N)
-        input = input.contiguous()
-        residual = residual.contiguous()
-        weight = weight.contiguous()
+    BLOCK_SIZE = triton.next_power_of_2(N)
 
-        # Launch the Triton kernel
+    input = input.contiguous()
+    residual = residual.contiguous()
+    weight = weight.contiguous()
+
+    # Launch the Triton kernel
+    with torch.no_grad():
         fused_add_rms_norm_kernel[(M,)](
             input, residual, weight, N, 1, N, 1, N, eps, BLOCK_SIZE
         )
-        return input
 
-
-def fused_add_rms_norm_triton(input, residual, normalized_shape, weight, eps=1e-5):
-    return _FusedAddRMSNorm.apply(input, residual, normalized_shape, weight, eps)
+    return input
