@@ -1362,7 +1362,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
         if self.layer_id == 0:
-            self.layer_communicator.update_global_context(forward_batch)
+            self.layer_communicator.update_global_context()
 
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
