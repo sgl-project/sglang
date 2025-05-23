@@ -407,6 +407,7 @@ class GenerateReqInput:
                 else None
             ),
             return_hidden_states=self.return_hidden_states,
+            # if `__getitem__` is called, the bootstrap_host, bootstrap_port, bootstrap_room must be a list
             bootstrap_host=(
                 self.bootstrap_host[i] if self.bootstrap_host is not None else None
             ),

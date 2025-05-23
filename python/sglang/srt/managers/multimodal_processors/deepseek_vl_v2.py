@@ -70,8 +70,13 @@ class DeepseekVL2ImageProcessor(BaseMultimodalProcessor):
         batched_images_spatial_crop = torch.stack(batched_images_spatial_crop, dim=0)
 
         items = []
+        input_ids = res["input_ids"]
+        image_offsets = self.get_mm_items_offset(
+            input_ids=input_ids, mm_token_id=self._processor.image_token_id
+        )
         item = MultimodalDataItem(
             pixel_values=res["images"],
+            image_offsets=image_offsets,
             modality=Modality.IMAGE,
             image_emb_mask=images_seq_mask,
             image_spatial_crop=batched_images_spatial_crop,
@@ -80,6 +85,6 @@ class DeepseekVL2ImageProcessor(BaseMultimodalProcessor):
 
         return {
             "mm_items": items,
-            "input_ids": res["input_ids"].tolist(),
+            "input_ids": input_ids.tolist(),
             "im_token_id": self._processor.image_token_id,
         }
