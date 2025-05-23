@@ -175,6 +175,8 @@ class MooncakeKVManager(BaseKVManager):
             )
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.heartbeat_failures = {}
+            self.session_pool = defaultdict(requests.Session)
+            self.session_pool_lock = threading.Lock()
             self.addr_to_rooms_tracker = defaultdict(list)
             self.connection_lock = threading.Lock()
             # Heartbeat interval should be at least 2 seconds
@@ -444,31 +446,51 @@ class MooncakeKVManager(BaseKVManager):
                 with self.connection_lock:
                     addresses = list(self.prefill_dp_size_table.keys())
 
-                for addr in addresses:
+                for bootstrap_addr in addresses:
+                    session = None
                     try:
-                        response = requests.get(f"http://{addr}/health", timeout=2)
+                        with self.session_pool_lock:
+                            session = self.session_pool[bootstrap_addr]
+                        response = session.get(
+                            f"http://{bootstrap_addr}/health",
+                            timeout=(1.5, 2.5),
+                            headers={"Connection": "keep-alive"},
+                        )
                         if response.status_code == 200:
-                            self.heartbeat_failures[addr] = 0
+                            self.heartbeat_failures[bootstrap_addr] = 0
 
-                            for bootstrap_room in self.addr_to_rooms_tracker[addr]:
+                            for bootstrap_room in self.addr_to_rooms_tracker[
+                                bootstrap_addr
+                            ]:
                                 # Remove KVPoll.Success requests from the map
                                 if bootstrap_room not in self.request_status:
-                                    self.addr_to_rooms_tracker[addr].remove(
+                                    self.addr_to_rooms_tracker[bootstrap_addr].remove(
                                         bootstrap_room
                                     )
                         else:
-                            logger.info(f"Attempting to reconnect to {addr}...")
-                            self.heartbeat_failures[addr] = (
-                                self.heartbeat_failures.get(addr, 0) + 1
+                            logger.info(
+                                f"Attempting to reconnect to {bootstrap_addr}..."
                             )
+                            self.heartbeat_failures[bootstrap_addr] = (
+                                self.heartbeat_failures.get(bootstrap_addr, 0) + 1
+                            )
+                            with self.session_pool_lock:
+                                if bootstrap_addr in self.session_pool:
+                                    del self.session_pool[bootstrap_addr]
                     except Exception:
-                        logger.info(f"Attempting to reconnect to {addr}...")
-                        self.heartbeat_failures[addr] = (
-                            self.heartbeat_failures.get(addr, 0) + 1
+                        logger.info(f"Attempting to reconnect to {bootstrap_addr}...")
+                        self.heartbeat_failures[bootstrap_addr] = (
+                            self.heartbeat_failures.get(bootstrap_addr, 0) + 1
                         )
 
-                    if self.heartbeat_failures.get(addr, 0) >= self.max_failures:
-                        self._handle_node_failure(addr)
+                    if (
+                        self.heartbeat_failures.get(bootstrap_addr, 0)
+                        >= self.max_failures
+                    ):
+                        self._handle_node_failure(bootstrap_addr)
+                        with self.session_pool_lock:
+                            if bootstrap_addr in self.session_pool:
+                                del self.session_pool[bootstrap_addr]
 
         threading.Thread(target=decode_thread).start()
         threading.Thread(target=heartbeat_checker).start()
@@ -768,6 +790,9 @@ class MooncakeKVReceiver(BaseKVReceiver):
                         target_tp_rank == self.target_tp_rank
                         or self.target_tp_rank is None
                     )
+                    logger.debug(
+                        f"Fetched bootstrap info: {bootstrap_info} for DP {self.target_dp_group} TP {target_tp_rank}"
+                    )
                     bootstrap_infos.append(bootstrap_info)
                 else:
                     self.kv_mgr.record_failure(
@@ -866,9 +891,6 @@ class MooncakeKVReceiver(BaseKVReceiver):
         for bootstrap_info in self.bootstrap_infos:
             self.prefill_server_url = (
                 f"{bootstrap_info['rank_ip']}:{bootstrap_info['rank_port']}"
-            )
-            logger.debug(
-                f"Fetched bootstrap info: {bootstrap_info} for engine rank: {self.kv_mgr.kv_args.engine_rank}"
             )
             is_dummy = bootstrap_info["is_dummy"]
 
