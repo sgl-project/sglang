@@ -1,7 +1,7 @@
 #include <numa.h>
+#include <sched.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
-#include <sched.h>
 #include <unistd.h>
 
 #include <string>
