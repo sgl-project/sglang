@@ -47,6 +47,13 @@ from sglang.srt.utils import (
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
+# Detect whether the current forward pass is in capture mode
+is_capture_mode = False
+
+
+def get_is_capture_mode():
+    return is_capture_mode
+
 
 def _to_torch(model: torch.nn.Module, reverse: bool, num_tokens: int):
     for sub in model._modules.values():
@@ -240,6 +247,7 @@ class CudaGraphRunner:
             self.out_cache_loc = torch.zeros((self.max_num_token,), dtype=torch.int64)
             self.positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
             self.mrope_positions = torch.zeros((3, self.max_bs), dtype=torch.int64)
+            self.num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
 
             # pipeline parallelism
             if self.pp_size > 1:
@@ -310,17 +318,12 @@ class CudaGraphRunner:
 
     @contextmanager
     def model_capture_mode(self):
-        if hasattr(self.model_runner.model, "capture_mode"):
-            self.model_runner.model.capture_mode = True
-        if hasattr(self.model_runner.token_to_kv_pool, "capture_mode"):
-            self.model_runner.token_to_kv_pool.capture_mode = True
+        global is_capture_mode
+        is_capture_mode = True
 
         yield
 
-        if hasattr(self.model_runner.model, "capture_mode"):
-            self.model_runner.model.capture_mode = False
-        if hasattr(self.model_runner.token_to_kv_pool, "capture_mode"):
-            self.model_runner.token_to_kv_pool.capture_mode = False
+        is_capture_mode = False
 
     def can_run(self, forward_batch: ForwardBatch):
         if self.enable_dp_attention or self.enable_sp_layernorm:
@@ -403,6 +406,7 @@ class CudaGraphRunner:
         else:
             encoder_lens = None
         mrope_positions = self.mrope_positions[:, :bs]
+        self.num_token_non_padded[...] = num_tokens
 
         # pipeline parallelism
         if self.pp_size > 1:
@@ -461,6 +465,7 @@ class CudaGraphRunner:
             spec_info=spec_info,
             capture_hidden_mode=self.capture_hidden_mode,
             lora_paths=lora_paths,
+            num_token_non_padded=self.num_token_non_padded,
         )
 
         if lora_paths is not None:
@@ -556,6 +561,7 @@ class CudaGraphRunner:
         self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
         self.out_cache_loc[:raw_num_token].copy_(forward_batch.out_cache_loc)
         self.positions[:raw_num_token].copy_(forward_batch.positions)
+        self.num_token_non_padded[...] = len(forward_batch.input_ids)
         if forward_batch.seq_lens_cpu is not None:
             if bs != raw_bs:
                 self.seq_lens_cpu.fill_(1)
@@ -608,6 +614,7 @@ class CudaGraphRunner:
 
         # Replay
         self.graphs[self.bs].replay()
+
         output = self.output_buffers[self.bs]
         if isinstance(output, LogitsProcessorOutput):
             return LogitsProcessorOutput(

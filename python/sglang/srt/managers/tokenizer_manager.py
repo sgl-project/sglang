@@ -295,7 +295,7 @@ class TokenizerManager:
         self.flush_cache_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
-        self.start_profile_communicator = _Communicator(
+        self.profile_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
         self.health_check_communitcator = _Communicator(self.send_to_scheduler, 1)
@@ -360,7 +360,7 @@ class TokenizerManager:
                 ),
                 (
                     ProfileReqOutput,
-                    self.start_profile_communicator.handle_recv,
+                    self.profile_communicator.handle_recv,
                 ),
                 (
                     GetInternalStateReqOutput,
@@ -459,14 +459,16 @@ class TokenizerManager:
                 )
             input_ids = self.tokenizer.encode(input_text)
 
-        image_inputs: Dict = await self.mm_processor.process_mm_data_async(
-            image_data=obj.image_data,
-            input_text=input_text or input_ids,
-            request_obj=obj,
-            max_req_input_len=self.max_req_input_len,
-        )
-        if image_inputs and "input_ids" in image_inputs:
-            input_ids = image_inputs["input_ids"]
+        image_inputs: Optional[Dict] = None
+        if obj.contains_mm_input():
+            image_inputs = await self.mm_processor.process_mm_data_async(
+                image_data=obj.image_data,
+                input_text=input_text or input_ids,
+                request_obj=obj,
+                max_req_input_len=self.max_req_input_len,
+            )
+            if image_inputs and "input_ids" in image_inputs:
+                input_ids = image_inputs["input_ids"]
 
         self._validate_token_len(obj, input_ids)
         return self._create_tokenized_object(
@@ -792,6 +794,7 @@ class TokenizerManager:
         with_stack: Optional[bool] = None,
         record_shapes: Optional[bool] = None,
     ):
+        self.auto_create_handle_loop()
         req = ProfileReq(
             type=ProfileReqType.START_PROFILE,
             output_dir=output_dir,
@@ -801,22 +804,29 @@ class TokenizerManager:
             record_shapes=record_shapes,
             profile_id=str(time.time()),
         )
-        result = (await self.start_profile_communicator(req))[0]
+        return await self._execute_profile(req)
+
+    async def stop_profile(self):
+        self.auto_create_handle_loop()
+        req = ProfileReq(type=ProfileReqType.STOP_PROFILE)
+        return await self._execute_profile(req)
+
+    async def _execute_profile(self, req: ProfileReq):
+        result = (await self.profile_communicator(req))[0]
         if not result.success:
             raise RuntimeError(result.message)
         return result
 
-    def stop_profile(self):
-        req = ProfileReq(type=ProfileReqType.STOP_PROFILE)
-        self.send_to_scheduler.send_pyobj(req)
-
     async def start_expert_distribution_record(self):
+        self.auto_create_handle_loop()
         await self.expert_distribution_communicator(ExpertDistributionReq.START_RECORD)
 
     async def stop_expert_distribution_record(self):
+        self.auto_create_handle_loop()
         await self.expert_distribution_communicator(ExpertDistributionReq.STOP_RECORD)
 
     async def dump_expert_distribution_record(self):
+        self.auto_create_handle_loop()
         await self.expert_distribution_communicator(ExpertDistributionReq.DUMP_RECORD)
 
     async def update_weights_from_disk(
@@ -883,8 +893,8 @@ class TokenizerManager:
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
         assert (
-            self.server_args.dp_size == 1
-        ), "dp_size must be 1 for update weights from distributed"
+            self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
+        ), "dp_size must be 1 or dp attention must be enabled for update weights from distributed"
 
         # This means that weight sync
         # cannot run while requests are in progress.
@@ -899,8 +909,8 @@ class TokenizerManager:
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
         assert (
-            self.server_args.dp_size == 1
-        ), "dp_size must be 1 for update weights from distributed"
+            self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
+        ), "dp_size must be 1 or dp attention must be enabled for update weights from tensor"
 
         # This means that weight sync
         # cannot run while requests are in progress.

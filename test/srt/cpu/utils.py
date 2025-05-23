@@ -1,12 +1,23 @@
 import math
 
 import torch
+import torch.nn.functional as F
 
 precision = {
     torch.bfloat16: 1e-2,
     torch.float16: 1e-3,
     torch.float32: 1e-5,
 }
+
+
+BLOCK_N, BLOCK_K = 64, 128
+factor_for_scale = 1e-3
+fp8_max, fp8_min = 400, -400
+
+
+def SiluAndMul(x: torch.Tensor) -> torch.Tensor:
+    d = x.shape[-1] // 2
+    return F.silu(x[..., :d]) * x[..., d:]
 
 
 def per_token_quant_int8(x):
@@ -94,3 +105,142 @@ def native_w8a8_per_token_matmul(A, B, As, Bs, bias, output_dtype=torch.bfloat16
         C.add_(bias.view(1, -1))
 
     return C.reshape(origin_C_shape).to(output_dtype)
+
+
+def torch_naive_moe(a, w1, w2, b, routed_scaling_factor):
+
+    ic1 = torch.matmul(a, w1.transpose(0, 1))
+    ic2 = SiluAndMul(ic1)
+    ic3 = torch.matmul(ic2, w2.transpose(0, 1))
+
+    return ic3 + b * routed_scaling_factor
+
+
+def torch_w8a8_per_column_moe(a, w1_q, w2_q, w1_s, w2_s, b, routed_scaling_factor):
+
+    # Perform per-token quantization
+    a_q, a_s = per_token_quant_int8(a)
+
+    ic1 = native_w8a8_per_token_matmul(
+        a_q, w1_q, a_s, w1_s, bias=None, output_dtype=torch.float32
+    )
+    ic2 = SiluAndMul(ic1)
+
+    a1_q, a1_s = per_token_quant_int8(ic2)
+    ic3 = native_w8a8_per_token_matmul(
+        a1_q, w2_q, a1_s, w2_s, bias=None, output_dtype=torch.float32
+    )
+
+    return ic3 + b * routed_scaling_factor
+
+
+def scaled_weight(weight, scales):
+    E, N, K = weight.shape
+    weight_block = (
+        weight.view(E, N // BLOCK_N, BLOCK_N, K // BLOCK_K, BLOCK_K)
+        .permute(0, 1, 3, 2, 4)
+        .float()
+        .contiguous()
+    )
+    return (
+        (weight_block * scales.view(E, N // BLOCK_N, K // BLOCK_K, 1, 1))
+        .permute(0, 1, 3, 2, 4)
+        .contiguous()
+        .view(E, N, K)
+    )
+
+
+def torch_naive_fused_moe(a, w1, w2, score, topk, renormalize):
+    B, D = a.shape
+    a = a.view(B, -1, D).repeat(1, topk, 1).reshape(-1, D)
+    out = torch.zeros(B * topk, w2.shape[1], dtype=a.dtype, device=a.device)
+    score = torch.softmax(score, dim=-1, dtype=torch.float32)
+    topk_weight, topk_ids = torch.topk(score, topk)
+
+    if renormalize:
+        topk_weight = topk_weight / topk_weight.sum(dim=-1, keepdim=True)
+
+    topk_weight = topk_weight.view(-1)
+    topk_ids = topk_ids.view(-1)
+    for i in range(w1.shape[0]):
+        mask = topk_ids == i
+        if mask.sum():
+            out[mask] = SiluAndMul(a[mask] @ w1[i].transpose(0, 1)) @ w2[i].transpose(
+                0, 1
+            )
+    return (
+        out.view(B, -1, w2.shape[1]) * topk_weight.view(B, -1, 1).to(out.dtype)
+    ).sum(dim=1)
+
+
+def torch_w8a8_per_column_fused_moe(a, w1, w2, w1_s, w2_s, topk_weight, topk_ids, topk):
+    """This function performs fused moe with per-column int8 quantization using native torch."""
+
+    B, D = a.shape
+    # Perform per-token quantization
+    a_q, a_s = per_token_quant_int8(a)
+    # Repeat tokens to match topk
+    a_q = a_q.view(B, -1, D).repeat(1, topk, 1).reshape(-1, D)
+    # Also repeat the scale
+    a_s = a_s.view(B, -1, 1).repeat(1, topk, 1).reshape(-1, 1)  # [B*topk, 1]
+
+    out = torch.zeros(B * topk, w2.shape[1], dtype=torch.float32, device=a.device)
+
+    # Calculate routing
+    topk_weight = topk_weight.view(-1)
+    topk_ids = topk_ids.view(-1)
+    # Process each expert
+    for i in range(w1.shape[0]):
+        mask = topk_ids == i
+        if mask.sum():
+            # First MLP layer: note that a_s is now per-token
+            inter_out = native_w8a8_per_token_matmul(
+                a_q[mask],
+                w1[i],
+                a_s[mask],
+                w1_s[i],
+                bias=None,
+                output_dtype=torch.float32,
+            )
+            # Activation function
+            act_out = SiluAndMul(inter_out)
+            # Quantize activation output with per-token
+            act_out_q, act_out_s = per_token_quant_int8(act_out)
+            # Second MLP layer
+            out[mask] = native_w8a8_per_token_matmul(
+                act_out_q,
+                w2[i],
+                act_out_s,
+                w2_s[i],
+                bias=None,
+                output_dtype=torch.float32,
+            )
+    # Apply routing weights and sum
+    return (
+        (out.view(B, -1, w2.shape[1]) * topk_weight.view(B, -1, 1).to(out.dtype))
+        .sum(dim=1)
+        .to(a.dtype)
+    )
+
+
+def native_fp8_fused_moe(a, w1, w2, topk_weight, topk_ids, topk):
+    B, D = a.shape
+    a = a.view(B, -1, D).repeat(1, topk, 1).reshape(-1, D).float()
+    out = torch.zeros(B * topk, w2.shape[1], dtype=torch.float32, device=a.device)
+
+    # Calculate routing
+    topk_weight = topk_weight.view(-1)
+    topk_ids = topk_ids.view(-1)
+
+    for i in range(w1.shape[0]):
+        mask = topk_ids == i
+        if mask.sum():
+            ic0 = torch.matmul(a[mask], w1[i].transpose(0, 1))
+            ic1 = SiluAndMul(ic0)
+            out[mask] = torch.matmul(ic1, w2[i].transpose(0, 1))
+
+    return (
+        (out.view(B, -1, w2.shape[1]) * topk_weight.view(B, -1, 1).to(out.dtype))
+        .sum(dim=1)
+        .to(a.dtype)
+    )

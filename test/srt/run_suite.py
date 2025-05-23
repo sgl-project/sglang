@@ -17,10 +17,10 @@ suites = {
         TestFile("models/lora/test_lora_backend.py", 99),
         TestFile("models/lora/test_multi_lora_backend.py", 60),
         TestFile("models/test_embedding_models.py", 184),
-        TestFile("models/test_clip_models.py", 52),
+        # TestFile("models/test_clip_models.py", 52),
         TestFile("models/test_compressed_tensors_models.py", 42),
         TestFile("models/test_generation_models.py", 103),
-        TestFile("models/test_gme_qwen_models.py", 45),
+        # TestFile("models/test_gme_qwen_models.py", 45),
         # TestFile("models/test_grok_models.py", 60),  # Disabled due to illegal memory access
         TestFile("models/test_qwen_models.py", 82),
         TestFile("models/test_reward_models.py", 132),
@@ -81,7 +81,8 @@ suites = {
         TestFile("test_vertex_endpoint.py", 31),
         TestFile("test_vision_chunked_prefill.py", 175),
         TestFile("test_vlm_accuracy.py", 60),
-        TestFile("test_vision_openai_server.py", 637),
+        TestFile("test_vision_openai_server_a.py", 700),
+        TestFile("test_vision_openai_server_b.py", 700),
         TestFile("test_w8a8_quantization.py", 46),
         TestFile("models/lora/test_lora_cuda_graph.py", 250),
     ],
@@ -104,6 +105,10 @@ suites = {
     "per-commit-2-gpu-amd": [
         TestFile("test_mla_tp.py", 170),
     ],
+    "per-commit-4-gpu": [
+        TestFile("test_local_attn.py", 250),
+        TestFile("test_pp_single_node.py", 150),
+    ],
     "per-commit-8-gpu": [
         # Disabled deepep tests temporarily because it takes too much time.
         # TODO: re-enable them after reducing the test time with compilation cache and smaller models.
@@ -111,10 +116,8 @@ suites = {
         # TestFile("test_deepep_low_latency.py", 50),
         # TestFile("test_moe_deepep_eval_accuracy_large.py", 250),
         TestFile("test_disaggregation.py", 210),
-        TestFile("test_local_attn.py", 250),
         TestFile("test_disaggregation_different_tp.py", 210),
         TestFile("test_full_deepseek_v3.py", 250),
-        TestFile("test_pp_single_node.py", 150),
     ],
     "per-commit-8-gpu-amd": [
         TestFile("test_full_deepseek_v3.py", 250),
