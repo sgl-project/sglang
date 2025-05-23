@@ -25,6 +25,7 @@ class MistralDetector(BaseFormatDetector):
         """
         super().__init__()
         self.bot_token = "[TOOL_CALLS] ["
+        self.eot_token = "]"
         self.tool_call_regex = re.compile(r"\[{.*}\]", re.DOTALL)
 
     def has_tool_call(self, text: str) -> bool:
