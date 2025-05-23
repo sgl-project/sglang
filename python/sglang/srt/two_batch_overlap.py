@@ -423,11 +423,17 @@ class MaybeTboDeepEPDispatcher:
     def _execute(self, name, tbo_subbatch_index: Optional[int], **kwargs):
         return getattr(self._inners[tbo_subbatch_index or 0], name)(**kwargs)
 
+    def dispatch(self, **kwargs):
+        return self._execute("dispatch", **kwargs)
+
     def dispatch_a(self, **kwargs):
         return self._execute("dispatch_a", **kwargs)
 
     def dispatch_b(self, **kwargs):
         return self._execute("dispatch_b", **kwargs)
+
+    def combine(self, **kwargs):
+        return self._execute("combine", **kwargs)
 
     def combine_a(self, **kwargs):
         return self._execute("combine_a", **kwargs)
