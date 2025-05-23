@@ -354,7 +354,6 @@ class CudaGraphRunner:
         return is_bs_supported and is_encoder_lens_supported
 
     def capture(self):
-        print("!!capturing with", self.capture_hidden_mode.name)
         with graph_capture() as graph_capture_context:
             self.stream = graph_capture_context.stream
             avail_mem = get_available_gpu_memory(
@@ -558,6 +557,9 @@ class CudaGraphRunner:
             self.capture()
 
         """
+        hidden_mode_from_spec_info = getattr(
+            forward_batch.spec_info, "capture_hidden_mode", CaptureHiddenMode.NULL
+        )
         # If this forward batch is a full capture and we aren't in full capture mode,
         # we need to promote to full capture mode and recapture the CUDA graph
         # (forward_batch.capture_hidden_mode == CaptureHiddenMode.FULL wins over all)

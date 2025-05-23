@@ -117,9 +117,7 @@ class EAGLEDraftCudaGraphRunner:
         hidden_states = self.hidden_states[:num_seqs]
 
         spec_info = EagleDraftInput(
-            topk_p=topk_p,
-            topk_index=topk_index,
-            hidden_states=hidden_states,
+            topk_p=topk_p, topk_index=topk_index, hidden_states=hidden_states
         )
 
         # Forward batch
@@ -204,6 +202,10 @@ class EAGLEDraftCudaGraphRunner:
         self.positions[:raw_num_token].copy_(forward_batch.positions)
         self.topk_p[:raw_bs].copy_(forward_batch.spec_info.topk_p)
         self.topk_index[:raw_bs].copy_(forward_batch.spec_info.topk_index)
+        print(
+            self.hidden_states[:raw_bs].shape,
+            forward_batch.spec_info.hidden_states.shape,
+        )
         self.hidden_states[:raw_bs].copy_(forward_batch.spec_info.hidden_states)
 
         # Attention backend
