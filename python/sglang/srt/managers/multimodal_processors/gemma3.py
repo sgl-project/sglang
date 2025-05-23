@@ -61,6 +61,11 @@ class Gemma3SGLangImageProcessor(SGLangBaseProcessor):
         )
 
         items = []
+        input_ids = ret["input_ids"].flatten()
+        image_offsets = self.get_mm_items_offset(
+            input_ids=input_ids,
+            mm_token_id=self.hf_config.image_token_index,
+        )
         for i, image in enumerate(base_output.images):
             if images_are_preprocessed:
                 pixel_values = image.pixel_values
@@ -73,12 +78,13 @@ class Gemma3SGLangImageProcessor(SGLangBaseProcessor):
                 pixel_values=pixel_values,
                 precomputed_features=precomputed_features,
                 modality=Modality.IMAGE,
+                image_offsets=image_offsets[i],
             )
             items += [item]
 
         return {
             "mm_items": items,
-            "input_ids": ret["input_ids"].flatten().tolist(),
+            "input_ids": input_ids.tolist(),
             "im_start_id": self.IM_START_TOKEN_ID,
             "im_end_id": self.IM_END_TOKEN_ID,
         }
