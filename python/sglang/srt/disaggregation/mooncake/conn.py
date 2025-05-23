@@ -162,6 +162,9 @@ class MooncakeKVManager(BaseKVManager):
             self.decode_kv_args_table: Dict[str, KVArgsRegisterInfo] = {}
             self.start_prefill_thread()
             self._register_to_bootstrap()
+            self.session_failures = defaultdict(int)
+            self.failed_sessions = set()
+            self.session_lock = threading.Lock()
 
             # Determine the number of threads to use for kv sender
             cpu_count = os.cpu_count()
@@ -326,6 +329,11 @@ class MooncakeKVManager(BaseKVManager):
                     self.decode_kv_args_table[mooncake_session_id] = (
                         KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
                     )
+                    with self.session_lock:
+                        if mooncake_session_id in self.failed_sessions:
+                            self.failed_sessions.remove(mooncake_session_id)
+                        if mooncake_session_id in self.session_failures:
+                            del self.session_failures[mooncake_session_id]
                     logger.debug(
                         f"Register KVArgs from {mooncake_session_id} successfully"
                     )
@@ -353,6 +361,19 @@ class MooncakeKVManager(BaseKVManager):
                     dst_ranks_infos = []
                     for req in reqs_to_be_processed:
                         if not req.is_dummy:
+                            # Early exit if the request has failed
+                            with self.session_lock:
+                                if req.mooncake_session_id in self.failed_sessions:
+                                    self.record_failure(
+                                        kv_chunk.room,
+                                        f"Decode instance could be dead, {req.mooncake_session_id} failed due to multiple errors",
+                                    )
+                                    self.update_status(kv_chunk.room, KVPoll.Failed)
+                                    self.sync_status_to_decode_endpoint(
+                                        req.endpoint, req.dst_port, req.room
+                                    )
+                                    continue
+
                             chunked_dst_kv_indice = req.dst_kv_indices[
                                 kv_chunk.index_slice
                             ]
@@ -369,6 +390,18 @@ class MooncakeKVManager(BaseKVManager):
                                 chunked_dst_kv_indice,
                             )
                             if ret != 0:
+                                with self.session_lock:
+                                    self.session_failures[req.mooncake_session_id] += 1
+                                    if (
+                                        self.session_failures[req.mooncake_session_id]
+                                        >= 3
+                                    ):
+                                        self.failed_sessions.add(
+                                            req.mooncake_session_id
+                                        )
+                                        logger.error(
+                                            f"Session {req.mooncake_session_id} failed 3 times."
+                                        )
                                 self.record_failure(
                                     kv_chunk.room,
                                     f"Failed to send kv chunk of {kv_chunk.room} to {req.endpoint}:{req.dst_port}",
@@ -453,7 +486,7 @@ class MooncakeKVManager(BaseKVManager):
                             session = self.session_pool[bootstrap_addr]
                         response = session.get(
                             f"http://{bootstrap_addr}/health",
-                            timeout=(1.5, 2.5),
+                            timeout=(2, 3),
                             headers={"Connection": "keep-alive"},
                         )
                         if response.status_code == 200:
