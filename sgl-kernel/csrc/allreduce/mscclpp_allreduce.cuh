@@ -742,7 +742,7 @@ class Msccl1Shot2NodeLLcontext {
       memChans = it->second.data();
     }
     allreduce_1shotLL_2node<T><<<nblks, nthrs, 0, stream>>>(
-        d_memHandles_.data(),
+        memChans,
         d_portHandles_.data(),
         (T*)input,
         (T*)scratch_,
