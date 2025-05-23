@@ -40,7 +40,7 @@ from sglang.srt.conversation import (
     get_conv_template_by_model_path,
     register_conv_template,
 )
-from sglang.srt.function_call_parser import FunctionCallParser
+from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.openai_api.protocol import (
     BatchRequest,
