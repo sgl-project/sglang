@@ -2168,10 +2168,11 @@ def try_use_precomputed_features(items) -> Optional[torch.Tensor]:
     If some but not all have precomputed_features, raise NotImplementedError.
     If none have precomputed_features, return None.
     """
-    if any(item.precomputed_features is not None for item in items):
-        if not all(item.precomputed_features is not None for item in items):
+    precomputed_features = [item.precomputed_features for item in items]
+    if any(feature is not None for feature in precomputed_features):
+        if not all(feature is not None for feature in precomputed_features):
             raise NotImplementedError(
                 "MM inputs where only some items are precomputed."
             )
-        return torch.concat([item.precomputed_features for item in items])
+        return torch.concat(precomputed_features)
     return None
