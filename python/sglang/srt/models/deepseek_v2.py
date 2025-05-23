@@ -1530,20 +1530,11 @@ class DeepseekV2ForCausalLM(nn.Module):
 
         # Perform post-processing after loading weights
         layer_ids = (
-            range(self.config.num_hidden_layers)
+            range(self.model.start_layer, self.model.end_layer)
             if not is_nextn
             else [self.config.num_hidden_layers]
         )
         for layer_id in layer_ids:
-            if (
-                layer_id is not None
-                and hasattr(self.model, "start_layer")
-                and (
-                    layer_id < self.model.start_layer
-                    or layer_id >= self.model.end_layer
-                )
-            ):
-                continue
             self_attn = (
                 self.model.layers[layer_id].self_attn
                 if not is_nextn
@@ -1666,9 +1657,9 @@ class DeepseekV2ForCausalLM(nn.Module):
         # TODO support nextn later
         if not is_nextn:
             self.routed_experts_weights_of_layer = {
-                layer_id: layer.mlp.get_moe_weights()
-                for layer_id, layer in enumerate(self.model.layers)
-                if isinstance(layer.mlp, DeepseekV2MoE)
+                layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
+                for layer_id in layer_ids
+                if isinstance(self.model.layers[layer_id].mlp, DeepseekV2MoE)
             }
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
