@@ -5,7 +5,7 @@ import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from json import JSONDecodeError, JSONDecoder
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Type
+from typing import Any, Callable, Dict, List, Literal, Optional, Set, Tuple, Type, Union
 
 import partial_json_parser
 from partial_json_parser.core.exceptions import MalformedJSON
@@ -16,6 +16,7 @@ from sglang.srt.openai_api.protocol import (
     StructuralTagResponseFormat,
     StructuresResponseFormat,
     Tool,
+    ToolChoice,
 )
 
 logger = logging.getLogger(__name__)
@@ -317,6 +318,93 @@ class BaseFormatDetector(ABC):
         raise NotImplementedError()
 
 
+class EBNFComposer:
+    json_grammar_ebnf_str = r"""
+        json ::= basic_array | basic_object
+        basic_any ::= basic_number | basic_string | basic_boolean | basic_null | basic_array | basic_object
+        basic_integer ::= ("0" | "-"? [1-9] [0-9]*) ".0"?
+        basic_number ::= ("0" | "-"? [1-9] [0-9]*) ("." [0-9]+)? ([eE] [+-]? [0-9]+)?
+        basic_string ::= (([\"] basic_string_1 [\"]))
+        basic_string_1 ::= "" | [^"\\\x00-\x1F] basic_string_1 | "\\" escape basic_string_1
+        escape ::= ["\\/bfnrt] | "u" [A-Fa-f0-9] [A-Fa-f0-9] [A-Fa-f0-9] [A-Fa-f0-9]
+        basic_boolean ::= "true" | "false"
+        basic_null ::= "null"
+        basic_array ::= "[" ("" | ws basic_any (ws "," ws basic_any)*) ws "]"
+        basic_object ::= "{" ("" | ws basic_string ws ":" ws basic_any ( ws "," ws basic_string ws ":" ws basic_any)*) ws "}"
+        ws ::= [ \n\t]*
+        """
+
+    pythonic_grammar_ebnf_str = r"""
+        py_value ::= basic_number | basic_string | basic_array | "True" | "False" | "None"
+        basic_any ::= basic_number | basic_string | basic_array | basic_object
+        basic_number ::= ("0" | "-"? [1-9] [0-9]*) ("." [0-9]+)? ([eE] [+-]? [0-9]+)?
+        basic_string ::= (([\"] basic_string_1 [\"]))
+        basic_string_1 ::= "" | [^"\\\x00-\x1F] basic_string_1 | "\\" escape basic_string_1
+        escape ::= ["\\/bfnrt] | "u" [A-Fa-f0-9] [A-Fa-f0-9] [A-Fa-f0-9] [A-Fa-f0-9]
+        basic_array ::= "[" ("" | ws basic_any (ws "," ws basic_any)*) ws "]"
+        basic_object ::= "{" ("" | ws basic_string ws ":" ws basic_any ( ws "," ws basic_string ws ":" ws basic_any)*) ws "}"
+        ws ::= [ \n\t]*
+    """
+
+    @staticmethod
+    def get_value_rule(prop: dict, is_pythonic: bool) -> str:
+        if "enum" in prop:
+            return " | ".join([f'"{v}"' for v in prop["enum"]])
+        return "py_value" if is_pythonic else "json"
+
+    @staticmethod
+    def build_ebnf(
+        tools,
+        *,
+        tool_calls_rule: str,
+        call_rule_fmt: str,
+        arguments_rule_fmt: str,
+        key_value_fmt: str,
+        is_pythonic: bool = False,
+    ):
+        """
+        Generalized EBNF builder for all detectors.
+        Args:
+            tools: list of Tool
+            tool_calls_rule: the top-level rule string (e.g. "tool_calls ::= ...")
+            call_rule_fmt: format string for call_{name} rule (expects {name}, {arguments_rule})
+            arguments_rule_fmt: format string for arguments_{name} rule (expects {arg_rules})
+            key_value_fmt: format for key-value pairs (expects {key}, {valrule})
+            is_pythonic: if True, use pythonic value rules
+        """
+        lines = [
+            "root ::= " + tool_calls_rule,
+            "function_call ::= "
+            + " | ".join([f"call_{t.function.name}" for t in tools]),
+        ]
+        for tool in tools:
+            name = tool.function.name
+            params = tool.function.parameters or {}
+            props = list(params.get("properties", {}).keys())
+            required = set(params.get("required", []))
+            arg_rules = []
+            for key in props:
+                prop = params["properties"][key]
+                valrule = EBNFComposer.get_value_rule(prop, is_pythonic)
+                pair = key_value_fmt.format(key=key, valrule=valrule)
+                if key not in required:
+                    pair = f"[ {pair} ]"
+                arg_rules.append(pair)
+            arguments_rule = arguments_rule_fmt.format(
+                arg_rules=(' "," '.join(arg_rules) if arg_rules else "")
+            )
+            lines.append(
+                call_rule_fmt.format(name=name, arguments_rule=f"arguments_{name}")
+            )
+            lines.append(f"arguments_{name} ::= {arguments_rule}")
+
+        if is_pythonic:
+            lines.append(EBNFComposer.pythonic_grammar_ebnf_str)
+        else:
+            lines.append(EBNFComposer.json_grammar_ebnf_str)
+        return "\n".join(lines)
+
+
 class Qwen25Detector(BaseFormatDetector):
     """
     Detector for Qwen 2.5 models.
@@ -363,12 +451,23 @@ class Qwen25Detector(BaseFormatDetector):
             trigger="<tool_call>",
         )
 
+    def build_ebnf(self, tools: List[Tool]):
+        return EBNFComposer.build_ebnf(
+            tools,
+            # tool_calls_rule="tool_calls ::= ' ' function_call ' '",
+            tool_calls_rule='"<tool_call>" function_call "</tool_call>"',
+            call_rule_fmt='call_{name} ::= "{" "name" ":" "{name}" "," "arguments" ":" {arguments_rule} "}"',
+            arguments_rule_fmt='"{" {arg_rules} "}"',
+            key_value_fmt='"{key}" ":" {valrule}',
+            is_pythonic=False,
+        )
+
 
 class MistralDetector(BaseFormatDetector):
     """
     Detector for Mistral models.
     Assumes function call format:
-      <|action_start|><|plugin|>{"name":"xxx", "arguments":{...}}<|action_end|>
+      [TOOL_CALLS] [{"name":"xxx", "arguments":{...}}]
     """
 
     def __init__(self):
@@ -391,6 +490,7 @@ class MistralDetector(BaseFormatDetector):
             return '[TOOL_CALLS] [{"name": "get_current_weather", "arguments": {"location": "Boston, MA", "unit": "fahrenheit"}}]'
         The key pattern is [TOOL_CALLS] [...]
         """
+        # TODO: check if Mistral supports multiple tool calls, currently assume only support one tool call
         find_results = re.findall(r"\[TOOL_CALLS\] \[.*?\]", text, re.DOTALL)
         if len(find_results) > 0:
             return find_results[0]
@@ -423,6 +523,16 @@ class MistralDetector(BaseFormatDetector):
             begin='[TOOL_CALLS] [{"name":"' + name + '", "arguments":',
             end="}]",
             trigger="[TOOL_CALLS]",
+        )
+
+    def build_ebnf(self, tools: List[Tool]):
+        return EBNFComposer.build_ebnf(
+            tools,
+            tool_calls_rule='"[TOOL_CALLS] [ " function_call ( " , " function_call )* " ]"',
+            call_rule_fmt='call_{name} ::= "{" "name" ":" "{name}" "," "arguments" ":" {arguments_rule} "}"',
+            arguments_rule_fmt='"{" {arg_rules} "}"',
+            key_value_fmt='"{key}" ":" {valrule}',
+            is_pythonic=False,
         )
 
 
@@ -476,6 +586,16 @@ class Llama32Detector(BaseFormatDetector):
             begin='<|python_tag|>{"name":"' + name + '", "arguments":',
             end="}",
             trigger="<|python_tag|>",
+        )
+
+    def build_ebnf(self, tools: List[Tool]):
+        return EBNFComposer.build_ebnf(
+            tools,
+            tool_calls_rule='"<|python_tag|>" function_call',
+            call_rule_fmt='call_{name} ::= "{" "name" ":" "{name}" "," "arguments" ":" {arguments_rule} "}"',
+            arguments_rule_fmt='"{" {arg_rules} "}"',
+            key_value_fmt='"{key}" ":" {valrule}',
+            is_pythonic=False,
         )
 
 
@@ -533,6 +653,16 @@ class DeepSeekV3Detector(BaseFormatDetector):
             begin=">" + name + "\n```json\n",
             end="\n```<",
             trigger=">" + name + "\n```json\n",
+        )
+
+    def build_ebnf(self, tools: List[Tool]):
+        return EBNFComposer.build_ebnf(
+            tools,
+            tool_calls_rule="'<｜tool▁calls▁begin｜>' tool_call (tool_call)* '<｜tool▁calls▁end｜>'",
+            call_rule_fmt='call_{name} ::= "<｜tool▁call▁begin｜>function<｜tool▁sep｜>{name}\\n```json\\n" {arguments_rule} "\\n```<｜tool▁call▁end｜>"',
+            arguments_rule_fmt='"{" {arg_rules} "}"',
+            key_value_fmt='"{key}" ":" {valrule}',
+            is_pythonic=False,
         )
 
     def parse_streaming_increment(
@@ -609,62 +739,6 @@ class DeepSeekV3Detector(BaseFormatDetector):
             return StreamingParseResult(normal_text=current_text)
 
 
-class MultiFormatParser:
-    def __init__(self, detectors: List[BaseFormatDetector]):
-        """
-        :param detectors: A series of available Detector instances passed in
-        """
-        self.detectors = detectors
-
-    def parse_once(
-        self, text: str, tools: List[Tool]
-    ) -> Tuple[str, list[ToolCallItem]]:
-        """
-        One-time parsing: Loop through detectors until there are no new matches or text is exhausted
-        Return: (final_text, all_calls)
-        - final_text: The remaining text after parsing that was not consumed by any Detector (can be treated as normal text)
-        - all_calls: All calls parsed by the Detectors
-        """
-        final_calls = []
-        final_normal_text = text
-        for detector in self.detectors:
-            parsed_result = detector.detect_and_parse(text, tools)
-            tool_call_list = parsed_result.calls
-            if len(tool_call_list) > 0:  # parsed successfully
-                final_calls = tool_call_list
-                final_normal_text = parsed_result.normal_text
-                break
-
-        # leftover_text is the normal text not consumed by any Detector
-        return final_normal_text, final_calls
-
-    def parse_streaming_increment(
-        self, new_text: str, tools: List[Tool]
-    ) -> Tuple[str, list[ToolCallItem]]:
-        """
-        Streaming incremental parsing: Feed new_text to each detector's parse_streaming_increment
-        and merge their produced normal_text/calls to return.
-        (The logic here can be "priority-based" or "parallel parsing" based on your needs)
-        """
-        final_normal_text = ""
-        final_calls = []
-
-        for detector in self.detectors:
-            sp_result = detector.parse_streaming_increment(new_text, tools)
-            # Merge normal_text and calls
-            # If one sp_result contains result call, this should be a successful parse
-            # If one sp_result only contains normal_text, this can either be a successful
-            # parse or it is not using the desired parsing tool.
-            if sp_result.normal_text:
-                final_normal_text = sp_result.normal_text
-            if sp_result.calls:
-                final_calls.extend(sp_result.calls)
-                final_normal_text = sp_result.normal_text
-                break
-
-        return final_normal_text, final_calls
-
-
 class PythonicDetector(BaseFormatDetector):
     """
     Detector for Llama-3.2 and Llama-4 models with pythonic tool call format.
@@ -675,10 +749,32 @@ class PythonicDetector(BaseFormatDetector):
 
     def __init__(self):
         super().__init__()
+        FUNC_CALL = r"""
+            [a-zA-Z_][\w]*(\.[a-zA-Z_][\w]*)*       # Function name: dotted, Python-style identifiers
+            \(                                      # Opening parenthesis for arguments
+                (                                   # --- Optional repeated key=val pairs ending with comma ---
+                    [a-zA-Z]+\w*=.*,\s*             #     Match key=val followed by comma and optional whitespace
+                )*                                  # --- Zero or more such arguments
+                (                                   # --- Optional last argument without trailing comma ---
+                    [a-zA-Z]+\w*=.*\s*              #     Match final key=val (no comma)
+                )?                                  # --- This part is optional
+            \)                                      # Closing parenthesis
+        """
+
         self.tool_call_regex = re.compile(
-            r"\[([a-zA-Z]+\w*\(([a-zA-Z]+\w*=.*,\s*)*([a-zA-Z]+\w*=.*\s)?\),\s*)*([a-zA-Z]+\w*\(([a-zA-Z]+\w*=.*,\s*)*([a-zA-Z]+\w*=.*\s*)?\)\s*)+\]",
-            re.DOTALL,
+            rf"""
+            \[                                      # Opening square bracket
+                \s*
+                {FUNC_CALL}                         # First function call
+                (
+                    \s*,\s*{FUNC_CALL}              # Additional function calls (comma-separated)
+                )*                                  # Zero or more
+                \s*
+            \]                                      # Closing square bracket
+            """,
+            re.VERBOSE | re.DOTALL,
         )
+        # self.tool_call_regex_xgrammar = r"\[\s*[a-zA-Z_][\w]*(\.[a-zA-Z_][\w]*)*\(((?:[a-zA-Z]+\w*=.*,\s*)*([a-zA-Z]+\w*=.*\s*)?)\)(\s*,\s*[a-zA-Z_][\w]*(\.[a-zA-Z_][\w]*)*\(((?:[a-zA-Z]+\w*=.*,\s*)*([a-zA-Z]+\w*=.*\s*)?)\)))*\s*\]"
 
     def has_tool_call(self, text: str) -> bool:
         return bool(self.tool_call_regex.match(text.strip()))
@@ -755,14 +851,27 @@ class PythonicDetector(BaseFormatDetector):
 
     def structure_info(self) -> _GetInfoFunc:
         def info(name: str):
-            return StructureInfo(begin="[", end="]", trigger="")
+            return StructureInfo(begin=f"[{name}(", end=")]", trigger=f"[{name}(")
 
         return info
+
+    def build_ebnf(self, tools: List[Tool]) -> Optional[str]:
+        return EBNFComposer.build_ebnf(
+            tools,
+            tool_calls_rule='"[" function_call ("," function_call)* "]"',
+            call_rule_fmt='call_{name} ::= "{name}" "(" {arguments_rule} ")"',
+            arguments_rule_fmt="{arg_rules}",
+            key_value_fmt='"{key}" "=" {valrule}',
+            is_pythonic=True,
+        )
 
 
 class FunctionCallParser:
     """
-    In streaming scenarios, each time new_text is received, it calls multi_format_parser.parse_streaming_increment
+    Parser for function/tool calls in model outputs.
+
+    This class handles both streaming and non-streaming parsing of function calls using a detector.
+    In streaming scenarios, each time new_text is received, it calls detector.parse_streaming_increment
     and returns the resulting normal_text and calls to the upper layer (or SSE).
     """
 
@@ -775,17 +884,14 @@ class FunctionCallParser:
     }
 
     def __init__(self, tools: List[Tool], tool_call_parser: str):
-        detectors = []
-        if tool_call_parser:
-            detector_class = self.ToolCallParserEnum.get(tool_call_parser)
-            if detector_class:
-                detectors.append(detector_class())
-            else:
-                raise ValueError(f"Unsupported tool_call_parser: {tool_call_parser}")
+        detector = None
+        detector_class = self.ToolCallParserEnum.get(tool_call_parser)
+        if detector_class:
+            detector = detector_class()
         else:
-            raise ValueError("Tool Call Parser Not Given!")
+            raise ValueError(f"Unsupported tool_call_parser: {tool_call_parser}")
 
-        self.multi_format_parser = MultiFormatParser(detectors)
+        self.detector = detector
         self.tools = tools
 
     def has_tool_call(self, text: str) -> bool:
@@ -793,66 +899,122 @@ class FunctionCallParser:
         Check if the given text contains a tool call in the format supported by this parser.
         This delegates to the detector's implementation.
 
-        :param text: The text to check for tool calls
-        :return: True if the text contains a tool call, False otherwise
+        Args:
+            text: The text to check for tool calls
+
+        Returns:
+            True if the text contains a tool call, False otherwise
         """
-        # Check all detectors in the multi_format_parser
-        for detector in self.multi_format_parser.detectors:
-            if detector.has_tool_call(text):
-                return True
-        return False
+        return self.detector.has_tool_call(text)
 
     def parse_non_stream(self, full_text: str) -> Tuple[str, list[ToolCallItem]]:
         """
-        Non-streaming call: one-time parsing
+        One-time parsing of the full text to extract tool calls.
+
+        Args:
+            full_text: The complete text to parse
+
+        Returns:
+            A tuple containing:
+            - The remaining text after parsing that was not consumed by the detector (can be treated as normal text)
+            - A list of tool calls parsed from the text
         """
-        full_normal_text, calls = self.multi_format_parser.parse_once(
-            full_text, self.tools
-        )
-        return full_normal_text, calls
+        parsed_result = self.detector.detect_and_parse(full_text, self.tools)
+        tool_call_list = parsed_result.calls
+        if tool_call_list:
+            return parsed_result.normal_text, tool_call_list
+        else:
+            return full_text, []
 
     def parse_stream_chunk(self, chunk_text: str) -> Tuple[str, list[ToolCallItem]]:
         """
-        Streaming call: incremental parsing
-        """
-        normal_text, calls = self.multi_format_parser.parse_streaming_increment(
-            chunk_text, self.tools
-        )
-        return normal_text, calls
+        Streaming incremental parsing of chunks of text as they arrive.
 
-    def structure_infos(self) -> List[_GetInfoFunc]:
+        Args:
+            chunk_text: The new chunk of text to parse
+
+        Returns:
+            A tuple containing:
+            - The normal text that should be displayed to the user
+            - A list of tool calls parsed from the chunk
         """
-        Returns a list of structure_info functions for each detector
-        """
-        return [
-            detector.structure_info() for detector in self.multi_format_parser.detectors
-        ]
+        final_normal_text = ""
+        final_calls = []
+
+        sp_result = self.detector.parse_streaming_increment(chunk_text, self.tools)
+        if sp_result.normal_text:
+            final_normal_text = sp_result.normal_text
+        if sp_result.calls:
+            final_calls.extend(sp_result.calls)
+            final_normal_text = sp_result.normal_text
+
+        return final_normal_text, final_calls
 
     def get_structure_tag(self) -> StructuralTagResponseFormat:
+        """
+        Generate a structural tag response format for all available tools.
+
+        This creates the necessary structural tags that guide the model's output format.
+        """
         tool_structures: List[StructuresResponseFormat] = list()
         tool_trigger_set: Set[str] = set()
 
-        for wrapper in self.structure_infos():
-            for tool in self.tools:
-                function = tool.function
-                name = function.name
-                assert name is not None
-                info = wrapper(name)
+        get_structure_info = self.detector.structure_info()
+        for tool in self.tools:
+            function = tool.function
+            name = function.name
+            assert name is not None
+            info = get_structure_info(name)
 
-                # accept all if not strict, otherwise only accept the schema
-                schema = function.parameters if function.strict else {}
+            # accept all if not strict, otherwise only accept the schema
+            schema = function.parameters if function.strict else {}
 
-                tool_structures.append(
-                    StructuresResponseFormat(
-                        begin=info.begin,
-                        schema=schema,  # type: ignore
-                        end=info.end,
-                    )
+            tool_structures.append(
+                StructuresResponseFormat(
+                    begin=info.begin,
+                    schema=schema,  # type: ignore
+                    end=info.end,
                 )
-                tool_trigger_set.add(info.trigger)
+            )
+            tool_trigger_set.add(info.trigger)
 
         return StructuralTagResponseFormat(
             type="structural_tag",
             structures=tool_structures,
             triggers=list(tool_trigger_set),
         )
+
+    def get_structure_constraint(
+        self, tool_choice: Union[ToolChoice, Literal["auto", "required", "none"]]
+    ) -> Optional[Tuple[str, Any]]:
+        """
+        Returns the appropriate structure constraint for tool calls based on the tool_choice.
+        The constraint is used to guide the model's output format.
+
+        Args:
+            tool_choice: The tool choice setting from the request
+
+        Returns:
+            A tuple of (constraint_type, constraint_value) to be added to sampling parameters,
+            or None if no constraint applies.
+        """
+        if tool_choice == "auto":
+            strict_tag = self.get_structure_tag()
+            return ("structural_tag", strict_tag)
+        else:
+            ebnf = self.get_ebnf(tool_choice)
+            return ("ebnf", ebnf) if ebnf is not None else None
+
+    def get_ebnf(
+        self, tool_choice: Union[ToolChoice, Literal["required"]]
+    ) -> Optional[str]:
+        """
+        Get the EBNF grammar for the specified tool choice.
+        """
+        filtered_tools = []
+        if isinstance(tool_choice, ToolChoice):
+            fn_name = tool_choice.function.name
+            filtered_tools = [t for t in self.tools if t.function.name == fn_name]
+        else:
+            filtered_tools = self.tools
+        return self.detector.build_ebnf(filtered_tools)
