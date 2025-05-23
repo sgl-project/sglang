@@ -124,6 +124,9 @@ def enable_moe_dense_fully_dp():
     return global_server_args_dict["moe_dense_tp_size"] == 1
 
 
+communicator_global_context = None
+
+
 class LayerCommunicator:
     def __init__(
         self,
@@ -165,7 +168,9 @@ class LayerCommunicator:
             forward_batch=forward_batch,
             input_mode=self.layer_scatter_modes.layer_input_mode,
             output_mode=self.layer_scatter_modes.attn_mode,
-            context=self._compute_context(forward_batch),
+            # TODO
+            # context=self._compute_context(forward_batch),
+            context=communicator_global_context,
         )
 
         return hidden_states, residual
@@ -185,7 +190,9 @@ class LayerCommunicator:
             hidden_states_output_mode=self.layer_scatter_modes.mlp_mode,
             residual_output_mode=self.layer_scatter_modes.middle_residual_mode,
             layernorm=self.post_attention_layernorm,
-            context=self._compute_context(forward_batch),
+            # TODO
+            # context=self._compute_context(forward_batch),
+            context=communicator_global_context,
         )
 
     def postprocess_layer(
@@ -201,7 +208,9 @@ class LayerCommunicator:
             hidden_states_input_mode=self.layer_scatter_modes.mlp_mode,
             residual_input_mode=self.layer_scatter_modes.middle_residual_mode,
             output_mode=self.layer_scatter_modes.layer_output_mode,
-            context=self._compute_context(forward_batch),
+            # TODO
+            # context=self._compute_context(forward_batch),
+            context=communicator_global_context,
         )
 
     def _compute_context(self, forward_batch: ForwardBatch):
@@ -217,6 +226,11 @@ class LayerCommunicator:
             local_attn_dp_size=self.local_attn_dp_size,
             tp_size=self.tp_size,
         )
+
+    # TODO ugly
+    def update_global_context(self, forward_batch):
+        global communicator_global_context
+        communicator_global_context = self._compute_context(forward_batch)
 
 
 def _compute_num_tokens_of_mode(
