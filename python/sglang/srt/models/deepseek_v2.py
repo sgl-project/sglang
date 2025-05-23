@@ -569,6 +569,9 @@ def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
     return 0.1 * mscale * math.log(scale) + 1.0
 
 
+global_attn_forward_method = None
+
+
 class DeepseekV2AttentionMLA(nn.Module):
 
     def __init__(
@@ -818,7 +821,13 @@ class DeepseekV2AttentionMLA(nn.Module):
             ), "short-circuiting allreduce will lead to hangs"
             return hidden_states, forward_batch, None
 
-        attn_forward_method = self.dispatch_attn_forward_method(forward_batch)
+        global global_attn_forward_method
+        if global_attn_forward_method is None:
+            global_attn_forward_method = self.dispatch_attn_forward_method(
+                forward_batch
+            )
+        attn_forward_method = global_attn_forward_method
+
         if attn_forward_method == AttnForwardMethod.MHA:
             inner_state = self.forward_normal_prepare(
                 positions, hidden_states, forward_batch, zero_allocator
@@ -1708,6 +1717,8 @@ class DeepseekV2ForCausalLM(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
+        global global_attn_forward_method
+        global_attn_forward_method = None
 
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
 
