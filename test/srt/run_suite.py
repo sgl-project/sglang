@@ -102,9 +102,6 @@ suites = {
         TestFile("test_update_weights_from_distributed.py", 103),
         TestFile("test_verl_engine_2_gpu.py", 64),
     ],
-    "per-commit-4-gpu": [
-        TestFile("test_verl_engine.py", 64),
-    ],
     "per-commit-2-gpu-amd": [
         TestFile("test_mla_tp.py", 170),
     ],
