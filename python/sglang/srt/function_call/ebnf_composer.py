@@ -50,12 +50,55 @@ class EBNFComposer:
         "json": '"\\"{key}\\"" ":" {valrule}',
     }
 
+    JSON_TYPE_MAPPING = {
+        "string": "basic_string",
+        "number": "basic_number",
+        "integer": "basic_number",
+        "boolean": "basic_boolean",
+        "null": "basic_null",
+        "array": "basic_array",
+        "object": "basic_object",
+    }
+
+    PYTHONIC_TYPE_MAPPING = {
+        "string": "basic_string",
+        "number": "basic_number",
+        "integer": "basic_number",
+        "boolean": '"True" | "False"',
+        "null": '"None"',
+        "array": "basic_array",
+        "object": "basic_object",
+    }
+
     @staticmethod
     def get_value_rule(
         prop: dict, function_format: Literal["pythonic", "json"] = "json"
     ) -> str:
         if "enum" in prop:
             return " | ".join([f'"{v}"' for v in prop["enum"]])
+
+        if "type" in prop:
+            prop_type = prop["type"]
+            type_mapping = (
+                EBNFComposer.PYTHONIC_TYPE_MAPPING
+                if function_format == "pythonic"
+                else EBNFComposer.JSON_TYPE_MAPPING
+            )
+
+            # Handle case where type is an array of types
+            if isinstance(prop_type, list):
+                # Get the rule for each type and join with | operator
+                type_rules = []
+                for single_type in prop_type:
+                    if single_type in type_mapping:
+                        type_rules.append(type_mapping[single_type])
+
+                if type_rules:
+                    return " | ".join(type_rules)
+            # Handle case where type is a single string
+            elif prop_type in type_mapping:
+                return type_mapping[prop_type]
+
         return function_format
 
     @staticmethod
