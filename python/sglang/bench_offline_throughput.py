@@ -11,7 +11,9 @@ python -m sglang.bench_offline_throughput --model-path meta-llama/Meta-Llama-3.1
 """
 
 import argparse
+import asyncio
 import dataclasses
+import inspect
 import json
 import logging
 import os
@@ -262,6 +264,10 @@ def throughput_test_once(
         measurement_results["total_input_tokens"]
         + measurement_results["total_output_tokens"]
     ) / latency
+
+    if inspect.isawaitable(server_info):
+        server_info = asyncio.run(server_info)
+
     measurement_results["last_gen_throughput"] = server_info["internal_states"][0][
         "last_gen_throughput"
     ]
