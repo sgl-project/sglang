@@ -121,21 +121,19 @@ class BaseFormatDetector(ABC):
             if name and name in tool_indices:
                 current_args_payload = act.get("parameters") or act.get("arguments", {})
 
-                processed_args_payload = current_args_payload
                 if isinstance(current_args_payload, str):
-                    try:
-                        processed_args_payload = json.loads(current_args_payload)
-                    except json.JSONDecodeError:
-                        pass
+                    processed_args_str = current_args_payload
+                else:
+                    processed_args_str = json.dumps(
+                        current_args_payload,
+                        ensure_ascii=False,
+                    )
 
                 results.append(
                     ToolCallItem(
                         tool_index=tool_indices[name],
                         name=name,
-                        parameters=json.dumps(
-                            processed_args_payload,
-                            ensure_ascii=False,
-                        ),
+                        parameters=processed_args_str,
                     )
                 )
             else:
