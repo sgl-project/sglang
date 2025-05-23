@@ -38,16 +38,12 @@ _ENABLE_UPDATE_WEIGHTS = True
 # _ENABLE_UPDATE_WEIGHTS = False
 
 # TODO maybe we should add more other models? should we keep it in sync with test_generation_models.py?
-CI_MODELS = [
+ALL_MODELS = [
     dict(
         model_path="Qwen/Qwen2.5-0.5B",
         dp_size=2,
         tp_size=2,  # default to 2
     ),
-    # Fail to run gemma-2-2b after transformers==4.48.3 -> 4.50.0
-    # dict(model_path="google/gemma-2-2b"),
-]
-ALL_OTHER_MODELS = [
     dict(
         model_path="Qwen/Qwen2.5-14B-Instruct",
         mem_fraction_static=0.7,
@@ -58,7 +54,7 @@ ALL_OTHER_MODELS = [
     ),  # test_generation_models.py same config (qwen + tp=8) gives 1.22 decode error
     dict(
         model_path="THUDM/glm-4-9b-chat",
-        mem_fraction_static=0.2,
+        mem_fraction_static=0.5,
         dp_size=2,
         tp_size=2,
         tight_memory=True,
@@ -121,7 +117,7 @@ class TestVerlEngine(CustomTestCase):
             p.join()
 
     def test_ci_models(self):
-        ci_models = [random.choice(CI_MODELS)]
+        ci_models = [random.choice(ALL_MODELS)]
         for index, model_info in enumerate(ci_models):
             self.assert_fragment_e2e_execution(index=index, **model_info)
 
