@@ -661,6 +661,7 @@ register_conv_template(
     )
 )
 
+# TODO (lifuhuang): Refactor BaseMultimodalProcessor to support the default image token "<|image_{index}|>" in the future.
 register_conv_template(
     Conversation(
         name="phi-4-mm",
@@ -672,7 +673,6 @@ register_conv_template(
         stop_str="<|end|>",
         image_token="<|endoftext10|>",
         # image_token="<|image_{index}|>",
-        # audio_token="<|audio_{index}|>",
     )
 )
 

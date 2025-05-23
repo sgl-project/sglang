@@ -218,6 +218,7 @@ class TestPhi4MMServer(TestOpenAIVisionServer):
         pass
 
     def test_multi_images_chat_completion(self):
+        # TODO (lifuhuang): support LoRA to enable Phi4MM multi-image understanding capability.
         pass
 
 
