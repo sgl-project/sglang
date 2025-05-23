@@ -125,9 +125,6 @@ def enable_moe_dense_fully_dp():
     return global_server_args_dict["moe_dense_tp_size"] == 1
 
 
-communicator_global_context = None
-
-
 class LayerCommunicator:
     def __init__(
         self,
@@ -149,10 +146,17 @@ class LayerCommunicator:
             ScatterMode.FULL: self.tp_size,
         }
 
+        self._context = _Context(
+            process_group_sizes=self.process_group_sizes,
+            attn_tp_rank=self.attn_tp_rank,
+            attn_tp_size=self.attn_tp_size,
+            local_attn_dp_size=self.local_attn_dp_size,
+            tp_size=self.tp_size,
+        )
         self._communicate_simple_fn = _get_communicate_simple_fn(
             input_mode=self.layer_scatter_modes.layer_input_mode,
             output_mode=self.layer_scatter_modes.attn_mode,
-            context=self._compute_context(),
+            context=self._context,
         )
         self._communicate_with_all_reduce_and_layer_norm_fn = (
             _get_communicate_with_all_reduce_and_layer_norm_fn(
@@ -160,7 +164,7 @@ class LayerCommunicator:
                 residual_input_mode=self.layer_scatter_modes.layer_input_mode,
                 hidden_states_output_mode=self.layer_scatter_modes.mlp_mode,
                 residual_output_mode=self.layer_scatter_modes.middle_residual_mode,
-                context=self._compute_context(),
+                context=self._context,
             )
         )
         self._communicate_summable_tensor_pair_fn = (
@@ -168,7 +172,7 @@ class LayerCommunicator:
                 hidden_states_input_mode=self.layer_scatter_modes.mlp_mode,
                 residual_input_mode=self.layer_scatter_modes.middle_residual_mode,
                 output_mode=self.layer_scatter_modes.layer_output_mode,
-                context=self._compute_context(),
+                context=self._context,
             )
         )
 
@@ -190,9 +194,7 @@ class LayerCommunicator:
         hidden_states = self._communicate_simple_fn(
             hidden_states=hidden_states,
             forward_batch=forward_batch,
-            # TODO
-            # context=self._compute_context(forward_batch),
-            context=communicator_global_context,
+            context=self._context,
         )
 
         return hidden_states, residual
@@ -208,9 +210,7 @@ class LayerCommunicator:
             residual=residual,
             forward_batch=forward_batch,
             layernorm=self.post_attention_layernorm,
-            # TODO
-            # context=self._compute_context(forward_batch),
-            context=communicator_global_context,
+            context=self._context,
         )
 
     def postprocess_layer(
@@ -223,63 +223,12 @@ class LayerCommunicator:
             hidden_states=hidden_states,
             residual=residual,
             forward_batch=forward_batch,
-            # TODO
-            # context=self._compute_context(forward_batch),
-            context=communicator_global_context,
+            context=self._context,
         )
-
-    # def _compute_context(self, forward_batch: ForwardBatch):
-    def _compute_context(self):
-        return _Context(
-            # num_tokens_of_mode=_compute_num_tokens_of_mode(
-            #     forward_batch,
-            #     attn_tp_rank=self.attn_tp_rank,
-            #     attn_tp_size=self.attn_tp_size,
-            # ),
-            process_group_sizes=self.process_group_sizes,
-            attn_tp_rank=self.attn_tp_rank,
-            attn_tp_size=self.attn_tp_size,
-            local_attn_dp_size=self.local_attn_dp_size,
-            tp_size=self.tp_size,
-        )
-
-    # TODO ugly
-    def update_global_context(self):
-        global communicator_global_context
-        communicator_global_context = self._compute_context()
-
-
-def _compute_num_tokens_of_mode(
-    forward_batch: ForwardBatch, attn_tp_rank: int, attn_tp_size: int
-):
-    tp_attn_full_num_tokens = forward_batch.input_ids.shape[0]
-    return {
-        ScatterMode.SCATTERED: _torch_tensor_split_len(
-            tp_attn_full_num_tokens, attn_tp_size, attn_tp_rank
-        ),
-        ScatterMode.TP_ATTN_FULL: tp_attn_full_num_tokens,
-        ScatterMode.FULL: (
-            (
-                forward_batch.gathered_buffer.shape[0]
-                if forward_batch.gathered_buffer is not None
-                else None
-            )
-            if global_server_args_dict["enable_dp_attention"]
-            else forward_batch.input_ids.shape[0]
-        ),
-    }
-
-
-def _torch_tensor_split_len(tensor_len: int, n: int, output_index: int):
-    if output_index < int(tensor_len % n):
-        return int(tensor_len / n) + 1
-    else:
-        return int(tensor_len / n)
 
 
 @dataclass
 class _Context:
-    # num_tokens_of_mode: Dict["ScatterMode", int]
     process_group_sizes: Dict["ScatterMode", int]
     attn_tp_rank: int
     attn_tp_size: int
@@ -288,27 +237,6 @@ class _Context:
 
     def is_same_group_size(self, a: "ScatterMode", b: "ScatterMode"):
         return self.process_group_sizes[a] == self.process_group_sizes[b]
-
-    # def check_shape(self, x: torch.Tensor, mode: ScatterMode):
-    #     if x is None:
-    #         return
-    #
-    #     actual_num_tokens = x.shape[0]
-    #     expect_num_tokens = self.num_tokens_of_mode[mode]
-    #
-    #     if expect_num_tokens is not None:
-    #         assert (
-    #             actual_num_tokens == expect_num_tokens
-    #         ), f"{actual_num_tokens=} {expect_num_tokens=} {mode=} {x.shape=} {self.num_tokens_of_mode=} {self.process_group_sizes=}"
-    #
-    #     return x
-    #
-    # def check_shapes(
-    #     self, xs: Tuple[torch.Tensor, ...], modes: Tuple[ScatterMode, ...]
-    # ) -> Tuple[torch.Tensor, ...]:
-    #     return tuple(
-    #         [self.check_shape(x, mode) for x, mode in zip(xs, modes, strict=True)]
-    #     )
 
 
 # TODO each one be a cls
