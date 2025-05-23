@@ -282,12 +282,6 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
         Returns:
             image_features (`torch.Tensor`): Image feature tensor of shape `(num_images, image_length, embed_dim)`).
         """
-        if any(item.precomputed_features is not None for item in items):
-            if not all(item.precomputed_features is not None for item in items):
-                raise NotImplementedError(
-                    "MM inputs where only some items are precomputed."
-                )
-            return torch.concat([item.precomputed_features for item in items])
         pixel_values = torch.stack(
             flatten_nested_list([item.pixel_values for item in items]), dim=0
         )
