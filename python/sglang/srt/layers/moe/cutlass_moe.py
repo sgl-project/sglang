@@ -211,8 +211,6 @@ def cutlass_fused_experts(
 
 FLOAT4_E2M1_MAX = 6.0 
 FLOAT8_E4M3_MAX = 448.0
-MAX_TOKENS_PER_EXPERT = 65536
-
 def cutlass_moe_fp4(a: torch.Tensor, a1_gscale: torch.Tensor,
                     w1_fp4: torch.Tensor, w1_blockscale: torch.Tensor,
                     w1_alphas: torch.Tensor, a2_gscale: torch.Tensor,
@@ -267,9 +265,7 @@ def cutlass_moe_fp4(a: torch.Tensor, a1_gscale: torch.Tensor,
     assert a.dtype in [torch.half, torch.bfloat16], "Invalid input dtype"
     assert (topk_weights.shape[0] == m and topk_ids.shape[0]
             == m), ("topk must be provided for each row of a")
-    assert (m <= MAX_TOKENS_PER_EXPERT), (
-        f"m must be less than MAX_TOKENS_PER_EXPERT({MAX_TOKENS_PER_EXPERT})"
-        f" for cutlass_moe_fp4, observed m = {m}")
+
     out_dtype = a.dtype
     num_topk = topk_ids.shape[1]
 
