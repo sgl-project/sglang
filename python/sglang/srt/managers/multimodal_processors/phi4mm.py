@@ -35,14 +35,18 @@ class Phi4MMImageProcessor(BaseMultimodalProcessor):
 
         if not image_data and not audio_data:
             return None
-        if audio_data is not None:
-            logger.warning(
-                "Currently SGLang does not support audio data for Phi4MM. We are working on it. You can file an issue to help us prioritize."
-            )
-            audio_data = None
 
         if not isinstance(image_data, list):
             image_data = [image_data]
+
+        if not isinstance(audio_data, list):
+            audio_data = [audio_data]
+
+        if audio_data:
+            logger.warning(
+                "Currently SGLang does not support audio data for Phi4MM. We are working on it. You can file an issue to help us prioritize."
+            )
+            audio_data = []
 
         base_output = self.load_mm_data(
             prompt=input_text,
@@ -60,17 +64,24 @@ class Phi4MMImageProcessor(BaseMultimodalProcessor):
             audios=base_output.audios,
         )
 
+        input_ids = res["input_ids"].flatten()
+        image_offsets = self.get_mm_items_offset(
+            input_ids=input_ids,
+            mm_token_id=self._IMAGE_SPECIAL_TOKEN_ID,
+        )
+
         items = [
             MultimodalDataItem(
                 pixel_values=res["input_image_embeds"],
                 image_sizes=res["image_sizes"],
                 image_emb_mask=res["image_attention_mask"],
+                image_offsets=image_offsets,
                 modality=Modality.IMAGE,
             )
         ]
 
         return {
             "mm_items": items,
-            "input_ids": res["input_ids"].flatten().tolist(),
+            "input_ids": input_ids.tolist(),
             "im_token_id": _IMAGE_SPECIAL_TOKEN_ID,
         }
