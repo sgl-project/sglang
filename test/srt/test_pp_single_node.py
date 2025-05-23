@@ -120,7 +120,9 @@ class TestQwenPPTieWeightsAccuracy(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.base_url = "http://127.0.0.1:23334"  # different ports to avoid conflicts
-        cls.model_name = "Qwen/Qwen3-0.6B"  # qwen3 < 8B all have tie_word_embeddings = True
+        cls.model_name = (
+            "Qwen/Qwen3-0.6B"  # qwen3 < 8B all have tie_word_embeddings = True
+        )
 
     def run_gsm8k_test(self, pp_size):
         process = popen_launch_server(
