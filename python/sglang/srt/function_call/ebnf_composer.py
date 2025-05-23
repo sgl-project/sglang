@@ -2,6 +2,7 @@ from typing import Literal
 
 
 class EBNFComposer:
+    # Adapted from https://xgrammar.mlc.ai/docs/how_to/ebnf_guided_generation.html#try-out-via-hf-transformers
     json_grammar_ebnf_str = r"""
         json ::= basic_array | basic_object
         basic_any ::= basic_number | basic_string | basic_boolean | basic_null | basic_array | basic_object
