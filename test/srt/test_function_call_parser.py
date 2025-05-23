@@ -245,7 +245,7 @@ class TestEBNFGeneration(unittest.TestCase):
 
         # Check that the EBNF contains expected patterns
         self.assertIn('call_get_weather ::= "get_weather" "(" ', ebnf)
-        self.assertIn('"location" "=" pythonic', ebnf)
+        self.assertIn('"location" "=" basic_string', ebnf)
         self.assertIn('[ "unit" "=" "celsius" | "fahrenheit" ]', ebnf)
 
         # Validate that the EBNF can be compiled by GrammarCompiler
@@ -263,7 +263,7 @@ class TestEBNFGeneration(unittest.TestCase):
         # Check that the EBNF contains expected patterns
         self.assertIn("<｜tool▁calls▁begin｜>", ebnf)
         self.assertIn("<｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather", ebnf)
-        self.assertIn('\\"location\\"" ":" json ', ebnf)
+        self.assertIn('\\"location\\"" ":" basic_string ', ebnf)
 
         # Validate that the EBNF can be compiled by GrammarCompiler
         try:
