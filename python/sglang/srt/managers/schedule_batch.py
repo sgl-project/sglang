@@ -197,6 +197,7 @@ class MultimodalDataItem:
 
     audio_features: Union[torch.Tensor, np.ndarray] = None
     audio_feature_lens: Optional[List[torch.Tensor]] = None
+    audio_offsets: Optional[List[Tuple[int, int]]] = None
 
     precomputed_features: Optional[Union[torch.Tensor, np.ndarray]] = None
 
@@ -1097,7 +1098,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         else:
             self.encoder_out_cache_loc = torch.cat(encoder_out_cache_loc)
 
-        assert len(self.out_cache_loc) == self.extend_num_tokens
+        assert (
+            len(self.out_cache_loc) == self.extend_num_tokens
+        ), f"Expected {len(self.out_cache_loc)}, got {self.extend_num_tokens}"
 
     def prepare_for_extend(self):
         self.forward_mode = ForwardMode.EXTEND
