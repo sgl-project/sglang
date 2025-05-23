@@ -431,6 +431,11 @@ class MooncakeKVManager(BaseKVManager):
                 (bootstrap_room, status) = self.server_socket.recv_multipart()
                 status = int(status.decode("ascii"))
                 bootstrap_room = int(bootstrap_room.decode("ascii"))
+                if status == KVPoll.Failed:
+                    self.record_failure(
+                        bootstrap_room,
+                        f"Failed to get kvcache from prefill instance, it might be dead",
+                    )
                 self.update_status(bootstrap_room, status)
 
         def heartbeat_checker():
@@ -1011,7 +1016,11 @@ class MooncakeKVBootstrapServer(BaseKVBootstrapServer):
             self._loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self._loop)
 
-            self._runner = web.AppRunner(self.app)
+            access_log = None
+            if logging.getLogger(__name__).getEffectiveLevel() <= logging.DEBUG:
+                access_log = self.app.logger
+
+            self._runner = web.AppRunner(self.app, access_log=access_log)
             self._loop.run_until_complete(self._runner.setup())
 
             site = web.TCPSite(self._runner, port=self.port)
