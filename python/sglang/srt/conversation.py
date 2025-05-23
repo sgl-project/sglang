@@ -663,6 +663,21 @@ register_conv_template(
 
 register_conv_template(
     Conversation(
+        name="phi-4-mm",
+        system_message="You are a helpful language and vision assistant. You are able to understand the visual content that the user provides, and assist the user with a variety of tasks using natural language.",
+        system_template="<|system|>{system_message}<|end|>",
+        roles=("<|user|>", "<|assistant|>"),
+        sep_style=SeparatorStyle.NO_COLON_SINGLE,
+        sep="<|end|>",
+        stop_str="<|end|>",
+        image_token="<|endoftext10|>",
+        # image_token="<|image_{index}|>",
+        # audio_token="<|audio_{index}|>",
+    )
+)
+
+register_conv_template(
+    Conversation(
         name="chatml",
         system_template="<|im_start|>system\n{system_message}",
         system_message="You are a helpful assistant.",
@@ -945,3 +960,9 @@ def match_openbmb_minicpm(model_path: str):
 def match_moonshot_kimivl(model_path: str):
     if re.search(r"kimi.*vl", model_path, re.IGNORECASE):
         return "kimi-vl"
+
+
+@register_conv_template_matching_function
+def match_phi_4_mm(model_path: str):
+    if "phi-4-multimodal" in model_path.lower():
+        return "phi-4-mm"
