@@ -17,10 +17,9 @@ from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInp
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaForCausalLM
-from sglang.srt.models.minicpmv import Idefics2VisionTransformer
 
-# <|endoftext10|> (see vocab.json in hf model)
-_IMAGE_PLACEHOLDER_TOKEN_ID = 200010
+# TODO (lifuhuang): Idefics2VisionTransformer is introduced in minicpmv, we should extract it to a shared location as a quick follow-up.
+from sglang.srt.models.minicpmv import Idefics2VisionTransformer
 
 SIGLIP_NAME = "siglip-so400m-patch14-448"
 VISION_ENCODER_TO_PROCESSING_CONFIG = {
@@ -44,7 +43,6 @@ def get_navit_vision_model():
     }
     model_config = SiglipVisionConfig(**vision_config)
 
-    # TODO (lifuhuang): Idefics2VisionTransformer is introduced in minicpmv, we should extract it to a shared location.
     vision_model = Idefics2VisionTransformer(
         config=model_config, require_post_norm=False
     )
