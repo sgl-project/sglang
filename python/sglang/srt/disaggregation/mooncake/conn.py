@@ -267,7 +267,7 @@ class MooncakeKVManager(BaseKVManager):
 
         try:
             done, not_done = concurrent.futures.wait(
-                futures, timeout=3, return_when=concurrent.futures.ALL_COMPLETED
+                futures, timeout=20, return_when=concurrent.futures.ALL_COMPLETED
             )
 
             if not_done:
