@@ -330,6 +330,7 @@ class FusedMoE(torch.nn.Module):
         self.inplace = inplace
         self.no_combine = no_combine
         self.local_num_experts = num_experts
+        self.hidden_size = hidden_size
 
         if quant_config is None:
             self.quant_method: Optional[QuantizeMethodBase] = (
