@@ -1,10 +1,12 @@
 import unittest
 
+import sgl_kernel
 import torch
-from sgl_kernel.common_ops import decode_attention_cpu as decode_attention
 from torch.nn.functional import scaled_dot_product_attention
 
 from sglang.test.test_utils import CustomTestCase
+
+kernel = torch.ops.sgl_kernel
 
 
 class TestDecodeAttention(CustomTestCase):
@@ -105,7 +107,7 @@ class TestDecodeAttention(CustomTestCase):
         v_buffer = v_buffer.transpose(0, 1).contiguous().transpose(0, 1)
         key = key.transpose(0, 1).contiguous().transpose(0, 1)
         value = value.transpose(0, 1).contiguous().transpose(0, 1)
-        decode_attention(
+        kernel.decode_attention_cpu(
             q,
             k_buffer,
             v_buffer,
