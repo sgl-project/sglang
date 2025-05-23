@@ -76,13 +76,12 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.managers.expert_distribution import (
-    ExpertDistributionRecorder,
     get_global_expert_distribution_recorder,
 )
 from sglang.srt.managers.expert_location import ModelConfigForExpertLocation
 from sglang.srt.managers.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.managers.schedule_batch import global_server_args_dict
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.operations import execute_operations
 from sglang.srt.operations_strategy import compute_layer_operations
@@ -127,6 +126,9 @@ class AttnForwardMethod(IntEnum):
     # Use multi-head attention, but with KV cache chunked.
     # This method can avoid OOM when prefix lengths are long.
     MHA_CHUNKED_KV = auto()
+
+    # Use MLA but with fused RoPE
+    MLA_FUSED_ROPE = auto()
 
 
 class DeepseekV2MLP(nn.Module):
@@ -241,7 +243,9 @@ class DeepseekV2MoE(nn.Module):
         self.gate = MoEGate(config=config, prefix=add_prefix("gate", prefix))
 
         self.experts = get_moe_impl_class()(
-            num_experts=config.n_routed_experts + self.n_share_experts_fusion,
+            num_experts=config.n_routed_experts
+            + self.n_share_experts_fusion
+            + global_server_args_dict["ep_num_redundant_experts"],
             top_k=config.num_experts_per_tok + min(self.n_share_experts_fusion, 1),
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
@@ -283,7 +287,10 @@ class DeepseekV2MoE(nn.Module):
         if global_server_args_dict["enable_deepep_moe"]:
             # TODO: we will support tp < ep in the future
             self.ep_size = get_tensor_model_parallel_world_size()
-            self.num_experts = config.n_routed_experts
+            self.num_experts = (
+                config.n_routed_experts
+                + global_server_args_dict["ep_num_redundant_experts"]
+            )
             self.renormalize = config.norm_topk_prob
             self.topk_group = config.topk_group
             self.num_expert_group = config.n_group
@@ -297,7 +304,7 @@ class DeepseekV2MoE(nn.Module):
                 group=parallel_state.get_tp_group().device_group,
                 router_topk=self.top_k,
                 permute_fusion=True,
-                num_experts=config.n_routed_experts,
+                num_experts=self.num_experts,
                 num_local_experts=config.n_routed_experts // self.tp_size,
                 hidden_size=config.hidden_size,
                 params_dtype=config.torch_dtype,
@@ -309,6 +316,13 @@ class DeepseekV2MoE(nn.Module):
     @property
     def _enable_deepep_moe(self):
         return global_server_args_dict["enable_deepep_moe"]
+
+    def get_moe_weights(self):
+        return [
+            x.data
+            for name, x in self.experts.named_parameters()
+            if name not in ["correction_bias"]
+        ]
 
     def op_gate(self, state):
         if (not self._enable_deepep_moe) or is_non_idle_and_non_empty(
@@ -610,6 +624,18 @@ class DeepseekV2AttentionMLA(nn.Module):
     def dispatch_attn_forward_method(
         self, forward_batch: ForwardBatch
     ) -> AttnForwardMethod:
+        def _dispatch_mla_subtype():
+            if _is_hip:
+                if (
+                    self.rocm_fused_decode_mla
+                    and forward_batch.forward_mode.is_decode()
+                ):
+                    return AttnForwardMethod.MLA_FUSED_ROPE
+                else:
+                    return AttnForwardMethod.MLA
+            else:
+                return AttnForwardMethod.MLA
+
         if self.attention_backend == "flashinfer":
             # Flashinfer MLA: Do not absorb when enabling ragged prefill
             if (
@@ -621,7 +647,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             ):
                 return AttnForwardMethod.MHA
             else:
-                return AttnForwardMethod.MLA
+                return _dispatch_mla_subtype()
         elif self.attention_backend == "fa3":
             # Flash Attention: Use MHA with chunked KV cache when prefilling on long sequences.
             if forward_batch.extend_prefix_lens_cpu is not None:
@@ -638,7 +664,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             ):
                 return AttnForwardMethod.MHA_CHUNKED_KV
             else:
-                return AttnForwardMethod.MLA
+                return _dispatch_mla_subtype()
         else:
             # Triton: Use normal computation for prefill and use weight absorption for extend/decode
             if (
@@ -649,7 +675,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             ):
                 return AttnForwardMethod.MHA
             else:
-                return AttnForwardMethod.MLA
+                return _dispatch_mla_subtype()
 
     def forward(
         self,
@@ -670,6 +696,14 @@ class DeepseekV2AttentionMLA(nn.Module):
             return self.forward_normal(positions, hidden_states, forward_batch)
         elif attn_forward_method == AttnForwardMethod.MHA_CHUNKED_KV:
             return self.forward_normal_chunked_kv(
+                positions, hidden_states, forward_batch
+            )
+        elif attn_forward_method == AttnForwardMethod.MLA:
+            return self.forward_absorb(
+                positions, hidden_states, forward_batch, zero_allocator
+            )
+        elif attn_forward_method == AttnForwardMethod.MLA_FUSED_ROPE:
+            return self.forward_absorb_fused_mla_rope(
                 positions, hidden_states, forward_batch
             )
         else:
@@ -742,6 +776,8 @@ class DeepseekV2AttentionMLA(nn.Module):
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
+        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+
         if self.q_lora_rank is not None:
             q, latent_cache = self.fused_qkv_a_proj_with_mqa(hidden_states)[0].split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
@@ -749,7 +785,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             k_nope = latent_cache[..., : self.kv_lora_rank]
 
             # overlap qk norm
-            if self.alt_stream is not None and torch.cuda.is_current_stream_capturing():
+            if self.alt_stream is not None and get_is_capture_mode():
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
                 q = self.q_a_layernorm(q)
@@ -1321,8 +1357,7 @@ class DeepseekV2Model(nn.Module):
             config.hidden_size,
             enable_tp=not global_server_args_dict["enable_dp_attention"],
         )
-        # TODO(haishaw): multi-stream performance on ROCm
-        self.alt_stream = None if _is_hip else torch.cuda.Stream()
+        self.alt_stream = torch.cuda.Stream() if _is_cuda else None
         self.layers = nn.ModuleList(
             [
                 DeepseekV2DecoderLayer(
@@ -1585,6 +1620,14 @@ class DeepseekV2ForCausalLM(nn.Module):
                 self_attn.w_kc = w_kc.transpose(1, 2).contiguous()
                 self_attn.w_vc = w_vc.contiguous()
                 self_attn.use_deep_gemm_bmm = True
+
+        # TODO support nextn later
+        if not is_nextn:
+            self.routed_experts_weights_of_layer = {
+                layer_id: layer.mlp.get_moe_weights()
+                for layer_id, layer in enumerate(self.model.layers)
+                if isinstance(layer.mlp, DeepseekV2MoE)
+            }
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
         if is_nextn:
