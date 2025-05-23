@@ -1,4 +1,6 @@
 #include <numa.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
 #include <sched.h>
 #include <unistd.h>
 
@@ -68,7 +70,7 @@ std::string init_cpu_threads_env(const std::string& cpu_ids) {
     }
 
     omp_set_lock(&writelock);
-    thread_core_mapping.emplace_back(gettid(), omp_cpu_ids[i]);
+    thread_core_mapping.emplace_back(syscall(SYS_gettid), omp_cpu_ids[i]);
     omp_unset_lock(&writelock);
   }
 
