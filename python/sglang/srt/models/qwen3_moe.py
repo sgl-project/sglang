@@ -88,13 +88,14 @@ logger = logging.getLogger(__name__)
 class Qwen3MoeSparseMoeBlock(nn.Module):
     def __init__(
         self,
+        layer_id: int,
         config: Qwen3MoeConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
-
+        self.layer_id = layer_id
         if self.tp_size > config.num_experts:
             raise ValueError(
                 f"Tensor parallel size {self.tp_size} is greater than "
@@ -105,6 +106,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             num_experts=config.num_experts
             + global_server_args_dict["ep_num_redundant_experts"],
             top_k=config.num_experts_per_tok,
+            layer_id=layer_id,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             renormalize=config.norm_topk_prob,
@@ -414,6 +416,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
 
         if self.info.is_sparse:
             self.mlp = Qwen3MoeSparseMoeBlock(
+                layer_id=self.layer_id,
                 config=config,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
