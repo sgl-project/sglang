@@ -147,7 +147,7 @@ class FunctionCallParser:
             A tuple of (constraint_type, constraint_value) to be added to sampling parameters,
             or None if no constraint applies.
         """
-        if tool_choice == "auto":
+        if tool_choice == "auto" and any(tool.function.strict for tool in self.tools):
             strict_tag = self.get_structure_tag()
             return ("structural_tag", strict_tag)
         elif tool_choice == "required" or isinstance(tool_choice, ToolChoice):
