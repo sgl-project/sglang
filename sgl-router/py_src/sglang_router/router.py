@@ -87,9 +87,17 @@ class Router:
             service_discovery_namespace=service_discovery_namespace,
         )
 
+        self.inner_router = self._router.create_innerrouter()
+
     def start(self) -> None:
         """Start the router server.
 
         This method blocks until the server is shut down.
         """
         self._router.start()
+
+    def select_generate_worker(self, body, route) -> str:
+        """
+        This method calls internal Router to get best worker ID
+        """
+        return self.inner_router.select_generate_worker(body, route)

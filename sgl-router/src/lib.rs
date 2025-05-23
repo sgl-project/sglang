@@ -6,6 +6,22 @@ pub mod server;
 pub mod service_discovery;
 pub mod tree;
 
+use bytes::Bytes;
+use pyo3::types::PyBytes;
+
+#[pyclass]
+struct InnerRouter {
+    inner: router::Router,
+}
+
+#[pymethods]
+impl InnerRouter {
+    fn select_generate_worker<'p>(&self, py: Python<'p>, body: &[u8], route: &str) -> PyResult<String> {
+        let py_data = PyBytes::new(py, body);
+        Ok(self.inner.select_generate_worker(&Bytes::copy_from_slice(py_data.as_bytes()), route))
+    }
+}
+
 #[pyclass(eq)]
 #[derive(Clone, PartialEq, Debug)]
 pub enum PolicyType {
@@ -102,6 +118,32 @@ impl Router {
         })
     }
 
+    fn create_innerrouter<'p>(&self) -> PyResult<InnerRouter> {
+        let policy_config = match &self.policy {
+            PolicyType::Random => router::PolicyConfig::RandomConfig {
+                timeout_secs: self.worker_startup_timeout_secs,
+                interval_secs: self.worker_startup_check_interval,
+            },
+            PolicyType::RoundRobin => router::PolicyConfig::RoundRobinConfig {
+                timeout_secs: self.worker_startup_timeout_secs,
+                interval_secs: self.worker_startup_check_interval,
+            },
+            PolicyType::CacheAware => router::PolicyConfig::CacheAwareConfig {
+                timeout_secs: self.worker_startup_timeout_secs,
+                interval_secs: self.worker_startup_check_interval,
+                cache_threshold: self.cache_threshold,
+                balance_abs_threshold: self.balance_abs_threshold,
+                balance_rel_threshold: self.balance_rel_threshold,
+                eviction_interval_secs: self.eviction_interval_secs,
+                max_tree_size: self.max_tree_size,
+            },
+        };
+        let inner = router::Router::new(self.worker_urls.clone(), policy_config).unwrap();
+        Ok(InnerRouter {
+            inner,
+        })
+    }
+
     fn start(&self) -> PyResult<()> {
         let policy_config = match &self.policy {
             PolicyType::Random => router::PolicyConfig::RandomConfig {
@@ -158,5 +200,6 @@ impl Router {
 fn sglang_router_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PolicyType>()?;
     m.add_class::<Router>()?;
+    m.add_class::<InnerRouter>()?;
     Ok(())
 }
