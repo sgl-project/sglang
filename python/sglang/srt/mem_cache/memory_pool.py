@@ -709,18 +709,14 @@ class DoubleSparseTokenToKVPool(KVCache):
             self.k_head_dim = head_dim
             self.k_buffer = [
                 torch.zeros(
-                    (size + page_size, head_num, self.k_head_dim),
-                    dtype=dtype,
-                    device=device,
+                    (size + page_size, head_num, head_dim), dtype=dtype, device=device
                 )
                 for _ in range(layer_num)
             ]
             self.v_head_dim = head_dim
             self.v_buffer = [
                 torch.zeros(
-                    (size + page_size, head_num, self.v_head_dim),
-                    dtype=dtype,
-                    device=device,
+                    (size + page_size, head_num, head_dim), dtype=dtype, device=device
                 )
                 for _ in range(layer_num)
             ]
