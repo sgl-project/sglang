@@ -822,7 +822,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             assert (
                 not self.o_proj.reduce_results
             ), "short-circuiting allreduce will lead to hangs"
-            return hidden_states, forward_batch, None
+            return hidden_states, None, forward_batch, None
 
         if DeepseekV2AttentionMLA.cached_attn_forward_method is None:
             DeepseekV2AttentionMLA.cached_attn_forward_method = (
