@@ -27,30 +27,9 @@ class PythonicDetector(BaseFormatDetector):
 
     def __init__(self):
         super().__init__()
-        FUNC_CALL = r"""
-            [a-zA-Z_][\w]*(\.[a-zA-Z_][\w]*)*       # Function name: dotted, Python-style identifiers
-            \(                                      # Opening parenthesis for arguments
-                (                                   # --- Optional repeated key=val pairs ending with comma ---
-                    [a-zA-Z]+\w*=.*,\s*             #     Match key=val followed by comma and optional whitespace
-                )*                                  # --- Zero or more such arguments
-                (                                   # --- Optional last argument without trailing comma ---
-                    [a-zA-Z]+\w*=.*\s*              #     Match final key=val (no comma)
-                )?                                  # --- This part is optional
-            \)                                      # Closing parenthesis
-        """
-
         self.tool_call_regex = re.compile(
-            rf"""
-            \[                                      # Opening square bracket
-                \s*
-                {FUNC_CALL}                         # First function call
-                (
-                    \s*,\s*{FUNC_CALL}              # Additional function calls (comma-separated)
-                )*                                  # Zero or more
-                \s*
-            \]                                      # Closing square bracket
-            """,
-            re.VERBOSE | re.DOTALL,
+            r"\[([a-zA-Z]+\w*\(([a-zA-Z]+\w*=.*,\s*)*([a-zA-Z]+\w*=.*\s)?\),\s*)*([a-zA-Z]+\w*\(([a-zA-Z]+\w*=.*,\s*)*([a-zA-Z]+\w*=.*\s*)?\)\s*)+\]",
+            re.DOTALL,
         )
 
     def has_tool_call(self, text: str) -> bool:
@@ -105,12 +84,32 @@ class PythonicDetector(BaseFormatDetector):
         """
         self._buffer += new_text
         start = self._buffer.find("[")
+
+        if start == -1:
+            normal_text = self._buffer
+            self._buffer = ""
+            return StreamingParseResult(normal_text=normal_text)
+
+        normal_text = self._buffer[:start] if start > 0 else ""
+
         end = self._buffer.find("]", start)
-        if start != -1 and end != -1:
+        if end != -1:
             call_text = self._buffer[start : end + 1]
             result = self.detect_and_parse(call_text, tools)
             self._buffer = self._buffer[end + 1 :]
+
+            # If we had normal text before the tool call, add it to the result
+            if normal_text:
+                result.normal_text = normal_text + (result.normal_text or "")
+
             return result
+
+        # We have an opening bracket but no closing bracket yet
+        if normal_text:
+            self._buffer = self._buffer[start:]
+            return StreamingParseResult(normal_text=normal_text)
+
+        # Otherwise, we're still accumulating a potential tool call
         return StreamingParseResult(normal_text="")
 
     def _get_parameter_value(self, val):
