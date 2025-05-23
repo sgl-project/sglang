@@ -51,6 +51,7 @@ from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    prepare_abort,
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.hf_transformers_utils import (
@@ -937,6 +938,18 @@ class Scheduler(
                 bootstrap_room=recv_req.bootstrap_room,
             )
             req.tokenizer = self.tokenizer
+
+            if self.disaggregation_mode != DisaggregationMode.NULL:
+                # Invalid request for disaggregated mode
+                if recv_req.bootstrap_room is None:
+                    error_message = (
+                        f"Invalid request: Disaggregated request received without "
+                        f"boostrap room id. {req.rid=}"
+                    )
+                    logger.error(error_message)
+                    prepare_abort(req, error_message)
+                    self.stream_output([req], req.return_logprob)
+                    return
 
             if (
                 recv_req.session_params is not None

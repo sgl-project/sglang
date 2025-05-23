@@ -481,6 +481,41 @@ class TestEAGLEServer(CustomTestCase):
         with ThreadPoolExecutor(8) as executor:
             list(executor.map(self.run_decode, args))
 
+    def test_constrained_decoding(self):
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "Give me a json"},
+        ]
+
+        response = requests.post(
+            self.base_url + "/v1/chat/completions",
+            json={
+                "model": DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
+                "messages": messages,
+                "temperature": 0,
+                "response_format": {"type": "json_object"},
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        res = response.json()
+
+        # Validate response structure
+        self.assertIn("choices", res)
+        self.assertEqual(len(res["choices"]), 1)
+        self.assertIn("message", res["choices"][0])
+        self.assertIn("content", res["choices"][0]["message"])
+
+        # Validate JSON content
+        content_json = res["choices"][0]["message"]["content"]
+        is_valid_json = True
+        try:
+            content = json.loads(content_json)
+            self.assertIsInstance(content, dict)
+        except Exception:
+            print(f"parse JSON failed: {content_json}")
+            is_valid_json = False
+        self.assertTrue(is_valid_json)
+
 
 class TestEAGLERetract(TestEAGLEServer):
     @classmethod

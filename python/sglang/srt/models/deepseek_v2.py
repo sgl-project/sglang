@@ -246,7 +246,9 @@ class DeepseekV2MoE(nn.Module):
         self.gate = MoEGate(config=config, prefix=add_prefix("gate", prefix))
 
         self.experts = get_moe_impl_class()(
-            num_experts=config.n_routed_experts + self.n_share_experts_fusion,
+            num_experts=config.n_routed_experts
+            + self.n_share_experts_fusion
+            + global_server_args_dict["ep_num_redundant_experts"],
             top_k=config.num_experts_per_tok + min(self.n_share_experts_fusion, 1),
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
@@ -288,7 +290,10 @@ class DeepseekV2MoE(nn.Module):
         if global_server_args_dict["enable_deepep_moe"]:
             # TODO: we will support tp < ep in the future
             self.ep_size = get_tensor_model_parallel_world_size()
-            self.num_experts = config.n_routed_experts
+            self.num_experts = (
+                config.n_routed_experts
+                + global_server_args_dict["ep_num_redundant_experts"]
+            )
             self.renormalize = config.norm_topk_prob
             self.topk_group = config.topk_group
             self.num_expert_group = config.n_group
@@ -302,10 +307,10 @@ class DeepseekV2MoE(nn.Module):
                 group=parallel_state.get_tp_group().device_group,
                 router_topk=self.top_k,
                 permute_fusion=True,
-                num_experts=self.config.n_routed_experts,
-                num_local_experts=self.config.n_routed_experts // self.tp_size,
-                hidden_size=self.config.hidden_size,
-                params_dtype=self.config.torch_dtype,
+                num_experts=self.num_experts,
+                num_local_experts=config.n_routed_experts // self.tp_size,
+                hidden_size=config.hidden_size,
+                params_dtype=config.torch_dtype,
                 deepep_mode=DeepEPMode[global_server_args_dict["deepep_mode"]],
                 async_finish=True,
                 return_recv_hook=True,
@@ -314,6 +319,13 @@ class DeepseekV2MoE(nn.Module):
     @property
     def _enable_deepep_moe(self):
         return global_server_args_dict["enable_deepep_moe"]
+
+    def get_moe_weights(self):
+        return [
+            x.data
+            for name, x in self.experts.named_parameters()
+            if name not in ["correction_bias"]
+        ]
 
     def op_gate(self, state):
         if (not self._enable_deepep_moe) or is_non_idle_and_non_empty(
@@ -787,6 +799,8 @@ class DeepseekV2AttentionMLA(nn.Module):
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ):
+        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+
         if self.q_lora_rank is not None:
             q, latent_cache = self.fused_qkv_a_proj_with_mqa(hidden_states)[0].split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
@@ -794,7 +808,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             k_nope = latent_cache[..., : self.kv_lora_rank]
 
             # overlap qk norm
-            if self.alt_stream is not None and torch.cuda.is_current_stream_capturing():
+            if self.alt_stream is not None and get_is_capture_mode():
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
                 q = self.q_a_layernorm(q)
@@ -1701,6 +1715,14 @@ class DeepseekV2ForCausalLM(nn.Module):
                 self_attn.w_kc = w_kc.transpose(1, 2).contiguous()
                 self_attn.w_vc = w_vc.contiguous()
                 self_attn.use_deep_gemm_bmm = True
+
+        # TODO support nextn later
+        if not is_nextn:
+            self.routed_experts_weights_of_layer = {
+                layer_id: layer.mlp.get_moe_weights()
+                for layer_id, layer in enumerate(self.model.layers)
+                if isinstance(layer.mlp, DeepseekV2MoE)
+            }
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
         if is_nextn:
