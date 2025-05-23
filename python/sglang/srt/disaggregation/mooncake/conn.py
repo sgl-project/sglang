@@ -283,8 +283,6 @@ class MooncakeKVManager(BaseKVManager):
             self.kv_args.aux_data_ptrs[0] + prefill_aux_index * aux_item_len
         )
         decode_aux_addr = dst_aux_ptrs[0] + dst_aux_index * aux_item_len
-        # TODO: mooncake transfer engine can do async transfer. Do async later
-        # Not sure about the amount of aux data, maybe transfer it by zmq is more effective
         status = self.engine.transfer_sync(
             mooncake_session_id, prefill_aux_addr, decode_aux_addr, aux_item_len
         )
@@ -627,7 +625,7 @@ class MooncakeKVSender(BaseKVSender):
     def failure_exception(self):
         self.clear()
 
-        # Explicitly set the statue to failure since this request has failed in another rank
+        # Explicitly set the status to failure since this request has failed in another rank
         if self.conclude_state is None:
             self.conclude_state = KVPoll.Failed
 
@@ -880,7 +878,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
     def failure_exception(self):
         self.clear()
 
-        # Explicitly set the statue to failure since this request has failed in another rank
+        # Explicitly set the status to failure since this request has failed in another rank
         if self.conclude_state is None:
             self.conclude_state = KVPoll.Failed
 
@@ -947,11 +945,11 @@ class MooncakeKVBootstrapServer(BaseKVBootstrapServer):
         if self.tp_size_per_dp_rank == None:
             self.tp_size_per_dp_rank = tp_size_per_dp_rank
 
-        # Add lock to make sure thread-safe
         if role == "Prefill":
             dp_group = engine_rank // tp_size_per_dp_rank
             tp_rank_in_dp_group = engine_rank % tp_size_per_dp_rank
 
+            # Add lock to make sure thread-safe
             async with self.lock:
                 if dp_group not in self.prefill_port_table:
                     self.prefill_port_table[dp_group] = {}
