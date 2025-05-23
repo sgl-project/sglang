@@ -302,18 +302,21 @@ class TestDisaggregationMooncakeFailure(CustomTestCase):
         # Expect lots of failure but the server cannot crash
 
 
-class TestDisaggregationSpecAccuracy(CustomTestCase):
+class TestDisaggregationMooncakeSpec(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        super().setUpClass()
         cls.model = DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST
         cls.draft_model = DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST
-        cls.base_host = "127.0.0.1"
-        cls.base_port = int(DEFAULT_URL_FOR_TEST.split(":")[-1])
-        cls.lb_url = DEFAULT_URL_FOR_TEST
-        cls.prefill_url = f"http://{cls.base_host}:{cls.base_port + 100}"
-        cls.decode_url = f"http://{cls.base_host}:{cls.base_port + 200}"
+        parsed_url = urlparse(DEFAULT_URL_FOR_TEST)
+        cls.base_host = parsed_url.hostname
+        base_port = str(parsed_url.port)
+        cls.lb_port = base_port
+        cls.prefill_port = f"{int(base_port) + 100}"
+        cls.decode_port = f"{int(base_port) + 200}"
+        cls.prefill_url = f"http://{cls.base_host}:{cls.prefill_port}"
+        cls.decode_url = f"http://{cls.base_host}:{cls.decode_port}"
+        cls.lb_url = f"http://{cls.base_host}:{cls.lb_port}"
         cls.spec_args = [
             "--speculative-algorithm",
             "EAGLE",
@@ -328,10 +331,13 @@ class TestDisaggregationSpecAccuracy(CustomTestCase):
             "--cuda-graph-max-bs",
             "8",
         ]
+        print(f"{cls.base_host=} {cls.lb_port=} {cls.prefill_port=} {cls.decode_port=}")
 
-        run_with_timeout(cls.start_prefill, timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH)
-        run_with_timeout(cls.start_decode, timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH)
+        # Non blocking start servers
+        cls.start_prefill()
+        cls.start_decode()
 
+        # Block until both
         cls.wait_server_ready(cls.prefill_url + "/health")
         cls.wait_server_ready(cls.decode_url + "/health")
 
@@ -346,7 +352,7 @@ class TestDisaggregationSpecAccuracy(CustomTestCase):
             "--host",
             cls.base_host,
             "--port",
-            str(cls.base_port),
+            cls.lb_port,
         ]
 
         print("Starting load balancer:", " ".join(lb_command))
@@ -373,21 +379,15 @@ class TestDisaggregationSpecAccuracy(CustomTestCase):
 
     @classmethod
     def start_prefill(cls):
-
         prefill_args = [
             "--trust-remote-code",
             "--disaggregation-mode",
             "prefill",
-            "--host",
-            cls.base_host,
-            "--port",
-            str(cls.base_port + 100),
             "--tp",
-            "4",
-            # "--disaggregation-ib-device",
-            # "mlx5_roce0,mlx5_roce1,mlx5_roce2,mlx5_roce3",
+            "2",
+            "--disaggregation-ib-device",
+            "mlx5_roce0,mlx5_roce1",
         ] + cls.spec_args
-
         cls.process_prefill = popen_launch_pd_server(
             cls.model,
             cls.prefill_url,
@@ -401,16 +401,12 @@ class TestDisaggregationSpecAccuracy(CustomTestCase):
             "--trust-remote-code",
             "--disaggregation-mode",
             "decode",
-            "--host",
-            cls.base_host,
-            "--port",
-            str(cls.base_port + 200),
             "--tp",
-            "4",
+            "2",
             "--base-gpu-id",
-            "4",
-            # "--disaggregation-ib-device",
-            # "mlx5_roce4,mlx5_roce5,mlx5_roce6,mlx5_roce7",
+            "2",
+            "--disaggregation-ib-device",
+            "mlx5_roce2,mlx5_roce3",
         ] + cls.spec_args
         cls.process_decode = popen_launch_pd_server(
             cls.model,
@@ -419,15 +415,43 @@ class TestDisaggregationSpecAccuracy(CustomTestCase):
             other_args=decode_args,
         )
 
+    @classmethod
+    def wait_server_ready(cls, url, timeout=60):
+        start_time = time.perf_counter()
+        while True:
+            try:
+                response = requests.get(url)
+                if response.status_code == 200:
+                    print(f"Server {url} is ready")
+                    return
+            except Exception:
+                pass
+
+            if time.perf_counter() - start_time > timeout:
+                raise RuntimeError(f"Server {url} failed to start in {timeout}s")
+            time.sleep(1)
+
+    @classmethod
+    def tearDownClass(cls):
+        for process in [cls.process_lb, cls.process_decode, cls.process_prefill]:
+            if process:
+                try:
+                    kill_process_tree(process.pid)
+                except Exception as e:
+                    print(f"Error killing process {process.pid}: {e}")
+
+        # wait for 5 seconds
+        time.sleep(5)
+
     def test_gsm8k(self):
         args = SimpleNamespace(
             num_shots=5,
             data_path=None,
             num_questions=200,
             max_new_tokens=512,
-            parallel=4,  # TODO: 128 crashes the decode
-            host="http://127.0.0.1",
-            port=int(self.lb_url.split(":")[-1]),
+            parallel=2,
+            host=f"http://{self.base_host}",
+            port=int(self.lb_port),
         )
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"Evaluation metrics: {metrics}")
