@@ -1,3 +1,4 @@
+import logging
 import math
 from collections.abc import Iterable
 from typing import List, Optional, Tuple
@@ -7,11 +8,10 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig, SiglipVisionConfig
 
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
-    embed_mm_inputs,
+    general_mm_embed_routine,
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -20,6 +20,8 @@ from sglang.srt.models.llama import LlamaForCausalLM
 
 # TODO (lifuhuang): Idefics2VisionTransformer is introduced in minicpmv, we should extract it to a shared location as a quick follow-up.
 from sglang.srt.models.minicpmv import Idefics2VisionTransformer
+
+logger = logging.getLogger(__name__)
 
 SIGLIP_NAME = "siglip-so400m-patch14-448"
 VISION_ENCODER_TO_PROCESSING_CONFIG = {
@@ -372,7 +374,7 @@ class Phi4MMImageEncoder(nn.Module):
         return img_set_tensor
 
 
-class Phi4MMForCausalLM(LlamaForCausalLM):
+class Phi4MMForCausalLM(nn.Module):
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
@@ -384,9 +386,11 @@ class Phi4MMForCausalLM(LlamaForCausalLM):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
-        super().__init__(config=config, quant_config=quant_config, prefix=prefix)
+        super().__init__()
 
-        assert get_pp_group().world_size == 1, "pipeline parallel is not supported"
+        self.language_model = LlamaForCausalLM(
+            config=config, quant_config=quant_config, prefix=prefix
+        )
 
         self.vision_encoder = Phi4MMImageEncoder(
             config,
@@ -414,36 +418,15 @@ class Phi4MMForCausalLM(LlamaForCausalLM):
         forward_batch: ForwardBatch,
         **kwargs: object,
     ) -> torch.Tensor:
-        embed_tokens = self.model.embed_tokens
-        try:
-            if (
-                not forward_batch.forward_mode.is_decode()
-                and forward_batch.contains_mm_inputs()
-            ):
-                mm_input = forward_batch.merge_mm_inputs()
-                inputs_embeds = embed_mm_inputs(
-                    mm_inputs=mm_input,
-                    input_ids=input_ids,
-                    input_embedding=embed_tokens,
-                    image_data_embedding_func=self.get_image_feature,
-                )
-                # once used, mm_inputs is useless, considering chunked-prefill is disabled for multimodal models
-                # just being defensive here
-                forward_batch.mm_inputs = None
-
-            else:
-                inputs_embeds = embed_tokens(input_ids)
-        except Exception as e:
-            print("Error in embedding multimodal inputs:", e)
-            inputs_embeds = embed_tokens(input_ids)
-
-        return super().forward(
-            input_ids=None,
-            input_embeds=inputs_embeds,
+        hidden_states = general_mm_embed_routine(
+            input_ids=input_ids,
             forward_batch=forward_batch,
+            language_model=self.language_model,
+            image_data_embedding_func=self.get_image_feature,
             positions=positions,
-            **kwargs,
         )
+
+        return hidden_states
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         # Get all special token IDs
@@ -460,6 +443,7 @@ class Phi4MMForCausalLM(LlamaForCausalLM):
         ]
         prefix_mapping = {
             "model.embed_tokens_extend.image_embed.": "vision_encoder.",
+            "model.": "language_model.model.",
         }
 
         skip_list = [
@@ -499,7 +483,7 @@ class Phi4MMForCausalLM(LlamaForCausalLM):
                 param = params_dict.get(name)
                 if param is None:
                     if "lora" not in name:
-                        print(f"Warning: {name} not found in model parameters")
+                        logger.warning("Warning: {name} not found in model parameters")
                     continue
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
