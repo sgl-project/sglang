@@ -22,6 +22,7 @@ from __future__ import annotations
 import logging
 import threading
 from collections import deque
+from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
@@ -38,6 +39,7 @@ from sglang.srt.disaggregation.utils import (
     kv_to_page_indices,
     kv_to_page_num,
     poll_and_all_reduce,
+    prepare_abort,
 )
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req, ScheduleBatch
 
@@ -59,6 +61,7 @@ class PrefillBootstrapQueue:
     def __init__(
         self,
         token_to_kv_pool: KVCache,
+        draft_token_to_kv_pool: Optional[KVCache],
         req_to_metadata_buffer_idx_allocator: ReqToMetadataIdxAllocator,
         metadata_buffers: List[torch.Tensor],
         aux_dtype: torch.dtype,
@@ -70,6 +73,8 @@ class PrefillBootstrapQueue:
         scheduler: Scheduler,
     ):
         self.token_to_kv_pool = token_to_kv_pool
+        self.draft_token_to_kv_pool = draft_token_to_kv_pool
+
         self.is_mla_backend = is_mla_backend(token_to_kv_pool)
         self.aux_dtype = aux_dtype
 
@@ -95,6 +100,16 @@ class PrefillBootstrapQueue:
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )
+
+        if self.draft_token_to_kv_pool is not None:
+            # We should also transfer draft model kv cache. The indices are
+            # always shared with a target model.
+            draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
+                self.draft_token_to_kv_pool.get_contiguous_buf_infos()
+            )
+            kv_data_ptrs += draft_kv_data_ptrs
+            kv_data_lens += draft_kv_data_lens
+            kv_item_lens += draft_kv_item_lens
 
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
@@ -157,7 +172,18 @@ class PrefillBootstrapQueue:
             if poll == KVPoll.Bootstrapping:
                 continue
             elif poll == KVPoll.Failed:
-                raise Exception("Bootstrap failed")
+                error_message = f"Prefill bootstrap failed for request rank={self.tp_rank} {req.rid=} {req.bootstrap_room=}"
+                try:
+                    req.disagg_kv_sender.failure_exception()
+                except Exception as e:
+                    error_message += f" with exception {e}"
+                logger.error(error_message)
+                prepare_abort(
+                    req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
+                )
+                self.scheduler.stream_output([req], req.return_logprob)
+                indices_to_remove.add(i)
+                continue
 
             # KV.WaitingForInput
             num_kv_indices = len(req.origin_input_ids)
@@ -335,7 +361,17 @@ class SchedulerDisaggregationPrefillMixin:
                 # FIXME: clean up req's data in transfer engine
                 done_reqs.append(req)
             elif poll == KVPoll.Failed:
-                raise Exception("Transferring failed")
+                error_message = f"Prefill transfer failed for request rank={self.tp_rank} {req.rid=} {req.bootstrap_room=}"
+                try:
+                    req.disagg_kv_sender.failure_exception()
+                except Exception as e:
+                    error_message += f" with exception {e}"
+                logger.warning(error_message)
+                self.tree_cache.cache_finished_req(req)  # unlock the tree
+                prepare_abort(
+                    req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
+                )
+                done_reqs.append(req)
 
         for req in done_reqs:
             self.disagg_prefill_bootstrap_queue.req_to_metadata_buffer_idx_allocator.free(
@@ -384,11 +420,10 @@ class SchedulerDisaggregationPrefillMixin:
             if end_idx is not None
             else min(len(req.fill_ids), len(req.origin_input_ids))
         )
+
         last_chunk = token_id is not None
 
-        if (not last_chunk) and (
-            end_idx % page_size != 0
-        ):  # todo: remove the second condition
+        if not last_chunk:
             # if not the last chunk and the last page is partial, delay the last partial page to the next send
             end_idx = end_idx - end_idx % page_size
 
@@ -405,16 +440,10 @@ class SchedulerDisaggregationPrefillMixin:
                 req.metadata_buffer_index, token_id
             )
         page_indices = kv_to_page_indices(kv_indices, page_size)
-
-        page_start_idx = start_idx // page_size
-        page_end_idx = page_start_idx + len(page_indices)
-
         if len(page_indices) == 0:
             logger.info(
                 f"Skip sending kv chunk for request {req.rid=} {req.bootstrap_room=} because page_indices is empty"
             )
             return
 
-        req.disagg_kv_sender.send(
-            page_indices, slice(page_start_idx, page_end_idx), last_chunk
-        )
+        req.disagg_kv_sender.send(page_indices)

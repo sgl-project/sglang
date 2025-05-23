@@ -51,6 +51,7 @@ def group_concurrent_contiguous(
     return src_groups, dst_groups
 
 
+# prefill
 @dataclasses.dataclass
 class TransferKVChunk:
     room: int
@@ -60,6 +61,7 @@ class TransferKVChunk:
     prefill_aux_index: Optional[int]
 
 
+# decode
 @dataclasses.dataclass
 class TransferInfo:
     room: int
@@ -93,6 +95,7 @@ class TransferInfo:
         )
 
 
+# decode
 @dataclasses.dataclass
 class KVArgsRegisterInfo:
     room: str
@@ -464,6 +467,8 @@ class MooncakeKVSender(BaseKVSender):
         self.aux_index = None
         self.bootstrap_server_url = bootstrap_addr
         self.session_id = self.kv_mgr.get_session_id()
+        # inner state
+        self.curr_idx = 0
 
     def init(self, num_kv_indices: int, aux_index: Optional[int] = None):
         self.num_kv_indices = num_kv_indices
@@ -472,9 +477,11 @@ class MooncakeKVSender(BaseKVSender):
     def send(
         self,
         kv_indices: npt.NDArray[np.int64],
-        index_slice: slice,
-        is_last: bool,
     ):
+        index_slice = slice(self.curr_idx, self.curr_idx + len(kv_indices))
+        self.curr_idx += len(kv_indices)
+        is_last = self.curr_idx == self.num_kv_indices
+
         if not is_last:
             self.kv_mgr.add_transfer_request(
                 self.bootstrap_room, kv_indices, index_slice, False
@@ -492,6 +499,7 @@ class MooncakeKVSender(BaseKVSender):
         return self.kv_mgr.check_status(self.bootstrap_room)
 
     def failure_exception(self):
+        # TODO: raise a real exception
         raise Exception("Fake KVSender Exception")
 
 
@@ -719,6 +727,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
         return self.kv_mgr.check_status(self.bootstrap_room)
 
     def failure_exception(self):
+        # TODO: raise a real exception
         raise Exception("Fake KVReceiver Exception")
 
 

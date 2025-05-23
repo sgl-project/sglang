@@ -48,7 +48,9 @@ from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.disaggregation.base import BaseKVSender
-from sglang.srt.disaggregation.decode import ScheduleBatchDisaggregationDecodeMixin
+from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
+    ScheduleBatchDisaggregationDecodeMixin,
+)
 from sglang.srt.layers.multimodal import gpu_tensor_hash
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
@@ -90,6 +92,7 @@ global_server_args_dict = {
     "speculative_accept_threshold_single": ServerArgs.speculative_accept_threshold_single,
     "torchao_config": ServerArgs.torchao_config,
     "triton_attention_reduce_in_fp32": ServerArgs.triton_attention_reduce_in_fp32,
+    "ep_num_redundant_experts": ServerArgs.ep_num_redundant_experts,
 }
 
 logger = logging.getLogger(__name__)
@@ -194,6 +197,7 @@ class MultimodalDataItem:
 
     audio_features: Union[torch.Tensor, np.ndarray] = None
     audio_feature_lens: Optional[List[torch.Tensor]] = None
+    audio_offsets: Optional[List[Tuple[int, int]]] = None
 
     precomputed_features: Optional[Union[torch.Tensor, np.ndarray]] = None
 
@@ -1094,7 +1098,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         else:
             self.encoder_out_cache_loc = torch.cat(encoder_out_cache_loc)
 
-        assert len(self.out_cache_loc) == self.extend_num_tokens
+        assert (
+            len(self.out_cache_loc) == self.extend_num_tokens
+        ), f"Expected {len(self.out_cache_loc)}, got {self.extend_num_tokens}"
 
     def prepare_for_extend(self):
         self.forward_mode = ForwardMode.EXTEND
