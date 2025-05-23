@@ -73,6 +73,7 @@ class ModelConfig:
             model_override_args=self.model_override_args,
             **kwargs,
         )
+
         self.hf_text_config = get_hf_text_config(self.hf_config)
         self.attention_chunk_size = getattr(
             self.hf_text_config, "attention_chunk_size", None
@@ -97,6 +98,8 @@ class ModelConfig:
         ):
             self.hf_config.architectures[0] = "DeepseekV3ForCausalLMNextN"
 
+        if is_draft_model and self.hf_config.architectures[0] == "MiMoForCausalLM":
+            self.hf_config.architectures[0] = "MiMoMTP"
         # Check model type
         self.is_generation = is_generation_model(
             self.hf_config.architectures, is_embedding
@@ -112,6 +115,10 @@ class ModelConfig:
         )
         self.is_audio_model = enable_multimodal and is_audio_model(
             self.hf_config.architectures
+        )
+        self.is_multimodal_chunked_prefill_supported = (
+            enable_multimodal
+            and is_multimodal_chunked_prefill_supported(self.hf_config.architectures)
         )
         self.is_encoder_decoder = is_encoder_decoder_model(self.hf_config.architectures)
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
@@ -569,6 +576,21 @@ def is_audio_model(model_architectures: List[str]):
 
 def is_encoder_decoder_model(model_architectures: List[str]):
     return "MllamaForConditionalGeneration" in model_architectures
+
+
+def is_multimodal_chunked_prefill_supported(model_architectures: List[str]):
+    """Check if chunked prefill is supported for a MultiModal model."""
+    unsupported = [
+        "Grok1VForCausalLM",
+        "Grok1AForCausalLM",
+        "LlavaLlamaForCausalLM",
+        "MllamaForConditionalGeneration",
+        "CLIPModel",
+    ]
+    if any(multi_model_arch in unsupported for multi_model_arch in model_architectures):
+        return False
+    else:
+        return True
 
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
