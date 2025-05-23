@@ -1,9 +1,7 @@
 import unittest
 
+import sgl_kernel
 import torch
-from sgl_kernel.common_ops import (
-    rotary_position_embedding_cpu as rotary_position_embedding,
-)
 from utils import precision
 
 from sglang.srt.layers.rotary_embedding import DeepseekScalingRotaryEmbedding
@@ -64,8 +62,10 @@ class TestROPE(CustomTestCase):
                 )
 
                 # fused rope kernel
-                q_pe_clone, k_pe_clone = rotary_position_embedding(
-                    positions, q_pe_clone, k_pe_clone, cos_sin_cache
+                q_pe_clone, k_pe_clone = (
+                    torch.ops.sgl_kernel.rotary_position_embedding_cpu(
+                        positions, q_pe_clone, k_pe_clone, cos_sin_cache
+                    )
                 )
 
                 atol = rtol = precision[q_pe.dtype]

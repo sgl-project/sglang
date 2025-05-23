@@ -2,9 +2,8 @@ import itertools
 import unittest
 from typing import Optional, Tuple, Union
 
+import sgl_kernel
 import torch
-from sgl_kernel.common_ops import fused_add_rmsnorm_cpu as fused_add_rmsnorm
-from sgl_kernel.common_ops import rmsnorm_cpu as rmsnorm
 from utils import precision
 
 from sglang.test.test_utils import CustomTestCase
@@ -43,7 +42,7 @@ class TestNorm(CustomTestCase):
         weight = torch.randn(hidden_size, dtype=dtype)
         variance_epsilon = 1e-6
 
-        out = rmsnorm(x, weight, variance_epsilon)
+        out = torch.ops.sgl_kernel.rmsnorm_cpu(x, weight, variance_epsilon)
         ref_out = self._forward_native(x, weight, variance_epsilon)
 
         atol = rtol = precision[ref_out.dtype]
@@ -53,7 +52,9 @@ class TestNorm(CustomTestCase):
         residual = torch.randn([m, n], dtype=dtype)
         ref_residual = residual.clone()
 
-        fused_add_rmsnorm(x, residual, weight, variance_epsilon)
+        torch.ops.sgl_kernel.fused_add_rmsnorm_cpu(
+            x, residual, weight, variance_epsilon
+        )
 
         ref_x, ref_residual = self._forward_native(
             ref_x, weight, variance_epsilon, ref_residual

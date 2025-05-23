@@ -1,9 +1,9 @@
 import itertools
 import unittest
 
+import sgl_kernel
 import torch
 import torch.nn.functional as F
-from sgl_kernel.common_ops import silu_and_mul_cpu as silu_and_mul
 from utils import SiluAndMul, precision
 
 from sglang.test.test_utils import CustomTestCase
@@ -17,7 +17,7 @@ class TestActivation(CustomTestCase):
     def _activation_test(self, m, n, dtype):
         x = torch.randn([m, n], dtype=dtype)
 
-        out = silu_and_mul(x)
+        out = torch.ops.sgl_kernel.silu_and_mul_cpu(x)
         ref_out = SiluAndMul(x)
 
         atol = rtol = precision[ref_out.dtype]

@@ -1,9 +1,8 @@
 import itertools
 import unittest
 
+import sgl_kernel
 import torch
-from sgl_kernel.common_ops import biased_grouped_topk_cpu as biased_grouped_topk
-from sgl_kernel.common_ops import grouped_topk_cpu as grouped_topk
 from utils import precision
 
 from sglang.srt.layers.moe.topk import (
@@ -32,7 +31,7 @@ class TestGroupedTopK(CustomTestCase):
         )
 
         # fused version
-        topk_weights, topk_ids = grouped_topk(
+        topk_weights, topk_ids = torch.ops.sgl_kernel.grouped_topk_cpu(
             hidden_states, gating_output, topk, renormalize, G, topk_group
         )
 
@@ -74,7 +73,7 @@ class TestBiasedGroupedTopK(CustomTestCase):
         )
 
         # fused version
-        topk_weights, topk_ids = biased_grouped_topk(
+        topk_weights, topk_ids = torch.ops.sgl_kernel.biased_grouped_topk_cpu(
             hidden_states,
             gating_output,
             correction_bias,
