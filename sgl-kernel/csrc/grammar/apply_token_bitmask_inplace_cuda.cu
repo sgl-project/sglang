@@ -26,7 +26,7 @@
 #include <ATen/cuda/CUDAContext.h>
 
 #if !defined(CUDA_VERSION) || CUDA_VERSION < 12040
-void ApplyTokenBitmaskInplace(at::Tensor logits, at::Tensor bitmask, at::optional<at::Tensor> indices = at::nullopt) {
+void ApplyTokenBitmaskInplace(at::Tensor logits, at::Tensor bitmask, std::optional<at::Tensor> indices = std::nullopt) {
   TORCH_CHECK(false, "CUDA version must be >= 12.4 for ApplyTokenBitmaskInplace");
 }
 #else
@@ -175,7 +175,7 @@ void ApplyTokenBitmaskInplaceDispatchToPackedT(
   }
 }
 
-void ApplyTokenBitmaskInplace(at::Tensor logits, at::Tensor bitmask, at::optional<at::Tensor> indices = at::nullopt) {
+void ApplyTokenBitmaskInplace(at::Tensor logits, at::Tensor bitmask, std::optional<at::Tensor> indices = std::nullopt) {
   TORCH_CHECK(logits.is_cuda(), "logits must be a CUDA tensor.");
   TORCH_CHECK(logits.is_contiguous(), "logits must be contiguous.");
   TORCH_CHECK(logits.dim() == 1 || logits.dim() == 2, "logits must be a 1D or 2D tensor.");
