@@ -77,9 +77,7 @@ class MistralDetector(BaseFormatDetector):
     def build_ebnf(self, tools: List[Tool]):
         return EBNFComposer.build_ebnf(
             tools,
-            tool_calls_rule='"[TOOL_CALLS] [ " function_call ( " , " function_call )* " ]"',
-            call_rule_fmt='call_{name} ::= "{{" "\\"name\\"" ":" "\\"{name}\\"" ", " "\\"arguments\\"" ":" {arguments_rule} "}}"',
-            arguments_rule_fmt='"{{" {arg_rules} "}}"',
-            key_value_fmt='"\\"{key}\\"" ":" {valrule}',
-            is_pythonic=False,
+            bot_token=self.bot_token,
+            eot_token=self.eot_token,
+            function_format="json",
         )

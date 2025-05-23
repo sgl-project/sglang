@@ -149,9 +149,9 @@ class DeepSeekV3Detector(BaseFormatDetector):
     def build_ebnf(self, tools: List[Tool]):
         return EBNFComposer.build_ebnf(
             tools,
-            tool_calls_rule='"<｜tool▁calls▁begin｜>" function_call (function_call)* "<｜tool▁calls▁end｜>"',
-            call_rule_fmt='call_{name} ::= "<｜tool▁call▁begin｜>function<｜tool▁sep｜>{name}\\n```json\\n" {arguments_rule} "\\n```<｜tool▁call▁end｜>"',
-            arguments_rule_fmt='"{{" {arg_rules} "}}"',
-            key_value_fmt='"\\"{key}\\"" ":" {valrule}',
-            is_pythonic=False,
+            bot_token=self.bot_token,
+            eot_token=self.eot_token,
+            tool_call_separator="",
+            call_rule_fmt='"<｜tool▁call▁begin｜>function<｜tool▁sep｜>{name}\\n```json\\n" {arguments_rule} "\\n```<｜tool▁call▁end｜>"',
+            function_format="json",
         )

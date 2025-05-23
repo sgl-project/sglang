@@ -134,9 +134,8 @@ class PythonicDetector(BaseFormatDetector):
     def build_ebnf(self, tools: List[Tool]) -> Optional[str]:
         return EBNFComposer.build_ebnf(
             tools,
-            tool_calls_rule='"[" function_call ("," function_call)* "]"',
-            call_rule_fmt='call_{name} ::= "{name}" "(" {arguments_rule} ")"',
-            arguments_rule_fmt="{arg_rules}",
-            key_value_fmt='"{key}" "=" {valrule}',
-            is_pythonic=True,
+            bot_token="[",
+            eot_token="]",
+            tool_call_separator=",",
+            function_format="pythonic",
         )
