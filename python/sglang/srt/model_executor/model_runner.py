@@ -1010,11 +1010,11 @@ class ModelRunner:
                     FlashInferMLAAttnBackend,
                 )
 
-                return = FlashInferMLAAttnBackend(self)
+                return FlashInferMLAAttnBackend(self)
         elif self.server_args.attention_backend == "aiter":
             from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
 
-            return = AiterAttnBackend(self)
+            return AiterAttnBackend(self)
         elif self.server_args.attention_backend == "triton":
             assert self.sliding_window_size is None, (
                 "Window attention is not supported in the triton attention backend. "
