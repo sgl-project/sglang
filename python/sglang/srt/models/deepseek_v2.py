@@ -1483,7 +1483,11 @@ class DeepseekV2ForCausalLM(nn.Module):
             layer_ids = set()
             for name in weight_names:
                 if "kv_b_proj" in name:
-                    layer_ids.add(int(name.split(".")[2]))
+                    layer_id = int(name.split(".")[2])
+                    # filter the nextn layer.
+                    if layer_id == self.config.num_hidden_layers and not is_nextn:
+                        continue
+                    layer_ids.add(layer_id)
 
         for layer_id in layer_ids:
             self_attn = (
