@@ -193,9 +193,6 @@ class DecodePreallocQueue:
                     error_message,
                     status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
                 )
-                self.scheduler.stream_output(
-                    [decode_req.req], decode_req.req.return_logprob
-                )
                 indices_to_remove.add(i)
 
         self.queue = [
@@ -375,12 +372,7 @@ class DecodeTransferQueue:
                 )
 
                 # unlock the kv cache or it will have memory leak
-                self.scheduler.req_to_token_pool.free([decode_req.req.req_pool_idx])
-                token_locs = self.scheduler.req_to_token_pool.req_to_token[
-                    decode_req.req.req_pool_idx
-                ][: decode_req.req.extend_input_len]
-                self.scheduler.token_to_kv_pool_allocator.free(token_locs)
-                # self.tree_cache.cache_finished_req(decode_req.req)
+                self.tree_cache.cache_finished_req(decode_req.req)
                 indices_to_remove.add(i)
                 continue
             elif poll == KVPoll.Success:

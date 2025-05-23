@@ -626,6 +626,11 @@ class MooncakeKVSender(BaseKVSender):
 
     def failure_exception(self):
         self.clear()
+
+        # Explicitly set the statue to failure since this request has failed in another rank
+        if self.conclude_state is None:
+            self.conclude_state = KVPoll.Failed
+
         with self.kv_mgr.failure_lock:
             failure_reason = self.kv_mgr.failure_records.pop(
                 self.bootstrap_room, "Failed due to an unknown reason from another rank"
@@ -874,6 +879,11 @@ class MooncakeKVReceiver(BaseKVReceiver):
 
     def failure_exception(self):
         self.clear()
+
+        # Explicitly set the statue to failure since this request has failed in another rank
+        if self.conclude_state is None:
+            self.conclude_state = KVPoll.Failed
+
         with self.kv_mgr.failure_lock:
             failure_reason = self.kv_mgr.failure_records.pop(
                 self.bootstrap_room, "Failed due to an unknown reason from another rank"
