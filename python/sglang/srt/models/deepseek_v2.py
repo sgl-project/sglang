@@ -391,9 +391,9 @@ class DeepseekV2MoE(nn.Module):
                 masked_m,
                 expected_m,
             ) = self.deepep_dispatcher.dispatch(
-                hidden_states,
-                topk_idx,
-                topk_weights,
+                hidden_states=hidden_states,
+                topk_idx=topk_idx,
+                topk_weights=topk_weights,
                 forward_mode=forward_mode,
             )
         final_hidden_states = self.experts(
@@ -409,10 +409,10 @@ class DeepseekV2MoE(nn.Module):
         )
         if self.ep_size > 1:
             final_hidden_states = self.deepep_dispatcher.combine(
-                final_hidden_states,
-                topk_idx,
-                topk_weights,
-                forward_mode,
+                hidden_states=final_hidden_states,
+                topk_idx=topk_idx,
+                topk_weights=topk_weights,
+                forward_mode=forward_mode,
             )
         final_hidden_states *= self.routed_scaling_factor
 
