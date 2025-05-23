@@ -47,7 +47,7 @@ ALL_MODELS = [
         model_path="ibm-granite/granite-3.0-2b-instruct",
         prefill_tolerance=0.22,
         decode_tolerance=0.22,
-    )
+    ),
 ]
 
 
