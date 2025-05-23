@@ -175,8 +175,6 @@ class DecodePreallocQueue:
             [decode_req.kv_receiver for decode_req in self.queue], self.gloo_group
         )
 
-        indices_to_remove = set()
-
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
             if poll == KVPoll.Bootstrapping:
                 pass
@@ -194,11 +192,6 @@ class DecodePreallocQueue:
                     error_message,
                     status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
                 )
-                indices_to_remove.add(i)
-
-        self.queue = [
-            entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
-        ]
 
     def pop_preallocated(self) -> List[DecodeRequest]:
         """Pop the preallocated requests from the pending queue (FIFO)."""
