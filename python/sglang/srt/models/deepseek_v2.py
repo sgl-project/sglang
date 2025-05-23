@@ -316,9 +316,7 @@ class DeepseekV2MoE(nn.Module):
                 return_recv_hook=True,
             )
 
-    @property
-    def _enable_deepep_moe(self):
-        return global_server_args_dict["enable_deepep_moe"]
+        self._enable_deepep_moe = global_server_args_dict["enable_deepep_moe"]
 
     def get_moe_weights(self):
         return [
