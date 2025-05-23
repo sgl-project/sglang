@@ -136,7 +136,7 @@ class TboDPAttentionPreparer:
 
 class TboForwardBatchPreparer:
     @classmethod
-    def prepare_tbo(cls, batch: ForwardBatch):
+    def prepare(cls, batch: ForwardBatch):
         from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 
         if batch.tbo_split_seq_index is None:
