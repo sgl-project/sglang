@@ -6,7 +6,7 @@ import random
 import warnings
 from collections import deque
 from enum import Enum
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import numpy as np
 import requests
@@ -14,6 +14,9 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.utils import get_ip
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import Req
 
 FakeBootstrapHost = "2.2.2.2"
 
@@ -196,9 +199,6 @@ def prepare_abort(req: Req, error_message: str, status_code=None):
         req.input_top_logprobs_idx = []
         req.input_token_ids_logprobs_val = []
         req.input_token_ids_logprobs_idx = []
-
-
-from sglang.srt.managers.schedule_batch import Req
 
 
 class MetadataBuffers:
