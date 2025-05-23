@@ -1,6 +1,5 @@
 import unittest
 
-# TODO: use interface in cpu.py
 import sgl_kernel
 import torch
 from utils import (
@@ -10,8 +9,12 @@ from utils import (
     precision,
 )
 
+from sglang.srt.layers.rotary_embedding import _apply_rotary_emb
 from sglang.test.test_utils import CustomTestCase
 
+convert_weight_packed = torch.ops.sgl_kernel.convert_weight_packed
+qkv_proj_with_rope = torch.ops.sgl_kernel.qkv_proj_with_rope
+torch.manual_seed(0)
 # constants
 kv_lora_rank = 512
 qk_head_dim = 192
@@ -33,13 +36,6 @@ def layernorm(x, weight, variance_epsilon=1e-6, residual=None):
     return (x * weight).to(orig_dtype)
 
 
-def _rotate_gptj(x: torch.Tensor) -> torch.Tensor:
-    x1 = x[..., ::2]
-    x2 = x[..., 1::2]
-    x = torch.stack((-x2, x1), dim=-1)
-    return x.flatten(-2)
-
-
 def rotary_emb(q_pe, k_pe, pos, cos_sin_cache):
     orig_dtype = q_pe.dtype
     q_pe = q_pe.float()
@@ -50,10 +46,8 @@ def rotary_emb(q_pe, k_pe, pos, cos_sin_cache):
     key_rot = k_pe[..., :rotary_dim]
     cos_sin = cos_sin_cache[pos]
     cos, sin = cos_sin.chunk(2, dim=-1)
-    cos = cos.repeat_interleave(2, dim=-1).unsqueeze(-2)
-    sin = sin.repeat_interleave(2, dim=-1).unsqueeze(-2)
-    query_rot = query_rot * cos + _rotate_gptj(query_rot) * sin
-    key_rot = key_rot * cos + _rotate_gptj(key_rot) * sin
+    query_rot = _apply_rotary_emb(query_rot, cos, sin, False)
+    key_rot = _apply_rotary_emb(key_rot, cos, sin, False)
     return query_rot.to(orig_dtype), key_rot.to(orig_dtype)
 
 
@@ -169,12 +163,12 @@ class TestQKVProjWithROPE(CustomTestCase):
             pos,
             cos_sin_cache,
         )
-        qa_packed = torch.ops.sgl_kernel.convert_weight_packed(q_a_proj_weight)
-        qb_packed = torch.ops.sgl_kernel.convert_weight_packed(q_b_proj_weight)
-        kva_packed = torch.ops.sgl_kernel.convert_weight_packed(kv_a_proj_weight)
-        wkc_packed = torch.ops.sgl_kernel.convert_weight_packed(w_kc)
+        qa_packed = convert_weight_packed(q_a_proj_weight)
+        qb_packed = convert_weight_packed(q_b_proj_weight)
+        kva_packed = convert_weight_packed(kv_a_proj_weight)
+        wkc_packed = convert_weight_packed(w_kc)
 
-        q_out, k_out, v_out = torch.ops.sgl_kernel.qkv_proj_with_rope(
+        q_out, k_out, v_out = qkv_proj_with_rope(
             hidden_states,
             qa_packed,
             qb_packed,
@@ -235,11 +229,11 @@ class TestQKVProjWithROPE(CustomTestCase):
             pos,
             cos_sin_cache,
         )
-        w1_q_packed = torch.ops.sgl_kernel.convert_weight_packed(w1_q)
-        w2_q_packed = torch.ops.sgl_kernel.convert_weight_packed(w2_q)
-        w3_q_packed = torch.ops.sgl_kernel.convert_weight_packed(w3_q)
-        wkc_packed = torch.ops.sgl_kernel.convert_weight_packed(w_kc)
-        q_out, k_out, v_out = torch.ops.sgl_kernel.qkv_proj_with_rope(
+        w1_q_packed = convert_weight_packed(w1_q)
+        w2_q_packed = convert_weight_packed(w2_q)
+        w3_q_packed = convert_weight_packed(w3_q)
+        wkc_packed = convert_weight_packed(w_kc)
+        q_out, k_out, v_out = qkv_proj_with_rope(
             hidden_states,
             w1_q_packed,
             w2_q_packed,
@@ -317,17 +311,13 @@ class TestQKVProjWithROPE(CustomTestCase):
             pos,
             cos_sin_cache,
         )
-        fp8_q_a_proj_weight = torch.ops.sgl_kernel.convert_weight_packed(
-            fp8_q_a_proj_weight
-        )
-        fp8_q_b_proj_weight = torch.ops.sgl_kernel.convert_weight_packed(
-            fp8_q_b_proj_weight
-        )
-        fp8_kv_a_proj_with_mqa_weight = torch.ops.sgl_kernel.convert_weight_packed(
+        fp8_q_a_proj_weight = convert_weight_packed(fp8_q_a_proj_weight)
+        fp8_q_b_proj_weight = convert_weight_packed(fp8_q_b_proj_weight)
+        fp8_kv_a_proj_with_mqa_weight = convert_weight_packed(
             fp8_kv_a_proj_with_mqa_weight
         )
-        w_kc = torch.ops.sgl_kernel.convert_weight_packed(w_kc)
-        q_out, k_out, v_out = torch.ops.sgl_kernel.qkv_proj_with_rope(
+        w_kc = convert_weight_packed(w_kc)
+        q_out, k_out, v_out = qkv_proj_with_rope(
             hidden_states,
             fp8_q_a_proj_weight,
             fp8_q_b_proj_weight,
