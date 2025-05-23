@@ -2160,3 +2160,11 @@ class Withable(Generic[T]):
         finally:
             assert self._value is new_value
             self._value = None
+
+
+def bind_or_assign(target, source):
+    if target is not None:
+        target.copy_(source)
+        return target
+    else:
+        return source

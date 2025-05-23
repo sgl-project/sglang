@@ -89,6 +89,7 @@ from sglang.srt.utils import (
     BumpAllocator,
     DeepEPMode,
     add_prefix,
+    bind_or_assign,
     get_bool_env_var,
     get_int_env_var,
     is_cuda,
@@ -1583,22 +1584,19 @@ class DeepseekV2ForCausalLM(nn.Module):
                 0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
             ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
             if not use_deep_gemm_bmm:
-                if self_attn.w_kc is None:
-                    self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
-                    self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
-                else:
-                    self_attn.w_kc.copy_(
-                        w_kc.transpose(1, 2).contiguous().transpose(1, 2)
-                    )
-                    self_attn.w_vc.copy_(w_vc.contiguous().transpose(1, 2))
+                self_attn.w_kv = bind_or_assign(
+                    self_attn.w_kv, w_kc.transpose(1, 2).contiguous().transpose(1, 2)
+                )
+                self_attn.w_vc = bind_or_assign(
+                    self_attn.w_vc, w_vc.contiguous().transpose(1, 2)
+                )
                 if (
                     hasattr(self_attn.kv_b_proj, "weight_scale")
                     and self_attn.w_scale is None
                 ):
-                    if self_attn.w_scale is None:
-                        self_attn.w_scale = self_attn.kv_b_proj.weight_scale
-                    else:
-                        self_attn.w_scale.copy_(self_attn.kv_b_proj.weight_scale)
+                    self_attn.w_scale = bind_or_assign(
+                        self_attn.w_scale, self_attn.kv_b_proj.weight_scale
+                    )
                     if _is_hip:
                         self_attn.w_scale *= 2.0
             else:
@@ -1607,16 +1605,16 @@ class DeepseekV2ForCausalLM(nn.Module):
                 ws_kc, ws_vc = block_scale.unflatten(
                     0, (-1, (num_tiles_k + num_tiles_n))
                 ).split([num_tiles_k, num_tiles_n], dim=1)
-                if self_attn.w_kc is None:
-                    self_attn.w_scale_k = ws_kc.transpose(1, 2).contiguous()
-                    self_attn.w_scale_v = ws_vc.contiguous()
-                    self_attn.w_kc = w_kc.transpose(1, 2).contiguous()
-                    self_attn.w_vc = w_vc.contiguous()
-                else:
-                    self_attn.w_scale_k.copy_(ws_kc.transpose(1, 2).contiguous())
-                    self_attn.w_scale_v.copy_(ws_vc.contiguous())
-                    self_attn.w_kc.copy_(w_kc.transpose(1, 2).contiguous())
-                    self_attn.w_vc.copy_(w_vc.contiguous())
+                self_attn.w_scale_k = bind_or_assign(
+                    self_attn.w_scale_k, ws_kc.transpose(1, 2).contiguous()
+                )
+                self_attn.w_scale_v = bind_or_assign(
+                    self_attn.w_scale_v, ws_vc.contiguous()
+                )
+                self_attn.w_kc = bind_or_assign(
+                    self_attn.w_kc, w_kc.transpose(1, 2).contiguous()
+                )
+                self_attn.w_vc = bind_or_assign(self_attn.w_vc, w_vc.contiguous())
                 self_attn.use_deep_gemm_bmm = True
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
