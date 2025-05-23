@@ -324,7 +324,6 @@ class ServerArgs:
         if self.grammar_backend is None:
             self.grammar_backend = "xgrammar"
 
-
         # Data parallelism attention
         if self.enable_dp_attention:
             self.schedule_conservativeness = self.schedule_conservativeness * 0.3
@@ -364,7 +363,7 @@ class ServerArgs:
             self.disable_overlap_schedule = True
             logger.warning(
                 "Pipeline parallelism is incompatible with overlap schedule."
-            )    
+            )
 
         if self.expert_distribution_recorder_buffer_size is None:
             # TODO pr-chain: enable this later
