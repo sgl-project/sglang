@@ -246,7 +246,7 @@ class TestEBNFGeneration(unittest.TestCase):
         # Check that the EBNF contains expected patterns
         self.assertIn('call_get_weather ::= "get_weather" "(" ', ebnf)
         self.assertIn('"location" "=" basic_string', ebnf)
-        self.assertIn('[ "unit" "=" "celsius" | "fahrenheit" ]', ebnf)
+        self.assertIn('[ "unit" "=" ("\\"celsius\\"" | "\\"fahrenheit\\"") ]', ebnf)
 
         # Validate that the EBNF can be compiled by GrammarCompiler
         try:
