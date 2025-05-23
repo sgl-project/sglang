@@ -301,6 +301,7 @@ async def register(obj: PDRegistryRequest):
         load_balancer.prefill_configs.append(
             PrefillConfig(obj.registry_url, obj.bootstrap_port)
         )
+        load_balancer.prefill_servers.append(obj.registry_url)
         logger.info(
             f"Registered prefill server: {obj.registry_url} with bootstrap port: {obj.bootstrap_port}"
         )
