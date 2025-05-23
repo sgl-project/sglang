@@ -166,14 +166,25 @@ class MooncakeKVManager(BaseKVManager):
             # Determine the number of threads to use for kv sender
             cpu_count = os.cpu_count()
             self.executor = concurrent.futures.ThreadPoolExecutor(
-                min(max(1, cpu_count // 8), 8)
+                int(
+                    os.getenv(
+                        "DISAGGREGATION_THREAD_POOL_SIZE",
+                        min(max(1, cpu_count // 8), 8),
+                    )
+                )
             )
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.heartbeat_failures = {}
             self.addr_to_rooms_tracker = defaultdict(list)
             self.connection_lock = threading.Lock()
-            self.heartbeat_interval = 5
-            self.max_failures = 3
+            # Heartbeat interval should be at least 2 seconds
+            self.heartbeat_interval = max(
+                float(os.getenv("DISAGGREGATION_HEARTBEAT_INTERVAL", 3.0)), 2.0
+            )
+            # Heartbeat failure should be at least 1
+            self.max_failures = max(
+                int(os.getenv("DISAGGREGATION_HEARTBEAT_MAX_FAILURE", 3)), 1
+            )
             self.start_decode_thread()
             self.connection_pool: Dict[str, Dict[str, Union[str, int]]] = {}
             self.prefill_tp_size_table: Dict[str, int] = {}
@@ -468,8 +479,13 @@ class MooncakeKVManager(BaseKVManager):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last or (is_last and aux_index is not None)
 
-        if self.check_status(bootstrap_room) == KVPoll.Failed:
-            logger.info("Request with bootstrap_room=%s already failed", bootstrap_room)
+        if (
+            bootstrap_room not in self.request_status
+            or self.check_status(bootstrap_room) == KVPoll.Failed
+        ):
+            logger.debug(
+                "Request with bootstrap_room=%s already failed", bootstrap_room
+            )
             return
 
         self.transfer_queue.put(
