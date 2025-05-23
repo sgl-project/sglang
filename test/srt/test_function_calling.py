@@ -295,6 +295,182 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
         self.assertEqual(str(args_obj["int_a"]), "5", "Parameter int_a should be 5")
         self.assertEqual(str(args_obj["int_b"]), "7", "Parameter int_b should be 7")
 
+    def test_double_dumping_detection(self):
+        """
+        Test: Detect potential double dumping issues in function call arguments.
+        - Verify that arguments are valid JSON and not double-encoded strings.
+        - Check for common double dumping patterns like escaped quotes.
+        """
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "search_location",
+                    "description": "Search for information about a location with complex nested data",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "location": {
+                                "type": "string",
+                                "description": "The location name",
+                            },
+                            "search_options": {
+                                "type": "object",
+                                "properties": {
+                                    "include_weather": {"type": "boolean"},
+                                    "include_attractions": {"type": "boolean"},
+                                    "radius_km": {"type": "integer"},
+                                },
+                                "required": ["include_weather"],
+                            },
+                            "metadata": {
+                                "type": "object",
+                                "properties": {
+                                    "source": {"type": "string"},
+                                    "timestamp": {"type": "string"},
+                                },
+                            },
+                        },
+                        "required": ["location", "search_options"],
+                    },
+                },
+            }
+        ]
+
+        messages = [
+            {
+                "role": "user",
+                "content": "Search for information about Tokyo with weather data, attractions within 5km, from source 'travel_api' at timestamp '2024-01-01T00:00:00Z'",
+            }
+        ]
+
+        # Test non-streaming response
+        response = client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            temperature=0.1,
+            top_p=0.9,
+            stream=False,
+            tools=tools,
+        )
+
+        if response.choices[0].message.tool_calls:
+            tool_call = response.choices[0].message.tool_calls[0]
+            arguments_str = tool_call.function.arguments
+
+            # Check 1: Arguments should be valid JSON
+            try:
+                args_obj = json.loads(arguments_str)
+            except json.JSONDecodeError as e:
+                self.fail(
+                    f"Function arguments are not valid JSON: {e}. Arguments: {arguments_str}"
+                )
+
+            # Check 2: Arguments should not be a string representation of JSON (double dumping)
+            self.assertIsInstance(
+                args_obj,
+                dict,
+                f"Arguments should be parsed as dict, not string. Got: {type(args_obj)}. Value: {args_obj}",
+            )
+
+            # Check 3: Nested objects should also be properly parsed
+            if "search_options" in args_obj:
+                search_options = args_obj["search_options"]
+                self.assertIsInstance(
+                    search_options,
+                    dict,
+                    f"Nested search_options should be dict, not string. Got: {type(search_options)}. Value: {search_options}",
+                )
+
+            # Check 4: Look for double dumping patterns in the raw string
+            # Double dumping typically results in escaped quotes like \"
+            if arguments_str.count('\\"') > 0:
+                # Count the ratio of escaped quotes to total quotes
+                escaped_quotes = arguments_str.count('\\"')
+                total_quotes = arguments_str.count('"')
+                escaped_ratio = escaped_quotes / total_quotes if total_quotes > 0 else 0
+
+                # If more than 30% of quotes are escaped, it might indicate double dumping
+                if escaped_ratio > 0.3:
+                    self.fail(
+                        f"Potential double dumping detected: {escaped_ratio:.2%} of quotes are escaped. "
+                        f"Arguments: {arguments_str}"
+                    )
+
+            # Check 5: Arguments string should not start and end with quotes (indicating it's a JSON string)
+            arguments_stripped = arguments_str.strip()
+            if (
+                arguments_stripped.startswith('"')
+                and arguments_stripped.endswith('"')
+                and len(arguments_stripped) > 2
+            ):
+                # Try to parse it as a string to see if it contains JSON
+                try:
+                    inner_content = json.loads(arguments_stripped)
+                    if isinstance(inner_content, str):
+                        # This might be double dumped JSON
+                        try:
+                            json.loads(
+                                inner_content
+                            )  # Try to parse the inner string as JSON
+                            self.fail(
+                                f"Double dumping detected: arguments appear to be a JSON string containing JSON. "
+                                f"Arguments: {arguments_str}"
+                            )
+                        except json.JSONDecodeError:
+                            pass  # Inner content is not JSON, so it's fine
+                except json.JSONDecodeError:
+                    pass  # Not a JSON string, so it's fine
+
+        # Test streaming response for the same issue
+        response_stream = client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            temperature=0.1,
+            top_p=0.9,
+            stream=True,
+            tools=tools,
+        )
+
+        argument_fragments = []
+        for chunk in response_stream:
+            choice = chunk.choices[0]
+            if choice.delta.tool_calls:
+                tool_call = choice.delta.tool_calls[0]
+                if tool_call.function.arguments is not None:
+                    argument_fragments.append(tool_call.function.arguments)
+
+        if argument_fragments:
+            joined_args = "".join(argument_fragments)
+
+            # Same checks for streaming response
+            try:
+                args_obj = json.loads(joined_args)
+            except json.JSONDecodeError as e:
+                self.fail(
+                    f"Streaming function arguments are not valid JSON: {e}. Arguments: {joined_args}"
+                )
+
+            self.assertIsInstance(
+                args_obj,
+                dict,
+                f"Streaming arguments should be parsed as dict, not string. Got: {type(args_obj)}. Value: {args_obj}",
+            )
+
+            # Check for double dumping patterns in streaming
+            if joined_args.count('\\"') > 0:
+                escaped_quotes = joined_args.count('\\"')
+                total_quotes = joined_args.count('"')
+                escaped_ratio = escaped_quotes / total_quotes if total_quotes > 0 else 0
+
+                if escaped_ratio > 0.3:
+                    self.fail(
+                        f"Potential double dumping detected in streaming response: {escaped_ratio:.2%} of quotes are escaped. "
+                        f"Arguments: {joined_args}"
+                    )
+
 
 class TestOpenAIPythonicFunctionCalling(CustomTestCase):
     PYTHONIC_TOOLS = [
