@@ -25,10 +25,10 @@ from transformers import AutoConfig, AutoTokenizer
 from sglang.test.runners import DEFAULT_PROMPTS, HFRunner, SRTRunner
 from sglang.test.test_utils import CustomTestCase, get_similarities, is_in_ci
 
-MODELS = [("BAAI/bge-small-en", 1, 1e-5)]
+MODELS = [("BAAI/bge-small-en", 1, 1e-5), ("BAAI/bge-m3", 1, 1e-5)]
 
 ATTENTION_BACKEND = ["torch_native", "triton"]
-BATCH_SIZE = [30]
+BATCH_SIZE = [1, 2]
 TORCH_DTYPES = [torch.float32]
 sgl_to_st_ratio = []
 
@@ -79,9 +79,9 @@ class TestEncoderEmbeddingModels(CustomTestCase):
             # warm up
             hf_outputs = hf_runner.forward(truncated_prompts)
 
-            st_start_time = time.time()
+            st_start_time = time.perf_counter()
             hf_outputs = hf_runner.forward(truncated_prompts)
-            st_end_time = time.time()
+            st_end_time = time.perf_counter()
 
         with SRTRunner(
             model_path,
@@ -95,9 +95,9 @@ class TestEncoderEmbeddingModels(CustomTestCase):
             # warm up
             srt_outputs = srt_runner.forward(truncated_prompts)
 
-            sgl_start_time = time.time()
+            sgl_start_time = time.perf_counter()
             srt_outputs = srt_runner.forward(truncated_prompts)
-            sgl_end_time = time.time()
+            sgl_end_time = time.perf_counter()
 
         transformer_time = st_end_time - st_start_time
         sgl_time = sgl_end_time - sgl_start_time

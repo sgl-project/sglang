@@ -20,9 +20,10 @@ import torch
 import torch.nn as nn
 
 from sglang.srt.custom_op import CustomOp
-from sglang.srt.utils import is_cuda, is_xpu
+from sglang.srt.utils import is_cuda, is_hip, is_xpu
 
 _is_cuda = is_cuda()
+_is_hip = is_hip()
 _is_xpu = is_xpu()
 
 if _is_cuda:
@@ -33,6 +34,8 @@ if _is_cuda:
         rmsnorm,
     )
 
+if _is_hip:
+    from vllm._custom_ops import fused_add_rms_norm, rms_norm
 
 logger = logging.getLogger(__name__)
 
@@ -47,16 +50,40 @@ class RMSNorm(CustomOp):
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
 
+    def forward(self, *args, **kwargs):
+        if torch.compiler.is_compiling():
+            return self.forward_native(*args, **kwargs)
+        if _is_cuda:
+            return self.forward_cuda(*args, **kwargs)
+        elif _is_hip:
+            return self.forward_hip(*args, **kwargs)
+        else:
+            return self.forward_native(*args, **kwargs)
+
     def forward_cuda(
         self,
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-
         if residual is not None:
             fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
             return x, residual
         out = rmsnorm(x, self.weight.data, self.variance_epsilon)
+        return out
+
+    def forward_hip(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if not x.is_contiguous():
+            # NOTE: Remove this if aiter kernel supports discontinuous input
+            x = x.contiguous()
+        if residual is not None:
+            fused_add_rms_norm(x, residual, self.weight.data, self.variance_epsilon)
+            return x, residual
+        out = torch.empty_like(x)
+        rms_norm(out, x, self.weight.data, self.variance_epsilon)
         return out
 
     def forward_native(
@@ -64,6 +91,8 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if not x.is_contiguous():
+            x = x.contiguous()
         orig_dtype = x.dtype
         x = x.to(torch.float32)
         if residual is not None:
@@ -88,6 +117,14 @@ class GemmaRMSNorm(CustomOp):
         super().__init__()
         self.weight = nn.Parameter(torch.zeros(hidden_size))
         self.variance_epsilon = eps
+
+    def forward(self, *args, **kwargs):
+        if torch.compiler.is_compiling():
+            return self.forward_native(*args, **kwargs)
+        if _is_cuda:
+            return self.forward_cuda(*args, **kwargs)
+        else:
+            return self.forward_native(*args, **kwargs)
 
     def forward_native(
         self,
@@ -140,8 +177,8 @@ class Gemma3RMSNorm(nn.Module):
         return f"{tuple(self.weight.shape)}, eps={self.eps}"
 
 
-if not _is_cuda and not _is_xpu:
+if not (_is_cuda or _is_hip or _is_xpu):
     logger.info(
-        "sgl-kernel is not available on Non-NV platforms. Fallback to other kernel libraries."
+        "sgl-kernel layernorm implementation is not available on current platform. Fallback to other kernel libraries."
     )
     from vllm.model_executor.layers.layernorm import GemmaRMSNorm, RMSNorm

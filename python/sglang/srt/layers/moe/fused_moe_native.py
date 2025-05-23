@@ -8,6 +8,7 @@ from typing import Callable, Optional
 import torch
 from torch.nn import functional as F
 
+from sglang.srt.layers.activation import GeluAndMul, SiluAndMul
 from sglang.srt.layers.moe.topk import select_experts
 
 
@@ -30,7 +31,7 @@ def fused_moe_forward_native(
 ) -> torch.Tensor:
 
     if apply_router_weight_on_input:
-        raise NotImplementedError
+        raise NotImplementedError()
 
     topk_weights, topk_ids = select_experts(
         hidden_states=x,
@@ -75,9 +76,6 @@ def moe_forward_native(
     activation: str = "silu",
     routed_scaling_factor: Optional[float] = None,
 ) -> torch.Tensor:
-
-    from sglang.srt.layers.activation import GeluAndMul, SiluAndMul
-
     topk_weights, topk_ids = select_experts(
         hidden_states=x,
         router_logits=router_logits,

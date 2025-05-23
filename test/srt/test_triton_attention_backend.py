@@ -15,13 +15,13 @@ from sglang.test.test_utils import (
     CustomTestCase,
     is_in_ci,
     popen_launch_server,
-    run_bench_one_batch,
+    run_bench_offline_throughput,
 )
 
 
 class TestTritonAttnBackend(CustomTestCase):
     def test_latency(self):
-        output_throughput = run_bench_one_batch(
+        output_throughput = run_bench_offline_throughput(
             DEFAULT_MODEL_NAME_FOR_TEST,
             [
                 "--attention-backend",
@@ -31,6 +31,8 @@ class TestTritonAttnBackend(CustomTestCase):
                 4,
             ],
         )
+
+        print(f"{output_throughput=}")
 
         if is_in_ci():
             self.assertGreater(output_throughput, 153)

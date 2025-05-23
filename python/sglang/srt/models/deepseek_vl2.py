@@ -12,12 +12,13 @@ from sglang.srt.configs.deepseekvl2 import (
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternImageTokens,
+    MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.deepseek import DeepseekForCausalLM
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
 
 
@@ -189,7 +190,11 @@ class DeepseekVL2ForCausalLM(nn.Module):
 
         # ----------- language model ------------
         language_config = config.language_config
-        self.language_model = DeepseekV2ForCausalLM(language_config)
+        if language_config.use_mla:
+            self.language_model = DeepseekV2ForCausalLM(language_config)
+        else:
+            # deepseek-vl2-tiny forbids mla
+            self.language_model = DeepseekForCausalLM(language_config)
 
     def _init_vision_module(
         self, vision_config, quant_config: Optional[QuantizationConfig]
@@ -249,8 +254,8 @@ class DeepseekVL2ForCausalLM(nn.Module):
                 weights_loader(param, loaded_weight)
 
     def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
-        helper = MultiModalityDataPaddingPatternImageTokens(
-            image_token_id=image_inputs.im_token_id
+        helper = MultiModalityDataPaddingPatternMultimodalTokens(
+            [image_inputs.im_token_id]
         )
         return helper.pad_input_tokens(input_ids, image_inputs)
 
