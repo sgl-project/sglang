@@ -328,15 +328,14 @@ def _adjust_embedding_length(
     embedding: torch.Tensor,
     mask: torch.Tensor,
     logger,
-    embedding_desc: str = "multimodal embedding",
 ) -> torch.Tensor:
     num_mm_tokens_in_embedding = embedding.shape[0]
     num_mm_tokens_in_input_ids = mask.sum().item()
     if num_mm_tokens_in_input_ids != num_mm_tokens_in_embedding:
         logger.warning(
-            f"Number of tokens in {embedding_desc} does not match those in the input text. "
+            f"Number of tokens in multimodal embedding does not match those in the input text. "
             f"Got {num_mm_tokens_in_input_ids} tokens in the text but {num_mm_tokens_in_embedding} "
-            f"tokens from {embedding_desc}s."
+            f"tokens from multimodal embeddings."
         )
         if num_mm_tokens_in_input_ids < num_mm_tokens_in_embedding:
             chunked_prefill_size = global_server_args_dict["chunked_prefill_size"]
@@ -352,7 +351,7 @@ def _adjust_embedding_length(
                 embedding = embedding[-num_multimodal:, :]
         else:
             raise RuntimeError(
-                f"Insufficient {embedding_desc} length: {num_mm_tokens_in_input_ids=} vs {num_mm_tokens_in_embedding=}. This is an internal error"
+                f"Insufficient multimodal embedding length: {num_mm_tokens_in_input_ids=} vs {num_mm_tokens_in_embedding=}. This is an internal error"
             )
     return embedding
 
