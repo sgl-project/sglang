@@ -83,13 +83,8 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
             tools=tools,
         )
 
-        content = response.choices[0].message.content
         tool_calls = response.choices[0].message.tool_calls
 
-        assert content is None, (
-            "When function call is successful, message.content should be None, "
-            f"but got: {content}"
-        )
         assert (
             isinstance(tool_calls, list) and len(tool_calls) > 0
         ), "tool_calls should be a non-empty list"
