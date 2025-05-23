@@ -33,7 +33,7 @@ class FunctionCallParser:
     }
 
     def __init__(self, tools: List[Tool], tool_call_parser: str):
-        detector = None
+        detector: Type[BaseFormatDetector] = None
         detector_class = self.ToolCallParserEnum.get(tool_call_parser)
         if detector_class:
             detector = detector_class()

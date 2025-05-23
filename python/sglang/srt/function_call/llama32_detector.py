@@ -69,9 +69,9 @@ class Llama32Detector(BaseFormatDetector):
     def build_ebnf(self, tools: List[Tool]):
         return EBNFComposer.build_ebnf(
             tools,
-            tool_calls_rule='"<|python_tag|>" function_call',
-            call_rule_fmt='call_{name} ::= "{" "name" ":" "{name}" "," "arguments" ":" {arguments_rule} "}"',
-            arguments_rule_fmt='"{" {arg_rules} "}"',
-            key_value_fmt='"{key}" ":" {valrule}',
+            tool_calls_rule="function_call",
+            call_rule_fmt='call_{name} ::= "{{" "\\"name\\"" ":" "\\"{name}\\"" ", " "\\"arguments\\"" ":" {arguments_rule} "}}"',
+            arguments_rule_fmt='"{{" {arg_rules} "}}"',
+            key_value_fmt='"\\"{key}\\"" ":" {valrule}',
             is_pythonic=False,
         )

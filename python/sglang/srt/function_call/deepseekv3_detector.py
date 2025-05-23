@@ -66,23 +66,6 @@ class DeepSeekV3Detector(BaseFormatDetector):
             # return the normal text if parsing fails
             return StreamingParseResult(normal_text=text)
 
-    def structure_info(self) -> _GetInfoFunc:
-        return lambda name: StructureInfo(
-            begin=">" + name + "\n```json\n",
-            end="\n```<",
-            trigger=">" + name + "\n```json\n",
-        )
-
-    def build_ebnf(self, tools: List[Tool]):
-        return EBNFComposer.build_ebnf(
-            tools,
-            tool_calls_rule="'<｜tool▁calls▁begin｜>' tool_call (tool_call)* '<｜tool▁calls▁end｜>'",
-            call_rule_fmt='call_{name} ::= "<｜tool▁call▁begin｜>function<｜tool▁sep｜>{name}\\n```json\\n" {arguments_rule} "\\n```<｜tool▁call▁end｜>"',
-            arguments_rule_fmt='"{" {arg_rules} "}"',
-            key_value_fmt='"{key}" ":" {valrule}',
-            is_pythonic=False,
-        )
-
     def parse_streaming_increment(
         self, new_text: str, tools: List[Tool]
     ) -> StreamingParseResult:
@@ -155,3 +138,20 @@ class DeepSeekV3Detector(BaseFormatDetector):
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}")
             return StreamingParseResult(normal_text=current_text)
+
+    def structure_info(self) -> _GetInfoFunc:
+        return lambda name: StructureInfo(
+            begin=">" + name + "\n```json\n",
+            end="\n```<",
+            trigger=">" + name + "\n```json\n",
+        )
+
+    def build_ebnf(self, tools: List[Tool]):
+        return EBNFComposer.build_ebnf(
+            tools,
+            tool_calls_rule='"<｜tool▁calls▁begin｜>" function_call (function_call)* "<｜tool▁calls▁end｜>"',
+            call_rule_fmt='call_{name} ::= "<｜tool▁call▁begin｜>function<｜tool▁sep｜>{name}\\n```json\\n" {arguments_rule} "\\n```<｜tool▁call▁end｜>"',
+            arguments_rule_fmt='"{{" {arg_rules} "}}"',
+            key_value_fmt='"\\"{key}\\"" ":" {valrule}',
+            is_pythonic=False,
+        )

@@ -1,4 +1,5 @@
 import json
+import re
 from typing import List
 
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
@@ -60,10 +61,9 @@ class Qwen25Detector(BaseFormatDetector):
     def build_ebnf(self, tools: List[Tool]):
         return EBNFComposer.build_ebnf(
             tools,
-            # tool_calls_rule="tool_calls ::= ' ' function_call ' '",
             tool_calls_rule='"<tool_call>" function_call "</tool_call>"',
-            call_rule_fmt='call_{name} ::= "{" "name" ":" "{name}" "," "arguments" ":" {arguments_rule} "}"',
-            arguments_rule_fmt='"{" {arg_rules} "}"',
-            key_value_fmt='"{key}" ":" {valrule}',
+            call_rule_fmt='call_{name} ::= "{{" "\\"name\\"" ":" "\\"{name}\\"" ", " "\\"arguments\\"" ":" {arguments_rule} "}}"',
+            arguments_rule_fmt='"{{" {arg_rules} "}}"',
+            key_value_fmt='"\\"{key}\\"" ":" {valrule}',
             is_pythonic=False,
         )

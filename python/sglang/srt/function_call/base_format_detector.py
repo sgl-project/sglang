@@ -244,3 +244,7 @@ class BaseFormatDetector(ABC):
     @abstractmethod
     def structure_info(self) -> _GetInfoFunc:
         raise NotImplementedError()
+
+    @abstractmethod
+    def build_ebnf(self, tools: List[Tool]) -> str:
+        raise NotImplementedError()
