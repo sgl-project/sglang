@@ -193,21 +193,19 @@ class AutoRoundConfig(QuantizationConfig):
             sym,
         )
         if backend == "auto" or "marlin" in backend:
+            AWQ_TYPE_MAP = {
+                4: scalar_types.uint4,
+                8: scalar_types.uint8,
+            }
+            use_marlin = (weight_bits in AWQ_TYPE_MAP) and check_marlin_supported(
+                AWQ_TYPE_MAP[weight_bits], group_size, not sym
+            )
+
             if isinstance(layer, FusedMoE):
-
-                use_marlin = check_moe_marlin_supports_layer(layer, group_size)
-            else:
-
-                AWQ_TYPE_MAP = {
-                    4: scalar_types.uint4,
-                    8: scalar_types.uint8,
-                }
-                use_marlin = (
-                    weight_bits,
-                    sym,
-                ) in AWQ_TYPE_MAP and check_marlin_supported(
-                    AWQ_TYPE_MAP[(weight_bits)], group_size, not sym
+                use_marlin = use_marlin and check_moe_marlin_supports_layer(
+                    layer, group_size
                 )
+
         else:
             use_marlin = False
         if use_marlin:
@@ -244,6 +242,7 @@ class AutoRoundConfig(QuantizationConfig):
                 "bits": weight_bits,
                 "group_size": group_size,
                 "zero_point": not sym,
+                "lm_head": False,
             }
             return MoeWNA16Config.from_config(config).get_quant_method(layer, prefix)
 
@@ -278,18 +277,16 @@ class AutoRoundConfig(QuantizationConfig):
             sym,
         )
         if backend == "auto" or "marlin" in backend:
+            GPTQ_TYPE_MAP = {
+                (4, True): scalar_types.uint4b8,
+                (8, True): scalar_types.uint8b128,
+            }
+            use_marlin = (weight_bits, sym) in GPTQ_TYPE_MAP and check_marlin_supported(
+                GPTQ_TYPE_MAP[(weight_bits, sym)], group_size, has_zp=not sym
+            )
             if isinstance(layer, FusedMoE):
-                use_marlin = check_moe_marlin_supports_layer(layer, group_size)
-            else:
-                GPTQ_TYPE_MAP = {
-                    (4, True): scalar_types.uint4b8,
-                    (8, True): scalar_types.uint8b128,
-                }
-                use_marlin = (
-                    weight_bits,
-                    sym,
-                ) in GPTQ_TYPE_MAP and check_marlin_supported(
-                    GPTQ_TYPE_MAP[(weight_bits, sym)], group_size, has_zp=not sym
+                use_marlin = use_marlin and check_moe_marlin_supports_layer(
+                    layer, group_size
                 )
         else:
             use_marlin = False
