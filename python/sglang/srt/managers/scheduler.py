@@ -50,6 +50,7 @@ from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    prepare_abort,
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.hf_transformers_utils import (
@@ -101,6 +102,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
+from sglang.srt.managers.mm_utils import init_embedding_cache
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     MultimodalInputs,
@@ -581,6 +583,8 @@ class Scheduler(
                 gloo_group=self.attn_tp_cpu_group,
                 req_to_metadata_buffer_idx_allocator=req_to_metadata_buffer_idx_allocator,
                 metadata_buffers=metadata_buffers,
+                scheduler=self,
+                tree_cache=self.tree_cache,
             )
 
             # The decode requests pending for pre-allocation
@@ -934,6 +938,18 @@ class Scheduler(
                 bootstrap_room=recv_req.bootstrap_room,
             )
             req.tokenizer = self.tokenizer
+
+            if self.disaggregation_mode != DisaggregationMode.NULL:
+                # Invalid request for disaggregated mode
+                if recv_req.bootstrap_room is None:
+                    error_message = (
+                        f"Invalid request: Disaggregated request received without "
+                        f"boostrap room id. {req.rid=}"
+                    )
+                    logger.error(error_message)
+                    prepare_abort(req, error_message)
+                    self.stream_output([req], req.return_logprob)
+                    return
 
             if (
                 recv_req.session_params is not None
@@ -2267,6 +2283,10 @@ def run_scheduler_process(
     if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
         set_gpu_proc_affinity(server_args.tp_size, server_args.nnodes, gpu_id)
 
+    embedding_cache_size = 100
+    if "SGLANG_VLM_CACHE_SIZE_MB" in os.environ:
+        embedding_cache_size = int(os.environ["SGLANG_VLM_CACHE_SIZE_MB"])
+    init_embedding_cache(embedding_cache_size * 1024 * 1024)
     # Create a scheduler and run the event loop
     try:
         scheduler = Scheduler(server_args, port_args, gpu_id, tp_rank, pp_rank, dp_rank)
