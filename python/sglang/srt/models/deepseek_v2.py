@@ -819,28 +819,39 @@ class DeepseekV2AttentionMLA(nn.Module):
             return hidden_states, forward_batch, None
 
         attn_forward_method = self.dispatch_attn_forward_method(forward_batch)
-        fn = {
-            AttnForwardMethod.MHA: self.forward_normal_prepare,
-            AttnForwardMethod.MHA_CHUNKED_KV: self.forward_normal_chunked_kv_prepare,
-            AttnForwardMethod.MLA: self.forward_absorb_prepare,
-            AttnForwardMethod.MLA_FUSED_ROPE: self.forward_absorb_fused_mla_rope_prepare,
-        }[attn_forward_method]
-        inner_state = fn(positions, hidden_states, forward_batch, zero_allocator)
-        return None, forward_batch, inner_state
+        if attn_forward_method == AttnForwardMethod.MHA:
+            inner_state = self.forward_normal_prepare(
+                positions, hidden_states, forward_batch, zero_allocator
+            )
+        elif attn_forward_method == AttnForwardMethod.MHA_CHUNKED_KV:
+            inner_state = self.forward_normal_chunked_kv_prepare(
+                positions, hidden_states, forward_batch, zero_allocator
+            )
+        elif attn_forward_method == AttnForwardMethod.MLA:
+            inner_state = self.forward_absorb_prepare(
+                positions, hidden_states, forward_batch, zero_allocator
+            )
+        elif attn_forward_method == AttnForwardMethod.MLA_FUSED_ROPE:
+            inner_state = self.forward_absorb_fused_mla_rope_prepare(
+                positions, hidden_states, forward_batch, zero_allocator
+            )
+        return None, attn_forward_method, forward_batch, inner_state
 
     def forward_core(self, intermediate_state):
-        hidden_states, forward_batch, inner_state = intermediate_state
+        hidden_states, attn_forward_method, forward_batch, inner_state = (
+            intermediate_state
+        )
         if inner_state is None:
             return hidden_states
 
-        attn_forward_method = self.dispatch_attn_forward_method(forward_batch)
-        fn = {
-            AttnForwardMethod.MHA: self.forward_normal_core,
-            AttnForwardMethod.MHA_CHUNKED_KV: self.forward_normal_chunked_kv_core,
-            AttnForwardMethod.MLA: self.forward_absorb_core,
-            AttnForwardMethod.MLA_FUSED_ROPE: self.forward_absorb_fused_mla_rope_core,
-        }[attn_forward_method]
-        return fn(*inner_state)
+        if attn_forward_method == AttnForwardMethod.MHA:
+            return self.forward_normal_core(*inner_state)
+        elif attn_forward_method == AttnForwardMethod.MHA_CHUNKED_KV:
+            return self.forward_normal_chunked_kv_core(*inner_state)
+        elif attn_forward_method == AttnForwardMethod.MLA:
+            return self.forward_absorb_core(*inner_state)
+        elif attn_forward_method == AttnForwardMethod.MLA_FUSED_ROPE:
+            return self.forward_absorb_fused_mla_rope_core(*inner_state)
 
     def forward_normal_prepare(
         self,
