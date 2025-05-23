@@ -142,8 +142,6 @@ def mscclpp_init_context(
 
 
 def mscclpp_allreduce(
-    context: int,
-    inp: torch.Tensor,
-    out: torch.Tensor,
+    context: int, inp: torch.Tensor, out: torch.Tensor, nthreads: int, nblocks: int
 ) -> None:
-    return sgl_kernel.allreduce.mscclpp_allreduce(context, inp, out)
+    return sgl_kernel.allreduce.mscclpp_allreduce(context, inp, out, nthreads, nblocks)

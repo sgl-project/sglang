@@ -45,7 +45,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "int[] rank_to_node, int[] rank_to_ib, int context_selection) -> int");
   m.impl("mscclpp_init_context", torch::kCUDA, &mscclpp_init_context);
 
-  m.def("mscclpp_allreduce(int context, Tensor inp, Tensor! out) -> ()");
+  m.def("mscclpp_allreduce(int context, Tensor inp, Tensor! out, int nthreads, int nblocks) -> ()");
   m.impl("mscclpp_allreduce", torch::kCUDA, &mscclpp_allreduce);
   /*
    * From csrc/attention

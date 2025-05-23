@@ -257,6 +257,8 @@ else()
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -D_GLIBCXX_USE_CXX11_ABI=1")
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -D_GLIBCXX_USE_CXX11_ABI=1")
 endif()
+set(MSCCLPP_USE_CUDA ON)
+set(MSCCLPP_BYPASS_GPU_CHECK ON)
 add_subdirectory(${repo-mscclpp_SOURCE_DIR})
 target_link_libraries(common_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
 

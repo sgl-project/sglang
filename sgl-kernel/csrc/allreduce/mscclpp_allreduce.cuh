@@ -546,10 +546,9 @@ class Msccl1Shot1NodeLLcontext {
   }
 
   template <typename T>
-  void
-  allreduce(cudaStream_t stream, T* input, T* output, size_t input_numel, int threads = 512, int block_limit = 21) {
-    dim3 nthrs(threads);
-    dim3 nblks(block_limit);
+  void allreduce(cudaStream_t stream, T* input, T* output, size_t input_numel, int nthreads = 512, int nblocks = 21) {
+    dim3 nthrs(nthreads);
+    dim3 nblks(nblocks);
     cudaStreamCaptureStatus capturing_status;
     CHECK_CUDA_SUCCESS(cudaStreamIsCapturing(stream, &capturing_status));
     mscclpp::MemoryChannelDeviceHandle* memChans;
@@ -639,8 +638,8 @@ class Msccl1Shot2NodeLLcontext {
         scratch_bytes_(scratch_bytes),
         put_buffer_(put_buffer),
         put_buffer_bytes_(put_buffer_bytes),
-        d_memHandles_(world_size - 1),
-        d_portHandles_(world_size - 1) {
+        d_memHandles_(7),
+        d_portHandles_(world_size - 8) {
     CHECK_CUDA_SUCCESS(cudaStreamCreateWithFlags(&h2d_stream, cudaStreamNonBlocking));
     comm_group_ = std::make_shared<MscclCommGroup>(unique_id, rank, world_size, rank_to_node, rank_to_ib);
     proxyService = std::make_shared<mscclpp::ProxyService>();
@@ -702,10 +701,10 @@ class Msccl1Shot2NodeLLcontext {
   }
 
   template <typename T>
-  void allreduce(
-      cudaStream_t stream, T* input, T* output, const size_t input_numel, int threads = 512, int block_limit = 21) {
-    dim3 nthrs(threads);
-    dim3 nblks(block_limit);
+  void
+  allreduce(cudaStream_t stream, T* input, T* output, const size_t input_numel, int nthreads = 512, int nblocks = 21) {
+    dim3 nthrs(nthreads);
+    dim3 nblks(nblocks);
     cudaStreamCaptureStatus capturing_status;
     CHECK_CUDA_SUCCESS(cudaStreamIsCapturing(stream, &capturing_status));
     mscclpp::MemoryChannelDeviceHandle* memChans;
@@ -726,7 +725,7 @@ class Msccl1Shot2NodeLLcontext {
       void* input_void_ptr = reinterpret_cast<void*>(input);
       if (input_ptr2d_memHandles_.find(input_void_ptr) == input_ptr2d_memHandles_.end()) {
         std::unordered_map<int, mscclpp::MemoryChannel> memory_channels;
-        mscclpp::GpuBuffer<mscclpp::MemoryChannelDeviceHandle> device_memory_handle(comm_group_->world_size_ - 1);
+        mscclpp::GpuBuffer<mscclpp::MemoryChannelDeviceHandle> device_memory_handle(7);
         comm_group_->make_device_memory_handle_base_on_new_ptr(
             memory_channels_,
             registered_sm_memories_,

@@ -143,7 +143,9 @@ class TestCustomAllReduce(unittest.TestCase):
                         inp1_ref = inp1.clone()
                         out1 = torch.empty_like(inp1)
 
-                        custom_ops.mscclpp_allreduce(mscclpp_context, inp1, out1)
+                        custom_ops.mscclpp_allreduce(
+                            mscclpp_context, inp1, out1, nthreads=512, nblocks=21
+                        )
 
                         dist.all_reduce(inp1_ref, group=group)
 

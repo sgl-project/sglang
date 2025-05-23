@@ -82,7 +82,7 @@ bool _mscclpp_is_weak_contiguous(torch::Tensor& t) {
   return t.is_contiguous() ||
          (t.storage().nbytes() - t.storage_offset() * t.element_size() == t.numel() * t.element_size());
 }
-void mscclpp_allreduce(fptr_t _context, torch::Tensor& inp, torch::Tensor& out) {
+void mscclpp_allreduce(fptr_t _context, torch::Tensor& inp, torch::Tensor& out, int64_t nthreads, int64_t nblocks) {
   MscclContext* context = reinterpret_cast<MscclContext*>(_context);
   const at::cuda::OptionalCUDAGuard device_guard(device_of(inp));
   auto stream = c10::cuda::getCurrentCUDAStream().stream();
@@ -91,16 +91,25 @@ void mscclpp_allreduce(fptr_t _context, torch::Tensor& inp, torch::Tensor& out) 
   TORCH_CHECK_EQ(inp.numel(), out.numel());
   TORCH_CHECK(_mscclpp_is_weak_contiguous(out));
   TORCH_CHECK(_mscclpp_is_weak_contiguous(inp));
-  auto input_size = inp.numel() * inp.element_size();
   switch (out.scalar_type()) {
     case at::ScalarType::Float: {
       context->allreduce<float>(
-          stream, reinterpret_cast<float*>(inp.data_ptr()), reinterpret_cast<float*>(out.data_ptr()), inp.numel());
+          stream,
+          reinterpret_cast<float*>(inp.data_ptr()),
+          reinterpret_cast<float*>(out.data_ptr()),
+          inp.numel(),
+          nthreads,
+          nblocks);
       break;
     }
     case at::ScalarType::Half: {
       context->allreduce<half>(
-          stream, reinterpret_cast<half*>(inp.data_ptr()), reinterpret_cast<half*>(out.data_ptr()), inp.numel());
+          stream,
+          reinterpret_cast<half*>(inp.data_ptr()),
+          reinterpret_cast<half*>(out.data_ptr()),
+          inp.numel(),
+          nthreads,
+          nblocks);
       break;
     }
 #if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
@@ -109,7 +118,9 @@ void mscclpp_allreduce(fptr_t _context, torch::Tensor& inp, torch::Tensor& out) 
           stream,
           reinterpret_cast<__nv_bfloat16*>(inp.data_ptr()),
           reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
-          inp.numel());
+          inp.numel(),
+          nthreads,
+          nblocks);
       break;
     }
 #endif

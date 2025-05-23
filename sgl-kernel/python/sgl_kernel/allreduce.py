@@ -65,9 +65,7 @@ if torch.version.hip is not None:
         raise NotImplementedError()
 
     def mscclpp_allreduce(
-        context: int,
-        inp: torch.Tensor,
-        out: torch.Tensor,
+        context: int, inp: torch.Tensor, out: torch.Tensor, nthreads: int, nblocks: int
     ) -> None:
         raise NotImplementedError()
 
@@ -133,8 +131,8 @@ else:
         )
 
     def mscclpp_allreduce(
-        context: int,
-        inp: torch.Tensor,
-        out: torch.Tensor,
+        context: int, inp: torch.Tensor, out: torch.Tensor, nthreads: int, nblocks: int
     ) -> None:
-        torch.ops.sgl_kernel.mscclpp_allreduce.default(context, inp, out)
+        torch.ops.sgl_kernel.mscclpp_allreduce.default(
+            context, inp, out, nthreads, nblocks
+        )

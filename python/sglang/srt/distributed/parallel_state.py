@@ -386,7 +386,7 @@ class GroupCoordinator:
             # --------------------------------------------
             # custom allreduce       | enabled | enabled |
             # PyNccl                 | disabled| enabled |
-            # PyMsccl                | disabled| enabled |
+            # PyMscclpp              | disabled| enabled |
             # torch.distributed      | enabled | disabled|
             #
             # Note that custom allreduce will have a runtime check, if the
@@ -411,12 +411,12 @@ class GroupCoordinator:
                 )
 
             pymscclpp_comm = self.pymscclpp_comm
-            maybe_pymsccl_context: Any
+            maybe_pymscclpp_context: Any
             if not pymscclpp_comm:
-                maybe_pymsccl_context = nullcontext()
+                maybe_pymscclpp_context = nullcontext()
             else:
-                maybe_pymsccl_context = pymscclpp_comm.change_state(enable=True)
-            with maybe_pynccl_context, maybe_pymsccl_context:
+                maybe_pymscclpp_context = pymscclpp_comm.change_state(enable=True)
+            with maybe_pynccl_context, maybe_pymscclpp_context:
                 yield graph_capture_context
 
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
@@ -464,7 +464,7 @@ class GroupCoordinator:
         ) or (
             self.pymscclpp_comm is not None
             and not self.pymscclpp_comm.disabled
-            and self.pymscclpp_comm.should_msccl_allreduce(input_)
+            and self.pymscclpp_comm.should_mscclpp_allreduce(input_)
         ):
             return torch.ops.sglang.outplace_all_reduce(
                 input_, group_name=self.unique_name

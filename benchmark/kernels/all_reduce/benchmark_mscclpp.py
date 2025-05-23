@@ -172,17 +172,24 @@ if __name__ == "__main__":
     )
     initialize_model_parallel(tensor_model_parallel_size=world_size)
     group = get_tensor_model_parallel_group().device_group
+    cpu_group = get_tensor_model_parallel_group().cpu_group
     pynccl_comm = get_tensor_model_parallel_group().pynccl_comm
     pymscclpp_comm = get_tensor_model_parallel_group().pymscclpp_comm
     dist.barrier()
-    profile = False
+    profile = True
     dtype = torch.bfloat16
     ctx = get_torch_prof_ctx(profile)
     result = []
+
     with ctx:
         for i in range(10, 20):
             sz = 2**i
+            if sz * dtype.itemsize > 2**20:
+                break
             inp_randn = torch.randint(1, 16, (sz,), dtype=dtype, device=device)
+
+            memory = torch.empty_like(inp_randn)
+            memory_out = torch.empty_like(memory)
             torch_eager_output, torch_eager_time = _bench_eager_time(
                 lambda inp: torch_allreduce(inp, group), inp_randn
             )
@@ -196,12 +203,11 @@ if __name__ == "__main__":
             _, pynccl_graph_time = _bench_graph_time(
                 lambda inp: pynccl_allreduce(inp, pynccl_comm), inp_randn
             )
-            inp_bytes = inp_randn.numel() * inp_randn.element_size()
             torch.testing.assert_close(torch_eager_output, msccl_graph_output)
             torch.testing.assert_close(torch_eager_output, msccl_eager_output)
             result.append(
                 {
-                    "msg_size": human_readable_size(inp_bytes),
+                    "msg_size": human_readable_size(inp_randn.nbytes),
                     "torch eager time": torch_eager_time,
                     "msccl eager time": msccl_eager_time,
                     "msccl graph time": msccl_graph_time,
