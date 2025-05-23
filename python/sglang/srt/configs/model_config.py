@@ -73,6 +73,7 @@ class ModelConfig:
             model_override_args=self.model_override_args,
             **kwargs,
         )
+
         self.hf_text_config = get_hf_text_config(self.hf_config)
         self.attention_chunk_size = getattr(
             self.hf_text_config, "attention_chunk_size", None
@@ -97,6 +98,8 @@ class ModelConfig:
         ):
             self.hf_config.architectures[0] = "DeepseekV3ForCausalLMNextN"
 
+        if is_draft_model and self.hf_config.architectures[0] == "MiMoForCausalLM":
+            self.hf_config.architectures[0] = "MiMoMTP"
         # Check model type
         self.is_generation = is_generation_model(
             self.hf_config.architectures, is_embedding

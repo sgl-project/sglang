@@ -1303,14 +1303,17 @@ async def benchmark(
 
     if "sglang" in backend:
         server_info = requests.get(base_url + "/get_server_info")
-        if pd_separated:
-            accept_length = server_info.json()["decode"][0]["internal_states"][0].get(
-                "avg_spec_accept_length", None
-            )
+        if server_info.status_code == 200:
+            if pd_separated:
+                accept_length = server_info.json()["decode"][0]["internal_states"][
+                    0
+                ].get("avg_spec_accept_length", None)
+            else:
+                accept_length = server_info.json()["internal_states"][0].get(
+                    "avg_spec_accept_length", None
+                )
         else:
-            accept_length = server_info.json()["internal_states"][0].get(
-                "avg_spec_accept_length", None
-            )
+            accept_length = None
     else:
         accept_length = None
 
