@@ -129,9 +129,8 @@ class AttnForwardMethod(IntEnum):
     # This method can avoid OOM when prefix lengths are long.
     MHA_CHUNKED_KV = auto()
 
-    # TODO
-    # # Use MLA but with fused RoPE
-    # MLA_FUSED_ROPE = auto()
+    # Use MLA but with fused RoPE
+    MLA_FUSED_ROPE = auto()
 
 
 class DeepseekV2MLP(nn.Module):
@@ -740,6 +739,18 @@ class DeepseekV2AttentionMLA(nn.Module):
     def dispatch_attn_forward_method(
         self, forward_batch: ForwardBatch
     ) -> AttnForwardMethod:
+        def _dispatch_mla_subtype():
+            if _is_hip:
+                if (
+                    self.rocm_fused_decode_mla
+                    and forward_batch.forward_mode.is_decode()
+                ):
+                    return AttnForwardMethod.MLA_FUSED_ROPE
+                else:
+                    return AttnForwardMethod.MLA
+            else:
+                return AttnForwardMethod.MLA
+
         if self.attention_backend == "flashinfer":
             # Flashinfer MLA: Do not absorb when enabling ragged prefill
             if (
@@ -751,7 +762,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             ):
                 return AttnForwardMethod.MHA
             else:
-                return AttnForwardMethod.MLA
+                return _dispatch_mla_subtype()
         elif self.attention_backend == "fa3":
             # Flash Attention: Use MHA with chunked KV cache when prefilling on long sequences.
             if forward_batch.extend_prefix_lens_cpu is not None:
@@ -768,7 +779,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             ):
                 return AttnForwardMethod.MHA_CHUNKED_KV
             else:
-                return AttnForwardMethod.MLA
+                return _dispatch_mla_subtype()
         else:
             # Triton: Use normal computation for prefill and use weight absorption for extend/decode
             if (
@@ -779,53 +790,65 @@ class DeepseekV2AttentionMLA(nn.Module):
             ):
                 return AttnForwardMethod.MHA
             else:
-                return AttnForwardMethod.MLA
+                return _dispatch_mla_subtype()
 
-    def forward(
+    def op_prepare(self, state):
+        state.attn_intermediate_state = self.forward_prepare(
+            positions=state.positions,
+            hidden_states=state.pop("hidden_states_after_comm_pre_attn"),
+            forward_batch=state.forward_batch,
+            zero_allocator=state.zero_allocator,
+        )
+
+    def op_core(self, state):
+        state.hidden_states_after_attn = self.forward_core(
+            state.pop("attn_intermediate_state")
+        )
+
+    def forward_prepare(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
-    ) -> torch.Tensor:
+    ):
         if hidden_states.shape[0] == 0:
             assert (
                 not self.o_proj.reduce_results
             ), "short-circuiting allreduce will lead to hangs"
+            return hidden_states, forward_batch, None
+
+        attn_forward_method = self.dispatch_attn_forward_method(forward_batch)
+        fn = {
+            AttnForwardMethod.MHA: self.forward_normal_prepare,
+            AttnForwardMethod.MHA_CHUNKED_KV: self.forward_normal_chunked_kv_prepare,
+            AttnForwardMethod.MLA: self.forward_absorb_prepare,
+            AttnForwardMethod.MLA_FUSED_ROPE: self.forward_absorb_fused_mla_rope_prepare,
+        }[attn_forward_method]
+        inner_state = fn(positions, hidden_states, forward_batch, zero_allocator)
+        return None, forward_batch, inner_state
+
+    def forward_core(self, intermediate_state):
+        hidden_states, forward_batch, inner_state = intermediate_state
+        if inner_state is None:
             return hidden_states
 
         attn_forward_method = self.dispatch_attn_forward_method(forward_batch)
+        fn = {
+            AttnForwardMethod.MHA: self.forward_normal_core,
+            AttnForwardMethod.MHA_CHUNKED_KV: self.forward_normal_chunked_kv_core,
+            AttnForwardMethod.MLA: self.forward_absorb_core,
+            AttnForwardMethod.MLA_FUSED_ROPE: self.forward_absorb_fused_mla_rope_core,
+        }[attn_forward_method]
+        return fn(*inner_state)
 
-        if attn_forward_method == AttnForwardMethod.MHA:
-            return self.forward_normal(positions, hidden_states, forward_batch)
-        elif attn_forward_method == AttnForwardMethod.MHA_CHUNKED_KV:
-            return self.forward_normal_chunked_kv(
-                positions, hidden_states, forward_batch
-            )
-        else:
-            if _is_hip:
-                if (
-                    self.rocm_fused_decode_mla
-                    and forward_batch.forward_mode.is_decode()
-                ):
-                    return self.forward_absorb_fused_mla_rope(
-                        positions, hidden_states, forward_batch
-                    )
-                else:
-                    return self.forward_absorb(
-                        positions, hidden_states, forward_batch, zero_allocator
-                    )
-            else:
-                return self.forward_absorb(
-                    positions, hidden_states, forward_batch, zero_allocator
-                )
-
-    def forward_normal(
+    def forward_normal_prepare(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-    ) -> torch.Tensor:
+        zero_allocator: BumpAllocator,
+    ):
         if self.q_lora_rank is not None:
             q, latent_cache = self.fused_qkv_a_proj_with_mqa(hidden_states)[0].split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
@@ -860,18 +883,24 @@ class DeepseekV2AttentionMLA(nn.Module):
         forward_batch.token_to_kv_pool.set_kv_buffer(
             self.attn_mha, forward_batch.out_cache_loc, latent_cache, None
         )
+
+        return q, k, v, forward_batch
+
+    def forward_normal_core(self, q, k, v, forward_batch):
         attn_output = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
         output, _ = self.o_proj(attn_output)
         return output
 
-    def forward_absorb(
+    def forward_absorb_prepare(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
-    ) -> torch.Tensor:
+    ):
+        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+
         if self.q_lora_rank is not None:
             q, latent_cache = self.fused_qkv_a_proj_with_mqa(hidden_states)[0].split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
@@ -879,7 +908,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             k_nope = latent_cache[..., : self.kv_lora_rank]
 
             # overlap qk norm
-            if self.alt_stream is not None and torch.cuda.is_current_stream_capturing():
+            if self.alt_stream is not None and get_is_capture_mode():
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
                 q = self.q_a_layernorm(q)
@@ -938,6 +967,11 @@ class DeepseekV2AttentionMLA(nn.Module):
         q_nope_out = q_nope_out.transpose(0, 1)
         q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
+        return q_pe, k_pe, q_nope_out, k_nope, forward_batch, zero_allocator
+
+    def forward_absorb_core(
+        self, q_pe, k_pe, q_nope_out, k_nope, forward_batch, zero_allocator
+    ):
         if self.attention_backend == "fa3" or self.attention_backend == "flashinfer":
             attn_output = self.attn_mqa(
                 q_nope_out, k_nope, k_nope, forward_batch, q_rope=q_pe, k_rope=k_pe
@@ -990,13 +1024,13 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         return output
 
-    def forward_absorb_fused_mla_rope(
+    def forward_absorb_fused_mla_rope_prepare(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
-    ) -> torch.Tensor:
+    ):
         enable_rope_fusion = (
             os.getenv("SGLANG_FUSED_MLA_ENABLE_ROPE_FUSION", "1") == "1"
         )
@@ -1085,6 +1119,44 @@ class DeepseekV2AttentionMLA(nn.Module):
         )
         val_cache_buf = key_cache_buf[..., : self.kv_lora_rank]
 
+        return (
+            q_input,
+            key_cache_buf,
+            val_cache_buf,
+            attn_output,
+            kv_indptr,
+            kv_indices,
+            k_pe_output,
+            cos_sin_cache,
+            positions,
+            attn_logits,
+            num_kv_split,
+            sm_scale,
+            enable_rope_fusion,
+            k_input,
+            forward_batch,
+            zero_allocator,
+        )
+
+    def forward_absorb_fused_mla_rope_core(
+        self,
+        q_input,
+        key_cache_buf,
+        val_cache_buf,
+        attn_output,
+        kv_indptr,
+        kv_indices,
+        k_pe_output,
+        cos_sin_cache,
+        positions,
+        attn_logits,
+        num_kv_split,
+        sm_scale,
+        enable_rope_fusion,
+        k_input,
+        forward_batch,
+        zero_allocator,
+    ):
         decode_attention_fwd_grouped_rope(
             q_input,
             key_cache_buf,
@@ -1191,12 +1263,13 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         return accum_output
 
-    def forward_normal_chunked_kv(
+    def forward_normal_chunked_kv_prepare(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-    ) -> torch.Tensor:
+        zero_allocator: BumpAllocator,
+    ):
         # In normal mha, the k and v tensors will become overly large when the prefix length is long.
         # To avoid this, we split the kv cache into chunks and process them one after another.
         # Since mha is compute friendly, the for loop induced here will not introduce significant overhead.
@@ -1239,6 +1312,9 @@ class DeepseekV2AttentionMLA(nn.Module):
             self.attn_mha, forward_batch.out_cache_loc, latent_cache, None
         )
 
+        return q, k, v, forward_batch
+
+    def forward_normal_chunked_kv_core(self, q, k, v, forward_batch):
         # Do mha for extended part without prefix
         forward_batch.set_attn_attend_prefix_cache(False)
         attn_output, lse = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
@@ -1365,11 +1441,13 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
-        hidden_states = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-            forward_batch=forward_batch,
-            zero_allocator=zero_allocator,
+        hidden_states = self.self_attn.forward_core(
+            self.self_attn.forward_prepare(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+                zero_allocator=zero_allocator,
+            )
         )
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
