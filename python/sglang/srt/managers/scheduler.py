@@ -582,6 +582,8 @@ class Scheduler(
                 gloo_group=self.attn_tp_cpu_group,
                 req_to_metadata_buffer_idx_allocator=req_to_metadata_buffer_idx_allocator,
                 metadata_buffers=metadata_buffers,
+                scheduler=self,
+                tree_cache=self.tree_cache,
             )
 
             # The decode requests pending for pre-allocation
