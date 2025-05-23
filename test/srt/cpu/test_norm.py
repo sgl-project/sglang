@@ -43,7 +43,6 @@ class TestNorm(CustomTestCase):
         weight = torch.randn(hidden_size, dtype=dtype)
         variance_epsilon = 1e-6
 
-        # TEST: rmsnorm
         out = rmsnorm(x, weight, variance_epsilon)
         ref_out = self._forward_native(x, weight, variance_epsilon)
 
