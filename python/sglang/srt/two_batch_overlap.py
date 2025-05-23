@@ -420,7 +420,7 @@ class MaybeTboDeepEPDispatcher:
             DeepEPDispatcher(**kwargs) for _ in range(num_inner_dispatchers)
         ]
 
-    def _execute(self, name, tbo_subbatch_index: Optional[int], **kwargs):
+    def _execute(self, name, tbo_subbatch_index: Optional[int] = None, **kwargs):
         return getattr(self._inners[tbo_subbatch_index or 0], name)(**kwargs)
 
     def dispatch(self, **kwargs):
