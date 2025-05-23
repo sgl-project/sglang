@@ -67,7 +67,7 @@ class Phi4MMImageProcessor(BaseMultimodalProcessor):
         input_ids = res["input_ids"].flatten()
         image_offsets = self.get_mm_items_offset(
             input_ids=input_ids,
-            mm_token_id=self._IMAGE_SPECIAL_TOKEN_ID,
+            mm_token_id=_IMAGE_SPECIAL_TOKEN_ID,
         )
 
         items = [
