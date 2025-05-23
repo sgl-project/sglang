@@ -3,18 +3,28 @@
 
 import unittest
 from io import BytesIO
-from typing import List
+from typing import List, Optional
 
 import numpy as np
 import requests
 import torch
 import torch.nn.functional as F
 from PIL import Image
-from transformers import AutoModel, AutoProcessor, AutoTokenizer
+from transformers import (
+    AutoModel,
+    AutoProcessor,
+    AutoTokenizer,
+    Gemma3ForConditionalGeneration,
+    Qwen2_5_VLForConditionalGeneration,
+)
 
+from sglang import Engine
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.conversation import generate_chat_conv
-from sglang.srt.managers.mm_utils import embed_mm_inputs
+from sglang.srt.managers.mm_utils import embed_mm_inputs, init_embedding_cache
+from sglang.srt.managers.multimodal_processors.base_processor import (
+    BaseMultimodalProcessor,
+)
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -100,7 +110,7 @@ class VisionLLMLogitsBase(unittest.IsolatedAsyncioTestCase):
 
         np.testing.assert_allclose(hf_np, sg_np)
 
-    def get_processor_output(self):
+    def get_completion_request(self) -> ChatCompletionRequest:
         json_str = f"""
         {{
   "model": "{self.model_path}",
@@ -116,7 +126,7 @@ class VisionLLMLogitsBase(unittest.IsolatedAsyncioTestCase):
         }},
         {{
           "type": "text",
-          "text": "Whats in this picture?"
+          "text": "What's in this picture?"
         }}
       ]
     }}
@@ -124,10 +134,12 @@ class VisionLLMLogitsBase(unittest.IsolatedAsyncioTestCase):
 }}
         """
 
-        req = ChatCompletionRequest.model_validate_json(json_str)
+        return ChatCompletionRequest.model_validate_json(json_str)
 
+    def get_processor_output(self, req: Optional[ChatCompletionRequest] = None):
+        if req is None:
+            req = self.get_completion_request()
         conv = generate_chat_conv(req, template_name=self.chat_template)
-
         text = conv.get_prompt()
 
         # Process inputs using processor
@@ -147,6 +159,8 @@ class VisionLLMLogitsBase(unittest.IsolatedAsyncioTestCase):
             gpu_id=0,
             tp_rank=0,
             tp_size=1,
+            pp_rank=0,
+            pp_size=1,
             nccl_port=12435,
             server_args=ServerArgs(
                 model_path=self.model_path,
@@ -177,6 +191,7 @@ class TestMiniCPMVLogits(VisionLLMLogitsBase):
             .eval()
             .to(cls.device)
         )
+        init_embedding_cache(0)
 
     async def test_vlm_embedding_output(self):
         """
@@ -215,26 +230,174 @@ class TestMiniCPMVLogits(VisionLLMLogitsBase):
                 for pixel_n, tgt_n in zip(pixel_b, tgt_b):
                     pixel_values_flat += [pixel_n]
                     tgt_sizes_flat += [tgt_n]
+
+            im_start_id, im_end_id = (
+                self.tokenizer.im_start_id,
+                self.tokenizer.im_end_id,
+            )
+            slice_start_id, slice_end_id = (
+                self.tokenizer.slice_start_id,
+                self.tokenizer.slice_end_id,
+            )
+
+            image_offsets = BaseMultimodalProcessor.get_mm_items_offset_by_pair(
+                input_ids=input_ids, mm_start_id=im_start_id, mm_end_id=im_end_id
+            )
+            slice_offsets = BaseMultimodalProcessor.get_mm_items_offset_by_pair(
+                input_ids=input_ids, mm_start_id=slice_start_id, mm_end_id=slice_end_id
+            )
+            image_offsets.extend(slice_offsets)
+            image_offsets = sorted(image_offsets)
+
             sglang_output = embed_mm_inputs(
-                mm_inputs=MultimodalInputs(
-                    mm_items=[
-                        MultimodalDataItem(
-                            pixel_values=pixel_values_flat,
-                            tgt_size=tgt_sizes_flat,
-                            modality=Modality.IMAGE,
-                            pad_value=self.processor.tokenizer.unk_token_id,
-                        )
-                    ]
-                ),
+                mm_inputs_list=[
+                    MultimodalInputs(
+                        mm_items=[
+                            MultimodalDataItem(
+                                pixel_values=pixel_values_flat,
+                                image_offsets=image_offsets,
+                                tgt_size=tgt_sizes_flat,
+                                modality=Modality.IMAGE,
+                                pad_value=self.processor.tokenizer.unk_token_id,
+                            )
+                        ]
+                    ),
+                ],
+                extend_prefix_lens=[0],
+                extend_seq_lens=[input_ids.shape[0]],
                 input_ids=input_ids,
                 input_embedding=model.get_input_embeddings(),
                 image_data_embedding_func=model.get_image_feature,
-                placeholder_token_ids=[
-                    self.processor.tokenizer.unk_token_id,
-                ],
+                placeholder_tokens={
+                    Modality.IMAGE: self.processor.tokenizer.unk_token_id,
+                },
             )
 
         self.compare_outputs(sglang_output, hf_output)
+
+
+class TestQwenVLUnderstandsImage(VisionLLMLogitsBase):
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.model_path = "Qwen/Qwen2.5-VL-3B-Instruct"
+        cls.chat_template = "qwen2-vl"
+        cls.processor = AutoProcessor.from_pretrained(
+            cls.model_path, trust_remote_code=True, use_fast=True
+        )
+        cls.visual = (
+            Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                cls.model_path, torch_dtype=torch.bfloat16
+            )
+            .eval()
+            .visual.to(cls.device)
+        )
+
+    def setUp(self):
+        self.engine = Engine(
+            model_path=self.model_path,
+            chat_template=self.chat_template,
+            device=self.device.type,
+            mem_fraction_static=0.8,
+        )
+
+    def tearDown(self):
+        self.engine.shutdown()
+
+    async def test_qwen_vl_understands_image(self):
+        req = self.get_completion_request()
+        conv = generate_chat_conv(req, template_name=self.chat_template)
+        text = conv.get_prompt()
+        output = await self.engine.async_generate(
+            prompt=text,
+            image_data=[self.main_image],
+            sampling_params=dict(temperature=0.0),
+        )
+        self.assertIn("taxi", output["text"].lower())
+
+    async def test_qwen_vl_understands_precomputed_features(self):
+        req = self.get_completion_request()
+        processor_output = self.get_processor_output(req=req)
+        with torch.inference_mode():
+            precomputed_features = self.visual(
+                processor_output["pixel_values"], processor_output["image_grid_thw"]
+            )
+        output = await self.engine.async_generate(
+            input_ids=processor_output["input_ids"][0].detach().cpu().tolist(),
+            image_data=[
+                dict(
+                    modality="IMAGE",
+                    image_grid_thws=processor_output["image_grid_thw"],
+                    precomputed_features=precomputed_features,
+                )
+            ],
+            sampling_params=dict(temperature=0.0),
+        )
+        self.assertIn("taxi", output["text"].lower())
+
+
+class TestGemmaUnderstandsImage(VisionLLMLogitsBase):
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.model_path = "google/gemma-3-4b-it"
+        cls.chat_template = "gemma-it"
+        cls.processor = AutoProcessor.from_pretrained(
+            cls.model_path, trust_remote_code=True, use_fast=True
+        )
+        model = Gemma3ForConditionalGeneration.from_pretrained(
+            cls.model_path, torch_dtype=torch.bfloat16
+        )
+        cls.vision_tower = model.vision_tower.eval().to(cls.device)
+        cls.mm_projector = model.multi_modal_projector.eval().to(cls.device)
+
+    @classmethod
+    def visual(cls, pixel_values):
+        vision_outputs = cls.vision_tower(pixel_values=pixel_values).last_hidden_state
+        image_features = cls.mm_projector(vision_outputs)
+        return image_features
+
+    def setUp(self):
+        self.engine = Engine(
+            model_path=self.model_path,
+            chat_template=self.chat_template,
+            device=self.device.type,
+            mem_fraction_static=0.5,
+            enable_multimodal=True,
+        )
+
+    def tearDown(self):
+        self.engine.shutdown()
+
+    async def test_gemma_understands_image(self):
+        req = self.get_completion_request()
+        conv = generate_chat_conv(req, template_name=self.chat_template)
+        text = conv.get_prompt()
+        output = await self.engine.async_generate(
+            prompt=text,
+            image_data=[self.main_image],
+            sampling_params=dict(temperature=0.0),
+        )
+        self.assertIn("taxi", output["text"].lower())
+
+    async def test_gemma_understands_precomputed_features(self):
+        req = self.get_completion_request()
+        processor_output = self.get_processor_output(req=req)
+        with torch.inference_mode():
+            precomputed_features = self.visual(processor_output["pixel_values"])
+        output = await self.engine.async_generate(
+            input_ids=processor_output["input_ids"][0].detach().cpu().tolist(),
+            image_data=[
+                dict(
+                    modality="IMAGE",
+                    precomputed_features=precomputed_features,
+                )
+            ],
+            sampling_params=dict(temperature=0.0),
+        )
+        self.assertIn("taxi", output["text"].lower())
 
 
 if __name__ == "__main__":

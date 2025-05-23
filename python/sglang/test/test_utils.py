@@ -8,7 +8,6 @@ import random
 import subprocess
 import threading
 import time
-import traceback
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -25,44 +24,68 @@ from sglang.bench_serving import run_benchmark
 from sglang.global_config import global_config
 from sglang.lang.backend.openai import OpenAI
 from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
-from sglang.srt.utils import get_bool_env_var, kill_process_tree, retry
+from sglang.srt.utils import (
+    get_bool_env_var,
+    is_port_available,
+    kill_process_tree,
+    retry,
+)
 from sglang.test.run_eval import run_eval
 from sglang.utils import get_exception_traceback
 
-DEFAULT_FP8_MODEL_NAME_FOR_TEST = "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8"
-DEFAULT_FP8_MODEL_NAME_FOR_ACCURACY_TEST = "neuralmagic/Meta-Llama-3-8B-Instruct-FP8"
-DEFAULT_FP8_MODEL_NAME_FOR_DYNAMIC_QUANT_ACCURACY_TEST = (
-    "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8-dynamic"
-)
-DEFAULT_FP8_MODEL_NAME_FOR_MODELOPT_QUANT_ACCURACY_TEST = (
-    "nvidia/Llama-3.1-8B-Instruct-FP8"
-)
-
+# General test models
 DEFAULT_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.1-8B-Instruct"
 DEFAULT_SMALL_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.2-1B-Instruct"
 DEFAULT_MOE_MODEL_NAME_FOR_TEST = "mistralai/Mixtral-8x7B-Instruct-v0.1"
 DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST = "Qwen/Qwen1.5-MoE-A2.7B"
-DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST = "Alibaba-NLP/gte-Qwen2-1.5B-instruct"
+
+# MLA test models
 DEFAULT_MLA_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"
 DEFAULT_MLA_FP8_MODEL_NAME_FOR_TEST = "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8"
+DEFAULT_MODEL_NAME_FOR_TEST_MLA = "lmsys/sglang-ci-dsv3-test"
+DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN = "lmsys/sglang-ci-dsv3-test-NextN"
+
+# FP8 models
+DEFAULT_MODEL_NAME_FOR_TEST_FP8 = "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8"
+DEFAULT_MODEL_NAME_FOR_ACCURACY_TEST_FP8 = "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8"
+DEFAULT_MODEL_NAME_FOR_DYNAMIC_QUANT_ACCURACY_TEST_FP8 = (
+    "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8-dynamic"
+)
+DEFAULT_MODEL_NAME_FOR_MODELOPT_QUANT_ACCURACY_TEST_FP8 = (
+    "nvidia/Llama-3.1-8B-Instruct-FP8"
+)
+
+# EAGLE
+DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST = "meta-llama/Llama-2-7b-chat-hf"
+DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST = "lmsys/sglang-EAGLE-llama2-chat-7B"
+DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3 = "jamesliu1/sglang-EAGLE3-Llama-3.1-Instruct-8B"
+
+# Other use cases
+DEFAULT_MODEL_NAME_FOR_TEST_LOCAL_ATTENTION = (
+    "meta-llama/Llama-4-Scout-17B-16E-Instruct"
+)
+DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST = "Alibaba-NLP/gte-Qwen2-1.5B-instruct"
 DEFAULT_REASONING_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
+DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-V3-0324"
 DEFAULT_AWQ_MOE_MODEL_NAME_FOR_TEST = (
     "hugging-quants/Mixtral-8x7B-Instruct-v0.1-AWQ-INT4"
 )
-DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 1000
+DEFAULT_ENABLE_THINKING_MODEL_NAME_FOR_TEST = "Qwen/Qwen3-30B-A3B"
+
+# Nightly tests
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1 = "meta-llama/Llama-3.1-8B-Instruct,mistralai/Mistral-7B-Instruct-v0.3,deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct,google/gemma-2-27b-it"
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2 = "meta-llama/Llama-3.1-70B-Instruct,mistralai/Mixtral-8x7B-Instruct-v0.1,Qwen/Qwen2-57B-A14B-Instruct"
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1 = "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8,neuralmagic/Mistral-7B-Instruct-v0.3-FP8,neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8,neuralmagic/gemma-2-2b-it-FP8"
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2 = "neuralmagic/Meta-Llama-3.1-70B-Instruct-FP8,neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8,neuralmagic/Qwen2-72B-Instruct-FP8,neuralmagic/Qwen2-57B-A14B-Instruct-FP8,neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8"
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_QUANT_TP1 = "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4,hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4,hugging-quants/Mixtral-8x7B-Instruct-v0.1-AWQ-INT4"
 DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN = "Qwen/Qwen2.5-1.5B-Instruct"
-DEFAULT_SMALL_VLM_MODEL_NAME = "Qwen/Qwen2-VL-2B"
-
-DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST = "meta-llama/Llama-2-7b-chat-hf"
-DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST = "lmsys/sglang-EAGLE-llama2-chat-7B"
+DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST = "Qwen/Qwen2.5-VL-3B-Instruct"
+DEFAULT_VLM_CHAT_TEMPLATE_FOR_TEST = "qwen2-vl"
 
 DEFAULT_IMAGE_URL = "https://github.com/sgl-project/sglang/blob/main/test/lang/example_image.png?raw=true"
 DEFAULT_VIDEO_URL = "https://raw.githubusercontent.com/EvolvingLMMs-Lab/sglang/dev/onevision_local/assets/jobs.mp4"
+
+DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 1000
 
 
 def is_in_ci():
@@ -96,6 +119,17 @@ def call_generate_lightllm(prompt, temperature, max_tokens, stop=None, url=None)
     assert res.status_code == 200
     pred = res.json()["generated_text"][0]
     return pred
+
+
+def find_available_port(base_port: int):
+    port = base_port + random.randint(100, 1000)
+    while True:
+        if is_port_available(port):
+            return port
+        if port < 60000:
+            port += 42
+        else:
+            port -= 43
 
 
 def call_generate_vllm(prompt, temperature, max_tokens, stop=None, n=1, url=None):
@@ -361,12 +395,12 @@ def popen_launch_server(
     other_args: list[str] = (),
     env: Optional[dict] = None,
     return_stdout_stderr: Optional[tuple] = None,
-    pd_seperated: bool = False,
+    pd_separated: bool = False,
 ):
     _, host, port = base_url.split(":")
     host = host[2:]
 
-    if pd_seperated:
+    if pd_separated:
         command = "sglang.launch_pd_server"
     else:
         command = "sglang.launch_server"
@@ -380,7 +414,7 @@ def popen_launch_server(
         *[str(x) for x in other_args],
     ]
 
-    if pd_seperated:
+    if pd_separated:
         command.extend(
             [
                 "--lb-host",
@@ -415,9 +449,9 @@ def popen_launch_server(
     else:
         process = subprocess.Popen(command, stdout=None, stderr=None, env=env)
 
-    start_time = time.time()
+    start_time = time.perf_counter()
     with requests.Session() as session:
-        while time.time() - start_time < timeout:
+        while time.perf_counter() - start_time < timeout:
             try:
                 headers = {
                     "Content-Type": "application/json; charset=utf-8",
@@ -434,12 +468,55 @@ def popen_launch_server(
 
             return_code = process.poll()
             if return_code is not None:
-                raise Exception(f"Server unexpectedly exits ({return_code=}).")
+                raise Exception(
+                    f"Server unexpectedly exits ({return_code=}). Usually there will be error logs describing the cause far above this line."
+                )
 
             time.sleep(10)
 
     kill_process_tree(process.pid)
     raise TimeoutError("Server failed to start within the timeout period.")
+
+
+def popen_launch_pd_server(
+    model: str,
+    base_url: str,
+    timeout: float,
+    api_key: Optional[str] = None,
+    other_args: list[str] = (),
+    env: Optional[dict] = None,
+):
+    _, host, port = base_url.split(":")
+    host = host[2:]
+
+    command = "sglang.launch_server"
+
+    command = [
+        "python3",
+        "-m",
+        command,
+        "--model-path",
+        model,
+        *[str(x) for x in other_args],
+    ]
+
+    command.extend(
+        [
+            "--host",
+            host,
+            "--port",
+            port,
+        ]
+    )
+
+    if api_key:
+        command += ["--api-key", api_key]
+
+    print(f"command={' '.join(command)}")
+
+    process = subprocess.Popen(command, stdout=None, stderr=None, env=env)
+
+    return process
 
 
 def run_with_timeout(
@@ -473,10 +550,10 @@ class TestFile:
 
 
 def run_unittest_files(files: List[TestFile], timeout_per_file: float):
-    tic = time.time()
+    tic = time.perf_counter()
     success = True
 
-    for file in files:
+    for i, file in enumerate(files):
         filename, estimated_time = file.name, file.estimated_time
         process = None
 
@@ -484,17 +561,20 @@ def run_unittest_files(files: List[TestFile], timeout_per_file: float):
             nonlocal process
 
             filename = os.path.join(os.getcwd(), filename)
-            print(f".\n.\nBegin:\npython3 {filename}\n.\n.\n", flush=True)
-            tic = time.time()
+            print(
+                f".\n.\nBegin ({i}/{len(files) - 1}):\npython3 {filename}\n.\n.\n",
+                flush=True,
+            )
+            tic = time.perf_counter()
 
             process = subprocess.Popen(
                 ["python3", filename], stdout=None, stderr=None, env=os.environ
             )
             process.wait()
-            elapsed = time.time() - tic
+            elapsed = time.perf_counter() - tic
 
             print(
-                f".\n.\nEnd:\n{filename=}, {elapsed=:.0f}, {estimated_time=}\n.\n.\n",
+                f".\n.\nEnd ({i}/{len(files) - 1}):\n{filename=}, {elapsed=:.0f}, {estimated_time=}\n.\n.\n",
                 flush=True,
             )
             return process.returncode
@@ -517,9 +597,9 @@ def run_unittest_files(files: List[TestFile], timeout_per_file: float):
             break
 
     if success:
-        print(f"Success. Time elapsed: {time.time() - tic:.2f}s", flush=True)
+        print(f"Success. Time elapsed: {time.perf_counter() - tic:.2f}s", flush=True)
     else:
-        print(f"Fail. Time elapsed: {time.time() - tic:.2f}s", flush=True)
+        print(f"Fail. Time elapsed: {time.perf_counter() - tic:.2f}s", flush=True)
 
     return 0 if success else -1
 
@@ -542,7 +622,7 @@ def get_benchmark_args(
     disable_stream=False,
     disable_ignore_eos=False,
     seed: int = 0,
-    pd_seperated: bool = False,
+    pd_separated: bool = False,
 ):
     return SimpleNamespace(
         backend="sglang",
@@ -572,7 +652,7 @@ def get_benchmark_args(
         profile=None,
         lora_name=None,
         prompt_suffix="",
-        pd_seperated=pd_seperated,
+        pd_separated=pd_separated,
     )
 
 
@@ -636,7 +716,7 @@ def run_bench_serving_multi(
     other_server_args,
     benchmark_args,
     need_warmup=False,
-    pd_seperated=False,
+    pd_separated=False,
 ):
     # Launch the server
     process = popen_launch_server(
@@ -644,7 +724,7 @@ def run_bench_serving_multi(
         base_url,
         timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
         other_args=other_server_args,
-        pd_seperated=pd_seperated,
+        pd_separated=pd_separated,
     )
 
     # run benchmark for all
@@ -694,6 +774,72 @@ def run_bench_one_batch(model, other_args):
         kill_process_tree(process.pid)
 
     return output_throughput
+
+
+def run_bench_offline_throughput(model, other_args):
+    command = [
+        "python3",
+        "-m",
+        "sglang.bench_offline_throughput",
+        "--num-prompts",
+        "1",
+        "--dataset-name",
+        "random",
+        "--random-input-len",
+        "256",
+        "--random-output-len",
+        "256",
+        "--model-path",
+        model,
+        *[str(x) for x in other_args],
+    ]
+
+    print(f"{command=}")
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    try:
+        stdout, stderr = process.communicate()
+        output = stdout.decode()
+        error = stderr.decode()
+        print(f"Output: {output}", flush=True)
+        print(f"Error: {error}", flush=True)
+
+        output_throughput = -1
+        for line in output.split("\n"):
+            if "Last generation throughput (tok/s):" in line:
+                output_throughput = float(line.split(":")[-1])
+    finally:
+        kill_process_tree(process.pid)
+
+    return output_throughput
+
+
+def run_bench_one_batch_server(
+    model,
+    base_url,
+    server_args,
+    bench_args,
+    other_server_args,
+    simulate_spec_acc_lens=None,
+):
+    from sglang.bench_one_batch_server import run_benchmark
+
+    if simulate_spec_acc_lens is not None:
+        env = {**os.environ, "SIMULATE_ACC_LEN": str(simulate_spec_acc_lens)}
+    else:
+        env = None
+
+    process = popen_launch_server(
+        model,
+        base_url,
+        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+        other_args=other_server_args,
+        env=env,
+    )
+    try:
+        run_benchmark(server_args=server_args, bench_args=bench_args)
+    finally:
+        kill_process_tree(process.pid)
 
 
 def lcs(X, Y):

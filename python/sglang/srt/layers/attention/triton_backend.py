@@ -10,6 +10,7 @@ import triton.language as tl
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import get_bool_env_var, get_device_core_count
 
@@ -154,6 +155,9 @@ class TritonAttnBackend(AttentionBackend):
         seq_lens: torch.Tensor,
     ):
         num_token, num_seq = num_kv_splits.shape[0], seq_lens.shape[0]
+        # NOTE(alcanderian): Considering speculative_decodeing,
+        # num_kv_splits.shape[0] will be topk * real_num_token.
+        # And the real_num_token is num_seq in decoding phase.
         num_group = num_token // num_seq
 
         assert (
@@ -528,6 +532,10 @@ class TritonAttnBackend(AttentionBackend):
                 layer, forward_batch.out_cache_loc, k, v
             )
 
+        causal = True
+        if layer.attn_type == AttentionType.ENCODER_ONLY:
+            causal = False
+
         self.extend_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             k.contiguous(),
@@ -539,6 +547,7 @@ class TritonAttnBackend(AttentionBackend):
             self.forward_metadata.kv_indptr,
             self.forward_metadata.kv_indices,
             self.forward_metadata.custom_mask,
+            causal,
             self.forward_metadata.mask_indptr,
             self.forward_metadata.max_extend_len,
             layer.scaling,

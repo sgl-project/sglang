@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from sglang.srt.custom_op import scaled_fp8_quant
+from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.utils import is_cuda
 
 

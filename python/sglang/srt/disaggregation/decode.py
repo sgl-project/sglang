@@ -21,22 +21,34 @@ Life cycle of a request in the decode server
 from __future__ import annotations
 
 import logging
+import os
+from collections import deque
 from dataclasses import dataclass
+from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import numpy as np
 import torch
 from torch.distributed import ProcessGroup
 
-from sglang.srt.disaggregation.conn import KVArgs, KVManager, KVPoll, KVReceiver
+from sglang.srt.disaggregation.base import BaseKVManager, BaseKVReceiver, KVArgs, KVPoll
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
+    FakeBootstrapHost,
+    KVClassType,
+    MetadataBuffers,
     ReqToMetadataIdxAllocator,
+    TransferBackend,
+    get_kv_class,
+    is_mla_backend,
+    kv_to_page_indices,
     poll_and_all_reduce,
+    prepare_abort,
 )
+from sglang.srt.managers.schedule_batch import FINISH_ABORT
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPoolAllocator
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
 logger = logging.getLogger(__name__)
@@ -51,7 +63,7 @@ if TYPE_CHECKING:
 @dataclass
 class DecodeRequest:
     req: Req
-    kv_receiver: KVReceiver
+    kv_receiver: BaseKVReceiver
     waiting_for_input: bool = False
     metadata_buffer_index: int = -1
 
@@ -65,9 +77,9 @@ class DecodePreallocQueue:
         self,
         req_to_token_pool: ReqToTokenPool,
         token_to_kv_pool_allocator: TokenToKVPoolAllocator,
+        draft_token_to_kv_pool: Optional[KVCache],
         req_to_metadata_buffer_idx_allocator: ReqToMetadataIdxAllocator,
-        metadata_buffers: List[torch.Tensor],
-        aux_dtype: torch.dtype,
+        metadata_buffers: MetadataBuffers,
         scheduler: Scheduler,
         transfer_queue: DecodeTransferQueue,
         tree_cache: BasePrefixCache,
@@ -75,11 +87,13 @@ class DecodePreallocQueue:
         tp_rank: int,
         tp_size: int,
         bootstrap_port: int,
+        transfer_backend: TransferBackend,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.token_to_kv_pool = token_to_kv_pool_allocator.get_kvcache()
-        self.aux_dtype = aux_dtype
+        self.draft_token_to_kv_pool = draft_token_to_kv_pool
+        self.is_mla_backend = is_mla_backend(self.token_to_kv_pool)
         self.metadata_buffers = metadata_buffers
         self.req_to_metadata_buffer_idx_allocator = req_to_metadata_buffer_idx_allocator
         self.scheduler = scheduler
@@ -90,42 +104,60 @@ class DecodePreallocQueue:
         self.tp_size = tp_size
         self.bootstrap_port = bootstrap_port
 
-        self.num_reserved_decode_tokens = 512
+        self.num_reserved_decode_tokens = int(
+            os.environ.get("SGLANG_NUM_RESERVED_DECODE_TOKENS", "512")
+        )
 
         # Queue for requests pending pre-allocation
         self.queue: List[DecodeRequest] = []
+        self.transfer_backend = transfer_backend
         self.kv_manager = self._init_kv_manager()
 
-    def _init_kv_manager(self) -> KVManager:
+    def _init_kv_manager(self) -> BaseKVManager:
         kv_args = KVArgs()
         kv_args.engine_rank = self.tp_rank
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )
 
+        if self.draft_token_to_kv_pool is not None:
+            draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
+                self.draft_token_to_kv_pool.get_contiguous_buf_infos()
+            )
+            kv_data_ptrs += draft_kv_data_ptrs
+            kv_data_lens += draft_kv_data_lens
+            kv_item_lens += draft_kv_item_lens
+
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
 
-        kv_args.aux_data_ptrs = [
-            output_id_tensor.data_ptr() for output_id_tensor in self.metadata_buffers
-        ]
-        kv_args.aux_data_lens = [
-            metadata_buffer.nbytes for metadata_buffer in self.metadata_buffers
-        ]
-        kv_args.aux_item_lens = [
-            metadata_buffer[0].nbytes for metadata_buffer in self.metadata_buffers
-        ]
-        kv_args.ib_device = "mock-ib-device"
-        kv_manager = KVManager(kv_args, DisaggregationMode("decode"))
+        kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
+            self.metadata_buffers.get_buf_infos()
+        )
+        kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
+        kv_args.gpu_id = self.scheduler.gpu_id
+        kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
+        kv_manager = kv_manager_class(
+            kv_args,
+            DisaggregationMode.DECODE,
+            self.scheduler.server_args,
+            self.is_mla_backend,
+        )
         return kv_manager
 
     def add(self, req: Req) -> None:
         """Add a request to the pending queue."""
-
-        kv_receiver = KVReceiver(
+        if req.bootstrap_host == FakeBootstrapHost:
+            # Fake transfer for warmup reqs
+            kv_receiver_class = get_kv_class(TransferBackend.FAKE, KVClassType.RECEIVER)
+        else:
+            kv_receiver_class = get_kv_class(
+                self.transfer_backend, KVClassType.RECEIVER
+            )
+        kv_receiver = kv_receiver_class(
             mgr=self.kv_manager,
-            bootstrap_addr=f"{req.bootstrap_host}:{self.bootstrap_port}",
+            bootstrap_addr=f"{req.bootstrap_host}:{req.bootstrap_port}",
             bootstrap_room=req.bootstrap_room,
         )
         self.queue.append(DecodeRequest(req=req, kv_receiver=kv_receiver))
@@ -152,7 +184,17 @@ class DecodePreallocQueue:
             elif poll == KVPoll.WaitingForInput:
                 decode_req.waiting_for_input = True
             elif poll == KVPoll.Failed:
-                raise Exception("Handshake failed")
+                error_message = f"Decode handshake failed for request rank={self.tp_rank} {decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
+                try:
+                    decode_req.kv_receiver.failure_exception()
+                except Exception as e:
+                    error_message += f" with exception {e}"
+                logger.error(error_message)
+                prepare_abort(
+                    decode_req.req,
+                    error_message,
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
 
     def pop_preallocated(self) -> List[DecodeRequest]:
         """Pop the preallocated requests from the pending queue (FIFO)."""
@@ -162,7 +204,18 @@ class DecodePreallocQueue:
         indices_to_remove = set()
         allocatable_tokens = self._allocatable_tokens()
 
+        # First, remove all failed requests from the queue
         for i, decode_req in enumerate(self.queue):
+            if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
+                self.scheduler.stream_output(
+                    [decode_req.req], decode_req.req.return_logprob
+                )
+                indices_to_remove.add(i)
+
+        for i, decode_req in enumerate(self.queue):
+            if i in indices_to_remove:
+                continue
+
             if not decode_req.waiting_for_input:
                 continue
 
@@ -195,7 +248,10 @@ class DecodePreallocQueue:
                 self.req_to_metadata_buffer_idx_allocator.alloc()
             )
             assert decode_req.metadata_buffer_index is not None
-            decode_req.kv_receiver.init(kv_indices, decode_req.metadata_buffer_index)
+            page_indices = kv_to_page_indices(
+                kv_indices, self.token_to_kv_pool_allocator.page_size
+            )
+            decode_req.kv_receiver.init(page_indices, decode_req.metadata_buffer_index)
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
 
@@ -235,10 +291,30 @@ class DecodePreallocQueue:
         assert req_pool_indices is not None
 
         req.req_pool_idx = req_pool_indices[0]
-        kv_loc = self.token_to_kv_pool_allocator.alloc(
-            len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
-        )
-
+        if self.token_to_kv_pool_allocator.page_size == 1:
+            kv_loc = self.token_to_kv_pool_allocator.alloc(
+                len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+            )
+        else:
+            num_tokens = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+            kv_loc = self.token_to_kv_pool_allocator.alloc_extend(
+                prefix_lens=torch.tensor(
+                    [0],
+                    dtype=torch.int64,
+                    device=self.token_to_kv_pool_allocator.device,
+                ),
+                seq_lens=torch.tensor(
+                    [num_tokens],
+                    dtype=torch.int64,
+                    device=self.token_to_kv_pool_allocator.device,
+                ),
+                last_loc=torch.tensor(
+                    [-1],
+                    dtype=torch.int64,
+                    device=self.token_to_kv_pool_allocator.device,
+                ),
+                extend_num_tokens=num_tokens,
+            )
         assert kv_loc is not None
 
         self.req_to_token_pool.write((req.req_pool_idx, slice(0, len(kv_loc))), kv_loc)
@@ -259,20 +335,24 @@ class DecodeTransferQueue:
         self,
         gloo_group: ProcessGroup,
         req_to_metadata_buffer_idx_allocator: ReqToMetadataIdxAllocator,
-        metadata_buffers: torch.Tensor,
+        metadata_buffers: MetadataBuffers,
+        scheduler: Scheduler,
+        tree_cache: BasePrefixCache,
     ):
         self.queue: List[DecodeRequest] = []
         self.gloo_group = gloo_group
         self.req_to_metadata_buffer_idx_allocator = req_to_metadata_buffer_idx_allocator
         self.metadata_buffers = metadata_buffers
+        self.scheduler = scheduler
+        self.tree_cache = tree_cache
 
-    def add(self, req_conn: DecodeRequest) -> None:
-        self.queue.append(req_conn)
+    def add(self, decode_req: DecodeRequest) -> None:
+        self.queue.append(decode_req)
 
-    def extend(self, req_conns) -> None:
-        self.queue.extend(req_conns)
+    def extend(self, decode_reqs: List[DecodeRequest]) -> None:
+        self.queue.extend(decode_reqs)
 
-    def pop_transferred(self) -> List[Req]:
+    def pop_transferred(self) -> List[DecodeRequest]:
         if not self.queue:
             return []
 
@@ -284,17 +364,55 @@ class DecodeTransferQueue:
         indices_to_remove = set()
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
             if poll == KVPoll.Failed:
-                raise Exception("Transfer failed")
+                error_message = f"Decode transfer failed for request {decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
+                try:
+                    decode_req.kv_receiver.failure_exception()
+                except Exception as e:
+                    error_message += f" with exception {e}"
+                logger.error(error_message)
+                prepare_abort(
+                    decode_req.req,
+                    error_message,
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+                self.scheduler.stream_output(
+                    [decode_req.req], decode_req.req.return_logprob
+                )
+                # unlock the kv cache or it will have memory leak
+                self.tree_cache.cache_finished_req(decode_req.req)
+                indices_to_remove.add(i)
+                continue
             elif poll == KVPoll.Success:
-                # pop and push it to waiting queue
+
                 idx = decode_req.metadata_buffer_index
-                assert len(decode_req.req.output_ids) == 0
-                output_id_buffer = self.metadata_buffers[0]
-                # the last dimension is padded by the same values.
-                output_id = output_id_buffer[idx][0].item()
-                assert len(decode_req.req.output_ids) == 0
-                assert decode_req.req.transferred_output_id is None
-                decode_req.req.transferred_output_id = output_id
+                (
+                    output_id,
+                    output_token_logprobs_val,
+                    output_token_logprobs_idx,
+                    output_top_logprobs_val,
+                    output_top_logprobs_idx,
+                ) = self.metadata_buffers.get_buf(idx)
+
+                decode_req.req.output_ids.append(output_id[0].item())
+
+                if decode_req.req.return_logprob:
+                    decode_req.req.output_token_logprobs_val.append(
+                        output_token_logprobs_val[0].item()
+                    )
+                    decode_req.req.output_token_logprobs_idx.append(
+                        output_token_logprobs_idx[0].item()
+                    )
+                    decode_req.req.output_top_logprobs_val.append(
+                        output_top_logprobs_val[
+                            : decode_req.req.top_logprobs_num
+                        ].tolist()
+                    )
+                    decode_req.req.output_top_logprobs_idx.append(
+                        output_top_logprobs_idx[
+                            : decode_req.req.top_logprobs_num
+                        ].tolist()
+                    )
+
                 transferred_reqs.append(decode_req.req)
                 indices_to_remove.add(i)
             elif poll in [
@@ -318,96 +436,126 @@ class DecodeTransferQueue:
         return transferred_reqs
 
 
-class ScheduleBatchDisaggregationDecodeMixin:
-
-    def prepare_for_prebuilt_extend(self: ScheduleBatch):
-        """
-        Prepare a prebuilt extend by populate metadata
-        Adapted from .prepare_for_extend().
-        """
-
-        self.forward_mode = ForwardMode.EXTEND
-        reqs = self.reqs
-        input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
-        extend_num_tokens = sum(len(ids) for ids in input_ids)
-        seq_lens = []
-        pre_lens = []
-        req_pool_indices = []
-
-        # Pre-calculate total size
-        total_size = sum(req.extend_input_len for req in reqs)
-        out_cache_loc = torch.empty(total_size, dtype=torch.int64, device=self.device)
-
-        # Fill the tensor in one pass
-        offset = 0
-        for i, req in enumerate(reqs):
-            req_pool_indices.append(req.req_pool_idx)
-
-            chunk = self.req_to_token_pool.req_to_token[req.req_pool_idx][
-                : req.extend_input_len
-            ]
-            assert (
-                offset + req.extend_input_len <= total_size
-            ), f"Exceeds total size: offset={offset}, req.extend_input_len={req.extend_input_len}, total_size={total_size}"
-            out_cache_loc[offset : offset + req.extend_input_len] = chunk
-            offset += req.extend_input_len
-
-            pre_len = len(req.prefix_indices)
-            seq_len = len(req.origin_input_ids) + max(0, len(req.output_ids) - 1)
-            seq_lens.append(seq_len)
-            if len(req.output_ids) == 0:
-                assert (
-                    seq_len - pre_len == req.extend_input_len
-                ), f"seq_len={seq_len}, pre_len={pre_len}, req.extend_input_len={req.extend_input_len}"
-
-            req.cached_tokens += pre_len - req.already_computed
-            req.already_computed = seq_len
-            req.is_retracted = False
-            pre_lens.append(pre_len)
-            req.extend_logprob_start_len = 0
-
-        extend_input_logprob_token_ids = None
-
-        # Set fields
-        self.input_ids = torch.tensor(
-            sum(input_ids, []), dtype=torch.int32, device=self.device
-        )
-        self.req_pool_indices = torch.tensor(
-            req_pool_indices, dtype=torch.int64, device=self.device
-        )
-        self.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, device=self.device)
-        self.out_cache_loc = out_cache_loc
-        self.seq_lens_sum = sum(seq_lens)
-        self.extend_num_tokens = extend_num_tokens
-        self.prefix_lens = [len(r.prefix_indices) for r in reqs]
-        self.extend_lens = [r.extend_input_len for r in reqs]
-        self.extend_logprob_start_lens = [r.extend_logprob_start_len for r in reqs]
-        self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
-
-        # Build sampling info
-        self.sampling_info = SamplingBatchInfo.from_schedule_batch(
-            self,
-            self.model_config.vocab_size,
-        )
-
-    def process_prebuilt_extend(
-        self: ScheduleBatch, server_args: ServerArgs, model_config: ModelConfig
-    ):
-        """Assign the buffered last input id to schedule batch"""
-        self.output_ids = []
-        for req in self.reqs:
-            if req.output_ids and len(req.output_ids) > 0:
-                # resumed retracted req
-                self.output_ids.append(req.output_ids[-1])
-            else:
-                assert req.transferred_output_id is not None
-                req.output_ids.append(req.transferred_output_id)
-                self.output_ids.append(req.transferred_output_id)
-            self.tree_cache.cache_unfinished_req(req)
-        self.output_ids = torch.tensor(self.output_ids, device=self.device)
-
-
 class SchedulerDisaggregationDecodeMixin:
+
+    def _prepare_idle_batch_and_run(self, batch, delay_process=False):
+        batch, _ = self.prepare_dp_attn_batch(batch)
+        result = None
+        if batch:
+            result = self.run_batch(batch)
+            if not delay_process:
+                self.process_batch_result(batch, result)
+        return batch, result
+
+    @torch.no_grad()
+    def event_loop_normal_disagg_decode(self: Scheduler):
+        """A normal scheduler loop for decode worker in disaggregation mode."""
+
+        while True:
+            recv_reqs = self.recv_requests()
+            self.process_input_requests(recv_reqs)
+            # polling and allocating kv cache
+            self.process_decode_queue()
+            batch = self.get_next_disagg_decode_batch_to_run()
+            self.cur_batch = batch
+
+            prepare_dp_attn_flag = (
+                self.server_args.enable_dp_attention
+                or self.server_args.enable_sp_layernorm
+            )
+
+            if batch:
+                # Generate fake extend output.
+                if batch.forward_mode.is_extend():
+                    # Note: Logprobs should be handled on the prefill engine.
+                    self.stream_output(
+                        batch.reqs, any(req.return_logprob for req in batch.reqs)
+                    )
+                    if prepare_dp_attn_flag:
+                        self._prepare_idle_batch_and_run(None)
+                else:
+                    if prepare_dp_attn_flag:
+                        self.prepare_dp_attn_batch(batch)
+                    result = self.run_batch(batch)
+                    self.process_batch_result(batch, result)
+            elif prepare_dp_attn_flag:
+                batch, _ = self._prepare_idle_batch_and_run(None)
+
+            if batch is None and (
+                len(self.disagg_decode_transfer_queue.queue)
+                + len(self.disagg_decode_prealloc_queue.queue)
+                == 0
+            ):
+                # When the server is idle, do self-check and re-init some states
+                self.check_memory()
+                self.new_token_ratio = self.init_new_token_ratio
+
+            self.last_batch = batch
+
+    @torch.no_grad()
+    def event_loop_overlap_disagg_decode(self: Scheduler):
+        result_queue = deque()
+        self.last_batch: Optional[ScheduleBatch] = None
+        self.last_batch_in_queue = False  # last batch is modified in-place, so we need another variable to track if it's extend
+
+        while True:
+            recv_reqs = self.recv_requests()
+            self.process_input_requests(recv_reqs)
+            # polling and allocating kv cache
+            self.process_decode_queue()
+            batch = self.get_next_disagg_decode_batch_to_run()
+            self.cur_batch = batch
+            last_batch_in_queue = False
+
+            prepare_dp_attn_flag = (
+                self.server_args.enable_dp_attention
+                or self.server_args.enable_sp_layernorm
+            )
+
+            if batch:
+                # Generate fake extend output.
+                if batch.forward_mode.is_extend():
+                    # Note: Logprobs should be handled on the prefill engine.
+                    self.stream_output(
+                        batch.reqs, any(req.return_logprob for req in batch.reqs)
+                    )
+                    if prepare_dp_attn_flag:
+                        batch_, result = self._prepare_idle_batch_and_run(
+                            None, delay_process=True
+                        )
+                        if batch_:
+                            result_queue.append((batch_.copy(), result))
+                            last_batch_in_queue = True
+                else:
+                    if prepare_dp_attn_flag:
+                        self.prepare_dp_attn_batch(batch)
+                    result = self.run_batch(batch)
+                    result_queue.append((batch.copy(), result))
+                    last_batch_in_queue = True
+            elif prepare_dp_attn_flag:
+                batch, result = self._prepare_idle_batch_and_run(
+                    None, delay_process=True
+                )
+                if batch:
+                    result_queue.append((batch.copy(), result))
+                    last_batch_in_queue = True
+
+            # Process the results of the previous batch but skip if the last batch is extend
+            if self.last_batch and self.last_batch_in_queue:
+                tmp_batch, tmp_result = result_queue.popleft()
+                self.process_batch_result(tmp_batch, tmp_result)
+
+            if batch is None and (
+                len(self.disagg_decode_transfer_queue.queue)
+                + len(self.disagg_decode_prealloc_queue.queue)
+                == 0
+            ):
+                # When the server is idle, do self-check and re-init some states
+                self.check_memory()
+                self.new_token_ratio = self.init_new_token_ratio
+
+            self.last_batch = batch
+            self.last_batch_in_queue = last_batch_in_queue
 
     def get_next_disagg_decode_batch_to_run(
         self: Scheduler,

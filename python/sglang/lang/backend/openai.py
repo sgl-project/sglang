@@ -2,7 +2,7 @@ import dataclasses
 import logging
 import time
 import warnings
-from typing import Callable, List, Optional, Union
+from typing import List, Optional, Union
 
 import numpy as np
 
@@ -161,7 +161,11 @@ class OpenAI(BaseBackend):
                 prompt = s.text_
 
             kwargs = sampling_params.to_openai_kwargs()
-            if self.model_name.startswith("o1") or self.model_name.startswith("o3"):
+            if (
+                self.model_name.startswith("o1")
+                or self.model_name.startswith("o3")
+                or "o1" in self.model_name
+            ):
                 kwargs.pop("max_tokens", None)
             else:
                 kwargs.pop("max_completion_tokens", None)

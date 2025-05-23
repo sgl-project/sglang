@@ -1,0 +1,28 @@
+tasks:
+  - name: sglang-32000-100-concurrency1
+    server_cmd: python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3-0324 --tp 8 --trust-remote-code --disable-radix-cache --max-prefill-tokens 32768
+    client_cmd: python3 -m sglang.bench_serving --dataset-name random --random-range-ratio 1 --random-input-len 32000 --random-output-len 100 --max-concurrency 1 --num-prompts 5 --output-file deepseek_v3_long_context_results.jsonl
+
+  - name: sglang-32000-100-concurrency2
+    server_cmd: python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3-0324 --tp 8 --trust-remote-code --disable-radix-cache --max-prefill-tokens 32768
+    client_cmd: python3 -m sglang.bench_serving --dataset-name random --random-range-ratio 1 --random-input-len 32000 --random-output-len 100 --max-concurrency 2 --num-prompts 10 --output-file deepseek_v3_long_context_results.jsonl
+
+  - name: sglang-32000-100-concurrency4
+    server_cmd: python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3-0324 --tp 8 --trust-remote-code --disable-radix-cache --max-prefill-tokens 32768
+    client_cmd: python3 -m sglang.bench_serving --dataset-name random --random-range-ratio 1 --random-input-len 32000 --random-output-len 100 --max-concurrency 4 --num-prompts 20 --output-file deepseek_v3_long_context_results.jsonl
+
+  - name: sglang-32000-100-concurrency8
+    server_cmd: python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3-0324 --tp 8 --trust-remote-code --disable-radix-cache --max-prefill-tokens 32768
+    client_cmd: python3 -m sglang.bench_serving --dataset-name random --random-range-ratio 1 --random-input-len 32000 --random-output-len 100 --max-concurrency 8 --num-prompts 32 --output-file deepseek_v3_long_context_results.jsonl
+
+  - name: sglang-32000-100-concurrency16
+    server_cmd: python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3-0324 --tp 8 --trust-remote-code --disable-radix-cache --max-prefill-tokens 32768
+    client_cmd: python3 -m sglang.bench_serving --dataset-name random --random-range-ratio 1 --random-input-len 32000 --random-output-len 100 --max-concurrency 16 --num-prompts 48 --output-file deepseek_v3_long_context_results.jsonl
+
+  - name: sglang-32000-100-concurrency24
+    server_cmd: python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3-0324 --tp 8 --trust-remote-code --disable-radix-cache --max-prefill-tokens 32768
+    client_cmd: python3 -m sglang.bench_serving --dataset-name random --random-range-ratio 1 --random-input-len 32000 --random-output-len 100 --max-concurrency 24 --num-prompts 72 --output-file deepseek_v3_long_context_results.jsonl
+
+  - name: sglang-32000-100-concurrency32
+    server_cmd: python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3-0324 --tp 8 --trust-remote-code --disable-radix-cache --max-prefill-tokens 32768
+    client_cmd: python3 -m sglang.bench_serving --dataset-name random --random-range-ratio 1 --random-input-len 32000 --random-output-len 100 --max-concurrency 32 --num-prompts 96 --output-file deepseek_v3_long_context_results.jsonl

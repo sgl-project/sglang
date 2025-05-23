@@ -1,5 +1,4 @@
 import json
-import multiprocessing as mp
 import os
 import random
 import threading
@@ -8,7 +7,6 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from types import SimpleNamespace
-from typing import List, Optional
 
 import numpy as np
 import requests
@@ -18,7 +16,6 @@ import sglang as sgl
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.utils import kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval
-from sglang.test.runners import DEFAULT_PROMPTS, SRTRunner
 from sglang.test.test_utils import (
     DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
     DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
@@ -43,7 +40,7 @@ class TestEAGLEEngine(CustomTestCase):
         "speculative_eagle_topk": 4,
         "speculative_num_draft_tokens": 8,
         "mem_fraction_static": 0.7,
-        "cuda_graph_max_bs": 4,
+        "cuda_graph_max_bs": 5,
     }
     NUM_CONFIGS = 2
 
@@ -100,7 +97,9 @@ class TestEAGLEEngine(CustomTestCase):
 
         print(f"{engine.get_server_info()=}")
 
-        avg_spec_accept_length = engine.get_server_info()["avg_spec_accept_length"]
+        avg_spec_accept_length = engine.get_server_info()["internal_states"][0][
+            "avg_spec_accept_length"
+        ]
         print(f"{avg_spec_accept_length=}")
         self.assertGreater(avg_spec_accept_length, 1.9)
 
@@ -157,7 +156,7 @@ class TestEAGLEEngineTokenMap(TestEAGLEEngine):
         "speculative_num_draft_tokens": 8,
         "speculative_token_map": "thunlp/LLaMA3-Instruct-8B-FR-Spec/freq_32768.pt",
         "mem_fraction_static": 0.7,
-        "cuda_graph_max_bs": 4,
+        "cuda_graph_max_bs": 5,
         "dtype": "float16",
     }
     NUM_CONFIGS = 1
@@ -172,7 +171,7 @@ class TestEAGLE3Engine(TestEAGLEEngine):
         "speculative_eagle_topk": 16,
         "speculative_num_draft_tokens": 64,
         "mem_fraction_static": 0.7,
-        "cuda_graph_max_bs": 4,
+        "cuda_graph_max_bs": 5,
         "dtype": "float16",
     }
     NUM_CONFIGS = 1
@@ -299,7 +298,9 @@ class TestEAGLEServer(CustomTestCase):
         self.assertGreater(metrics["accuracy"], 0.20)
 
         server_info = requests.get(self.base_url + "/get_server_info").json()
-        avg_spec_accept_length = server_info["avg_spec_accept_length"]
+        avg_spec_accept_length = server_info["internal_states"][0][
+            "avg_spec_accept_length"
+        ]
         print(f"{avg_spec_accept_length=}")
 
         speculative_eagle_topk = server_info["speculative_eagle_topk"]
@@ -480,6 +481,41 @@ class TestEAGLEServer(CustomTestCase):
         with ThreadPoolExecutor(8) as executor:
             list(executor.map(self.run_decode, args))
 
+    def test_constrained_decoding(self):
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "Give me a json"},
+        ]
+
+        response = requests.post(
+            self.base_url + "/v1/chat/completions",
+            json={
+                "model": DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
+                "messages": messages,
+                "temperature": 0,
+                "response_format": {"type": "json_object"},
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        res = response.json()
+
+        # Validate response structure
+        self.assertIn("choices", res)
+        self.assertEqual(len(res["choices"]), 1)
+        self.assertIn("message", res["choices"][0])
+        self.assertIn("content", res["choices"][0]["message"])
+
+        # Validate JSON content
+        content_json = res["choices"][0]["message"]["content"]
+        is_valid_json = True
+        try:
+            content = json.loads(content_json)
+            self.assertIsInstance(content, dict)
+        except Exception:
+            print(f"parse JSON failed: {content_json}")
+            is_valid_json = False
+        self.assertTrue(is_valid_json)
+
 
 class TestEAGLERetract(TestEAGLEServer):
     @classmethod
@@ -536,37 +572,6 @@ class TestEAGLEServerTriton(TestEAGLEServer):
                 "--attention-backend",
                 "triton",
                 "--max-running-requests",
-                8,
-            ],
-        )
-
-
-class TestEAGLEServerPageSize(TestEAGLEServer):
-    @classmethod
-    def setUpClass(cls):
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--speculative-algorithm",
-                "EAGLE",
-                "--speculative-draft-model-path",
-                DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
-                "--speculative-num-steps",
-                5,
-                "--speculative-eagle-topk",
-                1,
-                "--speculative-num-draft-tokens",
-                6,
-                "--mem-fraction-static",
-                0.7,
-                "--chunked-prefill-size",
-                128,
-                "--max-running-requests",
-                8,
-                "--page-size",
                 8,
             ],
         )

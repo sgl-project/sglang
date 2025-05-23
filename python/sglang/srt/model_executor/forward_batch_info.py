@@ -31,14 +31,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import IntEnum, auto
-from typing import TYPE_CHECKING, List, Optional, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 import torch
 import triton
 import triton.language as tl
 
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
-from sglang.srt.utils import get_compiler_backend
+from sglang.srt.utils import flatten_nested_list, get_compiler_backend
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -58,7 +58,7 @@ class ForwardMode(IntEnum):
     DECODE = auto()
     # Contains both EXTEND and DECODE when doing chunked prefill.
     MIXED = auto()
-    # No sequence to forward. For data parallel attention, some workers wil be IDLE if no sequence are allocated.
+    # No sequence to forward. For data parallel attention, some workers will be IDLE if no sequence are allocated.
     IDLE = auto()
 
     # Used in speculative decoding: verify a batch in the target model.
@@ -78,7 +78,7 @@ class ForwardMode(IntEnum):
             self == ForwardMode.EXTEND
             or self == ForwardMode.MIXED
             or self == ForwardMode.DRAFT_EXTEND
-            or self == self.TARGET_VERIFY
+            or self == ForwardMode.TARGET_VERIFY
         )
 
     def is_decode(self):
@@ -96,15 +96,19 @@ class ForwardMode(IntEnum):
     def is_draft_extend(self):
         return self == ForwardMode.DRAFT_EXTEND
 
+    def is_extend_or_draft_extend_or_mixed(self):
+        return (
+            self == ForwardMode.EXTEND
+            or self == ForwardMode.DRAFT_EXTEND
+            or self == ForwardMode.MIXED
+        )
+
     def is_cuda_graph(self):
         return (
             self == ForwardMode.DECODE
             or self == ForwardMode.TARGET_VERIFY
             or self == ForwardMode.IDLE
         )
-
-    def is_extend_or_draft_extend(self):
-        return self == ForwardMode.EXTEND or self == ForwardMode.DRAFT_EXTEND
 
     def is_dummy_first(self):
         return self == ForwardMode.DUMMY_FIRST
@@ -177,6 +181,28 @@ class ForwardBatch:
     extend_logprob_start_lens_cpu: Optional[List[int]] = None
     extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
 
+    # For MLA chunked prefix cache used in chunked prefill
+    # Tell attention backend whether the kv cache needs to be attended in current pass
+    attn_attend_prefix_cache: Optional[bool] = None
+    # Number of prefix cache chunks
+    num_prefix_chunks: Optional[int] = None
+    # Index of current chunk, used by attention backend
+    prefix_chunk_idx: Optional[int] = None
+    # Maximum number of tokens in each chunk per sequence. Computed from maximum chunk capacity
+    prefix_chunk_len: Optional[int] = None
+    # Start positions of prefix cache for each chunk, (num_prefix_chunks, batch_size)
+    prefix_chunk_starts: Optional[torch.Tensor] = None
+    # Lengths of prefix cache for each chunk, (num_prefix_chunks, batch_size)
+    prefix_chunk_seq_lens: Optional[torch.Tensor] = None
+    # Accumulated lengths of prefix cache for each chunk, (num_prefix_chunks, batch_size + 1)
+    prefix_chunk_cu_seq_lens: Optional[torch.Tensor] = None
+    # Max lengths of prefix cache for each chunk, (num_prefix_chunks,)
+    prefix_chunk_max_seq_lens: Optional[List[int]] = None
+    # Number of tokens in each prefix cache chunk, (num_prefix_chunks,)
+    prefix_chunk_num_tokens: Optional[List[int]] = None
+    # KV Indices for each chunk
+    prefix_chunk_kv_indices: Optional[List[torch.Tensor]] = None
+
     # For multimodal
     mm_inputs: Optional[List[MultimodalInputs]] = None
 
@@ -221,6 +247,7 @@ class ForwardBatch:
 
     # For padding
     padded_static_len: int = -1  # -1 if not padded
+    num_token_non_padded: Optional[torch.Tensor] = None  # scalar tensor
 
     # For Qwen2-VL
     mrope_positions: torch.Tensor = None
@@ -264,6 +291,9 @@ class ForwardBatch:
             capture_hidden_mode=batch.capture_hidden_mode,
             input_embeds=batch.input_embeds,
             extend_input_logprob_token_ids_gpu=extend_input_logprob_token_ids_gpu,
+            num_token_non_padded=torch.tensor(
+                len(batch.input_ids), dtype=torch.int32
+            ).to(device, non_blocking=True),
         )
 
         # For DP attention
@@ -338,23 +368,23 @@ class ForwardBatch:
 
     def merge_mm_inputs(self) -> Optional[MultimodalInputs]:
         """
-        Merge all image inputs in the batch into a single MultiModalInputs object.
+        Merge all multimodal inputs in the batch into a single MultiModalInputs object.
 
         Returns:
-            if none, current batch contains no image input
+            if none, current batch contains no multimodal input
 
         """
         if not self.mm_inputs or all(x is None for x in self.mm_inputs):
             return None
-
         # Filter out None values
         valid_inputs = [x for x in self.mm_inputs if x is not None]
 
-        # Start with the first valid image input
-        merged = valid_inputs[0]
+        # TODO: is it expensive?
+        # a workaround to avoid importing `MultimodalInputs`
+        merged = valid_inputs[0].__class__(mm_items=[])
 
         # Merge remaining inputs
-        for mm_input in valid_inputs[1:]:
+        for mm_input in valid_inputs:
             merged.merge(mm_input)
 
         return merged
@@ -381,104 +411,212 @@ class ForwardBatch:
     def _compute_mrope_positions(
         self, model_runner: ModelRunner, batch: ModelWorkerBatch
     ):
-        device = model_runner.device
-        hf_config = model_runner.model_config.hf_config
-        mrope_positions_list = [None] * self.seq_lens.shape[0]
-        if self.forward_mode.is_decode():
-            for i, _ in enumerate(mrope_positions_list):
-                mrope_position_delta = (
-                    0
-                    if batch.multimodal_inputs[i] is None
-                    else batch.multimodal_inputs[i].mrope_position_delta
+        # batch_size * [3 * seq_len]
+        batch_size = self.seq_lens.shape[0]
+        mrope_positions_list = [[]] * batch_size
+        for batch_idx in range(batch_size):
+            mm_input = batch.multimodal_inputs[batch_idx]
+            if self.forward_mode.is_decode():
+                mrope_position_deltas = (
+                    [0]
+                    if mm_input is None
+                    else flatten_nested_list(mm_input.mrope_position_delta.tolist())
                 )
-                mrope_positions_list[i] = MRotaryEmbedding.get_next_input_positions(
-                    mrope_position_delta,
-                    int(self.seq_lens[i]) - 1,
-                    int(self.seq_lens[i]),
-                )
-        elif self.forward_mode.is_extend():
-            extend_start_loc_cpu = self.extend_start_loc.cpu().numpy()
-            for i, mm_input in enumerate(batch.multimodal_inputs):
-                extend_start_loc, extend_seq_len, extend_prefix_len = (
-                    extend_start_loc_cpu[i],
-                    batch.extend_seq_lens[i],
-                    batch.extend_prefix_lens[i],
+                next_input_positions = []
+                for mrope_position_delta in mrope_position_deltas:
+                    # batched deltas needs to be processed separately
+                    # Convert list of lists to tensor with shape [3, seq_len]
+                    next_input_positions += [
+                        MRotaryEmbedding.get_next_input_positions(
+                            mrope_position_delta,
+                            int(self.seq_lens[batch_idx]) - 1,
+                            int(self.seq_lens[batch_idx]),
+                        )
+                    ]
+                # 3 * N
+                mrope_positions_list[batch_idx] = torch.cat(next_input_positions, dim=1)
+            elif self.forward_mode.is_extend():
+                extend_seq_len, extend_prefix_len = (
+                    batch.extend_seq_lens[batch_idx],
+                    batch.extend_prefix_lens[batch_idx],
                 )
                 if mm_input is None:
                     # text only
-                    mrope_positions = [
+                    mrope_positions = torch.tensor(
                         [
-                            pos
-                            for pos in range(
-                                extend_prefix_len, extend_prefix_len + extend_seq_len
-                            )
+                            [
+                                pos
+                                for pos in range(
+                                    extend_prefix_len,
+                                    extend_prefix_len + extend_seq_len,
+                                )
+                            ]
                         ]
-                    ] * 3
+                        * 3
+                    )
                 else:
-                    image_grid_thws_list = [
-                        item.image_grid_thws
-                        for item in mm_input.mm_items
-                        if item.image_grid_thws is not None
+                    mrope_positions = mm_input.mrope_positions[
+                        :,
+                        extend_prefix_len : extend_prefix_len + extend_seq_len,
                     ]
-                    image_grid_thw = (
-                        None
-                        if len(image_grid_thws_list) == 0
-                        else torch.cat(image_grid_thws_list, dim=0)
-                    )
-
-                    video_grid_thws_list = [
-                        item.video_grid_thws
-                        for item in mm_input.mm_items
-                        if item.video_grid_thws is not None
-                    ]
-                    video_grid_thw = (
-                        None
-                        if len(video_grid_thws_list) == 0
-                        else torch.cat(video_grid_thws_list, dim=0)
-                    )
-
-                    second_per_grid_ts_list = [
-                        item.second_per_grid_ts
-                        for item in mm_input.mm_items
-                        if item.second_per_grid_ts is not None
-                    ]
-                    second_per_grid_ts = (
-                        None
-                        if len(second_per_grid_ts_list) == 0
-                        else torch.cat(second_per_grid_ts_list, dim=0)
-                    )
-
-                    # TODO: current qwen2-vl do not support radix cache since mrope position calculation
-                    mrope_positions, mrope_position_delta = (
-                        MRotaryEmbedding.get_input_positions(
-                            input_tokens=self.input_ids[
-                                extend_start_loc : extend_start_loc + extend_seq_len
-                            ].tolist(),
-                            image_grid_thw=image_grid_thw,
-                            video_grid_thw=video_grid_thw,
-                            image_token_id=hf_config.image_token_id,
-                            video_token_id=hf_config.video_token_id,
-                            vision_start_token_id=hf_config.vision_start_token_id,
-                            vision_end_token_id=hf_config.vision_end_token_id,
-                            spatial_merge_size=hf_config.vision_config.spatial_merge_size,
-                            context_len=0,
-                            seq_len=len(self.input_ids),
-                            second_per_grid_ts=second_per_grid_ts,
-                            tokens_per_second=getattr(
-                                hf_config.vision_config, "tokens_per_second", None
-                            ),
-                        )
-                    )
-                    batch.multimodal_inputs[i].mrope_position_delta = (
-                        mrope_position_delta
-                    )
-                mrope_positions_list[i] = mrope_positions
+                mrope_positions_list[batch_idx] = mrope_positions
 
         self.mrope_positions = torch.cat(
-            [torch.tensor(pos, device=device) for pos in mrope_positions_list],
-            axis=1,
+            [pos.to(device=model_runner.device) for pos in mrope_positions_list],
+            dim=1,
+        ).to(dtype=torch.int64, device=model_runner.device)
+
+    def get_max_chunk_capacity(self):
+        # Maximum number of tokens in each chunk
+        # TODO: Should be changed to a better value, maybe passed through server args
+        return 128 * 1024
+
+    def set_prefix_chunk_idx(self, idx: int):
+        self.prefix_chunk_idx = idx
+
+    def set_attn_attend_prefix_cache(self, attn_attend_prefix_cache: bool):
+        self.attn_attend_prefix_cache = attn_attend_prefix_cache
+
+    def prepare_chunked_kv_indices(self, device: torch.device):
+        self.prefix_chunk_kv_indices = []
+        for idx in range(self.num_prefix_chunks):
+            chunk_starts = self.prefix_chunk_starts[idx]
+            chunk_seq_lens = self.prefix_chunk_seq_lens[idx]
+            chunk_cu_seq_lens = self.prefix_chunk_cu_seq_lens[idx]
+            num_chunk_tokens = self.prefix_chunk_num_tokens[idx]
+
+            chunk_kv_indices = torch.empty(
+                num_chunk_tokens, dtype=torch.int32, device=device
+            )
+
+            create_chunked_prefix_cache_kv_indices[(self.batch_size,)](
+                self.req_to_token_pool.req_to_token,
+                self.req_pool_indices,
+                chunk_starts,
+                chunk_seq_lens,
+                chunk_cu_seq_lens,
+                chunk_kv_indices,
+                self.req_to_token_pool.req_to_token.shape[1],
+            )
+            self.prefix_chunk_kv_indices.append(chunk_kv_indices)
+
+    # Here we suppose the length of each chunk is equal
+    # For example, if we have 4 sequences with prefix length [256, 512, 768, 1024], prefix_chunk_len = 256
+    # num_prefix_chunks = cdiv(1024, 256) = 4
+    # prefix_chunk_starts = [[0, 0, 0, 0], [256, 256, 256, 256], [512, 512, 512, 512], [768, 768, 768, 768]]
+    # prefix_chunk_ends = [[256, 256, 256, 256], [256, 512, 512, 512], [256, 512, 768, 768], [256, 512, 768, 1024]]
+    # prefix_chunk_seq_lens = [[256, 256, 256, 256], [0, 256, 256, 256], [0, 0, 256, 256], [0, 0, 0, 256]]
+    # TODO: Implement a better way to allocate chunk lengths that uses memory spaces more efficiently.
+    def get_prefix_chunk_seq_lens(
+        self, prefix_lens: torch.Tensor, num_prefix_chunks: int, prefix_chunk_len: int
+    ):
+        device = prefix_lens.device
+        prefix_chunk_starts = (
+            torch.arange(num_prefix_chunks, device=device, dtype=torch.int32)
+            .unsqueeze(1)
+            .expand(-1, self.batch_size)
+            * prefix_chunk_len
         )
-        self.mrope_positions = self.mrope_positions.to(torch.int64)
+        prefix_chunk_ends = torch.min(
+            prefix_lens.unsqueeze(0),
+            prefix_chunk_starts + prefix_chunk_len,
+        ).to(torch.int32)
+
+        prefix_chunk_seq_lens = (
+            (prefix_chunk_ends - prefix_chunk_starts).clamp(min=0).to(torch.int32)
+        )
+
+        return prefix_chunk_starts, prefix_chunk_seq_lens
+
+    # Called before each attention module if using chunked kv cache for prefill
+    # Some of the codes are adapted from https://github.com/vllm-project/vllm/blob/main/vllm/v1/attention/backends/mla/common.py
+    def prepare_chunked_prefix_cache_info(self, device: torch.device):
+
+        from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+
+        assert isinstance(
+            self.token_to_kv_pool, MLATokenToKVPool
+        ), "Currently chunked prefix cache can only be used by Deepseek models"
+
+        if self.prefix_chunk_len is not None:
+            # Chunked kv cache info already prepared by prior modules
+            return
+
+        self.prefix_chunk_idx = -1
+
+        # chunk_capacity is the maximum number of tokens in each chunk
+        chunk_capacity = self.get_max_chunk_capacity()
+        self.prefix_chunk_len = chunk_capacity // self.batch_size
+
+        self.num_prefix_chunks = (
+            max(self.extend_prefix_lens_cpu) + self.prefix_chunk_len - 1
+        ) // self.prefix_chunk_len
+
+        # Here we compute chunk lens twice to avoid stream sync, once on gpu and once on cpu.
+        prefix_chunk_starts_cuda, prefix_chunk_seq_lens_cuda = (
+            self.get_prefix_chunk_seq_lens(
+                self.extend_prefix_lens,
+                self.num_prefix_chunks,
+                self.prefix_chunk_len,
+            )
+        )
+        _, prefix_chunk_seq_lens_cpu = self.get_prefix_chunk_seq_lens(
+            torch.tensor(self.extend_prefix_lens_cpu),
+            self.num_prefix_chunks,
+            self.prefix_chunk_len,
+        )
+        self.prefix_chunk_starts = prefix_chunk_starts_cuda
+        self.prefix_chunk_seq_lens = prefix_chunk_seq_lens_cuda
+
+        # Metadata for attention backend
+        self.prefix_chunk_cu_seq_lens = torch.zeros(
+            self.num_prefix_chunks,
+            self.batch_size + 1,
+            device=device,
+            dtype=torch.int32,
+        )
+        self.prefix_chunk_cu_seq_lens[:, 1:] = prefix_chunk_seq_lens_cuda.cumsum(
+            dim=1
+        ).to(torch.int32)
+        self.prefix_chunk_max_seq_lens = prefix_chunk_seq_lens_cpu.max(
+            dim=1
+        ).values.tolist()
+
+        self.prefix_chunk_num_tokens = prefix_chunk_seq_lens_cpu.sum(dim=1).tolist()
+        assert max(self.prefix_chunk_num_tokens) <= self.get_max_chunk_capacity()
+
+        # Precompute the kv indices for each chunk
+        self.prepare_chunked_kv_indices(device)
+
+
+class PPProxyTensors:
+    # adapted from https://github.com/vllm-project/vllm/blob/d14e98d924724b284dc5eaf8070d935e214e50c0/vllm/sequence.py#L1103
+    tensors: Dict[str, torch.Tensor]
+
+    def __init__(self, tensors):
+        # manually define this function, so that
+        # Dynamo knows `IntermediateTensors()` comes from this file.
+        # Otherwise, dataclass will generate this function by evaluating
+        # a string, and we will lose the information about the source file.
+        self.tensors = tensors
+
+    def __getitem__(self, key: Union[str, slice]):
+        if isinstance(key, str):
+            return self.tensors[key]
+        elif isinstance(key, slice):
+            return self.__class__({k: v[key] for k, v in self.tensors.items()})
+
+    def __setitem__(self, key: str, value: torch.Tensor):
+        self.tensors[key] = value
+
+    def __len__(self):
+        return len(self.tensors)
+
+    def __eq__(self, other: object):
+        return isinstance(other, self.__class__) and self
+
+    def __repr__(self) -> str:
+        return f"PPProxyTensors(tensors={self.tensors})"
 
 
 def compute_position_triton(
@@ -557,3 +695,40 @@ def compute_position_torch(
 @torch.compile(dynamic=True, backend=get_compiler_backend())
 def clamp_position(seq_lens):
     return torch.clamp((seq_lens - 1), min=0).to(torch.int64)
+
+
+@triton.jit
+def create_chunked_prefix_cache_kv_indices(
+    req_to_token_ptr,  # (max_batch, max_context_len,)
+    req_pool_indices_ptr,  # (batch_size,)
+    chunk_start_idx_ptr,  # (batch_size,)
+    chunk_seq_lens_ptr,  # (batch_size,)
+    chunk_cu_seq_lens_ptr,  # (batch_size + 1,)
+    chunk_kv_indices_ptr,  # (num_chunk_tokens,)
+    req_to_token_ptr_stride: tl.constexpr,
+):
+    BLOCK_SIZE: tl.constexpr = 512
+    pid = tl.program_id(axis=0)
+
+    # find the req pool idx, this is for batch to token
+    req_pool_index = tl.load(req_pool_indices_ptr + pid)
+    chunk_kv_indices_offset = tl.load(chunk_cu_seq_lens_ptr + pid)
+
+    # get the token positions of current chunk
+    chunk_start_pos = tl.load(chunk_start_idx_ptr + pid).to(tl.int32)
+    chunk_seq_len = tl.load(chunk_seq_lens_ptr + pid).to(tl.int32)
+
+    num_loop = tl.cdiv(chunk_seq_len, BLOCK_SIZE)
+    for i in range(num_loop):
+        offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
+        mask = offset < chunk_seq_len
+        data = tl.load(
+            req_to_token_ptr
+            + req_pool_index * req_to_token_ptr_stride
+            + chunk_start_pos
+            + offset,
+            mask=mask,
+        )
+        tl.store(
+            chunk_kv_indices_ptr + chunk_kv_indices_offset + offset, data, mask=mask
+        )

@@ -1,6 +1,6 @@
 import torch
 
-from sglang.srt.lora.backend import BaseLoRABackend
+from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.triton_ops import (
     gate_up_lora_b_fwd,
     qkv_lora_b_fwd,
