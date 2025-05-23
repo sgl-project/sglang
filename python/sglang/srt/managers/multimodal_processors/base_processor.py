@@ -5,7 +5,7 @@ import multiprocessing as mp
 import os
 import re
 from abc import ABC, abstractmethod
-from typing import List, Optional, Union
+from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -342,6 +342,33 @@ class BaseMultimodalProcessor(ABC):
         )
         out.normalize()
         return out
+
+    @staticmethod
+    def get_mm_items_offset(
+        input_ids: torch.Tensor, mm_token_id: int
+    ) -> List[Tuple[int, int]]:
+        """
+        Get a set of range for mm_items from input_ids
+        Example:
+            input_ids = [1, 2, 3, 3, 3, 4, 3, 3]
+            mm_token_id = 3
+            return result = [(2,4),(6,7)]
+        """
+        mask = input_ids == mm_token_id
+
+        start_positions = (mask & ~torch.roll(mask, 1)).nonzero(as_tuple=True)[0]
+        end_positions = (mask & ~torch.roll(mask, -1)).nonzero(as_tuple=True)[0]
+
+        return list(zip(start_positions.tolist(), end_positions.tolist()))
+
+    @staticmethod
+    def get_mm_items_offset_by_pair(
+        input_ids: torch.Tensor, mm_start_id: int, mm_end_id: int
+    ) -> List[Tuple[int, int]]:
+        indices_start = (input_ids == mm_start_id).nonzero(as_tuple=True)[0] + 1
+        indices_end = (input_ids == mm_end_id).nonzero(as_tuple=True)[0] - 1
+
+        return list(zip(indices_start.tolist(), indices_end.tolist()))
 
     def mm_inputs_are_preprocessed(self, mm_inputs: Optional[list]):
         """Returns true if all images are preprocessed, false if all are not, and error otherwise."""
