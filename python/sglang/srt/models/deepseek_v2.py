@@ -735,7 +735,6 @@ class DeepseekV2AttentionMLA(nn.Module):
             "SGL_CHUNKED_PREFIX_CACHE_THRESHOLD", 8192
         )
 
-    # TODO can use cache object
     cached_attn_forward_method = None
 
     @staticmethod
