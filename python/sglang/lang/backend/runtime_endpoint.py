@@ -390,7 +390,8 @@ class Runtime:
         self.pid = None
         pipe_reader, pipe_writer = multiprocessing.Pipe(duplex=False)
 
-        proc = multiprocessing.Process(
+        ctx = multiprocessing.get_context("spawn")
+        proc = ctx.Process(
             target=launch_server,
             args=(self.server_args, pipe_writer),
         )
