@@ -197,10 +197,32 @@ def get_embedding_and_mask(
 ):
     """
     Get the multimodal embedding and its mask from input_ids
-
     """
+
+    # Check if the items have precomputed_features
+    def try_use_precomputed_features(
+        items: List[MultimodalDataItem],
+    ) -> Optional[torch.Tensor]:
+        """
+        If all items have precomputed_features, return their concatenation.
+        If some but not all have precomputed_features, raise NotImplementedError.
+        If none have precomputed_features, return None.
+        """
+        precomputed_features = [item.precomputed_features for item in items]
+        if any(feature is not None for feature in precomputed_features):
+            if not all(feature is not None for feature in precomputed_features):
+                raise NotImplementedError(
+                    "MM inputs where only some items are precomputed."
+                )
+            return torch.concat(precomputed_features)
+        return None
+
     # 1. Get the embedding
-    embedding = data_embedding_func(embedding_items)
+    precomputed_features = try_use_precomputed_features(embedding_items)
+    if precomputed_features is not None:
+        embedding = precomputed_features
+    else:
+        embedding = data_embedding_func(embedding_items)
 
     # 2. Check the embedding
     if embedding.dim() == 2:
