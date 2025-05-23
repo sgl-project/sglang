@@ -107,7 +107,7 @@ class TestDecodeAttention(CustomTestCase):
         v_buffer = v_buffer.transpose(0, 1).contiguous().transpose(0, 1)
         key = key.transpose(0, 1).contiguous().transpose(0, 1)
         value = value.transpose(0, 1).contiguous().transpose(0, 1)
-        kernel.decode_attention_cpu(
+        torch.ops.sgl_kernel.decode_attention_cpu(
             q,
             k_buffer,
             v_buffer,

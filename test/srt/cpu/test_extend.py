@@ -159,7 +159,7 @@ class TestExtendAttention(CustomTestCase):
         )
 
         o_extend = torch.empty((extend_token_num, H_Q, DV), dtype=dtype)
-        kernel.extend_attention_cpu(
+        torch.ops.sgl_kernel.extend_attention_cpu(
             q_extend,
             k_extend,
             v_extend,
