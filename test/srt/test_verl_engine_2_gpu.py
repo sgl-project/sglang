@@ -47,10 +47,7 @@ ALL_MODELS = [
         model_path="ibm-granite/granite-3.0-2b-instruct",
         prefill_tolerance=0.22,
         decode_tolerance=0.22,
-    ),
-    # Fail to run these models in test_generation_models.py, need to fix that first
-    # dict(model_path="openai-community/gpt2"),
-    # dict(model_path="microsoft/Phi-3-small-8k-instruct"),
+    )
 ]
 
 
