@@ -569,7 +569,11 @@ def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
     return 0.1 * mscale * math.log(scale) + 1.0
 
 
+global_attn_forward_method = None
+
+
 class DeepseekV2AttentionMLA(nn.Module):
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -735,12 +739,6 @@ class DeepseekV2AttentionMLA(nn.Module):
             "SGL_CHUNKED_PREFIX_CACHE_THRESHOLD", 8192
         )
 
-    cached_attn_forward_method = None
-
-    @staticmethod
-    def reset_cache():
-        DeepseekV2AttentionMLA.cached_attn_forward_method = None
-
     def dispatch_attn_forward_method(
         self, forward_batch: ForwardBatch
     ) -> AttnForwardMethod:
@@ -823,11 +821,12 @@ class DeepseekV2AttentionMLA(nn.Module):
             ), "short-circuiting allreduce will lead to hangs"
             return hidden_states, None, forward_batch, None
 
-        if DeepseekV2AttentionMLA.cached_attn_forward_method is None:
-            DeepseekV2AttentionMLA.cached_attn_forward_method = (
-                self.dispatch_attn_forward_method(forward_batch)
+        global global_attn_forward_method
+        if global_attn_forward_method is None:
+            global_attn_forward_method = self.dispatch_attn_forward_method(
+                forward_batch
             )
-        attn_forward_method = DeepseekV2AttentionMLA.cached_attn_forward_method
+        attn_forward_method = global_attn_forward_method
 
         if attn_forward_method == AttnForwardMethod.MHA:
             inner_state = self.forward_normal_prepare(
@@ -1600,8 +1599,6 @@ class DeepseekV2Model(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-        DeepseekV2AttentionMLA.reset_cache()
-
         device = input_embeds.device if input_embeds is not None else input_ids.device
         zero_allocator = BumpAllocator(
             buffer_size=len(self.layers) * 2 * (2 if forward_batch.can_run_tbo else 1),
@@ -1720,6 +1717,9 @@ class DeepseekV2ForCausalLM(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
+        global global_attn_forward_method
+        global_attn_forward_method = None
+
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
 
         return self.logits_processor(
