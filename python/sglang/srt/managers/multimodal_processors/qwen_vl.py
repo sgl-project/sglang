@@ -135,6 +135,9 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
             images=None if images_are_preprocessed else base_output.images,
         )
         input_ids = ret["input_ids"].flatten().tolist()
+        image_offsets = self.get_mm_items_offset(
+            input_ids=ret["input_ids"].flatten(), mm_token_id=self.image_token_id
+        )
         image_grid_thw = None
         video_grid_thw = None  # TODO
         items = []
@@ -175,6 +178,7 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
                     image_grid_thws=image_grid_thw,
                     video_grid_thws=video_grid_thw,
                     precomputed_features=precomputed_features,
+                    image_offsets=image_offsets,
                     modality=Modality.IMAGE,
                 )
             ]
