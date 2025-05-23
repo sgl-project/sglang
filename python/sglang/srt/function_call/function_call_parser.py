@@ -134,7 +134,7 @@ class FunctionCallParser:
         )
 
     def get_structure_constraint(
-        self, tool_choice: Union[ToolChoice, Literal["auto", "required", "none"]]
+        self, tool_choice: Union[ToolChoice, Literal["auto", "required"]]
     ) -> Optional[Tuple[str, Any]]:
         """
         Returns the appropriate structure constraint for tool calls based on the tool_choice.
@@ -150,7 +150,7 @@ class FunctionCallParser:
         if tool_choice == "auto":
             strict_tag = self.get_structure_tag()
             return ("structural_tag", strict_tag)
-        else:
+        elif tool_choice == "required" or isinstance(tool_choice, ToolChoice):
             ebnf = self.get_ebnf(tool_choice)
             return ("ebnf", ebnf) if ebnf is not None else None
 
