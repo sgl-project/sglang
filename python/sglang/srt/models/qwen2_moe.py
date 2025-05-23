@@ -59,13 +59,15 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.managers.expert_distribution import ExpertDistributionRecorder
+from sglang.srt.managers.expert_distribution import (
+    ExpertDistributionRecorder,
+    get_global_expert_distribution_recorder,
+)
+from sglang.srt.managers.expert_location import ModelConfigForExpertLocation
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix, make_layers
-
-expert_distribution_recorder = ExpertDistributionRecorder()
 
 logger = logging.getLogger(__name__)
 
@@ -591,11 +593,11 @@ class Qwen2MoeModel(nn.Module):
             residual = pp_proxy_tensors["residual"]
 
         for i in range(self.start_layer, self.end_layer):
-            expert_distribution_recorder.set_current_layer(i)
-            layer = self.layers[i]
-            hidden_states, residual = layer(
-                positions, hidden_states, forward_batch, residual
-            )
+            with get_global_expert_distribution_recorder().with_current_layer(i):
+                layer = self.layers[i]
+                hidden_states, residual = layer(
+                    positions, hidden_states, forward_batch, residual
+                )
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {
@@ -605,7 +607,10 @@ class Qwen2MoeModel(nn.Module):
             )
         else:
             if hidden_states.shape[0] != 0:
-                hidden_states, _ = self.norm(hidden_states, residual)
+                if residual is None:
+                    hidden_states = self.norm(hidden_states)
+                else:
+                    hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
 
@@ -751,6 +756,14 @@ class Qwen2MoeForCausalLM(nn.Module):
                         weight_loader(param, loaded_weight)
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
+
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        return ModelConfigForExpertLocation(
+            num_layers=config.num_hidden_layers,
+            num_logical_experts=config.num_experts,
+            num_groups=None,
+        )
 
 
 EntryClass = Qwen2MoeForCausalLM

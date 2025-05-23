@@ -48,7 +48,10 @@ from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.disaggregation.base import BaseKVSender
-from sglang.srt.disaggregation.decode import ScheduleBatchDisaggregationDecodeMixin
+from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
+    ScheduleBatchDisaggregationDecodeMixin,
+)
+from sglang.srt.layers.multimodal import gpu_tensor_hash
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPoolAllocator
@@ -82,12 +85,14 @@ global_server_args_dict = {
     "flashinfer_mla_disable_ragged": ServerArgs.flashinfer_mla_disable_ragged,
     "max_micro_batch_size": ServerArgs.max_micro_batch_size,
     "moe_dense_tp_size": ServerArgs.moe_dense_tp_size,
+    "ep_dispatch_algorithm": ServerArgs.ep_dispatch_algorithm,
     "n_share_experts_fusion": ServerArgs.n_share_experts_fusion,
     "sampling_backend": ServerArgs.sampling_backend,
     "speculative_accept_threshold_acc": ServerArgs.speculative_accept_threshold_acc,
     "speculative_accept_threshold_single": ServerArgs.speculative_accept_threshold_single,
     "torchao_config": ServerArgs.torchao_config,
     "triton_attention_reduce_in_fp32": ServerArgs.triton_attention_reduce_in_fp32,
+    "ep_num_redundant_experts": ServerArgs.ep_num_redundant_experts,
 }
 
 logger = logging.getLogger(__name__)
@@ -192,6 +197,7 @@ class MultimodalDataItem:
 
     audio_features: Union[torch.Tensor, np.ndarray] = None
     audio_feature_lens: Optional[List[torch.Tensor]] = None
+    audio_offsets: Optional[List[Tuple[int, int]]] = None
 
     precomputed_features: Optional[Union[torch.Tensor, np.ndarray]] = None
 
@@ -222,7 +228,8 @@ class MultimodalDataItem:
                     for x in tensor_list
                 ]
                 tensor = torch.concat(tensor_list)
-
+            if tensor.is_cuda:
+                return gpu_tensor_hash(tensor)
             tensor = tensor.detach().contiguous()
 
             if tensor.dtype == torch.bfloat16:
@@ -599,9 +606,6 @@ class Req:
         # We use `tmp_end_idx` to store the end index of the kv cache to send.
         self.tmp_end_idx: int = -1
         self.metadata_buffer_index: int = -1
-
-        # The first output_id transferred from prefill instance.
-        self.transferred_output_id: Optional[int] = None
 
     @property
     def seqlen(self):
@@ -1091,7 +1095,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         else:
             self.encoder_out_cache_loc = torch.cat(encoder_out_cache_loc)
 
-        assert len(self.out_cache_loc) == self.extend_num_tokens
+        assert (
+            len(self.out_cache_loc) == self.extend_num_tokens
+        ), f"Expected {len(self.out_cache_loc)}, got {self.extend_num_tokens}"
 
     def prepare_for_extend(self):
         self.forward_mode = ForwardMode.EXTEND
