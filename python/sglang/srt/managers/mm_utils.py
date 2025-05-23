@@ -266,7 +266,10 @@ def _get_precomputed_embedding(
             raise NotImplementedError(
                 "MM inputs where only some items are precomputed."
             )
-        return torch.concat(precomputed_features)
+        result = torch.concat(precomputed_features)
+        # some models embedding is 3-dim, reshape it to 2-dim (similar to get_embedding_chunk)
+        result = result.reshape(-1, result.shape[-1])
+        return result
     return None
 
 
