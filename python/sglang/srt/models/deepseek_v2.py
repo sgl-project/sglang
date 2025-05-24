@@ -19,7 +19,7 @@
 import logging
 import os
 from enum import IntEnum, auto
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, Iterable, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -28,6 +28,7 @@ from tqdm import tqdm
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
+    get_pp_group,
     get_tensor_model_parallel_world_size,
     parallel_state,
     tensor_model_parallel_all_reduce,
@@ -71,6 +72,7 @@ from sglang.srt.layers.quantization.int8_utils import (
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -81,7 +83,7 @@ from sglang.srt.managers.expert_distribution import (
 from sglang.srt.managers.expert_location import ModelConfigForExpertLocation
 from sglang.srt.managers.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.managers.schedule_batch import global_server_args_dict
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.operations import execute_operations
 from sglang.srt.operations_strategy import compute_layer_operations
@@ -94,6 +96,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     log_info_on_rank0,
+    make_layers,
 )
 
 _is_hip = is_hip()
@@ -1337,25 +1340,36 @@ class DeepseekV2Model(nn.Module):
         self.padding_id = config.pad_token_id
         self.vocab_size = config.vocab_size
 
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-            enable_tp=not global_server_args_dict["enable_dp_attention"],
-        )
+        self.pp_group = get_pp_group()
+        if self.pp_group.is_first_rank:
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                enable_tp=not global_server_args_dict["enable_dp_attention"],
+            )
+        else:
+            self.embed_tokens = PPMissingLayer()
+
         self.alt_stream = torch.cuda.Stream() if _is_cuda else None
-        self.layers = nn.ModuleList(
-            [
-                DeepseekV2DecoderLayer(
-                    config,
-                    layer_id,
-                    quant_config=quant_config,
-                    prefix=add_prefix(f"layers.{layer_id}", prefix),
-                    alt_stream=self.alt_stream,
-                )
-                for layer_id in range(config.num_hidden_layers)
-            ]
+
+        self.layers, self.start_layer, self.end_layer = make_layers(
+            config.num_hidden_layers,
+            lambda idx, prefix: DeepseekV2DecoderLayer(
+                config=config,
+                quant_config=quant_config,
+                layer_id=idx,
+                prefix=prefix,
+                alt_stream=self.alt_stream,
+            ),
+            pp_rank=self.pp_group.rank_in_group,
+            pp_size=self.pp_group.world_size,
+            prefix="layers",
         )
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        if self.pp_group.is_last_rank:
+            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        else:
+            self.norm = PPMissingLayer(return_tuple=True)
 
         self.dp_size = get_local_attention_dp_size()
 
@@ -1368,7 +1382,8 @@ class DeepseekV2Model(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
-    ) -> torch.Tensor:
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> Union[torch.Tensor, PPProxyTensors]:
         zero_allocator = BumpAllocator(
             # TODO for two-batch-overlap, we need a larger buffer size
             buffer_size=len(self.layers) * 2,
@@ -1378,23 +1393,37 @@ class DeepseekV2Model(nn.Module):
             ),
         )
 
-        if input_embeds is None:
-            hidden_states = self.embed_tokens(input_ids)
+        if self.pp_group.is_first_rank:
+            if input_embeds is None:
+                hidden_states = self.embed_tokens(input_ids)
+            else:
+                hidden_states = input_embeds
+            residual = None
         else:
-            hidden_states = input_embeds
+            assert pp_proxy_tensors is not None
+            hidden_states = pp_proxy_tensors["hidden_states"]
+            residual = pp_proxy_tensors["residual"]
 
-        residual = None
-        for i in range(len(self.layers)):
+        for i in range(self.start_layer, self.end_layer):
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 layer = self.layers[i]
                 hidden_states, residual = layer(
                     positions, hidden_states, forward_batch, residual, zero_allocator
                 )
-        if not forward_batch.forward_mode.is_idle():
-            if residual is None:
-                hidden_states = self.norm(hidden_states)
-            else:
-                hidden_states, _ = self.norm(hidden_states, residual)
+
+        if not self.pp_group.is_last_rank:
+            return PPProxyTensors(
+                {
+                    "hidden_states": hidden_states,
+                    "residual": residual,
+                }
+            )
+        else:
+            if not forward_batch.forward_mode.is_idle():
+                if residual is None:
+                    hidden_states = self.norm(hidden_states)
+                else:
+                    hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
 
@@ -1407,6 +1436,7 @@ class DeepseekV2ForCausalLM(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        self.pp_group = get_pp_group()
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
@@ -1470,19 +1500,37 @@ class DeepseekV2ForCausalLM(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
 
-        hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
-
-        return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch
+        hidden_states = self.model(
+            input_ids,
+            positions,
+            forward_batch,
+            input_embeds,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
+
+        if self.pp_group.is_last_rank:
+            return self.logits_processor(
+                input_ids, hidden_states, self.lm_head, forward_batch
+            )
+        else:
+            return hidden_states
+
+    @property
+    def start_layer(self):
+        return self.model.start_layer
+
+    @property
+    def end_layer(self):
+        return self.model.end_layer
 
     def post_load_weights(self, is_nextn=False):
 
         # Perform post-processing after loading weights
         layer_ids = (
-            range(self.config.num_hidden_layers)
+            range(self.model.start_layer, self.model.end_layer)
             if not is_nextn
             else [self.config.num_hidden_layers]
         )
@@ -1609,9 +1657,9 @@ class DeepseekV2ForCausalLM(nn.Module):
         # TODO support nextn later
         if not is_nextn:
             self.routed_experts_weights_of_layer = {
-                layer_id: layer.mlp.get_moe_weights()
-                for layer_id, layer in enumerate(self.model.layers)
-                if isinstance(layer.mlp, DeepseekV2MoE)
+                layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
+                for layer_id in layer_ids
+                if isinstance(self.model.layers[layer_id].mlp, DeepseekV2MoE)
             }
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
@@ -1714,6 +1762,16 @@ class DeepseekV2ForCausalLM(nn.Module):
 
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
+            layer_id = get_layer_id(name)
+            if (
+                layer_id is not None
+                and hasattr(self.model, "start_layer")
+                and (
+                    layer_id < self.model.start_layer
+                    or layer_id >= self.model.end_layer
+                )
+            ):
+                continue
             if not is_nextn:
                 if hasattr(self.config, "num_nextn_predict_layers"):
                     num_nextn_layers = self.config.num_nextn_predict_layers
@@ -1784,6 +1842,12 @@ class DeepseekV2ForCausalLM(nn.Module):
                 else:
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
+                        continue
+                    # Skip loading embed_tokens if not first rank in pipeline parallelism
+                    if ".embed_tokens." in name and not self.pp_group.is_first_rank:
+                        continue
+                    # Skip loading norm if not last rank in pipeline parallelism
+                    if ".norm." in name and not self.pp_group.is_last_rank:
                         continue
 
                     if fuse_qkv_a_proj and (
