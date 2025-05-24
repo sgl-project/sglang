@@ -28,13 +28,11 @@ jobs:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
       github.event.pull_request.draft == false
     strategy:
-      matrix:
-        runner: [linux-mi300-gpu-1]
-    runs-on: ${{matrix.runner}}
-    strategy:
       fail-fast: false
       matrix:
         part: [0, 1, 2, 3, 4, 5, 6, 7, 8]
+        runner: [linux-mi300-gpu-1]
+    runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -50,7 +48,7 @@ jobs:
       - name: Run test
         timeout-minutes: 40
         run: |
-          bash scripts/amd_ci_exec.sh python3 run_suite.py --suite per-commit
+          bash scripts/amd_ci_exec.sh python3 run_suite.py --suite per-commit --auto-partition-id ${{ matrix.part }} --auto-partition-size 9
 
   unit-test-backend-2-gpu-amd:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
