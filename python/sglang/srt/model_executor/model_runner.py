@@ -198,6 +198,7 @@ class ModelRunner:
                 "disable_radix_cache": server_args.disable_radix_cache,
                 "enable_nan_detection": server_args.enable_nan_detection,
                 "enable_dp_attention": server_args.enable_dp_attention,
+                "enable_dp_lm_head": server_args.enable_dp_lm_head,
                 "enable_ep_moe": server_args.enable_ep_moe,
                 "enable_deepep_moe": server_args.enable_deepep_moe,
                 "deepep_config": server_args.deepep_config,
