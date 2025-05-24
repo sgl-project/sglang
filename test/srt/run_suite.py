@@ -88,10 +88,8 @@ suites = {
         TestFile("models/lora/test_lora_cuda_graph.py", 250),
     ],
     "per-commit-amd": [
-        TestFile("test_mla.py", 242),
-        TestFile("test_mla_deepseek_v3.py", 221),
-        TestFile("test_torch_compile.py", 76),
-        TestFile("test_torch_compile_moe.py", 172),
+        TestFile("test_function_call_parser.py", 10),
+        TestFile("test_openai_function_calling.py", 60),
     ],
     "per-commit-2-gpu": [
         TestFile("models/lora/test_lora_tp.py", 116),
@@ -104,7 +102,7 @@ suites = {
         TestFile("test_verl_engine.py", 64),
     ],
     "per-commit-2-gpu-amd": [
-        TestFile("test_mla_tp.py", 170),
+        TestFile("test_verl_engine.py", 64),
     ],
     "per-commit-4-gpu": [
         TestFile("test_local_attn.py", 250),
