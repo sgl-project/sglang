@@ -6,6 +6,8 @@ import numpy.typing as npt
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.server_args import ServerArgs
+from typing import Callable
+import torch
 
 
 class KVArgs:
@@ -39,6 +41,32 @@ class BaseKVManager(ABC):
         server_args: ServerArgs,
         is_mla_backend: Optional[bool] = False,
     ): ...
+    
+    @property
+    def is_support_asnyc(self):
+        return False
+    
+    def prepare_batch(self, sch : "Scheduler", batch : "ScheduleBatch"):
+        raise NotImplementedError("the prepare_batch method is used in async mode, which is not implemented in BaseKVManager")
+    
+    def mark_layer_ready(self, layer_id : int):
+        raise NotImplementedError("the mark_layer_ready method is used in async mode, which is not implemented in BaseKVManager")
+    
+    def insert_layer_callbacks(self, model : torch.nn.Module):
+        def hack_forward_func(layer : torch.nn.Module, ori_func : Callable, layer_id : int):
+            def wrapper_forward(*args, **kwargs):
+                rst = ori_func(*args, **kwargs)
+                self.mark_layer_ready(layer_id)
+                layer._call_time += 1
+                return rst
+            return wrapper_forward
+        if not hasattr(model, "_hacked_by_kv_manager") or not model._hacked_by_kv_manager:
+            for layer_id, layer in enumerate(model.model.layers):
+                ori_forward = layer.forward
+                layer._call_time = 0
+                layer.forward = hack_forward_func(layer, ori_forward, layer_id)
+            self._layer_sizes = len(model.model.layers)
+            model._hacked_by_kv_manager = True
 
 
 class BaseKVSender(ABC):
