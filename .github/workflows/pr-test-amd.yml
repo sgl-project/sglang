@@ -141,8 +141,7 @@ jobs:
       - name: Benchmark online latency (EAGLE)
         timeout-minutes: 10
         run: |
-          cd test/srt
-          python3 -m unittest test_bench_serving.TestBenchServing.test_online_latency_eagle
+          bash scripts/amd_ci_exec.sh python3 -m unittest test_bench_serving.TestBenchServing.test_online_latency_eagle
 
   performance-test-1-gpu-part-2-amd:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
