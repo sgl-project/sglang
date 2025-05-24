@@ -608,9 +608,6 @@ class Req:
         self.tmp_end_idx: int = -1
         self.metadata_buffer_index: int = -1
 
-        # The first output_id transferred from prefill instance.
-        self.transferred_output_id: Optional[int] = None
-
     @property
     def seqlen(self):
         return len(self.origin_input_ids) + len(self.output_ids)
