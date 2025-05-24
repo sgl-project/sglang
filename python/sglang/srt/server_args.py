@@ -46,7 +46,6 @@ class ServerArgs:
     tokenizer_path: Optional[str] = None
     tokenizer_mode: str = "auto"
     skip_tokenizer_init: bool = False
-    enable_tokenizer_batch_encode: bool = False
     load_format: str = "auto"
     trust_remote_code: bool = False
     dtype: str = "auto"
@@ -59,6 +58,7 @@ class ServerArgs:
     chat_template: Optional[str] = None
     completion_template: Optional[str] = None
     is_embedding: bool = False
+    enable_multimodal: Optional[bool] = None
     revision: Optional[str] = None
 
     # Port for the HTTP server
@@ -97,7 +97,13 @@ class ServerArgs:
     log_requests_level: int = 0
     show_time_cost: bool = False
     enable_metrics: bool = False
+    bucket_time_to_first_token: Optional[List[float]] = None
+    bucket_e2e_request_latency: Optional[List[float]] = None
+    bucket_inter_token_latency: Optional[List[float]] = None
+    collect_tokens_histogram: bool = False
     decode_log_interval: int = 40
+    enable_request_time_stats_logging: bool = False
+    kv_events_config: Optional[str] = None
 
     # API related
     api_key: Optional[str] = None
@@ -119,6 +125,7 @@ class ServerArgs:
 
     # Model override args in JSON
     json_model_override_args: str = "{}"
+    preferred_sampling_params: Optional[str] = None
 
     # LoRA
     lora_paths: Optional[List[str]] = None
@@ -153,9 +160,9 @@ class ServerArgs:
     disable_cuda_graph: bool = False
     disable_cuda_graph_padding: bool = False
     enable_nccl_nvls: bool = False
+    enable_tokenizer_batch_encode: bool = False
     disable_outlines_disk_cache: bool = False
     disable_custom_all_reduce: bool = False
-    enable_multimodal: Optional[bool] = None
     disable_overlap_schedule: bool = False
     enable_mixed_chunk: bool = False
     enable_dp_attention: bool = False
@@ -163,6 +170,17 @@ class ServerArgs:
     enable_ep_moe: bool = False
     enable_deepep_moe: bool = False
     deepep_mode: Optional[Literal["auto", "normal", "low_latency"]] = "auto"
+    ep_num_redundant_experts: int = 0
+    ep_dispatch_algorithm: Optional[Literal["static", "dynamic"]] = None
+    init_expert_location: str = "trivial"
+    enable_eplb: bool = False
+    eplb_rebalance_num_iterations: int = 1000
+    expert_distribution_recorder_mode: Optional[
+        Literal["stat", "per_pass", "per_token"]
+    ] = None
+    expert_distribution_recorder_buffer_size: Optional[int] = None
+    enable_expert_distribution_metrics: bool = False
+    deepep_config: Optional[str] = None
     enable_torch_compile: bool = False
     torch_compile_max_bs: int = 32
     cuda_graph_max_bs: Optional[int] = None
@@ -228,7 +246,7 @@ class ServerArgs:
         # Set mem fraction static, which depends on the tensor parallelism size
         if self.mem_fraction_static is None:
             parallel_size = self.tp_size * self.pp_size
-            if gpu_mem <= 81920:
+            if gpu_mem is not None and gpu_mem <= 81920:
                 if parallel_size >= 16:
                     self.mem_fraction_static = 0.79
                 elif parallel_size >= 8:
@@ -241,7 +259,7 @@ class ServerArgs:
                     self.mem_fraction_static = 0.88
             else:
                 self.mem_fraction_static = 0.88
-            if gpu_mem > 96 * 1024:
+            if gpu_mem is not None and gpu_mem > 96 * 1024:
                 mem_fraction = self.mem_fraction_static
                 self.mem_fraction_static = min(
                     mem_fraction + 48 * 1024 * (1 - mem_fraction) / gpu_mem,
@@ -306,12 +324,6 @@ class ServerArgs:
         if self.grammar_backend is None:
             self.grammar_backend = "xgrammar"
 
-        if self.pp_size > 1:
-            self.disable_overlap_schedule = True
-            logger.warning(
-                "Overlap scheduler is disabled because of using pipeline parallelism."
-            )
-
         # Data parallelism attention
         if self.enable_dp_attention:
             self.schedule_conservativeness = self.schedule_conservativeness * 0.3
@@ -346,6 +358,21 @@ class ServerArgs:
             logger.warning(
                 f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
+
+        if self.pp_size > 1:
+            self.disable_overlap_schedule = True
+            logger.warning(
+                "Pipeline parallelism is incompatible with overlap schedule."
+            )
+
+        if self.expert_distribution_recorder_buffer_size is None:
+            # TODO pr-chain: enable this later
+            # if (x := self.eplb_rebalance_num_iterations) is not None:
+            #     self.expert_distribution_recorder_buffer_size = x
+            if False:
+                pass
+            elif self.expert_distribution_recorder_mode is not None:
+                self.expert_distribution_recorder_buffer_size = 1000
 
         # Speculative Decoding
         if self.speculative_algorithm == "NEXTN":
@@ -468,11 +495,6 @@ class ServerArgs:
             help="If set, skip init tokenizer and pass input_ids in generate request.",
         )
         parser.add_argument(
-            "--enable-tokenizer-batch-encode",
-            action="store_true",
-            help="Enable batch tokenization for improved performance when processing multiple text inputs. Do not use with image inputs, pre-tokenized input_ids, or input_embeds.",
-        )
-        parser.add_argument(
             "--load-format",
             type=str,
             default=ServerArgs.load_format,
@@ -549,6 +571,7 @@ class ServerArgs:
                 "w8a8_int8",
                 "w8a8_fp8",
                 "moe_wna16",
+                "qoq",
             ],
             help="The quantization method.",
         )
@@ -595,6 +618,12 @@ class ServerArgs:
             "--is-embedding",
             action="store_true",
             help="Whether to use a CausalLM as an embedding model.",
+        )
+        parser.add_argument(
+            "--enable-multimodal",
+            default=ServerArgs.enable_multimodal,
+            action="store_true",
+            help="Enable the multimodal functionality for the served model. If the model being served is not multimodal, nothing will happen",
         )
         parser.add_argument(
             "--revision",
@@ -774,10 +803,49 @@ class ServerArgs:
             help="Enable log prometheus metrics.",
         )
         parser.add_argument(
+            "--bucket-time-to-first-token",
+            type=float,
+            nargs="+",
+            default=ServerArgs.bucket_time_to_first_token,
+            help="The buckets of time to first token, specified as a list of floats.",
+        )
+        parser.add_argument(
+            "--bucket-inter-token-latency",
+            type=float,
+            nargs="+",
+            default=ServerArgs.bucket_inter_token_latency,
+            help="The buckets of inter-token latency, specified as a list of floats.",
+        )
+        parser.add_argument(
+            "--bucket-e2e-request-latency",
+            type=float,
+            nargs="+",
+            default=ServerArgs.bucket_e2e_request_latency,
+            help="The buckets of end-to-end request latency, specified as a list of floats.",
+        )
+        parser.add_argument(
+            "--collect-tokens-histogram",
+            action="store_true",
+            default=ServerArgs.collect_tokens_histogram,
+            help="Collect prompt/generation tokens histogram.",
+        )
+        parser.add_argument(
+            "--kv-events-config",
+            type=str,
+            default=None,
+            help="Config in json format for NVIDIA dynamo KV event publishing. Publishing will be enabled if this flag is used.",
+        )
+        parser.add_argument(
             "--decode-log-interval",
             type=int,
             default=ServerArgs.decode_log_interval,
             help="The log interval of decode batch.",
+        )
+        parser.add_argument(
+            "--enable-request-time-stats-logging",
+            action="store_true",
+            default=ServerArgs.enable_request_time_stats_logging,
+            help="Enable per request time stats logging",
         )
 
         # API related
@@ -855,6 +923,11 @@ class ServerArgs:
             help="A dictionary in JSON string format used to override default model configurations.",
             default=ServerArgs.json_model_override_args,
         )
+        parser.add_argument(
+            "--preferred-sampling-params",
+            type=str,
+            help="json-formatted sampling settings that will be returned in /get_model_info",
+        )
 
         # LoRA
         parser.add_argument(
@@ -883,6 +956,7 @@ class ServerArgs:
             "--attention-backend",
             type=str,
             choices=[
+                "aiter",
                 "flashinfer",
                 "triton",
                 "torch_native",
@@ -1031,6 +1105,11 @@ class ServerArgs:
             help="Enable NCCL NVLS for prefill heavy requests when available.",
         )
         parser.add_argument(
+            "--enable-tokenizer-batch-encode",
+            action="store_true",
+            help="Enable batch tokenization for improved performance when processing multiple text inputs. Do not use with image inputs, pre-tokenized input_ids, or input_embeds.",
+        )
+        parser.add_argument(
             "--disable-outlines-disk-cache",
             action="store_true",
             help="Disable disk cache of outlines to avoid possible crashes related to file system or high concurrency.",
@@ -1039,12 +1118,6 @@ class ServerArgs:
             "--disable-custom-all-reduce",
             action="store_true",
             help="Disable the custom all-reduce kernel and fall back to NCCL.",
-        )
-        parser.add_argument(
-            "--enable-multimodal",
-            default=ServerArgs.enable_multimodal,
-            action="store_true",
-            help="Enable the multimodal functionality for the served model. If the model being served is not multimodal, nothing will happen",
         )
         parser.add_argument(
             "--disable-overlap-schedule",
@@ -1059,7 +1132,7 @@ class ServerArgs:
         parser.add_argument(
             "--enable-dp-attention",
             action="store_true",
-            help="Enabling data parallelism for attention and tensor parallelism for FFN. The dp size should be equal to the tp size. Currently only DeepSeek-V2 is supported.",
+            help="Enabling data parallelism for attention and tensor parallelism for FFN. The dp size should be equal to the tp size. Currently DeepSeek-V2 and Qwen 2/3 MoE models are supported.",
         )
         parser.add_argument(
             "--enable-dp-lm-head",
@@ -1199,6 +1272,58 @@ class ServerArgs:
             default="auto",
             help="Select the mode when enable DeepEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch.",
         )
+        parser.add_argument(
+            "--ep-num-redundant-experts",
+            type=int,
+            default=ServerArgs.ep_num_redundant_experts,
+            help="Allocate this number of redundant experts in expert parallel.",
+        )
+        parser.add_argument(
+            "--ep-dispatch-algorithm",
+            type=str,
+            default=ServerArgs.ep_dispatch_algorithm,
+            help="The algorithm to choose ranks for redundant experts in expert parallel.",
+        )
+        parser.add_argument(
+            "--init-expert-location",
+            type=str,
+            default=ServerArgs.init_expert_location,
+            help="Initial location of EP experts.",
+        )
+        parser.add_argument(
+            "--enable-eplb",
+            action="store_true",
+            help="Enable EPLB algorithm",
+        )
+        parser.add_argument(
+            "--eplb-rebalance-num-iterations",
+            type=int,
+            default=ServerArgs.eplb_rebalance_num_iterations,
+            help="Number of iterations to automatically trigger a EPLB re-balance.",
+        )
+        parser.add_argument(
+            "--expert-distribution-recorder-mode",
+            type=str,
+            default=ServerArgs.expert_distribution_recorder_mode,
+            help="Mode of expert distribution recorder.",
+        )
+        parser.add_argument(
+            "--expert-distribution-recorder-buffer-size",
+            type=int,
+            default=ServerArgs.expert_distribution_recorder_buffer_size,
+            help="Circular buffer size of expert distribution recorder. Set to -1 to denote infinite buffer.",
+        )
+        parser.add_argument(
+            "--enable-expert-distribution-metrics",
+            action="store_true",
+            help="Enable logging metrics for expert balancedness",
+        )
+        parser.add_argument(
+            "--deepep-config",
+            type=str,
+            default=ServerArgs.deepep_config,
+            help="Tuned DeepEP config suitable for your own cluster.",
+        )
 
         parser.add_argument(
             "--n-share-experts-fusion",
@@ -1313,8 +1438,6 @@ class ServerArgs:
 
         # FIXME pp constraints
         if self.pp_size > 1:
-            logger.warning(f"Turn off overlap scheule for pipeline parallelism.")
-            self.disable_overlap_schedule = True
             assert (
                 self.disable_overlap_schedule
                 and self.speculative_algorithm is None

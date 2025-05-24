@@ -48,10 +48,14 @@ from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.disaggregation.base import BaseKVSender
-from sglang.srt.disaggregation.decode import ScheduleBatchDisaggregationDecodeMixin
+from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
+    ScheduleBatchDisaggregationDecodeMixin,
+)
+from sglang.srt.layers.multimodal import gpu_tensor_hash
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPoolAllocator
+from sglang.srt.metrics.collector import TimeStats
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -76,16 +80,19 @@ global_server_args_dict = {
     "enable_dp_attention": ServerArgs.enable_dp_attention,
     "enable_dp_lm_head": ServerArgs.enable_dp_lm_head,
     "enable_ep_moe": ServerArgs.enable_ep_moe,
+    "deepep_config": ServerArgs.deepep_config,
     "enable_nan_detection": ServerArgs.enable_nan_detection,
     "flashinfer_mla_disable_ragged": ServerArgs.flashinfer_mla_disable_ragged,
     "max_micro_batch_size": ServerArgs.max_micro_batch_size,
     "moe_dense_tp_size": ServerArgs.moe_dense_tp_size,
+    "ep_dispatch_algorithm": ServerArgs.ep_dispatch_algorithm,
     "n_share_experts_fusion": ServerArgs.n_share_experts_fusion,
     "sampling_backend": ServerArgs.sampling_backend,
     "speculative_accept_threshold_acc": ServerArgs.speculative_accept_threshold_acc,
     "speculative_accept_threshold_single": ServerArgs.speculative_accept_threshold_single,
     "torchao_config": ServerArgs.torchao_config,
     "triton_attention_reduce_in_fp32": ServerArgs.triton_attention_reduce_in_fp32,
+    "ep_num_redundant_experts": ServerArgs.ep_num_redundant_experts,
 }
 
 logger = logging.getLogger(__name__)
@@ -176,10 +183,10 @@ class MultimodalDataItem:
     image_offsets: Optional[list] = None
 
     # the real data, pixel_values or audio_features
-    # data: Union[List[torch.Tensor], List[np.array]]
-    pixel_values: Union[torch.Tensor, np.array] = None
-    image_grid_thws: Union[torch.Tensor, np.array] = None
-    video_grid_thws: Union[torch.Tensor, np.array] = None
+    # data: Union[List[torch.Tensor], List[np.ndarray]]
+    pixel_values: Union[torch.Tensor, np.ndarray] = None
+    image_grid_thws: Union[torch.Tensor, np.ndarray] = None
+    video_grid_thws: Union[torch.Tensor, np.ndarray] = None
 
     image_emb_mask: Optional[torch.Tensor] = None
     image_spatial_crop: Optional[torch.Tensor] = None
@@ -188,8 +195,11 @@ class MultimodalDataItem:
     # [num_images, (n, w, h)]
     tgt_size: Tuple[int, int] = None
 
-    audio_features: Union[torch.Tensor, np.array] = None
+    audio_features: Union[torch.Tensor, np.ndarray] = None
     audio_feature_lens: Optional[List[torch.Tensor]] = None
+    audio_offsets: Optional[List[Tuple[int, int]]] = None
+
+    precomputed_features: Optional[Union[torch.Tensor, np.ndarray]] = None
 
     @staticmethod
     def is_empty_list(l):
@@ -218,7 +228,8 @@ class MultimodalDataItem:
                     for x in tensor_list
                 ]
                 tensor = torch.concat(tensor_list)
-
+            if tensor.is_cuda:
+                return gpu_tensor_hash(tensor)
             tensor = tensor.detach().contiguous()
 
             if tensor.dtype == torch.bfloat16:
@@ -248,7 +259,9 @@ class MultimodalDataItem:
                 return tensor_hash([f])
             return data_hash(f)
 
-        if self.is_audio():
+        if self.precomputed_features is not None:
+            self.hash = hash_feature(self.precomputed_features)
+        elif self.is_audio():
             self.hash = hash_feature(self.audio_features)
         else:
             self.hash = hash_feature(self.pixel_values)
@@ -257,19 +270,24 @@ class MultimodalDataItem:
         self.pad_value = self.hash % (1 << 30)
 
     def is_audio(self):
-        return (
-            self.modality == Modality.AUDIO
-        ) and not MultimodalDataItem.is_empty_list(self.audio_features)
+        return (self.modality == Modality.AUDIO) and (
+            self.precomputed_features is not None
+            or not MultimodalDataItem.is_empty_list(self.audio_features)
+        )
 
     def is_image(self):
         return (
             self.modality == Modality.IMAGE or self.modality == Modality.MULTI_IMAGES
-        ) and not MultimodalDataItem.is_empty_list(self.pixel_values)
+        ) and (
+            self.precomputed_features is not None
+            or not MultimodalDataItem.is_empty_list(self.pixel_values)
+        )
 
     def is_video(self):
-        return (
-            self.modality == Modality.VIDEO
-        ) and not MultimodalDataItem.is_empty_list(self.pixel_values)
+        return (self.modality == Modality.VIDEO) and (
+            self.precomputed_features is not None
+            or not MultimodalDataItem.is_empty_list(self.pixel_values)
+        )
 
     def is_valid(self) -> bool:
         return self.is_image() or self.is_video() or self.is_audio()
@@ -277,6 +295,16 @@ class MultimodalDataItem:
     def validate(self):
         ...
         # TODO
+
+    @staticmethod
+    def from_dict(obj: dict):
+        kwargs = dict(obj)
+        modality = kwargs.pop("modality")
+        if isinstance(modality, str):
+            modality = Modality[modality]
+        ret = MultimodalDataItem(modality=modality, **kwargs)
+        ret.validate()
+        return ret
 
 
 @dataclasses.dataclass
@@ -303,8 +331,9 @@ class MultimodalInputs:
     video_token_id: Optional[int] = None
 
     # audio
-    audio_start_id: Optional[torch.Tensor] = None
-    audio_end_id: Optional[torch.Tensor] = None
+    audio_token_id: Optional[int] = None
+    audio_start_id: Optional[int] = None
+    audio_end_id: Optional[int] = None
 
     @staticmethod
     def from_dict(obj: dict):
@@ -328,6 +357,7 @@ class MultimodalInputs:
             "slice_end_id",
             "audio_start_id",
             "audio_end_id",
+            "audio_token_id",
         ]
         for arg in optional_args:
             if arg in obj:
@@ -436,6 +466,7 @@ class Req:
         self.sampling_params = sampling_params
         self.custom_logit_processor = custom_logit_processor
         self.return_hidden_states = return_hidden_states
+        self.lora_path = lora_path
 
         # Memory pool info
         self.req_pool_idx: Optional[int] = None
@@ -487,6 +518,13 @@ class Req:
         # For retraction
         self.is_retracted = False
 
+        # Incremental streamining
+        self.send_token_offset: int = 0
+        self.send_decode_id_offset: int = 0
+        # TODO (Byron): send_output_token_logprobs_offset and send_decode_id_offset can be different in disaggregation mode
+        # because the decode server does not have the first output token logprobs
+        self.send_output_token_logprobs_offset: int = 0
+
         # Logprobs (arguments)
         self.return_logprob = return_logprob
         # Start index to compute logprob from.
@@ -496,11 +534,9 @@ class Req:
         self.temp_scaled_logprobs = False
         self.top_p_normalized_logprobs = False
 
-        # Latency Breakdown
-        self.queue_time_start = None
-        self.queue_time_end = None
-
         # Logprobs (return values)
+        # True means the input logprob has been already sent to detokenizer.
+        self.input_logprob_sent: bool = False
         self.input_token_logprobs_val: Optional[List[float]] = None
         self.input_token_logprobs_idx: Optional[List[int]] = None
         self.input_top_logprobs_val: Optional[List[float]] = None
@@ -515,8 +551,10 @@ class Req:
         self.temp_input_token_ids_logprobs_idx: Optional[List[int]] = None
 
         if return_logprob:
+            # shape: (bs, 1)
             self.output_token_logprobs_val = []
             self.output_token_logprobs_idx = []
+            # shape: (bs, k)
             self.output_top_logprobs_val = []
             self.output_top_logprobs_idx = []
             self.output_token_ids_logprobs_val = []
@@ -543,7 +581,12 @@ class Req:
         # The number of verification forward passes in the speculative decoding.
         # This is used to compute the average acceptance length per request.
         self.spec_verify_ct = 0
-        self.lora_path = lora_path
+
+        # For metrics
+        self.time_stats: TimeStats = TimeStats()
+        self.has_log_time_stats: bool = False
+        self.queue_time_start = None
+        self.queue_time_end = None
 
         # For disaggregation
         self.bootstrap_host: str = bootstrap_host
@@ -562,10 +605,7 @@ class Req:
         # This is because kv is not ready in `process_prefill_chunk`.
         # We use `tmp_end_idx` to store the end index of the kv cache to send.
         self.tmp_end_idx: int = -1
-
         self.metadata_buffer_index: int = -1
-        # The first output_id transferred from prefill instance.
-        self.transferred_output_id: Optional[int] = None
 
     @property
     def seqlen(self):
@@ -656,6 +696,11 @@ class Req:
             )
             return
 
+        if self.grammar is not None:
+            if self.grammar.is_terminated():
+                self.finished_reason = FINISH_MATCHED_TOKEN(matched=self.output_ids[-1])
+                return
+
         last_token_id = self.output_ids[-1]
 
         if not self.sampling_params.ignore_eos:
@@ -712,6 +757,18 @@ class Req:
         ]
         token_to_kv_pool_allocator.load_cpu_copy(self.kv_cache_cpu, token_indices)
         del self.kv_cache_cpu
+
+    def log_time_stats(self):
+        # If overlap schedule, we schedule one decode batch ahead so this gets called twice.
+        if self.has_log_time_stats is True:
+            return
+
+        if self.bootstrap_room is not None:
+            prefix = f"Req Time Stats(rid={self.rid}, bootstrap_room={self.bootstrap_room}, input len={len(self.origin_input_ids)}, output len={len(self.output_ids)}, type={self.time_stats.get_type().value})"
+        else:
+            prefix = f"Req Time Stats(rid={self.rid}, input len={len(self.origin_input_ids)}, output len={len(self.output_ids)}, type={self.time_stats.get_type().value})"
+        logger.info(f"{prefix}: {self.time_stats}")
+        self.has_log_time_stats = True
 
     def __repr__(self):
         return (
@@ -1038,7 +1095,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         else:
             self.encoder_out_cache_loc = torch.cat(encoder_out_cache_loc)
 
-        assert len(self.out_cache_loc) == self.extend_num_tokens
+        assert (
+            len(self.out_cache_loc) == self.extend_num_tokens
+        ), f"Expected {len(self.out_cache_loc)}, got {self.extend_num_tokens}"
 
     def prepare_for_extend(self):
         self.forward_mode = ForwardMode.EXTEND
