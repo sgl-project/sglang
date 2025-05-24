@@ -333,8 +333,8 @@ class DeepseekV2MoE(nn.Module):
     def forward_normal(self, hidden_states: torch.Tensor) -> torch.Tensor:
         shared_output = self._forward_shared_experts(hidden_states)
         # router_logits: (num_tokens, n_experts)
-        router_logits = self.gate(hidden_states)
-        final_hidden_states = self.experts(
+        router_logits = self.gate.forward(hidden_states)
+        final_hidden_states = self.experts.forward(
             hidden_states=hidden_states, router_logits=router_logits
         )
         final_hidden_states *= self.routed_scaling_factor
@@ -848,19 +848,21 @@ class DeepseekV2AttentionMLA(nn.Module):
             q, latent_cache = self.fused_qkv_a_proj_with_mqa(hidden_states)[0].split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
             )
-            q = self.q_a_layernorm(q)
-            q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
-        else:
-            q = self.q_proj(hidden_states)[0].view(
+            q = self.q_a_layernorm.forward(q)
+            q = self.q_b_proj.forward(q)[0].view(
                 -1, self.num_local_heads, self.qk_head_dim
             )
-            latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
+        else:
+            q = self.q_proj.forward(hidden_states)[0].view(
+                -1, self.num_local_heads, self.qk_head_dim
+            )
+            latent_cache = self.kv_a_proj_with_mqa.forward(hidden_states)[0]
 
         _, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         kv_a, _ = latent_cache.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         latent_cache = latent_cache.unsqueeze(1)
-        kv_a = self.kv_a_layernorm(kv_a.contiguous())
-        kv = self.kv_b_proj(kv_a)[0]
+        kv_a = self.kv_a_layernorm.forward(kv_a.contiguous())
+        kv = self.kv_b_proj.forward(kv_a)[0]
         kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
         k_nope = kv[..., : self.qk_nope_head_dim]
         v = kv[..., self.qk_nope_head_dim :]
@@ -882,9 +884,9 @@ class DeepseekV2AttentionMLA(nn.Module):
         return q, k, v, forward_batch
 
     def forward_normal_core(self, q, k, v, forward_batch):
-        attn_output = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
+        attn_output = self.attn_mha.forward(q, k, v, forward_batch, save_kv_cache=False)
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
-        output, _ = self.o_proj(attn_output)
+        output, _ = self.o_proj.forward(attn_output)
         return output
 
     def forward_absorb_prepare(
