@@ -823,6 +823,8 @@ class DeepseekV2AttentionMLA(nn.Module):
             inner_state = self.forward_absorb_fused_mla_rope_prepare(
                 positions, hidden_states, forward_batch, zero_allocator
             )
+        else:
+            raise NotImplementedError
         return None, attn_forward_method, forward_batch, inner_state
 
     def forward_core(self, intermediate_state):
@@ -840,6 +842,8 @@ class DeepseekV2AttentionMLA(nn.Module):
             return self.forward_absorb_core(*inner_state)
         elif attn_forward_method == AttnForwardMethod.MLA_FUSED_ROPE:
             return self.forward_absorb_fused_mla_rope_core(*inner_state)
+        else:
+            raise NotImplementedError
 
     def forward_normal_prepare(
         self,
