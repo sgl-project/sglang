@@ -36,6 +36,7 @@ suites = {
         TestFile("test_fa3.py", 376),
         TestFile("test_fim_completion.py", 40),
         TestFile("test_fp8_kernel.py", 8),
+        TestFile("test_function_call_parser.py", 10),
         TestFile("test_fused_moe.py", 30),
         TestFile("test_hicache.py", 116),
         TestFile("test_hicache_mla.py", 254),

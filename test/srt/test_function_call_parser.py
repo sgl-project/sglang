@@ -183,6 +183,87 @@ class TestPythonicDetector(unittest.TestCase):
             self.detector._buffer, "["
         )  # Opening bracket remains in buffer
 
+    def test_parse_streaming_nested_brackets(self):
+        """Test parsing tool calls with nested brackets in arguments."""
+        # Test with list argument containing nested brackets
+        text = "[get_weather(location='New York', unit='celsius', data=[1, 2, 3])]"
+        result = self.detector.parse_streaming_increment(text, self.tools)
+
+        self.assertEqual(result.normal_text, "")
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(self.detector._buffer, "")
+
+        # Check the parameters
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["location"], "New York")
+        self.assertEqual(params["unit"], "celsius")
+        self.assertEqual(params["data"], [1, 2, 3])
+
+    def test_parse_streaming_nested_brackets_dict(self):
+        """Test parsing tool calls with nested dictionaries and lists."""
+        # Test with nested dict and list arguments
+        text = "[search(query='test', config={'options': [1, 2], 'nested': {'key': 'value'}})]"
+        result = self.detector.parse_streaming_increment(text, self.tools)
+
+        self.assertEqual(result.normal_text, "")
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "search")
+        self.assertEqual(self.detector._buffer, "")
+
+        # Check the parameters
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["query"], "test")
+        self.assertEqual(params["config"]["options"], [1, 2])
+        self.assertEqual(params["config"]["nested"]["key"], "value")
+
+    def test_parse_streaming_multiple_tools_with_nested_brackets(self):
+        """Test parsing multiple tool calls with nested brackets."""
+        text = "[get_weather(location='Paris', data=[10, 20]), search(query='test', filters=['a', 'b'])]"
+        result = self.detector.parse_streaming_increment(text, self.tools)
+
+        self.assertEqual(result.normal_text, "")
+        self.assertEqual(len(result.calls), 2)
+        self.assertEqual(self.detector._buffer, "")
+
+        # Check first tool call
+        params1 = json.loads(result.calls[0].parameters)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(params1["location"], "Paris")
+        self.assertEqual(params1["data"], [10, 20])
+
+        # Check second tool call
+        params2 = json.loads(result.calls[1].parameters)
+        self.assertEqual(result.calls[1].name, "search")
+        self.assertEqual(params2["query"], "test")
+        self.assertEqual(params2["filters"], ["a", "b"])
+
+    def test_parse_streaming_partial_nested_brackets(self):
+        """Test parsing partial tool calls with nested brackets across chunks."""
+        # First chunk with nested brackets but incomplete
+        text1 = "Here's a call: [get_weather(location='Tokyo', data=[1, 2"
+        result1 = self.detector.parse_streaming_increment(text1, self.tools)
+
+        self.assertEqual(result1.normal_text, "Here's a call: ")
+        self.assertEqual(result1.calls, [])
+        self.assertEqual(
+            self.detector._buffer, "[get_weather(location='Tokyo', data=[1, 2"
+        )
+
+        # Second chunk completing the nested brackets
+        text2 = ", 3])]"
+        result2 = self.detector.parse_streaming_increment(text2, self.tools)
+
+        self.assertEqual(result2.normal_text, "")
+        self.assertEqual(len(result2.calls), 1)
+        self.assertEqual(result2.calls[0].name, "get_weather")
+        self.assertEqual(self.detector._buffer, "")
+
+        # Check the parameters
+        params = json.loads(result2.calls[0].parameters)
+        self.assertEqual(params["location"], "Tokyo")
+        self.assertEqual(params["data"], [1, 2, 3])
+
 
 class TestEBNFGeneration(unittest.TestCase):
     def setUp(self):

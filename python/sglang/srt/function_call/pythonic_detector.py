@@ -74,6 +74,28 @@ class PythonicDetector(BaseFormatDetector):
             logger.exception("Error in pythonic tool call parsing.")
             return StreamingParseResult(normal_text=text, calls=[])
 
+    def _find_matching_bracket(self, buffer: str, start: int) -> int:
+        """
+        Find the matching closing bracket for the opening bracket at start position.
+        Properly handles nested brackets.
+
+        Args:
+            buffer: The text buffer to search in
+            start: Position of the opening bracket '['
+
+        Returns:
+            Position of the matching closing bracket ']', or -1 if not found
+        """
+        bracket_count = 0
+        for i in range(start, len(buffer)):
+            if buffer[i] == "[":
+                bracket_count += 1
+            elif buffer[i] == "]":
+                bracket_count -= 1
+                if bracket_count == 0:
+                    return i
+        return -1  # No matching bracket found
+
     def parse_streaming_increment(
         self, new_text: str, tools: List[Tool]
     ) -> StreamingParseResult:
@@ -92,7 +114,7 @@ class PythonicDetector(BaseFormatDetector):
 
         normal_text = self._buffer[:start] if start > 0 else ""
 
-        end = self._buffer.find("]", start)
+        end = self._find_matching_bracket(self._buffer, start)
         if end != -1:
             call_text = self._buffer[start : end + 1]
             result = self.detect_and_parse(call_text, tools)
