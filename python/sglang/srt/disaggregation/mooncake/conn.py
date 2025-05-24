@@ -63,6 +63,7 @@ class KVTransferError(Exception):
         return f"KVTransferError(bootstrap_room={self.bootstrap_room}): {self.failure_reason}"
 
 
+# prefill
 @dataclasses.dataclass
 class TransferKVChunk:
     room: int
@@ -72,6 +73,7 @@ class TransferKVChunk:
     prefill_aux_index: Optional[int]
 
 
+# decode
 @dataclasses.dataclass
 class TransferInfo:
     room: int
@@ -105,6 +107,7 @@ class TransferInfo:
         )
 
 
+# decode
 @dataclasses.dataclass
 class KVArgsRegisterInfo:
     room: str
