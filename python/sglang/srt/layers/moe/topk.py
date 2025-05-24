@@ -312,8 +312,13 @@ def select_experts(
 ):
     n_share_experts_fusion = global_server_args_dict["n_share_experts_fusion"]
 
-    router_logits, correction_bias = expert_location_dispatch.transform_select_experts_inputs(router_logits,
-                                                                                              correction_bias)
+    router_logits, correction_bias = (
+        expert_location_dispatch.transform_select_experts_inputs(
+            router_logits=router_logits,
+            correction_bias=correction_bias,
+            info=expert_location_dispatch_info,
+        )
+    )
 
     # DeepSeek V2/V3/R1 series models use grouped_top_k
     if use_grouped_topk:

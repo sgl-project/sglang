@@ -54,6 +54,7 @@ class ExpertLocationDispatchInfo:
             num_physical_experts=expert_location_metadata.num_physical_experts,
         )
 
+
 def transform_select_experts_inputs(
     router_logits: torch.Tensor,
     correction_bias: Optional[torch.Tensor],
