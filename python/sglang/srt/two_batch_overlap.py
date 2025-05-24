@@ -306,9 +306,8 @@ def _compute_extend_num_tokens(input_ids, forward_mode: ForwardMode):
 # -------------------------------- Execution ---------------------------------------
 
 
-def model_forward_maybe_tbo(
+def model_forward_tbo(
     layers,
-    enable_tbo: bool,
     positions: torch.Tensor,
     forward_batch: ForwardBatch,
     hidden_states: torch.Tensor,
@@ -325,13 +324,7 @@ def model_forward_maybe_tbo(
     operations_strategy = OperationsStrategy.init_new_tbo(
         layers, forward_batch.global_forward_mode
     )
-    if enable_tbo:
-        return _model_forward_tbo(inputs, operations_strategy)
-    else:
-        return _model_forward_non_tbo(inputs, operations_strategy)
 
-
-def _model_forward_tbo(inputs, operations_strategy: OperationsStrategy):
     # The attn_tp_size!=1 case is not yet extracted to master
     assert get_attention_tp_size() == 1
 
@@ -346,13 +339,6 @@ def _model_forward_tbo(inputs, operations_strategy: OperationsStrategy):
         )
 
     return _model_forward_tbo_merge_outputs(*outputs_arr)
-
-
-def _model_forward_non_tbo(inputs, operations_strategy: OperationsStrategy):
-    assert operations_strategy.deep_gemm_num_sms is None, "unsupported"
-    assert operations_strategy.tbo_delta_stages is None, "unsupported"
-    outputs = execute_operations(inputs, operations_strategy.operations)
-    return outputs["hidden_states"], outputs["residual"]
 
 
 def _model_forward_tbo_split_inputs(
