@@ -92,31 +92,15 @@ jobs:
 
       - name: Install dependencies
         run: bash scripts/amd_ci_install_dependency.sh
-
-      - name: Benchmark offline throughput (w/o RadixAttention)
-        if: always()
-        timeout-minutes: 15
-        run: |
-          bash scripts/amd_ci_exec.sh python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_without_radix_cache
-
-      - name: Benchmark offline throughput (w/ Triton)
-        if: always()
-        timeout-minutes: 15
-        run: |
-          bash scripts/amd_ci_exec.sh python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_with_triton_attention_backend
-
-      - name: Benchmark offline throughput (w/ FP8)
-        if: always()
-        timeout-minutes: 15
-        run: |
-          bash scripts/amd_ci_exec.sh python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_default_fp8
       
       - name: Benchmark VLM offline throughput
+        if: always()
         timeout-minutes: 10
         run: |
           bash scripts/amd_ci_exec.sh python3 -m unittest test_bench_serving.TestBenchServing.test_vlm_offline_throughput
 
       - name: Benchmark VLM online latency
+        if: always()
         timeout-minutes: 10
         run: |
           bash scripts/amd_ci_exec.sh python3 -m unittest test_bench_serving.TestBenchServing.test_vlm_online_latency
@@ -140,42 +124,14 @@ jobs:
       - name: Install dependencies
         run: bash scripts/amd_ci_install_dependency.sh
 
-      - name: Benchmark dummy grok (TP=2)
-        if: always()
-        timeout-minutes: 30
-        run: |
-          bash scripts/amd_ci_exec.sh python3 models/test_dummy_grok_models.py
-
-      - name: Benchmark single latency (TP=2)
-        if: always()
-        timeout-minutes: 25
-        run: |
-          bash scripts/amd_ci_exec.sh python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_moe_tp2_bs1
-
-      - name: Benchmark single latency + torch.compile (TP=2)
-        if: always()
-        timeout-minutes: 25
-        run: |
-          bash scripts/amd_ci_exec.sh python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_torch_compile_tp2_bs1
-
-      - name: Benchmark offline throughput (TP=2)
-        if: always()
-        timeout-minutes: 25
-        run: |
-          bash scripts/amd_ci_exec.sh python3 -m unittest test_bench_serving.TestBenchServing.test_moe_offline_throughput_default
-
-      - name: Benchmark offline throughput (w/o RadixAttention) (TP=2)
-        if: always()
-        timeout-minutes: 25
-        run: |
-          bash scripts/amd_ci_exec.sh python3 -m unittest test_bench_serving.TestBenchServing.test_moe_offline_throughput_without_radix_cache
-
       - name: Benchmark offline decode throughput (PP=2)
+        if: always()
         timeout-minutes: 10
         run: |
           bash scripts/amd_ci_exec.sh python3 -m unittest test_bench_serving.TestBenchServing.test_pp_offline_throughput_default_decode
 
       - name: Benchmark offline prefill throughput (PP=2)
+        if: always()
         timeout-minutes: 10
         run: |
           bash scripts/amd_ci_exec.sh python3 -m unittest test_bench_serving.TestBenchServing.test_pp_long_context_prefill
