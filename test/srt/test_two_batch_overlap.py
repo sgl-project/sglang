@@ -10,13 +10,20 @@ from sglang.test.test_utils import (
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    is_in_ci,
     popen_launch_server,
 )
 
 
-class TestTwoBatchOverlap(unittest.TestCase):
+class _BaseTestTwoBatchOverlap(unittest.TestCase):
+    extra_args = None
+    skip_in_ci = False
+
     @classmethod
     def setUpClass(cls):
+        if is_in_ci() and cls.skip_in_ci:
+            return
+
         cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
@@ -31,19 +38,23 @@ class TestTwoBatchOverlap(unittest.TestCase):
                 "2",
                 "--enable-dp-attention",
                 "--enable-deepep-moe",
-                "--deepep-mode",
-                "normal",
-                "--disable-cuda-graph",  # DeepEP normal does not support CUDA Graph
                 "--enable-two-batch-overlap",
+                *cls.extra_args,
             ],
             env={"SGL_ENABLE_JIT_DEEPGEMM": "0", **os.environ},
         )
 
     @classmethod
     def tearDownClass(cls):
+        if is_in_ci() and cls.skip_in_ci:
+            return
+
         kill_process_tree(cls.process.pid)
 
     def test_generate_single_prompt(self):
+        if is_in_ci() and self.skip_in_ci:
+            return
+
         response = requests.post(
             self.base_url + "/generate",
             # we use an uncommon start to minimise the chance that the cache is hit by chance
@@ -56,6 +67,9 @@ class TestTwoBatchOverlap(unittest.TestCase):
         self.assertEquals(response.json()["text"], "5, 1+5=6")
 
     def test_mmlu(self):
+        if is_in_ci() and self.skip_in_ci:
+            return
+
         args = SimpleNamespace(
             base_url=self.base_url,
             model=self.model,
@@ -66,6 +80,26 @@ class TestTwoBatchOverlap(unittest.TestCase):
 
         metrics = run_eval(args)
         self.assertGreater(metrics["score"], 0.5)
+
+
+class TestTwoBatchOverlapNormal(_BaseTestTwoBatchOverlap):
+    extra_args = [
+        "--deepep-mode",
+        "normal",
+        # DeepEP normal does not support CUDA Graph
+        "--disable-cuda-graph",
+    ]
+
+
+class TestTwoBatchOverlapLowLatency(_BaseTestTwoBatchOverlap):
+    extra_args = [
+        "--deepep-mode",
+        "low_latency",
+        "--chunked-prefill-size",
+        "128",
+    ]
+    # DeepEP low-latency requires IB
+    skip_in_ci = True
 
 
 if __name__ == "__main__":
