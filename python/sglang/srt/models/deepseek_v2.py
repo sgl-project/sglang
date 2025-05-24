@@ -442,7 +442,7 @@ class DeepseekV2MoE(nn.Module):
             state.shared_output = None
 
     def op_select_experts(self, state):
-        router_logits = state.router_logits
+        router_logits = state.pop("router_logits")
         hidden_states = state.hidden_states_mlp_input
 
         if router_logits is not None:
@@ -472,7 +472,7 @@ class DeepseekV2MoE(nn.Module):
         if self.ep_size > 1:
             # TODO(ch-wan): allow users to set num_max_dispatch_tokens_per_rank value
             self.deepep_dispatcher.dispatch_a(
-                hidden_states=state.hidden_states_mlp_input,
+                hidden_states=state.pop("hidden_states_mlp_input"),
                 topk_idx=state.pop("topk_idx_local"),
                 topk_weights=state.pop("topk_weights_local"),
                 forward_mode=state.forward_batch.forward_mode,
@@ -498,7 +498,6 @@ class DeepseekV2MoE(nn.Module):
                 )
 
     def op_experts(self, state):
-        state.pop("router_logits")
         state.hidden_states_experts_output = self.experts(
             hidden_states=state.pop("hidden_states_experts_input"),
             topk_idx=state.topk_idx_dispatched,
@@ -528,8 +527,6 @@ class DeepseekV2MoE(nn.Module):
             )
 
     def op_output(self, state):
-        state.pop("hidden_states_mlp_input")
-
         final_hidden_states = state.pop("hidden_states_after_combine")
         final_hidden_states *= self.routed_scaling_factor
         if (s := state.pop("shared_output")) is not None:
