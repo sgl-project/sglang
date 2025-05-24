@@ -261,6 +261,7 @@ else()
 endif()
 set(MSCCLPP_USE_CUDA ON)
 set(MSCCLPP_BYPASS_GPU_CHECK ON)
+set(MSCCLPP_BUILD_TESTS OFF)
 add_subdirectory(${repo-mscclpp_SOURCE_DIR})
 target_link_libraries(common_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
 
