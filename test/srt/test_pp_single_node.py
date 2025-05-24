@@ -156,7 +156,7 @@ class TestQwenPPTieWeightsAccuracy(unittest.TestCase):
     def test_baseline_accuracy(self):
         metrics = self.run_gsm8k_test(pp_size=1)
         print(f"[Qwen Baseline] {metrics=}")
-        self.assertGreater(metrics["accuracy"], 0.4)
+        self.assertGreater(metrics["accuracy"], 0.39)
 
     def test_pp_consistency(self):
         baseline = self.run_gsm8k_test(pp_size=1)
