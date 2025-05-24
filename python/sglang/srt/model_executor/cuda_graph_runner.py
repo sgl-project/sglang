@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Union
 import torch
 import tqdm
 
+from sglang.srt import two_batch_overlap
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.parallel_state import GroupCoordinator, graph_capture
@@ -38,7 +39,10 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.patch_torch import monkey_patch_torch_compile
-from sglang.srt.two_batch_overlap import TboForwardBatchPreparer
+from sglang.srt.two_batch_overlap import (
+    TboCudaGraphRunnerUtils,
+    TboForwardBatchPreparer,
+)
 from sglang.srt.utils import (
     get_available_gpu_memory,
     get_device_memory_capacity,
@@ -452,19 +456,6 @@ class CudaGraphRunner:
         else:
             lora_paths = None
 
-        if self.model_runner.server_args.enable_two_batch_overlap:
-            tbo_split_seq_index = two_batch_overlap.compute_split_seq_index(
-                forward_mode=self.capture_forward_mode,
-                num_tokens=num_tokens,
-                extend_lens=None,
-            )
-            # For simplicity, when two_batch_overlap is enabled, we only capture CUDA Graph for tbo=true
-            assert (
-                tbo_split_seq_index is not None
-            ), f"{self.capture_forward_mode=} {num_tokens=}"
-        else:
-            tbo_split_seq_index = None
-
         forward_batch = ForwardBatch(
             forward_mode=self.capture_forward_mode,
             batch_size=bs,
@@ -487,7 +478,9 @@ class CudaGraphRunner:
             capture_hidden_mode=self.capture_hidden_mode,
             lora_paths=lora_paths,
             num_token_non_padded=self.num_token_non_padded,
-            tbo_split_seq_index=tbo_split_seq_index,
+            tbo_split_seq_index=TboCudaGraphRunnerUtils.compute_tbo_split_seq_index(
+                self, num_tokens
+            ),
             global_forward_mode=self.capture_forward_mode,
         )
         TboForwardBatchPreparer.prepare(forward_batch)

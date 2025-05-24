@@ -1,5 +1,5 @@
 import dataclasses
-from typing import Dict, List, Optional, Sequence
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence
 
 import torch
 
@@ -9,9 +9,13 @@ from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPDispatcher
 from sglang.srt.layers.quantization.deep_gemm import configure_deep_gemm_num_sms
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.operations import execute_operations, execute_overlapped_operations
+from sglang.srt.operations import execute_overlapped_operations
 from sglang.srt.operations_strategy import OperationsStrategy
 from sglang.srt.utils import BumpAllocator, DeepEPMode
+
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
+
 
 # -------------------------------- Compute Basic Info ---------------------------------------
 
@@ -63,6 +67,24 @@ def compute_split_token_index(
 
 
 # -------------------------------- Preparation ---------------------------------------
+
+
+class TboCudaGraphRunnerUtils:
+    @staticmethod
+    def compute_tbo_split_seq_index(that: "CudaGraphRunner", num_tokens: int):
+        if that.model_runner.server_args.enable_two_batch_overlap:
+            tbo_split_seq_index = compute_split_seq_index(
+                forward_mode=that.capture_forward_mode,
+                num_tokens=num_tokens,
+                extend_lens=None,
+            )
+            # For simplicity, when two_batch_overlap is enabled, we only capture CUDA Graph for tbo=true
+            assert (
+                tbo_split_seq_index is not None
+            ), f"{that.capture_forward_mode=} {num_tokens=}"
+        else:
+            tbo_split_seq_index = None
+        return tbo_split_seq_index
 
 
 class TboDPAttentionPreparer:
