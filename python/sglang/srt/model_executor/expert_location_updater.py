@@ -342,7 +342,9 @@ def update_expert_weights_single_layer(
             for req in reqs:
                 req.wait(timeout=30)
         except RuntimeError:
-            logger.error(f"Context: {rank=} {old_physical_to_logical_map=} {new_physical_to_logical_map=} {num_local_physical_experts=} {num_gpu_per_node=}")
+            logger.error(
+                f"Context: {rank=} {old_physical_to_logical_map=} {new_physical_to_logical_map=} {num_local_physical_experts=} {num_gpu_per_node=}"
+            )
             raise
 
     def _execute_buffer2weight_copies(buffer2weight_copy_infos):
