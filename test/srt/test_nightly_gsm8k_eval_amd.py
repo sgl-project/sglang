@@ -42,24 +42,24 @@ failing_models = {
 }
 
 
-def remove_failing_models(model_str):
-    models = model_str.split(",")
-    filtered = [m for m in models if m not in failing_models]
-    return ",".join(filtered)
+# def remove_failing_models(model_str):
+#     models = model_str.split(",")
+#     filtered = [m for m in models if m not in failing_models]
+#     return ",".join(filtered)
 
 
-DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1 = remove_failing_models(
-    DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1
-)
-DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2 = remove_failing_models(
-    DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2
-)
-DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1 = remove_failing_models(
-    DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1
-)
-DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2 = remove_failing_models(
-    DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2
-)
+# DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1 = remove_failing_models(
+#     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1
+# )
+# DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2 = remove_failing_models(
+#     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2
+# )
+# DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1 = remove_failing_models(
+#     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1
+# )
+# DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2 = remove_failing_models(
+#     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2
+# )
 
 
 def parse_models(model_string):
