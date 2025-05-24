@@ -10,6 +10,7 @@ from sgl_kernel.sparse_flash_attn import (
     sparse_attn_func,
     sparse_attn_varlen_func,
 )
+from test_flash_attention import construct_local_mask
 
 
 def ref_attn(
