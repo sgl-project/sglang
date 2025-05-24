@@ -1,3 +1,4 @@
+import json
 import os
 import subprocess
 import time
@@ -21,8 +22,6 @@ from sglang.test.test_utils import (
 )
 
 
-# skip the test because we have different_tp test
-@unittest.skip("skip the test because we have different_tp test")
 class TestDisaggregationAccuracy(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -171,6 +170,34 @@ class TestDisaggregationAccuracy(CustomTestCase):
         assert (
             len(input_logprobs) > 0
         ), f"input_logprobs should have at least one token, but got {len(input_logprobs)}"
+
+    def test_structured_output(self):
+        json_schema = json.dumps(
+            {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "pattern": "^[\\w]+$"},
+                    "population": {"type": "integer"},
+                },
+                "required": ["name", "population"],
+            }
+        )
+
+        # JSON
+        response = requests.post(
+            f"{self.lb_url}/generate",
+            json={
+                "text": "Here is the information of the capital of France in the JSON format.\n",
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": 64,
+                    "json_schema": json_schema,
+                },
+            },
+        )
+        output = response.json()["text"]
+        # ensure the output is a valid JSON
+        json.loads(output)
 
 
 class TestDisaggregationMooncakeFailure(CustomTestCase):
