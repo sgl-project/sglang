@@ -54,6 +54,17 @@ class ExpertLocationDispatchInfo:
             num_physical_experts=expert_location_metadata.num_physical_experts,
         )
 
+def transform_select_experts_inputs(
+    router_logits: torch.Tensor,
+    correction_bias: Optional[torch.Tensor],
+    info: Optional[ExpertLocationDispatchInfo],
+):
+    if (info is not None) and (info.ep_dispatch_algorithm == "fake"):
+        router_logits = torch.randn_like(router_logits)
+        if correction_bias is not None:
+            correction_bias = torch.zeros_like(correction_bias)
+    return router_logits, correction_bias
+
 
 def topk_ids_logical_to_physical(
     topk_ids: torch.Tensor, info: Optional[ExpertLocationDispatchInfo]
