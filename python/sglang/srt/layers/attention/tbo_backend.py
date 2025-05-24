@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, List, Optional, Union
+from typing import TYPE_CHECKING, Callable, List, Optional, Union
 
 import torch
 
@@ -15,6 +15,13 @@ class TboAttnBackend(AttentionBackend):
         super().__init__()
         self.primary = primary
         self.children = children
+
+    @classmethod
+    def init_new(cls, creator: Callable[[], AttentionBackend]):
+        return cls(
+            primary=creator(),
+            children=[creator() for _ in range(2)],
+        )
 
     def init_forward_metadata(self, forward_batch: "ForwardBatch"):
         self.primary.init_forward_metadata(forward_batch=forward_batch)
