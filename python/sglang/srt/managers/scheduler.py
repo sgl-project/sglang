@@ -48,8 +48,10 @@ from sglang.srt.disaggregation.prefill import (
 )
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
+    MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    prepare_abort,
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.hf_transformers_utils import (
@@ -101,6 +103,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
+from sglang.srt.managers.mm_utils import init_embedding_cache
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     MultimodalInputs,
@@ -567,29 +570,28 @@ class Scheduler(
             req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
                 buffer_size
             )
-            aux_dtype = torch.int32
-            # A list of metadata buffers. The shape is (b, metadata_size) where
-            # b corresponds to a max running requests. The last shape * dtype.itemsize
-            # should be larger than 64 bytes to work with RDMA, so we pad it.
-            output_id_buffer = torch.zeros(
-                (buffer_size, 16), dtype=aux_dtype, device="cpu"
-            )
-            metadata_buffers = [output_id_buffer]
+            self.disagg_metadata_buffers = MetadataBuffers(buffer_size)
 
             # The decode requests polling kv cache
             self.disagg_decode_transfer_queue = DecodeTransferQueue(
                 gloo_group=self.attn_tp_cpu_group,
                 req_to_metadata_buffer_idx_allocator=req_to_metadata_buffer_idx_allocator,
-                metadata_buffers=metadata_buffers,
+                metadata_buffers=self.disagg_metadata_buffers,
+                scheduler=self,
+                tree_cache=self.tree_cache,
             )
 
             # The decode requests pending for pre-allocation
             self.disagg_decode_prealloc_queue = DecodePreallocQueue(
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                draft_token_to_kv_pool=(
+                    None
+                    if self.draft_worker is None
+                    else self.draft_worker.model_runner.token_to_kv_pool
+                ),
                 req_to_metadata_buffer_idx_allocator=req_to_metadata_buffer_idx_allocator,
-                metadata_buffers=metadata_buffers,
-                aux_dtype=aux_dtype,
+                metadata_buffers=self.disagg_metadata_buffers,
                 scheduler=self,
                 transfer_queue=self.disagg_decode_transfer_queue,
                 tree_cache=self.tree_cache,
@@ -609,20 +611,17 @@ class Scheduler(
             req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
                 buffer_size
             )
-            aux_dtype = torch.int32
-            # A list of metadata buffers. The shape is (b, metadata_size) where
-            # b corresponds to a max running requests. The last shape * dtype.itemsize
-            # should be larger than 64 bytes to work with RDMA, so we pad it.
-            output_id_buffer = torch.zeros(
-                (buffer_size, 16), dtype=aux_dtype, device="cpu"
-            )
-            metadata_buffers = [output_id_buffer]
+            self.disagg_metadata_buffers = MetadataBuffers(buffer_size)
 
             self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(
                 token_to_kv_pool=self.token_to_kv_pool_allocator.get_kvcache(),
+                draft_token_to_kv_pool=(
+                    None
+                    if self.draft_worker is None
+                    else self.draft_worker.model_runner.token_to_kv_pool
+                ),
                 req_to_metadata_buffer_idx_allocator=req_to_metadata_buffer_idx_allocator,
-                metadata_buffers=metadata_buffers,
-                aux_dtype=aux_dtype,
+                metadata_buffers=self.disagg_metadata_buffers,
                 tp_rank=self.tp_rank,
                 tp_size=self.tp_size,
                 bootstrap_port=self.server_args.disaggregation_bootstrap_port,
@@ -934,6 +933,18 @@ class Scheduler(
                 bootstrap_room=recv_req.bootstrap_room,
             )
             req.tokenizer = self.tokenizer
+
+            if self.disaggregation_mode != DisaggregationMode.NULL:
+                # Invalid request for disaggregated mode
+                if recv_req.bootstrap_room is None:
+                    error_message = (
+                        f"Invalid request: Disaggregated request received without "
+                        f"boostrap room id. {req.rid=}"
+                    )
+                    logger.error(error_message)
+                    prepare_abort(req, error_message)
+                    self.stream_output([req], req.return_logprob)
+                    return
 
             if (
                 recv_req.session_params is not None
@@ -1392,6 +1403,13 @@ class Scheduler(
             if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
                 self.running_batch.batch_is_full = True
                 break
+
+            if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                # In prefill mode, prealloc queue and transfer queue can also take memory,
+                # so we need to check if the available size for the actual available size.
+                if len(adder.can_run_list) >= self.req_to_token_pool.available_size():
+                    self.running_batch.batch_is_full = True
+                    break
 
             req.init_next_round_input(
                 None if prefix_computed else self.tree_cache,
@@ -2267,6 +2285,10 @@ def run_scheduler_process(
     if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
         set_gpu_proc_affinity(server_args.tp_size, server_args.nnodes, gpu_id)
 
+    embedding_cache_size = 100
+    if "SGLANG_VLM_CACHE_SIZE_MB" in os.environ:
+        embedding_cache_size = int(os.environ["SGLANG_VLM_CACHE_SIZE_MB"])
+    init_embedding_cache(embedding_cache_size * 1024 * 1024)
     # Create a scheduler and run the event loop
     try:
         scheduler = Scheduler(server_args, port_args, gpu_id, tp_rank, pp_rank, dp_rank)

@@ -173,10 +173,13 @@ class ServerArgs:
     ep_num_redundant_experts: int = 0
     ep_dispatch_algorithm: Optional[Literal["static", "dynamic"]] = None
     init_expert_location: str = "trivial"
+    enable_eplb: bool = False
+    eplb_rebalance_num_iterations: int = 1000
     expert_distribution_recorder_mode: Optional[
         Literal["stat", "per_pass", "per_token"]
     ] = None
     expert_distribution_recorder_buffer_size: Optional[int] = None
+    enable_expert_distribution_metrics: bool = False
     deepep_config: Optional[str] = None
     enable_torch_compile: bool = False
     torch_compile_max_bs: int = 32
@@ -574,6 +577,7 @@ class ServerArgs:
                 "w8a8_int8",
                 "w8a8_fp8",
                 "moe_wna16",
+                "qoq",
             ],
             help="The quantization method.",
         )
@@ -1134,7 +1138,7 @@ class ServerArgs:
         parser.add_argument(
             "--enable-dp-attention",
             action="store_true",
-            help="Enabling data parallelism for attention and tensor parallelism for FFN. The dp size should be equal to the tp size. Currently only DeepSeek-V2 is supported.",
+            help="Enabling data parallelism for attention and tensor parallelism for FFN. The dp size should be equal to the tp size. Currently DeepSeek-V2 and Qwen 2/3 MoE models are supported.",
         )
         parser.add_argument(
             "--enable-dp-lm-head",
@@ -1293,6 +1297,17 @@ class ServerArgs:
             help="Initial location of EP experts.",
         )
         parser.add_argument(
+            "--enable-eplb",
+            action="store_true",
+            help="Enable EPLB algorithm",
+        )
+        parser.add_argument(
+            "--eplb-rebalance-num-iterations",
+            type=int,
+            default=ServerArgs.eplb_rebalance_num_iterations,
+            help="Number of iterations to automatically trigger a EPLB re-balance.",
+        )
+        parser.add_argument(
             "--expert-distribution-recorder-mode",
             type=str,
             default=ServerArgs.expert_distribution_recorder_mode,
@@ -1303,6 +1318,11 @@ class ServerArgs:
             type=int,
             default=ServerArgs.expert_distribution_recorder_buffer_size,
             help="Circular buffer size of expert distribution recorder. Set to -1 to denote infinite buffer.",
+        )
+        parser.add_argument(
+            "--enable-expert-distribution-metrics",
+            action="store_true",
+            help="Enable logging metrics for expert balancedness",
         )
         parser.add_argument(
             "--deepep-config",
