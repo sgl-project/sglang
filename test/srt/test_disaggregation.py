@@ -18,7 +18,6 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_pd_server,
-    run_with_timeout,
 )
 
 
