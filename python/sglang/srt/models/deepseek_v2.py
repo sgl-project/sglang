@@ -783,6 +783,22 @@ class DeepseekV2AttentionMLA(nn.Module):
             state.pop("attn_intermediate_state")
         )
 
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        zero_allocator: BumpAllocator,
+    ):
+        return self.forward_core(
+            self.forward_prepare(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+                zero_allocator=zero_allocator,
+            )
+        )
+
     def forward_prepare(
         self,
         positions: torch.Tensor,
@@ -1436,13 +1452,11 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
-        hidden_states = self.self_attn.forward_core(
-            self.self_attn.forward_prepare(
-                positions=positions,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
-                zero_allocator=zero_allocator,
-            )
+        hidden_states = self.self_attn(
+            positions=positions,
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+            zero_allocator=zero_allocator,
         )
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
