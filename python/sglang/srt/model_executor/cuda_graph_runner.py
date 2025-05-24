@@ -157,6 +157,9 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
             model_runner.req_to_token_pool.size
         ]
 
+    if server_args.enable_two_batch_overlap:
+        capture_bs = [bs for bs in capture_bs if bs >= 2]
+
     if server_args.cuda_graph_max_bs:
         capture_bs = [bs for bs in capture_bs if bs <= server_args.cuda_graph_max_bs]
         if max(capture_bs) < server_args.cuda_graph_max_bs:
