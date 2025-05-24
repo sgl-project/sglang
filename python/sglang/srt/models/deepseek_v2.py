@@ -425,7 +425,7 @@ class DeepseekV2MoE(nn.Module):
             return None
 
     def op_gate(self, state):
-        if (not self._enable_deepep_moe) or is_non_idle_and_non_empty(
+        if is_non_idle_and_non_empty(
             state.forward_batch.forward_mode, state.hidden_states_mlp_input
         ):
             # router_logits: (num_tokens, n_experts)
@@ -434,11 +434,8 @@ class DeepseekV2MoE(nn.Module):
             state.router_logits = None
 
     def op_shared_experts(self, state):
-        if (self.n_share_experts_fusion == 0) and (
-            (not self._enable_deepep_moe)
-            or is_non_idle_and_non_empty(
-                state.forward_batch.forward_mode, state.hidden_states_mlp_input
-            )
+        if (self.n_share_experts_fusion == 0) and is_non_idle_and_non_empty(
+            state.forward_batch.forward_mode, state.hidden_states_mlp_input
         ):
             state.shared_output = self.shared_experts(state.hidden_states_mlp_input)
         else:
@@ -448,32 +445,31 @@ class DeepseekV2MoE(nn.Module):
         router_logits = state.router_logits
         hidden_states = state.hidden_states_mlp_input
 
-        if self._enable_deepep_moe:
-            if router_logits is not None:
-                state.topk_weights_local, state.topk_idx_local = select_experts(
-                    hidden_states=hidden_states,
-                    router_logits=router_logits,
-                    top_k=self.top_k,
-                    use_grouped_topk=True,
-                    renormalize=self.renormalize,
-                    topk_group=self.topk_group,
-                    num_expert_group=self.num_expert_group,
-                    correction_bias=self.correction_bias,
-                    routed_scaling_factor=self.routed_scaling_factor,
-                    expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                        layer_id=self.layer_id,
-                    ),
-                )
-            else:
-                state.topk_idx_local = torch.full(
-                    (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device
-                )
-                state.topk_weights_local = torch.empty(
-                    (0, self.top_k), dtype=torch.float32, device=hidden_states.device
-                )
+        if router_logits is not None:
+            state.topk_weights_local, state.topk_idx_local = select_experts(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                top_k=self.top_k,
+                use_grouped_topk=True,
+                renormalize=self.renormalize,
+                topk_group=self.topk_group,
+                num_expert_group=self.num_expert_group,
+                correction_bias=self.correction_bias,
+                routed_scaling_factor=self.routed_scaling_factor,
+                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                    layer_id=self.layer_id,
+                ),
+            )
+        else:
+            state.topk_idx_local = torch.full(
+                (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device
+            )
+            state.topk_weights_local = torch.empty(
+                (0, self.top_k), dtype=torch.float32, device=hidden_states.device
+            )
 
     def op_dispatch_a(self, state):
-        if self._enable_deepep_moe and (self.ep_size > 1):
+        if self.ep_size > 1:
             # TODO(ch-wan): allow users to set num_max_dispatch_tokens_per_rank value
             self.deepep_dispatcher.dispatch_a(
                 hidden_states=state.hidden_states_mlp_input,
@@ -484,7 +480,7 @@ class DeepseekV2MoE(nn.Module):
             )
 
     def op_dispatch_b(self, state):
-        if self._enable_deepep_moe and (self.ep_size > 1):
+        if self.ep_size > 1:
             with get_global_expert_distribution_recorder().with_current_layer(
                 self.layer_id
             ):
@@ -502,27 +498,21 @@ class DeepseekV2MoE(nn.Module):
                 )
 
     def op_experts(self, state):
-        if self._enable_deepep_moe:
-            state.pop("router_logits")
-            state.hidden_states_experts_output = self.experts(
-                hidden_states=state.pop("hidden_states_experts_input"),
-                topk_idx=state.topk_idx_dispatched,
-                topk_weights=state.topk_weights_dispatched,
-                reorder_topk_ids=state.pop("reorder_topk_ids"),
-                seg_indptr=state.pop("seg_indptr"),
-                masked_m=state.pop("masked_m"),
-                expected_m=state.pop("expected_m"),
-                num_recv_tokens_per_expert=state.pop("num_recv_tokens_per_expert"),
-                forward_mode=state.forward_batch.forward_mode,
-            )
-        else:
-            state.hidden_states_experts_output = self.experts(
-                hidden_states=state.pop("hidden_states_mlp_input"),
-                router_logits=state.pop("router_logits"),
-            )
+        state.pop("router_logits")
+        state.hidden_states_experts_output = self.experts(
+            hidden_states=state.pop("hidden_states_experts_input"),
+            topk_idx=state.topk_idx_dispatched,
+            topk_weights=state.topk_weights_dispatched,
+            reorder_topk_ids=state.pop("reorder_topk_ids"),
+            seg_indptr=state.pop("seg_indptr"),
+            masked_m=state.pop("masked_m"),
+            expected_m=state.pop("expected_m"),
+            num_recv_tokens_per_expert=state.pop("num_recv_tokens_per_expert"),
+            forward_mode=state.forward_batch.forward_mode,
+        )
 
     def op_combine_a(self, state):
-        if self._enable_deepep_moe and (self.ep_size > 1):
+        if self.ep_size > 1:
             self.deepep_dispatcher.combine_a(
                 hidden_states=state.pop("hidden_states_experts_output"),
                 topk_idx=state.pop("topk_idx_dispatched"),
@@ -532,28 +522,18 @@ class DeepseekV2MoE(nn.Module):
             )
 
     def op_combine_b(self, state):
-        if self._enable_deepep_moe and (self.ep_size > 1):
+        if self.ep_size > 1:
             state.hidden_states_after_combine = self.deepep_dispatcher.combine_b(
                 tbo_subbatch_index=state.get("tbo_subbatch_index"),
             )
 
     def op_output(self, state):
-        if self._enable_deepep_moe:
-            state.pop("hidden_states_mlp_input")
+        state.pop("hidden_states_mlp_input")
 
-        final_hidden_states = (
-            state.pop("hidden_states_after_combine")
-            if self._enable_deepep_moe
-            else state.pop("hidden_states_experts_output")
-        )
-
+        final_hidden_states = state.pop("hidden_states_after_combine")
         final_hidden_states *= self.routed_scaling_factor
-
         if (s := state.pop("shared_output")) is not None:
             final_hidden_states = final_hidden_states + s
-
-        if (not self._enable_deepep_moe) and (self.tp_size > 1):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         state.hidden_states_mlp_output = final_hidden_states
 
