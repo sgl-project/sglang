@@ -863,11 +863,10 @@ class DeepseekV2AttentionMLA(nn.Module):
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
-        return self.forward_absorb_core(
-            self.forward_absorb_prepare(
-                positions, hidden_states, forward_batch, zero_allocator
-            )
+        s = self.forward_absorb_prepare(
+            positions, hidden_states, forward_batch, zero_allocator
         )
+        return self.forward_absorb_core(*s)
 
     def forward_absorb_prepare(
         self,
@@ -944,10 +943,11 @@ class DeepseekV2AttentionMLA(nn.Module):
         q_nope_out = q_nope_out.transpose(0, 1)
         q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
-        return q_nope_out, k_nope, forward_batch, q_pe, k_pe, zero_allocator
+        return q_nope_out, k_nope, q_pe, k_pe, forward_batch, zero_allocator
 
-    def forward_absorb_core(self, s) -> torch.Tensor:
-        q_nope_out, k_nope, forward_batch, q_pe, k_pe, zero_allocator = s
+    def forward_absorb_core(
+        self, q_nope_out, k_nope, q_pe, k_pe, forward_batch, zero_allocator
+    ) -> torch.Tensor:
 
         if self.attention_backend == "fa3" or self.attention_backend == "flashinfer":
             attn_output = self.attn_mqa(
