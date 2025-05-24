@@ -2,7 +2,6 @@ import re
 from typing import Dict, List, Union
 
 import torch
-
 from sglang.srt.managers.multimodal_processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
@@ -77,14 +76,21 @@ class KimiVLImageProcessor(SGLangBaseProcessor):
                 pixel_values = ret["pixel_values"]
                 precomputed_features = None
 
+        input_ids = ret["input_ids"].flatten()
+        image_offsets = self.get_mm_items_offset(
+            input_ids=input_ids,
+            mm_token_id=self.im_token_id,
+        )
+
         return {
-            "input_ids": ret["input_ids"].flatten().tolist(),
+            "input_ids": input_ids.tolist(),
             "mm_items": [
                 MultimodalDataItem(
                     pixel_values=pixel_values,
                     image_grid_thws=image_grid_hws,
                     precomputed_features=precomputed_features,
                     modality=Modality.IMAGE,
+                    image_offsets=image_offsets,
                 )
             ],
             "im_token_id": self.im_token_id,

@@ -73,11 +73,27 @@ class MiniLoadBalancer:
                 session.post(f"{prefill_server}/{endpoint}", json=modified_request),
                 session.post(f"{decode_server}/{endpoint}", json=modified_request),
             ]
+
             # Wait for both responses to complete. Prefill should end first.
-            _, decode_response = await asyncio.gather(*tasks)
+            prefill_response, decode_response = await asyncio.gather(*tasks)
+
+            if "return_logprob" in modified_request:
+
+                prefill_json = await prefill_response.json()
+                ret_json = await decode_response.json()
+
+                # merge `meta_info.input_token_logprobs` from prefill to decode
+                if "meta_info" in ret_json:
+                    if "input_token_logprobs" in ret_json["meta_info"]:
+                        ret_json["meta_info"]["input_token_logprobs"] = (
+                            prefill_json["meta_info"]["input_token_logprobs"]
+                            + ret_json["meta_info"]["input_token_logprobs"]
+                        )
+            else:
+                ret_json = await decode_response.json()
 
             return ORJSONResponse(
-                content=await decode_response.json(),
+                content=ret_json,
                 status_code=decode_response.status,
             )
 
@@ -92,30 +108,47 @@ class MiniLoadBalancer:
                     total=3600
                 )  # Add timeout for request reliability
             ) as session:
-                try:
-                    # Create the tasks for both prefill and decode requests
-                    tasks = [
-                        session.post(
-                            f"{prefill_server}/{endpoint}", json=modified_request
-                        ),
-                        session.post(
-                            f"{decode_server}/{endpoint}", json=modified_request
-                        ),
-                    ]
-                    # Wait for both responses to complete. Since this is streaming, they return immediately.
-                    prefill_response, decode_response = await asyncio.gather(*tasks)
+                # Create the tasks for both prefill and decode requests
+                tasks = [
+                    session.post(f"{prefill_server}/generate", json=modified_request),
+                    session.post(f"{decode_server}/generate", json=modified_request),
+                ]
+                # Wait for both responses to complete. Since this is streaming, they return immediately.
+                prefill_response, decode_response = await asyncio.gather(*tasks)
+
+                if modified_request.get("return_logprob", False):
+                    prefill_chunks = []
+                    async for chunk in prefill_response.content:
+                        prefill_chunks.append(chunk)
+
+                    first_prefill_chunk = (
+                        prefill_chunks[0].decode("utf-8")[5:].strip("\n")
+                    )
+                    first_prefill_chunk_json = orjson.loads(first_prefill_chunk)
+
+                    async for chunk in decode_response.content:
+                        # Note: This is inefficient
+                        # merge prefill input_token_logprobs, output_token_logprobs to decode
+                        decoded_chunk = chunk.decode("utf-8")
+                        if (
+                            decoded_chunk
+                            and decoded_chunk.startswith("data:")
+                            and "[DONE]" not in decoded_chunk
+                        ):
+                            ret_json = orjson.loads(decoded_chunk[5:].strip("\n"))
+                            ret_json["meta_info"]["input_token_logprobs"] = (
+                                first_prefill_chunk_json["meta_info"][
+                                    "input_token_logprobs"
+                                ]
+                                + ret_json["meta_info"]["input_token_logprobs"]
+                            )
+
+                            yield b"data: " + orjson.dumps(ret_json) + b"\n\n"
+                        else:
+                            yield chunk
+                else:
                     async for chunk in decode_response.content:
                         yield chunk
-                except Exception as e:
-                    error_msg = {
-                        "error": {"message": f"Stream processing error: {str(e)}"}
-                    }
-                    yield b"data: " + orjson.dumps(
-                        error_msg, option=orjson.OPT_NON_STR_KEYS
-                    ) + b"\n\n"
-                finally:
-                    if prefill_response is not None:
-                        await prefill_response.release()
 
         return StreamingResponse(
             stream_results(),
