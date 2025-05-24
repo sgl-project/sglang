@@ -237,7 +237,7 @@ class PyMscclppCommunicator:
             if self.rank == 0:
                 print(f"{msg_size=}, best_config: {best_config}")
 
-    def should_msccl_allreduce(
+    def should_mscclpp_allreduce(
         self, inp: torch.Tensor, op: ReduceOp = ReduceOp.SUM
     ) -> bool:
         if self.disabled or self._context is None:
