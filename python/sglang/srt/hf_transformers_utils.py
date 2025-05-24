@@ -185,6 +185,14 @@ def get_context_length(config):
     return 2048
 
 
+def update_context_length(config, new_context_length: int):
+    """Update the context length of a model from a huggingface model configs."""
+    text_config = config
+    for key in CONTEXT_LENGTH_KEYS:
+        if hasattr(text_config, key):
+            setattr(text_config, key, new_context_length)
+
+
 # A fast LLaMA tokenizer with the pre-processed `tokenizer.json` file.
 _FAST_LLAMA_TOKENIZER = "hf-internal-testing/llama-tokenizer"
 

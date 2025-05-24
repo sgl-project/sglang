@@ -51,6 +51,7 @@ class ModelConfig:
         enable_multimodal: Optional[bool] = None,
         dtype: str = "auto",
         quantization: Optional[str] = None,
+        is_context_extended: Optional[bool] = None,
         override_config_file: Optional[str] = None,
         is_draft_model: bool = False,
     ) -> None:
@@ -127,22 +128,24 @@ class ModelConfig:
         derived_context_len = get_context_length(self.hf_text_config)
         if context_length is not None:
             if context_length > derived_context_len:
-                if get_bool_env_var(
+                if is_context_extended:
+                    logger.info(
+                        f"Context length is extended from {derived_context_len} to {context_length}."
+                    )
+                elif get_bool_env_var(
                     "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN", default="True"
                 ):
                     logger.warning(
                         f"Warning: User-specified context_length ({context_length}) is greater than the derived context_length ({derived_context_len}). "
                         f"This may lead to incorrect model outputs or CUDA errors."
                     )
-                    self.context_len = context_length
                 else:
                     raise ValueError(
                         f"User-specified context_length ({context_length}) is greater than the derived context_length ({derived_context_len}). "
                         f"This may lead to incorrect model outputs or CUDA errors. Note that the derived context_length may differ from max_position_embeddings in the model's config. "
                         f"To allow overriding this maximum, set the env var SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"
                     )
-            else:
-                self.context_len = context_length
+            self.context_len = context_length
         else:
             self.context_len = derived_context_len
 
@@ -240,6 +243,7 @@ class ModelConfig:
             enable_multimodal=server_args.enable_multimodal,
             dtype=server_args.dtype,
             quantization=server_args.quantization,
+            is_context_extended=server_args.enable_hip_attention,
             **kwargs,
         )
 

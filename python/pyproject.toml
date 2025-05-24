@@ -97,6 +97,7 @@ anthropic = ["anthropic>=0.20.0"]
 litellm = ["litellm>=1.0.0"]
 torch_memory_saver = ["torch_memory_saver>=0.0.4"]
 decord = ["decord"]
+hip-attn = ["hip-attn>=1.2.4"]
 test = [
     "accelerate",
     "jsonlines",
@@ -106,12 +107,12 @@ test = [
     "timm",
     "sentence_transformers",
 ]
-all = ["sglang[srt]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]", "sglang[torch_memory_saver]", "sglang[decord]"]
-all_hip = ["sglang[srt_hip]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]", "sglang[decord]"]
-all_xpu = ["sglang[srt_xpu]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]", "sglang[decord]"]
-all_hpu = ["sglang[srt_hpu]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]", "sglang[decord]"]
-all_cpu = ["sglang[srt_cpu]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]", "sglang[decord]"]
-all_npu = ["sglang[srt_npu]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]", "sglang[decord]"]
+all = ["sglang[srt]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]", "sglang[torch_memory_saver]", "sglang[decord]", "sglang[hip-attn]"]
+all_hip = ["sglang[srt_hip]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]", "sglang[decord]", "sglang[hip-attn]"]
+all_xpu = ["sglang[srt_xpu]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]", "sglang[decord]", "sglang[hip-attn]"]
+all_hpu = ["sglang[srt_hpu]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]", "sglang[decord]", "sglang[hip-attn]"]
+all_cpu = ["sglang[srt_cpu]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]", "sglang[decord]", "sglang[hip-attn]"]
+all_npu = ["sglang[srt_npu]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]", "sglang[decord]", "sglang[hip-attn]"]
 
 dev = ["sglang[all]", "sglang[test]"]
 dev_hip = ["sglang[all_hip]", "sglang[test]"]

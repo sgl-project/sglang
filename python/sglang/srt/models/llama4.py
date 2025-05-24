@@ -288,6 +288,9 @@ class Llama4Attention(nn.Module):
             layer_id=layer_id,
             prefix=add_prefix("attn", prefix),
             use_irope=self.use_rope,
+            orig_context_len=getattr(
+                config, "orig_context_len", max_position_embeddings
+            ),
         )
 
     def _get_attn_scale(self, positions: torch.Tensor) -> torch.Tensor:
@@ -492,9 +495,12 @@ class Llama4Model(nn.Module):
             hidden_states = input_embeds
         residual = None
         aux_hidden_states = []
+
+        forward_batch.on_model_start()
         for i in range(len(self.layers)):
             if i in self.layers_to_capture:
                 aux_hidden_states.append(hidden_states + residual)
+            forward_batch.on_layer_start(i)
             layer = self.layers[i]
             hidden_states, residual = layer(
                 positions,
@@ -502,6 +508,9 @@ class Llama4Model(nn.Module):
                 forward_batch,
                 residual,
             )
+            forward_batch.on_layer_end(i)
+        forward_batch.on_model_end()
+
         if not forward_batch.forward_mode.is_idle():
             hidden_states, _ = self.norm(hidden_states, residual)
 
@@ -516,6 +525,9 @@ class Llama4ForCausalLM(LlamaForCausalLM):
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
+    # TODO(ainl): prefetch 4 layers at the same time
+    # TODO(ainl): check sliding window fetch shape
+    hip_attention_supported = True
 
     def __init__(
         self,
