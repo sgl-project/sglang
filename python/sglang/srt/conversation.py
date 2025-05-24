@@ -672,7 +672,6 @@ register_conv_template(
         sep="<|end|>",
         stop_str="<|end|>",
         image_token="<|endoftext10|>",
-        # image_token="<|image_{index}|>",
     )
 )
 

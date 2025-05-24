@@ -183,12 +183,9 @@ class Phi4MMImageEncoder(nn.Module):
         # image_sizes: tensor([[ 896, 1344]], device='cuda:0')
         # output: torch.Size([1, 1841, 3072])
 
-        if isinstance(self.img_projection, nn.Sequential):
-            target_device = self.img_projection[0].bias.device
-            target_dtype = self.img_projection[0].bias.dtype
-        else:  # It's a single nn.Linear layer
-            target_device = self.img_projection.bias.device
-            target_dtype = self.img_projection.bias.dtype
+        img_projection_params = next(self.img_projection.parameters()) 
+        target_device = img_projection_params.device
+        target_dtype = img_projection_params.dtype
 
         img_sizes = image_sizes
         num_images, num_crops, c, h, w = pixel_values.shape
