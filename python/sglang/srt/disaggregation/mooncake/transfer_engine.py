@@ -61,7 +61,8 @@ class MooncakeTransferEngine:
         self, session_id: str, buffer: int, peer_buffer_address: int, length: int
     ) -> int:
         """Synchronously transfer data to the specified address."""
-
+        # the first time: based on session_id (which contains remote_ip) to construct a queue pair, and cache the queue pair
+        # later: based on the cached queue pair to send data
         ret = self.engine.transfer_sync_write(
             session_id, buffer, peer_buffer_address, length
         )
