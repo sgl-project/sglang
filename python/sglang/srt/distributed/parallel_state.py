@@ -477,8 +477,7 @@ class GroupCoordinator:
         ca_comm = self.ca_comm
         pymscclpp_comm = self.pymscclpp_comm
         assert ca_comm is not None or pymscclpp_comm is not None
-        if ca_comm is not None:
-            assert not ca_comm.disabled
+        if ca_comm is not None and not ca_comm.disabled:
             out = ca_comm.custom_all_reduce(input_)
         else:
             assert not pymscclpp_comm.disabled

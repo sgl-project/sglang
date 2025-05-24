@@ -209,6 +209,7 @@ class PyMscclppCommunicator:
         self.disabled = True
 
     def pre_tune_config(self, dtype=torch.bfloat16) -> bool:
+        logger.debug(f"start to pre-tune configs for rank {self.rank}")
         nthreads_to_try = [256, 512, 1024]
         nblocks_to_try = [21, 42, 84]
         inp_randn = torch.ones(
@@ -228,14 +229,12 @@ class PyMscclppCommunicator:
                             self._context, mock_inp, mock_outp, nthreads, nblocks
                         )
                     )
-                    if self.rank == 0:
-                        print(f"{msg_size=}, {nthreads=}, {nblocks=}, {cur_cost=}")
                     if best_time is None or cur_cost < best_time:
                         best_config = (nthreads, nblocks)
                         best_time = cur_cost
             self.msg_size2best_config[msg_size] = best_config
             if self.rank == 0:
-                print(f"{msg_size=}, best_config: {best_config}")
+                logger.debug(f"for msg_size {msg_size}, best_config: {best_config}")
 
     def should_mscclpp_allreduce(
         self, inp: torch.Tensor, op: ReduceOp = ReduceOp.SUM
