@@ -218,6 +218,110 @@ Important Notes:
 2. To receive more consistent tool call results, it is recommended to use `--chat-template examples/chat_template/tool_chat_template_deepseekv3.jinja`. It provides an improved unified prompt.
 
 
+### Thinking Budget for DeepSeek R1
+
+In SGLang, we can implement thinking budget with `CustomLogitProcessor`.
+
+Launch a server with `--enable-custom-logit-processor` flag on.
+
+```
+python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-R1 --tp 8 --port 30000 --host 0.0.0.0 --mem-fraction-static 0.9 --disable-cuda-graph --enable-custom-logit-processor
+```
+
+Define `ThinkingBudgetLogitProcessor`
+
+```python
+from typing import TYPE_CHECKING, Any
+
+from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
+
+
+if TYPE_CHECKING:
+    from torch import Tensor
+    from sglang.srt.managers.schedule_batch import Req
+
+
+class ThinkingBudgetLogitProcessor(CustomLogitProcessor):
+    """A logit processor that controls the length of thinking."""
+
+    THINKING_START_TOKEN_ID: int
+    THINKING_END_TOKEN_ID: int
+    NEW_LINE_TOKEN_ID: int
+
+    def __call__(self, logits: "Tensor", custom_param_list: list[dict[str, Any]]) -> "Tensor"
+        for i, param_dict in enumerate(custom_param_list):
+            thinking_budget: int | None = param_dict.get("thinking_budget")
+
+            # Skip if thinking_budget is unset, or not an integer, or negative
+            if thinking_budget is None or not isinstance(thinking_budget, int) or thinking_budget < 0:
+                continue
+
+            req: Req = param_dict.get("__req__")
+            cur_ids: list[int] = [*req.origin_input_ids, *req.output_ids]
+
+            # Check if out of thinking stage
+            if (
+                self.THINKING_START_TOKEN_ID not in cur_ids
+                or self.THINKING_END_TOKEN_ID in cur_ids
+            ):
+                continue
+
+            # Find the index of the thinking start token
+            start_index = cur_ids.index(self.THINKING_START_TOKEN_ID)
+
+            # Count the number of tokens after the thinking start token
+            num_tokens_after_start = len(cur_ids) - start_index
+
+            if num_tokens_after_start < thinking_budget:
+                continue
+
+            # Ensure new line token before thinking end token
+            if req.output_ids[-1] != self.NEW_LINE_TOKEN_ID:
+                logits[i, :] = -float("inf")
+                logits[i, self.NEW_LINE_TOKEN_ID] = 0.0
+                continue
+
+            # Assign highest probability to the thinking end token
+            logits[i, :] = -float("inf")
+            logits[i, self.THINKING_END_TOKEN_ID] = 0.0
+
+        return logits
+
+
+class DeepSeekR1ThinkingBudgetLogitProcessor(ThinkingBudgetLogitProcessor):
+    """A logit processor that controls the length of thinking for DeepSeek-R1 models."""
+
+    THINKING_START_TOKEN_ID: int = 128798
+    THINKING_END_TOKEN_ID: int = 128799
+    NEW_LINE_TOKEN_ID: int = 201
+```
+
+Sample Request:
+
+```python
+import openai
+from rich.pretty import pprint
+
+
+client = openai.Client(base_url="http://127.0.0.1:30000/v1", api_key="*")
+response = client.chat.completions.create(
+    model="deepseek-ai/DeepSeek-R1",
+    messages=[
+        {
+            "role": "user",
+            "content": "Question: Is Paris the Capital of France?",
+        }
+    ],
+    max_tokens=1024,
+    extra_body={
+        "custom_logit_processor": DeepSeekR1ThinkingBudgetLogitProcessor().to_str(),
+        "custom_params": {
+            "thinking_budget": 512,
+        },
+    },
+)
+pprint(response)
+```
 
 ## FAQ
 

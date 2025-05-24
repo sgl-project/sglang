@@ -391,6 +391,8 @@ class ChatCompletionRequest(BaseModel):
     separate_reasoning: bool = True
     stream_reasoning: bool = True
     chat_template_kwargs: Optional[Dict] = None
+    custom_params: Optional[Dict] = None
+    custom_logit_processor: Optional[str] = None
 
     # The request id.
     rid: Optional[str] = None

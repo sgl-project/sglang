@@ -296,3 +296,27 @@ response = requests.post(
 )
 print(response.json())
 ```
+
+Send an OpenAI chat completion request:
+
+```python
+import openai
+from sglang.utils import print_highlight
+
+client = openai.Client(base_url="http://127.0.0.1:30000/v1", api_key="None")
+
+response = client.chat.completions.create(
+    model="meta-llama/Meta-Llama-3-8B-Instruct",
+    messages=[
+        {"role": "user", "content": "List 3 countries and their capitals."},
+    ],
+    temperature=0.0,
+    max_tokens=32,
+    extra_body={
+        "custom_logit_processor": DeterministicLogitProcessor().to_str(),
+        "custom_params": {"token_id": 5},
+    },
+)
+
+print_highlight(f"Response: {response}")
+```
