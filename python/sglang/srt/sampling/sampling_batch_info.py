@@ -90,7 +90,14 @@ class SamplingBatchInfo:
                 device, non_blocking=True
             )
             thinking_budgets = torch.tensor(
-                [r.sampling_params.thinking_budget or -1 for r in reqs],
+                [
+                    (
+                        r.sampling_params.thinking_budget
+                        if r.samping_params.thinking_budget is not None
+                        else -1
+                    )
+                    for r in reqs
+                ],
                 dtype=torch.int64,
             ).to(device, non_blocking=True)
         else:
