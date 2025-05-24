@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import re
 from typing import Dict, List, Union
 
 import torch
@@ -44,6 +45,10 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
             self.image_start_id = hf_config.vision_start_token_id
             self.image_end_id = hf_config.vision_end_token_id
             self.video_token_id = hf_config.video_token_id
+        # The regex that matches expanded image tokens.
+        self.IMAGE_TOKEN_REGEX = re.compile(
+            r"<\|vision_start\|>(?:<\|image_pad\|>)+<\|vision_end\|>"
+        )
         self.NUM_TOKEN_PER_FRAME = 770
         self.IMAGE_FACTOR = 28
         self.MIN_PIXELS = 4 * 28 * 28
@@ -68,6 +73,7 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
             audio_data=request_obj.audio_data,
             multimodal_tokens=MultimodalSpecialTokens(
                 image_token=self.image_token_id,
+                image_token_regex=self.IMAGE_TOKEN_REGEX,
                 audio_token=getattr(self, "audio_token_id", None),
                 video_token=getattr(self, "video_token_id", None),
             ),
