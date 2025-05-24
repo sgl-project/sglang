@@ -28,14 +28,13 @@ class OperationsStrategy:
         )
 
     @staticmethod
-    def init_new(
+    def init_new_tbo(
         layers: torch.nn.ModuleList,
         forward_mode: ForwardMode,
-        enable_tbo: bool,
     ) -> "OperationsStrategy":
         return OperationsStrategy.concat(
             [
-                _compute_layer_operations_strategy(layer, forward_mode, enable_tbo)
+                _compute_layer_operations_strategy_tbo(layer, forward_mode)
                 for layer in layers
             ]
         )
@@ -47,58 +46,17 @@ def _assert_all_same(items: List):
 
 
 # TODO can refactor to make it more fancy if we have more complex strategies
-def _compute_layer_operations_strategy(
+def _compute_layer_operations_strategy_tbo(
     layer: torch.nn.Module,
     forward_mode: ForwardMode,
-    enable_tbo: bool,
 ) -> OperationsStrategy:
-    if enable_tbo:
-        assert layer.is_layer_sparse
-        if forward_mode == ForwardMode.EXTEND:
-            return _compute_moe_deepseek_blog_prefill(layer)
-        elif forward_mode == ForwardMode.DECODE:
-            return _compute_moe_deepseek_blog_decode(layer)
-        else:
-            raise NotImplementedError(f"Unsupported {forward_mode=}")
+    assert layer.is_layer_sparse, "dense layer TBO not yet implemented"
+    if forward_mode == ForwardMode.EXTEND:
+        return _compute_moe_deepseek_blog_prefill(layer)
+    elif forward_mode == ForwardMode.DECODE:
+        return _compute_moe_deepseek_blog_decode(layer)
     else:
-        if layer.is_layer_sparse:
-            return _compute_moe_normal(layer)
-        else:
-            return _compute_mlp_normal(layer)
-
-
-def _compute_mlp_normal(layer):
-    return OperationsStrategy(
-        operations=[
-            layer.op_comm_prepare_attn,
-            layer.self_attn.op_prepare,
-            layer.self_attn.op_core,
-            layer.op_comm_prepare_mlp,
-            layer.op_mlp,
-            layer.op_comm_postprocess_layer,
-        ],
-    )
-
-
-def _compute_moe_normal(layer):
-    return OperationsStrategy(
-        operations=[
-            layer.op_comm_prepare_attn,
-            layer.self_attn.op_prepare,
-            layer.self_attn.op_core,
-            layer.op_comm_prepare_mlp,
-            layer.mlp.op_gate,
-            layer.mlp.op_shared_experts,
-            layer.mlp.op_select_experts,
-            layer.mlp.op_dispatch_a,
-            layer.mlp.op_dispatch_b,
-            layer.mlp.op_experts,
-            layer.mlp.op_combine_a,
-            layer.mlp.op_combine_b,
-            layer.mlp.op_output,
-            layer.op_comm_postprocess_layer,
-        ],
-    )
+        raise NotImplementedError(f"Unsupported {forward_mode=}")
 
 
 def _compute_moe_deepseek_blog_prefill(layer):
