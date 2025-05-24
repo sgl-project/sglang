@@ -265,27 +265,14 @@ class MooncakeKVManager(BaseKVManager):
             for (src_ptr, dst_ptr, item_len) in layers_params
         ]
 
-        try:
-            done, not_done = concurrent.futures.wait(
-                futures, timeout=20, return_when=concurrent.futures.ALL_COMPLETED
-            )
-
-            if not_done:
-                logger.error(
-                    f"transfer_sync timed out with {len(not_done)} unfinished layers"
-                )
-                for f in not_done:
+        for future in concurrent.futures.as_completed(futures):
+            status = future.result()
+            if status != 0:
+                for f in futures:
                     f.cancel()
-                return -1
+                return status
 
-            for future in done:
-                status = future.result()
-                if status != 0:
-                    return status
-            return 0
-
-        except Exception as e:
-            return -1
+        return 0
 
     def send_aux(
         self,
@@ -655,7 +642,6 @@ class MooncakeKVSender(BaseKVSender):
         self.kv_mgr.update_status(bootstrap_room, KVPoll.Bootstrapping)
         self.aux_index = None
         self.bootstrap_server_url = bootstrap_addr
-        self.session_id = self.kv_mgr.get_session_id()
         self.conclude_state = None
         # inner state
         self.curr_idx = 0
