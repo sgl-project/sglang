@@ -43,6 +43,7 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
 )
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req, ScheduleBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
@@ -142,6 +143,10 @@ class PrefillBootstrapQueue:
         )
         self._process_req(req)
         self.queue.append(req)
+
+    def extend(self, reqs: List[Req]) -> None:
+        for req in reqs:
+            self.add(req)
 
     def _process_req(self, req: Req) -> None:
         """
@@ -268,6 +273,16 @@ class SchedulerDisaggregationPrefillMixin:
             if batch:
                 result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), result))
+
+                if self.last_batch is None:
+                    # Create a dummy first batch to start the pipeline for overlap schedule.
+                    # It is now used for triggering the sampling_info_done event.
+                    tmp_batch = ScheduleBatch(
+                        reqs=None,
+                        forward_mode=ForwardMode.DUMMY_FIRST,
+                        next_batch_sampling_info=self.tp_worker.cur_sampling_info,
+                    )
+                    self.set_next_batch_sampling_info_done(tmp_batch)
 
             if self.last_batch:
                 tmp_batch, tmp_result = self.result_queue.popleft()
