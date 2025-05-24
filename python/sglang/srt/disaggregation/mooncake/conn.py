@@ -452,6 +452,7 @@ class MooncakeKVManager(BaseKVManager):
                 except queue.Empty:
                     continue
                 except Exception as e:
+                    # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
                     raise RuntimeError(
                         "Transfer thread failed. Prefill instance with {bootstrap_port=%s} is dead.",
                         self.bootstrap_port,
