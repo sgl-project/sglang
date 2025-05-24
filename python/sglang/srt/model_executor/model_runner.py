@@ -335,7 +335,7 @@ class ModelRunner:
                 ):
                     server_args.attention_backend = "fa3"
                 elif _is_hip:
-                    server_args.attention_backend = "aiter"
+                    server_args.attention_backend = "triton"
                 else:
                     server_args.attention_backend = (
                         "flashinfer" if is_flashinfer_available() else "triton"
