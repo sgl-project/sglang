@@ -1574,9 +1574,10 @@ class DeepseekV2Model(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
+        total_num_layers = len(self.layers)
         device = input_embeds.device if input_embeds is not None else input_ids.device
         zero_allocator = BumpAllocator(
-            buffer_size=len(self.layers) * 2 * (2 if forward_batch.can_run_tbo else 1),
+            buffer_size=total_num_layers * 2 * (2 if forward_batch.can_run_tbo else 1),
             dtype=torch.float32,
             device=device,
         )
@@ -1591,7 +1592,7 @@ class DeepseekV2Model(nn.Module):
         normal_num_layers = (
             self.first_k_dense_replace
             if forward_batch.can_run_tbo
-            else len(self.layers)
+            else total_num_layers
         )
         for i in range(normal_num_layers):
             with get_global_expert_distribution_recorder().with_current_layer(i):
@@ -1600,7 +1601,7 @@ class DeepseekV2Model(nn.Module):
                     positions, hidden_states, forward_batch, residual, zero_allocator
                 )
 
-        if forward_batch.can_run_tbo:
+        if normal_num_layers != total_num_layers:
             hidden_states, residual = model_forward_tbo(
                 layers=self.layers[normal_num_layers:],
                 positions=positions,
