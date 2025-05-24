@@ -222,34 +222,37 @@ class BaseMultimodalProcessor(ABC):
         # Submit all tasks
         futures = []
         task_info = []
-        image_index, audio_index = 0, 0
+        image_iter, audio_iter = None, None
+        if isinstance(image_data, list):
+            image_iter = iter(image_data)
+        if isinstance(audio_data, list):
+            audio_iter = iter(audio_data)
 
         for text_part in text_parts:
             if (
                 multimodal_tokens.image_token_regex
                 and multimodal_tokens.image_token_regex.match(text_part)
             ):
-                data = image_data[image_index]
+                assert image_iter
+                data = next(image_iter)
                 is_video = isinstance(data, str) and data.startswith("video:")
-                estimated_frames = estimated_frames_list[image_index]
-                frame_count_limit = max(1, int(estimated_frames * scaling_factor))
                 futures.append(
                     self.io_executor.submit(
                         BaseMultimodalProcessor._load_single_item,
                         data,
                         is_video,
                         False,
-                        frame_count_limit,
+                        None,
                         discard_alpha_channel,
                     )
                 )
-                task_info.append((Modality.IMAGE, data, frame_count_limit))
-                image_index += 1
+                task_info.append((Modality.IMAGE, data, None))
             elif (
                 multimodal_tokens.audio_token_regex
                 and multimodal_tokens.audio_token_regex.match(text_part)
             ):
-                data = audio_data[audio_index]
+                assert audio_iter
+                data = next(audio_iter)
                 futures.append(
                     self.io_executor.submit(
                         BaseMultimodalProcessor._load_single_item,
@@ -261,7 +264,6 @@ class BaseMultimodalProcessor(ABC):
                     )
                 )
                 task_info.append((Modality.AUDIO, data, None))
-                audio_index += 1
 
         return futures, task_info
 
