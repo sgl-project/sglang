@@ -101,6 +101,9 @@ class ScheduleBatchDisaggregationDecodeMixin:
         for req in self.reqs:
             self.output_ids.append(req.output_ids[-1])
             self.tree_cache.cache_unfinished_req(req)
+            if req.grammar is not None:
+                req.grammar.accept_token(req.output_ids[-1])
+                req.grammar.finished = req.finished()
         self.output_ids = torch.tensor(self.output_ids, device=self.device)
 
         # Simulate the eagle run. We add mock data to hidden states for the
