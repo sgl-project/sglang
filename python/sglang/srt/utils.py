@@ -2160,3 +2160,19 @@ class Withable(Generic[T]):
         finally:
             assert self._value is new_value
             self._value = None
+
+
+def support_triton(backend: str) -> bool:
+    return backend not in ["torch_native", "intel_amx"]
+
+
+try:
+    from sgl_kernel.cpu import convert_weight_packed
+
+    is_intel_amx_backend_available = True
+except:
+    is_intel_amx_backend_available = False
+
+
+def cpu_has_amx_support():
+    return torch._C._cpu._is_amx_tile_supported() and is_intel_amx_backend_available

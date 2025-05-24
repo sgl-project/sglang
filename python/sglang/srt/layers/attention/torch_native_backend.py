@@ -265,3 +265,6 @@ class TorchNativeAttnBackend(AttentionBackend):
         )
 
         return o
+
+    def support_triton(self):
+        return False
