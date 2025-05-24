@@ -186,6 +186,9 @@ class ModelRunner:
         if server_args.show_time_cost:
             enable_show_time_cost()
 
+        if get_bool_env_var("SGL_USE_TRITON_NON_ATTN"):
+            logger.info("SGL_USE_TRITON_NON_ATTN is enabled")
+
         # Global vars
         global_server_args_dict.update(
             {
