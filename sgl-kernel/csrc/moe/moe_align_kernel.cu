@@ -69,9 +69,7 @@ __global__ void moe_align_block_size_kernel(
 
   for (size_t i = tid; i < numel; i += stride) {
     int expert_id = topk_ids[i];
-    int warp_idx = expert_id / experts_per_warp;
-    int expert_offset = expert_id % experts_per_warp;
-    atomicAdd(&shared_counts[warp_idx * experts_per_warp + expert_offset], 1);
+    atomicAdd(&shared_counts[expert_id], 1);
   }
 
   __syncthreads();
@@ -79,11 +77,7 @@ __global__ void moe_align_block_size_kernel(
   if (threadIdx.x == 0) {
     cumsum[0] = 0;
     for (int i = 1; i <= num_experts; ++i) {
-      int expert_count = 0;
-      int warp_idx = (i - 1) / experts_per_warp;
-      int expert_offset = (i - 1) % experts_per_warp;
-      expert_count = shared_counts[warp_idx * experts_per_warp + expert_offset];
-
+      int expert_count = shared_counts[i - 1];
       cumsum[i] = cumsum[i - 1] + CEILDIV(expert_count, block_size) * block_size;
     }
     *total_tokens_post_pad = cumsum[num_experts];
