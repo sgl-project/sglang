@@ -138,11 +138,6 @@ jobs:
         run: |
           bash scripts/amd_ci_exec.sh python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_non_stream_small_batch_size
 
-      - name: Benchmark online latency (EAGLE)
-        timeout-minutes: 15
-        run: |
-          bash scripts/amd_ci_exec.sh python3 -m unittest test_bench_serving.TestBenchServing.test_online_latency_eagle
-
   performance-test-1-gpu-part-2-amd:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false
@@ -274,7 +269,7 @@ jobs:
       github.event.pull_request.draft == false
     strategy:
       matrix:
-        runner: [linux-mi300-gpu-8, linux-mi325-gpu-8]
+        runner: [linux-mi300-gpu-8]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code

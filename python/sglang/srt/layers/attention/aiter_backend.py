@@ -506,6 +506,7 @@ class AiterIndicesUpdaterPrefill:
                 spec_info.generate_attn_arg_prefill(
                     req_pool_indices,
                     paged_kernel_lens,
+                    None,
                     self.req_to_token,
                 )
             )
