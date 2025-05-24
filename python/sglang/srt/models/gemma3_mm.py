@@ -282,12 +282,6 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
         Returns:
             image_features (`torch.Tensor`): Image feature tensor of shape `(num_images, image_length, embed_dim)`).
         """
-        pixel_values = torch.stack(
-            flatten_nested_list([item.pixel_values for item in items]), dim=0
-        )
-        pixel_values = pixel_values.to(device=self.vision_tower.device)
-        pixel_values = pixel_values.to(dtype=self.language_model.dtype())
-
         # Process images one by one to handle flatten_batch=True constraint in vision_tower
         all_pixel_values = flatten_nested_list([item.pixel_values for item in items])
         vision_outputs_list = []
