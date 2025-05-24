@@ -54,7 +54,7 @@ void shared_open(SharedData* data, const char* name, size_t nbytes) {
 void shared_create(SharedData* data, const char* name, void* bytes, size_t nbytes) {
   int d = shm_open(name, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR);
   if (d != -1) {
-    if (nbytes = write(d, bytes, nbytes)) {
+    if (nbytes == write(d, bytes, nbytes)) {
       shared_open(data, name, nbytes);
     }
   } else {
