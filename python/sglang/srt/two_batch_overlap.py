@@ -9,7 +9,7 @@ from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPDispatcher
 from sglang.srt.layers.quantization.deep_gemm import configure_deep_gemm_num_sms
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.operations import execute_overlapped_operations
+from sglang.srt.operations import execute_operations, execute_overlapped_operations
 from sglang.srt.operations_strategy import OperationsStrategy
 from sglang.srt.utils import BumpAllocator, DeepEPMode
 
@@ -371,8 +371,6 @@ def _model_forward_tbo(inputs, operations_strategy: OperationsStrategy):
 
 
 def _model_forward_non_tbo(inputs, operations_strategy: OperationsStrategy):
-    assert operations_strategy.deep_gemm_num_sms is None, "unsupported"
-    assert operations_strategy.tbo_delta_stages is None, "unsupported"
     outputs = execute_operations(inputs, operations_strategy.operations)
     return outputs["hidden_states"], outputs["residual"]
 
