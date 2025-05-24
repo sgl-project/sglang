@@ -324,12 +324,6 @@ class ServerArgs:
         if self.grammar_backend is None:
             self.grammar_backend = "xgrammar"
 
-        if self.pp_size > 1:
-            self.disable_overlap_schedule = True
-            logger.warning(
-                "Overlap scheduler is disabled because of using pipeline parallelism."
-            )
-
         # Data parallelism attention
         if self.enable_dp_attention:
             self.schedule_conservativeness = self.schedule_conservativeness * 0.3
@@ -577,6 +571,7 @@ class ServerArgs:
                 "w8a8_int8",
                 "w8a8_fp8",
                 "moe_wna16",
+                "qoq",
             ],
             help="The quantization method.",
         )
@@ -1137,7 +1132,7 @@ class ServerArgs:
         parser.add_argument(
             "--enable-dp-attention",
             action="store_true",
-            help="Enabling data parallelism for attention and tensor parallelism for FFN. The dp size should be equal to the tp size. Currently only DeepSeek-V2 is supported.",
+            help="Enabling data parallelism for attention and tensor parallelism for FFN. The dp size should be equal to the tp size. Currently DeepSeek-V2 and Qwen 2/3 MoE models are supported.",
         )
         parser.add_argument(
             "--enable-dp-lm-head",
@@ -1443,8 +1438,6 @@ class ServerArgs:
 
         # FIXME pp constraints
         if self.pp_size > 1:
-            logger.warning(f"Turn off overlap scheule for pipeline parallelism.")
-            self.disable_overlap_schedule = True
             assert (
                 self.disable_overlap_schedule
                 and self.speculative_algorithm is None

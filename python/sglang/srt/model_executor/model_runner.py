@@ -166,6 +166,9 @@ class ModelRunner:
         self.is_draft_worker = is_draft_worker
         self.is_generation = model_config.is_generation
         self.is_multimodal = model_config.is_multimodal
+        self.is_multimodal_chunked_prefill_supported = (
+            model_config.is_multimodal_chunked_prefill_supported
+        )
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
@@ -195,6 +198,7 @@ class ModelRunner:
                 "disable_radix_cache": server_args.disable_radix_cache,
                 "enable_nan_detection": server_args.enable_nan_detection,
                 "enable_dp_attention": server_args.enable_dp_attention,
+                "enable_dp_lm_head": server_args.enable_dp_lm_head,
                 "enable_ep_moe": server_args.enable_ep_moe,
                 "enable_deepep_moe": server_args.enable_deepep_moe,
                 "deepep_config": server_args.deepep_config,
@@ -389,12 +393,15 @@ class ModelRunner:
         if self.is_multimodal:
             self.mem_fraction_static *= 0.90
             logger.info(
-                f"Automatically reduce --mem-fraction-static to {self.mem_fraction_static:.3f} because this is a multimodal model."
+                f"Automatically reduce --mem-fraction-static to {self.mem_fraction_static:.3f} "
+                f"because this is a multimodal model."
             )
-            server_args.chunked_prefill_size = -1
-            logger.info(
-                "Automatically turn off --chunked-prefill-size for multimodal model."
-            )
+            if not self.is_multimodal_chunked_prefill_supported:
+                server_args.chunked_prefill_size = -1
+                logger.info(
+                    f"Automatically turn of --chunked-prefill-size as it is not supported for "
+                    f"{self.model_config.hf_config.model_type}"
+                )
 
         if not self.use_mla_backend:
             server_args.disable_chunked_prefix_cache = True
