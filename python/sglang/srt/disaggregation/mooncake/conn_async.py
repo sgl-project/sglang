@@ -193,7 +193,7 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
             if req.bootstrap_host == FakeBootstrapHost:
                 continue
             # print(f"req={req}, start_idx = {req.start_send_idx}, fill_ids = {req.fill_ids}, origin_input_ids={req.origin_input_ids}")
-            kv_chunk_info : Tuple[Tuple[npt.NDArray[np.int64], slice],int] = sch.get_kv_chunk_info(req, dealy_send = False)
+            kv_chunk_info : Tuple[Tuple[npt.NDArray[np.int64], slice],int] = sch.get_kv_chunk_info(req, delay_send = False)
             if kv_chunk_info is not None:
                 (page_indices, indexs),_ = kv_chunk_info
                 bootstrap_room = req.bootstrap_room

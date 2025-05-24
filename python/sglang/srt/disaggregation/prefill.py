@@ -466,7 +466,7 @@ class SchedulerDisaggregationPrefillMixin:
         req: Req,
         last_chunk: bool = False,
         end_idx: Optional[int] = None,
-        dealy_send : Optional[bool] = True,
+        delay_send : Optional[bool] = True,
     ) -> Tuple[Tuple[npt.NDArray[np.int64], slice],int]:
         """
         Send a prefilled chunk to the decode server
@@ -479,7 +479,7 @@ class SchedulerDisaggregationPrefillMixin:
             else min(len(req.fill_ids), len(req.origin_input_ids))
         )
 
-        if dealy_send and (not last_chunk):
+        if delay_send and (not last_chunk):
             # if not the last chunk and the last page is partial, delay the last partial page to the next send
             end_idx = end_idx - end_idx % page_size
 
