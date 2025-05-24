@@ -60,6 +60,7 @@ class ServerArgs:
     is_embedding: bool = False
     enable_multimodal: Optional[bool] = None
     revision: Optional[str] = None
+    disable_thinking: bool = False
 
     # Port for the HTTP server
     host: str = "127.0.0.1"
@@ -893,6 +894,11 @@ class ServerArgs:
             choices=list(ReasoningParser.DetectorMap.keys()),
             default=ServerArgs.reasoning_parser,
             help=f"Specify the parser for reasoning models, supported parsers are: {list(ReasoningParser.DetectorMap.keys())}.",
+        )
+        parser.add_argument(
+            "--disable-thinking",
+            action="store_true",
+            help="Disable thinking/reasoning output at server level, overriding any per-request settings.",
         )
 
         # Data parallelism

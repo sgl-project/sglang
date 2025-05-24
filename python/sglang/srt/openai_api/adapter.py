@@ -964,6 +964,11 @@ def v1_chat_generate_request(
 
     is_multimodal = tokenizer_manager.model_config.is_multimodal
     for request in all_requests:
+        # If server-level disable_thinking is set, override the request's chat_template_kwargs
+        if tokenizer_manager.server_args.disable_thinking:
+            if request.chat_template_kwargs is None:
+                request.chat_template_kwargs = {}
+            request.chat_template_kwargs["enable_thinking"] = False
         # Prep the data needed for the underlying GenerateReqInput:
         #  - prompt: The full prompt string.
         #  - stop: Custom stop tokens.
