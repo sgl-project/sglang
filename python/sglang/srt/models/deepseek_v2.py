@@ -863,6 +863,19 @@ class DeepseekV2AttentionMLA(nn.Module):
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
+        return self.forward_absorb_core(
+            self.forward_absorb_prepare(
+                positions, hidden_states, forward_batch, zero_allocator
+            )
+        )
+
+    def forward_absorb_prepare(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        zero_allocator: BumpAllocator,
+    ) -> torch.Tensor:
         from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
         if self.q_lora_rank is not None:
@@ -930,6 +943,11 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         q_nope_out = q_nope_out.transpose(0, 1)
         q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+
+        return q_nope_out, k_nope, forward_batch, q_pe, k_pe, zero_allocator
+
+    def forward_absorb_core(self, s) -> torch.Tensor:
+        q_nope_out, k_nope, forward_batch, q_pe, k_pe, zero_allocator = s
 
         if self.attention_backend == "fa3" or self.attention_backend == "flashinfer":
             attn_output = self.attn_mqa(
