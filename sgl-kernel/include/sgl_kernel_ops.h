@@ -415,3 +415,24 @@ void convert_vertical_slash_indexes_mergehead(
  * From XGrammar
  */
 void ApplyTokenBitmaskInplace(at::Tensor logits, at::Tensor bitmask, at::optional<at::Tensor> indices = at::nullopt);
+
+/*
+ * From QServe
+ */
+void qserve_w4a8_per_chn_gemm(
+    const torch::Tensor& _in_feats,
+    const torch::Tensor& _kernel,
+    const torch::Tensor& _wscales,
+    const torch::Tensor& _ascales,
+    const torch::Tensor& _w_szs,
+    const torch::Tensor& _a_ssums,
+    torch::Tensor& _out_feats);
+
+void qserve_w4a8_per_group_gemm(
+    const torch::Tensor& _in_feats,
+    const torch::Tensor& _kernel,
+    const torch::Tensor& _zeros,
+    const torch::Tensor& _scales_i8,
+    const torch::Tensor& _wscales,
+    const torch::Tensor& _ascales,
+    torch::Tensor& _out_feats);

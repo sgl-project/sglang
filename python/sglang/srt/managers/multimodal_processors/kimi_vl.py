@@ -1,9 +1,4 @@
-import asyncio
-import math
 from typing import List, Union
-
-import torch
-from PIL import Image
 
 from sglang.srt.managers.multimodal_processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
@@ -57,13 +52,19 @@ class KimiVLImageProcessor(SGLangBaseProcessor):
             input_text=base_output.input_text,
             images=base_output.images,
         )
+        input_ids = ret["input_ids"].flatten()
+        image_offsets = self.get_mm_items_offset(
+            input_ids=input_ids,
+            mm_token_id=self.im_token_id,
+        )
         return {
-            "input_ids": ret["input_ids"].flatten().tolist(),
+            "input_ids": input_ids.tolist(),
             "mm_items": [
                 MultimodalDataItem(
                     pixel_values=ret["pixel_values"],
                     image_grid_thws=ret["image_grid_hws"],
                     modality=Modality.IMAGE,
+                    image_offsets=image_offsets,
                 )
             ],
             "im_token_id": self.im_token_id,
