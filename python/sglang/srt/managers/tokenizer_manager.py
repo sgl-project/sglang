@@ -423,8 +423,17 @@ class TokenizerManager:
             if is_single:
                 tokenized_obj = await self._tokenize_one_request(obj)
                 self._send_one_request(obj, tokenized_obj, created_time)
+                previous_length = 0
                 async for response in self._wait_one_response(obj, request):
-                    yield response
+                    if (
+                        response.get("text") is None
+                    ):  # For embedding models and other outputs that do not go through tokenizer.decode
+                        yield response
+                    else:
+                        current_length = len(response["text"])
+                        if current_length > previous_length:
+                            previous_length = current_length
+                            yield response
             else:
                 async for response in self._handle_batch_request(
                     obj, request, created_time
