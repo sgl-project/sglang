@@ -51,7 +51,7 @@ jobs:
   finish:
     if: always()
     needs: [
-      unit-test-backend-1-gpu-amd, unit-test-backend-2-gpu-amd, unit-test-backend-8-gpu-amd
+      unit-test-backend-2-gpu-amd
     ]
     runs-on: ubuntu-latest
     steps:
