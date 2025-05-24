@@ -156,6 +156,10 @@ def is_xpu() -> bool:
     return hasattr(torch, "xpu") and torch.xpu.is_available()
 
 
+def is_npu() -> bool:
+    return hasattr(torch, "npu") and torch.npu.is_available()
+
+
 def is_flashinfer_available():
     """
     Check whether flashinfer is available.
@@ -339,6 +343,20 @@ def get_available_gpu_memory(device, gpu_id, distributed=False, empty_cache=True
             )
 
         free_gpu_memory, total_gpu_memory = torch.hpu.mem_get_info()
+    
+    elif device == "cuda":
+        num_gpus = torch.npu.device_count()
+        assert gpu_id < num_gpus
+
+        if torch.npu.current_device() != gpu_id:
+            print(
+                f"WARNING: current device is not {gpu_id}, but {torch.npu.current_device()}, ",
+                "which may cause useless memory allocation for torch CUDA context.",
+            )
+
+        if empty_cache:
+            torch.npu.empty_cache()
+        free_gpu_memory, _ = torch.npu.mem_get_info(gpu_id)
 
     elif device == "cpu":
         # TODO: rename the variables in the current function to be not GPU specific
@@ -1193,6 +1211,9 @@ def get_device_memory_capacity(device: str = None):
         gpu_mem = get_amdgpu_memory_capacity()
     elif device == "hpu":
         gpu_mem = get_hpu_memory_capacity()
+    elif device == "npu":
+        # TODO use npu-smi info
+        gpu_mem = 61400
     else:
         # GPU memory is not known yet or no GPU is available.
         gpu_mem = None
@@ -1309,6 +1330,11 @@ def get_device(device_id: Optional[int] = None) -> str:
         if device_id == None:
             return "xpu"
         return "xpu:{}".format(device_id)
+    
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        if device_id is None:
+            return "npu"
+        return "npu:{}".format(device_id)
 
     if is_habana_available():
         try:
@@ -1387,6 +1413,18 @@ def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
 def get_compiler_backend() -> str:
     if hasattr(torch, "hpu") and torch.hpu.is_available():
         return "hpu_backend"
+    
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        import torchair as tng
+        import torchair.ge_concrete_graph.ge_converter.experimental.patch_for_hcom_allreduce
+        from torchair.configs.compiler_config import CompilerConfig
+
+        compiler_config = CompilerConfig()
+        compiler_config.experimental_config.frozen_parameter = True
+        compiler_config.experimental_config.tiling_schedule_optimize = True
+        compiler_config.experimental_config.topology_sorting_strategy = "StableRDFS"
+        npu_backend = tng.get_npu_backend(compiler_config=compiler_config)
+        return npu_backend
 
     return "inductor"
 
