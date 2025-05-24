@@ -37,7 +37,7 @@ class MooncakeTransferEngine:
             ret_value = -1
 
         if ret_value != 0:
-            logger.info("Mooncake memory registration %s failed.", ptr)
+            logger.debug("Mooncake memory registration %s failed.", ptr)
 
     def deregister(self, ptr):
         try:
@@ -47,7 +47,7 @@ class MooncakeTransferEngine:
             ret_value = -1
 
         if ret_value != 0:
-            logger.info("Mooncake memory deregistration %s failed.", ptr)
+            logger.debug("Mooncake memory deregistration %s failed.", ptr)
 
     def initialize(
         self,
@@ -79,7 +79,7 @@ class MooncakeTransferEngine:
 
         if ret < 0:
             # Do not raise an exception here, since some transfer requests fail should be accepted and the execution thread should not be stopped.
-            logger.info(
+            logger.debug(
                 "Failed to transfer data from %s to %s - %s.",
                 buffer,
                 session_id,
