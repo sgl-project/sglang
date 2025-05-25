@@ -71,11 +71,18 @@ class TestTwoBatchOverlap(unittest.TestCase):
 
 class TestTwoBatchOverlapUnitTest(unittest.TestCase):
     def test_compute_split_seq_index(self):
-        for num_tokens, extend_lens, expect in [
+        for num_tokens, expect in [
+            (0, 0),
+            (100, 50),
+            (99, 49),
+        ]:
+            actual = compute_split_seq_index(forward_mode=ForwardMode.DECODE, num_tokens=num_tokens, extend_lens=None)
+            self.assertEqual(actual, expect)
+
+        for extend_lens, expect in [
 
         ]:
-            actual = compute_split_seq_index(forward_mode=ForwardMode.EXTEND, num_tokens=num_tokens,
-                                             extend_lens=extend_lens)
+            actual = compute_split_seq_index(forward_mode=ForwardMode.EXTEND, num_tokens=None, extend_lens=extend_lens)
             self.assertEqual(actual, expect)
 
 
