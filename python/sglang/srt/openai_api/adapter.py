@@ -40,7 +40,7 @@ from sglang.srt.conversation import (
     get_conv_template_by_model_path,
     register_conv_template,
 )
-from sglang.srt.function_call_parser import FunctionCallParser
+from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.openai_api.protocol import (
     BatchRequest,
@@ -970,7 +970,7 @@ def v1_chat_generate_request(
         #  - image_data: None or a list of image strings (URLs or base64 strings).
         #  - audio_data: None or a list of audio strings (URLs).
         #    None skips any image processing in GenerateReqInput.
-        strict_tag = None
+        tool_call_constraint = None
         prompt = ""
         prompt_ids = []
         if not isinstance(request.messages, str):
@@ -989,7 +989,9 @@ def v1_chat_generate_request(
 
                 tool_call_parser = tokenizer_manager.server_args.tool_call_parser
                 parser = FunctionCallParser(request.tools, tool_call_parser)
-                strict_tag = parser.get_structure_tag()
+                tool_call_constraint = parser.get_structure_constraint(
+                    request.tool_choice
+                )
 
             if chat_template_name is None:
                 openai_compatible_messages = []
@@ -1156,20 +1158,24 @@ def v1_chat_generate_request(
                 request.response_format.model_dump(by_alias=True)
             )
 
-        if strict_tag is not None:
-            if (
-                sampling_params.get("regex")
-                or sampling_params.get("ebnf")
-                or sampling_params.get("structural_tag")
-                or sampling_params.get("json_schema")
-            ):
-                logger.warning(
-                    "Constrained decoding is not compatible with tool calls."
+        # Check if there are already existing output constraints
+        has_existing_constraints = (
+            sampling_params.get("regex")
+            or sampling_params.get("ebnf")
+            or sampling_params.get("structural_tag")
+            or sampling_params.get("json_schema")
+        )
+
+        if tool_call_constraint and has_existing_constraints:
+            logger.warning("Constrained decoding is not compatible with tool calls.")
+        elif tool_call_constraint:
+            constraint_type, constraint_value = tool_call_constraint
+            if constraint_type == "structural_tag":
+                sampling_params[constraint_type] = convert_json_schema_to_str(
+                    constraint_value.model_dump(by_alias=True)
                 )
             else:
-                sampling_params["structural_tag"] = convert_json_schema_to_str(
-                    strict_tag.model_dump(by_alias=True)
-                )
+                sampling_params[constraint_type] = constraint_value
 
         sampling_params_list.append(sampling_params)
 
