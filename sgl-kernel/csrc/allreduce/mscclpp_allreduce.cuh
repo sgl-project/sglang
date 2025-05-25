@@ -349,7 +349,7 @@ class MscclCommGroup {
     std::unordered_map<int, mscclpp::NonblockingFuture<std::shared_ptr<mscclpp::Connection>>> conn_futures;
     for (int r = 0; r < world_size_; ++r) {
       if (r == rank_) continue;
-      mscclpp::Transport transport = is_same_node(r, rank_) ? mscclpp::Transport::CudaIpc : IBs[rank_to_node_[r]];
+      mscclpp::Transport transport = is_same_node(r, rank_) ? mscclpp::Transport::CudaIpc : IBs[rank_to_ib_[r]];
       conn_futures.emplace(r, comm_->connectOnSetup(r, 0, transport));
     }
     comm_->setup();

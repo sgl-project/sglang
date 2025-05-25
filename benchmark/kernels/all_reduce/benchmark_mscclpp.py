@@ -9,7 +9,7 @@ torchrun --nproc_per_node gpu \
 --nnodes $WORLD_SIZE \
 --node_rank $RANK \
 --master_addr $MASTER_ADDR \
---master_port $MASTER_PORT benchmark_mscclpp.py
+--master_port $MASTER_PORT benchmark/kernels/all_reduce/benchmark_mscclpp.py
 """
 
 import os
