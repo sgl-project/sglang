@@ -83,8 +83,10 @@ from sglang.srt.managers.expert_location_dispatch import ExpertLocationDispatchI
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.operations import execute_operations
-from sglang.srt.operations_strategy import compute_layer_operations
+from sglang.srt.two_batch_overlap import (
+    MaybeTboDeepEPDispatcher,
+    model_forward_maybe_tbo,
+)
 from sglang.srt.utils import (
     BumpAllocator,
     DeepEPMode,
@@ -226,6 +228,7 @@ class DeepseekV2MoE(nn.Module):
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
         self.n_share_experts_fusion = global_server_args_dict["n_share_experts_fusion"]
+        self.config = config
         self.layer_id = layer_id
 
         if self.tp_size > config.n_routed_experts:
@@ -300,7 +303,7 @@ class DeepseekV2MoE(nn.Module):
                 else None
             )
 
-            self.deepep_dispatcher = DeepEPDispatcher(
+            self.deepep_dispatcher = MaybeTboDeepEPDispatcher(
                 group=parallel_state.get_tp_group().device_group,
                 router_topk=self.top_k,
                 permute_fusion=True,
@@ -309,13 +312,11 @@ class DeepseekV2MoE(nn.Module):
                 hidden_size=config.hidden_size,
                 params_dtype=config.torch_dtype,
                 deepep_mode=DeepEPMode[global_server_args_dict["deepep_mode"]],
-                async_finish=True,  # TODO
+                async_finish=True,
                 return_recv_hook=True,
             )
 
-    @property
-    def _enable_deepep_moe(self):
-        return global_server_args_dict["enable_deepep_moe"]
+        self._enable_deepep_moe = global_server_args_dict["enable_deepep_moe"]
 
     def get_moe_weights(self):
         return [
@@ -324,8 +325,106 @@ class DeepseekV2MoE(nn.Module):
             if name not in ["correction_bias"]
         ]
 
+    def forward(
+        self, hidden_states: torch.Tensor, forward_batch: Optional[ForwardBatch] = None
+    ) -> torch.Tensor:
+        if not self._enable_deepep_moe:
+            return self.forward_normal(hidden_states)
+        else:
+            return self.forward_deepep(hidden_states, forward_batch)
+
+    def forward_normal(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        shared_output = self._forward_shared_experts(hidden_states)
+        # router_logits: (num_tokens, n_experts)
+        router_logits = self.gate(hidden_states)
+        final_hidden_states = self.experts(
+            hidden_states=hidden_states, router_logits=router_logits
+        )
+        final_hidden_states *= self.routed_scaling_factor
+        if shared_output is not None:
+            final_hidden_states = final_hidden_states + shared_output
+        if self.tp_size > 1:
+            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+        return final_hidden_states
+
+    def forward_deepep(
+        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+    ) -> torch.Tensor:
+        forward_mode = forward_batch.forward_mode
+        shared_output = None
+        if is_non_idle_and_non_empty(forward_mode, hidden_states):
+            # router_logits: (num_tokens, n_experts)
+            router_logits = self.gate(hidden_states)
+            shared_output = self._forward_shared_experts(hidden_states)
+            topk_weights, topk_idx = select_experts(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                top_k=self.top_k,
+                use_grouped_topk=True,
+                renormalize=self.renormalize,
+                topk_group=self.topk_group,
+                num_expert_group=self.num_expert_group,
+                correction_bias=self.correction_bias,
+                routed_scaling_factor=self.routed_scaling_factor,
+                num_token_non_padded=forward_batch.num_token_non_padded,
+            )
+        else:
+            topk_idx = torch.full(
+                (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device
+            )
+            topk_weights = torch.empty(
+                (0, self.top_k), dtype=torch.float32, device=hidden_states.device
+            )
+        if self.ep_size > 1:
+            # TODO(ch-wan): allow users to set num_max_dispatch_tokens_per_rank value
+            (
+                hidden_states,
+                topk_idx,
+                topk_weights,
+                reorder_topk_ids,
+                num_recv_tokens_per_expert,
+                seg_indptr,
+                masked_m,
+                expected_m,
+            ) = self.deepep_dispatcher.dispatch(
+                hidden_states=hidden_states,
+                topk_idx=topk_idx,
+                topk_weights=topk_weights,
+                forward_mode=forward_mode,
+            )
+        final_hidden_states = self.experts(
+            hidden_states=hidden_states,
+            topk_idx=topk_idx,
+            topk_weights=topk_weights,
+            reorder_topk_ids=reorder_topk_ids,
+            seg_indptr=seg_indptr,
+            masked_m=masked_m,
+            expected_m=expected_m,
+            num_recv_tokens_per_expert=num_recv_tokens_per_expert,
+            forward_mode=forward_mode,
+        )
+        if self.ep_size > 1:
+            final_hidden_states = self.deepep_dispatcher.combine(
+                hidden_states=final_hidden_states,
+                topk_idx=topk_idx,
+                topk_weights=topk_weights,
+                forward_mode=forward_mode,
+            )
+        final_hidden_states *= self.routed_scaling_factor
+
+        if shared_output is not None:
+            final_hidden_states = final_hidden_states + shared_output
+
+        return final_hidden_states
+
+    def _forward_shared_experts(self, hidden_states):
+        if self.n_share_experts_fusion == 0:
+            return self.shared_experts(hidden_states)
+        else:
+            return None
+
     def op_gate(self, state):
-        if (not self._enable_deepep_moe) or is_non_idle_and_non_empty(
+        if is_non_idle_and_non_empty(
             state.forward_batch.forward_mode, state.hidden_states_mlp_input
         ):
             # router_logits: (num_tokens, n_experts)
@@ -334,114 +433,104 @@ class DeepseekV2MoE(nn.Module):
             state.router_logits = None
 
     def op_shared_experts(self, state):
-        if (self.n_share_experts_fusion == 0) and (
-            (not self._enable_deepep_moe)
-            or is_non_idle_and_non_empty(
-                state.forward_batch.forward_mode, state.hidden_states_mlp_input
-            )
+        hidden_states_mlp_input = state.pop("hidden_states_mlp_input")
+        if (self.n_share_experts_fusion == 0) and is_non_idle_and_non_empty(
+            state.forward_batch.forward_mode, hidden_states_mlp_input
         ):
-            state.shared_output = self.shared_experts(state.hidden_states_mlp_input)
+            state.shared_output = self.shared_experts(hidden_states_mlp_input)
         else:
             state.shared_output = None
 
     def op_select_experts(self, state):
-        router_logits = state.router_logits
+        router_logits = state.pop("router_logits")
         hidden_states = state.hidden_states_mlp_input
 
-        if self._enable_deepep_moe:
-            if router_logits is not None:
-                state.topk_weights_local, state.topk_idx_local = select_experts(
-                    hidden_states=hidden_states,
-                    router_logits=router_logits,
-                    top_k=self.top_k,
-                    use_grouped_topk=True,
-                    renormalize=self.renormalize,
-                    topk_group=self.topk_group,
-                    num_expert_group=self.num_expert_group,
-                    correction_bias=self.correction_bias,
-                    routed_scaling_factor=self.routed_scaling_factor,
-                    expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                        layer_id=self.layer_id,
-                    ),
-                )
-            else:
-                state.topk_idx_local = torch.full(
-                    (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device
-                )
-                state.topk_weights_local = torch.empty(
-                    (0, self.top_k), dtype=torch.float32, device=hidden_states.device
-                )
+        if router_logits is not None:
+            state.topk_weights_local, state.topk_idx_local = select_experts(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                top_k=self.top_k,
+                use_grouped_topk=True,
+                renormalize=self.renormalize,
+                topk_group=self.topk_group,
+                num_expert_group=self.num_expert_group,
+                correction_bias=self.correction_bias,
+                routed_scaling_factor=self.routed_scaling_factor,
+                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                    layer_id=self.layer_id,
+                ),
+            )
+        else:
+            state.topk_idx_local = torch.full(
+                (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device
+            )
+            state.topk_weights_local = torch.empty(
+                (0, self.top_k), dtype=torch.float32, device=hidden_states.device
+            )
 
     def op_dispatch_a(self, state):
-        if self._enable_deepep_moe and (self.ep_size > 1):
+        if self.ep_size > 1:
             # TODO(ch-wan): allow users to set num_max_dispatch_tokens_per_rank value
             self.deepep_dispatcher.dispatch_a(
-                hidden_states=state.pop("hidden_states_mlp_input"),
+                hidden_states=state.hidden_states_mlp_input,
                 topk_idx=state.pop("topk_idx_local"),
                 topk_weights=state.pop("topk_weights_local"),
                 forward_mode=state.forward_batch.forward_mode,
+                tbo_subbatch_index=state.get("tbo_subbatch_index"),
             )
 
     def op_dispatch_b(self, state):
-        if self._enable_deepep_moe and (self.ep_size > 1):
-            (
-                state.hidden_states_experts_input,
-                state.topk_idx_dispatched,
-                state.topk_weights_dispatched,
-                state.reorder_topk_ids,
-                state.num_recv_tokens_per_expert,
-                state.seg_indptr,
-                state.masked_m,
-                state.expected_m,
-            ) = self.deepep_dispatcher.dispatch_b()
+        if self.ep_size > 1:
+            with get_global_expert_distribution_recorder().with_current_layer(
+                self.layer_id
+            ):
+                (
+                    state.hidden_states_experts_input,
+                    state.topk_idx_dispatched,
+                    state.topk_weights_dispatched,
+                    state.reorder_topk_ids,
+                    state.num_recv_tokens_per_expert,
+                    state.seg_indptr,
+                    state.masked_m,
+                    state.expected_m,
+                ) = self.deepep_dispatcher.dispatch_b(
+                    tbo_subbatch_index=state.get("tbo_subbatch_index"),
+                )
 
     def op_experts(self, state):
-        if self._enable_deepep_moe:
-            state.pop("router_logits")
-            state.hidden_states_experts_output = self.experts(
-                hidden_states=state.pop("hidden_states_experts_input"),
-                topk_idx=state.topk_idx_dispatched,
-                topk_weights=state.topk_weights_dispatched,
-                reorder_topk_ids=state.pop("reorder_topk_ids"),
-                seg_indptr=state.pop("seg_indptr"),
-                masked_m=state.pop("masked_m"),
-                expected_m=state.pop("expected_m"),
-                num_recv_tokens_per_expert=state.pop("num_recv_tokens_per_expert"),
-                forward_mode=state.forward_batch.forward_mode,
-            )
-        else:
-            state.hidden_states_experts_output = self.experts(
-                hidden_states=state.pop("hidden_states_mlp_input"),
-                router_logits=state.pop("router_logits"),
-            )
+        state.hidden_states_experts_output = self.experts(
+            hidden_states=state.pop("hidden_states_experts_input"),
+            topk_idx=state.topk_idx_dispatched,
+            topk_weights=state.topk_weights_dispatched,
+            reorder_topk_ids=state.pop("reorder_topk_ids"),
+            seg_indptr=state.pop("seg_indptr"),
+            masked_m=state.pop("masked_m"),
+            expected_m=state.pop("expected_m"),
+            num_recv_tokens_per_expert=state.pop("num_recv_tokens_per_expert"),
+            forward_mode=state.forward_batch.forward_mode,
+        )
 
     def op_combine_a(self, state):
-        if self._enable_deepep_moe and (self.ep_size > 1):
+        if self.ep_size > 1:
             self.deepep_dispatcher.combine_a(
-                state.pop("hidden_states_experts_output"),
+                hidden_states=state.pop("hidden_states_experts_output"),
                 topk_idx=state.pop("topk_idx_dispatched"),
                 topk_weights=state.pop("topk_weights_dispatched"),
                 forward_mode=state.forward_batch.forward_mode,
+                tbo_subbatch_index=state.get("tbo_subbatch_index"),
             )
 
     def op_combine_b(self, state):
-        if self._enable_deepep_moe and (self.ep_size > 1):
-            state.hidden_states_after_combine = self.deepep_dispatcher.combine_b()
+        if self.ep_size > 1:
+            state.hidden_states_after_combine = self.deepep_dispatcher.combine_b(
+                tbo_subbatch_index=state.get("tbo_subbatch_index"),
+            )
 
     def op_output(self, state):
-        final_hidden_states = (
-            state.pop("hidden_states_after_combine")
-            if self._enable_deepep_moe
-            else state.pop("hidden_states_experts_output")
-        )
-
+        final_hidden_states = state.pop("hidden_states_after_combine")
         final_hidden_states *= self.routed_scaling_factor
-
         if (s := state.pop("shared_output")) is not None:
             final_hidden_states = final_hidden_states + s
-
-        if (not self._enable_deepep_moe) and (self.tp_size > 1):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         state.hidden_states_mlp_output = final_hidden_states
 
@@ -677,44 +766,94 @@ class DeepseekV2AttentionMLA(nn.Module):
             else:
                 return _dispatch_mla_subtype()
 
+    def op_prepare(self, state):
+        state.attn_intermediate_state = self.forward_prepare(
+            positions=state.positions,
+            hidden_states=state.pop("hidden_states_after_comm_pre_attn"),
+            forward_batch=state.forward_batch,
+            zero_allocator=state.zero_allocator,
+        )
+
+    def op_core(self, state):
+        state.hidden_states_after_attn = self.forward_core(
+            state.pop("attn_intermediate_state")
+        )
+
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
-    ) -> torch.Tensor:
-        if hidden_states.shape[0] == 0:
-            assert (
-                not self.o_proj.reduce_results
-            ), "short-circuiting allreduce will lead to hangs"
-            return hidden_states
+    ):
+        s = self.forward_prepare(
+            positions=positions,
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+            zero_allocator=zero_allocator,
+        )
+        return self.forward_core(s)
 
-        attn_forward_method = self.dispatch_attn_forward_method(forward_batch)
-
-        if attn_forward_method == AttnForwardMethod.MHA:
-            return self.forward_normal(positions, hidden_states, forward_batch)
-        elif attn_forward_method == AttnForwardMethod.MHA_CHUNKED_KV:
-            return self.forward_normal_chunked_kv(
-                positions, hidden_states, forward_batch
-            )
-        elif attn_forward_method == AttnForwardMethod.MLA:
-            return self.forward_absorb(
-                positions, hidden_states, forward_batch, zero_allocator
-            )
-        elif attn_forward_method == AttnForwardMethod.MLA_FUSED_ROPE:
-            return self.forward_absorb_fused_mla_rope(
-                positions, hidden_states, forward_batch
-            )
-        else:
-            raise NotImplementedError
-
-    def forward_normal(
+    def forward_prepare(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-    ) -> torch.Tensor:
+        zero_allocator: BumpAllocator,
+    ):
+        if hidden_states.shape[0] == 0:
+            assert (
+                not self.o_proj.reduce_results
+            ), "short-circuiting allreduce will lead to hangs"
+            return hidden_states, None, forward_batch, None
+
+        attn_forward_method = self.dispatch_attn_forward_method(forward_batch)
+
+        if attn_forward_method == AttnForwardMethod.MHA:
+            inner_state = self.forward_normal_prepare(
+                positions, hidden_states, forward_batch, zero_allocator
+            )
+        elif attn_forward_method == AttnForwardMethod.MHA_CHUNKED_KV:
+            inner_state = self.forward_normal_chunked_kv_prepare(
+                positions, hidden_states, forward_batch, zero_allocator
+            )
+        elif attn_forward_method == AttnForwardMethod.MLA:
+            inner_state = self.forward_absorb_prepare(
+                positions, hidden_states, forward_batch, zero_allocator
+            )
+        elif attn_forward_method == AttnForwardMethod.MLA_FUSED_ROPE:
+            inner_state = self.forward_absorb_fused_mla_rope_prepare(
+                positions, hidden_states, forward_batch, zero_allocator
+            )
+        else:
+            raise NotImplementedError
+        return None, attn_forward_method, forward_batch, inner_state
+
+    def forward_core(self, intermediate_state):
+        hidden_states, attn_forward_method, forward_batch, inner_state = (
+            intermediate_state
+        )
+        if inner_state is None:
+            return hidden_states
+
+        if attn_forward_method == AttnForwardMethod.MHA:
+            return self.forward_normal_core(*inner_state)
+        elif attn_forward_method == AttnForwardMethod.MHA_CHUNKED_KV:
+            return self.forward_normal_chunked_kv_core(*inner_state)
+        elif attn_forward_method == AttnForwardMethod.MLA:
+            return self.forward_absorb_core(*inner_state)
+        elif attn_forward_method == AttnForwardMethod.MLA_FUSED_ROPE:
+            return self.forward_absorb_fused_mla_rope_core(*inner_state)
+        else:
+            raise NotImplementedError
+
+    def forward_normal_prepare(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        zero_allocator: BumpAllocator,
+    ):
         if self.q_lora_rank is not None:
             q, latent_cache = self.fused_qkv_a_proj_with_mqa(hidden_states)[0].split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
@@ -749,18 +888,22 @@ class DeepseekV2AttentionMLA(nn.Module):
         forward_batch.token_to_kv_pool.set_kv_buffer(
             self.attn_mha, forward_batch.out_cache_loc, latent_cache, None
         )
+
+        return q, k, v, forward_batch
+
+    def forward_normal_core(self, q, k, v, forward_batch):
         attn_output = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
         output, _ = self.o_proj(attn_output)
         return output
 
-    def forward_absorb(
+    def forward_absorb_prepare(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
-    ) -> torch.Tensor:
+    ):
         from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
         if self.q_lora_rank is not None:
@@ -829,6 +972,11 @@ class DeepseekV2AttentionMLA(nn.Module):
         q_nope_out = q_nope_out.transpose(0, 1)
         q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
+        return q_pe, k_pe, q_nope_out, k_nope, forward_batch, zero_allocator
+
+    def forward_absorb_core(
+        self, q_pe, k_pe, q_nope_out, k_nope, forward_batch, zero_allocator
+    ):
         if self.attention_backend == "fa3" or self.attention_backend == "flashinfer":
             attn_output = self.attn_mqa(
                 q_nope_out, k_nope, k_nope, forward_batch, q_rope=q_pe, k_rope=k_pe
@@ -881,13 +1029,13 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         return output
 
-    def forward_absorb_fused_mla_rope(
+    def forward_absorb_fused_mla_rope_prepare(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
-    ) -> torch.Tensor:
+    ):
         enable_rope_fusion = (
             os.getenv("SGLANG_FUSED_MLA_ENABLE_ROPE_FUSION", "1") == "1"
         )
@@ -976,6 +1124,44 @@ class DeepseekV2AttentionMLA(nn.Module):
         )
         val_cache_buf = key_cache_buf[..., : self.kv_lora_rank]
 
+        return (
+            q_input,
+            key_cache_buf,
+            val_cache_buf,
+            attn_output,
+            kv_indptr,
+            kv_indices,
+            k_pe_output,
+            cos_sin_cache,
+            positions,
+            attn_logits,
+            num_kv_split,
+            sm_scale,
+            enable_rope_fusion,
+            k_input,
+            forward_batch,
+            zero_allocator,
+        )
+
+    def forward_absorb_fused_mla_rope_core(
+        self,
+        q_input,
+        key_cache_buf,
+        val_cache_buf,
+        attn_output,
+        kv_indptr,
+        kv_indices,
+        k_pe_output,
+        cos_sin_cache,
+        positions,
+        attn_logits,
+        num_kv_split,
+        sm_scale,
+        enable_rope_fusion,
+        k_input,
+        forward_batch,
+        zero_allocator,
+    ):
         decode_attention_fwd_grouped_rope(
             q_input,
             key_cache_buf,
@@ -1082,12 +1268,13 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         return accum_output
 
-    def forward_normal_chunked_kv(
+    def forward_normal_chunked_kv_prepare(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-    ) -> torch.Tensor:
+        zero_allocator: BumpAllocator,
+    ):
         # In normal mha, the k and v tensors will become overly large when the prefix length is long.
         # To avoid this, we split the kv cache into chunks and process them one after another.
         # Since mha is compute friendly, the for loop induced here will not introduce significant overhead.
@@ -1130,6 +1317,9 @@ class DeepseekV2AttentionMLA(nn.Module):
             self.attn_mha, forward_batch.out_cache_loc, latent_cache, None
         )
 
+        return q, k, v, forward_batch
+
+    def forward_normal_chunked_kv_core(self, q, k, v, forward_batch):
         # Do mha for extended part without prefix
         forward_batch.set_attn_attend_prefix_cache(False)
         attn_output, lse = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
@@ -1252,16 +1442,28 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
-        return execute_operations(
-            inputs=dict(
-                positions=positions,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
-                residual=residual,
-                zero_allocator=zero_allocator,
-            ),
-            operations=compute_layer_operations(self),
+        hidden_states, residual = self.layer_communicator.prepare_attn(
+            hidden_states, residual, forward_batch
         )
+
+        hidden_states = self.self_attn(
+            positions=positions,
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+            zero_allocator=zero_allocator,
+        )
+
+        hidden_states, residual = self.layer_communicator.prepare_mlp(
+            hidden_states, residual, forward_batch
+        )
+
+        hidden_states = self.mlp(hidden_states, forward_batch)
+
+        hidden_states, residual = self.layer_communicator.postprocess_layer(
+            hidden_states, residual, forward_batch
+        )
+
+        return hidden_states, residual
 
     def op_comm_prepare_attn(
         self,
@@ -1271,6 +1473,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
+        tbo_subbatch_index: Optional[int] = None,
     ):
         state.hidden_states_after_comm_pre_attn, state.residual_after_input_ln = (
             self.layer_communicator.prepare_attn(hidden_states, residual, forward_batch)
@@ -1280,15 +1483,8 @@ class DeepseekV2DecoderLayer(nn.Module):
                 forward_batch=forward_batch,
                 positions=positions,
                 zero_allocator=zero_allocator,
+                tbo_subbatch_index=tbo_subbatch_index,
             )
-        )
-
-    def op_attn(self, state):
-        state.hidden_states_after_attn = self.self_attn(
-            positions=state.positions,
-            hidden_states=state.pop("hidden_states_after_comm_pre_attn"),
-            forward_batch=state.forward_batch,
-            zero_allocator=state.zero_allocator,
         )
 
     def op_comm_prepare_mlp(self, state):
@@ -1320,8 +1516,24 @@ class DeepseekV2DecoderLayer(nn.Module):
             state.forward_batch,
         )
 
-        state.clear(expect_keys={"positions", "forward_batch", "zero_allocator"})
-        return hidden_states, residual
+        output = dict(
+            positions=state.positions,
+            hidden_states=hidden_states,
+            residual=residual,
+            forward_batch=state.forward_batch,
+            zero_allocator=state.zero_allocator,
+            tbo_subbatch_index=state.tbo_subbatch_index,
+        )
+
+        state.clear(
+            expect_keys={
+                "positions",
+                "forward_batch",
+                "zero_allocator",
+                "tbo_subbatch_index",
+            }
+        )
+        return output
 
 
 class DeepseekV2Model(nn.Module):
@@ -1336,6 +1548,7 @@ class DeepseekV2Model(nn.Module):
         super().__init__()
         self.padding_id = config.pad_token_id
         self.vocab_size = config.vocab_size
+        self.first_k_dense_replace = config.first_k_dense_replace
 
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
@@ -1369,13 +1582,12 @@ class DeepseekV2Model(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
+        total_num_layers = len(self.layers)
+        device = input_embeds.device if input_embeds is not None else input_ids.device
         zero_allocator = BumpAllocator(
-            # TODO for two-batch-overlap, we need a larger buffer size
-            buffer_size=len(self.layers) * 2,
+            buffer_size=total_num_layers * 2 * (2 if forward_batch.can_run_tbo else 1),
             dtype=torch.float32,
-            device=(
-                input_embeds.device if input_embeds is not None else input_ids.device
-            ),
+            device=device,
         )
 
         if input_embeds is None:
@@ -1384,12 +1596,30 @@ class DeepseekV2Model(nn.Module):
             hidden_states = input_embeds
 
         residual = None
-        for i in range(len(self.layers)):
+
+        normal_num_layers = (
+            self.first_k_dense_replace
+            if forward_batch.can_run_tbo
+            else total_num_layers
+        )
+        for i in range(normal_num_layers):
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 layer = self.layers[i]
                 hidden_states, residual = layer(
                     positions, hidden_states, forward_batch, residual, zero_allocator
                 )
+
+        if normal_num_layers != total_num_layers:
+            hidden_states, residual = model_forward_maybe_tbo(
+                layers=self.layers[normal_num_layers:],
+                enable_tbo=True,
+                positions=positions,
+                forward_batch=forward_batch,
+                hidden_states=hidden_states,
+                residual=residual,
+                zero_allocator=zero_allocator,
+            )
+
         if not forward_batch.forward_mode.is_idle():
             if residual is None:
                 hidden_states = self.norm(hidden_states)
@@ -1471,7 +1701,6 @@ class DeepseekV2ForCausalLM(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
 
         return self.logits_processor(
