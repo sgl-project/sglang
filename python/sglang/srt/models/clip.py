@@ -168,7 +168,7 @@ class CLIPEncoderLayer(nn.Module):
             softmax_in_single_precision=softmax_in_single_precision,
             flatten_batch=True,
             quant_config=quant_config,
-            prefix=add_prefix("attn", prefix),
+            prefix=add_prefix("self_attn", prefix),
         )
         self.mlp = CLIPMLP(
             config,
@@ -394,6 +394,10 @@ class CLIPVisionModel(nn.Module):
         self.vision_model = CLIPVisionTransformer(
             config, quant_config, prefix=add_prefix("vision_model", prefix)
         )
+
+    @property
+    def device(self) -> torch.device:
+        return self.vision_model.device
 
     def forward(self, pixel_values: torch.Tensor):
         return self.vision_model(pixel_values)
