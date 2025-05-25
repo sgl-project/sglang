@@ -68,7 +68,7 @@ class Gemma3SGLangImageProcessor(SGLangBaseProcessor):
         )
         for i, image in enumerate(base_output.images):
             if images_are_preprocessed:
-                pixel_values = image.pixel_values
+                pixel_values = None
                 precomputed_features = image.precomputed_features
             else:
                 pixel_values = ret["pixel_values"][i]

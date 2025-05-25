@@ -78,10 +78,22 @@ class VLMInputTestBase:
         conv = generate_chat_conv(req, template_name=self.chat_template)
         text = conv.get_prompt()
 
-        # Process inputs using processor
         inputs = self.processor(
             text=[text],
             images=[self.main_image],
+            return_tensors="pt",
+        ).to(self.device)
+
+        return inputs 
+    
+    def get_tokenizer_output(self, req: Optional[ChatCompletionRequest] = None):
+        if req is None:
+            req = self.get_completion_request()
+        conv = generate_chat_conv(req, template_name=self.chat_template)
+        text = conv.get_prompt()
+
+        inputs = self.processor.tokenizer(
+            text=[text],
             return_tensors="pt",
         ).to(self.device)
 
@@ -114,10 +126,10 @@ class VLMInputTestBase:
 
     async def test_understands_pixel_values(self):
         req = self.get_completion_request()
-        processor_output = self.get_processor_output(req=req)
+        tokenizer_output = self.get_tokenizer_output(req=req)
         output = await self.engine.async_generate(
-            input_ids=processor_output["input_ids"][0].detach().cpu().tolist(),
-            image_data=[self._pixel_values_image_data(processor_output)],
+            input_ids=tokenizer_output["input_ids"][0].detach().cpu().tolist(),
+            image_data=[self.main_image],
             sampling_params=dict(temperature=0.0),
         )
         self.assertIn("taxi", output["text"].lower())
@@ -128,10 +140,6 @@ class VLMInputTestBase:
             modality="IMAGE",
             precomputed_features=precomputed_features,
         )
-
-    def _pixel_values_image_data(self, processor_output):
-        """Override in subclass to pass the correct set of arguments."""
-        raise NotImplementedError
 
 
 class TestQwenVLUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTestCase):
@@ -151,13 +159,6 @@ class TestQwenVLUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTestC
             processor_output["pixel_values"], processor_output["image_grid_thw"]
         )
 
-    def _pixel_values_image_data(self, processor_output):
-        return dict(
-            modality="IMAGE",
-            image_grid_thws=processor_output["image_grid_thw"],
-            pixel_values=processor_output["pixel_values"],
-        )
-
 
 class TestGemmaUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTestCase):
     model_path = "google/gemma-3-4b-it"
@@ -174,12 +175,6 @@ class TestGemmaUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTestCa
             cls.vision_tower(
                 pixel_values=processor_output["pixel_values"]
             ).last_hidden_state
-        )
-
-    def _pixel_values_image_data(self, processor_output):
-        return dict(
-            modality="IMAGE",
-            pixel_values=processor_output["pixel_values"][0],
         )
 
 
