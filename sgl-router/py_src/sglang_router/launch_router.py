@@ -48,6 +48,9 @@ class RouterArgs:
     selector: Dict[str, str] = dataclasses.field(default_factory=dict)
     service_discovery_port: int = 80
     service_discovery_namespace: Optional[str] = None
+    # Prometheus configuration
+    prometheus_port: Optional[int] = None
+    prometheus_host: Optional[str] = None
 
     @staticmethod
     def add_cli_args(
@@ -176,6 +179,19 @@ class RouterArgs:
             type=str,
             help="Kubernetes namespace to watch for pods. If not provided, watches all namespaces (requires cluster-wide permissions)",
         )
+        # Prometheus configuration
+        parser.add_argument(
+            f"--{prefix}prometheus-port",
+            type=int,
+            default=29000,
+            help="Port to expose Prometheus metrics. If not specified, Prometheus metrics are disabled",
+        )
+        parser.add_argument(
+            f"--{prefix}prometheus-host",
+            type=str,
+            default="127.0.0.1",
+            help="Host address to bind the Prometheus metrics server",
+        )
 
     @classmethod
     def from_cli_args(
@@ -215,6 +231,8 @@ class RouterArgs:
             service_discovery_namespace=getattr(
                 args, f"{prefix}service_discovery_namespace", None
             ),
+            prometheus_port=getattr(args, f"{prefix}prometheus_port", None),
+            prometheus_host=getattr(args, f"{prefix}prometheus_host", None),
         )
 
     @staticmethod
@@ -278,6 +296,8 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
             selector=router_args.selector,
             service_discovery_port=router_args.service_discovery_port,
             service_discovery_namespace=router_args.service_discovery_namespace,
+            prometheus_port=router_args.prometheus_port,
+            prometheus_host=router_args.prometheus_host,
         )
 
         router.start()
