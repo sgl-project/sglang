@@ -463,6 +463,7 @@ class Scheduler(
         self.disaggregation_mode = DisaggregationMode(
             self.server_args.disaggregation_mode
         )
+        self.kv_manager = None
         self.init_disaggregation()
 
     def init_tokenizer(self):
@@ -604,6 +605,7 @@ class Scheduler(
                 bootstrap_port=self.server_args.disaggregation_bootstrap_port,
                 transfer_backend=self.transfer_backend,
             )
+            self.kv_manager = self.disagg_decode_prealloc_queue.kv_manager
 
             # Metric for pre-allocation
             self.num_tokens_pre_allocated = 0
@@ -632,6 +634,7 @@ class Scheduler(
                 transfer_backend=self.transfer_backend,
                 scheduler=self,
             )
+            self.kv_manager = self.disagg_prefill_bootstrap_queue.kv_manager
             # The prefill requests that are in the middle of kv sending
             self.disagg_prefill_inflight_queue: List[Req] = []
 
