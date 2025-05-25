@@ -484,3 +484,19 @@ class EmbeddingResponse(BaseModel):
     model: str
     object: str = "list"
     usage: Optional[UsageInfo] = None
+
+
+class ScoringRequest(BaseModel):
+    text_1: str
+    text_2: List[str]
+    positive_token_id: int
+    negative_token_id: int
+    prepend: bool = False
+    model: str
+
+
+class ScoringResponse(BaseModel):
+    scores: List[Optional[float]]
+    model: str
+    usage: UsageInfo
+    object: str = "scoring"

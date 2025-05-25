@@ -18,6 +18,7 @@ import copy
 import dataclasses
 import json
 import logging
+import math
 import os
 import pickle
 import signal
@@ -1415,6 +1416,86 @@ class TokenizerManager:
             # set future if the all results are received
             if len(self.model_update_tmp) == self.server_args.dp_size:
                 self.model_update_result.set_result(self.model_update_tmp)
+
+    async def score_request(
+        self,
+        text_1: str,
+        text_2: Union[str, List[str]],
+        positive_token_id: int,
+        negative_token_id: int,
+        prepend: bool = False,
+        request: Optional[Any] = None,
+    ) -> Dict:
+        """
+        Internal implementation of the scoring API. See Engine.score() for detailed documentation.
+        """
+        if isinstance(text_2, str):
+            text_2 = [text_2]
+
+        prompts = [f"{text}{text_1}" for text in text_2] if prepend else [f"{text_1}{text}" for text in text_2]
+
+        if self.tokenizer is not None:
+            vocab_size = self.tokenizer.vocab_size
+            if positive_token_id >= vocab_size:
+                raise ValueError(f"Positive token ID {positive_token_id} is out of vocabulary (vocab size: {vocab_size})")
+            if negative_token_id >= vocab_size:
+                raise ValueError(f"Negative token ID {negative_token_id} is out of vocabulary (vocab size: {vocab_size})")
+
+        batch_request = GenerateReqInput(
+            text=prompts,
+            return_logprob=True,
+            token_ids_logprob=[positive_token_id, negative_token_id],
+            stream=False,
+            sampling_params={"max_new_tokens": 1},
+        )
+
+        scores = []
+        total_prompt_tokens = 0
+        total_completion_tokens = 0
+        total_cached_tokens = 0
+
+        request_to_pass = request if hasattr(request, 'is_disconnected') else None
+        async for results in self.generate_request(batch_request, request_to_pass):
+            if not isinstance(results, list):
+                results = [results]
+                
+            for result in results:
+                output_logprobs = result["meta_info"].get("output_token_ids_logprobs", [])
+                pos_logprob = None
+                neg_logprob = None
+                
+                if output_logprobs and len(output_logprobs) > 0:
+                    # Directly access logprobs for the target tokens
+                    first_position_logprobs = output_logprobs[0]
+                    logprob_dict = {token_id: logprob for logprob, token_id, _ in first_position_logprobs}
+                    pos_logprob = logprob_dict.get(positive_token_id)
+                    neg_logprob = logprob_dict.get(negative_token_id)
+
+                if pos_logprob is None or neg_logprob is None:
+                    scores.append(None)
+                else:
+                    pos_prob = math.exp(pos_logprob)
+                    neg_prob = math.exp(neg_logprob)
+                    score = pos_prob / (pos_prob + neg_prob)
+                    scores.append(score)
+
+                total_prompt_tokens += result["meta_info"]["prompt_tokens"]
+                total_completion_tokens += result["meta_info"]["completion_tokens"]
+                total_cached_tokens += result["meta_info"]["cached_tokens"]
+
+        return {
+            "scores": scores,
+            "model_info": {
+                "model": self.served_model_name,
+                "context_length": self.context_len,
+            },
+            "usage": {
+                "prompt_tokens": total_prompt_tokens,
+                "completion_tokens": total_completion_tokens,
+                "cached_tokens": total_cached_tokens,
+                "total_tokens": total_prompt_tokens + total_completion_tokens,
+            },
+        }
 
 
 async def print_exception_wrapper(func):
