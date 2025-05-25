@@ -348,7 +348,7 @@ class NixlKVManager(BaseKVManager):
                 room = int(components[0])
                 if components[1] == "kv":
                     chunk_id = int(components[2])
-                    is_last = bool(components[3])
+                    is_last = bool(int(components[3]))
                     self.transfer_statuses[room].received_kvs.add(chunk_id)
                     if is_last:
                         self.transfer_statuses[room].num_kvs_expected = chunk_id + 1
