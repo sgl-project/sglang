@@ -144,12 +144,11 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
 
         if base_output.images:
             if images_are_preprocessed:
-                image_grid_thw = torch.concat(
-                    [
-                        torch.as_tensor(item.image_grid_thws)
-                        for item in base_output.images
-                    ]
-                )
+                all_image_grid_thws = [
+                    item.image_grid_thws
+                    for item in base_output.images
+                    if item.image_grid_thws is not None
+                ]
                 all_pixel_values = [
                     item.pixel_values
                     for item in base_output.images
@@ -160,6 +159,9 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
                     for item in base_output.images
                     if item.precomputed_features is not None
                 ]
+                image_grid_thw = (
+                    torch.concat(all_image_grid_thws) if all_image_grid_thws else None
+                )
                 pixel_values = (
                     torch.concat(all_pixel_values) if all_pixel_values else None
                 )

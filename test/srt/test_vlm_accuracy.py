@@ -10,15 +10,8 @@ import requests
 import torch
 import torch.nn.functional as F
 from PIL import Image
-from transformers import (
-    AutoModel,
-    AutoProcessor,
-    AutoTokenizer,
-    Gemma3ForConditionalGeneration,
-    Qwen2_5_VLForConditionalGeneration,
-)
+from transformers import AutoModel, AutoProcessor, AutoTokenizer
 
-from sglang import Engine
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.conversation import generate_chat_conv
 from sglang.srt.managers.mm_utils import embed_mm_inputs, init_embedding_cache
@@ -41,9 +34,6 @@ class VisionLLMLogitsBase(unittest.IsolatedAsyncioTestCase):
     def setUpClass(cls):
         cls.image_url = "https://github.com/sgl-project/sglang/blob/main/test/lang/example_image.png?raw=true"
         cls.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        cls.model_path = ""
-        cls.chat_template = ""
-        cls.processor = ""
         response = requests.get(cls.image_url)
         cls.main_image = Image.open(BytesIO(response.content))
 
@@ -169,7 +159,7 @@ class VisionLLMLogitsBase(unittest.IsolatedAsyncioTestCase):
         )
         return self.model_runner.model
 
-
+      
 # TODO: MiniCPMV is not compatible with transformers==4.52.3, temporarily disabled
 # class TestMiniCPMVLogits(VisionLLMLogitsBase):
 #     @classmethod
