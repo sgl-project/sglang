@@ -2,6 +2,7 @@ import dataclasses
 from typing import TYPE_CHECKING, Dict, List, Optional, Sequence
 
 import torch
+
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPDispatcher
@@ -40,7 +41,7 @@ def compute_split_seq_index(
 def _split_array_by_half_sum(arr: Sequence[int]) -> int:
     overall_sum = sum(arr)
     left_sum = 0
-    min_diff = float('inf')
+    min_diff = float("inf")
     best_index = 0
 
     for i in range(1, len(arr)):
