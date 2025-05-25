@@ -53,7 +53,6 @@ def _fwd_kernel(
     mask_indptr,
     sm_scale,
     kv_group_num,
-    sliding_window_size,
     stride_qbs,
     stride_qh,
     stride_kbs,
@@ -66,6 +65,7 @@ def _fwd_kernel(
     stride_buf_kh,
     stride_buf_vbs,
     stride_buf_vh,
+    SLIDING_WINDOW_SIZE: tl.constexpr,
     logit_cap: tl.constexpr,
     Lq: tl.constexpr,
     Lv: tl.constexpr,
@@ -176,10 +176,10 @@ def _fwd_kernel(
                 other=0,
             )
             final_mask &= custom_mask
-        if sliding_window_size > 0:
+        if SLIDING_WINDOW_SIZE > 0:
             # Add mask where q_id <= kv_id + sliding_window_size
             window_mask = (cur_block_m * BLOCK_M + offs_m[:, None]) <= (
-                start_n + offs_n[None, :] + sliding_window_size
+                start_n + offs_n[None, :] + SLIDING_WINDOW_SIZE
             )
             final_mask &= window_mask
         qk = tl.where(final_mask, qk, float("-inf"))
@@ -407,7 +407,6 @@ def extend_attention_fwd(
         mask_indptr,
         sm_scale,
         kv_group_num,
-        sliding_window_size,
         q_extend.stride(0),
         q_extend.stride(1),
         k_extend.stride(0),
@@ -420,6 +419,7 @@ def extend_attention_fwd(
         k_buffer.stride(1),
         v_buffer.stride(0),
         v_buffer.stride(1),
+        SLIDING_WINDOW_SIZE=sliding_window_size,
         logit_cap=logit_cap,
         BLOCK_DMODEL=BLOCK_DMODEL,
         BLOCK_DPE=BLOCK_DPE,
