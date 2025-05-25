@@ -1,5 +1,6 @@
 import logging
 import math
+import re
 from collections.abc import Iterable
 from typing import List, Optional, Tuple
 
@@ -431,6 +432,14 @@ class Phi4MMForCausalLM(nn.Module):
         pattern = MultiModalityDataPaddingPatternMultimodalTokens([im_token_id])
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
+    def map_lora_module_name(self, module_name: str) -> Optional[str]:
+        pattern = re.compile(r"^language_model\.model\.layers\.(\d+)\.(?:self_attn|mlp)\.(?:qkv_proj|o_proj|down_proj|gate_up_proj)")
+        if pattern.match(module_name):
+            return module_name.replace("language_model.", "base_model.model.")
+        else:
+            # Only support LoRA modules in language model for now.
+            return None
+    
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
