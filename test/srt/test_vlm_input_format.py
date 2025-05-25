@@ -84,8 +84,8 @@ class VLMInputTestBase:
             return_tensors="pt",
         ).to(self.device)
 
-        return inputs 
-    
+        return inputs
+
     def get_tokenizer_output(self, req: Optional[ChatCompletionRequest] = None):
         if req is None:
             req = self.get_completion_request()
