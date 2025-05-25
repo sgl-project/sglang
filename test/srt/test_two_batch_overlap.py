@@ -68,5 +68,10 @@ class TestTwoBatchOverlap(unittest.TestCase):
         self.assertGreater(metrics["score"], 0.5)
 
 
+class TestTwoBatchOverlapUnitTest(unittest.TestCase):
+    def test_compute_split_seq_index(self):
+        TODO
+
+
 if __name__ == "__main__":
     unittest.main()
