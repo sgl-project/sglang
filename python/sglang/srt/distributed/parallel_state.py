@@ -41,6 +41,7 @@ from torch.distributed import Backend, ProcessGroup
 
 from sglang.srt.utils import (
     direct_register_custom_op,
+    get_bool_env_var,
     is_cuda_alike,
     is_npu,
     supports_custom_op,
@@ -1153,7 +1154,9 @@ def initialize_model_parallel(
         group_ranks,
         get_world_group().local_rank,
         backend,
-        use_message_queue_broadcaster=True,
+        use_message_queue_broadcaster=get_bool_env_var(
+            "SGLANG_USE_MESSAGE_QUEUE_BROADCASTER", "true"
+        ),
         group_name="tp",
     )
 
