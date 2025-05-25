@@ -229,11 +229,16 @@ class ModelConfig:
         )
 
     @staticmethod
-    def from_server_args(server_args: ServerArgs, model_path: str = None, **kwargs):
+    def from_server_args(
+        server_args: ServerArgs,
+        model_path: str = None,
+        model_revision: str = None,
+        **kwargs,
+    ):
         return ModelConfig(
             model_path=model_path or server_args.model_path,
             trust_remote_code=server_args.trust_remote_code,
-            revision=server_args.revision,
+            revision=model_revision or server_args.revision,
             context_length=server_args.context_length,
             model_override_args=server_args.json_model_override_args,
             is_embedding=server_args.is_embedding,
