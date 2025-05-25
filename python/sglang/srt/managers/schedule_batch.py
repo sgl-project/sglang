@@ -200,6 +200,9 @@ class MultimodalDataItem:
     audio_feature_lens: Optional[List[torch.Tensor]] = None
     audio_offsets: Optional[List[Tuple[int, int]]] = None
 
+    attention_mask: Optional[torch.Tensor] = None
+    feature_attention_mask: Optional[torch.Tensor] = None
+
     precomputed_features: Optional[Union[torch.Tensor, np.ndarray]] = None
 
     @staticmethod

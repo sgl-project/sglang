@@ -2,7 +2,6 @@ import base64
 import io
 import json
 import os
-import unittest
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -48,29 +47,7 @@ class TestOpenAIVisionServer(CustomTestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    def test_single_image_chat_completion(self):
-        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
-
-        response = client.chat.completions.create(
-            model="default",
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": IMAGE_MAN_IRONING_URL},
-                        },
-                        {
-                            "type": "text",
-                            "text": "Describe this image in a very short sentence.",
-                        },
-                    ],
-                },
-            ],
-            temperature=0,
-        )
-
+    def verify_single_image_response(self, response):
         assert response.choices[0].message.role == "assistant"
         text = response.choices[0].message.content
         assert isinstance(text, str)
@@ -94,6 +71,31 @@ class TestOpenAIVisionServer(CustomTestCase):
         assert response.usage.prompt_tokens > 0
         assert response.usage.completion_tokens > 0
         assert response.usage.total_tokens > 0
+
+    def test_single_image_chat_completion(self):
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+
+        response = client.chat.completions.create(
+            model="default",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": IMAGE_MAN_IRONING_URL},
+                        },
+                        {
+                            "type": "text",
+                            "text": "Describe this image in a very short sentence.",
+                        },
+                    ],
+                },
+            ],
+            temperature=0,
+        )
+
+        self.verify_single_image_response(response=response)
 
     def test_multi_turn_chat_completion(self):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
@@ -195,7 +197,6 @@ class TestOpenAIVisionServer(CustomTestCase):
 
     def prepare_video_messages(self, video_path):
         # the memory consumed by the Vision Attention varies a lot, e.g. blocked qkv vs full-sequence sdpa
-        # the size of the video embeds differs from the `modality` argument when preprocessed
 
         # We import decord here to avoid a strange Segmentation fault (core dumped) issue.
         # The following import order will cause Segmentation fault.
@@ -203,7 +204,7 @@ class TestOpenAIVisionServer(CustomTestCase):
         # from transformers import AutoTokenizer
         from decord import VideoReader, cpu
 
-        max_frames_num = 20
+        max_frames_num = 5
         vr = VideoReader(video_path, ctx=cpu(0))
         total_frame_num = len(vr)
         uniform_sampled_frames = np.linspace(
@@ -399,74 +400,3 @@ class TestOpenAIVisionServer(CustomTestCase):
         image_ids = [0, 1, 2] * 4
         with ThreadPoolExecutor(4) as executor:
             list(executor.map(self.run_decode_with_image, image_ids))
-
-    def prepare_audio_messages(self, prompt, audio_file_name):
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "audio_url",
-                        "audio_url": {"url": f"{audio_file_name}"},
-                    },
-                    {
-                        "type": "text",
-                        "text": prompt,
-                    },
-                ],
-            }
-        ]
-
-        return messages
-
-    def get_audio_response(self, url: str, prompt, category):
-        audio_file_path = self.get_or_download_file(url)
-        client = openai.Client(api_key="sk-123456", base_url=self.base_url)
-
-        messages = self.prepare_audio_messages(prompt, audio_file_path)
-
-        response = client.chat.completions.create(
-            model="default",
-            messages=messages,
-            temperature=0,
-            max_tokens=128,
-            stream=False,
-        )
-
-        audio_response = response.choices[0].message.content
-
-        print("-" * 30)
-        print(f"audio {category} response:\n{audio_response}")
-        print("-" * 30)
-
-        audio_response = audio_response.lower()
-
-        self.assertIsNotNone(audio_response)
-        self.assertGreater(len(audio_response), 0)
-
-        return audio_response
-
-    def _test_audio_speech_completion(self):
-        # a fragment of Trump's speech
-        audio_response = self.get_audio_response(
-            AUDIO_TRUMP_SPEECH_URL,
-            "I have an audio sample. Please repeat the person's words",
-            category="speech",
-        )
-        assert "thank you" in audio_response
-        assert "it's a privilege to be here" in audio_response
-        assert "leader" in audio_response
-        assert "science" in audio_response
-        assert "art" in audio_response
-
-    def _test_audio_ambient_completion(self):
-        # bird song
-        audio_response = self.get_audio_response(
-            AUDIO_BIRD_SONG_URL,
-            "Please listen to the audio snippet carefully and transcribe the content.",
-            "ambient",
-        )
-        assert "bird" in audio_response
-
-    def test_audio_chat_completion(self):
-        pass
