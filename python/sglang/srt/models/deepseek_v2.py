@@ -1600,8 +1600,8 @@ class DeepseekV2ForCausalLM(nn.Module):
                 0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
             ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
             if not use_deep_gemm_bmm:
-                self_attn.w_kv = bind_or_assign(
-                    self_attn.w_kv, w_kc.transpose(1, 2).contiguous().transpose(1, 2)
+                self_attn.w_kc = bind_or_assign(
+                    self_attn.w_kc, w_kc.transpose(1, 2).contiguous().transpose(1, 2)
                 )
                 self_attn.w_vc = bind_or_assign(
                     self_attn.w_vc, w_vc.contiguous().transpose(1, 2)
