@@ -204,6 +204,15 @@ class ModelConfig:
                     self.head_dim = (
                         self.hf_config.hidden_size // self.hf_config.num_attention_heads
                     )
+                    # In transformers==4.52.3, the head_dim is null in MistralConfig
+                    if (
+                        not hasattr(self.hf_text_config, "head_dim")
+                        or self.hf_text_config.head_dim is None
+                    ):
+                        print(f"11111")
+                        setattr(self.hf_text_config, "head_dim", self.head_dim)
+                        print(f"{self.hf_text_config=}")
+
             self.attention_arch = AttentionArch.MHA
 
         self.num_attention_heads = self.hf_text_config.num_attention_heads
