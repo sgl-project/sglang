@@ -893,6 +893,8 @@ class ModelRunner:
                 raise RuntimeError(
                     "Hybrid cache does not support radix_cache currently. Please set --diable-radix-cache."
                 )
+        else:
+            self.local_max_num_tokens = None
 
         if self.max_total_num_tokens <= 0:
             raise RuntimeError(
