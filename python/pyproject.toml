@@ -17,6 +17,7 @@ dependencies = ["aiohttp", "requests", "tqdm", "numpy", "IPython", "setproctitle
 
 [project.optional-dependencies]
 runtime_common = [
+    "blobfile==3.0.0",
     "compressed-tensors",
     "datasets",
     "fastapi",
@@ -38,12 +39,12 @@ runtime_common = [
     "python-multipart",
     "pyzmq>=25.1.2",
     "soundfile==0.13.1",
+    "scipy",
     "torchao==0.9.0",
     "transformers==4.51.1",
     "uvicorn",
     "uvloop",
     "xgrammar==0.1.19",
-    "blobfile==3.0.0"
 ]
 
 srt = [
