@@ -209,9 +209,7 @@ class ModelConfig:
                         not hasattr(self.hf_text_config, "head_dim")
                         or self.hf_text_config.head_dim is None
                     ):
-                        print(f"11111")
                         setattr(self.hf_text_config, "head_dim", self.head_dim)
-                        print(f"{self.hf_text_config=}")
 
             self.attention_arch = AttentionArch.MHA
 

@@ -786,7 +786,7 @@ def check_close_model_outputs(
                 assert torch.all(abs(hf_logprobs - srt_logprobs) < prefill_tolerance), (
                     f"prefill logprobs are not all close with {debug_text} "
                     f"prefill_tolerance={prefill_tolerance}."
-                    f"{hf_logprobs=}, {srt_logprobs=}, {abs(hf_logprobs - srt_logprobs)=}, {prefill_tolerance=}"
+                    f"{hf_logprobs=}, {srt_logprobs=}"
                 )
 
             # Compare output logprobs
@@ -800,5 +800,5 @@ def check_close_model_outputs(
                 assert torch.all(abs(hf_logprobs - srt_logprobs) < decode_tolerance), (
                     f"decode logprobs are not all close with {debug_text} "
                     f"decode_tolerance={decode_tolerance}."
-                    f"{hf_logprobs=}, {srt_logprobs=}, {abs(hf_logprobs - srt_logprobs)=}, {decode_tolerance=}"
+                    f"{hf_logprobs=}, {srt_logprobs=}"
                 )
