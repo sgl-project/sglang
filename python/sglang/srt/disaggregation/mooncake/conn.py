@@ -391,10 +391,10 @@ class MooncakeKVManager(BaseKVManager):
                             if ret != 0:
                                 with self.session_lock:
                                     self.session_failures[req.mooncake_session_id] += 1
-                                    # Failures should never happen if the session is not dead, if the session fails once, mark it as failed
+                                    # Failures should never happen if the session is not dead, if the session fails twice, mark it as failed
                                     if (
                                         self.session_failures[req.mooncake_session_id]
-                                        >= 1
+                                        >= 2
                                     ):
                                         self.failed_sessions.add(
                                             req.mooncake_session_id
@@ -454,7 +454,8 @@ class MooncakeKVManager(BaseKVManager):
                 except Exception as e:
                     # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
                     raise RuntimeError(
-                        "Transfer thread failed. Prefill instance with {bootstrap_port=%s} is dead.",
+                        "Transfer thread failed because of %s. Prefill instance with {bootstrap_port=%s} is dead.",
+                        str(e),
                         self.bootstrap_port,
                     )
 
