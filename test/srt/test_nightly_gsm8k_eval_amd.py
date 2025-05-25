@@ -31,14 +31,14 @@ failing_models = {
     "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8",
     "neuralmagic/gemma-2-2b-it-FP8",
     "neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8",
-    "neuralmagic/Meta-Llama-3.1-70B-Instruct-FP8": 0.93,
-    "neuralmagic/Qwen2-72B-Instruct-FP8": 0.93,
-    "neuralmagic/Qwen2-57B-A14B-Instruct-FP8": 0.82,
-    "Qwen/Qwen2-57B-A14B-Instruct": 0.86,
-    "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8": 0.81,
-    "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct": 0.85,
-    "meta-llama/Llama-3.1-70B-Instruct": 0.95,
-    "meta-llama/Llama-3.1-8B-Instruct": 0.82,
+    "neuralmagic/Meta-Llama-3.1-70B-Instruct-FP8",
+    "neuralmagic/Qwen2-72B-Instruct-FP8",
+    "neuralmagic/Qwen2-57B-A14B-Instruct-FP8",
+    "Qwen/Qwen2-57B-A14B-Instruct",
+    "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8",
+    "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct",
+    "meta-llama/Llama-3.1-70B-Instruct",
+    "meta-llama/Llama-3.1-8B-Instruct",
 }
 
 
