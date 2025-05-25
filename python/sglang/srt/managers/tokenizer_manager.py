@@ -25,6 +25,7 @@ import sys
 import threading
 import time
 import uuid
+import multiprocessing as mp
 from collections import deque
 from datetime import datetime
 from http import HTTPStatus
@@ -47,6 +48,10 @@ import zmq
 import zmq.asyncio
 from fastapi import BackgroundTasks
 
+
+import psutil
+import setproctitle
+
 from sglang.srt.aio_rwlock import RWLock
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.utils import (
@@ -55,11 +60,12 @@ from sglang.srt.disaggregation.utils import (
     TransferBackend,
     get_kv_class,
 )
-from sglang.srt.hf_transformers_utils import (
-    get_processor,
-    get_tokenizer,
-    get_tokenizer_from_processor,
-)
+from sglang.srt.managers.tokenization_worker import TokenizationWorker
+from sglang.srt.distributed import get_tensor_model_parallel_rank
+from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer,get_tokenizer_from_processor
+from sglang.srt.managers import expert_distribution
+from sglang.srt.managers.eplb_manager import EPLBManager
+from sglang.srt.managers.expert_location import ExpertLocationMetadata
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOut,
@@ -116,6 +122,9 @@ from sglang.srt.utils import (
     dataclass_to_string_truncated,
     get_zmq_socket,
     kill_process_tree,
+    configure_logger,
+    get_zmq_socket,
+    kill_itself_when_parent_died,
 )
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
@@ -187,6 +196,23 @@ class TokenizerManager:
             context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
         )
 
+        self.send_to_tokenizer_worker = get_zmq_socket(
+            context, zmq.PUSH, port_args.tokenizer_worker_ipc_name, True
+        )
+        self.recv_from_tokenizer_worker = get_zmq_socket(
+            context, zmq.PULL, port_args.tokenizer_worker_output_ipc_name, True
+        )
+
+        # Launch tokenizer worker process
+        tokenizer_worker_proc = mp.Process(
+            target=run_tokenizer_worker_process,
+            args=(
+                server_args,
+                port_args,
+            ),
+        )
+        tokenizer_worker_proc.start()
+
         # Read model args
         self.model_path = server_args.model_path
         self.served_model_name = server_args.served_model_name
@@ -197,41 +223,7 @@ class TokenizerManager:
         self.context_len = self.model_config.context_len
         self.image_token_id = self.model_config.image_token_id
 
-        if self.model_config.is_multimodal:
-            import_processors()
-            _processor = get_processor(
-                server_args.tokenizer_path,
-                tokenizer_mode=server_args.tokenizer_mode,
-                trust_remote_code=server_args.trust_remote_code,
-                revision=server_args.revision,
-                use_fast=not server_args.disable_fast_image_processor,
-            )
 
-            # We want to parallelize the image pre-processing so we create an executor for it
-            # We create mm_processor for any skip_tokenizer_init to make sure we still encode
-            # images even with skip_tokenizer_init=False.
-            self.mm_processor = get_mm_processor(
-                self.model_config.hf_config, server_args, _processor
-            )
-
-            if server_args.skip_tokenizer_init:
-                self.tokenizer = self.processor = None
-            else:
-                self.processor = _processor
-                self.tokenizer = get_tokenizer_from_processor(self.processor)
-                os.environ["TOKENIZERS_PARALLELISM"] = "false"
-        else:
-            self.mm_processor = get_dummy_processor()
-
-            if server_args.skip_tokenizer_init:
-                self.tokenizer = self.processor = None
-            else:
-                self.tokenizer = get_tokenizer(
-                    server_args.tokenizer_path,
-                    tokenizer_mode=server_args.tokenizer_mode,
-                    trust_remote_code=server_args.trust_remote_code,
-                    revision=server_args.revision,
-                )
 
         # Store states
         self.no_create_loop = False
@@ -421,11 +413,14 @@ class TokenizerManager:
         async with self.model_update_lock.reader_lock:
             is_single = obj.is_single
             if is_single:
-                tokenized_obj = await self._tokenize_one_request(obj)
+                await self.send_to_tokenizer_worker.send_pyobj(obj)
+                #tokenized_obj = await self._tokenize_one_request(obj)
+                tokenized_obj = await self.recv_from_tokenizer_worker.recv_pyobj()
                 self._send_one_request(obj, tokenized_obj, created_time)
                 async for response in self._wait_one_response(obj, request):
                     yield response
             else:
+                # TODO
                 async for response in self._handle_batch_request(
                     obj, request, created_time
                 ):
@@ -702,8 +697,12 @@ class TokenizerManager:
                 # Validate batch tokenization constraints
                 self._validate_batch_tokenization_constraints(batch_size, obj)
 
-                tokenized_objs = await self._batch_tokenize_and_process(batch_size, obj)
+                #tokenized_objs = await self._batch_tokenize_and_process(batch_size, obj)
+                await self.send_to_tokenizer_worker.send_pyobj(obj)
+                tokenized_objs = await self.recv_from_tokenizer_worker.recv_pyobj()
 
+                if enable_colocated_batch_gen():
+                    self._send_block_request(BlockReqType.BLOCK)
                 for i, tokenized_obj in enumerate(tokenized_objs):
                     tmp_obj = obj[i]
                     self._send_one_request(tmp_obj, tokenized_obj, created_time)
@@ -713,7 +712,9 @@ class TokenizerManager:
                 # Sequential tokenization and processing
                 for i in range(batch_size):
                     tmp_obj = obj[i]
-                    tokenized_obj = await self._tokenize_one_request(tmp_obj)
+                    #tokenized_obj = await self._tokenize_one_request(tmp_obj)
+                    await self.send_to_tokenizer_worker.send_pyobj(tmp_obj)
+                    tokenized_obj = await self.recv_from_tokenizer_worker.recv_pyobj()
                     self._send_one_request(tmp_obj, tokenized_obj, created_time)
                     generators.append(self._wait_one_response(tmp_obj, request))
                     rids.append(tmp_obj.rid)
@@ -1488,14 +1489,22 @@ class _Communicator(Generic[T]):
         if len(self._result_values) == self._fan_out:
             self._result_event.set()
 
+def run_tokenizer_worker_process(
+    server_args: ServerArgs,
+    port_args: PortArgs,
+):
+    kill_itself_when_parent_died()
+    setproctitle.setproctitle("sglang::tokenizer_worker")
+    configure_logger(server_args)
+    parent_process = psutil.Process().parent()
 
-# Note: request abort handling logic
-# We should handle all of the following cases correctly.
-#
-# | entrypoint | is_streaming | status          | abort engine    | cancel asyncio task   | rid_to_state                |
-# | ---------- | ------------ | --------------- | --------------- | --------------------- | --------------------------- |
-# | http       | yes          | waiting queue   | background task | fast api              | del in _handle_abort_req    |
-# | http       | yes          | running         | background task | fast api              | del in _handle_batch_output |
-# | http       | no           | waiting queue   | type 1          | type 1 exception      | del in _handle_abort_req    |
-# | http       | no           | running         | type 3          | type 3 exception      | del in _handle_batch_output |
-#
+    try:
+        worker = TokenizationWorker(server_args, port_args)
+        # Create and run event loop
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(worker.event_loop())
+    except Exception:
+        traceback = get_exception_traceback()
+        logger.error(f"TokenizerWorker hit an exception: {traceback}")
+        parent_process.send_signal(signal.SIGQUIT)
