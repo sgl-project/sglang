@@ -279,6 +279,7 @@ class SchedulerMetricsCollector:
         self._log_gauge(self.num_grammar_queue_reqs, stats.num_grammar_queue_reqs)
         self._log_gauge(self.cache_hit_rate, stats.cache_hit_rate)
         self._log_gauge(self.spec_accept_length, stats.spec_accept_length)
+        self._log_gauge(self.avg_request_queue_latency, stats.avg_request_queue_latency)
 
         # Disaggregation metrics
         self._log_gauge(
