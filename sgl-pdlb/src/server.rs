@@ -1,8 +1,7 @@
 use crate::strategy_lb::{EngineInfo, StrategyLB};
 use actix_web::{HttpRequest, HttpResponse, HttpServer, get, post, web};
 use bytes::Bytes;
-use futures::StreamExt;
-use futures::future::join_all;
+use futures::{StreamExt, future::join_all};
 use serde_json::json;
 use std::io::Write;
 
@@ -48,14 +47,22 @@ impl LBState {
         engine_info: EngineInfo,
         api_path: &str,
         request: serde_json::Value,
-    ) -> HttpResponse {
+    ) -> Result<HttpResponse, actix_web::Error> {
         let url = engine_info.api_path(api_path);
-        let response = self.client.post(&url).json(&request).send().await;
-        match response {
-            Ok(response) => HttpResponse::Ok().body(response.bytes().await.unwrap()),
-            Err(e) => HttpResponse::InternalServerError()
-                .body(format!("Failed to send request to worker {}: {}", url, e)),
-        }
+        let resp = self
+            .client
+            .post(&url)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| actix_web::error::ErrorBadGateway(e))?;
+
+        let resp = resp
+            .bytes()
+            .await
+            .map_err(|e| actix_web::error::ErrorBadGateway(e))?;
+
+        Ok(HttpResponse::Ok().body(resp))
     }
 
     async fn route_one_stream(
@@ -63,29 +70,22 @@ impl LBState {
         engine_info: EngineInfo,
         api_path: &str,
         request: serde_json::Value,
-    ) -> HttpResponse {
+    ) -> Result<HttpResponse, actix_web::Error> {
         let url = engine_info.api_path(api_path);
-        let response = self.client.post(&url).json(&request).send().await;
-        match response {
-            Ok(response) => {
-                let stream = response.bytes_stream();
-                let response_stream = futures::stream::unfold(stream, |mut stream| async move {
-                    match stream.next().await {
-                        Some(Ok(chunk)) => {
-                            let chunk = Bytes::from(chunk);
-                            Some((Ok::<Bytes, reqwest::Error>(chunk), stream))
-                        }
-                        Some(Err(_)) => None,
-                        None => None,
-                    }
-                });
-                HttpResponse::Ok()
-                    .content_type("application/octet-stream")
-                    .streaming(response_stream)
-            }
-            Err(e) => HttpResponse::InternalServerError()
-                .body(format!("Failed to send request to worker {}: {}", url, e)),
-        }
+        let resp = self
+            .client
+            .post(&url)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| actix_web::error::ErrorBadGateway(e))?;
+        let resp_stream = resp.bytes_stream().map(|r| {
+            r.map_err(|e| actix_web::error::ErrorBadGateway(e))
+                .map(Bytes::from)
+        });
+        Ok(HttpResponse::Ok()
+            .content_type("application/octet-stream")
+            .streaming(resp_stream))
     }
 
     async fn route_collect(
@@ -143,7 +143,7 @@ impl LBState {
         prefill: &EngineInfo,
         decode: &EngineInfo,
         modified_json: serde_json::Value,
-    ) -> HttpResponse {
+    ) -> Result<HttpResponse, actix_web::Error> {
         let prefill_task = self.route_one(prefill.clone(), "/generate", modified_json.clone());
         let decode_task = self.route_one(decode.clone(), "/generate", modified_json.clone());
         let (_, decode_response) = tokio::join!(prefill_task, decode_task);
@@ -155,7 +155,7 @@ impl LBState {
         prefill: &EngineInfo,
         decode: &EngineInfo,
         modified_json: serde_json::Value,
-    ) -> HttpResponse {
+    ) -> Result<HttpResponse, actix_web::Error> {
         let prefill_task = self.route_one(prefill.clone(), "/generate", modified_json.clone());
         let decode_task = self.route_one_stream(decode.clone(), "/generate", modified_json.clone());
         let (_, decode_response) = tokio::join!(prefill_task, decode_task);
@@ -269,7 +269,7 @@ pub async fn generate(
     _req: HttpRequest,
     json: web::Json<serde_json::Value>,
     app_state: web::Data<LBState>,
-) -> HttpResponse {
+) -> Result<HttpResponse, actix_web::Error> {
     let (prefill, decode) = app_state.strategy_lb.select_pair(&app_state.client).await;
     let modified_json = LBState::modify_request(&json, &prefill);
 
@@ -287,7 +287,7 @@ pub async fn chat_completions(
     _req: HttpRequest,
     json: web::Json<serde_json::Value>,
     app_state: web::Data<LBState>,
-) -> HttpResponse {
+) -> Result<HttpResponse, actix_web::Error> {
     let (prefill, decode) = app_state.strategy_lb.select_pair(&app_state.client).await;
     let modified_json = LBState::modify_request(&json, &prefill);
 
