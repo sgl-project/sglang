@@ -313,8 +313,9 @@ class Qwen2MoeDecoderLayer(nn.Module):
         self.attn_tp_rank = get_attention_tp_rank()
         self.local_dp_size = get_local_attention_dp_size()
 
-        self.is_layer_sparse = self._is_layer_sparse(layer_id, is_nextn=False)
-        is_previous_layer_sparse = self._is_layer_sparse(layer_id - 1, is_nextn=False)
+        # Qwen2MoE all layers are sparse and have no nextn now
+        self.is_layer_sparse = True
+        is_previous_layer_sparse = True
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
@@ -347,10 +348,6 @@ class Qwen2MoeDecoderLayer(nn.Module):
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
         )
-
-    def _is_layer_sparse(self, layer_id: int, is_nextn: bool) -> bool:
-        # Qwen2MoE all layers are sparse
-        return True
 
     def forward(
         self,
