@@ -40,10 +40,10 @@ class MistralDetector(BaseFormatDetector):
             return '[TOOL_CALLS] [{"name": "get_current_weather", "arguments": {"location": "Boston, MA", "unit": "fahrenheit"}}]'
         The key pattern is [TOOL_CALLS] [...]
         """
-        # TODO: check if Mistral supports multiple tool calls, currently assume only support one tool call
-        find_results = re.findall(r"\[TOOL_CALLS\] \[.*?\]", text, re.DOTALL)
-        if len(find_results) > 0:
-            return find_results[0]
+        # Find the tool calls section - Mistral supports multiple tool calls in a single JSON array
+        match = re.search(r"\[TOOL_CALLS\] \[.*?\]", text, re.DOTALL)
+        if match:
+            return match.group(0)
         else:
             return ""
 
@@ -78,7 +78,8 @@ class MistralDetector(BaseFormatDetector):
     def build_ebnf(self, tools: List[Tool]):
         return EBNFComposer.build_ebnf(
             tools,
-            bot_token=self.bot_token,
-            eot_token=self.eot_token,
+            individual_call_start_token=self.bot_token,
+            individual_call_end_token=self.eot_token,
             function_format="json",
+            tool_call_separator="\\n",
         )

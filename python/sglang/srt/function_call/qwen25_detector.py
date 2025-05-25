@@ -61,7 +61,8 @@ class Qwen25Detector(BaseFormatDetector):
     def build_ebnf(self, tools: List[Tool]):
         return EBNFComposer.build_ebnf(
             tools,
-            bot_token=self.bot_token,
-            eot_token=self.eot_token,
+            individual_call_start_token=self.bot_token,
+            individual_call_end_token=self.eot_token,
+            tool_call_separator="\\n",
             function_format="json",
         )
