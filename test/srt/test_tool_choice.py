@@ -19,12 +19,15 @@ from sglang.test.test_utils import (
 )
 
 
-class TestToolChoice(CustomTestCase):
+class TestToolChoiceLlama32(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        # Clear any previous warnings
-        cls._test_warnings = []
+        # Mark flaky tests for this model
+        cls.flaky_tests = {
+            "test_multi_tool_scenario_auto",
+            "test_multi_tool_scenario_required",
+        }
 
         # Use a model that supports function calling
         cls.model = "meta-llama/Llama-3.2-1B-Instruct"
@@ -47,43 +50,18 @@ class TestToolChoice(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        # Display summary of warnings before killing the process
-        if cls._test_warnings:
-            print(f"\n{'='*80}")
-            print(
-                f"🚨 {cls.__name__} TEST SUMMARY: {len(cls._test_warnings)} WARNINGS DETECTED"
-            )
-            print(f"{'='*80}")
-
-            # Group warnings by test method
-            warnings_by_test = {}
-            for full_test_name, warning_msg in cls._test_warnings:
-                test_method = full_test_name.split(".")[-1]  # Get just the method name
-                if test_method not in warnings_by_test:
-                    warnings_by_test[test_method] = []
-                warnings_by_test[test_method].append(warning_msg)
-
-            # Display grouped warnings
-            for test_method, warnings in warnings_by_test.items():
-                print(f"\n{test_method}:")
-                for i, warning in enumerate(warnings, 1):
-                    print(f"   {i}. {warning}")
-
-            print(f"\n{'='*80}")
-
         kill_process_tree(cls.process.pid)
 
     def setUp(self):
         self.client = openai.Client(base_url=self.base_url, api_key=self.api_key)
         self.model_name = self.client.models.list().data[0].id
 
-    def _add_test_warning(self, message):
-        """Add a warning to the class collection for end-of-test summary"""
-        test_name = self._testMethodName
-        class_name = self.__class__.__name__
-        full_test_name = f"{class_name}.{test_name}"
-        formatted_message = f"{message}"
-        self._test_warnings.append((full_test_name, formatted_message))
+    def _is_flaky_test(self):
+        """Check if the current test is marked as flaky for this class"""
+        return (
+            hasattr(self.__class__, "flaky_tests")
+            and self._testMethodName in self.__class__.flaky_tests
+        )
 
     def get_test_tools(self):
         """Get the test tools for function calling"""
@@ -218,7 +196,7 @@ class TestToolChoice(CustomTestCase):
         response = self.client.chat.completions.create(
             model=self.model_name,
             messages=messages,
-            max_tokens=200,
+            max_tokens=400,
             tools=tools,
             tool_choice="auto",
             stream=False,
@@ -226,7 +204,6 @@ class TestToolChoice(CustomTestCase):
 
         self.assertIsNotNone(response.choices[0].message)
         # With auto, tool calls are optional
-        print(f"Tool calls: {response.choices[0].message.tool_calls}")
 
     def test_tool_choice_auto_streaming(self):
         """Test tool_choice='auto' in streaming mode"""
@@ -236,7 +213,7 @@ class TestToolChoice(CustomTestCase):
         response = self.client.chat.completions.create(
             model=self.model_name,
             messages=messages,
-            max_tokens=200,
+            max_tokens=400,
             tools=tools,
             tool_choice="auto",
             stream=True,
@@ -264,7 +241,8 @@ class TestToolChoice(CustomTestCase):
         response = self.client.chat.completions.create(
             model=self.model_name,
             messages=messages,
-            max_tokens=200,
+            max_tokens=400,
+            temperature=0.2,
             tools=tools,
             tool_choice="required",
             stream=False,
@@ -283,7 +261,7 @@ class TestToolChoice(CustomTestCase):
         response = self.client.chat.completions.create(
             model=self.model_name,
             messages=messages,
-            max_tokens=200,
+            max_tokens=400,
             tools=tools,
             tool_choice="required",
             stream=True,
@@ -318,8 +296,10 @@ class TestToolChoice(CustomTestCase):
         # Should call the specific function
         tool_calls = response.choices[0].message.tool_calls
         self.assertIsNotNone(tool_calls)
-        self.assertEqual(len(tool_calls), 1)
-        self.assertEqual(tool_calls[0].function.name, "get_weather")
+        # Our messages ask the top 5 populated cities in the US, so the model could get 5 tool calls
+        self.assertGreaterEqual(len(tool_calls), 1)
+        for tool_call in tool_calls:
+            self.assertEqual(tool_call.function.name, "get_weather")
 
     def test_tool_choice_specific_function_streaming(self):
         """Test tool_choice with specific function in streaming mode"""
@@ -374,37 +354,27 @@ class TestToolChoice(CustomTestCase):
         # Should complete without errors
         self.assertIsNotNone(response.choices[0].message)
 
-        # Log the tool calls for debugging
         tool_calls = response.choices[0].message.tool_calls
         expected_functions = {"get_weather", "get_tourist_attractions"}
 
-        # Check if we got both expected functions
-        if not tool_calls:
-            self._add_test_warning(
-                f"⚠️  AUTO MODE LIMITATION: No tool calls made! "
-                f"Model chose not to use available tools. This is technically correct "
-                f"but not ideal for a travel assistant scenario."
+        if self._is_flaky_test():
+            # For flaky tests, just verify all called functions are available tools
+            if tool_calls:
+                available_names = [tool["function"]["name"] for tool in tools]
+                for call in tool_calls:
+                    self.assertIn(call.function.name, available_names)
+        else:
+            # For non-flaky tests, enforce strict requirements
+            self.assertIsNotNone(tool_calls, "Expected tool calls but got none")
+            self.assertEqual(
+                len(tool_calls), 2, f"Expected 2 tool calls, got {len(tool_calls)}"
             )
-            return
 
-        # With auto, the model may or may not call multipletools due to its capabilities
-        called_functions = set()
-
-        for call in tool_calls:
-            # Verify the called function is one of the available tools
-            available_names = [tool["function"]["name"] for tool in tools]
-            self.assertIn(call.function.name, available_names)
-            called_functions.add(call.function.name)
-
-        if len(called_functions) == 1:
-            missing = expected_functions - called_functions
-            self._add_test_warning(
-                f"⚠️  AUTO MODE LIMITATION: Only called {called_functions}, "
-                f"missing {missing}. This is acceptable but not ideal for travel scenario."
-            )
-        elif not expected_functions.issubset(called_functions):
-            self._add_test_warning(
-                f"⚠️  UNEXPECTED: Called {called_functions}, expected {expected_functions}"
+            called_functions = {call.function.name for call in tool_calls}
+            self.assertEqual(
+                called_functions,
+                expected_functions,
+                f"Expected functions {expected_functions}, got {called_functions}",
             )
 
     def test_multi_tool_scenario_required(self):
@@ -427,27 +397,30 @@ class TestToolChoice(CustomTestCase):
         self.assertIsNotNone(tool_calls)
         self.assertGreater(len(tool_calls), 0)
 
-        # Verify all called functions are available tools and analyze coverage
+        # Verify all called functions are available tools
         available_names = [tool["function"]["name"] for tool in tools]
-        called_functions = set()
         expected_functions = {"get_weather", "get_tourist_attractions"}
 
-        for call in tool_calls:
-            self.assertIn(call.function.name, available_names)
-            called_functions.add(call.function.name)
-
-        # Analyze the results
-        if len(called_functions) == 1:
-            missing = expected_functions - called_functions
-            self._add_test_warning(
-                f"⚠️  REQUIRED MODE LIMITATION: Only called {called_functions}, "
-                f"missing {missing}. Required mode should ideally call both functions "
-                f"for a comprehensive travel assistant response."
+        if self._is_flaky_test():
+            # For flaky tests, just ensure basic functionality works
+            self.assertGreater(
+                len(tool_calls),
+                0,
+                f"Expected at least 1 tool call, got {len(tool_calls)}",
             )
-        elif not expected_functions.issubset(called_functions):
-            self._add_test_warning(
-                f"⚠️  UNEXPECTED BEHAVIOR: Called {called_functions}, "
-                f"expected {expected_functions} for travel scenario"
+            for call in tool_calls:
+                self.assertIn(call.function.name, available_names)
+        else:
+            # For non-flaky tests, enforce strict requirements
+            self.assertEqual(
+                len(tool_calls), 2, f"Expected 2 tool calls, got {len(tool_calls)}"
+            )
+
+            called_functions = {call.function.name for call in tool_calls}
+            self.assertEqual(
+                called_functions,
+                expected_functions,
+                f"Expected functions {expected_functions}, got {called_functions}",
             )
 
     def test_error_handling_invalid_tool_choice(self):
@@ -481,19 +454,17 @@ class TestToolChoice(CustomTestCase):
             if mock_warning.called:
                 warning_message = mock_warning.call_args[0][0]
                 self.assertIn("nonexistent_function", warning_message)
-            else:
-                print(
-                    "No warnings logged - this might be handled elsewhere in the stack"
-                )
 
 
-class TestToolChoiceQwen25(TestToolChoice):
+class TestToolChoiceQwen25(TestToolChoiceLlama32):
     """Test tool_choice functionality with Qwen2.5 model"""
 
     @classmethod
     def setUpClass(cls):
-        # Each test class gets its own warning collection
-        cls._test_warnings = []
+        cls.flaky_tests = {
+            "test_multi_tool_scenario_auto",
+            "test_multi_tool_scenario_required",
+        }
 
         cls.model = "Qwen/Qwen2.5-7B-Instruct"
         cls.base_url = DEFAULT_URL_FOR_TEST
@@ -513,13 +484,16 @@ class TestToolChoiceQwen25(TestToolChoice):
         cls.tokenizer = get_tokenizer(cls.model)
 
 
-class TestToolChoiceMistral(TestToolChoice):
+class TestToolChoiceMistral(TestToolChoiceLlama32):
     """Test tool_choice functionality with Mistral model"""
 
     @classmethod
     def setUpClass(cls):
-        # Each test class gets its own warning collection
-        cls._test_warnings = []
+        # Mark flaky tests for this model
+        cls.flaky_tests = {
+            "test_multi_tool_scenario_auto",
+            "test_multi_tool_scenario_required",
+        }
 
         cls.model = "mistralai/Mistral-7B-Instruct-v0.3"
         cls.base_url = DEFAULT_URL_FOR_TEST
