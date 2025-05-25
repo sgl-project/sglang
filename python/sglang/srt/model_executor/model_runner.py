@@ -198,6 +198,7 @@ class ModelRunner:
                 "disable_radix_cache": server_args.disable_radix_cache,
                 "enable_nan_detection": server_args.enable_nan_detection,
                 "enable_dp_attention": server_args.enable_dp_attention,
+                "enable_dp_lm_head": server_args.enable_dp_lm_head,
                 "enable_ep_moe": server_args.enable_ep_moe,
                 "enable_deepep_moe": server_args.enable_deepep_moe,
                 "deepep_config": server_args.deepep_config,
@@ -410,6 +411,10 @@ class ModelRunner:
 
         if not server_args.disable_chunked_prefix_cache:
             logger.info("Chunked prefix cache is turned on.")
+
+        if server_args.attention_backend == "aiter":
+            if self.model_config.context_len > 8192:
+                self.mem_fraction_static *= 0.85
 
     def init_torch_distributed(self):
         logger.info("Init torch distributed begin.")
