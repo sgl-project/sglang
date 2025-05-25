@@ -65,6 +65,13 @@ class ServerArgs:
     host: str = "127.0.0.1"
     port: int = 30000
 
+    # SSL options
+    ssl_keyfile: Optional[str] = None
+    ssl_certfile: Optional[str] = None
+    ssl_ca_certs: Optional[str] = None
+    ssl_cert_reqs: int = 0
+    ssl_self_signed_cert: bool = False
+
     # Memory and scheduling
     mem_fraction_static: Optional[float] = None
     max_running_requests: Optional[int] = None
@@ -633,6 +640,37 @@ class ServerArgs:
             help="The specific model version to use. It can be a branch "
             "name, a tag name, or a commit id. If unspecified, will use "
             "the default version.",
+        )
+
+        # SSL options
+        parser.add_argument(
+            "--ssl-keyfile",
+            type=str,
+            default=ServerArgs.ssl_keyfile,
+            help="The file path to the SSL key file.",
+        )
+        parser.add_argument(
+            "--ssl-certfile",
+            type=str,
+            default=ServerArgs.ssl_certfile,
+            help="The file path to the SSL cert file.",
+        )
+        parser.add_argument(
+            "--ssl-ca-certs",
+            type=str,
+            default=ServerArgs.ssl_ca_certs,
+            help="The CA certificates file.",
+        )
+        parser.add_argument(
+            "--ssl-cert-reqs",
+            type=int,
+            default=ServerArgs.ssl_cert_reqs,
+            help="Whether client certificate is required. ",
+        )
+        parser.add_argument(
+            "--ssl-self-signed-cert",
+            action="store_true",
+            help="Whether the SSL certificate is self-signed.",
         )
 
         # Memory and scheduling
@@ -1435,7 +1473,8 @@ class ServerArgs:
         if is_valid_ipv6_address(self.host):
             return f"http://[{self.host}]:{self.port}"
         else:
-            return f"http://{self.host}:{self.port}"
+            proto = "https" if self.ssl_certfile else "http"
+            return f"{proto}://{self.host}:{self.port}"
 
     def check_server_args(self):
         assert (
