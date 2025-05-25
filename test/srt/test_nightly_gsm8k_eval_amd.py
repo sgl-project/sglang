@@ -38,7 +38,6 @@ failing_models = {
     "google/gemma-2-27b-it",
     "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8",
     "neuralmagic/gemma-2-2b-it-FP8",
-    "neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8",
 }
 
 
