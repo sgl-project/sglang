@@ -88,6 +88,8 @@ class TestTwoBatchOverlapUnitTest(unittest.TestCase):
             ([4095, 4096, 4096, 4096, 1], 2),
             ([1, 4095, 4096, 4096, 4096], 3),
             ([4097, 4096, 4096, 4095, 1], 2),
+            ([1, 1, 1, 1, 99999], 4),
+            ([99999, 1, 1, 1, 1], 1),
         ]:
             actual = compute_split_seq_index(forward_mode=ForwardMode.EXTEND, num_tokens=None, extend_lens=extend_lens)
             self.assertEqual(actual, expect)

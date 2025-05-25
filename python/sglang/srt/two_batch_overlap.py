@@ -41,9 +41,9 @@ def _split_array_by_half_sum(arr: Sequence[int]) -> int:
     overall_sum = sum(arr)
     cum_sum = 0
     for index, value in enumerate(arr[:-1]):
-        cum_sum += value
         if cum_sum >= overall_sum // 2:
             TODO
+        cum_sum += value
     return TODO
 
 
