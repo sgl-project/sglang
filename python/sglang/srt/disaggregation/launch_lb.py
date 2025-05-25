@@ -101,6 +101,12 @@ class LBArgs:
             timeout=args.timeout,
         )
 
+    def __post_init__(self):
+        if not self.rust_lb:
+            assert (
+                self.policy == "random"
+            ), "Only random policy is supported for Python load balancer"
+
 
 def main():
     parser = argparse.ArgumentParser(
