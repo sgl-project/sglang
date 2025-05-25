@@ -485,7 +485,6 @@ def popen_launch_pd_server(
     api_key: Optional[str] = None,
     other_args: list[str] = (),
     env: Optional[dict] = None,
-    return_stdout_stderr: Optional[tuple] = None,
 ):
     _, host, port = base_url.split(":")
     host = host[2:]
@@ -515,42 +514,9 @@ def popen_launch_pd_server(
 
     print(f"command={' '.join(command)}")
 
-    if return_stdout_stderr:
-        process = subprocess.Popen(
-            command,
-            stdout=return_stdout_stderr[0],
-            stderr=return_stdout_stderr[1],
-            env=env,
-            text=True,
-        )
-    else:
-        process = subprocess.Popen(command, stdout=None, stderr=None, env=env)
+    process = subprocess.Popen(command, stdout=None, stderr=None, env=env)
 
-    start_time = time.perf_counter()
-    with requests.Session() as session:
-        while time.perf_counter() - start_time < timeout:
-            try:
-                headers = {
-                    "Content-Type": "application/json; charset=utf-8",
-                    "Authorization": f"Bearer {api_key}",
-                }
-                response = session.get(
-                    f"{base_url}/health",
-                    headers=headers,
-                )
-                if response.status_code == 200:
-                    return process
-            except requests.RequestException:
-                pass
-
-            return_code = process.poll()
-            if return_code is not None:
-                raise Exception(f"Server unexpectedly exits ({return_code=}).")
-
-            time.sleep(10)
-
-    kill_process_tree(process.pid)
-    raise TimeoutError("Server failed to start within the timeout period.")
+    return process
 
 
 def run_with_timeout(
