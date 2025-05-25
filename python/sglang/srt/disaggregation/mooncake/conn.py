@@ -51,6 +51,7 @@ def group_concurrent_contiguous(
     return src_groups, dst_groups
 
 
+# prefill
 @dataclasses.dataclass
 class TransferKVChunk:
     room: int
@@ -60,6 +61,7 @@ class TransferKVChunk:
     prefill_aux_index: Optional[int]
 
 
+# decode
 @dataclasses.dataclass
 class TransferInfo:
     room: int
@@ -93,6 +95,7 @@ class TransferInfo:
         )
 
 
+# decode
 @dataclasses.dataclass
 class KVArgsRegisterInfo:
     room: str
