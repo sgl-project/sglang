@@ -2,7 +2,6 @@ import dataclasses
 from typing import TYPE_CHECKING, Dict, List, Optional, Sequence
 
 import torch
-
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPDispatcher
@@ -40,13 +39,12 @@ def compute_split_seq_index(
 
 def _split_array_by_half_sum(arr: Sequence[int]) -> int:
     overall_sum = sum(arr)
-    accumulator, split_index = 0, 0
-    for value in arr[:-1]:
+    accumulator = 0
+    for index, value in enumerate(arr[:-1]):
         accumulator += value
-        split_index += 1
         if accumulator >= overall_sum // 2:
-            break
-    return split_index
+            TODO
+    return TODO
 
 
 def compute_split_token_index(
