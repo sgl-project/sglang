@@ -187,11 +187,11 @@ class MooncakeKVManager(BaseKVManager):
             self.connection_lock = threading.Lock()
             # Heartbeat interval should be at least 2 seconds
             self.heartbeat_interval = max(
-                float(os.getenv("DISAGGREGATION_HEARTBEAT_INTERVAL", 3.0)), 2.0
+                float(os.getenv("DISAGGREGATION_HEARTBEAT_INTERVAL", 5.0)), 2.0
             )
             # Heartbeat failure should be at least 1
             self.max_failures = max(
-                int(os.getenv("DISAGGREGATION_HEARTBEAT_MAX_FAILURE", 3)), 1
+                int(os.getenv("DISAGGREGATION_HEARTBEAT_MAX_FAILURE", 2)), 1
             )
             self.start_decode_thread()
             self.connection_pool: Dict[str, Dict[str, Union[str, int]]] = {}
