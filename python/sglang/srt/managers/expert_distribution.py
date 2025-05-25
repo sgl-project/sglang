@@ -690,7 +690,9 @@ def _convert_global_physical_count_to_logical_count(
     )
     logical_count.scatter_add_(
         dim=2,
-        index=physical_to_logical_map.unsqueeze(0).expand(dim_extra, -1, -1),
+        index=physical_to_logical_map.unsqueeze(0)
+        .expand(dim_extra, -1, -1)
+        .to(torch.int64),
         src=global_physical_count,
     )
     return logical_count
