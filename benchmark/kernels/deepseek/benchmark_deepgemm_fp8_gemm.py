@@ -30,15 +30,36 @@ def tl_gemm(
         "float16",
     ], "Currently only bfloat16 and float16 are supported"
 
-    TILE_SIZE = (128, 128, 128)
-    block_M = TILE_SIZE[0]
-    block_N = TILE_SIZE[1]
-    block_K = TILE_SIZE[2]
+    # DeepSeek's implementation group size
+    group_size = 128
+    sm_count = 128
+
+    # Based on DeepGEMM tuning configs
+    # https://github.com/deepseek-ai/DeepGEMM/blob/8002b769c01c4667b63d3f9fed1d87d8599f298c/deep_gemm/jit_kernels/gemm.py#L60
+    # block_ns = tuple(range(16, 129, 8)) + (144, 160, )
+    block_ns = set(range(16, 129, 8))
+    block_ns.add(144)
+    block_ns.add(160)
+
+    # DeepGEMM allows 64 or 128 as block_M
+    block_M = min(128, (M + 64 - 1) // 64 * 64)
+    block_K = group_size
+    # block_N = group_size
+    # Tune n size based on DeepGEMM tuning configs
+    block_N = max(16, (M + block_M - 1) // block_M * ((N + sm_count - 1) // sm_count))
+    while block_N % 8 != 0:
+        block_N += 2
+    while block_N not in block_ns:
+        block_N //= 2
+    # DeepGEMM stage_candidates = (8, 7, 6, 5, 4)
+    num_stages = 8 - block_N // 40
+
+    print(f"block_M: {block_M}, block_N: {block_N}, num_stages: {num_stages}")
 
     A_shape = (M, K)
-    Scales_A_shape = (M, T.ceildiv(K, block_K))
+    Scales_A_shape = (M, T.ceildiv(K, group_size))
     B_shape = (N, K)
-    Scales_B_shape = (T.ceildiv(N, block_N), T.ceildiv(K, block_K))
+    Scales_B_shape = (T.ceildiv(N, group_size), T.ceildiv(K, group_size))
     A_shared_shape = (block_M, block_K)
     B_shared_shape = (block_N, block_K)
     C_shared_shape = (block_M, block_N)
@@ -51,7 +72,7 @@ def tl_gemm(
         scales_b: T.Buffer(Scales_B_shape, "float32"),
         C: T.Buffer((M, N), out_dtype),
     ):
-        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (
+        with T.Kernel(N // block_N, T.ceildiv(M, block_M), threads=128) as (
             bx,
             by,
         ):
@@ -69,20 +90,23 @@ def tl_gemm(
             T.clear(C_local)
             T.clear(C_local_accum)
             K_iters = T.ceildiv(K, block_K)
-            for k in T.Pipelined(K_iters, num_stages=4):
+            for k in T.Pipelined(K_iters, num_stages=num_stages):
                 # Load A into shared memory
                 T.copy(A[by * block_M, k * block_K], A_shared)
                 # Load B into shared memory
                 T.copy(B[bx * block_N, k * block_K], B_shared)
                 # Load scale into shared memory
-                Scale_B = scales_b[bx, k]
+                Scale_B_0 = scales_b[bx * block_N // group_size, k]
+                Scale_B_1 = scales_b[bx * block_N // group_size + 1, k]
                 for i in T.Parallel(block_M):
-                    Scale_C_shared[i] = scales_a[by * block_M + i, k] * Scale_B
+                    Scale_C_shared[i] = scales_a[by * block_M + i, k]
 
                 T.gemm(A_shared, B_shared, C_local, transpose_B=True)
+                scale_b_boundary_idx = group_size - bx * block_N % group_size
                 # Promote to enable 2xAcc
                 for i, j in T.Parallel(block_M, block_N):
-                    C_local_accum[i, j] += C_local[i, j] * Scale_C_shared[i]
+                    Scale_B = T.if_then_else(j < scale_b_boundary_idx, Scale_B_0, Scale_B_1)
+                    C_local_accum[i, j] += C_local[i, j] * Scale_C_shared[i] * Scale_B
                 T.clear(C_local)
             # TMA store
             T.copy(C_local_accum, C_shared)
@@ -203,13 +227,20 @@ def calculate_diff(m: int, n: int, k: int):
     diff_tilelang_sglang = torch.abs(out_tilelang - out_sglang).mean().item()
 
     print(f"Shape m={m}, n={n}, k={k}:")
-    print(f"DeepGEMM output: {out_deepgemm[0, 0:5]}")
-    print(f"SGLang output: {out_sglang[0, 0:5]}")
-    print(f"TileLang output: {out_tilelang[0, 0:5]}")
-    print(f"Mean absolute difference (SGLang-DeepGEMM): {diff_sglang_deepgemm}")
-    print(f"Mean absolute difference (TileLang-DeepGEMM): {diff_tilelang_deepgemm}")
-    print(f"Mean absolute difference (TileLang-SGLang): {diff_tilelang_sglang}")
+    # print(f"DeepGEMM output: {out_deepgemm[0, 0:128]}")
+    # print(f"SGLang output: {out_sglang[-2:, -32:]}")
+    # print(f"TileLang output: {out_tilelang[-2:, -32:]}")
+    # print(f"Mean absolute difference (SGLang-DeepGEMM): {diff_sglang_deepgemm}")
+    # print(f"Mean absolute difference (TileLang-DeepGEMM): {diff_tilelang_deepgemm}")
+    # print(f"Mean absolute difference (TileLang-SGLang): {diff_tilelang_sglang}")
 
+    diff = torch.abs(out_tilelang - out_sglang)
+
+    mask = diff > 1
+
+    # torch.set_printoptions(threshold=torch.inf, linewidth=1000)
+    indices = torch.nonzero(mask, as_tuple=False)
+    print(f"Indices of cells where diff > 1: {indices[:100, :]}")
     sglang_deepgemm_match = torch.allclose(
         out_deepgemm, out_sglang, atol=1e-2, rtol=1e-2
     )
@@ -291,7 +322,6 @@ def get_benchmark(tp_size):
         )
     )
     def benchmark(m, n, k, tp_size, provider):
-        print(f"Shape (m={m}, n={n}, k={k}, tp={tp_size}), Provider: {provider}")
         x = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
         y = torch.randn((n, k), device="cuda", dtype=torch.bfloat16)
 
@@ -301,7 +331,6 @@ def get_benchmark(tp_size):
         x_scale_col_major = get_col_major_tma_aligned_tensor(x_scale.clone())
 
         quantiles = [0.5, 0.2, 0.8]
-
         if provider == "deepgemm":
             ms, min_ms, max_ms = triton.testing.do_bench(
                 lambda: fp8_gemm_deepgemm(
@@ -341,12 +370,26 @@ def get_benchmark(tp_size):
                 quantiles=quantiles,
             )
 
+            out_sglang = fp8_gemm_sglang(
+                x_fp8.clone(), x_scale.clone(), y_fp8.clone(), y_scale.clone(), m, n, k
+            )
+
+            out_tilelang = tilelang_kernel(
+                x_fp8.clone(), x_scale.clone(), y_fp8.clone(), y_scale.clone()
+            )
+            tilelang_sglang_match = torch.allclose(
+                out_tilelang, out_sglang, atol=1e-2, rtol=1e-2
+            )
+            if tilelang_sglang_match:
+                print("✅ All implementations match")
+            else:
+                print("❌ Some implementations differ")
         # Calculate TFLOPS
         flops = 2 * m * n * k  # multiply-adds
         tflops = flops / (ms * 1e-3) / 1e12
 
         # Print shape-specific results with TFLOPS
-        print(f"Time: {ms*1000:.2f} ms, TFLOPS: {tflops:.2f}")
+        print(f"Provider: {provider}, Shape (m={m}, n={n}, k={k}, tp={tp_size}), Time: {ms*1000:.2f} ms, TFLOPS: {tflops:.2f}")
         return ms * 1000, max_ms * 1000, min_ms * 1000  # convert to ms
 
     return benchmark
@@ -387,9 +430,9 @@ if __name__ == "__main__":
     # Run correctness tests on a few examples
     if args.run_correctness:
         print("Running correctness tests...")
-        calculate_diff(64, 512, 7168)  # Small test
-        calculate_diff(64, 7168, 16384)  # Medium test
-        calculate_diff(64, 18432, 7168)  # Large test
+        # calculate_diff(64, 512, 7168)  # Small test
+        # calculate_diff(64, 7168, 16384)  # Medium test
+        # calculate_diff(64, 18432, 7168)  # Large test
 
     # Get the benchmark function with the specified tp_size
     benchmark = get_benchmark(args.tp_size)
