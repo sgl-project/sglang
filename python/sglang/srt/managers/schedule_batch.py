@@ -458,6 +458,9 @@ class Req:
         self.session_id = session_id
         self.input_embeds = input_embeds
 
+        # The length of KV that have been removed in local attention chunked prefill
+        self.evicted_seqlen_local = 0
+
         # Sampling info
         if isinstance(sampling_params.custom_params, dict):
             sampling_params = copy.copy(sampling_params)
@@ -504,6 +507,8 @@ class Req:
         # Prefix info
         # The indices to kv cache for the shared prefix.
         self.prefix_indices = []
+        # The indices to local kv cache for the shared prefix.
+        self.prefix_indices_local = []
         # Number of tokens to run prefill.
         self.extend_input_len = 0
         # The relative logprob_start_len in an extend batch
@@ -792,6 +797,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     reqs: List[Req]
     req_to_token_pool: ReqToTokenPool = None
     token_to_kv_pool_allocator: TokenToKVPoolAllocator = None
+    token_to_kv_pool_allocator_local: Optional[TokenToKVPoolAllocator] = None
     tree_cache: BasePrefixCache = None
 
     # Batch configs
@@ -820,6 +826,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     seq_lens: torch.Tensor = None  # shape: [b], int64
     # The output locations of the KV cache
     out_cache_loc: torch.Tensor = None  # shape: [b], int64
+    # The output locations of the KV cache for local allocator
+    out_cache_loc_local: Optional[torch.Tensor] = None  # shape: [b], int64
     output_ids: torch.Tensor = None  # shape: [b], int64
 
     # For multimodal inputs
@@ -890,6 +898,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         spec_algorithm: SpeculativeAlgorithm,
         enable_custom_logit_processor: bool,
         chunked_req: Optional[Req] = None,
+        token_to_kv_pool_allocator_local: Optional[TokenToKVPoolAllocator] = None,
     ):
         return_logprob = any(req.return_logprob for req in reqs)
 
@@ -897,6 +906,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             reqs=reqs,
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+            token_to_kv_pool_allocator_local=token_to_kv_pool_allocator_local,
             tree_cache=tree_cache,
             model_config=model_config,
             enable_overlap=enable_overlap,
@@ -926,6 +936,21 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 f"{num_reqs=}, "
             )
         return req_pool_indices
+
+    def alloc_token_slots_local(self, num_tokens: int, backup_state: bool = False):
+        out_cache_loc_local = self.token_to_kv_pool_allocator_local.alloc(num_tokens)
+        if out_cache_loc_local is None:
+            phase_str = "Prefill" if self.forward_mode.is_extend() else "Decode"
+            error_msg = (
+                f"{phase_str} out of memory. Try to lower your batch size.\n"
+                f"Try to allocate {num_tokens} tokens.\n"
+                f"Avaliable tokens: {self.token_to_kv_pool_allocator_local.available_size() + self.tree_cache.evictable_size()}\n"
+            )
+            logger.error(error_msg)
+            if self.tree_cache is not None:
+                self.tree_cache.pretty_print()
+            raise RuntimeError(error_msg)
+        return out_cache_loc_local
 
     def alloc_token_slots(self, num_tokens: int, backup_state: bool = False):
         if self.token_to_kv_pool_allocator.available_size() < num_tokens:
@@ -1144,6 +1169,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.req_to_token_pool.write(
                     (req.req_pool_idx, slice(0, pre_len)), req.prefix_indices
                 )
+                if self.token_to_kv_pool_allocator_local is not None:
+                    self.req_to_token_pool.write_local(
+                        (req.req_pool_idx, slice(0, pre_len)), req.prefix_indices_local
+                    )
+                    self.tree_cache.evict_hybrid(
+                        req, pre_len, self.model_config.attention_chunk_size
+                    )
 
             # If input_embeds are available, store them
             if req.input_embeds is not None:
@@ -1214,6 +1246,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Allocate memory
         if self.token_to_kv_pool_allocator.page_size == 1:
             out_cache_loc = self.alloc_token_slots(extend_num_tokens)
+            if self.token_to_kv_pool_allocator_local is not None:
+                out_cache_loc_local = self.alloc_token_slots_local(extend_num_tokens)
         else:
             last_loc = get_last_loc(
                 self.req_to_token_pool.req_to_token,
@@ -1229,6 +1263,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.req_pool_indices = req_pool_indices_tensor
         self.seq_lens = seq_lens_tensor
         self.out_cache_loc = out_cache_loc
+        if self.token_to_kv_pool_allocator_local is not None:
+            self.out_cache_loc_local = out_cache_loc_local
+        else:
+            self.out_cache_loc_local = None
         self.input_embeds = (
             torch.tensor(input_embeds).to(self.device, non_blocking=True)
             if input_embeds
@@ -1269,6 +1307,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 out_cache_loc,
                 self.req_to_token_pool.req_to_token.shape[1],
             )
+            if self.token_to_kv_pool_allocator_local is not None:
+                write_req_to_token_pool_triton[(bs,)](
+                    self.req_to_token_pool.req_to_token_local,
+                    req_pool_indices_tensor,
+                    prefix_lens_tensor,
+                    seq_lens_tensor,
+                    extend_lens_tensor,
+                    out_cache_loc_local,
+                    self.req_to_token_pool.req_to_token_local.shape[1],
+                )
         else:
             pt = 0
             for i in range(bs):
@@ -1329,13 +1377,22 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             * buf_multiplier
             * self.token_to_kv_pool_allocator.page_size
         )
-
-        if self.token_to_kv_pool_allocator.available_size() >= tokens_required:
+        if self.get_available_memory() >= tokens_required:
             return True
 
         self.tree_cache.evict(tokens_required)
 
-        return self.token_to_kv_pool_allocator.available_size() >= tokens_required
+        return self.get_available_memory() >= tokens_required
+
+    def get_available_memory(self):
+        if self.token_to_kv_pool_allocator_local is not None:
+            available_size = min(
+                self.token_to_kv_pool_allocator.available_size(),
+                self.token_to_kv_pool_allocator_local.available_size(),
+            )
+        else:
+            available_size = self.token_to_kv_pool_allocator.available_size()
+        return available_size
 
     def retract_decode(self, server_args: ServerArgs):
         """Retract the decoding requests when there is not enough memory."""
@@ -1372,14 +1429,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         seq_lens_cpu = self.seq_lens.cpu().numpy()
         first_iter = True
         while (
-            self.token_to_kv_pool_allocator.available_size()
-            < get_required_tokens(len(sorted_indices))
+            self.get_available_memory() < get_required_tokens(len(sorted_indices))
             or first_iter
         ):
             if len(sorted_indices) == 1:
                 # Corner case: only one request left
                 assert (
-                    self.token_to_kv_pool_allocator.available_size() > 0
+                    self.get_available_memory() > 0
                 ), "No space left for only one request"
                 break
 
@@ -1395,6 +1451,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 ]
                 self.token_to_kv_pool_allocator.free(token_indices)
                 self.req_to_token_pool.free(req.req_pool_idx)
+                if self.token_to_kv_pool_allocator_local is not None:
+                    token_indices_local = self.req_to_token_pool.req_to_token_local[
+                        req.req_pool_idx, : seq_lens_cpu[idx]
+                    ]
+                    self.token_to_kv_pool_allocator_local.free(token_indices_local)
             else:
                 # TODO: apply more fine-grained retraction
                 last_uncached_pos = (
@@ -1412,7 +1473,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # NOTE(lsyin): we should use the newly evictable memory instantly.
                 residual_size = (
                     len(sorted_indices) * global_config.retract_decode_steps
-                    - self.token_to_kv_pool_allocator.available_size()
+                    - self.get_available_memory()
                 )
                 residual_size = max(0, residual_size)
                 self.tree_cache.evict(residual_size)
@@ -1441,6 +1502,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.input_ids = torch.empty(0, dtype=torch.int64, device=self.device)
         self.seq_lens = torch.empty(0, dtype=torch.int64, device=self.device)
         self.out_cache_loc = torch.empty(0, dtype=torch.int64, device=self.device)
+        if self.token_to_kv_pool_allocator_local is not None:
+            self.out_cache_loc_local = torch.empty(
+                0, dtype=torch.int64, device=self.device
+            )
+        else:
+            self.out_cache_loc_local = None
         self.req_pool_indices = torch.empty(0, dtype=torch.int32, device=self.device)
         self.seq_lens_sum = 0
         self.extend_num_tokens = 0
@@ -1499,9 +1566,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.seq_lens.add_(1)
         self.seq_lens_sum += bs
 
+        # free memory
+        if self.token_to_kv_pool_allocator_local is not None:
+            for req in self.reqs:
+                self.tree_cache.evict_hybrid(
+                    req, req.seqlen - 1, self.model_config.attention_chunk_size
+                )
+
         # Allocate memory
         if self.token_to_kv_pool_allocator.page_size == 1:
             self.out_cache_loc = self.alloc_token_slots(bs)
+            if self.token_to_kv_pool_allocator_local is not None:
+                self.out_cache_loc_local = self.alloc_token_slots_local(bs)
+            else:
+                self.out_cache_loc_local = None
         else:
             last_loc = self.req_to_token_pool.req_to_token[
                 self.req_pool_indices, self.seq_lens - 2
@@ -1513,6 +1591,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.req_to_token_pool.write(
             (self.req_pool_indices, locs), self.out_cache_loc.to(torch.int32)
         )
+        if self.token_to_kv_pool_allocator_local is not None:
+            self.req_to_token_pool.write_local(
+                (self.req_pool_indices, locs), self.out_cache_loc_local.to(torch.int32)
+            )
 
     def filter_batch(
         self,
@@ -1554,6 +1636,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.req_pool_indices = self.req_pool_indices[keep_indices_device]
         self.seq_lens = self.seq_lens[keep_indices_device]
         self.out_cache_loc = None
+        self.out_cache_loc_local = None
         self.seq_lens_sum = self.seq_lens.sum().item()
         self.output_ids = self.output_ids[keep_indices_device]
         self.return_logprob = any(req.return_logprob for req in self.reqs)
@@ -1586,6 +1669,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
         self.seq_lens = torch.cat([self.seq_lens, other.seq_lens])
         self.out_cache_loc = None
+        self.out_cache_loc_local = None
         self.seq_lens_sum += other.seq_lens_sum
         if self.output_ids is not None:
             self.output_ids = torch.cat([self.output_ids, other.output_ids])
@@ -1648,6 +1732,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req_pool_indices=self.req_pool_indices,
             seq_lens=self.seq_lens,
             out_cache_loc=self.out_cache_loc,
+            out_cache_loc_local=self.out_cache_loc_local,
             seq_lens_sum=self.seq_lens_sum,
             return_logprob=self.return_logprob,
             top_logprobs_nums=self.top_logprobs_nums,
@@ -1694,6 +1779,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             model_config=self.model_config,
             forward_mode=self.forward_mode,
             out_cache_loc=self.out_cache_loc,
+            out_cache_loc_local=self.out_cache_loc_local,
             return_logprob=self.return_logprob,
             decoding_reqs=self.decoding_reqs,
             spec_algorithm=self.spec_algorithm,
@@ -1722,7 +1808,8 @@ class ModelWorkerBatch:
     seq_lens_cpu: Optional[torch.Tensor]
     # The indices of output tokens in the token_to_kv_pool_allocator
     out_cache_loc: torch.Tensor
-
+    # The indices of output tokens in the token_to_kv_pool_allocator_local
+    out_cache_loc_local: Optional[torch.Tensor]
     # The sum of all sequence lengths
     seq_lens_sum: int
 

@@ -42,6 +42,8 @@ class FlashAttentionMetadata:
     window_size: tuple = (-1, -1)
     # Page table, the index of KV Cache Tables/Blocks
     page_table: torch.Tensor = None
+    # Page table for local attention
+    page_table_local: torch.Tensor = None
 
     # Encoder metadata
     # Cumulative sequence lengths for encoder key
@@ -320,6 +322,7 @@ class FlashAttentionBackend(AttentionBackend):
         self.page_size = model_runner.page_size
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         self.skip_prefill = skip_prefill
+        self.is_hybrid = model_runner.is_hybrid
         self.topk = model_runner.server_args.speculative_eagle_topk or 0
         self.speculative_num_steps = speculative_num_steps
         self.speculative_num_draft_tokens = (
@@ -331,6 +334,11 @@ class FlashAttentionBackend(AttentionBackend):
         self.attention_chunk_size = (
             model_runner.attention_chunk_size
             if hasattr(model_runner, "attention_chunk_size")
+            else None
+        )
+        self.req_to_token_local = (
+            model_runner.req_to_token_pool.req_to_token_local
+            if self.is_hybrid is not None
             else None
         )
 
@@ -427,6 +435,12 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
                     forward_batch.req_pool_indices, : metadata.max_seq_len_k
                 ]
+                if self.is_hybrid is not None:
+                    metadata.page_table_local = (
+                        forward_batch.req_to_token_pool.req_to_token_local[
+                            forward_batch.req_pool_indices, : metadata.max_seq_len_k
+                        ]
+                    )
             # TODO: we need to test this part for llama 4 eagle case
             self._init_local_attn_metadata(metadata, device)
         elif forward_batch.forward_mode.is_target_verify():
@@ -562,6 +576,12 @@ class FlashAttentionBackend(AttentionBackend):
             metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
                 forward_batch.req_pool_indices, : metadata.max_seq_len_k
             ]
+            if self.is_hybrid is not None:
+                metadata.page_table_local = (
+                    forward_batch.req_to_token_pool.req_to_token_local[
+                        forward_batch.req_pool_indices, : metadata.max_seq_len_k
+                    ]
+                )
 
             if (
                 any(forward_batch.extend_prefix_lens_cpu)
@@ -627,14 +647,20 @@ class FlashAttentionBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
     ):
+        use_hybrid_loc = self.is_hybrid is not None and (
+            hasattr(layer, "use_irope") and layer.use_irope
+        )
         if k is not None:
             assert v is not None
             if save_kv_cache:
-                cache_loc = (
-                    forward_batch.out_cache_loc
-                    if not layer.is_cross_attention
-                    else forward_batch.encoder_out_cache_loc
-                )
+                if not use_hybrid_loc:
+                    cache_loc = (
+                        forward_batch.out_cache_loc
+                        if not layer.is_cross_attention
+                        else forward_batch.encoder_out_cache_loc
+                    )
+                else:
+                    cache_loc = forward_batch.out_cache_loc_local
                 if not self.use_mla:
                     forward_batch.token_to_kv_pool.set_kv_buffer(
                         layer, cache_loc, k, v, layer.k_scale, layer.v_scale
@@ -890,14 +916,20 @@ class FlashAttentionBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        use_hybrid_loc = self.is_hybrid is not None and (
+            hasattr(layer, "use_irope") and layer.use_irope
+        )
         if k is not None:
             assert v is not None
             if save_kv_cache:
-                cache_loc = (
-                    forward_batch.out_cache_loc
-                    if not layer.is_cross_attention
-                    else forward_batch.encoder_out_cache_loc
-                )
+                if not use_hybrid_loc:
+                    cache_loc = (
+                        forward_batch.out_cache_loc
+                        if not layer.is_cross_attention
+                        else forward_batch.encoder_out_cache_loc
+                    )
+                else:
+                    cache_loc = forward_batch.out_cache_loc_local
                 if not self.use_mla:
                     forward_batch.token_to_kv_pool.set_kv_buffer(
                         layer, cache_loc, k, v, layer.k_scale, layer.v_scale
@@ -1142,6 +1174,12 @@ class FlashAttentionBackend(AttentionBackend):
                 max_bs + 1, dtype=torch.int32, device=self.device
             ),
             "page_table": torch.zeros(
+                max_bs,
+                (self.max_context_len + self.page_size - 1) // self.page_size,
+                dtype=torch.int32,
+                device=self.device,
+            ),
+            "page_table_local": torch.zeros(
                 max_bs,
                 (self.max_context_len + self.page_size - 1) // self.page_size,
                 dtype=torch.int32,
@@ -1430,6 +1468,10 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.page_table = self.decode_cuda_graph_metadata["page_table"][
                     req_pool_indices, :
                 ]
+                if self.is_hybrid is not None:
+                    metadata.page_table_local = self.decode_cuda_graph_metadata[
+                        "page_table_local"
+                    ][req_pool_indices, :]
                 # Precompute cumulative sequence lengths
                 metadata.cu_seqlens_q = torch.arange(
                     0, batch_size + 1, dtype=torch.int32, device=device
@@ -1631,6 +1673,18 @@ class FlashAttentionBackend(AttentionBackend):
                 page_indices //= self.page_size
                 metadata.page_table[:, :max_seq_pages].copy_(page_indices)
                 metadata.page_table[:, max_seq_pages:].fill_(0)
+                if self.is_hybrid is not None:
+                    page_indices_local = self.req_to_token_local[
+                        req_pool_indices[:, None],
+                        self.decode_cuda_graph_metadata["strided_indices"][
+                            :max_seq_pages
+                        ][None, :],
+                    ]
+                    page_indices_local //= self.page_size
+                    metadata.page_table_local[:, :max_seq_pages].copy_(
+                        page_indices_local
+                    )
+                    metadata.page_table_local[:, max_seq_pages:].fill_(0)
 
                 self._update_local_attn_metadata_for_replay(metadata, bs)
         elif forward_mode.is_target_verify():
@@ -1769,7 +1823,10 @@ class FlashAttentionBackend(AttentionBackend):
 
         cu_seqlens_q = metadata.cu_seqlens_q
         cache_seqlens_int32 = metadata.cache_seqlens_int32
-        page_table = metadata.page_table
+        if self.is_hybrid is not None:
+            page_table = metadata.page_table_local
+        else:
+            page_table = metadata.page_table
         if cu_seqlens_q is None or cache_seqlens_int32 is None or page_table is None:
             metadata.local_attn_metadata = None
             return
@@ -1809,7 +1866,10 @@ class FlashAttentionBackend(AttentionBackend):
         """
         seq_lens_capture = metadata.cache_seqlens_int32
         max_seq_len = int(seq_lens_capture.max().item())
-        page_table_capture = metadata.page_table
+        if self.is_hybrid is not None:
+            page_table_capture = metadata.page_table_local
+        else:
+            page_table_capture = metadata.page_table
 
         cu_seqlens_q_np = metadata.cu_seqlens_q.cpu().numpy()
         seqlens_np = seq_lens_capture.cpu().numpy()
@@ -1886,7 +1946,10 @@ class FlashAttentionBackend(AttentionBackend):
         # Without this slicing, the pre-allocated page_table may contain zeros or invalid indices
         # beyond the actual sequence length, leading to incorrect attention calculations
         max_seq_len = int(seqlens.max().item())
-        sliced_page_table = metadata.page_table[:bs, :max_seq_len]
+        if self.is_hybrid is not None:
+            sliced_page_table = metadata.page_table_local[:bs, :max_seq_len]
+        else:
+            sliced_page_table = metadata.page_table[:bs, :max_seq_len]
 
         cu_seqlens_q_np = cu_seqlens_q.cpu().numpy()
         seqlens_np = seqlens.cpu().numpy()
