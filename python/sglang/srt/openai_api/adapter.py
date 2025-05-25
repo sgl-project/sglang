@@ -980,12 +980,12 @@ def v1_chat_generate_request(
                 request.skip_special_tokens = False
                 if not isinstance(request.tool_choice, str):
                     tools = [
-                        item.function.model_dump()
+                        item.model_dump()
                         for item in request.tools
                         if item.function.name == request.tool_choice.function.name
                     ]
                 else:
-                    tools = [item.function.model_dump() for item in request.tools]
+                    tools = [item.model_dump() for item in request.tools]
 
                 tool_call_parser = tokenizer_manager.server_args.tool_call_parser
                 parser = FunctionCallParser(request.tools, tool_call_parser)
@@ -1000,6 +1000,21 @@ def v1_chat_generate_request(
                     if message.content is None:
                         message.content = ""
                     msg_dict = message.dict()
+                    if (
+                        "tool_calls" in msg_dict
+                        and type(msg_dict["tool_calls"]) is list
+                    ):
+                        for call in msg_dict["tool_calls"]:
+                            try:
+                                if (
+                                    "arguments" in call["function"]
+                                    and type(call["function"]["arguments"]) is str
+                                ):
+                                    call["function"]["arguments"] = json.loads(
+                                        call["function"]["arguments"]
+                                    )
+                            except:
+                                continue
                     if isinstance(msg_dict.get("content"), list):
                         for chunk in msg_dict["content"]:
                             if isinstance(chunk, dict) and chunk.get("type") == "text":
