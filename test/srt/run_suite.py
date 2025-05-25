@@ -81,7 +81,7 @@ suites = {
         TestFile("test_update_weights_from_tensor.py", 48),
         TestFile("test_vertex_endpoint.py", 31),
         TestFile("test_vision_chunked_prefill.py", 175),
-        TestFile("test_vlm_accuracy.py", 60),
+        TestFile("test_vlm_input_format.py", 300),
         TestFile("test_vision_openai_server_a.py", 700),
         TestFile("test_vision_openai_server_b.py", 700),
         TestFile("test_w8a8_quantization.py", 46),
