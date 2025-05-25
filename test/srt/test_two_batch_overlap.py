@@ -93,6 +93,7 @@ class TestTwoBatchOverlapUnitTest(unittest.TestCase):
             ([99999, 1, 1, 1, 1], 1),
         ]:
             actual = compute_split_seq_index(forward_mode=ForwardMode.EXTEND, num_tokens=None, extend_lens=extend_lens)
+            print(f"{extend_lens=} {expect=} {actual=}")
             self.assertEqual(actual, expect)
 
 
