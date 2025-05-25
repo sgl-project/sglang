@@ -1,6 +1,6 @@
 ARG CUDA_VERSION=12.4.1
 
-FROM nvcr.io/nvidia/tritonserver:24.04-py3-min
+FROM nvcr.io/nvidia/tritonserver:25.03-py3-min
 
 ARG BUILD_TYPE=all
 ENV DEBIAN_FRONTEND=noninteractive
@@ -12,6 +12,7 @@ RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
     && apt install python3 python3-pip -y \
     && apt install curl git sudo libibverbs-dev -y \
     && apt install rdma-core infiniband-diags openssh-server perftest -y \
+    && apt install linux-libc-dev -y \
     && python3 --version \
     && python3 -m pip --version \
     && rm -rf /var/lib/apt/lists/* \
@@ -19,6 +20,8 @@ RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
 
 # For openbmb/MiniCPM models
 RUN pip3 install datamodel_code_generator
+
+RUN sed -i -e 's/Pillow==8.3.1/Pillow==11.2.1/g' /opt/hpcx/clusterkit/bin/output/requirements.txt
 
 WORKDIR /sgl-workspace
 
