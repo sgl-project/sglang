@@ -24,6 +24,7 @@ import warnings
 from argparse import ArgumentParser
 from dataclasses import dataclass, field
 from datetime import datetime
+from json import JSONDecodeError
 from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
 
@@ -471,6 +472,10 @@ def get_model(pretrained_model_name_or_path: str) -> str:
 def get_tokenizer(
     pretrained_model_name_or_path: str,
 ) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
+    assert (
+        pretrained_model_name_or_path is not None
+        and pretrained_model_name_or_path != ""
+    )
     if pretrained_model_name_or_path.endswith(
         ".json"
     ) or pretrained_model_name_or_path.endswith(".model"):
@@ -584,7 +589,7 @@ def download_and_cache_file(url: str, filename: Optional[str] = None):
         filename = os.path.join("/tmp", url.split("/")[-1])
 
     # Check if the cache file already exists
-    if os.path.exists(filename):
+    if is_file_valid_json(filename):
         return filename
 
     print(f"Downloading from {url} to {filename}")
@@ -610,6 +615,22 @@ def download_and_cache_file(url: str, filename: Optional[str] = None):
             bar.update(len(chunk))
 
     return filename
+
+
+def is_file_valid_json(path):
+    if not os.path.isfile(path):
+        return False
+
+    # TODO can fuse into the real file open later
+    try:
+        with open(path) as f:
+            json.load(f)
+        return True
+    except JSONDecodeError as e:
+        print(
+            f"{path} exists but json loading fails ({e=}), thus treat as invalid file"
+        )
+        return False
 
 
 @dataclass
@@ -751,7 +772,7 @@ def sample_sharegpt_requests(
         raise ValueError("output_len too small")
 
     # Download sharegpt if necessary
-    if not os.path.isfile(dataset_path) and dataset_path == "":
+    if not is_file_valid_json(dataset_path) and dataset_path == "":
         dataset_path = download_and_cache_file(SHAREGPT_URL)
 
     # Load the dataset.
@@ -832,6 +853,7 @@ def sample_random_requests(
     tokenizer: PreTrainedTokenizerBase,
     dataset_path: str,
     random_sample: bool = True,
+    return_text: bool = True,
 ) -> List[DatasetRow]:
     input_lens = np.random.randint(
         max(int(input_len * range_ratio), 1),
@@ -848,7 +870,7 @@ def sample_random_requests(
         # Sample token ids from ShareGPT and repeat/truncate them to satisfy the input_lens
 
         # Download sharegpt if necessary
-        if not os.path.isfile(dataset_path):
+        if not is_file_valid_json(dataset_path):
             dataset_path = download_and_cache_file(SHAREGPT_URL)
 
         # Load the dataset.
@@ -892,10 +914,12 @@ def sample_random_requests(
             else:
                 ratio = (input_lens[i] + prompt_len - 1) // prompt_len
                 input_ids = (prompt_token_ids * ratio)[: input_lens[i]]
-            prompt = tokenizer.decode(input_ids)
+            input_content = input_ids
+            if return_text:
+                input_content = tokenizer.decode(input_content)
             input_requests.append(
                 DatasetRow(
-                    prompt=prompt,
+                    prompt=input_content,
                     prompt_len=int(input_lens[i]),
                     output_len=int(output_lens[i]),
                 )
@@ -905,15 +929,15 @@ def sample_random_requests(
         offsets = np.random.randint(0, tokenizer.vocab_size, size=num_prompts)
         input_requests = []
         for i in range(num_prompts):
-            prompt = tokenizer.decode(
-                [
-                    (offsets[i] + i + j) % tokenizer.vocab_size
-                    for j in range(input_lens[i])
-                ]
-            )
+            input_content = [
+                (offsets[i] + i + j) % tokenizer.vocab_size
+                for j in range(input_lens[i])
+            ]
+            if return_text:
+                input_content = tokenizer.decode(input_content)
             input_requests.append(
                 DatasetRow(
-                    prompt=prompt,
+                    prompt=input_content,
                     prompt_len=int(input_lens[i]),
                     output_len=int(output_lens[i]),
                 )
@@ -1279,14 +1303,17 @@ async def benchmark(
 
     if "sglang" in backend:
         server_info = requests.get(base_url + "/get_server_info")
-        if pd_separated:
-            accept_length = server_info.json()["decode"][0]["internal_states"][0].get(
-                "avg_spec_accept_length", None
-            )
+        if server_info.status_code == 200:
+            if pd_separated:
+                accept_length = server_info.json()["decode"][0]["internal_states"][
+                    0
+                ].get("avg_spec_accept_length", None)
+            else:
+                accept_length = server_info.json()["internal_states"][0].get(
+                    "avg_spec_accept_length", None
+                )
         else:
-            accept_length = server_info.json()["internal_states"][0].get(
-                "avg_spec_accept_length", None
-            )
+            accept_length = None
     else:
         accept_length = None
 
