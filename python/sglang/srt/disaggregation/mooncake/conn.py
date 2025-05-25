@@ -391,10 +391,10 @@ class MooncakeKVManager(BaseKVManager):
                             if ret != 0:
                                 with self.session_lock:
                                     self.session_failures[req.mooncake_session_id] += 1
-                                    # Failures should never happen if the session is not dead, if the session fails twice, mark it as failed
+                                    # Failures should never happen if the session is not dead, if the session fails once, mark it as failed
                                     if (
                                         self.session_failures[req.mooncake_session_id]
-                                        >= 2
+                                        >= 1
                                     ):
                                         self.failed_sessions.add(
                                             req.mooncake_session_id
