@@ -82,6 +82,8 @@ class TestTwoBatchOverlapUnitTest(unittest.TestCase):
         for extend_lens, expect in [
             ([], 0),
             ([42], 0),
+            ([42, 999], 1),
+            ([999, 42], 1),
             ([4096, 4096, 4096, 4096], 2),
             ([4095, 4096, 4096, 4096, 1], 2),
             ([1, 4095, 4096, 4096, 4096], 3),
