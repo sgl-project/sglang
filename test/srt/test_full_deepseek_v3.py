@@ -90,9 +90,9 @@ class TestDeepseekV3MTP(CustomTestCase):
             "2",
             "--speculative-num-draft-tokens",
             "4",
-            "--mem-fraction-static",
-            "0.7",
         ]
+        if os.environ.get("SGLANG_AMD_CI") != "1":
+            other_args += ["--mem-frac", "0.7"]
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
