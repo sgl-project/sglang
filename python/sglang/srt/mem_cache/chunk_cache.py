@@ -72,17 +72,18 @@ class ChunkCache(BasePrefixCache):
     def evict_hybrid(
         self,
         req: Req,
+        prelen: int,
         attention_chunk_size: int,
     ):
-        if req.seqlen > req.evicted_seqlen_local + attention_chunk_size:
-            loc_idx = attention_chunk_size * (req.seqlen // attention_chunk_size)
-            with open("log.txt", "a") as f:
-                f.write(f"seqlen: {req.seqlen}, loc_idx: {loc_idx}\n")
+        if prelen >= req.evicted_seqlen_local + attention_chunk_size:
+            new_evicted_seqlen_local = attention_chunk_size * (
+                prelen // attention_chunk_size
+            )
             free_slots = self.req_to_token_pool.req_to_token_local[
-                req.req_pool_idx, req.evicted_seqlen_local : loc_idx
+                req.req_pool_idx, req.evicted_seqlen_local : new_evicted_seqlen_local
             ]
             self.token_to_kv_pool_allocator_local.free(free_slots)
-            req.evicted_seqlen_local = loc_idx
+            req.evicted_seqlen_local = new_evicted_seqlen_local
 
     def evict(self, num_tokens: int):
         pass

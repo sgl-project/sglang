@@ -288,7 +288,7 @@ class ModelConfig:
             num_kv_heads = getattr(self.hf_text_config, attr, None)
             if num_kv_heads is not None:
                 return num_kv_heads
-
+            
         # For non-grouped-query attention models, the number of KV heads is
         # equal to the number of attention heads.
         return self.hf_text_config.num_attention_heads

@@ -1168,7 +1168,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         (req.req_pool_idx, slice(0, pre_len)), req.prefix_indices_local
                     )
                     self.tree_cache.evict_hybrid(
-                        req, self.model_config.attention_chunk_size
+                        req, pre_len, self.model_config.attention_chunk_size
                     )
 
             # If input_embeds are available, store them
@@ -1560,6 +1560,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.seq_lens.add_(1)
         self.seq_lens_sum += bs
 
+        # free memory
+        if self.token_to_kv_pool_allocator_local is not None:
+            for req in self.reqs:
+                self.tree_cache.evict_hybrid(
+                    req, req.seqlen - 1, self.model_config.attention_chunk_size
+                )
+
         # Allocate memory
         if self.token_to_kv_pool_allocator.page_size == 1:
             self.out_cache_loc = self.alloc_token_slots(bs)
@@ -1582,10 +1589,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.req_to_token_pool.write_local(
                 (self.req_pool_indices, locs), self.out_cache_loc_local.to(torch.int32)
             )
-            for req in self.reqs:
-                self.tree_cache.evict_hybrid(
-                    req, self.model_config.attention_chunk_size
-                )
 
     def filter_batch(
         self,

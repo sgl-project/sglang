@@ -887,7 +887,12 @@ class ModelRunner:
 
         # create token size for hybrid cache
         if self.is_hybrid is not None:
-            self.get_num_token_hybrid()
+            if self.server_args.disable_radix_cache:
+                self.get_num_token_hybrid()
+            else:
+                raise RuntimeError(
+                    "Hybrid cache does not support radix_cache currently. Please set --diable-radix-cache."
+                )
 
         if self.max_total_num_tokens <= 0:
             raise RuntimeError(

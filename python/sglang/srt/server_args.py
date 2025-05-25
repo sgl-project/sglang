@@ -696,7 +696,7 @@ class ServerArgs:
         parser.add_argument(
             "--enable-hybrid-kvcache",
             nargs="?",
-            const=1.0,
+            const=0.5,
             type=float,
             default=ServerArgs.enable_hybrid_kvcache,
             help=(
