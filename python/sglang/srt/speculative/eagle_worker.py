@@ -306,14 +306,14 @@ class EAGLEWorker(TpModelWorker):
                 raise RuntimeError(
                     "extend data not found for draft model initialization"
                 )
-            return batch.extend_logits_output, batch.extend_next_token_ids, batch.bid, 0
+            return batch.extend_logits_output, batch.extend_next_token_ids, batch.bid, 0, False
         else:
             logits_output, next_token_ids, bid = self.forward_target_extend(batch)
             batch.extend_logits_output = logits_output
             batch.extend_next_token_ids = next_token_ids
             batch.bid = bid
             batch.extend_data_for_draft_model_ready = True
-            return logits_output, next_token_ids, bid, 0
+            return logits_output, next_token_ids, bid, 0, False
 
     def forward_target_extend(
         self, batch: ScheduleBatch
