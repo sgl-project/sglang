@@ -209,7 +209,7 @@ class Fp8LinearMethod(LinearMethodBase):
             # Marlin doesn't support block-wise fp8
             self.use_marlin = False
 
-        self.w8a8_block_fp8_linear = dispatch_w8a8_block_fp8_linear
+        self.w8a8_block_fp8_linear = dispatch_w8a8_block_fp8_linear()
 
     def create_weights(
         self,
