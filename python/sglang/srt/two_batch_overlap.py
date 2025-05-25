@@ -39,12 +39,21 @@ def compute_split_seq_index(
 
 def _split_array_by_half_sum(arr: Sequence[int]) -> int:
     overall_sum = sum(arr)
-    cum_sum = 0
-    for index, value in enumerate(arr[:-1]):
-        if cum_sum >= overall_sum // 2:
-            TODO
-        cum_sum += value
-    return TODO
+    left_sum = 0
+    min_diff = float('inf')
+    best_index = 0
+
+    for i in range(1, len(arr)):
+        left_sum += arr[i - 1]
+        right_sum = overall_sum - left_sum
+        diff = abs(left_sum - right_sum)
+        if diff <= min_diff:
+            min_diff = diff
+            best_index = i
+        else:
+            break
+
+    return best_index
 
 
 def compute_split_token_index(
