@@ -153,7 +153,9 @@ class ExpertLocationMetadata:
         return ExpertLocationMetadata._init_raw(
             ep_size=common["ep_size"],
             physical_to_logical_map=physical_to_logical_map.to(server_args.device),
-            logical_to_all_physical_map=logical_to_all_physical_map.to(server_args.device),
+            logical_to_all_physical_map=logical_to_all_physical_map.to(
+                server_args.device
+            ),
         )
 
     @staticmethod
