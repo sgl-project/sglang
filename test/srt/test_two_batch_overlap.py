@@ -3,7 +3,8 @@ import unittest
 from types import SimpleNamespace
 
 import requests
-
+from python.sglang.srt.model_executor.forward_batch_info import ForwardMode
+from python.sglang.srt.two_batch_overlap import compute_split_seq_index
 from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
@@ -70,7 +71,12 @@ class TestTwoBatchOverlap(unittest.TestCase):
 
 class TestTwoBatchOverlapUnitTest(unittest.TestCase):
     def test_compute_split_seq_index(self):
-        TODO
+        for num_tokens, extend_lens, expect in [
+
+        ]:
+            actual = compute_split_seq_index(forward_mode=ForwardMode.EXTEND, num_tokens=num_tokens,
+                                             extend_lens=extend_lens)
+            self.assertEqual(actual, expect)
 
 
 if __name__ == "__main__":
