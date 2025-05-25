@@ -30,11 +30,6 @@ class EBNFComposer:
         ws ::= [ \n\t]*
     """
 
-    TOOL_CALL_MAP = {
-        "pythonic": '"[" function_call "]"',
-        "json": "function_call",
-    }
-
     CALL_RULE_MAP = {
         "pythonic": 'call_{name} ::= "{name}" "(" {arguments_rule} ")"',
         "json": 'call_{name} ::= "{{" "\\"name\\"" ":" "\\"{name}\\"" ", " "\\"arguments\\"" ":" {arguments_rule} "}}"',
@@ -170,7 +165,7 @@ class EBNFComposer:
         if individual_call_start_token and individual_call_end_token:
             function_call_unit = f'"{individual_call_start_token}" function_call "{individual_call_end_token}"'
         else:
-            function_call_unit = EBNFComposer.TOOL_CALL_MAP[function_format]
+            function_call_unit = "function_call"
 
         # Handle multiple function calls with separators
         if tool_call_separator is not None:
