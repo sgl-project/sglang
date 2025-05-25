@@ -800,7 +800,7 @@ class TokenizerManager:
             output_dir=output_dir,
             num_steps=num_steps,
             activities=activities,
-            with_stack=with_stack,
+            with_stack=False,
             record_shapes=record_shapes,
             profile_id=str(time.time()),
         )
