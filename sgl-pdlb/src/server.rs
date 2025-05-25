@@ -16,7 +16,7 @@ pub struct LBState {
 impl LBState {
     pub fn new(lb_config: LBConfig) -> Self {
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(50))
+            .timeout(std::time::Duration::from_secs(lb_config.timeout))
             .build()
             .expect("Failed to build HTTP client");
 
@@ -355,6 +355,7 @@ pub struct LBConfig {
     pub prefill_infos: Vec<(String, Option<u16>)>,
     pub decode_infos: Vec<String>,
     pub log_interval: u64,
+    pub timeout: u64,
 }
 
 pub async fn periodic_logging(lb_state: LBState) {

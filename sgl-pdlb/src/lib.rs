@@ -20,6 +20,7 @@ impl LoadBalancer {
         prefill_infos: Vec<(String, Option<u16>)>,
         decode_infos: Vec<String>,
         log_interval: u64,
+        timeout: u64,
     ) -> PyResult<Self> {
         let lb_config = LBConfig {
             host,
@@ -28,6 +29,7 @@ impl LoadBalancer {
             prefill_infos,
             decode_infos,
             log_interval,
+            timeout,
         };
         Ok(LoadBalancer { lb_config })
     }

@@ -18,6 +18,7 @@ fn main() {
         prefill_infos,
         decode_infos,
         log_interval: 5,
+        timeout: 600,
     };
     let lb_state = server::LBState::new(lb_config.clone());
     actix_web::rt::System::new().block_on(async move {

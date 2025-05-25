@@ -61,6 +61,12 @@ class LBArgs:
             default=LBArgs.log_interval,
             help="Log interval in seconds (default: 5)",
         )
+        parser.add_argument(
+            "--timeout",
+            type=int,
+            default=600,
+            help="Timeout in seconds (default: 600)",
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace) -> "LBArgs":
@@ -86,6 +92,7 @@ class LBArgs:
             prefill_infos=prefill_infos,
             decode_infos=args.decode,
             log_interval=args.log_interval,
+            timeout=args.timeout,
         )
 
 
@@ -102,6 +109,7 @@ def main():
         prefill_infos=lb_args.prefill_infos,
         decode_infos=lb_args.decode_infos,
         log_interval=lb_args.log_interval,
+        timeout=lb_args.timeout,
     )
     lb.start()
 
