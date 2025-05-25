@@ -959,6 +959,7 @@ def v1_chat_generate_request(
     top_logprobs_nums = []
     modalities_list = []
     lora_paths = []
+    custom_logit_processor_list = []
 
     # NOTE: with openai API, the prompt's logprobs are always not computed
 
@@ -1124,6 +1125,7 @@ def v1_chat_generate_request(
         top_logprobs_nums.append(request.top_logprobs or 0)
         lora_paths.append(request.lora_path)
         prompts.append(prompt)
+        custom_logit_processor_list.append(request.custom_logit_processor)
 
         sampling_params = {
             "temperature": request.temperature,
@@ -1143,6 +1145,7 @@ def v1_chat_generate_request(
             "no_stop_trim": request.no_stop_trim,
             "ignore_eos": request.ignore_eos,
             "skip_special_tokens": request.skip_special_tokens,
+            "custom_params": request.custom_params,
         }
 
         if request.response_format and request.response_format.type == "json_schema":
@@ -1200,6 +1203,7 @@ def v1_chat_generate_request(
         modalities_list = modalities_list[0]
         lora_paths = lora_paths[0]
         request_ids = request_ids[0]
+        custom_logit_processor_list = custom_logit_processor_list[0]
     else:
         if tokenizer_manager.model_config.is_multimodal:
             # processor will need text input
@@ -1226,6 +1230,7 @@ def v1_chat_generate_request(
         bootstrap_host=all_requests[0].bootstrap_host,
         bootstrap_port=all_requests[0].bootstrap_port,
         bootstrap_room=all_requests[0].bootstrap_room,
+        custom_logit_processor=custom_logit_processor_list,
     )
 
     return adapted_request, all_requests if len(all_requests) > 1 else all_requests[0]
