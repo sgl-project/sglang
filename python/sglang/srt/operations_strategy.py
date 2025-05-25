@@ -7,7 +7,8 @@ def compute_layer_operations(
     if not layer.is_layer_sparse:
         return [
             layer.op_comm_prepare_attn,
-            layer.op_attn,
+            layer.self_attn.op_prepare,
+            layer.self_attn.op_core,
             layer.op_comm_prepare_mlp,
             layer.op_mlp,
             layer.op_comm_postprocess_layer,
@@ -16,7 +17,8 @@ def compute_layer_operations(
     # Will add TBO operation orders here
     return [
         layer.op_comm_prepare_attn,
-        layer.op_attn,
+        layer.self_attn.op_prepare,
+        layer.self_attn.op_core,
         layer.op_comm_prepare_mlp,
         layer.mlp.op_gate,
         layer.mlp.op_shared_experts,
