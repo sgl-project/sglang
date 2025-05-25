@@ -160,6 +160,7 @@ pub struct ServerConfig {
     pub verbose: bool,
     pub max_payload_size: usize,
     pub log_dir: Option<String>,
+    pub log_level: Option<String>,
     pub service_discovery_config: Option<ServiceDiscoveryConfig>,
 }
 
@@ -172,7 +173,21 @@ pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
             level: if config.verbose {
                 Level::DEBUG
             } else {
-                Level::INFO
+                config.log_level
+                    .as_deref()
+                    .and_then(|s| {
+                        match s.to_uppercase().parse::<Level>() {
+                            Ok(l) => Some(l),
+                            Err(_) => {
+                                warn!(
+                                    "Invalid log level string: '{}'. Defaulting to INFO (as verbose is false).",
+                                    s
+                                );
+                                None
+                            }
+                        }
+                    })
+                    .unwrap_or(Level::INFO)
             },
             json_format: false,
             log_dir: config.log_dir.clone(),
