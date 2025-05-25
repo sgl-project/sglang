@@ -64,6 +64,7 @@ Please refer to our dedicated guide on [constrained decoding](./structured_outpu
 | ignore_eos                    | `bool = False`                  | Don't stop generation when EOS token is sampled.                                                                                               |
 | skip_special_tokens           | `bool = True`                   | Remove special tokens during decoding.                                                                                                         |
 | custom_params                 | `Optional[List[Optional[Dict[str, Any]]]] = None` | Used when employing `CustomLogitProcessor`. For usage, see below.                                                                              |
+| thinking_budget               | `Optional[int] = None`          | The maximum number of reasoning tokens that can be generated for a request. |
 
 ## Examples
 
@@ -291,6 +292,32 @@ response = requests.post(
             "temperature": 0.0,
             "max_new_tokens": 32,
             "custom_params": {"token_id": 5},
+        },
+    },
+)
+print(response.json())
+```
+
+### Thinking Budget
+
+Launch a server with `--reasoning-parser`.
+
+```bash
+python3 -m sglang.launch_server --model Qwen/Qwen3-8B --reasoning-parser qwen3
+```
+
+Send a request:
+
+```python
+import requests
+response = requests.post(
+    "http://localhost:30000/generate",
+    json={
+        "text": "9.11 and 9.8, which is greater?",
+        "sampling_params": {
+            "temperature": 0.3,
+            "max_new_tokens": 256,
+            "thinking_budget": 20,
         },
     },
 )
