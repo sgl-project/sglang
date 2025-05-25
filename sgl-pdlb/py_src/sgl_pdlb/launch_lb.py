@@ -13,27 +13,28 @@ class LBArgs:
     prefill_infos: List[str] = dataclasses.field(default_factory=list)
     decode_infos: List[str] = dataclasses.field(default_factory=list)
     log_interval: int = 5
+    timeout: int = 600
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
         parser.add_argument(
             "--host",
             type=str,
-            default="0.0.0.0",
-            help="Host to bind the server (default: 0.0.0.0)",
+            default=LBArgs.host,
+            help=f"Host to bind the server (default: {LBArgs.host})",
         )
         parser.add_argument(
             "--port",
             type=int,
-            default=8000,
-            help="Port to bind the server (default: 8000)",
+            default=LBArgs.port,
+            help=f"Port to bind the server (default: {LBArgs.port})",
         )
         parser.add_argument(
             "--policy",
             type=str,
-            default="random",
+            default=LBArgs.policy,
             choices=["random", "po2"],
-            help="Policy to use for load balancing (default: random)",
+            help=f"Policy to use for load balancing (default: {LBArgs.policy})",
         )
         parser.add_argument(
             "--prefill",
@@ -59,13 +60,13 @@ class LBArgs:
             "--log-interval",
             type=int,
             default=LBArgs.log_interval,
-            help="Log interval in seconds (default: 5)",
+            help=f"Log interval in seconds (default: {LBArgs.log_interval})",
         )
         parser.add_argument(
             "--timeout",
             type=int,
-            default=600,
-            help="Timeout in seconds (default: 600)",
+            default=LBArgs.timeout,
+            help=f"Timeout in seconds (default: {LBArgs.timeout})",
         )
 
     @classmethod
