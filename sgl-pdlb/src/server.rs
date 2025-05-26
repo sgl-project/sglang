@@ -39,17 +39,17 @@ impl LBState {
 
         assert!(request.get("text").is_some() || request.get("input_ids").is_some());
         let batch_size = if let Some(text) = request.get("text").and_then(|text| text.as_array()) {
-            text.len()
+            Some(text.len())
         } else if let Some(input_ids) = request
             .get("input_ids")
             .and_then(|input_ids| input_ids.as_array())
         {
-            input_ids.len()
+            Some(input_ids.len())
         } else {
-            1
+            None
         };
 
-        if batch_size > 1 {
+        if let Some(batch_size) = batch_size {
             modified_request["bootstrap_host"] =
                 vec![prefill_info.get_hostname(); batch_size].into();
             modified_request["bootstrap_room"] = (0..batch_size)
