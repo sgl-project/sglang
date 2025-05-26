@@ -1515,6 +1515,11 @@ def run_benchmark(args_: argparse.Namespace):
     if args.extra_request_body:
         extra_request_body = json.loads(args.extra_request_body)
 
+    if args.tokenize_prompt:
+        assert (
+            args.backend == "sglang"
+        ), "`--tokenize-prompt` only compatible with `--backend sglang` currently"
+
     # Set url
     if args.port is None:
         args.port = {
@@ -1823,7 +1828,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--tokenize-prompt",
         action="store_true",
-        help="Use integer ids instead of string for inputs. Useful to control prompt lengths accurately. Only support SGLang backend now.",
+        help="Use integer ids instead of string for inputs. Useful to control prompt lengths accurately",
     )
 
     group = parser.add_argument_group("generated-shared-prefix dataset arguments")
