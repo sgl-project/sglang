@@ -184,6 +184,7 @@ class TestGemmaUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTestCa
             pixel_values=processor_output["pixel_values"][0],
         )
 
+
 class TestKimiVLImageUnderstandsImage(
     VLMInputTestBase, unittest.IsolatedAsyncioTestCase
 ):
