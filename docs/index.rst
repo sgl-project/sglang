@@ -76,16 +76,6 @@ The core features include:
    router/router.md
 
 .. toctree::
-   :maxdepth: 1
-   :caption: Developer
-
-   developer/development_guide_using_docker.md
-   developer/release_process.md
-   developer/setup_github_runner.md
-
-
-
-.. toctree::
       :maxdepth: 1
       :caption: References
 
@@ -93,3 +83,4 @@ The core features include:
       references/hardware
       references/advanced_deploy
       references/performance_analysis_and_optimization
+      developer/developer.rst
