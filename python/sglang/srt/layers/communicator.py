@@ -263,6 +263,11 @@ class CommunicateSimpleFn:
         ):
             return CommunicateSimpleFn._scattered_to_tp_attn_full
 
+        if (input_mode == ScatterMode.TP_ATTN_FULL) and (
+            output_mode == ScatterMode.SCATTERED
+        ):
+            return CommunicateSimpleFn._tp_attn_full_to_scattered
+
         raise NotImplementedError(f"{input_mode=} {output_mode=}")
 
     @staticmethod
@@ -289,6 +294,14 @@ class CommunicateSimpleFn:
         )
         return hidden_states
 
+    @staticmethod
+    def _tp_attn_full_to_scattered(
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        context: CommunicateContext,
+    ) -> torch.Tensor:
+        tensor_list = list(hidden_states.tensor_split(context.attn_tp_size))
+        return tensor_list[context.attn_tp_rank]
 
 class CommunicateWithAllReduceAndLayerNormFn:
     """Besides communication, needs to
