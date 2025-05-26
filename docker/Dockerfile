@@ -45,6 +45,19 @@ RUN mkdir -p /tmp/gdrcopy && cd /tmp \
 # Fix DeepEP IBGDA symlink
 RUN ln -sf /usr/lib/x86_64-linux-gnu/libmlx5.so.1 /usr/lib/x86_64-linux-gnu/libmlx5.so
 
+# ep statistics
+WORKDIR /sgl-workspace
+RUN wget https://github.com/user-attachments/files/20036217/attachment_ep_statistics.zip \
+    && unzip attachment_ep_statistics.zip \
+    && rm attachment_ep_statistics.zip \
+    && mv attachment_ep_statistics /sgl-workspace/eps
+
+WORKDIR /sgl-workspace
+RUN git clone https://github.com/deepseek-ai/FlashMLA.git
+WORKDIR /sgl-workspace/FlashMLA
+RUN python3 setup.py install
+
+
 # Clone and install SGLang
 WORKDIR /sgl-workspace
 RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel html5lib six \
@@ -63,7 +76,7 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel html5li
 
 # Build and install NVSHMEM + DeepEP
 RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.2.5/source/nvshmem_src_3.2.5-1.txz \
- && git clone https://github.com/deepseek-ai/DeepEP.git \
+ && git clone --branch h20_support https://github.com/bytedance-iaas/DeepEP.git \
  && tar -xf nvshmem_src_3.2.5-1.txz && mv nvshmem_src nvshmem \
  && cd nvshmem \
  && git apply /sgl-workspace/DeepEP/third-party/nvshmem.patch \
