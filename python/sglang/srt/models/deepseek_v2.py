@@ -71,7 +71,7 @@ from sglang.srt.layers.quantization.int8_utils import (
     block_dequant as int8_block_dequant,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.rotary_embedding import get_rope, get_rope_wrapper
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -668,13 +668,14 @@ class DeepseekV2AttentionMLA(nn.Module):
         if rope_scaling:
             rope_scaling["rope_type"] = "deepseek_yarn"
 
-        self.rotary_emb = get_rope(
+        self.rotary_emb = get_rope_wrapper(
             qk_rope_head_dim,
             rotary_dim=qk_rope_head_dim,
             max_position=max_position_embeddings,
             base=rope_theta,
             rope_scaling=rope_scaling,
             is_neox_style=False,
+            device=global_server_args_dict["device"],
         )
 
         if rope_scaling:
