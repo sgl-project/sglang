@@ -986,13 +986,13 @@ class TokenizerManager:
         # Many DP ranks
         return [res.internal_state for res in responses]
 
-    async def get_load(self) -> int:
+    async def get_load(self) -> dict:
         # TODO(lsyin): fake load report server
         if not self.current_load_lock.locked():
             async with self.current_load_lock:
                 internal_state = await self.get_internal_state()
                 self.current_load = internal_state[0]["load"]
-        return self.current_load
+        return {"load": self.current_load}
 
     async def set_internal_state(
         self, obj: SetInternalStateReq
