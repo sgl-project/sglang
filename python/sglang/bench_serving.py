@@ -1823,7 +1823,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--tokenize-prompt",
         action="store_true",
-        help="Use integer ids instead of string for inputs. Useful to control prompt lengths accurately.",
+        help="Use integer ids instead of string for inputs. Useful to control prompt lengths accurately. Only support SGLang backend now.",
     )
 
     group = parser.add_argument_group("generated-shared-prefix dataset arguments")
