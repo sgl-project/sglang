@@ -55,16 +55,22 @@ class PythonicDetector(BaseFormatDetector):
                 for i, tool in enumerate(tools)
                 if tool.function.name
             }
-            for call in parsed.elts:
+            for call_index, call in enumerate(parsed.elts):
                 if not isinstance(call.func, ast.Name):
                     continue
                 function_name = call.func.id
+                # Validate that the function exists in the tools
+                if function_name not in tool_indices:
+                    logger.warning(
+                        f"Model attempted to call undefined function: {function_name}"
+                    )
+                    continue
                 arguments = {}
                 for keyword in call.keywords:
                     arguments[keyword.arg] = self._get_parameter_value(keyword.value)
                 calls.append(
                     ToolCallItem(
-                        tool_index=tool_indices.get(function_name, -1),
+                        tool_index=call_index,  # Use the call index in the response, not tool position
                         name=function_name,
                         parameters=json.dumps(arguments, ensure_ascii=False),
                     )
