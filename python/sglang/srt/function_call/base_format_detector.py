@@ -72,20 +72,51 @@ class BaseFormatDetector(ABC):
         action = json.loads(text)
         return StreamingParseResult(calls=self.parse_base_json(action, tools))
 
+    def ends_with_partial_token(self, buffer: str, bot_token: str) -> int:
+        """
+        Check if buffer ends with a partial bot_token.
+        Return the length of the partial bot_token.
+
+        For some format, the bot_token is not a token in model's vocabulary, such as
+        `[TOOL_CALLS] [` in Mistral.
+        """
+        for i in range(1, min(len(buffer) + 1, len(bot_token))):
+            if bot_token.startswith(buffer[-i:]):
+                return i
+        return 0
+
     def parse_streaming_increment(
         self, new_text: str, tools: List[Tool]
     ) -> StreamingParseResult:
         """
         Streaming incremental parsing with tool validation.
+
+        This base implementation works best with formats where:
+        1. bot_token is followed immediately by JSON (e.g., bot_token + JSON_array)
+        2. JSON can be parsed incrementally using partial_json_loads
+        3. Multiple tool calls are separated by "; " or ", "
+
+        Examples of incompatible formats (need custom implementation, may reuse some logic from this class):
+        - Each tool call is wrapped in a separate block: See Qwen25Detector
+        - Multiple separate blocks: [TOOL_CALLS] [...] \n [TOOL_CALLS] [...]
+        - Tool call is Pythonic style
+
+        For incompatible formats, detectors should override this method with custom logic.
         """
         # Append new text to buffer
         self._buffer += new_text
         current_text = self._buffer
         if not (self.bot_token in current_text or current_text.startswith("{")):
-            self._buffer = ""
-            if self.eot_token in new_text:
-                new_text = new_text.replace(self.eot_token, "")
-            return StreamingParseResult(normal_text=new_text)
+            # Only clear buffer if we're sure no tool call is starting
+            if not self.ends_with_partial_token(self._buffer, self.bot_token):
+                normal_text = self._buffer
+                self._buffer = ""
+                if self.eot_token in normal_text:
+                    normal_text = normal_text.replace(self.eot_token, "")
+                return StreamingParseResult(normal_text=normal_text)
+            else:
+                # Might be partial bot_token, keep buffering
+                return StreamingParseResult()
 
         # Build tool indices if not already built
         if not hasattr(self, "_tool_indices"):
