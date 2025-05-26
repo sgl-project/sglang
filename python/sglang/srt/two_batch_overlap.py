@@ -1,4 +1,5 @@
 import dataclasses
+import logging
 from typing import TYPE_CHECKING, Dict, List, Optional, Sequence
 
 import torch
@@ -11,10 +12,14 @@ from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.operations import execute_operations, execute_overlapped_operations
 from sglang.srt.operations_strategy import OperationsStrategy
-from sglang.srt.utils import BumpAllocator, DeepEPMode
+from sglang.srt.utils import BumpAllocator, DeepEPMode, get_bool_env_var
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
+
+_tbo_debug = get_bool_env_var("SGLANG_TBO_DEBUG")
+
+logger = logging.getLogger(__name__)
 
 
 # -------------------------------- Compute Basic Info ---------------------------------------
@@ -40,13 +45,21 @@ def compute_split_seq_index(
 
 def _split_array_by_half_sum(arr: Sequence[int]) -> int:
     overall_sum = sum(arr)
-    accumulator, split_index = 0, 0
-    for value in arr[:-1]:
-        accumulator += value
-        split_index += 1
-        if accumulator >= overall_sum // 2:
+    left_sum = 0
+    min_diff = float("inf")
+    best_index = 0
+
+    for i in range(1, len(arr)):
+        left_sum += arr[i - 1]
+        right_sum = overall_sum - left_sum
+        diff = abs(left_sum - right_sum)
+        if diff <= min_diff:
+            min_diff = diff
+            best_index = i
+        else:
             break
-    return split_index
+
+    return best_index
 
 
 def compute_split_token_index(
@@ -169,6 +182,14 @@ class TboForwardBatchPreparer:
             forward_mode=batch.forward_mode,
             extend_seq_lens=batch.extend_seq_lens_cpu,
         )
+
+        if _tbo_debug:
+            logger.info(
+                f"TboForwardBatchPreparer.prepare "
+                f"tbo_split_seq_index={batch.tbo_split_seq_index} "
+                f"tbo_split_token_index={tbo_split_token_index} "
+                f"extend_seq_lens={batch.extend_seq_lens_cpu}"
+            )
 
         assert isinstance(batch.attn_backend, TboAttnBackend)
         attn_backend_child_a, attn_backend_child_b = batch.attn_backend.children

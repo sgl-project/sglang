@@ -18,6 +18,7 @@ from typing import Callable, Optional
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.managers import expert_location_dispatch
 from sglang.srt.managers.expert_distribution import (
     ExpertDistributionRecorder,
     get_global_expert_distribution_recorder,
@@ -310,6 +311,15 @@ def select_experts(
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
 ):
     n_share_experts_fusion = global_server_args_dict["n_share_experts_fusion"]
+
+    router_logits, correction_bias = (
+        expert_location_dispatch.transform_select_experts_inputs(
+            router_logits=router_logits,
+            correction_bias=correction_bias,
+            info=expert_location_dispatch_info,
+        )
+    )
+
     # DeepSeek V2/V3/R1 series models use grouped_top_k
     if use_grouped_topk:
         assert topk_group is not None
