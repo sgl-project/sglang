@@ -93,7 +93,7 @@ class SamplingBatchInfo:
                 [
                     (
                         r.sampling_params.thinking_budget
-                        if r.samping_params.thinking_budget is not None
+                        if r.sampling_params.thinking_budget is not None
                         else -1
                     )
                     for r in reqs
