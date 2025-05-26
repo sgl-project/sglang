@@ -68,16 +68,18 @@ impl LBState {
     async fn route_one(
         &self,
         engine_info: EngineInfo,
+        method: &str,
         api_path: &str,
         request: serde_json::Value,
         stream: bool,
     ) -> Result<HttpResponse, actix_web::Error> {
         let url = engine_info.api_path(api_path);
-        let resp = self
-            .client
-            .post(&url)
-            .json(&request)
-            .send()
+        let task = match method {
+            "POST" => self.client.post(&url).json(&request).send(),
+            "GET" => self.client.get(&url).send(),
+            _ => panic!("Unsupported method: {}", method),
+        };
+        let resp = task
             .await
             .map_err(|e| actix_web::error::ErrorBadGateway(e))?;
 
@@ -157,8 +159,20 @@ impl LBState {
         let (prefill, decode) = self.strategy_lb.select_pair(&self.client).await;
         let stream = json.get("stream").is_some() && json["stream"] == true;
         let modified_json = LBState::modify_request(&json, &prefill);
-        let prefill_task = self.route_one(prefill.clone(), api_path, modified_json.clone(), false);
-        let decode_task = self.route_one(decode.clone(), api_path, modified_json.clone(), stream);
+        let prefill_task = self.route_one(
+            prefill.clone(),
+            "POST",
+            api_path,
+            modified_json.clone(),
+            false,
+        );
+        let decode_task = self.route_one(
+            decode.clone(),
+            "POST",
+            api_path,
+            modified_json.clone(),
+            stream,
+        );
         let (_, decode_response) = tokio::join!(prefill_task, decode_task);
         decode_response
     }
@@ -252,14 +266,21 @@ pub async fn flush_cache(_req: HttpRequest, app_state: web::Data<LBState>) -> Ht
 }
 
 #[get("/get_model_info")]
-pub async fn get_model_info(_req: HttpRequest, app_state: web::Data<LBState>) -> HttpResponse {
-    // only first server is used
-    let engines = app_state.strategy_lb.get_all_servers().clone()[..1].to_vec();
-    let mut resp = app_state
-        .route_collect(engines, "GET", "/get_model_info", serde_json::Value::Null)
-        .await;
-    let resp = resp.pop().unwrap();
-    HttpResponse::Ok().json(resp.unwrap().json::<serde_json::Value>().await.unwrap())
+pub async fn get_model_info(
+    _req: HttpRequest,
+    app_state: web::Data<LBState>,
+) -> Result<HttpResponse, actix_web::Error> {
+    // Return the first server's model info
+    let engine = app_state.strategy_lb.get_one_server();
+    app_state
+        .route_one(
+            engine,
+            "GET",
+            "/get_model_info",
+            serde_json::Value::Null,
+            false,
+        )
+        .await
 }
 
 #[post("/generate")]

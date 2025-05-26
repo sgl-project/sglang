@@ -90,6 +90,12 @@ impl StrategyLB {
         }
     }
 
+    pub fn get_one_server(&self) -> EngineInfo {
+        assert!(self.prefill_servers.len() > 0);
+        assert!(self.decode_servers.len() > 0);
+        self.prefill_servers[0].clone()
+    }
+
     pub fn get_all_servers(&self) -> Vec<EngineInfo> {
         let mut all_servers = Vec::new();
         all_servers.extend(self.prefill_servers.clone());
