@@ -376,9 +376,20 @@ class MooncakeKVManager(BaseKVManager):
                             chunked_dst_kv_indice = req.dst_kv_indices[
                                 kv_chunk.index_slice
                             ]
-                            assert len(chunked_dst_kv_indice) == len(
+
+                            # NOTE: This is temporarily a workaround to deal with the case where the prefill_kv_indices
+                            # is mismatched with the dst_kv_indices when page size > 1, this should never happen.
+                            if len(chunked_dst_kv_indice) < len(
                                 kv_chunk.prefill_kv_indices
-                            ), f"len(chunked_dst_kv_indice) = {len(chunked_dst_kv_indice)}, len(kv_chunk.prefill_kv_indices) = {len(kv_chunk.prefill_kv_indices)}"
+                            ):
+                                kv_chunk.prefill_kv_indices = (
+                                    kv_chunk.prefill_kv_indices[
+                                        len(chunked_dst_kv_indice)
+                                    ]
+                                )
+                                logger.warning(
+                                    f"len(chunked_dst_kv_indice) = {len(chunked_dst_kv_indice)}, len(kv_chunk.prefill_kv_indices) = {len(kv_chunk.prefill_kv_indices)}"
+                                )
 
                             ret = self.send_kvcache(
                                 req.mooncake_session_id,
