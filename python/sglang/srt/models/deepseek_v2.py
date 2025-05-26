@@ -96,6 +96,7 @@ from sglang.srt.utils import (
     get_int_env_var,
     is_cuda,
     is_hip,
+    is_non_idle_and_non_empty,
     log_info_on_rank0,
 )
 
@@ -205,14 +206,6 @@ class MoEGate(nn.Module):
     def forward(self, hidden_states):
         logits = F.linear(hidden_states, self.weight, None)
         return logits
-
-
-def is_non_idle_and_non_empty(forward_mode, hidden_states):
-    return (
-        (forward_mode is not None)
-        and not forward_mode.is_idle()
-        and hidden_states.shape[0] > 0
-    )
 
 
 class DeepseekV2MoE(nn.Module):
@@ -368,6 +361,9 @@ class DeepseekV2MoE(nn.Module):
                 correction_bias=self.correction_bias,
                 routed_scaling_factor=self.routed_scaling_factor,
                 num_token_non_padded=forward_batch.num_token_non_padded,
+                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                    layer_id=self.layer_id,
+                ),
             )
         else:
             topk_idx = torch.full(

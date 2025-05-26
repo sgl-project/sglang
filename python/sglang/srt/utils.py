@@ -44,6 +44,7 @@ from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
 from importlib.util import find_spec
 from io import BytesIO
+from json import JSONDecodeError
 from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
 from typing import (
@@ -2023,6 +2024,14 @@ class DeepEPMode(Enum):
             return DeepEPMode.low_latency
         else:
             return DeepEPMode.normal
+
+
+def is_non_idle_and_non_empty(forward_mode, hidden_states):
+    return (
+        (forward_mode is not None)
+        and not forward_mode.is_idle()
+        and hidden_states.shape[0] > 0
+    )
 
 
 def fast_topk(values, topk, dim):
