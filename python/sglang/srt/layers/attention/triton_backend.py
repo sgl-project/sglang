@@ -294,7 +294,10 @@ class TritonAttnBackend(AttentionBackend):
                     self.req_to_token.stride(0),
                 )
                 # Sliding window
-                if self.sliding_window_size > 0:
+                if (
+                    self.sliding_window_size is not None
+                    and self.sliding_window_size > 0
+                ):
                     window_kv_indptr, window_kv_indices, window_kv_lens = (
                         update_sliding_window_buffer(
                             self.window_kv_indptr,
@@ -405,7 +408,7 @@ class TritonAttnBackend(AttentionBackend):
                 self.req_to_token.stride(0),
             )
             # Sliding window
-            if self.sliding_window_size > 0:
+            if self.sliding_window_size is not None and self.sliding_window_size > 0:
                 window_kv_indptr, window_kv_indices, _ = update_sliding_window_buffer(
                     self.window_kv_indptr,
                     self.req_to_token,
@@ -499,8 +502,8 @@ class TritonAttnBackend(AttentionBackend):
     ):
         assert encoder_lens is None, "Not supported"
         window_kv_indptr = self.window_kv_indptr
-        window_kv_indices = self.cuda_graph_window_kv_indices
-        window_num_kv_splits = self.cuda_graph_window_num_kv_splits
+        window_kv_indices = None
+        window_num_kv_splits = None
 
         if forward_mode.is_decode_or_idle():
             if spec_info is None:
@@ -517,7 +520,12 @@ class TritonAttnBackend(AttentionBackend):
                     kv_indices,
                     self.req_to_token.stride(0),
                 )
-                if self.sliding_window_size > 0:
+                if (
+                    self.sliding_window_size is not None
+                    and self.sliding_window_size > 0
+                ):
+                    window_kv_indices = self.cuda_graph_window_kv_indices
+                    window_num_kv_splits = self.cuda_graph_window_num_kv_splits
                     window_kv_indptr, _ = update_sliding_window_buffer_cuda_graph(
                         self.window_kv_indptr,
                         window_kv_indices,
@@ -534,7 +542,6 @@ class TritonAttnBackend(AttentionBackend):
             attn_lse = self.cuda_graph_attn_lse
             max_extend_len = None
             num_kv_splits = self.cuda_graph_num_kv_splits
-            window_num_kv_splits = self.cuda_graph_window_num_kv_splits
             qo_indptr = None
             custom_mask = None
             mask_indptr = None
@@ -605,8 +612,6 @@ class TritonAttnBackend(AttentionBackend):
             kv_indptr = self.kv_indptr
             kv_indices = self.cuda_graph_kv_indices
             num_kv_splits = self.cuda_graph_num_kv_splits
-            window_num_kv_splits = self.cuda_graph_window_num_kv_splits
-            window_kv_indices = self.cuda_graph_window_kv_indices
             if spec_info is None:
                 kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens[:bs], dim=0)
                 kv_indptr = kv_indptr[: bs + 1]
@@ -620,7 +625,12 @@ class TritonAttnBackend(AttentionBackend):
                     self.req_to_token.stride(0),
                 )
                 num_token = bs
-                if self.sliding_window_size > 0:
+                if (
+                    self.sliding_window_size is not None
+                    and self.sliding_window_size > 0
+                ):
+                    window_num_kv_splits = self.cuda_graph_window_num_kv_splits
+                    window_kv_indices = self.cuda_graph_window_kv_indices
                     _, window_kv_lens = update_sliding_window_buffer_cuda_graph(
                         self.window_kv_indptr,
                         window_kv_indices,
