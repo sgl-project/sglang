@@ -494,7 +494,7 @@ def get_tokenizer(
 
 def get_dataset(args, tokenizer):
     if args.dataset_name == "sharegpt":
-        assert args.tokenize_prompt
+        assert not args.tokenize_prompt
         input_requests = sample_sharegpt_requests(
             dataset_path=args.dataset_path,
             num_requests=args.num_prompts,
@@ -516,7 +516,7 @@ def get_dataset(args, tokenizer):
             return_text=not args.tokenize_prompt,
         )
     elif args.dataset_name == "generated-shared-prefix":
-        assert args.tokenize_prompt
+        assert not args.tokenize_prompt
         input_requests = sample_generated_shared_prefix_requests(
             num_groups=args.gsp_num_groups,
             prompts_per_group=args.gsp_prompts_per_group,
@@ -527,7 +527,7 @@ def get_dataset(args, tokenizer):
             args=args,
         )
     elif args.dataset_name == "mmmu":
-        assert args.tokenize_prompt
+        assert not args.tokenize_prompt
         input_requests = sample_mmmu_requests(
             num_requests=args.num_prompts,
             tokenizer=tokenizer,
@@ -1500,6 +1500,9 @@ def run_benchmark(args_: argparse.Namespace):
 
     if not hasattr(args, "output_details"):
         args.output_details = False
+
+    if not hasattr(args, "tokenize_prompt"):
+        args.tokenize_prompt = False
 
     print(f"benchmark_args={args}")
 
