@@ -18,9 +18,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import (
-    Optional,
-)
+from typing import Optional
 
 import torch
 from torch import nn
@@ -28,12 +26,10 @@ from transformers import PretrainedConfig
 
 from sglang.srt.layers.activation import get_act_fn
 from sglang.srt.layers.attention.vision import VisionAttention
-from sglang.srt.layers.linear import (
-    ColumnParallelLinear,
-    RowParallelLinear,
-)
+from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.utils import add_prefix
+
 
 class Idefics2VisionMLP(nn.Module):
 

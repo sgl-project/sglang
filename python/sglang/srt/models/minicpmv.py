@@ -42,9 +42,7 @@ from torch import nn
 from torch.nn.init import trunc_normal_
 from transformers import PretrainedConfig
 
-from sglang.srt.layers.linear import (
-    ReplicatedLinear,
-)
+from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
@@ -55,9 +53,9 @@ from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInp
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.idefics2 import Idefics2VisionTransformer
 from sglang.srt.models.qwen2 import Qwen2Config, Qwen2ForCausalLM
 from sglang.srt.utils import add_prefix, flatten_nested_list
-from sglang.srt.models.idefics2 import Idefics2VisionTransformer
 
 RawImageType = Union[Image.Image, torch.Tensor]
 
@@ -142,6 +140,7 @@ def get_2d_sincos_pos_embed(
     else:
         pos_embed = get_2d_sincos_pos_embed_from_grid(embed_dim, grid, version)
     return pos_embed
+
 
 class MiniCPMVImagePixelInputs(TypedDict):
     type: Literal["pixel_values"]
