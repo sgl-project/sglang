@@ -356,7 +356,7 @@ def model_forward_maybe_tbo(
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         hidden_states: torch.Tensor,
-        input_scatter_mode: ScatterMode,
+        input_data_scatter_mode: ScatterMode,
         residual: Optional[torch.Tensor],
         zero_allocator: Optional[BumpAllocator] = None,
 ):
@@ -367,20 +367,26 @@ def model_forward_maybe_tbo(
         residual=residual,
         **(dict(zero_allocator=zero_allocator) if zero_allocator is not None else {}),
     )
+    layer_input_scatter_mode = layers[0].layer_scatter_modes.layer_input_mode
     operations_strategy = OperationsStrategy.init_new_tbo(
         layers, forward_batch.global_forward_mode
     )
     if enable_tbo:
-        return _model_forward_tbo(inputs, operations_strategy, input_scatter_mode)
+        return _model_forward_tbo(inputs, operations_strategy, input_data_scatter_mode, layer_input_scatter_mode)
     else:
         return _model_forward_non_tbo(inputs, operations_strategy)
 
 
-def _model_forward_tbo(inputs, operations_strategy: OperationsStrategy, input_scatter_mode: ScatterMode):
+def _model_forward_tbo(inputs, operations_strategy: OperationsStrategy, input_data_scatter_mode: ScatterMode,
+                       layer_input_scatter_mode: ScatterMode):
     # The attn_tp_size!=1 case is not yet extracted to master
     assert get_attention_tp_size() == 1
 
-    inputs_arr = _model_forward_tbo_split_inputs(**inputs, input_scatter_mode=input_scatter_mode)
+    inputs_arr = _model_forward_tbo_split_inputs(
+        **inputs,
+        input_data_scatter_mode=input_data_scatter_mode,
+        layer_input_scatter_mode=layer_input_scatter_mode,
+    )
     del inputs
 
     with configure_deep_gemm_num_sms(operations_strategy.deep_gemm_num_sms):
@@ -401,14 +407,15 @@ def _model_forward_non_tbo(inputs, operations_strategy: OperationsStrategy):
 def _model_forward_tbo_split_inputs(
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
-        input_scatter_mode: ScatterMode,
+        input_data_scatter_mode: ScatterMode,
+        layer_input_scatter_mode: ScatterMode,
         **kwargs,
 ) -> List[Dict]:
     intermediate_mode = ScatterMode.TP_ATTN_FULL
     context = CommunicateContext.init_new()
 
     hidden_states, residual = CommunicateSimpleFn.execute(
-        input_mode=input_scatter_mode,
+        input_mode=input_data_scatter_mode,
         output_mode=intermediate_mode,
         hidden_states=hidden_states,
         forward_batch=residual,
@@ -423,7 +430,7 @@ def _model_forward_tbo_split_inputs(
         hidden_states, residual = CommunicateSummableTensorPairFn.execute(
             hidden_states_input_mode=intermediate_mode,
             residual_input_mode=intermediate_mode,
-            output_mode=TODO,
+            output_mode=layer_input_scatter_mode,
             hidden_states=hidden_states,
             residual=residual,
             forward_batch=forward_batch,
