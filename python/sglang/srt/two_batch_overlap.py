@@ -356,14 +356,14 @@ def model_forward_maybe_tbo(
     forward_batch: ForwardBatch,
     hidden_states: torch.Tensor,
     residual: Optional[torch.Tensor],
-    zero_allocator: BumpAllocator,
+    zero_allocator: Optional[BumpAllocator] = None,
 ):
     inputs = dict(
         positions=positions,
         hidden_states=hidden_states,
         forward_batch=forward_batch,
         residual=residual,
-        zero_allocator=zero_allocator,
+        **(dict(zero_allocator=zero_allocator) if zero_allocator is not None else {}),
     )
     operations_strategy = OperationsStrategy.init_new_tbo(
         layers, forward_batch.global_forward_mode
@@ -401,7 +401,7 @@ def _model_forward_tbo_split_inputs(
     residual: torch.Tensor,
     positions: torch.Tensor,
     forward_batch: ForwardBatch,
-    zero_allocator: BumpAllocator,
+    zero_allocator: Optional[BumpAllocator] = None,
 ) -> List[Dict]:
     return [
         dict(
@@ -412,7 +412,11 @@ def _model_forward_tbo_split_inputs(
                 output_forward_batch=output_forward_batch,
                 tbo_subbatch_index=tbo_subbatch_index,
             ),
-            zero_allocator=zero_allocator,
+            **(
+                dict(zero_allocator=zero_allocator)
+                if zero_allocator is not None
+                else {}
+            ),
         )
         for tbo_subbatch_index, output_forward_batch in enumerate(
             forward_batch.tbo_children
