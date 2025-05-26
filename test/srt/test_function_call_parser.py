@@ -265,6 +265,118 @@ class TestPythonicDetector(unittest.TestCase):
         self.assertEqual(params["data"], [1, 2, 3])
 
 
+class TestMistralDetector(unittest.TestCase):
+    def setUp(self):
+        """Set up test tools and detector for Mistral format testing."""
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="make_next_step_decision",
+                    description="Test function for decision making",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "decision": {
+                                "type": "string",
+                                "description": "The next step to take",
+                            },
+                            "content": {
+                                "type": "string",
+                                "description": "The content of the next step",
+                            },
+                        },
+                        "required": ["decision", "content"],
+                    },
+                ),
+            ),
+        ]
+        self.detector = MistralDetector()
+
+    def test_detect_and_parse_with_nested_brackets_in_content(self):
+        """Test parsing Mistral format with nested brackets in JSON content.
+
+        This test case specifically addresses the issue where the regex pattern
+        was incorrectly truncating JSON when it contained nested brackets like [City Name].
+        """
+        # This is the exact problematic text from the original test failure
+        test_text = '[TOOL_CALLS] [{"name":"make_next_step_decision", "arguments":{"decision":"","content":"```\\nTOOL: Access a weather API or service\\nOBSERVATION: Retrieve the current weather data for the top 5 populated cities in the US\\nANSWER: The weather in the top 5 populated cities in the US is as follows: [City Name] - [Weather Conditions] - [Temperature]\\n```"}}]'
+
+        result = self.detector.detect_and_parse(test_text, self.tools)
+
+        # Verify that the parsing was successful
+        self.assertEqual(len(result.calls), 1, "Should detect exactly one tool call")
+
+        call = result.calls[0]
+        self.assertEqual(
+            call.name,
+            "make_next_step_decision",
+            "Should detect the correct function name",
+        )
+
+        # Verify that the parameters are valid JSON and contain the expected content
+        params = json.loads(call.parameters)
+        self.assertEqual(
+            params["decision"], "", "Decision parameter should be empty string"
+        )
+
+        # The content should contain the full text including the nested brackets [City Name]
+        expected_content = "```\nTOOL: Access a weather API or service\nOBSERVATION: Retrieve the current weather data for the top 5 populated cities in the US\nANSWER: The weather in the top 5 populated cities in the US is as follows: [City Name] - [Weather Conditions] - [Temperature]\n```"
+        self.assertEqual(
+            params["content"],
+            expected_content,
+            "Content should include nested brackets without truncation",
+        )
+
+        # Verify that normal text is empty (since the entire input is a tool call)
+        self.assertEqual(
+            result.normal_text, "", "Normal text should be empty for pure tool call"
+        )
+
+    def test_detect_and_parse_simple_case(self):
+        """Test parsing a simple Mistral format tool call without nested brackets."""
+        test_text = '[TOOL_CALLS] [{"name":"make_next_step_decision", "arguments":{"decision":"TOOL", "content":"Use weather API"}}]'
+
+        result = self.detector.detect_and_parse(test_text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        call = result.calls[0]
+        self.assertEqual(call.name, "make_next_step_decision")
+
+        params = json.loads(call.parameters)
+        self.assertEqual(params["decision"], "TOOL")
+        self.assertEqual(params["content"], "Use weather API")
+
+    def test_detect_and_parse_no_tool_calls(self):
+        """Test parsing text without any tool calls."""
+        test_text = "This is just normal text without any tool calls."
+
+        result = self.detector.detect_and_parse(test_text, self.tools)
+
+        self.assertEqual(len(result.calls), 0, "Should detect no tool calls")
+        self.assertEqual(
+            result.normal_text,
+            test_text,
+            "Should return the original text as normal text",
+        )
+
+    def test_detect_and_parse_with_text_before_tool_call(self):
+        """Test parsing text that has content before the tool call."""
+        test_text = 'Here is some text before the tool call: [TOOL_CALLS] [{"name":"make_next_step_decision", "arguments":{"decision":"ANSWER", "content":"The answer is 42"}}]'
+
+        result = self.detector.detect_and_parse(test_text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.normal_text, "Here is some text before the tool call:")
+
+        call = result.calls[0]
+        self.assertEqual(call.name, "make_next_step_decision")
+
+        params = json.loads(call.parameters)
+        self.assertEqual(params["decision"], "ANSWER")
+        self.assertEqual(params["content"], "The answer is 42")
+
+
 class TestEBNFGeneration(unittest.TestCase):
     def setUp(self):
         # Create sample tools for testing

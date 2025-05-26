@@ -1,4 +1,4 @@
-prompt = "The capital of taiwan is "
+prompt = "The capital of france is "
 
 import json
 
