@@ -36,9 +36,33 @@ impl LBState {
         prefill_info: &EngineInfo,
     ) -> serde_json::Value {
         let mut modified_request = request.clone();
-        modified_request["bootstrap_host"] = prefill_info.get_hostname().into();
-        modified_request["bootstrap_room"] = rand::random::<u64>().into();
-        modified_request["bootstrap_port"] = prefill_info.boostrap_port.into();
+
+        assert!(request.get("text").is_some() || request.get("input_ids").is_some());
+        let batch_size = if let Some(text) = request.get("text").and_then(|text| text.as_array()) {
+            text.len()
+        } else if let Some(input_ids) = request
+            .get("input_ids")
+            .and_then(|input_ids| input_ids.as_array())
+        {
+            input_ids.len()
+        } else {
+            1
+        };
+
+        if batch_size > 1 {
+            modified_request["bootstrap_host"] =
+                vec![prefill_info.get_hostname(); batch_size].into();
+            modified_request["bootstrap_room"] = (0..batch_size)
+                .map(|_| rand::random::<u64>())
+                .collect::<Vec<_>>()
+                .into();
+            modified_request["bootstrap_port"] =
+                vec![prefill_info.boostrap_port; batch_size].into();
+        } else {
+            modified_request["bootstrap_host"] = prefill_info.get_hostname().into();
+            modified_request["bootstrap_room"] = rand::random::<u64>().into();
+            modified_request["bootstrap_port"] = prefill_info.boostrap_port.into();
+        }
         modified_request
     }
 
