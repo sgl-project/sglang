@@ -70,6 +70,7 @@ impl LBState {
         engine_info: EngineInfo,
         api_path: &str,
         request: serde_json::Value,
+        stream: bool,
     ) -> Result<HttpResponse, actix_web::Error> {
         let url = engine_info.api_path(api_path);
         let resp = self
@@ -80,35 +81,22 @@ impl LBState {
             .await
             .map_err(|e| actix_web::error::ErrorBadGateway(e))?;
 
-        let resp = resp
-            .bytes()
-            .await
-            .map_err(|e| actix_web::error::ErrorBadGateway(e))?;
+        if stream {
+            let resp_stream = resp.bytes_stream().map(|r| {
+                r.map_err(|e| actix_web::error::ErrorBadGateway(e))
+                    .map(Bytes::from)
+            });
+            Ok(HttpResponse::Ok()
+                .content_type("application/octet-stream")
+                .streaming(resp_stream))
+        } else {
+            let resp = resp
+                .bytes()
+                .await
+                .map_err(|e| actix_web::error::ErrorBadGateway(e))?;
 
-        Ok(HttpResponse::Ok().body(resp))
-    }
-
-    async fn route_one_stream(
-        &self,
-        engine_info: EngineInfo,
-        api_path: &str,
-        request: serde_json::Value,
-    ) -> Result<HttpResponse, actix_web::Error> {
-        let url = engine_info.api_path(api_path);
-        let resp = self
-            .client
-            .post(&url)
-            .json(&request)
-            .send()
-            .await
-            .map_err(|e| actix_web::error::ErrorBadGateway(e))?;
-        let resp_stream = resp.bytes_stream().map(|r| {
-            r.map_err(|e| actix_web::error::ErrorBadGateway(e))
-                .map(Bytes::from)
-        });
-        Ok(HttpResponse::Ok()
-            .content_type("application/octet-stream")
-            .streaming(resp_stream))
+            Ok(HttpResponse::Ok().body(resp))
+        }
     }
 
     async fn route_collect(
@@ -163,24 +151,14 @@ impl LBState {
 
     async fn generate(
         &self,
-        prefill: &EngineInfo,
-        decode: &EngineInfo,
-        modified_json: serde_json::Value,
+        api_path: &str,
+        json: serde_json::Value,
     ) -> Result<HttpResponse, actix_web::Error> {
-        let prefill_task = self.route_one(prefill.clone(), "/generate", modified_json.clone());
-        let decode_task = self.route_one(decode.clone(), "/generate", modified_json.clone());
-        let (_, decode_response) = tokio::join!(prefill_task, decode_task);
-        decode_response
-    }
-
-    async fn generate_stream(
-        &self,
-        prefill: &EngineInfo,
-        decode: &EngineInfo,
-        modified_json: serde_json::Value,
-    ) -> Result<HttpResponse, actix_web::Error> {
-        let prefill_task = self.route_one(prefill.clone(), "/generate", modified_json.clone());
-        let decode_task = self.route_one_stream(decode.clone(), "/generate", modified_json.clone());
+        let (prefill, decode) = self.strategy_lb.select_pair(&self.client).await;
+        let stream = json.get("stream").is_some() && json["stream"] == true;
+        let modified_json = LBState::modify_request(&json, &prefill);
+        let prefill_task = self.route_one(prefill.clone(), api_path, modified_json.clone(), false);
+        let decode_task = self.route_one(decode.clone(), api_path, modified_json.clone(), stream);
         let (_, decode_response) = tokio::join!(prefill_task, decode_task);
         decode_response
     }
@@ -290,16 +268,7 @@ pub async fn generate(
     json: web::Json<serde_json::Value>,
     app_state: web::Data<LBState>,
 ) -> Result<HttpResponse, actix_web::Error> {
-    let (prefill, decode) = app_state.strategy_lb.select_pair(&app_state.client).await;
-    let modified_json = LBState::modify_request(&json, &prefill);
-
-    if modified_json.get("stream").is_none() || modified_json["stream"] == false {
-        app_state.generate(&prefill, &decode, modified_json).await
-    } else {
-        app_state
-            .generate_stream(&prefill, &decode, modified_json)
-            .await
-    }
+    app_state.generate("/generate", json.into_inner()).await
 }
 
 #[post("/v1/chat/completions")]
@@ -308,16 +277,9 @@ pub async fn chat_completions(
     json: web::Json<serde_json::Value>,
     app_state: web::Data<LBState>,
 ) -> Result<HttpResponse, actix_web::Error> {
-    let (prefill, decode) = app_state.strategy_lb.select_pair(&app_state.client).await;
-    let modified_json = LBState::modify_request(&json, &prefill);
-
-    if modified_json.get("stream").is_none() || modified_json["stream"] == false {
-        app_state.generate(&prefill, &decode, modified_json).await
-    } else {
-        app_state
-            .generate_stream(&prefill, &decode, modified_json)
-            .await
-    }
+    app_state
+        .generate("/v1/chat/completions", json.into_inner())
+        .await
 }
 
 #[get("/get_server_info")]
