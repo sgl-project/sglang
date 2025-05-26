@@ -209,7 +209,6 @@ class InternVLImageProcessor(BaseMultimodalProcessor):
                 return None
 
         pixel_values = torch.cat(pixel_values, dim=0)
-        items = [MultimodalDataItem(pixel_values=pixel_values, modality=Modality.IMAGE)]
 
         for idx, num_patches in enumerate(num_patches_list):
             image_tokens = (
@@ -220,10 +219,21 @@ class InternVLImageProcessor(BaseMultimodalProcessor):
             input_text = input_text.replace("<image>", image_tokens, 1)
 
         tokenizer = self._processor
+        input_ids = tokenizer(input_text, return_tensors="pt")["input_ids"].flatten()
+        image_offsets = self.get_mm_items_offset(
+            input_ids=input_ids,
+            mm_token_id=self.img_context_token_id,
+        )
+        items = [
+            MultimodalDataItem(
+                pixel_values=pixel_values,
+                modality=Modality.IMAGE,
+                image_offsets=image_offsets,
+            )
+        ]
+
         return {
-            "input_ids": tokenizer(input_text, return_tensors="pt")["input_ids"]
-            .flatten()
-            .tolist(),
+            "input_ids": input_ids.tolist(),
             "mm_items": items,
             "im_start_id": self.img_start_token_id,
             "im_end_id": self.img_end_token_id,
