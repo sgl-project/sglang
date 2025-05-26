@@ -1,7 +1,7 @@
 import re
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional, Set, Tuple, List
+from typing import List, Optional, Set, Tuple
 
 import torch
 
@@ -116,11 +116,12 @@ def get_stacked_names(name: str) -> Tuple[List[str], List[str]]:
         "v_proj": (["qkv_proj"], ["kv_proj"]),
         "gate_proj": (["gate_up_proj"], ["gate_up_proj"]),
         "up_proj": (["gate_up_proj"], ["gate_up_proj"]),
-        "qkv_proj": (["qkv_proj"], ["q_proj", "kv_proj"]), 
+        "qkv_proj": (["qkv_proj"], ["q_proj", "kv_proj"]),
         "gate_up_proj": (["gate_up_proj"], ["gate_up_proj"]),
     }
     stacked = params_mapping.get(name, ([name], [name]))
     return stacked
+
 
 def get_stacked_multiply(module_name: str) -> int:
     """

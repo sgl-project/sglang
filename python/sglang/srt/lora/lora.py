@@ -95,7 +95,9 @@ class LoRAAdapter(nn.Module):
             self.normalize_qkv_proj(weight_names, layer.weights)
             self.normalize_gate_up_proj(weight_names, layer.weights)
 
-    def normalize_qkv_proj(self, weight_names: List[str], weights: Dict[str, torch.Tensor]):
+    def normalize_qkv_proj(
+        self, weight_names: List[str], weights: Dict[str, torch.Tensor]
+    ):
         # Collect target q/k/v modules. This process is necessary since there might be no lora attached to k_proj
         target_module = set()
         for weight_name in weight_names:
@@ -167,7 +169,7 @@ class LoRAAdapter(nn.Module):
                         weights[qkv_name],
                         [
                             head_size * self.base_hf_config.num_attention_heads,
-                            head_size * self.base_hf_config.num_key_value_heads * 2
+                            head_size * self.base_hf_config.num_key_value_heads * 2,
                         ],
                         dim=0,
                     )

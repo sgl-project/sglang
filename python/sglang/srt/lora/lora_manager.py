@@ -268,13 +268,13 @@ class LoRAManager:
         }
 
         for module_name, module in self.base_model.named_modules():
-            
-            # Skip if the base model supports LoRA module name mapping but cannot find 
+
+            # Skip if the base model supports LoRA module name mapping but cannot find
             # the mapped module name.
             #
-            # TODO (lifuhuang): in the future, we should consider generalizing the 
-            # prepare_lora_batch function to support mapping by full module name instead 
-            # of just the last part (e.g., "qkv_proj") to support scenarios with multiple 
+            # TODO (lifuhuang): in the future, we should consider generalizing the
+            # prepare_lora_batch function to support mapping by full module name instead
+            # of just the last part (e.g., "qkv_proj") to support scenarios with multiple
             # attention stacks (e.g., multimodal models).
             if (
                 getattr(self.base_model, "map_lora_module_name", None)
