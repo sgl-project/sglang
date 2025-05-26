@@ -13,22 +13,21 @@ pub struct LBState {
 }
 
 impl LBState {
-    pub fn new(lb_config: LBConfig) -> Self {
+    pub fn new(lb_config: LBConfig) -> anyhow::Result<Self> {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(lb_config.timeout))
-            .build()
-            .expect("Failed to build HTTP client");
+            .build()?;
 
         let lb = StrategyLB::new(
             lb_config.policy,
             lb_config.prefill_infos,
             lb_config.decode_infos,
         );
-        Self {
+        Ok(Self {
             strategy_lb: lb,
             client,
             log_interval: lb_config.log_interval,
-        }
+        })
     }
 
     pub fn modify_request(

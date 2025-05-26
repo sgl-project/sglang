@@ -1,6 +1,6 @@
 pub mod server;
 pub mod strategy_lb;
-use pyo3::prelude::*;
+use pyo3::{exceptions::PyRuntimeError, prelude::*};
 
 use server::{LBConfig, LBState, periodic_logging, startup};
 use tokio::signal;
@@ -35,10 +35,17 @@ impl LoadBalancer {
     }
 
     pub fn start(&self) -> PyResult<()> {
-        let lb_state = LBState::new(self.lb_config.clone());
-        actix_web::rt::System::new().block_on(async move {
+        let lb_state = LBState::new(self.lb_config.clone()).map_err(|e| {
+            PyRuntimeError::new_err(format!("Failed to build load balancer: {}", e))
+        })?;
+
+        let ret: PyResult<()> = actix_web::rt::System::new().block_on(async move {
             tokio::spawn(periodic_logging(lb_state.clone()));
-            startup(self.lb_config.clone(), lb_state).await.unwrap();
+            startup(self.lb_config.clone(), lb_state)
+                .await
+                .map_err(|e| {
+                    PyRuntimeError::new_err(format!("Failed to start LB server: {}", e))
+                })?;
 
             tokio::select! {
                 _ = signal::ctrl_c() => {
@@ -47,7 +54,7 @@ impl LoadBalancer {
                 }
             }
         });
-        Ok(())
+        ret
     }
 }
 

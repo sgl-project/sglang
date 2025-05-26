@@ -1,7 +1,7 @@
 mod server;
 mod strategy_lb;
 
-fn main() {
+fn main() -> anyhow::Result<()> {
     // test code
     let prefill_infos = (0..8)
         .map(|i| (format!("123.123.123.123:{}", i), None))
@@ -20,9 +20,10 @@ fn main() {
         log_interval: 5,
         timeout: 600,
     };
-    let lb_state = server::LBState::new(lb_config.clone());
+    let lb_state = server::LBState::new(lb_config.clone()).map_err(|e| anyhow::anyhow!(e))?;
     actix_web::rt::System::new().block_on(async move {
         tokio::spawn(server::periodic_logging(lb_state.clone()));
         server::startup(lb_config.clone(), lb_state).await.unwrap();
     });
+    Ok(())
 }
