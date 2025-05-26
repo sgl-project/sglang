@@ -5,7 +5,7 @@ import multiprocessing as mp
 import os
 import re
 from abc import ABC, abstractmethod
-from typing import List, Optional, Tuple, Union
+from typing import Any, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -382,3 +382,17 @@ class BaseMultimodalProcessor(ABC):
                 "Unsupported: mixture of multimodal inputs where some but not all are preprocessed."
             )
         return ret
+
+    @staticmethod
+    def _extract_processor_features(
+        items: List[Any], attr_name: str
+    ) -> Optional[torch.Tensor]:
+        """
+        Helper function to concat extracted attributes from processor output.
+        """
+        values = [
+            getattr(item, attr_name)
+            for item in items
+            if getattr(item, attr_name) is not None
+        ]
+        return torch.concat(values) if values else None
