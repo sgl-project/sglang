@@ -66,11 +66,9 @@ class KimiVLImageProcessor(SGLangBaseProcessor):
             image_grid_thws = self._extract_processor_features(
                 base_output.images, "image_grid_thws"
             )
-
             precomputed_features = self._extract_processor_features(
                 base_output.images, "precomputed_features"
             )
-
             pixel_values = self._extract_processor_features(
                 base_output.images, "pixel_values"
             )
@@ -93,19 +91,3 @@ class KimiVLImageProcessor(SGLangBaseProcessor):
             ],
             "im_token_id": self.im_token_id,
         }
-
-    @staticmethod
-    def _extract_processor_features(
-        items: List[Any], attr_name: str
-    ) -> Optional[torch.Tensor]:
-        """
-        Helper function to concat extracted attributes from processor output.
-
-        TODO (lifuhuang): add it to base class to simplify feature extraction?
-        """
-        values = [
-            getattr(item, attr_name)
-            for item in items
-            if getattr(item, attr_name) is not None
-        ]
-        return torch.concat(values) if values else None
