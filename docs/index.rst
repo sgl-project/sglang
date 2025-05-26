@@ -83,4 +83,4 @@ The core features include:
       references/hardware
       references/advanced_deploy
       references/performance_analysis_and_optimization
-      developer/developer.rst
+      developer/developer
