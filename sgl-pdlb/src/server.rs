@@ -252,16 +252,13 @@ pub async fn flush_cache(_req: HttpRequest, app_state: web::Data<LBState>) -> Ht
 
 #[get("/get_model_info")]
 pub async fn get_model_info(_req: HttpRequest, app_state: web::Data<LBState>) -> HttpResponse {
-    let model_infos = app_state
-        .route_collect_json(
-            app_state.strategy_lb.get_all_servers(),
-            "GET",
-            "/get_model_info",
-            serde_json::Value::Null,
-            false,
-        )
+    // only first server is used
+    let engines = app_state.strategy_lb.get_all_servers().clone()[..1].to_vec();
+    let mut resp = app_state
+        .route_collect(engines, "GET", "/get_model_info", serde_json::Value::Null)
         .await;
-    HttpResponse::Ok().json(model_infos)
+    let resp = resp.pop().unwrap();
+    HttpResponse::Ok().json(resp.unwrap().json::<serde_json::Value>().await.unwrap())
 }
 
 #[post("/generate")]
