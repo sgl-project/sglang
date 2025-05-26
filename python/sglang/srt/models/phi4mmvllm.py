@@ -378,6 +378,10 @@ class Phi4MMForCausalLM(nn.Module):
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
 
+    lora_pattern = re.compile(
+        r"^language_model\.model\.layers\.(\d+)\.(?:self_attn|mlp)\.(?:qkv_proj|o_proj|down_proj|gate_up_proj)"
+    )
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -432,15 +436,8 @@ class Phi4MMForCausalLM(nn.Module):
         pattern = MultiModalityDataPaddingPatternMultimodalTokens([im_token_id])
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
-    def map_lora_module_name(self, module_name: str) -> Optional[str]:
-        pattern = re.compile(
-            r"^language_model\.model\.layers\.(\d+)\.(?:self_attn|mlp)\.(?:qkv_proj|o_proj|down_proj|gate_up_proj)"
-        )
-        if pattern.match(module_name):
-            return module_name.replace("language_model.", "base_model.model.")
-        else:
-            # Only support LoRA modules in language model for now.
-            return None
+    def should_apply_lora(self, module_name: str) -> Optional[str]:
+        return self.lora_pattern.match(module_name)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

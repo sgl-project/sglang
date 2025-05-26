@@ -108,7 +108,7 @@ class LoRAAdapter(nn.Module):
             if "v_proj" in weight_name:
                 target_module.add("v_proj")
             if "qkv_proj" in weight_name:
-                target_module.add("v_proj")
+                target_module.add("qkv_proj")
         if len(target_module) == 0:
             return
 
@@ -211,3 +211,4 @@ class LoRAAdapter(nn.Module):
                 up_name = weight_name.replace("gate_up_proj", "up_proj")
                 if "lora_A" in weight_name:
                     weights[gate_up_name] = weights[gate_up_name].repeat(2, 1)
+                # else: "lora_B" is already stacked, no operations is needed.

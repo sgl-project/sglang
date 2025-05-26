@@ -32,7 +32,7 @@ from sglang.srt.lora.utils import (
     LoRAType,
     get_customized_names_from_hf_names,
     get_layer_id,
-    get_stacked_names,
+    get_normalized_lora_weight_names,
     get_weight_name,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -104,7 +104,7 @@ class LoRAManager:
         weights_A: List[str] = []
         weights_B: List[str] = []
         for module in self.hf_target_names:
-            lora_A, lora_B = get_stacked_names(module)
+            lora_A, lora_B = get_normalized_lora_weight_names(module)
             weights_A += lora_A
             weights_B += lora_B
         self.lora_weight_names: Tuple[Set[str]] = set(weights_A), set(weights_B)
@@ -268,18 +268,14 @@ class LoRAManager:
         }
 
         for module_name, module in self.base_model.named_modules():
-
-            # Skip if the base model supports LoRA module name mapping but cannot find
-            # the mapped module name.
-            #
             # TODO (lifuhuang): in the future, we should consider generalizing the
-            # prepare_lora_batch function to support mapping by full module name instead
+            # should_apply_lora function to support mapping by full module name instead
             # of just the last part (e.g., "qkv_proj") to support scenarios with multiple
             # attention stacks (e.g., multimodal models).
-            if (
-                getattr(self.base_model, "map_lora_module_name", None)
-                and self.base_model.map_lora_module_name(module_name) is None
-            ):
+            # See: https://github.com/sgl-project/sglang/issues/6608
+            if getattr(
+                self.base_model, "should_apply_lora", None
+            ) and not self.base_model.should_apply_lora(module_name):
                 continue
 
             # The module should be converted if it is included in target_names
