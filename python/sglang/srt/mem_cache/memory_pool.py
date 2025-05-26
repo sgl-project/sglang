@@ -552,7 +552,7 @@ class MLATokenToKVPool(KVCache):
 
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
-        self.v_head_dim = self.qk_rope_head_dim
+        self.v_head_dim = self.kv_lora_rank
 
         with self.memory_saver_adapter.region():
             # The padded slot 0 is used for writing dummy outputs from padded tokens.
