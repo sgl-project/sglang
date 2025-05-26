@@ -88,7 +88,7 @@ srt_hpu = ["sglang[runtime_common]", "outlines>=0.0.44,<=0.1.11"]
 # CPU: currently, there are no pre-built vllm wheels for CPU.
 # To install vllm for CPU, please follow the instruction here:
 # https://docs.vllm.ai/en/latest/getting_started/installation/cpu/index.html
-srt_cpu = ["sglang[runtime_common]", "outlines>=0.0.44,<=0.1.11", "torch"]
+srt_cpu = ["sglang[runtime_common]", "outlines>=0.0.44,<=0.1.11", "torch", "einops"]
 # https://vllm-ascend.readthedocs.io/en/latest/installation.html
 srt_npu = ["sglang[runtime_common]", "outlines>=0.0.44,<=0.1.11"]
 
