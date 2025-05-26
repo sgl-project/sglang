@@ -781,7 +781,7 @@ def w8a8_block_fp8_matmul_deepgemm(
 ) -> torch.Tensor:
     M, N, K, C = prepare_block_fp8_matmul_inputs(A, B, As, Bs, block_size)
 
-    # deepgemm only support bf16
+    # Deepgemm only supports output tensor type as bfloat16
     assert C.dtype == torch.bfloat16 and _ENABLE_JIT_DEEPGEMM
 
     if supports_custom_op():
