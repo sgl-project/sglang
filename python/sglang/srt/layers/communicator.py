@@ -136,13 +136,13 @@ class LayerCommunicator:
         self.post_attention_layernorm = post_attention_layernorm
 
         self._context = CommunicateContext.init_new()
-        self._communicate_simple_fn = _CommunicateSimpleFn.get_fn(
+        self._communicate_simple_fn = CommunicateSimpleFn.get_fn(
             input_mode=self.layer_scatter_modes.layer_input_mode,
             output_mode=self.layer_scatter_modes.attn_mode,
             context=self._context,
         )
         self._communicate_with_all_reduce_and_layer_norm_fn = (
-            _CommunicateWithAllReduceAndLayerNormFn.get_fn(
+            CommunicateWithAllReduceAndLayerNormFn.get_fn(
                 hidden_states_input_mode=self.layer_scatter_modes.attn_mode,
                 residual_input_mode=self.layer_scatter_modes.layer_input_mode,
                 hidden_states_output_mode=self.layer_scatter_modes.mlp_mode,
@@ -151,7 +151,7 @@ class LayerCommunicator:
             )
         )
         self._communicate_summable_tensor_pair_fn = (
-            _CommunicateSummableTensorPairFn.get_fn(
+            CommunicateSummableTensorPairFn.get_fn(
                 hidden_states_input_mode=self.layer_scatter_modes.mlp_mode,
                 residual_input_mode=self.layer_scatter_modes.middle_residual_mode,
                 output_mode=self.layer_scatter_modes.layer_output_mode,
@@ -241,7 +241,7 @@ class CommunicateContext:
         )
 
 
-class _CommunicateSimpleFn:
+class CommunicateSimpleFn:
     @staticmethod
     def get_fn(
         input_mode: ScatterMode,
@@ -249,12 +249,12 @@ class _CommunicateSimpleFn:
         context: CommunicateContext,
     ):
         if context.is_same_group_size(input_mode, output_mode):
-            return _CommunicateSimpleFn._trivial
+            return CommunicateSimpleFn._trivial
 
         if (input_mode == ScatterMode.SCATTERED) and (
             output_mode == ScatterMode.TP_ATTN_FULL
         ):
-            return _CommunicateSimpleFn._scattered_to_tp_attn_full
+            return CommunicateSimpleFn._scattered_to_tp_attn_full
 
         raise NotImplementedError(f"{input_mode=} {output_mode=}")
 
@@ -283,7 +283,7 @@ class _CommunicateSimpleFn:
         return hidden_states
 
 
-class _CommunicateWithAllReduceAndLayerNormFn:
+class CommunicateWithAllReduceAndLayerNormFn:
     """Besides communication, needs to
     1. All reduce in tp_attn_group on hidden_states
     2. Apply layer norm
@@ -305,7 +305,7 @@ class _CommunicateWithAllReduceAndLayerNormFn:
             and context.is_same_group_size(residual_input_mode, residual_output_mode)
             and context.attn_tp_size == 1
         ):
-            return _CommunicateWithAllReduceAndLayerNormFn._simple
+            return CommunicateWithAllReduceAndLayerNormFn._simple
 
         if (
             (hidden_states_input_mode == ScatterMode.TP_ATTN_FULL)
@@ -313,7 +313,7 @@ class _CommunicateWithAllReduceAndLayerNormFn:
             and (hidden_states_output_mode == ScatterMode.FULL)
             and (residual_output_mode == ScatterMode.TP_ATTN_FULL)
         ):
-            return _CommunicateWithAllReduceAndLayerNormFn._gather_hidden_states
+            return CommunicateWithAllReduceAndLayerNormFn._gather_hidden_states
 
         if (
             (hidden_states_input_mode == ScatterMode.TP_ATTN_FULL)
@@ -324,7 +324,7 @@ class _CommunicateWithAllReduceAndLayerNormFn:
             and (residual_output_mode == ScatterMode.SCATTERED)
         ):
             return partial(
-                _CommunicateWithAllReduceAndLayerNormFn._scatter_hidden_states_and_residual,
+                CommunicateWithAllReduceAndLayerNormFn._scatter_hidden_states_and_residual,
                 residual_input_mode=residual_input_mode,
             )
 
@@ -389,7 +389,7 @@ class _CommunicateWithAllReduceAndLayerNormFn:
         return hidden_states, residual
 
 
-class _CommunicateSummableTensorPairFn:
+class CommunicateSummableTensorPairFn:
 
     @staticmethod
     def get_fn(
@@ -403,21 +403,21 @@ class _CommunicateSummableTensorPairFn:
         if context.is_same_group_size(
             hidden_states_input_mode, output_mode
         ) and context.is_same_group_size(residual_input_mode, output_mode):
-            return _CommunicateSummableTensorPairFn._trivial
+            return CommunicateSummableTensorPairFn._trivial
 
         if (
             (hidden_states_input_mode == ScatterMode.FULL)
             and (residual_input_mode == ScatterMode.TP_ATTN_FULL)
             and (output_mode == ScatterMode.TP_ATTN_FULL)
         ):
-            return _CommunicateSummableTensorPairFn._scatter_hidden_states
+            return CommunicateSummableTensorPairFn._scatter_hidden_states
 
         if (
             (hidden_states_input_mode == ScatterMode.SCATTERED)
             and (residual_input_mode == ScatterMode.SCATTERED)
             and (output_mode == ScatterMode.TP_ATTN_FULL)
         ):
-            return _CommunicateSummableTensorPairFn._gather
+            return CommunicateSummableTensorPairFn._gather
 
         raise NotImplementedError(
             f"{hidden_states_input_mode=} {residual_input_mode=} {output_mode=}"
