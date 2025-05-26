@@ -243,13 +243,7 @@ class CommunicateContext:
 
 class CommunicateSimpleFn:
     @classmethod
-    def execute(
-        cls,
-        input_mode: ScatterMode,
-        output_mode: ScatterMode,
-        context: CommunicateContext,
-        **kwargs,
-    ):
+    def execute(cls, input_mode, output_mode, context, **kwargs):
         return cls.get_fn(input_mode=input_mode, output_mode=output_mode, context=context)(context=context, **kwargs)
 
     @staticmethod
@@ -400,6 +394,11 @@ class CommunicateWithAllReduceAndLayerNormFn:
 
 
 class CommunicateSummableTensorPairFn:
+    @classmethod
+    def execute(cls, hidden_states_input_mode, residual_input_mode, output_mode, context, **kwargs):
+        return cls.get_fn(
+            hidden_states_input_mode=hidden_states_input_mode, residual_input_mode=residual_input_mode,
+            output_mode=output_mode, context=context)(context=context, **kwargs)
 
     @staticmethod
     def get_fn(
