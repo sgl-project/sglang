@@ -3,28 +3,8 @@ name: Lint
 on:
   push:
     branches: [ main ]
-    paths:
-      - "python/**"
-      - "scripts/**"
-      - "test/**"
-      - ".github/workflows/pr-test.yml"
   pull_request:
     branches: [ main ]
-    paths:
-      - "python/**"
-      - "scripts/**"
-      - "test/**"
-      - ".github/workflows/pr-test.yml"
-  workflow_dispatch:
-    inputs:
-      version:
-        description: "FlashInfer version"
-        required: true
-        type: choice
-        default: 'release'
-        options:
-          - 'release'
-          - 'nightly'
 
 jobs:
   lint:
