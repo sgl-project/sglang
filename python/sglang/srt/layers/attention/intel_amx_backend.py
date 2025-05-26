@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 
 class IntelAMXAttnBackend(AttentionBackend):
     def __init__(self, model_runner: ModelRunner):
-        from sgl_kernel.cpu import decode_attention, extend_attention
+        import sgl_kernel
 
         super().__init__()
         self.forward_metadata = None
@@ -26,8 +26,8 @@ class IntelAMXAttnBackend(AttentionBackend):
 
         self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[-1]
 
-        self.decode_attention_fwd = decode_attention
-        self.extend_attention_fwd = extend_attention
+        self.decode_attention_fwd = torch.ops.sgl_kernel.decode_attention_cpu
+        self.extend_attention_fwd = torch.ops.sgl_kernel.extend_attention_cpu
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
@@ -114,10 +114,10 @@ class IntelAMXAttnBackend(AttentionBackend):
             k,
             v,
             forward_batch.out_cache_loc,
+            attn_logits,
             forward_batch.req_to_token_pool.req_to_token,
             forward_batch.req_pool_indices,
             forward_batch.seq_lens,
-            attn_logits,
             layer.scaling,
             layer.logit_cap,
         )
