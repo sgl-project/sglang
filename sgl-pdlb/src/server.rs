@@ -1,9 +1,35 @@
 use crate::strategy_lb::{EngineInfo, StrategyLB};
 use actix_web::{HttpRequest, HttpResponse, HttpServer, get, post, web};
 use bytes::Bytes;
-use futures::{StreamExt, future::join_all};
+use futures::{Stream, StreamExt, future::join_all};
+use reqwest::StatusCode;
 use serde_json::json;
-use std::io::Write;
+use std::{io::Write, pin::Pin};
+
+pub enum ProxyResponseType {
+    Full(Bytes),
+    Stream(Pin<Box<dyn Stream<Item = Result<Bytes, actix_web::Error>> + Send>>),
+}
+
+pub struct ProxyResponse {
+    pub status: StatusCode,
+    pub body: ProxyResponseType,
+}
+
+impl Into<Result<HttpResponse, actix_web::Error>> for ProxyResponse {
+    fn into(self) -> Result<HttpResponse, actix_web::Error> {
+        let status = actix_web::http::StatusCode::from_u16(self.status.as_u16()).map_err(|e| {
+            actix_web::error::ErrorBadGateway(format!("Invalid status code: {}", e))
+        })?;
+        match self.body {
+            ProxyResponseType::Full(body) => Ok(HttpResponse::Ok().status(status).body(body)),
+            ProxyResponseType::Stream(body) => Ok(HttpResponse::Ok()
+                .status(status)
+                .content_type("application/octet-stream")
+                .streaming(body)),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct LBState {
@@ -72,7 +98,7 @@ impl LBState {
         api_path: &str,
         request: serde_json::Value,
         stream: bool,
-    ) -> Result<HttpResponse, actix_web::Error> {
+    ) -> Result<ProxyResponse, actix_web::Error> {
         let url = engine_info.api_path(api_path);
         let task = match method {
             "POST" => self.client.post(&url).json(&request).send(),
@@ -82,22 +108,26 @@ impl LBState {
         let resp = task
             .await
             .map_err(|e| actix_web::error::ErrorBadGateway(e))?;
+        let status = resp.status();
 
         if stream {
             let resp_stream = resp.bytes_stream().map(|r| {
                 r.map_err(|e| actix_web::error::ErrorBadGateway(e))
                     .map(Bytes::from)
             });
-            Ok(HttpResponse::Ok()
-                .content_type("application/octet-stream")
-                .streaming(resp_stream))
+            Ok(ProxyResponse {
+                status,
+                body: ProxyResponseType::Stream(Box::pin(resp_stream)),
+            })
         } else {
-            let resp = resp
+            let body = resp
                 .bytes()
                 .await
                 .map_err(|e| actix_web::error::ErrorBadGateway(e))?;
-
-            Ok(HttpResponse::Ok().body(resp))
+            Ok(ProxyResponse {
+                status,
+                body: ProxyResponseType::Full(body),
+            })
         }
     }
 
@@ -174,7 +204,7 @@ impl LBState {
             stream,
         );
         let (_, decode_response) = tokio::join!(prefill_task, decode_task);
-        decode_response
+        decode_response?.into()
     }
 
     async fn get_engine_loads(
@@ -280,7 +310,8 @@ pub async fn get_model_info(
             serde_json::Value::Null,
             false,
         )
-        .await
+        .await?
+        .into()
 }
 
 #[post("/generate")]
