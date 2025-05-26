@@ -135,7 +135,7 @@ class LayerCommunicator:
         self.input_layernorm = input_layernorm
         self.post_attention_layernorm = post_attention_layernorm
 
-        self._context = _Context.init_new()
+        self._context = CommunicateContext.init_new()
         self._communicate_simple_fn = _CommunicateSimpleFn.get_fn(
             input_mode=self.layer_scatter_modes.layer_input_mode,
             output_mode=self.layer_scatter_modes.attn_mode,
@@ -211,7 +211,7 @@ class LayerCommunicator:
 
 
 @dataclass
-class _Context:
+class CommunicateContext:
     process_group_sizes: Dict["ScatterMode", int]
     attn_tp_rank: int
     attn_tp_size: int
@@ -246,7 +246,7 @@ class _CommunicateSimpleFn:
     def get_fn(
         input_mode: ScatterMode,
         output_mode: ScatterMode,
-        context: _Context,
+        context: CommunicateContext,
     ):
         if context.is_same_group_size(input_mode, output_mode):
             return _CommunicateSimpleFn._trivial
@@ -262,7 +262,7 @@ class _CommunicateSimpleFn:
     def _trivial(
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        context: _Context,
+        context: CommunicateContext,
     ) -> torch.Tensor:
         return hidden_states
 
@@ -270,7 +270,7 @@ class _CommunicateSimpleFn:
     def _scattered_to_tp_attn_full(
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        context: _Context,
+        context: CommunicateContext,
     ) -> torch.Tensor:
         hidden_states, local_hidden_states = (
             forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
@@ -295,7 +295,7 @@ class _CommunicateWithAllReduceAndLayerNormFn:
         residual_input_mode: ScatterMode,
         hidden_states_output_mode: ScatterMode,
         residual_output_mode: ScatterMode,
-        context: _Context,
+        context: CommunicateContext,
     ):
 
         if (
@@ -338,7 +338,7 @@ class _CommunicateWithAllReduceAndLayerNormFn:
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
         layernorm: torch.nn.Module,
-        context: _Context,
+        context: CommunicateContext,
     ):
         # TODO move these `if shape != 0` into LayerNorm itself
         if hidden_states.shape[0] != 0:
@@ -351,7 +351,7 @@ class _CommunicateWithAllReduceAndLayerNormFn:
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
         layernorm: torch.nn.Module,
-        context: _Context,
+        context: CommunicateContext,
     ):
         if context.local_attn_dp_size != 1:
             if context.attn_tp_rank == 0:
@@ -375,7 +375,7 @@ class _CommunicateWithAllReduceAndLayerNormFn:
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
         layernorm: torch.nn.Module,
-        context: _Context,
+        context: CommunicateContext,
         *,
         residual_input_mode,
     ):
@@ -396,7 +396,7 @@ class _CommunicateSummableTensorPairFn:
         hidden_states_input_mode: ScatterMode,
         residual_input_mode: ScatterMode,
         output_mode: ScatterMode,
-        context: _Context,
+        context: CommunicateContext,
     ):
         """It is allowed to make (hidden_states, residual) := (hidden_states + residual, None) if needed."""
 
@@ -428,7 +428,7 @@ class _CommunicateSummableTensorPairFn:
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
-        context: _Context,
+        context: CommunicateContext,
     ):
         return hidden_states, residual
 
@@ -437,7 +437,7 @@ class _CommunicateSummableTensorPairFn:
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
-        context: _Context,
+        context: CommunicateContext,
     ):
         # TODO(ch-wan): use reduce-scatter in MLP to avoid this scatter
         # important: forward batch.gathered_buffer is used both after scatter and after gather.
@@ -454,7 +454,7 @@ class _CommunicateSummableTensorPairFn:
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
-        context: _Context,
+        context: CommunicateContext,
     ):
         hidden_states += residual
         residual = None
