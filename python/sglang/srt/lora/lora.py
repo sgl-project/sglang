@@ -207,8 +207,6 @@ class LoRAAdapter(nn.Module):
             elif "gate_up_proj" in weight_name:
                 # If gate_up_proj is already stacked, we normalize it following the SGL convention
                 gate_up_name = weight_name
-                # gate_name = weight_name.replace("gate_up_proj", "gate_proj")
-                up_name = weight_name.replace("gate_up_proj", "up_proj")
                 if "lora_A" in weight_name:
                     weights[gate_up_name] = weights[gate_up_name].repeat(2, 1)
                 # else: "lora_B" is already stacked, no operations is needed.
