@@ -21,7 +21,7 @@ class TestSlidingWindowAttentionTriton(CustomTestCase):
     def setUpClass(cls):
         """Set up the test server with Gemma3 model and triton backend."""
         # Gemma3 model supports sliding window attention
-        cls.model = "google/gemma-3-27b-it"
+        cls.model = "google/gemma-3-4b-it"
         cls.base_url = DEFAULT_URL_FOR_TEST
 
         cls.common_args = [
@@ -32,8 +32,6 @@ class TestSlidingWindowAttentionTriton(CustomTestCase):
             "8192",
             "--random-seed",
             "42",
-            "--tp",
-            "8",
         ]
 
         cls.short_context_prompt = "The capital of France is"
