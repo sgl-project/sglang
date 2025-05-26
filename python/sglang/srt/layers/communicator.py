@@ -18,6 +18,7 @@ from functools import partial
 from typing import Dict, Optional
 
 import torch.distributed
+
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
@@ -244,7 +245,9 @@ class CommunicateContext:
 class CommunicateSimpleFn:
     @classmethod
     def execute(cls, input_mode, output_mode, context, **kwargs):
-        return cls.get_fn(input_mode=input_mode, output_mode=output_mode, context=context)(context=context, **kwargs)
+        return cls.get_fn(
+            input_mode=input_mode, output_mode=output_mode, context=context
+        )(context=context, **kwargs)
 
     @staticmethod
     def get_fn(
@@ -322,8 +325,8 @@ class CommunicateWithAllReduceAndLayerNormFn:
         if (
             (hidden_states_input_mode == ScatterMode.TP_ATTN_FULL)
             and (
-            residual_input_mode in [ScatterMode.SCATTERED, ScatterMode.TP_ATTN_FULL]
-        )
+                residual_input_mode in [ScatterMode.SCATTERED, ScatterMode.TP_ATTN_FULL]
+            )
             and (hidden_states_output_mode == ScatterMode.SCATTERED)
             and (residual_output_mode == ScatterMode.SCATTERED)
         ):
@@ -395,10 +398,20 @@ class CommunicateWithAllReduceAndLayerNormFn:
 
 class CommunicateSummableTensorPairFn:
     @classmethod
-    def execute(cls, hidden_states_input_mode, residual_input_mode, output_mode, context, **kwargs):
+    def execute(
+        cls,
+        hidden_states_input_mode,
+        residual_input_mode,
+        output_mode,
+        context,
+        **kwargs,
+    ):
         return cls.get_fn(
-            hidden_states_input_mode=hidden_states_input_mode, residual_input_mode=residual_input_mode,
-            output_mode=output_mode, context=context)(context=context, **kwargs)
+            hidden_states_input_mode=hidden_states_input_mode,
+            residual_input_mode=residual_input_mode,
+            output_mode=output_mode,
+            context=context,
+        )(context=context, **kwargs)
 
     @staticmethod
     def get_fn(

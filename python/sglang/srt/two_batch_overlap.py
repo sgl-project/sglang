@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Sequence
 import torch
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.communicator import CommunicateSimpleFn, CommunicateContext
+from sglang.srt.layers.communicator import CommunicateContext, CommunicateSimpleFn
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPDispatcher
 from sglang.srt.layers.quantization.deep_gemm import configure_deep_gemm_num_sms
@@ -398,9 +398,9 @@ def _model_forward_non_tbo(inputs, operations_strategy: OperationsStrategy):
 
 
 def _model_forward_tbo_split_inputs(
-        hidden_states: torch.Tensor,
-        residual: torch.Tensor,
-        **kwargs,
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    **kwargs,
 ) -> List[Dict]:
     context = CommunicateContext.init_new()
     hidden_states, residual = CommunicateSimpleFn.get_fn(
@@ -408,7 +408,9 @@ def _model_forward_tbo_split_inputs(
         output_mode=TODO,
         context=context,
     )()
-    inputs_arr = _model_forward_tbo_split_inputs_raw(hidden_states=hidden_states, residual=residual, **kwargs)
+    inputs_arr = _model_forward_tbo_split_inputs_raw(
+        hidden_states=hidden_states, residual=residual, **kwargs
+    )
     return [TODO for inputs in inputs_arr]
 
 
