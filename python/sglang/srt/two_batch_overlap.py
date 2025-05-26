@@ -397,6 +397,16 @@ def _model_forward_non_tbo(inputs, operations_strategy: OperationsStrategy):
 
 
 def _model_forward_tbo_split_inputs(
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        **kwargs,
+) -> List[Dict]:
+    hidden_states, residual = TODO()
+    inputs_arr = _model_forward_tbo_split_inputs_raw(hidden_states=hidden_states, residual=residual, **kwargs)
+    return [TODO for inputs in inputs_arr]
+
+
+def _model_forward_tbo_split_inputs_raw(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
     positions: torch.Tensor,
