@@ -495,14 +495,25 @@ class TokenizerManager:
             and (max_new_tokens + input_token_num) >= self.context_len
         ):
             total_tokens = max_new_tokens + input_token_num
-            error_msg = (
-                f"Requested token count exceeds the model's maximum context length "
-                f"of {self.context_len} tokens. You requested a total of {total_tokens} "
-                f"tokens: {input_token_num} tokens from the input messages and "
-                f"{max_new_tokens} tokens for the completion. Please reduce the number "
-                f"of tokens in the input messages or the completion to fit within the limit."
-            )
-            raise ValueError(error_msg)
+            if self.server_args.allow_auto_truncate:
+                logger.warning(
+                    f"Requested token count exceeds the model's maximum context length "
+                    f"of {self.context_len} tokens. But auto-truncation is enabled, "
+                    f"so the input will be truncated to fit within the limit."
+                    f"You requested a total of {total_tokens} "
+                    f"tokens: {input_token_num} tokens from the input messages and "
+                    f"{max_new_tokens} tokens for the completion. Please reduce the number "
+                    f"of tokens in the input messages or the completion to fit within the limit."
+                )
+            else:
+                error_msg = (
+                    f"Requested token count exceeds the model's maximum context length "
+                    f"of {self.context_len} tokens. You requested a total of {total_tokens} "
+                    f"tokens: {input_token_num} tokens from the input messages and "
+                    f"{max_new_tokens} tokens for the completion. Please reduce the number "
+                    f"of tokens in the input messages or the completion to fit within the limit."
+                )
+                raise ValueError(error_msg)
 
     def _create_tokenized_object(
         self,
