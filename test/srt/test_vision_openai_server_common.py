@@ -52,6 +52,11 @@ class TestOpenAIVisionServer(CustomTestCase):
         assert response.choices[0].message.role == "assistant"
         text = response.choices[0].message.content
         assert isinstance(text, str)
+
+        print("-" * 30)
+        print(f"Single image response:\n{text}")
+        print("-" * 30)
+
         # `driver` is for gemma-3-it
         assert (
             "man" in text or "person" or "driver" in text
@@ -140,7 +145,7 @@ class TestOpenAIVisionServer(CustomTestCase):
                         },
                         {
                             "type": "text",
-                            "text": "Describe this image in a very short sentence.",
+                            "text": "Describe this image in a very short sentence more than 20 words.",
                         },
                     ],
                 },

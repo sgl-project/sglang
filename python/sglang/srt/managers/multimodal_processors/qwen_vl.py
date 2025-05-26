@@ -40,15 +40,19 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
             self.audio_start_id = hf_config.thinker_config.audio_start_token_id
             self.audio_end_id = hf_config.thinker_config.audio_end_token_id
             self.video_token_id = hf_config.thinker_config.video_token_index
+            # TODO: precomputed features might not need pre-processing anymore, try removing this
+            self.IMAGE_TOKEN_REGEX = re.compile(
+                r"<\|vision_bos\|>(?:<\|IMAGE\|>)+<\|vision_eos\|>"
+            )
         else:
             self.image_token_id = hf_config.image_token_id
             self.image_start_id = hf_config.vision_start_token_id
             self.image_end_id = hf_config.vision_end_token_id
             self.video_token_id = hf_config.video_token_id
-        # The regex that matches expanded image tokens.
-        self.IMAGE_TOKEN_REGEX = re.compile(
-            r"<\|vision_start\|>(?:<\|image_pad\|>)+<\|vision_end\|>"
-        )
+            # The regex that matches expanded image tokens.
+            self.IMAGE_TOKEN_REGEX = re.compile(
+                r"<\|vision_start\|>(?:<\|image_pad\|>)+<\|vision_end\|>"
+            )
         self.NUM_TOKEN_PER_FRAME = 770
         self.IMAGE_FACTOR = 28
         self.MIN_PIXELS = 4 * 28 * 28
@@ -153,7 +157,7 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
         )
         input_ids = ret["input_ids"].flatten().tolist()
         image_offsets = self.get_mm_items_offset(
-            input_ids=ret["input_ids"].flatten(), mm_token_id=self.image_token_id
+            input_ids=input_ids, mm_token_id=self.image_token_id
         )
 
         image_grid_thw = None
@@ -169,10 +173,16 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
         second_per_grid_ts = getattr(combined_mm_item, "second_per_grid_ts", None)
 
         if "input_features" in ret and ret["input_features"] is not None:
+            audio_offsets = self.get_mm_items_offset(
+                input_ids=input_ids,
+                mm_token_id=getattr(self, "audio_token_id", None),
+            )
             item = MultimodalDataItem(
                 audio_features=ret["input_features"],
                 feature_attention_mask=ret["feature_attention_mask"],
                 attention_mask=ret["attention_mask"],
+                # TODO: unify feature and offsets across modalities
+                audio_offsets=audio_offsets,
                 modality=Modality.AUDIO,
             )
             items += [item]
@@ -185,7 +195,7 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
                 audio_feature_lengths = None
             mrope_positions, mrope_position_delta = (
                 MRotaryEmbedding.get_rope_index_omni(
-                    input_ids=torch.tensor(input_ids).unsqueeze(0),
+                    input_ids=input_ids.unsqueeze(0),
                     config=self.hf_config.thinker_config,
                     image_grid_thw=ret.get("image_grid_thw", None),
                     video_grid_thw=ret.get("video_grid_thw", None),

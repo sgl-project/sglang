@@ -217,6 +217,7 @@ class Qwen2_5OmniVisionBlock(nn.Module):
             softmax_in_single_precision=True,
             flatten_batch=True,
             quant_config=quant_config,
+            proj_bias=True,
             prefix=add_prefix("attn", prefix),
         )
         self.mlp = Qwen2_5_VLMLP(config, bias=True)
@@ -922,7 +923,7 @@ class Qwen2_5OmniModel(nn.Module):
         self.speaker_map = {}
 
         config.enable_audio_output = False
-        logger.info(f"Talker is not yet supported")
+        logger.info(f"Talker is not yet supported.")
         if config.enable_audio_output:
             self.enable_talker()
 
