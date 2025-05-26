@@ -30,11 +30,6 @@ class EBNFComposer:
         ws ::= [ \n\t]*
     """
 
-    TOOL_CALLS_MAP = {
-        "pythonic": '"[" function_call ("," function_call)* "]"',
-        "json": "function_call",
-    }
-
     CALL_RULE_MAP = {
         "pythonic": 'call_{name} ::= "{name}" "(" {arguments_rule} ")"',
         "json": 'call_{name} ::= "{{" "\\"name\\"" ":" "\\"{name}\\"" ", " "\\"arguments\\"" ":" {arguments_rule} "}}"',
@@ -138,35 +133,54 @@ class EBNFComposer:
     @staticmethod
     def build_ebnf(
         tools,
-        *,
-        call_rule_fmt: Optional[str] = None,
         function_format: Literal["pythonic", "json"] = "json",
-        bot_token: Optional[str] = None,
-        eot_token: Optional[str] = None,
+        # Parameters for wrapping the entire sequence of tool calls
+        sequence_start_token: Optional[str] = None,
+        sequence_end_token: Optional[str] = None,
+        # Parameters for wrapping individual tool calls
+        individual_call_start_token: Optional[str] = None,
+        individual_call_end_token: Optional[str] = None,
+        # Parameter for separating multiple tool calls
         tool_call_separator: Optional[str] = None,
+        call_rule_fmt: Optional[str] = None,
     ):
         """
         Generalized EBNF builder for all detectors.
         Args:
             tools: List of Tool objects to generate EBNF grammar for
+            function_format: The format of function calls, either "pythonic" or "json"
+            sequence_start_token: Token that wraps the entire sequence of tool calls (start)
+            sequence_end_token: Token that wraps the entire sequence of tool calls (end)
+            individual_call_start_token: Token that wraps each individual tool call (start)
+            individual_call_end_token: Token that wraps each individual tool call (end)
+            tool_call_separator: The separator between multiple tool calls
             call_rule_fmt: Optional custom format string for call_{name} rule. It should define each function call's format, with
                 the placeholders {name} for the function name and {arguments_rule} for the arguments rule. If None, a default
                 format based on function_format will be used.
-            function_format: The format of function calls, either "pythonic" or "json"
-            bot_token: The token that indicates the start of a tool call section
-            eot_token: The token that indicates the end of a tool call section
-            tool_call_separator: The separator between multiple tool calls
         """
         # =================================================================
         # Step 1: Determine the root tool calls rule
         # =================================================================
-        if bot_token and eot_token:
-            if tool_call_separator:
-                root_rule = f'"{bot_token}" function_call ( "{tool_call_separator}" function_call )* "{eot_token}"'
-            else:
-                root_rule = f'"{bot_token}" function_call "{eot_token}"'
+        # Handle a single function call
+        if individual_call_start_token and individual_call_end_token:
+            function_call_unit = f'"{individual_call_start_token}" function_call "{individual_call_end_token}"'
         else:
-            root_rule = EBNFComposer.TOOL_CALLS_MAP[function_format]
+            function_call_unit = "function_call"
+
+        # Handle multiple function calls with separators
+        if tool_call_separator is not None:
+            base_pattern = f'{function_call_unit} ( "{tool_call_separator}" {function_call_unit} )*'
+        else:
+            # Assume only support single function call
+            base_pattern = function_call_unit
+
+        # Apply sequence-level wrapping if needed
+        if sequence_start_token and sequence_end_token:
+            root_rule = (
+                f'"{sequence_start_token}" {base_pattern} "{sequence_end_token}"'
+            )
+        else:
+            root_rule = base_pattern
 
         # =================================================================
         # Step 2: Build the header rules
