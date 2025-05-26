@@ -405,17 +405,23 @@ def _model_forward_tbo_split_inputs(
 ) -> List[Dict]:
     split_raw_scatter_mode = ScatterMode.TP_ATTN_FULL
     context = CommunicateContext.init_new()
+
     hidden_states, residual = CommunicateSimpleFn.execute(
         input_mode=input_scatter_mode,
         output_mode=split_raw_scatter_mode,
-        hidden_states=TODO,
-        forward_batch=TODO,
+        hidden_states=hidden_states,
+        forward_batch=residual,
         context=context,
     )
+
     inputs_arr = _model_forward_tbo_split_inputs_raw(
         hidden_states=hidden_states, residual=residual, **kwargs
     )
-    return [TODO for inputs in inputs_arr]
+
+    def _post_transform(inputs):
+        return TODO
+
+    return [_post_transform(inputs) for inputs in inputs_arr]
 
 
 def _model_forward_tbo_split_inputs_raw(
