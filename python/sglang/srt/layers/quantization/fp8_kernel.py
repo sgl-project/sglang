@@ -792,7 +792,7 @@ def w8a8_block_fp8_matmul_deepgemm(
     return C
 
 
-def w8a8_block_fp8_matmul(
+def w8a8_block_fp8_matmul_triton(
     A: torch.Tensor,
     B: torch.Tensor,
     As: torch.Tensor,
@@ -816,10 +816,6 @@ def w8a8_block_fp8_matmul(
     Returns:
         torch.Tensor: The result of matmul.
     """
-
-    if output_dtype == torch.bfloat16 and _ENABLE_JIT_DEEPGEMM:
-        # Use deepgemm for bf16 output
-        return w8a8_block_fp8_matmul_deepgemm(A, B, As, Bs, block_size, output_dtype)
 
     M, N, K, C = prepare_block_fp8_matmul_inputs(A, B, As, Bs, block_size)
 
@@ -874,6 +870,25 @@ def w8a8_block_fp8_matmul(
     )
 
     return C
+
+
+# universal entry point, for testing purposes
+def w8a8_block_fp8_matmul(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    As: torch.Tensor,
+    Bs: torch.Tensor,
+    block_size: List[int],
+    output_dtype: torch.dtype = torch.float16,
+) -> torch.Tensor:
+    if output_dtype == torch.bfloat16 and _ENABLE_JIT_DEEPGEMM:
+        return w8a8_block_fp8_matmul_deepgemm(
+            A, B, As, Bs, block_size, output_dtype=output_dtype
+        )
+
+    return w8a8_block_fp8_matmul_triton(
+        A, B, As, Bs, block_size, output_dtype=output_dtype
+    )
 
 
 @triton.jit

@@ -21,8 +21,8 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     scaled_fp8_quant,
     sglang_per_token_quant_fp8,
     static_quant_fp8,
-    w8a8_block_fp8_matmul,
     w8a8_block_fp8_matmul_deepgemm,
+    w8a8_block_fp8_matmul_triton,
 )
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -252,7 +252,7 @@ def triton_w8a8_block_fp8_linear(
     q_input, x_scale = per_token_group_quant_fp8(
         input_2d, block_size[1], column_major_scales=False
     )
-    output = w8a8_block_fp8_matmul(
+    output = w8a8_block_fp8_matmul_triton(
         q_input, weight, x_scale, weight_scale, block_size, output_dtype=input_2d.dtype
     )
     if bias is not None:
