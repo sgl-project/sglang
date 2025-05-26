@@ -113,7 +113,7 @@ def normalize_e4m3fn_to_e4m3fnuz(
 
 
 def cutlass_block_fp8_supported() -> bool:
-    if not get_bool_env_var("SUPPORT_CUTLASS_BLOCK_FP8"):
+    if not get_bool_env_var("SGLANG_SUPPORT_CUTLASS_BLOCK_FP8"):
         return False
     if _is_cuda:
         major, minor = torch.cuda.get_device_capability()
@@ -125,7 +125,7 @@ def cutlass_block_fp8_supported() -> bool:
 
 
 CUTLASS_BLOCK_FP8_SUPPORTED = cutlass_block_fp8_supported()
-ENABLE_FLASHINFER_GEMM = get_bool_env_var("ENABLE_FLASHINFER_GEMM")
+ENABLE_FLASHINFER_GEMM = get_bool_env_var("SGLANG_ENABLE_FLASHINFER_GEMM")
 if ENABLE_FLASHINFER_GEMM:
     assert (
         is_flashinfer_available()
