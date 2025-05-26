@@ -1,6 +1,5 @@
 import argparse
 import dataclasses
-from typing import List
 
 
 @dataclasses.dataclass
@@ -9,8 +8,8 @@ class LBArgs:
     host: str = "0.0.0.0"
     port: int = 8000
     policy: str = "random"
-    prefill_infos: List[str] = dataclasses.field(default_factory=list)
-    decode_infos: List[str] = dataclasses.field(default_factory=list)
+    prefill_infos: list = dataclasses.field(default_factory=list)
+    decode_infos: list = dataclasses.field(default_factory=list)
     log_interval: int = 5
     timeout: int = 600
 
