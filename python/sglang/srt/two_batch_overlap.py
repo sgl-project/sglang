@@ -403,10 +403,11 @@ def _model_forward_tbo_split_inputs(
         input_scatter_mode: ScatterMode,
         **kwargs,
 ) -> List[Dict]:
+    split_raw_scatter_mode = ScatterMode.TP_ATTN_FULL
     context = CommunicateContext.init_new()
     hidden_states, residual = CommunicateSimpleFn.execute(
-        input_mode=TODO,
-        output_mode=TODO,
+        input_mode=input_scatter_mode,
+        output_mode=split_raw_scatter_mode,
         hidden_states=TODO,
         forward_batch=TODO,
         context=context,
