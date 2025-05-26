@@ -41,7 +41,6 @@ from sglang.srt.configs import (
     MultiModalityConfig,
 )
 from sglang.srt.configs.internvl import InternVLChatConfig
-from sglang.srt.configs.qwen2_5_omni import Qwen2_5OmniConfig
 from sglang.srt.connector import create_remote_connector
 from sglang.srt.utils import is_remote_url
 
@@ -53,7 +52,6 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
     MultiModalityConfig.model_type: MultiModalityConfig,
     KimiVLConfig.model_type: KimiVLConfig,
     InternVLChatConfig.model_type: InternVLChatConfig,
-    Qwen2_5OmniConfig.model_type: Qwen2_5OmniConfig,
 }
 
 for name, cls in _CONFIG_REGISTRY.items():
