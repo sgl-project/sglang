@@ -1630,6 +1630,7 @@ def run_benchmark(args_: argparse.Namespace):
             profile=args.profile,
             pd_separated=args.pd_separated,
             flush_cache=args.flush_cache,
+            warmup_requests=args.warmup_requests,
         )
     )
 

@@ -4,6 +4,8 @@ from types import SimpleNamespace
 
 import requests
 
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.two_batch_overlap import compute_split_seq_index
 from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
@@ -66,6 +68,40 @@ class TestTwoBatchOverlap(unittest.TestCase):
 
         metrics = run_eval(args)
         self.assertGreater(metrics["score"], 0.5)
+
+
+class TestTwoBatchOverlapUnitTest(unittest.TestCase):
+    # TODO change tests when having 6328
+    def test_compute_split_seq_index(self):
+        for num_tokens, expect in [
+            (0, 0),
+            (100, 50),
+            (99, 49),
+        ]:
+            actual = compute_split_seq_index(
+                forward_mode=ForwardMode.DECODE, num_tokens=num_tokens, extend_lens=None
+            )
+            self.assertEqual(actual, expect)
+
+        for extend_lens, expect in [
+            ([], 0),
+            ([42], 0),
+            ([42, 999], 1),
+            ([999, 42], 1),
+            ([4096, 4096, 4096, 4096], 2),
+            ([4095, 4096, 4096, 4096, 1], 2),
+            ([1, 4095, 4096, 4096, 4096], 3),
+            ([4097, 4096, 4096, 4095, 1], 2),
+            ([1, 1, 1, 1, 99999], 4),
+            ([99999, 1, 1, 1, 1], 1),
+        ]:
+            actual = compute_split_seq_index(
+                forward_mode=ForwardMode.EXTEND,
+                num_tokens=None,
+                extend_lens=extend_lens,
+            )
+            print(f"{extend_lens=} {expect=} {actual=}")
+            self.assertEqual(actual, expect)
 
 
 if __name__ == "__main__":
