@@ -136,7 +136,7 @@ class ExpertLocationMetadata:
         num_physical_experts = common["num_physical_experts"]
 
         phase = server_args.disaggregation_mode
-        if phase == "null":
+        if phase == "null" or model_config_for_expert_location.num_groups is None:
             phase = "decode"
 
         physical_to_logical_map, logical_to_all_physical_map, expert_count = (
