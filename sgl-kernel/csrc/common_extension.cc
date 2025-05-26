@@ -38,6 +38,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "all_reduce(int fa, Tensor inp, Tensor! out, int reg_buffer, "
       "int reg_buffer_sz_bytes) -> ()");
   m.impl("all_reduce", torch::kCUDA, &all_reduce);
+
+
+}
   /*
    * From csrc/attention
    */
