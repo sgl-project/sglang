@@ -144,31 +144,14 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
 
         if base_output.images:
             if images_are_preprocessed:
-                all_image_grid_thws = [
-                    item.image_grid_thws
-                    for item in base_output.images
-                    if item.image_grid_thws is not None
-                ]
-                all_pixel_values = [
-                    item.pixel_values
-                    for item in base_output.images
-                    if item.pixel_values is not None
-                ]
-                all_precomputed_features = [
-                    item.precomputed_features
-                    for item in base_output.images
-                    if item.precomputed_features is not None
-                ]
-                image_grid_thw = (
-                    torch.concat(all_image_grid_thws) if all_image_grid_thws else None
+                image_grid_thw = self._extract_processor_features(
+                    base_output.images, "image_grid_thws"
                 )
-                pixel_values = (
-                    torch.concat(all_pixel_values) if all_pixel_values else None
+                precomputed_features = self._extract_processor_features(
+                    base_output.images, "precomputed_features"
                 )
-                precomputed_features = (
-                    torch.concat(all_precomputed_features)
-                    if all_precomputed_features
-                    else None
+                pixel_values = self._extract_processor_features(
+                    base_output.images, "pixel_values"
                 )
             else:
                 image_grid_thw = ret["image_grid_thw"]
