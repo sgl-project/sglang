@@ -520,7 +520,6 @@ def popen_launch_pd_server(
     api_key: Optional[str] = None,
     other_args: list[str] = (),
     env: Optional[dict] = None,
-    return_stdout_stderr: Optional[tuple] = None,
 ):
     _, host, port = base_url.split(":")
     host = host[2:]
@@ -594,8 +593,7 @@ def popen_launch_pd_server(
 
             time.sleep(10)
 
-    kill_process_tree(process.pid)
-    raise TimeoutError("Server failed to start within the timeout period.")
+    return process
 
 
 def run_with_timeout(

@@ -44,9 +44,22 @@ from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
 from importlib.util import find_spec
 from io import BytesIO
+from json import JSONDecodeError
 from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Protocol, Set, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Generic,
+    List,
+    Optional,
+    Protocol,
+    Set,
+    Tuple,
+    TypeVar,
+    Union,
+)
 
 import numpy as np
 import psutil
@@ -123,10 +136,6 @@ FP8_E4M3_MIN = -FP8_E4M3_MAX
 
 builtins.FP8_E4M3_MAX = FP8_E4M3_MAX
 builtins.FP8_E4M3_MIN = FP8_E4M3_MIN
-
-
-def is_rocm() -> bool:
-    return torch.cuda.is_available() and torch.version.hip
 
 
 def is_cuda():
@@ -250,7 +259,7 @@ def mark_start(name, interval=0.1, color=0, indent=0):
     torch.cuda.synchronize()
     if time_infos.get(name, None) is None:
         time_infos[name] = TimeInfo(name, interval, color, indent)
-    time_infos[name].acc_time -= time.time()
+    time_infos[name].acc_time -= time.perf_counter()
 
 
 def mark_end(name):
@@ -258,7 +267,7 @@ def mark_end(name):
     if not show_time_cost:
         return
     torch.cuda.synchronize()
-    time_infos[name].acc_time += time.time()
+    time_infos[name].acc_time += time.perf_counter()
     if time_infos[name].check():
         time_infos[name].pretty_print()
 
@@ -268,11 +277,11 @@ def calculate_time(show=False, min_cost_ms=0.0):
         def inner_func(*args, **kwargs):
             torch.cuda.synchronize()
             if show:
-                start_time = time.time()
+                start_time = time.perf_counter()
             result = func(*args, **kwargs)
             torch.cuda.synchronize()
             if show:
-                cost_time = (time.time() - start_time) * 1000
+                cost_time = (time.perf_counter() - start_time) * 1000
                 if cost_time > min_cost_ms:
                     print(f"Function {func.__name__} took {cost_time} ms to run.")
             return result
@@ -1851,6 +1860,8 @@ def get_cuda_version():
 
 
 def launch_dummy_health_check_server(host, port):
+    import asyncio
+
     import uvicorn
     from fastapi import FastAPI, Response
 
@@ -1866,13 +1877,27 @@ def launch_dummy_health_check_server(host, port):
         """Check the health of the http server."""
         return Response(status_code=200)
 
-    uvicorn.run(
+    config = uvicorn.Config(
         app,
         host=host,
         port=port,
         timeout_keep_alive=5,
-        loop="uvloop",
+        loop="auto",
+        log_config=None,
+        log_level="warning",
     )
+    server = uvicorn.Server(config=config)
+
+    try:
+        loop = asyncio.get_running_loop()
+        logger.info(
+            f"Dummy health check server scheduled on existing loop at {host}:{port}"
+        )
+        loop.create_task(server.serve())
+
+    except RuntimeError:
+        logger.info(f"Starting dummy health check server at {host}:{port}")
+        server.run()
 
 
 def create_checksum(directory: str):
@@ -2001,6 +2026,14 @@ class DeepEPMode(Enum):
             return DeepEPMode.normal
 
 
+def is_non_idle_and_non_empty(forward_mode, hidden_states):
+    return (
+        (forward_mode is not None)
+        and not forward_mode.is_idle()
+        and hidden_states.shape[0] > 0
+    )
+
+
 def fast_topk(values, topk, dim):
     if topk == 1:
         # Use max along the specified dimension to get both value and index
@@ -2077,7 +2110,6 @@ def is_fa3_default_architecture(hf_config):
         "Qwen2ForCausalLM",
         "Llama4ForConditionalGeneration",
         "LlamaForCausalLM",
-        "MistralForCausalLM",
         "Gemma2ForCausalLM",
         "Gemma3ForConditionalGeneration",
         "Qwen3ForCausalLM",
@@ -2104,3 +2136,36 @@ def log_info_on_rank0(logger, msg):
 
     if get_tensor_model_parallel_rank() == 0:
         logger.info(msg)
+
+
+def load_json_config(data: str):
+    try:
+        return json.loads(data)
+    except JSONDecodeError:
+        return json.loads(Path(data).read_text())
+
+
+def dispose_tensor(x: torch.Tensor):
+    x.set_(torch.empty((0,), device=x.device, dtype=x.dtype))
+
+
+T = TypeVar("T")
+
+
+class Withable(Generic[T]):
+    def __init__(self):
+        self._value: Optional[T] = None
+
+    @property
+    def value(self) -> T:
+        return self._value
+
+    @contextmanager
+    def with_value(self, new_value: T):
+        assert self._value is None
+        self._value = new_value
+        try:
+            yield
+        finally:
+            assert self._value is new_value
+            self._value = None

@@ -20,6 +20,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only MiniCPM-V model compatible with HuggingFace weights."""
+
 from functools import partial
 from typing import (
     Any,
@@ -386,6 +387,7 @@ class Idefics2VisionTransformer(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        require_post_norm: bool = True,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -398,20 +400,35 @@ class Idefics2VisionTransformer(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("encoder", prefix),
         )
-        self.post_layernorm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
+        self.post_layernorm = (
+            nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
+            if require_post_norm
+            else nn.Identity()
+        )
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embeddings
 
-    def compute_cu_seqlens(self, tgt_sizes: torch.Tensor) -> torch.Tensor:
-        patch_len = tgt_sizes[:, 0] * tgt_sizes[:, 1]  # shape: (batch_size,)
+    def compute_cu_seqlens(
+        self,
+        tgt_sizes: Optional[torch.Tensor] = None,
+        atch_attention_mask: Optional[torch.BoolTensor] = None,
+    ) -> torch.Tensor:
+        # shape: (batch_size,)
+        if tgt_sizes is not None:
+            patch_len = tgt_sizes[:, 0] * tgt_sizes[:, 1]
+        else:
+            patch_len = atch_attention_mask[:, :, 0].sum(dim=1) * atch_attention_mask[
+                :, 0, :
+            ].sum(dim=1)
+
         cu_seqlens = torch.cat(
             [
                 torch.tensor([0], device=patch_len.device, dtype=torch.int32),
                 torch.cumsum(patch_len, dim=0, dtype=torch.int32),
             ],
             dim=0,
-        ).to(tgt_sizes.device)
+        ).to(patch_len.device)
         return cu_seqlens
 
     def forward(
@@ -425,7 +442,7 @@ class Idefics2VisionTransformer(nn.Module):
             patch_attention_mask=patch_attention_mask,
             tgt_sizes=tgt_sizes,
         )
-        cu_seqlens = self.compute_cu_seqlens(tgt_sizes)
+        cu_seqlens = self.compute_cu_seqlens(tgt_sizes, patch_attention_mask)
         encoder_outputs = self.encoder(
             hidden_states,
             cu_seqlens=cu_seqlens,

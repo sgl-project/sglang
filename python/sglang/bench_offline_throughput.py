@@ -17,11 +17,12 @@ import logging
 import os
 import random
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import numpy as np
 
 from sglang.bench_serving import (
+    DatasetRow,
     get_dataset,
     get_tokenizer,
     sample_random_requests,
@@ -194,7 +195,7 @@ class BenchArgs:
 def throughput_test_once(
     backend_name: str,
     backend,
-    reqs: List[Tuple[str, int, int]],
+    reqs: List[DatasetRow],
     ignore_eos: bool,
     extra_request_body: Dict,
     profile: bool,
@@ -203,7 +204,7 @@ def throughput_test_once(
         "backend": backend_name,
         "successful_requests": len(reqs),
         "total_latency": -1,
-        "total_input_tokens": sum(r[1] for r in reqs),
+        "total_input_tokens": sum(r.prompt_len for r in reqs),
         "total_output_tokens": -1,
         "request_throughput": -1,
         "input_throughput": -1,
@@ -211,11 +212,11 @@ def throughput_test_once(
         "total_throughput": -1,
     }
 
-    prompt = [r[0] for r in reqs]
+    prompt = [r.prompt for r in reqs]
     sampling_params = [
         {
             "temperature": 0,
-            "max_new_tokens": r[2],
+            "max_new_tokens": r.output_len,
             "ignore_eos": ignore_eos,
             **extra_request_body,
         }
@@ -267,7 +268,6 @@ def throughput_test_once(
 
 
 def monitor_trace_file(directory, interval=1):
-
     print(f"Monitoring {directory} for new trace files...")
 
     known_files = set(os.listdir(directory))
