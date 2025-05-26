@@ -18,7 +18,6 @@ from functools import partial
 from typing import Dict, Optional
 
 import torch.distributed
-
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
@@ -136,23 +135,7 @@ class LayerCommunicator:
         self.input_layernorm = input_layernorm
         self.post_attention_layernorm = post_attention_layernorm
 
-        self.attn_tp_rank = get_attention_tp_rank()
-        self.attn_tp_size = get_attention_tp_size()
-        self.local_attn_dp_size = get_local_attention_dp_size()
-        self.tp_size = get_tensor_model_parallel_world_size()
-        self.process_group_sizes = {
-            ScatterMode.SCATTERED: 1,
-            ScatterMode.TP_ATTN_FULL: self.attn_tp_size,
-            ScatterMode.FULL: self.tp_size,
-        }
-
-        self._context = _Context(
-            process_group_sizes=self.process_group_sizes,
-            attn_tp_rank=self.attn_tp_rank,
-            attn_tp_size=self.attn_tp_size,
-            local_attn_dp_size=self.local_attn_dp_size,
-            tp_size=self.tp_size,
-        )
+        self._context = _Context.init_new()
         self._communicate_simple_fn = _CommunicateSimpleFn.get_fn(
             input_mode=self.layer_scatter_modes.layer_input_mode,
             output_mode=self.layer_scatter_modes.attn_mode,
@@ -238,6 +221,25 @@ class _Context:
     def is_same_group_size(self, a: "ScatterMode", b: "ScatterMode"):
         return self.process_group_sizes[a] == self.process_group_sizes[b]
 
+    @classmethod
+    def init_new(cls):
+        attn_tp_rank = get_attention_tp_rank()
+        attn_tp_size = get_attention_tp_size()
+        local_attn_dp_size = get_local_attention_dp_size()
+        tp_size = get_tensor_model_parallel_world_size()
+        process_group_sizes = {
+            ScatterMode.SCATTERED: 1,
+            ScatterMode.TP_ATTN_FULL: attn_tp_size,
+            ScatterMode.FULL: tp_size,
+        }
+        return cls(
+            process_group_sizes=process_group_sizes,
+            attn_tp_rank=attn_tp_rank,
+            attn_tp_size=attn_tp_size,
+            local_attn_dp_size=local_attn_dp_size,
+            tp_size=tp_size,
+        )
+
 
 class _CommunicateSimpleFn:
     @staticmethod
@@ -316,8 +318,8 @@ class _CommunicateWithAllReduceAndLayerNormFn:
         if (
             (hidden_states_input_mode == ScatterMode.TP_ATTN_FULL)
             and (
-                residual_input_mode in [ScatterMode.SCATTERED, ScatterMode.TP_ATTN_FULL]
-            )
+            residual_input_mode in [ScatterMode.SCATTERED, ScatterMode.TP_ATTN_FULL]
+        )
             and (hidden_states_output_mode == ScatterMode.SCATTERED)
             and (residual_output_mode == ScatterMode.SCATTERED)
         ):
