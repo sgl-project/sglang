@@ -303,6 +303,7 @@ class CommunicateSimpleFn:
         tensor_list = list(hidden_states.tensor_split(context.attn_tp_size))
         return tensor_list[context.attn_tp_rank]
 
+
 class CommunicateWithAllReduceAndLayerNormFn:
     """Besides communication, needs to
     1. All reduce in tp_attn_group on hidden_states
