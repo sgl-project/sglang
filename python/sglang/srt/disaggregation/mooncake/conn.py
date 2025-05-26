@@ -454,9 +454,7 @@ class MooncakeKVManager(BaseKVManager):
                 except Exception as e:
                     # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
                     raise RuntimeError(
-                        "Transfer thread failed because of %s. Prefill instance with {bootstrap_port=%s} is dead.",
-                        str(e),
-                        self.bootstrap_port,
+                        f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
                     )
 
         threading.Thread(target=bootstrap_thread).start()
@@ -610,10 +608,12 @@ class MooncakeKVManager(BaseKVManager):
                 logger.debug("Prefill successfully registered to bootstrap server.")
             else:
                 logger.error(
-                    f"Prefill Failed to connect to bootstrap server: {response.status_code}, {response.text}"
+                    f"Prefill instance failed to connect to bootstrap server: {response.status_code}, {response.text}"
                 )
         except Exception as e:
-            logger.error(f"Prefill Failed to register to bootstrap server: {e}")
+            logger.error(
+                f"Prefill instance failed to register to bootstrap server: {e}"
+            )
 
     def _handle_node_failure(self, failed_bootstrap_addr):
         with self.connection_lock:
@@ -646,7 +646,7 @@ class MooncakeKVManager(BaseKVManager):
                 self.update_status(room, KVPoll.Failed)
                 affected_rooms.append(room)
         logger.error(
-            f"Detected failure on {failed_bootstrap_addr}, affected {len(affected_rooms)} requests"
+            f"Losing connection with prefill instance (bootstrap_addr: {failed_bootstrap_addr}), affected {len(affected_rooms)} requests"
         )
 
 
@@ -1025,7 +1025,7 @@ class MooncakeKVBootstrapServer(BaseKVBootstrapServer):
             self.dp_size = dp_size
 
         tp_size_per_dp_rank = tp_size // dp_size
-        if self.tp_size_per_dp_rank == None:
+        if self.tp_size_per_dp_rank is None:
             self.tp_size_per_dp_rank = tp_size_per_dp_rank
 
         if role == "Prefill":
@@ -1042,7 +1042,7 @@ class MooncakeKVBootstrapServer(BaseKVBootstrapServer):
                 "rank_port": rank_port,
             }
             logger.debug(
-                f"Register Prefill bootstrap: {engine_rank} with rank_ip: {rank_ip} and rank_port: {rank_port}"
+                f"Register prefill bootstrap: {engine_rank} with rank_ip: {rank_ip} and rank_port: {rank_port}"
             )
 
         return web.Response(text="OK", status=200)
