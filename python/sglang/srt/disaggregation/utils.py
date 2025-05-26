@@ -6,7 +6,7 @@ import random
 import warnings
 from collections import deque
 from enum import Enum
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import numpy as np
 import requests
@@ -14,6 +14,9 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.utils import get_ip
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import Req
 
 FakeBootstrapHost = "2.2.2.2"
 
@@ -196,3 +199,83 @@ def prepare_abort(req: Req, error_message: str, status_code=None):
         req.input_top_logprobs_idx = []
         req.input_token_ids_logprobs_val = []
         req.input_token_ids_logprobs_idx = []
+
+
+class MetadataBuffers:
+    def __init__(self, size: int, max_top_logprobs_num: int = 128):
+        # TODO: abort top_logprobs_num > 128 in PD
+
+        # We transfer the metadata of first output token to decode
+        # The minimal size for RDMA is 64Bytes, so we pad it to > 64Bytes
+        self.output_ids = torch.zeros((size, 16), dtype=torch.int32, device="cpu")
+        self.output_token_logprobs_val = torch.zeros(
+            (size, 16), dtype=torch.float32, device="cpu"
+        )
+        self.output_token_logprobs_idx = torch.zeros(
+            (size, 16), dtype=torch.int32, device="cpu"
+        )
+        self.output_top_logprobs_val = torch.zeros(
+            (size, max_top_logprobs_num), dtype=torch.float32, device="cpu"
+        )
+        self.output_top_logprobs_idx = torch.zeros(
+            (size, max_top_logprobs_num), dtype=torch.int32, device="cpu"
+        )
+
+    def get_buf_infos(self):
+        ptrs = [
+            self.output_ids.data_ptr(),
+            self.output_token_logprobs_val.data_ptr(),
+            self.output_token_logprobs_idx.data_ptr(),
+            self.output_top_logprobs_val.data_ptr(),
+            self.output_top_logprobs_idx.data_ptr(),
+        ]
+        data_lens = [
+            self.output_ids.nbytes,
+            self.output_token_logprobs_val.nbytes,
+            self.output_token_logprobs_idx.nbytes,
+            self.output_top_logprobs_val.nbytes,
+            self.output_top_logprobs_idx.nbytes,
+        ]
+        item_lens = [
+            self.output_ids[0].nbytes,
+            self.output_token_logprobs_val[0].nbytes,
+            self.output_token_logprobs_idx[0].nbytes,
+            self.output_top_logprobs_val[0].nbytes,
+            self.output_top_logprobs_idx[0].nbytes,
+        ]
+        return ptrs, data_lens, item_lens
+
+    def get_buf(self, idx: int):
+        return (
+            self.output_ids[idx],
+            self.output_token_logprobs_val[idx],
+            self.output_token_logprobs_idx[idx],
+            self.output_top_logprobs_val[idx],
+            self.output_top_logprobs_idx[idx],
+        )
+
+    def set_buf(self, req: Req):
+
+        self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
+        if req.return_logprob:
+            if req.output_token_logprobs_val:  # not none or empty list
+                self.output_token_logprobs_val[req.metadata_buffer_index][0] = (
+                    req.output_token_logprobs_val[0]
+                )
+            if req.output_token_logprobs_idx:  # not none or empty list
+                self.output_token_logprobs_idx[req.metadata_buffer_index][0] = (
+                    req.output_token_logprobs_idx[0]
+                )
+
+            if req.output_top_logprobs_val:  # not none or empty list
+                self.output_top_logprobs_val[req.metadata_buffer_index][
+                    : len(req.output_top_logprobs_val[0])
+                ] = torch.tensor(
+                    req.output_top_logprobs_val[0], dtype=torch.float32, device="cpu"
+                )
+            if req.output_top_logprobs_idx:  # not none or empty list
+                self.output_top_logprobs_idx[req.metadata_buffer_index][
+                    : len(req.output_top_logprobs_idx[0])
+                ] = torch.tensor(
+                    req.output_top_logprobs_idx[0], dtype=torch.int32, device="cpu"
+                )

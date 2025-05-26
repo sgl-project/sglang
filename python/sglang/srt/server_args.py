@@ -167,11 +167,12 @@ class ServerArgs:
     enable_mixed_chunk: bool = False
     enable_dp_attention: bool = False
     enable_dp_lm_head: bool = False
+    enable_two_batch_overlap: bool = False
     enable_ep_moe: bool = False
     enable_deepep_moe: bool = False
     deepep_mode: Optional[Literal["auto", "normal", "low_latency"]] = "auto"
     ep_num_redundant_experts: int = 0
-    ep_dispatch_algorithm: Optional[Literal["static", "dynamic"]] = None
+    ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake"]] = None
     init_expert_location: str = "trivial"
     enable_eplb: bool = False
     eplb_rebalance_num_iterations: int = 1000
@@ -323,12 +324,6 @@ class ServerArgs:
         # Choose grammar backend
         if self.grammar_backend is None:
             self.grammar_backend = "xgrammar"
-
-        if self.pp_size > 1:
-            self.disable_overlap_schedule = True
-            logger.warning(
-                "Overlap scheduler is disabled because of using pipeline parallelism."
-            )
 
         # Data parallelism attention
         if self.enable_dp_attention:
@@ -577,6 +572,7 @@ class ServerArgs:
                 "w8a8_int8",
                 "w8a8_fp8",
                 "moe_wna16",
+                "qoq",
             ],
             help="The quantization method.",
         )
@@ -1137,7 +1133,7 @@ class ServerArgs:
         parser.add_argument(
             "--enable-dp-attention",
             action="store_true",
-            help="Enabling data parallelism for attention and tensor parallelism for FFN. The dp size should be equal to the tp size. Currently only DeepSeek-V2 is supported.",
+            help="Enabling data parallelism for attention and tensor parallelism for FFN. The dp size should be equal to the tp size. Currently DeepSeek-V2 and Qwen 2/3 MoE models are supported.",
         )
         parser.add_argument(
             "--enable-dp-lm-head",
@@ -1148,6 +1144,11 @@ class ServerArgs:
             "--enable-ep-moe",
             action="store_true",
             help="Enabling expert parallelism for moe. The ep size is equal to the tp size.",
+        )
+        parser.add_argument(
+            "--enable-two-batch-overlap",
+            action="store_true",
+            help="Enabling two micro batches to overlap.",
         )
         parser.add_argument(
             "--enable-torch-compile",
@@ -1443,8 +1444,6 @@ class ServerArgs:
 
         # FIXME pp constraints
         if self.pp_size > 1:
-            logger.warning(f"Turn off overlap scheule for pipeline parallelism.")
-            self.disable_overlap_schedule = True
             assert (
                 self.disable_overlap_schedule
                 and self.speculative_algorithm is None
