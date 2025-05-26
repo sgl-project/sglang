@@ -10,7 +10,7 @@ from sgl_kernel import fp8_blockwise_scaled_mm
 from vllm._custom_ops import cutlass_scaled_mm as vllm_scaled_mm
 
 from sglang.srt.layers.quantization.fp8_kernel import (
-    w8a8_block_fp8_matmul_gemm as w8a8_block_fp8_matmul,
+    w8a8_block_fp8_matmul_deepgemm as w8a8_block_fp8_matmul,
 )
 
 
