@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Sequence
 
 import torch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.communicator import CommunicateContext, CommunicateSimpleFn
+from sglang.srt.layers.communicator import CommunicateContext, CommunicateSimpleFn, ScatterMode
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPDispatcher
 from sglang.srt.layers.quantization.deep_gemm import configure_deep_gemm_num_sms
@@ -355,6 +355,7 @@ def model_forward_maybe_tbo(
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         hidden_states: torch.Tensor,
+        input_scatter_mode: ScatterMode,
         residual: Optional[torch.Tensor],
         zero_allocator: Optional[BumpAllocator] = None,
 ):
@@ -369,16 +370,16 @@ def model_forward_maybe_tbo(
         layers, forward_batch.global_forward_mode
     )
     if enable_tbo:
-        return _model_forward_tbo(inputs, operations_strategy)
+        return _model_forward_tbo(inputs, operations_strategy, input_scatter_mode)
     else:
         return _model_forward_non_tbo(inputs, operations_strategy)
 
 
-def _model_forward_tbo(inputs, operations_strategy: OperationsStrategy):
+def _model_forward_tbo(inputs, operations_strategy: OperationsStrategy, input_scatter_mode: ScatterMode):
     # The attn_tp_size!=1 case is not yet extracted to master
     assert get_attention_tp_size() == 1
 
-    inputs_arr = _model_forward_tbo_split_inputs(**inputs)
+    inputs_arr = _model_forward_tbo_split_inputs(**inputs, input_scatter_mode=input_scatter_mode)
     del inputs
 
     with configure_deep_gemm_num_sms(operations_strategy.deep_gemm_num_sms):
@@ -399,6 +400,7 @@ def _model_forward_non_tbo(inputs, operations_strategy: OperationsStrategy):
 def _model_forward_tbo_split_inputs(
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
+        input_scatter_mode: ScatterMode,
         **kwargs,
 ) -> List[Dict]:
     context = CommunicateContext.init_new()
