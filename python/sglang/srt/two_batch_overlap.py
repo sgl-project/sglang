@@ -370,7 +370,7 @@ def model_forward_maybe_tbo(
         hidden_states=hidden_states,
         forward_batch=forward_batch,
         residual=residual,
-        **(dict(zero_allocator=zero_allocator) if zero_allocator is not None else {}),
+        zero_allocator=zero_allocator,
     )
     layer_input_scatter_mode = layers[0].layer_scatter_modes.layer_input_mode
     operations_strategy = OperationsStrategy.init_new_tbo(
