@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Union
 import torch
 import tqdm
 
+from sglang.srt import two_batch_overlap
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.parallel_state import GroupCoordinator, graph_capture
@@ -38,6 +39,10 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.patch_torch import monkey_patch_torch_compile
+from sglang.srt.two_batch_overlap import (
+    TboCudaGraphRunnerUtils,
+    TboForwardBatchPreparer,
+)
 from sglang.srt.utils import (
     get_available_gpu_memory,
     get_device_memory_capacity,
@@ -151,6 +156,9 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
         capture_bs += [model_runner.req_to_token_pool.size - 1] + [
             model_runner.req_to_token_pool.size
         ]
+
+    if server_args.enable_two_batch_overlap:
+        capture_bs = [bs for bs in capture_bs if bs >= 2]
 
     if server_args.cuda_graph_max_bs:
         capture_bs = [bs for bs in capture_bs if bs <= server_args.cuda_graph_max_bs]
@@ -349,7 +357,14 @@ class CudaGraphRunner:
             if self.is_encoder_decoder
             else True
         )
-        return is_bs_supported and is_encoder_lens_supported
+
+        is_tbo_supported = (
+            forward_batch.can_run_tbo
+            if self.model_runner.server_args.enable_two_batch_overlap
+            else True
+        )
+
+        return is_bs_supported and is_encoder_lens_supported and is_tbo_supported
 
     def capture(self):
         with graph_capture() as graph_capture_context:
@@ -466,7 +481,12 @@ class CudaGraphRunner:
             capture_hidden_mode=self.capture_hidden_mode,
             lora_paths=lora_paths,
             num_token_non_padded=self.num_token_non_padded,
+            tbo_split_seq_index=TboCudaGraphRunnerUtils.compute_tbo_split_seq_index(
+                self, num_tokens
+            ),
+            global_forward_mode=self.capture_forward_mode,
         )
+        TboForwardBatchPreparer.prepare(forward_batch)
 
         if lora_paths is not None:
             self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
