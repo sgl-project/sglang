@@ -1,8 +1,9 @@
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import pytest
-import torch
 import sgl_kernel
+import torch
+
 
 # vLLM torch native
 def _apply_rotary_emb(
@@ -181,13 +182,9 @@ def test_correctness(
     query_cpu, key_cpu = query.clone(), key.clone()
 
     query_ref_out, key_ref_out = rope_ref.forward_native(pos_ids, query_ref, key_ref)
-    query_cpu_out, key_cpu_out = rope_cpu.forward_cpu(
-        pos_ids, query_cpu, key_cpu
-    )
+    query_cpu_out, key_cpu_out = rope_cpu.forward_cpu(pos_ids, query_cpu, key_cpu)
 
-    torch.testing.assert_close(
-        query_ref_out, query_cpu_out, atol=1e-2, rtol=1e-2
-    )
+    torch.testing.assert_close(query_ref_out, query_cpu_out, atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(key_ref_out, key_cpu_out, atol=1e-2, rtol=1e-2)
 
 
