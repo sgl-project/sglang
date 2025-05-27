@@ -2282,9 +2282,9 @@ def check_device_cross_numa_node(visible_device_idx=None) -> bool:
             numa_id = get_numa_id_for_gpu(gpu_id)
             if numa_id is None:
                 logger.warning(
-                    f"Failed to get NUMA ID for GPU {gpu_id}, skipping cross-NUMA check"
+                    f"Failed to get NUMA ID for GPU {gpu_id}, assuming potential cross-NUMA for safety."
                 )
-                return False
+                return True
             numa_ids.append(numa_id)
 
         # Check if all GPUs are on the same NUMA node
