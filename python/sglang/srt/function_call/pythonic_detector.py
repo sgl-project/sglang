@@ -58,7 +58,7 @@ class PythonicDetector(BaseFormatDetector):
                 isinstance(parsed, ast.List)
                 and all(isinstance(e, ast.Call) for e in parsed.elts)
             ):
-                return StreamingParseResult(normal_text=text, calls=[])
+                return StreamingParseResult(normal_text=normal_text, calls=[])
 
             calls = []
             tool_indices = {
