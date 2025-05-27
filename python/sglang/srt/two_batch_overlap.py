@@ -86,14 +86,14 @@ def compute_split_token_index(
 
 def compute_split_indices_for_cuda_graph_replay(
     forward_mode: ForwardMode,
-    num_tokens: int,
+    cuda_graph_num_tokens: int,
 ):
     forward_mode_for_tbo_split = (
         forward_mode if forward_mode != ForwardMode.IDLE else ForwardMode.DECODE
     )
     tbo_split_seq_index = compute_split_seq_index(
         forward_mode=forward_mode_for_tbo_split,
-        num_tokens=num_tokens,
+        num_tokens=cuda_graph_num_tokens,
         extend_lens=None,
     )
     tbo_split_token_index = compute_split_token_index(

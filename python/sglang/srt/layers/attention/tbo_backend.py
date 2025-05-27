@@ -122,7 +122,10 @@ class TboAttnBackend(AttentionBackend):
             assert capture_num_tokens == bs, "Only support num_tokens==bs currently"
         num_tokens = bs
 
-        tbo_split_seq_index, tbo_split_token_index = two_batch_overlap.compute_split_indices_for_cuda_graph_replay()
+        tbo_split_seq_index, tbo_split_token_index = two_batch_overlap.compute_split_indices_for_cuda_graph_replay(
+            forward_mode=forward_mode,
+            cuda_graph_num_tokens=num_tokens,
+        )
 
         num_tokens_child_left = tbo_split_token_index
         num_tokens_child_right = num_tokens - tbo_split_token_index
