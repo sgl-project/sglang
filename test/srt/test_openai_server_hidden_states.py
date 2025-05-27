@@ -6,6 +6,7 @@ from abc import ABC
 
 import numpy as np
 import openai
+import torch
 
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.utils import kill_process_tree
