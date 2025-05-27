@@ -1,7 +1,7 @@
 import unittest
 
+import sgl_kernel
 import torch
-from sgl_kernel.common_ops import extend_attention_cpu as extend_attention
 from torch.nn.functional import scaled_dot_product_attention
 
 from sglang.test.test_utils import CustomTestCase
@@ -157,7 +157,7 @@ class TestExtendAttention(CustomTestCase):
         )
 
         o_extend = torch.empty((extend_token_num, H_Q, DV), dtype=dtype)
-        extend_attention(
+        torch.ops.sgl_kernel.extend_attention_cpu(
             q_extend,
             k_extend,
             v_extend,
