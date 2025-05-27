@@ -135,10 +135,6 @@ class ExpertLocationMetadata:
         model_config_for_expert_location = common["model_config_for_expert_location"]
         num_physical_experts = common["num_physical_experts"]
 
-        phase = server_args.disaggregation_mode
-        if phase == "null":
-            phase = "decode"
-
         physical_to_logical_map, logical_to_all_physical_map, expert_count = (
             deepseek_eplb.rebalance_experts(
                 tokens_per_expert=logical_count,
@@ -146,7 +142,7 @@ class ExpertLocationMetadata:
                 num_local_physical_experts=num_physical_experts // common["ep_size"],
                 num_groups=model_config_for_expert_location.num_groups,
                 num_nodes=server_args.nnodes,
-                phase=phase,
+                phase=server_args.disaggregation_mode,
             )
         )
 
