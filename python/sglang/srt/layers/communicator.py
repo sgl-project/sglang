@@ -243,12 +243,6 @@ class CommunicateContext:
 
 
 class CommunicateSimpleFn:
-    @classmethod
-    def execute(cls, input_mode, output_mode, context, **kwargs):
-        return cls.get_fn(
-            input_mode=input_mode, output_mode=output_mode, context=context
-        )(context=context, **kwargs)
-
     @staticmethod
     def get_fn(
         input_mode: ScatterMode,
