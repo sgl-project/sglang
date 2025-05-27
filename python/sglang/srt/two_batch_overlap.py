@@ -206,6 +206,7 @@ class TboForwardBatchPreparer:
             start_seq_index=0,
             end_seq_index=batch.tbo_split_seq_index,
             output_attn_backend=attn_backend_child_a,
+            out_num_token_non_padded=out_num_token_non_padded_a,
         )
         child_b = cls.filter_batch(
             batch,
@@ -214,6 +215,7 @@ class TboForwardBatchPreparer:
             start_seq_index=batch.tbo_split_seq_index,
             end_seq_index=batch.batch_size,
             output_attn_backend=attn_backend_child_b,
+            out_num_token_non_padded=out_num_token_non_padded_b,
         )
 
         assert batch.tbo_children is None
@@ -229,6 +231,7 @@ class TboForwardBatchPreparer:
             start_seq_index: int,
             end_seq_index: int,
             output_attn_backend: AttentionBackend,
+            out_num_token_non_padded: torch.Tensor,
     ):
         from sglang.srt.managers.schedule_batch import global_server_args_dict
 
@@ -312,6 +315,7 @@ class TboForwardBatchPreparer:
                 ),
                 extend_num_tokens=extend_num_tokens,
                 attn_backend=output_attn_backend,
+                num_token_non_padded=out_num_token_non_padded,
                 tbo_split_seq_index=None,
                 tbo_parent_token_range=(start_token_index, end_token_index),
                 tbo_children=None,
@@ -327,7 +331,6 @@ class TboForwardBatchPreparer:
                 top_p_normalized_logprobs=False,
                 top_p=None,
                 mm_inputs=None,
-                num_token_non_padded=TODO,
             )
         )
 
