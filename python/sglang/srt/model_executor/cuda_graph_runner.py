@@ -484,7 +484,7 @@ class CudaGraphRunner:
             num_token_non_padded=self.num_token_non_padded,
             global_forward_mode=self.capture_forward_mode,
         )
-        self.tbo_plugin.prepare_capture_one_batch_size(forward_batch, num_tokens=num_tokens)
+        self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 
         if lora_paths is not None:
             self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
@@ -580,6 +580,7 @@ class CudaGraphRunner:
         self.out_cache_loc[:raw_num_token].copy_(forward_batch.out_cache_loc)
         self.positions[:raw_num_token].copy_(forward_batch.positions)
         self.num_token_non_padded[...] = len(forward_batch.input_ids)
+        self.tbo_plugin.replay_prepare()
         if forward_batch.seq_lens_cpu is not None:
             if bs != raw_bs:
                 self.seq_lens_cpu.fill_(1)
