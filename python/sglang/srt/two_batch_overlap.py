@@ -103,7 +103,7 @@ class TboCudaGraphRunnerPlugin:
             tbo_children_num_token_non_padded=self.tbo_children_num_token_non_padded,
         )
 
-    def replay_prepare(self, num_token_non_padded: int):
+    def replay_prepare(self, batch: ForwardBatch):
         self.tbo_children_num_token_non_padded[
             ...] = TboForwardBatchPreparer.compute_tbo_children_num_token_non_padded_raw(
             tbo_split_token_index=TODO,

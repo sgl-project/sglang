@@ -579,9 +579,8 @@ class CudaGraphRunner:
         self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
         self.out_cache_loc[:raw_num_token].copy_(forward_batch.out_cache_loc)
         self.positions[:raw_num_token].copy_(forward_batch.positions)
-        num_token_non_padded = len(forward_batch.input_ids)
-        self.num_token_non_padded[...] = num_token_non_padded
-        self.tbo_plugin.replay_prepare(num_token_non_padded=num_token_non_padded)
+        self.num_token_non_padded[...] = len(forward_batch.input_ids)
+        self.tbo_plugin.replay_prepare(forward_batch)
         if forward_batch.seq_lens_cpu is not None:
             if bs != raw_bs:
                 self.seq_lens_cpu.fill_(1)
