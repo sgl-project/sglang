@@ -18,7 +18,7 @@ from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import 
     gpu_p2p_access_check,
 )
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils import check_device_cross_numa_node, is_cuda, is_hip
 
 logger = logging.getLogger(__name__)
 
@@ -237,6 +237,13 @@ class CustomAllreduce:
             logger.warning(
                 "Custom allreduce is disabled because it's not supported on"
                 " more than two PCIe-only GPUs. To silence this warning, "
+                "specify disable_custom_all_reduce=True explicitly."
+            )
+            return
+        if not full_nvlink and check_device_cross_numa_node(physical_device_ids):
+            logger.warning(
+                "Custom allreduce is disabled because your platform contains pcie-only "
+                "devices and cross-NUMA node communication. To silence this warning, "
                 "specify disable_custom_all_reduce=True explicitly."
             )
             return
