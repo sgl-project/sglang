@@ -196,26 +196,25 @@ class EAGLEDraftExtendCudaGraphRunner:
         assert forward_batch.out_cache_loc is not None
         # batch_size and num_seqs can be different in case there are finished examples
         # in the batch, which will not be counted as num_seqs
-        raw_bs = forward_batch.seq_lens.numel()
-        num_tokens = forward_batch.input_ids.numel()
+        raw_bs = forward_batch.batch_size
+        num_tokens = forward_batch.input_ids.shape[0]
         assert raw_bs * self.num_tokens_per_bs == num_tokens
 
         index = bisect.bisect_left(self.capture_bs, raw_bs)
         bs = self.capture_bs[index]
         if bs != raw_bs:
+            self.seq_lens.fill_(1)
             self.accept_length.fill_(1)
             self.out_cache_loc.zero_()
 
         # Common inputs
         self.input_ids[:num_tokens].copy_(forward_batch.input_ids)
-        self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens[:raw_bs])
-        self.extend_seq_lens[:raw_bs].copy_(forward_batch.extend_seq_lens[:raw_bs])
+        self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
+        self.extend_seq_lens[:raw_bs].copy_(forward_batch.extend_seq_lens)
         self.out_cache_loc[:num_tokens].copy_(forward_batch.out_cache_loc)
         self.positions[:num_tokens].copy_(forward_batch.positions)
         self.hidden_states[:num_tokens].copy_(forward_batch.spec_info.hidden_states)
-        self.accept_length[:raw_bs].copy_(
-            forward_batch.spec_info.accept_length[:raw_bs]
-        )
+        self.accept_length[:raw_bs].copy_(forward_batch.spec_info.accept_length)
         self.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
 
         if forward_batch.seq_lens_cpu is not None:
@@ -231,7 +230,7 @@ class EAGLEDraftExtendCudaGraphRunner:
             bs=bs,
             req_pool_indices=self.req_pool_indices,
             seq_lens=self.seq_lens,
-            seq_lens_sum=sum(forward_batch.seq_lens),
+            seq_lens_sum=forward_batch.seq_lens_sum + (bs - raw_bs),
             encoder_lens=None,
             forward_mode=ForwardMode.DRAFT_EXTEND,
             spec_info=forward_batch.spec_info,
