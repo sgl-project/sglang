@@ -503,7 +503,8 @@ class CommunicateSummableTensorPairFn:
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
         context: CommunicateContext,
-    ) -> torch.Tensor:
+    ):
         assert residual is None, "not yet handled residual!=None"
         tensor_list = list(hidden_states.tensor_split(context.attn_tp_size))
-        return tensor_list[context.attn_tp_rank]
+        hidden_states = tensor_list[context.attn_tp_rank]
+        return hidden_states, residual
