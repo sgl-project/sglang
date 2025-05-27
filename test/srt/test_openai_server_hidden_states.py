@@ -30,26 +30,22 @@ class BaseTestOpenAIServerWithHiddenStates(ABC):
         for return_hidden_states in [False, True]:
             for use_list_input in [True, False]:
                 for parallel_sample_num in [1]:
-                    for token_input in [False, True]:
-                        self.run_completion(
-                            use_list_input,
-                            parallel_sample_num,
-                            token_input,
-                            return_hidden_states,
-                        )
+                    self.run_completion(
+                        use_list_input,
+                        parallel_sample_num,
+                        return_hidden_states,
+                    )
 
     def test_completion_stream(self):
         # parallel sampling and list input are not supported in streaming mode
         for return_hidden_states in [False, True]:
             for use_list_input in [True]:
                 for parallel_sample_num in [1]:
-                    for token_input in [False, True]:
-                        self.run_completion_stream(
-                            use_list_input,
-                            parallel_sample_num,
-                            token_input,
-                            return_hidden_states,
-                        )
+                    self.run_completion_stream(
+                        use_list_input,
+                        parallel_sample_num,
+                        return_hidden_states,
+                    )
 
     def test_chat_completion(self):
         for return_hidden_states in [False, True]:
@@ -71,17 +67,12 @@ class BaseTestOpenAIServerWithHiddenStates(ABC):
         self,
         use_list_input,
         parallel_sample_num,
-        token_input,
         return_hidden_states,
     ):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
         prompt = "The capital of France is"
-        if token_input:
-            prompt_input = self.tokenizer.encode(prompt)
-            num_prompt_tokens = len(prompt_input)
-        else:
-            prompt_input = prompt
-            num_prompt_tokens = len(self.tokenizer.encode(prompt))
+        prompt_input = prompt
+        num_prompt_tokens = len(self.tokenizer.encode(prompt))
 
         if use_list_input:
             prompt_arg = [prompt_input, prompt_input]
@@ -126,17 +117,12 @@ class BaseTestOpenAIServerWithHiddenStates(ABC):
         self,
         use_list_input,
         parallel_sample_num,
-        token_input,
         return_hidden_states,
     ):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
         prompt = "The capital of France is"
-        if token_input:
-            prompt_input = self.tokenizer.encode(prompt)
-            num_prompt_tokens = len(prompt_input)
-        else:
-            prompt_input = prompt
-            num_prompt_tokens = len(self.tokenizer.encode(prompt))
+        prompt_input = prompt
+        num_prompt_tokens = len(self.tokenizer.encode(prompt))
 
         if use_list_input:
             prompt_arg = [prompt_input, prompt_input]
