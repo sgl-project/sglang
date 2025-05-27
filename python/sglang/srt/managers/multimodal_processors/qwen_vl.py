@@ -135,35 +135,23 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
             images=None if images_are_preprocessed else base_output.images,
         )
         input_ids = ret["input_ids"].flatten().tolist()
+        image_offsets = self.get_mm_items_offset(
+            input_ids=ret["input_ids"].flatten(), mm_token_id=self.image_token_id
+        )
         image_grid_thw = None
         video_grid_thw = None  # TODO
         items = []
 
         if base_output.images:
             if images_are_preprocessed:
-                image_grid_thw = torch.concat(
-                    [
-                        torch.as_tensor(item.image_grid_thws)
-                        for item in base_output.images
-                    ]
+                image_grid_thw = self._extract_processor_features(
+                    base_output.images, "image_grid_thws"
                 )
-                all_pixel_values = [
-                    item.pixel_values
-                    for item in base_output.images
-                    if item.pixel_values is not None
-                ]
-                all_precomputed_features = [
-                    item.precomputed_features
-                    for item in base_output.images
-                    if item.precomputed_features is not None
-                ]
-                pixel_values = (
-                    torch.concat(all_pixel_values) if all_pixel_values else None
+                precomputed_features = self._extract_processor_features(
+                    base_output.images, "precomputed_features"
                 )
-                precomputed_features = (
-                    torch.concat(all_precomputed_features)
-                    if all_precomputed_features
-                    else None
+                pixel_values = self._extract_processor_features(
+                    base_output.images, "pixel_values"
                 )
             else:
                 image_grid_thw = ret["image_grid_thw"]
@@ -175,6 +163,7 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
                     image_grid_thws=image_grid_thw,
                     video_grid_thws=video_grid_thw,
                     precomputed_features=precomputed_features,
+                    image_offsets=image_offsets,
                     modality=Modality.IMAGE,
                 )
             ]

@@ -5,7 +5,7 @@ import multiprocessing as mp
 import os
 import re
 from abc import ABC, abstractmethod
-from typing import List, Optional, Union
+from typing import Any, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -36,9 +36,21 @@ class BaseMultiModalProcessorOutput:
 
 @dataclasses.dataclass
 class MultimodalSpecialTokens:
-    image_token: Optional[str] = None
-    video_token: Optional[str] = None
-    audio_token: Optional[str] = None
+    image_token: Optional[Union[int, str, List[str]]] = None
+    video_token: Optional[Union[int, str, List[str]]] = None
+    audio_token: Optional[Union[int, str, List[str]]] = None
+
+    def convert_to_str(self, token: Union[str, int], processor) -> str:
+        if token is None:
+            return token
+        if isinstance(token, str):
+            return token
+        return processor.tokenizer.convert_ids_to_tokens([token])[0]
+
+    def convert_to_strs(self, processor):
+        self.image_token = self.convert_to_str(self.image_token, processor)
+        self.video_token = self.convert_to_str(self.video_token, processor)
+        self.audio_token = self.convert_to_str(self.audio_token, processor)
 
     image_token_regex: Optional[re.Pattern] = None
     video_token_regex: Optional[re.Pattern] = None
@@ -74,6 +86,7 @@ class BaseMultimodalProcessor(ABC):
     def __init__(self, hf_config, server_args, _processor):
         self.hf_config = hf_config
         self._processor = _processor
+        self.arch = hf_config.architectures[0]
         self.server_args = server_args
         # FIXME: not accurate, model and image specific
         self.NUM_TOKEN_PER_FRAME = 330
@@ -260,19 +273,10 @@ class BaseMultimodalProcessor(ABC):
         """
         if not return_text:
             raise NotImplementedError()
-
         if image_data is None:
             image_data = []
-        if isinstance(multimodal_tokens.image_token, int):
-            multimodal_tokens.image_token = re.compile(
-                re.escape(
-                    self._processor.tokenizer.convert_ids_to_tokens(
-                        multimodal_tokens.image_token
-                    )
-                )
-            )
-        else:
-            multimodal_tokens.image_token = multimodal_tokens.image_token
+
+        multimodal_tokens.convert_to_strs(self._processor)
         multimodal_tokens_pattern = multimodal_tokens.collect()
 
         if isinstance(prompt, list) and return_text:
@@ -332,12 +336,39 @@ class BaseMultimodalProcessor(ABC):
                 new_text += text_part
 
         out = BaseMultiModalProcessorOutput(
+            input_text=new_text,
             images=images,
             audios=audios,
-            input_text=new_text,
         )
         out.normalize()
         return out
+
+    @staticmethod
+    def get_mm_items_offset(
+        input_ids: torch.Tensor, mm_token_id: int
+    ) -> List[Tuple[int, int]]:
+        """
+        Get a set of range for mm_items from input_ids
+        Example:
+            input_ids = [1, 2, 3, 3, 3, 4, 3, 3]
+            mm_token_id = 3
+            return result = [(2,4),(6,7)]
+        """
+        mask = input_ids == mm_token_id
+
+        start_positions = (mask & ~torch.roll(mask, 1)).nonzero(as_tuple=True)[0]
+        end_positions = (mask & ~torch.roll(mask, -1)).nonzero(as_tuple=True)[0]
+
+        return list(zip(start_positions.tolist(), end_positions.tolist()))
+
+    @staticmethod
+    def get_mm_items_offset_by_pair(
+        input_ids: torch.Tensor, mm_start_id: int, mm_end_id: int
+    ) -> List[Tuple[int, int]]:
+        indices_start = (input_ids == mm_start_id).nonzero(as_tuple=True)[0] + 1
+        indices_end = (input_ids == mm_end_id).nonzero(as_tuple=True)[0] - 1
+
+        return list(zip(indices_start.tolist(), indices_end.tolist()))
 
     def mm_inputs_are_preprocessed(self, mm_inputs: Optional[list]):
         """Returns true if all images are preprocessed, false if all are not, and error otherwise."""
@@ -351,3 +382,17 @@ class BaseMultimodalProcessor(ABC):
                 "Unsupported: mixture of multimodal inputs where some but not all are preprocessed."
             )
         return ret
+
+    @staticmethod
+    def _extract_processor_features(
+        items: List[Any], attr_name: str
+    ) -> Optional[torch.Tensor]:
+        """
+        Helper function to concat extracted attributes from processor output.
+        """
+        values = [
+            getattr(item, attr_name)
+            for item in items
+            if getattr(item, attr_name) is not None
+        ]
+        return torch.concat(values) if values else None
