@@ -417,6 +417,8 @@ class SchedulerDisaggregationPrefillMixin:
                 self.tree_cache.cache_finished_req(req)  # unlock the tree
                 req.finished_reason = FINISH_LENGTH(length=0)
                 # FIXME: clean up req's data in transfer engine
+                if hasattr(req.disagg_kv_sender, "clear"):
+                    req.disagg_kv_sender.clear()
                 done_reqs.append(req)
             elif poll == KVPoll.Failed:
                 error_message = f"Prefill transfer failed for request rank={self.tp_rank} {req.rid=} {req.bootstrap_room=}"
