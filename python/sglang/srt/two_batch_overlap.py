@@ -5,6 +5,12 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Sequence
 import torch
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.communicator import (
+    CommunicateContext,
+    CommunicateSimpleFn,
+    CommunicateSummableTensorPairFn,
+    ScatterMode,
+)
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPDispatcher
 from sglang.srt.layers.quantization.deep_gemm import configure_deep_gemm_num_sms
@@ -355,6 +361,7 @@ def model_forward_maybe_tbo(
     positions: torch.Tensor,
     forward_batch: ForwardBatch,
     hidden_states: torch.Tensor,
+    input_data_scatter_mode: ScatterMode,
     residual: Optional[torch.Tensor],
     zero_allocator: Optional[BumpAllocator] = None,
 ):
@@ -365,20 +372,32 @@ def model_forward_maybe_tbo(
         residual=residual,
         **(dict(zero_allocator=zero_allocator) if zero_allocator is not None else {}),
     )
+    layer_input_scatter_mode = layers[0].layer_scatter_modes.layer_input_mode
     operations_strategy = OperationsStrategy.init_new_tbo(
         layers, forward_batch.global_forward_mode
     )
     if enable_tbo:
-        return _model_forward_tbo(inputs, operations_strategy)
+        return _model_forward_tbo(
+            inputs=inputs,
+            operations_strategy=operations_strategy,
+            input_data_scatter_mode=input_data_scatter_mode,
+            layer_input_scatter_mode=layer_input_scatter_mode,
+        )
     else:
         return _model_forward_non_tbo(inputs, operations_strategy)
 
 
-def _model_forward_tbo(inputs, operations_strategy: OperationsStrategy):
-    # The attn_tp_size!=1 case is not yet extracted to master
-    assert get_attention_tp_size() == 1
-
-    inputs_arr = _model_forward_tbo_split_inputs(**inputs)
+def _model_forward_tbo(
+    inputs,
+    operations_strategy: OperationsStrategy,
+    input_data_scatter_mode: ScatterMode,
+    layer_input_scatter_mode: ScatterMode,
+):
+    inputs_arr = _model_forward_tbo_split_inputs(
+        **inputs,
+        input_data_scatter_mode=input_data_scatter_mode,
+        layer_input_scatter_mode=layer_input_scatter_mode,
+    )
     del inputs
 
     with configure_deep_gemm_num_sms(operations_strategy.deep_gemm_num_sms):
@@ -401,7 +420,57 @@ def _model_forward_tbo_split_inputs(
     residual: torch.Tensor,
     positions: torch.Tensor,
     forward_batch: ForwardBatch,
-    zero_allocator: Optional[BumpAllocator] = None,
+    zero_allocator: Optional[BumpAllocator],
+    input_data_scatter_mode: ScatterMode,
+    layer_input_scatter_mode: ScatterMode,
+) -> List[Dict]:
+    tbo_splitter_scatter_mode = ScatterMode.TP_ATTN_FULL
+    context = CommunicateContext.init_new()
+
+    hidden_states, residual = CommunicateSummableTensorPairFn.execute(
+        hidden_states_input_mode=input_data_scatter_mode,
+        residual_input_mode=input_data_scatter_mode,
+        output_mode=tbo_splitter_scatter_mode,
+        hidden_states=hidden_states,
+        residual=residual,
+        forward_batch=forward_batch,
+        context=context,
+    )
+
+    inputs_arr = _model_forward_tbo_split_inputs_raw(
+        hidden_states=hidden_states,
+        residual=residual,
+        positions=positions,
+        forward_batch=forward_batch,
+        zero_allocator=zero_allocator,
+    )
+
+    def _post_transform(hidden_states, residual, forward_batch, **kwargs):
+        hidden_states, residual = CommunicateSummableTensorPairFn.execute(
+            hidden_states_input_mode=tbo_splitter_scatter_mode,
+            residual_input_mode=tbo_splitter_scatter_mode,
+            output_mode=layer_input_scatter_mode,
+            hidden_states=hidden_states,
+            residual=residual,
+            forward_batch=forward_batch,
+            context=context,
+        )
+        return dict(
+            hidden_states=hidden_states,
+            residual=residual,
+            forward_batch=forward_batch,
+            **kwargs,
+        )
+
+    return [_post_transform(**inputs) for inputs in inputs_arr]
+
+
+def _model_forward_tbo_split_inputs_raw(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    positions: torch.Tensor,
+    forward_batch: ForwardBatch,
+    zero_allocator: Optional[BumpAllocator],
 ) -> List[Dict]:
     return [
         dict(
