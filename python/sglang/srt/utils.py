@@ -2219,32 +2219,83 @@ def read_system_prompt_from_file(model_name: str) -> str:
         return ""
 
 
-def extract_numa_id(device_id):
-    return device_id.split(":")[0]
+def get_numa_id_for_gpu(gpu_id: int) -> Optional[str]:
+    """Get NUMA node ID for a specific GPU using nvidia-smi topo command.
 
+    Args:
+        gpu_id: GPU device ID (0, 1, 2, ...)
 
-def check_device_cross_numa_node(visible_device_idx=None) -> bool:
-    """Check if the GPU devices are on different NUMA nodes.
-    Assuming the device id format is like 00000001:8A:00.0
-    For example, for "00000001:8A:00.0", the NUMA node ID might be "01".
+    Returns:
+        NUMA node ID as string, or None if failed to get
     """
     try:
         result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=pci.bus_id", "--format=csv,noheader"],
+            ["nvidia-smi", "topo", "-C", "-i", str(gpu_id)],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=True,
             text=True,
         )
-        device_ids = result.stdout.strip().split("\n")
+        # Parse output like "NUMA IDs of closest CPU: 0"
+        for line in result.stdout.strip().split("\n"):
+            if "NUMA IDs of closest CPU:" in line:
+                numa_id = line.split(":")[-1].strip()
+                return numa_id
+        return None
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Failed to execute nvidia-smi topo for GPU {gpu_id}: {e}")
+        return None
+    except Exception as e:
+        logger.error(
+            f"An unexpected error occurred when getting NUMA ID for GPU {gpu_id}: {e}"
+        )
+        return None
+
+
+def extract_numa_id(device_id):
+    """Legacy function for compatibility. Now extracts from PCI bus ID format."""
+    return device_id.split(":")[0]
+
+
+def check_device_cross_numa_node(visible_device_idx=None) -> bool:
+    """Check if the GPU devices are on different NUMA nodes.
+    Uses nvidia-smi topo command to get accurate NUMA node information.
+    """
+    try:
+        # First get the total number of GPUs available
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+            text=True,
+        )
+        total_gpus = len(result.stdout.strip().split("\n"))
+
+        # Determine which GPU indices to check
         if visible_device_idx is not None:
-            valid_indices = [i for i in visible_device_idx if 0 <= i < len(device_ids)]
-            device_ids = [device_ids[i] for i in valid_indices]
-        if len(device_ids) <= 1:
+            gpu_indices = [i for i in visible_device_idx if 0 <= i < total_gpus]
+        else:
+            gpu_indices = list(range(total_gpus))
+
+        if len(gpu_indices) <= 1:
             return False
-        numa_ids = [extract_numa_id(device_id) for device_id in device_ids]
+
+        # Get NUMA IDs for each GPU
+        numa_ids = []
+        for gpu_id in gpu_indices:
+            numa_id = get_numa_id_for_gpu(gpu_id)
+            if numa_id is None:
+                logger.warning(
+                    f"Failed to get NUMA ID for GPU {gpu_id}, skipping cross-NUMA check"
+                )
+                return False
+            numa_ids.append(numa_id)
+
+        # Check if all GPUs are on the same NUMA node
         same_numa = all(numa == numa_ids[0] for numa in numa_ids)
         return not same_numa
+
     except subprocess.CalledProcessError as e:
         logger.error(f"Failed to execute nvidia-smi: {e}")
         return False
