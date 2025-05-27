@@ -12,7 +12,7 @@ concurrency:
 jobs:
   build-test:
     if: github.event_name == 'pull_request'
-    runs-on: test-7470
+    runs-on: spr-node
     environment: 'prod'
     strategy:
       matrix:
@@ -26,17 +26,16 @@ jobs:
           version=$(cat python/sglang/version.py | cut -d'"' -f2)
           tag=v${version}-xeon
 
-          docker build --build-arg https_proxy=http://proxy-dmz.intel.com:912/ . -f docker/Dockerfile.xeon  -t sglang_xeon --no-cache
+          docker build . -f docker/Dockerfile.xeon  -t sglang_xeon --no-cache
   unit-test:
     if: github.event_name == 'pull_request'
     needs: [build-test]
-    runs-on: test-7470
+    runs-on: spr-node
     steps:
       - name: Run container
         run: |
           docker run -dt \
             -v ${{ github.workspace }}:/sglang-checkout/ --ipc=host \
-            -e https_proxy=http://proxy-dmz.intel.com:912/ \
             --name ci_sglang_xeon \
             sglang_xeon
 
@@ -63,7 +62,7 @@ jobs:
   finish:
     if: always()
     needs: [build-test, unit-test]
-    runs-on: test-7470
+    runs-on: spr-node
     steps:
       - name: Check all dependent job statuses
         run: |
