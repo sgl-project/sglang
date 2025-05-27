@@ -481,12 +481,9 @@ class CudaGraphRunner:
             capture_hidden_mode=self.capture_hidden_mode,
             lora_paths=lora_paths,
             num_token_non_padded=self.num_token_non_padded,
-            tbo_split_seq_index=TboCudaGraphRunnerUtils.compute_tbo_split_seq_index(
-                self, num_tokens
-            ),
             global_forward_mode=self.capture_forward_mode,
         )
-        TboForwardBatchPreparer.prepare(forward_batch)
+        TboCudaGraphRunnerUtils.prepare(forward_batch, self, num_tokens)
 
         if lora_paths is not None:
             self.model_runner.lora_manager.prepare_lora_batch(forward_batch)

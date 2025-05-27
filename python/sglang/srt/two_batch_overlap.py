@@ -89,6 +89,11 @@ def compute_split_token_index(
 
 class TboCudaGraphRunnerUtils:
     @staticmethod
+    def prepare(batch: ForwardBatch, that: "CudaGraphRunner", num_tokens: int):
+        batch.tbo_split_seq_index = TboCudaGraphRunnerUtils.compute_tbo_split_seq_index(that, num_tokens)
+        TboForwardBatchPreparer.prepare(batch)
+
+    @staticmethod
     def compute_tbo_split_seq_index(that: "CudaGraphRunner", num_tokens: int):
         if that.model_runner.server_args.enable_two_batch_overlap:
             tbo_split_seq_index = compute_split_seq_index(
@@ -198,7 +203,7 @@ class TboForwardBatchPreparer:
 
         assert isinstance(batch.attn_backend, TboAttnBackend)
         attn_backend_child_a, attn_backend_child_b = batch.attn_backend.children
-        
+
         [out_num_token_non_padded_a, out_num_token_non_padded_b] = TODO
 
         child_a = cls.filter_batch(
