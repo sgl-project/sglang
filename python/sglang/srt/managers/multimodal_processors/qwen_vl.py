@@ -44,6 +44,7 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
             self.IMAGE_TOKEN_REGEX = re.compile(
                 r"<\|vision_bos\|>(?:<\|IMAGE\|>)+<\|vision_eos\|>"
             )
+            self.image_token = "<|vision_bos|><|IMAGE|><|vision_eo|>"
         else:
             self.image_token_id = hf_config.image_token_id
             self.image_start_id = hf_config.vision_start_token_id
@@ -53,6 +54,8 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
             self.IMAGE_TOKEN_REGEX = re.compile(
                 r"<\|vision_start\|>(?:<\|image_pad\|>)+<\|vision_end\|>"
             )
+            self.image_token = "<|vision_start|><|image_pad|><|vision_end|>"
+
         self.NUM_TOKEN_PER_FRAME = 770
         self.IMAGE_FACTOR = 28
         self.MIN_PIXELS = 4 * 28 * 28
@@ -76,7 +79,7 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
             image_data=image_data,
             audio_data=request_obj.audio_data,
             multimodal_tokens=MultimodalSpecialTokens(
-                image_token=self.image_token_id,
+                image_token=self.image_token,
                 image_token_regex=self.IMAGE_TOKEN_REGEX,
                 audio_token=getattr(self, "audio_token_id", None),
                 video_token=getattr(self, "video_token_id", None),
@@ -155,6 +158,7 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
             images=None if images_are_preprocessed else base_output.images,
             audio=base_output.audios,
         )
+
         input_ids = ret["input_ids"].flatten()
         image_offsets = self.get_mm_items_offset(
             input_ids=input_ids, mm_token_id=self.image_token_id
