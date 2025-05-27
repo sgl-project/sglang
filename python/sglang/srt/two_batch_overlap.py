@@ -104,19 +104,19 @@ class TboCudaGraphRunnerPlugin:
         # For simplicity, when two_batch_overlap is enabled, we only capture CUDA Graph for tbo=true
         assert batch.tbo_split_seq_index is not None, f"{num_tokens=}"
 
-        self._tbo_children_num_token_non_padded[...] = (
-            TboForwardBatchPreparer.compute_tbo_children_num_token_non_padded(batch)
-        )
+        self._fill_tensor_content(batch)
         TboForwardBatchPreparer.prepare_raw(
             batch,
             tbo_children_num_token_non_padded=self._tbo_children_num_token_non_padded,
         )
 
     def replay_prepare(self, batch: ForwardBatch):
+        self._fill_tensor_content(batch)
+
+    def _fill_tensor_content(self, batch: ForwardBatch):
         self._tbo_children_num_token_non_padded[...] = (
             TboForwardBatchPreparer.compute_tbo_children_num_token_non_padded(batch)
         )
-
 
 class TboDPAttentionPreparer:
     def prepare_all_gather(
