@@ -484,7 +484,7 @@ class CudaGraphRunner:
             global_forward_mode=self.capture_forward_mode,
         )
         TboCudaGraphRunnerUtils.prepare(
-            forward_batch=forward_batch, cuda_graph_runner=self, num_tokens=num_tokens
+            batch=forward_batch, cuda_graph_runner=self, num_tokens=num_tokens
         )
 
         if lora_paths is not None:
