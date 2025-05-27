@@ -2,7 +2,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import pytest
 import torch
-
+import sgl_kernel
 
 # vLLM torch native
 def _apply_rotary_emb(
@@ -126,8 +126,7 @@ class RotaryEmbeddingCPU(RotaryEmbedding):
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        import sgl_kernel
-        sgl_kernel.common_ops.rotary_embedding_origin_cpu(
+        torch.ops.sgl_kernel.rotary_embedding_origin_cpu(
             positions,
             query,
             key,

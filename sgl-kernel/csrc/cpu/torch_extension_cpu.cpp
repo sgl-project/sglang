@@ -32,10 +32,11 @@ at::Tensor rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps);
 // fused_add_rmsnorm
 void fused_add_rmsnorm_cpu(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps);
 
+// topk
 std::tuple<at::Tensor, at::Tensor> topk_sigmoid_cpu(at::Tensor& hidden_states, at::Tensor& gating_output, int64_t topk);
 std::tuple<at::Tensor, at::Tensor>
 topk_softmax_cpu(at::Tensor& hidden_states, at::Tensor& gating_output, int64_t topk, bool renormalize);
-// topk
+
 std::tuple<at::Tensor, at::Tensor> grouped_topk_cpu(
     at::Tensor& hidden_states,
     at::Tensor& gating_output,
@@ -316,7 +317,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   // rope
   m.def("rotary_position_embedding_cpu(Tensor t_pos, Tensor q_pe, Tensor k_pe, Tensor t_emb_pos) -> (Tensor, Tensor)");
   m.impl("rotary_position_embedding_cpu", torch::kCPU, &rotary_position_embedding_cpu);
-  m.def("rotary_embedding_origin_cpu(Tensor positions, Tensor query, Tensor key, int head_size, Tensor cos_sin_cache, bool is_neox) -> (Tensor, Tensor)");
+  m.def(
+      "rotary_embedding_origin_cpu(Tensor positions, Tensor query, Tensor key, int head_size, Tensor cos_sin_cache, "
+      "bool is_neox) -> ()");
   m.impl("rotary_embedding_origin_cpu", torch::kCPU, &rotary_embedding_origin_cpu);
 }
 
