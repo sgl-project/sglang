@@ -93,11 +93,16 @@ class TboCudaGraphRunnerPlugin:
         self._tbo_children_num_token_non_padded = torch.zeros((2,), dtype=torch.int32)
 
     def capture_one_batch_size(self, batch: ForwardBatch, num_tokens: int):
-        batch.tbo_split_seq_index = self._compute_tbo_split_seq_index(
-            num_tokens, batch.forward_mode
-        )
-        if batch.tbo_split_seq_index is None:
+        if not global_server_args_dict["enable_two_batch_overlap"]:
             return
+
+        batch.tbo_split_seq_index = compute_split_seq_index(
+            forward_mode=forward_mode,
+            num_tokens=num_tokens,
+            extend_lens=None,
+        )
+        # For simplicity, when two_batch_overlap is enabled, we only capture CUDA Graph for tbo=true
+        assert batch.tbo_split_seq_index is not None, f"{forward_mode=} {num_tokens=}"
 
         self._tbo_children_num_token_non_padded[...] = (
             TboForwardBatchPreparer.compute_tbo_children_num_token_non_padded(batch)
@@ -111,20 +116,6 @@ class TboCudaGraphRunnerPlugin:
         self._tbo_children_num_token_non_padded[...] = (
             TboForwardBatchPreparer.compute_tbo_children_num_token_non_padded(batch)
         )
-
-    @staticmethod
-    def _compute_tbo_split_seq_index(num_tokens: int, forward_mode):
-        if global_server_args_dict["enable_two_batch_overlap"]:
-            tbo_split_seq_index = compute_split_seq_index(
-                forward_mode=forward_mode,
-                num_tokens=num_tokens,
-                extend_lens=None,
-            )
-            # For simplicity, when two_batch_overlap is enabled, we only capture CUDA Graph for tbo=true
-            assert tbo_split_seq_index is not None, f"{forward_mode=} {num_tokens=}"
-            return tbo_split_seq_index
-        else:
-            return None
 
 
 class TboDPAttentionPreparer:
