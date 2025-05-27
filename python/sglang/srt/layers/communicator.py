@@ -325,8 +325,8 @@ class CommunicateWithAllReduceAndLayerNormFn:
         if (
             (hidden_states_input_mode == ScatterMode.TP_ATTN_FULL)
             and (
-            residual_input_mode in [ScatterMode.SCATTERED, ScatterMode.TP_ATTN_FULL]
-        )
+                residual_input_mode in [ScatterMode.SCATTERED, ScatterMode.TP_ATTN_FULL]
+            )
             and (hidden_states_output_mode == ScatterMode.SCATTERED)
             and (residual_output_mode == ScatterMode.SCATTERED)
         ):
