@@ -686,7 +686,7 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         self.w_kc = None
         self.w_vc = None
-        self.w_scale = None
+        self.w_scale = 1.0
 
         self.w_scale_k = None
         self.w_scale_v = None
@@ -1748,59 +1748,43 @@ class DeepseekV2ForCausalLM(nn.Module):
                 torch.float8_e4m3fn,
                 torch.float8_e4m3fnuz,
             ):
-                if hasattr(self.quant_config, "weight_block_size"):
+                if hasattr(self.quant_config, "weight_block_size") and self.quant_config.weight_block_size is not None:
                     weight_block_size = self.quant_config.weight_block_size
-                    if weight_block_size is not None:
-                        assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
-                        if _is_fp8_fnuz:
-                            weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
-                                weight=w,
-                                weight_scale=self_attn.kv_b_proj.weight_scale_inv,
-                                input_scale=None,
-                            )
-                        else:
-                            weight = w
-                            weight_scale = self_attn.kv_b_proj.weight_scale_inv
-
-                        if (
-                            _is_cuda
-                            and weight_block_size[0] == 128
-                            and weight_block_size[1] == 128
-                            and model_dtype == torch.bfloat16
-                        ):
-                            if _ENABLE_JIT_DEEPGEMM and get_bool_env_var(
-                                "SGL_USE_DEEPGEMM_BMM", "false"
-                            ):
-                                block_scale = weight_scale
-                                use_deep_gemm_bmm = True
-                            else:
-                                w = block_quant_dequant(
-                                    weight,
-                                    weight_scale,
-                                    weight_block_size,
-                                    model_dtype,
-                                )
-                        else:
-                            w, scale = block_quant_to_tensor_quant(
-                                weight, weight_scale, weight_block_size
-                            )
-                            self_attn.w_scale = scale
+                    assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
+                    if _is_fp8_fnuz:
+                        weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                            weight=w,
+                            weight_scale=self_attn.kv_b_proj.weight_scale_inv,
+                            input_scale=None,
+                        )
                     else:
-                        # weight_block_size is None
-                        if _is_fp8_fnuz:
-                            weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
-                                weight=w,
-                                weight_scale=self_attn.kv_b_proj.weight_scale,
-                                input_scale=None,
-                            )
-                        else:
-                            weight = w
-                            weight_scale = self_attn.kv_b_proj.weight_scale
+                        weight = w
+                        weight_scale = self_attn.kv_b_proj.weight_scale_inv
 
-                        w, scale = channel_quant_to_tensor_quant(weight, weight_scale)
+                    if (
+                        _is_cuda
+                        and weight_block_size[0] == 128
+                        and weight_block_size[1] == 128
+                        and model_dtype == torch.bfloat16
+                    ):
+                        if _ENABLE_JIT_DEEPGEMM and get_bool_env_var(
+                            "SGL_USE_DEEPGEMM_BMM", "false"
+                        ):
+                            block_scale = weight_scale
+                            use_deep_gemm_bmm = True
+                        else:
+                            w = block_quant_dequant(
+                                weight,
+                                weight_scale,
+                                weight_block_size,
+                                model_dtype,
+                            )
+                    else:
+                        w, scale = block_quant_to_tensor_quant(
+                            weight, weight_scale, weight_block_size
+                        )
                         self_attn.w_scale = scale
                 else:
-                    # !hasattr(self.quant_config, "weight_block_size")
                     if _is_fp8_fnuz:
                         weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
                             weight=w,
