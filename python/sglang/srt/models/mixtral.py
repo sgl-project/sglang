@@ -33,7 +33,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe.ep_moe.layer import EPMoE
+from sglang.srt.layers.moe.ep_moe.layer import EPMoE, EPMoETimer
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -47,8 +47,10 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix
 
+import time
 
-class MixtralMoE(nn.Module):
+
+class MixtralMoE(EPMoETimer, nn.Module):
     """A tensor-parallel MoE implementation for Mixtral that shards each expert
     across all ranks.
 
@@ -103,6 +105,9 @@ class MixtralMoE(nn.Module):
         final_hidden_states = self.experts(hidden_states, router_logits)
         if self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+        
+        self.append_by_dict(self.experts.get_timing() if isinstance(self.experts, EPMoETimer) else {})
+        
         return final_hidden_states.view(orig_shape)
 
 
@@ -196,6 +201,7 @@ class MixtralDecoderLayer(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        self.layer_id = layer_id
         self.hidden_size = config.hidden_size
         # Requires transformers > 4.32.0
         rope_theta = getattr(config, "rope_theta", 10000)
@@ -221,6 +227,19 @@ class MixtralDecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        
+        self.timing = {
+            "layer_id": self.layer_id,
+            "self_attn_time": [],
+            "block_sparse_moe_time": [],
+            "moe_timing": {
+                "pre_order_time": [],
+                "group_gemm_0_time": [],
+                "act_time": [],
+                "group_gemm_1_time": [],
+                "post_order_time": [],
+            },
+        }
 
     def forward(
         self,
@@ -235,15 +254,33 @@ class MixtralDecoderLayer(nn.Module):
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        start_time = time.time()
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
+        end_time = time.time()
+        attn_time = end_time - start_time
+        # print(f"[Layer {self.layer_id}] SelfAttention time: {attn_time} seconds")
 
+        start_time = time.time()
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.block_sparse_moe(hidden_states)
+        end_time = time.time()
+        moe_time = end_time - start_time
+        # print(f"[Layer {self.layer_id}] BlockSparseMoE time: {moe_time} seconds")
+        
+        self.timing["self_attn_time"].extend([attn_time])
+        self.timing["block_sparse_moe_time"].extend([moe_time])
+        if isinstance(self.block_sparse_moe, EPMoETimer):
+            self.timing["moe_timing"]["pre_order_time"].extend(self.block_sparse_moe.get_timing()["pre_order_time"])
+            self.timing["moe_timing"]["group_gemm_0_time"].extend(self.block_sparse_moe.get_timing()["group_gemm_0_time"])
+            self.timing["moe_timing"]["act_time"].extend(self.block_sparse_moe.get_timing()["act_time"])
+            self.timing["moe_timing"]["group_gemm_1_time"].extend(self.block_sparse_moe.get_timing()["group_gemm_1_time"])
+            self.timing["moe_timing"]["post_order_time"].extend(self.block_sparse_moe.get_timing()["post_order_time"])
+        
         return hidden_states, residual
 
 
@@ -275,6 +312,10 @@ class MixtralModel(nn.Module):
             ]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        
+        # 对每个layer_id，记录每个layer的timing
+        self.model_timings = []
+        self.forward_times = 0
 
     def forward(
         self,
@@ -294,8 +335,32 @@ class MixtralModel(nn.Module):
                 positions, hidden_states, forward_batch, residual
             )
         hidden_states, _ = self.norm(hidden_states, residual)
+        
+        for i in range(len(self.layers)):
+            info = {
+                "layer_id": i,
+                "self_attn_time": 1000 * sum(self.layers[i].timing["self_attn_time"]) / len(self.layers[i].timing["self_attn_time"]),
+                "block_sparse_moe_time": 1000 * sum(self.layers[i].timing["block_sparse_moe_time"]) / len(self.layers[i].timing["block_sparse_moe_time"]),
+                "moe_timing": {
+                    "pre_order_time": 1000 * sum(self.layers[i].timing["moe_timing"]["pre_order_time"]) / len(self.layers[i].timing["moe_timing"]["pre_order_time"]),
+                    "group_gemm_0_time": 1000 * sum(self.layers[i].timing["moe_timing"]["group_gemm_0_time"]) / len(self.layers[i].timing["moe_timing"]["group_gemm_0_time"]),
+                    "act_time": 1000 * sum(self.layers[i].timing["moe_timing"]["act_time"]) / len(self.layers[i].timing["moe_timing"]["act_time"]),
+                    "group_gemm_1_time": 1000 * sum(self.layers[i].timing["moe_timing"]["group_gemm_1_time"]) / len(self.layers[i].timing["moe_timing"]["group_gemm_1_time"]),
+                    "post_order_time": 1000 * sum(self.layers[i].timing["moe_timing"]["post_order_time"]) / len(self.layers[i].timing["moe_timing"]["post_order_time"]),
+                },
+            }
+            self.model_timings.append(info)
+        
+        import json
+        with open(f"MixtralModel_Timing.json", "w") as f:
+            info = {
+                "forward_id": self.forward_times,
+                "info": self.model_timings,
+            }
+            json.dump(info, f, indent=4)
+        
+        self.forward_times += 1
         return hidden_states
-
 
 class MixtralForCausalLM(nn.Module):
 

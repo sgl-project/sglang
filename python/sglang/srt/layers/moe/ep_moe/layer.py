@@ -47,6 +47,8 @@ if _is_hip:
 
 logger = logging.getLogger(__name__)
 
+import time
+
 
 class GroupedGemmRunner(torch.nn.Module):
     flashinfer_gemm_warpper = None
@@ -111,8 +113,49 @@ class GroupedGemmRunner(torch.nn.Module):
             )
         return c
 
+class EPMoETimer:
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.timing = {
+            "pre_order_time": [],
+            "group_gemm_0_time": [],
+            "act_time": [],
+            "group_gemm_1_time": [],
+            "post_order_time": [],
+        }
+    
+    def append(self, pre_order_time, group_gemm_0_time, act_time, group_gemm_1_time, post_order_time):
+        self.timing["pre_order_time"].append(pre_order_time)
+        self.timing["group_gemm_0_time"].append(group_gemm_0_time)
+        self.timing["act_time"].append(act_time)
+        self.timing["group_gemm_1_time"].append(group_gemm_1_time)
+        self.timing["post_order_time"].append(post_order_time)
+    
+    def append_by_dict(self, other_timing: dict):
+        for key, value in other_timing.items():
+            # 按照元素添加
+            self.timing[key].extend(value)
+    
+    def get_timing(self):
+        return {
+            "pre_order_time": self.timing["pre_order_time"],
+            "group_gemm_0_time": self.timing["group_gemm_0_time"],
+            "act_time": self.timing["act_time"],
+            "group_gemm_1_time": self.timing["group_gemm_1_time"],
+            "post_order_time": self.timing["post_order_time"],   
+        }
+    
+    def clear_timing(self):
+        self.timing = {
+            "pre_order_time": [],
+            "group_gemm_0_time": [],    
+            "act_time": [],
+            "group_gemm_1_time": [],
+            "post_order_time": [],
+        }
 
-class EPMoE(torch.nn.Module):
+
+class EPMoE(torch.nn.Module, EPMoETimer):
     """
     MoE Expert Parallel Impl
 
@@ -241,6 +284,7 @@ class EPMoE(torch.nn.Module):
             )
             self.w13_input_scale = max_value / torch.finfo(self.fp8_dtype).max
 
+        start_time = time.time()
         # PreReorder
         pre_reorder_triton_kernel[(hidden_states.shape[0],)](
             hidden_states,
@@ -254,6 +298,9 @@ class EPMoE(torch.nn.Module):
             hidden_states.shape[1],
             BLOCK_SIZE=512,
         )
+        end_time = time.time()
+        pre_order_time = end_time - start_time
+        # print(f"PreReorder time: {pre_order_time} seconds")
 
         seg_indptr_cur_rank = seg_indptr[self.start_expert_id : self.end_expert_id + 2]
         weight_indices_cur_rank = torch.arange(
@@ -269,6 +316,7 @@ class EPMoE(torch.nn.Module):
             device=hidden_states.device,
             dtype=hidden_states.dtype,
         )
+        start_time = time.time()
         gateup_output = self.grouped_gemm_runner(
             a=gateup_input,
             b=self.w13_weight,
@@ -286,8 +334,11 @@ class EPMoE(torch.nn.Module):
             ),
             block_shape=self.block_shape,
         )
-
+        end_time = time.time()
+        group_gemm_0_time = end_time - start_time
+        # print(f"GroupGemm-0 time: {group_gemm_0_time} seconds")
         # Act
+        start_time = time.time()
         down_input = torch.empty(
             gateup_output.shape[0],
             gateup_output.shape[1] // 2,
@@ -330,6 +381,11 @@ class EPMoE(torch.nn.Module):
         else:
             raise ValueError(f"Unsupported activation: {self.activation=}")
 
+        end_time = time.time()
+        act_time = end_time - start_time
+        # print(f"Act time: {act_time} seconds")
+
+        start_time = time.time()
         # GroupGemm-1
         down_output = torch.empty(
             down_input.shape[0],
@@ -354,7 +410,11 @@ class EPMoE(torch.nn.Module):
             ),
             block_shape=self.block_shape,
         )
+        end_time = time.time()
+        group_gemm_1_time = end_time - start_time
+        # print(f"GroupGemm-1 time: {group_gemm_1_time} seconds")
 
+        start_time = time.time()
         # PostReorder
         output = torch.empty_like(hidden_states)
         post_reorder_triton_kernel[(hidden_states.size(0),)](
@@ -369,6 +429,13 @@ class EPMoE(torch.nn.Module):
             hidden_states.size(1),
             BLOCK_SIZE=512,
         )
+        end_time = time.time()
+        post_order_time = end_time - start_time
+        # print(f"PostReorder time: {post_order_time} seconds")
+        
+        self.clear_timing()
+        self.append(pre_order_time, group_gemm_0_time, act_time, group_gemm_1_time, post_order_time)
+
         return output
 
     @classmethod
