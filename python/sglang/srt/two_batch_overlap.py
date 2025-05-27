@@ -88,23 +88,23 @@ def compute_split_token_index(
 
 
 class TboCudaGraphRunnerUtils:
-    @staticmethod
-    def prepare(batch: ForwardBatch, that: "CudaGraphRunner", num_tokens: int):
-        batch.tbo_split_seq_index = TboCudaGraphRunnerUtils.compute_tbo_split_seq_index(that, num_tokens)
+    @classmethod
+    def prepare(cls, batch: ForwardBatch, runner: "CudaGraphRunner", num_tokens: int):
+        batch.tbo_split_seq_index = cls.compute_tbo_split_seq_index(runner, num_tokens)
         TboForwardBatchPreparer.prepare(batch)
 
     @staticmethod
-    def compute_tbo_split_seq_index(that: "CudaGraphRunner", num_tokens: int):
-        if that.model_runner.server_args.enable_two_batch_overlap:
+    def compute_tbo_split_seq_index(runner: "CudaGraphRunner", num_tokens: int):
+        if runner.model_runner.server_args.enable_two_batch_overlap:
             tbo_split_seq_index = compute_split_seq_index(
-                forward_mode=that.capture_forward_mode,
+                forward_mode=runner.capture_forward_mode,
                 num_tokens=num_tokens,
                 extend_lens=None,
             )
             # For simplicity, when two_batch_overlap is enabled, we only capture CUDA Graph for tbo=true
             assert (
                     tbo_split_seq_index is not None
-            ), f"{that.capture_forward_mode=} {num_tokens=}"
+            ), f"{runner.capture_forward_mode=} {num_tokens=}"
         else:
             tbo_split_seq_index = None
         return tbo_split_seq_index
