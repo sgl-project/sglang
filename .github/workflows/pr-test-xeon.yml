@@ -26,7 +26,7 @@ jobs:
           version=$(cat python/sglang/version.py | cut -d'"' -f2)
           tag=v${version}-xeon
 
-          docker build . -f docker/Dockerfile.xeon  -t sglang_xeon --no-cache
+          docker build --build-arg https_proxy=http://proxy-dmz.intel.com:912/ . -f docker/Dockerfile.xeon  -t sglang_xeon --no-cache
   unit-test:
     if: github.event_name == 'pull_request'
     needs: [build-test]
