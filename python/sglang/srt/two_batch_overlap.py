@@ -189,7 +189,7 @@ class TboForwardBatchPreparer:
         cls.prepare_raw(
             batch,
             tbo_children_num_token_non_padded=cls.compute_tbo_children_num_token_non_padded(
-                tbo_split_token_index=TODO,
+                tbo_split_token_index=cls._compute_split_token_index(batch),
                 num_token_non_padded=len(batch.input_ids),
             )
         )
@@ -198,11 +198,7 @@ class TboForwardBatchPreparer:
     def prepare_raw(cls, batch: ForwardBatch, tbo_children_num_token_non_padded: torch.Tensor):
         from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 
-        tbo_split_token_index = compute_split_token_index(
-            split_seq_index=batch.tbo_split_seq_index,
-            forward_mode=batch.forward_mode,
-            extend_seq_lens=batch.extend_seq_lens_cpu,
-        )
+        tbo_split_token_index = cls._compute_split_token_index(batch)
 
         if _tbo_debug:
             logger.info(
@@ -360,6 +356,14 @@ class TboForwardBatchPreparer:
             raise Exception(f"{len(errors)} errors happen:\n" + "\n\n".join(errors))
 
         return ForwardBatch(**output_dict)
+
+    @classmethod
+    def _compute_split_token_index(cls, batch: ForwardBatch):
+        return compute_split_token_index(
+            split_seq_index=batch.tbo_split_seq_index,
+            forward_mode=batch.forward_mode,
+            extend_seq_lens=batch.extend_seq_lens_cpu,
+        )
 
     @classmethod
     def compute_tbo_children_num_token_non_padded(cls, *, tbo_split_token_index: int, num_token_non_padded: int):
