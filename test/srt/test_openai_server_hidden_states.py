@@ -21,7 +21,7 @@ from sglang.test.test_utils import (
 )
 
 HS_TEST_CASES = [True]
-ENABLE_HS_ARGS = []  # ["--enable-return-hidden-states"]
+ENABLE_HS_ARGS = ["--enable-return-hidden-states"]  # ["--enable-return-hidden-states"]
 
 
 class BaseTestOpenAIServerWithHiddenStatesEnabled(ABC):
@@ -449,7 +449,6 @@ class TestOpenAIServerWithEAGLEAndHiddenStatesEnabled(
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 *ENABLE_HS_ARGS,
-                "--disable-cuda-graph",
                 "--speculative-algorithm",
                 "EAGLE",
                 "--speculative-draft-model-path",

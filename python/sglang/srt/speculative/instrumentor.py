@@ -1,6 +1,8 @@
 import inspect
 from functools import wraps
 
+import torch
+
 
 def print_shapes(*param_paths: str):
     """
@@ -23,6 +25,7 @@ def print_shapes(*param_paths: str):
     """
 
     def decorator(func):
+        return func
         sig = inspect.signature(func)
 
         @wraps(func)
@@ -63,7 +66,7 @@ def print_shapes(*param_paths: str):
                 else:
                     shape = getattr(obj, "shape", None) if obj is not None else None
 
-                if shape is None:
+                if shape is None and not isinstance(obj, torch.Tensor):
                     print(f"   {path} = {obj}")
                 else:
                     print(f"   {path}.shape = {shape}")

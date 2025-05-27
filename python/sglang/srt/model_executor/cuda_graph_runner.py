@@ -210,6 +210,7 @@ class CudaGraphRunner:
 
         # If returning hidden states is enabled, set initial capture hidden mode to full to avoid double-capture on startup
         if model_runner.server_args.enable_return_hidden_states:
+            print("-->setting capture hidden mode to full", flush=True)
             self.capture_hidden_mode = CaptureHiddenMode.FULL
 
         # Attention backend
@@ -351,7 +352,35 @@ class CudaGraphRunner:
             if self.is_encoder_decoder
             else True
         )
-        return is_bs_supported and is_encoder_lens_supported
+
+        requested_capture_hidden_mode = max(
+            forward_batch.capture_hidden_mode,
+            (
+                forward_batch.spec_info.capture_hidden_mode
+                if getattr(forward_batch.spec_info, "capture_hidden_mode", None)
+                is not None
+                else CaptureHiddenMode.NULL
+            ),
+        )
+        capture_hidden_mode_matches = (
+            requested_capture_hidden_mode == CaptureHiddenMode.NULL
+            or requested_capture_hidden_mode == self.capture_hidden_mode
+        )
+
+        if (
+            is_encoder_lens_supported
+            and is_encoder_lens_supported
+            and not capture_hidden_mode_matches
+        ):
+            print(
+                "###Can't run graph runner solely due to mismatched Capture Hidden Mode"
+            )
+
+        return (
+            is_bs_supported
+            and is_encoder_lens_supported
+            and capture_hidden_mode_matches
+        )
 
     def capture(self):
         with graph_capture() as graph_capture_context:
@@ -535,6 +564,8 @@ class CudaGraphRunner:
         )
 
         # Determine the highest capture_hidden_mode required
+        # (If we have FULL, we can emulate LAST or NULL)
+        # (If we have LAST, we can emulate NULL)
         required_capture_hidden_mode = max(
             capture_hidden_mode_required_by_forward_batch,
             capture_hidden_mode_required_by_spec_info,
