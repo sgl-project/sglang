@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import dataclasses
 import logging
 import os
@@ -175,14 +176,21 @@ class MooncakeKVManager(BaseKVManager):
             cpu_count = os.cpu_count()
             transfer_thread_pool_size = get_int_env_var(
                 "SGLANG_DISAGGREGATION_THREAD_POOL_SIZE",
-                min(max(1, cpu_count // 8), 8),
+                min(max(4, int(0.75 * cpu_count) // 8), 12),
             )
+            transfer_queue_size = get_int_env_var("SGLANG_DISAGGREGATION_QUEUE_SIZE", 4)
             self.transfer_queues: List[FastQueue] = [
-                FastQueue() for _ in range(transfer_thread_pool_size)
+                FastQueue() for _ in range(transfer_queue_size)
             ]
-            for q in self.transfer_queues:
+            self.executors = [
+                concurrent.futures.ThreadPoolExecutor(
+                    transfer_thread_pool_size // transfer_queue_size
+                )
+                for _ in range(transfer_queue_size)
+            ]
+            for queue, executor in zip(self.transfer_queues, self.executors):
                 threading.Thread(
-                    target=self.transfer_worker, args=(q,), daemon=True
+                    target=self.transfer_worker, args=(queue, executor), daemon=True
                 ).start()
 
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
@@ -197,7 +205,7 @@ class MooncakeKVManager(BaseKVManager):
             )
             # Heartbeat failure should be at least 1
             self.max_failures = max(
-                int(os.getenv("SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE", 2)), 1
+                get_int_env_var("SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE", 2), 1
             )
             self.start_decode_thread()
             self.connection_pool: Dict[str, Dict[str, Union[str, int]]] = {}
@@ -234,6 +242,7 @@ class MooncakeKVManager(BaseKVManager):
         prefill_kv_indices: npt.NDArray[np.int64],
         dst_kv_ptrs: list[int],
         dst_kv_indices: npt.NDArray[np.int64],
+        executor: concurrent.futures.ThreadPoolExecutor,
     ):
         # Group by indices
         prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
@@ -241,11 +250,17 @@ class MooncakeKVManager(BaseKVManager):
         )
 
         num_layers = len(self.kv_args.kv_data_ptrs)
-        for layer_id in range(num_layers):
-            src_ptr = self.kv_args.kv_data_ptrs[layer_id]
-            dst_ptr = dst_kv_ptrs[layer_id]
-            item_len = self.kv_args.kv_item_lens[layer_id]
+        layers_params = [
+            (
+                self.kv_args.kv_data_ptrs[layer_id],
+                dst_kv_ptrs[layer_id],
+                self.kv_args.kv_item_lens[layer_id],
+            )
+            for layer_id in range(num_layers)
+        ]
 
+        # Worker function for processing a single layer
+        def process_layer(src_ptr: int, dst_ptr: int, item_len: int) -> int:
             for prefill_index, decode_index in zip(prefill_kv_blocks, dst_kv_blocks):
                 src_addr = src_ptr + int(prefill_index[0]) * item_len
                 dst_addr = dst_ptr + int(decode_index[0]) * item_len
@@ -256,6 +271,24 @@ class MooncakeKVManager(BaseKVManager):
                 )
                 if status != 0:
                     return status
+            return 0
+
+        futures = [
+            executor.submit(
+                process_layer,
+                src_ptr,
+                dst_ptr,
+                item_len,
+            )
+            for (src_ptr, dst_ptr, item_len) in layers_params
+        ]
+
+        for future in concurrent.futures.as_completed(futures):
+            status = future.result()
+            if status != 0:
+                for f in futures:
+                    f.cancel()
+                return status
 
         return 0
 
@@ -288,7 +321,9 @@ class MooncakeKVManager(BaseKVManager):
             ]
         )
 
-    def transfer_worker(self, queue: FastQueue):
+    def transfer_worker(
+        self, queue: FastQueue, executor: concurrent.futures.ThreadPoolExecutor
+    ):
         while True:
             try:
                 kv_chunk: TransferKVChunk = queue.get()
@@ -338,6 +373,7 @@ class MooncakeKVManager(BaseKVManager):
                                 req.mooncake_session_id
                             ].dst_kv_ptrs,
                             chunked_dst_kv_indice,
+                            executor,
                         )
                         if ret != 0:
                             with self.session_lock:
