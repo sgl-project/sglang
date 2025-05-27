@@ -25,24 +25,6 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-"""
-class TestOpenAIServerWithHiddenStates(TestOpenAIServer):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-123456"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            api_key=cls.api_key,
-            other_args=["--enable-return-hidden-states"]
-        )
-        cls.base_url += "/v1"
-        cls.tokenizer = get_tokenizer(DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
-"""
-
 
 class TestOpenAIServer(CustomTestCase):
     @classmethod
@@ -55,7 +37,6 @@ class TestOpenAIServer(CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             api_key=cls.api_key,
-            other_args=["--enable-return-hidden-states"],
         )
         cls.base_url += "/v1"
         cls.tokenizer = get_tokenizer(DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
@@ -535,75 +516,49 @@ class TestOpenAIServer(CustomTestCase):
         assert del_response.deleted
 
     def test_completion(self):
-        curr_return_hidden_states = False
-        for return_hidden_states in [False, True]:
-            if return_hidden_states != curr_return_hidden_states:
-                print(
-                    "~~~~ test_completion return_hidden_states NEW VALUE!",
-                    return_hidden_states,
-                )
-            curr_return_hidden_states = return_hidden_states
-            for echo in [False, True]:
-                for logprobs in [None, 5]:
-                    for use_list_input in [True, False]:
-                        for parallel_sample_num in [1, 2]:
-                            for token_input in [False, True]:
-                                self.run_completion(
-                                    echo,
-                                    logprobs,
-                                    use_list_input,
-                                    parallel_sample_num,
-                                    token_input,
-                                    return_hidden_states,
-                                )
+        for echo in [False, True]:
+            for logprobs in [None, 5]:
+                for use_list_input in [True, False]:
+                    for parallel_sample_num in [1, 2]:
+                        for token_input in [False, True]:
+                            self.run_completion(
+                                echo,
+                                logprobs,
+                                use_list_input,
+                                parallel_sample_num,
+                                token_input,
+                                return_hidden_states,
+                            )
 
     def test_completion_stream(self):
         # parallel sampling and list input are not supported in streaming mode
-        curr_return_hidden_states = False
-        for return_hidden_states in [False, True]:
-            if return_hidden_states != curr_return_hidden_states:
-                print(
-                    "~~~~ test_completion_stream return_hidden_states NEW VALUE!",
-                    return_hidden_states,
-                )
-            curr_return_hidden_states = return_hidden_states
-            for echo in [False, True]:
-                for logprobs in [None, 5]:
-                    for use_list_input in [True, False]:
-                        for parallel_sample_num in [1, 2]:
-                            for token_input in [False, True]:
-                                self.run_completion_stream(
-                                    echo,
-                                    logprobs,
-                                    use_list_input,
-                                    parallel_sample_num,
-                                    token_input,
-                                    return_hidden_states,
-                                )
+        for echo in [False, True]:
+            for logprobs in [None, 5]:
+                for use_list_input in [True, False]:
+                    for parallel_sample_num in [1, 2]:
+                        for token_input in [False, True]:
+                            self.run_completion_stream(
+                                echo,
+                                logprobs,
+                                use_list_input,
+                                parallel_sample_num,
+                                token_input,
+                                return_hidden_states,
+                            )
 
     def test_chat_completion(self):
-        curr_return_hidden_states = False
-        for return_hidden_states in [False, True]:
-            for logprobs in [None, 5]:
-                for parallel_sample_num in [1, 2]:
-                    self.run_chat_completion(
-                        logprobs, parallel_sample_num, return_hidden_states
-                    )
+        for logprobs in [None, 5]:
+            for parallel_sample_num in [1, 2]:
+                self.run_chat_completion(
+                    logprobs, parallel_sample_num, return_hidden_states
+                )
 
     def test_chat_completion_stream(self):
-        curr_return_hidden_states = False
-        for return_hidden_states in [False, True]:
-            if return_hidden_states != curr_return_hidden_states:
-                print(
-                    "~~~~ test_chat_completion_stream return_hidden_states NEW VALUE!",
-                    return_hidden_states,
+        for logprobs in [None, 5]:
+            for parallel_sample_num in [1, 2]:
+                self.run_chat_completion_stream(
+                    logprobs, parallel_sample_num, return_hidden_states
                 )
-            curr_return_hidden_states = return_hidden_states
-            for logprobs in [None, 5]:
-                for parallel_sample_num in [1, 2]:
-                    self.run_chat_completion_stream(
-                        logprobs, parallel_sample_num, return_hidden_states
-                    )
 
     def test_batch(self):
         for mode in ["completion", "chat"]:
