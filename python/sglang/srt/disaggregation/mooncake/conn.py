@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import concurrent.futures
 import dataclasses
 import logging
 import os
@@ -169,21 +168,19 @@ class MooncakeKVManager(BaseKVManager):
             self.session_lock = threading.Lock()
             # Determine the number of threads to use for kv sender
             cpu_count = os.cpu_count()
-            transfer_threads = int(
+            transfer_thread_pool_size = int(
                 os.getenv(
                     "DISAGGREGATION_THREAD_POOL_SIZE",
                     min(max(1, cpu_count // 8), 8),
                 )
             )
             self.transfer_queues: List[FastQueue] = [
-                FastQueue() for _ in range(transfer_threads)
+                FastQueue() for _ in range(transfer_thread_pool_size)
             ]
             for q in self.transfer_queues:
                 threading.Thread(
                     target=self.transfer_worker, args=(q,), daemon=True
                 ).start()
-
-            self.executor = concurrent.futures.ThreadPoolExecutor(transfer_threads)
 
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.heartbeat_failures = {}
@@ -241,17 +238,11 @@ class MooncakeKVManager(BaseKVManager):
         )
 
         num_layers = len(self.kv_args.kv_data_ptrs)
-        layers_params = [
-            (
-                self.kv_args.kv_data_ptrs[layer_id],
-                dst_kv_ptrs[layer_id],
-                self.kv_args.kv_item_lens[layer_id],
-            )
-            for layer_id in range(num_layers)
-        ]
+        for layer_id in range(num_layers):
+            src_ptr = self.kv_args.kv_data_ptrs[layer_id]
+            dst_ptr = dst_kv_ptrs[layer_id]
+            item_len = self.kv_args.kv_item_lens[layer_id]
 
-        # Worker function for processing a single layer
-        def process_layer(src_ptr: int, dst_ptr: int, item_len: int) -> int:
             for prefill_index, decode_index in zip(prefill_kv_blocks, dst_kv_blocks):
                 src_addr = src_ptr + int(prefill_index[0]) * item_len
                 dst_addr = dst_ptr + int(decode_index[0]) * item_len
@@ -262,24 +253,6 @@ class MooncakeKVManager(BaseKVManager):
                 )
                 if status != 0:
                     return status
-            return 0
-
-        futures = [
-            self.executor.submit(
-                process_layer,
-                src_ptr,
-                dst_ptr,
-                item_len,
-            )
-            for (src_ptr, dst_ptr, item_len) in layers_params
-        ]
-
-        for future in concurrent.futures.as_completed(futures):
-            status = future.result()
-            if status != 0:
-                for f in futures:
-                    f.cancel()
-                return status
 
         return 0
 
@@ -555,8 +528,13 @@ class MooncakeKVManager(BaseKVManager):
             )
             return
 
-        # simply shard according the room
-        shard_idx = bootstrap_room % len(self.transfer_queues)
+        # NOTE(shangming): sharding according to the dst_infos to make sure
+        # requests with the same dst_sessions will be added into the same
+        # queue, which enables early abort with failed sessions.
+        dst_infos = self.transfer_infos[bootstrap_room].keys()
+        session_port_sum = sum(int(session.split(":")[1]) for session in dst_infos)
+        shard_idx = session_port_sum % len(self.transfer_queues)
+
         self.transfer_queues[shard_idx].put(
             TransferKVChunk(
                 room=bootstrap_room,
