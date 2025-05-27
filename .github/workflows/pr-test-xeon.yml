@@ -52,13 +52,13 @@ jobs:
       - name: Run UT Cases
         timeout-minutes: 20
         run: |
-          docker exec -w /sglang-checkout/sglang ci_sglang_xeon \
+          docker exec -w /sglang-checkout/ ci_sglang_xeon \
             bash -c "cd ./test/srt && python3 run_suite.py --suite per-commit-cpu"
 
       - name: Cleanup container
         if: always()
         run: |
-          docker rm -f ci_sglang_xpu || true
+          docker rm -f ci_sglang_xeon || true
 
   finish:
     if: always()
