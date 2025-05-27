@@ -1539,7 +1539,7 @@ class Scheduler(
                     num_accepted_tokens,
                     can_run_cuda_graph,
                 ) = self.eagle_worker.forward_batch_speculative_generation(batch)
-                print("num_accepted_tokens", num_accepted_tokens)
+                # print("num_accepted_tokens", num_accepted_tokens)
                 self.spec_num_total_accepted_tokens += (
                     num_accepted_tokens + batch.batch_size()
                 )

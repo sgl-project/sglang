@@ -278,11 +278,6 @@ class EAGLEWorker(TpModelWorker):
                 self.verify(batch, spec_info)
             )
 
-            print(
-                "verify -> logits_output.hidden_states.shape",
-                logits_output.hidden_states.shape,
-            )
-
             # If it is None, it means all requests are finished
             if batch.spec_info.verified_id is not None:
                 with self.draft_tp_context(self.draft_model_runner.tp_group):
@@ -419,9 +414,9 @@ class EAGLEWorker(TpModelWorker):
         batch.seq_lens_sum = torch.sum(batch.seq_lens).item()
         spec_info.positions = batch.seq_lens.repeat_interleave(self.topk, dim=0)
         spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
+        batch.return_hidden_states = False
         model_worker_batch = batch.get_model_worker_batch()
-        # K
-        model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
+        assert model_worker_batch.capture_hidden_mode == CaptureHiddenMode.LAST
         forward_batch = ForwardBatch.init_new(
             model_worker_batch, self.draft_model_runner
         )
@@ -521,11 +516,11 @@ class EAGLEWorker(TpModelWorker):
     @print_shapes("batch.spec_info.hidden_states", "spec_info.hidden_states")
     def verify(self, batch: ScheduleBatch, spec_info: EagleVerifyInput):
         spec_info.prepare_for_verify(batch, self.page_size)
+        batch.return_hidden_states = False
         batch.forward_mode = ForwardMode.TARGET_VERIFY
         batch.spec_info = spec_info
         model_worker_batch = batch.get_model_worker_batch()
-        # K
-        model_worker_batch.capture_hidden_mode = spec_info.capture_hidden_mode
+        assert model_worker_batch.capture_hidden_mode == spec_info.capture_hidden_mode
         logits_output, _, can_run_cuda_graph = (
             self.target_worker.forward_batch_generation(
                 model_worker_batch, skip_sample=True
@@ -635,11 +630,11 @@ class EAGLEWorker(TpModelWorker):
             hidden_states=hidden_states,
             verified_id=next_token_ids,
         )
+        batch.return_hidden_states = False
         batch.spec_info.prepare_for_extend(batch)
         batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
         model_worker_batch = batch.get_model_worker_batch()
-        # K
-        model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
+        assert model_worker_batch.capture_hidden_mode == CaptureHiddenMode.LAST
         forward_batch = ForwardBatch.init_new(
             model_worker_batch, self.draft_model_runner
         )
@@ -690,9 +685,9 @@ class EAGLEWorker(TpModelWorker):
         )
         batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
         batch.return_logprob = False
+        batch.return_hidden_states = False
         model_worker_batch = batch.get_model_worker_batch()
-        # K
-        model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
+        assert model_worker_batch.capture_hidden_mode == CaptureHiddenMode.LAST
         forward_batch = ForwardBatch.init_new(
             model_worker_batch, self.draft_model_runner
         )

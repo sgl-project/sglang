@@ -412,6 +412,16 @@ class TokenizerManager:
 
         obj.normalize_batch_and_arguments()
 
+        if (
+            isinstance(obj, GenerateReqInput)
+            and getattr(obj, "return_hidden_states", False)
+            and not self.server_args.enable_return_hidden_states
+        ):
+            raise ValueError(
+                "return_hidden_states=True requires the server to be started "
+                "with --enable-return-hidden-states (ServerArgs.enable_return_hidden_states)."
+            )
+
         if self.log_requests:
             max_length, skip_names, _ = self.log_request_metadata
             logger.info(

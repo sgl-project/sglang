@@ -30,6 +30,8 @@ torch_dtype = torch.float16
 prefill_tolerance = 5e-2
 decode_tolerance: float = 5e-2
 
+disable_cuda_graph = False
+
 
 class TestEAGLEEngine(CustomTestCase):
     BASE_CONFIG = {
@@ -41,6 +43,7 @@ class TestEAGLEEngine(CustomTestCase):
         "speculative_num_draft_tokens": 8,
         "mem_fraction_static": 0.7,
         "cuda_graph_max_bs": 5,
+        "disable_cuda_graph": disable_cuda_graph,
     }
     NUM_CONFIGS = 2
 
@@ -173,6 +176,7 @@ class TestEAGLE3Engine(TestEAGLEEngine):
         "mem_fraction_static": 0.7,
         "cuda_graph_max_bs": 5,
         "dtype": "float16",
+        "disable_cuda_graph": disable_cuda_graph,
     }
     NUM_CONFIGS = 1
 
