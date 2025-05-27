@@ -87,10 +87,12 @@ def compute_split_token_index(
 # -------------------------------- Preparation ---------------------------------------
 
 
-class TboCudaGraphRunnerUtils:
-    @classmethod
-    def prepare(cls, batch: ForwardBatch, num_tokens: int):
-        batch.tbo_split_seq_index = cls._compute_tbo_split_seq_index(num_tokens, batch.forward_mode)
+class TboCudaGraphRunnerPlugin:
+    def __init__(self):
+        TODO
+
+    def prepare(self, batch: ForwardBatch, num_tokens: int):
+        batch.tbo_split_seq_index = self._compute_tbo_split_seq_index(num_tokens, batch.forward_mode)
         if batch.tbo_split_seq_index is None:
             return
 

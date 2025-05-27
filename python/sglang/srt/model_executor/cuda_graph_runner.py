@@ -40,7 +40,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.patch_torch import monkey_patch_torch_compile
 from sglang.srt.two_batch_overlap import (
-    TboCudaGraphRunnerUtils,
+    TboCudaGraphRunnerPlugin,
     TboForwardBatchPreparer,
 )
 from sglang.srt.utils import (
@@ -483,7 +483,7 @@ class CudaGraphRunner:
             num_token_non_padded=self.num_token_non_padded,
             global_forward_mode=self.capture_forward_mode,
         )
-        TboCudaGraphRunnerUtils.prepare(forward_batch, num_tokens=num_tokens)
+        TboCudaGraphRunnerPlugin.prepare(forward_batch, num_tokens=num_tokens)
 
         if lora_paths is not None:
             self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
