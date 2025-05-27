@@ -275,16 +275,25 @@ class CommunicateSimpleFn:
         residual_output_mode: ScatterMode,
         context: CommunicateContext,
     ):
-        if (
-            context.is_same_group_size(hidden_states_input_mode, hidden_states_output_mode)
-            and context.is_same_group_size(residual_input_mode, residual_output_mode)
-        ):
+        if context.is_same_group_size(
+            hidden_states_input_mode, hidden_states_output_mode
+        ) and context.is_same_group_size(residual_input_mode, residual_output_mode):
             return CommunicateSimpleFn._trivial
 
-        if hidden_states_input_mode == ScatterMode.TP_ATTN_FULL and residual_input_mode == ScatterMode.SCATTERED and hidden_states_output_mode == ScatterMode.TP_ATTN_FULL and residual_output_mode == ScatterMode.SCATTERED:
+        if (
+            hidden_states_input_mode == ScatterMode.TP_ATTN_FULL
+            and residual_input_mode == ScatterMode.SCATTERED
+            and hidden_states_output_mode == ScatterMode.TP_ATTN_FULL
+            and residual_output_mode == ScatterMode.SCATTERED
+        ):
             return CommunicateSimpleFn._gather_hidden_states
 
-        if hidden_states_input_mode == ScatterMode.TP_ATTN_FULL and residual_input_mode == ScatterMode.SCATTERED and hidden_states_output_mode == ScatterMode.TP_ATTN_FULL and residual_output_mode == ScatterMode.TP_ATTN_FULL:
+        if (
+            hidden_states_input_mode == ScatterMode.TP_ATTN_FULL
+            and residual_input_mode == ScatterMode.SCATTERED
+            and hidden_states_output_mode == ScatterMode.TP_ATTN_FULL
+            and residual_output_mode == ScatterMode.TP_ATTN_FULL
+        ):
             return CommunicateSimpleFn._gather_hidden_states_and_residual
 
         raise NotImplementedError(
