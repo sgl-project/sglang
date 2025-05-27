@@ -20,7 +20,7 @@ def _find_common_prefix(s1: str, s2: str) -> str:
 def _partial_json_loads(input_str: str, flags: Allow) -> Tuple[Any, int]:
     """
     Parse incomplete or partial JSON strings commonly encountered during streaming.
-    
+
     Args:
         input_str (str): The potentially incomplete JSON string to parse.
         flags (Allow): Bitwise flags controlling what types of partial data are allowed.
@@ -29,7 +29,7 @@ def _partial_json_loads(input_str: str, flags: Allow) -> Tuple[Any, int]:
             - Allow.OBJ: Allow partial objects (e.g., '{"key":' -> {'key': None})
             - Allow.ARR: Allow partial arrays (e.g., '[1, 2,' -> [1, 2])
             - Allow.ALL: Allow all types of partial data
-    
+
     Returns:
         Tuple[Any, int]: A tuple containing:
             - parsed_object: The Python object parsed from the JSON
