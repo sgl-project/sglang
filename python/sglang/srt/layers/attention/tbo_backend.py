@@ -1,6 +1,7 @@
 from typing import TYPE_CHECKING, Callable, List, Optional, Union
 
 import torch
+
 from sglang.srt import two_batch_overlap
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
@@ -122,9 +123,11 @@ class TboAttnBackend(AttentionBackend):
             assert capture_num_tokens == bs, "Only support num_tokens==bs currently"
         num_tokens = bs
 
-        tbo_split_seq_index, tbo_split_token_index = two_batch_overlap.compute_split_indices_for_cuda_graph_replay(
-            forward_mode=forward_mode,
-            cuda_graph_num_tokens=num_tokens,
+        tbo_split_seq_index, tbo_split_token_index = (
+            two_batch_overlap.compute_split_indices_for_cuda_graph_replay(
+                forward_mode=forward_mode,
+                cuda_graph_num_tokens=num_tokens,
+            )
         )
 
         num_tokens_child_left = tbo_split_token_index

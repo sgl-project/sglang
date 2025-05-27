@@ -3,6 +3,7 @@ import logging
 from typing import TYPE_CHECKING, Dict, List, Optional, Sequence
 
 import torch
+
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.communicator import (
     CommunicateContext,
@@ -123,25 +124,31 @@ class TboCudaGraphRunnerPlugin:
         # For simplicity, when two_batch_overlap is enabled, we only capture CUDA Graph for tbo=true
         assert batch.tbo_split_seq_index is not None, f"{num_tokens=}"
 
-        self._tbo_children_num_token_non_padded[
-            ...] = TboForwardBatchPreparer.compute_tbo_children_num_token_non_padded(batch)
+        self._tbo_children_num_token_non_padded[...] = (
+            TboForwardBatchPreparer.compute_tbo_children_num_token_non_padded(batch)
+        )
 
         TboForwardBatchPreparer.prepare_raw(
             batch,
             tbo_children_num_token_non_padded=self._tbo_children_num_token_non_padded,
         )
 
-    def replay_prepare(self, forward_mode: ForwardMode, bs: int, num_token_non_padded: int):
-        tbo_split_seq_index, tbo_split_token_index = compute_split_indices_for_cuda_graph_replay(
-            forward_mode=forward_mode,
-            # TODO support bs!=num_tokens
-            cuda_graph_num_tokens=bs,
+    def replay_prepare(
+        self, forward_mode: ForwardMode, bs: int, num_token_non_padded: int
+    ):
+        tbo_split_seq_index, tbo_split_token_index = (
+            compute_split_indices_for_cuda_graph_replay(
+                forward_mode=forward_mode,
+                # TODO support bs!=num_tokens
+                cuda_graph_num_tokens=bs,
+            )
         )
 
-        self._tbo_children_num_token_non_padded[
-            ...] = TboForwardBatchPreparer.compute_tbo_children_num_token_non_padded_raw(
-            tbo_split_token_index=tbo_split_token_index,
-            num_token_non_padded=num_token_non_padded,
+        self._tbo_children_num_token_non_padded[...] = (
+            TboForwardBatchPreparer.compute_tbo_children_num_token_non_padded_raw(
+                tbo_split_token_index=tbo_split_token_index,
+                num_token_non_padded=num_token_non_padded,
+            )
         )
 
 
@@ -220,8 +227,12 @@ class TboForwardBatchPreparer:
         if batch.tbo_split_seq_index is None:
             return
 
-        tbo_children_num_token_non_padded = cls.compute_tbo_children_num_token_non_padded(batch)
-        cls.prepare_raw(batch, tbo_children_num_token_non_padded=tbo_children_num_token_non_padded)
+        tbo_children_num_token_non_padded = (
+            cls.compute_tbo_children_num_token_non_padded(batch)
+        )
+        cls.prepare_raw(
+            batch, tbo_children_num_token_non_padded=tbo_children_num_token_non_padded
+        )
 
     @classmethod
     def prepare_raw(
@@ -398,7 +409,9 @@ class TboForwardBatchPreparer:
         )
 
     @classmethod
-    def compute_tbo_children_num_token_non_padded_raw(cls, tbo_split_token_index: int, num_token_non_padded: int):
+    def compute_tbo_children_num_token_non_padded_raw(
+        cls, tbo_split_token_index: int, num_token_non_padded: int
+    ):
         # TODO we may make padding on both sub-batches to make it slightly more balanced
         value_a = min(tbo_split_token_index, num_token_non_padded)
         value_b = max(0, num_token_non_padded - tbo_split_token_index)

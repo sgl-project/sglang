@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Union
 
 import torch
 import tqdm
+
 from sglang.srt import two_batch_overlap
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import get_tensor_model_parallel_rank
@@ -580,8 +581,11 @@ class CudaGraphRunner:
         self.positions[:raw_num_token].copy_(forward_batch.positions)
         num_tokens_non_padded = len(forward_batch.input_ids)
         self.num_token_non_padded[...] = num_tokens_non_padded
-        self.tbo_plugin.replay_prepare(forward_mode=forward_batch.forward_mode, bs=bs,
-                                       num_tokens_non_padded=num_tokens_non_padded)
+        self.tbo_plugin.replay_prepare(
+            forward_mode=forward_batch.forward_mode,
+            bs=bs,
+            num_tokens_non_padded=num_tokens_non_padded,
+        )
         if forward_batch.seq_lens_cpu is not None:
             if bs != raw_bs:
                 self.seq_lens_cpu.fill_(1)
