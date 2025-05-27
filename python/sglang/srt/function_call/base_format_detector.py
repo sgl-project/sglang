@@ -103,9 +103,17 @@ class BaseFormatDetector(ABC):
 
         For incompatible formats, detectors should override this method with custom logic.
         """
+        print(f"==============parse_streaming_increment================='")
+        print(f"DEBUG: parse_streaming_increment called with new_text='{new_text}'")
+        print(
+            f"DEBUG: current_tool_id={self.current_tool_id}, current_tool_name_sent={self.current_tool_name_sent}"
+        )
+        print(f"DEBUG: buffer before='{self._buffer}'")
+
         # Append new text to buffer
         self._buffer += new_text
         current_text = self._buffer
+        print(f"DEBUG: buffer after='{current_text}'")
 
         if not (self.bot_token in current_text or current_text.startswith("{")):
             # Only clear buffer if we're sure no tool call is starting
@@ -114,9 +122,11 @@ class BaseFormatDetector(ABC):
                 self._buffer = ""
                 if self.eot_token in normal_text:
                     normal_text = normal_text.replace(self.eot_token, "")
+                print(f"DEBUG: returning normal_text='{normal_text}'")
                 return StreamingParseResult(normal_text=normal_text)
             else:
                 # Might be partial bot_token, keep buffering
+                print(f"DEBUG: partial bot_token detected, keep buffering")
                 return StreamingParseResult()
 
         # Build tool indices if not already built
@@ -126,6 +136,7 @@ class BaseFormatDetector(ABC):
                 for i, tool in enumerate(tools)
                 if tool.function and tool.function.name
             }
+            print(f"DEBUG: built tool_indices={self._tool_indices}")
 
         flags = Allow.ALL if self.current_tool_name_sent else Allow.ALL & ~Allow.STR
 
@@ -137,19 +148,31 @@ class BaseFormatDetector(ABC):
                     if current_text.startswith(self.bot_token)
                     else 0
                 )
+                print(f"DEBUG: start_idx={start_idx}")
 
                 if start_idx >= len(current_text):
+                    print(
+                        f"DEBUG: start_idx >= len(current_text), returning empty result"
+                    )
                     return StreamingParseResult()
 
+                print(
+                    f"DEBUG: parsing from start_idx={start_idx}, text='{current_text[start_idx:]}'"
+                )
                 (obj, end_idx) = _partial_json_loads(current_text[start_idx:], flags)
+                print(
+                    f"DEBUG: _partial_json_loads returned obj={obj}, end_idx={end_idx}"
+                )
 
                 is_current_complete = _is_complete_json(
                     current_text[start_idx : start_idx + end_idx]
                 )
+                print(f"DEBUG: is_current_complete={is_current_complete}")
 
                 # Validate tool name if present
                 if "name" in obj and obj["name"] not in self._tool_indices:
                     # Invalid tool name - reset state
+                    print(f"DEBUG: invalid tool name '{obj['name']}', resetting state")
                     self._buffer = ""
                     self.current_tool_id = -1
                     self.current_tool_name_sent = False
@@ -166,27 +189,38 @@ class BaseFormatDetector(ABC):
                     obj["arguments"] = obj["parameters"]
 
                 current_tool_call = obj
+                print(f"DEBUG: current_tool_call={current_tool_call}")
 
             except MalformedJSON:
+                print(f"DEBUG: MalformedJSON exception, returning empty result")
                 return StreamingParseResult()
 
             if not current_tool_call:
+                print(f"DEBUG: current_tool_call is empty, returning empty result")
                 return StreamingParseResult()
 
             # Case 1: Handle tool name streaming
             # This happens when we encounter a tool but haven't sent its name yet
             if not self.current_tool_name_sent:
+                print(f"DEBUG: Case 1 - tool name streaming")
                 function_name = current_tool_call.get("name")
+                print(f"DEBUG: Case 1 - function_name='{function_name}'")
 
                 if function_name and function_name in self._tool_indices:
                     # If this is a new tool (current_tool_id was -1), initialize it
                     if self.current_tool_id == -1:
                         self.current_tool_id = 0
                         self.streamed_args_for_tool.append("")
+                        print(
+                            f"DEBUG: Case 1 - initialized first tool, current_tool_id={self.current_tool_id}"
+                        )
                     # If this is a subsequent tool, ensure streamed_args_for_tool is large enough
                     elif self.current_tool_id >= len(self.streamed_args_for_tool):
                         while len(self.streamed_args_for_tool) <= self.current_tool_id:
                             self.streamed_args_for_tool.append("")
+                        print(
+                            f"DEBUG: Case 1 - initialized tool {self.current_tool_id}, streamed_args_for_tool length now {len(self.streamed_args_for_tool)}"
+                        )
 
                     # Send the tool name with empty parameters
                     res = StreamingParseResult(
@@ -199,14 +233,20 @@ class BaseFormatDetector(ABC):
                         ],
                     )
                     self.current_tool_name_sent = True
+                    print(
+                        f"DEBUG: Case 1 - sent tool name '{function_name}' with tool_index={self.current_tool_id}"
+                    )
                 else:
                     res = StreamingParseResult()
+                    print(f"DEBUG: Case 1 - function name not valid or not found")
 
             # Case 2: Handle streaming arguments
             # This happens when we've already sent the tool name and now need to stream arguments incrementally
             else:
+                print(f"DEBUG: Case 2 - streaming arguments")
                 cur_arguments = current_tool_call.get("arguments")
                 res = StreamingParseResult()
+                print(f"DEBUG: Case 2 - cur_arguments={cur_arguments}")
 
                 if cur_arguments:
                     # Calculate how much of the arguments we've already streamed
@@ -217,6 +257,9 @@ class BaseFormatDetector(ABC):
                         prev_arguments = self.prev_tool_call_arr[
                             self.current_tool_id
                         ].get("arguments")
+                    print(
+                        f"DEBUG: Case 2 - sent={sent}, cur_args_json='{cur_args_json}', prev_arguments={prev_arguments}"
+                    )
 
                     argument_diff = None
 
@@ -229,12 +272,16 @@ class BaseFormatDetector(ABC):
 
                         # Clear buffer when tool completes
                         self._buffer = ""
+                        print(f"DEBUG: Case 2 - cleared buffer, tool complete")
 
                         if self.current_tool_id < len(self.prev_tool_call_arr):
                             self.prev_tool_call_arr[self.current_tool_id].clear()
                         self.current_tool_name_sent = False
                         self.streamed_args_for_tool[self.current_tool_id] = ""
                         self.current_tool_id += 1
+                        print(
+                            f"DEBUG: Case 2 - tool complete, argument_diff='{argument_diff}', completing_tool_id={completing_tool_id}, new current_tool_id={self.current_tool_id}"
+                        )
 
                     # If the tool is still being parsed, send incremental changes
                     elif prev_arguments:
@@ -242,6 +289,9 @@ class BaseFormatDetector(ABC):
                         if cur_args_json != prev_args_json:
                             prefix = _find_common_prefix(prev_args_json, cur_args_json)
                             argument_diff = prefix[sent:]
+                        print(
+                            f"DEBUG: Case 2 - incremental, argument_diff='{argument_diff}'"
+                        )
 
                     # Send the argument diff if there's something new
                     if argument_diff is not None:
@@ -263,6 +313,9 @@ class BaseFormatDetector(ABC):
                             self.streamed_args_for_tool[
                                 self.current_tool_id
                             ] += argument_diff
+                        print(
+                            f"DEBUG: Case 2 - sending argument_diff='{argument_diff}' with tool_index={tool_index_to_use}"
+                        )
 
             # Update prev_tool_call_arr with current state
             if self.current_tool_id >= 0:
@@ -271,9 +324,12 @@ class BaseFormatDetector(ABC):
                     self.prev_tool_call_arr.append({})
                 self.prev_tool_call_arr[self.current_tool_id] = current_tool_call
 
+            print(f"DEBUG: updated prev_tool_call_arr={self.prev_tool_call_arr}")
+            print(f"DEBUG: returning res={res}")
             return res
 
         except Exception as e:
+            print(f"DEBUG: Exception in parse_streaming_increment: {e}")
             logger.error(f"Error in parse_streaming_increment: {e}")
             return StreamingParseResult()
 
