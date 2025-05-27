@@ -50,7 +50,7 @@ class BaseFormatDetector(ABC):
             if name and name in tool_indices:
                 results.append(
                     ToolCallItem(
-                        tool_index=tool_indices[name],
+                        tool_index=-1,  # Caller should update this based on the actual tools array called
                         name=name,
                         parameters=json.dumps(
                             act.get("parameters") or act.get("arguments", {}),
@@ -173,8 +173,12 @@ class BaseFormatDetector(ABC):
                 tool_call_arr[self.current_tool_id] if len(tool_call_arr) > 0 else {}
             )
 
-            # Handle new tool in array
+            # Case 1:Handle new tool discovered in array
+            # This happens when we discover a new tool call in the JSON array that we haven't processed yet
+            # Example: Previously had [{"name": "tool1", ...}], now we have [{"name": "tool1", ...}, {"name": "tool2", ...}]
             if len(tool_call_arr) > 0 and len(tool_call_arr) > self.current_tool_id + 1:
+                # Before switching to the new tool, we need to finish streaming any remaining arguments
+                # from the previous tool (if there was one)
                 if self.current_tool_id >= 0:
                     cur_arguments = current_tool_call.get("arguments")
                     if cur_arguments:
@@ -191,6 +195,7 @@ class BaseFormatDetector(ABC):
                                 )
                             ],
                         )
+                        # Track what we've sent for this tool
                         self.streamed_args_for_tool[
                             self.current_tool_id
                         ] += argument_diff
@@ -204,14 +209,16 @@ class BaseFormatDetector(ABC):
                 self.streamed_args_for_tool.append("")
                 return res
 
-            # Handle tool name
+            # Case 2: Handle tool name streaming
+            # This happens when we encounter a tool but haven't sent its name yet
             elif not self.current_tool_name_sent:
                 function_name = current_tool_call.get("name")
                 if function_name and function_name in self._tool_indices:
+                    # Send the tool name with empty parameters
                     res = StreamingParseResult(
                         calls=[
                             ToolCallItem(
-                                tool_index=self._tool_indices[function_name],
+                                tool_index=self.current_tool_id,
                                 name=function_name,
                                 parameters="",
                             )
@@ -221,12 +228,14 @@ class BaseFormatDetector(ABC):
                 else:
                     res = StreamingParseResult()
 
-            # Handle streaming arguments
+            # Case 3:Handle streaming arguments
+            # This happens when we've already sent the tool name and now need to stream arguments incrementally
             else:
                 cur_arguments = current_tool_call.get("arguments")
                 res = StreamingParseResult()
 
                 if cur_arguments:
+                    # Calculate how much of the arguments we've already streamed
                     sent = len(self.streamed_args_for_tool[self.current_tool_id])
                     cur_args_json = json.dumps(cur_arguments)
                     prev_arguments = self.prev_tool_call_arr[self.current_tool_id].get(
@@ -234,6 +243,8 @@ class BaseFormatDetector(ABC):
                     )
 
                     argument_diff = None
+
+                    # If the current tool's JSON is complete, send all remaining arguments
                     if is_complete[self.current_tool_id]:
                         argument_diff = cur_args_json[sent:]
                         self._buffer = ""
@@ -241,12 +252,14 @@ class BaseFormatDetector(ABC):
                         self.current_tool_name_sent = False
                         self.streamed_args_for_tool[self.current_tool_id] = ""
 
+                    # If the tool is still being parsed, send incremental changes
                     elif prev_arguments:
                         prev_args_json = json.dumps(prev_arguments)
                         if cur_args_json != prev_args_json:
                             prefix = _find_common_prefix(prev_args_json, cur_args_json)
                             argument_diff = prefix[sent:]
 
+                    # Send the argument diff if there's something new
                     if argument_diff is not None:
                         res = StreamingParseResult(
                             calls=[
