@@ -37,6 +37,14 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 class ScatterMode(Enum):
+    """
+    Suppose we have TP=4, DP=2, enable-dp-attention, and the system handles seq a,b,c,d
+    Model input/output: [ab, ab, cd, cd] for four ranks respectively
+    SCATTERED: [a, b, c, d]
+    TP_ATTN_FULL: [ab, ab, cd, cd], i.e. all ranks inside a TP attn group have full data of the group
+    FULL: [abcd, abcd, abcd, abcd]
+    """
+
     SCATTERED = auto()
     TP_ATTN_FULL = auto()
     FULL = auto()
