@@ -3,6 +3,7 @@ import logging
 from typing import TYPE_CHECKING, Dict, List, Optional, Sequence
 
 import torch
+
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.communicator import (
     CommunicateContext,
@@ -32,9 +33,9 @@ logger = logging.getLogger(__name__)
 
 # TODO: may smartly disable TBO when batch size is too small b/c it will slow down
 def compute_split_seq_index(
-        forward_mode: "ForwardMode",
-        num_tokens: int,
-        extend_lens: Optional[Sequence[int]],
+    forward_mode: "ForwardMode",
+    num_tokens: int,
+    extend_lens: Optional[Sequence[int]],
 ) -> Optional[int]:
     if forward_mode.is_extend():
         assert extend_lens is not None
@@ -68,9 +69,9 @@ def _split_array_by_half_sum(arr: Sequence[int]) -> int:
 
 
 def compute_split_token_index(
-        split_seq_index: int,
-        forward_mode: "ForwardMode",
-        extend_seq_lens: Optional[Sequence[int]],
+    split_seq_index: int,
+    forward_mode: "ForwardMode",
+    extend_seq_lens: Optional[Sequence[int]],
 ) -> int:
     if forward_mode.is_extend():
         assert extend_seq_lens is not None
@@ -89,12 +90,18 @@ def compute_split_token_index(
 
 class TboCudaGraphRunnerUtils:
     @classmethod
-    def prepare(cls, batch: ForwardBatch, cuda_graph_runner: "CudaGraphRunner", num_tokens: int):
-        batch.tbo_split_seq_index = cls.compute_tbo_split_seq_index(cuda_graph_runner, num_tokens)
+    def prepare(
+        cls, batch: ForwardBatch, cuda_graph_runner: "CudaGraphRunner", num_tokens: int
+    ):
+        batch.tbo_split_seq_index = cls.compute_tbo_split_seq_index(
+            cuda_graph_runner, num_tokens
+        )
         TboForwardBatchPreparer.prepare(batch)
 
     @staticmethod
-    def compute_tbo_split_seq_index(cuda_graph_runner: "CudaGraphRunner", num_tokens: int):
+    def compute_tbo_split_seq_index(
+        cuda_graph_runner: "CudaGraphRunner", num_tokens: int
+    ):
         if cuda_graph_runner.model_runner.server_args.enable_two_batch_overlap:
             tbo_split_seq_index = compute_split_seq_index(
                 forward_mode=cuda_graph_runner.capture_forward_mode,
@@ -103,7 +110,7 @@ class TboCudaGraphRunnerUtils:
             )
             # For simplicity, when two_batch_overlap is enabled, we only capture CUDA Graph for tbo=true
             assert (
-                    tbo_split_seq_index is not None
+                tbo_split_seq_index is not None
             ), f"{cuda_graph_runner.capture_forward_mode=} {num_tokens=}"
         else:
             tbo_split_seq_index = None
@@ -112,7 +119,7 @@ class TboCudaGraphRunnerUtils:
 
 class TboDPAttentionPreparer:
     def prepare_all_gather(
-            self, local_batch, deepep_mode, enable_deepep_moe, enable_two_batch_overlap
+        self, local_batch, deepep_mode, enable_deepep_moe, enable_two_batch_overlap
     ):
         self.enable_two_batch_overlap = enable_two_batch_overlap
 
@@ -124,9 +131,9 @@ class TboDPAttentionPreparer:
             )
             resolved_deepep_mode = deepep_mode.resolve(local_batch.forward_mode)
             local_can_run_tbo = (self.local_tbo_split_seq_index is not None) and not (
-                    local_batch.forward_mode.is_extend()
-                    and enable_deepep_moe
-                    and (resolved_deepep_mode == DeepEPMode.low_latency)
+                local_batch.forward_mode.is_extend()
+                and enable_deepep_moe
+                and (resolved_deepep_mode == DeepEPMode.low_latency)
             )
         else:
             self.local_tbo_split_seq_index = 0
@@ -145,9 +152,9 @@ class TboDPAttentionPreparer:
         )
 
         can_run_tbo = (
-                self.enable_two_batch_overlap
-                and local_can_run_tbo_aggregated
-                and forward_mode_agree
+            self.enable_two_batch_overlap
+            and local_can_run_tbo_aggregated
+            and forward_mode_agree
         )
 
         tbo_split_seq_index = self.local_tbo_split_seq_index if can_run_tbo else None
@@ -230,15 +237,15 @@ class TboForwardBatchPreparer:
 
     @classmethod
     def filter_batch(
-            cls,
-            batch: ForwardBatch,
-            *,
-            start_token_index: int,
-            end_token_index: int,
-            start_seq_index: int,
-            end_seq_index: int,
-            output_attn_backend: AttentionBackend,
-            out_num_token_non_padded: torch.Tensor,
+        cls,
+        batch: ForwardBatch,
+        *,
+        start_token_index: int,
+        end_token_index: int,
+        start_seq_index: int,
+        end_seq_index: int,
+        output_attn_backend: AttentionBackend,
+        out_num_token_non_padded: torch.Tensor,
     ):
         from sglang.srt.managers.schedule_batch import global_server_args_dict
 
@@ -254,7 +261,7 @@ class TboForwardBatchPreparer:
         ]:
             old_value = getattr(batch, key)
             assert (
-                    old_value.shape[0] == num_tokens
+                old_value.shape[0] == num_tokens
             ), f"{key=} {old_value=} {num_tokens=} {batch=}"
             output_dict[key] = old_value[start_token_index:end_token_index]
 
@@ -274,7 +281,7 @@ class TboForwardBatchPreparer:
             if old_value is None:
                 continue
             assert (
-                    len(old_value) == num_seqs
+                len(old_value) == num_seqs
             ), f"{key=} {old_value=} {num_seqs=} {batch=}"
             output_dict[key] = old_value[start_seq_index:end_seq_index]
 
@@ -294,8 +301,8 @@ class TboForwardBatchPreparer:
             output_dict[key] = getattr(batch, key)
 
         assert (
-                _compute_extend_num_tokens(batch.input_ids, batch.forward_mode)
-                == batch.extend_num_tokens
+            _compute_extend_num_tokens(batch.input_ids, batch.forward_mode)
+            == batch.extend_num_tokens
         ), f"{batch=}"
         extend_num_tokens = _compute_extend_num_tokens(
             output_dict["input_ids"], output_dict["forward_mode"]
@@ -365,14 +372,14 @@ def _compute_extend_num_tokens(input_ids, forward_mode: ForwardMode):
 
 
 def model_forward_maybe_tbo(
-        layers,
-        enable_tbo: bool,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        hidden_states: torch.Tensor,
-        input_data_scatter_mode: ScatterMode,
-        residual: Optional[torch.Tensor],
-        zero_allocator: Optional[BumpAllocator] = None,
+    layers,
+    enable_tbo: bool,
+    positions: torch.Tensor,
+    forward_batch: ForwardBatch,
+    hidden_states: torch.Tensor,
+    input_data_scatter_mode: ScatterMode,
+    residual: Optional[torch.Tensor],
+    zero_allocator: Optional[BumpAllocator] = None,
 ):
     inputs = dict(
         positions=positions,
@@ -397,10 +404,10 @@ def model_forward_maybe_tbo(
 
 
 def _model_forward_tbo(
-        inputs,
-        operations_strategy: OperationsStrategy,
-        input_data_scatter_mode: ScatterMode,
-        layer_input_scatter_mode: ScatterMode,
+    inputs,
+    operations_strategy: OperationsStrategy,
+    input_data_scatter_mode: ScatterMode,
+    layer_input_scatter_mode: ScatterMode,
 ):
     inputs_arr = _model_forward_tbo_split_inputs(
         **inputs,
@@ -425,13 +432,13 @@ def _model_forward_non_tbo(inputs, operations_strategy: OperationsStrategy):
 
 
 def _model_forward_tbo_split_inputs(
-        hidden_states: torch.Tensor,
-        residual: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        zero_allocator: Optional[BumpAllocator],
-        input_data_scatter_mode: ScatterMode,
-        layer_input_scatter_mode: ScatterMode,
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    positions: torch.Tensor,
+    forward_batch: ForwardBatch,
+    zero_allocator: Optional[BumpAllocator],
+    input_data_scatter_mode: ScatterMode,
+    layer_input_scatter_mode: ScatterMode,
 ) -> List[Dict]:
     tbo_splitter_scatter_mode = ScatterMode.TP_ATTN_FULL
     context = CommunicateContext.init_new()
@@ -475,11 +482,11 @@ def _model_forward_tbo_split_inputs(
 
 
 def _model_forward_tbo_split_inputs_raw(
-        hidden_states: torch.Tensor,
-        residual: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        zero_allocator: Optional[BumpAllocator],
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    positions: torch.Tensor,
+    forward_batch: ForwardBatch,
+    zero_allocator: Optional[BumpAllocator],
 ) -> List[Dict]:
     return [
         dict(
@@ -503,11 +510,11 @@ def _model_forward_tbo_split_inputs_raw(
 
 
 def _model_forward_filter_inputs(
-        hidden_states: torch.Tensor,
-        residual: torch.Tensor,
-        positions: torch.Tensor,
-        output_forward_batch: ForwardBatch,
-        tbo_subbatch_index: int,
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    positions: torch.Tensor,
+    output_forward_batch: ForwardBatch,
+    tbo_subbatch_index: int,
 ) -> Dict:
     token_slice = slice(*output_forward_batch.tbo_parent_token_range)
     return dict(
